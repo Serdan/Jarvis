@@ -21,11 +21,19 @@ let private denied (result: Result<'a, string>) =
     | Error reason -> Assert.That(reason, Does.Contain "RecoveryBlocked")
     | Ok _ -> Assert.Fail("Expected fail-closed rejection.")
 
+// Disposable trusted first enrollment is never part of operational retry.
+let private openAtHostRoot root =
+    Client.SourceEffectJournal.openExistingAtHostRoot root (root + ".continuity.anchor")
+
 let private withStore callback =
     let root = Path.Combine(Path.GetTempPath(), "jarvis-wq03-effect-" + Guid.NewGuid().ToString("N"))
     Directory.CreateDirectory root |> ignore
-    try callback root (openAtHostRoot root |> success)
-    finally if Directory.Exists root then Directory.Delete(root, true)
+    try
+        provisionTrustedHostRoot root (root + ".continuity.anchor") |> success |> ignore
+        callback root (openAtHostRoot root |> success)
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+        if File.Exists(root + ".continuity.anchor") then File.Delete(root + ".continuity.anchor")
 
 let private scope () =
     { ProjectName = "Fixture"

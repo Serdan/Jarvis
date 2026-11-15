@@ -223,7 +223,8 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
             TimeSpan.FromSeconds(float executionSeconds) + permissionMargin
         | _ -> TimeSpan.FromMinutes(10L)
 
-    member this.SendCommandToUser(userId: string, command: AgentCommand, ?conversationId: string, ?deviceId: string, ?agentId: string) =
+    member this.SendCommandToUser(userId: string, command: AgentCommand, ?conversationId: string, ?deviceId: string,
+                                  ?agentId: string, ?sourceOperationId: string) =
         task {
             let requestAcceptedAt = Stopwatch.GetTimestamp()
             let requestAborted =
@@ -335,7 +336,14 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                   InboxActivation = sourceActivation; PendingJob = None }
                         else
                             try
-                                do! client.ReceiveCommand(correlationId, commandJson, defaultArg agentId "").WaitAsync(requestAborted)
+                                // Never synthesize the original source UUID from this
+                                // correlation ID; the caller owns it across retries.
+                                let dispatch =
+                                    match sourceOperationId with
+                                    | Some original -> client.ReceiveSourceCommand(
+                                        correlationId, commandJson, defaultArg agentId "", original)
+                                    | None -> client.ReceiveCommand(correlationId, commandJson, defaultArg agentId "")
+                                do! dispatch.WaitAsync(requestAborted)
                                 sendMs <- Stopwatch.GetElapsedTime(dispatchAt).TotalMilliseconds
                                 users.RecordDispatchSuccess(userId, connectionId)
                                 match activityHints with

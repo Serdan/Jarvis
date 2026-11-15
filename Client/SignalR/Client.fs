@@ -871,7 +871,8 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
 
 let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
                                     (resolved: ProjectPaths.ResolvedProject option)
-                                    (preparedTask: ProjectTaskDefinition option) (agentId: string) (command: AgentCommand) =
+                                    (preparedTask: ProjectTaskDefinition option) (agentId: string) (command: AgentCommand)
+                                    (sourceOriginalId: string option) =
     task {
         let activityId =
             match command with
@@ -918,28 +919,55 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
                     let! authorization =
                         PermissionPolicy.authorizeWithTrust permission.TrustLevel promptWithActivityState authorizationCommand
 
-                    // Explicit nonproduction DENY-only gate. The current source
-                    // RPC payloads lack original source-operation UUIDs, so a
-                    // generation checkout must never be treated as journaled.
-                    // Default off; no legacy/ordinary project semantics change.
-                    let diagnosticDenyGate =
-                        String.Equals(Environment.GetEnvironmentVariable("JARVIS_WQ03_NONPRODUCTION_DENY_UNBOUND_SOURCE"),
-                                      "deny-unbound-v1", StringComparison.Ordinal)
-                    let sourceAdmission =
-                        SourceEffectRouteBridge.denyUnboundGenerationDispatch diagnosticDenyGate command
-                    match authorization, sourceAdmission, resolvedTask with
-                    | Error error, _, _ ->
-                        return Error error
-                    | Ok(), Error problem, _ ->
-                        return Error(Client.ValidationError problem)
-                    | Ok(), Ok(), Some(cmd, task) ->
-                        let! result = (sourceOperation resolved
-                            (fun project -> ClientShell.runProjectTaskIn project task)
-                            (fun () -> ClientShell.runProjectTask cmd.ProjectName task)) rt |> serialize'
-                        return result
-                    | Ok(), Ok(), None ->
-                        let! result = dispatch rt target resolved agentId command
-                        return result
+                    match authorization with
+                    | Error error -> return Error error
+                    | Ok() ->
+                        match sourceOriginalId with
+                        | Some originalText ->
+                            // A separate, explicitly nonproduction RPC carries
+                            // the ORIGINAL caller-retained UUID. Never fall back
+                            // to unjournaled legacy dispatch when it is invalid,
+                            // missing, replayed or the host binding is unavailable.
+                            let enabled =
+                                String.Equals(
+                                    Environment.GetEnvironmentVariable("JARVIS_WQ03_NONPRODUCTION_HOST_BOUND_FILE"),
+                                    "host-bound-file-v1", StringComparison.Ordinal)
+                            if not enabled then
+                                return Error(Client.ValidationError "RecoveryBlocked: source effect transport is not enabled.")
+                            else
+                                match Guid.TryParse originalText, resolved, resolvedTask with
+                                | (true, originalId), Some source, None when originalId <> Guid.Empty ->
+                                    let journalRoot = Environment.GetEnvironmentVariable("JARVIS_WQ03_SOURCE_JOURNAL_ROOT")
+                                    match SourceEffectHostBinding.prepareHostFileEdit source command originalId journalRoot with
+                                    | Error reason -> return Error(Client.ValidationError reason)
+                                    | Ok invocation ->
+                                        let! result =
+                                            SourceEffectRouteBridge.executeDiagnostic invocation command
+                                                (fun () -> (dispatch rt target resolved agentId command).AsTask())
+                                        return result |> Result.mapError Client.ValidationError |> Result.bind id
+                                | _ ->
+                                    return Error(Client.ValidationError
+                                        "RecoveryBlocked: invalid original UUID, source checkout or unsupported source execution route.")
+                        | None ->
+                            // Legacy route stays unchanged, except for its
+                            // previously reviewed default-off deny-only switch.
+                            let diagnosticDenyGate =
+                                String.Equals(
+                                    Environment.GetEnvironmentVariable("JARVIS_WQ03_NONPRODUCTION_DENY_UNBOUND_SOURCE"),
+                                    "deny-unbound-v1", StringComparison.Ordinal)
+                                || String.Equals(
+                                    Environment.GetEnvironmentVariable("JARVIS_WQ03_NONPRODUCTION_HOST_BOUND_FILE"),
+                                    "host-bound-file-v1", StringComparison.Ordinal)
+                            match SourceEffectRouteBridge.denyUnboundGenerationDispatch diagnosticDenyGate command, resolvedTask with
+                            | Error problem, _ -> return Error(Client.ValidationError problem)
+                            | Ok(), Some(cmd, task) ->
+                                let! result = (sourceOperation resolved
+                                    (fun project -> ClientShell.runProjectTaskIn project task)
+                                    (fun () -> ClientShell.runProjectTask cmd.ProjectName task)) rt |> serialize'
+                                return result
+                            | Ok(), None ->
+                                let! result = dispatch rt target resolved agentId command
+                                return result
             }
 
         stopwatch.Stop()
@@ -962,18 +990,19 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
 
 let receiveCommand (rt: Runtime) (command: AgentCommand) =
     task {
-        let! result = receiveCommandForTarget rt None None None "" command
+        let! result = receiveCommandForTarget rt None None None "" command None
         return result |> Result.map (fun outcome -> outcome.Payload)
     }
 
 let private receiveCommandWithTypedInstructions (rt: Runtime)
-                                                (target: ProjectPaths.ProjectTarget option) (agentId: string) command =
+                                                (target: ProjectPaths.ProjectTarget option) (agentId: string) command
+                                                (sourceOriginalId: string option) =
     task {
         match command with
         | GetJobResultCommand _ | ListJobsCommand _ | CancelJobCommand _ ->
             // Cheap controls must bypass source instruction preparation and
             // remain responsive even while source/ledger commands are blocked.
-            let! response = receiveCommandForTarget rt target None None agentId command
+            let! response = receiveCommandForTarget rt target None None agentId command sourceOriginalId
             return response, [], AgentInstructions.RootBootstrapRequired
         | _ ->
             match AgentInstructions.prepareOperationWithTarget rt target command with
@@ -981,7 +1010,7 @@ let private receiveCommandWithTypedInstructions (rt: Runtime)
                 return Error error, [], AgentInstructions.RootBootstrapRequired
             | Ok prepared ->
                 let! response =
-                    receiveCommandForTarget rt target prepared.Source prepared.ProjectTask agentId command
+                    receiveCommandForTarget rt target prepared.Source prepared.ProjectTask agentId command sourceOriginalId
                 let provenance =
                     if prepared.Source.IsSome then AgentInstructions.HierarchyLoaded
                     else AgentInstructions.RootBootstrapRequired
@@ -997,14 +1026,15 @@ let receiveCommandWithInstructions (rt: Runtime) command =
         | Error error -> return Error error, []
         | Ok scope ->
             let! response, instructions, _ =
-                receiveCommandWithTypedInstructions rt (projectTarget scope) "" command
+                receiveCommandWithTypedInstructions rt (projectTarget scope) "" command None
             return response |> Result.map (fun outcome -> outcome.Payload), instructions
     }
 
 // Shared by SignalR receive and tests. Identity is supplied by the MCP call,
 // not inferred from provider conversation metadata.
 let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agentId: string)
-                                       (includeResponseAlerts: bool) =
+                                       (includeResponseAlerts: bool)
+                                       (sourceOriginalId: string option) =
     task {
         let mutable parsedCommand = None
         let mutable responseScope: ProjectPaths.ProjectTarget option = None
@@ -1087,7 +1117,7 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                                 // Polling does not activate or record local
                                 // agent activity, but access checks still need
                                 // the initiating actor label from the transport.
-                                receiveCommandWithTypedInstructions rt target agentId command
+                                receiveCommandWithTypedInstructions rt target agentId command sourceOriginalId
                             // A write may alter another agent's state, or none
                             // at all. Invalidate precisely the affected local
                             // cache entries before preparing turn guidance.
@@ -1150,7 +1180,7 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
 // Preserve direct dispatch semantics for callers that receive an immediate
 // response. Promoted tool jobs execute the undecorated core in the background.
 let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string) =
-    processIncomingCommandCore rt commandJson agentId true
+    processIncomingCommandCore rt commandJson agentId true None
 
 // Background completion is not an agent-visible response. This is the only
 // response-alert consumption point for SignalR-delivered tool calls, including
@@ -1279,18 +1309,20 @@ let executeOrPromoteWith (rt: Runtime) (commandJson: string) (agentId: string)
             return withVisibleResponseAlerts rt agentId command (merge outcome)
     }
 
-let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: string) =
+let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: string)
+                             (sourceOriginalId: string option) =
     executeOrPromoteWith rt commandJson agentId (promotionThreshold ())
         (fun serialized actor -> task {
-            let! _, _, outcome = processIncomingCommandCore rt serialized actor false
+            let! _, _, outcome = processIncomingCommandCore rt serialized actor false sourceOriginalId
             return outcome
         })
 
 let private receiveCommandAndReplyCore (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (agentId: string)
+    (sourceOriginalId: string option)
     (report: string -> float -> float -> bool -> unit) : Task =
     task {
         let commandStarted = Stopwatch.GetTimestamp()
-        let! agentResponse = executeOrPromote rt commandJson agentId
+        let! agentResponse = executeOrPromote rt commandJson agentId sourceOriginalId
         let commandMilliseconds = Stopwatch.GetElapsedTime(commandStarted).TotalMilliseconds
         let replyStarted = Stopwatch.GetTimestamp()
         let! sendResult =
@@ -1334,9 +1366,19 @@ let private receiveCommandAndReplyCore (connection: HubConnection) (rt: Runtime)
 let receiveCommandAndReplyWithTiming (connection: HubConnection) (rt: Runtime)
     (correlationId: string) (commandJson: string) (agentId: string)
     (report: string -> float -> float -> bool -> unit) : Task =
-    receiveCommandAndReplyCore connection rt correlationId commandJson agentId report
+    receiveCommandAndReplyCore connection rt correlationId commandJson agentId None report
 
 let receiveCommandAndReply (connection: HubConnection) (rt: Runtime)
     (correlationId: string) (commandJson: string) (agentId: string) : Task =
     receiveCommandAndReplyWithTiming connection rt correlationId commandJson agentId
         (fun _ _ _ _ -> ())
+
+
+// Distinct opt-in SignalR entrypoint. The original source operation UUID
+// survives reconnect, queueing and automatic tool-job promotion unchanged.
+let receiveSourceCommandAndReplyWithTiming (connection: HubConnection) (rt: Runtime)
+    (correlationId: string) (commandJson: string) (agentId: string)
+    (originalOperationId: string)
+    (report: string -> float -> float -> bool -> unit) : Task =
+    receiveCommandAndReplyCore connection rt correlationId commandJson agentId
+        (Some originalOperationId) report

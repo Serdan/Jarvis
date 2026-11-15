@@ -67,7 +67,12 @@ type SourceEffectPreflight =
       RecoveryBlocked: bool
       BlockReasons: string list }
 
-type SourceEffectStore = private { DatabasePath: string }
+type SourceEffectStore =
+    private
+        { DatabasePath: string
+          RootPath: string
+          AnchorPath: string
+          JournalId: Guid }
 
 // fsync the parent of a newly created SQLite database. SQLite uses EXTRA
 // synchronous transactions (including rollback-journal unlink directory sync)
@@ -188,6 +193,89 @@ let private command (connection: SqliteConnection) (transaction: SqliteTransacti
 
 let private add (cmd: SqliteCommand) key (value: obj) =
     cmd.Parameters.AddWithValue(key, value) |> ignore
+// Independent host-owned continuity evidence. SQLite cannot be its own replay
+// anchor: losing or rolling back the database must not erase original UUIDs.
+let private hostAnchorPath () =
+    Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "Jarvis", "wq03-source-journal-continuity-v1.anchor")
+
+let private normalizedPath path =
+    Path.TrimEndingDirectorySeparator(Path.GetFullPath path)
+
+let private sameHostPath left right =
+    String.Equals(left, right,
+        if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase
+        else StringComparison.Ordinal)
+
+let private anchorHeader (journalId: Guid) (root: string) =
+    "wq03-continuity-v1|" + journalId.ToString("D") + "|" +
+    Convert.ToBase64String(Encoding.UTF8.GetBytes root) + "\n"
+
+let private readAnchor path =
+    if not (File.Exists path) || FileInfo(path).LinkTarget <> null then
+        invalidOp "Source journal continuity anchor missing or linked."
+    let content = File.ReadAllText(path, Encoding.UTF8)
+    if not (content.EndsWith("\n", StringComparison.Ordinal)) then
+        invalidOp "Torn source journal continuity anchor."
+    let lines = content.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+    if lines.Length = 0 then invalidOp "Empty source journal continuity anchor."
+    let header = lines.[0].Split('|')
+    if header.Length <> 3 || header.[0] <> "wq03-continuity-v1" then
+        invalidOp "Unknown source journal continuity anchor format."
+    let journalId = Guid.ParseExact(header.[1], "D")
+    if journalId = Guid.Empty then invalidOp "Invalid source journal identity."
+    let root = Encoding.UTF8.GetString(Convert.FromBase64String(header.[2]))
+    let inventory =
+        lines
+        |> Seq.skip 1
+        |> Seq.map (fun line ->
+            let columns = line.Split('|')
+            if columns.Length <> 3 || columns.[0] <> "op" || not (hex64 columns.[2]) then
+                invalidOp "Corrupt original UUID continuity entry."
+            let id = Guid.ParseExact(columns.[1], "D")
+            if id = Guid.Empty then invalidOp "Empty original UUID continuity entry."
+            id.ToString("D"), columns.[2])
+        |> Seq.toList
+    if (inventory |> List.map fst |> List.distinct |> List.length) <> inventory.Length then
+        invalidOp "Duplicate original UUID in continuity anchor."
+    journalId, root, inventory
+
+let private appendAnchorOriginal (store: SourceEffectStore) (intent: SourceEffectIntent) =
+    // Called while holding the SQLite serializable writer transaction; fsync
+    // the independent marker BEFORE Prepared commits and BEFORE OS dispatch.
+    let row = "op|" + intent.OriginalOperationId.ToString("D") + "|" +
+              operationKey intent + "\n"
+    use stream = new FileStream(store.AnchorPath, FileMode.Append, FileAccess.Write, FileShare.Read)
+    let bytes = Encoding.UTF8.GetBytes row
+    stream.Write(bytes, 0, bytes.Length)
+    stream.Flush(true)
+
+let private verifyContinuity (store: SourceEffectStore) (connection: SqliteConnection)
+    (tx: SqliteTransaction option) =
+    if not (File.Exists store.DatabasePath) || FileInfo(store.DatabasePath).LinkTarget <> null then
+        invalidOp "Source effect SQLite database missing or linked."
+    let anchorId, anchorRoot, originals = readAnchor store.AnchorPath
+    if anchorId <> store.JournalId || not (sameHostPath anchorRoot store.RootPath) then
+        invalidOp "Source journal root or continuity identity changed."
+    use identity = command connection tx "SELECT journal_uuid,root_path FROM journal_identity WHERE id='v1';"
+    use reader = identity.ExecuteReader()
+    if not (reader.Read()) ||
+       reader.GetString(0) <> store.JournalId.ToString("D") ||
+       not (sameHostPath (reader.GetString(1)) store.RootPath) ||
+       reader.Read() then
+        invalidOp "SQLite journal identity not anchored to approved host root."
+    reader.Close()
+    use rows = command connection tx "SELECT operation_id,operation_key FROM effects;"
+    use rowReader = rows.ExecuteReader()
+    let mutable actual = Map.empty
+    while rowReader.Read() do
+        let id = rowReader.GetString(0)
+        if actual.ContainsKey id then invalidOp "Duplicate SQLite original UUID."
+        actual <- actual.Add(id, rowReader.GetString(1))
+    let expected = Map.ofList originals
+    if actual <> expected then
+        invalidOp "SQLite original UUID inventory diverged from durable independent anchor."
 
 let private connect (store: SourceEffectStore) =
     if not (File.Exists store.DatabasePath) then
@@ -209,62 +297,121 @@ let private connect (store: SourceEffectStore) =
         connection.Dispose()
         raise ex
 
-/// Root must be provisioned by the trusted client OUTSIDE any source checkout.
-/// The database is shared by independent client processes/clones on the host.
-/// Missing/corrupt databases always block; never fall back to a job list.
-let openAtHostRoot root : Result<SourceEffectStore, string> =
+// Provisioning is a separate, trusted host maintenance operation. There is
+// NO automatic provisioning from a source command or retry. A partial enrollment
+// (including a crash after the anchor but before SQLite) must remain blocked.
+let private locations root anchorPath =
+    if String.IsNullOrWhiteSpace root || not (Path.IsPathFullyQualified root) ||
+       String.IsNullOrWhiteSpace anchorPath || not (Path.IsPathFullyQualified anchorPath) then
+        invalidArg "root" "Source journal and independent anchor require absolute trusted paths."
+    let path = normalizedPath root
+    let anchor = Path.GetFullPath anchorPath
+    let anchorParent = Path.GetDirectoryName anchor
+    if not (Directory.Exists path) || DirectoryInfo(path).LinkTarget <> null then
+        invalidOp "Source journal root is absent or linked."
+    if String.IsNullOrWhiteSpace anchorParent ||
+       not (Directory.Exists anchorParent) ||
+       DirectoryInfo(anchorParent).LinkTarget <> null then
+        invalidOp "Continuity anchor parent is not provisioned by trusted host."
+    if sameHostPath path anchor ||
+       anchor.StartsWith(path + string Path.DirectorySeparatorChar,
+            if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase
+            else StringComparison.Ordinal) then
+        invalidOp "Independent continuity anchor may not reside under the source journal."
+    let dbPath = Path.Combine(path, "source-effects-v1.sqlite")
+    if FileInfo(dbPath).LinkTarget <> null || FileInfo(anchor).LinkTarget <> null then
+        invalidOp "SQLite journal or continuity anchor may not be linked."
+    path, dbPath, anchor
+
+/// Administrative/test-only first-time enrollment. Never called on a live
+/// dispatch/replay path and never resets an existing anchor or SQLite file.
+/// The independent anchor is written and fsynced FIRST so partial failure is
+/// a sticky RecoveryBlocked state instead of a silently reusable UUID domain.
+let provisionTrustedHostRoot root anchorPath : Result<unit,string> =
     try
-        if String.IsNullOrWhiteSpace root || not (Path.IsPathFullyQualified root) then
-            invalidArg "root" "Source journal requires a trusted absolute host root."
-        let path = Path.GetFullPath root
-        if not (Directory.Exists path) then
-            invalidOp "Source journal root not provisioned by the host."
-        if DirectoryInfo(path).LinkTarget <> null then
-            invalidOp "Source journal root may not be a symbolic link."
-        let dbPath = Path.Combine(path, "source-effects-v1.sqlite")
-        if FileInfo(dbPath).LinkTarget <> null then
-            invalidOp "Source journal database may not be a symbolic link."
-        let firstCreation = not (File.Exists dbPath)
-        if firstCreation then
-            let cs = SqliteConnectionStringBuilder()
-            cs.DataSource <- dbPath
-            cs.Mode <- SqliteOpenMode.ReadWriteCreate
-            cs.Pooling <- false
-            use initial = new SqliteConnection(cs.ToString())
-            initial.Open()
-            use configure = initial.CreateCommand()
-            configure.CommandText <- "PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA;"
-            configure.ExecuteNonQuery() |> ignore
-            use create = initial.CreateCommand()
-            create.CommandText <-
-                "CREATE TABLE IF NOT EXISTS effects (" +
-                "operation_id TEXT PRIMARY KEY, scope_key TEXT NOT NULL, scope_json TEXT NOT NULL, " +
-                "effect_kind TEXT NOT NULL, request_sha TEXT NOT NULL, operation_key TEXT NOT NULL, " +
-                "state TEXT NOT NULL, proof TEXT NOT NULL, reason TEXT NOT NULL);" +
-                "CREATE TABLE IF NOT EXISTS fences (" +
-                "scope_key TEXT PRIMARY KEY, scope_json TEXT NOT NULL, " +
-                "state TEXT NOT NULL CHECK(state = 'RecoveryBlocked'), reason TEXT NOT NULL);"
-            create.ExecuteNonQuery() |> ignore
-            initial.Close()
-            if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
-                File.SetUnixFileMode(dbPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
-            DurableDirectory.sync path
-        let store = { DatabasePath = dbPath }
-        use verify = connect store
-        use tables = verify.CreateCommand()
-        tables.CommandText <- "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('effects','fences');"
-        if Convert.ToInt32(tables.ExecuteScalar()) <> 2 then
-            invalidOp "Incomplete source effect journal schema."
+        let path, dbPath, anchor = locations root anchorPath
+        if File.Exists dbPath || File.Exists anchor then
+            invalidOp "Journal enrollment already exists or is incomplete; manual recovery required."
+        let journalId = Guid.NewGuid()
+        use marker = new FileStream(anchor, FileMode.CreateNew, FileAccess.Write, FileShare.None)
+        let header = Encoding.UTF8.GetBytes(anchorHeader journalId path)
+        marker.Write(header, 0, header.Length)
+        marker.Flush(true)
+        marker.Close()
+        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+            File.SetUnixFileMode(anchor, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+        DurableDirectory.sync (Path.GetDirectoryName anchor)
+        let cs = SqliteConnectionStringBuilder()
+        cs.DataSource <- dbPath
+        cs.Mode <- SqliteOpenMode.ReadWriteCreate
+        cs.Pooling <- false
+        use initial = new SqliteConnection(cs.ToString())
+        initial.Open()
+        use configure = initial.CreateCommand()
+        configure.CommandText <- "PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA;"
+        configure.ExecuteNonQuery() |> ignore
+        use create = initial.CreateCommand()
+        create.CommandText <-
+            "CREATE TABLE effects (" +
+            "operation_id TEXT PRIMARY KEY, scope_key TEXT NOT NULL, scope_json TEXT NOT NULL, " +
+            "effect_kind TEXT NOT NULL, request_sha TEXT NOT NULL, operation_key TEXT NOT NULL, " +
+            "state TEXT NOT NULL, proof TEXT NOT NULL, reason TEXT NOT NULL);" +
+            "CREATE TABLE fences (" +
+            "scope_key TEXT PRIMARY KEY, scope_json TEXT NOT NULL, " +
+            "state TEXT NOT NULL CHECK(state = 'RecoveryBlocked'), reason TEXT NOT NULL);" +
+            "CREATE TABLE journal_identity (" +
+            "id TEXT PRIMARY KEY CHECK(id='v1'), journal_uuid TEXT NOT NULL, root_path TEXT NOT NULL);" +
+            "INSERT INTO journal_identity(id,journal_uuid,root_path) VALUES('v1',$id,$root);"
+        add create "$id" (box (journalId.ToString("D")))
+        add create "$root" (box path)
+        create.ExecuteNonQuery() |> ignore
+        initial.Close()
+        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+            File.SetUnixFileMode(dbPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+        DurableDirectory.sync path
+        Ok ()
+    with ex -> Error ("RecoveryBlocked: cannot enroll trusted source journal: " + ex.Message)
+
+/// Open-only operational path. The independent host anchor pins root AND
+/// every original UUID; missing/replaced/corrupt/rolled-back SQLite fails
+/// closed before any OS file-edit callback can execute.
+let openExistingAtHostRoot root anchorPath : Result<SourceEffectStore,string> =
+    try
+        let path, dbPath, anchor = locations root anchorPath
+        if not (File.Exists dbPath) then
+            invalidOp "Previously provisioned source-effect journal is missing."
+        let journalId, anchoredRoot, _ = readAnchor anchor
+        if not (sameHostPath anchoredRoot path) then
+            invalidOp "Configured source journal root switched from anchored host root."
+        let store =
+            { DatabasePath = dbPath; RootPath = path
+              AnchorPath = anchor; JournalId = journalId }
+        use connection = connect store
+        use tables = command connection None "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('effects','fences','journal_identity');"
+        if Convert.ToInt32(tables.ExecuteScalar()) <> 3 then
+            invalidOp "Incomplete or incompatible source journal schema."
+        use integrity = command connection None "PRAGMA integrity_check;"
+        if Convert.ToString(integrity.ExecuteScalar()) <> "ok" then
+            invalidOp "Corrupt source journal integrity check."
+        verifyContinuity store connection None
         Ok store
-    with ex -> Error ("RecoveryBlocked: cannot open durable source-effect journal: " + ex.Message)
+    with ex -> Error ("RecoveryBlocked: cannot open existing source-effect journal: " + ex.Message)
+
+/// Runtime uses a fixed host-local anchor, independent of the selectable
+/// journal root. An operator must explicitly enroll that exact pair first.
+let openAtHostRoot root =
+    openExistingAtHostRoot root (hostAnchorPath())
 
 let private transaction (store: SourceEffectStore) work =
     try
         use connection = connect store
         use tx = connection.BeginTransaction(IsolationLevel.Serializable, false)
+        verifyContinuity store connection (Some tx)
         let result = work connection tx
         match result with
-        | Ok _ -> tx.Commit()
+        | Ok _ ->
+            verifyContinuity store connection (Some tx)
+            tx.Commit()
         | Error _ -> tx.Rollback()
         result
     with ex -> Error ("RecoveryBlocked: source-effect journal transaction failed: " + ex.Message)
@@ -318,6 +465,7 @@ let beginBeforeDispatch store intent : Result<DispatchAdmission, string> =
                 add insert "$request" (box intent.RequestSha256)
                 add insert "$key" (box requestKey)
                 insert.ExecuteNonQuery() |> ignore
+                appendAnchorOriginal store intent
                 Ok FirstDispatch)
 
 /// Only the Fresh begin path can execute callback. A callback failure may have
@@ -436,6 +584,7 @@ let inspectForHandoff store scope expectedOriginalIds : SourceEffectPreflight =
     else
         try
             use connection = connect store
+            verifyContinuity store connection None
             use fence = command connection None (
                 "SELECT reason FROM fences WHERE scope_key=$scope AND scope_json=$json;")
             add fence "$scope" (box (scopeKey scope))

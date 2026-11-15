@@ -1,0 +1,1 @@
+{"schemaVersion":2,"taskId":"p1-restore-stateless-jarvis-server","title":"[P1] Remove server SQLite persistence; keep server stateless except Jarvis-level instructions","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}

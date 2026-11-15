@@ -1,0 +1,9 @@
+# F02 (P2) — Race/unknown-outcome tests do not deterministically exercise stale-head or lost-ack interleavings
+
+**Evidence:** `Client.Tests/AccountCapacityLedgerTests.fs:182-260`; `Client/Modules/AccountCapacityLedger.fs:417-484`. Frozen SHA `75c2dd887e119315373aff66bbe4acc852fe4656`.
+
+The nine .NET 11 Release filtered tests pass, but the fixture called `LostAcknowledgementReplaysStableReceiptsWithFullSemanticEquality` performs an entirely *successful* first `reserve` followed by a later replay with the same UUID. It tests receipt idempotency but never drops a push acknowledgment, fails the post-push fetch, or exercises `AccountOutcomeUnknown` recovery. Likewise the cross-project reserve and shrink tests start two tasks with an event gate but do not synchronize their **fetched parent snapshots**; scheduling may serialize them before the second reads Git, so there is no guaranteed stale-clone lease rejection/replan even though the end state is valid.
+
+The implementation has several meaningful branches for failed `git push`, failed post-push `fetch`, and `Ok None` after a moved head (`AccountCapacityLedger.fs:459-483`). These need precise, reproducible coverage before this is a trusted distributed persistence primitive.
+
+**Requested:** Add a controllable process/Git transport seam or a disposable remote hook to (1) accept commit then simulate missing ACK and/or post-push read failure; (2) restart/read the exact operation UUID and confirm original result without re-mutating state; (3) force two clones to plan from the *same* old head, then confirm one loses lease and replays/replans without overcommit; (4) exercise durable uncertainty when outcome is truly not verifiable. The current happy-path tests should remain, but not be described as full lost-ack and stale-clone coverage.

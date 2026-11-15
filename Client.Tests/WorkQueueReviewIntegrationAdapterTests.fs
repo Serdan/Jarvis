@@ -122,9 +122,12 @@ module private Wq05Fixture =
         let reviewed =
             { reviewWork with State = WorkState.Completed
                               Domain = DomainState.FinalizedPendingTerminal "canonical-verdict" }
+        // Synthetic pure-contract fixture ONLY. Production WQ05 is not permitted
+        // to publish this stage before WQ04 same-CAS authoritative binding.
         let integrationWork =
-            (WorkQueueReviewIntegrationAdapter.planAcceptedIntegration "project"
-                "integration" Set.empty binding |> succeed).Work
+            { stage "project" (WorkQueueReviewIntegrationAdapter.integrationStageId binding)
+                    "integration" WorkKind.Integration with
+                Dependencies = Set.singleton (WorkQueueReviewIntegrationAdapter.reviewStageId review) }
         let p = emptyProject subscriptions |> fun p -> publish p reviewed |> fun p -> publish p integrationWork
         let p = activate p "integration-launch" "Integrator"
         binding, p
@@ -180,6 +183,52 @@ module private Wq05Fixture =
         finally
             try Directory.Delete(root, true) with _ -> ()
 
+    // Independent disposable Git CAS model fixture: stores the exact ordered
+    // contract inputs in two real clones. It does NOT represent WQ02/WQ03
+    // production integration-push persistence or verified host receipts.
+    let gateEventsPath = "wq05-gate-events.txt"
+
+    let gitExit dir arguments =
+        use p = new Process()
+        p.StartInfo.FileName <- "git"
+        p.StartInfo.WorkingDirectory <- dir
+        p.StartInfo.UseShellExecute <- false
+        p.StartInfo.RedirectStandardOutput <- true
+        p.StartInfo.RedirectStandardError <- true
+        arguments |> List.iter p.StartInfo.ArgumentList.Add
+        Assert.That(p.Start(), Is.True)
+        let _output = p.StandardOutput.ReadToEnd()
+        let _error = p.StandardError.ReadToEnd()
+        p.WaitForExit()
+        p.ExitCode
+
+    let beginGateModel (first: LedgerBinding) (second: LedgerBinding) =
+        File.WriteAllText(Path.Combine(first.RepositoryPath, gateEventsPath), "BASE\n")
+        git first.RepositoryPath [ "add"; gateEventsPath ] |> ignore
+        git first.RepositoryPath [ "commit"; "-m"; "gate model base" ] |> ignore
+        git first.RepositoryPath [ "push"; "origin"; "HEAD:refs/heads/main" ] |> ignore
+        git second.RepositoryPath [ "fetch"; "origin"; "main" ] |> ignore
+        git second.RepositoryPath [ "reset"; "--hard"; "origin/main" ] |> ignore
+
+    let appendGateEvent (client: LedgerBinding) eventName =
+        File.AppendAllText(Path.Combine(client.RepositoryPath, gateEventsPath), eventName + "\n")
+        git client.RepositoryPath [ "add"; gateEventsPath ] |> ignore
+        git client.RepositoryPath [ "commit"; "-m"; "gate model " + eventName + " from " + Path.GetFileName(client.RepositoryPath) ] |> ignore
+
+    let gateEvents (client: LedgerBinding) =
+        File.ReadAllLines(Path.Combine(client.RepositoryPath, gateEventsPath))
+        |> Array.skip 1 |> Array.toList
+
+    let pushGateModel (client: LedgerBinding) =
+        gitExit client.RepositoryPath [ "push"; "origin"; "HEAD:refs/heads/main" ] = 0
+
+    let refreshGateModel (client: LedgerBinding) =
+        git client.RepositoryPath [ "fetch"; "origin"; "main" ] |> ignore
+        git client.RepositoryPath [ "reset"; "--hard"; "origin/main" ] |> ignore
+
+    let modelHead (client: LedgerBinding) =
+        git client.RepositoryPath [ "rev-parse"; "HEAD" ]
+
 [<TestFixture>]
 type WorkQueueReviewIntegrationAdapterTests() =
     let success = Wq05Fixture.succeed
@@ -210,7 +259,7 @@ type WorkQueueReviewIntegrationAdapterTests() =
         | other -> Assert.Fail(sprintf "Decided review reentered the queue: %A" other)
 
     [<Test>]
-    member _.CorrectionIsOneCurrentLineageStageAfterChangesRequested() =
+    member _.CorrectionCannotCrossLineageOrPublishWithoutCanonicalJoin() =
         let review = Wq05Fixture.review "ChangesRequested"
                      |> WorkQueueReviewIntegrationAdapter.bindReview |> success
         let baseWork =
@@ -221,29 +270,39 @@ type WorkQueueReviewIntegrationAdapterTests() =
                     Some { RepositoryId = "source-repo"
                            TaskId = Wq05Fixture.taskId
                            TargetRef = "refs/heads/main"
-                           LineageId = "same-source"
+                           LineageId = "attempt-1"
                            PinnedBaseCommit = Wq05Fixture.baseSha
-                           ReachableRef = None
-                           ContinuationSha = None
+                           ReachableRef = Some "refs/heads/feat/wq05-source"
+                           ContinuationSha = Some Wq05Fixture.source
                            Generation = 2 } }
         let p = { emptyProject Wq05Fixture.subscriptions with
                     Works = Map.ofList [ "original", baseWork ] }
-        let first = WorkQueueReviewIntegrationAdapter.planCorrection p "implementation" review baseWork |> success
-        Assert.That(first.Work.StageGeneration, Is.EqualTo(3))
-        Assert.That(first.Work.Dependencies = Set.singleton (WorkQueueReviewIntegrationAdapter.reviewStageId review), Is.True)
-        Assert.That(first.Work.SourceLineage.Value.Generation, Is.EqualTo(3))
-        let alreadyActive = { p with Works = p.Works.Add(first.Work.Id, first.Work) }
-        match WorkQueueReviewIntegrationAdapter.planCorrection alreadyActive "implementation" review baseWork with
-        | Error AdapterError.DuplicateCorrection -> ()
-        | other -> Assert.Fail(sprintf "Duplicate source-lineage correction was admitted: %A" other)
-        // A completed successor still makes the prior generation stale.
-        // Otherwise a delayed ChangesRequested replay could manufacture the
-        // same correction stage again after its first terminal receipt.
-        let alreadyCompleted =
-            { p with Works = p.Works.Add(first.Work.Id, { first.Work with State = WorkState.Completed }) }
-        match WorkQueueReviewIntegrationAdapter.planCorrection alreadyCompleted "implementation" review baseWork with
-        | Error AdapterError.DuplicateCorrection -> ()
-        | other -> Assert.Fail(sprintf "Terminal successor allowed stale correction: %A" other)
+        let assertNoCorrection project source =
+            match WorkQueueReviewIntegrationAdapter.planCorrection project "implementation" review source with
+            | Error AdapterError.AuthoritativeJoinRequired
+            | Error AdapterError.StaleSourceLineage -> ()
+            | other -> Assert.Fail(sprintf "Unverified source-lineage correction was issued: %A" other)
+        // Matching names and SHA are still caller-supplied, NOT current-ledger
+        // identity and high-water proof.
+        assertNoCorrection p baseWork
+        let wrongSource =
+            { baseWork with Id = "newer-implementation"
+                            StageGeneration = 3
+                            SourceLineage =
+                                Some { baseWork.SourceLineage.Value with
+                                        LineageId = "attempt-2"; Generation = 3
+                                        ContinuationSha = Some Wq05Fixture.baseSha } }
+        let replaced = { p with Works = p.Works.Add(wrongSource.Id, wrongSource) }
+        assertNoCorrection replaced wrongSource
+        assertNoCorrection replaced baseWork
+        let wrongAttempt = { review with AttemptId = "attempt-previous"; SourceVersion = 1 }
+        match WorkQueueReviewIntegrationAdapter.planCorrection replaced "implementation" wrongAttempt wrongSource with
+        | Error AdapterError.AuthoritativeJoinRequired -> ()
+        | other -> Assert.Fail(sprintf "Older review attempted to create correction: %A" other)
+        let duplicateDifferentLineage =
+            { wrongSource with Id = "old-correction"; StageGeneration = 4 }
+        let duplicated = { replaced with Works = replaced.Works.Add(duplicateDifferentLineage.Id, duplicateDifferentLineage) }
+        assertNoCorrection duplicated baseWork
 
     [<Test>]
     member _.AcceptedExactShaTargetAndImmutableSubmissionAreRequired() =
@@ -251,8 +310,11 @@ type WorkQueueReviewIntegrationAdapterTests() =
         let staged =
             WorkQueueReviewIntegrationAdapter.planAcceptedIntegration "project" "integration"
                 (Set.singleton "blocking-B") binding |> success
-        Assert.That(staged.Work.Dependencies.Contains (WorkQueueReviewIntegrationAdapter.reviewStageId review), Is.True)
-        Assert.That(staged.Work.Dependencies.Contains "blocking-B", Is.True)
+        Assert.That(staged.HardPrerequisites.Contains (WorkQueueReviewIntegrationAdapter.reviewStageId review), Is.True)
+        Assert.That(staged.HardPrerequisites.Contains "blocking-B", Is.True)
+        Assert.That(staged.ImmutableBinding, Is.EqualTo(binding))
+        // Intent deliberately exposes no WorkStage that can lose provenance
+        // when projected to the live WQ02/WQ04 project ledger.
         for bad in [
             { Wq05Fixture.integration with SubmittedCommit = Wq05Fixture.baseSha }
             { Wq05Fixture.integration with TargetRef = "refs/heads/other" }
@@ -264,16 +326,17 @@ type WorkQueueReviewIntegrationAdapterTests() =
             | other -> Assert.Fail(sprintf "Invalid immutable integration evidence admitted: %A" other)
 
     [<Test>]
-    member _.PostGateOriginalPushIsObservedNotAuthorizedUntilEdgeWaived() =
+    member _.PureContractGateHoldSeparatesObservedExternalEffectFromAuthorization() =
         let binding, p = Wq05Fixture.activeIntegration()
+        let workId = WorkQueueReviewIntegrationAdapter.integrationStageId binding
+        // Direct Contracts calls are disposable model tests, NOT a WQ05
+        // authorized dispatch or a WQ03 host-journal receipt.
         let p =
-            WorkQueueReviewIntegrationAdapter.startPinnedOriginalPush binding p.Version
-                "original-intent" "integration-launch" "original-push" p |> success
+            Contracts.startOriginalPush p.Version "original-intent"
+                "integration-launch" workId "original-push" binding.SourceSha binding.TargetRef p |> success
         let p = Wq05Fixture.publish p (Wq05Fixture.stage "project" "blocking-B" "planning" WorkKind.Planning)
-        let p =
-            WorkQueueReviewIntegrationAdapter.addHardEdge p.Version "insert-B"
-                binding "blocking-B" 100L p |> success
-        let stage = p.Works.[WorkQueueReviewIntegrationAdapter.integrationStageId binding]
+        let p = Contracts.setHardPrerequisite p.Version "insert-B" workId "blocking-B" 100L p |> success
+        let stage = p.Works.[workId]
         Assert.That(stage.Gate, Is.EqualTo(GateState.IntegrationGateHold(p.GraphVersion, "original-push")))
         let observed : VerifiedRemoteEffect =
             { OriginalPushOperationId = "original-push"
@@ -283,46 +346,44 @@ type WorkQueueReviewIntegrationAdapterTests() =
               AncestryVerified = true
               JobsReconciled = true }
         let p =
-            WorkQueueReviewIntegrationAdapter.observeOriginalPushUnderGate
-                p.Version "reconcile-original" "integration-launch" binding observed 101L p |> success
-        let held = p.Works.[WorkQueueReviewIntegrationAdapter.integrationStageId binding]
+            Contracts.reconcileExternalEffect p.Version "reconcile-original"
+                "integration-launch" workId observed 101L p |> success
+        let held = p.Works.[workId]
         Assert.That(held.State, Is.EqualTo(WorkState.GateException))
         Assert.That(held.Domain, Is.EqualTo(DomainState.Undecided))
         Assert.That(held.IntegrationAuthorized, Is.False)
         Assert.That(p.ProducerCount, Is.EqualTo(0))
         Assert.That(WorkQueueReviewIntegrationAdapter.isAuthorizedIntegration p binding, Is.False)
-        match WorkQueueReviewIntegrationAdapter.resolveObservedGate p.Version "premature"
-                binding None 102L p with
-        | Error (AdapterError.ContractRejected Rejection.MissingProof) -> ()
+        match Contracts.resolveIntegrationGateException p.Version "premature" workId None 102L p with
+        | Error Rejection.MissingProof -> ()
         | other -> Assert.Fail(sprintf "Unsatisfied B was bypassed: %A" other)
         let waiver : VerifiedWaiverReceipt =
-            { ReceiptId = "canonical-approval-1"
-              WorkId = WorkQueueReviewIntegrationAdapter.integrationStageId binding
+            { ReceiptId = "model-waiver-not-live-approval"
+              WorkId = workId
               Dependencies = Set.singleton "blocking-B"
               AccountApprovalVersion = 2
               ApprovedByRole = "Lead"
               CanonicallyVerified = true }
-        let resolved =
-            WorkQueueReviewIntegrationAdapter.resolveObservedGate p.Version "waive-B"
-                binding (Some waiver) 103L p |> success
-        Assert.That(WorkQueueReviewIntegrationAdapter.isAuthorizedIntegration resolved binding, Is.True)
+        let resolved = Contracts.resolveIntegrationGateException p.Version "waive-B" workId (Some waiver) 103L p |> success
         Assert.That(resolved.ProducerCount, Is.EqualTo(1))
-        Assert.That(resolved.Works.[WorkQueueReviewIntegrationAdapter.integrationStageId binding].WaivedDependencies.["blocking-B"],
+        Assert.That(resolved.Works.[workId].WaivedDependencies.["blocking-B"],
                     Is.EqualTo(waiver.ReceiptId))
-        match WorkQueueReviewIntegrationAdapter.resolveObservedGate resolved.Version "repeat"
-                binding (Some waiver) 104L resolved with
-        | Error AdapterError.UnsafeGateState -> ()
+        // A pure model's 'Integrated' result is never live canonical authority.
+        Assert.That(WorkQueueReviewIntegrationAdapter.isAuthorizedIntegration resolved binding, Is.False)
+        match Contracts.resolveIntegrationGateException resolved.Version "repeat" workId (Some waiver) 104L resolved with
+        | Error (Rejection.InvalidState _) -> ()
         | other -> Assert.Fail(sprintf "Gate finalized twice: %A" other)
-        Assert.That(resolved.ProducerCount, Is.EqualTo(1))
 
     [<Test>]
     member _.UnknownPushCannotBeReconciledAsNoEffectOrDuplicate() =
         let binding, p = Wq05Fixture.activeIntegration()
         let p =
-            WorkQueueReviewIntegrationAdapter.startPinnedOriginalPush binding p.Version
-                "start" "integration-launch" "push-original" p |> success
+            Contracts.startOriginalPush p.Version "start"
+                "integration-launch" (WorkQueueReviewIntegrationAdapter.integrationStageId binding)
+                "push-original" binding.SourceSha binding.TargetRef p |> success
         let p = Wq05Fixture.publish p (Wq05Fixture.stage "project" "B" "planning" WorkKind.Planning)
-        let p = WorkQueueReviewIntegrationAdapter.addHardEdge p.Version "gate" binding "B" 20L p |> success
+        let p = Contracts.setHardPrerequisite p.Version "gate"
+                    (WorkQueueReviewIntegrationAdapter.integrationStageId binding) "B" 20L p |> success
         let invalid : VerifiedRemoteEffect =
             { OriginalPushOperationId = "other-push"
               AcceptedSourceSha = binding.SourceSha
@@ -330,9 +391,9 @@ type WorkQueueReviewIntegrationAdapterTests() =
               RemoteCommitSha = Wq05Fixture.remoteCommit
               AncestryVerified = true
               JobsReconciled = true }
-        match WorkQueueReviewIntegrationAdapter.observeOriginalPushUnderGate p.Version "wrong-original"
-                "integration-launch" binding invalid 21L p with
-        | Error (AdapterError.ContractRejected Rejection.UnsafeExternalEffect) -> ()
+        match Contracts.reconcileExternalEffect p.Version "wrong-original" "integration-launch"
+                (WorkQueueReviewIntegrationAdapter.integrationStageId binding) invalid 21L p with
+        | Error Rejection.UnsafeExternalEffect -> ()
         | other -> Assert.Fail(sprintf "Unknown new push was admitted: %A" other)
         match Contracts.resolveDependencyGate p.Version "unsafe-noeffect"
                 "integration-launch" (WorkQueueReviewIntegrationAdapter.integrationStageId binding)
@@ -424,12 +485,13 @@ type WorkQueueReviewIntegrationAdapterTests() =
     member _.OriginalPushWithDefinitivelyNoEffectCanBlockButNeverAuthorizeIntegration() =
         let binding, initial = Wq05Fixture.activeIntegration()
         let launched =
-            WorkQueueReviewIntegrationAdapter.startPinnedOriginalPush binding initial.Version
-                "dispatch-once" "integration-launch" "original-operation" initial |> success
+            Contracts.startOriginalPush initial.Version "dispatch-once" "integration-launch"
+                (WorkQueueReviewIntegrationAdapter.integrationStageId binding)
+                "original-operation" binding.SourceSha binding.TargetRef initial |> success
         let b = Wq05Fixture.stage "project" "B" "planning" WorkKind.Planning
         let withB = Wq05Fixture.publish launched b
-        let gated = WorkQueueReviewIntegrationAdapter.addHardEdge withB.Version
-                        "add-hard-edge" binding "B" 33L withB |> success
+        let gated = Contracts.setHardPrerequisite withB.Version "add-hard-edge"
+                        (WorkQueueReviewIntegrationAdapter.integrationStageId binding) "B" 33L withB |> success
         let unproven : DefinitiveNoEffectProof =
             { OriginalPushOperationId = "original-operation"
               DispatchedOperationTerminal = false
@@ -499,3 +561,226 @@ type WorkQueueReviewIntegrationAdapterTests() =
             let _, finalState = WorkQueueGitLedger.load second |> success
             Assert.That(finalState.Works.[staged.Work.Id].State, Is.EqualTo(WorkState.Cancelled))
             Assert.That(finalState.GraphVersion, Is.EqualTo(0)))
+
+
+    [<Test>]
+    member _.EffectingAdaptersRejectEveryUnjoinedAcceptedIdentitySubstitution() =
+        let binding, initial = Wq05Fixture.activeIntegration()
+        let workId = WorkQueueReviewIntegrationAdapter.integrationStageId binding
+        let evidence : VerifiedRemoteEffect =
+            { OriginalPushOperationId = "same-original"
+              AcceptedSourceSha = binding.SourceSha
+              TargetRef = binding.TargetRef
+              RemoteCommitSha = Wq05Fixture.remoteCommit
+              AncestryVerified = true
+              JobsReconciled = true }
+        let variants = [
+            binding
+            { binding with SourceSha = Wq05Fixture.baseSha }
+            { binding with TargetRef = "refs/heads/other" }
+            { binding with ReviewId = Guid.NewGuid().ToString("N") }
+            { binding with ReviewRef = "refs/heads/jarvis-review/forged" }
+            { binding with ReviewVersion = binding.ReviewVersion + 1 }
+            { binding with SourceRef = "refs/heads/other-source" }
+            { binding with TargetHeadAtSubmission = Wq05Fixture.remoteCommit }
+            { binding with IntegrationRef = "refs/heads/jarvis-integration/forged" }
+        ]
+        let check = function
+            | Error AdapterError.AuthoritativeJoinRequired -> ()
+            | other -> Assert.Fail(sprintf "Unjoined effecting API admitted source: %A" other)
+        for candidate in variants do
+            WorkQueueReviewIntegrationAdapter.startPinnedOriginalPush candidate initial.Version
+                "model-start" "integration-launch" "same-original" initial |> check
+            WorkQueueReviewIntegrationAdapter.addHardEdge initial.Version "model-edge"
+                candidate "B" 100L initial |> check
+            WorkQueueReviewIntegrationAdapter.observeOriginalPushUnderGate initial.Version
+                "model-reconcile" "integration-launch" candidate evidence 101L initial |> check
+            WorkQueueReviewIntegrationAdapter.resolveObservedGate initial.Version
+                "model-resolve" candidate None 102L initial |> check
+            Assert.That(WorkQueueReviewIntegrationAdapter.isAuthorizedIntegration initial candidate, Is.False)
+        // Even a manufactured Completed stage/observed effect cannot turn the
+        // sidecar caller binding into a trusted accepted review identity.
+        let manufactured =
+            { initial.Works.[workId] with
+                State = WorkState.Completed
+                Domain = DomainState.Integrated Wq05Fixture.remoteCommit
+                Push = Some { OperationId = "same-original"
+                              AcceptedSourceSha = binding.SourceSha
+                              TargetRef = binding.TargetRef
+                              Outcome = PushOutcome.Observed Wq05Fixture.remoteCommit }
+                IntegrationAuthorized = true }
+        let changed = { initial with Works = initial.Works.Add(workId, manufactured) }
+        Assert.That(WorkQueueReviewIntegrationAdapter.isAuthorizedIntegration changed binding, Is.False)
+
+    [<Test>]
+    member _.TwoGitClientsPushIntentFirstGateSecondLossAndExactlyOnceResolution() =
+        Wq05Fixture.withTwoClients (fun first second ->
+            let binding, initial = Wq05Fixture.activeIntegration()
+            let workId = WorkQueueReviewIntegrationAdapter.integrationStageId binding
+            let d = { Wq05Fixture.stage "project" "downstream-D" "planning" WorkKind.Planning
+                      with Dependencies = Set.singleton workId }
+            let seed = initial
+                       |> fun p -> Wq05Fixture.publish p (Wq05Fixture.stage "project" "B" "planning" WorkKind.Planning)
+                       |> fun p -> Wq05Fixture.publish p d
+            let evidence : VerifiedRemoteEffect =
+                { OriginalPushOperationId = "one-original-push"
+                  AcceptedSourceSha = binding.SourceSha
+                  TargetRef = binding.TargetRef
+                  RemoteCommitSha = Wq05Fixture.remoteCommit
+                  AncestryVerified = true
+                  JobsReconciled = true }
+            let waiver : VerifiedWaiverReceipt =
+                { ReceiptId = "synthetic-versioned-model-waiver"
+                  WorkId = workId
+                  Dependencies = Set.singleton "B"
+                  AccountApprovalVersion = 9
+                  ApprovedByRole = "Lead"
+                  CanonicallyVerified = true }
+            let evolve (p: Project) eventName =
+                match eventName with
+                | "intent" ->
+                    Contracts.startOriginalPush p.Version "one-intent-op" "integration-launch"
+                        workId "one-original-push" binding.SourceSha binding.TargetRef p |> success
+                | "edge" -> Contracts.setHardPrerequisite p.Version "one-hard-edge"
+                                workId "B" 110L p |> success
+                | "ungated" -> Contracts.recordUngatedPushEffect p.Version "stale-observed"
+                                    workId evidence p |> success
+                | "finalize" -> Contracts.finalizeIntegration p.Version "stale-final"
+                                    workId "stale-final-receipt" p |> success
+                | "complete" -> Contracts.completeOrdinary p.Version "stale-complete"
+                                    "integration-launch" workId 115L p |> success
+                | "observed" -> Contracts.reconcileExternalEffect p.Version "one-reconcile"
+                                    "integration-launch" workId evidence 120L p |> success
+                | "waiver" -> Contracts.resolveIntegrationGateException p.Version
+                                  "one-waiver-op" workId (Some waiver) 130L p |> success
+                | item -> failwithf "Unexpected model event: %s" item
+            let load client : Project = Wq05Fixture.gateEvents client |> List.fold evolve seed
+            Wq05Fixture.beginGateModel first second
+            let beforeA = load first
+            let beforeB = load second
+            Assert.That(beforeA.Version, Is.EqualTo(beforeB.Version))
+            let preRemoteHead = Wq05Fixture.modelHead second
+            Wq05Fixture.appendGateEvent first "intent"
+            Assert.That(Wq05Fixture.pushGateModel first, Is.True)
+            let launched = load first
+            Assert.That(launched.Works.[workId].Push.Value.OperationId, Is.EqualTo("one-original-push"))
+            // A lost acknowledgement may not synthesize a different push ID.
+            let replay = Contracts.startOriginalPush seed.Version "one-intent-op"
+                            "integration-launch" workId "one-original-push"
+                            binding.SourceSha binding.TargetRef launched |> success
+            Assert.That(replay, Is.EqualTo(launched))
+            // B is still on the old source Git head. Its edge cannot overwrite
+            // A's durable original intent even though the local contract accepts.
+            Wq05Fixture.appendGateEvent second "edge"
+            Assert.That(Wq05Fixture.pushGateModel second, Is.False)
+            Wq05Fixture.refreshGateModel second
+            Assert.That(Wq05Fixture.modelHead second, Is.Not.EqualTo(preRemoteHead))
+            let afterRefresh = load second
+            Assert.That(afterRefresh.Version, Is.EqualTo(launched.Version))
+            Wq05Fixture.appendGateEvent second "edge"
+            Assert.That(Wq05Fixture.pushGateModel second, Is.True)
+            let gated = load second
+            Assert.That(gated.GraphVersion, Is.EqualTo(seed.GraphVersion + 1))
+            Assert.That(gated.Works.[workId].Gate,
+                        Is.EqualTo(GateState.IntegrationGateHold(gated.GraphVersion, "one-original-push")))
+            Assert.That(gated.Works.[workId].IntegrationAuthorized, Is.False)
+            // The old clone would locally finalize from stale no-gate data,
+            // but its final authorization / downstream-ready CAS cannot land.
+            Wq05Fixture.appendGateEvent first "ungated"
+            Wq05Fixture.appendGateEvent first "finalize"
+            Wq05Fixture.appendGateEvent first "complete"
+            let staleCompleted = load first
+            Assert.That(staleCompleted.Works.["downstream-D"].State, Is.EqualTo(WorkState.Available))
+            // Local D eligibility after the stale completion is not remote CAS
+            // admission; its entire stale history loses to B's gate commit.
+            Assert.That(Wq05Fixture.pushGateModel first, Is.False)
+            Wq05Fixture.refreshGateModel first
+            Assert.That(load first, Is.EqualTo(gated))
+            let unsafeJobs = { evidence with JobsReconciled = false }
+            let unsafeAncestry = { evidence with AncestryVerified = false }
+            let wrongUuid = { evidence with OriginalPushOperationId = "second-push" }
+            for bad in [ unsafeJobs; unsafeAncestry; wrongUuid ] do
+                match Contracts.reconcileExternalEffect gated.Version "untrusted"
+                        "integration-launch" workId bad 119L gated with
+                | Error Rejection.UnsafeExternalEffect -> ()
+                | other -> Assert.Fail(sprintf "Untrusted effect was accepted: %A" other)
+            let missingTerminal : DefinitiveNoEffectProof =
+                { OriginalPushOperationId = "one-original-push"
+                  DispatchedOperationTerminal = false
+                  JobsReconciled = false }
+            match Contracts.recordDefinitiveNoEffect gated.Version "negative-tip"
+                    workId missingTerminal gated with
+            | Error Rejection.UnsafeExternalEffect -> ()
+            | other -> Assert.Fail(sprintf "Unknown original push erased: %A" other)
+            Wq05Fixture.appendGateEvent second "observed"
+            Assert.That(Wq05Fixture.pushGateModel second, Is.True)
+            let held = load second
+            Assert.That(held.Works.[workId].State, Is.EqualTo(WorkState.GateException))
+            Assert.That(held.Works.[workId].Gate,
+                        Is.EqualTo(GateState.ExternalEffectObservedPendingGate(held.GraphVersion, "one-original-push", Wq05Fixture.remoteCommit)))
+            Assert.That(held.ProducerCount, Is.EqualTo(0))
+            Assert.That(held.Works.["downstream-D"].State, Is.EqualTo(WorkState.Blocked))
+            match Contracts.resolveIntegrationGateException held.Version "too-early" workId None 125L held with
+            | Error Rejection.MissingProof -> ()
+            | other -> Assert.Fail(sprintf "Unsatisfied B authorized integration: %A" other)
+            Wq05Fixture.refreshGateModel first
+            Assert.That((load first).Version, Is.EqualTo(held.Version))
+            // Both resolvers race with one verified *synthetic* waiver; only
+            // one Git CAS can finalize. This is not host approval evidence.
+            Wq05Fixture.appendGateEvent first "waiver"
+            Wq05Fixture.appendGateEvent second "waiver"
+            Assert.That(Wq05Fixture.pushGateModel second, Is.True)
+            Assert.That(Wq05Fixture.pushGateModel first, Is.False)
+            Wq05Fixture.refreshGateModel first
+            let finalized = load first
+            Assert.That(finalized.Works.[workId].IntegrationAuthorized, Is.True)
+            Assert.That(finalized.Works.[workId].Domain, Is.EqualTo(DomainState.Integrated Wq05Fixture.remoteCommit))
+            Assert.That(finalized.ProducerCount, Is.EqualTo(1))
+            Assert.That(finalized.Works.[workId].WaivedDependencies.["B"], Is.EqualTo(waiver.ReceiptId))
+            Assert.That(finalized.Works.["downstream-D"].State, Is.EqualTo(WorkState.Available))
+            let idempotent = Contracts.resolveIntegrationGateException held.Version
+                                "one-waiver-op" workId (Some waiver) 130L finalized |> success
+            Assert.That(idempotent.ProducerCount, Is.EqualTo(1))
+            Assert.That(idempotent, Is.EqualTo(finalized))
+            Assert.That(WorkQueueReviewIntegrationAdapter.isAuthorizedIntegration finalized binding, Is.False)
+        )
+
+    [<Test>]
+    member _.TwoGitClientsGateFirstRejectsStaleAndFreshOriginalPushIntents() =
+        Wq05Fixture.withTwoClients (fun first second ->
+            let binding, initial = Wq05Fixture.activeIntegration()
+            let workId = WorkQueueReviewIntegrationAdapter.integrationStageId binding
+            let seed =
+                Wq05Fixture.publish initial
+                    (Wq05Fixture.stage "project" "B" "planning" WorkKind.Planning)
+            let replay (p: Project) eventName =
+                match eventName with
+                | "edge" -> Contracts.setHardPrerequisite p.Version "gate-first"
+                                workId "B" 140L p |> success
+                | "intent" -> Contracts.startOriginalPush p.Version "stale-intent"
+                                  "integration-launch" workId "one-original-push"
+                                  binding.SourceSha binding.TargetRef p |> success
+                | item -> failwithf "Unexpected model event: %s" item
+            let load client : Project = Wq05Fixture.gateEvents client |> List.fold replay seed
+            Wq05Fixture.beginGateModel first second
+            let old = load first
+            Assert.That(old.Version, Is.EqualTo((load second).Version))
+            Wq05Fixture.appendGateEvent second "edge"
+            Assert.That(Wq05Fixture.pushGateModel second, Is.True)
+            let remoteGated = load second
+            Assert.That(remoteGated.Works.[workId].Gate,
+                        Is.EqualTo(GateState.DependencyGatePending remoteGated.GraphVersion))
+            Wq05Fixture.appendGateEvent first "intent"
+            Assert.That(Wq05Fixture.pushGateModel first, Is.False)
+            Wq05Fixture.refreshGateModel first
+            let fresh = load first
+            Assert.That(fresh, Is.EqualTo(remoteGated))
+            match Contracts.startOriginalPush fresh.Version "new-original"
+                    "integration-launch" workId "one-original-push"
+                    binding.SourceSha binding.TargetRef fresh with
+            | Error (Rejection.InvalidState _) -> ()
+            | other -> Assert.Fail(sprintf "Gate-first admitted original push: %A" other)
+            Assert.That(fresh.Works.[workId].Push, Is.EqualTo(None))
+            Assert.That(fresh.Works.[workId].IntegrationAuthorized, Is.False)
+            Assert.That(WorkQueueReviewIntegrationAdapter.isAuthorizedIntegration fresh binding, Is.False)
+        )

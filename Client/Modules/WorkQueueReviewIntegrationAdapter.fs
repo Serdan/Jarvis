@@ -21,6 +21,8 @@ type AdapterError =
     | DuplicateCorrection
     | StageIdentityMismatch
     | UnsafeGateState
+    // The WQ-04 immutable source/review/submission-to-stage CAS join does not exist yet.
+    | AuthoritativeJoinRequired
     | ContractRejected of Rejection
 
 type FrozenReviewBinding =
@@ -54,6 +56,14 @@ type StagePlan<'Provenance> =
     { Work: WorkStage
       Provenance: 'Provenance
       // The queue owner interprets these edges; they are not ordering hints.
+      HardPrerequisites: Set<string> }
+
+// WQ-04 must consume this untrusted proposal and verify its complete binding
+// under its authoritative project high-water CAS. No WorkStage is issued here.
+type AcceptedIntegrationIntent =
+    { ProjectId: string
+      QueueId: string
+      ImmutableBinding: AcceptedIntegrationBinding
       HardPrerequisites: Set<string> }
 
 [<RequireQualifiedAccess>]
@@ -163,47 +173,24 @@ module WorkQueueReviewIntegrationAdapter =
                   Provenance = review
                   HardPrerequisites = prerequisites }
 
+    // WQ-04 has not yet supplied an authoritative review -> current attempt ->
+    // exact frozen SHA/ref -> lineage/generation join. Task+target and local
+    // WorkStage equality alone cannot establish source ownership. Never emit a
+    // correction WorkStage, even for a plausible single-lineage fixture.
     let planCorrection (project: Project) queue (review: FrozenReviewBinding)
-                       (source: WorkStage) =
+                       (source: WorkStage) : Result<StagePlan<FrozenReviewBinding>, AdapterError> =
         if review.Status <> "ChangesRequested" then Error AdapterError.ReviewNotDecided
         elif source.SubjectId <> review.TaskId
              || source.Kind <> WorkKind.Implementation
              || source.State <> WorkState.Completed
-             || project.Works.TryFind source.Id <> Some source then
+             || project.Works.TryFind source.Id <> Some source
+             || not (subject queue)
+             || (source.SourceLineage |> Option.exists (fun lineage ->
+                 lineage.TaskId <> review.TaskId || lineage.TargetRef <> review.TargetRef))
+             || source.SourceLineage.IsNone then
             Error AdapterError.StaleSourceLineage
         else
-            match source.SourceLineage with
-            | None -> Error AdapterError.StaleSourceLineage
-            | Some lineage when lineage.TaskId <> review.TaskId
-                                || lineage.TargetRef <> review.TargetRef
-                                || not (sha lineage.PinnedBaseCommit)
-                                || not (subject queue) ->
-                Error AdapterError.StaleSourceLineage
-            | Some lineage ->
-                let duplicate =
-                    project.Works
-                    |> Map.exists (fun id work ->
-                        id <> source.Id
-                        && work.SubjectId = review.TaskId
-                        && work.Kind = WorkKind.Implementation
-                        && (work.StageGeneration >= source.StageGeneration
-                            || (work.State <> WorkState.Completed
-                                && work.State <> WorkState.Cancelled))
-                        && (work.SourceLineage |> Option.exists (fun value ->
-                            value.LineageId = lineage.LineageId)))
-                if duplicate then Error AdapterError.DuplicateCorrection
-                else
-                    let next =
-                        draft source.ProjectId
-                            (sprintf "source-correction-%s-g%d" review.ReviewId (source.StageGeneration + 1))
-                            review.TaskId WorkKind.Implementation queue
-                            (source.StageGeneration + 1) (Set.singleton (reviewStageId review))
-                    Ok
-                        { Work =
-                            { next with
-                                SourceLineage = Some { lineage with Generation = lineage.Generation + 1 } }
-                          Provenance = review
-                          HardPrerequisites = Set.singleton (reviewStageId review) }
+            Error AdapterError.AuthoritativeJoinRequired
 
     // Submission and review are independently immutable canonical records;
     // exact identity is checked again by the eventual WQ-04 same-CAS producer.
@@ -245,106 +232,47 @@ module WorkQueueReviewIntegrationAdapter =
                       ReviewVersion = review.SourceVersion
                       SubmissionStatus = submission.Status }
 
+    // Planning produces a non-runnable intent. There is intentionally no
+    // WorkStage to publish: that would drop canonical Accepted identity and
+    // allow substituted review/SHA/target fields after a later claim.
     let planAcceptedIntegration projectId queue (prerequisites: Set<string>)
                                 (binding: AcceptedIntegrationBinding) =
-        if not (nonBlank projectId) || not (subject queue) then
-            Error AdapterError.InvalidCanonicalIntegration
-        elif binding.SubmissionStatus <> "Pending" then
+        if not (nonBlank projectId) || not (subject queue)
+           || binding.SubmissionStatus <> "Pending" then
             Error AdapterError.InvalidCanonicalIntegration
         else
-            let prerequisites = prerequisites.Add
-                                   (sprintf "frozen-review-%s-g%d" binding.ReviewId binding.ReviewVersion)
-            Ok
-                { Work =
-                    draft projectId (integrationStageId binding) binding.TaskId
-                          WorkKind.Integration queue 1 prerequisites
-                  Provenance = binding
-                  HardPrerequisites = prerequisites }
+            let prerequisites =
+                prerequisites.Add (sprintf "frozen-review-%s-g%d" binding.ReviewId binding.ReviewVersion)
+            Ok { ProjectId = projectId
+                 QueueId = queue
+                 ImmutableBinding = binding
+                 HardPrerequisites = prerequisites }
 
     // Only the original immutable push may be recorded. The external caller
     // still must prove journal coverage, remote SHA/target ancestry and jobs
     // at the WQ-03 boundary; this pure contract adapter cannot self-attest them.
-    let startPinnedOriginalPush (binding: AcceptedIntegrationBinding)
-                                expected op launchId pushOperation (project: Project) =
-        let workId = integrationStageId binding
-        match project.Works.TryFind workId with
-        | Some work when work.Kind = WorkKind.Integration
-                         && work.SubjectId = binding.TaskId
-                         && work.State = WorkState.Claimed launchId
-                         && work.Gate = GateState.Clear
-                         && not (String.IsNullOrWhiteSpace pushOperation) ->
-            Contracts.startOriginalPush expected op launchId workId pushOperation
-                binding.SourceSha binding.TargetRef project
-            |> Result.mapError AdapterError.ContractRejected
-        | _ -> Error AdapterError.StageIdentityMismatch
+    // Every effecting adapter path stays disabled until WQ04 can prove a
+    // canonical same-CAS join to stage/generation/current source high-water.
+    // The pure Contracts transitions are covered by disposable tests only.
+    let startPinnedOriginalPush (_binding: AcceptedIntegrationBinding)
+                                _expected _op _launchId _pushOperation (_project: Project)
+                                : Result<Project, AdapterError> =
+        Error AdapterError.AuthoritativeJoinRequired
 
-    let addHardEdge expected op (binding: AcceptedIntegrationBinding)
-                    prerequisite now (project: Project) =
-        let workId = integrationStageId binding
-        match project.Works.TryFind workId with
-        | Some work when work.SubjectId = binding.TaskId
-                         && work.Kind = WorkKind.Integration ->
-            Contracts.setHardPrerequisite expected op workId prerequisite now project
-            |> Result.mapError AdapterError.ContractRejected
-        | _ -> Error AdapterError.StageIdentityMismatch
+    let addHardEdge _expected _op (_binding: AcceptedIntegrationBinding)
+                    _prerequisite _now (_project: Project) : Result<Project, AdapterError> =
+        Error AdapterError.AuthoritativeJoinRequired
 
-    let observeOriginalPushUnderGate expected op launchId
-                                     (binding: AcceptedIntegrationBinding)
-                                     (verified: VerifiedRemoteEffect) now
-                                     (project: Project) =
-        if verified.OriginalPushOperationId = ""
-           || verified.AcceptedSourceSha <> binding.SourceSha
-           || verified.TargetRef <> binding.TargetRef
-           || not verified.AncestryVerified
-           || not verified.JobsReconciled
-           || not (sha verified.RemoteCommitSha) then
-            Error AdapterError.UnsafeGateState
-        else
-            Contracts.reconcileExternalEffect expected op launchId
-                (integrationStageId binding) verified now project
-            |> Result.mapError AdapterError.ContractRejected
+    let observeOriginalPushUnderGate _expected _op _launchId
+                                     (_binding: AcceptedIntegrationBinding)
+                                     (_verified: VerifiedRemoteEffect) _now
+                                     (_project: Project) : Result<Project, AdapterError> =
+        Error AdapterError.AuthoritativeJoinRequired
 
-    let resolveObservedGate expected op (binding: AcceptedIntegrationBinding)
-                            waiver now (project: Project) =
-        match project.Works.TryFind (integrationStageId binding) with
-        | Some stage when stage.Kind = WorkKind.Integration
-                          && stage.SubjectId = binding.TaskId
-                          && stage.State = WorkState.GateException
-                          && stage.Domain = DomainState.Undecided
-                          && not stage.IntegrationAuthorized
-                          && (match stage.Push with
-                              | Some journal ->
-                                  journal.AcceptedSourceSha = binding.SourceSha
-                                  && journal.TargetRef = binding.TargetRef
-                              | None -> false) ->
-            Contracts.resolveIntegrationGateException expected op stage.Id waiver now project
-            |> Result.mapError AdapterError.ContractRejected
-        | _ -> Error AdapterError.UnsafeGateState
+    let resolveObservedGate _expected _op (_binding: AcceptedIntegrationBinding)
+                            _waiver _now (_project: Project) : Result<Project, AdapterError> =
+        Error AdapterError.AuthoritativeJoinRequired
 
-    // The adapter only *checks* the post-CAS gate. Readiness of a downstream
-    // stage requires the canonical authorized producer and complete WQ-04 index.
-    let isAuthorizedIntegration (project: Project) binding =
-        project.GraphCovered && project.QueueCovered
-        && project.MessageCovered && project.SourceCovered
-        && (match project.Works.TryFind (integrationStageId binding) with
-            | Some stage ->
-                stage.Kind = WorkKind.Integration
-                && stage.SubjectId = binding.TaskId
-                && stage.State = WorkState.Completed
-                && stage.IntegrationAuthorized
-                && stage.Gate = GateState.Clear
-                && (stage.Dependencies
-                    |> Set.forall (fun id ->
-                        stage.WaivedDependencies.ContainsKey id
-                        || Contracts.isSatisfied project id))
-                && (match stage.Domain, stage.Push with
-                    | DomainState.Integrated integratedCommit,
-                      Some { AcceptedSourceSha = sourceSha
-                             TargetRef = targetRef
-                             Outcome = PushOutcome.Observed observedCommit } ->
-                        integratedCommit = observedCommit
-                        && sha integratedCommit
-                        && sourceSha = binding.SourceSha
-                        && targetRef = binding.TargetRef
-                    | _ -> false)
-            | None -> false)
+    // Even a pure contract Completed/Integrated result is not an authorized
+    // WQ04 high-water projection and must never unblock dependent work here.
+    let isAuthorizedIntegration (_project: Project) (_binding: AcceptedIntegrationBinding) = false

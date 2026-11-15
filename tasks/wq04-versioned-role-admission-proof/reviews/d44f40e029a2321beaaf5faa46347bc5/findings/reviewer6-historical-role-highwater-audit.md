@@ -1,0 +1,29 @@
+# Reviewer 6 — independent WQ04 historical high-water correction audit
+
+**Verdict: Accepted** for frozen exact `d44f40e029a2321beaaf5faa46347bc52cec67c4` (direct parent `d2dac5bef128c0f8f07662b7e2d6e819be0a4dad`), review `d44f40e029a2321beaaf5faa46347bc5`, task `wq04-versioned-role-admission-proof`.
+
+## Scope and provenance
+
+Independently inspected the frozen commit in a separate clean review worktree, `review/reviewer6-wq04-d44f`. `git diff-tree` reports exactly two changed files: `Client/Modules/WorkQueueRoleAuthority.fs` and `Client.Tests/WorkQueueRoleAuthorityTests.fs`. `git diff --check d2dac5be d44f40e0` succeeds. No host-effect, Scheduler/Manager, server, WQ03, WQ05, or admission/claim integration implementation changed.
+
+The prior independent `ChangesRequested` review `d659d75c796c49d0b96553b647c59b4e` (decision seq 3851) established that revision v2 could be omitted by replacing the current role-catalog JSON with a genuine old v1 blob while leaving the v2 issuance in Git. The present correction specifically addresses that historical tail-rewind failure, in addition to preserving the previous B1/B2/B3 limitations.
+
+## Independent source audit
+
+1. **Complete first-parent catalog mutation history, not projection-only receipts.** `catalogChangeHistory` (`WorkQueueRoleAuthority.fs:262-288`) runs bounded `git log --first-parent --format=%H <snapshot-head> -- records/work-queue/role-catalog.json`. It uses the verified snapshot commit as the anchor and rejects absent, invalid, timed-out or unavailable history; no current projection field chooses which issued revisions to enumerate. This closes the old `catalog.Receipts` enumeration gap.
+2. **Authenticated provisioning and exact sequential issuance.** `verifyRoleHistory` (`:295-350`) requires that the earliest path-changing commit equal the authenticated original `InitializeWQ04RoleCatalog` operation origin; the initial state must be empty at revision 0 with no earlier launches. Every later path change must add exactly one new receipt, advance global catalog revision by one, have an original matching `ConfigureWQ04Role` operation issued *at that commit*, and reconstruct **exactly** the result of `Producer.configureRole` from the prior authenticated state. It finally requires structural equality with the current catalog and equality between current revision and the number of issued transitions.
+3. **Previous P1 exploit is denied even with authentic bytes.** After an original `Lead v1` planning subscription and an issued disabled `v2`, a generic Git CAS restoring the authentic v1 JSON creates an additional catalog-path change but no newly issued `ConfigureWQ04Role` receipt. The sequential transition check fails closed (`:327-350`), so `load` cannot return v1 as fresh demand authority. Reset to the authentic original empty epoch fails for the same reason. A shape-valid replacement of a retained historical entry remains checked by reconstruction and original operation origin.
+4. **No retroactive B1 provision or false B3 claim authority.** `initializeCatalog` still denies provision after any legacy launch (`:679-696`); `loadAt` calls historical proof before producing `RoleRevisionProof`, then verifies each launch's original admission (`:448-479`). `verifyAt` binds the proof to project, ledger, epoch, head and blob provenance (`:484-499`), so a caller-fabricated fresh head cannot bypass the history check. `ClaimWork` remains candidate-only, `RolePreflight` advertises missing combined authority, and `authorizeClaimAt` remains unconditional denial pending exact same-CAS selected work, credit, role, source, account and generation proof (`:593-669`). No runtime launch effect is enabled.
+
+## Adversarial and Release evidence
+
+- New `AuthenticIssuedV1TailRewindAndEmptyEpochResetFailAcrossTwoClones` (`Client.Tests/WorkQueueRoleAuthorityTests.fs:262-327`) preserves original authentic v1 and empty catalog bytes, issues disabled v2 from another clone, replaces v2 via a normal generic Git-CAS fixture, then verifies both clones reject `load`, a fabricated fresh `inspectFresh` proof is rejected, an old proof becomes stale and the original v2 UUID replay is already applied rather than reissued.
+- Existing two-clone negatives for shape-valid retained-row rewrite/receipt substitution, retroactive provision, concurrent revision/admission/claim, stale pinned role, missing history and forged proof remain in the 10-test focused suite.
+- Independently executed `dotnet test Client.Tests/Client.Tests.fsproj -c Release --filter FullyQualifiedName~WorkQueueRoleAuthorityTests --verbosity minimal` at exact frozen source: **10 passed / 0 failed / 0 skipped** on .NET 11.
+- Independently executed `dotnet vstest Client.Tests/bin/Release/net11.0/Client.Tests.dll --TestCaseFilter:FullyQualifiedName~WorkQueue`: **42 passed / 0 failed / 0 skipped**.
+- Independently executed `dotnet test Server.Tests/Server.Tests.fsproj -c Release --verbosity minimal`: **233 passed / 0 failed / 0 skipped**.
+- Review worktree `git status --short --branch` is clean; no code changes or pushes were made by Reviewer 6.
+
+## Acceptance boundary
+
+**Accept this frozen isolated historical-role-catalog correction only.** The design assumes the approved Git-backed ledger's verified, append-only first-parent history; loss/rewrite of the trusted Git ledger itself is not solved by this adapter. New role-history reads are bounded and fail closed if their history proof cannot be reconstructed. This does **not** establish positive WQ04 executable authority: canonical event/source high-water, WQ05 account/credit/identity, actual claim selection, and a future joint same-CAS writer remain independent prerequisites. Keep Scheduler, Manager, YieldSource, live admissions and host source effects disabled until their own integrated proofs and reviews are accepted. No GitHub Actions, deployment, migration, production mutation, or Codex were used.

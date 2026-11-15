@@ -410,7 +410,12 @@ module Contracts =
         && (match work.Kind with
             | WorkKind.RoleMessage messageId ->
                 match project.Messages.TryFind messageId with
-                | Some message -> message.Subject = Subject.Role launch.RoleId
+                | Some message ->
+                    message.Subject = Subject.Role launch.RoleId
+                    && message.WorkId = Some work.Id
+                    && message.State = MessageState.Pending
+                    && work.QueueId = "role:" + launch.RoleId
+                    && work.SubjectId = launch.RoleId
                 | None -> false
             | _ -> true)
 
@@ -569,12 +574,28 @@ module Contracts =
     let postMessage expected op (message: SubjectMessage) roleWork project =
         messageCas expected op message roleWork (fun current ->
             if current.Messages.ContainsKey message.Id then Error(Rejection.InvalidState "duplicate message ID")
+            // The input is an unclaimed conversation event, never a handler or
+            // work-stage capability. Role work is generated only by this CAS.
+            elif message.State <> MessageState.Pending
+                 || message.HandlerGeneration <> 0
+                 || message.WorkId.IsSome then
+                Error(Rejection.InvalidState "message must be new passive attention")
             else
                 match message.Subject, roleWork with
                 | Subject.Task _, None ->
                     Ok { current with Messages = current.Messages.Add(message.Id, message) }
                 | Subject.Role roleId, Some work when work.Kind = WorkKind.RoleMessage message.Id
                                                      && work.QueueId = "role:" + roleId
+                                                     && work.SubjectId = roleId
+                                                     && work.StageGeneration > 0
+                                                     && work.ClaimGeneration = 0
+                                                     && (work.State = WorkState.Available
+                                                         || work.State = WorkState.Blocked)
+                                                     && work.Gate = GateState.Clear
+                                                     && work.Domain = DomainState.Undecided
+                                                     && work.SourceLineage.IsNone
+                                                     && work.Push.IsNone
+                                                     && not work.IntegrationAuthorized
                                                      && not (current.Works.ContainsKey work.Id) ->
                     normalizePublishedStage current work
                     |> Result.map (fun normalized ->
@@ -891,6 +912,9 @@ module Contracts =
             | Some primary ->
                 primary.State = WorkState.Claimed launchId
                 && primary.ClaimGeneration > 0
+                // A dedicated Role-message activation owns one message only.
+                // It cannot widen that primary claim by ancillary intake.
+                && (match primary.Kind with WorkKind.RoleMessage _ -> false | _ -> true)
                 && primary.Gate = GateState.Clear
                 && primary.Domain = DomainState.Undecided
                 && hardDependenciesSatisfied current primary
@@ -911,7 +935,28 @@ module Contracts =
                             current.Works.TryFind id
                             |> Option.exists (fun primary -> primary.SubjectId = taskId)
                         | None -> false
+                // WorkId is an untrusted field in a stored conversation event.
+                // A Task message must stay passive; a Role message may claim
+                // only its own typed stage in the launch's subscribed queue.
+                let validMessageWork =
+                    match message.Subject, message.WorkId with
+                    | Subject.Task _, None -> true
+                    | Subject.Role roleId, Some workId ->
+                        match current.Works.TryFind workId with
+                        | Some work ->
+                            work.Kind = WorkKind.RoleMessage messageId
+                            && work.QueueId = "role:" + roleId
+                            && work.SubjectId = roleId
+                            && compatible current launch work
+                            && work.SourceLineage.IsNone
+                            && work.Push.IsNone
+                            && work.Domain = DomainState.Undecided
+                            && not work.IntegrationAuthorized
+                        | None -> false
+                    | _ -> false
                 if not eligibleSubject then Error(Rejection.InvalidState "ineligible task/role actor")
+                elif not validMessageWork then
+                    Error(Rejection.InvalidState "ancillary message does not match passive Task or its Role work generation")
                 else
                     match message.WorkId with
                     | None ->

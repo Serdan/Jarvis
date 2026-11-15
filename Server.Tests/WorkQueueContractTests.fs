@@ -1829,3 +1829,186 @@ let wq01_stopped_launch_cannot_turn_prior_ancillary_receipt_into_new_authority (
     Assert.That(stopped.Works.["D"].State, Is.EqualTo(WorkState.Blocked))
     Assert.That(stopped.Launches.["L"].AccountTokenId, Is.EqualTo(live.Launches.["L"].AccountTokenId))
     Assert.That(stopped.NextAvailability, Is.EqualTo(accepted.NextAvailability))
+
+
+[<Test>]
+let wq01_task_workid_never_grants_cross_queue_claim_or_strands_primary_terminal () =
+    let live =
+        empty ()
+        |> fun p -> publish p (stage "Plan" WorkKind.Planning "planning" 1L [] WorkState.Available)
+        |> fun p -> publish p (implementation "Victim" 2L [])
+        |> fun p -> admit p "L" "Lead"
+        |> fun p -> submit p "L"
+        |> fun p -> initialize p "L"
+        |> fun p -> claim p "L"
+    let account = reserveGlobal 0 "reserve:foreign-work-test" "L" (emptyAccount 1) |> success
+    let malformed = { message "T" (Subject.Task "task-Plan") with WorkId = Some "Victim" }
+    rejected (Rejection.InvalidState "message must be new passive attention")
+        (postMessage live.Version "reject-task-workid" malformed None live)
+    Assert.That(live.Messages.ContainsKey "T", Is.False)
+    Assert.That(live.Receipts.ContainsKey "reject-task-workid", Is.False)
+
+    // An independently imported legacy/malformed snapshot cannot bypass the
+    // publication guard through the exported ancillary intake transition.
+    let imported = { live with Messages = live.Messages.Add("T", malformed) }
+    rejected (Rejection.InvalidState "ancillary message does not match passive Task or its Role work generation")
+        (claimAncillaryMessage imported.Version "claim-foreign-work" "L" "T" imported)
+    let producer =
+        postMessage imported.Version "new-producer" (message "Later" (Subject.Task "task-Plan")) None imported
+        |> success
+    rejected Rejection.CasConflict
+        (claimAncillaryMessage imported.Version "stale-foreign-claim" "L" "T" producer)
+    rejected (Rejection.InvalidState "ancillary message does not match passive Task or its Role work generation")
+        (claimAncillaryMessage producer.Version "fresh-foreign-claim" "L" "T" producer)
+    Assert.That(producer.Works.["Victim"].State, Is.EqualTo(WorkState.Available))
+    Assert.That(producer.Works.["Plan"].State, Is.EqualTo(WorkState.Claimed "L"))
+    Assert.That(producer.Messages.["T"].State, Is.EqualTo(MessageState.Pending))
+    Assert.That(producer.Launches.["L"].AncillaryMessages, Is.Empty)
+    Assert.That(producer.Receipts.ContainsKey "claim-foreign-work", Is.False)
+    Assert.That(producer.Receipts.ContainsKey "fresh-foreign-claim", Is.False)
+    Assert.That(producer.NextAvailability, Is.EqualTo(live.NextAvailability))
+    let terminal = completeOrdinary producer.Version "terminal-plan-with-forged-attention" "L" "Plan" 100L producer |> success
+    Assert.That(terminal.Works.["Victim"].State, Is.EqualTo(WorkState.Available))
+    Assert.That(terminal.Messages.["T"].State, Is.EqualTo(MessageState.Pending))
+    let released = releaseGlobal account.Version "release-foreign-work-test" "L" terminal account |> success
+    Assert.That(released.Tokens.["L"], Is.True)
+    let replay = completeOrdinary producer.Version "terminal-plan-with-forged-attention" "L" "Plan" 100L terminal |> success
+    Assert.That(replay, Is.EqualTo(terminal))
+
+[<Test>]
+let wq01_publication_rejects_noncanonical_task_role_drafts_and_role_stage_mismatch () =
+    let p = empty ()
+    let taskDraft = message "T" (Subject.Task "task-Plan")
+    let roleDraft = message "M" (Subject.Role "Lead")
+    let roleWork = roleMessageWork "M" 3L
+    let noncanonical : (string * SubjectMessage * WorkStage option) list =
+        [ "task-workid", { taskDraft with WorkId = Some "Victim" }, None
+          "task-already-handled", { taskDraft with State = MessageState.Handled "reply" }, None
+          "task-handler-generation", { taskDraft with HandlerGeneration = 9 }, None
+          "role-workid", { roleDraft with WorkId = Some roleWork.Id }, Some roleWork
+          "role-already-claimed", { roleDraft with State = MessageState.ClaimedPrimary "L" }, Some roleWork
+          "role-handler-generation", { roleDraft with HandlerGeneration = 1 }, Some roleWork ]
+    for label, draft, work in noncanonical do
+        rejected (Rejection.InvalidState "message must be new passive attention")
+            (postMessage p.Version ("reject-" + label) draft work p)
+        Assert.That(p.Messages, Is.Empty, label)
+        Assert.That(p.Works, Is.Empty, label)
+
+    let invalidStages =
+        [ "wrong-kind", { roleWork with Kind = WorkKind.Implementation }
+          "wrong-queue", { roleWork with QueueId = "implementation" }
+          "wrong-subject", { roleWork with SubjectId = "task-other" }
+          "wrong-message-id", { roleWork with Kind = WorkKind.RoleMessage "Other" }
+          "claimed-stage", { roleWork with State = WorkState.Claimed "Someone" }
+          "claimed-generation", { roleWork with ClaimGeneration = 1 }
+          "zero-stage-generation", { roleWork with StageGeneration = 0 }
+          "pending-gate", { roleWork with Gate = GateState.DependencyGatePending 2 }
+          "source-writer", { roleWork with SourceLineage = Some sourceLineage }
+          "push-effect", { roleWork with Push = Some { OperationId = "p"; AcceptedSourceSha = "sha"
+                                                       TargetRef = "refs/heads/main"; Outcome = PushOutcome.Unknown } }
+          "final-domain", { roleWork with Domain = DomainState.FinalizedPendingTerminal "receipt" } ]
+    for label, work in invalidStages do
+        rejected (Rejection.InvalidState "Role message requires exactly one dedicated work generation")
+            (postMessage p.Version ("reject-stage-" + label) roleDraft (Some work) p)
+        Assert.That(p.Receipts.ContainsKey ("reject-stage-" + label), Is.False)
+
+    let legal = postMessage p.Version "typed-publication" roleDraft (Some roleWork) p |> success
+    Assert.That(legal.Messages.["M"].WorkId, Is.EqualTo(Some roleWork.Id))
+    Assert.That(legal.Messages.["M"].State, Is.EqualTo(MessageState.Pending))
+    Assert.That(legal.Works.[roleWork.Id].Kind, Is.EqualTo(WorkKind.RoleMessage "M"))
+    let replay = postMessage p.Version "typed-publication" roleDraft (Some roleWork) legal |> success
+    Assert.That(replay, Is.EqualTo(legal))
+    rejected Rejection.OperationIdReused
+        (postMessage legal.Version "typed-publication" { roleDraft with WorkId = Some "Victim" }
+            (Some roleWork) legal)
+
+[<Test>]
+let wq01_malformed_imported_subject_work_pairs_never_claim_even_with_no_other_credits () =
+    let live = wq01StopCoverageInitial () |> fun p -> publish p (implementation "Victim" 4L [])
+    let task = live.Messages.["T"]
+    let role = live.Messages.["M"]
+    let roleWork = live.Works.["role-msg:M"]
+    let snapshots : (string * string * SubjectMessage * WorkStage option * Rejection) list =
+        [ "task-implementation", "T", { task with WorkId = Some "Victim" }, None,
+              Rejection.InvalidState "ancillary message does not match passive Task or its Role work generation"
+          "task-role-stage", "T", { task with WorkId = Some roleWork.Id }, None,
+              Rejection.InvalidState "ancillary message does not match passive Task or its Role work generation"
+          "role-implementation", "M", { role with WorkId = Some "Victim" }, None,
+              Rejection.InvalidState "ancillary message does not match passive Task or its Role work generation"
+          "role-workless", "M", { role with WorkId = None }, None,
+              Rejection.InvalidState "ancillary message does not match passive Task or its Role work generation"
+          "role-kind", "M", role, Some { roleWork with Kind = WorkKind.Implementation },
+              Rejection.InvalidState "ancillary message does not match passive Task or its Role work generation"
+          "role-queue", "M", role, Some { roleWork with QueueId = "implementation" },
+              Rejection.InvalidState "ancillary message does not match passive Task or its Role work generation"
+          "role-subject", "M", role, Some { roleWork with SubjectId = "task-Victim" },
+              Rejection.InvalidState "ancillary message does not match passive Task or its Role work generation"
+          "role-source-effect", "M", role, Some { roleWork with SourceLineage = Some sourceLineage },
+              Rejection.InvalidState "ancillary message does not match passive Task or its Role work generation"
+          "wrong-actor-role", "M", { role with Subject = Subject.Role "Reviewer" }, None,
+              Rejection.InvalidState "ineligible task/role actor" ]
+    for label, messageId, malformed, replacement, error in snapshots do
+        let withMessage = { live with Messages = live.Messages.Add(messageId, malformed) }
+        let imported =
+            match replacement with
+            | Some work -> { withMessage with Works = withMessage.Works.Add(work.Id, work) }
+            | None -> withMessage
+        rejected error (claimAncillaryMessage imported.Version ("reject-import-" + label) "L" messageId imported)
+        Assert.That(imported.Receipts.ContainsKey ("reject-import-" + label), Is.False, label)
+        Assert.That(imported.Launches.["L"].AncillaryMessages, Is.Empty, label)
+        Assert.That(imported.Messages.[messageId].State, Is.EqualTo(MessageState.Pending), label)
+        Assert.That(imported.Works.["Victim"].State, Is.EqualTo(WorkState.Available), label)
+        Assert.That(imported.Works.["Plan"].State, Is.EqualTo(WorkState.Claimed "L"), label)
+
+[<TestCase(false)>]
+[<TestCase(true)>]
+let wq01_dedicated_role_primary_cannot_widen_to_second_message (withReservedPeer: bool) =
+    let posted =
+        empty ()
+        |> fun p -> publishRoleMessage p "M1" 1L
+        |> fun p -> publishRoleMessage p "M2" 2L
+        |> fun p -> admit p "L" "Lead"
+    let beforeClaim = if withReservedPeer then admit posted "Reserved" "Lead" else posted
+    let active = beforeClaim |> fun p -> submit p "L" |> fun p -> initialize p "L" |> fun p -> claim p "L"
+    Assert.That(active.Launches.["L"].PrimaryWorkId, Is.EqualTo(Some "role-msg:M1"))
+    Assert.That(active.Messages.["M1"].State, Is.EqualTo(MessageState.ClaimedPrimary "L"))
+    Assert.That(active.Messages.["M2"].State, Is.EqualTo(MessageState.Pending))
+    rejected Rejection.CasConflict
+        (claimAncillaryMessage beforeClaim.Version "dedicated-stale-M2" "L" "M2" active)
+    rejected (Rejection.InvalidState "ancillary handler requires active unrelated primary claim")
+        (claimAncillaryMessage active.Version "dedicated-fresh-M2" "L" "M2" active)
+    Assert.That(active.Receipts.ContainsKey "dedicated-fresh-M2", Is.False)
+    Assert.That(active.Works.["role-msg:M2"].State, Is.EqualTo(WorkState.Available))
+    Assert.That(active.Launches.["L"].AncillaryMessages, Is.Empty)
+    if withReservedPeer then
+        Assert.That(active.Launches.["Reserved"].Credit, Is.EqualTo(Some "role-msg:M2"))
+    let account = reserveGlobal 0 "reserve-dedicated-L" "L" (emptyAccount 1) |> success
+    let terminal = completePrimaryCurrent active.Version "complete-dedicated-M1" "L" "role-msg:M1" "M1" "reply" 100L active |> success
+    Assert.That(terminal.Messages.["M1"].State, Is.EqualTo(MessageState.Handled "reply"))
+    Assert.That(terminal.Messages.["M2"].State, Is.EqualTo(MessageState.Pending))
+    Assert.That(terminal.Works.["role-msg:M2"].State, Is.EqualTo(WorkState.Available))
+    Assert.That(terminal.Launches.["L"].AncillaryMessages, Is.Empty)
+    let release = releaseGlobal account.Version "release-dedicated-L" "L" terminal account |> success
+    Assert.That(release.Tokens.["L"], Is.True)
+    let replay = completePrimaryCurrent active.Version "complete-dedicated-M1" "L" "role-msg:M1" "M1" "reply" 100L terminal |> success
+    Assert.That(replay, Is.EqualTo(terminal))
+
+[<Test>]
+let wq01_live_plan_primary_still_claims_and_answers_own_role_message_as_ancillary () =
+    let active =
+        empty ()
+        |> fun p -> publish p (stage "Plan" WorkKind.Planning "planning" 0L [] WorkState.Available)
+        |> fun p -> publishRoleMessage p "M" 1L
+        |> fun p -> admit p "L" "Lead"
+        |> fun p -> submit p "L"
+        |> fun p -> initialize p "L"
+        |> fun p -> claim p "L"
+    Assert.That(active.Launches.["L"].PrimaryWorkId, Is.EqualTo(Some "Plan"))
+    let claimed = claimAncillaryMessage active.Version "claim-role-from-plan" "L" "M" active |> success
+    Assert.That(claimed.Messages.["M"].State, Is.EqualTo(MessageState.ClaimedAncillary "L"))
+    Assert.That(claimed.Works.["role-msg:M"].Kind, Is.EqualTo(WorkKind.RoleMessage "M"))
+    let handled = completeAncillaryCurrent claimed.Version "answer-from-plan" "L" "M" "answer" 100L claimed |> success
+    Assert.That(handled.Messages.["M"].State, Is.EqualTo(MessageState.Handled "answer"))
+    Assert.That(handled.Works.["Plan"].State, Is.EqualTo(WorkState.Claimed "L"))
+    let terminal = completeOrdinary handled.Version "finish-plan-after-role" "L" "Plan" 101L handled |> success
+    Assert.That(terminal.Launches.["L"].AncillaryMessages, Is.Empty)

@@ -8,9 +8,16 @@
         <WarningsAsErrors>FS0025</WarningsAsErrors>
     </PropertyGroup>
 
+    <!-- WQ08's hypothetical planner is internal and callable only by the test assembly.
+         The normal Planner entry point keeps WQ04 canDispatch fail-closed. -->
+    <ItemGroup>
+        <InternalsVisibleTo Include="Server.Tests" />
+    </ItemGroup>
+
     <ItemGroup>
         <Content Include="Structure.md"/>
         <Compile Include="WorkQueueContracts.fs"/>
+        <Compile Include="WorkQueueSchedulerInert.fs"/>
         <Compile Include="WorkQueueDependencyDiagnostics.fs"/>
         <Compile Include="WorkQueueProducers.fs"/>
         <Compile Include="JarvisOptions.fs"/>

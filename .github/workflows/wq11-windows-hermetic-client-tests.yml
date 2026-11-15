@@ -82,8 +82,30 @@ jobs:
       - name: Failed setup must exit nonzero and remove its private scratch
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $false
           $text = (& dotnet fsi scripts/test-client-hermetic.fsx -- --scratch-parent "$env:RUNNER_TEMP" --self-test-failed-setup 2>&1 | Out-String)
           $code = $LASTEXITCODE
           Write-Output $text
-          if ($code -eq 0) { throw "Injected setup failure unexpectedly returned 0" }
+          if ($code -ne 1) { throw "Injected setup failure unexpectedly returned $code (wanted 1)" }
           if ($text -notmatch "scratch cleanup verified = true") { throw "Missing cleanup proof" }
+
+      - name: Zero discovery must fail with exact cleanup
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $text = (& dotnet fsi scripts/test-client-hermetic.fsx -- --scratch-parent "$env:RUNNER_TEMP" --no-build --filter "FullyQualifiedName~definitely_nonexistent_wq11_test" --timeout-seconds 90 2>&1 | Out-String)
+          $code = $LASTEXITCODE
+          Write-Output $text
+          if ($code -ne 2) { throw "Zero discovery returned $code (wanted 2)" }
+          if ($text -notmatch "executed tests 0") { throw "Missing zero-discovery diagnostic" }
+          if ($text -notmatch "scratch cleanup verified = true") { throw "Missing zero-discovery cleanup proof" }
+
+      - name: Hard timeout kills Windows testhost and removes scratch
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $text = (& dotnet fsi scripts/test-client-hermetic.fsx -- --scratch-parent "$env:RUNNER_TEMP" --no-build --timeout-seconds 10 2>&1 | Out-String)
+          $code = $LASTEXITCODE
+          Write-Output $text
+          if ($code -ne 124) { throw "Hard timeout returned $code (wanted 124)" }
+          if ($text -notmatch "scratch cleanup verified = true") { throw "Missing timeout cleanup proof" }

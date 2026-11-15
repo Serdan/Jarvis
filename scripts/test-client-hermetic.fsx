@@ -121,6 +121,26 @@ let makeDirectory child =
     Directory.CreateDirectory(path) |> ignore
     path
 
+// Windows Git object files can be ReadOnly. Recursive Directory.Delete leaves
+// them behind and incorrectly masks the original test outcome. Remove only
+// this generated scratch tree, clearing ReadOnly on ordinary descendants;
+// never recurse through a symlink/junction/reparse point.
+let rec deleteDisposableTree (path: string) =
+    let attributes = File.GetAttributes path
+    if attributes.HasFlag(FileAttributes.ReparsePoint) then
+        if attributes.HasFlag(FileAttributes.Directory) then Directory.Delete(path)
+        else File.Delete(path)
+    elif attributes.HasFlag(FileAttributes.Directory) then
+        for child in Directory.EnumerateFileSystemEntries(path) |> Seq.toArray do
+            deleteDisposableTree child
+        if attributes.HasFlag(FileAttributes.ReadOnly) then
+            File.SetAttributes(path, attributes &&& ~~~FileAttributes.ReadOnly)
+        Directory.Delete(path)
+    else
+        if attributes.HasFlag(FileAttributes.ReadOnly) then
+            File.SetAttributes(path, attributes &&& ~~~FileAttributes.ReadOnly)
+        File.Delete(path)
+
 try
     // Avoid ever inheriting the operator's Jarvis config, activity, identity,
     // binding or local file-edit locks. Set environment BEFORE starting testhost.
@@ -310,7 +330,7 @@ finally
     // A failed setup, test failure, cancellation or timeout must not retain
     // activity, bindings, test output or private temporary credentials.
     if Directory.Exists(tempDirectory) then
-        Directory.Delete(tempDirectory, true)
+        deleteDisposableTree tempDirectory
     printfn "Hermetic Client.Tests: scratch cleanup verified = %b" (not (Directory.Exists tempDirectory))
     if injectSetupFailure then
         eprintfn "Hermetic Client.Tests: scratch cleanup verified = %b" (not (Directory.Exists tempDirectory))

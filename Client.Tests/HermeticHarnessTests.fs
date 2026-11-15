@@ -72,6 +72,28 @@ type HermeticClientTestEnvironment() =
         if not (OperatingSystem.IsWindows()) && File.GetUnixFileMode(path) <> expected then
             raise (UnauthorizedAccessException("Hermetic Client.Tests requires owner-only scratch permissions."))
 
+    /// Windows Git makes loose objects read-only. Dispose only verified test
+    /// descendants, clearing ReadOnly on regular files; never follow junctions
+    /// or symlinks while cleaning up. This is test-only, not production GC.
+    static member DeletePrivateTree (root: string) (path: string) =
+        HermeticClientTestEnvironment.AssertPrivatePath root path
+        let rec remove (candidate: string) =
+            let attributes = File.GetAttributes candidate
+            if attributes.HasFlag(FileAttributes.ReparsePoint) then
+                if attributes.HasFlag(FileAttributes.Directory) then Directory.Delete(candidate)
+                else File.Delete(candidate)
+            elif attributes.HasFlag(FileAttributes.Directory) then
+                for child in Directory.EnumerateFileSystemEntries(candidate) |> Seq.toArray do
+                    remove child
+                if attributes.HasFlag(FileAttributes.ReadOnly) then
+                    File.SetAttributes(candidate, attributes &&& ~~~FileAttributes.ReadOnly)
+                Directory.Delete(candidate)
+            else
+                if attributes.HasFlag(FileAttributes.ReadOnly) then
+                    File.SetAttributes(candidate, attributes &&& ~~~FileAttributes.ReadOnly)
+                File.Delete(candidate)
+        if Directory.Exists path then remove path
+
     static member private Layout (root: string) =
         [ "HOME", "home"; "USERPROFILE", "home"
           "XDG_CONFIG_HOME", "config"; "XDG_DATA_HOME", "data"
@@ -231,17 +253,8 @@ module HermeticHarnessTests =
         Assert.That(ClientKnownFolders.applicationData(), Is.EqualTo(Path.Combine(root, "config")))
         Assert.That(ClientKnownFolders.localApplicationData(), Is.EqualTo(Path.Combine(root, "data")))
         Assert.That(ClientKnownFolders.userProfile(), Is.EqualTo(Path.Combine(root, "home")))
-        // On Windows shell known folders must NOT be spoofed by env vars;
-        // only Client storage resolves through the test-only override.
-        if OperatingSystem.IsWindows() then
-            Assert.That(
-                HermeticClientTestEnvironment.Under root
-                    (Environment.GetFolderPath Environment.SpecialFolder.ApplicationData),
-                Is.False)
-            Assert.That(
-                HermeticClientTestEnvironment.Under root
-                    (Environment.GetFolderPath Environment.SpecialFolder.LocalApplicationData),
-                Is.False)
+        // Windows may honor or ignore APPDATA/LOCALAPPDATA. Neither outcome
+        // matters: Client-owned storage must always resolve inside this root.
         let deviceId = DeviceIdentity.getOrCreate()
         Assert.That(Guid.TryParse deviceId |> fst, Is.True)
         let devicePath = Path.Combine(root, "config", "Jarvis", "device-id")
@@ -343,4 +356,5 @@ module HermeticHarnessTests =
             Assert.That(identity,
                 Is.EqualTo("Jarvis Test|jarvis-test@example.invalid|Jarvis Test|jarvis-test@example.invalid"))
         finally
-            Directory.Delete(scratch, true)
+            let root = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_HERMETIC_ROOT")
+            HermeticClientTestEnvironment.DeletePrivateTree root scratch

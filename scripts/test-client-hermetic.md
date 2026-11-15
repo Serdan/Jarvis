@@ -19,7 +19,7 @@ dotnet fsi scripts/test-client-hermetic.fsx -- --no-build --timeout-seconds 900
 
 ## Windows validation (disposable VM only)
 
-The workflow `.github/workflows/wq11-windows-hermetic-client-tests.yml` runs on GitHub-hosted `windows-latest` with .NET 11 Release, attests that `RUNNER_TEMP` is outside `USERPROFILE`, then runs focused tests, all Client.Tests, two concurrent isolated testhosts, and a deliberately failed setup. A CI worker is an ephemeral Windows OS profile: it is not the operator's Windows account. The caller must provide an explicit existing safe scratch parent (e.g. the workflow's `$env:RUNNER_TEMP`) because the ambient Windows temp directory typically belongs to a real profile.
+The workflow `.github/workflows/wq11-windows-hermetic-client-tests.yml` runs on GitHub-hosted `windows-latest` with .NET 11 Release, attests that `RUNNER_TEMP` is outside `USERPROFILE`, then runs focused tests, all Client.Tests, two concurrent isolated testhosts, a deliberately failed setup, a zero-discovery negative probe, and a 10-second forced timeout with verified scratch cleanup. A CI worker is an ephemeral Windows OS profile: it is not the operator's Windows account. The caller must provide an explicit existing safe scratch parent (e.g. the workflow's `$env:RUNNER_TEMP`) because the ambient Windows temp directory typically belongs to a real profile.
 
 ```powershell
 dotnet fsi scripts/test-client-hermetic.fsx -- --scratch-parent "$env:RUNNER_TEMP" --no-build --filter "FullyQualifiedName~HermeticHarnessTests" --timeout-seconds 180 --self-test-git-sentinel

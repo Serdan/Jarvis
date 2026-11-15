@@ -49,6 +49,14 @@ module private AccountFixture =
         | Ok value -> value
         | Error e -> failwithf "Expected successful ledger operation, got %A" e
 
+    // Keep the foundation tests scoped to their disposable, account-local project
+    // authority. Production callers must pass a full independently trusted binding.
+    let reserve (b: AccountBinding) op actor launch (projectId: Guid) role version =
+        AccountCapacityLedger.reserve b op actor launch
+            { ProjectId = projectId; LedgerId = projectId; Epoch = 1
+              ApprovedFetchUrl = b.ApprovedFetchUrl; ApprovedPushUrl = b.ApprovedPushUrl }
+            role version
+
     let withGit capacity action =
         let root = Path.Combine(Path.GetTempPath(), "jarvis-account-fixture-" + Guid.NewGuid().ToString("N"))
         Directory.CreateDirectory(root) |> ignore
@@ -66,7 +74,8 @@ module private AccountFixture =
             git root [ "clone"; remote; two ] |> ignore
             let sourceHead = git one [ "rev-parse"; "HEAD" ]
             let accountId, accountLedgerId = Guid.NewGuid(), Guid.NewGuid()
-            let projectId, projectLedgerId = Guid.NewGuid(), Guid.NewGuid()
+            let projectId = Guid.NewGuid()
+            let projectLedgerId = projectId
             let account path =
                 { RepositoryPath = path; RemoteName = "origin"
                   ApprovedFetchUrl = remote; ApprovedPushUrl = remote
@@ -211,6 +220,13 @@ module private AccountFixture =
                                                          LaunchId = document.LaunchId
                                                          AdmissionOperationId = document.AccountAdmissionOperationId
                                                          ProjectLedgerId = string p.LedgerId
+                                                         ProjectLedgerEpoch = p.Epoch
+                                                         ProjectAuthoritySha256 =
+                                                             AccountCapacityLedger.projectAuthoritySha256
+                                                                 { ProjectId = p.ProjectId; LedgerId = p.LedgerId
+                                                                   Epoch = p.Epoch
+                                                                   ApprovedFetchUrl = p.ApprovedFetchUrl
+                                                                   ApprovedPushUrl = p.ApprovedPushUrl }
                                                          ProjectHead = snapshot.Commit
                                                          TerminalOperationId = string locator.TerminalOperationId
                                                          TerminalBlobOid = oid
@@ -233,10 +249,10 @@ type AccountCapacityLedgerTests() =
             use gate = new ManualResetEventSlim(false)
             let first = Task.Run(fun () ->
                 gate.Wait()
-                AccountCapacityLedger.reserve f.AccountOne op1 "Worker" l1 p1 "Worker" 1L)
+                AccountFixture.reserve f.AccountOne op1 "Worker" l1 p1 "Worker" 1L)
             let second = Task.Run(fun () ->
                 gate.Wait()
-                AccountCapacityLedger.reserve f.AccountTwo op2 "Reviewer" l2 p2 "Reviewer" 1L)
+                AccountFixture.reserve f.AccountTwo op2 "Reviewer" l2 p2 "Reviewer" 1L)
             gate.Set()
             Task.WaitAll([| first :> Task; second :> Task |])
             let outcomes = [ first.Result; second.Result ]
@@ -254,22 +270,22 @@ type AccountCapacityLedgerTests() =
         AccountFixture.withGit 2 (fun f ->
             let launch, project, op = Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid()
             let first =
-                AccountCapacityLedger.reserve f.AccountOne op "Scheduler" launch project "Worker" 3L
+                AccountFixture.reserve f.AccountOne op "Scheduler" launch project "Worker" 3L
                 |> success
             let replay =
-                AccountCapacityLedger.reserve f.AccountTwo op "Scheduler" launch project "Worker" 3L
+                AccountFixture.reserve f.AccountTwo op "Scheduler" launch project "Worker" 3L
                 |> success
             Assert.That(first.AlreadyApplied, Is.False)
             Assert.That(replay.AlreadyApplied, Is.True)
             Assert.That(first.Receipt.RequestSha256, Is.EqualTo(replay.Receipt.RequestSha256))
             Assert.That(first.Receipt.OriginalResultJson, Is.EqualTo(replay.Receipt.OriginalResultJson))
-            match AccountCapacityLedger.reserve f.AccountTwo op "Scheduler" launch project "Reviewer" 3L with
+            match AccountFixture.reserve f.AccountTwo op "Scheduler" launch project "Reviewer" 3L with
             | Error AccountOperationIdReused -> ()
             | other -> Assert.Fail(sprintf "Changed role reusing op ID must fail: %A" other)
-            match AccountCapacityLedger.reserve f.AccountTwo op "Scheduler" launch (Guid.NewGuid()) "Worker" 3L with
+            match AccountFixture.reserve f.AccountTwo op "Scheduler" launch (Guid.NewGuid()) "Worker" 3L with
             | Error AccountOperationIdReused -> ()
             | other -> Assert.Fail(sprintf "Changed project reusing op ID must fail: %A" other)
-            match AccountCapacityLedger.reserve f.AccountTwo (Guid.NewGuid()) "Scheduler" launch project "Worker" 3L with
+            match AccountFixture.reserve f.AccountTwo (Guid.NewGuid()) "Scheduler" launch project "Worker" 3L with
             | Error AccountLaunchExists -> ()
             | other -> Assert.Fail(sprintf "Second op may not mint another token: %A" other)
             let _, receipt = AccountCapacityLedger.readOperation f.AccountTwo op |> success
@@ -295,7 +311,7 @@ type AccountCapacityLedgerTests() =
                     | _ -> AccountGitTestFault.PassThrough }
             let unknown =
                 AccountCapacityLedger.withTestInterposition hooks (fun () ->
-                    AccountCapacityLedger.reserve f.AccountOne op "Scheduler"
+                    AccountFixture.reserve f.AccountOne op "Scheduler"
                         launch project "Worker" 1L)
             match unknown with
             | Error(AccountOutcomeUnknown actual) when actual = op -> ()
@@ -307,7 +323,7 @@ type AccountCapacityLedgerTests() =
             let initial, original = AccountCapacityLedger.readOperation f.AccountTwo op |> success
             Assert.That(original.IsSome, Is.True)
             let replay =
-                AccountCapacityLedger.reserve f.AccountTwo op "Scheduler"
+                AccountFixture.reserve f.AccountTwo op "Scheduler"
                     launch project "Worker" 1L |> success
             Assert.That(replay.AlreadyApplied, Is.True)
             Assert.That(replay.Receipt, Is.EqualTo(original.Value))
@@ -332,7 +348,7 @@ type AccountCapacityLedgerTests() =
             let run account =
                 Task.Run(fun () ->
                     AccountCapacityLedger.withTestInterposition hooks (fun () ->
-                        AccountCapacityLedger.reserve account (Guid.NewGuid())
+                        AccountFixture.reserve account (Guid.NewGuid())
                             "Scheduler" (Guid.NewGuid()) (Guid.NewGuid()) "Worker" 1L))
             let first, second = run f.AccountOne, run f.AccountTwo
             Task.WaitAll([| first :> Task; second :> Task |])
@@ -352,7 +368,7 @@ type AccountCapacityLedgerTests() =
     member _.UnverifiableAccountReleaseTransportKeepsTokenHeldUntilExactReplay() =
         AccountFixture.withGit 1 (fun f ->
             let launch, admission = Guid.NewGuid(), Guid.NewGuid()
-            AccountCapacityLedger.reserve f.AccountOne admission "Scheduler" launch
+            AccountFixture.reserve f.AccountOne admission "Scheduler" launch
                 f.ProjectOne.ProjectId "Worker" 1L |> success |> ignore
             AccountFixture.publishProjectAdmission f.ProjectOne launch admission
             let terminal =
@@ -380,7 +396,7 @@ type AccountCapacityLedgerTests() =
             let snapshot, receipt = AccountCapacityLedger.readOperation f.AccountTwo releaseId |> success
             Assert.That(receipt.IsNone, Is.True)
             Assert.That(AccountCapacityLedger.occupied snapshot.State, Is.EqualTo(1))
-            match AccountCapacityLedger.reserve f.AccountTwo (Guid.NewGuid()) "Scheduler"
+            match AccountFixture.reserve f.AccountTwo (Guid.NewGuid()) "Scheduler"
                     (Guid.NewGuid()) (Guid.NewGuid()) "Worker" 1L with
             | Error(AccountCapacityFull(1, 1)) -> ()
             | other -> Assert.Fail(sprintf "Outcome-unknown release improperly freed token: %A" other)
@@ -392,7 +408,7 @@ type AccountCapacityLedgerTests() =
     [<Test>]
     member _.CapacityShrinkRacesReservationFromSameStaleParent() =
         AccountFixture.withGit 2 (fun f ->
-            AccountCapacityLedger.reserve f.AccountOne (Guid.NewGuid()) "Scheduler"
+            AccountFixture.reserve f.AccountOne (Guid.NewGuid()) "Scheduler"
                 (Guid.NewGuid()) (Guid.NewGuid()) "Lead" 1L |> success |> ignore
             let oldHead = (AccountCapacityLedger.fetch f.AccountOne |> success).Head
             let observed = ConcurrentBag<string>()
@@ -407,7 +423,7 @@ type AccountCapacityLedgerTests() =
                   GitCommand = fun _ -> AccountGitTestFault.PassThrough }
             let reservation = Task.Run(fun () ->
                 AccountCapacityLedger.withTestInterposition hooks (fun () ->
-                    AccountCapacityLedger.reserve f.AccountTwo (Guid.NewGuid()) "Scheduler"
+                    AccountFixture.reserve f.AccountTwo (Guid.NewGuid()) "Scheduler"
                         (Guid.NewGuid()) (Guid.NewGuid()) "Worker" 1L))
             let shrink = Task.Run(fun () ->
                 AccountCapacityLedger.withTestInterposition hooks (fun () ->
@@ -431,7 +447,7 @@ type AccountCapacityLedgerTests() =
     member _.ReleaseRequiresCurrentVerifiedProjectTerminalAndNeverDoubleFrees() =
         AccountFixture.withGit 1 (fun f ->
             let launch, project, admission = Guid.NewGuid(), f.ProjectOne.ProjectId, Guid.NewGuid()
-            AccountCapacityLedger.reserve f.AccountOne admission "Scheduler" launch project "Worker" 1L
+            AccountFixture.reserve f.AccountOne admission "Scheduler" launch project "Worker" 1L
             |> success |> ignore
             let verifier = AccountFixture.verifier f.ProjectTwo
             let missing =
@@ -456,7 +472,7 @@ type AccountCapacityLedgerTests() =
             Assert.That(replay.AlreadyApplied, Is.True)
             Assert.That(first.Receipt.OriginalResultJson, Is.EqualTo(replay.Receipt.OriginalResultJson))
             let successor = Guid.NewGuid()
-            AccountCapacityLedger.reserve f.AccountTwo (Guid.NewGuid()) "Scheduler"
+            AccountFixture.reserve f.AccountTwo (Guid.NewGuid()) "Scheduler"
                 successor (Guid.NewGuid()) "Reviewer" 1L |> success |> ignore
             match AccountCapacityLedger.release f.AccountOne verifier
                 (Guid.NewGuid()) "Reconciler" terminal with
@@ -464,7 +480,7 @@ type AccountCapacityLedgerTests() =
             | other -> Assert.Fail(sprintf "Second release must not free successor: %A" other)
             Assert.That((AccountCapacityLedger.fetch f.AccountOne |> success).State
                         |> AccountCapacityLedger.occupied, Is.EqualTo(1))
-            match AccountCapacityLedger.reserve f.AccountTwo (Guid.NewGuid()) "Scheduler"
+            match AccountFixture.reserve f.AccountTwo (Guid.NewGuid()) "Scheduler"
                 launch project "Worker" 1L with
             | Error AccountLaunchExists -> ()
             | other -> Assert.Fail(sprintf "Released launch ID must never be reused: %A" other))
@@ -473,7 +489,7 @@ type AccountCapacityLedgerTests() =
     member _.AbortWinsPerLaunchCasAndFencesOriginalAdmissionAfterCapacityRelease() =
         AccountFixture.withGit 1 (fun f ->
             let launch, admission = Guid.NewGuid(), Guid.NewGuid()
-            AccountCapacityLedger.reserve f.AccountOne admission "Scheduler" launch
+            AccountFixture.reserve f.AccountOne admission "Scheduler" launch
                 f.ProjectOne.ProjectId "Worker" 1L |> success |> ignore
             let abortOp = Guid.NewGuid()
             let aborted, first =
@@ -485,7 +501,7 @@ type AccountCapacityLedgerTests() =
             let verifier = AccountFixture.verifier f.ProjectTwo
             AccountCapacityLedger.release f.AccountTwo verifier
                 (Guid.NewGuid()) "Reconciler" aborted |> success |> ignore
-            AccountCapacityLedger.reserve f.AccountTwo (Guid.NewGuid()) "Scheduler"
+            AccountFixture.reserve f.AccountTwo (Guid.NewGuid()) "Scheduler"
                 (Guid.NewGuid()) (Guid.NewGuid()) "Worker" 1L |> success |> ignore
             for _ in 1..2 do
                 match AccountFixture.tryPublishProjectAdmission f.ProjectTwo launch admission with
@@ -502,7 +518,7 @@ type AccountCapacityLedgerTests() =
     member _.OriginalAdmissionWinsCasAndLateAbortCannotReleaseAccountToken() =
         AccountFixture.withGit 1 (fun f ->
             let launch, admission = Guid.NewGuid(), Guid.NewGuid()
-            AccountCapacityLedger.reserve f.AccountOne admission "Scheduler" launch
+            AccountFixture.reserve f.AccountOne admission "Scheduler" launch
                 f.ProjectOne.ProjectId "Worker" 1L |> success |> ignore
             AccountFixture.publishProjectAdmission f.ProjectOne launch admission
             let abortOp = Guid.NewGuid()
@@ -523,7 +539,7 @@ type AccountCapacityLedgerTests() =
     member _.AmbiguousOriginalProjectAdmissionAcknowledgmentReplaysSameCasOutcome() =
         AccountFixture.withGit 1 (fun f ->
             let launch, admission = Guid.NewGuid(), Guid.NewGuid()
-            AccountCapacityLedger.reserve f.AccountOne admission "Scheduler" launch
+            AccountFixture.reserve f.AccountOne admission "Scheduler" launch
                 f.ProjectOne.ProjectId "Worker" 1L |> success |> ignore
             // Pretend the caller lost the first successful admission response.
             // Reissue the exact original UUID from a different project clone.
@@ -549,7 +565,7 @@ type AccountCapacityLedgerTests() =
     member _.CleanAbortOnlyTombstonePermitsReleaseWithoutProjectLaunch() =
         AccountFixture.withGit 1 (fun f ->
             let launch, admission = Guid.NewGuid(), Guid.NewGuid()
-            AccountCapacityLedger.reserve f.AccountOne admission "Scheduler" launch
+            AccountFixture.reserve f.AccountOne admission "Scheduler" launch
                 f.ProjectOne.ProjectId "Worker" 1L |> success |> ignore
             let aborted = AccountFixture.publishTerminal f.ProjectOne launch admission "AbortOnlyUnbound"
             let outcome =
@@ -563,7 +579,7 @@ type AccountCapacityLedgerTests() =
     member _.ResizeReceiptReplayRejectsChangedPayloadAndStaleConfig() =
         AccountFixture.withGit 2 (fun f ->
             let launch, project = Guid.NewGuid(), Guid.NewGuid()
-            AccountCapacityLedger.reserve f.AccountOne (Guid.NewGuid()) "Scheduler"
+            AccountFixture.reserve f.AccountOne (Guid.NewGuid()) "Scheduler"
                 launch project "Lead" 1L |> success |> ignore
             let op = Guid.NewGuid()
             let resized = AccountCapacityLedger.setCapacity f.AccountOne op "Operator" 1L 1 |> success
@@ -585,7 +601,7 @@ type AccountCapacityLedgerTests() =
     member _.DescendantMayNotRewriteAnImmutableAccountOperationReceipt() =
         AccountFixture.withGit 1 (fun f ->
             let launch, project, op = Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid()
-            AccountCapacityLedger.reserve f.AccountOne op "Scheduler" launch project "Worker" 1L
+            AccountFixture.reserve f.AccountOne op "Scheduler" launch project "Worker" 1L
             |> success |> ignore
             // A third writable clone creates a *descendant*, so ordinary
             // trusted-head ancestry alone would accept it; receipt origin must

@@ -28,6 +28,12 @@ type AccountAdmissionOutcome =
 module AccountAdmissionAdapter =
     let private explain error = sprintf "%A" error
 
+    let projectAuthority (project: LedgerBinding) : ProjectLedgerAuthority =
+        { ProjectId = project.ProjectId; LedgerId = project.LedgerId; Epoch = project.Epoch
+          ApprovedFetchUrl = project.ApprovedFetchUrl
+          ApprovedPushUrl = project.ApprovedPushUrl }
+
+
     // The immutable operation must have originated the exact witness alongside
     // the canonical project-state change. Its origin and witness bytes must
     // still be identical at the latest independently fetched, trusted head.
@@ -115,6 +121,8 @@ module AccountAdmissionAdapter =
                                                     Ok { ProjectId = projectId; LaunchId = launchId
                                                          AdmissionOperationId = admissionId
                                                          ProjectLedgerId = binding.LedgerId.ToString("D")
+                                                         ProjectLedgerEpoch = binding.Epoch
+                                                         ProjectAuthoritySha256 = projectAuthority binding |> AccountCapacityLedger.projectAuthoritySha256
                                                          ProjectHead = snapshot.Commit
                                                          TerminalOperationId = terminalId
                                                          TerminalBlobOid = decisionOid
@@ -200,6 +208,8 @@ module AccountAdmissionAdapter =
                                                                                 Ok { ProjectId = projectId; LaunchId = launchId
                                                                                      AdmissionOperationId = admissionId
                                                                                      ProjectLedgerId = binding.LedgerId.ToString("D")
+                                                                                     ProjectLedgerEpoch = binding.Epoch
+                                                                                     ProjectAuthoritySha256 = projectAuthority binding |> AccountCapacityLedger.projectAuthoritySha256
                                                                                      ProjectHead = snapshot.Commit
                                                                                      TerminalOperationId = terminalId
                                                                                      TerminalBlobOid = terminalOid
@@ -209,6 +219,13 @@ module AccountAdmissionAdapter =
                                                             | _ -> Error "No exact immutable project terminal witness.")
                                                     | _ -> Error "Original admission operation did not publish this launch."))
                                     | _ -> Error "Missing immutable original project admission decision."))
+
+    let private tokenOwns (project: LedgerBinding) (token: AccountToken) =
+        token.ProjectId = string project.ProjectId
+        && token.ProjectLedgerId = string project.LedgerId
+        && token.ProjectLedgerEpoch = project.Epoch
+        && token.ProjectAuthoritySha256 =
+            (projectAuthority project |> AccountCapacityLedger.projectAuthoritySha256)
 
     let private initialLaunch (project: LedgerBinding) (request: AccountAdmissionRequest) =
         { Id = request.LaunchId.ToString("D")
@@ -246,7 +263,7 @@ module AccountAdmissionAdapter =
                 |> Result.bind (fun accountSnapshot ->
                     match accountSnapshot.State.Tokens
                           |> Array.tryFind (fun token -> token.LaunchId = locator.LaunchId.ToString("D")) with
-                    | Some token when token.ProjectId = project.ProjectId.ToString("D")
+                    | Some token when tokenOwns project token
                                       && token.AdmissionOperationId = locator.AdmissionOperationId.ToString("D")
                                       && (token.Status = "Held" || token.Status = "Released") ->
                         WorkQueueGitLedger.load project
@@ -276,7 +293,7 @@ module AccountAdmissionAdapter =
             | Ok snapshot ->
                 match snapshot.State.Tokens |> Array.tryFind (fun t -> t.LaunchId = launch.Id) with
                 | None -> TokenRetained "Original account token is not present at a trusted head."
-                | Some token when token.ProjectId <> launch.ProjectId
+                | Some token when not (tokenOwns project token)
                                   || token.AdmissionOperationId <> launch.AccountTokenId
                                   || token.RoleId <> launch.RoleId
                                   || token.RoleConfigVersion <> int64 launch.RoleVersion ->
@@ -334,7 +351,7 @@ module AccountAdmissionAdapter =
             snapshot.State.Tokens
             |> Array.exists (fun token ->
                 token.LaunchId = request.LaunchId.ToString("D")
-                && token.ProjectId = project.ProjectId.ToString("D")
+                && tokenOwns project token
                 && token.AdmissionOperationId = request.AdmissionOperationId.ToString("D")
                 && token.RoleId = request.RoleId
                 && token.RoleConfigVersion = int64 request.RoleVersion
@@ -349,7 +366,7 @@ module AccountAdmissionAdapter =
             GlobalReservationRejected(InvalidAccountBinding "Invalid admission request.")
         else
             match AccountCapacityLedger.reserve account request.AdmissionOperationId
-                    request.Actor request.LaunchId project.ProjectId request.RoleId
+                    request.Actor request.LaunchId (projectAuthority project) request.RoleId
                     (int64 request.RoleVersion) with
             | Error(AccountOutcomeUnknown _) ->
                 GlobalReservationUncertain request.AdmissionOperationId

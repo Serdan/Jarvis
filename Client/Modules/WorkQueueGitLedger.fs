@@ -185,6 +185,17 @@ type WorkMutation =
     // remain explicitly unavailable rather than accepting caller proof booleans.
 
 module WorkQueueGitLedger =
+    // Test-only seam at the publication/acknowledgement boundary. The real
+    // project CAS and immutable witnesses commit first; the caller then loses
+    // its reply. No production scheduler or Git transport is altered.
+    let private dropPublishedAck = System.Threading.AsyncLocal<(Guid -> bool) option>()
+
+    let internal withTestPublishedAckLoss predicate operation =
+        let previous = dropPublishedAck.Value
+        dropPublishedAck.Value <- Some predicate
+        try operation ()
+        finally dropPublishedAck.Value <- previous
+
     [<Literal>]
     let RecordPath = "records/work-queue/project.json"
 
@@ -691,8 +702,13 @@ module WorkQueueGitLedger =
     // Server clock authority must be added before live cutover.
     let execute binding actor operationId expectedVersion mutation =
         let now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
-        validateMutationPayload mutation
-        |> Result.bind (fun () -> change binding actor operationId expectedVersion now mutation)
+        let result =
+            validateMutationPayload mutation
+            |> Result.bind (fun () -> change binding actor operationId expectedVersion now mutation)
+        match result, dropPublishedAck.Value with
+        | Ok _, Some shouldDrop when shouldDrop operationId ->
+            Error(OutcomeUnknown $"Injected lost WQ-02 post-publication acknowledgement {operationId:D}.")
+        | _ -> result
 
     // Deterministic tests can replay adversarial interleavings with virtual time.
     let internal executeAt binding actor operationId expectedVersion now mutation =

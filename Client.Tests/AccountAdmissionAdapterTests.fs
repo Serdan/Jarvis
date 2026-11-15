@@ -17,7 +17,9 @@ type private AdmissionFixture =
       ProjectA: LedgerBinding
       ProjectASecond: LedgerBinding
       ProjectB: LedgerBinding
-      ProjectBSecond: LedgerBinding }
+      ProjectBSecond: LedgerBinding
+      SameGuidForeign: LedgerBinding
+      SameGuidForeignSecond: LedgerBinding }
 
 module private AdmissionFixtures =
     let git dir arguments =
@@ -61,9 +63,11 @@ module private AdmissionFixtures =
             let ar, a1, a2 = repository root "account"
             let pr1, p1, p2 = repository root "project-one"
             let pr2, q1, q2 = repository root "project-two"
+            let foreignRemote, foreign1, foreign2 = repository root "same-guid-foreign-ledger"
             let accountId, accountLedger = Guid.NewGuid(), Guid.NewGuid()
             let projectId1, projectLedger1 = Guid.NewGuid(), Guid.NewGuid()
             let projectId2, projectLedger2 = Guid.NewGuid(), Guid.NewGuid()
+            let foreignLedger = Guid.NewGuid()
             let account dir =
                 { RepositoryPath = dir; RemoteName = "origin"
                   ApprovedFetchUrl = ar; ApprovedPushUrl = ar
@@ -77,14 +81,16 @@ module private AdmissionFixtures =
                   ProjectA = project p1 pr1 projectId1 projectLedger1
                   ProjectASecond = project p2 pr1 projectId1 projectLedger1
                   ProjectB = project q1 pr2 projectId2 projectLedger2
-                  ProjectBSecond = project q2 pr2 projectId2 projectLedger2 }
+                  ProjectBSecond = project q2 pr2 projectId2 projectLedger2
+                  SameGuidForeign = project foreign1 foreignRemote projectId1 foreignLedger
+                  SameGuidForeignSecond = project foreign2 foreignRemote projectId1 foreignLedger }
             AccountCapacityLedger.initialize fixture.AccountA cap |> success |> ignore
-            for p in [ fixture.ProjectA; fixture.ProjectB ] do
+            for p in [ fixture.ProjectA; fixture.ProjectB; fixture.SameGuidForeign ] do
                 LedgerStore.initialize p true |> success |> ignore
                 WorkQueueGitLedger.initialize p "fixture" (Guid.NewGuid())
                     (Map.ofList [ "Lead", set [ "planning" ] ]) |> success |> ignore
             action fixture
-            for dir in [ a1; a2; p1; p2; q1; q2 ] do
+            for dir in [ a1; a2; p1; p2; q1; q2; foreign1; foreign2 ] do
                 Assert.That(git dir [ "status"; "--porcelain" ], Is.Empty)
         finally
             try Directory.Delete(root, true) with _ -> ()
@@ -215,10 +221,16 @@ type AccountAdmissionAdapterTests() =
     member _.ProjectRemoteUnverifiableKeepsGlobalSlotUntilFreshC01Proof() =
         withFixture 1 (fun f ->
             let r = request()
-            let inaccessible = { f.ProjectA with ApprovedFetchUrl = "file:///nonexistent-wq07-remote" }
-            match AccountAdmissionAdapter.admit f.AccountA inaccessible r with
-            | TokenRetained _ -> ()
-            | other -> failwithf "Expected held token on unverified project remote: %A" other
+            let remote = f.ProjectA.ApprovedFetchUrl
+            let offline = remote + ".temporarily-offline"
+            Directory.Move(remote, offline)
+            try
+                match AccountAdmissionAdapter.admit f.AccountA f.ProjectA r with
+                | TokenRetained _ -> ()
+                | other -> failwithf "Expected held token on unverified project remote: %A" other
+                Assert.That(AdmissionFixtures.occupied f, Is.EqualTo(1))
+            finally
+                Directory.Move(offline, remote)
             Assert.That(AdmissionFixtures.occupied f, Is.EqualTo(1))
             Assert.That((WorkQueueGitLedger.load f.ProjectA |> success |> snd).Launches.IsEmpty, Is.True)
             match AccountAdmissionAdapter.abortUnbound f.AccountB f.ProjectASecond r with
@@ -250,7 +262,7 @@ type AccountAdmissionAdapterTests() =
             available f.ProjectA "work-race"
             let r = request()
             AccountCapacityLedger.reserve f.AccountA r.AdmissionOperationId "fixture"
-                r.LaunchId f.ProjectA.ProjectId "Lead" 1L |> success |> ignore
+                r.LaunchId (AccountAdmissionAdapter.projectAuthority f.ProjectA) "Lead" 1L |> success |> ignore
             let launch =
                 { Id = r.LaunchId.ToString("D"); ProjectId = f.ProjectA.ProjectId.ToString("D")
                   RoleId = "Lead"; RoleVersion = 1
@@ -324,7 +336,7 @@ type AccountAdmissionAdapterTests() =
             // project has an authentic terminal receipt, a token reserved
             // for a different role/configuration cannot be released by it.
             AccountCapacityLedger.reserve f.AccountA r.AdmissionOperationId "fixture"
-                r.LaunchId f.ProjectA.ProjectId "OtherRole" 2L |> success |> ignore
+                r.LaunchId (AccountAdmissionAdapter.projectAuthority f.ProjectA) "OtherRole" 2L |> success |> ignore
             let launchId = r.LaunchId.ToString("D")
             let initial =
                 { Id = launchId; ProjectId = f.ProjectA.ProjectId.ToString("D")
@@ -376,3 +388,206 @@ type AccountAdmissionAdapterTests() =
             match verifier.VerifyCurrentTerminal locator with
             | Error _ -> ()
             | Ok proof -> failwithf "Rewritten decision accepted: %A" proof)
+
+
+    [<Test>]
+    member _.SameGuidForeignTerminalCannotReleaseOriginalLedgerToken() =
+        withFixture 1 (fun f ->
+            available f.ProjectA "authoritative-work"
+            let r = request()
+            match AccountAdmissionAdapter.admit f.AccountA f.ProjectA r with
+            | ProjectAdmitted _ -> ()
+            | other -> failwithf "Original project not admitted: %A" other
+
+            // A second REAL Git remote is internally self-consistent and carries
+            // the same project GUID, but not the ledger identity/trust anchor.
+            let foreign = f.SameGuidForeign
+            Assert.That(foreign.ProjectId, Is.EqualTo(f.ProjectA.ProjectId))
+            Assert.That(foreign.LedgerId, Is.Not.EqualTo(f.ProjectA.LedgerId))
+            Assert.That(foreign.ApprovedFetchUrl, Is.Not.EqualTo(f.ProjectA.ApprovedFetchUrl))
+            let fakeLaunch =
+                { Id = r.LaunchId.ToString("D"); ProjectId = foreign.ProjectId.ToString("D")
+                  RoleId = r.RoleId; RoleVersion = r.RoleVersion
+                  AccountTokenId = r.AdmissionOperationId.ToString("D")
+                  State = LaunchState.ReservedUnregistered; Lease = None
+                  Version = 0; Credit = None; PrimaryWorkId = None
+                  EverClaimed = false; AncillaryMessages = Set.empty; DispatchCount = 0 }
+            let _, fakeBefore = WorkQueueGitLedger.load foreign |> success
+            WorkQueueGitLedger.execute foreign "fixture" r.AbortOperationId fakeBefore.Version
+                (AbortUnboundProjectAdmission(fakeLaunch, r.AdmissionOperationId.ToString("D")))
+            |> success |> ignore
+            let locator =
+                { ProjectId = foreign.ProjectId; LaunchId = r.LaunchId
+                  AdmissionOperationId = r.AdmissionOperationId
+                  TerminalOperationId = r.AbortOperationId }
+            let foreignVerifier =
+                new AccountAdmissionAdapter.VerifiedProjectTerminalReceipts(f.SameGuidForeignSecond)
+                :> IProjectTerminalReceiptVerifier
+            match foreignVerifier.VerifyCurrentTerminal locator with
+            | Ok proof ->
+                Assert.That(proof.ProjectLedgerId, Is.EqualTo(string foreign.LedgerId))
+                Assert.That(proof.TerminalKind, Is.EqualTo("AbortOnlyUnbound"))
+            | Error reason -> failwithf "Foreign self-consistent C01 did not verify: %s" reason
+
+            match AccountAdmissionAdapter.releaseTerminal f.AccountB f.SameGuidForeignSecond
+                    "fixture" r.ReleaseOperationId locator with
+            | Error(AccountTerminalProofRejected _) -> ()
+            | other -> failwithf "Foreign real C01 released original ledger: %A" other
+            match AccountAdmissionAdapter.abortUnbound f.AccountB f.SameGuidForeignSecond r with
+            | TokenRetained _ -> ()
+            | other -> failwithf "Foreign abort bypassed original authority: %A" other
+            match AccountAdmissionAdapter.admit f.AccountB f.SameGuidForeignSecond r with
+            | GlobalReservationRejected AccountOperationIdReused -> ()
+            | other -> failwithf "Same-UUID foreign ledger replay was accepted: %A" other
+            // Even spoofing original ledger ID cannot change the immutable
+            // approved endpoint in an original account operation.
+            let swappedEndpoint =
+                { f.ProjectASecond with ApprovedPushUrl = foreign.ApprovedPushUrl }
+            match AccountAdmissionAdapter.admit f.AccountB swappedEndpoint r with
+            | GlobalReservationRejected AccountOperationIdReused -> ()
+            | other -> failwithf "Same-UUID changed remote identity replay accepted: %A" other
+            Assert.That(AdmissionFixtures.occupied f, Is.EqualTo(1))
+            match AccountAdmissionAdapter.admit f.AccountB f.ProjectBSecond (request()) with
+            | GlobalReservationRejected(AccountCapacityFull(1, 1)) -> ()
+            | other -> failwithf "Foreign C01 enabled global cap overcommit: %A" other
+            let _, real = WorkQueueGitLedger.load f.ProjectA |> success
+            Assert.That(real.Launches.[r.LaunchId.ToString("D")].State,
+                        Is.EqualTo(LaunchState.ReservedUnregistered))
+            let token = (AccountCapacityLedger.fetch f.AccountB |> success).State.Tokens[0]
+            Assert.That(token.Status, Is.EqualTo("Held"))
+            Assert.That(token.ProjectLedgerId, Is.EqualTo(string f.ProjectA.LedgerId))
+            Assert.That(token.ProjectAuthoritySha256,
+                        Is.EqualTo(AccountCapacityLedger.projectAuthoritySha256
+                            (AccountAdmissionAdapter.projectAuthority f.ProjectA)))
+            Assert.That(token.ProjectAuthoritySha256, Is.Not.EqualTo(f.ProjectA.ApprovedFetchUrl)))
+
+    [<Test>]
+    member _.PublishedProjectAdmissionLostAckKeepsOneTokenAndReplaysOriginalWinner() =
+        withFixture 1 (fun f ->
+            available f.ProjectA "lost-admission-reply"
+            let r = request()
+            let mutable dropped = false
+            let first =
+                WorkQueueGitLedger.withTestPublishedAckLoss
+                    (fun op ->
+                        if op = r.AdmissionOperationId && not dropped then
+                            dropped <- true
+                            true
+                        else false)
+                    (fun () -> AccountAdmissionAdapter.admit f.AccountA f.ProjectA r)
+            Assert.That(dropped, Is.True)
+            match first with
+            | TokenRetained _ -> ()
+            | other -> failwithf "Lost committed admission reply prematurely resolved: %A" other
+            Assert.That(AdmissionFixtures.occupied f, Is.EqualTo(1))
+            let snapshot, project = WorkQueueGitLedger.load f.ProjectASecond |> success
+            Assert.That(project.Launches.Count, Is.EqualTo(1))
+            Assert.That(project.Receipts.ContainsKey(r.AdmissionOperationId.ToString("D")), Is.True)
+            let witness =
+                WorkQueueGitLedger.readAdmissionAt f.ProjectASecond snapshot (r.LaunchId.ToString("D"))
+                |> success
+            Assert.That(witness.IsSome, Is.True)
+            Assert.That((fst witness.Value).Kind, Is.EqualTo("AdmissionWon"))
+            match AccountAdmissionAdapter.admit f.AccountB f.ProjectASecond r with
+            | ProjectAdmitted _ -> ()
+            | other -> failwithf "Original project admission UUID did not reconcile: %A" other
+            Assert.That(AdmissionFixtures.occupied f, Is.EqualTo(1))
+            Assert.That((AccountCapacityLedger.fetch f.AccountB |> success).State.Tokens.Length, Is.EqualTo(1))
+            match AccountAdmissionAdapter.admit f.AccountB f.ProjectBSecond (request()) with
+            | GlobalReservationRejected(AccountCapacityFull(1, 1)) -> ()
+            | other -> failwithf "Lost-ack admission overcommitted account: %A" other)
+
+    [<Test>]
+    member _.PublishedC01LostAckRetainsTokenUntilOriginalAbortProofThenReleasesOnce() =
+        withFixture 1 (fun f ->
+            let r = request()
+            let mutable dropped = false
+            let first =
+                WorkQueueGitLedger.withTestPublishedAckLoss
+                    (fun op ->
+                        if op = r.AbortOperationId && not dropped then
+                            dropped <- true
+                            true
+                        else false)
+                    (fun () -> AccountAdmissionAdapter.admit f.AccountA f.ProjectA r)
+            Assert.That(dropped, Is.True)
+            match first with
+            | TokenRetained _ -> ()
+            | other -> failwithf "Unknown C01 reply released account: %A" other
+            Assert.That(AdmissionFixtures.occupied f, Is.EqualTo(1))
+            let snap, state = WorkQueueGitLedger.load f.ProjectASecond |> success
+            let decision = WorkQueueGitLedger.readAdmissionAt f.ProjectASecond snap (r.LaunchId.ToString("D"))
+                           |> success
+            Assert.That(decision.IsSome, Is.True)
+            Assert.That((fst decision.Value).Kind, Is.EqualTo("AbortOnlyUnbound"))
+            Assert.That(state.Receipts.ContainsKey(r.AdmissionOperationId.ToString("D")), Is.False)
+            match AccountAdmissionAdapter.abortUnbound f.AccountB f.ProjectASecond r with
+            | UnboundAbortedAndReleased _ -> ()
+            | other -> failwithf "Exact original C01 winner could not be reconciled: %A" other
+            let accountSnap, releaseReceipt =
+                AccountCapacityLedger.readOperation f.AccountA r.ReleaseOperationId |> success
+            Assert.That(releaseReceipt.IsSome, Is.True)
+            Assert.That(AccountCapacityLedger.occupied accountSnap.State, Is.Zero)
+            match AccountAdmissionAdapter.abortUnbound f.AccountA f.ProjectA r with
+            | UnboundAbortedAndReleased _ -> ()
+            | other -> failwithf "Exact C01/release replay not idempotent: %A" other
+            let replaySnap, replayReceipt =
+                AccountCapacityLedger.readOperation f.AccountB r.ReleaseOperationId |> success
+            Assert.That(replayReceipt, Is.EqualTo(releaseReceipt))
+            Assert.That(replaySnap.State.Tokens.Length, Is.EqualTo(1))
+            Assert.That(AccountCapacityLedger.occupied replaySnap.State, Is.Zero))
+
+    [<Test>]
+    member _.TerminalAccountReleaseLostAckReplaysImmutableReceiptWithoutDoubleFree() =
+        withFixture 1 (fun f ->
+            available f.ProjectA "terminal-lost-reply"
+            let r = request()
+            match AccountAdmissionAdapter.admit f.AccountA f.ProjectA r with
+            | ProjectAdmitted _ -> ()
+            | other -> failwithf "Expected original admission: %A" other
+            let launch = r.LaunchId.ToString("D")
+            mutate f.ProjectA (Guid.NewGuid()) (DispatchOnce(launch, DispatchState.Submitted))
+            mutate f.ProjectA (Guid.NewGuid()) (InitializeAgent(launch, "terminal-recovery"))
+            mutate f.ProjectA (Guid.NewGuid()) (ClaimNext launch)
+            let terminal = Guid.NewGuid()
+            mutate f.ProjectA terminal (CompleteOrdinary(launch, "terminal-lost-reply"))
+            let locator =
+                { ProjectId = f.ProjectA.ProjectId; LaunchId = r.LaunchId
+                  AdmissionOperationId = r.AdmissionOperationId
+                  TerminalOperationId = terminal }
+            let mutable pushedWithoutAck = false
+            let mutable postPushFetchFailed = false
+            let hooks =
+                { BeforeLeasePush = fun _ _ -> ()
+                  GitCommand = fun args ->
+                    match args with
+                    | "push" :: _ when not pushedWithoutAck ->
+                        pushedWithoutAck <- true
+                        AccountGitTestFault.ExecuteThenLoseAcknowledgment
+                    | "fetch" :: _ when pushedWithoutAck && not postPushFetchFailed ->
+                        postPushFetchFailed <- true
+                        AccountGitTestFault.FailBeforeExecution
+                    | _ -> AccountGitTestFault.PassThrough }
+            let unknown =
+                AccountCapacityLedger.withTestInterposition hooks (fun () ->
+                    AccountAdmissionAdapter.releaseTerminal f.AccountA f.ProjectA
+                        "fixture" r.ReleaseOperationId locator)
+            Assert.That(pushedWithoutAck, Is.True)
+            Assert.That(postPushFetchFailed, Is.True)
+            match unknown with
+            | Error(AccountOutcomeUnknown op) when op = r.ReleaseOperationId -> ()
+            | other -> failwithf "Lost release ack did not preserve exact uncertainty: %A" other
+            let snapshot, original = AccountCapacityLedger.readOperation f.AccountB r.ReleaseOperationId
+                                     |> success
+            Assert.That(original.IsSome, Is.True)
+            Assert.That(AccountCapacityLedger.occupied snapshot.State, Is.Zero)
+            let replay =
+                AccountAdmissionAdapter.releaseTerminal f.AccountB f.ProjectASecond
+                    "fixture" r.ReleaseOperationId locator |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That(replay.Receipt, Is.EqualTo(original.Value))
+            Assert.That((AccountCapacityLedger.fetch f.AccountA |> success).State.Tokens.Length, Is.EqualTo(1))
+            match AccountAdmissionAdapter.releaseTerminal f.AccountA f.ProjectA
+                    "fixture" (Guid.NewGuid()) locator with
+            | Error AccountLaunchAlreadyReleased -> ()
+            | other -> failwithf "Distinct release double-freed capacity: %A" other)

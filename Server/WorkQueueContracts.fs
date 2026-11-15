@@ -1427,6 +1427,54 @@ module Contracts =
             | Some _, Some true -> Ok current
             | _ -> Error Rejection.MissingProof) account
 
+    // WQ-02: A read-only, still-claimed work generation can yield and requeue
+    // once, with fresh FIFO keys, an exact terminal project receipt, and an
+    // injective rematch of every other unclaimed launch credit. Mutable source
+    // handoff is deliberately excluded until remote refs and job journals are
+    // validated by the Git adapter.
+    let yieldReadOnly expected op launchId workId expectedClaimGeneration now project =
+        projectCas expected op
+            (fullInput "yield-readonly" (launchId, workId, expectedClaimGeneration, now))
+            (fun current ->
+                match current.Launches.TryFind launchId, current.Works.TryFind workId with
+                | Some launch, Some work
+                    when launch.PrimaryWorkId = Some workId
+                         && work.State = WorkState.Claimed launchId
+                         && work.ClaimGeneration = expectedClaimGeneration
+                         && (match launch.State with LaunchState.Registered _ -> true | _ -> false) ->
+                    if work.Gate <> GateState.Clear || not (hardDependenciesSatisfied current work) then
+                        Error Rejection.DependencyGatePending
+                    elif work.Kind = WorkKind.Implementation
+                         || work.Kind = WorkKind.Integration
+                         || (match work.Kind with WorkKind.RoleMessage _ -> true | _ -> false)
+                         || work.SourceLineage.IsSome
+                         || work.Push.IsSome
+                         || work.Domain <> DomainState.Undecided
+                         || work.IntegrationAuthorized then
+                        Error Rejection.UnsafeExternalEffect
+                    else
+                        releaseAncillaryOnTerminal now launch current
+                        |> Result.bind (fun released ->
+                            let fifo = released.NextAvailability + 1L
+                            let ready =
+                                { work with
+                                    State = WorkState.Available
+                                    ClaimGeneration = work.ClaimGeneration + 1
+                                    AvailableAt = now
+                                    AvailableSequence = fifo }
+                            let terminal =
+                                { launch with
+                                    State = LaunchState.TerminalPendingRelease("yield:" + op)
+                                    Credit = None
+                                    AncillaryMessages = Set.empty
+                                    Version = launch.Version + 1 }
+                            { released with
+                                Works = released.Works.Add(workId, ready)
+                                Launches = released.Launches.Add(launchId, terminal)
+                                NextAvailability = fifo }
+                            |> reconcileCredits)
+                | _ -> Error(Rejection.InvalidState "stale primary work claim/yield generation")) project
+
     let canDispatch (account: Account) (projects: Project list) =
         account.Migration = MigrationEpoch.Activated
         && (projects |> List.forall (fun p ->

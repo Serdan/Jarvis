@@ -38,6 +38,7 @@
         <Compile Include="LedgerStoreTests.fs"/>
         <Compile Include="WorkQueueGitLedgerTests.fs"/>
         <Compile Include="AccountCapacityLedgerTests.fs"/>
+        <Compile Include="AccountAdmissionAdapterTests.fs"/>
         <Compile Include="RoleInstructionsTests.fs"/>
         <Compile Include="ReviewWorkflowTests.fs"/>
         <Compile Include="ChallengeWorkflowTests.fs"/>

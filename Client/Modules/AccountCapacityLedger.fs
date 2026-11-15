@@ -34,12 +34,23 @@ type AccountBinding =
       LedgerId: Guid
       Epoch: int }
 
+// Immutable, independently configured authority for one project Git ledger.
+// Clone-local repository paths and remote aliases are not identity.
+type ProjectLedgerAuthority =
+    { ProjectId: Guid
+      LedgerId: Guid
+      Epoch: int
+      ApprovedFetchUrl: string
+      ApprovedPushUrl: string }
+
 [<CLIMutable>]
 type AccountTerminalProof =
     { ProjectId: string
       LaunchId: string
       AdmissionOperationId: string
       ProjectLedgerId: string
+      ProjectLedgerEpoch: int
+      ProjectAuthoritySha256: string
       ProjectHead: string
       TerminalOperationId: string
       TerminalBlobOid: string
@@ -64,6 +75,9 @@ type IProjectTerminalReceiptVerifier =
 type AccountToken =
     { LaunchId: string
       ProjectId: string
+      ProjectLedgerId: string
+      ProjectLedgerEpoch: int
+      ProjectAuthoritySha256: string
       RoleId: string
       RoleConfigVersion: int64
       AdmissionOperationId: string
@@ -131,6 +145,14 @@ module AccountCapacityLedger =
     let private json value = JsonSerializer.Serialize(value, options)
     let private hash (value: string) =
         Convert.ToHexString(SHA256.HashData(enc.GetBytes(value))).ToLowerInvariant()
+
+    // Bind the exact trusted source/push authority while never persisting Git
+    // remote URLs (which may contain credentials) to the account Git ledger.
+    let projectAuthoritySha256 (project: ProjectLedgerAuthority) =
+        hash (json {| projectId = string project.ProjectId
+                      ledgerId = string project.LedgerId; epoch = project.Epoch
+                      approvedFetchUrl = project.ApprovedFetchUrl
+                      approvedPushUrl = project.ApprovedPushUrl |})
     let private receiptPath (id: Guid) = $"operations/{id:N}.json"
     let private trustedRef (b: AccountBinding) = $"refs/jarvis/account-trusted/{b.LedgerId:N}"
     let private validOid (v: string) = not (isNull v) && shaPattern.IsMatch v
@@ -282,9 +304,18 @@ module AccountCapacityLedger =
                    || s.Tokens |> Array.exists (fun t ->
                        isNull (box t) || String.IsNullOrWhiteSpace t.LaunchId
                        || String.IsNullOrWhiteSpace t.ProjectId || String.IsNullOrWhiteSpace t.RoleId
+                       || String.IsNullOrWhiteSpace t.ProjectLedgerId
+                       || t.ProjectLedgerId = string Guid.Empty || t.ProjectLedgerEpoch < 1
+                       || isNull t.ProjectAuthoritySha256
+                       || not (Regex.IsMatch(t.ProjectAuthoritySha256, "^[0-9a-f]{64}$"))
                        || t.Status <> "Held" && t.Status <> "Released"
                        || (t.Status = "Held" && not (isNull (box t.ReleaseProof)))
-                       || (t.Status = "Released" && isNull (box t.ReleaseProof)))
+                       || (t.Status = "Released" &&
+                           (isNull (box t.ReleaseProof)
+                            || t.ReleaseProof.ProjectId <> t.ProjectId
+                            || t.ReleaseProof.ProjectLedgerId <> t.ProjectLedgerId
+                            || t.ReleaseProof.ProjectLedgerEpoch <> t.ProjectLedgerEpoch
+                            || t.ReleaseProof.ProjectAuthoritySha256 <> t.ProjectAuthoritySha256)))
                    || (s.Tokens |> Array.map _.LaunchId |> Array.distinct |> Array.length) <> s.Tokens.Length
                    || (s.Tokens |> Array.filter (fun t -> t.Status = "Held") |> Array.length) > s.MaxConcurrentAgents then
                     Error(AccountIntegrityError "Account ledger identity, epoch, configuration, or token invariants failed")
@@ -525,13 +556,19 @@ module AccountCapacityLedger =
     let occupied (s: AccountCapacityState) =
         s.Tokens |> Array.sumBy (fun t -> if t.Status = "Held" then 1 else 0)
 
-    let reserve (b: AccountBinding) operationId actor launchId projectId roleId roleConfigVersion =
-        if launchId = Guid.Empty || projectId = Guid.Empty
+    let reserve (b: AccountBinding) operationId actor launchId (project: ProjectLedgerAuthority) roleId roleConfigVersion =
+        if isNull (box project) || launchId = Guid.Empty
+           || project.ProjectId = Guid.Empty || project.LedgerId = Guid.Empty
+           || project.Epoch < 1 || String.IsNullOrWhiteSpace project.ApprovedFetchUrl
+           || String.IsNullOrWhiteSpace project.ApprovedPushUrl
            || String.IsNullOrWhiteSpace roleId || roleConfigVersion < 1L then
-            Error(InvalidAccountBinding "Launch, project and versioned role are required")
+            Error(InvalidAccountBinding "Launch, trusted project ledger authority and versioned role are required")
         else
+            let authority = projectAuthoritySha256 project
             let request =
-                json {| launchId = string launchId; projectId = string projectId
+                json {| launchId = string launchId; projectId = string project.ProjectId
+                        projectLedgerId = string project.LedgerId; projectLedgerEpoch = project.Epoch
+                        projectAuthoritySha256 = authority
                         roleId = roleId; roleConfigVersion = roleConfigVersion
                         admissionEpoch = b.Epoch |}
             transact b operationId actor "ReserveGlobalAgentSlot" request (fun state ->
@@ -541,7 +578,10 @@ module AccountCapacityLedger =
                     Error(AccountCapacityFull(occupied state, state.MaxConcurrentAgents))
                 else
                     let token =
-                        { LaunchId = string launchId; ProjectId = string projectId
+                        { LaunchId = string launchId; ProjectId = string project.ProjectId
+                          ProjectLedgerId = string project.LedgerId
+                          ProjectLedgerEpoch = project.Epoch
+                          ProjectAuthoritySha256 = authority
                           RoleId = roleId; RoleConfigVersion = roleConfigVersion
                           AdmissionOperationId = string operationId; Status = "Held"
                           ReleaseProof = Unchecked.defaultof<AccountTerminalProof> }
@@ -592,7 +632,9 @@ module AccountCapacityLedger =
                                     proof.LaunchId <> token.LaunchId ||
                                     proof.AdmissionOperationId <> token.AdmissionOperationId ||
                                     proof.TerminalOperationId <> string locator.TerminalOperationId ||
-                                    String.IsNullOrWhiteSpace proof.ProjectLedgerId ||
+                                    proof.ProjectLedgerId <> token.ProjectLedgerId ||
+                                    proof.ProjectLedgerEpoch <> token.ProjectLedgerEpoch ||
+                                    proof.ProjectAuthoritySha256 <> token.ProjectAuthoritySha256 ||
                                     proof.LaunchGeneration < 1L ||
                                     not (validOid proof.ProjectHead) ||
                                     not (validOid proof.TerminalBlobOid) ||

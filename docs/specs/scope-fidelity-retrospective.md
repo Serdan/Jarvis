@@ -1,0 +1,106 @@
+# Scope fidelity in autonomous Jarvis work: bounded retrospective and instruction proposal
+
+**Status:** Working draft; evidence read 2026-11-15; analysis-only, no role changes or deployment.  
+**Assignment:** `scope-drift-overengineering` (canonical spec v4, blob `4a519300530a4aabea0e7b9ca8ac245a316c786e`; Worker 2).  
+**Primary case:** `task-c4460fbd65a244419650fc5ef5669a6f` (Worker 3; canonical spec v1, blob `df17c3baab0bd4eb3e3e6c0e39cfda70c2c1cbc6`).  
+**Evidence boundary:** Ledger task records, frozen reviewer documents, branch commits, and the design note were inspected; this does not certify live system behavior or completeness of every checkpoint. A reviewer accepting an isolated source stage is not integration/deployment acceptance.
+
+## Decision in one paragraph
+
+Use **instructions and existing canonical Challenge/spec/review mechanisms**, not new authorization states or an operator approval gate. Require a *causal scope-fidelity test* before promoting a newly discovered risk into a blocker: point to the original observable outcome/acceptance criterion, a concrete counterexample, why the current implementation fails it, and the smallest remedy. Worker raises a proportionate Challenge to Lead for material changes; Lead autonomously chooses the smaller correct solution, revises a versioned canonical task where warranted, or separates optional hardening. Reviewer checks *correctness and scope fidelity* independently of Worker/Lead rationales. Operator involvement is reserved for genuinely unresolved strategic intent or priorities.
+
+## 1. Primary case: requirements versus expanding proof obligations
+
+The original administrative Working-to-Ready task asked for a distinct, authenticated operator/admin action using exact task/attempt/agent identities, versions and generation; a nonempty reason; a **Working -> Ready** state-only correction; immutable actor/target audit; preservation of owner, generation, checkpoint, reviews, integrations, notifications and last-seen; rejection of stale corrections racing genuine activity or worker self-yield; idempotent replay; and Release tests. It expressly said not to deploy without operator approval. It did **not** ask to create a general OS-level process-tree containment platform, certify detached descendants across restarts, coordinate a multi-version client fleet migration, or make those capacities mandatory for the state correction. These are different product guarantees unless a concrete counterexample links them to the requested semantics.
+
+| Milestone (CET, 2026) | Evidence | Scope-fidelity assessment |
+|---|---|---|
+| Nov 11 03:10: first implementation `f68449e6` | Canonical CAS and separate audit; frozen review `89a50286`, created seq 1151 / ChangesRequested seq 1183 | **Genuine blocker.** Ordinary Working tool activity did not bump canonical version. A stale correction could succeed despite recent genuine work, contrary to explicit acceptance. Reviewer found an observable counterexample, not merely speculative hardening. |
+| Nov 11 04:57–05:29: activity lease `94aef9b1` / `e8a14cb5` | Frozen review `6fd76f42`, created seq 1245 / ChangesRequested seq 1288 | **Still causally related, but implementation not prescribed.** Owner checkpoint/yield/complete calls bypassed admission, and heartbeat failure could outlive lease and mask terminal outcome. Fixing the admitted-call race is essential; five-minute leases/heartbeats were only one design choice. |
+| Nov 11 07:43–10:30: in-flight reservation `7021c003`, then persistent execution witnesses/permits `14a550cf` | `docs/specs/admin-working-correction-liveness-design.md` lines 11–30, 45–53; `14a550cf` adds ~563 lines across server/fixture/design files | **First clear architectural scope inflection.** A less expensive authoritative in-flight fence is defensible; proving every old/device/detached execution and inventing a crash-durable process certification barrier is a materially stronger product contract. The design states Lead approved the direction on Nov 11, but no corresponding canonical task spec revision was recorded (still v1). Lead agreement in a design note is not the same as explicit scope reconciliation against original acceptance. |
+| Nov 12–13: detached StartJob, migration and exact-job attestation | `e9eea617`, `52357449`, `265ef992`; design note lines 178–207 and 278–334 | **New proof burden.** A launch handle is not proof a job stopped, so do not silently treat it as terminal; however, permanently refusing uncertain corrections can preserve the no-false-Ready invariant without requiring new OS descendant-reaping proof to finish the original task. An operator-visible “cannot prove idle” outcome is not the same as a request to implement general process ownership. |
+| Nov 14 10:02: integration candidate `287ef750` | Frozen source review `24813afc`, created seq 2122 / Accepted seq 2130 | **A technically reviewed staged gate, not acceptance of original outcome.** Reviewer explicitly said production correction remains unusable pending OS descendant reaping, legacy 3.63–3.66 drain, exact Git receipt reconciliation and operator consent. Reviewer independently confirmed Server Release 186/186, with submitter reporting Client 711/711; not all Client checks were independently finished. No merge/deploy was authorized. |
+| Nov 14 08:22–13:54: native process group, cgroup-v2, output drain and regressions | `bfcbc174`, `44c854f4`, `152fb66d`, `077071bc`, `e076cc38`, `e54eba2d`, `63242918`; reviews `709b0bfb` (ChangesRequested), `553ff3ac` (Accepted), `7f845301` (Accepted) | **Substantial adjacent platform work.** Valuable when building process isolation, but no original acceptance case states that all Linux descendants must be contained with native cgroups before a versioned ledger correction may be usable. The additional reviews optimized correctness within the expanded frame rather than questioning whether that frame was requested. |
+
+The precise first *unjustified* change is a **decision boundary**, not a malicious commit. The first `f68449e6` review was correct: canonical versions alone did not fence ordinary activity. By `14a550cf`, the remedy had become a durable server-wide execution-proof and fleet-protocol program. The design note itself records a Lead approval, so this was not entirely unnoticed; the failure was that the approval did not include an explicit canonical decision that this larger proof obligation was now required to meet the task.
+
+### Correct causal distinction
+
+- **Necessary:** An actual concurrent owner operation must not be misclassified as idle so that an administrative correction overrides it. If a detached job remains an agent-owned execution under the product semantics, an unresolved job should conservatively veto the correction.
+- **Not thereby necessary:** To *clear* that veto, the correction task must provide native Linux cgroup-v2 containment, cross-restart descendant certificates, and fleet-wide migration approval. “Cannot safely determine quiescence; correction refused” can be an accurate, conservative outcome until a **separately scoped** job-ownership feature exists.
+- **Decision Lead should explicitly make:** Does “genuine work” include detached independent StartJob lifetime, or just its admitted command/owned task execution? How should administrative correction behave for a known idle Worker with historical unresolved jobs? This is a product-semantics decision, not a fact an engineering reviewer can invent by implication. If the operator's overall intended use is still clear, Lead can decide and revise the spec; consult the operator only if priorities or intended behavior genuinely cannot be inferred.
+- **Real tradeoff:** Conservative refusal avoids false-Ready but can create false-busy/never-correctable states. That is an availability limitation to document, not a safety guarantee that silently requires a new unrelated subsystem. Do not pretend it satisfies a requirement if the intended outcome also explicitly demands recoverability for those states.
+
+### Earlier intervention that would have saved work
+
+Immediately after review `6fd76f42` on Nov 11, Reviewer or Lead could have asked: “Which original acceptance example requires a *positive OS-wide proof* of child-process termination? Could a bounded admission fence plus a truthful refusal for unknown activity satisfy the admin-state contract?” Lead should have chosen a narrowly testable correction behavior, updated the canonical spec *if* the meaning of active detached jobs truly changed it, and opened a separate process-containment/recovery task for the native implementation. That decision would not excuse the actual activity race, the heartbeat result-masking bug or the need for exact CAS; it would have separated them from general fleet/process ambitions.
+
+## 2. Contrasting cases: necessary depth versus accidental adjacent work
+
+### Legitimate expansion: `simplify-lifecycle-versions`
+
+The task explicitly required that versionless lifecycle calls not act on a newer assignment. Initial source `23a6a558` resolved omitted optimistic arguments from the current ledger but did not distinguish an *old session* from a newly recovered/reissued generation of the **same task and owner**. Reviewer `274c7f54` requested changes for a specific stale-session checkpoint/yield/complete counterexample, and accepted `90689856` in review `c1943c71` after a session-context fence and regression. This was a **necessary local correctness fix to an explicit acceptance invariant**, not grounds to build a generalized session revocation or process safety subsystem. Minimal causal remedy and verified closure.
+
+### Current-task dry run: `task-0cb70b5fc5a146c795850b456facc577`
+
+This active Worker 5 task requires cheap operator-owned Challenge TUI reads with immutable history, correct owner filtering, bounded recent results, restart/multi-client semantics and 4,096+ archive scaling. At inspected clean branch `perf/operator-challenge-index`, source `1438a682` adds indexing and `83eeb345` adds a one-time CAS-atomic legacy Challenge backfill. The latter responds to an independent P1 case: pre-index pending operator Challenges otherwise disappear. That has a direct causal link to the stated “operator-owned pending never missing after restart” acceptance; it is **justified scope expansion**, provided backfill is not repeated on every 30-second poll. The two commits touch five files in total (674 additions, 84 deletions) versus base `c84ce8c9`. This is **dry-run document/source review only**, not a replacement for the task's own frozen code review or performance tests. No reason here to expand into a generic account-wide cache framework, new transport or notifications.
+
+### Another boundary: `task-93ebda6a3d23442cb36e8c4a2f830196`
+
+Its acceptance *already explicitly* requires immutable remote review/integration refs, idempotent uncertain-push recovery, cross-checkout fetchability, protected namespaces and host-rule enforcement. These architectural steps may be complex but cannot be dismissed as overengineering merely because they are deep. Scope fidelity is relative to the requested guarantee, not lines of code or amount of testing.
+
+## 3. Default behaviors for persistent Jarvis instructions (proposed, **not applied**)
+
+**Worker — original outcome and early Challenge.**
+
+> Implement the current canonical task and preserve its original observable goal. Treat acceptance criteria, declared boundaries and clearly necessary implementation details as the target; do not rewrite your own task's success conditions to justify additional work. If a discovered issue seems to require a new subsystem, materially stronger invariant, platform guarantee, or substantial new proof burden, first state: (1) the requirement at risk, (2) a reproducible counterexample, (3) why the current approach fails, and (4) the smallest sufficient remedy. Raise a concise canonical Challenge to Lead for a material change, labelling required correction versus optional hardening. Keep doing safe, uncontroversially in-scope work. Routine design/refactoring choices remain yours.
+
+**Reviewer — independent correctness *and* fidelity.**
+
+> Review the frozen implementation against the original intended outcome and the current Lead-owned, versioned task specification, not only the implementer's latest explanation. Report both technical correctness and whether delivered behavior actually satisfies each material acceptance criterion. Before making a newly discovered concern blocking, cite a specific requirement and concrete failing scenario; distinguish necessary repair from optional hardening or changed product scope. A technically impressive, well-tested solution to the wrong problem is not acceptable. A review finding does not itself revise requirements; challenge material ambiguity or enlargement to Lead.
+
+**Lead — autonomous scope arbiter and integration check.**
+
+> Resolve material scope Challenges by independently checking the requirement, counterexample and smallest viable fix. Decide ordinary clarifications and changes autonomously within delegated goals; record the reason and revise the canonical, versioned task when acceptance meaning materially changes. Preserve the original outcome as a comparison baseline and never let the worker's implementation silently redefine its own target. Split unrelated improvements into separately prioritized tasks. Consult the operator only when strategic goal, priority or fundamental product tradeoff genuinely cannot be resolved. At integration, compare the exact reviewed source against *both* current acceptance criteria and the enduring initial goal; ensure deviations have a recorded Lead disposition. Successful tests and multiple reviewer approvals do not replace this check.
+
+These are **behavioral checks**, not a new checklist to fill on every code change. No Challenge for trivial refactor, normal API detail or demonstrably necessary local edge case. No automatic modifications of all current agents, role memberships, task templates or deployment.
+
+### Example canonical Challenge to Lead
+
+> **Task:** administrative Working -> Ready correction. **Requirement at risk:** stale correction must fail if genuine concurrent work occurred. **Counterexample:** a Working agent performs an ordinary read without changing canonical versions, while the operator uses the previously observed versions; CAS accepts the correction. **Cause:** version predicates do not fence owner ingress. **Smallest remedy:** serialize actual owner admission with correction, preserve exact CAS/audit, and reject unknown/in-flight work; regression with an interleaved read. **Not required for this fix:** cross-restart Linux descendant-reaping certification. **Decision requested:** confirm whether detached independently launched jobs are part of “active agent work”; if yes, define conservative refusal while their status is unresolved and separate later recovery enhancements.
+
+### Minimum task specification and decision rights
+
+A good task usually needs (a) the user problem and why it matters, (b) observable intended outcome, (c) material non-goals/boundaries, and (d) a few representative success/failure examples. Avoid prescribing internal class structure or forcing detailed up-front architecture. Workers choose implementation details; Lead decides material requirement changes after Challenge; operator resolves genuinely uncertain project direction. Lead records intent and reason in a spec revision rather than overwriting the rationale in the worker's implementation branch.
+
+### Practical exit test at review and integration
+
+1. **Outcome:** What user-observable behavior was requested, and which acceptance examples demonstrate it?
+2. **Traceability:** Is every blocking finding tied to that behavior by a concrete counterexample? If not, file follow-up rather than a new hidden gate.
+3. **Change control:** If the intended outcome or proof obligation materially changed, is there a Lead rationale in the canonical spec history, rather than only source comments/review prose?
+4. **Finish:** Exact reviewed commit meets the clarified task, integration source equals accepted snapshot, and remaining optional hardening is separately tracked. Do not convert "nice to have" into "cannot finish".
+
+## 4. Bounded Critical Senior Dev consult: design and desk comparison
+
+**Independent live role experiment is not yet run.** Manager-controlled agent launches and current instruction-role ownership should not be bypassed by this investigation. The following is a ready-to-run **six-response** comparison (three short prompts x two cases), not fabricated empirical model output or latency data.
+
+Give each consultant **first** the original user goal, original and current canonical task acceptance, and relevant frozen source facts; **then** the worker's proposed expansion and review arguments. Do not reveal the Lead's preferred decision until after response. Hold model, evidence, token budget and temperature/effort constant; measure tokens, elapsed time and coordination calls. Two fixed cases: (A) Worker 3 native cgroup + fleet drain as purported condition for audited Ready correction; (B) real same-task/new-generation stale-session collision in `simplify-lifecycle-versions`. Require per-response classification `proceed / minimal fix / revise scope / separate follow-up`, the acceptance citation, falsifying example and condition where expansion *would* be justified.
+
+**Critical Senior Dev prompt** (intentionally skeptical, not contrarian): “Assume the worker's new proof obligation may be unnecessary. Starting from the original acceptance criteria, give a concrete counterexample that genuinely requires it, or show the smallest correct alternative. Identify hidden assumptions, downstream costs, and one condition that would make the expansion justified. Recommend proceed, minimal fix, canonical revision, or separate task. Keep to 180 words.”
+
+**Standard Reviewer prompt:** “Assess correctness and task-scope fidelity of this frozen change against original/current acceptance. Identify proven regressions and unsupported newly blocking requirements. Classify each as must-fix, clarification, or follow-up. Give the shortest defensible verdict in 180 words.”
+
+**Pragmatic Lead prompt:** “Choose the smallest solution that delivers the intended outcome safely. Decide normal scope changes yourself, with a reason; separate adjacent improvements. Identify any truly strategic ambiguity that warrants operator input. State acceptance and completion criteria in 180 words.”
+
+**Desk expectation, not measured outcomes:** Case A should trigger skepticism of *mandatory positive OS-wide reaping proof*, while preserving a real ongoing-activity veto. Case B should trigger an actual must-fix session fence even for the Critical Senior Dev persona; indiscriminate “no” is a false negative. A standard reviewer may over-index on technical sufficiency within the worker's frame; a pragmatic Lead may better balance usability versus safety but anchor on already accepted work. A consultant is useful only if it produces a materially different, evidence-backed minimal alternative that Lead could not identify unaided; otherwise it adds cost. With 3 x 2 bounded responses, overhead is six model calls plus one Lead comparison; no recurring approvals, role installations or automatic spawning.
+
+**False positive:** labeling a real race as overengineering, causing unsafe acceptance. **False negative:** accepting OS/fleet proof as necessary because reviewer prose says P1, failing to question original requirement. **Independence risk:** feeding consultant the current proposed solution first anchors all three prompts; use initial-goal-first order. **Operator decision:** none required for adopting a small pilot; any wider persistent-role rollout or changing role instructions requires project-owner/Lead approval, and this report does not do it.
+
+## 5. Recommended next step and acceptance status
+
+1. Have Lead examine this evidence and either endorse the three short role paragraphs or request small revisions; **do not auto-edit** current agents/roles.
+2. Run the bounded six-response trial through the authorized Manager/role mechanism, preserving raw outputs and actual token/latency counts. Assess whether Critical Senior Dev improves counterexample quality over Lead alone **on both cases** without simply saying “no”.
+3. Apply the scope-fidelity question prospectively to one actual new Challenge/review, with Lead recording a decision in the existing canonical task path. If useful, integrate the role wording; no new Jarvis state or tool is needed.
+4. Treat Worker 3's extensive process containment as its own architectural/recovery feature until Lead explicitly links it to the correction task's intended observable outcome; keep any current fail-closed safety gate and no-deploy constraints intact. Do not weaken an existing safety control based solely on this retrospective.
+
+**This document meets the evidence/recommendation and dry-run parts of the assignment. The live role A/B experiment and any persistent role adoption remain intentionally pending; therefore do not mark the assignment complete on this draft.**

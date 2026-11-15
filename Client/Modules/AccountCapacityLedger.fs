@@ -105,6 +105,19 @@ type AccountWrite =
       CurrentHead: string
       AlreadyApplied: bool }
 
+// Controlled, dynamically scoped Git transport test seam. No production caller
+// binds it; it permits deterministic post-publication uncertainty and stale
+// snapshot interleavings against disposable remote repositories.
+[<RequireQualifiedAccess>]
+type AccountGitTestFault =
+    | PassThrough
+    | FailBeforeExecution
+    | ExecuteThenLoseAcknowledgment
+
+type AccountGitTestInterposition =
+    { BeforeLeasePush: Guid -> string -> unit
+      GitCommand: string list -> AccountGitTestFault }
+
 module AccountCapacityLedger =
     [<Literal>]
     let AccountRef = "refs/heads/jarvis-account-admission"
@@ -156,27 +169,46 @@ module AccountCapacityLedger =
 
     type private GitOutput = { Code: int; Out: string; Err: string }
 
+    let private gitInterposition = System.Threading.AsyncLocal<AccountGitTestInterposition>()
+
+    let withTestInterposition (hooks: AccountGitTestInterposition) operation =
+        let previous = gitInterposition.Value
+        gitInterposition.Value <- hooks
+        try operation ()
+        finally gitInterposition.Value <- previous
+
     let private gitWith (b: AccountBinding) args input environment =
-        BoundedProcess.run
-            { Executable = "git"
-              Args = args
-              WorkingDirectory = b.RepositoryPath
-              Timeout = TimeSpan.FromSeconds 30.
-              MaxOutputBytes = None
-              StandardInput = input |> Option.map BoundedProcess.TextInput
-                                    |> Option.defaultValue BoundedProcess.ClosedInput
-              ExtraEnvironment =
-                  [ "GIT_TERMINAL_PROMPT", "0"
-                    "GIT_AUTHOR_NAME", "Jarvis Account Admission"
-                    "GIT_AUTHOR_EMAIL", "jarvis-account@localhost"
-                    "GIT_COMMITTER_NAME", "Jarvis Account Admission"
-                    "GIT_COMMITTER_EMAIL", "jarvis-account@localhost" ] @ environment
-              ConfigureStart = None }
-        |> function
-            | Ok output when not output.TimedOut ->
-                Ok { Code = output.ExitCode; Out = output.StdOut.TrimEnd('\n', '\r'); Err = output.StdErr }
-            | Ok _ -> Error(AccountRemoteUnavailable "Git operation timed out; remote outcome may be unknown")
-            | Error failure -> Error(AccountGitError(string failure))
+        let fault =
+            let hooks = gitInterposition.Value
+            if isNull (box hooks) then AccountGitTestFault.PassThrough
+            else hooks.GitCommand args
+        if fault = AccountGitTestFault.FailBeforeExecution then
+            Error(AccountRemoteUnavailable "Injected unavailable Git transport")
+        else
+            BoundedProcess.run
+                { Executable = "git"
+                  Args = args
+                  WorkingDirectory = b.RepositoryPath
+                  Timeout = TimeSpan.FromSeconds 30.
+                  MaxOutputBytes = None
+                  StandardInput = input |> Option.map BoundedProcess.TextInput
+                                        |> Option.defaultValue BoundedProcess.ClosedInput
+                  ExtraEnvironment =
+                      [ "GIT_TERMINAL_PROMPT", "0"
+                        "GIT_AUTHOR_NAME", "Jarvis Account Admission"
+                        "GIT_AUTHOR_EMAIL", "jarvis-account@localhost"
+                        "GIT_COMMITTER_NAME", "Jarvis Account Admission"
+                        "GIT_COMMITTER_EMAIL", "jarvis-account@localhost" ] @ environment
+                  ConfigureStart = None }
+            |> function
+                | Ok output when not output.TimedOut ->
+                    Ok { Code = output.ExitCode; Out = output.StdOut.TrimEnd('\n', '\r'); Err = output.StdErr }
+                | Ok _ -> Error(AccountRemoteUnavailable "Git operation timed out; remote outcome may be unknown")
+                | Error failure -> Error(AccountGitError(string failure))
+            |> fun outcome ->
+                if fault = AccountGitTestFault.ExecuteThenLoseAcknowledgment then
+                    Error(AccountRemoteUnavailable "Injected lost Git acknowledgment")
+                else outcome
 
     let private git b args = gitWith b args None []
     let private command b args =
@@ -456,6 +488,9 @@ module AccountCapacityLedger =
                                         |> Result.bind (fun proposed ->
                                             // A lease requires *this* observed parent: stale writers cannot
                                             // push an incompatible capacity calculation.
+                                            let hooks = gitInterposition.Value
+                                            if not (isNull (box hooks)) then
+                                                hooks.BeforeLeasePush operationId snapshot.Head
                                             let pushed =
                                                 git b [ "push"; "--porcelain";
                                                         $"--force-with-lease={AccountRef}:{snapshot.Head}";

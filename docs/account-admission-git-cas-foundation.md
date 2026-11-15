@@ -68,19 +68,39 @@ records the exact project evidence in the same account CAS as the token's
 
 The disposable tests use a deliberately scoped project-ledger adapter
 backed by the existing `LedgerStore` (real bare Git, two clones, immutable
-project operation, current-head read and history check). It exercises both
-terminal types and contradictory fixture histories; it is **not** WQ-02's
-production terminal-state implementation. Final integration must replace
-it with the accepted WQ-02 adapter and acceptance fixtures.
+project operation, current-head read and history check). Its **single**
+`records/launch-{launchId}.json` path is created with expected absence by
+either the original project admission operation UUID (`AdmissionWon`) or
+the abort-only operation UUID (`AbortOnlyUnbound`). A winning creation is
+immutable for this fixture; the losing candidate sees the same path occupied
+after its stale Git push is rejected and re-fetched. It can neither commit
+later nor replay a different operation. A normal launch terminal is separate
+and is certified only when the immutable admission decision and original
+admission operation origin match. An abort-only release is certified only
+when its **own** immutable origin is the shared winning decision and the
+original admission receipt remains absent. Absence *without* that winning
+abort CAS is never evidence of terminality.
+
+This adapter is **not** WQ-02's production terminal-state implementation.
+Final integration must replace it with the accepted WQ-02 adapter and
+acceptance fixtures. Without that adapter, production releases and
+migration remain gated and fail closed.
 
 ## Tests and operational assumptions
 
 `Client.Tests/AccountCapacityLedgerTests.fs` uses per-test disposable bare
 Git remotes with two independent clones and separately initialized account
 and project orphan refs. It exercises cap=1 cross-project concurrent reserve,
-two-client lost-ack replay, full semantic mismatch, resize/reserve races,
-verified normal terminal release, C01 abort-only release and contradictory
-admission, duplicate release, launch ID reuse fencing, epoch mismatch,
+full semantic replay/mismatch, deterministic *same-parent* reserve/reserve
+and resize/reserve CAS interleavings, actual accepted Git push followed by
+lost ACK plus failed post-push fetch, immutable operation replay after
+transport recovery, and unverifiable release with the token remaining held.
+The fault-interposition seam is confined to explicit dynamically scoped
+test calls; by default the account ledger runs the real Git process directly.
+The project-side cases verify both CAS orders (abort first and late original
+admission; original admission first and late abort), same-UUID project
+admission replay, verified ordinary release, abort-only release after an
+irrevocable project fence, duplicate release, launch ID reuse, epoch mismatch,
 remote rewind rejection, resize replay, descendant receipt tampering, and
 clean source checkout invariants.
 

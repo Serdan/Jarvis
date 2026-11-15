@@ -1,6 +1,7 @@
 module Client.Tests.AccountCapacityLedgerTests
 
 open System
+open System.Collections.Concurrent
 open System.Diagnostics
 open System.IO
 open System.Text.Json
@@ -90,90 +91,133 @@ module private AccountFixture =
             Directory.Delete(root, true)
 
     let terminalPath (launch: Guid) = $"records/terminal-{launch:N}.json"
-    let admissionPath (launch: Guid) = $"records/admission-{launch:N}.json"
+    // One absence/version guard for BOTH possible project admission outcomes.
+    // The admission write and abort-only tombstone race on this exact path.
+    let decisionPath (launch: Guid) = $"records/launch-{launch:N}.json"
+
+    let decision (p: LedgerBinding) launch accountAdmission kind =
+        { LaunchId = string launch; ProjectId = string p.ProjectId
+          AccountAdmissionOperationId = string accountAdmission
+          TerminalKind = kind; LaunchGeneration = 1L }
+
+    let tryPublishProjectAdmission (p: LedgerBinding) (launch: Guid) (accountAdmission: Guid) =
+        LedgerStore.putRecord p
+            { OperationId = accountAdmission; Actor = "project admission fixture"
+              Path = decisionPath launch; ExpectedBlobOid = None
+              Content = JsonSerializer.Serialize(decision p launch accountAdmission "AdmissionWon") }
 
     let publishProjectAdmission (p: LedgerBinding) (launch: Guid) (accountAdmission: Guid) =
-        LedgerStore.putRecord p
-            { OperationId = Guid.NewGuid(); Actor = "project fixture"
-              Path = admissionPath launch; ExpectedBlobOid = None
-              Content = JsonSerializer.Serialize(
-                  {| launchId = string launch; projectId = string p.ProjectId
-                     accountAdmissionOperationId = string accountAdmission |}) }
-        |> success |> ignore
+        tryPublishProjectAdmission p launch accountAdmission |> success |> ignore
 
-    let publishTerminal (p: LedgerBinding) (launch: Guid) (accountAdmission: Guid) kind =
-        let operationId = Guid.NewGuid()
-        let document =
-            { LaunchId = string launch; ProjectId = string p.ProjectId
-              AccountAdmissionOperationId = string accountAdmission
-              TerminalKind = kind; LaunchGeneration = 1L }
+    let tryPublishTerminal (p: LedgerBinding) (launch: Guid) (accountAdmission: Guid)
+                           kind operationId =
+        let path =
+            if kind = "AbortOnlyUnbound" then decisionPath launch
+            else terminalPath launch
         LedgerStore.putRecord p
             { OperationId = operationId; Actor = "project terminal fixture"
-              Path = terminalPath launch; ExpectedBlobOid = None
-              Content = JsonSerializer.Serialize(document) }
-        |> success |> ignore
-        { ProjectId = p.ProjectId; LaunchId = launch
-          AdmissionOperationId = accountAdmission
-          TerminalOperationId = operationId }
+              Path = path; ExpectedBlobOid = None
+              Content = JsonSerializer.Serialize(decision p launch accountAdmission kind) }
+        |> Result.map (fun outcome ->
+            { ProjectId = p.ProjectId; LaunchId = launch
+              AdmissionOperationId = accountAdmission
+              TerminalOperationId = operationId }, outcome)
 
-    // Fixture adapter reads the project authority on a freshly fetched verified
-    // head, proves the original terminal operation introduced the immutable
-    // terminal blob, and checks that admitted vs abort-only histories are
-    // consistent. WQ-02 replaces this adapter with its canonical launch CAS.
+    let publishTerminal (p: LedgerBinding) (launch: Guid) (accountAdmission: Guid) kind =
+        tryPublishTerminal p launch accountAdmission kind (Guid.NewGuid()) |> success |> fst
+
+    // Disposable WQ-02 adapter: the single decision-path CAS fences the loser.
+    // Resolve the exact immutable operation at a fresh canonical project head.
+    // An absent admission op is NOT proof alone; only the original abort winner
+    // recorded at that same immutable path can justify abort-only release.
     let verifier (p: LedgerBinding) : IProjectTerminalReceiptVerifier =
         { new IProjectTerminalReceiptVerifier with
             member _.VerifyCurrentTerminal locator =
                 match LedgerStore.fetch p with
                 | Error error -> Error(sprintf "Project head unverified: %A" error)
                 | Ok snapshot ->
-                    let path = terminalPath locator.LaunchId
-                    match LedgerStore.readAt p snapshot path,
-                          LedgerStore.getOperationAt p snapshot locator.TerminalOperationId with
-                    | Ok(Some raw, Some oid), Ok(Some operation)
-                        when operation.Paths |> Array.contains path ->
-                        match LedgerStore.getOperationOriginAt p snapshot operation with
-                        | Error error -> Error(sprintf "No immutable terminal origin: %A" error)
-                        | Ok origin ->
-                            match LedgerStore.readAt p { snapshot with Commit = origin } path with
-                            | Ok(Some original, Some originalOid)
-                                when original = raw && originalOid = oid ->
-                                try
-                                    let document = JsonSerializer.Deserialize<ProjectTerminalDocument>(raw)
-                                    let matches =
-                                        not (isNull (box document))
-                                        && document.LaunchId = string locator.LaunchId
-                                        && document.ProjectId = string locator.ProjectId
-                                        && document.AccountAdmissionOperationId =
-                                            string locator.AdmissionOperationId
-                                    if not matches then Error "Project terminal identity mismatch"
-                                    else
-                                        match LedgerStore.readAt p snapshot (admissionPath locator.LaunchId) with
-                                        | Error error -> Error(sprintf "Admission history unverified: %A" error)
-                                        | Ok(admission, _) when document.TerminalKind = "LaunchTerminal"
-                                                                && admission.IsSome ->
-                                            Ok { ProjectId = document.ProjectId
-                                                 LaunchId = document.LaunchId
-                                                 AdmissionOperationId = document.AccountAdmissionOperationId
-                                                 ProjectLedgerId = string p.LedgerId
-                                                 ProjectHead = snapshot.Commit
-                                                 TerminalOperationId = string locator.TerminalOperationId
-                                                 TerminalBlobOid = oid
-                                                 TerminalKind = document.TerminalKind
-                                                 LaunchGeneration = document.LaunchGeneration }
-                                        | Ok(None, _) when document.TerminalKind = "AbortOnlyUnbound" ->
-                                            Ok { ProjectId = document.ProjectId
-                                                 LaunchId = document.LaunchId
-                                                 AdmissionOperationId = document.AccountAdmissionOperationId
-                                                 ProjectLedgerId = string p.LedgerId
-                                                 ProjectHead = snapshot.Commit
-                                                 TerminalOperationId = string locator.TerminalOperationId
-                                                 TerminalBlobOid = oid
-                                                 TerminalKind = document.TerminalKind
-                                                 LaunchGeneration = document.LaunchGeneration }
-                                        | _ -> Error "Project admission/abort-only history contradicts terminal kind"
-                                with ex -> Error(sprintf "Malformed project terminal: %s" ex.Message)
-                            | _ -> Error "Terminal path overwritten or no longer matches original operation"
-                    | _ -> Error "No independently committed current project terminal operation" }
+                    let guardPath = decisionPath locator.LaunchId
+                    let terminalPath = terminalPath locator.LaunchId
+                    let readDecision =
+                        match LedgerStore.readAt p snapshot guardPath with
+                        | Ok(Some raw, Some oid) ->
+                            try
+                                let document = JsonSerializer.Deserialize<ProjectTerminalDocument>(raw)
+                                if isNull (box document)
+                                   || document.LaunchId <> string locator.LaunchId
+                                   || document.ProjectId <> string locator.ProjectId
+                                   || document.AccountAdmissionOperationId <> string locator.AdmissionOperationId then
+                                    Error "Per-launch decision identity mismatch"
+                                else Ok(document, raw, oid)
+                            with ex -> Error(sprintf "Invalid per-launch decision: %s" ex.Message)
+                        | _ -> Error "No canonical per-launch admission/abort CAS decision"
+                    match readDecision with
+                    | Error error -> Error error
+                    | Ok(decision, decisionRaw, decisionOid) ->
+                        match LedgerStore.getOperationAt p snapshot locator.TerminalOperationId with
+                        | Error error -> Error(sprintf "Terminal operation unverified: %A" error)
+                        | Ok None -> Error "No independently committed project terminal operation"
+                        | Ok(Some operation) ->
+                            let path =
+                                if decision.TerminalKind = "AbortOnlyUnbound" then guardPath
+                                else terminalPath
+                            if operation.Paths.Length <> 1 || operation.Paths[0] <> path then
+                                Error "Terminal operation does not own the required launch path"
+                            else
+                                match LedgerStore.getOperationOriginAt p snapshot operation with
+                                | Error error -> Error(sprintf "No immutable terminal origin: %A" error)
+                                | Ok origin ->
+                                    match LedgerStore.readAt p snapshot path,
+                                          LedgerStore.readAt p { snapshot with Commit = origin } path with
+                                    | Ok(Some raw, Some oid), Ok(Some original, Some originalOid)
+                                        when raw = original && oid = originalOid ->
+                                        try
+                                            let document = JsonSerializer.Deserialize<ProjectTerminalDocument>(raw)
+                                            if isNull (box document)
+                                               || document.LaunchId <> string locator.LaunchId
+                                               || document.ProjectId <> string locator.ProjectId
+                                               || document.AccountAdmissionOperationId <> string locator.AdmissionOperationId then
+                                                Error "Project terminal identity mismatch"
+                                            else
+                                                let decisionVerified =
+                                                    match document.TerminalKind with
+                                                    | "AbortOnlyUnbound" when path = guardPath
+                                                         && decision.TerminalKind = "AbortOnlyUnbound"
+                                                         && raw = decisionRaw && oid = decisionOid ->
+                                                        match LedgerStore.getOperationAt p snapshot locator.AdmissionOperationId with
+                                                        | Ok None -> Ok()
+                                                        | _ -> Error "Original admission committed despite abort-only decision"
+                                                    | "LaunchTerminal" when path = terminalPath
+                                                         && decision.TerminalKind = "AdmissionWon" ->
+                                                        match LedgerStore.getOperationAt p snapshot locator.AdmissionOperationId with
+                                                        | Ok(Some admissionOperation)
+                                                            when admissionOperation.Paths.Length = 1
+                                                              && admissionOperation.Paths[0] = guardPath ->
+                                                            match LedgerStore.getOperationOriginAt p snapshot admissionOperation with
+                                                            | Error error -> Error(sprintf "Admission origin unverified: %A" error)
+                                                            | Ok admissionOrigin ->
+                                                                match LedgerStore.readAt p
+                                                                        { snapshot with Commit = admissionOrigin } guardPath with
+                                                                | Ok(Some admissionRaw, Some admissionOid)
+                                                                    when admissionRaw = decisionRaw
+                                                                      && admissionOid = decisionOid -> Ok()
+                                                                | _ -> Error "Original admission did not win immutable launch CAS"
+                                                        | _ -> Error "Original admission operation absent or incompatible"
+                                                    | _ -> Error "Project terminal and original launch CAS are incompatible"
+                                                match decisionVerified with
+                                                | Error error -> Error error
+                                                | Ok () ->
+                                                    Ok { ProjectId = document.ProjectId
+                                                         LaunchId = document.LaunchId
+                                                         AdmissionOperationId = document.AccountAdmissionOperationId
+                                                         ProjectLedgerId = string p.LedgerId
+                                                         ProjectHead = snapshot.Commit
+                                                         TerminalOperationId = string locator.TerminalOperationId
+                                                         TerminalBlobOid = oid
+                                                         TerminalKind = document.TerminalKind
+                                                         LaunchGeneration = document.LaunchGeneration }
+                                        with ex -> Error(sprintf "Malformed project terminal: %s" ex.Message)
+                                    | _ -> Error "Terminal path overwritten or lacks immutable origin" }
 
 [<TestFixture>]
 type AccountCapacityLedgerTests() =
@@ -206,7 +250,7 @@ type AccountCapacityLedgerTests() =
                         Is.EqualTo(initialProject.Commit)))
 
     [<Test>]
-    member _.LostAcknowledgementReplaysStableReceiptsWithFullSemanticEquality() =
+    member _.SuccessfulReceiptReplayUsesFullSemanticEquality() =
         AccountFixture.withGit 2 (fun f ->
             let launch, project, op = Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid()
             let first =
@@ -233,27 +277,151 @@ type AccountCapacityLedgerTests() =
             Assert.That(receipt.Value.OriginalResultJson, Is.EqualTo(first.Receipt.OriginalResultJson)))
 
     [<Test>]
-    member _.CapacityShrinkRacesReservationInSingleGitCasDomain() =
+    member _.AcceptedGitPushWithLostAckAndFailedPostPushFetchReplaysOriginalReceipt() =
+        AccountFixture.withGit 1 (fun f ->
+            let launch, project, op = Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid()
+            let mutable pushAcceptedWithoutAck = false
+            let mutable postPushFetchFailed = false
+            let hooks =
+                { BeforeLeasePush = fun _ _ -> ()
+                  GitCommand = fun args ->
+                    match args with
+                    | "push" :: _ when not pushAcceptedWithoutAck ->
+                        pushAcceptedWithoutAck <- true
+                        AccountGitTestFault.ExecuteThenLoseAcknowledgment
+                    | "fetch" :: _ when pushAcceptedWithoutAck && not postPushFetchFailed ->
+                        postPushFetchFailed <- true
+                        AccountGitTestFault.FailBeforeExecution
+                    | _ -> AccountGitTestFault.PassThrough }
+            let unknown =
+                AccountCapacityLedger.withTestInterposition hooks (fun () ->
+                    AccountCapacityLedger.reserve f.AccountOne op "Scheduler"
+                        launch project "Worker" 1L)
+            match unknown with
+            | Error(AccountOutcomeUnknown actual) when actual = op -> ()
+            | other -> Assert.Fail(sprintf "Post-push uncertainty must be explicit: %A" other)
+            Assert.That(pushAcceptedWithoutAck, Is.True)
+            Assert.That(postPushFetchFailed, Is.True)
+            // The original push DID reach the bare remote. Reconciliation must
+            // return the exact immutable receipt without a second mutation.
+            let initial, original = AccountCapacityLedger.readOperation f.AccountTwo op |> success
+            Assert.That(original.IsSome, Is.True)
+            let replay =
+                AccountCapacityLedger.reserve f.AccountTwo op "Scheduler"
+                    launch project "Worker" 1L |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That(replay.Receipt, Is.EqualTo(original.Value))
+            Assert.That(replay.CurrentHead, Is.EqualTo(initial.Head))
+            Assert.That(initial.State.Tokens.Length, Is.EqualTo(1))
+            Assert.That(AccountCapacityLedger.occupied initial.State, Is.EqualTo(1)))
+
+    [<Test>]
+    member _.DeterministicallyConcurrentClonesUseSameParentAndLoserReplans() =
+        AccountFixture.withGit 1 (fun f ->
+            let oldHead = (AccountCapacityLedger.fetch f.AccountOne |> success).Head
+            let seen = ConcurrentDictionary<Guid, bool>()
+            let heads = ConcurrentBag<string>()
+            use twoPlanned = new Barrier(2)
+            let hooks =
+                { BeforeLeasePush = fun op head ->
+                    if seen.TryAdd(op, true) then
+                        heads.Add(head)
+                        Assert.That(twoPlanned.SignalAndWait(TimeSpan.FromSeconds(45.)), Is.True,
+                                    "Both clones must plan before either push")
+                  GitCommand = fun _ -> AccountGitTestFault.PassThrough }
+            let run account =
+                Task.Run(fun () ->
+                    AccountCapacityLedger.withTestInterposition hooks (fun () ->
+                        AccountCapacityLedger.reserve account (Guid.NewGuid())
+                            "Scheduler" (Guid.NewGuid()) (Guid.NewGuid()) "Worker" 1L))
+            let first, second = run f.AccountOne, run f.AccountTwo
+            Task.WaitAll([| first :> Task; second :> Task |])
+            Assert.That(heads.Count, Is.EqualTo(2))
+            Assert.That(heads |> Seq.forall ((=) oldHead), Is.True,
+                        "Both writers must have computed from the same stale parent")
+            let outcomes = [ first.Result; second.Result ]
+            Assert.That(outcomes |> List.filter Result.isOk |> List.length, Is.EqualTo(1))
+            Assert.That(outcomes |> List.filter (function
+                | Error(AccountCapacityFull(_, 1)) -> true | _ -> false) |> List.length,
+                Is.EqualTo(1))
+            let state = (AccountCapacityLedger.fetch f.AccountTwo |> success).State
+            Assert.That(AccountCapacityLedger.occupied state, Is.EqualTo(1))
+            Assert.That(state.Tokens.Length, Is.EqualTo(1)))
+
+    [<Test>]
+    member _.UnverifiableAccountReleaseTransportKeepsTokenHeldUntilExactReplay() =
+        AccountFixture.withGit 1 (fun f ->
+            let launch, admission = Guid.NewGuid(), Guid.NewGuid()
+            AccountCapacityLedger.reserve f.AccountOne admission "Scheduler" launch
+                f.ProjectOne.ProjectId "Worker" 1L |> success |> ignore
+            AccountFixture.publishProjectAdmission f.ProjectOne launch admission
+            let terminal =
+                AccountFixture.publishTerminal f.ProjectOne launch admission "LaunchTerminal"
+            let releaseId = Guid.NewGuid()
+            let mutable attemptedPush = false
+            let hooks =
+                { BeforeLeasePush = fun _ _ -> ()
+                  GitCommand = fun args ->
+                    match args with
+                    | "push" :: _ ->
+                        attemptedPush <- true
+                        AccountGitTestFault.FailBeforeExecution
+                    | "fetch" :: _ when attemptedPush ->
+                        AccountGitTestFault.FailBeforeExecution
+                    | _ -> AccountGitTestFault.PassThrough }
+            let result =
+                AccountCapacityLedger.withTestInterposition hooks (fun () ->
+                    AccountCapacityLedger.release f.AccountOne
+                        (AccountFixture.verifier f.ProjectTwo) releaseId "Reconciler" terminal)
+            match result with
+            | Error(AccountOutcomeUnknown id) when id = releaseId -> ()
+            | other -> Assert.Fail(sprintf "Unverifiable release must be unknown: %A" other)
+            Assert.That(attemptedPush, Is.True)
+            let snapshot, receipt = AccountCapacityLedger.readOperation f.AccountTwo releaseId |> success
+            Assert.That(receipt.IsNone, Is.True)
+            Assert.That(AccountCapacityLedger.occupied snapshot.State, Is.EqualTo(1))
+            match AccountCapacityLedger.reserve f.AccountTwo (Guid.NewGuid()) "Scheduler"
+                    (Guid.NewGuid()) (Guid.NewGuid()) "Worker" 1L with
+            | Error(AccountCapacityFull(1, 1)) -> ()
+            | other -> Assert.Fail(sprintf "Outcome-unknown release improperly freed token: %A" other)
+            AccountCapacityLedger.release f.AccountTwo (AccountFixture.verifier f.ProjectTwo)
+                releaseId "Reconciler" terminal |> success |> ignore
+            Assert.That((AccountCapacityLedger.fetch f.AccountTwo |> success).State
+                        |> AccountCapacityLedger.occupied, Is.Zero))
+
+    [<Test>]
+    member _.CapacityShrinkRacesReservationFromSameStaleParent() =
         AccountFixture.withGit 2 (fun f ->
             AccountCapacityLedger.reserve f.AccountOne (Guid.NewGuid()) "Scheduler"
                 (Guid.NewGuid()) (Guid.NewGuid()) "Lead" 1L |> success |> ignore
-            use gate = new ManualResetEventSlim(false)
-            let second = Task.Run(fun () ->
-                gate.Wait()
-                AccountCapacityLedger.reserve f.AccountTwo (Guid.NewGuid()) "Scheduler"
-                    (Guid.NewGuid()) (Guid.NewGuid()) "Worker" 1L)
+            let oldHead = (AccountCapacityLedger.fetch f.AccountOne |> success).Head
+            let observed = ConcurrentBag<string>()
+            let seen = ConcurrentDictionary<Guid, bool>()
+            use planned = new Barrier(2)
+            let hooks =
+                { BeforeLeasePush = fun op head ->
+                    if seen.TryAdd(op, true) then
+                        observed.Add(head)
+                        Assert.That(planned.SignalAndWait(TimeSpan.FromSeconds(45.)), Is.True,
+                                    "Shrink and reserve must both plan at the old head")
+                  GitCommand = fun _ -> AccountGitTestFault.PassThrough }
+            let reservation = Task.Run(fun () ->
+                AccountCapacityLedger.withTestInterposition hooks (fun () ->
+                    AccountCapacityLedger.reserve f.AccountTwo (Guid.NewGuid()) "Scheduler"
+                        (Guid.NewGuid()) (Guid.NewGuid()) "Worker" 1L))
             let shrink = Task.Run(fun () ->
-                gate.Wait()
-                AccountCapacityLedger.setCapacity f.AccountOne (Guid.NewGuid()) "Operator" 1L 1)
-            gate.Set()
-            Task.WaitAll([| second :> Task; shrink :> Task |])
+                AccountCapacityLedger.withTestInterposition hooks (fun () ->
+                    AccountCapacityLedger.setCapacity f.AccountOne (Guid.NewGuid()) "Operator" 1L 1))
+            Task.WaitAll([| reservation :> Task; shrink :> Task |])
+            Assert.That(observed.Count, Is.EqualTo(2))
+            Assert.That(observed |> Seq.forall ((=) oldHead), Is.True)
             let state = (AccountCapacityLedger.fetch f.AccountTwo |> success).State
             Assert.That(AccountCapacityLedger.occupied state, Is.LessThanOrEqualTo(state.MaxConcurrentAgents))
-            Assert.That(Result.isOk second.Result, Is.Not.EqualTo(Result.isOk shrink.Result))
-            match second.Result, shrink.Result with
+            Assert.That(Result.isOk reservation.Result, Is.Not.EqualTo(Result.isOk shrink.Result))
+            match reservation.Result, shrink.Result with
             | Ok _, Error(AccountResizeBelowOccupancy 2) -> ()
             | Error(AccountCapacityFull(1, 1)), Ok _ -> ()
-            | other -> Assert.Fail(sprintf "Unexpected reserve/resize result: %A" other)
+            | other -> Assert.Fail(sprintf "Unexpected same-parent reserve/resize result: %A" other)
             match AccountCapacityLedger.setCapacity f.AccountTwo (Guid.NewGuid()) "Operator"
                 state.ConfigVersion 0 with
             | Error(InvalidAccountBinding _) -> ()
@@ -302,22 +470,80 @@ type AccountCapacityLedgerTests() =
             | other -> Assert.Fail(sprintf "Released launch ID must never be reused: %A" other))
 
     [<Test>]
-    member _.AbortOnlyRequiresProofAdmissionNeverWonAndRejectsLaterConflicts() =
+    member _.AbortWinsPerLaunchCasAndFencesOriginalAdmissionAfterCapacityRelease() =
         AccountFixture.withGit 1 (fun f ->
             let launch, admission = Guid.NewGuid(), Guid.NewGuid()
             AccountCapacityLedger.reserve f.AccountOne admission "Scheduler" launch
                 f.ProjectOne.ProjectId "Worker" 1L |> success |> ignore
-            let aborted = AccountFixture.publishTerminal f.ProjectOne launch admission "AbortOnlyUnbound"
+            let abortOp = Guid.NewGuid()
+            let aborted, first =
+                AccountFixture.tryPublishTerminal f.ProjectOne launch admission
+                    "AbortOnlyUnbound" abortOp |> success
+            Assert.That(first.AlreadyApplied, Is.False)
+            // Actual late original operation, issued from another Git clone,
+            // must not commit even when the released account slot is reused.
             let verifier = AccountFixture.verifier f.ProjectTwo
-            // Simulate the original admission unexpectedly winning after an invalid
-            // abort-only fixture: the verifier must not certify a contradictory head.
-            AccountFixture.publishProjectAdmission f.ProjectOne launch admission
-            match AccountCapacityLedger.release f.AccountTwo verifier
-                (Guid.NewGuid()) "Reconciler" aborted with
-            | Error(AccountTerminalProofRejected _) -> ()
-            | other -> Assert.Fail(sprintf "Conflicting admission/tombstone must hold token: %A" other)
+            AccountCapacityLedger.release f.AccountTwo verifier
+                (Guid.NewGuid()) "Reconciler" aborted |> success |> ignore
+            AccountCapacityLedger.reserve f.AccountTwo (Guid.NewGuid()) "Scheduler"
+                (Guid.NewGuid()) (Guid.NewGuid()) "Worker" 1L |> success |> ignore
+            for _ in 1..2 do
+                match AccountFixture.tryPublishProjectAdmission f.ProjectTwo launch admission with
+                | Error(StaleEntityVersion _) -> ()
+                | other -> Assert.Fail(sprintf "Late admission escaped winning abort CAS: %A" other)
+            let _, replay =
+                AccountFixture.tryPublishTerminal f.ProjectTwo launch admission
+                    "AbortOnlyUnbound" abortOp |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
             Assert.That((AccountCapacityLedger.fetch f.AccountOne |> success).State
                         |> AccountCapacityLedger.occupied, Is.EqualTo(1)))
+
+    [<Test>]
+    member _.OriginalAdmissionWinsCasAndLateAbortCannotReleaseAccountToken() =
+        AccountFixture.withGit 1 (fun f ->
+            let launch, admission = Guid.NewGuid(), Guid.NewGuid()
+            AccountCapacityLedger.reserve f.AccountOne admission "Scheduler" launch
+                f.ProjectOne.ProjectId "Worker" 1L |> success |> ignore
+            AccountFixture.publishProjectAdmission f.ProjectOne launch admission
+            let abortOp = Guid.NewGuid()
+            match AccountFixture.tryPublishTerminal f.ProjectTwo launch admission
+                    "AbortOnlyUnbound" abortOp with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Abort escaped winning admission CAS: %A" other)
+            let locator = { ProjectId = f.ProjectOne.ProjectId; LaunchId = launch
+                            AdmissionOperationId = admission; TerminalOperationId = abortOp }
+            match AccountCapacityLedger.release f.AccountTwo (AccountFixture.verifier f.ProjectTwo)
+                (Guid.NewGuid()) "Reconciler" locator with
+            | Error(AccountTerminalProofRejected _) -> ()
+            | other -> Assert.Fail(sprintf "Uncommitted abort freed account slot: %A" other)
+            Assert.That((AccountCapacityLedger.fetch f.AccountTwo |> success).State
+                        |> AccountCapacityLedger.occupied, Is.EqualTo(1)))
+
+    [<Test>]
+    member _.AmbiguousOriginalProjectAdmissionAcknowledgmentReplaysSameCasOutcome() =
+        AccountFixture.withGit 1 (fun f ->
+            let launch, admission = Guid.NewGuid(), Guid.NewGuid()
+            AccountCapacityLedger.reserve f.AccountOne admission "Scheduler" launch
+                f.ProjectOne.ProjectId "Worker" 1L |> success |> ignore
+            // Pretend the caller lost the first successful admission response.
+            // Reissue the exact original UUID from a different project clone.
+            let first = AccountFixture.tryPublishProjectAdmission f.ProjectOne launch admission |> success
+            let replay = AccountFixture.tryPublishProjectAdmission f.ProjectTwo launch admission |> success
+            Assert.That(first.AlreadyApplied, Is.False)
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That(first.Operation.OriginalResultJson,
+                        Is.EqualTo(replay.Operation.OriginalResultJson))
+            match AccountFixture.tryPublishTerminal f.ProjectTwo launch admission
+                    "AbortOnlyUnbound" (Guid.NewGuid()) with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Ambiguous admission allowed abort: %A" other)
+            Assert.That((AccountCapacityLedger.fetch f.AccountTwo |> success).State
+                        |> AccountCapacityLedger.occupied, Is.EqualTo(1))
+            let terminal = AccountFixture.publishTerminal f.ProjectOne launch admission "LaunchTerminal"
+            AccountCapacityLedger.release f.AccountTwo (AccountFixture.verifier f.ProjectTwo)
+                (Guid.NewGuid()) "Reconciler" terminal |> success |> ignore
+            Assert.That((AccountCapacityLedger.fetch f.AccountOne |> success).State
+                        |> AccountCapacityLedger.occupied, Is.Zero))
 
     [<Test>]
     member _.CleanAbortOnlyTombstonePermitsReleaseWithoutProjectLaunch() =

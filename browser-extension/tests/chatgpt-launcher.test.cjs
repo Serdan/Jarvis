@@ -13,6 +13,7 @@ function harness(options = {}) {
   let renderedBubble = null;
   let clicks = 0;
   let focused = false;
+  let editorSelected = false;
   let mode = options.initialMode || "Chat";
   let chatClicks = 0;
   const makeMode = name => ({
@@ -51,11 +52,27 @@ function harness(options = {}) {
       }, options.bubbleDelayMs || 0);
     }
   }};
+  const selection = {
+    removeAllRanges() { editorSelected = false; },
+    addRange(range) { editorSelected = range.composerSelected === true; }
+  };
   const document = {
     readyState: "complete",
+    createRange() {
+      return {
+        composerSelected: false,
+        selectNodeContents(node) { this.composerSelected = node === editor; }
+      };
+    },
     execCommand(command, _, value) {
-      if (options.throwOnInsert) throw new Error("ProseMirror changed unexpectedly");
-      if (!focused || command !== "insertText") return false;
+      if (options.throwOnInsert && command === "insertText") throw new Error("ProseMirror changed unexpectedly");
+      if (!focused) return false;
+      if (command === "delete") {
+        if (!editorSelected || options.clearFails) return false;
+        content = options.clearLeavesText ? "residual draft" : "";
+        return true;
+      }
+      if (command !== "insertText") return false;
       content = options.insertWrong ? "wrong" : value;
       return true;
     },
@@ -85,10 +102,11 @@ function harness(options = {}) {
         ? Array(userTurns).fill({}) : [];
     }
   };
-  const ctx = vm.createContext({ document, location: site, setTimeout, Date, URL });
-  const run = async (prompt = "Start fresh\nRead Jarvis assignment") =>
+  const window = { getSelection: () => options.selectionUnavailable ? null : selection };
+  const ctx = vm.createContext({ document, window, location: site, setTimeout, Date, URL });
+  const run = async (prompt = "Start fresh\nRead Jarvis assignment", extra = {}) =>
     await vm.runInContext(source + "\nexecute(" + JSON.stringify({
-      prompt, timeoutMs: options.timeoutMs || 350
+      prompt, timeoutMs: options.timeoutMs || 350, ...extra
     }) + ")", ctx);
   return { run, site, get clicks() { return clicks; }, get chatClicks() { return chatClicks; },
     get mode() { return mode; }, get content() { return content; } };
@@ -110,6 +128,49 @@ test("does not overwrite a restored draft", async () => {
   assert.equal(result.reason, "ExistingDraft");
   assert.equal(h.clicks, 0);
   assert.equal(h.content, "unsent text");
+});
+
+test("clears only an exact previously confirmed bootstrap and sends the new one once", async () => {
+  const oldPrompt = "You are Worker 1 in Jarvis.\nRead your Jarvis inbox.";
+  const nextPrompt = "You are Worker 2 in Jarvis.\nRead your Jarvis inbox.";
+  const h = harness({ existingDraft: oldPrompt });
+  const result = await h.run(nextPrompt, { confirmedSubmittedPrompts: [oldPrompt] });
+  assert.equal(result.status, "submitted");
+  assert.equal(h.clicks, 1);
+  assert.equal(h.content, "");
+  assert.equal(JSON.stringify(result).includes(oldPrompt), false);
+});
+
+test("rejects any restored draft without exact confirmation, without deleting it", async () => {
+  const h = harness({ existingDraft: "Unsent personal text" });
+  const result = await h.run("Start new Jarvis agent", {
+    confirmedSubmittedPrompts: ["Different previously sent bootstrap"]
+  });
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "ExistingDraft");
+  assert.equal(h.content, "Unsent personal text");
+  assert.equal(h.clicks, 0);
+});
+
+test("rejects invalid stale-bootstrap evidence rather than trusting a partial list", async () => {
+  const h = harness({ existingDraft: "Old bootstrap" });
+  const result = await h.run("New bootstrap", {
+    confirmedSubmittedPrompts: ["Old bootstrap", 123]
+  });
+  assert.equal(result.reason, "ExistingDraft");
+  assert.equal(h.content, "Old bootstrap");
+  assert.equal(h.clicks, 0);
+});
+
+test("failed stale-draft deletion never inserts or submits another prompt", async () => {
+  const h = harness({ existingDraft: "Old bootstrap", clearFails: true });
+  const result = await h.run("New bootstrap", {
+    confirmedSubmittedPrompts: ["Old bootstrap"]
+  });
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.reason, "StaleDraftClearFailed");
+  assert.equal(h.content, "Old bootstrap");
+  assert.equal(h.clicks, 0);
 });
 
 test("does not click Send if editor rejects insertion", async () => {
@@ -293,4 +354,14 @@ test("only a client-local temporary conversation route is still uncertain and ca
   assert.equal(result.reason, "ConversationUrlUnavailable");
   assert.equal(h.clicks, 1);
   assert.equal(result.conversationUrl, undefined);
+});
+
+test("does not resend an identical restored bootstrap even with prior-send evidence", async () => {
+  const prompt = "You are Worker 1 in Jarvis. Read your inbox.";
+  const h = harness({ existingDraft: prompt });
+  const result = await h.run(prompt, { confirmedSubmittedPrompts: [prompt] });
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "ExistingDraft");
+  assert.equal(h.content, prompt);
+  assert.equal(h.clicks, 0);
 });

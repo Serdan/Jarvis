@@ -74,8 +74,48 @@ type Service(port: int, pairingSecret: string) =
     let listener = new HttpListener()
     let cancellation = new CancellationTokenSource()
     let sync = obj()
-    let mutable active: Connection option = None
+    // Each authenticated extension has independent registrations and requests.
+    // A newly connected browser profile must not evict an existing one.
+    let connections = ResizeArray<Connection>()
     let mutable acceptLoop: Task = Task.CompletedTask
+
+    // Call under sync; explicit connection IDs pin multi-step operations.
+    let selectConnections (ownerConnectionId: string option) =
+        match ownerConnectionId with
+        | Some id ->
+            match connections |> Seq.tryFind (fun conn -> conn.Id = id) with
+            | Some conn -> Ok [conn]
+            | None -> Error "ExtensionDisconnected"
+        | None when connections.Count = 0 -> Error "ExtensionDisconnected"
+        | None -> Ok (connections |> Seq.toList)
+
+    let matchesRegistration (registration: JsonElement) (primary: string) (value: string) =
+        not (String.IsNullOrWhiteSpace value) &&
+        ((match registration.TryGetProperty(primary) with
+          | true, id when id.ValueKind = JsonValueKind.String -> id.GetString() = value
+          | _ -> false) ||
+         (match registration.TryGetProperty("alias") with
+          | true, alias when alias.ValueKind = JsonValueKind.String -> alias.GetString() = value
+          | _ -> false))
+
+    // Resolve across all connections unless an earlier operation provided the
+    // authenticated connection which created the tab. Collision is an error.
+    let resolveRegistration ownerConnectionId isWindow value =
+        match selectConnections ownerConnectionId with
+        | Error error -> Error error
+        | Ok live ->
+            let matches =
+                live |> List.collect (fun conn ->
+                    (if isWindow then conn.Windows else conn.Registrations)
+                    |> List.choose (fun registration ->
+                        if matchesRegistration registration
+                             (if isWindow then "windowRegistration" else "registrationId") value then
+                            Some(conn, registration)
+                        else None))
+            match matches with
+            | [] -> Error (if isWindow then "WindowNotRegistered" else "TabNotRegistered")
+            | [single] -> Ok single
+            | _ -> Error "AliasAmbiguous"
 
     let send (conn: Connection) (payload: string) = task {
         if Encoding.UTF8.GetByteCount(payload) > MaxFrameBytes then
@@ -146,14 +186,7 @@ type Service(port: int, pairingSecret: string) =
             try
                 try
                     do! authenticated conn
-                    lock sync (fun () ->
-                        match active with
-                        | Some old ->
-                            for KeyValue(_,tcs) in old.Pending do
-                                tcs.TrySetException(IOException("Browser extension replaced connection; outcome unknown.")) |> ignore
-                            try old.Socket.Abort() with _ -> ()
-                        | None -> ()
-                        active <- Some conn)
+                    lock sync (fun () -> connections.Add conn)
                     while socket.State = WebSocketState.Open && not cancellation.IsCancellationRequested do
                         let! payload = read socket
                         let doc = JsonNode.Parse(payload)
@@ -206,8 +239,7 @@ type Service(port: int, pairingSecret: string) =
                         | _ -> ()
                 with _ -> ()
             finally
-                lock sync (fun () ->
-                    if active |> Option.exists (fun x -> obj.ReferenceEquals(x, conn)) then active <- None)
+                lock sync (fun () -> connections.Remove conn |> ignore)
                 for KeyValue(_,tcs) in conn.Pending do
                     tcs.TrySetException(IOException("Browser bridge disconnected; outcome unknown.")) |> ignore
                 conn.SendLock.Dispose()
@@ -247,19 +279,21 @@ type Service(port: int, pairingSecret: string) =
             | :? ObjectDisposedException when cancellation.IsCancellationRequested -> ()
         }
 
-    member _.ListTabs() =
+    member _.ListTabs(?ownerConnectionId: string) =
         lock sync (fun () ->
-            match active with
-            | None -> Error "ExtensionDisconnected"
-            | Some conn ->
-                let tabs = conn.Registrations |> List.map (fun x -> x.Clone())
+            match selectConnections ownerConnectionId with
+            | Error error -> Error error
+            | Ok live ->
+                let tabs = live |> List.collect (fun conn -> conn.Registrations |> List.map (fun x -> x.Clone()))
                 Ok (serialize {| tabs = tabs |}))
 
     member _.ListWindows() =
         lock sync (fun () ->
-            match active with
-            | None -> Error "ExtensionDisconnected"
-            | Some conn -> Ok (serialize {| windows = conn.Windows |> List.map (fun x -> x.Clone()) |}))
+            match selectConnections None with
+            | Error error -> Error error
+            | Ok live ->
+                let windows = live |> List.collect (fun conn -> conn.Windows |> List.map (fun x -> x.Clone()))
+                Ok (serialize {| windows = windows |}))
 
     member _.OpenTab(windowRegistration: string, url: string, alias: string, makeActive: bool) = task {
         let isValid =
@@ -275,10 +309,16 @@ type Service(port: int, pairingSecret: string) =
             return Error "InvalidTabAlias"
         else
             let connection = lock sync (fun () ->
-                match active with
-                | None -> Error "ExtensionDisconnected"
-                | Some conn when conn.Pending.Count >= 4 -> Error "BridgeBusy"
-                | Some conn -> Ok conn)
+                match resolveRegistration None true windowRegistration with
+                | Error error -> Error error
+                | Ok (conn, window) ->
+                    let availability =
+                        match window.TryGetProperty("availability") with
+                        | true, value when value.ValueKind = JsonValueKind.String -> value.GetString()
+                        | _ -> "unknown"
+                    if availability <> "ready" then Error ("WindowUnavailable:" + availability)
+                    elif conn.Pending.Count >= 4 then Error "BridgeBusy"
+                    else Ok conn)
             match connection with
             | Error error -> return Error error
             | Ok conn ->
@@ -320,24 +360,18 @@ type Service(port: int, pairingSecret: string) =
                         conn.Pending.TryRemove(requestId, &removed) |> ignore
     }
 
-    member _.CloseTab(tabRegistration: string) = task {
+    member _.CloseTab(tabRegistration: string, ?ownerConnectionId: string) = task {
         let resolved = lock sync (fun () ->
-            match active with
-            | None -> Error "ExtensionDisconnected"
-            | Some conn ->
-                match conn.Registrations |> List.filter (fun tab ->
-                    tab.GetProperty("registrationId").GetString() = tabRegistration ||
-                    (match tab.TryGetProperty("alias") with | true, a -> a.GetString() = tabRegistration | _ -> false)) with
-                | [] -> Error "TabNotRegistered"
-                | [tab] ->
-                    let agentCreated =
-                        match tab.TryGetProperty("agentCreated") with
-                        | true, value -> value.GetBoolean()
-                        | _ -> false
-                    if not agentCreated then Error "TabNotAgentCreated"
-                    elif conn.Pending.Count >= 4 then Error "BridgeBusy"
-                    else Ok(conn, tab)
-                | _ -> Error "AliasAmbiguous")
+            match resolveRegistration ownerConnectionId false tabRegistration with
+            | Error error -> Error error
+            | Ok (conn, tab) ->
+                let agentCreated =
+                    match tab.TryGetProperty("agentCreated") with
+                    | true, value -> value.GetBoolean()
+                    | _ -> false
+                if not agentCreated then Error "TabNotAgentCreated"
+                elif conn.Pending.Count >= 4 then Error "BridgeBusy"
+                else Ok(conn, tab))
         match resolved with
         | Error e -> return Error e
         | Ok(conn, tab) ->
@@ -372,7 +406,8 @@ type Service(port: int, pairingSecret: string) =
                     conn.Pending.TryRemove(requestId, &removed) |> ignore
     }
 
-    member _.Execute(tabRegistration: string, source: string, argsJson: string, timeoutMs: int, isInline: bool) = task {
+    member _.Execute(tabRegistration: string, source: string, argsJson: string, timeoutMs: int,
+                     isInline: bool, ?ownerConnectionId: string) = task {
         let sourceBytes = utf8.GetByteCount(source)
         if sourceBytes > MaxScriptBytes then return Error "InputTooLarge: script exceeds 64 KiB."
         elif utf8.GetByteCount(argsJson) > MaxArgumentsBytes then return Error "InputTooLarge: arguments exceed 64 KiB."
@@ -381,29 +416,16 @@ type Service(port: int, pairingSecret: string) =
             try
                 use arguments = JsonDocument.Parse(argsJson)
                 let resolved = lock sync (fun () ->
-                    match active with
-                    | None -> Error "ExtensionDisconnected"
-                    | Some conn ->
-                        let matching =
-                            conn.Registrations
-                            |> List.filter (fun tab ->
-                                let id = tab.GetProperty("registrationId").GetString()
-                                let alias =
-                                    match tab.TryGetProperty("alias") with
-                                    | true, x -> x.GetString()
-                                    | _ -> ""
-                                id = tabRegistration || alias = tabRegistration)
-                        match matching with
-                        | [] -> Error "TabNotRegistered"
-                        | [tab] ->
-                            let state =
-                                match tab.TryGetProperty("availability") with
-                                | true, x -> x.GetString()
-                                | _ -> ""
-                            if state <> "ready" then Error ("TabUnavailable:" + state)
-                            elif conn.Pending.Count >= 4 then Error "BridgeBusy"
-                            else Ok(conn, tab)
-                        | _ -> Error "AliasAmbiguous")
+                    match resolveRegistration ownerConnectionId false tabRegistration with
+                    | Error error -> Error error
+                    | Ok (conn, tab) ->
+                        let state =
+                            match tab.TryGetProperty("availability") with
+                            | true, x -> x.GetString()
+                            | _ -> ""
+                        if state <> "ready" then Error ("TabUnavailable:" + state)
+                        elif conn.Pending.Count >= 4 then Error "BridgeBusy"
+                        else Ok(conn, tab))
                 match resolved with
                 | Error error -> return Error error
                 | Ok(conn, tab) ->
@@ -481,26 +503,17 @@ type Service(port: int, pairingSecret: string) =
                     return Error "InvalidSnapshotOptions"
                 else
                     let selected = lock sync (fun () ->
-                        match active with
-                        | None -> Error "ExtensionDisconnected"
-                        | Some conn ->
-                            let matches = conn.Registrations |> List.filter (fun tab ->
-                                tab.GetProperty("registrationId").GetString() = tabRegistration ||
-                                (match tab.TryGetProperty("alias") with
-                                 | true, value -> value.GetString() = tabRegistration
-                                 | _ -> false))
-                            match matches with
-                            | [] -> Error "TabNotRegistered"
-                            | [tab] ->
-                                let status =
-                                    match tab.TryGetProperty("availability") with
-                                    | true, value -> value.GetString()
-                                    | _ -> "unknown"
-                                if status <> "ready" then Error("TabUnavailable:" + status)
-                                elif not (conn.Features.Contains("domSnapshotV1")) then
-                                    Error "ExtensionOutdated: DOM snapshots require a newer browser extension"
-                                else Ok(conn, tab)
-                            | _ -> Error "AliasAmbiguous")
+                        match resolveRegistration None false tabRegistration with
+                        | Error error -> Error error
+                        | Ok (conn, tab) ->
+                            let status =
+                                match tab.TryGetProperty("availability") with
+                                | true, value -> value.GetString()
+                                | _ -> "unknown"
+                            if status <> "ready" then Error("TabUnavailable:" + status)
+                            elif not (conn.Features.Contains("domSnapshotV1")) then
+                                Error "ExtensionOutdated: DOM snapshots require a newer browser extension"
+                            else Ok(conn, tab))
                     match selected with
                     | Error error -> return Error error
                     | Ok(conn, tab) ->
@@ -655,8 +668,8 @@ type Service(port: int, pairingSecret: string) =
             cancellation.Cancel()
             listener.Close()
             lock sync (fun () ->
-                active |> Option.iter (fun conn -> conn.Socket.Abort())
-                active <- None)
+                for conn in connections do conn.Socket.Abort()
+                connections.Clear())
             cancellation.Dispose()
 
 
@@ -687,6 +700,7 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
             | Ok response ->
                 use openDoc = JsonDocument.Parse(response)
                 registrationId <- openDoc.RootElement.GetProperty("tab").GetProperty("registrationId").GetString()
+                let ownerConnectionId = openDoc.RootElement.GetProperty("connectionId").GetString()
                 if String.IsNullOrWhiteSpace(registrationId) then
                     return Error("", "OutcomeUnknown: created tab response lacked registration ID")
                 else
@@ -699,7 +713,7 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                     let cleanupNotReady () = task {
                         // No user script was injected; cleanup cannot cancel a submission.
                         if closeAfterExecution then
-                            match! bridge.CloseTab(registrationId) with
+                            match! bridge.CloseTab(registrationId, ownerConnectionId = ownerConnectionId) with
                             | Ok _ -> return Error(registrationId, "TabNotReady; cleanup=closed")
                             | Error e ->
                                 let safe = if e.Length > 100 then e.Substring(0, 100) else e
@@ -709,7 +723,7 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                     }
                     let mutable ready = false
                     while not ready && withinReadinessBudget() do
-                        match bridge.ListTabs() with
+                        match bridge.ListTabs(ownerConnectionId = ownerConnectionId) with
                         | Ok listing ->
                             use listDoc = JsonDocument.Parse(listing)
                             ready <- listDoc.RootElement.GetProperty("tabs").EnumerateArray()
@@ -731,7 +745,8 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                             | _ -> false
                         let mutable execution : Result<string, string> option = None
                         while execution.IsNone && withinReadinessBudget() do
-                            let! attempt = bridge.Execute(registrationId, source, argsJson, timeoutMs, false)
+                            let! attempt = bridge.Execute(registrationId, source, argsJson, timeoutMs, false,
+                                                          ownerConnectionId = ownerConnectionId)
                             match attempt with
                             | Error e when isLoadingPreflight e -> do! Task.Delay(500)
                             | _ -> execution <- Some attempt
@@ -797,7 +812,7 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                             else
                                 let mutable cleanup = "retained"
                                 if closeAfterExecution then
-                                    let! closed = bridge.CloseTab(registrationId)
+                                    let! closed = bridge.CloseTab(registrationId, ownerConnectionId = ownerConnectionId)
                                     cleanup <- match closed with
                                                | Ok _ -> "closed"
                                                | Error e -> "cleanupFailed:" + (if e.Length > 100 then e.Substring(0, 100) else e)

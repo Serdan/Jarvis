@@ -474,3 +474,62 @@ The registered window is a destination, **not permission to inspect every tab in
 - [Chrome tabs API](https://developer.chrome.com/docs/extensions/reference/api/tabs) — tab identities, frozen/discarded states and lifecycle fields.
 - [Chrome permissions API](https://developer.chrome.com/docs/extensions/reference/api/permissions) — optional host access and user gestures.
 - [Chrome webNavigation API](https://developer.chrome.com/docs/extensions/reference/api/webNavigation) — navigation/History API events and document identity.
+
+
+## 2026-11-15: multi-profile launch reliability (Worker 5 isolated fix)
+
+### Failure B: oscillating window registry / post-dispatch I/O uncertainty
+
+Source root cause: the earlier client `Service` in `Client/Modules/BrowserBridge.fs`
+stored a single `active: Connection option`. Each new authenticated WebSocket
+explicitly aborted its predecessor and completed that predecessor's pending
+operations with an `IOException` ("outcome unknown"). The extension reconnects
+after closure, so two valid paired profiles could continually evict each other.
+This explains alternating `main` and `agents` visibility,
+`WindowNotRegistered` / `TabNotRegistered` despite a registered tab, and
+post-injection transport failure without proving a failed ChatGPT submission.
+
+The client now preserves independent authenticated connection registries.
+Read-only listings return the union of *explicitly registered* entries; Open,
+Execute, Close and CaptureDom select the owning connection. Aliases or opaque
+registration IDs that collide across connections fail closed as
+`AliasAmbiguous`. A multi-step `runInNewTab` pins the exact authenticated
+connection returned by OpenTab for readiness, execution and cleanup. A different
+profile's coincidentally identical registration ID cannot steal the launch.
+Disconnect only fails that connection's operations; an in-flight operation on
+another connection continues. `needsReauthorization` windows remain unusable,
+and all prior extension-origin/pairing and agent-created close rules remain.
+
+The `BrowserBridgeTests` two-connection fixtures simulate union listings,
+targeted Open/Execute/Close/CaptureDom, collision/revocation, disconnection,
+a new connection during an in-flight request, and a colliding tab during a pinned
+composite launch. These deterministic simulated WebSockets validate the code
+path without changing the live running Jarvis process.
+
+### Failure A: previously submitted composer draft restored in new ChatGPT tab
+
+Observed in the original 2026-11-15 Edge multi-agent launch: a newly created
+`https://chatgpt.com/` tab could display an exact previously submitted
+Jarvis bootstrap. The provider-specific persistence mechanism is **not
+independently established**. The previous `ExistingDraft` refusal was correct
+but required manual intervention.
+
+`browser-scripts/chatgpt/launchAgent.js` still refuses every unknown draft.
+Its optional `confirmedSubmittedPrompts` argument is a bounded array (1-8)
+of **exact bootstrap messages that the caller has already confirmed were sent**
+(e.g., by an earlier returned `submitted` result with a stable conversation
+URL). If, and only if, the current composer text matches one of those strings
+after newline/NBSP normalization, the script selects **only the composer
+contents** and issues a normal `delete` editor command. It verifies the draft
+is empty before inserting the new message. Failed selection/deletion returns a
+pre-send incompatibility; it never proceeds to Send. The script does not query
+ChatGPT private APIs, persist transcript or prompt history, blindly resubmit,
+clear arbitrary drafts, or expose draft text in diagnostics. The caller remains
+responsible for confirmed prior-submission provenance; merely supplying a string
+does not independently prove the prior send.
+
+The Node launcher fixture tests successful exact-match clearing, unknown/invalid
+provenance refusal, deletion failure, and all earlier one-send-only/uncertainty
+cases. Live browser verification of three distinct bootstraps and adverse
+connection flips remains an acceptance step **after authorized installation or
+restart of the modified client**; this worktree is not deployed.

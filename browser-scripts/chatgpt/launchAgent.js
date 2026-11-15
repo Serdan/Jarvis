@@ -77,7 +77,32 @@ async function execute(args) {
   const composer = await until(() => document.querySelector(composerSelector));
   if (!composer) return incompatible("composer", "ComposerUnavailable");
   const readEditor = () => composer.innerText.replace(/\r\n/g, "\n").replace(/\u00a0/g, " ");
-  if (readEditor().trim()) return { status: "notSubmitted", reason: "ExistingDraft" };
+  const restoredDraft = readEditor().trim();
+  if (restoredDraft) {
+    if (restoredDraft === normalizedPrompt) return { status: "notSubmitted", reason: "ExistingDraft" };
+    // Some fresh ChatGPT home tabs restore a previous agent's sent bootstrap.
+    // The caller supplies only prompts with confirmed prior submission evidence;
+    // no prompt history is stored or inferred from arbitrary page text.
+    const confirmed = args?.confirmedSubmittedPrompts;
+    const normalize = text => text.replace(/\r\n/g, "\n").replace(/\u00a0/g, " ").trim();
+    const known =
+      Array.isArray(confirmed) && confirmed.length > 0 && confirmed.length <= 8 &&
+      confirmed.every(text => typeof text === "string" && text.length > 0 && text.length <= 24000) &&
+      confirmed.some(text => normalize(text) === restoredDraft);
+    if (!known) return { status: "notSubmitted", reason: "ExistingDraft" };
+    composer.focus();
+    // Only select the composer content. An editor command, not textContent,
+    // preserves ProseMirror's state, and failure never leads to submission.
+    const selection = window.getSelection();
+    if (!selection) return incompatible("composer", "StaleDraftSelectionUnavailable");
+    const range = document.createRange();
+    range.selectNodeContents(composer);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const removed = document.execCommand("delete", false, null);
+    selection.removeAllRanges();
+    if (!removed || readEditor().trim()) return incompatible("composer", "StaleDraftClearFailed");
+  }
   if (document.querySelector(sendSelector)) return { status: "notSubmitted", reason: "UnexpectedSendState" };
 
   composer.focus();

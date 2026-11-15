@@ -480,15 +480,24 @@ module McpToolHelpers =
                         |> Option.filter (fun receipt -> receipt.ActivatedByThisCall) }
 
     /// A polled tool job carries the exact original response as typed data.
-    /// Present its instructions and canonical side effects with the polling
-    /// envelope, rather than substituting invented empty metadata.
+    /// Preserve the original error and canonical side effects, but also include
+    /// guidance newly delivered to the polling response (notably one-shot
+    /// operator STOP alerts consumed by this very GetJobResult call).
     let completedToolEvidence command (response: AgentCommandResponse) =
         match command, response.Result with
         | GetJobResultCommand _, Some payload ->
             try
                 let job = JsonSerializer.Deserialize<JobResult>(payload)
                 if isNull (box job) then response
-                else job.ToolResponse |> Option.defaultValue response
+                else
+                    match job.ToolResponse with
+                    | Some original ->
+                        let latest =
+                            if isNull (box response.Instructions) then [] else response.Instructions
+                        let originalGuidance =
+                            if isNull (box original.Instructions) then [] else original.Instructions
+                        { original with Instructions = latest @ originalGuidance }
+                    | None -> response
             with _ -> response
         | _ -> response
 

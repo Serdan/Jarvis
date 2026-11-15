@@ -1762,6 +1762,11 @@ let polledToolJobsRestoreExactInstructionsAndMutationEvidence () =
         [ { Scope = "project"; Path = "Jarvis/AGENTS.md"
             Sha256 = "sha256:" + String('c', 64)
             Content = "Canonical instructions from the original command." } ]
+    let pollGuidance =
+        [ { Scope = "response-alert"; Path = "jarvis/response-alert/new-stop"; Sha256 = ""
+            Content = "JARVIS OPERATOR ALERT:\nSTOP - preserve safe work and yield" }
+          { Scope = "working-turn"; Path = ""; Sha256 = ""
+            Content = "HARD STOP: preserve work and yield for duration limit" } ]
     let receipt : AgentInboxActivation =
         { ProjectName = "Jarvis"; AgentId = "Worker 1"
           ActivatedByThisCall = true; BeforeState = Some "Ready"
@@ -1780,11 +1785,15 @@ let polledToolJobsRestoreExactInstructionsAndMutationEvidence () =
               ToolResponse = Some original; OperationId = Some "stable-operation-id" }
         let poll : AgentCommandResponse =
             { Result = Some(JsonSerializer.Serialize job)
-              Error = None; Instructions = []
+              Error = None; Instructions = pollGuidance
               AgentStateChanges = []; InboxActivation = None; PendingJob = None }
         let command = GetJobResultCommand { ProjectName = "Jarvis"; JobId = job.JobId; AfterSequence = None }
         let effective = McpToolHelpers.completedToolEvidence command poll
-        Assert.That(effective, Is.EqualTo(original))
+        // Job completion and poll-time alert delivery happen independently.
+        // The poll must keep the original terminal result and mutations, but
+        // never consume and discard its newly delivered STOP alert.
+        Assert.That({ effective with Instructions = guidance }, Is.EqualTo(original))
+        Assert.That(effective.Instructions = pollGuidance @ guidance, Is.True)
         let displayed =
             poll |> McpToolHelpers.toCallToolResult
             |> McpToolHelpers.attachStateEffects effective
@@ -1792,13 +1801,45 @@ let polledToolJobsRestoreExactInstructionsAndMutationEvidence () =
         Assert.That(displayed.IsError, Is.EqualTo(Nullable false))
         Assert.That(displayed.Meta["jarvis/agent_state_changes"].ToJsonString(), Does.Contain("Worker 1"))
         Assert.That(displayed.Meta["jarvis/inbox_activation"].ToJsonString(), Does.Contain("activation-id"))
+        Assert.That(displayed.Content.Count, Is.EqualTo(5))
         Assert.That((displayed.Content[0] :?> TextContentBlock).Text,
+                    Does.Contain("STOP - preserve safe work and yield"))
+        Assert.That((displayed.Content[1] :?> TextContentBlock).Text,
                     Does.Contain("Canonical instructions from the original command"))
-        use terminalJson = JsonDocument.Parse((displayed.Content[1] :?> TextContentBlock).Text)
+        Assert.That((displayed.Content[2] :?> TextContentBlock).Text,
+                    Does.Contain("HARD STOP: preserve work"))
+        use terminalJson = JsonDocument.Parse((displayed.Content[3] :?> TextContentBlock).Text)
         let terminal = terminalJson.RootElement.GetProperty("ToolResponse")
         Assert.That(terminal.GetProperty("AgentStateChanges").GetArrayLength(), Is.EqualTo(1))
         Assert.That(terminal.GetProperty("Instructions").GetArrayLength(), Is.EqualTo(1))
         Assert.That(terminal.GetProperty("InboxActivation").GetProperty("ActivatedByThisCall").GetBoolean(), Is.True)
+
+[<Test>]
+let pollResponseAlertsRemainVisibleOnPendingAndErroredJobLookups () =
+    let pollCommand = GetJobResultCommand { ProjectName = "Jarvis"; JobId = "job-poll"; AfterSequence = None }
+    let alert =
+        { Scope = "response-alert"; Path = "jarvis/response-alert/new-stop"; Sha256 = ""
+          Content = "JARVIS OPERATOR ALERT:\nSTOP - yield safely" }
+    let inProgress : JobResult =
+        { JobId = "job-poll"; Status = Running
+          Events = []; NextSequence = 0L; Truncated = false
+          ToolResponse = None; OperationId = None }
+    let pendingPoll : AgentCommandResponse =
+        { Result = Some(JsonSerializer.Serialize inProgress); Error = None
+          Instructions = [alert]; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+    let failedPoll : AgentCommandResponse =
+        { pendingPoll with Result = None; Error = Some(NotFound "job not found") }
+    for response in [pendingPoll; failedPoll] do
+        let effective = McpToolHelpers.completedToolEvidence pollCommand response
+        Assert.That(effective, Is.EqualTo(response))
+        let displayed =
+            response |> McpToolHelpers.toCallToolResult
+            |> McpToolHelpers.attachStateEffects effective
+            |> McpToolHelpers.attachInstructions effective.Instructions
+        Assert.That((displayed.Content[0] :?> TextContentBlock).Text,
+                    Does.Contain("STOP - yield safely"))
+        Assert.That(displayed.IsError, Is.EqualTo(Nullable(response.Error.IsSome)))
+        Assert.That(displayed.Meta["jarvis/agent_state_changes"].ToJsonString(), Is.EqualTo("[]"))
 
 [<Test>]
 let pendingToolJobNeverAdvertisesAFalseEmptyMutationList () =

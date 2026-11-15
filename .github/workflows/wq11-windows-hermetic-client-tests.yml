@@ -1,0 +1,89 @@
+name: WQ-11 disposable Windows Client.Tests
+on:
+  push:
+    branches:
+      - fix/wq11-windows-hermetic-client-tests
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-client-tests:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 11.0.x
+
+      - name: Attest disposable scratch outside Windows user profile
+        shell: pwsh
+        run: |
+          $scratch = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
+          $profile = [IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\')
+          if (-not [IO.Directory]::Exists($scratch)) { throw "Missing RUNNER_TEMP" }
+          if ($scratch.Equals($profile, [StringComparison]::OrdinalIgnoreCase) -or
+              $scratch.StartsWith(($profile + '\'), [StringComparison]::OrdinalIgnoreCase)) {
+            throw "RUNNER_TEMP is inside user profile; refuse test execution."
+          }
+          Write-Output "Disposable scratch parent: $scratch"
+          Write-Output "GitHub-hosted ephemeral Windows runner; no real operator profile is mounted."
+
+      - name: Restore and build .NET 11 Release (no test execution)
+        shell: pwsh
+        run: |
+          dotnet --version
+          dotnet restore Client.Tests/Client.Tests.fsproj --nologo
+          if ($LASTEXITCODE -ne 0) { throw "Restore failed" }
+          dotnet build Client.Tests/Client.Tests.fsproj -c Release --no-restore --nologo
+          if ($LASTEXITCODE -ne 0) { throw "Release build failed" }
+
+      - name: Focused Windows known-folder, junction and Git identity tests
+        shell: pwsh
+        run: |
+          dotnet fsi scripts/test-client-hermetic.fsx -- --scratch-parent "$env:RUNNER_TEMP" --no-build --filter "FullyQualifiedName~HermeticHarnessTests" --timeout-seconds 180 --self-test-git-sentinel
+          if ($LASTEXITCODE -ne 0) { throw "Focused hermetic tests failed" }
+
+      - name: Full bounded Client.Tests .NET 11 Release
+        shell: pwsh
+        run: |
+          dotnet fsi scripts/test-client-hermetic.fsx -- --scratch-parent "$env:RUNNER_TEMP" --no-build --timeout-seconds 900
+          if ($LASTEXITCODE -ne 0) { throw "Full hermetic suite failed" }
+
+      - name: Two concurrent isolated Windows testhosts
+        shell: pwsh
+        run: |
+          $root = $env:RUNNER_TEMP
+          $cwd = $PWD.Path
+          $script = {
+            param($scratch, $repository)
+            Set-Location $repository
+            & dotnet fsi scripts/test-client-hermetic.fsx -- --scratch-parent $scratch --no-build --filter "FullyQualifiedName~HermeticHarnessTests" --timeout-seconds 180
+            if ($LASTEXITCODE -ne 0) { throw "Concurrent hermetic testhost failed ($LASTEXITCODE)" }
+          }
+          $a = Start-Job -ScriptBlock $script -ArgumentList $root, $cwd
+          $b = Start-Job -ScriptBlock $script -ArgumentList $root, $cwd
+          try {
+            $complete = @($a, $b) | Wait-Job -Timeout 420
+            @($a, $b) | ForEach-Object {
+              Receive-Job -Job $_
+              if ($_.State -ne "Completed") { throw "Concurrent testhost: $($_.State)" }
+            }
+          } finally {
+            @($a, $b) | Stop-Job -ErrorAction SilentlyContinue
+            @($a, $b) | Remove-Job -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Failed setup must exit nonzero and remove its private scratch
+        shell: pwsh
+        run: |
+          $text = (& dotnet fsi scripts/test-client-hermetic.fsx -- --scratch-parent "$env:RUNNER_TEMP" --self-test-failed-setup 2>&1 | Out-String)
+          $code = $LASTEXITCODE
+          Write-Output $text
+          if ($code -eq 0) { throw "Injected setup failure unexpectedly returned 0" }
+          if ($text -notmatch "scratch cleanup verified = true") { throw "Missing cleanup proof" }

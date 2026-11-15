@@ -14,15 +14,16 @@ let args =
     |> Array.toList
     |> function | "--" :: tail -> tail | rest -> rest
 
-let rec parse timeout forwarded = function
+let rec parse timeout scratchParent forwarded = function
     | "--timeout-seconds" :: value :: tail ->
         match Int32.TryParse value with
-        | true, seconds when seconds >= 10 && seconds <= 900 -> parse seconds forwarded tail
+        | true, seconds when seconds >= 10 && seconds <= 900 -> parse seconds scratchParent forwarded tail
         | _ -> failwith "Timeout must be between 10 and 900 seconds."
-    | head :: tail -> parse timeout (head :: forwarded) tail
-    | [] -> timeout, List.rev forwarded
+    | "--scratch-parent" :: value :: tail -> parse timeout (Some value) forwarded tail
+    | head :: tail -> parse timeout scratchParent (head :: forwarded) tail
+    | [] -> timeout, scratchParent, List.rev forwarded
 
-let timeout, suppliedArgs = parse 240 [] args
+let timeout, scratchParent, suppliedArgs = parse 240 None [] args
 let injectSetupFailure = suppliedArgs |> List.contains "--self-test-failed-setup"
 let injectGitIdentitySentinel = suppliedArgs |> List.contains "--self-test-git-sentinel"
 let forwarded =
@@ -30,10 +31,54 @@ let forwarded =
     |> List.filter (fun arg ->
         arg <> "--self-test-failed-setup" && arg <> "--self-test-git-sentinel")
 
-// Windows Shell known folders do not follow APPDATA/LOCALAPPDATA overrides.
-// Do not run any testhost there until a disposable known-folder resolver exists.
-if not (OperatingSystem.IsLinux()) then
-    failwith "Hermetic Client.Tests runner is Linux-only until Windows/macOS known-folder isolation is implemented."
+// A Windows test runner must be given a pre-existing, disposable directory
+// OUTSIDE the operator profile. Never create scratch under ambient Windows
+// %TEMP% (normally inside the real user's LocalApplicationData).
+if OperatingSystem.IsMacOS() then
+    failwith "Hermetic Client.Tests macOS known-folder isolation is unverified."
+if OperatingSystem.IsWindows() && scratchParent.IsNone then
+    failwith "Windows requires --scratch-parent under an explicitly disposable directory outside the operator profile."
+
+let privatePathComparison =
+    if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase
+    else StringComparison.Ordinal
+
+let sameOrUnder (root: string) (candidate: string) =
+    if String.IsNullOrWhiteSpace root then false
+    else
+        let root = Path.TrimEndingDirectorySeparator(Path.GetFullPath root)
+        let target = Path.TrimEndingDirectorySeparator(Path.GetFullPath candidate)
+        String.Equals(root, target, privatePathComparison)
+        || target.StartsWith(root + string Path.DirectorySeparatorChar, privatePathComparison)
+
+let validateScratchParent (path: string) =
+    if String.IsNullOrWhiteSpace path || not (Path.IsPathFullyQualified path) then
+        failwith "Hermetic scratch parent must be an absolute path."
+    let full = Path.TrimEndingDirectorySeparator(Path.GetFullPath path)
+    if not (Directory.Exists full) then
+        failwith "Hermetic scratch parent must already exist."
+    // No path can be trusted merely because its spelling has a safe prefix.
+    let mutable ancestor = full
+    let mutable checking = true
+    while checking do
+        let attributes = File.GetAttributes ancestor
+        if attributes.HasFlag(FileAttributes.ReparsePoint)
+           || not (isNull (DirectoryInfo(ancestor).LinkTarget)) then
+            failwith "Hermetic scratch parent has a linked/junction ancestor."
+        let parent = Path.GetDirectoryName ancestor
+        if String.IsNullOrWhiteSpace parent || parent = ancestor then
+            checking <- false
+        else ancestor <- parent
+    if OperatingSystem.IsWindows() then
+        for protectedPath in
+            [ Environment.GetFolderPath Environment.SpecialFolder.UserProfile
+              Environment.GetFolderPath Environment.SpecialFolder.ApplicationData
+              Environment.GetFolderPath Environment.SpecialFolder.LocalApplicationData ] do
+            if sameOrUnder protectedPath full then
+                failwith "Hermetic scratch parent must be outside the real Windows user profile."
+    full
+
+let scratchLocation = scratchParent |> Option.map validateScratchParent
 let captureTail (reader: StreamReader) =
     task {
         // Never retain the unbounded output of a failing or chatty test process.
@@ -51,13 +96,26 @@ let captureTail (reader: StreamReader) =
     }
 
 let sourceRoot = Path.GetFullPath(Path.Combine(__SOURCE_DIRECTORY__, ".."))
-let tempDirectory = Directory.CreateTempSubdirectory("jarvis-client-tests-").FullName
+let tempDirectory =
+    match scratchLocation with
+    | Some parent ->
+        // Directory.CreateTempSubdirectory has no parent overload in .NET 11.
+        // Allocate a unique child only under the pre-attested scratch parent.
+        let path = Path.Combine(parent, $"jarvis-client-tests-{Guid.NewGuid():N}")
+        if File.Exists path || Directory.Exists path then
+            failwith "Refusing an already occupied disposable Client.Tests scratch name."
+        let created = Directory.CreateDirectory(path)
+        if created.Attributes.HasFlag(FileAttributes.ReparsePoint) then
+            failwith "Refusing a linked disposable Client.Tests scratch root."
+        created.FullName
+    | None -> Directory.CreateTempSubdirectory("jarvis-client-tests-").FullName
 // Direct/external NUnit fixtures attest that the root and every layout
 // directory are owner-only. Set a known private mode before child startup.
 if OperatingSystem.IsLinux() then
     File.SetUnixFileMode(tempDirectory,
         UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
 printfn "Hermetic Client.Tests: scratch id %s" (Path.GetFileName tempDirectory)
+printfn "Hermetic Client.Tests: scratch path %s" tempDirectory
 let makeDirectory child =
     let path = Path.Combine(tempDirectory, child)
     Directory.CreateDirectory(path) |> ignore
@@ -154,6 +212,7 @@ try
           "GIT_COMMITTER_EMAIL", "jarvis-test@example.invalid"
           "LOCALAPPDATA", data
           "JARVIS_CLIENT_TEST_HERMETIC_ROOT", tempDirectory
+          "NUGET_PACKAGES", Path.Combine(cache, "nuget")
           "DOTNET_CLI_TELEMETRY_OPTOUT", "1"
           "DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1"
           "DOTNET_NOLOGO", "1" ] do
@@ -219,6 +278,7 @@ finally
     // activity, bindings, test output or private temporary credentials.
     if Directory.Exists(tempDirectory) then
         Directory.Delete(tempDirectory, true)
+    printfn "Hermetic Client.Tests: scratch cleanup verified = %b" (not (Directory.Exists tempDirectory))
     if injectSetupFailure then
         eprintfn "Hermetic Client.Tests: scratch cleanup verified = %b" (not (Directory.Exists tempDirectory))
 

@@ -29,7 +29,7 @@ type Settings =
       MaxFileBytes: int64 }
 
 let defaultSettings () =
-    let root = Environment.GetFolderPath Environment.SpecialFolder.LocalApplicationData
+    let root = ClientKnownFolders.localApplicationData()
     { DirectoryPath = Path.Combine(root, "Jarvis", "activity")
       RetentionDays = 14
       MaxFileBytes = 10L * 1024L * 1024L }

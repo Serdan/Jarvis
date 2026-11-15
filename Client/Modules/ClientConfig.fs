@@ -48,8 +48,8 @@ module ClientConfig =
         else Path.Combine(appData, "Jarvis")
 
     let configPath () =
-        let home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
-        let appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData)
+        let home = ClientKnownFolders.userProfile()
+        let appData = ClientKnownFolders.applicationData()
         directoryFor (OperatingSystem.IsLinux()) (OperatingSystem.IsMacOS()) home appData (Environment.GetEnvironmentVariable "XDG_CONFIG_HOME")
         |> fun directory -> Path.Combine(directory, "config.json")
 

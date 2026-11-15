@@ -28,6 +28,7 @@
         <Compile Include="Misc.fs"/>
         <Compile Include="Effect.fs"/>
         <Compile Include="BuildInfo.fs"/>
+        <Compile Include="Modules\ClientKnownFolders.fs"/>
         <Compile Include="IO\ProjectIO.fs"/>
         <Compile Include="IO\FileIO.fs"/>
         <Compile Include="IO\WebIO.fs"/>

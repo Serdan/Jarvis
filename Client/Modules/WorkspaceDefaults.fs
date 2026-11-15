@@ -13,7 +13,7 @@ module WorkspaceDefaults =
             ""
 
     let current () =
-        let userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+        let userHome = ClientKnownFolders.userProfile()
         choose
             (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
             userHome

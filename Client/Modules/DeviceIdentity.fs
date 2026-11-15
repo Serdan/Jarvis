@@ -5,7 +5,7 @@ open System.IO
 
 module DeviceIdentity =
     let private deviceIdPath () =
-        let root = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData)
+        let root = ClientKnownFolders.applicationData()
         let directory = Path.Combine(root, "Jarvis")
         Directory.CreateDirectory(directory) |> ignore
         Path.Combine(directory, "device-id")

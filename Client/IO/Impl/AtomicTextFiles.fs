@@ -12,7 +12,7 @@ open Client
 // canonical filesystem path. Locks deliberately live outside the Git worktree
 // and are never unlinked (unlinking would allow two live lock inodes).
 let private lockDirectory () =
-    let root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)
+    let root = ClientKnownFolders.localApplicationData()
     let directory = Path.Combine(root, "Jarvis", "file-edit-locks")
     if DirectoryInfo(directory).LinkTarget <> null then
         raise (UnauthorizedAccessException "The Jarvis file-lock directory is a symbolic link.")

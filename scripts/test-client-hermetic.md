@@ -1,35 +1,38 @@
-# Hermetic .NET 11 Client.Tests Release runner (Linux only)
+# WQ-11 hermetic .NET 11 Client.Tests Release runner
 
-**Platform scope:** This foundation deliberately supports Linux only. On Windows, .NET `SpecialFolder.ApplicationData` / `LocalApplicationData` may ignore `APPDATA` and `LOCALAPPDATA` environment overrides; on macOS, known-folder resolution is likewise unverified. The runner and global NUnit fixture reject non-Linux execution before any profile config/activity access. The canonical follow-on `wq11-windows-hermetic-client-tests` requires test-only known-folder resolution or a disposable Windows account, Windows .NET 11 Release proof, and a separate accepted frozen review. Do not claim cross-platform hermeticity or remove the fail-closed gate.
+**Evidence boundary:** Linux is verified independently by the preceding WQ-11 foundation review. The Windows follow-on introduces a *test-only* Client known-folder resolver, but Windows support remains unaccepted until the exact frozen source passes the Windows GitHub-hosted ephemeral runner and an independent review. macOS is not supported. Never run bare `dotnet test Client.Tests` against a real Windows user profile.
 
+## Storage isolation
 
-Use `dotnet fsi scripts/test-client-hermetic.fsx --` as the supported Client test entrypoint. It runs `dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-restore`, with NUnit diagnostics, a 75-second per-test hang detector, a 240-second default hard process-tree timeout, and explicit executed-test-count verification. Do not infer success from an empty test discovery or a shell exit code alone.
+All Client-owned paths (config, device identity, activity default, ledger bindings through config, and file-edit locks) use `ClientKnownFolders`. Production resolves the normal OS special folders. The internal `installForTests` scope is exposed only to the `Client.Tests` friend assembly, not through environment variables or the shipping CLI. The global NUnit setup fixture installs it only after checking every externally supplied sandbox path, root ancestor and descendant for lexical containment and symlink/junction/reparse points. On Linux it also enforces owner-only 0700 directories and 0600 Git config. On Windows use an **ephemeral Windows machine/user** and a pre-existing scratch parent outside the real user profile; the runner refuses Windows without `--scratch-parent` and rejects a linked parent or a path inside UserProfile/ApplicationData/LocalApplicationData.
 
-Before the first run in a new worktree:
+The runner launches the testhost with disposable HOME, USERPROFILE, XDG paths, APPDATA/LOCALAPPDATA, DOTNET_CLI_HOME, TEMP/TMP/TMPDIR, and a disposable Git global config, clearing inherited `GIT_*` (including `GIT_CONFIG_COUNT`, identities, repository/index overrides). It uses a hard process-tree timeout, bounded stdout/stderr tails, a nonzero-test-count assertion, and cleanup on successful execution, setup failure, test failure, and timeout. Root path/cleanup evidence is printed. The parent Jarvis client and operator environment remain unchanged.
+
+## Linux commands
 
 ```sh
 dotnet restore Client.Tests/Client.Tests.fsproj
 dotnet build Client.Tests/Client.Tests.fsproj -c Release --no-restore
+dotnet fsi scripts/test-client-hermetic.fsx -- --no-build --filter 'FullyQualifiedName~HermeticHarnessTests' --timeout-seconds 180 --self-test-git-sentinel
+dotnet fsi scripts/test-client-hermetic.fsx -- --no-build --timeout-seconds 900
 ```
 
-Full suite (bounded), once Release binaries exist:
+## Windows validation (disposable VM only)
+
+The workflow `.github/workflows/wq11-windows-hermetic-client-tests.yml` runs on GitHub-hosted `windows-latest` with .NET 11 Release, attests that `RUNNER_TEMP` is outside `USERPROFILE`, then runs focused tests, all Client.Tests, two concurrent isolated testhosts, and a deliberately failed setup. A CI worker is an ephemeral Windows OS profile: it is not the operator's Windows account. The caller must provide an explicit existing safe scratch parent (e.g. the workflow's `$env:RUNNER_TEMP`) because the ambient Windows temp directory typically belongs to a real profile.
+
+```powershell
+dotnet fsi scripts/test-client-hermetic.fsx -- --scratch-parent "$env:RUNNER_TEMP" --no-build --filter "FullyQualifiedName~HermeticHarnessTests" --timeout-seconds 180 --self-test-git-sentinel
+dotnet fsi scripts/test-client-hermetic.fsx -- --scratch-parent "$env:RUNNER_TEMP" --no-build --timeout-seconds 900
+```
+
+The setup fixture refuses direct Windows runs without the externally supplied `JARVIS_CLIENT_TEST_HERMETIC_ROOT` provisioned by the runner. The Windows regression explicitly verifies that real shell special-folder paths are *not* spoofed, while Client config, activity, ledger, identity, and temp resolve into the private root. The linked-ancestor regression creates a Windows directory junction (or Unix symlink) only between two disposable roots. Any timeout, discovered-test count zero, unsupported platform, invalid parent, unexpected exit, or failed cleanup is a **failure**, not a pass.
+
+## Negative-space probes
 
 ```sh
-dotnet fsi scripts/test-client-hermetic.fsx -- --no-build --timeout-seconds 240
+dotnet fsi scripts/test-client-hermetic.fsx -- --self-test-failed-setup
+dotnet fsi scripts/test-client-hermetic.fsx -- --no-build --filter 'FullyQualifiedName~nonexistent-test-name' --timeout-seconds 120
 ```
 
-Target a fixture/module without skipping it silently:
-
-```sh
-dotnet fsi scripts/test-client-hermetic.fsx -- --no-build --filter 'FullyQualifiedName~ActivityLogTests' --timeout-seconds 120
-```
-
-The runner creates one randomly named private directory per invocation, sets HOME, USERPROFILE, XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_STATE_HOME, XDG_CACHE_HOME, XDG_RUNTIME_DIR, APPDATA, LOCALAPPDATA, DOTNET_CLI_HOME, TEMP, TMP, and TMPDIR **before launching the testhost**, and removes the directory on success, test failure, launch failure, and timeout. It also strips every inherited `GIT_*` override (including Git author/committer identity, `GIT_CONFIG_COUNT`, injected parameters and repository/index bindings) before installing **per-run disposable Git global config** and explicit test-only `GIT_AUTHOR_*` / `GIT_COMMITTER_*` values. Offline Git fixtures therefore cannot inherit the operator's identity or higher-precedence configuration. Use `--self-test-git-sentinel` to inject synthetic higher-precedence identity/config sentinels *before* sanitization and filter `FullyQualifiedName~git_commit_identity_does_not_inherit_operator_or_sentinel_overrides` to prove author and committer in a disposable Git commit. The parent Jarvis client and operator environment are not modified. The global NUnit SetUpFixture in `Client.Tests/HermeticHarnessTests.fs` independently verifies that all supplied layout directories match the expected disposable paths, that no sandbox ancestor or leaf is a symlink/junction/reparse point, that all scratch directories are owner-only (0700) and the Git config is private (0600), and that Client config, activity, application-data, temp and Git config resolve physically within the private root. Two throwaway directories test linked `config`/`data` escape rejection without using any operator profile data. A direct `dotnet test` launch creates its own disposable fixture root, provides the same temporary Git identity, and fails closed if the OS runtime has already cached an unsafe special-folder mapping.
-
-The path checks are read-only with respect to the operator's `~/.config/Jarvis`: neither the runner nor the proof tests read, rewrite or enumerate live activity, identity, client configuration, or ledger-binding data. Intentional `UnauthorizedAccessException` and `InvalidDataException` diagnostics may appear in negative ActivityLog tests without indicating that live files were accessed.
-
-For the full suite, increase the bounded hard timeout (for example `--timeout-seconds 900`) if a known expensive test family exhausts the 240-second default. A timeout is a FAIL and needs named diagnosis or segmented reruns; it is not an acceptance signal.
-
-For concurrent-process regression, launch **two instances** with `--no-build --filter FullyQualifiedName~HermeticHarnessTests` in parallel. Each has an independently generated HOME/XDG/tmp tree and must report a nonzero executed-test count and exit 0. For cleanup-after-failed-setup regression, run `dotnet fsi scripts/test-client-hermetic.fsx -- --self-test-failed-setup`; it must exit nonzero and print `scratch cleanup verified = true`. This flag is for harness diagnostics only.
-
-The temporary NUnit results directory and potential hang-diagnostic artifacts are deleted with the sandbox. Always report exact Release test counts and named failures/hangs; hard timeouts and zero executed tests are failures, never PASS. This WQ-11 preparatory change does not modify production service, scheduler, account/project ledgers, or WQ-01 contract fixtures.
+The failure probe must exit nonzero and report `scratch cleanup verified = true`. The zero-discovery probe must return exit 2. Two concurrent invocations of the focused filter must have different scratch IDs, positive executed-test counts, and independently verified cleanup. No production service restart, migration, live operator data access, or WQ-01 source change belongs to this task.

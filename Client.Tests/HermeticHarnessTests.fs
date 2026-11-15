@@ -8,10 +8,11 @@ open Client
 
 /// Global NUnit fixture: neither wrapped nor direct Client.Tests runs may use
 /// the operator's config, activity, ledger, temporary paths, or Git identity.
-/// Windows/macOS are deliberately unsupported until known-folder isolation is implemented.
+/// Windows requires an externally provisioned disposable root; macOS is not verified.
 [<SetUpFixture>]
 type HermeticClientTestEnvironment() =
     let mutable ownedRoot : string option = None
+    let mutable knownFolderOverride : IDisposable option = None
     let mutable originalEnvironment : (string * string) list = []
 
     static member Under (root: string) (path: string) =
@@ -40,7 +41,17 @@ type HermeticClientTestEnvironment() =
                 raise (UnauthorizedAccessException("Refusing a linked/reparse-point Client.Tests sandbox path."))
         if not (Directory.Exists canonicalRoot) then
             raise (UnauthorizedAccessException("Hermetic Client.Tests sandbox root is missing."))
-        rejectLink canonicalRoot
+        // Reject a linked ancestor of the root as well as linked descendants.
+        // A Windows junction above the root is otherwise invisible to a
+        // lexical Path.GetFullPath check.
+        let mutable ancestor = canonicalRoot
+        let mutable checking = true
+        while checking do
+            rejectLink ancestor
+            let parent = Path.GetDirectoryName ancestor
+            if String.IsNullOrEmpty parent || parent = ancestor then
+                checking <- false
+            else ancestor <- parent
         let relative = Path.GetRelativePath(canonicalRoot, Path.GetFullPath(path))
         let segments = relative.Split([| Path.DirectorySeparatorChar; Path.AltDirectorySeparatorChar |],
                                       StringSplitOptions.RemoveEmptyEntries)
@@ -58,7 +69,7 @@ type HermeticClientTestEnvironment() =
                 UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute
             else
                 UnixFileMode.UserRead ||| UnixFileMode.UserWrite
-        if File.GetUnixFileMode(path) <> expected then
+        if not (OperatingSystem.IsWindows()) && File.GetUnixFileMode(path) <> expected then
             raise (UnauthorizedAccessException("Hermetic Client.Tests requires owner-only scratch permissions."))
 
     static member private Layout (root: string) =
@@ -76,6 +87,8 @@ type HermeticClientTestEnvironment() =
           "GIT_COMMITTER_NAME"; "GIT_COMMITTER_EMAIL" ]
 
     member private _.Restore() =
+        knownFolderOverride |> Option.iter (fun scope -> scope.Dispose())
+        knownFolderOverride <- None
         for key, value in originalEnvironment do
             Environment.SetEnvironmentVariable(key, value)
         originalEnvironment <- []
@@ -84,12 +97,14 @@ type HermeticClientTestEnvironment() =
 
     [<OneTimeSetUp>]
     member this.BeforeAll() =
-        // .NET Windows known folders ignore process APPDATA overrides. Until a
-        // test-only Windows path resolver exists, fail before touching a profile.
-        if not (OperatingSystem.IsLinux()) then
-            failwith "Hermetic Client.Tests currently supports Linux only; Windows/macOS known-folder isolation is a tracked follow-on."
-
+        if OperatingSystem.IsMacOS() then
+            failwith "Hermetic Client.Tests macOS known-folder isolation has not been verified."
         let externallyManaged = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_HERMETIC_ROOT")
+        // Direct Windows testhost execution would allocate inside the real
+        // profile's TEMP. Require the runner to provision the scratch tree
+        // before the NUnit process starts.
+        if OperatingSystem.IsWindows() && String.IsNullOrWhiteSpace externallyManaged then
+            failwith "Windows Client.Tests must run through the disposable hermetic harness."
         let root =
             if String.IsNullOrWhiteSpace externallyManaged then
                 let created = Directory.CreateTempSubdirectory("jarvis-client-tests-direct-").FullName
@@ -133,7 +148,9 @@ type HermeticClientTestEnvironment() =
             // Externally managed roots must supply exactly the expected layout.
             // Checking every directory before config/activity access rejects
             // config/data links even when their lexical prefix is private.
-            let comparison = StringComparison.Ordinal
+            let comparison =
+                if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase
+                else StringComparison.Ordinal
             for key, expected in layout do
                 let actual = Environment.GetEnvironmentVariable key
                 if String.IsNullOrWhiteSpace actual ||
@@ -147,6 +164,11 @@ type HermeticClientTestEnvironment() =
                 raise (UnauthorizedAccessException("Hermetic Git config is missing."))
             HermeticClientTestEnvironment.AssertPrivatePath root gitConfig
             HermeticClientTestEnvironment.AssertOwnerOnly gitConfig false
+            // Only after containment and layout checks can the test assembly
+            // replace Client-owned Windows known-folder resolution. The normal
+            // executable has no environment-controlled path override.
+            knownFolderOverride <- Some (ClientKnownFolders.installForTests root)
+
             // Do not inherit even higher-precedence per-command Git identity,
             // configuration injection or repository/index overrides.
             for key in gitVariables do
@@ -161,10 +183,16 @@ type HermeticClientTestEnvironment() =
             let paths =
                 [ "ClientConfig", ClientConfig.configPath()
                   "ActivityLog", ActivityLog.defaultSettings().DirectoryPath
-                  "ApplicationData", Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData)
-                  "LocalApplicationData", Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)
+                  "Client ApplicationData", ClientKnownFolders.applicationData()
+                  "Client LocalApplicationData", ClientKnownFolders.localApplicationData()
+                  "Client UserProfile", ClientKnownFolders.userProfile()
+                  "Ledger binding", OrchestrationApi.LedgerBindingConfig.pathForRoot root
                   "test temporary directory", Path.GetTempPath()
                   "Git global config", Environment.GetEnvironmentVariable("GIT_CONFIG_GLOBAL") ]
+                @ (if OperatingSystem.IsLinux() then
+                       [ "OS ApplicationData", Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData)
+                         "OS LocalApplicationData", Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) ]
+                   else [])
             for description, path in paths do
                 try HermeticClientTestEnvironment.AssertPrivatePath root path
                 with :? UnauthorizedAccessException as ex ->
@@ -189,6 +217,55 @@ module HermeticHarnessTests =
         Assert.That(File.ReadAllText(git), Does.Contain("jarvis-test@example.invalid"))
 
     [<Test>]
+    let client_storage_and_ledger_are_resolved_inside_disposable_known_folders () =
+        let root = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_HERMETIC_ROOT")
+        let paths =
+            [ ClientConfig.configPath()
+              ActivityLog.defaultSettings().DirectoryPath
+              OrchestrationApi.LedgerBindingConfig.pathForRoot root
+              ClientKnownFolders.applicationData()
+              ClientKnownFolders.localApplicationData()
+              ClientKnownFolders.userProfile()
+              Path.GetTempPath() ]
+        for path in paths do HermeticClientTestEnvironment.AssertPrivatePath root path
+        Assert.That(ClientKnownFolders.applicationData(), Is.EqualTo(Path.Combine(root, "config")))
+        Assert.That(ClientKnownFolders.localApplicationData(), Is.EqualTo(Path.Combine(root, "data")))
+        Assert.That(ClientKnownFolders.userProfile(), Is.EqualTo(Path.Combine(root, "home")))
+        // On Windows shell known folders must NOT be spoofed by env vars;
+        // only Client storage resolves through the test-only override.
+        if OperatingSystem.IsWindows() then
+            Assert.That(
+                HermeticClientTestEnvironment.Under root
+                    (Environment.GetFolderPath Environment.SpecialFolder.ApplicationData),
+                Is.False)
+            Assert.That(
+                HermeticClientTestEnvironment.Under root
+                    (Environment.GetFolderPath Environment.SpecialFolder.LocalApplicationData),
+                Is.False)
+        let deviceId = DeviceIdentity.getOrCreate()
+        Assert.That(Guid.TryParse deviceId |> fst, Is.True)
+        let devicePath = Path.Combine(root, "config", "Jarvis", "device-id")
+        HermeticClientTestEnvironment.AssertPrivatePath root devicePath
+        Assert.That(File.Exists devicePath, Is.True)
+
+    let private createLinkedDirectory (link: string) (outside: string) =
+        if OperatingSystem.IsWindows() then
+            // Junction creation is available to unprivileged Windows users.
+            let start = ProcessStartInfo("cmd.exe", $"/d /c mklink /J \"{link}\" \"{outside}\"")
+            start.UseShellExecute <- false
+            start.RedirectStandardOutput <- true
+            start.RedirectStandardError <- true
+            use child = Process.Start(start)
+            let output = child.StandardOutput.ReadToEnd()
+            let error = child.StandardError.ReadToEnd()
+            if not (child.WaitForExit(10000)) then
+                child.Kill(true)
+                failwith "Disposable Windows junction creation timed out."
+            Assert.That(child.ExitCode, Is.EqualTo(0), output + error)
+        else
+            Directory.CreateSymbolicLink(link, outside) |> ignore
+
+    [<Test>]
     let linked_config_and_activity_ancestors_are_rejected_without_outside_writes () =
         // Both roots are disposable. Never use or inspect a real user directory.
         let root = Directory.CreateTempSubdirectory("jarvis-link-root-").FullName
@@ -201,19 +278,28 @@ module HermeticHarnessTests =
             HermeticClientTestEnvironment.AssertPrivatePath root normal
             let weakPermissions = Path.Combine(root, "weak-permissions")
             Directory.CreateDirectory(weakPermissions) |> ignore
-            File.SetUnixFileMode(weakPermissions,
-                UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute ||| UnixFileMode.GroupRead)
-            Assert.Throws<UnauthorizedAccessException>(
-                TestDelegate(fun () -> HermeticClientTestEnvironment.AssertOwnerOnly weakPermissions true))
-            |> ignore
+            if not (OperatingSystem.IsWindows()) then
+                File.SetUnixFileMode(weakPermissions,
+                    UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute ||| UnixFileMode.GroupRead)
+                Assert.Throws<UnauthorizedAccessException>(
+                    TestDelegate(fun () -> HermeticClientTestEnvironment.AssertOwnerOnly weakPermissions true))
+                |> ignore
             for name in [ "config"; "data" ] do
                 let link = Path.Combine(root, name)
-                Directory.CreateSymbolicLink(link, outside) |> ignore
+                createLinkedDirectory link outside
                 try
                     let escaped = Path.Combine(link, "Jarvis", "activity", "state.json")
                     Assert.That(HermeticClientTestEnvironment.Under root escaped, Is.True)
                     Assert.Throws<UnauthorizedAccessException>(
                         TestDelegate(fun () -> HermeticClientTestEnvironment.AssertPrivatePath root escaped))
+                    |> ignore
+                    let nested = Path.Combine(outside, "nested")
+                    Directory.CreateDirectory(nested) |> ignore
+                    Assert.Throws<UnauthorizedAccessException>(
+                        TestDelegate(fun () ->
+                            HermeticClientTestEnvironment.AssertPrivatePath
+                                (Path.Combine(link, "nested"))
+                                (Path.Combine(link, "nested", "config.json"))))
                     |> ignore
                     Assert.That(File.ReadAllText marker, Is.EqualTo("sentinel"))
                     Assert.That(File.Exists(Path.Combine(outside, "Jarvis", "activity", "state.json")), Is.False)

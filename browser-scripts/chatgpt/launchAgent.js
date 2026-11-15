@@ -9,6 +9,11 @@ async function execute(args) {
   if (location.href !== startUrl) {
     return { status: "notSubmitted", reason: "UnexpectedStartUrl" };
   }
+  // Never change even the mode in an already established conversation.
+  if (document.querySelectorAll('[data-message-author-role="user"]').length ||
+      document.querySelectorAll('[data-user-message-bubble]').length) {
+    return { status: "notSubmitted", reason: "ExistingConversation" };
+  }
   // A single budget for hydration, insertion, acknowledgement and route capture.
   // Leaves a three-second margin inside the bridge's 30-second execution limit.
   const overallMs = Math.min(Math.max(Number(args.timeoutMs) || 27000, 100), 27000);
@@ -73,12 +78,34 @@ async function execute(args) {
   // Current ChatGPT renders user messages under data-user-message-bubble,
   // without the older data-message-author-role marker.
   const initialBubbles = document.querySelectorAll('[data-user-message-bubble]').length;
+  // This script is for new Jarvis-owned home tabs only. An existing user turn
+  // means this is not an empty new-chat surface, even if the URL still matches.
+  if (initialUrl !== startUrl || initialTurns || initialBubbles) {
+    return { status: "notSubmitted", reason: "ExistingConversation" };
+  }
   const normalizedPrompt = prompt.replace(/\r\n/g, "\n").replace(/\u00a0/g, " ").trim();
   const composer = await until(() => document.querySelector(composerSelector));
   if (!composer) return incompatible("composer", "ComposerUnavailable");
+  if (location.href !== startUrl) return { status: "notSubmitted", reason: "UnexpectedStartUrl" };
   const readEditor = () => composer.innerText.replace(/\r\n/g, "\n").replace(/\u00a0/g, " ");
-  if (readEditor().trim()) return { status: "notSubmitted", reason: "ExistingDraft" };
+  if ((composer.textContent || "").length > 0) {
+    // Only actual editor text, not a rendered empty-paragraph newline,
+    // counts as a restored draft.
+    // Any restored draft on the newly Jarvis-created home tab is disposable.
+    // Replace it through ProseMirror editing, not direct DOM text mutation.
+    composer.focus();
+    const selection = window.getSelection();
+    if (!selection) return incompatible("composer", "DraftSelectionUnavailable");
+    const range = document.createRange();
+    range.selectNodeContents(composer);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const removed = document.execCommand("delete", false, null);
+    selection.removeAllRanges();
+    if (!removed || (composer.textContent || "").length > 0) return incompatible("composer", "DraftClearFailed");
+  }
   if (document.querySelector(sendSelector)) return { status: "notSubmitted", reason: "UnexpectedSendState" };
+  if (location.href !== startUrl) return { status: "notSubmitted", reason: "UnexpectedStartUrl" };
 
   composer.focus();
   // ProseMirror must observe the editing operation. Setting textContent bypasses its state.
@@ -91,6 +118,7 @@ async function execute(args) {
   if (readEditor() !== prompt.replace(/\r\n/g, "\n")) {
     return incompatible("composer", "ComposerChanged");
   }
+  if (location.href !== startUrl) return { status: "notSubmitted", reason: "UnexpectedStartUrl" };
   // Once this click is attempted the effect is non-idempotent. Never try again.
   try {
     sendAttempted = true;

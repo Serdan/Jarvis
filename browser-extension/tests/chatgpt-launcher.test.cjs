@@ -9,10 +9,12 @@ const source = fs.readFileSync(path.resolve(__dirname, "../../browser-scripts/ch
 function harness(options = {}) {
   const site = { origin: "https://chatgpt.com", href: options.startUrl || "https://chatgpt.com/" };
   let content = options.existingDraft || "";
-  let userTurns = 0;
+  let userTurns = options.initialUserTurns || 0;
+  let lastSubmittedText = null;
   let renderedBubble = null;
   let clicks = 0;
   let focused = false;
+  let editorSelected = false;
   let mode = options.initialMode || "Chat";
   let chatClicks = 0;
   const makeMode = name => ({
@@ -32,7 +34,8 @@ function harness(options = {}) {
   const chatMode = makeMode("Chat");
   const workMode = makeMode("Work");
   const editor = {
-    get innerText() { return content; },
+    get innerText() { return content || (options.emptyRenderedNewline ? "\n" : ""); },
+    get textContent() { return content; },
     focus() { focused = true; }
   };
   const send = { click() {
@@ -43,6 +46,7 @@ function harness(options = {}) {
     }
     if (!options.noRoute) setTimeout(() => { site.href = "https://chatgpt.com/c/00000000-0000-0000-0000-000000000001"; }, options.routeDelayMs || 0);
     const submittedText = content;
+    lastSubmittedText = submittedText;
     content = "";
     userTurns++;
     if (options.renderUserBubble) {
@@ -51,11 +55,27 @@ function harness(options = {}) {
       }, options.bubbleDelayMs || 0);
     }
   }};
+  const selection = {
+    removeAllRanges() { editorSelected = false; },
+    addRange(range) { editorSelected = range.composerSelected === true; }
+  };
   const document = {
     readyState: "complete",
+    createRange() {
+      return {
+        composerSelected: false,
+        selectNodeContents(node) { this.composerSelected = node === editor; }
+      };
+    },
     execCommand(command, _, value) {
-      if (options.throwOnInsert) throw new Error("ProseMirror changed unexpectedly");
-      if (!focused || command !== "insertText") return false;
+      if (options.throwOnInsert && command === "insertText") throw new Error("ProseMirror changed unexpectedly");
+      if (!focused) return false;
+      if (command === "delete") {
+        if (!editorSelected || options.clearFails) return false;
+        content = options.clearLeavesText ? "residual draft" : "";
+        return true;
+      }
+      if (command !== "insertText") return false;
       content = options.insertWrong ? "wrong" : value;
       return true;
     },
@@ -85,13 +105,14 @@ function harness(options = {}) {
         ? Array(userTurns).fill({}) : [];
     }
   };
-  const ctx = vm.createContext({ document, location: site, setTimeout, Date, URL });
-  const run = async (prompt = "Start fresh\nRead Jarvis assignment") =>
+  const window = { getSelection: () => options.selectionUnavailable ? null : selection };
+  const ctx = vm.createContext({ document, window, location: site, setTimeout, Date, URL });
+  const run = async (prompt = "Start fresh\nRead Jarvis assignment", extra = {}) =>
     await vm.runInContext(source + "\nexecute(" + JSON.stringify({
-      prompt, timeoutMs: options.timeoutMs || 350
+      prompt, timeoutMs: options.timeoutMs || 350, ...extra
     }) + ")", ctx);
   return { run, site, get clicks() { return clicks; }, get chatClicks() { return chatClicks; },
-    get mode() { return mode; }, get content() { return content; } };
+    get mode() { return mode; }, get content() { return content; }, get lastSubmittedText() { return lastSubmittedText; } };
 }
 
 test("inserts multiline prompt through editor and submits once", async () => {
@@ -103,13 +124,82 @@ test("inserts multiline prompt through editor and submits once", async () => {
   assert.deepEqual(Array.from(result.evidence), ["newUserTurn", "conversationRoute"]);
 });
 
-test("does not overwrite a restored draft", async () => {
-  const h = harness({ existingDraft: "unsent text" });
-  const result = await h.run();
-  assert.equal(result.status, "notSubmitted");
-  assert.equal(result.reason, "ExistingDraft");
+test("replaces arbitrary restored draft with exact intended bootstrap once", async () => {
+  const h = harness({ existingDraft: "Personal unsent text from another session" });
+  const result = await h.run("Worker 2 bootstrap");
+  assert.equal(result.status, "submitted");
+  assert.equal(h.lastSubmittedText, "Worker 2 bootstrap");
+  assert.equal(h.clicks, 1);
+  assert.equal(JSON.stringify(result).includes("Personal unsent text"), false);
+});
+
+test("replaces an identical restored draft instead of refusing", async () => {
+  const h = harness({ existingDraft: "Worker 1 bootstrap" });
+  const result = await h.run("Worker 1 bootstrap");
+  assert.equal(result.status, "submitted");
+  assert.equal(h.lastSubmittedText, "Worker 1 bootstrap");
+  assert.equal(h.clicks, 1);
+});
+
+test("empty editor's visual paragraph newline is not mistaken for a real restored draft", async () => {
+  const h = harness({ emptyRenderedNewline: true, clearFails: true });
+  const result = await h.run("New bootstrap");
+  assert.equal(result.status, "submitted");
+  assert.equal(h.lastSubmittedText, "New bootstrap");
+  assert.equal(h.clicks, 1);
+});
+
+test("clears whitespace-only restored composer content", async () => {
+  const h = harness({ existingDraft: "   " });
+  const result = await h.run("Worker 3 bootstrap");
+  assert.equal(result.status, "submitted");
+  assert.equal(h.lastSubmittedText, "Worker 3 bootstrap");
+  assert.equal(h.clicks, 1);
+});
+
+test("no prior-send evidence is needed or considered", async () => {
+  const h = harness({ existingDraft: "Unrelated text" });
+  const result = await h.run("New bootstrap", { confirmedSubmittedPrompts: ["irrelevant", 123] });
+  assert.equal(result.status, "submitted");
+  assert.equal(h.lastSubmittedText, "New bootstrap");
+  assert.equal(h.clicks, 1);
+});
+
+test("failed draft deletion never inserts or sends", async () => {
+  const h = harness({ existingDraft: "Old bootstrap", clearFails: true });
+  const result = await h.run("New bootstrap");
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.reason, "DraftClearFailed");
+  assert.equal(h.content, "Old bootstrap");
   assert.equal(h.clicks, 0);
-  assert.equal(h.content, "unsent text");
+});
+
+test("partially cleared draft never inserts or sends", async () => {
+  const h = harness({ existingDraft: "Old bootstrap", clearLeavesText: true });
+  const result = await h.run("New bootstrap");
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.reason, "DraftClearFailed");
+  assert.equal(h.content, "residual draft");
+  assert.equal(h.clicks, 0);
+});
+
+test("unavailable selection preserves existing text without sending", async () => {
+  const h = harness({ existingDraft: "Old bootstrap", selectionUnavailable: true });
+  const result = await h.run("New bootstrap");
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.reason, "DraftSelectionUnavailable");
+  assert.equal(h.content, "Old bootstrap");
+  assert.equal(h.clicks, 0);
+});
+
+test("existing conversation on a home-looking URL is not edited", async () => {
+  const h = harness({ existingDraft: "A personal draft", initialUserTurns: 1, initialMode: "Work" });
+  const result = await h.run("New bootstrap");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "ExistingConversation");
+  assert.equal(h.content, "A personal draft");
+  assert.equal(h.chatClicks, 0);
+  assert.equal(h.clicks, 0);
 });
 
 test("does not click Send if editor rejects insertion", async () => {
@@ -293,4 +383,13 @@ test("only a client-local temporary conversation route is still uncertain and ca
   assert.equal(result.reason, "ConversationUrlUnavailable");
   assert.equal(h.clicks, 1);
   assert.equal(result.conversationUrl, undefined);
+});
+
+test("existing conversation with draft is not touched", async () => {
+  const h = harness({ startUrl: "https://chatgpt.com/c/existing", existingDraft: "Personal text" });
+  const result = await h.run("Jarvis bootstrap");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "UnexpectedStartUrl");
+  assert.equal(h.content, "Personal text");
+  assert.equal(h.clicks, 0);
 });

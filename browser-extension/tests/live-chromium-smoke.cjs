@@ -433,13 +433,20 @@ async function main() {
         && m.windows?.some(x => x.alias === "e2e-window" && x.availability === "ready"));
     }
     phases.push("Authenticated loopback pairing");
+    // Pin the exact window identity and generation used by the bridge. The
+    // extension must not silently resolve a mutable alias on tab creation.
+    const pinnedWindow = (await fromExtension({ kind: "getState" })).windows
+      .find(w => w.alias === "e2e-window");
+    assert.ok(pinnedWindow?.windowRegistration && pinnedWindow.registrationGeneration > 0);
+    const openPin = { windowRegistration: pinnedWindow.windowRegistration,
+      registrationGeneration: pinnedWindow.registrationGeneration };
     await assert.rejects(
-      () => bridge.request({ kind: "openTab", windowRegistration: "e2e-window",
+      () => bridge.request({ kind: "openTab", ...openPin,
         url: "https://example.invalid/no", alias: "not-granted", active: false }),
       /BrowserPermissionMissing/);
     phases.push("Unapproved destination denied");
     const opened = await bridge.request({
-      kind: "openTab", windowRegistration: "e2e-window",
+      kind: "openTab", ...openPin,
       url: "http://127.0.0.1:" + bridge.port + "/fixture?agent",
       alias: "e2e-agent", active: false
     });

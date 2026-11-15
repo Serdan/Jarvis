@@ -334,7 +334,8 @@ For diagnosis, expose optional coarse timings (tab ready, composer ready, text a
 | No pairing/registered window/host permission/extension opt-in | `notSubmitted` | Operator resolves consent/configuration; no alternate-window fallback |
 | Registered window closed, moved, or stale after browser restart | `notSubmitted` | Explicitly re-register/rebind window; do not target another window |
 | Page fails to load; login/challenge/incorrect project | `notSubmitted` | Report typed reason; no automatic bypass |
-| Composer missing or contains restored draft | `notSubmitted` | Leave draft unchanged; report/diagnose |
+| Restored draft in fresh Jarvis-created home tab | `submitted` after verification, otherwise `uiIncompatible` | Replace only that tab's composer using editor commands; no prior-send evidence required |
+| Composer missing, deletion fails, or an existing conversation is detected | `notSubmitted` / `uiIncompatible` | Never send or touch the unrelated conversation |
 | Text insertion fails exact verification; Send never enabled | `notSubmitted` | No click; safe to inspect/fix script |
 | Send clicked, UI reports new turn and route | `submitted` | Record URL; close owned tab |
 | Send clicked, no conclusive acknowledgement before timeout | `outcomeUnknown` | No replay; preserve evidence and preferably tab |
@@ -363,7 +364,7 @@ No new task database, browser automation engine, direct HTTP ChatGPT integration
 
 **Unit / simulation tests**
 - The script waits through delayed hydration, finds the current ProseMirror textbox, inserts multiline Unicode text via editing operations, verifies exact content, waits for **Send** to replace **Start voice**, and clicks Send once.
-- Empty, pre-populated/restored, replaced, disabled, loading, duplicate, and misleading composer/button fixtures fail safely. The script does not target arbitrary page submit buttons.
+- Empty and arbitrary restored-draft fixtures on fresh owned tabs submit exactly once after verified replacement; deletion/insertion failures, existing conversations and misleading composer/button fixtures fail safely. The script does not target arbitrary page submit buttons.
 - Verified post-submit transition yields `submitted` and actual same-origin conversation URL. Click without acknowledgement yields `outcomeUnknown`; no second click.
 - ChatGPT UI remains independent of hashed CSS class names and internal `prepare`/`conversation` network messages.
 - Correct project context is enforced when requested; missing/wrong context does not submit.

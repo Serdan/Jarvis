@@ -25,6 +25,7 @@ let sessionEpoch = null;
 let configuredPort = 43822;
 let secret = "";
 let allowAgentCreatedTabs = false;
+let agentTabAuthorizationEpoch = 0;
 let openQueue = Promise.resolve();
 let registryWriteQueue = Promise.resolve();
 let initPromise = null;
@@ -180,6 +181,68 @@ async function assess(reg) {
     return "ready";
   } catch { return "needsReauthorization"; }
 }
+// Page access is pinned at receipt. assess() awaits Chrome and can report a
+// stale "ready" after the operator revokes an agent-created tab in that await.
+// Recheck all local authorities synchronously after the final Chrome query.
+function pinPageExecution(reg, generation, requestSocket, requestConnection) {
+  const window = reg.agentCreated
+    ? registeredWindows.find(w => w.registrationId === reg.windowRegistration)
+    : null;
+  return { reg, generation, agentCreated: reg.agentCreated === true,
+    authorizationEpoch: agentTabAuthorizationEpoch, sessionEpoch,
+    window, windowGeneration: window?.generation,
+    socket: requestSocket, connectionId: requestConnection };
+}
+function pageExecutionRevocation(pin) {
+  if (socket !== pin.socket || !connected || connectionId !== pin.connectionId)
+    return "ConnectionEpochMismatch";
+  const reg = pin.reg;
+  if (registrations.find(r => r.registrationId === reg.registrationId) !== reg ||
+      reg.registrationGeneration !== pin.generation ||
+      (reg.agentCreated === true) !== pin.agentCreated)
+    return "RegistrationStale";
+  if (pin.agentCreated) {
+    if (!allowAgentCreatedTabs) return "AgentCreatedTabsDisabled";
+    if (agentTabAuthorizationEpoch !== pin.authorizationEpoch)
+      return "AgentCreatedTabsAuthorizationChanged";
+  }
+  if (reg.blocked || reg.sessionEpoch !== sessionEpoch || sessionEpoch !== pin.sessionEpoch)
+    return "RegistrationStale";
+  if (pin.agentCreated &&
+      (!pin.window ||
+       registeredWindows.find(w => w.registrationId === reg.windowRegistration) !== pin.window ||
+       pin.window.generation !== pin.windowGeneration ||
+       pin.window.blocked || pin.window.sessionEpoch !== sessionEpoch))
+    return "WindowRegistrationChanged";
+  return null;
+}
+async function authorizePageExecution(pin) {
+  const initialRevocation = pageExecutionRevocation(pin);
+  if (initialRevocation) return initialRevocation;
+  let tab, window, permission;
+  try {
+    tab = await chrome.tabs.get(pin.reg.tabId);
+    if (pin.agentCreated) window = await validWindow(pin.reg.windowRegistration);
+    // This must be the last awaited preflight check. Subsequent checks are
+    // synchronous and execute() / captureDom() inject without another await.
+    const origin = pin.agentCreated
+      ? pin.reg.boundOrigin : new URL(pin.reg.boundUrl).origin;
+    permission = await chrome.permissions.contains({ origins: [origin + "/*"] });
+  } catch {
+    return pageExecutionRevocation(pin) || "TabUnavailable:needsReauthorization";
+  }
+  const revocation = pageExecutionRevocation(pin);
+  if (revocation) return revocation;
+  if (!permission) return "BrowserPermissionMissing";
+  if (pin.agentCreated && (window !== pin.window || tab.windowId !== window?.windowId))
+    return "WindowRegistrationChanged";
+  if (!isAllowedUrl(tab.url) || tab.discarded || tab.frozen || tab.status !== "complete" ||
+      (pin.agentCreated
+        ? new URL(tab.url).origin !== pin.reg.boundOrigin
+        : tab.url !== pin.reg.boundUrl))
+    return "TabUnavailable:needsReauthorization";
+  return null;
+}
 async function refreshRegistrations() {
   const missing = new Set();
   for (const reg of [...registrations]) {
@@ -245,7 +308,11 @@ async function connect() {
         if (message.connectionId === connectionId) snapshots.delete(message.snapshotId);
       } else if (message.kind === "openTab" && connected) {
         // Serialize creations to enforce alias uniqueness and the tab quota.
-        openQueue = openQueue.then(() => openNewTab(message)).catch(() => {});
+        // Pin authority when the socket receives the request, not when its
+        // turn in the queue arrives (a disable/re-enable must not revive it).
+        const requestContext = { socket: ws, connectionId,
+          authorizationEpoch: agentTabAuthorizationEpoch };
+        openQueue = openQueue.then(() => openNewTab(message, requestContext)).catch(() => {});
       } else if (message.kind === "closeTab" && connected) {
         openQueue = openQueue.then(() => closeCreatedTab(message)).catch(() => {});
       } else if (message.kind === "ping") {
@@ -280,11 +347,21 @@ async function execute(message) {
       bytes(JSON.stringify(args)) > 65536) return error("InputTooLarge");
   if (inflight >= 4) return error("BridgeBusy");
   const registration = registrations.find(r => r.registrationId === registrationId);
-  if (!registration || registration.registrationGeneration !== registrationGeneration) {
+  if (!registration || registration.registrationGeneration !== registrationGeneration ||
+      (message.requireAgentCreated === true && registration.agentCreated !== true)) {
     return error("RegistrationStale");
   }
+  const pagePin = pinPageExecution(registration, registrationGeneration, requestSocket, requestConnection);
   const state = await assess(registration);
+  const revocation = pageExecutionRevocation(pagePin);
+  if (revocation) return error(revocation);
   if (state !== "ready") return error("TabUnavailable:" + state);
+  // assess() awaits Chrome APIs. Registration may be reclaimed or revoked while
+  // it runs; re-check ownership before the irreversible page execution.
+  if (registrations.find(r => r.registrationId === registrationId) !== registration ||
+      registration.registrationGeneration !== registrationGeneration ||
+      (message.requireAgentCreated === true && registration.agentCreated !== true))
+    return error("RegistrationStale");
   let api;
   try { api = chrome.userScripts; } catch { return error("AllowUserScriptsDisabled"); }
   if (typeof api?.execute !== "function") return error("AllowUserScriptsDisabled");
@@ -305,6 +382,10 @@ async function execute(message) {
       "return await execute(" + invocationArguments + ");\n") +
     "})()";
   if (bytes(wrapper) > 140000) return error("InputTooLarge");
+  const finalAuthorization = await authorizePageExecution(pagePin);
+  if (finalAuthorization) return error(finalAuthorization);
+  const lastRevocation = pageExecutionRevocation(pagePin);
+  if (lastRevocation) return error(lastRevocation);
   inflight++;
   try {
     const results = await api.execute({
@@ -491,7 +572,11 @@ async function captureDom(message) {
   const reg = registrations.find(r => r.registrationId === registrationId);
   if (!reg || reg.registrationGeneration !== registrationGeneration)
     return reject("RegistrationStale");
-  if (await assess(reg) !== "ready") return reject("TabUnavailable");
+  const pagePin = pinPageExecution(reg, registrationGeneration, requestSocket, requestConnection);
+  const state = await assess(reg);
+  const revocation = pageExecutionRevocation(pagePin);
+  if (revocation) return reject(revocation);
+  if (state !== "ready") return reject("TabUnavailable");
   const api = chrome.userScripts;
   if (typeof api?.execute !== "function") return reject("AllowUserScriptsDisabled");
   const options = { timeoutMs: message.timeoutMs, wait: message.wait,
@@ -502,6 +587,10 @@ async function captureDom(message) {
   const source = "(async () => { if (!(" + identityCheck +
     ")) return {failure:'NavigationDuringCapture'}; return (" +
     capturePage.toString() + ")(" + JSON.stringify(options) + "); })()";
+  const finalAuthorization = await authorizePageExecution(pagePin);
+  if (finalAuthorization) return reject(finalAuthorization);
+  const lastRevocation = pageExecutionRevocation(pagePin);
+  if (lastRevocation) return reject(lastRevocation);
   inflight++;
   try {
     const results = await api.execute({ target: { tabId: reg.tabId },
@@ -577,10 +666,10 @@ async function readSnapshotChunk(message) {
     offset: message.offset, data: btoa(binary) });
 }
 
-async function openNewTab(message) {
+async function openNewTab(message, requestContext) {
   const { requestId } = message;
-  const requestSocket = socket;
-  const requestConnection = connectionId;
+  const { socket: requestSocket, connectionId: requestConnection,
+    authorizationEpoch: requestAuthorizationEpoch } = requestContext;
   const respond = payload => {
     if (socket === requestSocket && connected && connectionId === requestConnection) {
       send({ requestId, connectionId: requestConnection, ...payload });
@@ -589,7 +678,10 @@ async function openNewTab(message) {
   function reject(error) { respond({ kind: "error", error }); }
 
   if (message.connectionId !== requestConnection) return reject("ConnectionEpochMismatch");
+  if (socket !== requestSocket || !connected || connectionId !== requestConnection) return;
   if (!allowAgentCreatedTabs) return reject("AgentCreatedTabsDisabled");
+  if (agentTabAuthorizationEpoch !== requestAuthorizationEpoch)
+    return reject("AgentCreatedTabsAuthorizationChanged");
   if (typeof message.url !== "string" || message.url.length > 2048 || !isAllowedUrl(message.url)) {
     return reject("InvalidTabUrl");
   }
@@ -603,14 +695,47 @@ async function openNewTab(message) {
   if (registrations.filter(r => r.agentCreated && !r.blocked && r.sessionEpoch === sessionEpoch).length >= MAX_AGENT_TABS) {
     return reject("AgentTabLimitReached");
   }
+  // The bridge resolves aliases to an immutable registration + generation before
+  // dispatch. Never re-resolve its original alias to another user window.
+  const expectedGeneration = message.registrationGeneration;
+  if (!Number.isInteger(expectedGeneration) || expectedGeneration < 1)
+    return reject("WindowRegistrationChanged");
   const window = await validWindow(message.windowRegistration);
   if (!window) return reject("WindowNotRegistered");
+  if (window.registrationId !== message.windowRegistration ||
+      window.generation !== expectedGeneration)
+    return reject("WindowRegistrationChanged");
   let tabCreated = false;
   try {
     const permission = await chrome.permissions.contains({ origins: [target.origin + "/*"] });
+    if (socket !== requestSocket || !connected || connectionId !== requestConnection) return;
+    if (!allowAgentCreatedTabs) return reject("AgentCreatedTabsDisabled");
+    if (agentTabAuthorizationEpoch !== requestAuthorizationEpoch)
+      return reject("AgentCreatedTabsAuthorizationChanged");
     if (!permission) return reject("BrowserPermissionMissing");
-    if (socket !== requestSocket || !connected || connectionId !== requestConnection ||
-        !allowAgentCreatedTabs || !(await validWindow(window.registrationId))) return;
+    // Permission queries await Chrome. A user might have re-registered or
+    // revoked the selected window in the interim.
+    const currentWindow = await validWindow(message.windowRegistration);
+    // Window lookup also awaits Chrome: its result does not prove that site
+    // permission still exists. Recheck it after that lookup, then synchronously
+    // revalidate all pinned authorities before the irreversible tabs.create.
+    if (!currentWindow || currentWindow !== window ||
+        currentWindow.registrationId !== message.windowRegistration ||
+        currentWindow.generation !== expectedGeneration ||
+        currentWindow.windowId !== window.windowId)
+      return reject("WindowRegistrationChanged");
+    const finalPermission = await chrome.permissions.contains({ origins: [target.origin + "/*"] });
+    if (socket !== requestSocket || !connected || connectionId !== requestConnection) return;
+    if (!allowAgentCreatedTabs) return reject("AgentCreatedTabsDisabled");
+    if (agentTabAuthorizationEpoch !== requestAuthorizationEpoch)
+      return reject("AgentCreatedTabsAuthorizationChanged");
+    if (!finalPermission) return reject("BrowserPermissionMissing");
+    if (!registeredWindows.includes(window) || window.blocked ||
+        window.sessionEpoch !== sessionEpoch ||
+        window.registrationId !== message.windowRegistration ||
+        window.generation !== expectedGeneration ||
+        window.windowId !== currentWindow.windowId)
+      return reject("WindowRegistrationChanged");
 
     // Creating the tab is the irreversible operation; a transport failure afterwards
     // is reported as indeterminate and must not be blindly retried by Jarvis.
@@ -661,9 +786,21 @@ async function closeCreatedTab(message) {
     return reject("RegistrationStale");
   const parent = await validWindow(reg.windowRegistration);
   if (!parent) return reject("WindowNotRegistered");
+  const parentGeneration = parent.generation;
   let tab;
   try { tab = await chrome.tabs.get(reg.tabId); } catch { return reject("TabMissing"); }
   if (tab.windowId !== parent.windowId) return reject("WindowMismatch");
+  // assess(), window lookup and tabs.get all await Chrome APIs. The operator
+  // may have adopted this created tab in the meantime. A cleanup request
+  // must never close that now user-owned registration.
+  const finalParent = await validWindow(reg.windowRegistration);
+  if (registrations.find(r => r.registrationId === registrationId) !== reg ||
+      !reg.agentCreated || reg.registrationGeneration !== registrationGeneration)
+    return reject("TabNotAgentCreated");
+  if (reg.blocked || reg.sessionEpoch !== sessionEpoch || !allowAgentCreatedTabs ||
+      !finalParent || finalParent !== parent || finalParent.generation !== parentGeneration ||
+      finalParent.windowId !== tab.windowId)
+    return reject("RegistrationStale");
   try {
     await chrome.tabs.remove(reg.tabId);
     registrations = registrations.filter(r => r !== reg);
@@ -775,6 +912,8 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
     }
     if (message.kind === "setAgentCreatedTabs") {
       if (typeof message.allowed !== "boolean") throw new Error("Invalid setting");
+      // A disable/re-enable cycle must not revive an in-flight OpenTab.
+      agentTabAuthorizationEpoch++;
       allowAgentCreatedTabs = message.allowed;
       await chrome.storage.local.set({ [OPEN_TABS_KEY]: allowAgentCreatedTabs });
       if (!allowAgentCreatedTabs) {

@@ -474,3 +474,61 @@ The registered window is a destination, **not permission to inspect every tab in
 - [Chrome tabs API](https://developer.chrome.com/docs/extensions/reference/api/tabs) — tab identities, frozen/discarded states and lifecycle fields.
 - [Chrome permissions API](https://developer.chrome.com/docs/extensions/reference/api/permissions) — optional host access and user gestures.
 - [Chrome webNavigation API](https://developer.chrome.com/docs/extensions/reference/api/webNavigation) — navigation/History API events and document identity.
+
+
+## 2026-11-15: multi-profile launch reliability (Worker 5 isolated fix)
+
+### Failure B: oscillating window registry / post-dispatch I/O uncertainty
+
+Source root cause: the earlier client `Service` in `Client/Modules/BrowserBridge.fs`
+stored a single `active: Connection option`. Each new authenticated WebSocket
+explicitly aborted its predecessor and completed that predecessor's pending
+operations with an `IOException` ("outcome unknown"). The extension reconnects
+after closure, so two valid paired profiles could continually evict each other.
+This explains alternating `main` and `agents` visibility,
+`WindowNotRegistered` / `TabNotRegistered` despite a registered tab, and
+post-injection transport failure without proving a failed ChatGPT submission.
+
+The client now preserves independent authenticated connection registries.
+Read-only listings return the union of *explicitly registered* entries; Open,
+Execute, Close and CaptureDom select the owning connection. Aliases or opaque
+registration IDs that collide across connections fail closed as
+`AliasAmbiguous`. A multi-step `runInNewTab` pins the exact authenticated
+connection returned by OpenTab for readiness, execution and cleanup. A different
+profile's coincidentally identical registration ID cannot steal the launch.
+Disconnect only fails that connection's operations; an in-flight operation on
+another connection continues. `needsReauthorization` windows remain unusable,
+and all prior extension-origin/pairing and agent-created close rules remain.
+
+The `BrowserBridgeTests` two-connection fixtures simulate union listings,
+targeted Open/Execute/Close/CaptureDom, collision/revocation, disconnection,
+a new connection during an in-flight request, and a colliding tab during a pinned
+composite launch. These deterministic simulated WebSockets validate the code
+path without changing the live running Jarvis process.
+
+### Failure A: restored draft in fresh Jarvis-created ChatGPT home tab
+
+During the 2026-11-15 Edge multi-agent launch, a newly opened
+`https://chatgpt.com/` tab occasionally displayed an earlier bootstrap.
+The precise provider-side persistence mechanism remains unverified. The
+initial `ExistingDraft` refusal protected unknown user text but blocked
+disposable, newly Jarvis-created agent tabs.
+
+The operator clarified that **any** composer text restored in a freshly
+Jarvis-created home tab is disposable. `browser-scripts/chatgpt/launchAgent.js`
+now selects only that tab's composer and uses ordinary editor deletion
+before inserting the exact intended bootstrap. It verifies the composer
+is empty, then verifies the inserted text before clicking Send once.
+It no longer accepts or requires `confirmedSubmittedPrompts` evidence.
+Selection/deletion/insertion failure returns a pre-send incompatibility.
+A changed route, an existing conversation, or an uncertain post-Send
+result never causes a retry or retarget to an unrelated tab.
+
+The ownership restriction is enforced by using the generic
+`BrowserRunInNewTab` path with an explicitly user-registered window.
+It is **not** permission to run the script against an unrelated
+manually registered user tab; a home URL alone does not prove provenance.
+The Node fixtures cover arbitrary, identical and whitespace-only drafts,
+failed deletion, existing conversations and one-send-only uncertainty.
+Live verification of three distinct bootstraps and connection flips
+still requires authorized installation or restart of the modified client.

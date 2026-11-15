@@ -64,6 +64,14 @@ let private waitUntil condition = task {
     Assert.That(valid, Is.True, "Timed out awaiting registry synchronization")
 }
 
+let private registerReadyAgentWindow (socket: ClientWebSocket) (bridge: BrowserBridge.Service) = task {
+    do! send socket """{"version":2,"kind":"windows","windows":[{"windowRegistration":"window-agents","alias":"agents","availability":"ready","registrationGeneration":1}]}"""
+    do! waitUntil (fun () ->
+        match bridge.ListWindows() with
+        | Ok listing -> listing.Contains("window-agents")
+        | Error _ -> false)
+}
+
 [<Test>]
 let pairingAndExecution () = task {
     let port = findPort()
@@ -210,19 +218,22 @@ let openTabUsesPairedExtensionAndReturnsRegistration () = task {
     bridge.Start()
     let! client, connectionId = handshake port "test-secret"
     use socket = client
+    do! registerReadyAgentWindow socket bridge
 
     let opening = bridge.OpenTab("agents", "https://example.test/chat/new", "agent-new", false)
     let! request = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     Assert.That(property request "kind", Is.EqualTo("openTab"))
     Assert.That(property request "url", Is.EqualTo("https://example.test/chat/new"))
-    Assert.That(property request "windowRegistration", Is.EqualTo("agents"))
+    Assert.That(property request "windowRegistration", Is.EqualTo("window-agents"))
+    use selectedWindow = JsonDocument.Parse(request)
+    Assert.That(selectedWindow.RootElement.GetProperty("registrationGeneration").GetInt32(), Is.EqualTo(1))
     Assert.That(property request "alias", Is.EqualTo("agent-new"))
     use requestDoc = JsonDocument.Parse(request)
     Assert.That(requestDoc.RootElement.GetProperty("active").GetBoolean(), Is.False)
     let response = JsonSerializer.Serialize({|
         version = 2; kind = "tabOpened"
         requestId = property request "requestId"; connectionId = connectionId
-        tab = {| registrationId = "created-id-01"; alias = "agent-new"; availability = "loading"; agentCreated = true |}
+        tab = {| registrationId = "created-id-01"; alias = "agent-new"; availability = "loading"; agentCreated = true; registrationGeneration = 1 |}
     |})
     do! send socket response
     let! result = opening
@@ -272,12 +283,12 @@ let immediateLaunchUsesRegisteredWindowAndClosesOnlyCreatedTab () = task {
                      "async function execute(args) { return {status:'submitted'}; }" """{"prompt":"Go"}""" 5000 true
     let! openedRequest = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     Assert.That(property openedRequest "kind", Is.EqualTo("openTab"))
-    Assert.That(property openedRequest "windowRegistration", Is.EqualTo("agents"))
+    Assert.That(property openedRequest "windowRegistration", Is.EqualTo("window-01"))
     do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"created-tab-01","alias":"agent-new","agentCreated":true,"availability":"ready","registrationGeneration":1}]}"""
     do! send socket (JsonSerializer.Serialize({|
         version = 2; kind = "tabOpened"; requestId = property openedRequest "requestId"
         connectionId = connectionId
-        tab = {| registrationId = "created-tab-01"; availability = "ready"; agentCreated = true |}
+        tab = {| registrationId = "created-tab-01"; availability = "ready"; agentCreated = true; registrationGeneration = 1 |}
     |}))
     let! executeFrame = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     Assert.That(property executeFrame "kind", Is.EqualTo("executeJs"))
@@ -313,6 +324,7 @@ let compositeLaunchRetriesOnlyConfirmedPreInjectionLoadingFailures () = task {
     bridge.Start()
     let! client, connectionId = handshake port "test-secret"
     use socket = client
+    do! registerReadyAgentWindow socket bridge
     let launch = BrowserBridge.runInNewTab bridge "agents" "https://chatgpt.com/" "" false
                      "async function execute(args) { return { status: 'submitted' }; }"
                      """{"prompt":"Hi"}""" 5000 false
@@ -321,14 +333,14 @@ let compositeLaunchRetriesOnlyConfirmedPreInjectionLoadingFailures () = task {
 
     // New tab advertises loading before navigating; composite must not inject
     // until it observes ready, even if tabOpened was already acknowledged.
-    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"retry-tab","availability":"loading","registrationGeneration":1}]}"""
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"retry-tab","agentCreated":true,"availability":"loading","registrationGeneration":1}]}"""
     do! send socket (JsonSerializer.Serialize({|
         version = 2; kind = "tabOpened"; requestId = property opened "requestId"
         connectionId = connectionId
-        tab = {| registrationId = "retry-tab"; availability = "loading"; agentCreated = true |}
+        tab = {| registrationId = "retry-tab"; availability = "loading"; agentCreated = true; registrationGeneration = 1 |}
     |}))
     do! Task.Delay(80)
-    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"retry-tab","availability":"ready","registrationGeneration":1}]}"""
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"retry-tab","agentCreated":true,"availability":"ready","registrationGeneration":1}]}"""
     let! firstExecute = (receive socket).WaitAsync(TimeSpan.FromSeconds(4.0))
     Assert.That(property firstExecute "kind", Is.EqualTo("executeJs"))
     Assert.That(property firstExecute "registrationId", Is.EqualTo("retry-tab"))
@@ -369,14 +381,15 @@ let compositeLaunchNeverReplaysUncertainPostInjectionOutcome () = task {
     bridge.Start()
     let! client, connectionId = handshake port "test-secret"
     use socket = client
+    do! registerReadyAgentWindow socket bridge
     let launch = BrowserBridge.runInNewTab bridge "agents" "https://chatgpt.com/" "" false
                      "async function execute(args) { submitMessage(); return args; }" "{}" 5000 true
     let! opened = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
-    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"uncertain-tab","availability":"ready","registrationGeneration":1}]}"""
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"uncertain-tab","agentCreated":true,"availability":"ready","registrationGeneration":1}]}"""
     do! send socket (JsonSerializer.Serialize({|
         version = 2; kind = "tabOpened"; requestId = property opened "requestId"
         connectionId = connectionId
-        tab = {| registrationId = "uncertain-tab"; availability = "ready"; agentCreated = true |}
+        tab = {| registrationId = "uncertain-tab"; availability = "ready"; agentCreated = true; registrationGeneration = 1 |}
     |}))
     let! executed = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     Assert.That(property executed "kind", Is.EqualTo("executeJs"))
@@ -427,6 +440,7 @@ let compositeLaunchKeepsUncertainTabButClosesDefinitiveFailure (scriptStatus: st
     bridge.Start()
     let! client, connectionId = handshake port "test-secret"
     use socket = client
+    do! registerReadyAgentWindow socket bridge
     let launch = BrowserBridge.runInNewTab bridge "agents" "https://chatgpt.com/" "" false
                      "async function execute(args) { return args; }" "{}" 5000 true
     let! openFrame = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
@@ -434,7 +448,7 @@ let compositeLaunchKeepsUncertainTabButClosesDefinitiveFailure (scriptStatus: st
     do! send socket (JsonSerializer.Serialize({|
         version = 2; kind = "tabOpened"; requestId = property openFrame "requestId"
         connectionId = connectionId
-        tab = {| registrationId = "created-tab-02"; availability = "ready"; agentCreated = true |}
+        tab = {| registrationId = "created-tab-02"; availability = "ready"; agentCreated = true; registrationGeneration = 1 |}
     |}))
     let! executeFrame = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     Assert.That(property executeFrame "kind", Is.EqualTo("executeJs"))
@@ -477,6 +491,7 @@ let compositeNotReadyCleanupReportsFailureOrConfirmedClosure () = task {
     bridge.Start()
     let! client, connectionId = handshake port "test-secret"
     use socket = client
+    do! registerReadyAgentWindow socket bridge
 
     // These two workflows wait for distinct created tabs that become discarded.
     // They exercise the real 30-second bounded readiness path concurrently.
@@ -788,4 +803,268 @@ let snapshotExportDeadlineStopsSlowChunksWithoutPublishing () = task {
         Assert.That(IO.File.Exists(target), Is.False)
     finally
         IO.Directory.Delete(dir, true)
+}
+
+
+[<Test>]
+let twoExtensionsKeepIndependentRegistriesAndRouteByOwner () = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let! first, firstId = handshake port "test-secret"
+    use socketA = first
+    let! second, secondId = handshake port "test-secret"
+    use socketB = second
+    do! send socketA """{"version":2,"kind":"windows","windows":[{"windowRegistration":"window-main","alias":"main","availability":"ready","registrationGeneration":1}]}"""
+    do! send socketA """{"version":2,"kind":"registrations","tabs":[{"registrationId":"tab-a-ready","alias":"first","availability":"ready","registrationGeneration":1}]}"""
+    do! send socketA """{"version":2,"kind":"capabilities","features":["domSnapshotV1"]}"""
+    do! send socketB """{"version":2,"kind":"windows","windows":[{"windowRegistration":"window-agents","alias":"agents","availability":"ready","registrationGeneration":2}]}"""
+    do! send socketB """{"version":2,"kind":"registrations","tabs":[{"registrationId":"tab-b-ready","alias":"second","availability":"ready","registrationGeneration":2},{"registrationId":"tab-b-created","alias":"closing","agentCreated":true,"availability":"ready","registrationGeneration":2}]}"""
+    do! waitUntil (fun () ->
+        bridge.ListWindows() |> Result.exists (fun json -> json.Contains("window-main") && json.Contains("window-agents")) &&
+        bridge.ListTabs() |> Result.exists (fun json -> json.Contains("tab-a-ready") && json.Contains("tab-b-ready")))
+
+    let executionA = bridge.Execute("first", "document.title", "{}", 3000, true)
+    let! executeA = (receive socketA).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property executeA "kind", Is.EqualTo("executeJs"))
+    Assert.That(property executeA "registrationId", Is.EqualTo("tab-a-ready"))
+    do! send socketA (JsonSerializer.Serialize({|
+        version = 2; kind = "result"; requestId = property executeA "requestId"
+        connectionId = firstId; registrationId = "tab-a-ready"; registrationGeneration = 1
+        result = "first-profile"
+    |}))
+    match! executionA with
+    | Ok value -> Assert.That(value, Does.Contain("first-profile"))
+    | Error error -> Assert.Fail(error)
+
+    let executionB = bridge.Execute("second", "document.title", "{}", 3000, true)
+    let! executeB = (receive socketB).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property executeB "kind", Is.EqualTo("executeJs"))
+    Assert.That(property executeB "registrationId", Is.EqualTo("tab-b-ready"))
+    do! send socketB (JsonSerializer.Serialize({|
+        version = 2; kind = "result"; requestId = property executeB "requestId"
+        connectionId = secondId; registrationId = "tab-b-ready"; registrationGeneration = 2
+        result = "second-profile"
+    |}))
+    match! executionB with
+    | Ok value -> Assert.That(value, Does.Contain("second-profile"))
+    | Error error -> Assert.Fail(error)
+
+    let opening = bridge.OpenTab("agents", "https://example.test/new", "new", false)
+    let! openFrame = (receive socketB).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property openFrame "kind", Is.EqualTo("openTab"))
+    Assert.That(property openFrame "windowRegistration", Is.EqualTo("window-agents"))
+    do! send socketB (JsonSerializer.Serialize({|
+        version = 2; kind = "tabOpened"; requestId = property openFrame "requestId"
+        connectionId = secondId
+        tab = {| registrationId = "tab-b-new"; agentCreated = true; registrationGeneration = 1 |}
+    |}))
+    match! opening with
+    | Ok value -> Assert.That(value, Does.Contain("tab-b-new"))
+    | Error error -> Assert.Fail(error)
+
+    let closing = bridge.CloseTab("closing")
+    let! closeFrame = (receive socketB).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property closeFrame "kind", Is.EqualTo("closeTab"))
+    Assert.That(property closeFrame "registrationId", Is.EqualTo("tab-b-created"))
+    do! send socketB (JsonSerializer.Serialize({|
+        version = 2; kind = "tabClosed"; requestId = property closeFrame "requestId"
+        connectionId = secondId; registrationId = "tab-b-created"; registrationGeneration = 2
+    |}))
+    match! closing with
+    | Ok _ -> ()
+    | Error error -> Assert.Fail(error)
+
+    let capturing = bridge.CaptureDom("first", """{"kind":"immediate"}""", "", 3000, None)
+    let! captureFrame = (receive socketA).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property captureFrame "kind", Is.EqualTo("captureDom"))
+    Assert.That(property captureFrame "registrationId", Is.EqualTo("tab-a-ready"))
+    let markup = "<div>owned by first extension</div>"
+    do! send socketA (JsonSerializer.Serialize({|
+        version = 2; kind = "snapshotReady"; requestId = property captureFrame "requestId"
+        connectionId = firstId; registrationId = "tab-a-ready"; registrationGeneration = 1
+        bytes = Encoding.UTF8.GetByteCount(markup)
+        title = "First"; url = "https://example.test/first"
+        capturedAtUtc = "2026-11-15T01:00:00Z"; waitKind = "immediate"; html = markup
+    |}))
+    match! capturing with
+    | Ok value -> Assert.That(value, Does.Contain("owned by first extension"))
+    | Error error -> Assert.Fail(error)
+}
+
+[<Test>]
+let revokedAmbiguousAndDisconnectedExtensionsFailClosed () = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let! first, firstId = handshake port "test-secret"
+    use socketA = first
+    let! second, _ = handshake port "test-secret"
+    use socketB = second
+    do! send socketA """{"version":2,"kind":"windows","windows":[{"windowRegistration":"window-main","alias":"main","availability":"ready","registrationGeneration":1}]}"""
+    do! send socketA """{"version":2,"kind":"registrations","tabs":[{"registrationId":"tab-a-owned","alias":"collision","availability":"ready","registrationGeneration":1}]}"""
+    do! send socketB """{"version":2,"kind":"windows","windows":[{"windowRegistration":"window-revoked","alias":"agents","availability":"needsReauthorization","registrationGeneration":1}]}"""
+    do! send socketB """{"version":2,"kind":"registrations","tabs":[{"registrationId":"tab-b-revoked","alias":"collision","availability":"needsReauthorization","registrationGeneration":1}]}"""
+    do! waitUntil (fun () ->
+        bridge.ListWindows() |> Result.exists (fun json -> json.Contains("window-main") && json.Contains("window-revoked")) &&
+        bridge.ListTabs() |> Result.exists (fun json -> json.Contains("tab-a-owned") && json.Contains("tab-b-revoked")))
+
+    match! bridge.OpenTab("agents", "https://example.test/", "", false) with
+    | Error error -> Assert.That(error, Is.EqualTo("WindowUnavailable:needsReauthorization"))
+    | Ok _ -> Assert.Fail("Revoked window must not be used")
+    match! bridge.Execute("collision", "document.title", "{}", 3000, true) with
+    | Error error -> Assert.That(error, Is.EqualTo("AliasAmbiguous"))
+    | Ok _ -> Assert.Fail("Colliding aliases must fail closed")
+    match! bridge.Execute("tab-b-revoked", "document.title", "{}", 3000, true) with
+    | Error error -> Assert.That(error, Is.EqualTo("TabUnavailable:needsReauthorization"))
+    | Ok _ -> Assert.Fail("Revoked tab must not execute")
+
+    do! send socketB """{"version":2,"kind":"registrations","tabs":[{"registrationId":"tab-a-owned","alias":"other","availability":"ready","registrationGeneration":1}]}"""
+    do! waitUntil (fun () ->
+        bridge.ListTabs() |> Result.exists (fun json -> json.Contains("other")))
+    match! bridge.Execute("tab-a-owned", "document.title", "{}", 3000, true) with
+    | Error error -> Assert.That(error, Is.EqualTo("AliasAmbiguous"))
+    | Ok _ -> Assert.Fail("Colliding registration IDs must fail closed")
+
+    socketB.Abort()
+    do! waitUntil (fun () ->
+        bridge.ListWindows() |> Result.exists (fun json -> json.Contains("window-main") && not (json.Contains("window-revoked"))))
+    match! bridge.OpenTab("agents", "https://example.test/", "", false) with
+    | Error error -> Assert.That(error, Is.EqualTo("WindowNotRegistered"))
+    | Ok _ -> Assert.Fail("Disconnected extension cannot receive opens")
+    let execution = bridge.Execute("collision", "document.title", "{}", 3000, true)
+    let! frame = (receive socketA).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property frame "registrationId", Is.EqualTo("tab-a-owned"))
+    do! send socketA (JsonSerializer.Serialize({|
+        version = 2; kind = "result"; requestId = property frame "requestId"
+        connectionId = firstId; registrationId = "tab-a-owned"; registrationGeneration = 1
+        result = "surviving-profile"
+    |}))
+    match! execution with
+    | Ok value -> Assert.That(value, Does.Contain("surviving-profile"))
+    | Error error -> Assert.Fail(error)
+}
+
+
+[<Test>]
+let secondExtensionArrivingDuringExecutionDoesNotAbortFirst () = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let! first, firstId = handshake port "test-secret"
+    use socketA = first
+    do! send socketA """{"version":2,"kind":"registrations","tabs":[{"registrationId":"inflight-a","alias":"inflight","availability":"ready","registrationGeneration":1}]}"""
+    do! waitUntil (fun () ->
+        bridge.ListTabs() |> Result.exists (fun value -> value.Contains("inflight-a")))
+    let pending = bridge.Execute("inflight", "performOneNonIdempotentAction()", "{}", 3000, true)
+    let! request = (receive socketA).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property request "kind", Is.EqualTo("executeJs"))
+    let! second, _ = handshake port "test-secret"
+    use socketB = second
+    do! send socketB """{"version":2,"kind":"windows","windows":[{"windowRegistration":"other-window","alias":"other","availability":"ready","registrationGeneration":1}]}"""
+    do! waitUntil (fun () ->
+        bridge.ListWindows() |> Result.exists (fun value -> value.Contains("other-window")))
+    do! send socketA (JsonSerializer.Serialize({|
+        version = 2; kind = "result"; requestId = property request "requestId"
+        connectionId = firstId; registrationId = "inflight-a"; registrationGeneration = 1
+        result = {| status = "submitted"; count = 1 |}
+    |}))
+    match! pending with
+    | Ok value -> Assert.That(value, Does.Contain("\"count\":1"))
+    | Error error -> Assert.Fail("A second extension must not cancel the first: " + error)
+    Assert.That(bridge.ListTabs() |> Result.exists (fun value -> value.Contains("inflight-a")), Is.True)
+}
+
+[<Test>]
+let compositeLaunchPinsOwnershipAcrossCollidingSecondExtension () = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let! first, firstId = handshake port "test-secret"
+    use socketA = first
+    do! registerReadyAgentWindow socketA bridge
+    let launch = BrowserBridge.runInNewTab bridge "agents" "https://chatgpt.com/" "" false
+                     "async function execute(args) { return { status: 'submitted' }; }" "{}" 3000 true
+    let! openFrame = (receive socketA).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property openFrame "kind", Is.EqualTo("openTab"))
+    do! send socketA """{"version":2,"kind":"registrations","tabs":[{"registrationId":"same-created-id","alias":"mine","agentCreated":true,"availability":"loading","registrationGeneration":7}]}"""
+    do! send socketA (JsonSerializer.Serialize({|
+        version = 2; kind = "tabOpened"; requestId = property openFrame "requestId"
+        connectionId = firstId
+        tab = {| registrationId = "same-created-id"; agentCreated = true
+                 availability = "loading"; registrationGeneration = 7 |}
+    |}))
+    let! second, _ = handshake port "test-secret"
+    use socketB = second
+    do! send socketB """{"version":2,"kind":"windows","windows":[{"windowRegistration":"window-other","alias":"other","availability":"ready","registrationGeneration":1}]}"""
+    do! send socketB """{"version":2,"kind":"registrations","tabs":[{"registrationId":"same-created-id","alias":"other-tab","agentCreated":true,"availability":"ready","registrationGeneration":1}]}"""
+    do! waitUntil (fun () ->
+        bridge.ListTabs() |> Result.exists (fun json -> json.Contains("other-tab")))
+    // The unrelated profile must not make the original loading page appear ready.
+    do! Task.Delay(125)
+    do! send socketA """{"version":2,"kind":"registrations","tabs":[{"registrationId":"same-created-id","alias":"mine","agentCreated":true,"availability":"ready","registrationGeneration":7}]}"""
+    let! execution = (receive socketA).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property execution "kind", Is.EqualTo("executeJs"))
+    use executePacket = JsonDocument.Parse(execution)
+    Assert.That(executePacket.RootElement.GetProperty("registrationGeneration").GetInt32(), Is.EqualTo(7))
+    Assert.That(property execution "registrationId", Is.EqualTo("same-created-id"))
+    do! send socketA (JsonSerializer.Serialize({|
+        version = 2; kind = "result"; requestId = property execution "requestId"
+        connectionId = firstId; registrationId = "same-created-id"; registrationGeneration = 7
+        result = {| status = "submitted" |}
+    |}))
+    let! closing = (receive socketA).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property closing "kind", Is.EqualTo("closeTab"))
+    Assert.That(property closing "registrationId", Is.EqualTo("same-created-id"))
+    do! send socketA (JsonSerializer.Serialize({|
+        version = 2; kind = "tabClosed"; requestId = property closing "requestId"
+        connectionId = firstId; registrationId = "same-created-id"; registrationGeneration = 7
+    |}))
+    match! launch with
+    | Ok value -> Assert.That(value, Does.Contain("closed"))
+    | Error (_, error) -> Assert.Fail("Pinned multi-step launch failed: " + error)
+    match! bridge.Execute("same-created-id", "document.title", "{}", 3000, true) with
+    | Error error -> Assert.That(error, Is.EqualTo("AliasAmbiguous"))
+    | Ok _ -> Assert.Fail("An unpinned call must reject duplicate registration IDs")
+}
+
+[<Test>]
+let compositeLaunchRejectsManualReRegistrationWithoutInjection () = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let! client, connectionId = handshake port "test-secret"
+    use socket = client
+    do! registerReadyAgentWindow socket bridge
+    let launch = BrowserBridge.runInNewTab bridge "agents" "https://chatgpt.com/" "" false
+                     "async function execute(args) { return {status:'submitted'}; }" "{}" 5000 true
+    let! openFrame = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property openFrame "kind", Is.EqualTo("openTab"))
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"ownership-tab","alias":"owned","agentCreated":true,"availability":"loading","registrationGeneration":1}]}"""
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "tabOpened"; requestId = property openFrame "requestId"
+        connectionId = connectionId
+        tab = {| registrationId = "ownership-tab"; agentCreated = true
+                 registrationGeneration = 1; availability = "loading" |}
+    |}))
+    do! waitUntil (fun () ->
+        bridge.ListTabs() |> Result.exists (fun x -> x.Contains("ownership-tab")))
+    // Manual registration adopts the same tab ID but changes its generation
+    // and removes agent-created provenance. The composite must not execute or close it.
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"ownership-tab","alias":"user-owned","agentCreated":false,"availability":"ready","registrationGeneration":2}]}"""
+    match! launch.WaitAsync(TimeSpan.FromSeconds(3.0)) with
+    | Error (id, reason) ->
+        Assert.That(id, Is.EqualTo("ownership-tab"))
+        Assert.That(reason, Is.EqualTo("TabRegistrationChanged; cleanup=retained"))
+    | Ok _ -> Assert.Fail("Manually re-registered tab was accepted for bootstrap")
+
+    match! bridge.Execute("ownership-tab", "dangerousSubmit()", "{}", 1000, true,
+                          ownerConnectionId = connectionId,
+                          expectedRegistrationGeneration = 1, requireAgentCreated = true) with
+    | Error error -> Assert.That(error, Is.EqualTo("TabRegistrationChanged"))
+    | Ok _ -> Assert.Fail("Stale generation must be rejected before execute dispatch")
+    match! bridge.CloseTab("ownership-tab", ownerConnectionId = connectionId,
+                           expectedRegistrationGeneration = 1) with
+    | Error error -> Assert.That(error, Is.EqualTo("TabRegistrationChanged"))
+    | Ok _ -> Assert.Fail("Stale generation must never close a user-owned tab")
 }

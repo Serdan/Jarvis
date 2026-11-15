@@ -7,8 +7,18 @@ open System.Runtime.InteropServices
 open NUnit.Framework
 open Client
 
-// Query Windows token-owned known folders, not environment mappings.
+// Read the real profile from the process token (userenv), not USERPROFILE.
+// Shell known folders may reflect Client.Tests' synthetic environment and
+// therefore cannot independently establish the operator profile boundary.
 module private WindowsKnownFolderNative =
+    [<DllImport("kernel32.dll", ExactSpelling = true)>]
+    extern nativeint GetCurrentProcess()
+    [<DllImport("kernel32.dll", ExactSpelling = true)>]
+    extern bool CloseHandle(nativeint handle)
+    [<DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)>]
+    extern bool OpenProcessToken(nativeint processHandle, uint32 desiredAccess, nativeint& token)
+    [<DllImport("userenv.dll", EntryPoint = "GetUserProfileDirectoryW", CharSet = CharSet.Unicode, SetLastError = true)>]
+    extern bool GetUserProfileDirectory(nativeint token, System.Text.StringBuilder buffer, uint32& length)
     [<DllImport("shell32.dll", ExactSpelling = true)>]
     extern int SHGetKnownFolderPath(Guid& folderId, uint32 flags, nativeint token, nativeint& path)
 
@@ -55,13 +65,33 @@ type HermeticClientTestEnvironment() =
         for protectedFolder in protectedFolders do
             if String.IsNullOrWhiteSpace protectedFolder ||
                not (Path.IsPathFullyQualified protectedFolder) ||
-               sameOrUnder protectedFolder full ||
-               sameOrUnder full protectedFolder then
+               sameOrUnder protectedFolder full then
                 raise (UnauthorizedAccessException("Refusing Windows Client.Tests root overlapping an actual OS profile folder."))
 
+    /// USERPROFILE and shell known-folders can be redirected by our test
+    /// process. userenv resolves the *token's* actual Windows profile path,
+    /// independent of that synthetic environment, without touching files.
+    static member private TokenProfileDirectory () =
+        let mutable token = IntPtr.Zero
+        if not (WindowsKnownFolderNative.OpenProcessToken(
+                    WindowsKnownFolderNative.GetCurrentProcess(), 0x8u, &token)) then
+            raise (UnauthorizedAccessException("Windows Client.Tests cannot query the OS user token."))
+        try
+            let mutable capacity = 0u
+            WindowsKnownFolderNative.GetUserProfileDirectory(token, null, &capacity) |> ignore
+            if capacity = 0u || capacity > 32768u then
+                raise (UnauthorizedAccessException("Windows Client.Tests cannot size actual token profile path."))
+            let buffer = System.Text.StringBuilder(int capacity)
+            if not (WindowsKnownFolderNative.GetUserProfileDirectory(token, buffer, &capacity)) then
+                raise (UnauthorizedAccessException("Windows Client.Tests cannot resolve actual token profile path."))
+            let profile = buffer.ToString()
+            if String.IsNullOrWhiteSpace profile then
+                raise (UnauthorizedAccessException("Windows Client.Tests resolved empty token profile path."))
+            profile
+        finally
+            WindowsKnownFolderNative.CloseHandle(token) |> ignore
+
     /// Run before installing Client overrides or any Client persistence.
-    /// SHGetKnownFolderPath obtains the current token's real profile folders,
-    /// independent of the synthetic environment supplied to the testhost.
     static member AssertWindowsDisposableRoot (root: string) =
         let parentValue = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_DISPOSABLE_PARENT")
         if String.IsNullOrWhiteSpace parentValue || not (Path.IsPathFullyQualified parentValue) then
@@ -83,8 +113,14 @@ type HermeticClientTestEnvironment() =
                     raise (UnauthorizedAccessException("Windows Client.Tests obtained an empty OS profile folder."))
                 path
             finally Marshal.FreeCoTaskMem(pointer)
+        let tokenProfile = HermeticClientTestEnvironment.TokenProfileDirectory()
+        // The disposable root may contain synthetic shell known folders, but
+        // may never contain the real user token's profile (cleanup hazard).
+        if HermeticClientTestEnvironment.Under root tokenProfile then
+            raise (UnauthorizedAccessException("Refusing Windows Client.Tests root containing actual OS user profile."))
         let actualFolders =
-            [ nativeFolder "5E6C858F-0E22-4760-9AFE-EA3317B67173" // Profile
+            [ tokenProfile // Actual user token, not forged env
+              nativeFolder "5E6C858F-0E22-4760-9AFE-EA3317B67173" // Shell Profile (may be synthetic)
               nativeFolder "3EB685DB-65F9-4CF6-A03A-E3EF65729F3D" // RoamingAppData
               nativeFolder "F1B32785-6FBA-4FCF-9D55-7B8E7F157091" ] // LocalAppData
         HermeticClientTestEnvironment.AssertOutsideProtectedFolders root actualFolders
@@ -329,6 +365,16 @@ module HermeticHarnessTests =
                     forged [ fakeProfile; fakeAppData; fakeLocalAppData ]))
         |> ignore
         Assert.That(Directory.Exists forged, Is.False, "Provenance rejection must precede test writes.")
+
+    [<Test>]
+    let synthetic_home_under_disposable_root_does_not_masquerade_as_real_profile () =
+        let scratch = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_HERMETIC_ROOT")
+        let root = Path.Combine(scratch, "jarvis-client-tests-" + Guid.NewGuid().ToString("N"))
+        let otherProfile = Path.Combine(scratch, "distinct-synthetic-os-profile")
+        let mappedHome = Path.Combine(root, "home")
+        HermeticClientTestEnvironment.AssertOutsideProtectedFolders
+            root [otherProfile; mappedHome]
+        Assert.That(Directory.Exists root, Is.False)
 
     [<Test>]
     let read_only_git_object_is_cleaned_inside_disposable_fixture () =

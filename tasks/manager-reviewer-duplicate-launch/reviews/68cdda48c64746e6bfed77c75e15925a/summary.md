@@ -1,1 +1,7 @@
-Fix at 394f485d. Node Manager planner 45/45 passing; .NET 11 Release build succeeded (0 errors, one existing FS0760 warning), .NET Release test run underway. git diff --check clean. No Manager activation, browser launch, or deployment.
+# Independent frozen re-review — changes requested
+
+**Frozen source:** `394f485d39514a44a6231867398d1b833af096d5` (base `7a14651c1cd620bf707130c26e446b9f9921418f`).
+
+**Independent verification:** Read the frozen planner, regression tests, Manager contract and task acceptance; ran `node --test scripts/tests/manager-heartbeat.test.mjs` in the frozen Worker 4 worktree — **45 passed, 0 failed**. The submitted summary reports a successful .NET 11 Release build; that build was not independently rerun here. No Manager schedule activation, browser dispatch or deployment performed.
+
+**Verdict: ChangesRequested.** One remaining P1 session-termination race is documented in `findings/claim-resolution-before-session-yield.md`: a review decision can happen between Manager's attributed-activity read and its H2 canonical review read. The code treats disappearance of the claim as completion of the browser session and permits another launch of the same reviewer before the original tab has yielded. Existing positive tests assert this unsafe relaunch without representing session liveness. Require independently verified reviewer session end/yield, or fail closed; then rerun the ordered-read and restart regressions.

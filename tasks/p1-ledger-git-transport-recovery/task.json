@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"p1-ledger-git-transport-recovery","title":"[P1] Recover canonical Git-ledger writes from transient DNS and uncertain publication","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"edcb31388e3a4da7a74f4b5f7c8e2d11"}
+{"schemaVersion":2,"taskId":"p1-ledger-git-transport-recovery","title":"[P1] Recover canonical Git-ledger writes from transient DNS and uncertain publication","version":3,"lifecycle":"Closed","specVersion":1,"attemptId":"edcb31388e3a4da7a74f4b5f7c8e2d11"}

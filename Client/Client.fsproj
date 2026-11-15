@@ -27,6 +27,7 @@
         <Compile Include="Types.fs"/>
         <Compile Include="..\Server\WorkQueueContracts.fs" Link="WorkQueueContracts.fs"/>
         <Compile Include="..\Server\WorkQueueDependencyDiagnostics.fs" Link="WorkQueueDependencyDiagnostics.fs"/>
+        <Compile Include="Modules\TaskFirstUiProjection.fs"/>
         <Compile Include="..\Server\WorkQueueProducers.fs" Link="WorkQueueProducers.fs"/>
         <Compile Include="Misc.fs"/>
         <Compile Include="Effect.fs"/>

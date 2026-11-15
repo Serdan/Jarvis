@@ -1,0 +1,28 @@
+# Reviewer 3 — independent frozen WQ04 canonical event/CAS binder audit
+
+**Review:** `ab41d9fc41b848e5a1d60d404fba2c17` (task-bound `wq-04-queue-producers-priority-roles`)  
+**Exact frozen source:** `76ca7864002157cde6901a562ea64dba8306e68c`  
+**Baseline:** `e837d2d67277af8eb4b634ff58d5ba9e1b59d19e`  
+**Scope:** inert, non-authorizing source-event reader and negative-only project-CAS binder, *not* completed positive producer/source/role authority.
+
+## Independent source and authority findings
+
+1. **The accepted WQ04 fail-closed runtime surface is preserved.** Exact `git diff --stat e837d2d6..76ca7864` consists only of two new Client modules, two new Client test files, two docs and two `.fsproj` compile entries (8 files, 1,118 additions). There is no edit to `WorkQueueGitLedger.fs`, `WorkQueueProducers.fs`, Server, host source effects, Scheduler, or production routing; the ID-independent `PublishStage`, `PostMessage`, `AdmitProject`, `ClaimNext`, `ProduceEvent` holds remain the inherited accepted code. `git diff --check` passes. The selected review worktree is clean at the frozen commit.
+2. **Accepted Worker10 source reader was imported without modification.** `git diff --exit-code 0ba335368d6f621f186fbc0e062833da8e0b8625 76ca7864 -- Client/Modules/WorkQueueCanonicalSourceEvidence.fs Client.Tests/WorkQueueCanonicalSourceEvidenceTests.fs` returns 0/empty. Source reader independently checks original canonical Git operation UUID/request hash/receipt/effect path/sequence/typed event and refetches the pinned head; its only coverage case is `IncompleteCoverage`. Crucially this establishes *orchestration event provenance only*, not the WQ03 host job/push source-effect, source protection, complete source/index high-water, account/role credit or independent project CAS.
+3. **The new binder cannot authorize work.** `CanonicalBindAssessment` has only `RecoveryBlocked`, with no success/admitted/ready branch. `inspectAt` unconditionally adds `SameCasProducerUnproved` even with matching original event evidence; `roleGaps` reports unproved historical role/admission when a role is requested. `attemptUnderCas` calls the genuine `LedgerStore.transact` planner, but that planner *always returns* `Error(LedgerIntegrityError("IncompleteCoverage / RecoveryBlocked ..."))`. Inspection of `LedgerStore.transact` at lines 2151–2163 confirms a planner error returns before creating a change list, tree, commit, operation receipt or push. A matching caller UUID, event, high-water or role version cannot change this.
+4. **No runtime call site was added.** Bounded `search_text` over all 68 Client `.fs` source files completes with only the new binder module's own definition references; source-evidence references are confined to the binder and its own definition. The new `.fsproj` includes compile modules before the production API, but none of the API, Scheduler or route files call them. This is inert source, not a hidden positive bypass.
+5. **Rejected role proof was correctly excluded.** Worker11 historical catalog `1cd0b88d...` was ChangesRequested (review `ed89f134...`, seq3808) for retroactive pre-provision authority, mutable historical version evidence and non-atomic claim winner. This source does not import that catalog as valid authority. Merely finding a catalog blob explicitly produces `RoleAdmissionUncovered`.
+
+## Independent Release and adversarial test evidence
+
+- Independently executed `dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-restore --filter 'FullyQualifiedName~WorkQueueCanonicalSourceEvidenceTests|FullyQualifiedName~WorkQueueCanonicalCasBinderTests' --verbosity quiet` twice against the selected frozen branch: **11/11 passed, 0 failed, 0 skipped** each time, .NET 11.0. Source fixtures cover original receipts, tampering, decided review/target pin, challenge response, role membership and Pending-vs-Integrated.
+- Binder's four new two-clone fixtures were read in full: valid original evidence still refuses production, forged UUID/hash/event selector refuse, clone advance invalidates pinned head/high-water and unverifiable role revision, raced `attemptUnderCas` calls produce neither project change nor operation receipt.
+- Independently executed `dotnet test Server.Tests/Server.Tests.fsproj -c Release --no-restore --verbosity quiet`: **233/233 passed, 0 failed, 0 skipped** on .NET 11.0.
+- Clean selected branch status, `git diff --check` clean. Build warnings are existing F# style warnings, not test failures.
+- Full Client suite **has no completed passing verdict** in owner evidence: worker's 240-second run timed out. Do not present the full Client suite as passed.
+
+## Limitation / forward gate
+
+This review can accept only the **new non-authorizing audit/read and negative-CAS seam**. Positive WQ04 producer, actual source effects, role `ClaimWork`, account credits and Scheduler remain blocked: canonical event/index coverage, immutable host source-job and push/WIP evidence, durable role-history provenance, and same-winner same-CAS account/project/source admission have no trusted atomic join. Nothing here establishes permission to activate, migrate, merge directly into a live route, deploy or schedule. A future positive authority writer must have a separate independently frozen review and adversarial two-clone/source-host validation.
+
+The review is against the exact frozen SHA only; no production mutations, host actions, server data changes, main push or GitHub Actions were performed.

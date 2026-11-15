@@ -1529,3 +1529,303 @@ let wq01_workless_ancillary_handler_cannot_reuse_preclaim_generation () =
     rejected Rejection.OperationIdReused
         (completeAncillaryMessage handled.Version "new-workless-answer" "L" "W"
             (generation - 1) "new" 10000L handled)
+
+
+// Review #6: STOP is a one-way lease fence for ancillary intake, not
+// merely a terminal acknowledgement fence. Passive Task attention and
+// runnable Role demand share the same canonical coverage boundary.
+let private wq01StopCoverageInitial () =
+    empty ()
+    |> fun p -> publish p (stage "Plan" WorkKind.Planning "planning" 1L [] WorkState.Available)
+    |> fun p -> publishRoleMessage p "M" 2L
+    |> fun p ->
+        postMessage p.Version "post:task-T" (message "T" (Subject.Task "task-Plan")) None p
+        |> success
+    |> fun p -> admit p "L" "Lead"
+    |> fun p -> submit p "L"
+    |> fun p -> initialize p "L"
+    |> fun p -> claim p "L"
+    |> fun p -> publish p (implementation "D" 3L ["role-msg:M"])
+
+let private wq01CoverageMissing field (p: Project) =
+    match field with
+    | "queue" -> { p with QueueCovered = false }
+    | "graph" -> { p with GraphCovered = false }
+    | "message" -> { p with MessageCovered = false }
+    | "source" -> { p with SourceCovered = false }
+    | _ -> failwithf "Unknown coverage field %s" field
+
+let private wq01CoverageRestored field (p: Project) =
+    match field with
+    | "queue" -> { p with QueueCovered = true }
+    | "graph" -> { p with GraphCovered = true }
+    | "message" -> { p with MessageCovered = true }
+    | "source" -> { p with SourceCovered = true }
+    | _ -> failwithf "Unknown coverage field %s" field
+
+let private wq01MissingError field =
+    match field with
+    | "queue" -> Rejection.IncompleteCoverage "queue high-water/index"
+    | "graph" -> Rejection.IncompleteCoverage "dependency graph"
+    | "message" -> Rejection.IncompleteCoverage "message high-water/handler"
+    | "source" -> Rejection.IncompleteCoverage "source/lineage"
+    | _ -> failwithf "Unknown coverage field %s" field
+
+[<Test>]
+let wq01_stop_first_fences_fresh_and_stale_role_and_task_intake_without_consuming_demand () =
+    let active = wq01StopCoverageInitial ()
+    let account = reserveGlobal 0 "reserve:stop-L" "L" (emptyAccount 1) |> success
+    Assert.That(active.Launches.["L"].PrimaryWorkId, Is.EqualTo(Some "Plan"))
+    let lease = active.Launches.["L"].Lease.Value
+    let stopped = markStalled active.Version "stop-first" "L" lease.Generation 11L 10L active |> success
+    Assert.That(stopped.Launches.["L"].Lease.Value.StopRequested, Is.True)
+    Assert.That(stopped.Launches.["L"].State, Is.EqualTo(active.Launches.["L"].State))
+    Assert.That(stopped.Works.["Plan"], Is.EqualTo(active.Works.["Plan"]))
+    for id in ["M"; "T"] do
+        let op = "stopped-claim-" + id
+        rejected Rejection.CasConflict
+            (claimAncillaryMessage active.Version (op + "-stale") "L" id stopped)
+        rejected (Rejection.InvalidState "ancillary handler requires active unrelated primary claim")
+            (claimAncillaryMessage stopped.Version op "L" id stopped)
+        // A rejected operation cannot acquire an idempotent success receipt.
+        rejected (Rejection.InvalidState "ancillary handler requires active unrelated primary claim")
+            (claimAncillaryMessage stopped.Version op "L" id stopped)
+        Assert.That(stopped.Receipts.ContainsKey op, Is.False)
+        Assert.That(stopped.Messages.[id].State, Is.EqualTo(MessageState.Pending))
+        Assert.That(stopped.Messages.[id].HandlerGeneration, Is.EqualTo(active.Messages.[id].HandlerGeneration))
+    Assert.That(stopped.Works.["role-msg:M"].State, Is.EqualTo(WorkState.Available))
+    Assert.That(stopped.Works.["D"].State, Is.EqualTo(WorkState.Blocked))
+    Assert.That(stopped.Launches.["L"].AncillaryMessages, Is.Empty)
+    Assert.That(stopped.Launches.["L"].AccountTokenId, Is.EqualTo(active.Launches.["L"].AccountTokenId))
+    Assert.That(stopped.NextAvailability, Is.EqualTo(active.NextAvailability))
+    Assert.That(stopped.ProducerCount, Is.EqualTo(active.ProducerCount))
+    Assert.That(account.Tokens.["L"], Is.False)
+
+[<Test>]
+let wq01_claim_wins_stop_then_authorized_terminal_requeues_each_handler_once () =
+    for id in ["M"; "T"] do
+        let active = wq01StopCoverageInitial ()
+        let globalToken = reserveGlobal 0 ("global-" + id) "L" (emptyAccount 1) |> success
+        let handling = claimAncillaryMessage active.Version ("take-" + id) "L" id active |> success
+        let generation = handling.Messages.[id].HandlerGeneration
+        let stopped =
+            markStalled handling.Version ("stop-after-" + id) "L"
+                handling.Launches.["L"].Lease.Value.Generation 11L 10L handling
+            |> success
+        let unclaimedId = if id = "M" then "T" else "M"
+        rejected Rejection.CasConflict
+            (claimAncillaryMessage handling.Version ("stale-take-" + unclaimedId) "L" unclaimedId stopped)
+        rejected (Rejection.InvalidState "ancillary handler requires active unrelated primary claim")
+            (claimAncillaryMessage stopped.Version ("fresh-take-" + unclaimedId) "L" unclaimedId stopped)
+        rejected (Rejection.InvalidState "no live ancillary message handler")
+            (completeAncillaryMessage stopped.Version ("reply-after-stop-" + id)
+                "L" id generation "should-not-handle" 120L stopped)
+        Assert.That(stopped.Messages.[id].State, Is.EqualTo(MessageState.ClaimedAncillary "L"))
+        let terminal =
+            completeOrdinary stopped.Version ("terminal-after-stop-" + id) "L" "Plan" 1000L stopped
+            |> success
+        Assert.That(terminal.Launches.["L"].State,
+                    Is.EqualTo(LaunchState.TerminalPendingRelease("terminal:terminal-after-stop-" + id)))
+        Assert.That(terminal.Messages.[id].State, Is.EqualTo(MessageState.Pending))
+        Assert.That(terminal.Messages.[id].HandlerGeneration, Is.EqualTo(generation + 1))
+        Assert.That(terminal.Works.["role-msg:M"].State, Is.EqualTo(WorkState.Available))
+        Assert.That(terminal.Works.["D"].State, Is.EqualTo(WorkState.Blocked))
+        Assert.That(terminal.Launches.["L"].AncillaryMessages, Is.Empty)
+        Assert.That(terminal.Launches.["L"].AccountTokenId, Is.EqualTo(handling.Launches.["L"].AccountTokenId))
+        if id = "M" then
+            Assert.That(terminal.Works.["role-msg:M"].ClaimGeneration,
+                        Is.EqualTo(handling.Works.["role-msg:M"].ClaimGeneration + 1))
+        else
+            Assert.That(terminal.Works.["role-msg:M"], Is.EqualTo(handling.Works.["role-msg:M"]))
+        let replay =
+            completeOrdinary stopped.Version ("terminal-after-stop-" + id) "L" "Plan" 1000L terminal
+            |> success
+        Assert.That(replay, Is.EqualTo(terminal))
+        rejected Rejection.OperationIdReused
+            (completeOrdinary terminal.Version ("terminal-after-stop-" + id) "L" "Plan" 1001L terminal)
+        // The terminal receipt, not STOP alone, authorizes account release.
+        let released = releaseGlobal globalToken.Version ("release-" + id) "L" terminal globalToken |> success
+        Assert.That(released.Tokens.["L"], Is.True)
+        let nextAccount = reserveGlobal released.Version ("reserve-next-" + id) "Other" released |> success
+        Assert.That(nextAccount.Tokens.["Other"], Is.False)
+        let next = admit terminal "Other" "Lead"
+        Assert.That(next.Launches.["Other"].Credit, Is.EqualTo(Some "role-msg:M"))
+        Assert.That(next.Messages.["T"].State, Is.EqualTo(MessageState.Pending))
+        Assert.That(next.ProducerCount, Is.EqualTo(terminal.ProducerCount))
+
+[<Test>]
+let wq01_primary_terminal_wins_before_ancillary_claim_for_both_subjects () =
+    let active = wq01StopCoverageInitial ()
+    let terminal = completeOrdinary active.Version "primary-terminal-first" "L" "Plan" 1000L active |> success
+    for id in ["M"; "T"] do
+        rejected Rejection.CasConflict
+            (claimAncillaryMessage active.Version ("claim-stale-terminal-" + id) "L" id terminal)
+        rejected (Rejection.InvalidState "ancillary handler requires active unrelated primary claim")
+            (claimAncillaryMessage terminal.Version ("claim-fresh-terminal-" + id) "L" id terminal)
+        Assert.That(terminal.Messages.[id].State, Is.EqualTo(MessageState.Pending))
+    Assert.That(terminal.Works.["role-msg:M"].State, Is.EqualTo(WorkState.Available))
+    Assert.That(terminal.Works.["Plan"].State, Is.EqualTo(WorkState.Completed))
+
+[<Test>]
+let wq01_ancillary_claim_requires_live_primary_lease_claim_and_ungated_activation () =
+    let live = wq01StopCoverageInitial ()
+    let alterLaunch f (p: Project) =
+        { p with Launches = p.Launches.Add("L", f p.Launches.["L"]) }
+    let alterPrimary f (p: Project) =
+        { p with Works = p.Works.Add("Plan", f p.Works.["Plan"]) }
+    let snapshots : (string * Project) list =
+        [ "lease absent", alterLaunch (fun l -> { l with Lease = None }) live
+          "stop requested", alterLaunch (fun l -> { l with Lease = Some { l.Lease.Value with StopRequested = true } }) live
+          "no primary", alterLaunch (fun l -> { l with PrimaryWorkId = None }) live
+          "no primary ever claimed", alterLaunch (fun l -> { l with EverClaimed = false }) live
+          "unregistered", alterLaunch (fun l -> { l with State = LaunchState.SubmittedUnregistered DispatchState.Submitted }) live
+          "terminal", alterLaunch (fun l -> { l with State = LaunchState.TerminalPendingRelease "terminal" }) live
+          "invalidated", alterLaunch (fun l -> { l with State = LaunchState.DemandInvalidatedPendingTerminal l.State }) live
+          "primary missing", { live with Works = live.Works.Remove "Plan" }
+          "primary released", alterPrimary (fun w -> { w with State = WorkState.Available }) live
+          "primary belongs to other", alterPrimary (fun w -> { w with State = WorkState.Claimed "Other" }) live
+          "primary generation zero", alterPrimary (fun w -> { w with ClaimGeneration = 0 }) live
+          "primary gated", alterPrimary (fun w -> { w with Gate = GateState.DependencyGatePending 1 }) live
+          "primary domain decided", alterPrimary (fun w -> { w with Domain = DomainState.FinalizedPendingTerminal "receipt" }) live ]
+    for label, p in snapshots do
+        for id in ["M"; "T"] do
+            rejected (Rejection.InvalidState "ancillary handler requires active unrelated primary claim")
+                (claimAncillaryMessage p.Version ("bad-" + label + "-" + id) "L" id p)
+            Assert.That(p.Messages.[id].State, Is.EqualTo(MessageState.Pending), label)
+        Assert.That(p.Launches.["L"].AncillaryMessages, Is.Empty, label)
+    // Conversely, the real live state still permits both independent branches.
+    for id in ["M"; "T"] do
+        let accepted = claimAncillaryMessage live.Version ("live-" + id) "L" id live |> success
+        Assert.That(accepted.Messages.[id].State, Is.EqualTo(MessageState.ClaimedAncillary "L"))
+        Assert.That(accepted.Works.["Plan"], Is.EqualTo(live.Works.["Plan"]))
+
+[<TestCase("queue")>]
+[<TestCase("graph")>]
+[<TestCase("message")>]
+[<TestCase("source")>]
+let wq01_passive_task_and_role_intake_fail_closed_on_each_incomplete_index (field: string) =
+    let live = wq01StopCoverageInitial ()
+    let incomplete = wq01CoverageMissing field live
+    let coverageError = wq01MissingError field
+    rejected coverageError (orderAvailable incomplete)
+    for id in ["M"; "T"] do
+        rejected coverageError
+            (claimAncillaryMessage incomplete.Version ("uncovered-take-" + field + "-" + id) "L" id incomplete)
+        Assert.That(incomplete.Messages.[id].State, Is.EqualTo(MessageState.Pending))
+        Assert.That(incomplete.Messages.[id].HandlerGeneration, Is.EqualTo(0))
+    Assert.That(incomplete.Works.["role-msg:M"].State, Is.EqualTo(WorkState.Available))
+    Assert.That(incomplete.Works.["Plan"].State, Is.EqualTo(WorkState.Claimed "L"))
+    Assert.That(incomplete.Launches.["L"].AncillaryMessages, Is.Empty)
+    // Once the producer high-water has been verified, Task attention can be
+    // handled without publishing an extra runnable work stage or launch.
+    let restored = wq01CoverageRestored field incomplete
+    let claimed = claimAncillaryMessage restored.Version ("covered-take-" + field) "L" "T" restored |> success
+    let handled =
+        completeAncillaryCurrent claimed.Version ("covered-reply-" + field) "L" "T" "answer" 100L claimed
+        |> success
+    Assert.That(handled.Messages.["T"].State, Is.EqualTo(MessageState.Handled "answer"))
+    Assert.That(handled.Works = restored.Works, Is.True)
+    Assert.That(handled.Launches.["L"].PrimaryWorkId, Is.EqualTo(Some "Plan"))
+    Assert.That(handled.Launches.["L"].AccountTokenId, Is.EqualTo(restored.Launches.["L"].AccountTokenId))
+    Assert.That(handled.NextAvailability, Is.EqualTo(restored.NextAvailability))
+    Assert.That(handled.Launches.Count, Is.EqualTo(restored.Launches.Count))
+    Assert.That(handled.ProducerCount, Is.EqualTo(restored.ProducerCount))
+
+[<TestCase("queue")>]
+[<TestCase("graph")>]
+[<TestCase("message")>]
+[<TestCase("source")>]
+let wq01_passive_task_ack_rechecks_current_coverage_and_replays_only_valid_generation (field: string) =
+    let active = wq01StopCoverageInitial ()
+    let claimed = claimAncillaryMessage active.Version ("take-for-ack-" + field) "L" "T" active |> success
+    let generation = claimed.Messages.["T"].HandlerGeneration
+    let incomplete = wq01CoverageMissing field claimed
+    rejected (wq01MissingError field)
+        (completeAncillaryMessage incomplete.Version ("ack-uncovered-" + field)
+            "L" "T" generation "answer" 100L incomplete)
+    Assert.That(incomplete.Messages.["T"].State, Is.EqualTo(MessageState.ClaimedAncillary "L"))
+    Assert.That(incomplete.Messages.["T"].HandlerGeneration, Is.EqualTo(generation))
+    Assert.That(incomplete.Launches.["L"].AncillaryMessages.Contains "T", Is.True)
+    let restored = wq01CoverageRestored field incomplete
+    let handled =
+        completeAncillaryMessage restored.Version ("ack-covered-" + field)
+            "L" "T" generation "answer" 100L restored |> success
+    Assert.That(handled.Messages.["T"].State, Is.EqualTo(MessageState.Handled "answer"))
+    let replay =
+        completeAncillaryMessage restored.Version ("ack-covered-" + field)
+            "L" "T" generation "answer" 100L handled |> success
+    Assert.That(replay, Is.EqualTo(handled))
+    rejected Rejection.OperationIdReused
+        (completeAncillaryMessage handled.Version ("ack-covered-" + field)
+            "L" "T" (generation - 1) "answer" 100L handled)
+    Assert.That(handled.Works.["Plan"], Is.EqualTo(restored.Works.["Plan"]))
+    Assert.That(handled.Works.["role-msg:M"], Is.EqualTo(restored.Works.["role-msg:M"]))
+
+[<Test>]
+let wq01_task_message_producer_highwater_races_intake_and_ack_without_missed_attention () =
+    let before = wq01StopCoverageInitial ()
+    let posted =
+        postMessage before.Version "producer-new-T2" (message "T2" (Subject.Task "task-Plan")) None before
+        |> success
+    rejected Rejection.CasConflict
+        (claimAncillaryMessage before.Version "stale-producer-intake" "L" "T" posted)
+    let uncovered = { posted with MessageCovered = false }
+    rejected (Rejection.IncompleteCoverage "message high-water/handler")
+        (claimAncillaryMessage uncovered.Version "fresh-uncovered-intake" "L" "T" uncovered)
+    let covered = { uncovered with MessageCovered = true }
+    let claimed = claimAncillaryMessage covered.Version "covered-intake" "L" "T" covered |> success
+    let generated = claimed.Messages.["T"].HandlerGeneration
+    let postedAgain =
+        postMessage claimed.Version "producer-new-T3" (message "T3" (Subject.Task "task-Plan")) None claimed
+        |> success
+    rejected Rejection.CasConflict
+        (completeAncillaryMessage claimed.Version "stale-producer-ack"
+            "L" "T" generated "answer" 100L postedAgain)
+    let lostCoverage = { postedAgain with MessageCovered = false }
+    rejected (Rejection.IncompleteCoverage "message high-water/handler")
+        (completeAncillaryMessage lostCoverage.Version "fresh-uncovered-ack"
+            "L" "T" generated "answer" 100L lostCoverage)
+    let restored = { lostCoverage with MessageCovered = true }
+    let answered =
+        completeAncillaryMessage restored.Version "verified-producer-ack"
+            "L" "T" generated "answer" 100L restored |> success
+    Assert.That(answered.Messages.["T"].State, Is.EqualTo(MessageState.Handled "answer"))
+    Assert.That(answered.Messages.["T2"].State, Is.EqualTo(MessageState.Pending))
+    Assert.That(answered.Messages.["T3"].State, Is.EqualTo(MessageState.Pending))
+    Assert.That(answered.Works = before.Works, Is.True)
+    Assert.That(answered.Launches.Count, Is.EqualTo(1))
+    Assert.That(answered.NextAvailability, Is.EqualTo(before.NextAvailability))
+    Assert.That(answered.ProducerCount, Is.EqualTo(before.ProducerCount))
+    Assert.That(answered.Works.["D"].State, Is.EqualTo(WorkState.Blocked))
+    let replay =
+        completeAncillaryMessage restored.Version "verified-producer-ack"
+            "L" "T" generated "answer" 100L answered |> success
+    Assert.That(replay, Is.EqualTo(answered))
+
+
+[<Test>]
+let wq01_stopped_launch_cannot_turn_prior_ancillary_receipt_into_new_authority () =
+    let live = wq01StopCoverageInitial ()
+    let accepted = claimAncillaryMessage live.Version "pre-stop-claim" "L" "M" live |> success
+    let stopped =
+        markStalled accepted.Version "stop-after-receipt" "L"
+            accepted.Launches.["L"].Lease.Value.Generation 11L 10L accepted
+        |> success
+    // The exact old receipt may be replayed even when the original CAS
+    // snapshot is stale; replay is observation, not a new handler acquisition.
+    let replay =
+        claimAncillaryMessage live.Version "pre-stop-claim" "L" "M" stopped
+        |> success
+    Assert.That(replay, Is.EqualTo(stopped))
+    Assert.That(replay.Version, Is.EqualTo(stopped.Version))
+    Assert.That(replay.Messages.["M"].HandlerGeneration,
+                Is.EqualTo(accepted.Messages.["M"].HandlerGeneration))
+    // Altering semantic input under that operation ID is a distinct command.
+    rejected Rejection.OperationIdReused
+        (claimAncillaryMessage stopped.Version "pre-stop-claim" "L" "T" stopped)
+    rejected (Rejection.InvalidState "ancillary handler requires active unrelated primary claim")
+        (claimAncillaryMessage stopped.Version "new-after-stop" "L" "T" stopped)
+    Assert.That(stopped.Messages.["T"].State, Is.EqualTo(MessageState.Pending))
+    Assert.That(stopped.Works.["D"].State, Is.EqualTo(WorkState.Blocked))
+    Assert.That(stopped.Launches.["L"].AccountTokenId, Is.EqualTo(live.Launches.["L"].AccountTokenId))
+    Assert.That(stopped.NextAvailability, Is.EqualTo(accepted.NextAvailability))

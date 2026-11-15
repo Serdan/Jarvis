@@ -881,29 +881,50 @@ module Contracts =
                 |> Result.bind (projectDependenciesChanged now)
             | _ -> Error(Rejection.InvalidState "message handler does not own primary work")) project
 
+    // A Registered launch remains Registered after STOP; ancillary intake and
+    // acknowledgement require its live, ungated primary activation under CAS.
+    let private hasLivePrimaryActivation (current: Project) launchId (launch: Launch) =
+        match launch.State, launch.Lease, launch.PrimaryWorkId with
+        | LaunchState.Registered _, Some lease, Some primaryId
+            when launch.EverClaimed && not lease.StopRequested ->
+            match current.Works.TryFind primaryId with
+            | Some primary ->
+                primary.State = WorkState.Claimed launchId
+                && primary.ClaimGeneration > 0
+                && primary.Gate = GateState.Clear
+                && primary.Domain = DomainState.Undecided
+                && hardDependenciesSatisfied current primary
+            | None -> false
+        | _ -> false
+
     let claimAncillaryMessage expected op launchId messageId project =
         projectCas expected op ("ancillary-claim|" + launchId + "|" + messageId) (fun current ->
             match current.Launches.TryFind launchId, current.Messages.TryFind messageId with
-            | Some launch, Some message when launch.PrimaryWorkId.IsSome
-                                             && (match launch.State with LaunchState.Registered _ -> true | _ -> false)
+            | Some launch, Some message when hasLivePrimaryActivation current launchId launch
                                              && message.State = MessageState.Pending ->
                 let eligibleSubject =
                     match message.Subject with
                     | Subject.Role roleId -> roleId = launch.RoleId
                     | Subject.Task taskId ->
                         match launch.PrimaryWorkId with
-                        | Some id -> current.Works.[id].SubjectId = taskId
+                        | Some id ->
+                            current.Works.TryFind id
+                            |> Option.exists (fun primary -> primary.SubjectId = taskId)
                         | None -> false
                 if not eligibleSubject then Error(Rejection.InvalidState "ineligible task/role actor")
                 else
                     match message.WorkId with
                     | None ->
-                        let updatedLaunch = { launch with AncillaryMessages = launch.AncillaryMessages.Add messageId }
-                        Ok { current with
+                        // Passive Task attention has no orderAvailable path, but
+                        // must obey its verified message/queue/source high-water.
+                        completeCoverage current
+                        |> Result.map (fun () ->
+                            let updatedLaunch = { launch with AncillaryMessages = launch.AncillaryMessages.Add messageId }
+                            { current with
                                 Launches = current.Launches.Add(launchId, updatedLaunch)
                                 Messages = current.Messages.Add(messageId,
                                     { message with State = MessageState.ClaimedAncillary launchId
-                                                   HandlerGeneration = message.HandlerGeneration + 1 }) }
+                                                   HandlerGeneration = message.HandlerGeneration + 1 }) })
                     | Some workId ->
                         match orderAvailable current with
                         | Error e -> Error e
@@ -939,20 +960,17 @@ module Contracts =
             | Some launch, Some message when launch.AncillaryMessages.Contains messageId
                                              && message.State = MessageState.ClaimedAncillary launchId
                                              && message.HandlerGeneration = expectedHandlerGeneration
-                                             && (match launch.State, launch.Lease, launch.PrimaryWorkId with
-                                                 | LaunchState.Registered _, Some lease, Some primaryId
-                                                     when not lease.StopRequested ->
-                                                     match current.Works.TryFind primaryId with
-                                                     | Some primary -> primary.State = WorkState.Claimed launchId
-                                                     | None -> false
-                                                 | _ -> false) ->
+                                             && hasLivePrimaryActivation current launchId launch ->
                 let markHandled (next: Project) =
                     let updatedLaunch = { launch with AncillaryMessages = launch.AncillaryMessages.Remove messageId }
                     { next with
                         Launches = next.Launches.Add(launchId, updatedLaunch)
                         Messages = next.Messages.Add(messageId, { message with State = MessageState.Handled replyId }) }
                 match message.WorkId with
-                | None -> Ok(markHandled current)
+                | None ->
+                    // Intake coverage may have regressed while this passive
+                    // handler held the message; fail closed before acknowledging.
+                    completeCoverage current |> Result.map (fun () -> markHandled current)
                 | Some workId ->
                     match current.Works.TryFind workId with
                     | Some work when work.State = WorkState.Claimed launchId

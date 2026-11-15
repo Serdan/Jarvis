@@ -1,0 +1,1 @@
+Pin exact unchanged 371fdb636f694c60c69746f15786603dc697a947 parent integrated main 8ed9671543f05073f7d453728b50772138dd87f2. Ensure task-bound Accepted verdict can authorize later canonical integration only after WQ04 dependency integration/combined re-review.

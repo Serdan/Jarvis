@@ -52,18 +52,16 @@ jobs:
       - name: Direct testhost must reject forged profile root before writes
         shell: pwsh
         run: |
-          # The hosted Windows account is ephemeral. Never create the forged
-          # profile location: rejection must happen before any Client write.
+          # Hosted runner only; no real operator profile is mounted. Do not
+          # redirect HOME/USERPROFILE/APPDATA here: VSTest itself can create
+          # those mapped directories before NUnit's global setup executes.
+          # Testhost preflight must reject this non-created candidate instead.
           $profile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
           $forged = Join-Path $profile ("jarvis-client-tests-" + [Guid]::NewGuid().ToString("N"))
           if (Test-Path -LiteralPath $forged) { throw "Unsafe negative fixture already exists" }
           $mapping = @{
             JARVIS_CLIENT_TEST_HERMETIC_ROOT = $forged
             JARVIS_CLIENT_TEST_DISPOSABLE_PARENT = $profile
-            HOME = (Join-Path $forged "home")
-            USERPROFILE = (Join-Path $forged "home")
-            APPDATA = (Join-Path $forged "config")
-            LOCALAPPDATA = (Join-Path $forged "data")
           }
           $saved = @{}
           foreach ($key in $mapping.Keys) {

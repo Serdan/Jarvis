@@ -359,6 +359,12 @@ module HermeticHarnessTests =
         let forged = Path.Combine(fakeProfile, "jarvis-client-tests-" + Guid.NewGuid().ToString("N"))
         let fakeAppData = Path.Combine(fakeProfile, "AppData", "Roaming")
         let fakeLocalAppData = Path.Combine(fakeProfile, "AppData", "Local")
+        // The forged mappings are fully self-consistent and would appear safe
+        // if the testhost trusted HOME/USERPROFILE/APPDATA instead of the
+        // separate OS profile provenance. Do not set them on this process:
+        // VSTest can create mapped directories before NUnit setup runs.
+        for mapped in [ "home"; "config"; "data" ] do
+            Assert.That(HermeticClientTestEnvironment.Under forged (Path.Combine(forged, mapped)), Is.True)
         Assert.Throws<UnauthorizedAccessException>(
             TestDelegate(fun () ->
                 HermeticClientTestEnvironment.AssertOutsideProtectedFolders

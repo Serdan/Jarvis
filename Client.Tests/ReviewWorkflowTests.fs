@@ -6333,3 +6333,759 @@ type ReviewWorkflowTests() =
                 Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head))
             finally
                 if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
+    member _.TransientPrepublicationDnsRetriesAndSameUuidRecovery() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let taskId = "transient-dns-ledger"
+            let operationId = Guid.NewGuid()
+            let command =
+                {| Action = "CreateTask"; TaskId = taskId
+                   Title = "Transport retry"; Html = "<h1>Transport retry</h1>" |}
+            let run () =
+                Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite
+                    first operationId "TaskWrite" command (fun () ->
+                        ReviewWorkflow.createTaskWithSpec first operationId taskId command.Title command.Html
+                        |> Result.mapError Client.OrchestrationApi.LedgerErrors.toEffect)
+            let secretStderr =
+                "fatal: unable to access 'https://user:password@github.com/repo?token=secret': Could not resolve host: github.com"
+            let before = (LedgerStore.fetch first |> success).Header.NextSequence
+            let ownerBefore = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent.Version
+            let mutable fetchFailures = 0
+            let mutable pushes = 0
+            let offline =
+                LedgerStore.withGitTransportFaults (fun phase args ->
+                    match args with
+                    | "fetch" :: _ when phase = "prepublication-fetch" ->
+                        fetchFailures <- fetchFailures + 1
+                        Some { FaultExitCode = 128; FaultStderr = secretStderr; FaultTimedOut = false }
+                    | "push" :: _ ->
+                        pushes <- pushes + 1
+                        None
+                    | _ -> None)
+                    run
+            match offline with
+            | Error(Client.LedgerFailureError failure) ->
+                Assert.That(failure.Code, Is.EqualTo("RemoteUnavailable"))
+                Assert.That(failure.OperationId, Is.EqualTo(Some(operationId.ToString("D"))))
+                Assert.That(failure.Message, Does.Contain("phase=prepublication-fetch"))
+                Assert.That(failure.Message, Does.Contain("attempt=3"))
+                Assert.That(failure.Message, Does.Contain("class=dns"))
+                Assert.That(failure.Message, Does.Not.Contain("https://"))
+                Assert.That(failure.Message, Does.Not.Contain("password"))
+                Assert.That(failure.Message, Does.Not.Contain("token=secret"))
+            | other -> Assert.Fail(sprintf "Expected bounded DNS failure: %A" other)
+            Assert.That(fetchFailures, Is.EqualTo(3))
+            Assert.That(pushes, Is.Zero)
+            Assert.That((LedgerStore.fetch first |> success).Header.NextSequence, Is.EqualTo(before))
+            Assert.That((ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent.Version, Is.EqualTo(ownerBefore))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome, Is.True)
+
+            // Same UUID and same request recover when the remote returns.
+            let recovered = run () |> success
+            Assert.That(recovered.AlreadyApplied, Is.False)
+            Assert.That((LedgerStore.fetch first |> success).Header.NextSequence, Is.EqualTo(before + 1L))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsNone, Is.True)
+            let replay = run () |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That(replay.Operation.OriginalResultJson, Is.EqualTo(recovered.Operation.OriginalResultJson))
+            Assert.That((LedgerStore.fetch first |> success).Header.NextSequence, Is.EqualTo(before + 1L)))
+
+    [<Test>]
+    member _.TransientPrepublicationDnsRecoversWithoutPublishingTwice() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let taskId = "transient-dns-short-outage"
+            let operationId = Guid.NewGuid()
+            let mutable failures = 0
+            let mutable pushes = 0
+            let result =
+                LedgerStore.withGitTransportFaults (fun phase args ->
+                    match args with
+                    | "fetch" :: _ when phase = "prepublication-fetch" && failures < 2 ->
+                        failures <- failures + 1
+                        Some { FaultExitCode = 128
+                               FaultStderr = "Could not resolve host: github.com"
+                               FaultTimedOut = false }
+                    | "push" :: _ when phase = "publication-push" ->
+                        pushes <- pushes + 1
+                        None
+                    | _ -> None)
+                    (fun () -> ReviewWorkflow.createTaskWithSpec first operationId taskId
+                                   "Transient" "<h1>Transient</h1>")
+                |> success
+            Assert.That(failures, Is.EqualTo(2))
+            Assert.That(pushes, Is.EqualTo(1))
+            Assert.That(result.AlreadyApplied, Is.False)
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsNone, Is.True)
+            let duplicate = ReviewWorkflow.createTaskWithSpec first operationId taskId "Transient" "<h1>Transient</h1>" |> success
+            Assert.That(duplicate.AlreadyApplied, Is.True)
+            Assert.That(duplicate.Operation.Sequence, Is.EqualTo(result.Operation.Sequence)))
+
+    [<Test>]
+    member _.PostPushConfirmationLossRetainsJournalAndOriginalReceipt() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let taskId = "confirmation-loss"
+            let command =
+                {| Action = "CreateTask"; TaskId = taskId
+                   Title = "Exactly once"; Html = "<h1>Exactly once</h1>" |}
+            let run () =
+                Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite
+                    first operationId "TaskWrite" command (fun () ->
+                        ReviewWorkflow.createTaskWithSpec first operationId taskId command.Title command.Html
+                        |> Result.mapError Client.OrchestrationApi.LedgerErrors.toEffect)
+            let before = (LedgerStore.fetch first |> success).Header.NextSequence
+            let mutable pushes = 0
+            let mutable failedConfirmations = 0
+            let unknown =
+                LedgerStore.withGitTransportFaults (fun phase args ->
+                    match args with
+                    | "push" :: _ when phase = "publication-push" ->
+                        pushes <- pushes + 1
+                        None
+                    | "fetch" :: _ when phase = "confirmation-fetch" || phase = "remote-fetch" ->
+                        failedConfirmations <- failedConfirmations + 1
+                        Some { FaultExitCode = 128
+                               FaultStderr = "Could not resolve host: github.com https://secret.invalid"
+                               FaultTimedOut = false }
+                    | _ -> None)
+                    run
+            match unknown with
+            | Error(Client.LedgerFailureError issue) ->
+                Assert.That(issue.Code, Is.EqualTo("OutcomeUnknown"))
+                Assert.That(issue.OperationId, Is.EqualTo(Some(operationId.ToString("D"))))
+                Assert.That(issue.Message, Does.Contain("phase=confirmation-fetch"))
+                Assert.That(issue.Message, Does.Contain("nextAction=reconcile-same-uuid"))
+                Assert.That(issue.Message.Split([| "nextAction=" |], StringSplitOptions.None).Length - 1,
+                            Is.EqualTo(1), "Uncertain publication must not advertise two recovery actions.")
+                Assert.That(issue.Message, Does.Not.Contain("secret.invalid"))
+            | other -> Assert.Fail(sprintf "Unconfirmed publication must remain recoverable: %A" other)
+            Assert.That(pushes, Is.EqualTo(1))
+            Assert.That(failedConfirmations, Is.EqualTo(6))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome, Is.True)
+            let snapshot, remoteReceipt = LedgerStore.getOperationStatus second operationId |> success
+            Assert.That(remoteReceipt.IsSome, Is.True)
+            Assert.That(snapshot.Header.NextSequence, Is.EqualTo(before + 1L))
+            let recovered = run () |> success
+            Assert.That(recovered.AlreadyApplied, Is.True)
+            Assert.That(recovered.Operation.OriginalResultJson, Is.EqualTo(remoteReceipt.Value.OriginalResultJson))
+            Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(before + 1L))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsNone, Is.True))
+
+    [<Test>]
+    member _.RemoteCasContentionReplansSameUuidWithoutDuplicateReceipt() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let contenderId = Guid.NewGuid()
+            let original = (LedgerStore.fetch first |> success).Header.NextSequence
+            let mutable injected = false
+            let updated =
+                LedgerStore.withGitTransportFaults (fun phase args ->
+                    match args with
+                    | "push" :: _ when phase = "publication-push" && not injected ->
+                        injected <- true
+                        // Competing client advances the remote between our
+                        // verified fetch and our first optimistic Git push.
+                        ReviewWorkflow.createTaskWithSpec second contenderId
+                            "cas-contender" "Contender" "<h1>Contender</h1>"
+                        |> success |> ignore
+                        None
+                    | _ -> None)
+                    (fun () -> ReviewWorkflow.createTaskWithSpec first operationId
+                                   "cas-retry-owner" "Owner" "<h1>Owner</h1>")
+                |> success
+            Assert.That(injected, Is.True)
+            Assert.That(updated.AlreadyApplied, Is.False)
+            let snapshot = LedgerStore.fetch second |> success
+            Assert.That(snapshot.Header.NextSequence, Is.EqualTo(original + 2L))
+            for id in [ operationId; contenderId ] do
+                let _, receipt = LedgerStore.getOperationStatus second id |> success
+                Assert.That(receipt.IsSome, Is.True)
+            let replay =
+                ReviewWorkflow.createTaskWithSpec first operationId
+                    "cas-retry-owner" "Owner" "<h1>Owner</h1>" |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That(replay.Operation.Sequence, Is.EqualTo(updated.Operation.Sequence))
+            Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(original + 2L)))
+
+    [<Test>]
+    member _.AuthAndLocalPreparationFailuresDoNotRetryOrLeakTransportSecrets() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let head = (LedgerStore.fetch first |> success).Commit
+            let authId = Guid.NewGuid()
+            let mutable calls = 0
+            let unauthorized =
+                LedgerStore.withGitTransportFaults (fun phase args ->
+                    match args with
+                    | "fetch" :: _ when phase = "prepublication-fetch" ->
+                        calls <- calls + 1
+                        Some { FaultExitCode = 128
+                               FaultStderr = "fatal: Authentication failed for 'https://user:pass@github.com/secret'"
+                               FaultTimedOut = false }
+                    | _ -> None)
+                    (fun () -> ReviewWorkflow.createTaskWithSpec first authId
+                                   "auth-refused" "Auth" "<h1>Auth</h1>")
+            match unauthorized with
+            | Error(GitFailure diagnostic) ->
+                Assert.That(diagnostic, Does.Contain("class=authentication"))
+                Assert.That(diagnostic, Does.Contain("phase=prepublication-fetch"))
+                Assert.That(diagnostic, Does.Contain("nextAction=fix-auth-and-reconcile"))
+                Assert.That(diagnostic, Does.Not.Contain("github.com"))
+                Assert.That(diagnostic, Does.Not.Contain("user:pass"))
+            | other -> Assert.Fail(sprintf "Auth failure must not be retried as transient: %A" other)
+            Assert.That(calls, Is.EqualTo(1))
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head))
+
+            let localId = Guid.NewGuid()
+            let command = {| Action = "CreateTask"; TaskId = "local-prep-failure"
+                             Title = "Prep"; Html = "<h1>Prep</h1>" |}
+            let mutable hashFaults = 0
+            let prepared =
+                LedgerStore.withGitTransportFaults (fun phase args ->
+                    match args with
+                    | "hash-object" :: _ when phase = "local-preparation" ->
+                        hashFaults <- hashFaults + 1
+                        Some { FaultExitCode = 1
+                               FaultStderr = "secret: https://user:password@github.com"
+                               FaultTimedOut = false }
+                    | _ -> None)
+                    (fun () ->
+                        Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite
+                            first localId "TaskWrite" command (fun () ->
+                                ReviewWorkflow.createTaskWithSpec first localId
+                                    command.TaskId command.Title command.Html
+                                |> Result.mapError Client.OrchestrationApi.LedgerErrors.toEffect))
+            match prepared with
+            | Error(Client.LedgerFailureError failure) ->
+                Assert.That(failure.Code, Is.EqualTo("GitFailure"))
+                Assert.That(failure.Message, Does.Contain("phase=local-preparation"))
+                Assert.That(failure.Message, Does.Not.Contain("user:password"))
+            | other -> Assert.Fail(sprintf "Expected sanitized local Git preparation failure: %A" other)
+            Assert.That(hashFaults, Is.EqualTo(1))
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one localId |> success).IsSome, Is.True))
+
+    [<Test>]
+    member _.YieldAgentDnsFailurePreservesWorkingAndCheckpointUntilSameUuidRecovery() =
+        withFixture (fun one _ first second _ _ _ initTask ->
+            let taskId = "p1-yield-agent-transient"
+            initTask taskId
+            let operationId = Guid.NewGuid()
+            let summary = "Work completed before transient DNS outage"
+            let nextAction = "Continue after confirmed yield"
+            let command =
+                {| Action = "YieldAgent"; TaskId = taskId; OwnerId = "Owner"
+                   Summary = summary; NextAction = nextAction |}
+            let run () =
+                Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite
+                    first operationId "TaskWrite" command (fun () ->
+                        ReviewWorkflow.yieldAgent first operationId taskId "Owner" 0 0 1
+                            summary nextAction
+                        |> Result.mapError Client.OrchestrationApi.LedgerErrors.toEffect)
+            let before = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(before.State, Is.EqualTo("Working"))
+            let sequence = (LedgerStore.fetch first |> success).Header.NextSequence
+            let mutable dnsFailures = 0
+            let offline =
+                LedgerStore.withGitTransportFaults (fun phase args ->
+                    match args with
+                    | "fetch" :: _ when phase = "prepublication-fetch" ->
+                        dnsFailures <- dnsFailures + 1
+                        Some { FaultExitCode = 128
+                               FaultStderr = "Could not resolve host: github.com"
+                               FaultTimedOut = false }
+                    | _ -> None)
+                    run
+            match offline with
+            | Error(Client.LedgerFailureError failure) ->
+                Assert.That(failure.Code, Is.EqualTo("RemoteUnavailable"))
+                Assert.That(failure.OperationId, Is.EqualTo(Some(operationId.ToString("D"))))
+            | other -> Assert.Fail(sprintf "Yield should remain recoverable without fake Ready: %A" other)
+            Assert.That(dnsFailures, Is.EqualTo(3))
+            Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence))
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent, Is.EqualTo(before))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
+                        Is.True)
+            let confirmed = run () |> success
+            Assert.That(confirmed.AlreadyApplied, Is.False)
+            Assert.That(confirmed.Operation.Sequence, Is.EqualTo(sequence))
+            let after = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(after.State, Is.EqualTo("Ready"))
+            Assert.That(after.Execution, Is.EqualTo("Stopped"))
+            Assert.That(after.Version, Is.EqualTo(before.Version + 1))
+            let _, checkpoint = ReviewWorkflow.getCheckpoint second taskId sequence |> success
+            Assert.That(checkpoint.Summary, Is.EqualTo(summary))
+            Assert.That(checkpoint.NextAction, Is.EqualTo(nextAction))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsNone,
+                        Is.True)
+            let repeat = run () |> success
+            Assert.That(repeat.AlreadyApplied, Is.True)
+            Assert.That(repeat.Operation.OriginalResultJson, Is.EqualTo(confirmed.Operation.OriginalResultJson))
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent, Is.EqualTo(after))
+            Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence + 1L)))
+
+    [<Test>]
+    member _.PushTimeoutNeverBlindlyRetriesAndRecoversOriginalPendingUuid() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let taskId = "p1-uncertain-push-timeout"
+            let command =
+                {| Action = "CreateTask"; TaskId = taskId
+                   Title = "Recover push timeout"; Html = "<h1>Recover push timeout</h1>" |}
+            let run () =
+                Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite
+                    first operationId "TaskWrite" command (fun () ->
+                        ReviewWorkflow.createTaskWithSpec first operationId taskId
+                            command.Title command.Html
+                        |> Result.mapError Client.OrchestrationApi.LedgerErrors.toEffect)
+            let sequence = (LedgerStore.fetch first |> success).Header.NextSequence
+            let mutable pushAttempts = 0
+            let unknown =
+                LedgerStore.withGitTransportFaults (fun phase args ->
+                    match args with
+                    | "push" :: _ when phase = "publication-push" ->
+                        pushAttempts <- pushAttempts + 1
+                        Some { FaultExitCode = 128
+                               FaultStderr = "https://user:secret@github.com/repo"
+                               FaultTimedOut = true }
+                    | _ -> None)
+                    run
+            match unknown with
+            | Error(Client.LedgerFailureError failure) ->
+                Assert.That(failure.Code, Is.EqualTo("OutcomeUnknown"))
+                Assert.That(failure.OperationId, Is.EqualTo(Some(operationId.ToString("D"))))
+                Assert.That(failure.Message, Does.Contain("phase=publication-push"))
+                Assert.That(failure.Message, Does.Contain("timedOut=True"))
+                Assert.That(failure.Message, Does.Contain("class=timeout"))
+                Assert.That(failure.Message, Does.Contain("nextAction=reconcile-same-uuid"))
+                Assert.That(failure.Message, Does.Not.Contain("user:secret"))
+            | other -> Assert.Fail(sprintf "Push timeout must be uncertain, not retried: %A" other)
+            Assert.That(pushAttempts, Is.EqualTo(1))
+            Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
+                        Is.True)
+            let recovered = run () |> success
+            Assert.That(recovered.AlreadyApplied, Is.False)
+            Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence + 1L))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsNone,
+                        Is.True)
+            let replay = run () |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That(replay.Operation.OriginalResultJson, Is.EqualTo(recovered.Operation.OriginalResultJson))
+            Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence + 1L)))
+
+    [<Test>]
+    member _.PendingRenameFsyncFailureFailsClosedBeforePublicTaskFetchAndRetainsOriginalUuid() =
+        if not (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS()) then
+            Assert.Ignore("Directory fsync fault injection applies to the Unix rename path.")
+        withFixture (fun one _ first second _ _ _ initTask ->
+            let taskId = "p1-pending-rename-fsync-failure"
+            initTask taskId
+            let sequence = (LedgerStore.fetch second |> success).Header.NextSequence
+            let agentBefore = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            let path = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
+            let approved : Client.OrchestrationApi.LedgerTrustBinding =
+                { SchemaVersion = 1; Enabled = true; ProjectRoot = one
+                  ProjectId = first.ProjectId.ToString("D"); LedgerId = first.LedgerId.ToString("D")
+                  Epoch = first.Epoch; RemoteName = first.RemoteName
+                  ApprovedFetchUrl = first.ApprovedFetchUrl; ApprovedPushUrl = first.ApprovedPushUrl
+                  HighestTrustedHead = (LedgerStore.fetch first |> success).Commit }
+            File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize approved)
+            try
+                let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+                let operationId = Guid.NewGuid()
+                let command : Common.TaskWriteCommand =
+                    { ProjectName = "owner"; Action = "YieldAgent"
+                      OperationId = operationId.ToString("D"); TaskId = taskId; AttemptId = ""
+                      ActorId = "Owner"; OwnerId = ""; Title = ""; Html = ""
+                      ExpectedVersion = 0; ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
+                      AssignmentGeneration = 1; Summary = "Original fsync-failure checkpoint"
+                      NextAction = "Resume after verified yield"; Reason = ""; BaseOid = ""
+                      TargetRef = ""; SourceRef = ""; AllowDetached = false
+                      AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""
+                      SessionId = "" }
+                let run () = Client.OrchestrationApi.TaskApi.write command context
+                let journal =
+                    Path.Combine(Path.GetDirectoryName path, "pending",
+                                 Path.GetFileNameWithoutExtension path)
+                let mutable failedSyncs = 0
+                let mutable remoteCommands = 0
+                let failAfterRename () =
+                    LedgerStore.withGitTransportFaults
+                        (fun _ args ->
+                            match args with
+                            | "fetch" :: _ | "push" :: _ | "ls-remote" :: _ ->
+                                remoteCommands <- remoteCommands + 1
+                                None
+                            | _ -> None)
+                        (fun () ->
+                            Client.OrchestrationApi.PendingIntentJournal.withDirectorySyncFault
+                                (fun folder ->
+                                    if folder = journal then
+                                        failedSyncs <- failedSyncs + 1
+                                        raise (IOException("injected rename-then-fsync failure")))
+                                run)
+                for attempt in 1 .. 2 do
+                    match failAfterRename () with
+                    | Error(Client.ValidationError issue) ->
+                        Assert.That(issue, Does.Contain("injected rename-then-fsync failure"))
+                    | other -> Assert.Fail(sprintf "Directory fsync failure must fail closed: %A" other)
+                    Assert.That(failedSyncs, Is.EqualTo(attempt),
+                                "The second attempt must re-fsync the existing pending record.")
+                    Assert.That(remoteCommands, Is.Zero,
+                                "No remote Git fetch/push may precede confirmed journal durability.")
+                    let pending =
+                        Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                        |> success |> Option.get
+                    let savedCommand = System.Text.Json.JsonSerializer.Serialize command
+                    let hash =
+                        System.Security.Cryptography.SHA256.HashData(
+                            System.Text.Encoding.UTF8.GetBytes savedCommand)
+                        |> Convert.ToHexString
+                    Assert.That(pending.OperationId, Is.EqualTo(operationId.ToString("D")))
+                    Assert.That(pending.CommandType, Is.EqualTo("TaskWrite"))
+                    Assert.That(pending.CommandJson, Is.EqualTo(savedCommand))
+                    Assert.That(pending.CommandSha256, Is.EqualTo(hash))
+                    Assert.That(Directory.GetFiles(journal, "*.tmp"), Is.Empty)
+                Assert.That((LedgerStore.fetch second |> success).Header.NextSequence,
+                            Is.EqualTo(sequence))
+                Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent,
+                            Is.EqualTo(agentBefore))
+                match Client.OrchestrationApi.TaskApi.write
+                        { command with Summary = "Changed payload under original UUID" } context with
+                | Error(Client.ValidationError _) -> ()
+                | other -> Assert.Fail(sprintf "Changed payload must fail closed: %A" other)
+                let recovered = run () |> success
+                use recoveredJson = System.Text.Json.JsonDocument.Parse(
+                    System.Text.Json.JsonSerializer.Serialize recovered)
+                Assert.That(recoveredJson.RootElement.GetProperty("alreadyApplied").GetBoolean(),
+                            Is.False)
+                Assert.That((LedgerStore.fetch second |> success).Header.NextSequence,
+                            Is.EqualTo(sequence + 1L))
+                let _, receipt = LedgerStore.getOperationStatus second operationId |> success
+                Assert.That(receipt.IsSome, Is.True)
+                Assert.That(receipt.Value.Sequence, Is.EqualTo(sequence))
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                             |> success).IsNone, Is.True)
+                let replay = run () |> success
+                use replayJson = System.Text.Json.JsonDocument.Parse(
+                    System.Text.Json.JsonSerializer.Serialize replay)
+                Assert.That(replayJson.RootElement.GetProperty("alreadyApplied").GetBoolean(),
+                            Is.True)
+                Assert.That((LedgerStore.fetch second |> success).Header.NextSequence,
+                            Is.EqualTo(sequence + 1L))
+            finally
+                if File.Exists path then File.Delete path)
+
+    [<Test>]
+    member _.FirstPendingParentFsyncFailurePreservesOriginalUuidUntilSameUuidReplay() =
+        if not (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS()) then
+            Assert.Ignore("Parent directory fsync fault injection applies to Unix.")
+        withFixture (fun one _ first second _ _ _ initTask ->
+            let taskId = "p1-first-pending-parent-fsync"
+            initTask taskId
+            let sequence = (LedgerStore.fetch second |> success).Header.NextSequence
+            let agentBefore = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            let path = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
+            let approved : Client.OrchestrationApi.LedgerTrustBinding =
+                { SchemaVersion = 1; Enabled = true; ProjectRoot = one
+                  ProjectId = first.ProjectId.ToString("D"); LedgerId = first.LedgerId.ToString("D")
+                  Epoch = first.Epoch; RemoteName = first.RemoteName
+                  ApprovedFetchUrl = first.ApprovedFetchUrl; ApprovedPushUrl = first.ApprovedPushUrl
+                  HighestTrustedHead = (LedgerStore.fetch first |> success).Commit }
+            File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize approved)
+            try
+                let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+                let operationId = Guid.NewGuid()
+                let command : Common.TaskWriteCommand =
+                    { ProjectName = "owner"; Action = "YieldAgent"
+                      OperationId = operationId.ToString("D"); TaskId = taskId; AttemptId = ""
+                      ActorId = "Owner"; OwnerId = ""; Title = ""; Html = ""
+                      ExpectedVersion = 0; ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
+                      AssignmentGeneration = 1; Summary = "Original parent-sync checkpoint"
+                      NextAction = "Resume after durable parent sync"; Reason = ""; BaseOid = ""
+                      TargetRef = ""; SourceRef = ""; AllowDetached = false
+                      AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""
+                      SessionId = "" }
+                let run () = Client.OrchestrationApi.TaskApi.write command context
+                let journal =
+                    Path.Combine(Path.GetDirectoryName path, "pending",
+                                 Path.GetFileNameWithoutExtension path)
+                let parent = Path.GetDirectoryName journal
+                Assert.That(Directory.Exists journal, Is.False, "This must exercise first-write directory creation.")
+                let savedCommand = System.Text.Json.JsonSerializer.Serialize command
+                let hash =
+                    System.Security.Cryptography.SHA256.HashData(
+                        System.Text.Encoding.UTF8.GetBytes savedCommand)
+                    |> Convert.ToHexString
+                let mutable failedParentSyncs = 0
+                let mutable remoteCommands = 0
+                let failParentSync () =
+                    LedgerStore.withGitTransportFaults
+                        (fun _ args ->
+                            match args with
+                            | "fetch" :: _ | "push" :: _ | "ls-remote" :: _ ->
+                                remoteCommands <- remoteCommands + 1
+                                None
+                            | _ -> None)
+                        (fun () ->
+                            Client.OrchestrationApi.PendingIntentJournal.withDirectorySyncFault
+                                (fun folder ->
+                                    if folder = parent then
+                                        failedParentSyncs <- failedParentSyncs + 1
+                                        raise (IOException("injected first-write parent fsync failure")))
+                                run)
+                for attempt in 1 .. 2 do
+                    match failParentSync () with
+                    | Error(Client.ValidationError issue) ->
+                        Assert.That(issue, Does.Contain("injected first-write parent fsync failure"))
+                    | other -> Assert.Fail(sprintf "Parent fsync must fail closed: %A" other)
+                    Assert.That(failedParentSyncs, Is.EqualTo(attempt),
+                                "Same-UUID replay must retry the failed parent fsync.")
+                    Assert.That(remoteCommands, Is.Zero,
+                                "No remote Git I/O may precede durable parent entries.")
+                    let pending =
+                        Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                        |> success |> Option.get
+                    Assert.That(pending.OperationId, Is.EqualTo(operationId.ToString("D")))
+                    Assert.That(pending.CommandType, Is.EqualTo("TaskWrite"))
+                    Assert.That(pending.CommandJson, Is.EqualTo(savedCommand))
+                    Assert.That(pending.CommandSha256, Is.EqualTo(hash))
+                    Assert.That(Directory.GetFiles(journal, "*.tmp"), Is.Empty)
+                Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence))
+                Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent,
+                            Is.EqualTo(agentBefore))
+                match Client.OrchestrationApi.TaskApi.write
+                        { command with Summary = "Different payload under old UUID" } context with
+                | Error(Client.ValidationError _) -> ()
+                | other -> Assert.Fail(sprintf "Changed UUID payload must be refused: %A" other)
+                let recovered = run () |> success
+                use recoveredJson =
+                    System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize recovered)
+                Assert.That(recoveredJson.RootElement.GetProperty("alreadyApplied").GetBoolean(), Is.False)
+                let _, receipt = LedgerStore.getOperationStatus second operationId |> success
+                Assert.That(receipt.IsSome, Is.True)
+                Assert.That(receipt.Value.Sequence, Is.EqualTo(sequence))
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                             |> success).IsNone, Is.True)
+                let replay = run () |> success
+                use replayJson =
+                    System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize replay)
+                Assert.That(replayJson.RootElement.GetProperty("alreadyApplied").GetBoolean(), Is.True)
+                Assert.That((LedgerStore.fetch second |> success).Header.NextSequence,
+                            Is.EqualTo(sequence + 1L))
+                Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.State,
+                            Is.EqualTo("Ready"))
+            finally
+                if File.Exists path then File.Delete path)
+
+    [<Test>]
+    member _.PublicTaskYieldBindingDnsFailurePersistsOriginalCommandBeforeFirstFetch() =
+        withFixture (fun one _ first second _ _ _ initTask ->
+            let taskId = "p1-public-binding-yield"
+            initTask taskId
+            let before = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            let sequence = (LedgerStore.fetch first |> success).Header.NextSequence
+            let path = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
+            let approved : Client.OrchestrationApi.LedgerTrustBinding =
+                { SchemaVersion = 1; Enabled = true; ProjectRoot = one
+                  ProjectId = first.ProjectId.ToString("D"); LedgerId = first.LedgerId.ToString("D")
+                  Epoch = first.Epoch; RemoteName = first.RemoteName
+                  ApprovedFetchUrl = first.ApprovedFetchUrl; ApprovedPushUrl = first.ApprovedPushUrl
+                  HighestTrustedHead = (LedgerStore.fetch first |> success).Commit }
+            File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize approved)
+            try
+                let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+                let operationId = Guid.NewGuid()
+                let command : Common.TaskWriteCommand =
+                    { ProjectName = "owner"; Action = "YieldAgent"
+                      OperationId = operationId.ToString("D"); TaskId = taskId; AttemptId = ""
+                      ActorId = "Owner"; OwnerId = ""; Title = ""; Html = ""
+                      ExpectedVersion = 0; ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
+                      AssignmentGeneration = 1; Summary = "Original checkpoint summary"
+                      NextAction = "Resume after verified yield"; Reason = ""; BaseOid = ""
+                      TargetRef = ""; SourceRef = ""; AllowDetached = false
+                      AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""
+                      SessionId = "" }
+                let run () = Client.OrchestrationApi.TaskApi.write command context
+                let mutable failedFetches = 0
+                let mutable pushes = 0
+                let failure =
+                    LedgerStore.withGitTransportFaults (fun phase args ->
+                        match args with
+                        | "fetch" :: _ when phase = "remote-fetch" ->
+                            failedFetches <- failedFetches + 1
+                            Some { FaultExitCode = 128
+                                   FaultStderr = "fatal: Could not resolve host github.com https://user:secret@github.com"
+                                   FaultTimedOut = false }
+                        | "push" :: _ -> pushes <- pushes + 1; None
+                        | _ -> None) run
+                match failure with
+                | Error(Client.LedgerFailureError issue) ->
+                    Assert.That(issue.Code, Is.EqualTo("RemoteUnavailable"))
+                    Assert.That(issue.OperationId, Is.EqualTo(Some(operationId.ToString("D"))))
+                    Assert.That(issue.Message, Does.Contain("operationId=" + operationId.ToString("D")))
+                    Assert.That(issue.Message, Does.Contain("phase=remote-fetch"))
+                    Assert.That(issue.Message, Does.Contain("nextAction=retry-same-uuid"))
+                    Assert.That(issue.Message.Split([| "nextAction=" |], StringSplitOptions.None).Length - 1,
+                                Is.EqualTo(1))
+                    Assert.That(issue.Message, Does.Not.Contain("user:secret"))
+                | other -> Assert.Fail(sprintf "Public preflight must preserve original UUID: %A" other)
+                Assert.That(failedFetches, Is.EqualTo(3))
+                Assert.That(pushes, Is.Zero)
+                Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence))
+                Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent,
+                            Is.EqualTo(before))
+                let pending =
+                    Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                    |> success |> Option.get
+                let serialized = System.Text.Json.JsonSerializer.Serialize command
+                let expectedHash =
+                    System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes serialized)
+                    |> Convert.ToHexString
+                Assert.That(pending.OperationId, Is.EqualTo(operationId.ToString("D")))
+                Assert.That(pending.CommandType, Is.EqualTo("TaskWrite"))
+                Assert.That(pending.CommandJson, Is.EqualTo(serialized))
+                Assert.That(pending.CommandSha256, Is.EqualTo(expectedHash))
+                match Client.OrchestrationApi.TaskApi.write
+                        { command with Summary = "Altered command under same UUID" } context with
+                | Error(Client.ValidationError _) -> ()
+                | other -> Assert.Fail(sprintf "Changed UUID payload must fail closed: %A" other)
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                             |> success |> Option.get).CommandSha256, Is.EqualTo(expectedHash))
+                match Client.OrchestrationApi.TaskApi.write
+                        { command with OperationId = Guid.NewGuid().ToString("D")
+                                       AssignmentGeneration = 2 } context with
+                | Error _ -> ()
+                | Ok _ -> Assert.Fail("Stale generation unexpectedly yielded.")
+                Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence))
+                let recovered = run () |> success
+                use recoveredJson = System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize recovered)
+                Assert.That(recoveredJson.RootElement.GetProperty("alreadyApplied").GetBoolean(), Is.False)
+                let after = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                Assert.That(after.State, Is.EqualTo("Ready"))
+                Assert.That(after.Execution, Is.EqualTo("Stopped"))
+                Assert.That(after.Version, Is.EqualTo(before.Version + 1))
+                let _, checkpoint = ReviewWorkflow.getCheckpoint second taskId sequence |> success
+                Assert.That(checkpoint.Summary, Is.EqualTo(command.Summary))
+                Assert.That(checkpoint.NextAction, Is.EqualTo(command.NextAction))
+                let _, receipt = LedgerStore.getOperationStatus second operationId |> success
+                Assert.That(receipt.IsSome, Is.True)
+                Assert.That(receipt.Value.Sequence, Is.EqualTo(sequence))
+                Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence + 1L))
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                             |> success).IsNone, Is.True)
+                let repeated = run () |> success
+                use repeatedJson = System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize repeated)
+                Assert.That(repeatedJson.RootElement.GetProperty("alreadyApplied").GetBoolean(), Is.True)
+                Assert.That((LedgerStore.getOperationStatus second operationId |> success |> snd).Value.OriginalResultJson,
+                            Is.EqualTo(receipt.Value.OriginalResultJson))
+                Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence + 1L))
+            finally
+                if File.Exists path then File.Delete path)
+
+    [<Test>]
+    member _.PublicReviewBindingDnsFailurePersistsOriginalCommandAndReplaysOnce() =
+        withFixture (fun one _ first second _ sourceRef newCommit initTask ->
+            let taskId = "p1-public-binding-review"
+            initTask taskId
+            let head = newCommit "P1 reviewed source" "Public Review binding preflight"
+            let sequence = (LedgerStore.fetch first |> success).Header.NextSequence
+            let path = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
+            let approved : Client.OrchestrationApi.LedgerTrustBinding =
+                { SchemaVersion = 1; Enabled = true; ProjectRoot = one
+                  ProjectId = first.ProjectId.ToString("D"); LedgerId = first.LedgerId.ToString("D")
+                  Epoch = first.Epoch; RemoteName = first.RemoteName
+                  ApprovedFetchUrl = first.ApprovedFetchUrl; ApprovedPushUrl = first.ApprovedPushUrl
+                  HighestTrustedHead = (LedgerStore.fetch first |> success).Commit }
+            File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize approved)
+            try
+                let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+                let operationId = Guid.NewGuid()
+                let reviewId = Guid.NewGuid()
+                let command : Common.ReviewWriteCommand =
+                    { ProjectName = "owner"; Action = "Submit"; OperationId = operationId.ToString("D")
+                      TaskId = taskId; RequestId = reviewId.ToString("D"); ActorId = "Owner"
+                      ReviewerId = ""; ExpectedVersion = 0; Kind = "Progress"
+                      SourceRef = sourceRef; HeadOid = head; TargetRef = ""; Summary = "P1 review candidate"
+                      Verdict = ""; DocumentPath = ""; Content = ""; ExpectedBlobOid = "" }
+                let run () = Client.OrchestrationApi.ReviewApi.write command context
+                let mutable failedFetches = 0
+                let failed =
+                    LedgerStore.withGitTransportFaults (fun phase args ->
+                        match args with
+                        | "fetch" :: _ when phase = "remote-fetch" ->
+                            failedFetches <- failedFetches + 1
+                            Some { FaultExitCode = 128
+                                   FaultStderr = "Could not resolve host: github.com"
+                                   FaultTimedOut = false }
+                        | _ -> None) run
+                match failed with
+                | Error(Client.LedgerFailureError issue) ->
+                    Assert.That(issue.Code, Is.EqualTo("RemoteUnavailable"))
+                    Assert.That(issue.OperationId, Is.EqualTo(Some(operationId.ToString("D"))))
+                    Assert.That(issue.Message, Does.Contain("operationId=" + operationId.ToString("D")))
+                    Assert.That(issue.Message, Does.Contain("nextAction=retry-same-uuid"))
+                    Assert.That(issue.Message.Split([| "nextAction=" |], StringSplitOptions.None).Length - 1,
+                                Is.EqualTo(1))
+                | other -> Assert.Fail(sprintf "Review API lost original intent at binding: %A" other)
+                Assert.That(failedFetches, Is.EqualTo(3))
+                Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence))
+                let pending =
+                    Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                    |> success |> Option.get
+                let serialized = System.Text.Json.JsonSerializer.Serialize command
+                let expectedHash =
+                    System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes serialized)
+                    |> Convert.ToHexString
+                Assert.That(pending.CommandJson, Is.EqualTo(serialized))
+                Assert.That(pending.CommandSha256, Is.EqualTo(expectedHash))
+                match Client.OrchestrationApi.ReviewApi.write
+                        { command with Summary = "Unexpected changed review" } context with
+                | Error(Client.ValidationError _) -> ()
+                | other -> Assert.Fail(sprintf "Review UUID reuse with new command accepted: %A" other)
+                let recovered = run () |> success
+                use recoveredJson = System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize recovered)
+                Assert.That(recoveredJson.RootElement.GetProperty("alreadyApplied").GetBoolean(), Is.False)
+                let saved = ReviewWorkflow.getBranchReview second taskId reviewId |> success
+                Assert.That(saved.Review.Status, Is.EqualTo("Unclaimed"))
+                let _, receipt = LedgerStore.getOperationStatus second operationId |> success
+                Assert.That(receipt.IsSome, Is.True)
+                Assert.That(receipt.Value.Sequence, Is.EqualTo(sequence))
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                             |> success).IsNone, Is.True)
+                let repeated = run () |> success
+                use repeatedJson = System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize repeated)
+                Assert.That(repeatedJson.RootElement.GetProperty("alreadyApplied").GetBoolean(), Is.True)
+                Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence + 1L))
+            finally
+                if File.Exists path then File.Delete path)
+
+    [<Test>]
+    member _.PureRemoteReadDnsFailureNeverAdvertisesWriteRecoveryAction() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let baseline = (LedgerStore.fetch first |> success).Commit
+            let mutable failedFetches = 0
+            let offline =
+                LedgerStore.withGitTransportFaults (fun phase args ->
+                    match args with
+                    | "fetch" :: _ when phase = "remote-fetch" ->
+                        failedFetches <- failedFetches + 1
+                        Some { FaultExitCode = 128
+                               FaultStderr = "Could not resolve host: github.com"
+                               FaultTimedOut = false }
+                    | _ -> None) (fun () -> LedgerStore.fetch first)
+            match offline with
+            | Error(RemoteUnavailable diagnostic) ->
+                Assert.That(diagnostic, Does.Contain("operationId=none"))
+                Assert.That(diagnostic, Does.Contain("nextAction=retry-read-after-reconnect"))
+                Assert.That(diagnostic, Does.Not.Contain("nextAction=retry-same-uuid"))
+                Assert.That(diagnostic.Split([| "nextAction=" |], StringSplitOptions.None).Length - 1,
+                            Is.EqualTo(1))
+            | other -> Assert.Fail(sprintf "Read should report only a safe read retry: %A" other)
+            Assert.That(failedFetches, Is.EqualTo(3))
+            Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(baseline)))

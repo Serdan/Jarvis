@@ -237,6 +237,111 @@ module LedgerStore =
                 previous.Attempted <- true
             activePublicationObservation.Value <- previous
 
+    // An operation ID follows every Git stage, but no remote URL, command
+    // payload, process environment or raw stderr is ever included in a
+    // transport diagnostic.
+    [<AllowNullLiteral>]
+    type private TransportScope(operationId: Guid) =
+        let clock = Stopwatch.StartNew()
+        member _.OperationId = operationId
+        member _.ElapsedMilliseconds = clock.ElapsedMilliseconds
+        member val Phase = "prepublication-fetch" with get, set
+        member val Attempt = 1 with get, set
+
+    let private activeTransportScope = System.Threading.AsyncLocal<TransportScope>()
+    let private activeGitPhase = System.Threading.AsyncLocal<string>()
+    let private activeGitTimeout = System.Threading.AsyncLocal<TimeSpan option>()
+
+    let private withTransportScope operationId action =
+        let previous = activeTransportScope.Value
+        activeTransportScope.Value <- TransportScope(operationId)
+        try action ()
+        finally activeTransportScope.Value <- previous
+
+    let private withPhase phase action =
+        let scope = activeTransportScope.Value
+        let previousPhase = activeGitPhase.Value
+        let previousScopePhase = if isNull scope then "" else scope.Phase
+        activeGitPhase.Value <- phase
+        if not (isNull scope) then scope.Phase <- phase
+        try action ()
+        finally
+            if not (isNull scope) then scope.Phase <- previousScopePhase
+            activeGitPhase.Value <- previousPhase
+
+    let private currentPhase fallback =
+        let scope = activeTransportScope.Value
+        if not (isNull scope) then scope.Phase
+        elif String.IsNullOrEmpty activeGitPhase.Value then fallback
+        else activeGitPhase.Value
+
+    let private classifyTransport (stderr: string) =
+        let text = if isNull stderr then "" else stderr.ToLowerInvariant()
+        let contains (tokens: string list) = tokens |> List.exists text.Contains
+        if contains [ "could not resolve host"; "temporary failure in name resolution";
+                      "name or service not known"; "could not resolve proxy" ] then "dns"
+        elif contains [ "authentication failed"; "permission denied"; "could not read username";
+                        "access denied"; "http 401"; "http 403" ] then "authentication"
+        elif contains [ "couldn't find remote ref"; "not our ref"; "remote ref does not exist" ] then "reference"
+        elif contains [ "timed out"; "timeout" ] then "timeout"
+        elif contains [ "failed to connect"; "connection refused"; "connection reset";
+                        "network is unreachable"; "connection closed"; "broken pipe";
+                        "remote end hung up unexpectedly"; "failed to receive http" ] then "network"
+        elif contains [ "the requested url returned error: 500";
+                        "the requested url returned error: 502";
+                        "the requested url returned error: 503";
+                        "the requested url returned error: 504";
+                        "http 500"; "http 502"; "http 503"; "http 504" ] then "server"
+        else "unknown"
+
+    let private transientTransport = function
+        | "dns" | "timeout" | "network" | "server" -> true
+        | _ -> false
+
+    let private transportDiagnostic stage attempt (exitCode: int option) timedOut failureClass =
+        let scope = activeTransportScope.Value
+        let id = if isNull scope then "none" else scope.OperationId.ToString("D")
+        let elapsed = if isNull scope then 0L else scope.ElapsedMilliseconds
+        let exit = exitCode |> Option.map string |> Option.defaultValue "none"
+        $"operationId={id}; phase={stage}; attempt={attempt}; elapsedMs={elapsed}; exit={exit}; timedOut={timedOut}; class={failureClass}"
+
+    let private retryAction () =
+        if isNull activeTransportScope.Value then "retry-read-after-reconnect"
+        else "retry-same-uuid"
+
+    let private withoutNextAction (diagnostic: string) =
+        diagnostic.Split(';', StringSplitOptions.TrimEntries)
+        |> Array.filter (fun field -> not (field.StartsWith("nextAction=", StringComparison.Ordinal)))
+        |> String.concat "; "
+
+    let private remoteFailure stage attempt exitCode timedOut stderr =
+        let failureClass = if timedOut then "timeout" else classifyTransport stderr
+        let nextAction =
+            if failureClass = "authentication" then "fix-auth-and-reconcile"
+            elif failureClass = "reference" then "inspect-remote-binding"
+            elif isNull activeTransportScope.Value then "retry-read-after-reconnect"
+            else "retry-same-uuid"
+        let diagnostic =
+            transportDiagnostic stage attempt exitCode timedOut failureClass + "; nextAction=" + nextAction
+        if failureClass = "authentication" || failureClass = "reference" then GitFailure diagnostic
+        else RemoteUnavailable diagnostic
+
+    // Deterministic, execution-context-local fault seam. Tests inject a Git
+    // transport result without modifying PATH or touching a real remote.
+    type internal GitTransportFault =
+        { FaultExitCode: int
+          FaultStderr: string
+          FaultTimedOut: bool }
+
+    let private activeGitFault =
+        System.Threading.AsyncLocal<(string -> string list -> GitTransportFault option)>()
+
+    let internal withGitTransportFaults inject action =
+        let previous = activeGitFault.Value
+        activeGitFault.Value <- inject
+        try action ()
+        finally activeGitFault.Value <- previous
+
     let private json value = JsonSerializer.Serialize(value, options)
     let private digest (value: string) =
         SHA256.HashData(encoding.GetBytes value)
@@ -301,37 +406,90 @@ module LedgerStore =
             | "show" :: _ -> measured.IndividualBlobReads <- measured.IndividualBlobReads + 1
             | "cat-file" :: "--batch" :: _ -> measured.BatchBlobReads <- measured.BatchBlobReads + 1
             | _ -> ()
-        BoundedProcess.run
-            { Executable = "git"
-              Args = args
-              WorkingDirectory = repo
-              Timeout = TimeSpan.FromSeconds 30.
-              MaxOutputBytes = None // Git blob reads are intentionally not page-limited here.
-              StandardInput = input |> Option.map BoundedProcess.TextInput |> Option.defaultValue BoundedProcess.ClosedInput
-              ExtraEnvironment = ("GIT_TERMINAL_PROMPT", "0") :: environment
-              ConfigureStart = None }
-        |> function
-            | Error(ExceptionError ex) -> Error(GitFailure ex.Message)
-            | Error failure -> Error(GitFailure(string failure))
-            | Ok output when output.TimedOut -> Error(RemoteUnavailable "Git command timed out.")
-            | Ok output ->
-                if not (isNull measured) then
-                    measured.OutputBytes <- measured.OutputBytes + int64 (encoding.GetByteCount output.StdOut)
-                Ok
-                    { ExitCode = output.ExitCode
-                      Stdout = if preserveStdout then output.StdOut else output.StdOut.TrimEnd('\n', '\r')
-                      Stderr = output.StdErr }
+        let injected = activeGitFault.Value
+        let fault =
+            if isNull (box injected) then None
+            else injected (currentPhase "git") args
+        match fault with
+        | Some failure when failure.FaultTimedOut ->
+            Error(RemoteUnavailable "Git command timed out.")
+        | Some failure ->
+            Ok { ExitCode = failure.FaultExitCode; Stdout = ""; Stderr = failure.FaultStderr }
+        | None ->
+            BoundedProcess.run
+                { Executable = "git"
+                  Args = args
+                  WorkingDirectory = repo
+                  Timeout = activeGitTimeout.Value |> Option.defaultValue (TimeSpan.FromSeconds 30.)
+                  MaxOutputBytes = None // Git blob reads are intentionally not page-limited here.
+                  StandardInput = input |> Option.map BoundedProcess.TextInput |> Option.defaultValue BoundedProcess.ClosedInput
+                  ExtraEnvironment = ("GIT_TERMINAL_PROMPT", "0") :: environment
+                  ConfigureStart = None }
+            |> function
+                | Error(ExceptionError ex) -> Error(GitFailure $"Git process failed to start ({ex.GetType().Name}).")
+                | Error _ -> Error(GitFailure "Git process failed.")
+                | Ok output when output.TimedOut -> Error(RemoteUnavailable "Git command timed out.")
+                | Ok output ->
+                    if not (isNull measured) then
+                        measured.OutputBytes <- measured.OutputBytes + int64 (encoding.GetByteCount output.StdOut)
+                    Ok
+                        { ExitCode = output.ExitCode
+                          Stdout = if preserveStdout then output.StdOut else output.StdOut.TrimEnd('\n', '\r')
+                          Stderr = output.StdErr }
 
     let private git repo args = execute repo args None [] false
     let private gitRaw repo args = execute repo args None [] true
     let private gitInput repo args input = execute repo args (Some input) [] false
     let private gitIndex repo index args = execute repo args None [ "GIT_INDEX_FILE", index ] false
 
+    // Remote probes are read-only. A retry cannot publish an intent, and each
+    // child is bounded by the remaining wall-clock budget. Publication pushes
+    // deliberately do NOT use this helper.
+    let private remoteGitWithRetries stage repo args =
+        let deadline = Stopwatch.StartNew()
+        let rec attempt count =
+            let remaining = 12000L - deadline.ElapsedMilliseconds
+            if remaining <= 0L then
+                Error(RemoteUnavailable
+                    (transportDiagnostic stage count None true "timeout" + "; nextAction=" + retryAction ()))
+            else
+                let previousTimeout = activeGitTimeout.Value
+                activeGitTimeout.Value <- Some(TimeSpan.FromMilliseconds(float (min 6000L remaining)))
+                let result =
+                    try
+                        let scope = activeTransportScope.Value
+                        if not (isNull scope) then scope.Attempt <- count
+                        withPhase stage (fun () -> git repo args)
+                    finally activeGitTimeout.Value <- previousTimeout
+                let failureClass =
+                    match result with
+                    | Ok output when output.ExitCode <> 0 && output.ExitCode <> 2 ->
+                        classifyTransport output.Stderr
+                    | Error(RemoteUnavailable _) -> "timeout"
+                    | _ -> ""
+                if transientTransport failureClass && count < 3
+                   && deadline.ElapsedMilliseconds < 12000L then
+                    let pause = min (12000L - deadline.ElapsedMilliseconds) (150L * (1L <<< (count - 1)))
+                    if pause > 0L then System.Threading.Thread.Sleep(int pause)
+                    attempt (count + 1)
+                else
+                    match result with
+                    | Ok output -> Ok(output, count)
+                    | Error(RemoteUnavailable _) ->
+                        Error(RemoteUnavailable
+                            (transportDiagnostic stage count None true "timeout" + "; nextAction=" + retryAction ()))
+                    | Error error -> Error error
+        attempt 1
+
     let private requireSuccess label result =
         match result with
         | Error error -> Error error
         | Ok output when output.ExitCode = 0 -> Ok output.Stdout
-        | Ok output -> Error(GitFailure $"{label}: {output.Stderr.Trim()}")
+        | Ok output ->
+            let scope = activeTransportScope.Value
+            if isNull scope then Error(GitFailure $"{label}: {output.Stderr.Trim()}")
+            else Error(GitFailure (transportDiagnostic "local-preparation" scope.Attempt
+                                       (Some output.ExitCode) false "local-git"))
 
     let private run repo args = git repo args |> requireSuccess (String.concat " " args)
 
@@ -471,10 +629,11 @@ module LedgerStore =
         | Error error -> Error error
 
     let private remoteExists binding =
-        match git binding.RepositoryPath [ "ls-remote"; "--exit-code"; binding.RemoteName; ledgerRef ] with
-        | Ok result when result.ExitCode = 0 -> Ok true
-        | Ok result when result.ExitCode = 2 -> Ok false
-        | Ok result -> Error(RemoteUnavailable result.Stderr)
+        match remoteGitWithRetries "remote-existence" binding.RepositoryPath
+                [ "ls-remote"; "--exit-code"; binding.RemoteName; ledgerRef ] with
+        | Ok(result, _) when result.ExitCode = 0 -> Ok true
+        | Ok(result, _) when result.ExitCode = 2 -> Ok false
+        | Ok(result, count) -> Error(remoteFailure "remote-existence" count (Some result.ExitCode) false result.Stderr)
         | Error error -> Error error
 
     // All authoritative reads fetch a fresh remote head; local refs are only GC/trust anchors.
@@ -487,12 +646,17 @@ module LedgerStore =
             let repo = binding.RepositoryPath
             let stage = $"refs/jarvis/fetch/{Guid.NewGuid():N}"
             try
-                match git repo [ "fetch"; "--no-tags"; "--no-write-fetch-head"; "--refmap="; binding.RemoteName; $"{ledgerRef}:{stage}" ] with
+                let phase = currentPhase "remote-fetch"
+                match remoteGitWithRetries phase repo
+                        [ "fetch"; "--no-tags"; "--no-write-fetch-head"; "--refmap="; binding.RemoteName; $"{ledgerRef}:{stage}" ] with
                 | Error error -> Error error
-                | Ok fetched when fetched.ExitCode <> 0 ->
-                    match remoteExists binding with
-                    | Ok false -> Error(LedgerIntegrityError "Previously configured ledger branch is missing.")
-                    | _ -> Error(RemoteUnavailable fetched.Stderr)
+                | Ok(fetched, count) when fetched.ExitCode <> 0 ->
+                    if classifyTransport fetched.Stderr = "reference" then
+                        match remoteExists binding with
+                        | Ok false -> Error(LedgerIntegrityError "Previously configured ledger branch is missing.")
+                        | Error error -> Error error
+                        | Ok true -> Error(remoteFailure phase count (Some fetched.ExitCode) false fetched.Stderr)
+                    else Error(remoteFailure phase count (Some fetched.ExitCode) false fetched.Stderr)
                 | Ok _ ->
                     match run repo [ "rev-parse"; "--verify"; $"{stage}^{{commit}}" ] with
                     | Error _ -> Error(LedgerHistoryUnavailable "Fetched ledger commit is missing.")
@@ -1984,7 +2148,7 @@ module LedgerStore =
             let requestHash = intentHash binding intent
             let repo = binding.RepositoryPath
             let rec attempt retry =
-                match fetch binding with
+                match withPhase "prepublication-fetch" (fun () -> fetch binding) with
                 | Error error -> Error error
                 | Ok snapshot ->
                     let head = snapshot.Commit
@@ -2043,16 +2207,31 @@ module LedgerStore =
                                           [ "ledger.json", json header
                                             opPath intent.OperationId, json operation ]
                                           @ (changes |> List.map (fun change -> change.Path, change.Content))
-                                      match writeTree repo (Some head) files with
+                                      match withPhase "local-preparation" (fun () -> writeTree repo (Some head) files) with
                                       | Error error -> Error error
                                       | Ok tree ->
-                                          match commitTree repo tree (Some head)
-                                                  $"Jarvis {intent.Kind}\n\nJarvis-Operation-Id: {intent.OperationId:D}\nJarvis-Request-Hash: {requestHash}" with
+                                          match withPhase "local-preparation" (fun () ->
+                                                  commitTree repo tree (Some head)
+                                                      $"Jarvis {intent.Kind}\n\nJarvis-Operation-Id: {intent.OperationId:D}\nJarvis-Request-Hash: {requestHash}") with
                                           | Error error -> Error error
                                           | Ok proposed ->
-                                              let pushed = git repo [ "push"; "--porcelain"; binding.RemoteName; $"{proposed}:{ledgerRef}" ]
-                                              match fetch binding with
-                                              | Error _ -> Error(OutcomeUnknown $"Cannot confirm operation {intent.OperationId:D}.")
+                                              let pushed = withPhase "publication-push" (fun () ->
+                                                  git repo [ "push"; "--porcelain"; binding.RemoteName; $"{proposed}:{ledgerRef}" ])
+                                              match withPhase "confirmation-fetch" (fun () -> fetch binding) with
+                                              | Error failure ->
+                                                  let phaseDiagnostic =
+                                                      match failure with
+                                                      | RemoteUnavailable detail when detail.StartsWith("operationId=", StringComparison.Ordinal) ->
+                                                          // Publication is already possible: remove the
+                                                          // transport's read retry advice before adding
+                                                          // the one safe reconciliation action below.
+                                                          withoutNextAction detail
+                                                      | LedgerIntegrityError _ ->
+                                                          transportDiagnostic "confirmation-fetch" 1 None false "integrity"
+                                                      | _ ->
+                                                          transportDiagnostic "confirmation-fetch" 1 None false "verification"
+                                                  Error(OutcomeUnknown
+                                                      (phaseDiagnostic + "; nextAction=reconcile-same-uuid"))
                                               | Ok observed ->
                                                   match readOperation binding observed.Commit intent.OperationId with
                                                   | Error error -> Error error
@@ -2071,11 +2250,23 @@ module LedgerStore =
                                                       | Error error -> Error error
                                                   | Ok None ->
                                                       match pushed with
-                                                      | Error _ -> Error(OutcomeUnknown $"Push outcome uncertain: {intent.OperationId:D}.")
+                                                      | Error(RemoteUnavailable detail) ->
+                                                          let classification = classifyTransport detail
+                                                          let timedOut = classification = "timeout"
+                                                          Error(OutcomeUnknown
+                                                              (transportDiagnostic "publication-push" 1 None timedOut classification
+                                                               + "; nextAction=reconcile-same-uuid"))
+                                                      | Error _ ->
+                                                          Error(OutcomeUnknown
+                                                              (transportDiagnostic "publication-push" 1 None false "process"
+                                                               + "; nextAction=reconcile-same-uuid"))
                                                       | Ok output when output.ExitCode <> 0 && observed.Commit = head ->
-                                                          Error(GitFailure $"Ledger push failed: {output.Stderr}")
+                                                          Error(OutcomeUnknown
+                                                              (transportDiagnostic "publication-push" 1
+                                                                  (Some output.ExitCode) false (classifyTransport output.Stderr)
+                                                               + "; nextAction=reconcile-same-uuid"))
                                                       | Ok _ when retry >= 7 -> Error LedgerContended
                                                       | _ ->
                                                           System.Threading.Thread.Sleep(contentionDelay retry)
                                                           attempt (retry + 1)
-            attempt 0
+            withTransportScope intent.OperationId (fun () -> attempt 0)

@@ -21,6 +21,7 @@ function createHarness(initialStorage = {}, initialSession = {}) {
   const createdTabs = [];
   const removedTabs = [];
   let userScriptHook = null;
+  let postUserScriptHook = null;
   let nextCreatedId = 19;
   let hostPermissionGranted = true;
   let failNextPermissionQuery = false;
@@ -99,7 +100,8 @@ function createHarness(initialStorage = {}, initialSession = {}) {
           throw Error("Temporary tabs API failure");
         }
         if (!tabs.has(id)) throw Error(`No tab with id: ${id}.`);
-        return tabs.get(id);
+        // Chrome returns a snapshot; a previous get must not see later navigation.
+        return { ...tabs.get(id) };
       },
       onUpdated: { addListener: cb => { listeners.updated = cb; } },
       onRemoved: { addListener: cb => { listeners.removed = cb; } }
@@ -149,6 +151,11 @@ function createHarness(initialStorage = {}, initialSession = {}) {
             }, () => ({}))
           }
         });
+        if (postUserScriptHook) {
+          const hook = postUserScriptHook;
+          postUserScriptHook = null;
+          await hook();
+        }
         return [{ frameId: 0, result }];
       }
     }
@@ -167,6 +174,7 @@ function createHarness(initialStorage = {}, initialSession = {}) {
   return { storage, session, tabs, createdTabs, removedTabs, sockets, calls, listeners, message, deliver,
     userScripts: chrome.userScripts,
     beforeNextUserScript: fn => { userScriptHook = fn; },
+    afterNextUserScript: fn => { postUserScriptHook = fn; },
     setHostPermissionGranted: granted => { hostPermissionGranted = granted; },
     beforeNextPermissionCheck: fn => { permissionHook = fn; },
     onWindowQuery: fn => { windowQueryHook = fn; },
@@ -615,6 +623,66 @@ for (const [label, mutate] of [
     assert.equal(h.calls.length, 1, "Cleanup revalidates live page state");
   });
 }
+
+// A previous empty-home DOM snapshot never authorizes deletion if Chrome is
+// already navigating (or starts navigating while the async probe is running).
+// The harness snapshots tabs.get like Chrome, so the after-probe case requires
+// a new tab query rather than observing mutation through a stale object.
+for (const [label, phase, pending, probeCount] of [
+  ["pending /c/ route before close admission", "before", true, 0],
+  ["pending /c/ route during async DOM probe", "during", true, 1],
+  ["pending /c/ route after DOM probe returns home", "after", true, 1],
+  ["loading home without observable pending URL", "before", false, 0]
+]) {
+  test("failed-launch cleanup retains " + label, async () => {
+    const { h, ws, tab, close } = await createdTabForCloseRegression("https://chatgpt.com/");
+    const historicalPageResult = { status: "notSubmitted", reason: "UnexpectedSendState",
+      safeToDisposeCreatedTab: true };
+    assert.equal(historicalPageResult.safeToDisposeCreatedTab, true);
+    const startNavigation = () => {
+      // The committed URL and old document are intentionally still fresh home.
+      tab.status = "loading";
+      if (pending) tab.pendingUrl = "https://chatgpt.com/c/late-conversation";
+      else delete tab.pendingUrl;
+    };
+    if (phase === "before") startNavigation();
+    else if (phase === "during") h.beforeNextUserScript(startNavigation);
+    else h.afterNextUserScript(startNavigation);
+    const response = await close("pending-" + phase + "-" + (pending ? "route" : "unknown"),
+      { requireFreshHomeNoTurns: true });
+    assert.equal(response.error, "CleanupSafetyChanged");
+    assert.equal(h.calls.length, probeCount,
+      "Do not trust an old home DOM after a pending navigation");
+    assert.equal(h.removedTabs.includes(tab.id), false, "Pending conversation must survive");
+    assert.equal(h.tabs.has(tab.id), true);
+    assert.equal(h.tabs.has(17), true, "Manually registered tab survives");
+    assert.equal(h.tabs.has(18), true, "Unrelated tab survives");
+    assert.equal(ws.sent.some(m => m.kind === "executeJs"), false,
+      "Cleanup cannot replay a launcher after a definitive failure");
+  });
+}
+
+test("failed-launch cleanup rejects a pending /c/ URL even if status reports complete", async () => {
+  const { h, tab, close } = await createdTabForCloseRegression("https://chatgpt.com/");
+  tab.pendingUrl = "https://chatgpt.com/c/not-yet-committed";
+  // Contradictory Chrome observations must not grant deletion authority.
+  assert.equal(tab.status, "complete");
+  const response = await close("pending-complete", { requireFreshHomeNoTurns: true });
+  assert.equal(response.error, "CleanupSafetyChanged");
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.removedTabs.length, 0);
+  assert.equal(h.tabs.has(tab.id), true);
+});
+
+test("failed-launch cleanup retains tab when post-probe navigation inspection fails", async () => {
+  const { h, tab, close } = await createdTabForCloseRegression("https://chatgpt.com/");
+  h.afterNextUserScript(() => h.failTabQueryOnce());
+  const response = await close("post-probe-unverified", { requireFreshHomeNoTurns: true });
+  assert.equal(response.error, "CleanupSafetyUnverified");
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.removedTabs.length, 0);
+  assert.equal(h.tabs.has(tab.id), true);
+});
 
 test("failed-launch disposal closes a still-fresh, zero-turn ChatGPT home tab", async () => {
   const { h, tab, close } = await createdTabForCloseRegression("https://chatgpt.com/");

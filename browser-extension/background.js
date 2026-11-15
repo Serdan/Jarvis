@@ -807,8 +807,8 @@ async function closeCreatedTab(message) {
   const parent = await validWindow(reg.windowRegistration);
   if (!parent) return reject("WindowNotRegistered");
   const parentGeneration = parent.generation;
-  // Resolve the window before probing the page, so no Chrome awaits remain
-  // between a successful live probe and the final synchronous remove call.
+  // Resolve the window before probing the page; after the probe, only the
+  // required fresh navigation check awaits Chrome before calling tabs.remove.
   const finalParent = await validWindow(reg.windowRegistration);
   let tab;
   try { tab = await chrome.tabs.get(reg.tabId); } catch { return reject("TabMissing"); }
@@ -823,7 +823,12 @@ async function closeCreatedTab(message) {
     if (!initialBlank) {
       // Other providers do not have the ChatGPT turn markers used below.
       if (reg.boundUrl !== CHATGPT_FRESH_HOME) return reject("CleanupSafetyUnverified");
-      if (current.url !== reg.boundUrl || current.discarded || current.frozen)
+      // A committed home document is not proof that the tab is still on home:
+      // Chrome exposes a /c/ navigation in pendingUrl while url and the old
+      // DOM continue to report the empty home page. Apart from the strictly
+      // verified initial about:blank case, any navigation in flight is unsafe.
+      if (current.url !== reg.boundUrl || current.status !== "complete" ||
+          current.pendingUrl || current.discarded || current.frozen)
         return reject("CleanupSafetyChanged");
       // Recheck current route and turn state after the launcher returned.
       // A missing/unfinished inspection is never interpreted as empty.
@@ -837,6 +842,16 @@ async function closeCreatedTab(message) {
       } catch { return reject("CleanupSafetyUnverified"); }
       if (!result || result.ready !== true) return reject("CleanupSafetyUnverified");
       if (result.home !== true || result.userTurns !== 0)
+        return reject("CleanupSafetyChanged");
+      // The page probe is asynchronous. A new navigation can start while the
+      // previous home document is being inspected; inspect Chrome's *tab*
+      // state again after that await, not just the committed document's DOM.
+      let afterProbe;
+      try { afterProbe = await chrome.tabs.get(reg.tabId); }
+      catch { return reject("CleanupSafetyUnverified"); }
+      if (afterProbe.windowId !== parent.windowId ||
+          afterProbe.url !== reg.boundUrl || afterProbe.status !== "complete" ||
+          afterProbe.pendingUrl || afterProbe.discarded || afterProbe.frozen)
         return reject("CleanupSafetyChanged");
     }
   }

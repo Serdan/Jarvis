@@ -1,0 +1,6 @@
+WQ03 ORIGINAL UUID OFFLINE CONTRACT FIXTURE (not an implementation/integration test)
+warning: You appear to have cloned an empty repository.
+Applied original op UUID=77777777-7777-4777-8777-777777777777 request_hash=c97d14087d26563712cbbccfd3242dc78d55bb47d75314f9ad96c5cd351e3c99 ledger_G1=2196b0fa0769a30635fd548990aab012b65d9dc3; simulated ACK loss
+PASS stale duplicate clone CAS rejected (exit 1)
+PASS lost ledger ACK recoverable at fresh pinned canonical HEAD; exact same UUID/hash => idempotent, different hash => conflict
+LIMIT: fixture does not attest a live original network push or terminal process state; missing receipt is never proof of effect terminality.

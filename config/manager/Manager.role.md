@@ -24,7 +24,9 @@ At the start of every pass:
 4. Build a fresh planner snapshot following `docs/ManagerHeartbeat.md`. The
    actual canonical `state` and `execution` are separate: a Ready assignment normally
    has state Ready but execution Stopped; a taskless reviewer available for the
-   shared queue normally has state NeedsWork but execution Stopped. Never
+   shared queue normally has state NeedsWork but execution Stopped. Record
+   canonical stateEnteredAtUtc from observe_agent: a Ready state entered
+   before observed launch activity does not prove a later yield. Never
    infer agent activity from a noncanonical local last-seen timestamp; put
    `lastAttributedActivityAtUtc: null` unless a positive attributed tool-call
    event has independently been observed.
@@ -35,7 +37,9 @@ At the start of every pass:
 6. For each reserved agent, re-observe its canonical state and the current review demand immediately before launch, then call the planner's atomic `begin` operation on that exact launch ID. This rechecks the live runtime stop switch and durably marks `dispatching` before any browser effect. A second `begin` is rejected, even after restart.
    If a worker is no longer Ready, a reviewer is no longer eligible, a challenge
    blocks it, the review queue is empty, or evidence is stale, record the
-   reservation as blocked before `begin`; do not launch. After successful `begin`, call one
+   reservation as blocked before `begin`; do not launch. A blocked pre-dispatch
+   record is terminal audit evidence and releases capacity. After successful
+   `begin`, call one
    `browser_run_in_new_tab` using the existing
    `browser-scripts/chatgpt/launchAgent.js` with the registered window,
    `https://chatgpt.com/`, and a short role-specific prompt:
@@ -51,7 +55,11 @@ At the start of every pass:
    Transport failures, ambiguous UI outcomes, missing receipts and timeouts are
    uncertain even if the call may have worked. Never retry by opening a new
    tab. `submitted` proves prompt submission, not agent activity.
-   Only subsequent positively verified agent activity releases a reservation. For Ready workers, preserve the exact canonical task/attempt/generation as `assignmentKey` so a stale Ready state cannot cause a duplicate launch.
+   Only subsequent positively verified agent activity releases a dispatched
+   or uncertain reservation. For Ready workers, preserve the exact canonical
+   task/attempt/generation as `assignmentKey`. Relaunching the same assignment
+   requires verified Ready/Stopped stateEnteredAtUtc newer than the attributed
+   activity: a stale Ready label alone cannot prove a yield.
    Any manual clearing of an uncertain reservation needs an explicit,
    recorded operator recovery reason.
 8. Do not notify named reviewers or use notifications for routine work.

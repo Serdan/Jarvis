@@ -84,7 +84,7 @@ The Manager gets task_overview at a verified ledger head, observes **all**
 configured agents using observe_agent, checks the independent review queue,
 task readiness, challenges, and relevant client activity. Include other
 working or uncertain agents in the snapshot so their activity counts against
-the per-project budget. Never set complete/verified flags by assumption.
+the per-project budget. Unclassified active or uncertain agents fail closed. Never set complete/verified flags by assumption.
 
 The planner accepts JSON in this form (the example is deliberately
 incomplete for the full 5/3 Jarvis config; the real file must include all
@@ -120,6 +120,7 @@ configured labels):
       "slotAvailable": false,
       "verified": true,
       "hasReadyAssignment": true,
+      "stateEnteredAtUtc": "2026-11-15T01:59:00Z",
       "assignmentKey": "task-123/attempt-456/gen-1",
       "priorityRank": 0,
       "waitingOnChallenge": false,
@@ -134,7 +135,10 @@ Ready workers normally have state Ready and execution Stopped; reviewers
 available for the shared queue commonly have state NeedsWork and execution
 Stopped. A Ready worker must carry an `assignmentKey` made from canonical
 task ID, attempt ID and generation; this suppresses stale Ready relaunches
-after an observed tool call. The local lastSeenAtUtc field is explicitly
+after an observed tool call. Include canonical `stateEnteredAtUtc` from
+`observe_agent` for Ready workers: the same assignment can be relaunched only
+when a verified Ready/Stopped transition is later than the attributed launch
+activity. An old Ready snapshot cannot prove yield. The local lastSeenAtUtc field is explicitly
 noncanonical and must
 not be copied into lastAttributedActivityAtUtc merely because it is recent.
 Only a positively observed, project/agent-attributed tool call may populate
@@ -167,11 +171,13 @@ that pass. The planner fills workers with Ready assignments first, ordered by
 optional verified canonical priorityRank (0 is highest), then eligible
 taskless reviewers against the unclaimed frozen review count,
 and counts prior pending/uncertain launches and other Working agents against
-the 5/3 budget. Duplicate timer ticks reserve nothing twice.
+the 5/3 budget. Unclassified live or uncertain agents prevent all launches. Duplicate timer ticks reserve nothing twice.
 
 For each reservation, re-observe the agent and review demand immediately
 before dispatch. If eligibility changed, mark the reservation blocked and
-do not launch. Otherwise atomically **begin** the reserved launch:
+do not launch. A blocked-before-dispatch record remains in the audit journal
+but frees its capacity; a later eligible pass may reserve again. Otherwise
+atomically **begin** the reserved launch:
 
 ~~~sh
 node scripts/manager-heartbeat.mjs begin --config artifacts/manager/Jarvis/config.json --journal artifacts/manager/Jarvis/journal.json --launch-id <launch-id>
@@ -198,9 +204,12 @@ node scripts/manager-heartbeat.mjs mark --config artifacts/manager/Jarvis/config
 
 Use --result uncertain on timeout, transport loss, unexpected UI result
 or unverified submission, and --result blocked on a known safe pre-launch
-stop. Neither is automatically retried. A successful browser submission is
-not proof the agent called Jarvis. Retain reservations until positive
-attributed agent activity or explicit operator recovery.
+stop. Never retry a dispatched or uncertain launch automatically. A blocked
+pre-dispatch reservation is terminal, not a browser retry, and is safe to
+replan. A successful browser submission is not proof the agent called Jarvis.
+Retain dispatched/uncertain reservations until positive attributed activity
+or explicit operator recovery. Verified Ready/Stopped stateEnteredAtUtc after
+such activity proves the worker later yielded and can resume the same task.
 
 ## Start the one Manager idle heartbeat (only after approval)
 

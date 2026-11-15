@@ -11,7 +11,9 @@ const ACTIVE_STATES = new Set(["Working", "Unknown"]);
 const ALLOWED_STATES = new Set(["Ready", "Working", "NeedsWork", "Free",
   "Blocked", "Parked", "Stopped", "Unknown"]);
 const ALLOWED_EXECUTIONS = new Set(["Working", "Stopped", "Unknown"]);
-const LIVE_RECORDS = new Set(["reserved", "dispatching", "submitted", "uncertain", "blocked"]);
+// A blocked-before-dispatch reservation is terminal, not a live browser effect.
+const LIVE_RECORDS = new Set(["reserved", "dispatching", "submitted", "uncertain"]);
+const TERMINAL_RECORDS = new Set(["blocked", "observed", "cleared"]);
 const LAUNCH_RESULTS = new Set(["submitted", "uncertain", "blocked"]);
 
 function assert(condition, message) {
@@ -91,6 +93,16 @@ export function validateSnapshot(config, snapshot, nowUtc) {
       assert(agent.activityEvidence === "ExplicitAttributedToolCall",
         "Client-local last-seen is not proof of agent activity");
     }
+    if (agent.stateEnteredAtUtc !== undefined && agent.stateEnteredAtUtc !== null) {
+      const enteredAt = validTime(agent.stateEnteredAtUtc, "stateEnteredAtUtc");
+      assert(enteredAt <= observed + 1000,
+        "stateEnteredAtUtc is after the authoritative snapshot");
+    }
+    // Unknown capacity classification must never free a worker/reviewer slot.
+    assert(!(agent.kind === "other" &&
+      (ACTIVE_STATES.has(agent.state) || agent.execution === "Working" ||
+       agent.execution === "Unknown")),
+      "Unclassified live or uncertain project agent: " + agent.agentId);
     agents.set(agent.agentId, agent);
   }
   for (const kind of ["worker", "reviewer"]) {
@@ -119,12 +131,23 @@ export function validateJournal(journal, projectName) {
       "Invalid/duplicate journal launch ID");
     assert(typeof rec.agentId === "string" &&
       ["worker", "reviewer"].includes(rec.kind) &&
-      [...LIVE_RECORDS, "observed", "cleared"].includes(rec.status),
+      [...LIVE_RECORDS, ...TERMINAL_RECORDS].includes(rec.status),
       "Invalid journal record");
     validTime(rec.reservedAtUtc, "journal reservation");
+    if (rec.status === "observed") validTime(rec.observedAtUtc, "observedAtUtc");
     ids.add(rec.launchId);
   }
   return journal;
+}
+
+// State Ready/Stopped alone may be a stale pre-launch snapshot. The canonical
+// state-entered time must be newer than the positively attributed launch
+// activity: this proves a later yield/stop, even for the SAME assignment.
+function yieldedAfterActivity(agent, activityAtUtc) {
+  return agent?.state === "Ready" && agent.execution === "Stopped" &&
+    agent.hasReadyAssignment === true &&
+    typeof agent.stateEnteredAtUtc === "string" &&
+    Date.parse(agent.stateEnteredAtUtc) > Date.parse(activityAtUtc);
 }
 
 export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
@@ -149,7 +172,8 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
   // successful UI submission is proof the agent started.
   for (const rec of journal.records) {
     if (rec.status === "observed" && rec.kind === "worker" &&
-      rec.assignmentKey && agents.get(rec.agentId)?.assignmentKey === rec.assignmentKey) {
+      rec.assignmentKey && agents.get(rec.agentId)?.assignmentKey === rec.assignmentKey &&
+      !yieldedAfterActivity(agents.get(rec.agentId), rec.observedAtUtc)) {
       observedAssignments.add(rec.agentId);
     }
     if (!LIVE_RECORDS.has(rec.status)) continue;
@@ -159,9 +183,10 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
       Date.parse(activity) > Date.parse(rec.reservedAtUtc) &&
       Date.parse(activity) <= Date.parse(snapshot.capturedAtUtc);
     if (observed) {
-      observedThisPass.add(rec.agentId);
+      if (!yieldedAfterActivity(agent, activity)) observedThisPass.add(rec.agentId);
       if (rec.kind === "worker" && rec.assignmentKey &&
-        agent.assignmentKey === rec.assignmentKey) observedAssignments.add(rec.agentId);
+        agent.assignmentKey === rec.assignmentKey &&
+        !yieldedAfterActivity(agent, activity)) observedAssignments.add(rec.agentId);
       if (!dryRun) {
         rec.status = "observed";
         rec.observedAtUtc = activity;

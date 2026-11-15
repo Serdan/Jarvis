@@ -22,6 +22,8 @@ function agent(agentId, kind, state, overrides = {}) {
     agentId, kind, state, execution: state === "Working" ? "Working" : "Stopped",
     slotAvailable: state === "Free" || state === "NeedsWork", verified: true,
     hasReadyAssignment: state === "Ready",
+    // Canonical state transition time from observe_agent, not a client-local cache.
+    stateEnteredAtUtc: "2026-11-14T02:00:00Z",
     assignmentKey: kind === "worker" && state === "Ready" ? "task/gen1/" + agentId : null,
     waitingOnChallenge: false,
     lastAttributedActivityAtUtc: null,
@@ -326,4 +328,120 @@ test("positive activity cannot relaunch same Ready assignment", () => {
   s.agents[1].assignmentKey = "different-task/gen1/Worker 1";
   const later = decide(config(), s, j, s.capturedAtUtc);
   assert.ok(later.reservations.some(x => x.agentId === "Worker 1"));
+});
+
+
+test("observed Working then canonical yield to Ready relaunches same assignment once", () => {
+  const c = config();
+  c.budgets.worker = 1;
+  c.budgets.reviewer = 0;
+  const j = journal();
+  const initial = snapshot();
+  initial.agents[2].state = "Free";
+  initial.agents[2].hasReadyAssignment = false;
+  decide(c, initial, j, NOW);
+  assert.equal(j.records.length, 1);
+
+  const working = snapshot();
+  working.agents[2].state = "Free";
+  working.agents[2].hasReadyAssignment = false;
+  working.capturedAtUtc = "2026-11-15T02:01:00Z";
+  working.agents[1].state = "Working";
+  working.agents[1].execution = "Working";
+  working.agents[1].lastAttributedActivityAtUtc = "2026-11-15T02:00:30Z";
+  working.agents[1].activityEvidence = "ExplicitAttributedToolCall";
+  assert.equal(decide(c, working, j, working.capturedAtUtc).reservations.length, 0);
+  assert.equal(j.records[0].status, "observed");
+
+  const yielded = snapshot();
+  yielded.agents[2].state = "Free";
+  yielded.agents[2].hasReadyAssignment = false;
+  yielded.capturedAtUtc = "2026-11-15T02:02:00Z";
+  yielded.agents[1].lastAttributedActivityAtUtc = "2026-11-15T02:00:30Z";
+  yielded.agents[1].activityEvidence = "ExplicitAttributedToolCall";
+  yielded.agents[1].stateEnteredAtUtc = "2026-11-15T02:01:30Z";
+  const resumed = decide(c, yielded, j, yielded.capturedAtUtc);
+  assert.deepEqual(resumed.reservations.map(r => r.agentId), ["Worker 1"]);
+  assert.equal(j.records.length, 2);
+  assert.equal(j.records[0].status, "observed");
+  assert.equal(j.records[1].status, "reserved");
+  assert.equal(decide(c, yielded, j, yielded.capturedAtUtc).reservations.length, 0);
+});
+
+test("yield between Manager observations clears observed reservation and relaunches", () => {
+  const c = config();
+  c.budgets.worker = 1;
+  c.budgets.reviewer = 0;
+  const j = journal();
+  const s = snapshot();
+  s.agents[2].state = "Free";
+  s.agents[2].hasReadyAssignment = false;
+  decide(c, s, j, NOW);
+
+  s.capturedAtUtc = "2026-11-15T02:02:00Z";
+  s.agents[1].lastAttributedActivityAtUtc = "2026-11-15T02:00:30Z";
+  s.agents[1].activityEvidence = "ExplicitAttributedToolCall";
+  s.agents[1].stateEnteredAtUtc = "2026-11-15T02:01:30Z";
+  const next = decide(c, s, j, s.capturedAtUtc);
+  assert.deepEqual(next.reservations.map(r => r.agentId), ["Worker 1"]);
+  assert.equal(j.records[0].status, "observed");
+  assert.equal(j.records[1].status, "reserved");
+});
+
+test("blocked pre-dispatch reservation releases budget across process restart", () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-manager-blocked-"));
+  try {
+    const conf = path.join(temp, "config.json");
+    const snap = path.join(temp, "snapshot.json");
+    const state = path.join(temp, "journal.json");
+    const c = config();
+    c.budgets.worker = 1;
+    c.budgets.reviewer = 0;
+    const s = snapshot();
+    s.capturedAtUtc = new Date().toISOString();
+    s.agents[2].state = "Free";
+    s.agents[2].hasReadyAssignment = false;
+    fs.writeFileSync(conf, JSON.stringify(c));
+    fs.writeFileSync(snap, JSON.stringify(s));
+    const args = ["plan", "--config", conf, "--snapshot", snap, "--journal", state];
+    const first = spawnSync(process.execPath, [SCRIPT, ...args], { encoding: "utf8" });
+    assert.equal(first.status, 0, first.stderr);
+    const [original] = JSON.parse(first.stdout).reservations;
+    assert.equal(original.agentId, "Worker 1");
+    const blocked = runCli(["mark", "--config", conf, "--journal", state,
+      "--launch-id", original.launchId, "--result", "blocked"]);
+    assert.equal(blocked.status, "blocked");
+    assert.throws(() => runCli(["release", "--config", conf, "--journal", state,
+      "--launch-id", original.launchId, "--reason", "Unnecessary blocked release"]),
+      /Only live reservations/);
+
+    const restarted = spawnSync(process.execPath, [SCRIPT, ...args], { encoding: "utf8" });
+    assert.equal(restarted.status, 0, restarted.stderr);
+    const decisions = JSON.parse(restarted.stdout);
+    assert.deepEqual(decisions.reservations.map(r => r.agentId), ["Worker 1"]);
+    assert.equal(decisions.counts.worker, 1);
+    assert.notEqual(decisions.reservations[0].launchId, original.launchId);
+    const persisted = JSON.parse(fs.readFileSync(state, "utf8"));
+    assert.equal(persisted.records[0].status, "blocked");
+    assert.equal(persisted.records[1].status, "reserved");
+    const duplicate = spawnSync(process.execPath, [SCRIPT, ...args], { encoding: "utf8" });
+    assert.equal(duplicate.status, 0, duplicate.stderr);
+    assert.equal(JSON.parse(duplicate.stdout).reservations.length, 0);
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("unclassified active or uncertain project agents fail closed", () => {
+  for (const state of ["Working", "Unknown"]) {
+    const s = snapshot();
+    s.agents.push(agent("Independent agent", "other", state));
+    const j = journal();
+    assert.throws(() => decide(config(), s, j, NOW),
+      /Unclassified live or uncertain project agent/);
+    assert.equal(j.records.length, 0);
+  }
+  const s = snapshot();
+  s.agents.push(agent("Inactive helper", "other", "Parked"));
+  assert.equal(decide(config(), s, journal(), NOW).reservations.length, 4);
 });

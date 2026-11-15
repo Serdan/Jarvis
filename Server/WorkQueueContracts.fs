@@ -140,6 +140,7 @@ type SubjectMessage =
       Subject: Subject
       Body: string
       State: MessageState
+      HandlerGeneration: int
       WorkId: string option }
 
 [<RequireQualifiedAccess>]
@@ -753,7 +754,8 @@ module Contracts =
                             else
                                 Ok { next with
                                         Messages = next.Messages.Add(id,
-                                            { message with State = MessageState.ClaimedPrimary launchId }) }
+                                            { message with State = MessageState.ClaimedPrimary launchId
+                                                           HandlerGeneration = nextWork.ClaimGeneration }) }
                         | _ -> Ok next
                 | _ -> Error(Rejection.InvalidState "requires registered launch with no prior primary claim")) project
 
@@ -783,7 +785,11 @@ module Contracts =
             if failure.IsNone then
                 match state.Messages.TryFind messageId with
                 | Some message when message.State = MessageState.ClaimedAncillary launch.Id ->
-                    state <- { state with Messages = state.Messages.Add(messageId, { message with State = MessageState.Pending }) }
+                    // Invalidate even a workless ancillary handler at terminal.
+                    // Stage-backed claims advance the same canonical generation.
+                    let pending = { message with State = MessageState.Pending
+                                                 HandlerGeneration = message.HandlerGeneration + 1 }
+                    state <- { state with Messages = state.Messages.Add(messageId, pending) }
                     match message.WorkId with
                     | None -> ()
                     | Some workId ->
@@ -854,12 +860,17 @@ module Contracts =
                 | _ -> Error Rejection.DependencyGatePending) current
             |> Result.bind (projectDependenciesChanged now)) project
 
-    let completeMessageWork expected op launchId workId messageId replyId now project =
-        projectCas expected op (fullInput "complete-message" (launchId, workId, messageId, replyId, now)) (fun current ->
+    let completeMessageWork expected op launchId workId messageId expectedHandlerGeneration replyId now project =
+        projectCas expected op
+            (fullInput "complete-message" (launchId, workId, messageId, expectedHandlerGeneration, replyId, now))
+            (fun current ->
             match current.Messages.TryFind messageId with
-            | Some message when message.WorkId = Some workId && message.State = MessageState.ClaimedPrimary launchId ->
+            | Some message when message.WorkId = Some workId
+                                && message.State = MessageState.ClaimedPrimary launchId
+                                && message.HandlerGeneration = expectedHandlerGeneration ->
                 finishClaim op launchId workId now (fun stage ->
                     if stage.Kind = WorkKind.RoleMessage messageId
+                       && stage.ClaimGeneration = expectedHandlerGeneration
                        && stage.Gate = GateState.Clear
                        && hardDependenciesSatisfied current stage then
                         Ok { stage with State = WorkState.Completed }
@@ -891,7 +902,8 @@ module Contracts =
                         Ok { current with
                                 Launches = current.Launches.Add(launchId, updatedLaunch)
                                 Messages = current.Messages.Add(messageId,
-                                    { message with State = MessageState.ClaimedAncillary launchId }) }
+                                    { message with State = MessageState.ClaimedAncillary launchId
+                                                   HandlerGeneration = message.HandlerGeneration + 1 }) }
                     | Some workId ->
                         match orderAvailable current with
                         | Error e -> Error e
@@ -911,16 +923,29 @@ module Contracts =
                                             Works = current.Works.Add(workId, claimed)
                                             Launches = current.Launches.Add(launchId, updatedLaunch)
                                             Messages = current.Messages.Add(messageId,
-                                                { message with State = MessageState.ClaimedAncillary launchId }) }
+                                                { message with State = MessageState.ClaimedAncillary launchId
+                                                               HandlerGeneration = claimed.ClaimGeneration }) }
                                     Ok(applyCredits next matching)
                             | _ -> Error(Rejection.InvalidState "role message work is not Available")
             | _ -> Error(Rejection.InvalidState "ancillary handler requires active unrelated primary claim")) project
 
-    let completeAncillaryMessage expected op launchId messageId replyId now project =
-        projectCas expected op (fullInput "ancillary-complete" (launchId, messageId, replyId, now)) (fun current ->
+    // Project.Version cannot fence a reply created before a same-launch reclaim.
+    // The response and the idempotent receipt must pin its handler generation.
+    let completeAncillaryMessage expected op launchId messageId expectedHandlerGeneration replyId now project =
+        projectCas expected op
+            (fullInput "ancillary-complete" (launchId, messageId, expectedHandlerGeneration, replyId, now))
+            (fun current ->
             match current.Launches.TryFind launchId, current.Messages.TryFind messageId with
             | Some launch, Some message when launch.AncillaryMessages.Contains messageId
-                                             && message.State = MessageState.ClaimedAncillary launchId ->
+                                             && message.State = MessageState.ClaimedAncillary launchId
+                                             && message.HandlerGeneration = expectedHandlerGeneration
+                                             && (match launch.State, launch.Lease, launch.PrimaryWorkId with
+                                                 | LaunchState.Registered _, Some lease, Some primaryId
+                                                     when not lease.StopRequested ->
+                                                     match current.Works.TryFind primaryId with
+                                                     | Some primary -> primary.State = WorkState.Claimed launchId
+                                                     | None -> false
+                                                 | _ -> false) ->
                 let markHandled (next: Project) =
                     let updatedLaunch = { launch with AncillaryMessages = launch.AncillaryMessages.Remove messageId }
                     { next with
@@ -935,7 +960,9 @@ module Contracts =
                         // The graph edit and completion compete at Project.Version.
                         // Once a new hard edge wins, both reply and downstream
                         // publication must remain fenced by its dependency gate.
-                        if work.Gate <> GateState.Clear || not (hardDependenciesSatisfied current work) then
+                        if work.ClaimGeneration <> expectedHandlerGeneration then
+                            Error(Rejection.InvalidState "stale ancillary handler generation")
+                        elif work.Gate <> GateState.Clear || not (hardDependenciesSatisfied current work) then
                             Error Rejection.DependencyGatePending
                         elif work.SourceLineage.IsSome || work.Push.IsSome
                              || work.Domain <> DomainState.Undecided then
@@ -945,6 +972,10 @@ module Contracts =
                             |> markHandled
                             |> projectDependenciesChanged now
                     | _ -> Error(Rejection.InvalidState "ancillary work lost its handler claim")
+            | Some launch, Some message when launch.AncillaryMessages.Contains messageId
+                                             && message.State = MessageState.ClaimedAncillary launchId
+                                             && message.HandlerGeneration <> expectedHandlerGeneration ->
+                Error(Rejection.InvalidState "stale ancillary handler generation")
             | _ -> Error(Rejection.InvalidState "no live ancillary message handler")) project
 
     // A new hard prerequisite may gate an ancillary Role handler while its
@@ -972,6 +1003,7 @@ module Contracts =
                        || not (launch.AncillaryMessages.Contains messageId)
                        || message.State <> MessageState.ClaimedAncillary launchId
                        || message.WorkId <> Some workId
+                       || message.HandlerGeneration <> expectedClaimGeneration
                        || work.Kind <> WorkKind.RoleMessage messageId
                        || work.State <> WorkState.Claimed launchId
                        || work.ClaimGeneration <> expectedClaimGeneration
@@ -997,7 +1029,9 @@ module Contracts =
                         let next =
                             { current with
                                 Works = current.Works.Add(workId, released)
-                                Messages = current.Messages.Add(messageId, { message with State = MessageState.Pending })
+                                Messages = current.Messages.Add(messageId,
+                                    { message with State = MessageState.Pending
+                                                   HandlerGeneration = released.ClaimGeneration })
                                 Launches = current.Launches.Add(launchId,
                                     { launch with
                                         AncillaryMessages = launch.AncillaryMessages.Remove messageId

@@ -947,6 +947,58 @@ test("revoking agent-created tabs during final window lookup cannot create tab",
   assert.equal(h.createdTabs.length, 0, "A revoked opt-in forbids tab creation");
 });
 
+test("revoking host permission during final window lookup prevents agent tab creation", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("registerWindow", { windowId: 1, alias: "agents" });
+  await h.message("setAgentCreatedTabs", { allowed: true });
+  await h.message("pair", { port: 43822, secret: "b".repeat(64) });
+  await tick(); await tick();
+  const ws = h.sockets[0];
+  await h.deliver(ws, { kind: "challenge", nonce: "d".repeat(64) });
+  await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  const pin = await windowPin(h);
+  let windowQueries = 0;
+  h.onWindowQuery(async () => {
+    if (++windowQueries !== 2) return;
+    h.onWindowQuery(null);
+    h.setHostPermissionGranted(false);
+  });
+  await h.deliver(ws, { kind: "openTab", requestId: "host-revoked-during-lookup",
+    connectionId: "epoch-1", url: "https://example.test/chat", alias: "must-not-open", ...pin });
+  assert.equal(windowQueries, 2, "Host permission must be revoked after the first permission check");
+  assert.equal(ws.sent.find(m => m.requestId === "host-revoked-during-lookup")?.error,
+    "BrowserPermissionMissing");
+  assert.equal(h.createdTabs.length, 0, "No new tab may bypass a revoked destination permission");
+});
+
+test("window re-registration during final permission check cannot create tab", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("registerWindow", { windowId: 1, alias: "agents" });
+  await h.message("setAgentCreatedTabs", { allowed: true });
+  await h.message("pair", { port: 43822, secret: "b".repeat(64) });
+  await tick(); await tick();
+  const ws = h.sockets[0];
+  await h.deliver(ws, { kind: "challenge", nonce: "d".repeat(64) });
+  await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  const pin = await windowPin(h);
+  let windowQueries = 0;
+  h.onWindowQuery(async () => {
+    if (++windowQueries !== 2) return;
+    h.onWindowQuery(null);
+    h.beforeNextPermissionCheck(async () => {
+      assert.equal((await h.message("registerWindow", { windowId: 1, alias: "agents" })).ok, true);
+    });
+  });
+  await h.deliver(ws, { kind: "openTab", requestId: "window-changed-during-final-permission",
+    connectionId: "epoch-1", url: "https://example.test/chat", alias: "must-not-open", ...pin });
+  assert.equal(windowQueries, 2);
+  assert.equal(ws.sent.find(m => m.requestId === "window-changed-during-final-permission")?.error,
+    "WindowRegistrationChanged");
+  assert.equal(h.createdTabs.length, 0, "Final async permission check must not leave window identity stale");
+});
+
 test("re-enabling opt-in during final window lookup does not authorize stale open", async () => {
   const h = createHarness();
   await tick(); await tick();
@@ -972,6 +1024,49 @@ test("re-enabling opt-in during final window lookup does not authorize stale ope
   assert.equal(ws.sent.find(m => m.requestId === "stale-opt-in")?.error,
     "AgentCreatedTabsAuthorizationChanged");
   assert.equal(h.createdTabs.length, 0, "Fresh opt-in must not revive the old request");
+});
+
+test("queued OpenTab cannot survive disable and re-enable of agent tab creation", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("registerWindow", { windowId: 1, alias: "agents" });
+  await h.message("setAgentCreatedTabs", { allowed: true });
+  await h.message("pair", { port: 43822, secret: "b".repeat(64) });
+  await tick(); await tick();
+  const ws = h.sockets[0];
+  await h.deliver(ws, { kind: "challenge", nonce: "d".repeat(64) });
+  await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  const pin = await windowPin(h);
+
+  let releaseLookup;
+  const heldLookup = new Promise(resolve => { releaseLookup = resolve; });
+  let reportLookup;
+  const reachedLookup = new Promise(resolve => { reportLookup = resolve; });
+  let windowQueries = 0;
+  h.onWindowQuery(async () => {
+    if (++windowQueries !== 2) return;
+    h.onWindowQuery(null);
+    reportLookup();
+    await heldLookup;
+  });
+  const first = h.deliver(ws, { kind: "openTab", requestId: "first-queued-open",
+    connectionId: "epoch-1", url: "https://example.test/chat", alias: "first", ...pin });
+  await reachedLookup;
+  // This request is received under the old epoch, but awaits the first tab.
+  await h.deliver(ws, { kind: "openTab", requestId: "second-queued-open",
+    connectionId: "epoch-1", url: "https://example.test/chat", alias: "second", ...pin });
+  assert.equal((await h.message("setAgentCreatedTabs", { allowed: false })).ok, true);
+  assert.equal((await h.message("setAgentCreatedTabs", { allowed: true })).ok, true);
+  releaseLookup();
+  await first;
+  await tick(); await tick();
+
+  assert.equal(windowQueries, 2);
+  assert.equal(ws.sent.find(m => m.requestId === "first-queued-open")?.error,
+    "AgentCreatedTabsAuthorizationChanged");
+  assert.equal(ws.sent.find(m => m.requestId === "second-queued-open")?.error,
+    "AgentCreatedTabsAuthorizationChanged");
+  assert.equal(h.createdTabs.length, 0, "Old queued request must never adopt fresh opt-in");
 });
 
 test("unpairing during final window lookup prevents any created tab", async () => {

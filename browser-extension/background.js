@@ -246,7 +246,11 @@ async function connect() {
         if (message.connectionId === connectionId) snapshots.delete(message.snapshotId);
       } else if (message.kind === "openTab" && connected) {
         // Serialize creations to enforce alias uniqueness and the tab quota.
-        openQueue = openQueue.then(() => openNewTab(message)).catch(() => {});
+        // Pin authority when the socket receives the request, not when its
+        // turn in the queue arrives (a disable/re-enable must not revive it).
+        const requestContext = { socket: ws, connectionId,
+          authorizationEpoch: agentTabAuthorizationEpoch };
+        openQueue = openQueue.then(() => openNewTab(message, requestContext)).catch(() => {});
       } else if (message.kind === "closeTab" && connected) {
         openQueue = openQueue.then(() => closeCreatedTab(message)).catch(() => {});
       } else if (message.kind === "ping") {
@@ -585,11 +589,10 @@ async function readSnapshotChunk(message) {
     offset: message.offset, data: btoa(binary) });
 }
 
-async function openNewTab(message) {
+async function openNewTab(message, requestContext) {
   const { requestId } = message;
-  const requestSocket = socket;
-  const requestConnection = connectionId;
-  const requestAuthorizationEpoch = agentTabAuthorizationEpoch;
+  const { socket: requestSocket, connectionId: requestConnection,
+    authorizationEpoch: requestAuthorizationEpoch } = requestContext;
   const respond = payload => {
     if (socket === requestSocket && connected && connectionId === requestConnection) {
       send({ requestId, connectionId: requestConnection, ...payload });
@@ -598,7 +601,10 @@ async function openNewTab(message) {
   function reject(error) { respond({ kind: "error", error }); }
 
   if (message.connectionId !== requestConnection) return reject("ConnectionEpochMismatch");
+  if (socket !== requestSocket || !connected || connectionId !== requestConnection) return;
   if (!allowAgentCreatedTabs) return reject("AgentCreatedTabsDisabled");
+  if (agentTabAuthorizationEpoch !== requestAuthorizationEpoch)
+    return reject("AgentCreatedTabsAuthorizationChanged");
   if (typeof message.url !== "string" || message.url.length > 2048 || !isAllowedUrl(message.url)) {
     return reject("InvalidTabUrl");
   }
@@ -629,19 +635,27 @@ async function openNewTab(message) {
     if (socket !== requestSocket || !connected || connectionId !== requestConnection ||
         !allowAgentCreatedTabs) return;
     // Permission queries await Chrome. A user might have re-registered or
-    // revoked the selected window in the interim. This is the last async check
-    // before tabs.create, and it must reject any identity/generation change.
+    // revoked the selected window in the interim.
     const currentWindow = await validWindow(message.windowRegistration);
-    // The final window check awaits Chrome. Do not create a tab if the operator
-    // revoked (even briefly) the opt-in or this request lost its connection.
-    if (socket !== requestSocket || !connected || connectionId !== requestConnection) return;
-    if (!allowAgentCreatedTabs) return reject("AgentCreatedTabsDisabled");
-    if (agentTabAuthorizationEpoch !== requestAuthorizationEpoch)
-      return reject("AgentCreatedTabsAuthorizationChanged");
+    // Window lookup also awaits Chrome: its result does not prove that site
+    // permission still exists. Recheck it after that lookup, then synchronously
+    // revalidate all pinned authorities before the irreversible tabs.create.
     if (!currentWindow || currentWindow !== window ||
         currentWindow.registrationId !== message.windowRegistration ||
         currentWindow.generation !== expectedGeneration ||
         currentWindow.windowId !== window.windowId)
+      return reject("WindowRegistrationChanged");
+    const finalPermission = await chrome.permissions.contains({ origins: [target.origin + "/*"] });
+    if (socket !== requestSocket || !connected || connectionId !== requestConnection) return;
+    if (!allowAgentCreatedTabs) return reject("AgentCreatedTabsDisabled");
+    if (agentTabAuthorizationEpoch !== requestAuthorizationEpoch)
+      return reject("AgentCreatedTabsAuthorizationChanged");
+    if (!finalPermission) return reject("BrowserPermissionMissing");
+    if (!registeredWindows.includes(window) || window.blocked ||
+        window.sessionEpoch !== sessionEpoch ||
+        window.registrationId !== message.windowRegistration ||
+        window.generation !== expectedGeneration ||
+        window.windowId !== currentWindow.windowId)
       return reject("WindowRegistrationChanged");
 
     // Creating the tab is the irreversible operation; a transport failure afterwards

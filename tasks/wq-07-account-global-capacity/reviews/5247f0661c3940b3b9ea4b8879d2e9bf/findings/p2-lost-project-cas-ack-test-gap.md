@@ -1,0 +1,9 @@
+# P2 — Missing end-to-end lost project-CAS acknowledgement regression
+
+Frozen source: `b7aadb7b1490220ba10310f121c8eaca5e9fe969`.
+
+The new `Client.Tests/AccountAdmissionAdapterTests.fs` has eight targeted tests. Their successful run is valuable: two-clone account cap contention, original-admit vs C01 race, terminal proof and replay, wrong role, witness rewriting, and failed project **fetch**. But `ProjectRemoteUnverifiableKeepsGlobalSlotUntilFreshC01Proof` (lines 214-227) changes `ApprovedFetchUrl` to a nonexistent remote **before** project reservation; it does not exercise a CAS that committed and then lost its push acknowledgement.
+
+The WQ-07 acceptance contract explicitly requires a global grant with a failed **or lost project reservation reply** to retain exactly one slot until the original project operation or terminal/C01 proof is independently reconciled. The account foundation tests cover a lost acknowledgement in the account ledger, and WQ-02 has same-UUID replay tests, but the newly added adapter suite does not deterministically combine that failure with the two-ledger state machine.
+
+Add disposable two-clone fault-injection regressions for (a) post-publication `AdmitProject` reply loss with the account slot held and the same admission UUID resolving the true winner; (b) post-publication C01 reply loss with the account slot held until the exact abort witness is read, then exactly one release; and (c) terminal/account release acknowledgement loss with immutable receipt replay. Assert neither duplicate project launch nor duplicate capacity release. This is a **coverage gap**, not an observed production failure; P1 project-ledger identity substitution is the independent blocking source finding.

@@ -1,0 +1,16 @@
+<h1>[P1] Prevent duplicate taskless reviewer launches after observed activity</h1>
+<p><strong>Context:</strong> Jarvis Manager planner integrated at <code>7a14651c1cd620bf707130c26e446b9f9921418f</code> (frozen source <code>062dd4a5e3dbfc9e47a49c851e279ec256f1629f</code>), with runtime Manager disabled. Reviewer 2 independently reproduced an additional P1 bug after the earlier accepted review, documented in review <code>8d70e8a469dc4bcca75f932d0bef0c74</code>, <code>findings/taskless-reviewer-duplicate-launch.md</code>. Correct it as a small follow-up rather than reopening unrelated requirements.</p>
+<h2>Failure</h2>
+<p>Reviewer 1 begins as NeedsWork/Stopped with 2 unclaimed frozen reviews; Manager reserves/launches Reviewer 1; first positively attributed tool call marks reservation <code>observed</code>; reviewer claims one review, leaving another unclaimed. Agent can still appear NeedsWork/Stopped even while holding the claimed review. On a later heartbeat with <code>unclaimedReviewCount:1</code>, observed reservation is considered terminal, and planner creates a second launch for Reviewer 1. This bypasses no-duplicate and reviewer-capacity guarantees.</p>
+<h2>Requirement</h2>
+<ul>
+<li>Use authoritative existing canonical claimed-review/session progress evidence in the planner snapshot and eligibility to recognize a reviewer actively handling a claim, even when its normal task assignment state is NeedsWork/Stopped. Treat missing/contradictory evidence as unknown and fail closed. Do not mistake one attributed tool call as reviewer completion.</li>
+<li>Prevent a second launch of the same reviewer while their prior claimed review/session remains active or uncertain. Preserve legitimate relaunch after independently verifiable completion/release or explicit cooperative yield, including the case a review remains claimed but the reviewer has actually yielded and should resume it. Specify what evidence proves this without inventing a broad new reviewer lease/daemon.</li>
+<li>Keep 5-worker/3-reviewer bounds, existing Ready-worker yield behavior, blocked pre-dispatch capacity release, one-send-only and journal restart safety. No changes to general scheduler or live browser bridge unless a concrete causal requirement is demonstrated; escalate scope changes to Lead.</li>
+</ul>
+<h2>Acceptance</h2>
+<ol>
+<li>Deterministic regression reproduces two unclaimed reviews, first reviewer launch, observed activity, claimed review still in progress and later heartbeat: no duplicate reservation. Include restart and other reviewer capacity.</li>
+<li>Positive tests show eventual safe relaunch when canonical completion/release or real yield is established; stale/unknown snapshots fail closed. Include cross-snapshot claimed-review evidence and exact activity/yield semantics.</li>
+<li>Node planner tests pass on .NET 11-compatible checkout; run relevant Release builds/tests, publish exact frozen commit and get independent review. Lead integrates accepted exact source; no Manager schedule activation, production deployment or restart.</li>
+</ol>

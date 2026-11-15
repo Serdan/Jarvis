@@ -14,7 +14,7 @@
 
 - `dotnet test Client.Tests/Client.Tests.fsproj -c Release --filter AdministrativeCorrection`: **3/3 passed**.
 - `dotnet test Server.Tests/Server.Tests.fsproj -c Release`: **132/132 passed**.
-- An unfiltered Client.Tests run was still in progress when this report was written. It surfaced the unrelated `BrowserBridgeTests.snapshotExportDeadlineStopsSlowChunksWithoutPublishing` timing assertion (`SnapshotTransportTimeout` instead of `SnapshotDeadlineExceeded`, 400-ms deadline); that test **passed 1/1** in an isolated Release rerun. BrowserBridge files are unchanged in this frozen patch. The broad run must not be reported as all-green.
+- An unfiltered Client.Tests run surfaced one `BrowserBridgeTests.snapshotExportDeadlineStopsSlowChunksWithoutPublishing` 400-ms timing assertion (`SnapshotTransportTimeout` rather than `SnapshotDeadlineExceeded`). The same test **passed 1/1** in an isolated Release rerun. BrowserBridge files are unchanged in this frozen patch. The long-running broad job produced no further progress output and was explicitly **canceled**, so it is **not a completed or passing suite**.
 
 ## Boundaries / nonblocking considerations
 

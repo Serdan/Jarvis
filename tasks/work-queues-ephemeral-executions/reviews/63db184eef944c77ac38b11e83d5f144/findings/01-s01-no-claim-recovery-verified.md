@@ -1,0 +1,21 @@
+# Verification V01 — S01 taskless stalled-launch recovery (no blocking finding)
+
+**Source:** docs/specs/work-queues-and-ephemeral-executions.md at 35e7465a122fd9d767a9f75494b241ff2eb7fe72; §§7–9 (lines 179–206, 254–295), API lines 394–400, fixtures 56–59.
+
+**Prior defect:** Reviewer 2's S01 in c689a0bd7a6e4e518ed7a2acfb88d153: the prior RecoverStalledExecution required an exclusive work claim. Ordinary taskless Manager and submitted zero-claim Worker/Reviewer had no reclaimable item, so one cap-one Manager could strand the account token.
+
+## Independently checked interleavings
+
+1. **Ordinary Manager at capacity one, no children.** A registered/submitted M with an authoritative Stalled/StopRequested receipt, a stable STOP request and expired server-witnessed reclaim lease may undergo RecoverStalledLaunchWithoutClaim. One project Git CAS compares launch/UUID, lease and launch generations, claim absence, journals and terminal state. The committed StalledReclaimedNoClaim receipt is positive logical revocation/fencing evidence. An independent account CAS subsequently frees only M's matching current token once. A late ManagerFinished/NoWork/ClaimNextWork loses the project fence; an account release retry is idempotent. Mere wall-clock time or STOP delivery is insufficient. This supplies the missing terminal-proof path from S01 and lets non-agent reconciliation restart capacity-one scheduling.
+
+2. **Manager with child dispatch.** Parent recovery must inspect original stable child launch IDs, per-child credits, one-shot browser submit and mutating-job journals. Confirmed children retain their separately owned global tokens and continue independently; the parent release cannot free them. Unknown browser submit, pending Git outcome, unfenced parent-owned dispatch or unknown source mutation retains the parent token in RecoveryNeeded/RecoveryBlocked. No negative read is mistaken for a completed child operation. A terminal parent fence prevents a late dispatch.
+
+3. **Pre-claim Worker/Reviewer and concurrent NoWork/ClaimNextWork.** The launch's one-claim marker, project terminal state and launch generation share a CAS ordering. If ClaimNextWork commits first, the no-claim recovery cannot assert absence of an active claim and must take the claimed-work path after settling any lost claim receipt. If NoWork/normal terminal wins, recovery does not create a second receipt. If recovery wins, later claim/NoWork/acknowledgement fails the terminal generation fence. Unknown claim results require original-operation reconciliation before any new claim or no-claim terminal decision.
+
+4. **Prepared Manager last-slot handoff.** TerminalPreparedHandoff is expressly ineligible for generic no-claim recovery. Project prepare first fences M; the account-ledger one-shot Swapped-or-Aborted disposition determines current token owner; project finalization either dispatches valid C after a verified swap or cancels it and releases precisely the current owner. A delayed swap cannot revive an Aborted handoff. This preserves the C02 correction.
+
+5. **Replays and evidence boundary.** Recovery requires stable launch, agent UUID, STOP, lease and journal evidence; exact project receipt is independently verified before account release. This is logical Jarvis revocation, not proof a provider tab exited or that owner-account Git/file rights disappeared. Source-writing continuations remain pinned to independently reachable immutable commits; unknown external effects fail closed.
+
+## Assessment
+
+**S01 resolved at the architecture-contract level; no blocking finding.** Negative fixtures 56–59 cover the previously omitted no-claim Manager, independent/uncertain children, pre-claim race and prepared handoff. They are **specified scenarios, not executed tests**. Phase A–D implementation must exercise them against two Git clones, lost receipts, account/project CAS reordering, stale UUID tool calls and a cap-one fixture. Particular regression gate: a global child token reserved before project registration cannot be confused with a confirmed child, and an unknown child operation must remain reconcilable under its original ID.

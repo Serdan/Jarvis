@@ -6333,3 +6333,290 @@ type ReviewWorkflowTests() =
                 Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head))
             finally
                 if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
+    member _.TransientPrepublicationDnsRetriesAndSameUuidRecovery() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let taskId = "transient-dns-ledger"
+            let operationId = Guid.NewGuid()
+            let command =
+                {| Action = "CreateTask"; TaskId = taskId
+                   Title = "Transport retry"; Html = "<h1>Transport retry</h1>" |}
+            let run () =
+                Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite
+                    first operationId "TaskWrite" command (fun () ->
+                        ReviewWorkflow.createTaskWithSpec first operationId taskId command.Title command.Html
+                        |> Result.mapError Client.OrchestrationApi.LedgerErrors.toEffect)
+            let secretStderr =
+                "fatal: unable to access 'https://user:password@github.com/repo?token=secret': Could not resolve host: github.com"
+            let before = (LedgerStore.fetch first |> success).Header.NextSequence
+            let ownerBefore = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent.Version
+            let mutable fetchFailures = 0
+            let mutable pushes = 0
+            let offline =
+                LedgerStore.withGitTransportFaults (fun phase args ->
+                    match args with
+                    | "fetch" :: _ when phase = "prepublication-fetch" ->
+                        fetchFailures <- fetchFailures + 1
+                        Some { FaultExitCode = 128; FaultStderr = secretStderr; FaultTimedOut = false }
+                    | "push" :: _ ->
+                        pushes <- pushes + 1
+                        None
+                    | _ -> None)
+                    run
+            match offline with
+            | Error(Client.LedgerFailureError failure) ->
+                Assert.That(failure.Code, Is.EqualTo("RemoteUnavailable"))
+                Assert.That(failure.OperationId, Is.EqualTo(Some(operationId.ToString("D"))))
+                Assert.That(failure.Message, Does.Contain("phase=prepublication-fetch"))
+                Assert.That(failure.Message, Does.Contain("attempt=3"))
+                Assert.That(failure.Message, Does.Contain("class=dns"))
+                Assert.That(failure.Message, Does.Not.Contain("https://"))
+                Assert.That(failure.Message, Does.Not.Contain("password"))
+                Assert.That(failure.Message, Does.Not.Contain("token=secret"))
+            | other -> Assert.Fail(sprintf "Expected bounded DNS failure: %A" other)
+            Assert.That(fetchFailures, Is.EqualTo(3))
+            Assert.That(pushes, Is.Zero)
+            Assert.That((LedgerStore.fetch first |> success).Header.NextSequence, Is.EqualTo(before))
+            Assert.That((ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent.Version, Is.EqualTo(ownerBefore))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome, Is.True)
+
+            // Same UUID and same request recover when the remote returns.
+            let recovered = run () |> success
+            Assert.That(recovered.AlreadyApplied, Is.False)
+            Assert.That((LedgerStore.fetch first |> success).Header.NextSequence, Is.EqualTo(before + 1L))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsNone, Is.True)
+            let replay = run () |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That(replay.Operation.OriginalResultJson, Is.EqualTo(recovered.Operation.OriginalResultJson))
+            Assert.That((LedgerStore.fetch first |> success).Header.NextSequence, Is.EqualTo(before + 1L)))
+
+    [<Test>]
+    member _.TransientPrepublicationDnsRecoversWithoutPublishingTwice() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let taskId = "transient-dns-short-outage"
+            let operationId = Guid.NewGuid()
+            let mutable failures = 0
+            let mutable pushes = 0
+            let result =
+                LedgerStore.withGitTransportFaults (fun phase args ->
+                    match args with
+                    | "fetch" :: _ when phase = "prepublication-fetch" && failures < 2 ->
+                        failures <- failures + 1
+                        Some { FaultExitCode = 128
+                               FaultStderr = "Could not resolve host: github.com"
+                               FaultTimedOut = false }
+                    | "push" :: _ when phase = "publication-push" ->
+                        pushes <- pushes + 1
+                        None
+                    | _ -> None)
+                    (fun () -> ReviewWorkflow.createTaskWithSpec first operationId taskId
+                                   "Transient" "<h1>Transient</h1>")
+                |> success
+            Assert.That(failures, Is.EqualTo(2))
+            Assert.That(pushes, Is.EqualTo(1))
+            Assert.That(result.AlreadyApplied, Is.False)
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsNone, Is.True)
+            let duplicate = ReviewWorkflow.createTaskWithSpec first operationId taskId "Transient" "<h1>Transient</h1>" |> success
+            Assert.That(duplicate.AlreadyApplied, Is.True)
+            Assert.That(duplicate.Operation.Sequence, Is.EqualTo(result.Operation.Sequence)))
+
+    [<Test>]
+    member _.PostPushConfirmationLossRetainsJournalAndOriginalReceipt() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let taskId = "confirmation-loss"
+            let command =
+                {| Action = "CreateTask"; TaskId = taskId
+                   Title = "Exactly once"; Html = "<h1>Exactly once</h1>" |}
+            let run () =
+                Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite
+                    first operationId "TaskWrite" command (fun () ->
+                        ReviewWorkflow.createTaskWithSpec first operationId taskId command.Title command.Html
+                        |> Result.mapError Client.OrchestrationApi.LedgerErrors.toEffect)
+            let before = (LedgerStore.fetch first |> success).Header.NextSequence
+            let mutable pushes = 0
+            let mutable failedConfirmations = 0
+            let unknown =
+                LedgerStore.withGitTransportFaults (fun phase args ->
+                    match args with
+                    | "push" :: _ when phase = "publication-push" ->
+                        pushes <- pushes + 1
+                        None
+                    | "fetch" :: _ when phase = "confirmation-fetch" || phase = "remote-fetch" ->
+                        failedConfirmations <- failedConfirmations + 1
+                        Some { FaultExitCode = 128
+                               FaultStderr = "Could not resolve host: github.com https://secret.invalid"
+                               FaultTimedOut = false }
+                    | _ -> None)
+                    run
+            match unknown with
+            | Error(Client.LedgerFailureError issue) ->
+                Assert.That(issue.Code, Is.EqualTo("OutcomeUnknown"))
+                Assert.That(issue.OperationId, Is.EqualTo(Some(operationId.ToString("D"))))
+                Assert.That(issue.Message, Does.Contain("phase=confirmation-fetch"))
+                Assert.That(issue.Message, Does.Not.Contain("secret.invalid"))
+            | other -> Assert.Fail(sprintf "Unconfirmed publication must remain recoverable: %A" other)
+            Assert.That(pushes, Is.EqualTo(1))
+            Assert.That(failedConfirmations, Is.EqualTo(6))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome, Is.True)
+            let snapshot, remoteReceipt = LedgerStore.getOperationStatus second operationId |> success
+            Assert.That(remoteReceipt.IsSome, Is.True)
+            Assert.That(snapshot.Header.NextSequence, Is.EqualTo(before + 1L))
+            let recovered = run () |> success
+            Assert.That(recovered.AlreadyApplied, Is.True)
+            Assert.That(recovered.Operation.OriginalResultJson, Is.EqualTo(remoteReceipt.Value.OriginalResultJson))
+            Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(before + 1L))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsNone, Is.True))
+
+    [<Test>]
+    member _.RemoteCasContentionReplansSameUuidWithoutDuplicateReceipt() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let contenderId = Guid.NewGuid()
+            let original = (LedgerStore.fetch first |> success).Header.NextSequence
+            let mutable injected = false
+            let updated =
+                LedgerStore.withGitTransportFaults (fun phase args ->
+                    match args with
+                    | "push" :: _ when phase = "publication-push" && not injected ->
+                        injected <- true
+                        // Competing client advances the remote between our
+                        // verified fetch and our first optimistic Git push.
+                        ReviewWorkflow.createTaskWithSpec second contenderId
+                            "cas-contender" "Contender" "<h1>Contender</h1>"
+                        |> success |> ignore
+                        None
+                    | _ -> None)
+                    (fun () -> ReviewWorkflow.createTaskWithSpec first operationId
+                                   "cas-retry-owner" "Owner" "<h1>Owner</h1>")
+                |> success
+            Assert.That(injected, Is.True)
+            Assert.That(updated.AlreadyApplied, Is.False)
+            let snapshot = LedgerStore.fetch second |> success
+            Assert.That(snapshot.Header.NextSequence, Is.EqualTo(original + 2L))
+            for id in [ operationId; contenderId ] do
+                let _, receipt = LedgerStore.getOperationStatus second id |> success
+                Assert.That(receipt.IsSome, Is.True)
+            let replay =
+                ReviewWorkflow.createTaskWithSpec first operationId
+                    "cas-retry-owner" "Owner" "<h1>Owner</h1>" |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That(replay.Operation.Sequence, Is.EqualTo(updated.Operation.Sequence))
+            Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(original + 2L)))
+
+    [<Test>]
+    member _.AuthAndLocalPreparationFailuresDoNotRetryOrLeakTransportSecrets() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let head = (LedgerStore.fetch first |> success).Commit
+            let authId = Guid.NewGuid()
+            let mutable calls = 0
+            let unauthorized =
+                LedgerStore.withGitTransportFaults (fun phase args ->
+                    match args with
+                    | "fetch" :: _ when phase = "prepublication-fetch" ->
+                        calls <- calls + 1
+                        Some { FaultExitCode = 128
+                               FaultStderr = "fatal: Authentication failed for 'https://user:pass@github.com/secret'"
+                               FaultTimedOut = false }
+                    | _ -> None)
+                    (fun () -> ReviewWorkflow.createTaskWithSpec first authId
+                                   "auth-refused" "Auth" "<h1>Auth</h1>")
+            match unauthorized with
+            | Error(GitFailure diagnostic) ->
+                Assert.That(diagnostic, Does.Contain("class=authentication"))
+                Assert.That(diagnostic, Does.Contain("phase=prepublication-fetch"))
+                Assert.That(diagnostic, Does.Contain("nextAction=fix-auth-and-reconcile"))
+                Assert.That(diagnostic, Does.Not.Contain("github.com"))
+                Assert.That(diagnostic, Does.Not.Contain("user:pass"))
+            | other -> Assert.Fail(sprintf "Auth failure must not be retried as transient: %A" other)
+            Assert.That(calls, Is.EqualTo(1))
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head))
+
+            let localId = Guid.NewGuid()
+            let command = {| Action = "CreateTask"; TaskId = "local-prep-failure"
+                             Title = "Prep"; Html = "<h1>Prep</h1>" |}
+            let mutable hashFaults = 0
+            let prepared =
+                LedgerStore.withGitTransportFaults (fun phase args ->
+                    match args with
+                    | "hash-object" :: _ when phase = "local-preparation" ->
+                        hashFaults <- hashFaults + 1
+                        Some { FaultExitCode = 1
+                               FaultStderr = "secret: https://user:password@github.com"
+                               FaultTimedOut = false }
+                    | _ -> None)
+                    (fun () ->
+                        Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite
+                            first localId "TaskWrite" command (fun () ->
+                                ReviewWorkflow.createTaskWithSpec first localId
+                                    command.TaskId command.Title command.Html
+                                |> Result.mapError Client.OrchestrationApi.LedgerErrors.toEffect))
+            match prepared with
+            | Error(Client.LedgerFailureError failure) ->
+                Assert.That(failure.Code, Is.EqualTo("GitFailure"))
+                Assert.That(failure.Message, Does.Contain("phase=local-preparation"))
+                Assert.That(failure.Message, Does.Not.Contain("user:password"))
+            | other -> Assert.Fail(sprintf "Expected sanitized local Git preparation failure: %A" other)
+            Assert.That(hashFaults, Is.EqualTo(1))
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one localId |> success).IsSome, Is.True))
+
+    [<Test>]
+    member _.YieldAgentDnsFailurePreservesWorkingAndCheckpointUntilSameUuidRecovery() =
+        withFixture (fun one _ first second _ _ _ initTask ->
+            let taskId = "p1-yield-agent-transient"
+            initTask taskId
+            let operationId = Guid.NewGuid()
+            let summary = "Work completed before transient DNS outage"
+            let nextAction = "Continue after confirmed yield"
+            let command =
+                {| Action = "YieldAgent"; TaskId = taskId; OwnerId = "Owner"
+                   Summary = summary; NextAction = nextAction |}
+            let run () =
+                Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite
+                    first operationId "TaskWrite" command (fun () ->
+                        ReviewWorkflow.yieldAgent first operationId taskId "Owner" 0 0 1
+                            summary nextAction
+                        |> Result.mapError Client.OrchestrationApi.LedgerErrors.toEffect)
+            let before = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(before.State, Is.EqualTo("Working"))
+            let sequence = (LedgerStore.fetch first |> success).Header.NextSequence
+            let mutable dnsFailures = 0
+            let offline =
+                LedgerStore.withGitTransportFaults (fun phase args ->
+                    match args with
+                    | "fetch" :: _ when phase = "prepublication-fetch" ->
+                        dnsFailures <- dnsFailures + 1
+                        Some { FaultExitCode = 128
+                               FaultStderr = "Could not resolve host: github.com"
+                               FaultTimedOut = false }
+                    | _ -> None)
+                    run
+            match offline with
+            | Error(Client.LedgerFailureError failure) ->
+                Assert.That(failure.Code, Is.EqualTo("RemoteUnavailable"))
+                Assert.That(failure.OperationId, Is.EqualTo(Some(operationId.ToString("D"))))
+            | other -> Assert.Fail(sprintf "Yield should remain recoverable without fake Ready: %A" other)
+            Assert.That(dnsFailures, Is.EqualTo(3))
+            Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence))
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent, Is.EqualTo(before))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
+                        Is.True)
+            let confirmed = run () |> success
+            Assert.That(confirmed.AlreadyApplied, Is.False)
+            Assert.That(confirmed.Operation.Sequence, Is.EqualTo(sequence))
+            let after = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(after.State, Is.EqualTo("Ready"))
+            Assert.That(after.Execution, Is.EqualTo("Stopped"))
+            Assert.That(after.Version, Is.EqualTo(before.Version + 1))
+            let _, checkpoint = ReviewWorkflow.getCheckpoint second taskId sequence |> success
+            Assert.That(checkpoint.Summary, Is.EqualTo(summary))
+            Assert.That(checkpoint.NextAction, Is.EqualTo(nextAction))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsNone,
+                        Is.True)
+            let repeat = run () |> success
+            Assert.That(repeat.AlreadyApplied, Is.True)
+            Assert.That(repeat.Operation.OriginalResultJson, Is.EqualTo(confirmed.Operation.OriginalResultJson))
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent, Is.EqualTo(after))
+            Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence + 1L)))

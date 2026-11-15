@@ -68,6 +68,7 @@
         <Compile Include="Modules\BoundedFifoCache.fs"/>
         <Compile Include="Modules\\LedgerStore.fs"/>
         <Compile Include="Modules\SourceEffectJournal.fs"/>
+        <Compile Include="Modules\SourceEffectRouteBridge.fs"/>
         <Compile Include="Modules\WorkQueueGitLedger.fs"/>
         <Compile Include="Modules\AccountCapacityLedger.fs"/>
         <Compile Include="Modules\AccountAdmissionAdapter.fs"/>

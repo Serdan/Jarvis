@@ -918,15 +918,26 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
                     let! authorization =
                         PermissionPolicy.authorizeWithTrust permission.TrustLevel promptWithActivityState authorizationCommand
 
-                    match authorization, resolvedTask with
-                    | Error error, _ ->
+                    // Explicit nonproduction DENY-only gate. The current source
+                    // RPC payloads lack original source-operation UUIDs, so a
+                    // generation checkout must never be treated as journaled.
+                    // Default off; no legacy/ordinary project semantics change.
+                    let diagnosticDenyGate =
+                        String.Equals(Environment.GetEnvironmentVariable("JARVIS_WQ03_NONPRODUCTION_DENY_UNBOUND_SOURCE"),
+                                      "deny-unbound-v1", StringComparison.Ordinal)
+                    let sourceAdmission =
+                        SourceEffectRouteBridge.denyUnboundGenerationDispatch diagnosticDenyGate command
+                    match authorization, sourceAdmission, resolvedTask with
+                    | Error error, _, _ ->
                         return Error error
-                    | Ok(), Some(cmd, task) ->
+                    | Ok(), Error problem, _ ->
+                        return Error(Client.ValidationError problem)
+                    | Ok(), Ok(), Some(cmd, task) ->
                         let! result = (sourceOperation resolved
                             (fun project -> ClientShell.runProjectTaskIn project task)
                             (fun () -> ClientShell.runProjectTask cmd.ProjectName task)) rt |> serialize'
                         return result
-                    | Ok(), None ->
+                    | Ok(), Ok(), None ->
                         let! result = dispatch rt target resolved agentId command
                         return result
             }

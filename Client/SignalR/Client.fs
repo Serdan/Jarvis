@@ -992,7 +992,8 @@ let receiveCommandWithInstructions (rt: Runtime) command =
 
 // Shared by SignalR receive and tests. Identity is supplied by the MCP call,
 // not inferred from provider conversation metadata.
-let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string) =
+let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agentId: string)
+                                       (includeResponseAlerts: bool) =
     task {
         let mutable parsedCommand = None
         let mutable responseScope: ProjectPaths.ProjectTarget option = None
@@ -1115,9 +1116,11 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                 |> List.distinct
                 |> List.map (fun id -> { ProjectName = project; AgentId = id })
             | _ -> []
-        // Failed operations and job polls receive pending alerts without
-        // changing the ordinary agent activity/activation rules.
-        instructions <- checkResponseAlerts rt agentId responseScope @ instructions
+        // Direct callers receive alerts here. Promoted background operations
+        // must not consume them: their terminal response may never be polled.
+        // Those alerts are delivered when a reply is actually sent instead.
+        if includeResponseAlerts then
+            instructions <- checkResponseAlerts rt agentId responseScope @ instructions
         let agentResponse =
             match parsedCommand with
             | Some command -> toAgentResponse command instructions changes inboxActivation response
@@ -1132,6 +1135,27 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
             else agentResponse
         return parsedCommand, (response |> Result.map (fun outcome -> outcome.Payload)), agentResponse
     }
+
+// Preserve direct dispatch semantics for callers that receive an immediate
+// response. Promoted tool jobs execute the undecorated core in the background.
+let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string) =
+    processIncomingCommandCore rt commandJson agentId true
+
+// Background completion is not an agent-visible response. This is the only
+// response-alert consumption point for SignalR-delivered tool calls, including
+// pending handles, quick completions, polls and errors.
+let private withVisibleResponseAlerts (rt: Runtime) (agentId: string)
+                                      (command: AgentCommand option)
+                                      (response: AgentCommandResponse) =
+    let alerts =
+        match command with
+        | Some original when mayReceiveResponseAlert original ->
+            match classifyProject original with
+            | Ok scope -> checkResponseAlerts rt agentId (projectTarget scope)
+            | Error _ -> []
+        | _ -> []
+    let existing = if isNull (box response.Instructions) then [] else response.Instructions
+    { response with Instructions = alerts @ existing }
 
 // Bounded, client-owned execution begins before the deadline. An HTTP
 // request and SignalR delivery may end without cancelling this operation.
@@ -1174,7 +1198,9 @@ let combineCrossProjectNotification (source: CrossProjectNotificationCommand)
                 source.SourceInboxActivation
                 |> Option.filter (fun receipt -> receipt.ActivatedByThisCall) }
 
-let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: string) =
+// Injectable command runner and threshold keep promotion timing deterministic in tests.
+let executeOrPromoteWith (rt: Runtime) (commandJson: string) (agentId: string)
+                         (threshold: TimeSpan) (runCommand: string -> string -> Task<AgentCommandResponse>) =
     task {
         let command =
             try Some(JsonSerializer.Deserialize<AgentCommand>(commandJson))
@@ -1202,7 +1228,7 @@ let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: strin
                          |> Option.filter (String.IsNullOrWhiteSpace >> not))
                         (Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(normalizedJson))))
                         (fun () -> task {
-                            let! _, _, outcome = processIncomingCommand rt normalizedJson agentId
+                            let! outcome = runCommand normalizedJson agentId
                             return merge outcome
                         }) merge
                 match registered with
@@ -1214,10 +1240,12 @@ let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: strin
                           AgentStateChanges = []
                           InboxActivation = None
                           PendingJob = None }
+                        |> withVisibleResponseAlerts rt agentId (Some command)
                 | Ok operation ->
-                    let! first = JobManager.awaitToolOperation operation (promotionThreshold ())
+                    let! first = JobManager.awaitToolOperation operation threshold
                     match first with
-                    | Choice1Of2 response -> return response
+                    | Choice1Of2 response ->
+                        return withVisibleResponseAlerts rt agentId (Some command) response
                     | Choice2Of2 handle ->
                         // Do not invent state-change evidence: activation and
                         // canonical writes may still be running at this moment.
@@ -1231,13 +1259,21 @@ let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: strin
                               AgentStateChanges = Unchecked.defaultof<_>
                               InboxActivation = None
                               PendingJob = Some handle }
+                            |> withVisibleResponseAlerts rt agentId (Some command)
             | Error _ ->
-                let! _, _, outcome = processIncomingCommand rt normalizedJson agentId
-                return merge outcome
+                let! outcome = runCommand normalizedJson agentId
+                return withVisibleResponseAlerts rt agentId (Some command) (merge outcome)
         | _ ->
-            let! _, _, outcome = processIncomingCommand rt normalizedJson agentId
-            return merge outcome
+            let! outcome = runCommand normalizedJson agentId
+            return withVisibleResponseAlerts rt agentId command (merge outcome)
     }
+
+let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: string) =
+    executeOrPromoteWith rt commandJson agentId (promotionThreshold ())
+        (fun serialized actor -> task {
+            let! _, _, outcome = processIncomingCommandCore rt serialized actor false
+            return outcome
+        })
 
 let private receiveCommandAndReplyCore (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (agentId: string)
     (report: string -> float -> float -> bool -> unit) : Task =

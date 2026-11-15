@@ -495,7 +495,12 @@ module McpToolHelpers =
                         let latest =
                             if isNull (box response.Instructions) then [] else response.Instructions
                         let originalGuidance =
-                            if isNull (box original.Instructions) then [] else original.Instructions
+                            // Old clients may have consumed one-shot alerts
+                            // during background completion. The immutable job
+                            // can be polled repeatedly, so never replay those
+                            // original alerts. Fresh poll-time alerts are in latest.
+                            if isNull (box original.Instructions) then [] else
+                                original.Instructions |> List.filter (fun item -> item.Scope <> "response-alert")
                         { original with Instructions = latest @ originalGuidance }
                     | None -> response
             with _ -> response

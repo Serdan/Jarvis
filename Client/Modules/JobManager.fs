@@ -546,7 +546,15 @@ module private ToolOperations =
                     | Ok () ->
                         let response =
                             if entry.Completion.Task.IsCompletedSuccessfully then
-                                Some entry.Completion.Task.Result
+                                // The stored completion is immutable and can
+                                // be polled repeatedly. Never expose one-shot
+                                // alerts captured by an older background path
+                                // as recurring job-result instructions.
+                                let original = entry.Completion.Task.Result
+                                let instructions =
+                                    if isNull (box original.Instructions) then [] else
+                                        original.Instructions |> List.filter (fun doc -> doc.Scope <> "response-alert")
+                                Some { original with Instructions = instructions }
                             else None
                         Ok
                             { JobId = jobId

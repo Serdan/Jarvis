@@ -24,6 +24,14 @@ records agent activity nor activates Ready assignments. Project health probes,
 cross-project coordination routing and observer-only operations must not
 establish the destination agent identity.
 
+For slow commands promoted to client-owned jobs, the pending handle is an
+agent-visible response and may carry a queued alert. Background job completion
+is **not** a response boundary: it never consumes a queued alert or stores one
+in the immutable completed job response. The next completed-job poll or any
+other ordinary tool reply may deliver an alert queued after the pending handle.
+Repeated completed polls do not replay earlier alerts, even if an old stored
+job result contains an alert from a previous client version.
+
 Delivery uses a Git compare-and-swap to clear the pending queue **before**
 returning instructions. This is best-effort at-most-once: a lost response after
 the consume commit can lose an alert; if the read or mutation fails, pending

@@ -1815,6 +1815,42 @@ let polledToolJobsRestoreExactInstructionsAndMutationEvidence () =
         Assert.That(terminal.GetProperty("InboxActivation").GetProperty("ActivatedByThisCall").GetBoolean(), Is.True)
 
 [<Test>]
+let completedPollsNeverReplayAlertsEmbeddedInAnOriginalPromotedJobResponse () =
+    // A previously stored original completion may contain an alert consumed
+    // before the caller ever saw the job. It cannot become a recurring alert.
+    let legacyStop =
+        { Scope = "response-alert"; Path = "jarvis/response-alert/old-stop"; Sha256 = ""
+          Content = "STOP - stale original background completion" }
+    let canonical =
+        { Scope = "project"; Path = "Jarvis/AGENTS.md"; Sha256 = ""
+          Content = "Original project instructions must survive." }
+    let newStop =
+        { Scope = "response-alert"; Path = "jarvis/response-alert/new-stop"; Sha256 = ""
+          Content = "STOP - newly consumed during this poll" }
+    let original : AgentCommandResponse =
+        { Result = Some """{"terminal":true}"""; Error = None
+          Instructions = [legacyStop; canonical]
+          AgentStateChanges = [{ ProjectName = "Jarvis"; AgentId = "Worker 1" }]
+          InboxActivation = None; PendingJob = None }
+    let job : JobResult =
+        { JobId = "promoted-job"; Status = ToolCompleted; Events = []
+          NextSequence = 0L; Truncated = false
+          ToolResponse = Some original; OperationId = None }
+    let command = GetJobResultCommand { ProjectName = "Jarvis"; JobId = job.JobId; AfterSequence = None }
+    let poll : AgentCommandResponse =
+        { Result = Some(JsonSerializer.Serialize job); Error = None
+          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+    for _ in 1..2 do
+        let evidence = McpToolHelpers.completedToolEvidence command poll
+        Assert.That(evidence.Instructions, Is.EqualTo([canonical] :> obj),
+                    "Repeated polling must not replay one-shot original STOP content.")
+        Assert.That(evidence.Result, Is.EqualTo(original.Result))
+        Assert.That(evidence.AgentStateChanges, Is.EqualTo(original.AgentStateChanges :> obj))
+    let fresh = McpToolHelpers.completedToolEvidence command { poll with Instructions = [newStop] }
+    Assert.That(fresh.Instructions, Is.EqualTo([newStop; canonical] :> obj),
+                "A new alert attached to the poll itself must not be removed.")
+
+[<Test>]
 let pollResponseAlertsRemainVisibleOnPendingAndErroredJobLookups () =
     let pollCommand = GetJobResultCommand { ProjectName = "Jarvis"; JobId = "job-poll"; AfterSequence = None }
     let alert =

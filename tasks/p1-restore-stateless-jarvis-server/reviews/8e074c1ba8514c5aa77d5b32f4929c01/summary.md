@@ -1,0 +1,1 @@
+Exact bca24efa. .NET11 Release Server.Tests 237/237 and BrowserSchedules 20/20. Local two-client/restart/SQLite/auth negatives and docs/stateless-server-p1-worker12.md. Production idle disabled pending durable client/Git activity proof.

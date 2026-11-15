@@ -78,6 +78,10 @@ let private coverage (p: Project) (catalog: RoleCatalog) =
       ProjectHeadVerified = true
       CrossProjectCovered = true }
 
+let private producerAdmissionBlocked =
+    Rejection.IncompleteCoverage
+        "WQ-04 authoritative source/index and pinned role admission proof unavailable"
+
 let private launch id role =
     { Id = id; ProjectId = "Jarvis"; RoleId = role; RoleVersion = 1
       AccountTokenId = "token-" + id
@@ -134,8 +138,9 @@ let task_message_is_passive_role_message_has_one_distinct_runnable_generation ()
     Assert.That(p.Messages.["M2"].WorkId, Is.EqualTo(Some(workId role)))
     Assert.That(p.Works.[workId role].AvailableAt, Is.EqualTo(11L))
     let catalog = roles ()
-    let candidate = selectRoleDemand (coverage p catalog) catalog p "Lead" |> ok
-    Assert.That(candidate.Chosen.Value.WorkId, Is.EqualTo(workId role))
+    // Role demand cannot be admitted while the catalog is not persisted
+    // at the same project-CAS boundary as launch eligibility.
+    error producerAdmissionBlocked (selectRoleDemand (coverage p catalog) catalog p "Lead")
     let duplicate = event "operator-msg-another-projection" (QueueProducerOrigin.OperatorMessage(roleMessage "M2" "Lead")) []
     error (Rejection.InvalidState "duplicate message ID")
         (applyEvent p.Version "post-duplicate" 12L duplicate p)
@@ -158,11 +163,8 @@ let blocking_review_beats_older_ordinary_work_and_blocked_work_stays_blocked () 
     Assert.That(order, Is.EqualTo(box [ workId review; workId older ]))
     Assert.That(p.Works.[workId dependent].State, Is.EqualTo(WorkState.Blocked))
     let catalog = roles ()
-    let reviewDemand = selectRoleDemand (coverage p catalog) catalog p "Reviewer" |> ok
-    Assert.That(reviewDemand.Chosen.Value.BlocksUnfinishedStage, Is.True)
-    Assert.That(reviewDemand.Chosen.Value.WorkId, Is.EqualTo(workId review))
-    let workerDemand = selectRoleDemand (coverage p catalog) catalog p "Worker" |> ok
-    Assert.That(workerDemand.Chosen.IsNone, Is.True)
+    error producerAdmissionBlocked (selectRoleDemand (coverage p catalog) catalog p "Reviewer")
+    error producerAdmissionBlocked (selectRoleDemand (coverage p catalog) catalog p "Worker")
 
 [<Test>]
 let versioned_roles_pin_old_launches_and_fail_closed_when_history_is_missing () =
@@ -180,11 +182,12 @@ let versioned_roles_pin_old_launches_and_fail_closed_when_history_is_missing () 
     error Rejection.CasConflict
         (configureRole catalog.Revision 1 "role-lead-v3" (roleConfig "Lead" 2 [ "planning" ]) revised)
     let p = admitProject p.Version "admit:old" (launch "old" "Lead") p |> ok
-    let selected = selectRoleDemand (coverage p revised) revised p "Lead" |> ok
-    Assert.That(selected.Chosen.IsNone, Is.True)
+    // Pure v1/v2 history exists, but it cannot authorize WQ-02's legacy
+    // unversioned match/claim predicate until a CAS-visible shared catalog
+    // is implemented. Both consistent and incomplete snapshots fail closed.
+    error producerAdmissionBlocked (selectRoleDemand (coverage p revised) revised p "Lead")
     let invalid = { revised with Versions = revised.Versions.Add("Lead", Map.ofList [ 2, v2 ]) }
-    error (Rejection.IncompleteCoverage "missing historical role configuration")
-        (selectRoleDemand (coverage p invalid) invalid p "Lead")
+    error producerAdmissionBlocked (selectRoleDemand (coverage p invalid) invalid p "Lead")
 
 [<Test>]
 let role_demand_rematches_existing_launch_before_choosing_older_work () =
@@ -194,9 +197,7 @@ let role_demand_rematches_existing_launch_before_choosing_older_work () =
     let p = project () |> fun p -> publish p 1L r |> fun p -> publish p 2L i
     let p = admitProject p.Version "admit:reviewer" (launch "reviewer" "Reviewer") p |> ok
     let catalog = roles ()
-    let picked = selectRoleDemand (coverage p catalog) catalog p "Flexible" |> ok
-    Assert.That(picked.Chosen.Value.WorkId, Is.EqualTo(workId i))
-    Assert.That(picked.MatchingSkips, Is.EqualTo(box [ workId r ]))
+    error producerAdmissionBlocked (selectRoleDemand (coverage p catalog) catalog p "Flexible")
     Assert.That(p.Launches.["reviewer"].Credit, Is.EqualTo(Some(workId r)))
 
 [<Test>]
@@ -212,8 +213,9 @@ let missing_highwater_or_cross_project_evidence_is_not_a_healthy_empty_queue () 
         (selectRoleDemand { source with CrossProjectCovered = false } catalog p "Lead")
     error (Rejection.IncompleteCoverage "source/index generation does not match pinned project head")
         (selectRoleDemand { source with GraphVersion = p.GraphVersion + 1 } catalog p "Lead")
-    let empty = selectRoleDemand source catalog p "Lead" |> ok
-    Assert.That(empty.Chosen.IsNone, Is.True)
+    // Equal self-reported counters, even with every boolean set, are not
+    // authoritative coverage of a possibly missing canonical producer event.
+    error producerAdmissionBlocked (selectRoleDemand source catalog p "Lead")
 
 [<Test>]
 let circular_hard_stages_warn_but_do_not_run_and_edit_clears_warning () =
@@ -227,9 +229,7 @@ let circular_hard_stages_warn_but_do_not_run_and_edit_clears_warning () =
     Assert.That(diagnostics.CycleWarnings.Head.WitnessEdges.Length, Is.EqualTo(2))
     Assert.That(orderAvailable p |> ok, Is.Empty)
     let catalog = roles ()
-    let selection = selectRoleDemand (coverage p catalog) catalog p "Lead" |> ok
-    Assert.That(selection.Chosen.IsNone, Is.True)
-    Assert.That(selection.CycleWarnings.Length, Is.EqualTo(1))
+    error producerAdmissionBlocked (selectRoleDemand (coverage p catalog) catalog p "Lead")
     let beforeWake = p.NextAvailability
     let clear = removeHardPrerequisite p.Version "remove-B-A" (workId b) (workId a) 12L p |> ok
     let after = WorkQueueDependencyDiagnostics.analyze clear.GraphVersion true clear.Works |> ok
@@ -265,6 +265,36 @@ let integration_policy_never_reruns_push_before_exact_completed_authorization ()
             IntegrationAuthorized = true
             Domain = DomainState.Integrated "sha" }
     let p = { p with Works = p.Works.Add(i.Id, authorized) }
-    let p = publish p 3L followup
+    let p = applyEvent p.Version "policy-op-original" 3L followup p |> ok
     Assert.That(p.Works.[workId followup].QueueId, Is.EqualTo("planning"))
     Assert.That(p.Works.[workId followup].Kind, Is.EqualTo(WorkKind.Planning))
+    let replay = applyEvent p.Version "policy-op-original" 4L followup p |> ok
+    Assert.That(replay, Is.EqualTo(p))
+    let changed = { followup with
+                        SourceId = "different-caller-source-id"
+                        Origin = QueueProducerOrigin.IntegrationPolicyResolved(
+                            "T", workId integration, "another-caller-receipt") }
+    Assert.That(workId changed, Is.EqualTo(workId followup),
+                "Logical policy successor must not depend on mutable caller labels")
+    error Rejection.OperationIdReused
+        (applyEvent p.Version "policy-op-original" 4L changed p)
+    error (Rejection.InvalidState "duplicate immutable work ID")
+        (applyEvent p.Version "policy-op-second" 4L changed p)
+    let anotherGeneration = { changed with StageGeneration = 2 }
+    Assert.That(workId anotherGeneration, Is.EqualTo(workId followup))
+    error (Rejection.InvalidState "producer lacks exact canonical event evidence")
+        (applyEvent p.Version "policy-op-third" 4L anotherGeneration p)
+
+[<Test>]
+let producer_fixture_replay_tracks_full_event_payload_not_only_derived_stage () =
+    let initial = project ()
+    let sourceEvent = event "source-id-1" (QueueProducerOrigin.TaskRequested "T") []
+    let published = applyEvent initial.Version "semantic-operation" 100L sourceEvent initial |> ok
+    let replay = applyEvent published.Version "semantic-operation" 101L sourceEvent published |> ok
+    Assert.That(replay, Is.EqualTo(published))
+    error Rejection.OperationIdReused
+        (applyEvent published.Version "semantic-operation" 101L
+            { sourceEvent with SourceId = "changed-source" } published)
+    error Rejection.OperationIdReused
+        (applyEvent published.Version "semantic-operation" 101L
+            { sourceEvent with Origin = QueueProducerOrigin.TaskRequested "Other" } published)

@@ -98,14 +98,20 @@ module WorkQueueProducers =
     // Length-prefix prevents separator ambiguity; hash keeps Git-ref-safe stage
     // IDs even for arbitrary operator message and task identifiers.
     let workId (event: QueueProducerEvent) =
+        // A completed integration has exactly one logical policy successor:
+        // neither caller-selected SourceId, receipt nor generation is its key.
+        let source, generation =
+            match event.Origin with
+            | QueueProducerOrigin.IntegrationPolicyResolved(_, preceding, _) -> preceding, 1
+            | _ -> event.SourceId, event.StageGeneration
+        let token = sourceToken event.Origin
         let identity = sprintf "%d:%s%d:%s%d:%s" event.ProjectId.Length event.ProjectId
-                           event.SourceId.Length event.SourceId
-                           (sourceToken event.Origin).Length (sourceToken event.Origin)
+                           source.Length source token.Length token
         let digest =
             SHA256.HashData(Encoding.UTF8.GetBytes identity)
             |> Convert.ToHexString
             |> fun value -> value.ToLowerInvariant()
-        sprintf "wq04-%s-%s-g%d" (sourceToken event.Origin) digest event.StageGeneration
+        sprintf "wq04-%s-%s-g%d" token digest generation
 
     let private validSha (sha: string) =
         nonBlank sha && (sha.Length = 40 || sha.Length = 64)
@@ -150,7 +156,15 @@ module WorkQueueProducers =
             Error(Rejection.IncompleteCoverage "source/effect high-water/index")
         elif not project.QueueCovered || not project.MessageCovered || not project.SourceCovered then
             Error(Rejection.IncompleteCoverage "project queue/message/source coverage")
-        else completeProjectGraph project |> Result.map ignore
+        else
+            completeProjectGraph project
+            |> Result.bind (fun _ ->
+                // Equal caller assertions do not witness the source-event,
+                // queue and message indexes at a pinned canonical Git head.
+                // No durable CAS-visible role catalog exists either. Do not
+                // infer a healthy empty queue or grant launch demand.
+                Error(Rejection.IncompleteCoverage
+                    "WQ-04 authoritative source/index and pinned role admission proof unavailable"))
 
     /// Parse one authoritative event to its deterministic, immutable projection.
     /// Upstream task/review/challenge source verification must precede this call.
@@ -213,10 +227,12 @@ module WorkQueueProducers =
                 Ok(ProducedProjection.Work(make WorkKind.Planning "challenge" task None))
             | QueueProducerOrigin.IntegrationPolicyResolved(task, oldWork, receipt)
                 when nonBlank task && nonBlank oldWork && nonBlank receipt
+                     && event.StageGeneration = 1
                      && event.HardPrerequisites.Contains oldWork
                      && (match project.Works.TryFind oldWork with
                          | Some previous ->
                              previous.Kind = WorkKind.Integration
+                             && previous.SubjectId = task
                              && previous.State = WorkState.Completed
                              && previous.Gate = GateState.Clear
                              && previous.IntegrationAuthorized
@@ -243,14 +259,20 @@ module WorkQueueProducers =
                 | _ -> Error(Rejection.InvalidState "invalid operator-message subject")
             | _ -> Error(Rejection.InvalidState "producer lacks exact canonical event evidence")
 
-    /// Pure project CAS fixture; publication and its typed work/message receipt
-    /// are one transition. Production must recheck the original source event
-    /// against the verified head in the same Git mutation, not use caller flags.
+    /// Pure project-CAS *fixture*. The actual Git mutation remains disabled
+    /// until a canonical event resolver and role-catalog CAS source exist.
+    /// Retain complete event semantics, not only the derived work stage, for
+    /// same-operation replay. A changed SourceId/payload must be rejected.
     let applyEvent expectedVersion operationId now (event: QueueProducerEvent) (project: Project) =
-        if project.Version <> expectedVersion then Error Rejection.CasConflict
-        elif not project.QueueCovered || not project.GraphCovered || not project.MessageCovered || not project.SourceCovered then
+        let semanticReceipt =
+            ProjectOperationPayload.OtherMutation(sprintf "wq04-fixture-event|%A" event)
+        match project.Receipts.TryFind operationId with
+        | Some original when original = semanticReceipt -> Ok project
+        | Some _ -> Error Rejection.OperationIdReused
+        | None when project.Version <> expectedVersion -> Error Rejection.CasConflict
+        | None when not project.QueueCovered || not project.GraphCovered || not project.MessageCovered || not project.SourceCovered ->
             Error(Rejection.IncompleteCoverage "producer source/index coverage")
-        else
+        | None ->
             completeProjectGraph project
             |> Result.bind (fun _ -> projectEvent project event)
             |> Result.bind (fun projection ->
@@ -266,6 +288,8 @@ module WorkQueueProducers =
                     Contracts.postMessage expectedVersion operationId message (Some(stamp stage)) project
                 | ProducedProjection.PassiveTaskAttention message ->
                     Contracts.postMessage expectedVersion operationId message None project)
+            |> Result.map (fun next ->
+                { next with Receipts = next.Receipts.Add(operationId, semanticReceipt) })
 
     let emptyRoleCatalog =
         { Revision = 0; Covered = true

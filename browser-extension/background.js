@@ -181,6 +181,68 @@ async function assess(reg) {
     return "ready";
   } catch { return "needsReauthorization"; }
 }
+// Page access is pinned at receipt. assess() awaits Chrome and can report a
+// stale "ready" after the operator revokes an agent-created tab in that await.
+// Recheck all local authorities synchronously after the final Chrome query.
+function pinPageExecution(reg, generation, requestSocket, requestConnection) {
+  const window = reg.agentCreated
+    ? registeredWindows.find(w => w.registrationId === reg.windowRegistration)
+    : null;
+  return { reg, generation, agentCreated: reg.agentCreated === true,
+    authorizationEpoch: agentTabAuthorizationEpoch, sessionEpoch,
+    window, windowGeneration: window?.generation,
+    socket: requestSocket, connectionId: requestConnection };
+}
+function pageExecutionRevocation(pin) {
+  if (socket !== pin.socket || !connected || connectionId !== pin.connectionId)
+    return "ConnectionEpochMismatch";
+  const reg = pin.reg;
+  if (registrations.find(r => r.registrationId === reg.registrationId) !== reg ||
+      reg.registrationGeneration !== pin.generation ||
+      (reg.agentCreated === true) !== pin.agentCreated)
+    return "RegistrationStale";
+  if (pin.agentCreated) {
+    if (!allowAgentCreatedTabs) return "AgentCreatedTabsDisabled";
+    if (agentTabAuthorizationEpoch !== pin.authorizationEpoch)
+      return "AgentCreatedTabsAuthorizationChanged";
+  }
+  if (reg.blocked || reg.sessionEpoch !== sessionEpoch || sessionEpoch !== pin.sessionEpoch)
+    return "RegistrationStale";
+  if (pin.agentCreated &&
+      (!pin.window ||
+       registeredWindows.find(w => w.registrationId === reg.windowRegistration) !== pin.window ||
+       pin.window.generation !== pin.windowGeneration ||
+       pin.window.blocked || pin.window.sessionEpoch !== sessionEpoch))
+    return "WindowRegistrationChanged";
+  return null;
+}
+async function authorizePageExecution(pin) {
+  const initialRevocation = pageExecutionRevocation(pin);
+  if (initialRevocation) return initialRevocation;
+  let tab, window, permission;
+  try {
+    tab = await chrome.tabs.get(pin.reg.tabId);
+    if (pin.agentCreated) window = await validWindow(pin.reg.windowRegistration);
+    // This must be the last awaited preflight check. Subsequent checks are
+    // synchronous and execute() / captureDom() inject without another await.
+    const origin = pin.agentCreated
+      ? pin.reg.boundOrigin : new URL(pin.reg.boundUrl).origin;
+    permission = await chrome.permissions.contains({ origins: [origin + "/*"] });
+  } catch {
+    return pageExecutionRevocation(pin) || "TabUnavailable:needsReauthorization";
+  }
+  const revocation = pageExecutionRevocation(pin);
+  if (revocation) return revocation;
+  if (!permission) return "BrowserPermissionMissing";
+  if (pin.agentCreated && (window !== pin.window || tab.windowId !== window?.windowId))
+    return "WindowRegistrationChanged";
+  if (!isAllowedUrl(tab.url) || tab.discarded || tab.frozen || tab.status !== "complete" ||
+      (pin.agentCreated
+        ? new URL(tab.url).origin !== pin.reg.boundOrigin
+        : tab.url !== pin.reg.boundUrl))
+    return "TabUnavailable:needsReauthorization";
+  return null;
+}
 async function refreshRegistrations() {
   const missing = new Set();
   for (const reg of [...registrations]) {
@@ -289,7 +351,10 @@ async function execute(message) {
       (message.requireAgentCreated === true && registration.agentCreated !== true)) {
     return error("RegistrationStale");
   }
+  const pagePin = pinPageExecution(registration, registrationGeneration, requestSocket, requestConnection);
   const state = await assess(registration);
+  const revocation = pageExecutionRevocation(pagePin);
+  if (revocation) return error(revocation);
   if (state !== "ready") return error("TabUnavailable:" + state);
   // assess() awaits Chrome APIs. Registration may be reclaimed or revoked while
   // it runs; re-check ownership before the irreversible page execution.
@@ -317,6 +382,10 @@ async function execute(message) {
       "return await execute(" + invocationArguments + ");\n") +
     "})()";
   if (bytes(wrapper) > 140000) return error("InputTooLarge");
+  const finalAuthorization = await authorizePageExecution(pagePin);
+  if (finalAuthorization) return error(finalAuthorization);
+  const lastRevocation = pageExecutionRevocation(pagePin);
+  if (lastRevocation) return error(lastRevocation);
   inflight++;
   try {
     const results = await api.execute({
@@ -503,7 +572,11 @@ async function captureDom(message) {
   const reg = registrations.find(r => r.registrationId === registrationId);
   if (!reg || reg.registrationGeneration !== registrationGeneration)
     return reject("RegistrationStale");
-  if (await assess(reg) !== "ready") return reject("TabUnavailable");
+  const pagePin = pinPageExecution(reg, registrationGeneration, requestSocket, requestConnection);
+  const state = await assess(reg);
+  const revocation = pageExecutionRevocation(pagePin);
+  if (revocation) return reject(revocation);
+  if (state !== "ready") return reject("TabUnavailable");
   const api = chrome.userScripts;
   if (typeof api?.execute !== "function") return reject("AllowUserScriptsDisabled");
   const options = { timeoutMs: message.timeoutMs, wait: message.wait,
@@ -514,6 +587,10 @@ async function captureDom(message) {
   const source = "(async () => { if (!(" + identityCheck +
     ")) return {failure:'NavigationDuringCapture'}; return (" +
     capturePage.toString() + ")(" + JSON.stringify(options) + "); })()";
+  const finalAuthorization = await authorizePageExecution(pagePin);
+  if (finalAuthorization) return reject(finalAuthorization);
+  const lastRevocation = pageExecutionRevocation(pagePin);
+  if (lastRevocation) return reject(lastRevocation);
   inflight++;
   try {
     const results = await api.execute({ target: { tabId: reg.tabId },
@@ -631,9 +708,11 @@ async function openNewTab(message, requestContext) {
   let tabCreated = false;
   try {
     const permission = await chrome.permissions.contains({ origins: [target.origin + "/*"] });
+    if (socket !== requestSocket || !connected || connectionId !== requestConnection) return;
+    if (!allowAgentCreatedTabs) return reject("AgentCreatedTabsDisabled");
+    if (agentTabAuthorizationEpoch !== requestAuthorizationEpoch)
+      return reject("AgentCreatedTabsAuthorizationChanged");
     if (!permission) return reject("BrowserPermissionMissing");
-    if (socket !== requestSocket || !connected || connectionId !== requestConnection ||
-        !allowAgentCreatedTabs) return;
     // Permission queries await Chrome. A user might have re-registered or
     // revoked the selected window in the interim.
     const currentWindow = await validWindow(message.windowRegistration);

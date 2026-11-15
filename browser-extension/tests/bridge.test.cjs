@@ -1173,3 +1173,129 @@ test("adoption during execute permission checks fails before page injection", as
   assert.equal(h.calls.length, 0, "Ownership mutation during assess must prevent injection");
   assert.equal(h.tabs.has(tab.id), true);
 });
+
+async function createdPageForExecutionRace() {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("registerWindow", { windowId: 1, alias: "agents" });
+  await h.message("setAgentCreatedTabs", { allowed: true });
+  await h.message("pair", { port: 43822, secret: "b".repeat(64) });
+  await tick(); await tick();
+  const ws = h.sockets[0];
+  await h.deliver(ws, { kind: "challenge", nonce: "d".repeat(64) });
+  await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  await h.deliver(ws, { kind: "openTab", requestId: "page-for-race", connectionId: "epoch-1",
+    url: "https://example.test/chat", alias: "created-page", ...(await windowPin(h)) });
+  const opened = ws.sent.find(m => m.requestId === "page-for-race" && m.kind === "tabOpened")?.tab;
+  assert.ok(opened);
+  const tab = h.createdTabs[0];
+  tab.url = "https://example.test/chat";
+  tab.status = "complete";
+  delete tab.pendingUrl;
+  return { h, ws, opened, tab };
+}
+async function requestPageAction({ h, ws, opened }, kind, requestId) {
+  const request = { kind, requestId, connectionId: "epoch-1",
+    registrationId: opened.registrationId, registrationGeneration: opened.registrationGeneration };
+  if (kind === "executeJs") {
+    Object.assign(request, { requireAgentCreated: true,
+      source: "document.title", entrypoint: "expression", args: {} });
+  } else {
+    Object.assign(request, { mode: "inline", captureSelector: "",
+      timeoutMs: 500, wait: { kind: "immediate" } });
+  }
+  await h.deliver(ws, request);
+  return ws.sent.find(m => m.requestId === requestId);
+}
+
+test("OpenTab opt-out during first host permission check returns definite rejection", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("registerWindow", { windowId: 1, alias: "agents" });
+  await h.message("setAgentCreatedTabs", { allowed: true });
+  await h.message("pair", { port: 43822, secret: "b".repeat(64) });
+  await tick(); await tick();
+  const ws = h.sockets[0];
+  await h.deliver(ws, { kind: "challenge", nonce: "d".repeat(64) });
+  await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  h.beforeNextPermissionCheck(async () => {
+    assert.equal((await h.message("setAgentCreatedTabs", { allowed: false })).ok, true);
+  });
+  await h.deliver(ws, { kind: "openTab", requestId: "preflight-revoked",
+    connectionId: "epoch-1", url: "https://example.test/chat", alias: "must-not-open",
+    ...(await windowPin(h)) });
+  assert.equal(ws.sent.find(m => m.requestId === "preflight-revoked")?.error,
+    "AgentCreatedTabsDisabled");
+  assert.equal(h.createdTabs.length, 0);
+});
+
+for (const kind of ["executeJs", "captureDom"]) {
+  for (const reenable of [false, true]) {
+    test(kind + " rejects in-flight opt-out" + (reenable ? " and re-enable" : "") +
+      " during assessment before injection", async () => {
+      const x = await createdPageForExecutionRace();
+      x.h.beforeNextPermissionCheck(async () => {
+        assert.equal((await x.h.message("setAgentCreatedTabs", { allowed: false })).ok, true);
+        if (reenable)
+          assert.equal((await x.h.message("setAgentCreatedTabs", { allowed: true })).ok, true);
+      });
+      const response = await requestPageAction(x, kind, "assess-revoked");
+      assert.equal(response?.error, reenable
+        ? "AgentCreatedTabsAuthorizationChanged" : "AgentCreatedTabsDisabled");
+      assert.equal(x.h.calls.length, 0, "No page code may execute after explicit opt-out");
+    });
+  }
+
+  test(kind + " rechecks host permission after last window assessment", async () => {
+    const x = await createdPageForExecutionRace();
+    let lookups = 0;
+    x.h.onWindowQuery(async () => {
+      if (++lookups !== 3) return;
+      x.h.onWindowQuery(null);
+      x.h.setHostPermissionGranted(false);
+    });
+    const response = await requestPageAction(x, kind, "host-revoked");
+    assert.equal(lookups, 3, "Permission revocation must occur during final preflight");
+    assert.equal(response?.error, "BrowserPermissionMissing");
+    assert.equal(x.h.calls.length, 0);
+  });
+
+  test(kind + " rejects window generation changed during last permission await", async () => {
+    const x = await createdPageForExecutionRace();
+    let lookups = 0;
+    x.h.onWindowQuery(async () => {
+      if (++lookups !== 3) return;
+      x.h.onWindowQuery(null);
+      x.h.beforeNextPermissionCheck(async () => {
+        assert.equal((await x.h.message("registerWindow", { windowId: 1, alias: "agents" })).ok, true);
+      });
+    });
+    const response = await requestPageAction(x, kind, "window-reregistered");
+    assert.equal(lookups, 3);
+    assert.equal(response?.error, "WindowRegistrationChanged");
+    assert.equal(x.h.calls.length, 0);
+  });
+}
+
+test("agent-created-tab opt-out does not revoke manually registered page execution", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("register", { tabId: 17, alias: "manual" });
+  await h.message("pair", { port: 43822, secret: "b".repeat(64) });
+  await tick(); await tick();
+  const ws = h.sockets[0];
+  await h.deliver(ws, { kind: "challenge", nonce: "d".repeat(64) });
+  await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  const reg = (await h.message("getState")).registrations.find(r => r.alias === "manual");
+  h.beforeNextPermissionCheck(async () => {
+    assert.equal((await h.message("setAgentCreatedTabs", { allowed: false })).ok, true);
+  });
+  await h.deliver(ws, { kind: "executeJs", requestId: "manual-still-allowed",
+    connectionId: "epoch-1", registrationId: reg.registrationId,
+    registrationGeneration: reg.registrationGeneration,
+    source: "document.title", entrypoint: "expression", args: {} });
+  const response = ws.sent.find(m => m.requestId === "manual-still-allowed");
+  assert.equal(response?.kind, "result");
+  assert.equal(response?.result, "Agent 7");
+  assert.equal(h.calls.length, 1);
+});

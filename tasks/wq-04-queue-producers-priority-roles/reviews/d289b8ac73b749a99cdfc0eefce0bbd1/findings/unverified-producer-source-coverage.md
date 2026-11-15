@@ -1,0 +1,16 @@
+# F02 — Blocking: producer CAS lacks canonical event provenance and independently derived high-water
+
+**Severity:** Blocking source-integrity / fail-closed coverage. **Frozen source:** `6f0686720e56e198e085111cd8f22f5c6a6d7b83`.
+
+## Evidence
+- `Client/Modules/WorkQueueGitLedger.fs:924-930` accepts a caller-supplied `ProduceEvent` whenever `event.ProjectId` matches the project binding. At `:1042-1060` the additional proof validates implementation lineage only; there is no read of the authoritative task/review/challenge/operator source event at the same pinned Git head and no verified source-generation status for other origins.
+- `Server/WorkQueueProducers.fs:157-165,186-244` only checks nonblank source IDs, syntactically valid refs/SHAs, and the existence of *any* frozen-review prerequisite for `AcceptedIntegration`. It never checks that the identified review has an Accepted verdict bound to the `reviewId`, `acceptedSha` and target; `FrozenReviewRequested` likewise does not validate the frozen request. A client can supply a fresh arbitrary `SourceId` and enqueue a plausible integration stage for a review that has merely been created. Project CAS serialization prevents duplicate writes but does not authenticate the source event.
+- `Server/WorkQueueProducers.fs:135-153` checks only equality of caller-supplied high-water values with their caller-supplied indexed-through values. They are not derived from the pinned canonical event/queue/source indexes. `applyEvent` never updates an authoritative producer high-water; `Server.Tests/WorkQueueProducerTests.fs:110` even asserts `ProducerCount = 0` after publication. Tests create arbitrary matched values (`10/10`, `4/4`, `3/3`) instead of proving exact source/index coverage.
+
+## Why this matters
+A `true` flag plus matching fabricated counters is not evidence of complete canonical source ingestion. Missing or unauthenticated event generations can be silently omitted while demand selection reports `Chosen=None`, or an unaccepted review can be represented as an integration demand. These are precisely the gaps the WQ-04 task's canonical stage-generation source and high-water acceptance conditions must close.
+
+The source comments correctly warn that a *future adapter* must recheck source events. That warning does not make the newly exposed `ProduceEvent` Git mutation authoritative: in this review it is only an inert/test-fixture projection and must not be integrated as a verified producer route.
+
+## Required correction
+Either (a) make source-to-queue publication a same-snapshot canonical event projector with verified event ID, immutable generation, explicit source terminal/accepted status, persisted producer high-water/index and typed CAS receipt; or (b) keep the current `ProduceEvent` route inaccessible to production/cutover and explicitly fail closed until the authoritative adapter is supplied and separately reviewed. Add negative two-clone tests for a nonexistent/undecided review, mismatched accepted SHA, skipped event high-water, stale source generation and replay with changed source payload. No Scheduler, live tokens, migration or deployment until that safety boundary is proven.

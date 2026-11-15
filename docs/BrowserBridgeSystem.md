@@ -506,30 +506,29 @@ a new connection during an in-flight request, and a colliding tab during a pinne
 composite launch. These deterministic simulated WebSockets validate the code
 path without changing the live running Jarvis process.
 
-### Failure A: previously submitted composer draft restored in new ChatGPT tab
+### Failure A: restored draft in fresh Jarvis-created ChatGPT home tab
 
-Observed in the original 2026-11-15 Edge multi-agent launch: a newly created
-`https://chatgpt.com/` tab could display an exact previously submitted
-Jarvis bootstrap. The provider-specific persistence mechanism is **not
-independently established**. The previous `ExistingDraft` refusal was correct
-but required manual intervention.
+During the 2026-11-15 Edge multi-agent launch, a newly opened
+`https://chatgpt.com/` tab occasionally displayed an earlier bootstrap.
+The precise provider-side persistence mechanism remains unverified. The
+initial `ExistingDraft` refusal protected unknown user text but blocked
+disposable, newly Jarvis-created agent tabs.
 
-`browser-scripts/chatgpt/launchAgent.js` still refuses every unknown draft.
-Its optional `confirmedSubmittedPrompts` argument is a bounded array (1-8)
-of **exact bootstrap messages that the caller has already confirmed were sent**
-(e.g., by an earlier returned `submitted` result with a stable conversation
-URL). If, and only if, the current composer text matches one of those strings
-after newline/NBSP normalization, the script selects **only the composer
-contents** and issues a normal `delete` editor command. It verifies the draft
-is empty before inserting the new message. Failed selection/deletion returns a
-pre-send incompatibility; it never proceeds to Send. The script does not query
-ChatGPT private APIs, persist transcript or prompt history, blindly resubmit,
-clear arbitrary drafts, or expose draft text in diagnostics. The caller remains
-responsible for confirmed prior-submission provenance; merely supplying a string
-does not independently prove the prior send.
+The operator clarified that **any** composer text restored in a freshly
+Jarvis-created home tab is disposable. `browser-scripts/chatgpt/launchAgent.js`
+now selects only that tab's composer and uses ordinary editor deletion
+before inserting the exact intended bootstrap. It verifies the composer
+is empty, then verifies the inserted text before clicking Send once.
+It no longer accepts or requires `confirmedSubmittedPrompts` evidence.
+Selection/deletion/insertion failure returns a pre-send incompatibility.
+A changed route, an existing conversation, or an uncertain post-Send
+result never causes a retry or retarget to an unrelated tab.
 
-The Node launcher fixture tests successful exact-match clearing, unknown/invalid
-provenance refusal, deletion failure, and all earlier one-send-only/uncertainty
-cases. Live browser verification of three distinct bootstraps and adverse
-connection flips remains an acceptance step **after authorized installation or
-restart of the modified client**; this worktree is not deployed.
+The ownership restriction is enforced by using the generic
+`BrowserRunInNewTab` path with an explicitly user-registered window.
+It is **not** permission to run the script against an unrelated
+manually registered user tab; a home URL alone does not prove provenance.
+The Node fixtures cover arbitrary, identical and whitespace-only drafts,
+failed deletion, existing conversations and one-send-only uncertainty.
+Live verification of three distinct bootstraps and connection flips
+still requires authorized installation or restart of the modified client.

@@ -1,0 +1,1 @@
+Review new exhaustive claimed-review snapshot contract; unresolved observed-session capacity and restart behavior; canonical claim completion vs explicit verified yield; paused claimed-review resumption; audited operator recovery. Node planner suite 33/33 green; Manager live activation remains disabled.

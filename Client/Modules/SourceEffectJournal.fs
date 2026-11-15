@@ -475,3 +475,49 @@ let inspectForHandoff store scope expectedOriginalIds : SourceEffectPreflight =
             blocked reasons entries missing
         with ex ->
             blocked [ "Journal read/provenance failure: " + ex.Message ] [] expectedOriginalIds
+
+
+// Only a host-owned awaited WriteFile/PatchFile dispatch may produce this
+// narrow terminal receipt. A callback error, exception or lost acknowledgement
+// is uncertain, never proof of a completed effect. No process/Git/remote
+// operation may invoke this as a terminal attestation.
+let runAwaitedHostFileEdit store (intent: SourceEffectIntent)
+    (edit: unit -> System.Threading.Tasks.Task<Result<'T, 'E>>)
+    : System.Threading.Tasks.Task<Result<Result<'T, 'E>, string>> =
+    task {
+        if intent.Kind <> FileEdit then
+            return Error "RecoveryBlocked: awaited terminal proof restricted to host-owned file edits."
+        else
+            match beginBeforeDispatch store intent with
+            | Error reason -> return Error reason
+            | Ok(AlreadyRecorded _) ->
+                return Error "RecoveryBlocked: original file edit already recorded; no redispatch."
+            | Ok FirstDispatch ->
+                try
+                    let! result = edit()
+                    match result with
+                    | Error _ ->
+                        match recordUncertain store intent "Awaited host file edit returned an error; original outcome may be partial." with
+                        | Ok () -> return Ok result
+                        | Error reason -> return Error reason
+                    | Ok _ ->
+                        let completion = transaction store (fun connection tx ->
+                            match queryExisting connection tx intent.OriginalOperationId with
+                            | Some (scope, kind, sha, key, Prepared)
+                                when scope = scopeKey intent.Scope && kind = "FileEdit"
+                                     && sha = intent.RequestSha256 && key = operationKey intent ->
+                                use update = command connection (Some tx) (
+                                    "UPDATE effects SET state='Terminal',proof='host-awaited-file-edit-returned-v1',reason='' WHERE operation_id=$id;")
+                                add update "$id" (box (intent.OriginalOperationId.ToString("D")))
+                                update.ExecuteNonQuery() |> ignore
+                                Ok ()
+                            | _ -> Error "RecoveryBlocked: awaited file edit identity/state changed before terminal receipt.")
+                        match completion with
+                        | Ok () -> return Ok result
+                        | Error reason -> return Error ("RecoveryBlocked: effect may have completed; " + reason)
+                with ex ->
+                    let uncertainty = "Awaited host file edit raised " + ex.GetType().Name + "."
+                    match recordUncertain store intent uncertainty with
+                    | Ok () -> return Error ("RecoveryBlocked: " + uncertainty)
+                    | Error reason -> return Error reason
+    }

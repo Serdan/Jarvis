@@ -1,0 +1,35 @@
+# Independent WQ-03 real-route source-effect audit — frozen e7a8a3ed
+
+**Reviewer:** Reviewer 1  
+**Request:** 183f6a7d39e14faebaa303ab08a62296, task `wq03-source-effect-journal-bridge`  
+**Scope verdict:** **Accepted solely as a nonproduction, deny-only, inert diagnostic foundation.** This is **not** acceptance of operational source succession, trusted full-route journaling, host WIP protection, production Scheduler activation, or deployment.
+
+## Exact provenance and executed verification
+
+- Frozen SHA `e7a8a3edacbbcdfc3f74e72361b21a6a912f85da` has exactly one parent, `8ed9671543f05073f7d453728b50772138dd87f2`, matching review base. Independent registered review worktree `reviewer1-wq03-e7a8-frozen` was clean at this SHA before/after Release tests. `git diff --check 8ed96715 e7a8a3ed`: exit 0.
+- Changed seven files: `SourceEffectRouteBridge.fs`, additions to `SourceEffectJournal.fs`, `Client/SignalR/Client.fs`, project compile entries, the route tests, and explicit limitation document.
+- Toolchain: `dotnet --version` = **11.0.100**. Independent `dotnet restore Client.Tests/Client.Tests.fsproj --ignore-failed-sources`: exit 0. `dotnet build Client.Tests/Client.Tests.fsproj -c Release --no-restore --nologo`: **exit 0**, 0 errors, two pre-existing/unrelated warnings (FS0760 in Client/Program.fs and FS3369 in Client.Tests/BrowserSchedulesTests.fs).
+- Test execution via **`dotnet vstest` on the built Release DLL** (not the build-only `dotnet test` invocation): exact journal/route filter **20 passed / 0 failed / 0 skipped**, and bounded WQ03 WorkQueueGitLedger + SignalRDispatch + AgentCommandInfo + RouteBridge regression filter **42 passed / 0 failed / 0 skipped**. Both exit 0. These are overlapping runs, not 62 distinct assertions. The original journal suite includes real two-Git-clone identity isolation; the new route suite uses two concurrent client/store handles and host-handler callbacks.
+
+## What the frozen source actually guarantees
+
+1. `Client/Modules/SourceEffectRouteBridge.fs:16-51` explicitly classifies seven source RPCs as journal candidates, with `CreateWorktree`, `RemoveWorktree`, `CreateSkill`, scheduling, retry and other mutation-capable paths marked **uncovered**. For RunCommand/RunProjectTask/StartJob/GitCommit/import, no successful external process or remote receipt is accepted as terminal. Push/merge through a subprocess remain uncertain.
+2. The diagnostic entry `executeDiagnostic` (`SourceEffectRouteBridge.fs:103-135`) requires a supplied original nonempty UUID, exact serialized request SHA, source kind, checkout selector, and intent/supplied-scope agreement; `beginBeforeDispatch` precedes invoking the awaited callback, and same original UUID replay is denied. Non-file routes durably mark Uncertain even on a returned success; an exception also remains blocked. `runAwaitedHostFileEdit` (`SourceEffectJournal.fs:484-529`) marks Terminal only for a successful awaited host-owned file edit; errors or journal failures do not grant a positive handoff receipt.
+3. The only live receiver change is an opt-in `JARVIS_WQ03_NONPRODUCTION_DENY_UNBOUND_SOURCE=deny-unbound-v1` check at `Client/SignalR/Client.fs:922-941`, after authorization but before either RunProjectTask's special execution branch or ordinary dispatch. It **denies**, never fabricates UUIDs or promotes journal evidence. It is off by default. The selector-based scope is a diagnostic convention, **not** authoritative generation verification. `git grep` confirms `executeDiagnostic` has no production receiver caller; only tests invoke it.
+4. `SourceEffectJournal.inspectForHandoff` continues to return `RecoveryBlocked=true` regardless of individual Terminal rows, and `WorkQueueGitLedger.fs:444-450` still rejects all external-effect/WIP-protection handoff proof. No successor, claim release, token, launch, Scheduler or YieldSource enablement is present in this diff.
+
+## Hard blockers that this acceptance **does not waive**
+
+**A — No original source-UUID transport or authoritative host binding.** The real RunCommand, StartJob, RunProjectTask, Write/Patch/ImportFile and GitCommit RPCs carry no caller-stable source operation UUID or authenticated work/claim/launch/ledger envelope. `SourceRouteInvocation` exposes public record fields; checking `Intent.Scope = TrustedScope` is only an internal consistency check, not host authentication of the source scope. A future production caller must derive an unforgeable scope from the canonical bound host state and exact original request. Until then the diagnostic positive receipt is **not authoritative**.
+
+**B — Incomplete/full-route and remote process proof.** Scheduled, retried, detached-child, arbitrary subprocess, legacy/out-of-band OS/Git and remote pushes/merges have no comprehensive pre-dispatch interception or process-tree/remote-ack terminal attestation. `ListJobs`, clean worktree, elapsed time and `ls-remote` are not positive proof. Source events may occur after the apparent handler return. No safe production journal-completeness claim is possible; unknown outcomes must preserve the original UUID and block succession.
+
+**C — Canonical RecoveryBlocked persistence not wired.** SQLite source fences are durable for diagnostic records, but the project-level `MarkSourceRecoveryBlocked` CAS transition is not invoked by the new live receiver. Source transitions remain rejected by the pre-existing unconditional gate, not by a newly verified canonical source-recovery bridge. This must be reconciled before operational source handoff and must not release claim/token/launch on failure.
+
+**D — Host WIP ref immutability/retention is external and unproven.** No evidence here establishes create-only, anti-force, anti-delete and retained `refs/heads/jarvis-wip/**` for all effective credentials/bypass paths. This requires separate operator authorization and host proof; no destructive host tests were attempted. A Git SHA or branch listing cannot substitute for it.
+
+**E — End-to-end evidence remains intentionally narrow.** Focused tests validate the diagnostic wrapper with injected host callbacks and prove two-client/two-clone isolation at the journal level, but do not test live SignalR source effect journaling, cross-process original operation-UUID transportation, detached child termination or lost remote-push acknowledgment at the actual OS/Git dispatch boundary. No claims to those properties follow from the 20/20 and 42/42 results.
+
+## Review conclusion and next integration boundary
+
+No defect was found that lets this **currently inert** code authorize source handoff or reinterpret unknown effects as terminal. It is safe to consider integrating this exact frozen SHA **as nonproduction infrastructure only**, preserving the unconditional source-handoff rejection. Operational activation requires a separate exact-source implementation, independent review, fully attested route/host coverage, canonical fail-closed CAS, effective host WIP protection/retention, and explicit operator cutover authorization. Do not label WQ03 source succession complete based on this review.

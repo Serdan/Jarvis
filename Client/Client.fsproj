@@ -78,6 +78,8 @@
         <Compile Include="Modules\\ReviewWorkflow.fs"/>
         <Compile Include="Modules\\WorkQueueReviewIntegrationAdapter.fs"/>
         <Compile Include="Modules\\ChallengeWorkflow.fs"/>
+        <Compile Include="Modules\\WorkQueueCanonicalSourceEvidence.fs"/>
+        <Compile Include="Modules\\WorkQueueCanonicalCasBinder.fs"/>
         <Compile Include="Modules\\OrchestrationApi.fs"/>
         <Compile Include="Modules\SourceEffectHostBinding.fs"/>
         <Compile Include="Modules\ProjectCreation.fs"/>

@@ -148,10 +148,10 @@ try
         eprintfn "Hermetic Client.Tests: intentional setup failure in %s" tempDirectory
         failwith "Harness setup failure injected after allocating disposable paths."
 
-    let dotnet =
-        match Environment.ProcessPath with
-        | null | "" -> "dotnet"
-        | executable -> executable
+    // FSI can be launched through an SDK-specific executable on Windows;
+    // Environment.ProcessPath may then be fsi.exe rather than dotnet.exe.
+    // Explicitly run the dotnet CLI already required to launch this script.
+    let dotnet = "dotnet"
 
     let start = ProcessStartInfo(dotnet)
     start.UseShellExecute <- false
@@ -171,6 +171,7 @@ try
     start.ArgumentList.Add("--blame-hang-timeout")
     start.ArgumentList.Add("75s")
     for arg in forwarded do start.ArgumentList.Add(arg)
+    printfn "Hermetic Client.Tests: child executable %s; CLI command dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-restore" dotnet
 
     // Exercise inherited-Git-identity failure with synthetic sentinels only.
     if injectGitIdentitySentinel then
@@ -251,6 +252,9 @@ try
         eprintfn "Hermetic Client.Tests: could not drain all child output."
 
     if finished then
+        printfn "Hermetic Client.Tests: child exit %d; drained %b; stdout chars %d; stderr chars %d" child.ExitCode drained
+            (if drained then stdoutTask.Result.Length else -1)
+            (if drained then stderrTask.Result.Length else -1)
         let discoveryOnly = forwarded |> List.contains "--list-tests"
         let testCount =
             if drained then

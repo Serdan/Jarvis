@@ -168,7 +168,8 @@ module WorkQueueReviewIntegrationAdapter =
         if review.Status <> "ChangesRequested" then Error AdapterError.ReviewNotDecided
         elif source.SubjectId <> review.TaskId
              || source.Kind <> WorkKind.Implementation
-             || source.State <> WorkState.Completed then
+             || source.State <> WorkState.Completed
+             || project.Works.TryFind source.Id <> Some source then
             Error AdapterError.StaleSourceLineage
         else
             match source.SourceLineage with
@@ -185,8 +186,9 @@ module WorkQueueReviewIntegrationAdapter =
                         id <> source.Id
                         && work.SubjectId = review.TaskId
                         && work.Kind = WorkKind.Implementation
-                        && work.State <> WorkState.Completed
-                        && work.State <> WorkState.Cancelled
+                        && (work.StageGeneration >= source.StageGeneration
+                            || (work.State <> WorkState.Completed
+                                && work.State <> WorkState.Cancelled))
                         && (work.SourceLineage |> Option.exists (fun value ->
                             value.LineageId = lineage.LineageId)))
                 if duplicate then Error AdapterError.DuplicateCorrection
@@ -323,6 +325,7 @@ module WorkQueueReviewIntegrationAdapter =
     // stage requires the canonical authorized producer and complete WQ-04 index.
     let isAuthorizedIntegration (project: Project) binding =
         project.GraphCovered && project.QueueCovered
+        && project.MessageCovered && project.SourceCovered
         && (match project.Works.TryFind (integrationStageId binding) with
             | Some stage ->
                 stage.Kind = WorkKind.Integration

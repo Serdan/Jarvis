@@ -236,6 +236,14 @@ type WorkQueueReviewIntegrationAdapterTests() =
         match WorkQueueReviewIntegrationAdapter.planCorrection alreadyActive "implementation" review baseWork with
         | Error AdapterError.DuplicateCorrection -> ()
         | other -> Assert.Fail(sprintf "Duplicate source-lineage correction was admitted: %A" other)
+        // A completed successor still makes the prior generation stale.
+        // Otherwise a delayed ChangesRequested replay could manufacture the
+        // same correction stage again after its first terminal receipt.
+        let alreadyCompleted =
+            { p with Works = p.Works.Add(first.Work.Id, { first.Work with State = WorkState.Completed }) }
+        match WorkQueueReviewIntegrationAdapter.planCorrection alreadyCompleted "implementation" review baseWork with
+        | Error AdapterError.DuplicateCorrection -> ()
+        | other -> Assert.Fail(sprintf "Terminal successor allowed stale correction: %A" other)
 
     [<Test>]
     member _.AcceptedExactShaTargetAndImmutableSubmissionAreRequired() =

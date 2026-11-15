@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"work-queues-ephemeral-executions","title":"[Architecture epic] Durable work queues and ephemeral agent activations","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"work-queues-ephemeral-executions","title":"[Architecture epic] Durable task-centric work queues and ephemeral role executions","version":2,"lifecycle":"Open","specVersion":2,"attemptId":null}

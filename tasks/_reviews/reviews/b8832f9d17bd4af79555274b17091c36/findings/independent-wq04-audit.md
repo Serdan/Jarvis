@@ -7,7 +7,7 @@
 - `dotnet test Server.Tests/Server.Tests.fsproj -c Release --no-restore --filter FullyQualifiedName~WorkQueueProducerTests`: 9/9 passed, exit 0.
 - `dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-restore --filter FullyQualifiedName~WorkQueueProducerGitTests`: 3/3 passed, exit 0. These are disposable two-clone CAS fixtures.
 - `dotnet test Server.Tests/Server.Tests.fsproj -c Release --no-build --no-restore --filter FullyQualifiedName~WorkQueue`: 97/97 passed, exit 0.
-- A broader Client.Tests `WorkQueue` Release filter was started independently; its final outcome will be added before deciding this review. Passing tests do not settle the negative-space issues below.
+- `dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-build --no-restore --filter FullyQualifiedName~WorkQueue`: 28/28 passed, exit 0 (1m16s). Passing tests do not settle the negative-space issues below.
 
 ## F01 — P1 blocking: arbitrary producer assertions enter project Git CAS without canonical event proof
 - `Client/Modules/WorkQueueGitLedger.fs:903-932` handles a caller-provided `WorkMutation.ProduceEvent` by checking only that `event.ProjectId` matches the ledger binding, then invokes `WorkQueueProducers.applyEvent`. At `:1039-1059`, the post-transition source proof verifies *implementation lineage* only. Planning, frozen review, review correction's verdict, accepted integration, challenge follow-up, and policy resolution do not obtain authoritative task/review/challenge source-event proof in that transaction.

@@ -66,6 +66,13 @@ type InertUnregisteredDeadline =
 module InertScheduler =
     let private bad reason = Error(Rejection.InvalidState reason)
 
+    // Only the guarded entry point is usable by runtime consumers. The other
+    // case exists solely for the friend test assembly's hypothetical WQ02/WQ07
+    // model; it is NOT a producer/high-water/role provenance witness.
+    type private PlannerScope =
+        | RuntimeGuarded
+        | TestOnlyHypothetical
+
     // Length-prefixed UTF-8 removes ambiguity from colons, slashes and unicode.
     // The adapter must persist this fingerprint with the original one-shot intent.
     let private fingerprint fields =
@@ -115,12 +122,16 @@ module InertScheduler =
           AncillaryMessages = Set.empty
           DispatchCount = 0 }
 
-    let private validateInput (snapshot: InertSchedulingSnapshot) launchId =
+    let private validateInput scope (snapshot: InertSchedulingSnapshot) launchId =
         if String.IsNullOrWhiteSpace launchId then
             bad "launchId must be supplied once by the external journal"
         elif not snapshot.CompleteProjectSet || not snapshot.CompleteRoleVersions then
             Error(Rejection.IncompleteCoverage "account project set or canonical role versions")
-        elif not (canDispatch snapshot.Account (snapshot.Projects |> List.map (fun item -> item.State))) then
+        elif (match scope with
+              | RuntimeGuarded ->
+                  not (canDispatch snapshot.Account (snapshot.Projects |> List.map (fun item -> item.State)))
+              | TestOnlyHypothetical ->
+                  not (canDispatchPrototype snapshot.Account (snapshot.Projects |> List.map (fun item -> item.State)))) then
             Error(Rejection.IncompleteCoverage "migration/high-water prerequisites")
         elif snapshot.Projects.IsEmpty
              || (snapshot.Projects |> List.map (fun item -> item.Id) |> Set.ofList |> Set.count) <> snapshot.Projects.Length then
@@ -143,8 +154,8 @@ module InertScheduler =
     // Non-agent, no I/O, no UUID allocation, no token claim, no dispatch.
     // A caller-stable launchId is persisted before invoking this planner.
     // A different project head or role witness produces a different fingerprint.
-    let plan (snapshot: InertSchedulingSnapshot) launchId : Result<InertLaunchPlan option, Rejection> =
-        validateInput snapshot launchId
+    let private planInScope scope (snapshot: InertSchedulingSnapshot) launchId : Result<InertLaunchPlan option, Rejection> =
+        validateInput scope snapshot launchId
         |> Result.bind (fun () ->
             let occupied =
                 snapshot.Account.Tokens
@@ -204,6 +215,17 @@ module InertScheduler =
                                           ReleaseOperationId = op "release" }
                                 | _ -> None))
                     |> Ok)
+
+    // No caller-supplied WQ02 flags can authorize the normal planner. The
+    // WQ04 semantic/source guard stays fail-closed until verified adapters land.
+    let plan (snapshot: InertSchedulingSnapshot) launchId : Result<InertLaunchPlan option, Rejection> =
+        planInScope RuntimeGuarded snapshot launchId
+
+    // INTERNAL + friend test assembly only. This produces a hypothetical
+    // plan for pure disposable CAS tests, NOT an executable launch permission.
+    // No live Scheduler is bound to or able to call this test seam.
+    let internal planHypotheticalFixtureOnly (snapshot: InertSchedulingSnapshot) launchId =
+        planInScope TestOnlyHypothetical snapshot launchId
 
     // A public record is not permission to substitute a pre-registered agent,
     // change a token binding or invent new operation IDs after an uncertain send.

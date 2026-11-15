@@ -68,7 +68,8 @@ let private single () =
     project "alpha" [worker] [work "alpha" "W" 1L]
 
 let private planned id input =
-    match plan input id |> ok with
+    // Explicitly hypothetical fixture-only planning; normal plan is fail-closed.
+    match planHypotheticalFixtureOnly input id |> ok with
     | Some value -> value
     | None -> failwith "Expected eligible WQ08 launch plan"
 
@@ -99,8 +100,27 @@ let cap_one_worker_directly_without_manager_or_any_eager_uuid () =
     let reserved, admitted = admission first original.Account entry.State
     Assert.That(reserved.Tokens.[first.Launch.Id], Is.False)
     Assert.That(admitted.Launches.[first.Launch.Id].Credit, Is.EqualTo(Some "W"))
-    Assert.That(plan (snapshot reserved [ { entry with State = admitted } ]) "another-launch" |> ok,
+    Assert.That(planHypotheticalFixtureOnly (snapshot reserved [ { entry with State = admitted } ]) "another-launch" |> ok,
                 Is.EqualTo(None))
+
+[<Test>]
+let runtime_planner_never_promotes_hypothetical_wq02_flags_into_verified_source_authority () =
+    let entry = single ()
+    let baseCase = snapshot (emptyAccount 1) [entry]
+    let review = stage "beta" "forged-review-identity" WorkKind.FrozenReview "review" 1L [] WorkState.Available
+    let roleCase = project "beta" [reviewer] [review]
+    // All these fixtures say migration/index/roles are complete. None has an
+    // authentic pinned WQ04 producer/high-water/role proof; no source ID or
+    // cap variation may turn the normal runtime planner into a positive path.
+    for scenario in
+        [ baseCase
+          { baseCase with Account = emptyAccount 0 }
+          snapshot (emptyAccount 1) [roleCase]
+          snapshot (emptyAccount 2) [entry; roleCase] ] do
+        Assert.That(canDispatch scenario.Account (scenario.Projects |> List.map (fun p -> p.State)),
+                    Is.False)
+        mustReject (Rejection.IncompleteCoverage "migration/high-water prerequisites")
+            (plan scenario "blocked-launch")
 
 [<Test>]
 let blocking_first_global_fifo_and_role_pinning_are_deterministic () =
@@ -123,28 +143,28 @@ let incomplete_account_scope_role_or_producer_projection_fails_closed () =
     let entry = single ()
     let original = snapshot (emptyAccount 1) [entry]
     mustReject (Rejection.IncompleteCoverage "account project set or canonical role versions")
-        (plan { original with CompleteProjectSet = false } "L")
+        (planHypotheticalFixtureOnly { original with CompleteProjectSet = false } "L")
     mustReject (Rejection.IncompleteCoverage "account project set or canonical role versions")
-        (plan { original with CompleteRoleVersions = false } "L")
+        (planHypotheticalFixtureOnly { original with CompleteRoleVersions = false } "L")
     mustReject (Rejection.IncompleteCoverage "migration/high-water prerequisites")
-        (plan { original with Projects = [{ entry with State = { entry.State with QueueCovered = false } }] } "L")
+        (planHypotheticalFixtureOnly { original with Projects = [{ entry with State = { entry.State with QueueCovered = false } }] } "L")
     mustReject (Rejection.IncompleteCoverage "migration/high-water prerequisites")
-        (plan { original with Account = { original.Account with Migration = MigrationEpoch.Preparing } } "L")
+        (planHypotheticalFixtureOnly { original with Account = { original.Account with Migration = MigrationEpoch.Preparing } } "L")
     mustReject (Rejection.IncompleteCoverage "role subscription, version or stage provenance")
-        (plan { original with Projects = [{ entry with Roles = [{ worker with Queues = Set.singleton "review" }] }] } "L")
+        (planHypotheticalFixtureOnly { original with Projects = [{ entry with Roles = [{ worker with Queues = Set.singleton "review" }] }] } "L")
     mustReject (Rejection.IncompleteCoverage "missing or duplicate project authority")
-        (plan { original with Projects = [entry; entry] } "L")
+        (planHypotheticalFixtureOnly { original with Projects = [entry; entry] } "L")
     mustReject (Rejection.InvalidState "launchId must be supplied once by the external journal")
-        (plan original "")
+        (planHypotheticalFixtureOnly original "")
 
 [<Test>]
 let role_unmatched_or_covered_demand_does_not_allocate_a_second_token () =
     let emptyRole = project "alpha" [reviewer] [work "alpha" "W" 1L]
-    Assert.That(plan (snapshot (emptyAccount 1) [emptyRole]) "unused" |> ok, Is.EqualTo(None))
+    Assert.That(planHypotheticalFixtureOnly (snapshot (emptyAccount 1) [emptyRole]) "unused" |> ok, Is.EqualTo(None))
     let entry = single ()
     let first = planned "L1" (snapshot (emptyAccount 2) [entry])
     let reserved, admitted = admission first (emptyAccount 2) entry.State
-    Assert.That(plan (snapshot reserved [{entry with State = admitted}]) "L2" |> ok,
+    Assert.That(planHypotheticalFixtureOnly (snapshot reserved [{entry with State = admitted}]) "L2" |> ok,
                 Is.EqualTo(None))
 
 [<Test>]
@@ -365,7 +385,7 @@ let disposable_two_clone_last_slot_cas_rejects_loser_and_recovers_original_reser
         mustReject Rejection.CasConflict (reserveAccount bPlan afterA)
         let duplicate = reserveAccount aPlan afterA |> ok
         Assert.That(duplicate, Is.EqualTo(afterA))
-        Assert.That(plan (snapshot afterA [entry]) "C" |> ok, Is.EqualTo(None)))
+        Assert.That(planHypotheticalFixtureOnly (snapshot afterA [entry]) "C" |> ok, Is.EqualTo(None)))
 
 [<Test>]
 let disposable_two_clone_project_c01_abort_fences_late_admission () =

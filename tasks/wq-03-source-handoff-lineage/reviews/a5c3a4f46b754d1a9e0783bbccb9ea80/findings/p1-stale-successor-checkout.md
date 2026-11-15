@@ -1,0 +1,9 @@
+# P1 — successor source claim does not pin the local checkout
+
+**Frozen source:** `4f0ac4df3f3f437501c8da054c262706ec3f5e64` (WQ-03 review a5c3a4f46b754d1a9e0783bbccb9ea80).
+
+**Evidence:** `Client/Modules/WorkQueueGitLedger.fs:773-785` handles `ClaimNext` by checking only `verifySourceContinuation`, which calls `git ls-remote` on the approved remote (`:266-276`). It does not establish a new isolated successor worktree or assert the claiming clone's `HEAD == lineage.ContinuationSha`. The included two-clone test `SourceYieldPublishesExactPortableCheckpointAndSuccessorFencesOldWriter` explicitly leaves clone B at the original source HEAD (comment before replay at `Client.Tests/WorkQueueGitLedgerTests.fs:1060`), then successfully executes `ClaimNext "L2"` on clone B at `:1096` after restoring the WIP ref. No checkout of WIP SHA occurs. This is a reproducible executable counterexample to the immutable source-resumption contract.
+
+**Impact:** A new role launch can receive an actionable claim and begin source mutations from the previous generation's checkout, despite having a valid remote WIP checkpoint. Project Git CAS fences old claim transitions but does not make the physical checkout's starting source correct, and eventual `YieldSource` ancestry validation is too late.
+
+**Required correction:** Gate actionable successor source-writing activation on a generation-scoped isolated worktree at the independently fetched and verified exact continuation SHA, with correct repository identity, clean HEAD/worktree and no unresolved old writer effects. If bootstrap occurs after project claim, use a non-actionable pending activation with explicit verified source-start CAS before work is executable. Add a two-clone regression that **rejects/defers** the stale checkout, then allows the successor once its isolated worktree is pinned to the WIP SHA. Do not reuse predecessor mutable checkout.

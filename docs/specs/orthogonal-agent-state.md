@@ -107,6 +107,7 @@ All mutations remain explicit, Git-ledger-backed, idempotent by operation ID and
 | Historical `AcknowledgeAssignment` (internal compatibility only) | Unchanged (Ready) | Write acknowledgment receipt, phase stays Queued | None |
 | `ResumeAgent` on newly assigned Ready agent | Keep assignment / Working / null | Queued → Started | Atomic assignment acknowledgement |
 | `YieldAgent` | Keep assignment / Stopped / null → **Ready** | Remains Started; add yield checkpoint | None |
+| `CorrectAgentWorkingState` (operator only) | Keep assignment / Working → Stopped (**Ready**) | Remains Started; no checkpoint or generation change | Immutable correction audit with operator, requesting agent, target and before/after state |
 | `ResumeAgent` on stopped agent | Keep assignment / Working / null | Remains Started | None |
 | `ResumeAgent` after reported stall | Remains Working | Remains Started | Explicit recovery event and new timed segment only |
 | `CheckpointAttempt` | Unchanged | Record progress checkpoint; remains Started | None |
@@ -130,6 +131,7 @@ Clarifications:
 - `ResumeAttempt` is an explicit reassignment of the deferred/blocked work, not an automatic resumption when a tool call arrives. If the recorded owner is occupied by another assignment, reject with a useful busy result; the orchestrator may transfer ownership or wait.
 - `ReissueQueuedAttempt` must be able to allocate an unoccupied slot for a Queued attempt without manufacturing an additional attempt. Reissuing instructions/adopting specs for an already Ready assignment does not create a new agent state.
 - `RecoverAgentAssignment` remains explicit and resets the same assignment to Stopped/Ready with a new generation and preserved checkpoint/history; it never auto-interrupts an unrelated task.
+- `CorrectAgentWorkingState` requires exact task/attempt identity and task/attempt/agent versions and generation. It is operator-authorized, not worker self-yield: no worker checkpoint, attempt mutation, source reset, review changes or target last-seen update. A stale correction loses to genuine agent activity.
 - Completion or abandonment **after task closure** remains supported. Closed task state is not silently reopened or revoked by agent operations.
 - Do not allow a generic review, Git, file or job action to start/stop execution or to acquire/release an assignment.
 - A currently assigned and stopped agent cannot receive another assignment without explicit completion, abandonment, defer/block or transfer of the existing assignment.

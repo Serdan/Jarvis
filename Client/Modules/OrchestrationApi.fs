@@ -1026,6 +1026,13 @@ module PendingIntentJournal =
                       "ExpectedAgentVersion", "expectedAgentVersion"; "Reason", "reason" ]
                 | "TaskWrite", "RecoverTasklessWork" ->
                     [ "ActorId", "agentId"; "ExpectedAgentVersion", "expectedAgentVersion"; "Reason", "reason" ]
+                | "TaskWrite", "CorrectAgentWorkingState" ->
+                    common @ [ "AttemptId", "attemptId"; "ActorId", "requestingAgentId"
+                               "OwnerId", "targetAgentId"
+                               "ExpectedTaskVersion", "expectedTaskVersion"
+                               "ExpectedVersion", "expectedAttemptVersion"
+                               "ExpectedAgentVersion", "expectedAgentVersion"
+                               "AssignmentGeneration", "generation"; "Reason", "reason" ]
                 | "TaskWrite", "ReissueQueuedAttempt"
                 | "TaskWrite", "RecoverAgentAssignment" ->
                     attempt @ [ "Reason", "reason" ]
@@ -2515,6 +2522,12 @@ module TaskApi =
                                 withAdministrativeActor (fun actor ->
                                     ReviewWorkflow.ReviewWorkflow.setAgentAdministrativeStateAs binding actor operationId
                                         cmd.ActorId cmd.Summary cmd.ExpectedAgentVersion cmd.Reason |> mapError)
+                            | "CorrectAgentWorkingState" ->
+                                withAdministrativeActor (fun actor ->
+                                    ReviewWorkflow.ReviewWorkflow.correctAgentWorkingStateAs binding actor operationId
+                                        cmd.ActorId cmd.OwnerId cmd.TaskId cmd.AttemptId cmd.ExpectedTaskVersion
+                                        cmd.ExpectedVersion cmd.ExpectedAgentVersion cmd.AssignmentGeneration cmd.Reason
+                                    |> mapError)
                             | "ReissueQueuedAttempt" ->
                                 withAdministrativeActor (fun actor ->
                                     ReviewWorkflow.ReviewWorkflow.reissueQueuedAttemptAs binding actor operationId

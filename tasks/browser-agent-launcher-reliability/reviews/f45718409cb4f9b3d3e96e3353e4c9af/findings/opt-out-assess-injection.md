@@ -1,0 +1,11 @@
+# P1 — Revoked agent-created tabs still execute scripts and DOM captures
+
+**Location:** frozen \`f45718409cb4f9b3d3e96e3353e4c9af78aff1d3\`, \`browser-extension/background.js:130-182, 292-300, 503-509, 834-844\`.
+
+**Issue:** \`assess(reg)\` checks \`allowAgentCreatedTabs\`/\`reg.blocked\` before later asynchronous Chrome permission/window calls. If the operator disables agent-created tabs during one of those awaits, \`assess\` can still return \`ready\`. The added post-assess guard in \`execute()\` only checks object identity, generation and agent-created provenance; it does not check revoked opt-in, \`reg.blocked\` or authorization epoch. \`captureDom()\` has no corresponding post-assess guard. Both proceed to \`chrome.userScripts.execute\` after revocation.
+
+**Deterministic evidence:** With the frozen \`browser-extension/tests/bridge.test.cjs\` harness, create and ready an agent-created tab, install \`beforeNextPermissionCheck(async () => await message("setAgentCreatedTabs", {allowed:false}))\`, then request \`executeJs\` with \`requireAgentCreated:true\`. The test asserting \`h.calls.length === 0\` fails: **actual 1**. Repeating with a valid \`captureDom\` request also fails: **actual 1**. Both test requests arrive while opt-in was enabled; the operator revokes it before the injection. These two additional negative tests are read-only test harness invocations, not modifications to the submitted source.
+
+**Impact:** An explicit opt-out does not reliably prevent new scripts from being injected into agent-created tabs. This is an authorization boundary, not merely a stale response.
+
+**Required fix:** Pin request authorization (including opt-in epoch) and revalidate \`allowAgentCreatedTabs\`, \`reg.blocked\`, \`sessionEpoch\`, live registration ownership/generation, and relevant host/window permissions at the final synchronous pre-injection point in **both** execution and capture paths. Add negative tests for disable and disable/re-enable during the final assessment await; preserve user-owned manual tab behavior.

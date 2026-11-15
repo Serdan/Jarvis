@@ -1,0 +1,11 @@
+# F01 (P1) — Abort-only fixture has no CAS exclusion against late project admission
+
+**Verdict impact: ChangesRequested.** This affects the submitted disposable project-proof adapter and the positive release fixture; the production WQ-02 adapter is explicitly deferred.
+
+**Evidence:** `Client.Tests/AccountCapacityLedgerTests.fs:92-114,119-176,304-334`; `Client/Modules/LedgerStore.fs:968-1047`; accepted architecture `docs/specs/work-queues-and-ephemeral-executions.md:240`. Frozen SHA: `75c2dd887e119315373aff66bbe4acc852fe4656`.
+
+1. A global token for launch L is held. `publishTerminal` writes `records/terminal-L.json` with `ExpectedBlobOid=None`. `verifier` considers `AbortOnlyUnbound` proven merely if `records/admission-L.json` is **currently absent** (`AccountCapacityLedgerTests.fs:150-173`). `CleanAbortOnlyTombstonePermitsReleaseWithoutProjectLaunch` then frees the account token (`323-334`).
+2. The original project admission subsequently writes `records/admission-L.json`, a **different path**, also with `ExpectedBlobOid=None` (`95-102`). `LedgerStore.putRecord` checks the expected blob of its own path, and retries on moved Git heads; there is no shared launch-ID absence/version CAS (`LedgerStore.fs:968-1047`). Thus this late admission succeeds after release, while another launch may already hold that freed capacity.
+3. The contradictory-history test (`304-320`) only verifies when the admission was already visible before abort proof. It does not test the essential original-admission-vs-abort race.
+
+**Required correction:** Model admission and abort against one canonical per-launch version/absence guard so the loser is *permanently* fenced; include the stable original admission operation/replay receipt. Add two-client deterministic interleavings (abort wins then original admission retries/late commit; admission wins then abort tries; ambiguous original admission acknowledgment). In the second/third case the account token stays held absent an actual ordinary terminal receipt. If WQ-02 is needed to prove this, remove the misleading positive clean-abort release fixture and mark this proof unverified/gated rather than certify absence-only terminality.

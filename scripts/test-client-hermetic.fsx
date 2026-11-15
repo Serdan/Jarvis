@@ -156,7 +156,12 @@ try
     // Isolated Git plumbing uses a test-only identity for commit-tree in
     // temporary repositories. Never read or modify the operator's gitconfig.
     let gitConfig = Path.Combine(tempDirectory, "gitconfig")
-    File.WriteAllText(gitConfig, "[user]\n\tname = Jarvis Test\n\temail = jarvis-test@example.invalid\n")
+    // Git for Windows otherwise rejects long synthetic canonical ledger paths
+    // in these disposable fixtures. Do not change the operator's Git settings.
+    let gitConfigContents =
+        "[user]\n\tname = Jarvis Test\n\temail = jarvis-test@example.invalid\n"
+        + (if OperatingSystem.IsWindows() then "[core]\n\tlongpaths = true\n" else "")
+    File.WriteAllText(gitConfig, gitConfigContents)
     if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
         File.SetUnixFileMode(gitConfig, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
     if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then

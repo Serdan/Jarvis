@@ -140,10 +140,31 @@ type ProjectEnvelope =
       StateHash: string
       State: Project }
 
+// Immutable project-CAS witnesses, not caller assertions.
+type ProjectAdmissionRecord =
+    { SchemaVersion: int
+      ProjectId: string
+      LaunchId: string
+      AccountTokenId: string
+      AdmissionOperationId: string
+      Kind: string
+      AbortOperationId: string }
+
+type ProjectTerminalRecord =
+    { SchemaVersion: int
+      ProjectId: string
+      LaunchId: string
+      AccountTokenId: string
+      AdmissionOperationId: string
+      TerminalOperationId: string
+      TerminalKind: string
+      LaunchGeneration: int64 }
+
 type WorkMutation =
     | PublishStage of WorkStage
     | PostMessage of SubjectMessage * WorkStage option
     | AdmitProject of Launch
+    | AbortUnboundProjectAdmission of Launch * originalAdmissionOperationId: string
     | DispatchOnce of launchId: string * outcome: DispatchState
     | InitializeAgent of launchId: string * sessionKey: string
     | Heartbeat of launchId: string * leaseGeneration: int
@@ -166,6 +187,31 @@ type WorkMutation =
 module WorkQueueGitLedger =
     [<Literal>]
     let RecordPath = "records/work-queue/project.json"
+
+    let admissionPath launchId =
+        "records/work-queue/admissions/" + CanonicalCodec.digest launchId + ".json"
+
+    let terminalPath launchId =
+        "records/work-queue/terminals/" + CanonicalCodec.digest launchId + ".json"
+
+    let private readCanonical<'T> binding snapshot path =
+        LedgerStore.readAt binding snapshot path
+        |> Result.bind (function
+            | None, None -> Ok None
+            | Some raw, Some oid ->
+                try
+                    let decoded = CanonicalCodec.decode<'T> raw
+                    if CanonicalCodec.encode decoded <> raw then
+                        Error(LedgerIntegrityError "Noncanonical WQ-07 witness.")
+                    else Ok(Some(decoded, oid))
+                with ex -> Error(LedgerIntegrityError ("Malformed WQ-07 witness: " + ex.Message))
+            | _ -> Error(LedgerIntegrityError "Incomplete WQ-07 witness object."))
+
+    let readAdmissionAt binding snapshot launchId =
+        readCanonical<ProjectAdmissionRecord> binding snapshot (admissionPath launchId)
+
+    let readTerminalAt binding snapshot launchId =
+        readCanonical<ProjectTerminalRecord> binding snapshot (terminalPath launchId)
 
     let private failure (reason: Rejection) =
         match reason with
@@ -403,14 +449,17 @@ module WorkQueueGitLedger =
                 with ex ->
                     Error(LedgerIntegrityError ("Malformed canonical work ledger: " + ex.Message)))
 
+    let loadAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) =
+        readPinned binding snapshot
+        |> Result.bind (fun (state, _) ->
+            match state with
+            | None -> Error(InvalidBinding "WQ-02 ledger is not initialized; no migration is permitted.")
+            | Some state -> Ok state)
+
     let load (binding: LedgerBinding) =
         LedgerStore.fetch binding
         |> Result.bind (fun snapshot ->
-            readPinned binding snapshot
-            |> Result.bind (fun (state, _) ->
-                match state with
-                | None -> Error(InvalidBinding "WQ-02 ledger is not initialized; no migration is permitted.")
-                | Some state -> Ok(snapshot, state)))
+            loadAt binding snapshot |> Result.map (fun state -> snapshot, state))
 
     // Explicit initialization is for disposable WQ-02 ledgers. It is not wired
     // to the live orchestration branch or any deployment path.
@@ -440,6 +489,76 @@ module WorkQueueGitLedger =
     // Clock time is transition context, not semantic request identity:
     // delayed retries of the same UUID must recover the original receipt.
     // The winning transition retains its witness in persisted project state.
+    // Admission and terminal witnesses are published with the authoritative
+    // project-state transition and its immutable LedgerStore operation receipt.
+    // A different CAS winner cannot later forge the original launch decision.
+    let private witnessChanges (binding: LedgerBinding) (snapshot: LedgerSnapshot)
+                               (before: Project) (after: Project)
+                               (mutation: WorkMutation) (operationId: Guid) =
+        let op = operationId.ToString("D")
+        let project = binding.ProjectId.ToString("D")
+        let decision =
+            match mutation with
+            | AdmitProject launch -> Some(launch, "AdmissionWon", op, "")
+            | AbortUnboundProjectAdmission (launch, original) ->
+                Some(launch, "AbortOnlyUnbound", original, op)
+            | _ -> None
+        let admissionChanges =
+            match decision with
+            | None -> Ok []
+            | Some(launch, kind, original, abort) ->
+                let record =
+                    { SchemaVersion = 1; ProjectId = project; LaunchId = launch.Id
+                      AccountTokenId = launch.AccountTokenId
+                      AdmissionOperationId = original; Kind = kind
+                      AbortOperationId = abort }
+                readAdmissionAt binding snapshot launch.Id
+                |> Result.bind (function
+                    | Some _ -> Error(LedgerIntegrityError "Launch decision path already exists.")
+                    | None ->
+                        Ok [ { Path = admissionPath launch.Id; ExpectedBlobOid = None
+                               Content = CanonicalCodec.encode record } ])
+        let terminals =
+            after.Launches
+            |> Map.toList
+            |> List.choose (fun (id, launch) ->
+                match before.Launches.TryFind id, launch.State with
+                | Some old, LaunchState.TerminalPendingRelease marker
+                    when (match old.State with LaunchState.TerminalPendingRelease _ -> false | _ -> true)
+                         && marker.EndsWith(":" + op, StringComparison.Ordinal)
+                         && launch.Version > old.Version -> Some launch
+                | _ -> None)
+        let rec terminalChanges accumulated remaining =
+            match remaining with
+            | [] -> Ok(List.rev accumulated)
+            | launch :: rest ->
+                readAdmissionAt binding snapshot launch.Id
+                |> Result.bind (function
+                    | Some(record, _) when record.SchemaVersion = 1
+                                          && record.ProjectId = project
+                                          && record.LaunchId = launch.Id
+                                          && record.AccountTokenId = launch.AccountTokenId
+                                          && record.Kind = "AdmissionWon"
+                                          && record.AbortOperationId = ""
+                                          && not (String.IsNullOrWhiteSpace record.AdmissionOperationId) ->
+                        readTerminalAt binding snapshot launch.Id
+                        |> Result.bind (function
+                            | Some _ -> Error(LedgerIntegrityError "Terminal witness already exists.")
+                            | None ->
+                                let terminal =
+                                    { SchemaVersion = 1; ProjectId = project; LaunchId = launch.Id
+                                      AccountTokenId = launch.AccountTokenId
+                                      AdmissionOperationId = record.AdmissionOperationId
+                                      TerminalOperationId = op; TerminalKind = "LaunchTerminal"
+                                      LaunchGeneration = int64 launch.Version }
+                                terminalChanges
+                                    ({ Path = terminalPath launch.Id; ExpectedBlobOid = None
+                                       Content = CanonicalCodec.encode terminal } :: accumulated) rest)
+                    | _ -> Error(LedgerIntegrityError "Terminal launch lacks its original project admission decision."))
+        admissionChanges
+        |> Result.bind (fun admissions ->
+            terminalChanges [] terminals |> Result.map (fun terminal -> admissions @ terminal))
+
     let private change (binding: LedgerBinding) (actor: string) (operationId: Guid) (expectedVersion: int) (now: int64) (mutation: WorkMutation) =
         let request = JsonObject()
         request.Add("schemaVersion", JsonValue.Create(1))
@@ -472,8 +591,8 @@ module WorkQueueGitLedger =
                                 Contracts.postMessage expectedVersion op message
                                     (roleWork |> Option.map (witnessNewStage state now)) state
                         | AdmitProject launch ->
-                            // An account reservation is still a pre-activation gate;
-                            // this project mutation cannot accept a forged live launch.
+                            // Account reservation is proven by the separate bridge before
+                            // invoking this inert project-CAS adapter.
                             if not (validInitialLaunch binding launch)
                                || (state.Launches
                                    |> Map.exists (fun _ existing ->
@@ -481,6 +600,16 @@ module WorkQueueGitLedger =
                                 Error(Rejection.InvalidState "invalid unverified launch admission")
                             else
                                 Contracts.admitProject expectedVersion op launch state
+                        | AbortUnboundProjectAdmission (launch, originalAdmission) ->
+                            // C01 competes with original admission on launch-ID absence.
+                            // The bridge must independently prove the account token.
+                            match Guid.TryParse originalAdmission with
+                            | true, id when id <> Guid.Empty && id <> operationId
+                                            && launch.AccountTokenId = originalAdmission
+                                            && validInitialLaunch binding launch
+                                            && not (state.Receipts.ContainsKey originalAdmission) ->
+                                Contracts.abortUnboundAdmission expectedVersion op launch state
+                            | _ -> Error Rejection.MissingProof
                         | DispatchOnce (launch, outcome) -> Contracts.dispatchOnce expectedVersion op launch outcome state
                         | InitializeAgent (launch, sessionKey) ->
                             Contracts.initializeAgent expectedVersion op launch sessionKey (Guid.NewGuid().ToString("D")) now state
@@ -551,9 +680,11 @@ module WorkQueueGitLedger =
                     |> Result.mapError failure
                     |> Result.bind (fun changed ->
                         validatedContent binding changed
-                        |> Result.map (fun raw ->
-                            [ { Path = RecordPath; ExpectedBlobOid = oid
-                                Content = raw } ]))))
+                        |> Result.bind (fun raw ->
+                            witnessChanges binding snapshot state changed mutation operationId
+                            |> Result.map (fun evidence ->
+                                { Path = RecordPath; ExpectedBlobOid = oid
+                                  Content = raw } :: evidence)))))
 
     // The timestamp is captured for the winning transition's persisted state,
     // but is excluded from the original command's stable semantic identity.

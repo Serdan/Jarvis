@@ -1,8 +1,11 @@
 # Scope fidelity in autonomous Jarvis work: bounded retrospective and instruction proposal
 
-**Status:** Working draft; evidence read 2026-11-15; analysis-only, no role changes or deployment.  
-**Assignment:** `scope-drift-overengineering` (canonical spec v4, blob `4a519300530a4aabea0e7b9ca8ac245a316c786e`; Worker 2).  
-**Primary case:** `task-c4460fbd65a244419650fc5ef5669a6f` (Worker 3; canonical spec v1, blob `df17c3baab0bd4eb3e3e6c0e39cfda70c2c1cbc6`).  
+**Status:** Working draft; evidence read 2026-11-15; analysis-only, no role changes or deployment.
+
+**Assignment:** `scope-drift-overengineering` (canonical spec v4, blob `4a519300530a4aabea0e7b9ca8ac245a316c786e`; Worker 2).
+
+**Primary case:** `task-c4460fbd65a244419650fc5ef5669a6f` (Worker 3; canonical spec v1, blob `df17c3baab0bd4eb3e3e6c0e39cfda70c2c1cbc6`).
+
 **Evidence boundary:** Ledger task records, frozen reviewer documents, branch commits, and the design note were inspected; this does not certify live system behavior or completeness of every checkpoint. A reviewer accepting an isolated source stage is not integration/deployment acceptance.
 
 ## Decision in one paragraph

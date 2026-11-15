@@ -506,7 +506,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     let ledgerWire = set [ "TaskRead"; "TaskWrite"; "ReviewRead"; "ReviewWrite";
                           "LedgerRead"; "LedgerWrite"; "ChallengeRead"; "ChallengeWrite" ]
     let orchestrationTools =
-        set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "GetNotificationPreferences"; "SetNotificationSenderBlock"; "SetNotificationMute"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
+        set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "GetNotificationPreferences"; "GetResponseAlerts"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
               "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"
               "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"
               "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
@@ -605,7 +605,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
     // Preserve role/instruction aliases, Challenges, taskless execution and
     // recipient-notification public methods, all with device routing.
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 76)
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 79)
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -1064,11 +1064,11 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
                             "PendingOperationSummary"; "PendingOperationsPage"; "InspectPendingOperation" ] -> name, ledgerRead
               for name in [ "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"; "AcknowledgePendingOperation" ] -> name, ledgerWrite
               for name in [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec";
-                            "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"; "GetNotificationPreferences" ] ->
+                            "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"; "GetNotificationPreferences"; "GetResponseAlerts" ] ->
                   name, (if name = "AgentInbox" then
                              { taskRead with MutatesState = true }
                          else taskRead)
-              for name in [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
+              for name in [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
                             "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions";
                             "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork";
                             "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork";
@@ -1304,6 +1304,32 @@ let mcp_guidance_blocks_precede_result_without_changing_success () =
     let operation = result.Content[1] :?> TextContentBlock
     Assert.That(operation.Text, Is.EqualTo("""{"result":"ok"}"""))
 
+[<Test>]
+let operator_alert_blocks_precede_guidance_timing_and_failed_tool_result () =
+    let alerts : InstructionDocument list =
+        [ { Scope = "workspace"; Path = "AGENTS.md"; Sha256 = ""
+            Content = "Repository instructions" }
+          { Scope = "working-turn"; Path = ""; Sha256 = ""
+            Content = "HARD STOP - persist and yield" }
+          { Scope = "response-alert"; Path = "jarvis/response-alert/stop"; Sha256 = ""
+            Content = "JARVIS OPERATOR ALERT:\nSTOP — yield safely" }
+          { Scope = "response-alert"; Path = "jarvis/response-alert/ordinary"; Sha256 = ""
+            Content = "JARVIS OPERATOR ALERT:\nPlease save test output" } ]
+    let failure =
+        { Result = None; Error = Some(ValidationFailed "Unrelated error")
+          Instructions = alerts; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+    let shown = failure |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions alerts
+    Assert.That(shown.IsError, Is.EqualTo(Nullable true))
+    Assert.That(shown.Content.Count, Is.EqualTo(5))
+    Assert.That((shown.Content[0] :?> TextContentBlock).Text, Does.Contain("STOP — yield"))
+    Assert.That((shown.Content[1] :?> TextContentBlock).Text, Does.Contain("save test output"))
+    use guidance = JsonDocument.Parse((shown.Content[2] :?> TextContentBlock).Text)
+    let map = guidance.RootElement.GetProperty("AGENTS.md")
+    Assert.That(map.EnumerateObject() |> Seq.length, Is.EqualTo(1),
+                "Response alerts must never be buried as synthetic AGENTS.md keys")
+    Assert.That(map.GetProperty(".").GetString(), Is.EqualTo("Repository instructions"))
+    Assert.That((shown.Content[3] :?> TextContentBlock).Text, Does.Contain("HARD STOP"))
+    Assert.That((shown.Content[4] :?> TextContentBlock).Text, Does.Contain("Unrelated error"))
 [<Test>]
 let mcp_agency_write_warning_precedes_success_without_marking_error () =
     let notes =
@@ -1736,6 +1762,11 @@ let polledToolJobsRestoreExactInstructionsAndMutationEvidence () =
         [ { Scope = "project"; Path = "Jarvis/AGENTS.md"
             Sha256 = "sha256:" + String('c', 64)
             Content = "Canonical instructions from the original command." } ]
+    let pollGuidance =
+        [ { Scope = "response-alert"; Path = "jarvis/response-alert/new-stop"; Sha256 = ""
+            Content = "JARVIS OPERATOR ALERT:\nSTOP - preserve safe work and yield" }
+          { Scope = "working-turn"; Path = ""; Sha256 = ""
+            Content = "HARD STOP: preserve work and yield for duration limit" } ]
     let receipt : AgentInboxActivation =
         { ProjectName = "Jarvis"; AgentId = "Worker 1"
           ActivatedByThisCall = true; BeforeState = Some "Ready"
@@ -1754,11 +1785,15 @@ let polledToolJobsRestoreExactInstructionsAndMutationEvidence () =
               ToolResponse = Some original; OperationId = Some "stable-operation-id" }
         let poll : AgentCommandResponse =
             { Result = Some(JsonSerializer.Serialize job)
-              Error = None; Instructions = []
+              Error = None; Instructions = pollGuidance
               AgentStateChanges = []; InboxActivation = None; PendingJob = None }
         let command = GetJobResultCommand { ProjectName = "Jarvis"; JobId = job.JobId; AfterSequence = None }
         let effective = McpToolHelpers.completedToolEvidence command poll
-        Assert.That(effective, Is.EqualTo(original))
+        // Job completion and poll-time alert delivery happen independently.
+        // The poll must keep the original terminal result and mutations, but
+        // never consume and discard its newly delivered STOP alert.
+        Assert.That({ effective with Instructions = guidance }, Is.EqualTo(original))
+        Assert.That(effective.Instructions = pollGuidance @ guidance, Is.True)
         let displayed =
             poll |> McpToolHelpers.toCallToolResult
             |> McpToolHelpers.attachStateEffects effective
@@ -1766,13 +1801,81 @@ let polledToolJobsRestoreExactInstructionsAndMutationEvidence () =
         Assert.That(displayed.IsError, Is.EqualTo(Nullable false))
         Assert.That(displayed.Meta["jarvis/agent_state_changes"].ToJsonString(), Does.Contain("Worker 1"))
         Assert.That(displayed.Meta["jarvis/inbox_activation"].ToJsonString(), Does.Contain("activation-id"))
+        Assert.That(displayed.Content.Count, Is.EqualTo(5))
         Assert.That((displayed.Content[0] :?> TextContentBlock).Text,
+                    Does.Contain("STOP - preserve safe work and yield"))
+        Assert.That((displayed.Content[1] :?> TextContentBlock).Text,
                     Does.Contain("Canonical instructions from the original command"))
-        use terminalJson = JsonDocument.Parse((displayed.Content[1] :?> TextContentBlock).Text)
+        Assert.That((displayed.Content[2] :?> TextContentBlock).Text,
+                    Does.Contain("HARD STOP: preserve work"))
+        use terminalJson = JsonDocument.Parse((displayed.Content[3] :?> TextContentBlock).Text)
         let terminal = terminalJson.RootElement.GetProperty("ToolResponse")
         Assert.That(terminal.GetProperty("AgentStateChanges").GetArrayLength(), Is.EqualTo(1))
         Assert.That(terminal.GetProperty("Instructions").GetArrayLength(), Is.EqualTo(1))
         Assert.That(terminal.GetProperty("InboxActivation").GetProperty("ActivatedByThisCall").GetBoolean(), Is.True)
+
+[<Test>]
+let completedPollsNeverReplayAlertsEmbeddedInAnOriginalPromotedJobResponse () =
+    // A previously stored original completion may contain an alert consumed
+    // before the caller ever saw the job. It cannot become a recurring alert.
+    let legacyStop =
+        { Scope = "response-alert"; Path = "jarvis/response-alert/old-stop"; Sha256 = ""
+          Content = "STOP - stale original background completion" }
+    let canonical =
+        { Scope = "project"; Path = "Jarvis/AGENTS.md"; Sha256 = ""
+          Content = "Original project instructions must survive." }
+    let newStop =
+        { Scope = "response-alert"; Path = "jarvis/response-alert/new-stop"; Sha256 = ""
+          Content = "STOP - newly consumed during this poll" }
+    let original : AgentCommandResponse =
+        { Result = Some """{"terminal":true}"""; Error = None
+          Instructions = [legacyStop; canonical]
+          AgentStateChanges = [{ ProjectName = "Jarvis"; AgentId = "Worker 1" }]
+          InboxActivation = None; PendingJob = None }
+    let job : JobResult =
+        { JobId = "promoted-job"; Status = ToolCompleted; Events = []
+          NextSequence = 0L; Truncated = false
+          ToolResponse = Some original; OperationId = None }
+    let command = GetJobResultCommand { ProjectName = "Jarvis"; JobId = job.JobId; AfterSequence = None }
+    let poll : AgentCommandResponse =
+        { Result = Some(JsonSerializer.Serialize job); Error = None
+          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+    for _ in 1..2 do
+        let evidence = McpToolHelpers.completedToolEvidence command poll
+        Assert.That(evidence.Instructions, Is.EqualTo([canonical] :> obj),
+                    "Repeated polling must not replay one-shot original STOP content.")
+        Assert.That(evidence.Result, Is.EqualTo(original.Result))
+        Assert.That(evidence.AgentStateChanges, Is.EqualTo(original.AgentStateChanges :> obj))
+    let fresh = McpToolHelpers.completedToolEvidence command { poll with Instructions = [newStop] }
+    Assert.That(fresh.Instructions, Is.EqualTo([newStop; canonical] :> obj),
+                "A new alert attached to the poll itself must not be removed.")
+
+[<Test>]
+let pollResponseAlertsRemainVisibleOnPendingAndErroredJobLookups () =
+    let pollCommand = GetJobResultCommand { ProjectName = "Jarvis"; JobId = "job-poll"; AfterSequence = None }
+    let alert =
+        { Scope = "response-alert"; Path = "jarvis/response-alert/new-stop"; Sha256 = ""
+          Content = "JARVIS OPERATOR ALERT:\nSTOP - yield safely" }
+    let inProgress : JobResult =
+        { JobId = "job-poll"; Status = Running
+          Events = []; NextSequence = 0L; Truncated = false
+          ToolResponse = None; OperationId = None }
+    let pendingPoll : AgentCommandResponse =
+        { Result = Some(JsonSerializer.Serialize inProgress); Error = None
+          Instructions = [alert]; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+    let failedPoll : AgentCommandResponse =
+        { pendingPoll with Result = None; Error = Some(NotFound "job not found") }
+    for response in [pendingPoll; failedPoll] do
+        let effective = McpToolHelpers.completedToolEvidence pollCommand response
+        Assert.That(effective, Is.EqualTo(response))
+        let displayed =
+            response |> McpToolHelpers.toCallToolResult
+            |> McpToolHelpers.attachStateEffects effective
+            |> McpToolHelpers.attachInstructions effective.Instructions
+        Assert.That((displayed.Content[0] :?> TextContentBlock).Text,
+                    Does.Contain("STOP - yield safely"))
+        Assert.That(displayed.IsError, Is.EqualTo(Nullable(response.Error.IsSome)))
+        Assert.That(displayed.Meta["jarvis/agent_state_changes"].ToJsonString(), Is.EqualTo("[]"))
 
 [<Test>]
 let pendingToolJobNeverAdvertisesAFalseEmptyMutationList () =

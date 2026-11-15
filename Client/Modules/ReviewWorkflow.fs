@@ -239,6 +239,19 @@ type ReviewFeedbackNotice =
       Version: int }
 
 [<CLIMutable>]
+type ResponseAlert =
+    { AlertId: string
+      IssuedBy: string
+      Message: string
+      QueuedAtUtc: string }
+
+[<CLIMutable>]
+type ResponseAlertQueue =
+    { AgentId: string
+      Version: int
+      Pending: ResponseAlert list }
+
+[<CLIMutable>]
 type AgentNotification =
     { NotificationId: string
       FromAgentId: string
@@ -578,6 +591,8 @@ module ReviewWorkflow =
     let private agentPath (agentId: string) = $"agents/{agentKey agentId}.json"
     let private notificationPreferencesPath agentId =
         $"records/notification-preferences/{agentKey agentId}.json"
+    let private responseAlertsPath agentId =
+        $"records/response-alerts/{agentKey agentId}.json"
 
     // Reverse indexes constrain dependency lookups to one challenge or one
     // owner rather than scanning historical task records at every transition.
@@ -1485,6 +1500,106 @@ module ReviewWorkflow =
                       return [ change (notificationPath operationId) None notification ]
                 })
 
+    // Small, durable, project-scoped alert queue. Unlike discretionary inbox
+    // notifications, these instructions bypass recipient mute preferences and
+    // are consumed by the next response assembled for that exact agent.
+    // Git CAS permits one consumer across connected clients; delivery is
+    // at-most-once after the consume commit, not an acknowledgement protocol.
+    let private responseAlertsAt binding snapshot agentId = result {
+        let! stored = read<ResponseAlertQueue> binding snapshot (responseAlertsPath agentId)
+        match stored with
+        | None ->
+            return { AgentId = agentId; Version = 0; Pending = [] }, None
+        | Some(queue, oid) ->
+            let valid =
+                queue.AgentId = agentId
+                && queue.Version > 0
+                && not (isNull (box queue.Pending))
+                && queue.Pending.Length <= 4
+                && (queue.Pending |> List.forall (fun alert ->
+                    let mutable id = Guid.Empty
+                    Guid.TryParseExact(alert.AlertId, "N", &id)
+                    && id <> Guid.Empty
+                    && validText 1536 alert.Message
+                    && not (String.IsNullOrWhiteSpace alert.IssuedBy)
+                    && not (String.IsNullOrWhiteSpace alert.QueuedAtUtc)))
+                && (queue.Pending |> List.map (fun alert -> alert.AlertId) |> List.distinct |> List.length) = queue.Pending.Length
+            if not valid then
+                return! Error(LedgerIntegrityError "Invalid response alert queue identity or content.")
+            return queue, Some oid
+    }
+
+    let getResponseAlerts binding agentId =
+        if not (validAgent agentId) then Error(InvalidBinding "Invalid alert target.")
+        else
+            LedgerStore.fetch binding
+            |> Result.bind (fun snapshot ->
+                responseAlertsAt binding snapshot agentId
+                |> Result.map fst)
+
+    let queueResponseAlert binding operationId actorId targetAgentId message =
+        if not (validAgent targetAgentId) || not (validText 1536 message) then
+            Error(InvalidBinding "Invalid alert target or message (maximum 1536 UTF-8 bytes).")
+        else
+            LedgerStore.transact binding
+                (intent operationId actorId "QueueResponseAlert"
+                    {| targetAgentId = targetAgentId; message = message |})
+                (fun snapshot -> result {
+                    let! _ = required<ReviewAgent> binding snapshot (agentPath targetAgentId)
+                    let! queue, oid = responseAlertsAt binding snapshot targetAgentId
+                    if queue.Pending.Length >= 4 then
+                        return! Error(StaleEntityVersion "The target already has four undelivered alerts; wait or clear one.")
+                    let alert =
+                        { AlertId = operationId.ToString("N")
+                          IssuedBy = actorId
+                          Message = message
+                          QueuedAtUtc = DateTimeOffset.UtcNow.ToString("O") }
+                    return [ change (responseAlertsPath targetAgentId) oid
+                                { queue with Version = queue.Version + 1
+                                             Pending = queue.Pending @ [alert] } ]
+                })
+
+    let clearResponseAlert binding operationId actorId targetAgentId alertId =
+        if not (validAgent targetAgentId) || alertId = Guid.Empty then
+            Error(InvalidBinding "Invalid alert target or alert ID.")
+        else
+            LedgerStore.transact binding
+                (intent operationId actorId "ClearResponseAlert"
+                    {| targetAgentId = targetAgentId; alertId = alertId.ToString("N") |})
+                (fun snapshot -> result {
+                    let! queue, oid = responseAlertsAt binding snapshot targetAgentId
+                    if not (queue.Pending |> List.exists (fun alert -> alert.AlertId = alertId.ToString("N"))) then
+                        return! Error(StaleEntityVersion "That alert is no longer pending.")
+                    return [ change (responseAlertsPath targetAgentId) oid
+                                { queue with Version = queue.Version + 1
+                                             Pending = queue.Pending |> List.filter (fun alert ->
+                                                 alert.AlertId <> alertId.ToString("N")) } ]
+                })
+
+    let takeResponseAlerts binding agentId =
+        if not (validAgent agentId) then Error(InvalidBinding "Invalid alert target.")
+        else result {
+            let! snapshot = LedgerStore.fetch binding
+            let! queued, _ = responseAlertsAt binding snapshot agentId
+            if queued.Pending.IsEmpty then
+                return []
+            else
+                // Commit consumption before returning any alert text. If the
+                // response is lost afterward, the one-shot alert is lost too.
+                // On a failed CAS, do not deliver stale or replaced messages.
+                let! _ =
+                    LedgerStore.transact binding
+                        (intent (Guid.NewGuid()) agentId "DeliverResponseAlerts"
+                            {| agentId = agentId; version = queued.Version |})
+                        (fun latest -> result {
+                            let! current, oid = responseAlertsAt binding latest agentId
+                            if current.Version <> queued.Version || current.Pending <> queued.Pending then
+                                return! Error(StaleEntityVersion "Response alert queue changed before delivery.")
+                            return [ change (responseAlertsPath agentId) oid
+                                        { current with Version = current.Version + 1; Pending = [] } ]
+                        })
+                return queued.Pending
+        }
     let acknowledgeNotification binding operationId agentId notificationId =
         if not (validAgent agentId) || notificationId = Guid.Empty then
             Error(InvalidBinding "Invalid notification acknowledgement.")

@@ -252,11 +252,18 @@ module McpToolHelpers =
         if isNull (box documents) || documents.IsEmpty then result
         else
             let contents = ResizeArray<ContentBlock>()
+            // Operator instructions are first-class response blocks, not
+            // synthetic AGENTS.md paths. Preserve STOP-first ordering ahead
+            // of source guidance, timing warnings, and tool results.
+            for document in documents do
+                if document.Scope = "response-alert" then
+                    contents.Add(textContent document.Content)
             let repository = JsonObject()
             for document in documents do
                 if document.Scope <> "working-turn"
                    && document.Scope <> "write-warning"
-                   && document.Scope <> "instruction-warning" then
+                   && document.Scope <> "instruction-warning"
+                   && document.Scope <> "response-alert" then
                     let path =
                         if document.Path = "AGENTS.md" then "."
                         elif document.Path.EndsWith("/AGENTS.md", StringComparison.Ordinal) then
@@ -294,9 +301,9 @@ module McpToolHelpers =
           OutputSchemaJson = None }
 
     let private ledgerTaskReadMethods = [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint";  "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec";
-                                         "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"; "GetNotificationPreferences" ]
+                                         "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"; "GetNotificationPreferences"; "GetResponseAlerts" ]
     let private ledgerTaskWriteMethods =
-        [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
+        [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
           "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
           "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork"
           "SetAgentState"; "CorrectAgentWorkingState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"
@@ -473,15 +480,29 @@ module McpToolHelpers =
                         |> Option.filter (fun receipt -> receipt.ActivatedByThisCall) }
 
     /// A polled tool job carries the exact original response as typed data.
-    /// Present its instructions and canonical side effects with the polling
-    /// envelope, rather than substituting invented empty metadata.
+    /// Preserve the original error and canonical side effects, but also include
+    /// guidance newly delivered to the polling response (notably one-shot
+    /// operator STOP alerts consumed by this very GetJobResult call).
     let completedToolEvidence command (response: AgentCommandResponse) =
         match command, response.Result with
         | GetJobResultCommand _, Some payload ->
             try
                 let job = JsonSerializer.Deserialize<JobResult>(payload)
                 if isNull (box job) then response
-                else job.ToolResponse |> Option.defaultValue response
+                else
+                    match job.ToolResponse with
+                    | Some original ->
+                        let latest =
+                            if isNull (box response.Instructions) then [] else response.Instructions
+                        let originalGuidance =
+                            // Old clients may have consumed one-shot alerts
+                            // during background completion. The immutable job
+                            // can be polled repeatedly, so never replay those
+                            // original alerts. Fresh poll-time alerts are in latest.
+                            if isNull (box original.Instructions) then [] else
+                                original.Instructions |> List.filter (fun item -> item.Scope <> "response-alert")
+                        { original with Instructions = latest @ originalGuidance }
+                    | None -> response
             with _ -> response
         | _ -> response
 
@@ -1661,6 +1682,19 @@ type JarvisMcpTools =
             (TaskWriteCommand { cmd with Reason = (if muted then "Mute" else "Unmute")
                                          Summary = autoReply })
 
+    [<McpServerTool(Title = "inspect pending response alerts", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Inspect up to four undelivered operator instructions for an exact project and target agent. Read-only: does not consume alerts or activate an assignment.")>]
+    static member GetResponseAlerts(projectName: string, agentId: string, targetAgentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (TaskCommands.read projectName "GetResponseAlerts" agentId targetAgentId)
+
+    [<McpServerTool(Title = "queue next-response alert", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Authenticated operator: queue a bounded one-shot instruction for the exact target project/agent, visible in its next ordinary Jarvis tool response including job polling or failures. Advisory only; no process kill, task change or required acknowledgement. Up to four pending alerts; STOP messages are shown first. Reuse operationId for an uncertain retry.")>]
+    static member QueueResponseAlert(projectName: string, agentId: string, targetAgentId: string, message: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "QueueResponseAlert" operationId "" TaskCommands.legacyAdministrativePlaceholder
+        McpToolHelpers.send client http (TaskWriteCommand { cmd with OwnerId = targetAgentId; Summary = message })
+
+    [<McpServerTool(Title = "clear pending response alert", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Authenticated operator: clear an exact undelivered response alert by ID. Does not affect the agent assignment or other pending alerts. Inspect first; stale IDs cannot clear replacement messages. Reuse operationId for an uncertain retry.")>]
+    static member ClearResponseAlert(projectName: string, agentId: string, targetAgentId: string, alertId: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "ClearResponseAlert" operationId "" TaskCommands.legacyAdministrativePlaceholder
+        McpToolHelpers.send client http (TaskWriteCommand { cmd with OwnerId = targetAgentId; AttemptId = alertId })
     [<McpServerTool(Title = "notify agent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Send a durable notification to an agent in the same project or in optional toProjectName. Cross-project sends verify the sender in the source ledger and write only to the destination Git ledger, routing to a connected client that has its binding. The recipient inbox exposes the source project and agent. Omit operationId for a generated ID; reuse the returned ID for an uncertain retry.")>]
     static member NotifyAgent(projectName: string, fromAgentId: string, toAgentId: string, message: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] toProjectName: string, client: ClientService, http: IHttpContextAccessor) =
         let command =

@@ -425,6 +425,47 @@ let autoPromotedToolRetainsIdenticalTypedOutcomeAndNeverExecutesTwice () =
         Directory.Delete(root, true)
 
 [<Test>]
+let completedToolPollStripsLegacyOneShotAlertsFromRawResultWithoutAlteringStoredEvidence () =
+    let root = createTempProject ()
+    try
+        let context = TestContext root
+        let blocked = TaskCompletionSource<AgentCommandResponse>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let previousStop =
+            { Scope = "response-alert"; Path = "jarvis/response-alert/previous"
+              Sha256 = ""; Content = "STOP - consumed before old background completion" }
+        let canonical =
+            { Scope = "project"; Path = "AGENTS.md"; Sha256 = ""
+              Content = "Preserve ordinary original job instructions" }
+        let original =
+            { completedToolResponse """{"immutable":true}""" with
+                Instructions = [previousStop; canonical] }
+        let registered =
+            match startToolOperation jobProject (Some "Project1") "Worker 1" "ReadFile"
+                    None "legacy-alert-result" (fun () -> blocked.Task) with
+            | Ok job -> job
+            | Error error -> failwith $"Cannot register legacy job: {error}"
+        let handle =
+            match (awaitToolOperation registered (TimeSpan.FromMilliseconds 10.)).GetAwaiter().GetResult() with
+            | Choice2Of2 job -> job
+            | Choice1Of2 _ -> failwith "Blocked tool must promote"
+        blocked.SetResult original
+        let _, completion = registered
+        Assert.That(completion.WaitAsync(TimeSpan.FromSeconds 4.).GetAwaiter().GetResult(),
+                    Is.EqualTo(original), "The terminal completion itself must remain immutable.")
+        let request = { ProjectName = "Project1"; JobId = handle.JobId; AfterSequence = None }
+        for _ in 1..2 do
+            match getJobResultForProjectAsAgent jobProject (Some "Worker 1") request context with
+            | Error error -> Assert.Fail($"Cannot poll completed job: {error}")
+            | Ok result ->
+                let visible = result.ToolResponse |> Option.get
+                Assert.That(visible.Instructions, Is.EqualTo([canonical] :> obj),
+                            "Neither completed poll may expose the already-consumed STOP.")
+                Assert.That(visible.Result, Is.EqualTo(original.Result))
+                Assert.That(visible.AgentStateChanges, Is.EqualTo(original.AgentStateChanges :> obj))
+    finally
+        Directory.Delete(root, true)
+
+[<Test>]
 let quickToolOperationReturnsOriginalResponseWithoutJobPromotion () =
     let response = completedToolResponse """{"quick":true}"""
     let registered =

@@ -2272,6 +2272,9 @@ module TaskApi =
             | "GetAgentInstructionConfig" ->
                 RoleInstructions.RoleInstructions.getAgentConfig binding cmd.AgentId
                 |> mapError |> Result.map box
+            | "GetResponseAlerts" ->
+                ReviewWorkflow.ReviewWorkflow.getResponseAlerts binding cmd.TaskId
+                |> mapError |> Result.map box
             | "GetNotificationPreferences" ->
                 ReviewWorkflow.ReviewWorkflow.getNotificationPreferences binding cmd.AgentId
                 |> mapError |> Result.map box
@@ -2354,6 +2357,16 @@ module TaskApi =
                                 |> Result.bind (fun submissionId ->
                                     ReviewWorkflow.ReviewWorkflow.completeIntegration binding operationId
                                         cmd.TaskId cmd.ActorId submissionId cmd.BaseOid |> mapError)
+                            | "QueueResponseAlert" ->
+                                withAdministrativeActor (fun actor ->
+                                    ReviewWorkflow.ReviewWorkflow.queueResponseAlert binding operationId
+                                        actor cmd.OwnerId cmd.Summary |> mapError)
+                            | "ClearResponseAlert" ->
+                                guid "alertId" cmd.AttemptId
+                                |> Result.bind (fun alertId ->
+                                    withAdministrativeActor (fun actor ->
+                                        ReviewWorkflow.ReviewWorkflow.clearResponseAlert binding operationId
+                                            actor cmd.OwnerId alertId |> mapError))
                             | "NotifyAgent" ->
                                 ReviewWorkflow.ReviewWorkflow.notifyAgent binding operationId
                                     cmd.ActorId cmd.SourceRef cmd.OwnerId cmd.TaskId cmd.Summary |> mapError

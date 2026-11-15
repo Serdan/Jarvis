@@ -1,0 +1,1 @@
+Replaces any restored composer text only in fresh Jarvis-created home tab launcher, with verified editor clearing/insertion, existing-conversation and route guards, one-send-only uncertainty. Updates Node fixtures (browser extension full suite green) and docs; .NET 11 Release Client.Tests is running, prior multi-connection bridge source unchanged. No merge/restart/deploy.

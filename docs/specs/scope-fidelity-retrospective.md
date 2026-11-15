@@ -1,6 +1,6 @@
 # Scope fidelity in autonomous Jarvis work: bounded retrospective and instruction proposal
 
-**Status:** Evidence-only frozen review 9f6079f6c0304c1c9f8b7a22bf4b82f9 Accepted (seq 2362); consultation packet prepared at docs/specs/scope-fidelity-consult-pilot.md but not executed or measured. The connected Jarvis catalog currently lacks the documented canonical Challenge commands, so no Challenge receipt is claimed. No role changes or deployment.
+**Status:** Initial evidence-only frozen review 9f6079f6c0304c1c9f8b7a22bf4b82f9 Accepted (seq 2362). The six-response consultation packet was subsequently executed by Lead and independently scored by Worker 2; see `docs/specs/scope-fidelity-consult-results.md` and complete raw transcripts at `docs/evidence/scope-fidelity-six-run-2026-11-15.md`. The connected Jarvis catalog lacks documented canonical Challenge commands, so no Challenge receipt is claimed. No roles, main branch or deployment changed.
 
 **Assignment:** `scope-drift-overengineering` (canonical spec v4, blob `4a519300530a4aabea0e7b9ca8ac245a316c786e`; Worker 2).
 
@@ -85,7 +85,7 @@ A good task usually needs (a) the user problem and why it matters, (b) observabl
 
 ## 4. Bounded Critical Senior Dev consult: design and desk comparison
 
-**Independent live role experiment is not yet run.** Manager-controlled agent launches and current instruction-role ownership should not be bypassed by this investigation. The following is a ready-to-run **six-response** comparison (three short prompts x two cases), not fabricated empirical model output or latency data.
+**Historical design at the earlier frozen review:** The independent role experiment was not yet run. Manager/Lead-controlled launches and current instruction-role ownership were not bypassed by Worker 2. The following describes the precommitted **six-response** comparison (three short prompts x two cases); real outcomes and measurement limits are now recorded in the consultation results, not inferred from this design.
 
 Give each consultant **first** the original user goal, original and current canonical task acceptance, and relevant frozen source facts; **then** the worker's proposed expansion and review arguments. Do not reveal the Lead's preferred decision until after response. Hold model, evidence, token budget and temperature/effort constant; measure tokens, elapsed time and coordination calls. Two fixed cases: (A) Worker 3 native cgroup + fleet drain as purported condition for audited Ready correction; (B) real same-task/new-generation stale-session collision in `simplify-lifecycle-versions`. Require per-response classification `proceed / minimal fix / revise scope / separate follow-up`, the acceptance citation, falsifying example and condition where expansion *would* be justified.
 
@@ -106,4 +106,11 @@ Give each consultant **first** the original user goal, original and current cano
 3. Apply the scope-fidelity question prospectively to one actual new Challenge/review, with Lead recording a decision in the existing canonical task path. If useful, integrate the role wording; no new Jarvis state or tool is needed.
 4. Treat Worker 3's extensive process containment as its own architectural/recovery feature until Lead explicitly links it to the correction task's intended observable outcome; keep any current fail-closed safety gate and no-deploy constraints intact. Do not weaken an existing safety control based solely on this retrospective.
 
-**This document meets the evidence/recommendation and dry-run parts of the assignment. The live role A/B experiment and any persistent role adoption remain intentionally pending; therefore do not mark the assignment complete on this draft.**
+**Updated 2026-11-15:** The six consultation responses were retrieved and scored as recorded in `docs/specs/scope-fidelity-consult-results.md`. Independent review of the final exact evidence source remains a separate gate. Any persistent role adoption remains unapproved; do not mark the assignment complete merely because the consultations finished.
+
+
+## 6. Completed bounded consultation (post-baseline addendum)
+
+Lead launched six independent ChatGPT conversations across Case A (ledger Working-to-Ready correction and proposed OS/fleet proof) and Case B (same-task/same-owner stale-session versionless call). All six completed; their exact submitted prompts, unedited answers, browser conversation URLs and tab IDs are in `docs/evidence/scope-fidelity-six-run-2026-11-15.md`. Worker 2 scored each against the packet's precommitted five-dimension rubric in `docs/specs/scope-fidelity-consult-results.md`: **9/10 for all six**, withholding one independence point because answer cues and original/challenge evidence arrived in one turn. None dismissed a demonstrated concurrency defect; none asserted unrequested OS/fleet proof as mandatory. Critical Senior Dev gave no material decision improvement beyond pragmatic Lead on these two selected prompts.
+
+Model identity, actual per-response generation start/end time, token usage and latency were unavailable; browser retrieval timestamps are explicitly not generation latency. This is not a quantitatively controlled comparison. The default recommendation remains lightweight role/AGENTS.md instructions plus canonical Lead scope decisions and independent fidelity review, not an automatic consultant gate or new governance subsystem. Preserve existing fail-closed safety, and keep optional hardening separately prioritized. No roles, main integration, or deployment were changed by Worker 2.

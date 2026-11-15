@@ -3,6 +3,7 @@ module Client.WorkQueueGitLedger
 open System
 open System.Collections
 open System.Diagnostics
+open System.IO
 open System.Reflection
 open System.Security.Cryptography
 open System.Text
@@ -263,13 +264,133 @@ module WorkQueueGitLedger =
                 | _ -> Error(sourceReject "remote ref does not identify the exact immutable SHA")
             | _ -> Error(sourceReject "expected one exact remote WIP ref"))
 
+    // First-generation stages must have a trustworthy source binding and a
+    // real pinned base reachable on the approved target, before any claim.
+    let private verifyInitialSource binding (lineage: SourceLineage) =
+        let approvedSourceCheckout =
+            match LedgerStore.sourceRepositoryIdentity binding with
+            | Ok identity ->
+                identity.FetchUrl = (binding: LedgerBinding).ApprovedFetchUrl
+                && identity.PushUrl = binding.ApprovedPushUrl
+            | Error _ -> false
+        if not approvedSourceCheckout
+           || lineage.RepositoryId <> sourceRepositoryId binding
+           || not (validGitSha lineage.PinnedBaseCommit)
+           || not (lineage.TargetRef.StartsWith("refs/heads/", StringComparison.Ordinal)) then
+            Error(sourceReject "source identity, target or pinned base is invalid")
+        else
+            successfulGit binding [ "check-ref-format"; lineage.TargetRef ]
+                "invalid source target ref"
+            |> Result.bind (fun _ ->
+                successfulGit binding
+                    [ "ls-remote"; "--refs"; (binding: LedgerBinding).ApprovedFetchUrl; lineage.TargetRef ]
+                    "cannot independently read approved source target")
+            |> Result.bind (fun output ->
+                match output.Split([| '\n' |], StringSplitOptions.RemoveEmptyEntries) with
+                | [| line |] ->
+                    match line.Split('\t') with
+                    | [| sha; reference |] when reference = lineage.TargetRef && validGitSha sha ->
+                        // Only Git object fetch: do not modify HEAD or any branch.
+                        successfulGit binding
+                            [ "fetch"; "--no-tags"; "--no-write-fetch-head";
+                              (binding: LedgerBinding).ApprovedFetchUrl; lineage.TargetRef ]
+                            "approved source target cannot be fetched"
+                        |> Result.bind (fun _ ->
+                            successfulGit binding
+                                [ "cat-file"; "-e"; lineage.PinnedBaseCommit + "^{commit}" ]
+                                "pinned base is not a local commit")
+                        |> Result.bind (fun _ ->
+                            successfulGit binding
+                                [ "cat-file"; "-e"; sha + "^{commit}" ]
+                                "approved target SHA is not a commit")
+                        |> Result.bind (fun _ ->
+                            successfulGit binding
+                                [ "merge-base"; "--is-ancestor"; lineage.PinnedBaseCommit; sha ]
+                                "pinned source base is not reachable from approved target"
+                            |> Result.map ignore)
+                    | _ -> Error(sourceReject "approved target ref identity does not match")
+                | _ -> Error(sourceReject "approved target ref missing or ambiguous"))
+
     let private verifySourceContinuation binding (lineage: SourceLineage) =
-        match lineage.ReachableRef, lineage.ContinuationSha with
-        | None, None -> Ok() // WQ02 unmodified first-generation source stages
-        | Some remoteRef, Some sha when validGitSha sha
-                                        && lineage.RepositoryId = sourceRepositoryId binding ->
-            verifyRemoteTip binding remoteRef sha
-        | _ -> Error(sourceReject "source continuation lacks complete approved-remote provenance")
+        verifyInitialSource binding lineage
+        |> Result.bind (fun () ->
+            match lineage.ReachableRef, lineage.ContinuationSha with
+            | None, None -> Ok()
+            | Some remoteRef, Some sha when validGitSha sha ->
+                verifyRemoteTip binding remoteRef sha
+            | _ -> Error(sourceReject "source continuation lacks complete approved-remote provenance"))
+
+    // ClaimNext is immediately actionable. Require a clean, detached, linked
+    // worktree already pinned to this exact launch/claim generation; never
+    // allow a stale clone or the predecessor's mutable checkout to claim.
+    let internal verifySourceClaimCheckout binding launchId (work: WorkStage) =
+        match work.SourceLineage with
+        | None -> Error(sourceReject "source claim has no lineage")
+        | Some lineage ->
+            let expectedSha = lineage.ContinuationSha |> Option.defaultValue lineage.PinnedBaseCommit
+            let expectedName = sprintf "wq03-%s-%s-g%d" work.Id launchId work.ClaimGeneration
+            if not (validSourceRefPart work.Id && validSourceRefPart launchId) then
+                Error(sourceReject "invalid source claim worktree identity")
+            else
+                verifySourceContinuation binding lineage
+                |> Result.bind (fun () ->
+                    successfulGit binding [ "rev-parse"; "--show-toplevel" ]
+                        "cannot resolve source worktree")
+                |> Result.bind (fun root ->
+                    let selected = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root))
+                    let configured =
+                        Path.TrimEndingDirectorySeparator(Path.GetFullPath((binding: LedgerBinding).RepositoryPath))
+                    if selected <> configured || Path.GetFileName(selected) <> expectedName then
+                        Error(sourceReject "source claim requires its generation-scoped worktree")
+                    else Ok selected)
+                |> Result.bind (fun selected ->
+                    successfulGit binding [ "rev-parse"; "--absolute-git-dir" ]
+                        "cannot verify linked source worktree"
+                    |> Result.bind (fun gitDir ->
+                        successfulGit binding [ "rev-parse"; "--git-common-dir" ]
+                            "cannot verify common source object store"
+                        |> Result.bind (fun common ->
+                            let gitPath = Path.GetFullPath(gitDir)
+                            let commonPath = Path.GetFullPath(
+                                if Path.IsPathRooted(common) then common
+                                else Path.Combine(selected, common))
+                            if gitPath = commonPath then
+                                Error(sourceReject "source claim must use an isolated linked worktree")
+                            else Ok())))
+                |> Result.bind (fun () ->
+                    successfulGit binding [ "worktree"; "list"; "--porcelain" ]
+                        "cannot inspect source worktree registration"
+                    |> Result.bind (fun output ->
+                        let registered =
+                            output.Split([| "\n\n" |], StringSplitOptions.RemoveEmptyEntries)
+                            |> Array.exists (fun block ->
+                                let lines = block.Split([| '\n' |], StringSplitOptions.RemoveEmptyEntries)
+                                lines |> Array.contains ("worktree " + (binding: LedgerBinding).RepositoryPath)
+                                && lines |> Array.contains ("HEAD " + expectedSha)
+                                && lines |> Array.contains "detached"
+                                && not (lines |> Array.exists (fun line -> line.StartsWith("prunable ", StringComparison.Ordinal))))
+                        if registered then Ok()
+                        else Error(sourceReject "generation checkout is not pinned and registered")))
+                |> Result.bind (fun () ->
+                    successfulGit binding [ "rev-parse"; "HEAD" ] "source checkout HEAD missing"
+                    |> Result.bind (fun head ->
+                        if head = expectedSha then Ok()
+                        else Error(sourceReject "source checkout HEAD differs from pinned generation")))
+                |> Result.bind (fun () ->
+                    successfulGit binding
+                        [ "status"; "--porcelain"; "--untracked-files=all"; "--ignore-submodules=none" ]
+                        "source checkout status unknown"
+                    |> Result.bind (fun dirty ->
+                        if dirty = "" then Ok()
+                        else Error(sourceReject "dirty generation checkout; RecoveryBlocked required")))
+
+    // Source jobs and original pushes are not yet journaled by an authoritative
+    // WQ03 host bridge, and Git fetch/ls-remote cannot attest branch protection
+    // or retention. Never infer their safety from a clean checkout or a string
+    // supplied by the worker. Keep source handoff disabled/fail-closed.
+    let private verifySourceExternalEffectsAndRefProtection () =
+        Error(sourceReject
+            "RecoveryBlocked: authoritative mutating-job and original-push journals are unavailable; host-enforced immutable WIP ref retention is not attested")
 
     // No caller-controlled "reachability verified" boolean is accepted.
     // The source worktree must contain the committed WIP, be entirely clean,
@@ -566,6 +687,7 @@ module WorkQueueGitLedger =
         && (match stage.Kind, stage.SourceLineage with
             | WorkKind.Implementation, Some lineage ->
                 lineage.ReachableRef.IsNone && lineage.ContinuationSha.IsNone
+            | WorkKind.Implementation, None -> false
             | _ -> true)
         && (stage.State = WorkState.Available || stage.State = WorkState.Blocked)
         && stage.StageGeneration > 0
@@ -766,9 +888,15 @@ module WorkQueueGitLedger =
                         // clone with a different local source checkout.
                         let sourceProof =
                             match mutation with
+                            | PublishStage stage ->
+                                match stage.Kind, stage.SourceLineage with
+                                | WorkKind.Implementation, Some lineage -> verifyInitialSource binding lineage
+                                | _ -> Ok()
                             | YieldSource checkpoint ->
                                 match state.Works.TryFind checkpoint.WorkId with
-                                | Some prior -> verifySourceHandoff binding prior checkpoint
+                                | Some prior ->
+                                    verifySourceHandoff binding prior checkpoint
+                                    |> Result.bind (fun () -> verifySourceExternalEffectsAndRefProtection ())
                                 | None -> Error(sourceReject "missing source stage")
                             | ClaimNext launchId ->
                                 match changed.Launches.TryFind launchId with
@@ -777,9 +905,12 @@ module WorkQueueGitLedger =
                                     | Some workId ->
                                         match changed.Works.TryFind workId with
                                         | Some work ->
-                                            match work.SourceLineage with
-                                            | Some lineage -> verifySourceContinuation binding lineage
-                                            | None -> Ok()
+                                            match work.Kind, work.SourceLineage with
+                                            | WorkKind.Implementation, Some _ ->
+                                                verifySourceClaimCheckout binding launchId work
+                                            | WorkKind.Implementation, None ->
+                                                Error(sourceReject "source claim lacks lineage")
+                                            | _ -> Ok()
                                         | None -> Error(sourceReject "claimed work disappeared")
                                     | None -> Error(sourceReject "claim has no primary work")
                                 | None -> Error(sourceReject "claimed launch disappeared")

@@ -104,6 +104,21 @@ export function validateSnapshot(config, snapshot, nowUtc) {
       assert(validTime(agent.reviewerYieldAtUtc, "reviewerYieldAtUtc") <= observed + 1000,
         "Reviewer yield is after the snapshot");
     }
+    if (agent.claimActivityProof !== undefined) {
+      const proof = agent.claimActivityProof;
+      assert(agent.kind === "reviewer" && agent.lastAttributedActivityAtUtc &&
+        proof?.kind === "PostActivityVerifiedReviewHead" &&
+        proof.activityAtUtc === agent.lastAttributedActivityAtUtc &&
+        proof.ledgerHead === snapshot.ledgerHead,
+        "Claim/activity proof must bind this reviewer, activity and review head");
+      const activityReadAt = validTime(proof.activityReadCompletedAtUtc,
+        "activityReadCompletedAtUtc");
+      const reviewReadAt = validTime(proof.reviewHeadReadStartedAtUtc,
+        "reviewHeadReadStartedAtUtc");
+      assert(Date.parse(proof.activityAtUtc) <= activityReadAt &&
+        activityReadAt < reviewReadAt && reviewReadAt <= observed + 1000,
+        "Claim/activity proof lacks a post-activity canonical review read");
+    }
     if (agent.stateEnteredAtUtc !== undefined && agent.stateEnteredAtUtc !== null) {
       const enteredAt = validTime(agent.stateEnteredAtUtc, "stateEnteredAtUtc");
       assert(enteredAt <= observed + 1000,
@@ -125,6 +140,12 @@ export function validateSnapshot(config, snapshot, nowUtc) {
       agents.get(claim.reviewerId)?.kind === "reviewer",
       "Invalid, duplicate or unclassified canonical claimed review");
     reviewIds.add(claim.reviewId);
+  }
+  for (const agent of agents.values()) {
+    if (agent.claimActivityProof !== undefined) {
+      assert(snapshot.claimedReviews.some(claim => claim.reviewerId === agent.agentId),
+        "Claim/activity proof requires a claim in the rechecked review head");
+    }
   }
   for (const kind of ["worker", "reviewer"]) {
     for (const id of config[kind + "Ids"]) {
@@ -172,6 +193,13 @@ export function validateJournal(journal, projectName) {
         validTime(rec.claimObservedActivityAtUtc, "claimObservedActivityAtUtc") >=
         validTime(rec.observedAtUtc, "observedAtUtc"),
         "Invalid claim-present activity evidence");
+    }
+    if (rec.claimActivityProvenance !== undefined ||
+        rec.claimActivityProofLedgerHead !== undefined) {
+      assert(rec.claimActivityProvenance === "PostActivityVerifiedReviewHead" &&
+        rec.claimObservedActivityAtUtc !== undefined &&
+        /^[0-9a-f]{40,64}$/.test(rec.claimActivityProofLedgerHead ?? ""),
+        "Invalid ordered claim/activity provenance");
     }
     if (rec.reviewerSessionCleared !== undefined) {
       assert(rec.reviewerSessionCleared === true && rec.kind === "reviewer" &&
@@ -275,9 +303,22 @@ function reviewerSessionResumedAfterEnd(rec, agent, snapshot) {
   if (agent?.lastAttributedActivityAtUtc == null) return true;
   const activityAt = Date.parse(agent.lastAttributedActivityAtUtc);
   const observedAt = Date.parse(rec.observedAtUtc);
-  if (activityAt < Date.parse(rec.claimObservedActivityAtUtc ?? rec.observedAtUtc)) return true;
-  if (activityAt <= observedAt) return false;
   const capturedAt = Date.parse(snapshot.capturedAtUtc);
+  const orderedClaimActivity = rec.claimActivityProvenance === "PostActivityVerifiedReviewHead" ?
+    rec.claimObservedActivityAtUtc : null;
+  // A previously read claim head plus a newer activity sample is not ordered
+  // evidence: the tool call might be AFTER the canonical claim resolution.
+  // Old journals without this proof remain guarded until an actual later
+  // reviewer yield or an operator-confirmed tab closure.
+  if (rec.completionEvidence === "CanonicalReviewClaimResolved" && !orderedClaimActivity) {
+    const laterEnds = [agent.reviewerYieldAtUtc,
+      rec.reviewerSessionCleared === true ? rec.releasedAtUtc : null];
+    return !laterEnds.some(time => typeof time === "string" &&
+      Date.parse(time) >= observedAt && Date.parse(time) >= activityAt &&
+      Date.parse(time) <= capturedAt);
+  }
+  if (activityAt < Date.parse(orderedClaimActivity ?? rec.observedAtUtc)) return true;
+  if (activityAt <= observedAt) return false;
   const endTimes = [];
   if (rec.status === "review-finished") {
     if (rec.completionEvidence === "ExplicitReviewerYield") endTimes.push(rec.explicitYieldAtUtc);
@@ -285,8 +326,9 @@ function reviewerSessionResumedAfterEnd(rec, agent, snapshot) {
       // Claim disappearance is known only between ledger snapshots; the
       // Manager's completedAtUtc is not an authoritative decision timestamp.
       // Activity newly seen during that interval may be post-resolution.
-      // Legacy journals retain the original attributed-call lower bound.
-      endTimes.push(rec.claimObservedActivityAtUtc ?? rec.observedAtUtc);
+      // Only a claim head explicitly re-read after this tool call can bound
+      // the later canonical decision against old session activity.
+      endTimes.push(orderedClaimActivity);
     }
   }
   if (rec.reviewerSessionCleared === true) endTimes.push(rec.releasedAtUtc);
@@ -302,6 +344,9 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
   validateConfig(config);
   const agents = validateSnapshot(config, snapshot, nowUtc);
   validateJournal(journal, config.projectName);
+  // Both modes evaluate identical transitions; dry-run uses private records.
+  // Only persistence and real reservation ID allocation are conditional.
+  const records = dryRun ? journal.records.map(rec => ({ ...rec })) : journal.records;
   const result = {
     projectName: config.projectName,
     ledgerHead: snapshot.ledgerHead,
@@ -322,14 +367,14 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
     claimsByReviewer.get(claim.reviewerId).push(claim.reviewId);
   }
   const latestReviewerRecord = new Map();
-  for (const rec of journal.records) {
+  for (const rec of records) {
     if (rec.kind === "reviewer") latestReviewerRecord.set(rec.agentId, rec);
   }
 
   // A reviewer may be NeedsWork/Stopped while working on a frozen claim.
   // Keep observed reviewer sessions and their capacity until a positive
   // review resolution or explicitly attributed cooperative yield.
-  for (const rec of journal.records) {
+  for (const rec of records) {
     const agent = agents.get(rec.agentId);
     if (LIVE_RECORDS.has(rec.status) || rec.status === "observed") {
       assert(agent?.kind === rec.kind, "Unknown journal owner/kind: " + rec.agentId);
@@ -341,12 +386,15 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
         observedClaimIds: [...new Set([...(rec.observedClaimIds ?? []), ...claims])],
         claimSeenLedgerHead: rec.claimSeenLedgerHead ?? (claims.length ? snapshot.ledgerHead : undefined)
       };
-      // Preserve the last attributed call seen with the claim still present.
+      // An independently read claim head and activity timestamp have no
+      // causal ordering. Only a fresh head re-read after that activity counts.
       const claimActivity = agent?.lastAttributedActivityAtUtc;
-      if (claims.length && claimActivity &&
-          (!updated.claimObservedActivityAtUtc ||
+      if (claims.length && claimActivity && agent.claimActivityProof &&
+          (updated.claimActivityProvenance !== "PostActivityVerifiedReviewHead" ||
             Date.parse(claimActivity) > Date.parse(updated.claimObservedActivityAtUtc))) {
         updated.claimObservedActivityAtUtc = claimActivity;
+        updated.claimActivityProvenance = "PostActivityVerifiedReviewHead";
+        updated.claimActivityProofLedgerHead = snapshot.ledgerHead;
       }
       const ended = reviewerSessionEnd(updated, agent, claims, snapshot);
       if (ended) {
@@ -359,18 +407,20 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
         if (reviewerSessionResumedAfterEnd(completed, agent, snapshot))
           unresolvedReviewers.add(rec.agentId);
       } else unresolvedReviewers.add(rec.agentId);
-      if (!dryRun) {
-        rec.observedClaimIds = updated.observedClaimIds;
-        if (updated.claimSeenLedgerHead) rec.claimSeenLedgerHead = updated.claimSeenLedgerHead;
-        if (updated.claimObservedActivityAtUtc)
-          rec.claimObservedActivityAtUtc = updated.claimObservedActivityAtUtc;
-        if (ended) {
-          rec.status = "review-finished";
-          rec.completionEvidence = ended;
-          rec.completionLedgerHead = snapshot.ledgerHead;
-          rec.completedAtUtc = snapshot.capturedAtUtc;
-          if (ended === "ExplicitReviewerYield") rec.explicitYieldAtUtc = agent.reviewerYieldAtUtc;
-        }
+      rec.observedClaimIds = updated.observedClaimIds;
+      if (updated.claimSeenLedgerHead) rec.claimSeenLedgerHead = updated.claimSeenLedgerHead;
+      if (updated.claimObservedActivityAtUtc)
+        rec.claimObservedActivityAtUtc = updated.claimObservedActivityAtUtc;
+      if (updated.claimActivityProvenance)
+        rec.claimActivityProvenance = updated.claimActivityProvenance;
+      if (updated.claimActivityProofLedgerHead)
+        rec.claimActivityProofLedgerHead = updated.claimActivityProofLedgerHead;
+      if (ended) {
+        rec.status = "review-finished";
+        rec.completionEvidence = ended;
+        rec.completionLedgerHead = snapshot.ledgerHead;
+        rec.completedAtUtc = snapshot.capturedAtUtc;
+        if (ended === "ExplicitReviewerYield") rec.explicitYieldAtUtc = agent.reviewerYieldAtUtc;
       }
       continue;
     }
@@ -397,27 +447,27 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
           unresolvedReviewers.add(rec.agentId);
           observedThisPass.add(rec.agentId);
         }
-        if (!dryRun) {
-          rec.observedClaimIds = claims;
-          if (claims.length) rec.claimSeenLedgerHead = snapshot.ledgerHead;
-          if (claims.length) rec.claimObservedActivityAtUtc = activity;
-          rec.status = ended ? "review-finished" : "observed";
-          rec.observedAtUtc = activity;
-          if (ended) {
-            rec.completionEvidence = ended;
-            rec.completionLedgerHead = snapshot.ledgerHead;
-            rec.completedAtUtc = snapshot.capturedAtUtc;
-            if (ended === "ExplicitReviewerYield") rec.explicitYieldAtUtc = agent.reviewerYieldAtUtc;
-          }
+        rec.observedClaimIds = claims;
+        if (claims.length) rec.claimSeenLedgerHead = snapshot.ledgerHead;
+        if (claims.length && agent.claimActivityProof) {
+          rec.claimObservedActivityAtUtc = activity;
+          rec.claimActivityProvenance = "PostActivityVerifiedReviewHead";
+          rec.claimActivityProofLedgerHead = snapshot.ledgerHead;
+        }
+        rec.status = ended ? "review-finished" : "observed";
+        rec.observedAtUtc = activity;
+        if (ended) {
+          rec.completionEvidence = ended;
+          rec.completionLedgerHead = snapshot.ledgerHead;
+          rec.completedAtUtc = snapshot.capturedAtUtc;
+          if (ended === "ExplicitReviewerYield") rec.explicitYieldAtUtc = agent.reviewerYieldAtUtc;
         }
       } else {
         if (!yieldedAfterActivity(agent, activity)) observedThisPass.add(rec.agentId);
         if (rec.assignmentKey && agent.assignmentKey === rec.assignmentKey &&
           !yieldedAfterActivity(agent, activity)) observedAssignments.add(rec.agentId);
-        if (!dryRun) {
-          rec.status = "observed";
-          rec.observedAtUtc = activity;
-        }
+        rec.status = "observed";
+        rec.observedAtUtc = activity;
       }
       continue;
     }

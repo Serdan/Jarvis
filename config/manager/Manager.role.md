@@ -33,8 +33,14 @@ At the start of every pass:
    review and owner at the same ledger head; set `reviewClaimsVerified` only
    when complete. Never infer reviewer idleness from NeedsWork/Stopped. An
    observed reviewer launch or claimed review remains active until a later
-   canonical review completion/release is proved or an explicit reviewer
-   yield is independently attributed. A generic tool call is not a yield.
+   canonical review completion/release and *ordered* pre-resolution activity
+   are proved, or an explicit reviewer yield is independently attributed.
+   To prove order, first finish reading the attributed activity event, then
+   initiate a fresh verified task_overview read; only if that later head
+   still holds the claim may you supply `claimActivityProof` with both read
+   timestamps and matching ledger head (see the runbook). Never combine an
+   earlier claim head with a newer attributed call. A generic tool call is
+   not a yield.
 5. Run `node scripts/manager-heartbeat.mjs plan` with the current project
    config, snapshot and durable per-project launch journal. The planner reserves
    intended launches *before* any browser side effect. Do not create a launch
@@ -67,7 +73,8 @@ At the start of every pass:
    requires verified Ready/Stopped stateEnteredAtUtc newer than the attributed
    activity: a stale Ready label alone cannot prove a yield.
    For reviewers, canonical claim completion/release across verified ledger
-   heads permits the next unclaimed review. If a reviewer explicitly yields
+   heads permits the next unclaimed review only with the ordered
+   claim/activity proof and no newer attributed call. If a reviewer explicitly yields
    while keeping a claim, verify the positive reviewer-specific yield event
    before using `reviewerYieldAtUtc` / `ExplicitAttributedReviewerYield`;
    then resume that same reviewer under `ResumeVerifiedPausedReview`. If no

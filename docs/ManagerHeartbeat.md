@@ -163,17 +163,53 @@ operator-cleared record is proof only at its recorded end boundary. If a
 later verified tool call occurs in that old browser session, count it as
 unresolved and suppress a duplicate launch even if zero reviews are claimed.
 A later explicitly attributed reviewer yield or audited operator recovery
-after positive verification of tab closure restores eligibility.
+after positive verification of tab closure restores eligibility. Legacy journal
+records with `claimObservedActivityAtUtc` but without the corresponding
+`PostActivityVerifiedReviewHead` provenance are **not** ordered evidence and
+must remain guarded; restarting the Manager does not upgrade their authority.
 
-After a claimed review is seen in a prior ledger snapshot, a **later,
-verified different ledger head** with that review no longer Claimed and no
-other claim for the reviewer is evidence of canonical decision/release.
-This permits a subsequent reviewer session. An unchanged head,
-incomplete claim enumeration, or a single attributed activity event is
-not completion. If a session claims and resolves its review entirely
-between Manager snapshots, the missing transition is *not* fabricated:
-keep the observed session unresolved until an independently verified
-yield or explicit operator recovery.
+A later **verified different ledger head** where a previously Claimed review
+is no longer Claimed proves its canonical decision/release. That decision
+permits a subsequent session only when the last attributed reviewer activity
+was positively established **before** a still-claimed canonical head, with no
+newer attributed call afterward. Review resolution alone is *not* proof the
+old browser tab stopped. Missing ordering, an unchanged head, incomplete
+enumeration, or activity newer than the ordered claim observation leaves the
+old session unresolved (even when zero claims remain). An explicit later yield
+or audited operator recovery can independently establish an end. If a session
+claims and resolves entirely between Manager snapshots, do not fabricate the
+missing transition.
+
+A reviewer claim/activity ordering barrier is required before the planner
+uses observed claimed-review state as an activity lower bound. First fetch the
+positively attributed reviewer tool-call event and record when that activity
+query **completed**. Only **after it returns**, start a *fresh*
+`task_overview` read, verify the exhaustive Claimed review set at its
+canonical ledger head, and record when that second read **started**. If the
+reviewer still owns a claim at that new head, attach to that reviewer's agent
+observation:
+
+~~~json
+{
+  "claimActivityProof": {
+    "kind": "PostActivityVerifiedReviewHead",
+    "activityAtUtc": "2026-11-15T02:00:30Z",
+    "activityReadCompletedAtUtc": "2026-11-15T02:00:40Z",
+    "reviewHeadReadStartedAtUtc": "2026-11-15T02:00:45Z",
+    "ledgerHead": "6ab793928fa7f998b9d5796061cf66d3c0b02e40"
+  }
+}
+~~~
+
+The `activityAtUtc` must exactly match `lastAttributedActivityAtUtc`;
+`ledgerHead` must match the verified queue/claims head in that snapshot.
+The timestamps attest to *sequential tool observations*, not merely an event
+timestamp earlier than snapshot capture. A cached or already-in-flight head
+read is insufficient even if it returns after activity is sampled. On head
+change, new activity, missing verification, or no longer-held claim, omit the
+proof and fail closed. In particular, never stamp `claimObservedActivityAtUtc`
+from an older H1 claim enumeration alongside a newer post-resolution tool
+call. Journal provenance and the exact verified head survive restarts.
 
 An optional `reviewerYieldAtUtc` may be supplied on the reviewer agent
 only when the Manager can independently verify an **explicit cooperative

@@ -547,6 +547,113 @@ test("explicit attributed reviewer yield resumes an existing claimed review once
   assert.equal(decide(c, yielded, persisted, yielded.capturedAtUtc).reservations.length, 0);
 });
 
+test("a terminal explicit yield cannot outlive newer reviewer activity across journal restart", () => {
+  const c = reviewerOnlyConfig();
+  c.budgets.reviewer = 1;
+  const j = journal();
+  const initial = snapshot();
+  initial.unclaimedReviewCount = 1;
+  assert.deepEqual(decide(c, initial, j, NOW).reservations.map(r => r.agentId),
+    ["Reviewer 1"]);
+
+  const claimed = snapshot();
+  claimed.capturedAtUtc = "2026-11-15T02:01:00Z";
+  claimed.ledgerHead = NEXT_HEAD;
+  claimed.claimedReviews = [REVIEW];
+  claimed.unclaimedReviewCount = 1; // Another frozen review remains available.
+  reviewerObserved(claimed);
+  decide(c, claimed, j, claimed.capturedAtUtc);
+  assert.equal(j.records[0].status, "observed");
+
+  // Finish the browser turn but leave the claimed review in progress.
+  const paused = structuredClone(claimed);
+  paused.capturedAtUtc = "2026-11-15T02:04:00Z";
+  paused.agents[3].reviewerYieldAtUtc = "2026-11-15T02:03:00Z";
+  paused.agents[3].reviewerYieldEvidence = "ExplicitAttributedReviewerYield";
+  paused.agents[3].lastAttributedActivityAtUtc = "2026-11-15T02:03:00Z";
+  const disabled = { ...c, enabled: false };
+  assert.equal(decide(disabled, paused, j, paused.capturedAtUtc).reservations.length, 0);
+  assert.equal(j.records[0].status, "review-finished");
+  assert.equal(j.records[0].completionEvidence, "ExplicitReviewerYield");
+  assert.equal(j.records[0].explicitYieldAtUtc, "2026-11-15T02:03:00Z");
+
+  // The reviewer resumed in the same tab after yielding. A later attributed
+  // tool call invalidates that OLD pause even though the journal is terminal.
+  const restarted = JSON.parse(JSON.stringify(j)); // Reopened durable journal.
+  const activeAgain = structuredClone(paused);
+  activeAgain.capturedAtUtc = "2026-11-15T02:06:00Z";
+  activeAgain.agents[3].lastAttributedActivityAtUtc = "2026-11-15T02:05:00Z";
+  const suppressed = decide(c, activeAgain, restarted, activeAgain.capturedAtUtc);
+  assert.equal(suppressed.reservations.length, 0);
+  assert.equal(suppressed.counts.reviewer, 1);
+  assert.equal(restarted.records[0].status, "review-finished");
+  assert.equal(decide(c, activeAgain, restarted, activeAgain.capturedAtUtc).reservations.length, 0);
+
+  // A second, strictly newer explicit reviewer yield is valid recovery proof.
+  const yieldedAgain = structuredClone(activeAgain);
+  yieldedAgain.capturedAtUtc = "2026-11-15T02:08:00Z";
+  yieldedAgain.agents[3].reviewerYieldAtUtc = "2026-11-15T02:07:00Z";
+  yieldedAgain.agents[3].lastAttributedActivityAtUtc = "2026-11-15T02:07:00Z";
+  const resumed = decide(c, yieldedAgain, restarted, yieldedAgain.capturedAtUtc);
+  assert.deepEqual(resumed.reservations.map(r => r.reason),
+    ["ResumeVerifiedPausedReview"]);
+  assert.equal(decide(c, yieldedAgain, restarted, yieldedAgain.capturedAtUtc).reservations.length, 0);
+
+  // Migrating old journals with a terminal label but no yield timestamp must
+  // fail closed unless that proof is still present in the current snapshot.
+  const legacy = structuredClone(j);
+  delete legacy.records[0].explicitYieldAtUtc;
+  const noYieldEvidence = structuredClone(paused);
+  delete noYieldEvidence.agents[3].reviewerYieldAtUtc;
+  delete noYieldEvidence.agents[3].reviewerYieldEvidence;
+  assert.equal(decide(c, noYieldEvidence, legacy, noYieldEvidence.capturedAtUtc)
+    .reservations.length, 0);
+});
+
+test("operator reviewer recovery is invalidated by later attributed activity", () => {
+  const c = reviewerOnlyConfig();
+  c.budgets.reviewer = 1;
+  const j = journal();
+  const first = snapshot();
+  first.unclaimedReviewCount = 1;
+  decide(c, first, j, NOW);
+
+  const claimed = snapshot();
+  claimed.capturedAtUtc = "2026-11-15T02:01:00Z";
+  claimed.claimedReviews = [REVIEW];
+  claimed.unclaimedReviewCount = 1;
+  reviewerObserved(claimed);
+  decide(c, claimed, j, claimed.capturedAtUtc);
+  Object.assign(j.records[0], {
+    status: "cleared",
+    reviewerSessionCleared: true,
+    recoveryReason: "Operator positively verified session end",
+    releasedAtUtc: "2026-11-15T02:03:00Z"
+  });
+  const beforeRelease = decide(c, claimed, structuredClone(j), claimed.capturedAtUtc);
+  assert.equal(beforeRelease.reservations.length, 0);
+
+  const released = structuredClone(claimed);
+  released.capturedAtUtc = "2026-11-15T02:04:00Z";
+  assert.equal(decide({ ...c, enabled: false }, released, j, released.capturedAtUtc)
+    .counts.reviewer, 0);
+  const restarted = JSON.parse(JSON.stringify(j)); // Reopened durable journal.
+  const activeAgain = structuredClone(released);
+  activeAgain.capturedAtUtc = "2026-11-15T02:06:00Z";
+  reviewerObserved(activeAgain, "2026-11-15T02:05:00Z");
+  const suppressed = decide(c, activeAgain, restarted, activeAgain.capturedAtUtc);
+  assert.equal(suppressed.reservations.length, 0);
+  assert.equal(suppressed.counts.reviewer, 1);
+
+  const yieldedAgain = structuredClone(activeAgain);
+  yieldedAgain.capturedAtUtc = "2026-11-15T02:08:00Z";
+  yieldedAgain.agents[3].reviewerYieldAtUtc = "2026-11-15T02:07:00Z";
+  yieldedAgain.agents[3].reviewerYieldEvidence = "ExplicitAttributedReviewerYield";
+  yieldedAgain.agents[3].lastAttributedActivityAtUtc = "2026-11-15T02:07:00Z";
+  assert.deepEqual(decide(c, yieldedAgain, restarted, yieldedAgain.capturedAtUtc)
+    .reservations.map(r => r.reason), ["ResumeVerifiedPausedReview"]);
+});
+
 test("missing or contradictory reviewer claim/yield evidence fails closed", () => {
   const c = reviewerOnlyConfig();
   const initial = snapshot();
@@ -634,10 +741,15 @@ test("observed unresolved reviewer can be explicitly operator-cleared with audit
     assert.equal(persisted.records[0].reviewerSessionCleared, true);
     assert.equal(persisted.records[0].recoveryReason,
       "Operator positively verified prior reviewer session ended");
-    const resumed = decide(c, inProgress, persisted, inProgress.capturedAtUtc);
+    // An operator recovery is verified only by a snapshot captured AFTER
+    // its recorded release time, not the earlier observed-claim snapshot.
+    const afterRecovery = structuredClone(inProgress);
+    afterRecovery.capturedAtUtc =
+      new Date(Date.parse(persisted.records[0].releasedAtUtc) + 1000).toISOString();
+    const resumed = decide(c, afterRecovery, persisted, afterRecovery.capturedAtUtc);
     assert.deepEqual(resumed.reservations.map(x => x.reason),
       ["ResumeVerifiedPausedReview"]);
-    assert.equal(decide(c, inProgress, persisted, inProgress.capturedAtUtc).reservations.length, 0);
+    assert.equal(decide(c, afterRecovery, persisted, afterRecovery.capturedAtUtc).reservations.length, 0);
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
   }

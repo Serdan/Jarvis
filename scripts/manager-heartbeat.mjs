@@ -169,6 +169,9 @@ export function validateJournal(journal, projectName) {
         rec.status === "cleared" && typeof rec.observedAtUtc === "string" &&
         typeof rec.recoveryReason === "string" && rec.recoveryReason.length >= 12,
         "Invalid observed reviewer operator recovery");
+      assert(validTime(rec.releasedAtUtc, "reviewer recovery time") >=
+        validTime(rec.observedAtUtc, "observedAtUtc"),
+        "Reviewer recovery cannot predate observed activity");
     }
     if (rec.status === "review-finished") {
       assert(rec.kind === "reviewer" &&
@@ -181,6 +184,14 @@ export function validateJournal(journal, projectName) {
           rec.claimSeenLedgerHead !== rec.completionLedgerHead,
           "Reviewer claim resolution requires a later canonical ledger head");
       }
+    }
+    if (rec.explicitYieldAtUtc !== undefined) {
+      assert(rec.status === "review-finished" &&
+        rec.completionEvidence === "ExplicitReviewerYield" &&
+        validTime(rec.explicitYieldAtUtc, "explicitYieldAtUtc") >=
+        validTime(rec.observedAtUtc, "observedAtUtc") &&
+        Date.parse(rec.explicitYieldAtUtc) <= Date.parse(rec.completedAtUtc),
+        "Invalid recorded explicit reviewer yield");
     }
     ids.add(rec.launchId);
   }
@@ -217,6 +228,30 @@ function reviewerSessionEnd(rec, agent, currentClaims, snapshot) {
     return "CanonicalReviewClaimResolved";
   }
   return null;
+}
+
+// An explicit reviewer yield or operator recovery is evidence at a point in
+// time, not a permanent lease release. Activity after that boundary means the
+// previous browser session might have resumed while its claim is still active.
+function reviewerPauseStillProven(rec, agent, snapshot, ended) {
+  const activityAt = agent?.lastAttributedActivityAtUtc == null ? -Infinity :
+    Date.parse(agent.lastAttributedActivityAtUtc);
+  const capturedAt = Date.parse(snapshot.capturedAtUtc);
+  if (ended === "ExplicitReviewerYield" || rec.reviewerSessionCleared === true) {
+    // Preserve the attributed yield time over journal restarts. A legacy
+    // terminal record without this field needs fresh canonical yield proof;
+    // completedAtUtc is not the same as the actual yield boundary.
+    const yieldTimes = [rec.explicitYieldAtUtc, agent?.reviewerYieldAtUtc]
+      .filter(time => typeof time === "string")
+      .map(time => Date.parse(time))
+      .filter(time => time >= Date.parse(rec.observedAtUtc) && time <= capturedAt);
+    if (yieldTimes.some(time => activityAt <= time)) return true;
+  }
+  if (rec.reviewerSessionCleared === true) {
+    const clearedAt = Date.parse(rec.releasedAtUtc);
+    return clearedAt <= capturedAt && activityAt <= clearedAt;
+  }
+  return false;
 }
 
 export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
@@ -273,6 +308,7 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
           rec.completionEvidence = ended;
           rec.completionLedgerHead = snapshot.ledgerHead;
           rec.completedAtUtc = snapshot.capturedAtUtc;
+          if (ended === "ExplicitReviewerYield") rec.explicitYieldAtUtc = agent.reviewerYieldAtUtc;
         }
       }
       continue;
@@ -309,6 +345,7 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
             rec.completionEvidence = ended;
             rec.completionLedgerHead = snapshot.ledgerHead;
             rec.completedAtUtc = snapshot.capturedAtUtc;
+            if (ended === "ExplicitReviewerYield") rec.explicitYieldAtUtc = agent.reviewerYieldAtUtc;
           }
         }
       } else {
@@ -332,7 +369,7 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
     const ended = reviewerSessionEnds.get(rec.launchId) ??
       (rec.status === "review-finished" ? rec.completionEvidence : null);
     const claims = claimsByReviewer.get(reviewerId) ?? [];
-    if ((ended === "ExplicitReviewerYield" || rec.reviewerSessionCleared === true) &&
+    if (reviewerPauseStillProven(rec, agents.get(reviewerId), snapshot, ended) &&
         claims.every(id => (rec.observedClaimIds ?? []).includes(id)) &&
         !unresolvedReviewers.has(reviewerId) && !reserved.has(reviewerId)) {
       pausedClaimReviewers.add(reviewerId);

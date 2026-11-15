@@ -6620,3 +6620,53 @@ type ReviewWorkflowTests() =
             Assert.That(repeat.Operation.OriginalResultJson, Is.EqualTo(confirmed.Operation.OriginalResultJson))
             Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent, Is.EqualTo(after))
             Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence + 1L)))
+
+    [<Test>]
+    member _.PushTimeoutNeverBlindlyRetriesAndRecoversOriginalPendingUuid() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let taskId = "p1-uncertain-push-timeout"
+            let command =
+                {| Action = "CreateTask"; TaskId = taskId
+                   Title = "Recover push timeout"; Html = "<h1>Recover push timeout</h1>" |}
+            let run () =
+                Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite
+                    first operationId "TaskWrite" command (fun () ->
+                        ReviewWorkflow.createTaskWithSpec first operationId taskId
+                            command.Title command.Html
+                        |> Result.mapError Client.OrchestrationApi.LedgerErrors.toEffect)
+            let sequence = (LedgerStore.fetch first |> success).Header.NextSequence
+            let mutable pushAttempts = 0
+            let unknown =
+                LedgerStore.withGitTransportFaults (fun phase args ->
+                    match args with
+                    | "push" :: _ when phase = "publication-push" ->
+                        pushAttempts <- pushAttempts + 1
+                        Some { FaultExitCode = 128
+                               FaultStderr = "https://user:secret@github.com/repo"
+                               FaultTimedOut = true }
+                    | _ -> None)
+                    run
+            match unknown with
+            | Error(Client.LedgerFailureError failure) ->
+                Assert.That(failure.Code, Is.EqualTo("OutcomeUnknown"))
+                Assert.That(failure.OperationId, Is.EqualTo(Some(operationId.ToString("D"))))
+                Assert.That(failure.Message, Does.Contain("phase=publication-push"))
+                Assert.That(failure.Message, Does.Contain("timedOut=True"))
+                Assert.That(failure.Message, Does.Contain("class=timeout"))
+                Assert.That(failure.Message, Does.Contain("nextAction=reconcile-same-uuid"))
+                Assert.That(failure.Message, Does.Not.Contain("user:secret"))
+            | other -> Assert.Fail(sprintf "Push timeout must be uncertain, not retried: %A" other)
+            Assert.That(pushAttempts, Is.EqualTo(1))
+            Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
+                        Is.True)
+            let recovered = run () |> success
+            Assert.That(recovered.AlreadyApplied, Is.False)
+            Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence + 1L))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsNone,
+                        Is.True)
+            let replay = run () |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That(replay.Operation.OriginalResultJson, Is.EqualTo(recovered.Operation.OriginalResultJson))
+            Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence + 1L)))

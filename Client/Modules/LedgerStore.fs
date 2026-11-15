@@ -2239,6 +2239,12 @@ module LedgerStore =
                                                       | Error error -> Error error
                                                   | Ok None ->
                                                       match pushed with
+                                                      | Error(RemoteUnavailable detail) ->
+                                                          let classification = classifyTransport detail
+                                                          let timedOut = classification = "timeout"
+                                                          Error(OutcomeUnknown
+                                                              (transportDiagnostic "publication-push" 1 None timedOut classification
+                                                               + "; nextAction=reconcile-same-uuid"))
                                                       | Error _ ->
                                                           Error(OutcomeUnknown
                                                               (transportDiagnostic "publication-push" 1 None false "process"

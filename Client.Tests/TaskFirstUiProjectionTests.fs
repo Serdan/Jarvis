@@ -271,15 +271,17 @@ let capacityUnknownCannotBeMistakenForAvailableTokens () =
     Assert.That(lines, Does.Contain("Account-global capacity\n  UNKNOWN"))
 
 [<Test>]
-let accountOccupancyCountsUnreleasedTokensAndFlagsOvercommit () =
+let unjoinedAccountSnapshotCannotCertifyOvercommitOrFreeTokens () =
     let occupied =
         { Contracts.emptyAccount 1 with
             Tokens = Map.ofList [ "L1", false; "L2", false; "released", true ] }
     let result = projectDashboard "P" Map.empty (Ok(snapshot [])) (Ok occupied) None 50L
-    let capacity = result.Capacity |> known
-    Assert.That(capacity.Occupied, Is.EqualTo(2))
-    Assert.That(capacity.Free, Is.EqualTo(0))
-    Assert.That(capacity.Overcommitted, Is.True)
+    // Even account-only token accounting does not prove the cross-ledger
+    // head/high-water join required before displaying safe free capacity.
+    unknown result.Capacity
+    let preview = renderPreview result |> String.concat "\n"
+    Assert.That(preview, Does.Contain("cross-ledger heads and high-water join unverified"))
+    Assert.That(preview, Does.Not.Contain("2/1 occupied"))
 
 [<Test>]
 let projectIdentityMismatchIsUnknownNotAnotherProjectsWork () =
@@ -333,7 +335,7 @@ let claimedDependencyGateMutationIsHeldAtFreshAndStaleClocks () =
         let output = renderPreview result |> String.concat "\n"
         Assert.That(output, Does.Contain("HELD"))
         Assert.That(output, Does.Not.Contain("ACTIVE claimed by L"))
-        Assert.That((result.Capacity |> known).Occupied, Is.EqualTo(1))
+        unknown result.Capacity
 
 // The gate itself takes precedence over lease/clock health: STOP, stale
 // heartbeat and a missing clock must not relabel a held claim as ACTIVE.
@@ -423,23 +425,32 @@ let missingReleasedOrDuplicateAccountTokensCannotLookLikeFreeCapacity () =
                 (Ok tokens) None 50L).Capacity
 
 [<Test>]
-let consistentAndTerminalReleaseSnapshotsPreserveAccurateCapacityAccounting () =
+let matchedButUnjoinedLiveTerminalAndUnrelatedAccountSnapshotsRemainUnknown () =
     let registered = launch "L" (LaunchState.Registered("uuid-L", "session-L")) None
-    let project = { snapshot [] with Launches = Map.ofList [ "L", registered ] }
+    let project = { snapshot [] with Launches = Map.ofList [ "L", registered ]; Version = 41 }
     let accountWithOtherProject =
-        { account with Tokens = Map.ofList [ "L", false; "other-project", false ] }
-    let knownLive =
+        { account with Version = 41; Tokens = Map.ofList [ "L", false; "other-project", false ] }
+    // IDs, token values AND numeric versions match, but no independently
+    // verified cross-ledger head/high-water fence accompanies these DTOs.
+    let matched =
         projectDashboard "P" Map.empty (Ok project) (Ok accountWithOtherProject) None 50L
-    Assert.That((knownLive.Capacity |> known).Occupied, Is.EqualTo(2))
-    Assert.That((knownLive.Capacity |> known).Free, Is.EqualTo(1))
+    unknown matched.Capacity
+    Assert.That((matched.Launches |> known).Length, Is.EqualTo(1))
+    let preview = renderPreview matched |> String.concat "\n"
+    Assert.That(preview, Does.Contain("cross-ledger heads and high-water join unverified"))
+    Assert.That(preview, Does.Not.Contain("2/3 occupied; 1 free"))
     let terminal = { registered with State = LaunchState.TerminalPendingRelease "terminal-proof" }
-    let fullyReleased =
-        { project with Launches = Map.ofList [ "L", terminal ] }
-    let accountReleased = { account with Tokens = Map.ofList [ "L", true ] }
+    let fullyReleased = { project with Version = 42; Launches = Map.ofList [ "L", terminal ] }
+    let accountReleased = { account with Version = 42; Tokens = Map.ofList [ "L", true ] }
     let completed =
         projectDashboard "P" Map.empty (Ok fullyReleased) (Ok accountReleased) None 50L
-    Assert.That((completed.Capacity |> known).Occupied, Is.EqualTo(0))
-    Assert.That((completed.Capacity |> known).Free, Is.EqualTo(3))
+    unknown completed.Capacity
+    // Even when this project has no launch, other projects may occupy
+    // tokens or mutate account state between two independent reads.
+    let onlyElsewhere = { snapshot [] with Version = 42 }
+    unknown (projectDashboard "P" Map.empty (Ok onlyElsewhere) (Ok accountWithOtherProject)
+                None 50L).Capacity
+    unknown (view (snapshot [])).Capacity
     unknown (projectDashboard "P" Map.empty (Error "project ledger unknown") (Ok account)
                 None 50L).Capacity
 
@@ -463,3 +474,93 @@ let terminalRendererEscapesUntrustedMessageControlCharacters () =
     // Source DTO retains the canonical body; only terminal preview is escaped.
     Assert.That((result.Threads |> known |> List.find (fun r -> r.Subject = Subject.Role "Lead"))
                     .MessagesByCanonicalId.Head.Body, Is.EqualTo(item.Body))
+
+
+[<Test>]
+let twoCloneStaleReorderedAndMatchedVersionsCannotForgeAccountJoin () =
+    let registered = launch "L" (LaunchState.Registered("uuid-L", "session-L")) None
+    // Two independent clone views retain a matching launch/token pair, but
+    // neither DTO carries the Git-ledger head or a verified joined high-water.
+    let cloneAProject = { snapshot [] with Version = 12; Launches = Map.ofList [ "L", registered ] }
+    let cloneAAccount =
+        { account with Version = 12; Tokens = Map.ofList [ "L", false; "other-project", false ] }
+    let cloneBProject = { cloneAProject with Version = 13 }
+    let cloneBAccount = { cloneAAccount with Version = 13 }
+    let readOrders =
+        [ "both from clone A", cloneAProject, cloneAAccount
+          "project B / stale account A", cloneBProject, cloneAAccount
+          "stale project A / account B", cloneAProject, cloneBAccount
+          "both from clone B", cloneBProject, cloneBAccount ]
+    for (label, projectRead, accountRead) in readOrders do
+        let result = projectDashboard "P" Map.empty (Ok projectRead) (Ok accountRead) None 50L
+        match result.Capacity with
+        | Evidence.Unknown reason ->
+            Assert.That(reason, Does.Contain("cross-ledger heads and high-water join unverified"), label)
+        | Evidence.Known capacity ->
+            Assert.Fail(sprintf "%s manufactured %d known free tokens from unjoined views" label capacity.Free)
+        Assert.That((result.Launches |> known).Length, Is.EqualTo(1), label)
+
+
+[<Test>]
+let terminalPreviewSanitizesTitlesIdsCyclePathsAndUnknownReasonsWithoutChangingDto () =
+    let injection = "\u001b[31mFORGED\nNEW ROW\u2028LINE\u2029BLOCK\u200eFORMAT"
+    let original = snapshot [ stage "A" [] ]
+    let projected =
+        projectDashboard "P" (Map.ofList [ "task-A", injection ])
+            (Ok original) (Ok account) None 50L
+    let firstRow = (projected.Next |> known).Head
+    Assert.That(firstRow.SubjectTitle, Is.EqualTo(injection),
+                "The raw projection retains canonical text; escaping is presentation-only")
+    let forgedRow =
+        { firstRow with WorkId = injection
+                        ProjectId = injection
+                        SubjectTitle = injection
+                        Kind = injection
+                        HardBlockers = [ injection ]
+                        State = RowState.RecoveryHold injection }
+    let msg =
+        { MessageId = injection
+          Body = injection
+          State = injection
+          ClaimLaunchId = Some injection
+          HandlerGeneration = 1
+          WorkId = Some injection }
+    let threads =
+        [ { Subject = Subject.Role injection
+            SubjectTitle = "Role: " + injection
+            MessagesByCanonicalId = [ msg ] } ]
+    let launches =
+        [ { LaunchId = injection
+            RoleId = injection
+            Phase = injection
+            AgentUuid = Some injection
+            RecoveryWarning = Some injection } ]
+    let health = projected.QueueHealth |> known
+    let preview =
+        { projected with
+            Next = Evidence.Known [ forgedRow ]
+            ActiveAndStalled = Evidence.Known [ forgedRow ]
+            Blocked = Evidence.Known [ forgedRow ]
+            Cycles = Evidence.Known
+                [ { Members = [ injection ]
+                    ExactStagePath = [ injection; injection ]
+                    WitnessEdges = [ injection, injection ] } ]
+            Threads = Evidence.Known threads
+            Launches = Evidence.Known launches
+            Capacity = Evidence.Unknown injection
+            QueueHealth = Evidence.Known { health with ProjectId = injection } }
+    let rendered = renderPreview preview
+    let unsafeCharacter ch =
+        Char.IsControl ch
+        || match Char.GetUnicodeCategory ch with
+           | Globalization.UnicodeCategory.Format
+           | Globalization.UnicodeCategory.LineSeparator
+           | Globalization.UnicodeCategory.ParagraphSeparator -> true
+           | _ -> false
+    for line in rendered do
+        Assert.That(line |> Seq.exists unsafeCharacter, Is.False,
+                    sprintf "Untrusted terminal control escaped sanitization: %A" line)
+    let text = rendered |> String.concat "\n"
+    Assert.That(text, Does.Contain("FORGED"))
+    Assert.That(text, Does.Not.Contain("FORGED\nNEW ROW"))
+    Assert.That((projected.Next |> known).Head.SubjectTitle, Is.EqualTo(injection))

@@ -296,8 +296,9 @@ let private blockedState (stage: WorkStage) =
         | _ -> RowState.Blocked
 
 // A caller may provide two independently readable but contradictory ledger
-// snapshots. Every visible project launch must reconcile with an account-global
-// reservation; even a Known value is only a read-only preview, not a CAS grant.
+// snapshots. Value-level token checks detect contradictions, but even matching
+// maps cannot establish a cross-ledger CAS/high-water read fence. No verified
+// join proof is carried by this inert DTO: never certify occupied/free slots.
 let private capacityView (project: Project) invalidIdentity (account: Result<Account, string>) =
     match account with
     | Error reason -> Evidence.Unknown ("Account capacity unverified: " + reason)
@@ -331,13 +332,10 @@ let private capacityView (project: Project) invalidIdentity (account: Result<Acc
         | true, _ -> Evidence.Unknown "Multiple project launches claim the same account admission identity"
         | _, Some reason -> Evidence.Unknown("Account/project ledger snapshots inconsistent: " + reason)
         | false, None ->
-            let occupied = state.Tokens |> Map.filter (fun _ released -> not released) |> Map.count
-            Evidence.Known
-                { Limit = state.MaxConcurrentAgents
-                  Occupied = occupied
-                  Free = max 0 (state.MaxConcurrentAgents - occupied)
-                  Overcommitted = occupied > state.MaxConcurrentAgents
-                  Migration = state.Migration }
+            // Matching values and even equal numeric versions cannot prove a
+            // project/account high-water join. This inert DTO carries no
+            // independently verified head pair or CAS read fence.
+            Evidence.Unknown "Account/project cross-ledger heads and high-water join unverified; occupied/free slots unknown"
 
 let private unknownDashboard reason capacity =
     { Next = Evidence.Unknown reason
@@ -497,8 +495,12 @@ let private terminalSafe (value: string) =
     else
         value
         |> Seq.map (fun ch ->
-            if Char.IsControl ch || Char.GetUnicodeCategory ch = Globalization.UnicodeCategory.Format
-            then ' ' else ch)
+            match Char.GetUnicodeCategory ch with
+            | Globalization.UnicodeCategory.Format
+            | Globalization.UnicodeCategory.LineSeparator
+            | Globalization.UnicodeCategory.ParagraphSeparator -> ' '
+            | _ when Char.IsControl ch -> ' '
+            | _ -> ch)
         |> Array.ofSeq
         |> String
 
@@ -554,8 +556,12 @@ let renderPreview (view: Dashboard) =
             [ "Queue health"
               sprintf "  %s v%d graph v%d: %d unfinished, %d projected next, %d blocked, %d cycles"
                   q.ProjectId q.ProjectVersion q.GraphVersion q.Unfinished q.Runnable q.Blocked q.Cycles ]
-    [ "WQ09 TASK-FIRST PREVIEW - READ ONLY; NO CLAIM, POST, DISPATCH OR ACTIVATION" ]
-    @ health @ tasks "Next (blocking-first FIFO)" view.Next
-    @ tasks "Active and stalled" view.ActiveAndStalled
-    @ tasks "Blocked / recovery holds" view.Blocked
-    @ cycles @ threads @ launches @ capacity
+    ([ "WQ09 TASK-FIRST PREVIEW - READ ONLY; NO CLAIM, POST, DISPATCH OR ACTIVATION" ]
+     @ health @ tasks "Next (blocking-first FIFO)" view.Next
+     @ tasks "Active and stalled" view.ActiveAndStalled
+     @ tasks "Blocked / recovery holds" view.Blocked
+     @ cycles @ threads @ launches @ capacity)
+    // Every interpolated field is untrusted: task/role titles, stage and
+    // launch IDs, blockers, errors, message states/replies and bodies.
+    // Sanitize only the terminal output, never the canonical DTOs.
+    |> List.map terminalSafe

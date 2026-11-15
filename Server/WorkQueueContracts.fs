@@ -311,6 +311,13 @@ module Contracts =
             stage.Kind <> WorkKind.Integration || stage.IntegrationAuthorized
         | _ -> false
 
+    // One canonical predicate fences every completion, ancillary handoff,
+    // and FIFO wake inside its graph/project CAS snapshot.
+    let private hardDependenciesSatisfied (project: Project) (stage: WorkStage) =
+        stage.Dependencies
+        |> Set.forall (fun id ->
+            stage.WaivedDependencies.ContainsKey id || isSatisfied project id)
+
     let isUnfinished (stage: WorkStage) =
         stage.State <> WorkState.Completed && stage.State <> WorkState.Cancelled
 
@@ -325,7 +332,7 @@ module Contracts =
     let private ready (project: Project) (stage: WorkStage) =
         stage.State = WorkState.Available
         && stage.Gate = GateState.Clear
-        && (stage.Dependencies |> Set.forall (fun id -> stage.WaivedDependencies.ContainsKey id || isSatisfied project id))
+        && hardDependenciesSatisfied project stage
 
     let orderAvailable (project: Project) =
         completeCoverage project
@@ -497,11 +504,7 @@ module Contracts =
         |> Result.map (fun () ->
             (project, project.Works |> Map.toList |> List.map snd)
             ||> List.fold (fun current stage ->
-                let allSatisfied =
-                    stage.Dependencies
-                    |> Set.forall (fun prerequisite ->
-                        stage.WaivedDependencies.ContainsKey prerequisite
-                        || isSatisfied current prerequisite)
+                let allSatisfied = hardDependenciesSatisfied current stage
                 if stage.State = WorkState.Blocked
                    && stage.Gate = GateState.Clear
                    && not stage.Dependencies.IsEmpty
@@ -771,6 +774,8 @@ module Contracts =
 
     // An ancillary message lease cannot survive its unrelated primary activation.
     // Release/requeue all unfinished handler responsibilities in the same terminal Git CAS.
+    // An unresolved hard edge becomes an ordinary dependency-Blocked Role stage,
+    // never Available with an unowned DependencyGatePending.
     let private releaseAncillaryOnTerminal now (launch: Launch) (current: Project) =
         let mutable state = current
         let mutable failure = None
@@ -783,16 +788,31 @@ module Contracts =
                     | None -> ()
                     | Some workId ->
                         match state.Works.TryFind workId with
-                        | Some work when work.State = WorkState.Claimed launch.Id ->
-                            let nextSequence = state.NextAvailability + 1L
-                            let released =
-                                { work with State = WorkState.Available
-                                            ClaimGeneration = work.ClaimGeneration + 1
-                                            AvailableSequence = nextSequence
-                                            AvailableAt = now }
-                            state <- { state with
-                                        Works = state.Works.Add(workId, released)
-                                        NextAvailability = nextSequence }
+                        | Some work when work.State = WorkState.Claimed launch.Id
+                                         && work.Kind = WorkKind.RoleMessage messageId ->
+                            match work.Gate with
+                            | GateState.Clear
+                            | GateState.DependencyGatePending _ when work.SourceLineage.IsNone
+                                                                 && work.Push.IsNone
+                                                                 && work.Domain = DomainState.Undecided ->
+                                // This pure Role-message handler cannot have a
+                                // source/effect to reconcile. Invalidate its old
+                                // claim before publishing any new handler credit.
+                                let satisfied = hardDependenciesSatisfied state work
+                                let nextSequence =
+                                    if satisfied then state.NextAvailability + 1L
+                                    else state.NextAvailability
+                                let released =
+                                    { work with
+                                        State = if satisfied then WorkState.Available else WorkState.Blocked
+                                        Gate = GateState.Clear
+                                        ClaimGeneration = work.ClaimGeneration + 1
+                                        AvailableSequence = if satisfied then nextSequence else work.AvailableSequence
+                                        AvailableAt = if satisfied then now else work.AvailableAt }
+                                state <- { state with
+                                            Works = state.Works.Add(workId, released)
+                                            NextAvailability = nextSequence }
+                            | _ -> failure <- Some Rejection.UnsafeExternalEffect
                         | _ -> failure <- Some(Rejection.InvalidState "unreconciled ancillary Role-message claim")
                 | _ -> failure <- Some(Rejection.InvalidState "unreconciled ancillary message handler")
         match failure with
@@ -823,8 +843,7 @@ module Contracts =
             finishClaim op launchId workId now (fun stage ->
                 match stage.Kind, stage.Gate, stage.Domain with
                 | WorkKind.RoleMessage _, _, _ -> Error(Rejection.InvalidState "dedicated message needs atomic completion")
-                | _, GateState.Clear, _ when not (stage.Dependencies |> Set.forall (fun id ->
-                    stage.WaivedDependencies.ContainsKey id || isSatisfied current id)) ->
+                | _, GateState.Clear, _ when not (hardDependenciesSatisfied current stage) ->
                     Error Rejection.DependencyGatePending
                 | WorkKind.FrozenReview, GateState.Clear, DomainState.Undecided
                 | WorkKind.Integration, GateState.Clear, DomainState.Undecided ->
@@ -840,7 +859,9 @@ module Contracts =
             match current.Messages.TryFind messageId with
             | Some message when message.WorkId = Some workId && message.State = MessageState.ClaimedPrimary launchId ->
                 finishClaim op launchId workId now (fun stage ->
-                    if stage.Kind = WorkKind.RoleMessage messageId && stage.Gate = GateState.Clear then
+                    if stage.Kind = WorkKind.RoleMessage messageId
+                       && stage.Gate = GateState.Clear
+                       && hardDependenciesSatisfied current stage then
                         Ok { stage with State = WorkState.Completed }
                     else Error(Rejection.InvalidState "not the one claimed primary message")) current
                 |> Result.map (fun next ->
@@ -900,20 +921,30 @@ module Contracts =
             match current.Launches.TryFind launchId, current.Messages.TryFind messageId with
             | Some launch, Some message when launch.AncillaryMessages.Contains messageId
                                              && message.State = MessageState.ClaimedAncillary launchId ->
-                let updatedLaunch = { launch with AncillaryMessages = launch.AncillaryMessages.Remove messageId }
-                let updated =
-                    { current with
-                        Launches = current.Launches.Add(launchId, updatedLaunch)
-                        Messages = current.Messages.Add(messageId, { message with State = MessageState.Handled replyId }) }
+                let markHandled (next: Project) =
+                    let updatedLaunch = { launch with AncillaryMessages = launch.AncillaryMessages.Remove messageId }
+                    { next with
+                        Launches = next.Launches.Add(launchId, updatedLaunch)
+                        Messages = next.Messages.Add(messageId, { message with State = MessageState.Handled replyId }) }
                 match message.WorkId with
-                | None -> Ok updated
+                | None -> Ok(markHandled current)
                 | Some workId ->
-                    let work = updated.Works.[workId]
-                    if work.State <> WorkState.Claimed launchId then
-                        Error(Rejection.InvalidState "ancillary work lost its handler claim")
-                    else
-                        { updated with Works = updated.Works.Add(workId, { work with State = WorkState.Completed }) }
-                        |> projectDependenciesChanged now
+                    match current.Works.TryFind workId with
+                    | Some work when work.State = WorkState.Claimed launchId
+                                     && work.Kind = WorkKind.RoleMessage messageId ->
+                        // The graph edit and completion compete at Project.Version.
+                        // Once a new hard edge wins, both reply and downstream
+                        // publication must remain fenced by its dependency gate.
+                        if work.Gate <> GateState.Clear || not (hardDependenciesSatisfied current work) then
+                            Error Rejection.DependencyGatePending
+                        elif work.SourceLineage.IsSome || work.Push.IsSome
+                             || work.Domain <> DomainState.Undecided then
+                            Error Rejection.UnsafeExternalEffect
+                        else
+                            { current with Works = current.Works.Add(workId, { work with State = WorkState.Completed }) }
+                            |> markHandled
+                            |> projectDependenciesChanged now
+                    | _ -> Error(Rejection.InvalidState "ancillary work lost its handler claim")
             | _ -> Error(Rejection.InvalidState "no live ancillary message handler")) project
 
     let startOriginalPush expected op launchId workId pushOperation acceptedSourceSha targetRef project =

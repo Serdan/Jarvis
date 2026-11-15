@@ -1033,3 +1033,148 @@ let wq01_role_message_initially_blocked_by_hard_edge_wakes_on_same_edge_completi
     Assert.That(woken.Works.["role-msg:M"].State, Is.EqualTo(WorkState.Available))
     Assert.That(woken.Works.["role-msg:M"].AvailableAt, Is.EqualTo(4000L))
     Assert.That(woken.Messages.["M"].State, Is.EqualTo(MessageState.Pending))
+
+
+// Review #3: ancillary Role-message claims must obey the same hard-edge
+// graph CAS as primary work, and must recover without orphaning a gate.
+let private wq01ClaimedAncillaryWithNewHardEdge () =
+    let initial =
+        empty ()
+        |> fun p -> publish p (stage "Plan" WorkKind.Planning "planning" 1L [] WorkState.Available)
+        |> fun p -> publishRoleMessage p "M" 2L
+        |> fun p -> publish p (implementation "B" 3L [])
+        |> fun p -> admit p "L" "Lead"
+        |> fun p -> submit p "L"
+        |> fun p -> initialize p "L"
+        |> fun p -> claim p "L"
+    Assert.That(initial.Launches.["L"].PrimaryWorkId, Is.EqualTo(Some "Plan"))
+    let dependent = publish initial (implementation "D" 4L ["role-msg:M"])
+    Assert.That(dependent.Works.["D"].State, Is.EqualTo(WorkState.Blocked))
+    let ancillary = claimAncillaryMessage dependent.Version "take-ancillary-M" "L" "M" dependent |> success
+    Assert.That(ancillary.Messages.["M"].State, Is.EqualTo(MessageState.ClaimedAncillary "L"))
+    let gated =
+        setHardPrerequisite ancillary.Version "new-hard-edge:W-B" "role-msg:M" "B" 5000L ancillary
+        |> success
+    Assert.That(gated.Works.["role-msg:M"].Gate,
+                Is.EqualTo(GateState.DependencyGatePending gated.GraphVersion))
+    ancillary, gated
+
+[<Test>]
+let wq01_ancillary_hard_edge_wins_before_reply_and_stale_clone_cannot_publish () =
+    let before, gated = wq01ClaimedAncillaryWithNewHardEdge ()
+    rejected Rejection.DependencyGatePending
+        (completeAncillaryMessage gated.Version "ack-after-edge" "L" "M" "reply" 6000L gated)
+    rejected Rejection.CasConflict
+        (completeAncillaryMessage before.Version "stale-clone-ack" "L" "M" "reply" 6000L gated)
+    Assert.That(gated.Works.["role-msg:M"].State, Is.EqualTo(WorkState.Claimed "L"))
+    Assert.That(gated.Messages.["M"].State, Is.EqualTo(MessageState.ClaimedAncillary "L"))
+    Assert.That(gated.Works.["D"].State, Is.EqualTo(WorkState.Blocked))
+    // The opposite CAS winner may finish the message, but a late hard-edge
+    // operation must not resurrect or mutate its already-terminal generation.
+    let completed =
+        completeAncillaryMessage before.Version "ack-before-edge" "L" "M" "reply" 6000L before
+        |> success
+    Assert.That(completed.Works.["role-msg:M"].State, Is.EqualTo(WorkState.Completed))
+    Assert.That(completed.Messages.["M"].State, Is.EqualTo(MessageState.Handled "reply"))
+    Assert.That(completed.Works.["D"].State, Is.EqualTo(WorkState.Available))
+    rejected Rejection.CasConflict
+        (setHardPrerequisite before.Version "stale-edge" "role-msg:M" "B" 7000L completed)
+    rejected Rejection.StageAlreadyTerminal
+        (setHardPrerequisite completed.Version "too-late-edge" "role-msg:M" "B" 7000L completed)
+    let replay =
+        completeAncillaryMessage before.Version "ack-before-edge" "L" "M" "reply" 6000L completed
+        |> success
+    Assert.That(replay, Is.EqualTo(completed))
+    rejected Rejection.OperationIdReused
+        (completeAncillaryMessage completed.Version "ack-before-edge" "L" "M" "different-reply" 6000L completed)
+
+[<Test>]
+let wq01_gated_ancillary_terminal_blocks_then_wakes_once_on_real_dependency_completion () =
+    let before, gated = wq01ClaimedAncillaryWithNewHardEdge ()
+    let original = gated.Works.["role-msg:M"]
+    let terminal = completeOrdinary gated.Version "finish-primary" "L" "Plan" 10000L gated |> success
+    let blocked = terminal.Works.["role-msg:M"]
+    Assert.That(blocked.State, Is.EqualTo(WorkState.Blocked))
+    Assert.That(blocked.Gate, Is.EqualTo(GateState.Clear))
+    Assert.That(blocked.ClaimGeneration, Is.EqualTo(original.ClaimGeneration + 1))
+    Assert.That(blocked.AvailableSequence, Is.EqualTo(original.AvailableSequence))
+    Assert.That(terminal.Messages.["M"].State, Is.EqualTo(MessageState.Pending))
+    Assert.That(terminal.Launches.["L"].AncillaryMessages, Is.Empty)
+    Assert.That(terminal.Launches.["L"].State,
+                Is.EqualTo(LaunchState.TerminalPendingRelease "terminal:finish-primary"))
+    Assert.That(terminal.Works.["D"].State, Is.EqualTo(WorkState.Blocked))
+    Assert.That(orderAvailable terminal |> success |> List.exists (fun w -> w.Id = "role-msg:M"), Is.False)
+    let claimedB =
+        terminal |> fun p -> admit p "WorkerB" "Worker"
+                 |> fun p -> submit p "WorkerB"
+                 |> fun p -> initialize p "WorkerB"
+                 |> fun p -> claim p "WorkerB"
+    Assert.That(claimedB.Launches.["WorkerB"].PrimaryWorkId, Is.EqualTo(Some "B"))
+    let woken = completeOrdinary claimedB.Version "finish-B" "WorkerB" "B" 12000L claimedB |> success
+    let revived = woken.Works.["role-msg:M"]
+    Assert.That(revived.State, Is.EqualTo(WorkState.Available))
+    Assert.That(revived.Gate, Is.EqualTo(GateState.Clear))
+    Assert.That(revived.AvailableAt, Is.EqualTo(12000L))
+    Assert.That(revived.AvailableSequence, Is.GreaterThan(original.AvailableSequence))
+    Assert.That(revived.AvailableSequence, Is.EqualTo(woken.NextAvailability))
+    Assert.That(woken.Works.["D"].State, Is.EqualTo(WorkState.Blocked))
+    let replay = completeOrdinary claimedB.Version "finish-B" "WorkerB" "B" 12000L woken |> success
+    Assert.That(replay, Is.EqualTo(woken))
+    rejected Rejection.CasConflict
+        (completeOrdinary claimedB.Version "stale-finish-B" "WorkerB" "B" 12000L woken)
+    let next =
+        woken |> fun p -> admit p "NextLead" "Lead"
+              |> fun p -> submit p "NextLead"
+              |> fun p -> initialize p "NextLead"
+              |> fun p -> claim p "NextLead"
+    Assert.That(next.Launches.["NextLead"].PrimaryWorkId, Is.EqualTo(Some "role-msg:M"))
+    let answered =
+        completeMessageWork next.Version "answer-requeued" "NextLead" "role-msg:M" "M" "answer" 14000L next
+        |> success
+    Assert.That(answered.Messages.["M"].State, Is.EqualTo(MessageState.Handled "answer"))
+    Assert.That(answered.Works.["D"].State, Is.EqualTo(WorkState.Available))
+
+[<Test>]
+let wq01_ancillary_gate_waiver_and_terminal_edge_race_preserve_launch_credits () =
+    let before, gated = wq01ClaimedAncillaryWithNewHardEdge ()
+    let withSecondPlan =
+        gated
+        |> fun p -> publish p (stage "OtherPlan" WorkKind.Planning "planning" 5L [] WorkState.Available)
+        |> fun p -> admit p "OtherLead" "Lead"
+    Assert.That(withSecondPlan.Launches.["OtherLead"].Credit, Is.EqualTo(Some "OtherPlan"))
+    let terminal = completeOrdinary withSecondPlan.Version "primary-term-waiver" "L" "Plan" 10000L withSecondPlan |> success
+    Assert.That(terminal.Works.["role-msg:M"].State, Is.EqualTo(WorkState.Blocked))
+    Assert.That(terminal.Launches.["OtherLead"].Credit, Is.EqualTo(Some "OtherPlan"))
+    rejected Rejection.MissingProof
+        (waiveHardPrerequisite terminal.Version "unverified-waiver" "role-msg:M" "B"
+            { waiver "role-msg:M" ["B"] with CanonicallyVerified = false } 11000L terminal)
+    let woken =
+        waiveHardPrerequisite terminal.Version "approved-waiver" "role-msg:M" "B"
+            (waiver "role-msg:M" ["B"]) 15000L terminal |> success
+    Assert.That(woken.Works.["role-msg:M"].State, Is.EqualTo(WorkState.Available))
+    Assert.That(woken.Works.["role-msg:M"].Gate, Is.EqualTo(GateState.Clear))
+    Assert.That(woken.Works.["role-msg:M"].AvailableAt, Is.EqualTo(15000L))
+    Assert.That(woken.Launches.["OtherLead"].Credit, Is.EqualTo(Some "role-msg:M"))
+    Assert.That(woken.Works.["D"].State, Is.EqualTo(WorkState.Blocked))
+    let replay = waiveHardPrerequisite terminal.Version "approved-waiver" "role-msg:M" "B"
+                     (waiver "role-msg:M" ["B"]) 15000L woken |> success
+    Assert.That(replay, Is.EqualTo(woken))
+    let resumed = woken |> fun p -> submit p "OtherLead" |> fun p -> initialize p "OtherLead" |> fun p -> claim p "OtherLead"
+    Assert.That(resumed.Launches.["OtherLead"].PrimaryWorkId, Is.EqualTo(Some "role-msg:M"))
+    let completed = completeMessageWork resumed.Version "answered-after-waiver" "OtherLead" "role-msg:M" "M" "reply" 16000L resumed |> success
+    Assert.That(completed.Works.["D"].State, Is.EqualTo(WorkState.Available))
+    // Primary terminal winning before the edge is equally safe: the newly
+    // available work becomes ordinarily Blocked when the later edge wins.
+    let terminalFirst = completeOrdinary before.Version "primary-before-edge" "L" "Plan" 10000L before |> success
+    rejected Rejection.CasConflict
+        (setHardPrerequisite before.Version "stale-after-terminal" "role-msg:M" "B" 11000L terminalFirst)
+    let edgeAfter = setHardPrerequisite terminalFirst.Version "edge-after-terminal" "role-msg:M" "B" 11000L terminalFirst |> success
+    Assert.That(edgeAfter.Works.["role-msg:M"].State, Is.EqualTo(WorkState.Blocked))
+    Assert.That(edgeAfter.Works.["role-msg:M"].Gate, Is.EqualTo(GateState.Clear))
+    Assert.That(edgeAfter.Messages.["M"].State, Is.EqualTo(MessageState.Pending))
+    // A Role stage with invented external source state cannot be terminally
+    // released by this side-effect-free contract without reconciliation.
+    let fakeSource = { gated.Works.["role-msg:M"] with SourceLineage = Some sourceLineage }
+    let unsafe = { gated with Works = gated.Works.Add("role-msg:M", fakeSource) }
+    rejected Rejection.UnsafeExternalEffect
+        (completeOrdinary unsafe.Version "unsafe-source-terminal" "L" "Plan" 12000L unsafe)

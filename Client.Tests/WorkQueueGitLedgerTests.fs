@@ -105,6 +105,76 @@ type WorkQueueGitLedgerTests() =
               HandlerGeneration = 0; WorkId = None }
         message, work
 
+    let startSourceClaim (a: LedgerBinding) (b: LedgerBinding) =
+        let mutate client now mutation =
+            let _, state = WorkQueueGitLedger.load client |> success
+            WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) state.Version now mutation
+            |> success |> ignore
+        let projectId = a.ProjectId.ToString("D")
+        let pinnedBase = git a.RepositoryPath [ "rev-parse"; "HEAD" ]
+        let lineage : SourceLineage =
+            { RepositoryId = WorkQueueGitLedger.sourceRepositoryId a
+              TaskId = "task-I"
+              TargetRef = "refs/heads/main"
+              LineageId = "primary"
+              PinnedBaseCommit = pinnedBase
+              ReachableRef = None
+              ContinuationSha = None
+              Generation = 1 }
+        let implementation =
+            { plan projectId "I" [] with
+                Kind = WorkKind.Implementation
+                QueueId = "implementation"
+                SourceLineage = Some lineage }
+        WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid())
+            (Map.ofList [ "Worker", set [ "implementation" ] ])
+        |> success |> ignore
+        mutate a 1000L (PublishStage implementation)
+        mutate b 1000L
+            (PostMessage
+                ({ Id = "source-thread-note"; Subject = Subject.Task "task-I"
+                   Body = "Original task thread survives source generation handoff"
+                   State = MessageState.Pending; HandlerGeneration = 0; WorkId = None }, None))
+        mutate b 1001L (AdmitProject (launch projectId "L1" "Worker"))
+        mutate a 1002L (DispatchOnce ("L1", DispatchState.Submitted))
+        mutate b 1003L (InitializeAgent ("L1", "session-one"))
+        mutate a 1004L (ClaimNext "L1")
+        let _, claimed = WorkQueueGitLedger.load b |> success
+        let uuid =
+            match claimed.Launches.["L1"].State with
+            | LaunchState.Registered (id, _) -> id
+            | other -> failwithf "Expected source owner registration, found %A" other
+        implementation, lineage, uuid, claimed
+
+    let commitSourceWip (a: LedgerBinding) workId launchId generation =
+        File.WriteAllText(Path.Combine(a.RepositoryPath, "source.txt"), "portable handoff " + Guid.NewGuid().ToString("D"))
+        git a.RepositoryPath [ "add"; "source.txt" ] |> ignore
+        git a.RepositoryPath
+            [ "-c"; "user.name=Fixture"; "-c"; "user.email=fixture@example.test"
+              "commit"; "-m"; "isolated source WIP" ] |> ignore
+        let sha = git a.RepositoryPath [ "rev-parse"; "HEAD" ]
+        let remoteRef = sprintf "refs/heads/jarvis-wip/%s/%s-g%d" workId launchId generation
+        sha, remoteRef
+
+    let checkpointSource (lineage: SourceLineage) uuid (claimed: Project) sha remoteRef =
+        let work = claimed.Works.["I"]
+        { WorkId = "I"
+          LaunchId = "L1"
+          AgentUuid = uuid
+          RepositoryId = lineage.RepositoryId
+          TaskId = lineage.TaskId
+          TargetRef = lineage.TargetRef
+          LineageId = lineage.LineageId
+          PinnedBaseCommit = lineage.PinnedBaseCommit
+          StageGeneration = work.StageGeneration
+          ClaimGeneration = work.ClaimGeneration
+          LineageGeneration = lineage.Generation
+          ContinuationRef = remoteRef
+          ContinuationSha = sha
+          Summary = "Completed source slice and committed all tracked and untracked work"
+          NextAction = "Resume task from immutable WIP and run Release tests"
+          TestEvidence = "NUnit deterministic two-clone WQ03 fixture" }
+
 
     [<Test>]
     member _.CrossCloneStaleWriterAndOriginalReplayReceipt() =
@@ -938,3 +1008,140 @@ type WorkQueueGitLedgerTests() =
             Assert.That(recovered.Launches.["L"].PrimaryWorkId, Is.EqualTo(Some roleWork.Id))
             Assert.That(recovered.Works.[roleWork.Id].State, Is.EqualTo(WorkState.Claimed "L"))
             Assert.That(recovered.Receipts.Count, Is.EqualTo(recovered.Version)))
+
+    [<Test>]
+    member _.SourceYieldPublishesExactPortableCheckpointAndSuccessorFencesOldWriter() =
+        withClones (fun a b ->
+            let implementation, lineage, uuid, claimed = startSourceClaim a b
+            let expectedVersion = claimed.Version
+            // A second task publication cannot create a concurrent writer
+            // for the same repository/task/target-ref/lineage.
+            let duplicate =
+                { implementation with
+                    Id = "duplicate-I"
+                    SubjectId = "task-I-duplicate"
+                    StageGeneration = 2 }
+            match WorkQueueGitLedger.executeAt b "Worker" (Guid.NewGuid()) expectedVersion 1005L
+                    (PublishStage duplicate) with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Concurrent source writer accepted: %A" other)
+            let forgedLineage =
+                { lineage with
+                    ReachableRef = Some "refs/heads/main"
+                    ContinuationSha = Some lineage.PinnedBaseCommit }
+            let forgedContinuation =
+                { implementation with Id = "forged-I"; SourceLineage = Some forgedLineage }
+            match WorkQueueGitLedger.executeAt b "Worker" (Guid.NewGuid()) expectedVersion 1005L
+                    (PublishStage forgedContinuation) with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Unreviewed initial lineage tip accepted: %A" other)
+            let sha, remoteRef = commitSourceWip a "I" "L1" claimed.Works.["I"].ClaimGeneration
+            git a.RepositoryPath [ "push"; "origin"; "HEAD:" + remoteRef ] |> ignore
+            let proof = checkpointSource lineage uuid claimed sha remoteRef
+            let operationId = Guid.NewGuid()
+            let first =
+                WorkQueueGitLedger.executeAt a "Worker" operationId expectedVersion 1006L
+                    (YieldSource proof)
+                |> success
+            Assert.That(first.AlreadyApplied, Is.False)
+            let _, handed = WorkQueueGitLedger.load b |> success
+            Assert.That(handed.Works.["I"].State, Is.EqualTo(WorkState.Available))
+            Assert.That(handed.Works.["I"].ClaimGeneration, Is.EqualTo(proof.ClaimGeneration + 1))
+            Assert.That(handed.Works.["I"].SourceLineage.Value.ContinuationSha, Is.EqualTo(Some sha))
+            Assert.That(handed.Works.["I"].SourceLineage.Value.ReachableRef, Is.EqualTo(Some remoteRef))
+            Assert.That(handed.Works.["I"].SourceLineage.Value.Generation, Is.EqualTo(2))
+            Assert.That(handed.Works.["I"].AvailableSequence, Is.GreaterThan(claimed.Works.["I"].AvailableSequence))
+            match handed.Launches.["L1"].State with
+            | LaunchState.TerminalPendingRelease _ -> ()
+            | other -> Assert.Fail(sprintf "Previous source launch remained live: %A" other)
+            Assert.That(handed.Receipts.[operationId.ToString("D")], Is.EqualTo(ProjectOperationPayload.SourceHandoff proof))
+            Assert.That(WorkQueueGitLedger.latestSourceHandoff handed "I", Is.EqualTo(Some proof))
+            // Clone B still has the original source HEAD. A lost ledger reply
+            // must replay the canonical original result, not demand a local
+            // WIP checkout or assign another FIFO position.
+            let replay =
+                WorkQueueGitLedger.executeAt b "Worker" operationId expectedVersion 1007L
+                    (YieldSource proof)
+                |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That(replay.Operation, Is.EqualTo(first.Operation))
+            let _, identical = WorkQueueGitLedger.load a |> success
+            Assert.That(identical, Is.EqualTo(handed))
+            match WorkQueueGitLedger.executeAt b "Worker" (Guid.NewGuid()) identical.Version 1008L
+                    (YieldSource { proof with Summary = "late altered source proof" }) with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Stale claim generation changed handoff: %A" other)
+            let mutate client now mutation =
+                let _, state = WorkQueueGitLedger.load client |> success
+                WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) state.Version now mutation
+                |> success |> ignore
+            let projectId = a.ProjectId.ToString("D")
+            mutate b 1009L (AdmitProject (launch projectId "L2" "Worker"))
+            mutate a 1010L (DispatchOnce ("L2", DispatchState.Submitted))
+            mutate b 1011L (InitializeAgent ("L2", "session-two"))
+            // If the remote WIP ref is externally rewritten after handoff,
+            // the next claim must fail closed without consuming this launch.
+            git a.RepositoryPath
+                [ "push"; "--force"; "origin"; lineage.PinnedBaseCommit + ":" + remoteRef ] |> ignore
+            let _, beforeWrongTip = WorkQueueGitLedger.load a |> success
+            match WorkQueueGitLedger.executeAt b "Worker" (Guid.NewGuid()) beforeWrongTip.Version
+                    1012L (ClaimNext "L2") with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Remote WIP ref drift allowed successor claim: %A" other)
+            let _, stillUnclaimed = WorkQueueGitLedger.load a |> success
+            Assert.That(stillUnclaimed.Version, Is.EqualTo(beforeWrongTip.Version))
+            Assert.That(stillUnclaimed.Works.["I"].State, Is.EqualTo(WorkState.Available))
+            git a.RepositoryPath [ "push"; "--force"; "origin"; sha + ":" + remoteRef ] |> ignore
+            mutate b 1012L (ClaimNext "L2")
+            let _, resumed = WorkQueueGitLedger.load a |> success
+            Assert.That(resumed.Works.["I"].State, Is.EqualTo(WorkState.Claimed "L2"))
+            Assert.That(resumed.Works.["I"].ClaimGeneration, Is.EqualTo(proof.ClaimGeneration + 2))
+            let successorUuid =
+                match resumed.Launches.["L2"].State with
+                | LaunchState.Registered (id, _) -> id
+                | other -> failwithf "Wrong successor launch: %A" other
+            Assert.That(successorUuid, Is.Not.EqualTo(uuid))
+            Assert.That(resumed.Works.["I"].SourceLineage.Value.ContinuationSha, Is.EqualTo(Some sha))
+            Assert.That(resumed.Messages.["source-thread-note"].Body,
+                        Is.EqualTo("Original task thread survives source generation handoff"))
+            match WorkQueueGitLedger.executeAt a "Worker" (Guid.NewGuid()) resumed.Version 1013L
+                    (YieldSource proof) with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Old session re-used a fenced claim: %A" other))
+
+    [<Test>]
+    member _.MissingRemoteWipDirtyCheckoutAndUnknownJobRemainClaimedRecoveryBlocked() =
+        withClones (fun a b ->
+            let _, lineage, uuid, claimed = startSourceClaim a b
+            let sha, remoteRef = commitSourceWip a "I" "L1" claimed.Works.["I"].ClaimGeneration
+            let proof = checkpointSource lineage uuid claimed sha remoteRef
+            let originalVersion = claimed.Version
+            let rejected client mutation =
+                let _, before = WorkQueueGitLedger.load client |> success
+                match WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) before.Version
+                        2000L mutation with
+                | Error(InvalidBinding _) -> ()
+                | other -> Assert.Fail(sprintf "Unsafe source handoff published: %A" other)
+                let _, unchanged = WorkQueueGitLedger.load b |> success
+                Assert.That(unchanged.Version, Is.EqualTo(before.Version))
+                Assert.That(unchanged.Works.["I"].State, Is.EqualTo(WorkState.Claimed "L1"))
+            // Commit is local, not yet on the approved source remote.
+            rejected a (YieldSource proof)
+            git a.RepositoryPath [ "push"; "origin"; "HEAD:" + remoteRef ] |> ignore
+            File.WriteAllText(Path.Combine(a.RepositoryPath, "forgotten-untracked.txt"), "dirty source")
+            rejected a (YieldSource proof)
+            File.Delete(Path.Combine(a.RepositoryPath, "forgotten-untracked.txt"))
+            // A conservative journal or unknown push outcome requires an
+            // explicit durable RecoveryBlocked record before any requeue.
+            WorkQueueGitLedger.executeAt b "Worker" (Guid.NewGuid()) originalVersion 2001L
+                (MarkSourceRecoveryBlocked ("L1", "I", proof.ClaimGeneration, "mutating job not reconciled"))
+            |> success |> ignore
+            let _, blocked = WorkQueueGitLedger.load a |> success
+            Assert.That(blocked.Works.["I"].Gate,
+                        Is.EqualTo(GateState.SourceRecoveryBlocked "mutating job not reconciled"))
+            Assert.That(blocked.Works.["I"].State, Is.EqualTo(WorkState.Claimed "L1"))
+            Assert.That(blocked.Works.["I"].ClaimGeneration, Is.EqualTo(proof.ClaimGeneration))
+            match blocked.Launches.["L1"].State with
+            | LaunchState.Registered _ -> ()
+            | other -> Assert.Fail(sprintf "Uncertain source released its token: %A" other)
+            rejected b (YieldSource proof))

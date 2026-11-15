@@ -33,6 +33,9 @@ type GateState =
     | DependencyGatePending of graphVersion: int
     | IntegrationGateHold of graphVersion: int * pushOperationId: string
     | ExternalEffectObservedPendingGate of graphVersion: int * pushOperationId: string * remoteCommit: string
+    // Unresolved source effects retain their original claim and capacity token.
+    // Clearing this hold requires a separate audited recovery transition.
+    | SourceRecoveryBlocked of reason: string
 
 [<RequireQualifiedAccess>]
 type PushOutcome =
@@ -105,6 +108,26 @@ type SourceLineage =
       ReachableRef: string option
       ContinuationSha: string option
       Generation: int }
+
+// Portable immutable context: the adapter independently verifies this exact
+// ref/SHA on the approved remote before it may enter the project Git ledger.
+type SourceCheckpoint =
+    { WorkId: string
+      LaunchId: string
+      AgentUuid: string
+      RepositoryId: string
+      TaskId: string
+      TargetRef: string
+      LineageId: string
+      PinnedBaseCommit: string
+      StageGeneration: int
+      ClaimGeneration: int
+      LineageGeneration: int
+      ContinuationRef: string
+      ContinuationSha: string
+      Summary: string
+      NextAction: string
+      TestEvidence: string }
 
 type WorkStage =
     { Id: string
@@ -186,6 +209,7 @@ type ProjectOperationPayload =
     | PublishStage of WorkStage
     | PostMessage of SubjectMessage * WorkStage option
     | AdmitProject of Launch
+    | SourceHandoff of SourceCheckpoint
     | OtherMutation of string
 
 type Project =
@@ -1426,6 +1450,106 @@ module Contracts =
                 | _ -> Error Rejection.MissingProof
             | Some _, Some true -> Ok current
             | _ -> Error Rejection.MissingProof) account
+
+    // WQ-03: A source writer can leave its claim only with an immutable
+    // generation-bound checkpoint. The caller is the Git adapter, which must
+    // have independently verified the remote WIP ref/SHA, clean worktree and
+    // absence of unresolved mutating side effects before this project CAS.
+    let yieldSource expected op (checkpoint: SourceCheckpoint) now project =
+        projectCasTyped expected op (ProjectOperationPayload.SourceHandoff checkpoint)
+            (fun current ->
+                match current.Launches.TryFind checkpoint.LaunchId,
+                      current.Works.TryFind checkpoint.WorkId with
+                | Some launch, Some work
+                    when launch.PrimaryWorkId = Some checkpoint.WorkId
+                         && work.Kind = WorkKind.Implementation
+                         && work.State = WorkState.Claimed checkpoint.LaunchId
+                         && work.ClaimGeneration = checkpoint.ClaimGeneration
+                         && work.StageGeneration = checkpoint.StageGeneration ->
+                    match launch.State, work.SourceLineage with
+                    | LaunchState.Registered (agentUuid, _), Some lineage
+                        when agentUuid = checkpoint.AgentUuid
+                             && work.Gate = GateState.Clear
+                             && work.Domain = DomainState.Undecided
+                             && work.Push.IsNone
+                             && not work.IntegrationAuthorized
+                             && hardDependenciesSatisfied current work
+                             && checkpoint.RepositoryId = lineage.RepositoryId
+                             && checkpoint.TaskId = lineage.TaskId
+                             && checkpoint.TargetRef = lineage.TargetRef
+                             && checkpoint.LineageId = lineage.LineageId
+                             && checkpoint.PinnedBaseCommit = lineage.PinnedBaseCommit
+                             && checkpoint.LineageGeneration = lineage.Generation
+                             && not (String.IsNullOrWhiteSpace checkpoint.Summary)
+                             && not (String.IsNullOrWhiteSpace checkpoint.NextAction)
+                             && not (String.IsNullOrWhiteSpace checkpoint.TestEvidence)
+                             && not (String.IsNullOrWhiteSpace checkpoint.ContinuationSha)
+                             && not (String.IsNullOrWhiteSpace checkpoint.ContinuationRef) ->
+                        let alreadyCheckpointed =
+                            current.Receipts
+                            |> Map.exists (fun _ payload ->
+                                match payload with
+                                | ProjectOperationPayload.SourceHandoff previous ->
+                                    previous.WorkId = checkpoint.WorkId
+                                    && previous.ClaimGeneration = checkpoint.ClaimGeneration
+                                | _ -> false)
+                        if alreadyCheckpointed then
+                            Error(Rejection.InvalidState "claim generation already has an immutable source checkpoint")
+                        else
+                            releaseAncillaryOnTerminal now launch current
+                            |> Result.bind (fun released ->
+                                let fifo = released.NextAvailability + 1L
+                                let source =
+                                    { lineage with
+                                        ReachableRef = Some checkpoint.ContinuationRef
+                                        ContinuationSha = Some checkpoint.ContinuationSha
+                                        Generation = lineage.Generation + 1 }
+                                let ready =
+                                    { work with
+                                        SourceLineage = Some source
+                                        State = WorkState.Available
+                                        ClaimGeneration = work.ClaimGeneration + 1
+                                        AvailableAt = now
+                                        AvailableSequence = fifo }
+                                let terminal =
+                                    { launch with
+                                        State = LaunchState.TerminalPendingRelease("source-yield:" + op)
+                                        Credit = None
+                                        AncillaryMessages = Set.empty
+                                        Version = launch.Version + 1 }
+                                { released with
+                                    Works = released.Works.Add(work.Id, ready)
+                                    Launches = released.Launches.Add(launch.Id, terminal)
+                                    NextAvailability = fifo }
+                                |> reconcileCredits)
+                    | _ -> Error Rejection.UnsafeExternalEffect
+                | _ -> Error(Rejection.InvalidState "stale source claim/launch generation"))
+            project
+
+    // An unresolved job, dirty source checkout or unknown push is never a
+    // normal YieldSource. Persist the hold without releasing the original
+    // primary claim/launch/token; only a separate audited recovery can clear it.
+    let markSourceRecoveryBlocked expected op launchId workId expectedClaimGeneration reason project =
+        projectCas expected op
+            (fullInput "source-recovery-blocked" (launchId, workId, expectedClaimGeneration, reason))
+            (fun current ->
+                match current.Launches.TryFind launchId, current.Works.TryFind workId with
+                | Some launch, Some work
+                    when launch.PrimaryWorkId = Some workId
+                         && work.Kind = WorkKind.Implementation
+                         && work.State = WorkState.Claimed launchId
+                         && work.ClaimGeneration = expectedClaimGeneration
+                         && work.SourceLineage.IsSome
+                         && (match launch.State with LaunchState.Registered _ -> true | _ -> false)
+                         && (work.Gate = GateState.Clear
+                             || match work.Gate with GateState.DependencyGatePending _ -> true | _ -> false)
+                         && not (String.IsNullOrWhiteSpace reason)
+                         && reason.Length <= 4096 ->
+                    Ok { current with
+                            Works = current.Works.Add(workId,
+                                { work with Gate = GateState.SourceRecoveryBlocked reason }) }
+                | _ -> Error(Rejection.InvalidState "stale or non-source recovery claim"))
+            project
 
     // WQ-02: A read-only, still-claimed work generation can yield and requeue
     // once, with fresh FIFO keys, an exact terminal project receipt, and an

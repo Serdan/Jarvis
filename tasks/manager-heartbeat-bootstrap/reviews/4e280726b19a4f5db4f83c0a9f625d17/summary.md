@@ -1,3 +1,17 @@
+# Independent Reviewer 2 re-review
+
+**Verdict: ChangesRequested** for frozen commit `062dd4a5e3dbfc9e47a49c851e279ec256f1629f`.
+
+Independently inspected the 404-line planner, regression fixtures, tracked disabled config and Manager runbook. Executed `node --test scripts/tests/manager-heartbeat.test.mjs` in the pinned worktree: **26 passed, 0 failed**. Executed `git diff --check 6ab793928fa7f998b9d5796061cf66d3c0b02e40 062dd4a5e3dbfc9e47a49c851e279ec256f1629f`: **exit 0**. The targeted worker Ready/Stopped post-yield, blocked-before-begin terminal reservation, and unclassified live-agent fail-closed scenarios are present and pass their deterministic tests.
+
+**Blocking P1:** `findings/taskless-reviewer-duplicate-launch.md` documents an independently reproduced duplicate reviewer launch across Manager passes when a taskless reviewer is actively working a claimed review and another unclaimed review exists. The canonical taskless reviewer state remains `NeedsWork/Stopped`, but once a previous launch record becomes `observed` the next pass re-reserves the same reviewer. Changes are needed before integration.
+
+No live browser launch, schedule, deployment, or restart was performed. Full .NET test suites were not independently rerun; author-reported outcomes below remain author evidence only.
+
+---
+
+## Author's submitted report (preserved)
+
 # Independent frozen re-review — Accepted
 
 **Reviewer:** Reviewer 2  

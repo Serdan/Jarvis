@@ -1,6 +1,6 @@
 # WQ03 — ledger-anchored immutable snapshot alternative (architecture investigation)
 
-**Date:** 2026-11-15. **Agent:** Worker 2. **Canonical task:** `wq03-wip-host-protection-proof`, task-spec revision seq 3673.  
+**Date:** 2026-11-15. **Agent:** Worker 2. **Canonical task:** `wq03-wip-host-protection-proof`, task-spec revision seq 3673.
 **Decision:** **CONDITIONALLY VIABLE DESIGN, NOT AN ACTIVATION PROOF.** Replacing one protected WIP branch per generation with self-contained snapshot bytes embedded in a trusted append-only canonical ledger can preserve exact source continuation despite deletion/mutation of the *source* remote. It **does not** eliminate the need to protect the *ledger anchor*, prohibit old writers' physical/remote effects, ensure host retention and establish non-bypass credentials. The current inert WQ03 adapter **rejects handoff with a RecoveryBlocked error and is not activated**; this is not proof that a durable canonical SourceRecoveryBlocked gate was persisted.
 
 ## Evidence boundary and source version

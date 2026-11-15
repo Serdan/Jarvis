@@ -1,6 +1,6 @@
 # WQ-03 remote WIP host-protection proof — fail closed
 
-**Audit:** 2026-11-15, Worker 2, canonical task `wq03-wip-host-protection-proof`, assignment generation 1.  
+**Audit:** 2026-11-15, Worker 2, canonical task `wq03-wip-host-protection-proof`, assignment generation 1.
 **Disposition:** **FAIL / activation blocker** for the actual tested Jarvis Git transport and nested `refs/heads/jarvis-wip/**` namespace. No host settings were changed. No production WIP ref was probed or modified. No code changed, so .NET 11 Release tests were not applicable.
 
 ## Trust anchor and read-only inventory

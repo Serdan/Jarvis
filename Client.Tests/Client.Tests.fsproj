@@ -35,6 +35,7 @@
         <Compile Include="ProjectCreationTests.fs"/>
         <Compile Include="WorktreeTests.fs"/>
         <Compile Include="LedgerStoreTests.fs"/>
+        <Compile Include="AccountCapacityLedgerTests.fs"/>
         <Compile Include="RoleInstructionsTests.fs"/>
         <Compile Include="ReviewWorkflowTests.fs"/>
         <Compile Include="ChallengeWorkflowTests.fs"/>

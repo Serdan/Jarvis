@@ -1,9 +1,23 @@
-# Worker correction and validation
+# Independent frozen re-review — Accepted
 
-**Frozen source:** `062dd4a5e3dbfc9e47a49c851e279ec256f1629f` (new exact review after changes requested on `94e3c1ef`).
+**Reviewer:** Reviewer 2  
+**Review ID:** `4e280726b19a4f5db4f83c0a9f625d17`  
+**Frozen commit:** `062dd4a5e3dbfc9e47a49c851e279ec256f1629f`  
+**Correction base:** `94e3c1ef3e257361f48b86e9b598092a96d06e47`  
+**Task base:** `6ab793928fa7f998b9d5796061cf66d3c0b02e40`
 
-The planner now permits the same assignment to relaunch after canonical Ready/Stopped `stateEnteredAtUtc` is strictly newer than verified attributed launch activity; stale Ready remains suppressed. `blocked` before `begin` is terminal audit evidence, not a live reservation. Live/uncertain `kind: other` activity causes a fail-closed decision. The persistent Manager role and runbook document these distinctions.
+## Independent evidence
+- Verified registered worktree `feature/manager-heartbeat-bootstrap` is clean and at the exact frozen SHA.
+- Ran `node --test scripts/tests/manager-heartbeat.test.mjs` in that worktree: **26 passed, 0 failed** (exit 0). These are independently executed results, not merely Worker 4's reported counts.
+- Ran `git diff --check 94e3c1ef... 062dd4a5...`: exit 0, no output.
+- Examined the exact four-file corrective diff, full planner control flow, runbook, and new regression fixtures.
 
-**Evidence:** `node --test scripts/tests/manager-heartbeat.test.mjs`: **26 passed, 0 failed** (including four new deterministic lifecycle, restart, and unclassified-agent regressions). `git diff --check`: clean. `dotnet test Server.Tests/Server.Tests.fsproj -c Release` using .NET 11: **exit 0** (existing F# warnings). `dotnet test Client.Tests/Client.Tests.fsproj -c Release` using .NET 11: **hit the 180-second command timeout**, so no completed Client.Tests verdict exists; do not infer a pass or failure. A separate `dotnet build Client.Tests/Client.Tests.fsproj -c Release --no-restore` using .NET 11 **succeeded (exit 0, 0 errors, 2 warnings)**. The full Client.Tests test suite remains unverified because it timed out.
+## Prior findings resolved
+1. **P1 — yielded Ready worker relaunch:** `yieldedAfterActivity` requires canonical Ready/Stopped, a current assignment, and `stateEnteredAtUtc` strictly later than positively attributed activity. Historical observed assignment records still suppress stale Ready snapshots, but do not permanently prohibit a verified later yield. Two new tests cover observed Working → yield → new reservation, including a yield between Manager observations, and confirm same-tick deduplication.
+2. **P1 — blocked reservation capacity:** `blocked` is now terminal rather than live. The `mark` action only allows it from `reserved`, not a dispatched/uncertain record; audit history remains intact. The process-restart test demonstrates capacity release and fresh reservation without a duplicate within the same state.
+3. **P2 — unclassified live agents:** snapshot validation now rejects `kind: other` with live or unknown state/execution, before planning any launches. The negative fixture covers Working and Unknown agents and confirms no journal reservation is created.
 
-Connected Jarvis catalog still has only the older browser scheduling command family, not general AfterAgentIdle scheduler commands. No live schedule, tab, client/server restart, integration, or deployment was performed. Independent reviewer must verify the frozen source and report a decision before integration.
+## Limits / rollout boundary
+This is acceptance of the frozen Manager planner, role and documentation **for review/integration consideration**, not a live deployment authorization. No browser launch, schedule creation, role mutation, or service restart was performed. Worker 4 reported a successful .NET 11 Server.Tests run and a Client.Tests build; the full Client.Tests test run timed out. I did not rerun either .NET suite, and therefore do not claim independent .NET verification. The connected catalog's general `AfterAgentIdle` scheduling commands remain unavailable for live wiring per the runbook.
+
+**Verdict: Accepted.** No outstanding blocking finding in this frozen corrective delta.

@@ -13,7 +13,7 @@ const ALLOWED_STATES = new Set(["Ready", "Working", "NeedsWork", "Free",
 const ALLOWED_EXECUTIONS = new Set(["Working", "Stopped", "Unknown"]);
 // A blocked-before-dispatch reservation is terminal, not a live browser effect.
 const LIVE_RECORDS = new Set(["reserved", "dispatching", "submitted", "uncertain"]);
-const TERMINAL_RECORDS = new Set(["blocked", "observed", "cleared"]);
+const TERMINAL_RECORDS = new Set(["blocked", "observed", "review-finished", "cleared"]);
 const LAUNCH_RESULTS = new Set(["submitted", "uncertain", "blocked"]);
 
 function assert(condition, message) {
@@ -58,7 +58,8 @@ export function validateSnapshot(config, snapshot, nowUtc) {
   assert(snapshot && snapshot.projectName === config.projectName,
     "Snapshot project mismatch");
   assert(snapshot.complete === true && snapshot.agentActivityVerified === true &&
-    snapshot.reviewQueueVerified === true && snapshot.challengesVerified === true,
+    snapshot.reviewQueueVerified === true && snapshot.reviewClaimsVerified === true &&
+    snapshot.challengesVerified === true,
     "Snapshot lacks authoritative task, activity, review or challenge evidence");
   assert(typeof snapshot.ledgerHead === "string" &&
     /^[0-9a-f]{40,64}$/.test(snapshot.ledgerHead), "Missing ledger head");
@@ -68,7 +69,8 @@ export function validateSnapshot(config, snapshot, nowUtc) {
     "Snapshot is stale or from the future");
   assert(Number.isInteger(snapshot.unclaimedReviewCount) &&
     snapshot.unclaimedReviewCount >= 0, "Invalid review count");
-  assert(Array.isArray(snapshot.agents), "Missing agents");
+  assert(Array.isArray(snapshot.agents) && Array.isArray(snapshot.claimedReviews),
+    "Missing agents or canonical claimed-review enumeration");
   const agents = new Map();
   for (const agent of snapshot.agents) {
     assert(agent && typeof agent.agentId === "string" &&
@@ -93,6 +95,13 @@ export function validateSnapshot(config, snapshot, nowUtc) {
       assert(agent.activityEvidence === "ExplicitAttributedToolCall",
         "Client-local last-seen is not proof of agent activity");
     }
+    if (agent.reviewerYieldAtUtc !== undefined && agent.reviewerYieldAtUtc !== null) {
+      assert(agent.kind === "reviewer" &&
+        agent.reviewerYieldEvidence === "ExplicitAttributedReviewerYield",
+        "Reviewer yield requires positively attributed explicit yield evidence");
+      assert(validTime(agent.reviewerYieldAtUtc, "reviewerYieldAtUtc") <= observed + 1000,
+        "Reviewer yield is after the snapshot");
+    }
     if (agent.stateEnteredAtUtc !== undefined && agent.stateEnteredAtUtc !== null) {
       const enteredAt = validTime(agent.stateEnteredAtUtc, "stateEnteredAtUtc");
       assert(enteredAt <= observed + 1000,
@@ -104,6 +113,16 @@ export function validateSnapshot(config, snapshot, nowUtc) {
        agent.execution === "Unknown")),
       "Unclassified live or uncertain project agent: " + agent.agentId);
     agents.set(agent.agentId, agent);
+  }
+  // Exhaustive claim enumeration must come from the same verified ledger head
+  // as the review queue. A missing claim is not inferred from agent state.
+  const reviewIds = new Set();
+  for (const claim of snapshot.claimedReviews) {
+    assert(claim && typeof claim.reviewId === "string" && claim.reviewId.trim() &&
+      !reviewIds.has(claim.reviewId) && typeof claim.reviewerId === "string" &&
+      agents.get(claim.reviewerId)?.kind === "reviewer",
+      "Invalid, duplicate or unclassified canonical claimed review");
+    reviewIds.add(claim.reviewId);
   }
   for (const kind of ["worker", "reviewer"]) {
     for (const id of config[kind + "Ids"]) {
@@ -134,7 +153,35 @@ export function validateJournal(journal, projectName) {
       [...LIVE_RECORDS, ...TERMINAL_RECORDS].includes(rec.status),
       "Invalid journal record");
     validTime(rec.reservedAtUtc, "journal reservation");
-    if (rec.status === "observed") validTime(rec.observedAtUtc, "observedAtUtc");
+    if (rec.status === "observed" || rec.status === "review-finished") {
+      validTime(rec.observedAtUtc, "observedAtUtc");
+    }
+    if (rec.observedClaimIds !== undefined) {
+      assert(rec.kind === "reviewer" && Array.isArray(rec.observedClaimIds) &&
+        rec.observedClaimIds.every(x => typeof x === "string" && x.trim()) &&
+        new Set(rec.observedClaimIds).size === rec.observedClaimIds.length &&
+        (rec.observedClaimIds.length === 0 ||
+          /^[0-9a-f]{40,64}$/.test(rec.claimSeenLedgerHead ?? "")),
+        "Invalid observed reviewer claims");
+    }
+    if (rec.reviewerSessionCleared !== undefined) {
+      assert(rec.reviewerSessionCleared === true && rec.kind === "reviewer" &&
+        rec.status === "cleared" && typeof rec.observedAtUtc === "string" &&
+        typeof rec.recoveryReason === "string" && rec.recoveryReason.length >= 12,
+        "Invalid observed reviewer operator recovery");
+    }
+    if (rec.status === "review-finished") {
+      assert(rec.kind === "reviewer" &&
+        ["CanonicalReviewClaimResolved", "ExplicitReviewerYield"].includes(rec.completionEvidence) &&
+        /^[0-9a-f]{40,64}$/.test(rec.completionLedgerHead ?? ""),
+        "Missing reviewer completion provenance");
+      validTime(rec.completedAtUtc, "completedAtUtc");
+      if (rec.completionEvidence === "CanonicalReviewClaimResolved") {
+        assert(rec.observedClaimIds?.length > 0 &&
+          rec.claimSeenLedgerHead !== rec.completionLedgerHead,
+          "Reviewer claim resolution requires a later canonical ledger head");
+      }
+    }
     ids.add(rec.launchId);
   }
   return journal;
@@ -148,6 +195,28 @@ function yieldedAfterActivity(agent, activityAtUtc) {
     agent.hasReadyAssignment === true &&
     typeof agent.stateEnteredAtUtc === "string" &&
     Date.parse(agent.stateEnteredAtUtc) > Date.parse(activityAtUtc);
+}
+
+
+function reviewerSessionEnd(rec, agent, currentClaims, snapshot) {
+  const yieldAt = agent?.reviewerYieldAtUtc;
+  const latestActivity = agent?.lastAttributedActivityAtUtc;
+  // Taskless reviewers do not have an implementation Ready transition.
+  // Only a separately verified, explicit reviewer yield after THIS launch
+  // can resume a still-claimed review. A generic tool call is not a yield.
+  if (yieldAt && Date.parse(yieldAt) > Date.parse(rec.reservedAtUtc) &&
+      Date.parse(yieldAt) >= Date.parse(rec.observedAtUtc) &&
+      (latestActivity == null || Date.parse(latestActivity) <= Date.parse(yieldAt))) {
+    return "ExplicitReviewerYield";
+  }
+  // A claim observed in an earlier authoritative head and now absent from
+  // an exhaustive later head was decided/released. Missing old journal
+  // evidence or equal-head contradictory claims cannot prove completion.
+  if (rec.observedClaimIds?.length && currentClaims.length === 0 &&
+      snapshot.ledgerHead !== rec.claimSeenLedgerHead) {
+    return "CanonicalReviewClaimResolved";
+  }
+  return null;
 }
 
 export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
@@ -166,43 +235,121 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
   const reserved = new Set();
   const observedThisPass = new Set();
   const observedAssignments = new Set();
-
-  // Latest agent-attributed activity is positive evidence of a bootstrapped
-  // session. It may release a reservation; neither time elapsed nor a
-  // successful UI submission is proof the agent started.
+  const unresolvedReviewers = new Set();
+  const reviewerSessionEnds = new Map();
+  const claimsByReviewer = new Map();
+  for (const claim of snapshot.claimedReviews) {
+    if (!claimsByReviewer.has(claim.reviewerId)) claimsByReviewer.set(claim.reviewerId, []);
+    claimsByReviewer.get(claim.reviewerId).push(claim.reviewId);
+  }
+  const latestReviewerRecord = new Map();
   for (const rec of journal.records) {
+    if (rec.kind === "reviewer") latestReviewerRecord.set(rec.agentId, rec);
+  }
+
+  // A reviewer may be NeedsWork/Stopped while working on a frozen claim.
+  // Keep observed reviewer sessions and their capacity until a positive
+  // review resolution or explicitly attributed cooperative yield.
+  for (const rec of journal.records) {
+    const agent = agents.get(rec.agentId);
+    if (LIVE_RECORDS.has(rec.status) || rec.status === "observed") {
+      assert(agent?.kind === rec.kind, "Unknown journal owner/kind: " + rec.agentId);
+    }
+    const claims = claimsByReviewer.get(rec.agentId) ?? [];
+    if (rec.kind === "reviewer" && rec.status === "observed") {
+      const updated = {
+        ...rec,
+        observedClaimIds: [...new Set([...(rec.observedClaimIds ?? []), ...claims])],
+        claimSeenLedgerHead: rec.claimSeenLedgerHead ?? (claims.length ? snapshot.ledgerHead : undefined)
+      };
+      const ended = reviewerSessionEnd(updated, agent, claims, snapshot);
+      if (ended) reviewerSessionEnds.set(rec.launchId, ended);
+      else unresolvedReviewers.add(rec.agentId);
+      if (!dryRun) {
+        rec.observedClaimIds = updated.observedClaimIds;
+        if (updated.claimSeenLedgerHead) rec.claimSeenLedgerHead = updated.claimSeenLedgerHead;
+        if (ended) {
+          rec.status = "review-finished";
+          rec.completionEvidence = ended;
+          rec.completionLedgerHead = snapshot.ledgerHead;
+          rec.completedAtUtc = snapshot.capturedAtUtc;
+        }
+      }
+      continue;
+    }
     if (rec.status === "observed" && rec.kind === "worker" &&
-      rec.assignmentKey && agents.get(rec.agentId)?.assignmentKey === rec.assignmentKey &&
-      !yieldedAfterActivity(agents.get(rec.agentId), rec.observedAtUtc)) {
+      rec.assignmentKey && agent?.assignmentKey === rec.assignmentKey &&
+      !yieldedAfterActivity(agent, rec.observedAtUtc)) {
       observedAssignments.add(rec.agentId);
     }
     if (!LIVE_RECORDS.has(rec.status)) continue;
-    const agent = agents.get(rec.agentId);
     const activity = agent?.lastAttributedActivityAtUtc;
-    const observed = activity !== null && activity !== undefined &&
+    const observed = activity != null &&
       Date.parse(activity) > Date.parse(rec.reservedAtUtc) &&
       Date.parse(activity) <= Date.parse(snapshot.capturedAtUtc);
     if (observed) {
-      if (!yieldedAfterActivity(agent, activity)) observedThisPass.add(rec.agentId);
-      if (rec.kind === "worker" && rec.assignmentKey &&
-        agent.assignmentKey === rec.assignmentKey &&
-        !yieldedAfterActivity(agent, activity)) observedAssignments.add(rec.agentId);
-      if (!dryRun) {
-        rec.status = "observed";
-        rec.observedAtUtc = activity;
+      if (rec.kind === "reviewer") {
+        const updated = {
+          ...rec, observedAtUtc: activity,
+          observedClaimIds: claims,
+          claimSeenLedgerHead: claims.length ? snapshot.ledgerHead : undefined
+        };
+        const ended = reviewerSessionEnd(updated, agent, claims, snapshot);
+        if (ended) reviewerSessionEnds.set(rec.launchId, ended);
+        else {
+          unresolvedReviewers.add(rec.agentId);
+          observedThisPass.add(rec.agentId);
+        }
+        if (!dryRun) {
+          rec.observedClaimIds = claims;
+          if (claims.length) rec.claimSeenLedgerHead = snapshot.ledgerHead;
+          rec.status = ended ? "review-finished" : "observed";
+          rec.observedAtUtc = activity;
+          if (ended) {
+            rec.completionEvidence = ended;
+            rec.completionLedgerHead = snapshot.ledgerHead;
+            rec.completedAtUtc = snapshot.capturedAtUtc;
+          }
+        }
+      } else {
+        if (!yieldedAfterActivity(agent, activity)) observedThisPass.add(rec.agentId);
+        if (rec.assignmentKey && agent.assignmentKey === rec.assignmentKey &&
+          !yieldedAfterActivity(agent, activity)) observedAssignments.add(rec.agentId);
+        if (!dryRun) {
+          rec.status = "observed";
+          rec.observedAtUtc = activity;
+        }
       }
       continue;
     }
     reserved.add(rec.agentId);
     result.counts[rec.kind]++;
   }
-  // Count every live/uncertain agent in the project, not just our configured
-  // agents. Unidentified activity must not be ignored to free capacity.
+  // Only the latest explicit yield can pause a claimed review. A later
+  // unresolved launch or any non-yield completion invalidates that pause.
+  const pausedClaimReviewers = new Set();
+  for (const [reviewerId, rec] of latestReviewerRecord) {
+    const ended = reviewerSessionEnds.get(rec.launchId) ??
+      (rec.status === "review-finished" ? rec.completionEvidence : null);
+    const claims = claimsByReviewer.get(reviewerId) ?? [];
+    if ((ended === "ExplicitReviewerYield" || rec.reviewerSessionCleared === true) &&
+        claims.every(id => (rec.observedClaimIds ?? []).includes(id)) &&
+        !unresolvedReviewers.has(reviewerId) && !reserved.has(reviewerId)) {
+      pausedClaimReviewers.add(reviewerId);
+    }
+  }
+  // Count both canonical claims and unresolved taskless sessions, including
+  // reviewers whose task slot looks available. Never count the same agent
+  // twice, and never classify paused, explicitly yielded claims as active.
   for (const agent of agents.values()) {
     if (!["worker", "reviewer"].includes(agent.kind)) continue;
-    if ((ACTIVE_STATES.has(agent.state) ||
-      agent.execution === "Working" || agent.execution === "Unknown") &&
-      !reserved.has(agent.agentId)) {
+    const active = ACTIVE_STATES.has(agent.state) ||
+      agent.execution === "Working" || agent.execution === "Unknown" ||
+      (agent.kind === "reviewer" &&
+        (unresolvedReviewers.has(agent.agentId) ||
+        ((claimsByReviewer.get(agent.agentId)?.length ?? 0) > 0 &&
+          !pausedClaimReviewers.has(agent.agentId))));
+    if (active && !reserved.has(agent.agentId)) {
       result.counts[agent.kind]++;
     }
   }
@@ -225,6 +372,9 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
       else if (reserved.has(agentId)) reason = "PriorLaunchPendingOrUncertain";
       else if (observedThisPass.has(agentId) || observedAssignments.has(agentId))
         reason = "AlreadyObservedThisAssignment";
+      else if (kind === "reviewer" && (unresolvedReviewers.has(agentId) ||
+        ((claimsByReviewer.get(agentId)?.length ?? 0) > 0 &&
+          !pausedClaimReviewers.has(agentId)))) reason = "ReviewerSessionOrClaimActive";
       else if (agent.waitingOnChallenge) reason = "ChallengeBlocked";
       else if (kind === "worker" &&
         !(agent.state === "Ready" && agent.execution === "Stopped" &&
@@ -233,7 +383,10 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
         !((agent.state === "NeedsWork" || agent.state === "Free") &&
         agent.execution === "Stopped" && agent.slotAvailable &&
         !agent.hasReadyAssignment &&
-        remainingReviews > 0)) reason = "NoUnclaimedReviewOrReviewerBusy";
+        (remainingReviews > 0 ||
+          (pausedClaimReviewers.has(agentId) &&
+            (claimsByReviewer.get(agentId)?.length ?? 0) > 0))))
+        reason = "NoUnclaimedReviewOrReviewerBusy";
       if (reason) {
         result.suppressed.push({ agentId, kind, reason });
         continue;
@@ -242,11 +395,14 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
         randomUUID();
       result.reservations.push({
         launchId, agentId, kind,
-        reason: kind === "worker" ? "ReadyImplementation" : "UnclaimedFrozenReview"
+        reason: kind === "worker" ? "ReadyImplementation" :
+          pausedClaimReviewers.has(agentId) && (claimsByReviewer.get(agentId)?.length ?? 0) > 0 ?
+            "ResumeVerifiedPausedReview" : "UnclaimedFrozenReview"
       });
       result.counts[kind]++;
       reserved.add(agentId);
-      if (kind === "reviewer") remainingReviews--;
+      if (kind === "reviewer" && result.reservations.at(-1).reason === "UnclaimedFrozenReview")
+        remainingReviews--;
       if (!dryRun) {
         journal.records.push({
           launchId, agentId, kind,
@@ -381,7 +537,12 @@ export function runCli(argv) {
       } else {
         assert(typeof opts.reason === "string" && opts.reason.trim().length >= 12,
           "Explicit operator recovery reason required");
-        assert(LIVE_RECORDS.has(rec.status), "Only live reservations can be released");
+        assert(LIVE_RECORDS.has(rec.status) ||
+          (rec.kind === "reviewer" && rec.status === "observed"),
+          "Only live reservations or observed reviewer sessions can be released");
+        if (rec.status === "observed" && rec.kind === "reviewer") {
+          rec.reviewerSessionCleared = true;
+        }
         rec.status = "cleared";
         rec.recoveryReason = opts.reason;
         rec.releasedAtUtc = new Date().toISOString();

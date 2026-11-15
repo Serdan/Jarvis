@@ -33,8 +33,9 @@ function agent(agentId, kind, state, overrides = {}) {
 function snapshot(projectName = "Jarvis") {
   return {
     projectName, complete: true, agentActivityVerified: true,
-    reviewQueueVerified: true, challengesVerified: true,
+    reviewQueueVerified: true, reviewClaimsVerified: true, challengesVerified: true,
     ledgerHead: HEAD, capturedAtUtc: NOW, unclaimedReviewCount: 2,
+    claimedReviews: [],
     agents: [
       agent("Manager", "manager", "Working"),
       agent("Worker 1", "worker", "Ready"),
@@ -444,4 +445,200 @@ test("unclassified active or uncertain project agents fail closed", () => {
   const s = snapshot();
   s.agents.push(agent("Inactive helper", "other", "Parked"));
   assert.equal(decide(config(), s, journal(), NOW).reservations.length, 4);
+});
+
+const NEXT_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const REVIEW = { reviewId: "frozen-review-1", reviewerId: "Reviewer 1" };
+
+function reviewerOnlyConfig() {
+  const c = config();
+  c.budgets.worker = 0;
+  return c;
+}
+function reviewerObserved(s, at = "2026-11-15T02:00:30Z") {
+  s.agents[3].lastAttributedActivityAtUtc = at;
+  s.agents[3].activityEvidence = "ExplicitAttributedToolCall";
+}
+
+test("taskless reviewer claim remains active across heartbeats and journal restart", () => {
+  const c = reviewerOnlyConfig();
+  const j = journal();
+  const initial = snapshot();
+  initial.unclaimedReviewCount = 1; // 2 exist in the queue over time; first reviewer gets first.
+  const first = decide(c, initial, j, NOW);
+  assert.deepEqual(first.reservations.map(r => r.agentId), ["Reviewer 1"]);
+
+  const claiming = snapshot();
+  claiming.capturedAtUtc = "2026-11-15T02:01:00Z";
+  claiming.ledgerHead = NEXT_HEAD;
+  claiming.claimedReviews = [REVIEW];
+  claiming.unclaimedReviewCount = 1;
+  reviewerObserved(claiming);
+  const active = decide(c, claiming, j, claiming.capturedAtUtc);
+  assert.equal(j.records[0].status, "observed");
+  assert.deepEqual(j.records[0].observedClaimIds, [REVIEW.reviewId]);
+  assert.equal(active.counts.reviewer, 2);
+  assert.deepEqual(active.reservations.map(r => r.agentId), ["Reviewer 2"]);
+  assert.ok(active.suppressed.some(x => x.agentId === "Reviewer 1"));
+
+  // Later than the first tool call and after a process restart, the reviewer
+  // is still NeedsWork/Stopped and still holds the claim. No second launch.
+  const restarted = JSON.parse(JSON.stringify(j));
+  const later = structuredClone(claiming);
+  later.capturedAtUtc = "2026-11-15T02:16:00Z";
+  const subsequent = decide(c, later, restarted, later.capturedAtUtc);
+  assert.equal(subsequent.reservations.length, 0);
+  assert.equal(subsequent.counts.reviewer, 2);
+  assert.equal(restarted.records[0].status, "observed");
+});
+
+test("resolved canonical claim at a later verified head frees reviewer for other work", () => {
+  const c = reviewerOnlyConfig();
+  c.budgets.reviewer = 1;
+  const j = journal();
+  const first = snapshot();
+  first.unclaimedReviewCount = 1;
+  decide(c, first, j, NOW);
+
+  const claimed = snapshot();
+  claimed.capturedAtUtc = "2026-11-15T02:01:00Z";
+  claimed.claimedReviews = [REVIEW];
+  reviewerObserved(claimed);
+  decide(c, claimed, j, claimed.capturedAtUtc);
+  assert.equal(j.records[0].status, "observed");
+
+  const resolved = structuredClone(claimed);
+  resolved.capturedAtUtc = "2026-11-15T02:03:00Z";
+  resolved.ledgerHead = NEXT_HEAD; // new authoritative review decision/release head
+  resolved.claimedReviews = [];
+  const r = decide(c, resolved, j, resolved.capturedAtUtc);
+  assert.equal(j.records[0].status, "review-finished");
+  assert.equal(j.records[0].completionEvidence, "CanonicalReviewClaimResolved");
+  assert.deepEqual(r.reservations.map(x => x.agentId), ["Reviewer 1"]);
+  assert.equal(decide(c, resolved, j, resolved.capturedAtUtc).reservations.length, 0);
+});
+
+test("explicit attributed reviewer yield resumes an existing claimed review once", () => {
+  const c = reviewerOnlyConfig();
+  c.budgets.reviewer = 1;
+  const j = journal();
+  const first = snapshot();
+  first.unclaimedReviewCount = 1;
+  decide(c, first, j, NOW);
+
+  const claiming = snapshot();
+  claiming.capturedAtUtc = "2026-11-15T02:01:00Z";
+  claiming.claimedReviews = [REVIEW];
+  claiming.unclaimedReviewCount = 0;
+  reviewerObserved(claiming);
+  assert.equal(decide(c, claiming, j, claiming.capturedAtUtc).reservations.length, 0);
+
+  const yielded = structuredClone(claiming);
+  yielded.capturedAtUtc = "2026-11-15T02:04:00Z";
+  yielded.agents[3].reviewerYieldAtUtc = "2026-11-15T02:03:00Z";
+  yielded.agents[3].reviewerYieldEvidence = "ExplicitAttributedReviewerYield";
+  yielded.agents[3].lastAttributedActivityAtUtc = "2026-11-15T02:03:00Z";
+  const r = decide(c, yielded, j, yielded.capturedAtUtc);
+  assert.deepEqual(r.reservations.map(x => [x.agentId, x.reason]),
+    [["Reviewer 1", "ResumeVerifiedPausedReview"]]);
+  assert.equal(j.records[0].completionEvidence, "ExplicitReviewerYield");
+  assert.equal(j.records[0].status, "review-finished");
+  const persisted = JSON.parse(JSON.stringify(j));
+  assert.equal(decide(c, yielded, persisted, yielded.capturedAtUtc).reservations.length, 0);
+});
+
+test("missing or contradictory reviewer claim/yield evidence fails closed", () => {
+  const c = reviewerOnlyConfig();
+  const initial = snapshot();
+  initial.reviewClaimsVerified = false;
+  assert.throws(() => decide(c, initial, journal(), NOW), /authoritative/);
+  initial.reviewClaimsVerified = true;
+  delete initial.claimedReviews;
+  assert.throws(() => decide(c, initial, journal(), NOW), /claimed-review/);
+  initial.claimedReviews = [{ reviewId: "review", reviewerId: "Unknown" }];
+  assert.throws(() => decide(c, initial, journal(), NOW), /unclassified/);
+  initial.claimedReviews = [];
+  initial.agents[3].reviewerYieldAtUtc = "2026-11-15T02:00:00Z";
+  assert.throws(() => decide(c, initial, journal(), NOW), /positively attributed/);
+
+  // Activity alone, even after a long delay, is never an explicit yield.
+  delete initial.agents[3].reviewerYieldAtUtc;
+  const j = journal();
+  initial.unclaimedReviewCount = 1;
+  decide(c, initial, j, NOW);
+  reviewerObserved(initial);
+  initial.capturedAtUtc = "2026-11-15T02:01:00Z";
+  decide(c, initial, j, initial.capturedAtUtc);
+  const later = structuredClone(initial);
+  later.capturedAtUtc = "2026-11-15T02:20:00Z";
+  later.unclaimedReviewCount = 2;
+  assert.ok(!decide(c, later, j, later.capturedAtUtc).reservations
+    .some(r => r.agentId === "Reviewer 1"));
+});
+
+test("active review claim without a Manager journal consumes reviewer capacity", () => {
+  const c = reviewerOnlyConfig();
+  c.budgets.reviewer = 1;
+  const s = snapshot();
+  s.claimedReviews = [REVIEW];
+  s.unclaimedReviewCount = 1;
+  const r = decide(c, s, journal(), NOW);
+  assert.equal(r.counts.reviewer, 1);
+  assert.equal(r.reservations.length, 0);
+  assert.ok(r.suppressed.some(x => x.agentId === "Reviewer 1" &&
+    x.reason === "BudgetFull"));
+});
+
+test("same-head missing claimed review never proves session completion", () => {
+  const c = reviewerOnlyConfig();
+  c.budgets.reviewer = 1;
+  const j = journal();
+  const s = snapshot();
+  s.unclaimedReviewCount = 1;
+  decide(c, s, j, NOW);
+  s.capturedAtUtc = "2026-11-15T02:01:00Z";
+  reviewerObserved(s);
+  s.claimedReviews = [REVIEW];
+  decide(c, s, j, s.capturedAtUtc);
+  s.capturedAtUtc = "2026-11-15T02:03:00Z";
+  s.claimedReviews = []; // contradictory if head is unchanged
+  assert.equal(decide(c, s, j, s.capturedAtUtc).reservations.length, 0);
+  assert.equal(j.records[0].status, "observed");
+});
+
+test("observed unresolved reviewer can be explicitly operator-cleared with audited reason", () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-manager-review-recover-"));
+  try {
+    const conf = path.join(temp, "config.json");
+    const state = path.join(temp, "journal.json");
+    const c = reviewerOnlyConfig();
+    c.budgets.reviewer = 1;
+    fs.writeFileSync(conf, JSON.stringify(c));
+    const j = journal();
+    const initial = snapshot();
+    initial.unclaimedReviewCount = 1;
+    decide(c, initial, j, NOW);
+    const inProgress = snapshot();
+    inProgress.capturedAtUtc = "2026-11-15T02:01:00Z";
+    inProgress.claimedReviews = [REVIEW];
+    inProgress.unclaimedReviewCount = 0;
+    reviewerObserved(inProgress);
+    decide(c, inProgress, j, inProgress.capturedAtUtc);
+    fs.writeFileSync(state, JSON.stringify(j));
+
+    const released = runCli(["release", "--config", conf, "--journal", state,
+      "--launch-id", j.records[0].launchId,
+      "--reason", "Operator positively verified prior reviewer session ended"]);
+    assert.equal(released.status, "cleared");
+    const persisted = JSON.parse(fs.readFileSync(state, "utf8"));
+    assert.equal(persisted.records[0].reviewerSessionCleared, true);
+    assert.equal(persisted.records[0].recoveryReason,
+      "Operator positively verified prior reviewer session ended");
+    const resumed = decide(c, inProgress, persisted, inProgress.capturedAtUtc);
+    assert.deepEqual(resumed.reservations.map(x => x.reason),
+      ["ResumeVerifiedPausedReview"]);
+    assert.equal(decide(c, inProgress, persisted, inProgress.capturedAtUtc).reservations.length, 0);
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
 });

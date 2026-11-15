@@ -29,13 +29,19 @@ At the start of every pass:
    before observed launch activity does not prove a later yield. Never
    infer agent activity from a noncanonical local last-seen timestamp; put
    `lastAttributedActivityAtUtc: null` unless a positive attributed tool-call
-   event has independently been observed.
+   event has independently been observed. Enumerate every currently Claimed
+   review and owner at the same ledger head; set `reviewClaimsVerified` only
+   when complete. Never infer reviewer idleness from NeedsWork/Stopped. An
+   observed reviewer launch or claimed review remains active until a later
+   canonical review completion/release is proved or an explicit reviewer
+   yield is independently attributed. A generic tool call is not a yield.
 5. Run `node scripts/manager-heartbeat.mjs plan` with the current project
    config, snapshot and durable per-project launch journal. The planner reserves
    intended launches *before* any browser side effect. Do not create a launch
    outside its returned reservations or reinterpret its budget/suppression rules.
 6. For each reserved agent, re-observe its canonical state and the current review demand immediately before launch, then call the planner's atomic `begin` operation on that exact launch ID. This rechecks the live runtime stop switch and durably marks `dispatching` before any browser effect. A second `begin` is rejected, even after restart.
-   If a worker is no longer Ready, a reviewer is no longer eligible, a challenge
+   If a worker is no longer Ready, a reviewer is no longer eligible (including
+   claimed-review/session evidence), a challenge
    blocks it, the review queue is empty, or evidence is stale, record the
    reservation as blocked before `begin`; do not launch. A blocked pre-dispatch
    record is terminal audit evidence and releases capacity. After successful
@@ -60,8 +66,15 @@ At the start of every pass:
    task/attempt/generation as `assignmentKey`. Relaunching the same assignment
    requires verified Ready/Stopped stateEnteredAtUtc newer than the attributed
    activity: a stale Ready label alone cannot prove a yield.
-   Any manual clearing of an uncertain reservation needs an explicit,
-   recorded operator recovery reason.
+   For reviewers, canonical claim completion/release across verified ledger
+   heads permits the next unclaimed review. If a reviewer explicitly yields
+   while keeping a claim, verify the positive reviewer-specific yield event
+   before using `reviewerYieldAtUtc` / `ExplicitAttributedReviewerYield`;
+   then resume that same reviewer under `ResumeVerifiedPausedReview`. If no
+   reliable completion/yield evidence exists, fail closed rather than launch
+   a duplicate. Any manual clearing of an uncertain reservation needs an
+   explicit, recorded operator recovery reason, including any observed
+   taskless reviewer session that cannot be conclusively ended automatically.
 8. Do not notify named reviewers or use notifications for routine work.
    Eligible reviewers claim from the shared frozen review queue. Use canonical
    task, review, challenge and assignment mechanisms for coordination.

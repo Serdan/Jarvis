@@ -96,10 +96,12 @@ configured labels):
   "complete": true,
   "agentActivityVerified": true,
   "reviewQueueVerified": true,
+  "reviewClaimsVerified": true,
   "challengesVerified": true,
   "ledgerHead": "6ab793928fa7f998b9d5796061cf66d3c0b02e40",
   "capturedAtUtc": "2026-11-15T02:00:00Z",
   "unclaimedReviewCount": 1,
+  "claimedReviews": [],
   "agents": [
     {
       "agentId": "Manager",
@@ -146,7 +148,42 @@ lastAttributedActivityAtUtc, with activityEvidence set to
 "ExplicitAttributedToolCall". Otherwise leave it null, allowing the durable
 reservation to remain uncertain until independently resolved.
 
-Record the actual task/agent/review evidence before setting all four
+For each pass, enumerate **all currently Claimed frozen reviews** from the
+same verified `task_overview` ledger head as the unclaimed queue. Supply
+`claimedReviews: [{ "reviewId": "...", "reviewerId": "Reviewer 1" }]` and set
+`reviewClaimsVerified: true` only when the enumeration is exhaustive and the
+reviewer ownership is canonical. Cross-check `reviewer_inbox` when useful;
+do not interpret a NeedsWork/Stopped or free task slot as proof that no
+review is claimed. A reviewer with a claimed review occupies reviewer
+capacity even if its task slot is free. An `observed` reviewer journal
+record also occupies capacity, even without a currently seen claim, until
+separate completion evidence is established. The journal retains claims
+seen across passes and process restarts.
+
+After a claimed review is seen in a prior ledger snapshot, a **later,
+verified different ledger head** with that review no longer Claimed and no
+other claim for the reviewer is evidence of canonical decision/release.
+This permits a subsequent reviewer session. An unchanged head,
+incomplete claim enumeration, or a single attributed activity event is
+not completion. If a session claims and resolves its review entirely
+between Manager snapshots, the missing transition is *not* fabricated:
+keep the observed session unresolved until an independently verified
+yield or explicit operator recovery.
+
+An optional `reviewerYieldAtUtc` may be supplied on the reviewer agent
+only when the Manager can independently verify an **explicit cooperative
+reviewer-session yield** from a positively project/agent-attributed event,
+with `reviewerYieldEvidence: "ExplicitAttributedReviewerYield"`.
+This is not the generic last-attributed tool-call time, a browser send,
+or the local last-seen cache. It must be later than that session's
+reservation and no later than the latest attributed action. If the
+connected activity evidence does not expose a verifiable explicit
+reviewer yield, leave these fields absent and fail closed. Such an
+explicit yield allows a still-claimed review to be resumed by the same
+reviewer: the planner emits `ResumeVerifiedPausedReview`, even with zero
+unclaimed reviews. Do not remove or reassign the claim to simulate yield.
+
+Record the actual task/agent/review evidence before setting all five
 completeness booleans true. A missing registered agent, missing challenge
 query, stale data, contradictory state or incomplete queue read must fail
 closed. Captures older than three minutes are rejected.
@@ -170,8 +207,8 @@ The returned reservations are the **only** approved launch candidates for
 that pass. The planner fills workers with Ready assignments first, ordered by
 optional verified canonical priorityRank (0 is highest), then eligible
 taskless reviewers against the unclaimed frozen review count,
-and counts prior pending/uncertain launches and other Working agents against
-the 5/3 budget. Unclassified live or uncertain agents prevent all launches. Duplicate timer ticks reserve nothing twice.
+and counts prior pending/uncertain launches, unresolved observed reviewer
+sessions, claimed reviews, and other Working agents against the 5/3 budget. Unclassified live or uncertain agents prevent all launches. Duplicate timer ticks reserve nothing twice.
 
 For each reservation, re-observe the agent and review demand immediately
 before dispatch. If eligibility changed, mark the reservation blocked and
@@ -210,6 +247,10 @@ replan. A successful browser submission is not proof the agent called Jarvis.
 Retain dispatched/uncertain reservations until positive attributed activity
 or explicit operator recovery. Verified Ready/Stopped stateEnteredAtUtc after
 such activity proves the worker later yielded and can resume the same task.
+For taskless reviewers, observed activity alone never releases reviewer
+capacity: canonical claim resolution or independently verified explicit
+reviewer yield is required. Preserve the journal until a positive end
+condition, including across restarts.
 
 ## Start the one Manager idle heartbeat (only after approval)
 
@@ -276,6 +317,16 @@ explicitly clear a **specific** reservation with a durable audit reason:
 ~~~sh
 node scripts/manager-heartbeat.mjs release --config artifacts/manager/Jarvis/config.json --journal artifacts/manager/Jarvis/journal.json --launch-id <launch-id> --reason "Operator verified previous launch cannot be active"
 ~~~
+
+An `observed` taskless reviewer session with no observed claim
+resolution or verifiable yield remains an unresolved capacity consumer.
+If the operator has independently verified that **this specific** reviewer
+session is no longer active, `release --launch-id ... --reason "..."`
+also permits an observed reviewer record; it durably marks
+`reviewerSessionCleared`, retains the audit reason, and allows the
+same reviewer to resume any verified already-claimed frozen review.
+Do not treat this operator override as automatic completion evidence.
+A blocked reservation is not recoverable through this path.
 
 If journal.json.lock remains after a crash, verify there is no running
 planner process or competing Manager before manually removing that lock.

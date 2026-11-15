@@ -305,6 +305,15 @@ module LedgerStore =
         let exit = exitCode |> Option.map string |> Option.defaultValue "none"
         $"operationId={id}; phase={stage}; attempt={attempt}; elapsedMs={elapsed}; exit={exit}; timedOut={timedOut}; class={failureClass}"
 
+    let private retryAction () =
+        if isNull activeTransportScope.Value then "retry-read-after-reconnect"
+        else "retry-same-uuid"
+
+    let private withoutNextAction (diagnostic: string) =
+        diagnostic.Split(';', StringSplitOptions.TrimEntries)
+        |> Array.filter (fun field -> not (field.StartsWith("nextAction=", StringComparison.Ordinal)))
+        |> String.concat "; "
+
     let private remoteFailure stage attempt exitCode timedOut stderr =
         let failureClass = if timedOut then "timeout" else classifyTransport stderr
         let nextAction =
@@ -442,7 +451,7 @@ module LedgerStore =
             let remaining = 12000L - deadline.ElapsedMilliseconds
             if remaining <= 0L then
                 Error(RemoteUnavailable
-                    (transportDiagnostic stage count None true "timeout" + "; nextAction=retry-same-uuid"))
+                    (transportDiagnostic stage count None true "timeout" + "; nextAction=" + retryAction ()))
             else
                 let previousTimeout = activeGitTimeout.Value
                 activeGitTimeout.Value <- Some(TimeSpan.FromMilliseconds(float (min 6000L remaining)))
@@ -468,7 +477,7 @@ module LedgerStore =
                     | Ok output -> Ok(output, count)
                     | Error(RemoteUnavailable _) ->
                         Error(RemoteUnavailable
-                            (transportDiagnostic stage count None true "timeout" + "; nextAction=retry-same-uuid"))
+                            (transportDiagnostic stage count None true "timeout" + "; nextAction=" + retryAction ()))
                     | Error error -> Error error
         attempt 1
 
@@ -2213,8 +2222,10 @@ module LedgerStore =
                                                   let phaseDiagnostic =
                                                       match failure with
                                                       | RemoteUnavailable detail when detail.StartsWith("operationId=", StringComparison.Ordinal) ->
-                                                          // Already bounded and sanitized by the transport.
-                                                          detail
+                                                          // Publication is already possible: remove the
+                                                          // transport's read retry advice before adding
+                                                          // the one safe reconciliation action below.
+                                                          withoutNextAction detail
                                                       | LedgerIntegrityError _ ->
                                                           transportDiagnostic "confirmation-fetch" 1 None false "integrity"
                                                       | _ ->

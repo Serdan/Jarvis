@@ -250,15 +250,21 @@ module LedgerBindingConfig =
     // Inspect locally approved, validated binding identity before network I/O.
     // Dashboard refreshes use it to group aliases of one canonical ledger;
     // this read neither fetches a head nor updates the trust anchor.
+    let private inspectLocalAtRoot root =
+        let path = pathForRoot root
+        withConfigLock path (fun () ->
+            readStored path
+            |> Result.bind (fun stored ->
+                validStored root stored
+                |> Result.map (fun binding -> binding, stored.HighestTrustedHead)))
+
+    let inspectLocalForContext (context: ProjectPaths.ResolvedProject) =
+        let (FolderPath root) = ProjectPaths.ResolvedProject.sourceRoot context
+        inspectLocalAtRoot root
+
     let inspectLocal projectName rt =
         ProjectPaths.resolveProjectRoot projectName rt
-        |> Result.bind (fun (FolderPath root) ->
-            let path = pathForRoot root
-            withConfigLock path (fun () ->
-                readStored path
-                |> Result.bind (fun stored ->
-                    validStored root stored
-                    |> Result.map (fun binding -> binding, stored.HighestTrustedHead))))
+        |> Result.bind (fun (FolderPath root) -> inspectLocalAtRoot root)
 
     // Setup is always an explicit approved action, never a side effect of a read.
     // The expected head is a separately supplied trust anchor, not inferred
@@ -831,10 +837,19 @@ module PendingIntentJournal =
                             UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
                     let temp = file + "." + Guid.NewGuid().ToString("N") + ".tmp"
                     try
-                        File.WriteAllText(temp, JsonSerializer.Serialize(newRecord), UTF8Encoding(false))
-                        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
-                            File.SetUnixFileMode(temp, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
-                        try File.Move(temp, file, false)
+                        // The first remote fetch must not begin before both
+                        // the command bytes AND the published directory entry
+                        // are crash-durable. Reuse the archive's write-through
+                        // rename, without granting overwrite of an existing UUID.
+                        do
+                            use stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write,
+                                                        FileShare.None, 4096, FileOptions.WriteThrough)
+                            if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                                File.SetUnixFileMode(temp, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                            let bytes = UTF8Encoding(false).GetBytes(JsonSerializer.Serialize(newRecord))
+                            stream.Write(bytes, 0, bytes.Length)
+                            stream.Flush(true)
+                        try durableArchiveMove temp file directory
                         with :? IOException when File.Exists file -> ()
                         readFile file |> Result.bind (fun existing ->
                             if matches existing then Ok ()
@@ -1876,10 +1891,43 @@ module PendingIntentJournal =
                     reason operationId (ex.GetType().Name)
             with _ -> ()
 
-    let private withOperationId (operationId: Guid) = function
+    let private withOperationId (operationId: Guid)
+                                (publication: LedgerStore.LedgerStore.PublicationExposure) = function
         | Client.LedgerFailureError failure ->
+            // Public binding preflight runs before transact's transport scope;
+            // confirmation can run after publication. Report one recovery
+            // action selected by observed publication exposure, not by Git.
+            let message =
+                if failure.Message.Contains("operationId=", StringComparison.Ordinal) then
+                    let original = operationId.ToString("D")
+                    // LedgerErrors.toEffect stringifies the DU, adding a
+                    // "RemoteUnavailable" wrapper around the sanitized detail.
+                    // Extract the structured payload; never preserve a stale
+                    // operationId=none or wrapper quotes on a public write.
+                    let marker = failure.Message.IndexOf("operationId=", StringComparison.Ordinal)
+                    let detail =
+                        failure.Message.Substring(marker).TrimEnd([| '"'; '\r'; '\n' |])
+                    let fields =
+                        detail.Split(';', StringSplitOptions.TrimEntries)
+                        |> Array.filter (fun field ->
+                            not (field.StartsWith("nextAction=", StringComparison.Ordinal)))
+                        |> Array.map (fun field ->
+                            if field.StartsWith("operationId=", StringComparison.Ordinal)
+                            then "operationId=" + original else field)
+                    let action =
+                        if publication = LedgerStore.LedgerStore.PublicationExposure.Attempted
+                           || failure.Code = "OutcomeUnknown" then "reconcile-same-uuid"
+                        elif failure.Code = "GitFailure"
+                             && failure.Message.Contains("class=authentication", StringComparison.Ordinal) then
+                            "fix-auth-and-reconcile"
+                        elif failure.Code = "GitFailure"
+                             && failure.Message.Contains("class=reference", StringComparison.Ordinal) then
+                            "inspect-remote-binding"
+                        else "retry-same-uuid"
+                    String.concat "; " fields + "; nextAction=" + action
+                else failure.Message
             Client.LedgerFailureError
-                { failure with OperationId = Some(operationId.ToString("D")) }
+                { failure with OperationId = Some(operationId.ToString("D")); Message = message }
         | error -> error
 
     let private executeUnsafe binding operationId commandType command (apply: unit -> Result<'t, EffectError>) =
@@ -1900,10 +1948,10 @@ module PendingIntentJournal =
                 // and this UUID had no prior local uncertain attempt. The
                 // authoritative domain error must still reach the caller.
                 retireAfterOutcome binding operationId "definitive pre-publication rejection"
-                Error(withOperationId operationId error)
+                Error(withOperationId operationId publication error)
             | Error(Client.LedgerFailureError failure) ->
                 // The caller-owned UUID remains recoverable even after a harness reset.
-                Error(withOperationId operationId (Client.LedgerFailureError failure))
+                Error(withOperationId operationId publication (Client.LedgerFailureError failure))
             | Error _ -> outcome // Preserve exact intent for recovery after lost response.
             | Ok _ ->
                 retireAfterOutcome binding operationId "confirmed success"
@@ -2132,13 +2180,15 @@ module ReviewApi =
             | _ -> Error(Client.ValidationError "Unsupported  read operation."))
 
     let write (cmd: ReviewWriteCommand) rt =
-        LedgerBindingConfig.load cmd.ProjectName rt
-        |> Result.bind (fun binding ->
-            parseId "operationId" cmd.OperationId
-            |> Result.bind (fun operationId ->
+        parseId "operationId" cmd.OperationId
+        |> Result.bind (fun operationId ->
+            // A local, explicitly approved binding is sufficient to journal
+            // the original command before the first remote fetch.
+            LedgerBindingConfig.inspectLocal cmd.ProjectName rt
+            |> Result.bind (fun (binding, _) ->
                 let id () = parseId "requestId" cmd.RequestId
                 let result =
-                    PendingIntentJournal.executeLedgerWrite binding operationId "ReviewWrite" cmd (fun () ->
+                    let apply () =
                         match cmd.Action with
                         | "PutDocument" ->
                             id () |> Result.bind (fun reviewId ->
@@ -2182,7 +2232,14 @@ module ReviewApi =
                             ReviewWorkflow.ReviewWorkflow.acknowledgeBranchReview binding operationId
                                 cmd.TaskId cmd.ActorId (int64 cmd.ExpectedVersion) |> mapError
                         | _ -> Error(Client.ValidationError "Unsupported  write operation.")
-                    )
+                    let verifyBinding () =
+                        LedgerBindingConfig.load cmd.ProjectName rt
+                        |> Result.bind (fun verified ->
+                            if verified <> binding then
+                                Error(Client.ValidationError "Trust binding changed before review publication.")
+                            else Ok ())
+                    PendingIntentJournal.executeLedgerWrite binding operationId "ReviewWrite" cmd (fun () ->
+                        verifyBinding () |> Result.bind (fun () -> apply ()))
                 result |> Result.map OperationResponse.present))
 
 
@@ -2321,19 +2378,27 @@ module TaskApi =
         | Ok(_, None) -> Ok "AuthenticatedUser"
 
     let private writeUsingContext (context: ProjectPaths.ResolvedProject option) (cmd: TaskWriteCommand) rt =
-        let binding =
+        let inspectLocal () =
+            match context with
+            | Some resolved -> LedgerBindingConfig.inspectLocalForContext resolved
+            | None -> LedgerBindingConfig.inspectLocal cmd.ProjectName rt
+        let verifyRemote () =
             match context with
             | Some resolved -> LedgerBindingConfig.loadForContext resolved
             | None -> LedgerBindingConfig.load cmd.ProjectName rt
-        binding
-        |> Result.bind (fun binding ->
+        inspectLocal ()
+        |> Result.bind (fun (binding, _) ->
             guid "operationId" cmd.OperationId
             |> Result.bind (fun operationId ->
                 if cmd.Action = "ExportTaskSpec" then
-                    // Filesystem mutation must use the write permission route,
-                    // not the TaskRead protocol or its read-only capability.
-                    ReviewWorkflow.ReviewWorkflow.exportTaskSpecWithId binding operationId cmd.TaskId
-                        cmd.SourceRef cmd.BaseOid |> mapError |> Result.map box
+                    // This filesystem-only operation still verifies the trusted
+                    // remote before exporting; it has no canonical journal write.
+                    verifyRemote () |> Result.bind (fun verified ->
+                        if verified <> binding then
+                            Error(Client.ValidationError "Trust binding changed before task export.")
+                        else
+                            ReviewWorkflow.ReviewWorkflow.exportTaskSpecWithId verified operationId cmd.TaskId
+                                cmd.SourceRef cmd.BaseOid |> mapError |> Result.map box)
                 else
                     // Preserve historical session metadata only in lifecycle
                     // journals; it is not used to establish agent identity.
@@ -2341,7 +2406,7 @@ module TaskApi =
                         if List.contains cmd.Action [ "BeginAttempt"; "ResumeAgent"; "YieldAgent"; "CheckpointAttempt"; "CompleteAgentWork" ] then cmd
                         else { cmd with SessionId = "" }
                     let result =
-                        PendingIntentJournal.executeLedgerWrite binding operationId "TaskWrite" journalCommand (fun () ->
+                        let apply () =
                             let withAdministrativeActor action =
                                 administrativeActor binding operationId cmd.SessionId |> Result.bind action
                             match cmd.Action with
@@ -2556,7 +2621,15 @@ module TaskApi =
                                     cmd.TaskId cmd.ActorId cmd.DecisionSequence
                                 |> mapError
                             | _ -> Error(Client.ValidationError "Unsupported  task operation.")
-                        )
+                        let verifyBinding () =
+                            verifyRemote () |> Result.bind (fun verified ->
+                                if verified <> binding then
+                                    Error(Client.ValidationError "Trust binding changed before task publication.")
+                                else Ok ())
+                        // Persist the original operation UUID and command BEFORE
+                        // verifyRemote makes its first authoritative Git fetch.
+                        PendingIntentJournal.executeLedgerWrite binding operationId "TaskWrite" journalCommand (fun () ->
+                            verifyBinding () |> Result.bind (fun () -> apply ()))
                     result |> Result.bind (fun write ->
                         if cmd.Action = "NotifyAgent" then
                             ReviewWorkflow.ReviewWorkflow.notificationDelivery binding write

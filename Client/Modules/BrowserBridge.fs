@@ -761,16 +761,11 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                     let withinReadinessBudget () =
                         Stopwatch.GetElapsedTime(readinessStarted) < TimeSpan.FromSeconds(30.0)
                     let cleanupNotReady () = task {
-                        // No user script was injected; cleanup cannot cancel a submission.
-                        if closeAfterExecution then
-                            match! bridge.CloseTab(registrationId, ownerConnectionId = ownerConnectionId,
-                                                   expectedRegistrationGeneration = createdGeneration) with
-                            | Ok _ -> return Error(registrationId, "TabNotReady; cleanup=closed")
-                            | Error e ->
-                                let safe = if e.Length > 100 then e.Substring(0, 100) else e
-                                return Error(registrationId, "TabNotReady; cleanupFailed:" + safe)
-                        else
-                            return Error(registrationId, "TabNotReady; cleanup=retained")
+                        // No user script was injected. The post-success preference
+                        // must not retain a definitive failed launch.
+                        match! closeDefinitive() with
+                        | Ok cleanup -> return Error(registrationId, "TabNotReady; cleanup=" + cleanup)
+                        | Error failure -> return Error(registrationId, "TabNotReady; " + failure)
                     }
                     let mutable ready = false
                     let mutable ownershipChanged = false
@@ -832,6 +827,27 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                                     | true, x when x.ValueKind = JsonValueKind.String -> x.GetString()
                                     | _ -> "completed"
                                 | _ -> "completed"
+                            // Never equate "script did not click Send" with "no
+                            // conversation exists". Only explicitly asserted
+                            // fresh-home/zero-turn evidence permits disposal.
+                            let disposable =
+                                match payload.ValueKind with
+                                | JsonValueKind.Object ->
+                                    // Contradictory evidence must fail closed even
+                                    // if a script accidentally asserts disposal.
+                                    let conversationObserved =
+                                        match payload.TryGetProperty("reason") with
+                                        | true, reason when reason.ValueKind = JsonValueKind.String ->
+                                            reason.GetString() = "ExistingConversation" ||
+                                            reason.GetString() = "UnexpectedStartUrl"
+                                        | _ -> false
+                                    match payload.TryGetProperty("safeToDisposeCreatedTab") with
+                                    | true, proof -> proof.ValueKind = JsonValueKind.True && not conversationObserved
+                                    | _ -> false
+                                | _ -> false
+                            let disposeFailedLaunch () =
+                                if disposable then closeDefinitive()
+                                else task { return Ok "retained" }
                             if status = "outcomeUnknown" then
                                 return Error(registrationId, "OutcomeUnknown: page submission was not confirmed")
                             elif status = "uiIncompatible" then
@@ -876,13 +892,13 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                                     | _ -> ""
                                 let summary = "UiIncompatible:" + safeField "stage" + ":" + safeField "reason"
                                 let details = if diagnostics = "" then summary else summary + ";" + diagnostics
-                                match! closeDefinitive() with
+                                match! disposeFailedLaunch() with
                                 | Ok cleanup -> return Error(registrationId, details + ";cleanup=" + cleanup)
                                 | Error failure -> return Error(registrationId, details + ";" + failure)
                             elif status = "notSubmitted" then
-                                // The page script guarantees it never attempted Send.
-                                // Do not strand old restored drafts in fresh tabs.
-                                match! closeDefinitive() with
+                                // An unsent draft is disposable, but a new turn or
+                                // route is not, even if this script did not send.
+                                match! disposeFailedLaunch() with
                                 | Error failure -> return Error(registrationId, "NotSubmitted;" + failure)
                                 | Ok cleanup ->
                                     return Ok(JsonSerializer.Serialize(

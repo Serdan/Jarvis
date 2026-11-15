@@ -3,16 +3,32 @@
 async function execute(args) {
   const prompt = args?.prompt;
   const startUrl = "https://chatgpt.com/";
+  let sendAttempted = false;
+  // A non-submission does not prove that a tab is disposable: a different
+  // session may have created a turn or navigated while this script was waiting.
+  // Only a still-home zero-turn surface can authorize failed-launch cleanup.
+  const safeToDisposeCreatedTab = () => {
+    try {
+      return !sendAttempted && location.href === startUrl &&
+        document.querySelectorAll('[data-message-author-role="user"]').length === 0 &&
+        document.querySelectorAll('[data-user-message-bubble]').length === 0;
+    } catch {
+      return false;
+    }
+  };
+  const notSubmitted = reason => ({
+    status: "notSubmitted", reason, safeToDisposeCreatedTab: safeToDisposeCreatedTab()
+  });
   if (typeof prompt !== "string" || !prompt.trim() || prompt.length > 24000) {
-    return { status: "notSubmitted", reason: "InvalidPrompt" };
+    return notSubmitted("InvalidPrompt");
   }
   if (location.href !== startUrl) {
-    return { status: "notSubmitted", reason: "UnexpectedStartUrl" };
+    return notSubmitted("UnexpectedStartUrl");
   }
   // Never change even the mode in an already established conversation.
   if (document.querySelectorAll('[data-message-author-role="user"]').length ||
       document.querySelectorAll('[data-user-message-bubble]').length) {
-    return { status: "notSubmitted", reason: "ExistingConversation" };
+    return notSubmitted("ExistingConversation");
   }
   // A single budget for hydration, insertion, acknowledgement and route capture.
   // Leaves a three-second margin inside the bridge's 30-second execution limit.
@@ -43,9 +59,9 @@ async function execute(args) {
     status: "uiIncompatible",
     stage,
     reason,
+    safeToDisposeCreatedTab: safeToDisposeCreatedTab(),
     diagnostics: { documentReadyState: document.readyState || "unknown", ...selectorCounts() }
   });
-  let sendAttempted = false;
   try {
   // ChatGPT can remember Work mode even when opening the new-chat homepage.
   // Resolve by visible label and aria-pressed, not generated classes or DOM order.
@@ -81,7 +97,7 @@ async function execute(args) {
   // This script is for new Jarvis-owned home tabs only. An existing user turn
   // means this is not an empty new-chat surface, even if the URL still matches.
   if (initialUrl !== startUrl || initialTurns || initialBubbles) {
-    return { status: "notSubmitted", reason: "ExistingConversation" };
+    return notSubmitted("ExistingConversation");
   }
   const normalizedPrompt = prompt.replace(/\r\n/g, "\n").replace(/\u00a0/g, " ").trim();
   const composer = await until(() => {
@@ -89,7 +105,7 @@ async function execute(args) {
     return editors.length === 1 ? editors[0] : null;
   });
   if (!composer) return incompatible("composer", "ComposerUnavailable");
-  if (location.href !== startUrl) return { status: "notSubmitted", reason: "UnexpectedStartUrl" };
+  if (location.href !== startUrl) return notSubmitted("UnexpectedStartUrl");
   const readEditor = () => composer.innerText.replace(/\r\n/g, "\n").replace(/\u00a0/g, " ");
   if ((composer.textContent || "").length > 0) {
     // Only actual editor text, not a rendered empty-paragraph newline,
@@ -113,10 +129,10 @@ async function execute(args) {
   const settleDeadline = Math.min(deadline, Date.now() + 1800);
   let settledSamples = 0;
   while (true) {
-    if (location.href !== startUrl) return { status: "notSubmitted", reason: "UnexpectedStartUrl" };
+    if (location.href !== startUrl) return notSubmitted("UnexpectedStartUrl");
     if (document.querySelectorAll('[data-message-author-role="user"]').length !== initialTurns ||
         document.querySelectorAll('[data-user-message-bubble]').length !== initialBubbles) {
-      return { status: "notSubmitted", reason: "ExistingConversation" };
+      return notSubmitted("ExistingConversation");
     }
     const editors = document.querySelectorAll(composerSelector);
     if (editors.length !== 1 || editors[0] !== composer) {
@@ -129,7 +145,7 @@ async function execute(args) {
     if (settledSamples >= 3) break;
     if (Date.now() >= settleDeadline) {
       return {
-        status: "notSubmitted", stage: "draftStabilization", reason: "UnexpectedSendState",
+        ...notSubmitted("UnexpectedSendState"), stage: "draftStabilization",
         diagnostics: { documentReadyState: document.readyState || "unknown", ...selectorCounts() }
       };
     }
@@ -147,10 +163,10 @@ async function execute(args) {
   if (readEditor() !== prompt.replace(/\r\n/g, "\n")) {
     return incompatible("composer", "ComposerChanged");
   }
-  if (location.href !== startUrl) return { status: "notSubmitted", reason: "UnexpectedStartUrl" };
+  if (location.href !== startUrl) return notSubmitted("UnexpectedStartUrl");
   if (document.querySelectorAll('[data-message-author-role="user"]').length !== initialTurns ||
       document.querySelectorAll('[data-user-message-bubble]').length !== initialBubbles) {
-    return { status: "notSubmitted", reason: "ExistingConversation" };
+    return notSubmitted("ExistingConversation");
   }
   // Once this click is attempted the effect is non-idempotent. Never try again.
   try {

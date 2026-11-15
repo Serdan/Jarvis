@@ -457,6 +457,7 @@ let compositeLaunchKeepsUncertainTabButClosesDefinitiveFailure (scriptStatus: st
         connectionId = connectionId; registrationId = "created-tab-02"
         registrationGeneration = 1; status = "completed"
         result = {| status = scriptStatus; stage = "modeSelection"; reason = if scriptStatus = "notSubmitted" then "UnexpectedSendState" else "ModeToggleUnavailable"
+                    safeToDisposeCreatedTab = shouldClose
                     diagnostics = {| chatLabels = 0; editableTextboxes = 1;
                                      documentReadyState = "complete" |} |}
     |}))
@@ -514,7 +515,7 @@ let definitiveLaunchCleanupFailureIsSurfacedWithoutRetry (scriptStatus: string) 
     do! send socket (JsonSerializer.Serialize({|
         version = 2; kind = "result"; requestId = property execution "requestId"
         connectionId = connectionId; registrationId = "cleanup-failure"; registrationGeneration = 4
-        result = {| status = scriptStatus; stage = "composer"; reason = "UnexpectedSendState" |}
+        result = {| status = scriptStatus; stage = "composer"; reason = "UnexpectedSendState"; safeToDisposeCreatedTab = true |}
     |}))
     let! closing = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     Assert.That(property closing "kind", Is.EqualTo("closeTab"))
@@ -533,6 +534,91 @@ let definitiveLaunchCleanupFailureIsSurfacedWithoutRetry (scriptStatus: string) 
     Assert.That(bridge.ListTabs() |> Result.exists (fun x -> x.Contains("personal-tab")), Is.True)
 }
 
+// The page script and bridge share an explicit disposal contract: no Send
+// attempt alone is insufficient when another conversation/route appears.
+[<TestCase("notSubmitted", "ExistingConversation", "false", false)>]
+[<TestCase("notSubmitted", "UnexpectedStartUrl", "false", false)>]
+[<TestCase("notSubmitted", "ExistingConversation", "true", false)>]
+[<TestCase("notSubmitted", "UnexpectedStartUrl", "true", false)>]
+[<TestCase("notSubmitted", "UnexpectedSendState", "true", true)>]
+[<TestCase("uiIncompatible", "ComposerChanged", "false", false)>]
+[<TestCase("uiIncompatible", "DraftClearFailed", "true", true)>]
+[<TestCase("notSubmitted", "UnexpectedSendState", "absent", false)>]
+[<TestCase("notSubmitted", "UnexpectedSendState", "\"true\"", false)>]
+[<TestCase("outcomeUnknown", "SubmissionUnconfirmed", "true", false)>]
+let composedLauncherDisposalHonorsFreshHomeProof
+    (scriptStatus: string, reason: string, proof: string, shouldClose: bool) = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let! client, connectionId = handshake port "test-secret"
+    use socket = client
+    do! registerReadyAgentWindow socket bridge
+    let launch = BrowserBridge.runInNewTab bridge "agents" "https://chatgpt.com/" "safe-close" false
+                     "async function execute(args) { return args; }" "{}" 5000 false
+    let! opened = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property opened "kind", Is.EqualTo("openTab"))
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"launcher-created","agentCreated":true,"availability":"ready","registrationGeneration":3},{"registrationId":"unrelated-conversation","agentCreated":true,"availability":"ready","registrationGeneration":1},{"registrationId":"personal-tab","agentCreated":false,"availability":"ready","registrationGeneration":1}]}"""
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "tabOpened"; requestId = property opened "requestId"
+        connectionId = connectionId
+        tab = {| registrationId = "launcher-created"; agentCreated = true
+                 availability = "ready"; registrationGeneration = 3 |}
+    |}))
+    let! executeFrame = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property executeFrame "kind", Is.EqualTo("executeJs"))
+    Assert.That(property executeFrame "registrationId", Is.EqualTo("launcher-created"))
+    let proofField = if proof = "absent" then "" else ",\"safeToDisposeCreatedTab\":" + proof
+    let pageJson =
+        "{\"status\":\"" + scriptStatus + "\",\"stage\":\"draftStabilization\",\"reason\":\"" +
+        reason + "\"" + proofField + "}"
+    let pageResult = JsonSerializer.Deserialize<JsonElement>(pageJson)
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "result"; requestId = property executeFrame "requestId"
+        connectionId = connectionId; registrationId = "launcher-created"
+        registrationGeneration = 3; status = "completed"; result = pageResult
+    |}))
+    if shouldClose then
+        let! closing = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+        Assert.That(property closing "kind", Is.EqualTo("closeTab"))
+        Assert.That(property closing "registrationId", Is.EqualTo("launcher-created"))
+        use closeDoc = JsonDocument.Parse(closing)
+        Assert.That(closeDoc.RootElement.GetProperty("registrationGeneration").GetInt32(), Is.EqualTo(3))
+        do! send socket (JsonSerializer.Serialize({|
+            version = 2; kind = "tabClosed"; requestId = property closing "requestId"
+            connectionId = connectionId; registrationId = "launcher-created"
+            registrationGeneration = 3
+        |}))
+        do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"unrelated-conversation","agentCreated":true,"availability":"ready","registrationGeneration":1},{"registrationId":"personal-tab","agentCreated":false,"availability":"ready","registrationGeneration":1}]}"""
+    let! outcome = launch.WaitAsync(TimeSpan.FromSeconds(3.0))
+    match outcome with
+    | Ok json when scriptStatus = "notSubmitted" ->
+        Assert.That(json, Does.Contain("notSubmitted"))
+        Assert.That(json, Does.Contain(if shouldClose then "cleanup\":\"closed" else "cleanup\":\"retained"))
+        Assert.That(json, Does.Contain(reason))
+    | Error (id, text) when scriptStatus = "uiIncompatible" ->
+        Assert.That(id, Is.EqualTo("launcher-created"))
+        Assert.That(text, Does.Contain("UiIncompatible"))
+        Assert.That(text, Does.Contain(if shouldClose then "cleanup=closed" else "cleanup=retained"))
+    | Error (id, text) when scriptStatus = "outcomeUnknown" ->
+        Assert.That(id, Is.EqualTo("launcher-created"))
+        Assert.That(text, Does.Contain("OutcomeUnknown"))
+    | _ -> Assert.Fail("Unexpected result at launcher/bridge cleanup boundary")
+    do! waitUntil (fun () ->
+        bridge.ListTabs() |> Result.exists (fun tabs ->
+            tabs.Contains("personal-tab") && tabs.Contains("unrelated-conversation") &&
+            (tabs.Contains("launcher-created") <> shouldClose)))
+    if not shouldClose then
+        // Bounded negative-space assertion: no close or replay frame may be
+        // emitted on ambiguous, unproven, or confirmed-conversation states.
+        use cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200.0))
+        try
+            let! frame = socket.ReceiveAsync(ArraySegment<byte>(Array.zeroCreate<byte> 8192), cts.Token)
+            Assert.Fail("Unexpected bridge command after retained failure: " + string frame.MessageType)
+        with :? OperationCanceledException -> ()
+    return ()
+}
+
 [<Test>]
 let compositeNotReadyCleanupReportsFailureOrConfirmedClosure () = task {
     let port = findPort()
@@ -543,11 +629,12 @@ let compositeNotReadyCleanupReportsFailureOrConfirmedClosure () = task {
     do! registerReadyAgentWindow socket bridge
 
     // These two workflows wait for distinct created tabs that become discarded.
-    // They exercise the real 30-second bounded readiness path concurrently.
+    // They exercise the real 30-second bounded readiness path concurrently,
+    // including the MCP's default closeAfterExecution=false.
     let fail = BrowserBridge.runInNewTab bridge "agents" "https://example.test/fail" "fail" false
-                   "async function execute(args) { return args; }" "{}" 5000 true
+                   "async function execute(args) { return args; }" "{}" 5000 false
     let close = BrowserBridge.runInNewTab bridge "agents" "https://example.test/close" "close" false
-                    "async function execute(args) { return args; }" "{}" 5000 true
+                    "async function execute(args) { return args; }" "{}" 5000 false
 
     let! openA = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     let! openB = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))

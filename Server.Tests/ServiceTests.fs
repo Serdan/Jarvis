@@ -506,7 +506,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     let ledgerWire = set [ "TaskRead"; "TaskWrite"; "ReviewRead"; "ReviewWrite";
                           "LedgerRead"; "LedgerWrite"; "ChallengeRead"; "ChallengeWrite" ]
     let orchestrationTools =
-        set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "GetNotificationPreferences"; "SetNotificationSenderBlock"; "SetNotificationMute"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
+        set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "GetNotificationPreferences"; "GetResponseAlerts"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
               "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"
               "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"
               "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
@@ -605,7 +605,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
     // Preserve role/instruction aliases, Challenges, taskless execution and
     // recipient-notification public methods, all with device routing.
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 76)
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 79)
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -1064,11 +1064,11 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
                             "PendingOperationSummary"; "PendingOperationsPage"; "InspectPendingOperation" ] -> name, ledgerRead
               for name in [ "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"; "AcknowledgePendingOperation" ] -> name, ledgerWrite
               for name in [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec";
-                            "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"; "GetNotificationPreferences" ] ->
+                            "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"; "GetNotificationPreferences"; "GetResponseAlerts" ] ->
                   name, (if name = "AgentInbox" then
                              { taskRead with MutatesState = true }
                          else taskRead)
-              for name in [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
+              for name in [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
                             "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions";
                             "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork";
                             "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork";
@@ -1304,6 +1304,32 @@ let mcp_guidance_blocks_precede_result_without_changing_success () =
     let operation = result.Content[1] :?> TextContentBlock
     Assert.That(operation.Text, Is.EqualTo("""{"result":"ok"}"""))
 
+[<Test>]
+let operator_alert_blocks_precede_guidance_timing_and_failed_tool_result () =
+    let alerts : InstructionDocument list =
+        [ { Scope = "workspace"; Path = "AGENTS.md"; Sha256 = ""
+            Content = "Repository instructions" }
+          { Scope = "working-turn"; Path = ""; Sha256 = ""
+            Content = "HARD STOP - persist and yield" }
+          { Scope = "response-alert"; Path = "jarvis/response-alert/stop"; Sha256 = ""
+            Content = "JARVIS OPERATOR ALERT:\nSTOP — yield safely" }
+          { Scope = "response-alert"; Path = "jarvis/response-alert/ordinary"; Sha256 = ""
+            Content = "JARVIS OPERATOR ALERT:\nPlease save test output" } ]
+    let failure =
+        { Result = None; Error = Some(ValidationFailed "Unrelated error")
+          Instructions = alerts; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+    let shown = failure |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions alerts
+    Assert.That(shown.IsError, Is.EqualTo(Nullable true))
+    Assert.That(shown.Content.Count, Is.EqualTo(5))
+    Assert.That((shown.Content[0] :?> TextContentBlock).Text, Does.Contain("STOP — yield"))
+    Assert.That((shown.Content[1] :?> TextContentBlock).Text, Does.Contain("save test output"))
+    use guidance = JsonDocument.Parse((shown.Content[2] :?> TextContentBlock).Text)
+    let map = guidance.RootElement.GetProperty("AGENTS.md")
+    Assert.That(map.EnumerateObject() |> Seq.length, Is.EqualTo(1),
+                "Response alerts must never be buried as synthetic AGENTS.md keys")
+    Assert.That(map.GetProperty(".").GetString(), Is.EqualTo("Repository instructions"))
+    Assert.That((shown.Content[3] :?> TextContentBlock).Text, Does.Contain("HARD STOP"))
+    Assert.That((shown.Content[4] :?> TextContentBlock).Text, Does.Contain("Unrelated error"))
 [<Test>]
 let mcp_agency_write_warning_precedes_success_without_marking_error () =
     let notes =

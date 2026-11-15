@@ -93,6 +93,48 @@ let private checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.Pro
                     Sha256 = ""; Content = content } ]
             | None -> []
 
+// Response alerts are distinct from cached Working-turn timing guidance.
+// A fresh canonical ledger read on each eligible response makes alerts
+// visible across devices and restarts, even if an invalidation push was lost.
+// Successful Git CAS consumption gives at-most-once best-effort delivery.
+let private checkResponseAlerts (rt: Runtime) agentId (target: ProjectPaths.ProjectTarget option) =
+    if String.IsNullOrWhiteSpace agentId then []
+    else
+        match target with
+        | None -> []
+        | Some selected ->
+            let project = selected |> ProjectPaths.ProjectTarget.projectId |> ProjectPaths.ProjectId.value
+            match OrchestrationApi.LedgerBindingConfig.load project rt with
+            | Error _ -> []
+            | Ok binding ->
+                match ReviewWorkflow.ReviewWorkflow.takeResponseAlerts binding agentId with
+                | Error _ -> [] // Retain pending content for a later response.
+                | Ok alerts ->
+                    alerts
+                    |> List.sortBy (fun alert ->
+                        (if alert.Message.TrimStart().StartsWith("STOP", StringComparison.OrdinalIgnoreCase)
+                         then 0 else 1), alert.QueuedAtUtc, alert.AlertId)
+                    |> List.map (fun alert ->
+                        { Scope = "response-alert"
+                          Path = $"jarvis/response-alert/{alert.AlertId}"
+                          Sha256 = ""
+                          Content = "JARVIS OPERATOR ALERT (one-shot coordination instruction):\n" + alert.Message })
+
+let private mayReceiveResponseAlert = function
+    // Neither a source-ledger health probe nor a cross-project notification
+    // transports the destination agent's identity or ordinary tool response.
+    | CrossProjectNotificationCommand _ -> false
+    // Observer and operator inspection are administrative, not the target
+    // agent's ordinary tool usage. They must never consume a message.
+    | ObserveAgentCommand _ -> false
+    | TaskReadCommand cmd when cmd.Action = "GetResponseAlerts" -> false
+    | TaskWriteCommand cmd when cmd.Action = "QueueResponseAlert"
+                                 || cmd.Action = "ClearResponseAlert" -> false
+    | LedgerReadCommand cmd when cmd.Action = "Health" -> false
+    | TaskWriteCommand cmd when cmd.Action = "NotifyAgent"
+                                 && not (String.IsNullOrWhiteSpace cmd.SourceRef) -> false
+    | _ -> true
+
 // A cross-project notification is sent using the *source* agent identity,
 // which is not an identity of an agent in the destination project. Routing
 // health probes likewise do not represent agent activity. Keep both out of
@@ -117,6 +159,8 @@ let private activatesAgent (agentId: string) command =
               "SetNotificationSenderBlock"; "SetNotificationMute"
               "BindAttemptSource"; "RebindAttemptSource"; "BindReviewBase"
               "SetAttemptSource"; "SubmitIntegration"; "CompleteIntegration" ]
+    // Administrative alert inspection must never start the inspector's Ready task.
+    | TaskReadCommand cmd when cmd.Action = "GetResponseAlerts" -> false
     | TaskReadCommand cmd ->
         String.IsNullOrWhiteSpace cmd.AgentId || cmd.AgentId = agentId
     // Challenge inspection is observational. ReadOnly MCP methods must
@@ -951,6 +995,7 @@ let receiveCommandWithInstructions (rt: Runtime) command =
 let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string) =
     task {
         let mutable parsedCommand = None
+        let mutable responseScope: ProjectPaths.ProjectTarget option = None
         let mutable unexpectedFailure = false
         let mutable instructions: InstructionDocument list = []
         let mutable implicitChanges: string list = []
@@ -1002,6 +1047,8 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                     | Error error -> return Error error
                     | Ok scope ->
                         let target = projectTarget scope
+                        if mayReceiveResponseAlert command then
+                            responseScope <- target
                         // The caller's agentId belongs to the source project
                         // of a cross-project notification, not the destination.
                         let localAgentId =
@@ -1068,6 +1115,9 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                 |> List.distinct
                 |> List.map (fun id -> { ProjectName = project; AgentId = id })
             | _ -> []
+        // Failed operations and job polls receive pending alerts without
+        // changing the ordinary agent activity/activation rules.
+        instructions <- checkResponseAlerts rt agentId responseScope @ instructions
         let agentResponse =
             match parsedCommand with
             | Some command -> toAgentResponse command instructions changes inboxActivation response

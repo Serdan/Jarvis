@@ -1764,6 +1764,63 @@ type ReviewWorkflowTests() =
             | other -> Assert.Fail(sprintf "Already acknowledged notification: %A" other))
 
     [<Test>]
+    member _.ResponseAlertsAreTargetedDurableAndConsumedOnceAcrossClients() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let stopId = Guid.NewGuid()
+            let send () =
+                ReviewWorkflow.queueResponseAlert first stopId "AuthenticatedUser" "Reviewer"
+                    "STOP — preserve safe changes and yield."
+            Assert.That((send () |> success).AlreadyApplied, Is.False)
+            Assert.That((send () |> success).AlreadyApplied, Is.True)
+            let pending = ReviewWorkflow.getResponseAlerts second "Reviewer" |> success
+            Assert.That(pending.Pending.Length, Is.EqualTo(1))
+            Assert.That(pending.Pending.Head.AlertId, Is.EqualTo(stopId.ToString("N")))
+            Assert.That(pending.Pending.Head.Message, Does.StartWith("STOP"))
+            Assert.That((ReviewWorkflow.getResponseAlerts first "Owner" |> success).Pending, Is.Empty)
+            let consumed = ReviewWorkflow.takeResponseAlerts second "Reviewer" |> success
+            Assert.That(consumed.Length, Is.EqualTo(1))
+            Assert.That(consumed.Head.Message, Is.EqualTo(pending.Pending.Head.Message))
+            Assert.That((ReviewWorkflow.takeResponseAlerts first "Reviewer" |> success), Is.Empty)
+            Assert.That((ReviewWorkflow.getResponseAlerts second "Reviewer" |> success).Pending, Is.Empty))
+
+    [<Test>]
+    member _.ResponseAlertsCanBeClearedPreciselyAndQueueIsBounded() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let firstId = Guid.NewGuid()
+            let secondId = Guid.NewGuid()
+            ReviewWorkflow.queueResponseAlert first firstId "Lead" "Reviewer" "Review status note"
+            |> success |> ignore
+            ReviewWorkflow.queueResponseAlert second secondId "Lead" "Reviewer" "STOP — end turn"
+            |> success |> ignore
+            ReviewWorkflow.clearResponseAlert first (Guid.NewGuid()) "Lead" "Reviewer" firstId
+            |> success |> ignore
+            match ReviewWorkflow.clearResponseAlert first (Guid.NewGuid()) "Lead" "Reviewer" firstId with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Stale clear may not affect another alert: %A" other)
+            let pending = (ReviewWorkflow.getResponseAlerts second "Reviewer" |> success).Pending
+            Assert.That(pending.Length, Is.EqualTo(1))
+            Assert.That(pending.Head.AlertId, Is.EqualTo(secondId.ToString("N")))
+            for index in 1 .. 3 do
+                ReviewWorkflow.queueResponseAlert first (Guid.NewGuid()) "Lead" "Reviewer"
+                    (sprintf "Another note %d" index)
+                |> success |> ignore
+            match ReviewWorkflow.queueResponseAlert second (Guid.NewGuid()) "Lead" "Reviewer" "Overflow" with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Expected bounded queue: %A" other)
+            Assert.That((ReviewWorkflow.takeResponseAlerts second "Reviewer" |> success).Length, Is.EqualTo(4))
+            Assert.That((ReviewWorkflow.getResponseAlerts first "Reviewer" |> success).Pending, Is.Empty))
+
+    [<Test>]
+    member _.ResponseAlertsRejectOversizedTextAndUnknownTarget() =
+        withFixture (fun _ _ first _ _ _ _ _ ->
+            match ReviewWorkflow.queueResponseAlert first (Guid.NewGuid()) "Lead" "Reviewer" (String('x', 1537)) with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Oversized alert unexpectedly accepted: %A" other)
+            match ReviewWorkflow.queueResponseAlert first (Guid.NewGuid()) "Lead" "Missing Agent" "STOP" with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Unknown agent unexpectedly accepted: %A" other)
+            Assert.That((ReviewWorkflow.getResponseAlerts first "Reviewer" |> success).Pending, Is.Empty))
+    [<Test>]
     member _.NotificationBlockAutoreplyAndOriginalRetryAreDurable() =
         withFixture (fun _ _ first second _ _ _ _ ->
             let initial = ReviewWorkflow.getNotificationPreferences first "Reviewer" |> success
@@ -5965,6 +6022,123 @@ type ReviewWorkflowTests() =
                 if File.Exists(configPath + ".lock") then File.Delete(configPath + ".lock"))
 
 
+    [<Test>]
+    member _.ResponseAlertsReachErroredPollAndUnrelatedToolResponsesWithoutActivity() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            try
+                let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+                let head = (LedgerStore.fetch first |> success).Commit
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" context first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl head true
+                |> success |> ignore
+                let runtime =
+                    Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+                let invoke actor (command: Common.AgentCommand) =
+                    Client.SignalR.Client.processIncomingCommand runtime
+                        (System.Text.Json.JsonSerializer.Serialize(command)) actor
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                let poll : Common.AgentCommand =
+                    Common.GetJobResultCommand
+                        { ProjectName = "owner"; JobId = "missing-job"; AfterSequence = None }
+                ReviewWorkflow.queueResponseAlert second (Guid.NewGuid()) "Lead"
+                    "Reviewer" "Please preserve test evidence" |> success |> ignore
+                let _, _, other = invoke "Owner" poll
+                Assert.That(other.Instructions |> List.exists (fun item ->
+                    item.Scope = "response-alert"), Is.False)
+                Assert.That((ReviewWorkflow.getResponseAlerts first "Reviewer" |> success).Pending.Length, Is.EqualTo(1))
+                ReviewWorkflow.queueResponseAlert first (Guid.NewGuid()) "Lead"
+                    "Reviewer" "STOP — commit safe changes and yield" |> success |> ignore
+                let _, polled, delivered = invoke "Reviewer" poll
+                Assert.That(polled.IsError, Is.True)
+                let alerts = delivered.Instructions |> List.filter (fun item ->
+                    item.Scope = "response-alert")
+                Assert.That(alerts.Length, Is.EqualTo(2))
+                Assert.That(alerts.Head.Content, Does.Contain("STOP"))
+                Assert.That(alerts.[1].Content, Does.Contain("preserve test evidence"))
+                Assert.That(delivered.AgentStateChanges, Is.Empty)
+                Assert.That(delivered.InboxActivation.IsNone, Is.True)
+                Assert.That(runtime.Tui.GetAgentLastSeen("owner", "Reviewer").IsNone, Is.True)
+                Assert.That((ReviewWorkflow.getResponseAlerts second "Reviewer" |> success).Pending, Is.Empty)
+                let ordinary : Common.AgentCommand =
+                    Common.TaskReadCommand
+                        { ProjectName = "owner"; AgentId = "Reviewer"; Action = "GetNotificationPreferences"
+                          TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
+                          Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
+                let _, readResult, after = invoke "Reviewer" ordinary
+                Assert.That(readResult.IsOk, Is.True)
+                Assert.That(after.Instructions |> List.exists (fun item ->
+                    item.Scope = "response-alert"), Is.False)
+                ReviewWorkflow.queueResponseAlert first (Guid.NewGuid()) "Lead"
+                    "Reviewer" "Non-stop instruction" |> success |> ignore
+                let missing : Common.AgentCommand =
+                    Common.ReadFileCommand
+                        { ProjectName = "owner"; FilePath = "missing-file"; StartLine = None
+                          EndLine = None; IncludeLineNumbers = None }
+                let _, missingResult, missingReply = invoke "Reviewer" missing
+                Assert.That(missingResult.IsError, Is.True)
+                Assert.That(missingReply.Instructions |> List.exists (fun item ->
+                    item.Scope = "response-alert" && item.Content.Contains("Non-stop instruction")), Is.True)
+                Assert.That((ReviewWorkflow.getResponseAlerts second "Reviewer" |> success).Pending, Is.Empty)
+            finally
+                if File.Exists configPath then File.Delete configPath
+                if File.Exists(configPath + ".lock") then File.Delete(configPath + ".lock"))
+    [<Test>]
+    member _.ResponseAlertInspectionAndJobPollNeverActivateReadyAssignment() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let taskId = "pending-alert-do-not-activate"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId taskId |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let before = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(before.State, Is.EqualTo("Ready"))
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            try
+                let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+                let head = (LedgerStore.fetch first |> success).Commit
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" context first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl head true
+                |> success |> ignore
+                let runtime =
+                    Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+                let invoke (command: Common.AgentCommand) =
+                    Client.SignalR.Client.processIncomingCommand runtime
+                        (System.Text.Json.JsonSerializer.Serialize(command)) "Owner"
+                    |> Async.AwaitTask |> Async.RunSynchronously
+
+                ReviewWorkflow.queueResponseAlert second (Guid.NewGuid()) "Lead" "Owner"
+                    "STOP — yield safely" |> success |> ignore
+                let inspect : Common.AgentCommand =
+                    Common.TaskReadCommand
+                        { ProjectName = "owner"; AgentId = "Owner"; Action = "GetResponseAlerts"
+                          TaskId = "Owner"; AssignmentGeneration = 0; CheckpointSequence = 0L
+                          Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
+                          RelativePath = null }
+                let _, result, metadata = invoke inspect
+                Assert.That(result.IsOk, Is.True)
+                Assert.That(metadata.Instructions |> List.exists (fun item ->
+                    item.Scope = "response-alert"), Is.False)
+                Assert.That((ReviewWorkflow.getResponseAlerts first "Owner" |> success).Pending.Length, Is.EqualTo(1))
+                Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.Version, Is.EqualTo(before.Version))
+
+                let poll : Common.AgentCommand =
+                    Common.GetJobResultCommand
+                        { ProjectName = "owner"; JobId = "missing-job"; AfterSequence = None }
+                let _, polled, response = invoke poll
+                Assert.That(polled.IsError, Is.True)
+                Assert.That(response.Instructions |> List.exists (fun item ->
+                    item.Scope = "response-alert" && item.Content.Contains("STOP")), Is.True)
+                Assert.That(response.AgentStateChanges, Is.Empty)
+                Assert.That(response.InboxActivation.IsNone, Is.True)
+                let after = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                Assert.That(after.State, Is.EqualTo("Ready"))
+                Assert.That(after.Version, Is.EqualTo(before.Version))
+                Assert.That(runtime.Tui.GetAgentLastSeen("owner", "Owner").IsNone, Is.True)
+            finally
+                if File.Exists configPath then File.Delete configPath
+                if File.Exists(configPath + ".lock") then File.Delete(configPath + ".lock"))
     [<Test>]
     member _.ChallengeReadsDoNotActivateReadyAgentOrPublishCanonicalChanges() =
         withFixture (fun one _ first second _ _ _ _ ->

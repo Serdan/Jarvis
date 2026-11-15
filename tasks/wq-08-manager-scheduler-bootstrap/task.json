@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"wq-08-manager-scheduler-bootstrap","title":"[Planned P1][WQ-08] Scheduler preflight, role bootstrap and Manager slot handoff","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"wq-08-manager-scheduler-bootstrap","title":"[Planned P1][WQ-08] Direct deterministic Scheduler and connect-time role bootstrap","version":2,"lifecycle":"Open","specVersion":2,"attemptId":null}

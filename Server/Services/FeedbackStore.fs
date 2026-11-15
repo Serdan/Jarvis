@@ -102,9 +102,14 @@ module FeedbackValidation =
     let status value = canonical statuses "status" value
     let isClosed value = value = "Resolved" || value = "WontFix"
 
-type FeedbackStore(databasePath: string, ?telemetryRetention: TimeSpan, ?runPruneTimer: bool) =
+type FeedbackStore(databasePath: string, ?telemetryRetention: TimeSpan, ?runPruneTimer: bool,
+                   ?maxDatabaseBytes: int64) =
     let telemetryRetention = defaultArg telemetryRetention (TimeSpan.FromDays 30.0)
     do if telemetryRetention <= TimeSpan.Zero then invalidArg "telemetryRetention" "Must be positive"
+    // This disposable diagnostics database cannot grow new SQLite pages indefinitely.
+    // The optional wrapper quarantines oversized pre-existing files before opening.
+    let maxDatabaseBytes = defaultArg maxDatabaseBytes (16L * 1024L * 1024L)
+    do if maxDatabaseBytes < 128L * 1024L then invalidArg "maxDatabaseBytes" "Must be at least 128 KiB"
     let connectionString =
         let builder = SqliteConnectionStringBuilder()
         builder.DataSource <- databasePath
@@ -131,6 +136,21 @@ type FeedbackStore(databasePath: string, ?telemetryRetention: TimeSpan, ?runPrun
     let openConnection () =
         let connection = new SqliteConnection(connectionString)
         connection.Open()
+
+        use size = connection.CreateCommand()
+        size.CommandText <- "PRAGMA page_size;"
+        let pageSize = Convert.ToInt64(size.ExecuteScalar())
+        use pageLimit = connection.CreateCommand()
+        pageLimit.CommandText <- $"PRAGMA max_page_count = {max 1L (maxDatabaseBytes / pageSize)};"
+        pageLimit.ExecuteScalar() |> ignore
+        // Checkpoints keep WAL space small normally. A blocked checkpoint can
+        // outlive this limit, so OptionalFeedbackStore also checks sidecar sizes.
+        use checkpoint = connection.CreateCommand()
+        checkpoint.CommandText <- "PRAGMA wal_autocheckpoint = 64;"
+        checkpoint.ExecuteScalar() |> ignore
+        use journalLimit = connection.CreateCommand()
+        journalLimit.CommandText <- "PRAGMA journal_size_limit = 1048576;"
+        journalLimit.ExecuteScalar() |> ignore
 
         use foreignKeys = connection.CreateCommand()
         foreignKeys.CommandText <- "PRAGMA foreign_keys = ON;"
@@ -253,7 +273,10 @@ CREATE TABLE IF NOT EXISTS attributed_agent_activity (
         for table in [ "connection_events"; "operations" ] do
             use command = connection.CreateCommand()
             command.Transaction <- transaction
-            command.CommandText <- $"DELETE FROM {table} WHERE created_at < $cutoff;"
+            // Each pass has a finite write/lock budget, even for legacy files
+            // containing years of old data.
+            command.CommandText <-
+                $"DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE created_at < $cutoff LIMIT 128);"
             addParameter command "$cutoff" (cutoff.ToString("O"))
             command.ExecuteNonQuery() |> ignore
         transaction.Commit()

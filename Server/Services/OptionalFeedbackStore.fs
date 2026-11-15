@@ -1,6 +1,7 @@
 namespace Server.Services
 
 open System
+open System.IO
 open System.Threading
 open System.Threading.Tasks
 
@@ -10,11 +11,23 @@ open System.Threading.Tasks
 /// request/SignalR routing thread. A stuck database consumes at most one worker;
 /// later diagnostics fail immediately instead of piling up blocking SQLite calls.
 /// The underlying database is deliberately neither deleted nor migrated here.
-type OptionalFeedbackStore(databasePath: string, ?timeout: TimeSpan) as this =
+type OptionalFeedbackStore(databasePath: string, ?timeout: TimeSpan, ?maxDiskBytes: int64) as this =
     let deadline = defaultArg timeout (TimeSpan.FromMilliseconds 200.)
     do if deadline <= TimeSpan.Zero then invalidArg "timeout" "Must be positive."
+    // Hard high-water: no new diagnostic operation starts once the main DB
+    // plus WAL/SHM/rollback sidecars consume 32 MiB. SQLite itself is limited
+    // to 16 MiB of database pages; WAL is periodically checkpointed.
+    // Legacy oversized files are left byte-for-byte untouched and unavailable.
+    let diskBudget = defaultArg maxDiskBytes (32L * 1024L * 1024L)
+    do if diskBudget < 256L * 1024L then invalidArg "maxDiskBytes" "Must be at least 256 KiB."
+    let databaseBudget = min (16L * 1024L * 1024L) (diskBudget / 2L)
+    let fileBytes path =
+        if File.Exists path then FileInfo(path).Length else 0L
+    let diagnosticBytes () =
+        [| databasePath; databasePath + "-wal"; databasePath + "-shm"; databasePath + "-journal" |]
+        |> Array.sumBy fileBytes
     let database =
-        lazy (new FeedbackStore(databasePath, runPruneTimer = false))
+        lazy (new FeedbackStore(databasePath, runPruneTimer = false, maxDatabaseBytes = databaseBudget))
     let mutable inFlight = 0
     let unavailable = "TelemetryUnavailable: optional server SQLite is disabled, busy, or unresponsive."
     // Periodic retention must follow the same single-flight budget; the
@@ -36,7 +49,13 @@ type OptionalFeedbackStore(databasePath: string, ?timeout: TimeSpan) as this =
                 let background =
                     try
                         Task.Run(Func<'T>(fun () ->
-                            try operation database.Value
+                            try
+                                // Stat and SQLite both execute off the MCP request
+                                // path; over-budget existing DBs are not opened.
+                                if fileBytes databasePath >= databaseBudget ||
+                                   diagnosticBytes() >= diskBudget then
+                                    invalidOp "TelemetryQuotaExceeded: diagnostic disk budget reached."
+                                operation database.Value
                             finally Interlocked.Exchange(&inFlight, 0) |> ignore))
                     with _ ->
                         Interlocked.Exchange(&inFlight, 0) |> ignore
@@ -49,6 +68,9 @@ type OptionalFeedbackStore(databasePath: string, ?timeout: TimeSpan) as this =
                     // The worker may still finish. Never start another SQLite
                     // operation until it returns, and do not claim a write failed.
                     return Error "TelemetryUnavailable: SQLite timed out; diagnostic outcome unknown."
+                | :? InvalidOperationException as ex when
+                    ex.Message.StartsWith("TelemetryQuotaExceeded:", StringComparison.Ordinal) ->
+                    return Error ex.Message
                 | ex ->
                     return Error("TelemetryUnavailable: " + ex.GetType().Name)
         }

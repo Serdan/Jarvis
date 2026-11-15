@@ -166,6 +166,10 @@ module AgentStateInvalidationRouting =
 
 
 type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker, http: IHttpContextAccessor, logger: ILogger<ClientService>) =
+    // Cross-device hints are nonauthoritative. Allow only one pending batch
+    // globally: a hung SignalR recipient cannot create an unbounded backlog
+    // of tasks, closures or device snapshots under sustained MCP traffic.
+    let mutable activityHintBatchInFlight = 0
 
     member this.SendMessageToAll(message) = ctx.Clients.All.ReceiveMessage(message)
 
@@ -188,21 +192,33 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                         agentId: string, observedAtUtc: DateTimeOffset) : Task =
         if String.IsNullOrWhiteSpace projectName || String.IsNullOrWhiteSpace agentId then
             Task.CompletedTask
+        elif Interlocked.CompareExchange(&activityHintBatchInFlight, 1, 0) <> 0 then
+            // Drop rather than enqueue: hints cannot prove agent idleness.
+            Task.CompletedTask
         else
             let separator = projectName.IndexOf("::", StringComparison.Ordinal)
             let project = if separator < 0 then projectName else projectName.Substring(0, separator)
-            let deliver = task {
-                try
-                    do!
-                        users.ListDevices(userId)
-                        |> AgentStateInvalidationRouting.recipients
-                        |> Array.map (fun connectionId ->
-                            ctx.Clients.Client(connectionId).RecordAgentActivity(project, agentId, observedAtUtc))
-                        |> Task.WhenAll
-                with ex ->
-                    logger.LogWarning(ex, "Optional cross-device activity hint failed")
-            }
-            deliver |> ignore
+            try
+                Task.Run(Func<Task>(fun () ->
+                    task {
+                        try
+                            try
+                                do!
+                                    users.ListDevices(userId)
+                                    |> AgentStateInvalidationRouting.recipients
+                                    |> Array.map (fun connectionId ->
+                                        ctx.Clients.Client(connectionId).RecordAgentActivity(project, agentId, observedAtUtc))
+                                    |> Task.WhenAll
+                            with ex ->
+                                logger.LogWarning(ex, "Optional cross-device activity hint failed")
+                        finally
+                            // If a send never completes, the one in-flight
+                            // batch remains held and later hints are dropped.
+                            Interlocked.Exchange(&activityHintBatchInFlight, 0) |> ignore
+                    } :> Task)) |> ignore
+            with ex ->
+                Interlocked.Exchange(&activityHintBatchInFlight, 0) |> ignore
+                logger.LogWarning(ex, "Optional cross-device activity hint could not be queued")
             Task.CompletedTask
 
     // A client exception after a possible mutation cannot identify all

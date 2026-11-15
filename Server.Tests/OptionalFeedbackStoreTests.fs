@@ -133,3 +133,110 @@ let realSQLiteWriterLockIsOptionalAndCannotGateRequestThread () = task {
     finally
         Directory.Delete(directory, true)
 }
+
+[<Test>]
+let existingOversizedDatabaseOrWalIsQuarantinedWithoutDestructiveCleanup () = task {
+    let directory = tempDirectory()
+    try
+        let path = Path.Combine(directory, "oversized.db")
+        let prior = Array.init (512 * 1024) (fun i -> byte (i % 251))
+        File.WriteAllBytes(path, prior)
+        use oversized =
+            new OptionalFeedbackStore(path, maxDiskBytes = 256L * 1024L,
+                                      timeout = TimeSpan.FromSeconds(1.))
+        let! blocked = oversized.TryExecute(fun db -> db.DatabasePath)
+        match blocked with
+        | Error reason -> Assert.That(reason, Does.Contain("TelemetryQuotaExceeded"))
+        | Ok _ -> Assert.Fail("Oversized pre-existing diagnostics must not be opened or mutated.")
+        Assert.That(File.ReadAllBytes(path) = prior, Is.True,
+                    "Quota exhaustion must not delete or rewrite legacy feedback.")
+
+        // Also fail closed when the main DB alone exceeds its page ceiling,
+        // even if the aggregate 1 MiB high-water has not yet been reached.
+        let aboveMainLimit = Path.Combine(directory, "over-main-only.db")
+        let oldMain = Array.create (600 * 1024) 19uy
+        File.WriteAllBytes(aboveMainLimit, oldMain)
+        use mainLimit =
+            new OptionalFeedbackStore(aboveMainLimit, maxDiskBytes = 1024L * 1024L,
+                                      timeout = TimeSpan.FromSeconds(1.))
+        let! mainBlocked = mainLimit.TryExecute(fun db -> db.DatabasePath)
+        match mainBlocked with
+        | Error reason -> Assert.That(reason, Does.Contain("TelemetryQuotaExceeded"))
+        | Ok _ -> Assert.Fail("An already oversized main database must not gain new pages.")
+        Assert.That(File.ReadAllBytes(aboveMainLimit) = oldMain, Is.True)
+
+        let fresh = Path.Combine(directory, "wal-present.db")
+        let walPath = fresh + "-wal"
+        let oldWal = Array.create (384 * 1024) 7uy
+        File.WriteAllBytes(walPath, oldWal)
+        use oversizedWal =
+            new OptionalFeedbackStore(fresh, maxDiskBytes = 256L * 1024L,
+                                      timeout = TimeSpan.FromSeconds(1.))
+        let! walBlocked = oversizedWal.TryExecute(fun db -> db.DatabasePath)
+        Assert.That(walBlocked.IsError, Is.True)
+        Assert.That(File.Exists(fresh), Is.False,
+                    "An oversized WAL sidecar must be rejected before opening SQLite.")
+        Assert.That(File.ReadAllBytes(walPath) = oldWal, Is.True)
+    finally
+        Directory.Delete(directory, true)
+}
+
+[<Test>]
+let sqlitePageBudgetRejectsUnboundedFeedbackWritesWithoutGrowingMainFile () = task {
+    let directory = tempDirectory()
+    try
+        let path = Path.Combine(directory, "bounded.db")
+        use diagnostics =
+            new OptionalFeedbackStore(path, maxDiskBytes = 1024L * 1024L,
+                                      timeout = TimeSpan.FromSeconds(2.))
+        let input =
+            { ProjectName = Some "Jarvis"; ToolName = Some "ListProjects"
+              Category = "Other"; Severity = "Info"; Summary = "bounded report"
+              Details = Some(String('x', 8192)); Workaround = None; OperationId = None }
+        let mutable rejected = false
+        let mutable accepted = 0
+        for _ in 1 .. 300 do
+            let! outcome = diagnostics.TryExecute(fun db -> db.AddFeedback("alice", input, None))
+            match outcome with
+            | Ok _ -> accepted <- accepted + 1
+            | Error _ -> rejected <- true
+        Assert.That(accepted, Is.GreaterThan(0), "The finite diagnostics budget should allow small feedback.")
+        Assert.That(rejected, Is.True, "A stream of optional feedback must eventually hit a finite quota.")
+        Assert.That(FileInfo(path).Length, Is.LessThanOrEqualTo(512L * 1024L),
+                    "SQLite max_page_count must limit even repeated feedback inserts.")
+    finally
+        Directory.Delete(directory, true)
+}
+
+[<Test>]
+let expiredTelemetryPruningDeletesAtMost128RowsPerTablePerPass () =
+    let directory = tempDirectory()
+    try
+        let path = Path.Combine(directory, "prune.db")
+        use store = new FeedbackStore(path, runPruneTimer = false)
+        use connection = new SqliteConnection($"Data Source={path}")
+        connection.Open()
+        use transaction = connection.BeginTransaction()
+        for i in 1 .. 300 do
+            use command = connection.CreateCommand()
+            command.Transaction <- transaction
+            command.CommandText <-
+                $"""
+INSERT INTO operations(id,created_at,user_id,tool_name,server_version)
+VALUES('expired-{i}', '2020-01-01T00:00:00.0000000+00:00','alice','ListProjects','1');
+INSERT INTO connection_events(created_at,user_id,event_type,connection_id)
+VALUES('2020-01-01T00:00:00.0000000+00:00','alice','Disconnect','expired-{i}');
+"""
+            command.ExecuteNonQuery() |> ignore
+        transaction.Commit()
+        let rowCount table =
+            use command = connection.CreateCommand()
+            command.CommandText <- $"SELECT COUNT(*) FROM {table};"
+            Convert.ToInt32(command.ExecuteScalar())
+        Assert.That(rowCount "operations", Is.EqualTo(300))
+        for remaining in [ 172; 44; 0 ] do
+            store.PruneTelemetry(DateTimeOffset.UtcNow)
+            Assert.That(rowCount "operations", Is.EqualTo(remaining))
+            Assert.That(rowCount "connection_events", Is.EqualTo(remaining))
+    finally
+        Directory.Delete(directory, true)

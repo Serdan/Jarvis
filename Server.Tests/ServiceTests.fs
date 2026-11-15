@@ -2356,6 +2356,10 @@ let attributed_tool_dispatch_survives_missing_sqlite_and_notifies_only_user_devi
               Reason = None; WorkingDirectory = None; TimeoutSeconds = None; MaxOutputBytes = None }
     let! result = service.SendCommandToUser("alice", run, deviceId = "desktop", agentId = "Manager")
     Assert.That(result.Result, Is.EqualTo(Some "ok"))
+    // Hints run off the MCP request thread and may arrive slightly later.
+    let hintDeadline = System.Diagnostics.Stopwatch.StartNew()
+    while received.Count < 2 && hintDeadline.Elapsed < TimeSpan.FromSeconds(2.) do
+        do! Task.Delay(10)
     let notifications = received.ToArray()
     Assert.That(notifications.Length, Is.EqualTo(2))
     let observedDevices = notifications |> Array.map (fun (connection, _, _, _) -> connection) |> Set.ofArray
@@ -2379,4 +2383,94 @@ let attributed_tool_dispatch_survives_missing_sqlite_and_notifies_only_user_devi
         restartedService.SendCommandToUser("alice", run, deviceId = "laptop", agentId = "Manager")
     Assert.That(afterRestart.Result, Is.EqualTo(Some "ok"))
     Assert.That(deliveredCommands, Is.EqualTo(beforeRestart + 1))
+}
+
+[<Test>]
+let stalled_cross_device_activity_hints_drop_without_unbounded_tasks_or_blocking_commands () = task {
+    let users = UserService()
+    let registrations = System.Collections.Generic.Dictionary<string, int64>()
+    for connection in [ "first"; "second" ] do
+        users.TransportConnected("alice", connection)
+        let registered =
+            users.Register("alice",
+                { DeviceId = connection; DeviceName = connection
+                  ProtocolVersion = AgentProtocol.version; ClientVersion = "test"
+                  SupportedCommands = [ "RunCommand" ] }, connection)
+        registrations[connection] <- registered.Generation
+
+    let tracker = ClientResponseTracker()
+    let mutable hintSends = 0
+    let mutable commands = 0
+    let firstBatchStarted =
+        TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let releaseHints =
+        TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let accepted =
+        { Result = Some "ok"; Error = None; Instructions = []
+          AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+    let recipient connection =
+        { new IClientService with
+            member _.ReceiveMessage(_) = Task.CompletedTask
+            member _.ReceiveCommand(correlationId, _, _) =
+                System.Threading.Interlocked.Increment(&commands) |> ignore
+                tracker.Complete(correlationId, "alice", connection,
+                                 registrations[connection], accepted) |> ignore
+                Task.CompletedTask
+            member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+            member _.InvalidateAllAgentStates() = Task.CompletedTask
+            member _.RecordAgentActivity(_, _, _) =
+                if System.Threading.Interlocked.Increment(&hintSends) = 2 then
+                    firstBatchStarted.TrySetResult(()) |> ignore
+                releaseHints.Task :> Task }
+    let clients =
+        { new Microsoft.AspNetCore.SignalR.IHubClients<IClientService> with
+            member _.All = recipient "first"
+            member _.AllExcept(_) = recipient "first"
+            member _.Client(connection) = recipient connection
+            member _.Clients(_) = recipient "first"
+            member _.Group(_) = recipient "first"
+            member _.GroupExcept(_, _) = recipient "first"
+            member _.Groups(_) = recipient "first"
+            member _.User(_) = recipient "first"
+            member _.Users(_) = recipient "first" }
+    let hub =
+        { new Microsoft.AspNetCore.SignalR.IHubContext<HubService, IClientService> with
+            member _.Clients = clients
+            member _.Groups = Unchecked.defaultof<_> }
+    let accessor = Microsoft.AspNetCore.Http.HttpContextAccessor()
+    accessor.HttpContext <- Microsoft.AspNetCore.Http.DefaultHttpContext()
+    let service = ClientService(hub, users, tracker, accessor,
+        Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
+
+    let! first = service.RecordAgentActivityForUser("alice", "Jarvis", "Manager", DateTimeOffset.UtcNow)
+    do! firstBatchStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.))
+    let timer = System.Diagnostics.Stopwatch.StartNew()
+    for _ in 1 .. 3000 do
+        let hint = service.RecordAgentActivityForUser("alice", "Jarvis", "Manager", DateTimeOffset.UtcNow)
+        Assert.That(hint.IsCompletedSuccessfully, Is.True)
+    Assert.That(timer.Elapsed, Is.LessThan(TimeSpan.FromSeconds(2.)))
+    Assert.That(System.Threading.Volatile.Read(&hintSends), Is.EqualTo(2),
+                "Only the first two device sends may be retained while both recipients are stalled.")
+
+    // Real attributed commands still travel through SignalR and return the
+    // client's verified response even when the optional hint batch is stuck.
+    let command =
+        RunCommandCommand
+            { ProjectName = "Jarvis"; Executable = "dotnet"; Args = [ "--version" ]
+              Reason = None; WorkingDirectory = None
+              TimeoutSeconds = None; MaxOutputBytes = None }
+    let! result = service.SendCommandToUser("alice", command, deviceId = "first", agentId = "Manager")
+    Assert.That(result.Result, Is.EqualTo(Some "ok"))
+    Assert.That(commands, Is.EqualTo(1))
+    Assert.That(System.Threading.Volatile.Read(&hintSends), Is.EqualTo(2))
+
+    releaseHints.TrySetResult(()) |> ignore
+    let retryDeadline = System.Diagnostics.Stopwatch.StartNew()
+    while System.Threading.Volatile.Read(&hintSends) = 2 &&
+          retryDeadline.Elapsed < TimeSpan.FromSeconds(2.) do
+        service.RecordAgentActivityForUser("alice", "Jarvis", "Manager", DateTimeOffset.UtcNow)
+        |> ignore
+        do! Task.Delay(10)
+    Assert.That(System.Threading.Volatile.Read(&hintSends), Is.EqualTo(4),
+                "After the blocked batch settles, a new bounded hint batch may run.")
 }

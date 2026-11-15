@@ -1,0 +1,11 @@
+# F02 — Acceptance gate — exact frozen Windows full/concurrent/negative Release evidence not yet complete
+
+**Frozen SHA:** `8bfa5d7248df94755860fbdb3f73ffc03e20359b`. **Authoritative run:** GitHub Actions WQ-11 run #5, `43705053252` — https://github.com/Serdan/Jarvis/actions/runs/43705053252 (job `132784232410`).
+
+**Independently observed at review decision preparation:** the hosted ephemeral Windows job is **in progress**, not successful/complete. Scratch-outside-profile attestation, .NET 11 Release restore/build, and focused Windows known-folder/junction/Git-identity tests have completed successfully. The full bounded `Client.Tests` step has not completed; the two concurrent testhosts and failed-setup, zero-discovery and hard-timeout cleanup probes are still pending. There is no defensible exact-Windows full-suite count, exit, or all-path cleanup result yet. Linux Release builds/focused tests and full-suite exit zero are useful but cannot replace Windows evidence.
+
+**Context, not attribution to frozen SHA:** prior Windows run #4 at `8f77d7958c8c43626da9e12f561a06afa395fb04` had a passing focused 4/4 result but **failed** the full suite (729 discovered, 501 passed, 223 failed, 5 skipped), with many `git init` failures. The frozen SHA adds the built apphost helper to address that. Never credit the earlier failure to the later SHA or the earlier focused success as a full-suite pass.
+
+**Required to accept:** for this exact source or a corrected newly frozen SHA, capture final Windows GitHub job result and step logs: positive focused and full executed-test counts, .NET 11 Release command and exit, two simultaneous runs with separate disposable paths and positive counts, setup-failure / no-discovery / forced-timeout **expected nonzero** exit codes and exact scratch cleanup true. Any skipped/failed step blocks acceptance. Run only on an ephemeral Windows account, never an actual operator profile.
+
+**Disposition:** Acceptance remains blocked until evidence is complete; this is a verification gap, not a claim of a source failure in the ongoing exact-sha CI job.

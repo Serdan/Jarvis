@@ -74,6 +74,7 @@
         <Compile Include="Modules\SourceEffectRouteBridge.fs"/>
         <Compile Include="Modules\WorkQueueGitLedger.fs"/>
         <Compile Include="Modules\WorkQueueRoleAuthority.fs"/>
+        <Compile Include="Modules\WorkQueueConversationTransport.fs"/>
         <Compile Include="Modules\AccountCapacityLedger.fs"/>
         <Compile Include="Modules\AccountAdmissionAdapter.fs"/>
         <Compile Include="Modules\RoleInstructions.fs"/>

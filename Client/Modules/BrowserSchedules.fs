@@ -143,7 +143,7 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
     let interval = defaultArg pollMs 1000
     let seen = defaultArg agentLastSeen (fun _ _ -> None)
     // An unverified local hint is never sufficient to launch a Manager.
-    // Production uses an authenticated server-side SQLite-backed snapshot.
+    // Production rejects idle until independent client/Git evidence exists.
     let verify = defaultArg verifyIdleActivity (fun _ _ ->
         Task.FromResult(Error "ActivityVerificationUnavailable: authenticated server snapshot is required."))
     let isIdle (a: ScheduledAction) = a.TriggerKind = "AfterAgentIdle"
@@ -652,10 +652,21 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                                                 { a with Error = message; UpdatedAtUtc = now }
                                                             else a))
                                                     None
-                                                | Ok remote ->
+                                                | Ok None ->
+                                                    // A fresh DB with zero rows is NOT proof
+                                                    // that the agent has been idle, even if a
+                                                    // local cached timer has already expired.
+                                                    let message = "ActivityProofUnavailable: no trusted cross-device activity watermark."
+                                                    if currentEntry.Error <> message then
+                                                        setActions (actions |> List.map (fun a ->
+                                                            if a.Id = currentEntry.Id then
+                                                                { a with Error = message; UpdatedAtUtc = now }
+                                                            else a))
+                                                    None
+                                                | Ok (Some verified) ->
                                                     let local = seen currentEntry.ProjectName currentEntry.IdleAgentId
                                                     let latest =
-                                                        [remote; local]
+                                                        [Some verified; local]
                                                         |> List.choose id
                                                         |> List.sortDescending
                                                         |> List.tryHead

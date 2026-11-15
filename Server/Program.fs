@@ -32,11 +32,7 @@ let private getConfiguredOptions (configuration: IConfiguration) =
 
 let private getDatabasePath (configuration: IConfiguration) =
     let path = configuration["DatabasePath"]
-
-    if String.IsNullOrWhiteSpace(path) then
-        invalidOp "DatabasePath is required."
-
-    path
+    if String.IsNullOrWhiteSpace(path) then "" else path
 
 let configureServices (services: IServiceCollection) (configuration: IConfiguration) =
     let configured = getConfiguredOptions configuration
@@ -120,7 +116,9 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
         .AddSingleton<UserService>()
         .AddSingleton<ClientResponseTracker>()
         .AddSingleton<ExportStore>(fun _ -> new ExportStore())
-        .AddSingleton<FeedbackStore>(fun _ -> FeedbackStore(databasePath))
+        // SQLite is optional diagnostics. Its initialization, lock acquisition
+        // and filesystem I/O must never gate authentication or MCP readiness.
+        .AddSingleton<OptionalFeedbackStore>(fun _ -> new OptionalFeedbackStore(databasePath))
         .AddScoped<ClientService>()
     |> ignore
 
@@ -202,10 +200,6 @@ configureServices builder.Services builder.Configuration
 
 let app = builder.Build()
 
-// Resolve the persistent SQLite dependency before accepting readiness traffic.
-// Without this, the public discovery and auth routes can appear healthy while
-// the feedback/operation store cannot even initialize.
-app.Services.GetRequiredService<FeedbackStore>() |> ignore
 
 if app.Environment.IsDevelopment() then
     app.UseDeveloperExceptionPage() |> ignore

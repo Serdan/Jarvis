@@ -672,7 +672,7 @@ module McpToolHelpers =
 
     let private beginOperation (context: HttpContext) userId command =
         try
-            let store = context.RequestServices.GetRequiredService<FeedbackStore>()
+            let store = context.RequestServices.GetRequiredService<OptionalFeedbackStore>()
             let users = context.RequestServices.GetRequiredService<UserService>()
             let clientVersion, protocolVersion =
                 match users.GetSelectedSession(userId, RequestDeviceRouting.session(), RequestDeviceRouting.deviceOverride()) with
@@ -680,14 +680,21 @@ module McpToolHelpers =
                 | ValueNone -> None, None
 
             let operation =
-                store.BeginOperation(
+                { Id = Guid.NewGuid().ToString("N")
+                  StartedAt = DateTimeOffset.UtcNow }
+            // IDs identify an MCP diagnostic attempt, not a persisted receipt.
+            // A broken SQLite database can never delay the tool call itself.
+            store.TryPost(fun db ->
+                db.BeginOperation(
                     userId,
                     toolName command,
                     AgentCommandInfo.projectName command,
                     serverVersion,
                     clientVersion,
-                    protocolVersion
-                )
+                    protocolVersion,
+                    operationId = operation.Id,
+                    startedAt = operation.StartedAt
+                ) |> ignore)
 
             Some(store, operation)
         with _ ->
@@ -696,11 +703,11 @@ module McpToolHelpers =
     let private finishOperation tracking response elapsedMs =
         match tracking with
         | None -> ()
-        | Some(store: FeedbackStore, operation: OperationStart) ->
+        | Some(store: OptionalFeedbackStore, operation: OperationStart) ->
             try
                 let success = response.Error.IsNone && response.Result.IsSome
                 let category = response.Error |> Option.map errorCategory
-                store.CompleteOperation(operation.Id, success, category, elapsedMs)
+                store.TryPost(fun db -> db.CompleteOperation(operation.Id, success, category, elapsedMs))
             with _ ->
                 ()
 
@@ -1016,6 +1023,21 @@ module McpToolHelpers =
             | None ->
                 Error(authenticationErrorResult context (Some Auth.WorkspaceRead))
 
+    // Diagnostics have their own strict time budget and single-flight worker.
+    // A corrupt/locked/full/stalled database cannot consume a routed MCP slot.
+    // Authorization is checked before attempting even optional diagnostic IO.
+    let optionalFeedback (store: OptionalFeedbackStore) (http: IHttpContextAccessor)
+                         (action: FeedbackStore -> Task<CallToolResult>) =
+        task {
+            match authenticatedFeedbackContext http with
+            | Error result -> return result
+            | Ok _ ->
+                let! outcome =
+                    store.TryExecute(fun db -> action db |> fun work -> work.GetAwaiter().GetResult())
+                match outcome with
+                | Ok result -> return result
+                | Error reason -> return errorResult (ExecutionFailed reason)
+        }
     let submitFeedback
         (store: FeedbackStore)
         (http: IHttpContextAccessor)
@@ -1371,10 +1393,11 @@ type JarvisMcpTools =
         [<Optional; DefaultParameterValue("")>] details: string,
         [<Optional; DefaultParameterValue("")>] workaround: string,
         [<Optional; DefaultParameterValue("")>] operationId: string,
-        store: FeedbackStore,
+        store: OptionalFeedbackStore,
         http: IHttpContextAccessor
     ) =
-        McpToolHelpers.submitFeedback store http projectName toolName category severity summary details workaround operationId
+        McpToolHelpers.optionalFeedback store http (fun db ->
+            McpToolHelpers.submitFeedback db http projectName toolName category severity summary details workaround operationId)
 
     [<McpServerTool(Title = "List feedback", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List recent feedback submitted by the authenticated user. Filters are optional and limit defaults to 50.")>]
     static member ListFeedback(
@@ -1383,27 +1406,31 @@ type JarvisMcpTools =
         [<Optional; DefaultParameterValue("")>] category: string,
         [<Optional; DefaultParameterValue("")>] severity: string,
         [<Optional; DefaultParameterValue(50)>] limit: int,
-        store: FeedbackStore,
+        store: OptionalFeedbackStore,
         http: IHttpContextAccessor
     ) =
-        McpToolHelpers.listFeedback store http projectName toolName category severity (Nullable limit)
+        McpToolHelpers.optionalFeedback store http (fun db ->
+            McpToolHelpers.listFeedback db http projectName toolName category severity (Nullable limit))
 
     [<McpServerTool(Title = "Get feedback", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get a feedback record by ID for the authenticated user.")>]
-    static member GetFeedback(feedbackId: string, store: FeedbackStore, http: IHttpContextAccessor) =
-        McpToolHelpers.getFeedback store http feedbackId
+    static member GetFeedback(feedbackId: string, store: OptionalFeedbackStore, http: IHttpContextAccessor) =
+        McpToolHelpers.optionalFeedback store http (fun db ->
+            McpToolHelpers.getFeedback db http feedbackId)
 
     [<McpServerTool(Title = "Update feedback", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Update feedback status: Open, InProgress, Resolved, WontFix. Closing stores resolution commit and notes; reopening clears resolution details.")>]
-    static member UpdateFeedback(feedbackId: string, status: string, resolutionCommit: string, resolutionNotes: string, store: FeedbackStore, http: IHttpContextAccessor) =
-        McpToolHelpers.updateFeedback store http feedbackId status resolutionCommit resolutionNotes
+    static member UpdateFeedback(feedbackId: string, status: string, resolutionCommit: string, resolutionNotes: string, store: OptionalFeedbackStore, http: IHttpContextAccessor) =
+        McpToolHelpers.optionalFeedback store http (fun db ->
+            McpToolHelpers.updateFeedback db http feedbackId status resolutionCommit resolutionNotes)
 
     [<McpServerTool(Title = "Get feedback summary", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Summarize feedback counts by tool, category, and severity for the authenticated user.")>]
     static member GetFeedbackSummary(
         [<Optional; DefaultParameterValue("")>] projectName: string,
         [<Optional; DefaultParameterValue("")>] toolName: string,
-        store: FeedbackStore,
+        store: OptionalFeedbackStore,
         http: IHttpContextAccessor
     ) =
-        McpToolHelpers.feedbackSummary store http projectName toolName
+        McpToolHelpers.optionalFeedback store http (fun db ->
+            McpToolHelpers.feedbackSummary db http projectName toolName)
 
     [<McpServerTool(Title = "Update server", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Update the Jarvis server from a verified published release, with automatic rollback. The service restarts during the update.")>]
     static member UpdateServer(http: IHttpContextAccessor) =
@@ -1424,11 +1451,12 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "Get connection diagnostics", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Return the current Jarvis client session and recent persisted SignalR connection lifecycle events. Does not require the local client to be connected.")>]
     static member GetConnectionDiagnostics(
         [<Optional; DefaultParameterValue(50)>] limit: int,
-        store: FeedbackStore,
+        store: OptionalFeedbackStore,
         users: UserService,
         http: IHttpContextAccessor
     ) =
-        McpToolHelpers.getConnectionDiagnostics store users http (Nullable limit)
+        McpToolHelpers.optionalFeedback store http (fun db ->
+            McpToolHelpers.getConnectionDiagnostics db users http (Nullable limit))
 
     [<McpServerTool(Title = "List commands", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List the complete public Jarvis MCP command catalog, including server-local tools.")>]
     static member ListCommands(http: IHttpContextAccessor) =

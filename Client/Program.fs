@@ -352,27 +352,14 @@ let private runClient args =
     connection.KeepAliveInterval <- TimeSpan.FromSeconds 10.0
     connection.ServerTimeout <- TimeSpan.FromSeconds 60.0
 
-    verifyIdleActivity <- (fun project agent -> task {
-        if not registered || connection.State <> HubConnectionState.Connected then
-            return Error "ActivityVerificationUnavailable: Jarvis connection is offline or unregistered."
-        else
-            try
-                let! current =
-                    HubConnectionExtensions.InvokeCoreAsync<AgentActivitySnapshot>(
-                        connection, "GetAgentActivity", [| box project; box agent |], CancellationToken.None)
-                        .WaitAsync(TimeSpan.FromSeconds(5.))
-                if not registered || connection.State <> HubConnectionState.Connected then
-                    return Error "ActivityVerificationUnavailable: connection changed during verification."
-                else
-                    // The server is the attributed activity authority across
-                    // every authenticated device and persists this watermark.
-                    return Ok current.LastSeenAtUtc
-            with ex ->
-                return Error("ActivityVerificationUnavailable: " + ex.GetType().Name)
-    })
+    // Server SQLite is intentionally disposable and cannot prove cross-device
+    // agent inactivity. Keep AfterAgentIdle inert until a verified durable
+    // client/Git activity source exists. Once/Every are unaffected.
+    verifyIdleActivity <- (fun _ _ ->
+        Task.FromResult(Error "ActivityProofUnavailable: independent durable activity evidence is not implemented."))
     scheduler |> Option.iter (fun service -> service.Start())
     if scheduler.IsSome then
-        tui.Log "Persistent execution scheduler enabled; Manager idle launches require server verification."
+        tui.Log "Persistent scheduler enabled; AfterAgentIdle disabled pending durable activity proof."
 
     let dispatch =
         CommandDispatchQueue(

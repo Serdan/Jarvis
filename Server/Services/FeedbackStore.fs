@@ -102,7 +102,7 @@ module FeedbackValidation =
     let status value = canonical statuses "status" value
     let isClosed value = value = "Resolved" || value = "WontFix"
 
-type FeedbackStore(databasePath: string, ?telemetryRetention: TimeSpan) =
+type FeedbackStore(databasePath: string, ?telemetryRetention: TimeSpan, ?runPruneTimer: bool) =
     let telemetryRetention = defaultArg telemetryRetention (TimeSpan.FromDays 30.0)
     do if telemetryRetention <= TimeSpan.Zero then invalidArg "telemetryRetention" "Must be positive"
     let connectionString =
@@ -110,15 +110,17 @@ type FeedbackStore(databasePath: string, ?telemetryRetention: TimeSpan) =
         builder.DataSource <- databasePath
         builder.Mode <- SqliteOpenMode.ReadWriteCreate
         builder.Cache <- SqliteCacheMode.Shared
+        // Best-effort diagnostics must never hold a SQLite lock indefinitely.
+        builder.DefaultTimeout <- 1
         builder.ToString()
 
     let dbValue = function
         | Some value -> box value
         | None -> box DBNull.Value
 
-    // Fail closed for an agent whose most recent accepted tool activity
-    // could not be persisted. A later successful write repairs the watermark.
-    // This is only a safety guard; the durable values remain in SQLite.
+    // Legacy attributed-activity diagnostics: production no longer reads
+    // SQLite as AfterAgentIdle authority. Never restore scheduling from these
+    // rows, including after a server restart or database replacement.
     let unverifiedActivity = ConcurrentDictionary<struct (string * string * string), byte>()
 
     let optionText (reader: SqliteDataReader) ordinal =
@@ -215,9 +217,9 @@ CREATE TABLE IF NOT EXISTS connection_events (
 CREATE INDEX IF NOT EXISTS ix_connection_events_user_created
     ON connection_events(user_id, created_at DESC);
 
--- Authoritative, authenticated, user-scoped activity watermarks for
--- AfterAgentIdle scheduling. Not canonical agent lifecycle state and never
--- written by observer queries or another agent's read.
+-- Legacy, NONAUTHORITATIVE attributed activity diagnostics, retained in
+-- existing databases without destructive migration. A reset/lost row must
+-- NEVER be interpreted as agent inactivity or authorize AfterAgentIdle.
 CREATE TABLE IF NOT EXISTS attributed_agent_activity (
     user_id TEXT NOT NULL,
     project_name TEXT NOT NULL,
@@ -259,14 +261,16 @@ CREATE TABLE IF NOT EXISTS attributed_agent_activity (
     do initialize()
     do pruneTelemetry DateTimeOffset.UtcNow
     let pruneTimer =
-        new Timer(TimerCallback(fun _ ->
-            try pruneTelemetry DateTimeOffset.UtcNow
-            with _ -> ()), null, TimeSpan.FromHours 1.0, TimeSpan.FromHours 1.0)
+        if defaultArg runPruneTimer true then
+            Some(new Timer(TimerCallback(fun _ ->
+                try pruneTelemetry DateTimeOffset.UtcNow
+                with _ -> ()), null, TimeSpan.FromHours 1.0, TimeSpan.FromHours 1.0))
+        else None
 
     member _.PruneTelemetry(now: DateTimeOffset) = pruneTelemetry now
 
     interface IDisposable with
-        member _.Dispose() = pruneTimer.Dispose()
+        member _.Dispose() = pruneTimer |> Option.iter (fun timer -> timer.Dispose())
 
     member _.DatabasePath = databasePath
 
@@ -410,10 +414,12 @@ LIMIT $limit;
         projectName: string option,
         serverVersion: string,
         clientVersion: string option,
-        protocolVersion: string option
+        protocolVersion: string option,
+        ?operationId: string,
+        ?startedAt: DateTimeOffset
     ) =
-        let startedAt = DateTimeOffset.UtcNow
-        let operationId = Guid.NewGuid().ToString("N")
+        let startedAt = defaultArg startedAt DateTimeOffset.UtcNow
+        let operationId = defaultArg operationId (Guid.NewGuid().ToString("N"))
 
         use connection = openConnection()
         use command = connection.CreateCommand()

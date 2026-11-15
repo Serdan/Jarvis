@@ -8,7 +8,7 @@ open Microsoft.AspNetCore.SignalR
 open Microsoft.Extensions.Logging
 open Server
 
-type HubService(users: UserService, tracker: ClientResponseTracker, store: FeedbackStore, logger: ILogger<HubService>) =
+type HubService(users: UserService, tracker: ClientResponseTracker, store: OptionalFeedbackStore, logger: ILogger<HubService>) =
     inherit Hub<IClientService>()
 
     member private this.UserId =
@@ -27,7 +27,7 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Feedb
         error: Exception
     ) =
         try
-            store.AddConnectionEvent(
+            store.TryPost(fun db -> db.AddConnectionEvent(
                 this.UserId,
                 eventType,
                 this.Context.ConnectionId,
@@ -39,7 +39,7 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Feedb
                 durationMs,
                 Option.ofObj error |> Option.map (fun ex -> ex.GetType().FullName),
                 Option.ofObj error |> Option.map (fun ex -> ex.Message)
-            )
+            ))
         with ex ->
             logger.LogWarning(
                 ex,
@@ -121,19 +121,17 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Feedb
         )
         Task.FromResult result
 
-    // Read-only self-user query. Never activates the target agent or counts as
-    // its activity. Requires a currently registered authenticated client.
+    // A disposable SQLite watermark is not an activity proof. Until the
+    // client/Git ledger supplies an independently durable, fresh cross-device
+    // watermark, idle-based launches are explicitly unavailable.
+    // Old clients must also fail closed instead of interpreting a reset DB
+    // row as an idle interval.
     member this.GetAgentActivity(projectName: string, agentId: string) =
         match users.GetSessionByConnection(this.Context.ConnectionId) with
         | ValueSome session when session.State = Registered
                                  && session.ConnectionId = Some this.Context.ConnectionId ->
-            let project =
-                if isNull projectName then ""
-                else
-                    let marker = projectName.IndexOf("::", StringComparison.Ordinal)
-                    if marker < 0 then projectName else projectName.Substring(0, marker)
-            let seen = store.GetAttributedAgentActivity(this.UserId, project, agentId)
-            Task.FromResult({ LastSeenAtUtc = seen; ServerNowUtc = DateTimeOffset.UtcNow })
+            Task.FromException<AgentActivitySnapshot>(
+                InvalidOperationException("ActivityProofUnavailable: server SQLite is not authoritative for AfterAgentIdle."))
         | _ ->
             Task.FromException<AgentActivitySnapshot>(
                 UnauthorizedAccessException("A registered Jarvis client is required to verify Manager activity."))

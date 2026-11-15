@@ -1,1 +1,9 @@
-Addressed three independent findings on 94e3c1e. Added deterministic tests for observed Working -> yield Ready same-generation relaunch, yield before Manager observation, blocked-before-dispatch recovery after process restart, and active/unknown unclassified agents; 26 Node tests pass. Server.Tests .NET 11 Release exit 0. Client.Tests Release still running at submission. Disabled runtime config retained, no live schedule/browser action, no integration/deployment.
+# Worker correction and validation
+
+**Frozen source:** `062dd4a5e3dbfc9e47a49c851e279ec256f1629f` (new exact review after changes requested on `94e3c1ef`).
+
+The planner now permits the same assignment to relaunch after canonical Ready/Stopped `stateEnteredAtUtc` is strictly newer than verified attributed launch activity; stale Ready remains suppressed. `blocked` before `begin` is terminal audit evidence, not a live reservation. Live/uncertain `kind: other` activity causes a fail-closed decision. The persistent Manager role and runbook document these distinctions.
+
+**Evidence:** `node --test scripts/tests/manager-heartbeat.test.mjs`: **26 passed, 0 failed** (including four new deterministic lifecycle, restart, and unclassified-agent regressions). `git diff --check`: clean. `dotnet test Server.Tests/Server.Tests.fsproj -c Release` using .NET 11: **exit 0** (existing F# warnings). `dotnet test Client.Tests/Client.Tests.fsproj -c Release` using .NET 11: **hit the 180-second command timeout**, so no completed Client.Tests verdict exists; do not infer a pass or failure. A separate `dotnet build Client.Tests/Client.Tests.fsproj -c Release --no-restore` was started as job `974affb584e340aeba76c5d29ca70072`; its result must be checked separately.
+
+Connected Jarvis catalog still has only the older browser scheduling command family, not general AfterAgentIdle scheduler commands. No live schedule, tab, client/server restart, integration, or deployment was performed. Independent reviewer must verify the frozen source and report a decision before integration.

@@ -371,7 +371,8 @@ type Service(port: int, pairingSecret: string) =
     }
 
     member _.CloseTab(tabRegistration: string, ?ownerConnectionId: string,
-                      ?expectedRegistrationGeneration: int) = task {
+                      ?expectedRegistrationGeneration: int,
+                      ?requireFreshHomeNoTurns: bool) = task {
         let resolved = lock sync (fun () ->
             match resolveRegistration ownerConnectionId false tabRegistration with
             | Error error -> Error error
@@ -403,7 +404,8 @@ type Service(port: int, pairingSecret: string) =
                         do! send conn (serialize
                             {| version = ProtocolVersion; kind = "closeTab"
                                requestId = requestId; connectionId = conn.Id
-                               registrationId = registrationId; registrationGeneration = generation |})
+                               registrationId = registrationId; registrationGeneration = generation
+                               requireFreshHomeNoTurns = defaultArg requireFreshHomeNoTurns false |})
                         let! response = completion.Task.WaitAsync(TimeSpan.FromSeconds(15.0))
                         let root = JsonNode.Parse(response)
                         if asString root "connectionId" <> conn.Id ||
@@ -748,8 +750,14 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                     // Close only the pinned agent-created registration.
                     let closeDefinitive () = task {
                         match! bridge.CloseTab(registrationId, ownerConnectionId = ownerConnectionId,
-                                               expectedRegistrationGeneration = createdGeneration) with
+                                               expectedRegistrationGeneration = createdGeneration,
+                                               requireFreshHomeNoTurns = true) with
                         | Ok _ -> return Ok "closed"
+                        // The extension rechecks fresh-home/zero-turn at disposal.
+                        // The earlier page result is not an enduring close authority.
+                        | Error "BrowserCloseTabError:CleanupSafetyChanged"
+                        | Error "BrowserCloseTabError:CleanupSafetyUnverified" ->
+                            return Ok "retained"
                         | Error e ->
                             let safe = if e.Length > 100 then e.Substring(0, 100) else e
                             return Error("cleanupFailed:" + safe)

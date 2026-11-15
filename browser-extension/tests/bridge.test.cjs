@@ -19,6 +19,8 @@ function createHarness(initialStorage = {}, initialSession = {}) {
   const sockets = [];
   const calls = [];
   const createdTabs = [];
+  const removedTabs = [];
+  let userScriptHook = null;
   let nextCreatedId = 19;
   let hostPermissionGranted = true;
   let failNextPermissionQuery = false;
@@ -85,7 +87,7 @@ function createHarness(initialStorage = {}, initialSession = {}) {
         createdTabs.push(tab);
         return tab;
       },
-      remove: async id => { tabs.delete(id); listeners.removed?.(id); },
+      remove: async id => { removedTabs.push(id); tabs.delete(id); listeners.removed?.(id); },
       get: async id => {
         if (nextTabQueryHook) {
           const hook = nextTabQueryHook;
@@ -129,11 +131,23 @@ function createHarness(initialStorage = {}, initialSession = {}) {
     },
     userScripts: {
       execute: async ({ target, js, world }) => {
+        if (userScriptHook) {
+          const hook = userScriptHook;
+          userScriptHook = null;
+          await hook();
+        }
         calls.push({ target, world });
         const page = tabs.get(target.tabId);
         if (!page) throw new Error("Missing target");
         const result = await vm.runInNewContext(js[0].code, {
-          location: { href: page.url, origin: new URL(page.url).origin }, document: { title: page.title }
+          location: { href: page.url, origin: new URL(page.url).origin },
+          document: {
+            title: page.title,
+            readyState: page.documentReadyState || "complete",
+            querySelectorAll: () => Array.from({
+              length: (page.userTurns || 0) + (page.userBubbles || 0)
+            }, () => ({}))
+          }
         });
         return [{ frameId: 0, result }];
       }
@@ -150,8 +164,9 @@ function createHarness(initialStorage = {}, initialSession = {}) {
     await socket.onmessage({ data: JSON.stringify({ version: 2, ...value }) });
     await tick(); await tick();
   };
-  return { storage, session, tabs, createdTabs, sockets, calls, listeners, message, deliver,
+  return { storage, session, tabs, createdTabs, removedTabs, sockets, calls, listeners, message, deliver,
     userScripts: chrome.userScripts,
+    beforeNextUserScript: fn => { userScriptHook = fn; },
     setHostPermissionGranted: granted => { hostPermissionGranted = granted; },
     beforeNextPermissionCheck: fn => { permissionHook = fn; },
     onWindowQuery: fn => { windowQueryHook = fn; },
@@ -545,7 +560,7 @@ test("only agent-created tabs can be closed, preserving the window and manual ta
   assert.equal((await h.message("getState")).registrations.length, 1);
 });
 
-async function createdTabForCloseRegression() {
+async function createdTabForCloseRegression(url = "https://example.test/chat/new") {
   const h = createHarness();
   await tick(); await tick();
   await h.message("registerWindow", { windowId: 1, alias: "agents" });
@@ -558,12 +573,12 @@ async function createdTabForCloseRegression() {
   await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
   await h.deliver(ws, {
     kind: "openTab", requestId: "owned-open", connectionId: "epoch-1",
-    url: "https://example.test/chat/new", alias: "owned", ...(await windowPin(h)), active: false
+    url, alias: "owned", ...(await windowPin(h)), active: false
   });
   const registered = ws.sent.find(m => m.requestId === "owned-open" && m.kind === "tabOpened")?.tab;
   assert.ok(registered);
   const tab = h.createdTabs[0];
-  tab.url = "https://example.test/chat/new";
+  tab.url = url;
   tab.status = "complete";
   delete tab.pendingUrl;
   const close = async (requestId, options = {}) => {
@@ -576,6 +591,78 @@ async function createdTabForCloseRegression() {
   };
   return { h, ws, tab, registered, close };
 }
+
+// True launcher disposal evidence is historical, not authority to close later.
+// Each transition happens while closeTab awaits its live page inspection.
+for (const [label, mutate] of [
+  ["same-origin conversation navigation", tab => { tab.url = "https://chatgpt.com/c/new-turn"; }],
+  ["user turn on unchanged home route", tab => { tab.userTurns = 1; }],
+  ["user bubble on unchanged home route", tab => { tab.userBubbles = 1; }]
+]) {
+  test("failed-launch disposal retains a tab after late " + label, async () => {
+    const { h, tab, close } = await createdTabForCloseRegression("https://chatgpt.com/");
+    const pageResult = { status: "notSubmitted", reason: "UnexpectedSendState",
+      safeToDisposeCreatedTab: true };
+    assert.equal(pageResult.safeToDisposeCreatedTab, true);
+    h.beforeNextUserScript(() => mutate(tab));
+    const response = await close("late-change-" + label.replaceAll(" ", "-"),
+      { requireFreshHomeNoTurns: true });
+    assert.equal(response.error, "CleanupSafetyChanged");
+    assert.equal(h.tabs.has(tab.id), true, "New conversation must survive");
+    assert.equal(h.removedTabs.includes(tab.id), false, "No remove call may occur");
+    assert.equal(h.tabs.has(17), true, "Manually registered tab survives");
+    assert.equal(h.tabs.has(18), true, "Unregistered tab survives");
+    assert.equal(h.calls.length, 1, "Cleanup revalidates live page state");
+  });
+}
+
+test("failed-launch disposal closes a still-fresh, zero-turn ChatGPT home tab", async () => {
+  const { h, tab, close } = await createdTabForCloseRegression("https://chatgpt.com/");
+  const response = await close("fresh-home", { requireFreshHomeNoTurns: true });
+  assert.equal(response.kind, "tabClosed");
+  assert.equal(h.tabs.has(tab.id), false);
+  assert.deepEqual(h.removedTabs, [tab.id]);
+  assert.equal(h.calls.length, 1, "Live DOM revalidation is mandatory");
+  assert.equal(h.tabs.has(17), true);
+  assert.equal(h.tabs.has(18), true);
+});
+
+test("pre-injection cleanup removes only uncommitted blank initial navigation", async () => {
+  const { h, tab, close } = await createdTabForCloseRegression("https://chatgpt.com/");
+  tab.url = "about:blank";
+  tab.pendingUrl = "https://chatgpt.com/";
+  tab.status = "loading";
+  const response = await close("initial-blank", { requireFreshHomeNoTurns: true });
+  assert.equal(response.kind, "tabClosed");
+  assert.equal(h.tabs.has(tab.id), false);
+  assert.equal(h.calls.length, 0, "No provider DOM yet exists");
+});
+
+test("pre-injection cleanup also disposes a genuinely blank generic initial navigation", async () => {
+  const url = "https://example.test/chat/new";
+  const { h, tab, close } = await createdTabForCloseRegression(url);
+  tab.url = "about:blank";
+  tab.pendingUrl = url;
+  tab.status = "loading";
+  const response = await close("generic-initial-blank", { requireFreshHomeNoTurns: true });
+  assert.equal(response.kind, "tabClosed");
+  assert.equal(h.tabs.has(tab.id), false);
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.tabs.has(17), true);
+  assert.equal(h.tabs.has(18), true);
+});
+
+test("failed-launch cleanup retains uninspectable and non-ChatGPT tabs", async () => {
+  const a = await createdTabForCloseRegression("https://chatgpt.com/");
+  a.tab.documentReadyState = "interactive";
+  const result = await a.close("not-hydrated", { requireFreshHomeNoTurns: true });
+  assert.equal(result.error, "CleanupSafetyUnverified");
+  assert.equal(a.h.removedTabs.length, 0);
+  const b = await createdTabForCloseRegression();
+  const generic = await b.close("other-site", { requireFreshHomeNoTurns: true });
+  assert.equal(generic.error, "CleanupSafetyUnverified");
+  assert.equal(b.h.removedTabs.length, 0);
+});
 
 for (const lifecycleState of ["discarded", "frozen"]) {
   test("owned " + lifecycleState + " tab can be safely closed without waking it", async () => {

@@ -764,6 +764,26 @@ async function openNewTab(message, requestContext) {
   }
 }
 
+// Cleanup of a failed ChatGPT launch requires independent, live evidence.
+// The launcher may have seen an empty home page before a conversation appears.
+const CHATGPT_FRESH_HOME = "https://chatgpt.com/";
+const FRESH_HOME_PROBE = [
+  "(() => {",
+  "  try {",
+  "    return {",
+  "      home: location.href === 'https://chatgpt.com/',",
+  "      ready: document.readyState === 'complete',",
+  "      userTurns: document.querySelectorAll(",
+  "        '[data-message-author-role=\"user\"],[data-user-message-bubble]'",
+  "      ).length",
+  "    };",
+  "  } catch { return null; }",
+  "})()"
+].join("\n");
+
+// This cleanup-only policy does not change the explicitly requested post-send
+// close behavior. An initial about:blank navigation is the one safe case where
+// a fresh tab can be disposed before its provider DOM exists.
 async function closeCreatedTab(message) {
   const { requestId, registrationId, registrationGeneration } = message;
   const requestSocket = socket;
@@ -787,17 +807,47 @@ async function closeCreatedTab(message) {
   const parent = await validWindow(reg.windowRegistration);
   if (!parent) return reject("WindowNotRegistered");
   const parentGeneration = parent.generation;
+  // Resolve the window before probing the page, so no Chrome awaits remain
+  // between a successful live probe and the final synchronous remove call.
+  const finalParent = await validWindow(reg.windowRegistration);
   let tab;
   try { tab = await chrome.tabs.get(reg.tabId); } catch { return reject("TabMissing"); }
   if (tab.windowId !== parent.windowId) return reject("WindowMismatch");
+  if (message.requireFreshHomeNoTurns === true) {
+    let current;
+    try { current = await chrome.tabs.get(reg.tabId); }
+    catch { return reject("CleanupSafetyUnverified"); }
+    if (current.windowId !== parent.windowId) return reject("CleanupSafetyChanged");
+    const initialBlank = current.url === "about:blank" &&
+      current.status === "loading" && current.pendingUrl === reg.boundUrl;
+    if (!initialBlank) {
+      // Other providers do not have the ChatGPT turn markers used below.
+      if (reg.boundUrl !== CHATGPT_FRESH_HOME) return reject("CleanupSafetyUnverified");
+      if (current.url !== reg.boundUrl || current.discarded || current.frozen)
+        return reject("CleanupSafetyChanged");
+      // Recheck current route and turn state after the launcher returned.
+      // A missing/unfinished inspection is never interpreted as empty.
+      let result;
+      try {
+        const frames = await chrome.userScripts.execute({
+          target: { tabId: reg.tabId }, js: [{ code: FRESH_HOME_PROBE }],
+          world: "USER_SCRIPT"
+        });
+        result = frames?.length === 1 && frames[0]?.frameId === 0 ? frames[0].result : null;
+      } catch { return reject("CleanupSafetyUnverified"); }
+      if (!result || result.ready !== true) return reject("CleanupSafetyUnverified");
+      if (result.home !== true || result.userTurns !== 0)
+        return reject("CleanupSafetyChanged");
+    }
+  }
   // assess(), window lookup and tabs.get all await Chrome APIs. The operator
   // may have adopted this created tab in the meantime. A cleanup request
   // must never close that now user-owned registration.
-  const finalParent = await validWindow(reg.windowRegistration);
   if (registrations.find(r => r.registrationId === registrationId) !== reg ||
       !reg.agentCreated || reg.registrationGeneration !== registrationGeneration)
     return reject("TabNotAgentCreated");
-  if (reg.blocked || reg.sessionEpoch !== sessionEpoch || !allowAgentCreatedTabs ||
+  if (socket !== requestSocket || !connected || connectionId !== requestConnection ||
+      reg.blocked || reg.sessionEpoch !== sessionEpoch || !allowAgentCreatedTabs ||
       !finalParent || finalParent !== parent || finalParent.generation !== parentGeneration ||
       finalParent.windowId !== tab.windowId)
     return reject("RegistrationStale");

@@ -37,6 +37,7 @@ type StoredRoleCatalog =
     { SchemaVersion: int
       ProjectId: string
       Revision: int
+      ProvisionOperationId: string
       Current: StoredRolePointer array
       Versions: StoredRole array
       Receipts: StoredRoleReceipt array }
@@ -51,7 +52,8 @@ type RoleRevisionProof =
       ProjectBlobOid: string
       ProjectVersion: int
       CatalogBlobOid: string
-      CatalogRevision: int }
+      CatalogRevision: int
+      ProvisionOperationId: string }
 
 type PinnedRoleView =
     { Proof: RoleRevisionProof
@@ -72,7 +74,9 @@ type RoleUse =
 type RolePreflight =
     { Proof: RoleRevisionProof
       Use: RoleUse
-      RequiresCanonicalSourceAndAccountProof: bool }
+      RequiresCanonicalSourceAndAccountProof: bool
+      // Candidate feasibility only. Never a permit to mutate or claim.
+      RequiresSameCasChosenWorkAndCreditProof: bool }
 
 module WorkQueueRoleAuthority =
     [<Literal>]
@@ -90,7 +94,7 @@ module WorkQueueRoleAuthority =
           Instructions = role.Instructions; Enabled = role.Enabled
           QueueSubscriptions = Set.ofArray role.QueueSubscriptions }
 
-    let private encode projectId (catalog: RoleCatalog) =
+    let private encode projectId provisionOperationId (catalog: RoleCatalog) =
         let current =
             catalog.Current
             |> Map.toSeq
@@ -113,8 +117,9 @@ module WorkQueueRoleAuthority =
             |> Seq.sortWith (fun a b -> StringComparer.Ordinal.Compare(a.OperationId, b.OperationId))
             |> Seq.toArray
         JsonSerializer.Serialize(
-            { SchemaVersion = 1; ProjectId = projectId
-              Revision = catalog.Revision; Current = current
+            { SchemaVersion = 2; ProjectId = projectId
+              Revision = catalog.Revision; ProvisionOperationId = provisionOperationId
+              Current = current
               Versions = versions; Receipts = receipts })
 
     let private validCatalog (catalog: RoleCatalog) =
@@ -138,11 +143,12 @@ module WorkQueueRoleAuthority =
         && (catalog.Receipts |> Map.toSeq
             |> Seq.map (fun (_, role) -> role.RoleId, role.Version) |> Seq.distinct |> Seq.length) = versions
 
-    let private decode projectId (raw: string) : Result<RoleCatalog, LedgerFailure> =
+    let private decode projectId (raw: string) : Result<RoleCatalog * string, LedgerFailure> =
         try
             let persisted = JsonSerializer.Deserialize<StoredRoleCatalog>(raw)
             if isNull (box persisted)
-               || persisted.SchemaVersion <> 1 || persisted.ProjectId <> projectId
+               || persisted.SchemaVersion <> 2 || persisted.ProjectId <> projectId
+               || not (nonBlank persisted.ProvisionOperationId)
                || isNull persisted.Current || isNull persisted.Versions || isNull persisted.Receipts then
                 Error(LedgerIntegrityError "WQ04 role-catalog schema/project identity mismatch.")
             else
@@ -165,9 +171,9 @@ module WorkQueueRoleAuthority =
                    || persisted.Versions.Length <> catalog.Revision
                    || persisted.Current.Length <> catalog.Current.Count
                    || persisted.Receipts.Length <> catalog.Receipts.Count
-                   || encode projectId catalog <> raw then
+                   || encode projectId persisted.ProvisionOperationId catalog <> raw then
                     Error(LedgerIntegrityError "WQ04 role-catalog history, receipt, ordering or canonical bytes invalid.")
-                else Ok catalog
+                else Ok(catalog, persisted.ProvisionOperationId)
         with ex ->
             Error(LedgerIntegrityError ("WQ04 invalid historical role catalog: " + ex.Message))
 
@@ -177,7 +183,7 @@ module WorkQueueRoleAuthority =
             | None, None -> Error(InvalidBinding "WQ04 role-catalog not provisioned; unversioned WQ02 subscriptions are not authority.")
             | Some raw, Some oid ->
                 decode ((binding: LedgerBinding).ProjectId.ToString("D")) raw
-                |> Result.map (fun catalog -> catalog, oid)
+                |> Result.map (fun (catalog, provisionId) -> catalog, oid, provisionId)
             | _ -> Error(LedgerIntegrityError "WQ04 role-catalog blob/provenance incomplete."))
 
     let private historical (catalog: RoleCatalog) (roleId: string) (version: int) : Result<RoleConfiguration, LedgerFailure> =
@@ -196,6 +202,202 @@ module WorkQueueRoleAuthority =
                 if role.Enabled then Ok role
                 else Error(InvalidBinding "WQ04 role is disabled for new sessions."))
 
+    // The role-specific admission witness must be emitted alongside the
+    // original project admission and its operation receipt by the future
+    // combined SAME-CAS writer. WQ02's legacy admission alone is insufficient.
+    [<CLIMutable>]
+    type StoredRoleAdmission =
+        { SchemaVersion: int
+          ProjectId: string
+          LaunchId: string
+          AccountTokenId: string
+          RoleId: string
+          RoleVersion: int
+          CatalogBlobOid: string
+          RoleDefinitionOid: string
+          AdmissionOperationId: string }
+
+    let roleAdmissionPath launchId =
+        (WorkQueueGitLedger.admissionPath launchId)
+            .Replace("/admissions/", "/role-admissions/", StringComparison.Ordinal)
+
+    let private integrity reason =
+        LedgerIntegrityError ("WQ04 historical role authority: " + reason)
+
+    let private requestMatches (operation: LedgerOperation) (predicate: JsonElement -> bool) =
+        try
+            use outer = JsonDocument.Parse(operation.CanonicalRequestJson)
+            let root = outer.RootElement
+            let body = root.GetProperty("request").GetString()
+            use inner = JsonDocument.Parse(body)
+            root.GetProperty("kind").GetString() = operation.Type
+            && predicate inner.RootElement
+        with _ -> false
+
+    let private operationOrigin (binding: LedgerBinding) (snapshot: LedgerSnapshot)
+                                (operationId: string) (kind: string) (paths: string list) =
+        match Guid.TryParse operationId with
+        | true, uuid when uuid <> Guid.Empty ->
+            LedgerStore.getOperationAt binding snapshot uuid
+            |> Result.bind (function
+                | Some receipt when receipt.Type = kind
+                                    && receipt.OperationId = uuid.ToString("D")
+                                    && (paths |> List.forall (fun path ->
+                                        receipt.Paths |> Array.contains path)) ->
+                    LedgerStore.getOperationOriginAt binding snapshot receipt
+                    |> Result.map (fun origin -> receipt, { snapshot with Commit = origin })
+                | _ -> Error(integrity ("missing immutable " + kind + " operation receipt or witness paths")))
+        | _ -> Error(integrity "missing or malformed original operation UUID")
+
+    let private originalRoleRequest (operation: LedgerOperation)
+                                    (revision: int) (role: RoleConfiguration) =
+        requestMatches operation (fun body ->
+            body.GetProperty("schemaVersion").GetInt32() = 1
+            && body.GetProperty("command").GetString() = "ConfigureWQ04Role"
+            && body.GetProperty("expectedCatalogRevision").GetInt32() = revision - 1
+            && body.GetProperty("expectedPreviousVersion").GetInt32() = role.Version - 1
+            && JsonSerializer.Deserialize<StoredRole>(body.GetProperty("role").GetRawText())
+               = storedRole role)
+
+    // Cross-head proof: the canonical current JSON is only a projection. For
+    // every role version, locate the immutable operation's ORIGINAL Git commit
+    // and compare that commit's issued role and receipt to today's bytes.
+    // Shape-valid rewrites of earlier roles/receipt mappings are rejected.
+    let private verifyRoleHistory (binding: LedgerBinding) (snapshot: LedgerSnapshot)
+                                  (catalog: RoleCatalog) (provisionId: string) =
+        operationOrigin binding snapshot provisionId "InitializeWQ04RoleCatalog" [CatalogPath]
+        |> Result.bind (fun (receipt, origin) ->
+            if not (requestMatches receipt (fun body ->
+                body.GetProperty("schemaVersion").GetInt32() = 1
+                && body.GetProperty("command").GetString() = "InitializeWQ04RoleCatalog")) then
+                Error(integrity "original provision operation does not match its canonical request")
+            else
+                readCatalogAt binding origin
+                |> Result.bind (fun (initial, _, originalProvision) ->
+                    WorkQueueGitLedger.loadAt binding origin
+                    |> Result.bind (fun project ->
+                        if originalProvision <> provisionId
+                           || initial.Revision <> 0
+                           || not initial.Current.IsEmpty
+                           || not initial.Versions.IsEmpty
+                           || not initial.Receipts.IsEmpty
+                           || not project.Launches.IsEmpty then
+                            Error(integrity "catalog was not originally provisioned empty before any launch")
+                        else Ok())))
+        |> Result.bind (fun () ->
+            catalog.Receipts
+            |> Map.toList
+            |> List.fold (fun result (opId, role) ->
+                result |> Result.bind (fun () ->
+                    operationOrigin binding snapshot opId "ConfigureWQ04Role" [CatalogPath]
+                    |> Result.bind (fun (receipt, issued) ->
+                        readCatalogAt binding issued
+                        |> Result.bind (fun (original, _, originalProvision) ->
+                            if originalProvision <> provisionId
+                               || not (originalRoleRequest receipt original.Revision role)
+                               || original.Receipts.TryFind opId <> Some role
+                               || (original.Versions.TryFind role.RoleId
+                                   |> Option.bind (fun history -> history.TryFind role.Version)) <> Some role
+                               || original.Revision < role.Version then
+                                Error(integrity ("role version or issuance receipt rewritten: " + role.RoleId))
+                            else Ok())))) (Ok ()))
+
+    let private originalAdmissionRequest (operation: LedgerOperation) (launch: Launch) =
+        requestMatches operation (fun body ->
+            if body.GetProperty("schemaVersion").GetInt32() <> 1 then false
+            else
+                let mutation = body.GetProperty("mutation")
+                let admitted = mutation.GetProperty("fields").EnumerateArray() |> Seq.head
+                mutation.GetProperty("case").GetString() = "AdmitProject"
+                && admitted.GetProperty("Id").GetString() = launch.Id
+                && admitted.GetProperty("ProjectId").GetString() = launch.ProjectId
+                && admitted.GetProperty("AccountTokenId").GetString() = launch.AccountTokenId
+                && admitted.GetProperty("RoleId").GetString() = launch.RoleId
+                && admitted.GetProperty("RoleVersion").GetInt32() = launch.RoleVersion)
+
+    let private readRoleAdmission binding snapshot launchId =
+        LedgerStore.readAt binding snapshot (roleAdmissionPath launchId)
+        |> Result.bind (function
+            | Some raw, Some oid ->
+                try
+                    let record = JsonSerializer.Deserialize<StoredRoleAdmission>(raw)
+                    if isNull (box record)
+                       || record.SchemaVersion <> 1
+                       || JsonSerializer.Serialize(record) <> raw then
+                        Error(integrity "noncanonical or malformed role-specific admission witness")
+                    else Ok(record, oid)
+                with _ -> Error(integrity "invalid role-specific admission witness")
+            | _ -> Error(integrity ("missing same-CAS role-specific admission for " + launchId)))
+
+    // Legacy WQ02 admissions, even if made after a role catalog was created,
+    // never become WQ04-authorized by backfilling a matching numeric version.
+    let private verifyLaunchAdmission (binding: LedgerBinding) (snapshot: LedgerSnapshot)
+                                      (catalog: RoleCatalog) (launch: Launch) =
+        match historical catalog launch.RoleId launch.RoleVersion with
+        | Error error -> Error error
+        | Ok role when not role.Enabled ->
+            Error(integrity ("original pinned role was disabled: " + launch.Id))
+        | Ok role ->
+            WorkQueueGitLedger.readAdmissionAt binding snapshot launch.Id
+            |> Result.bind (function
+                | Some (decision, decisionOid) when
+                    decision.SchemaVersion = 1
+                    && decision.ProjectId = binding.ProjectId.ToString("D")
+                    && decision.LaunchId = launch.Id
+                    && decision.AccountTokenId = launch.AccountTokenId
+                    && decision.Kind = "AdmissionWon"
+                    && decision.AbortOperationId = "" ->
+                    let path = WorkQueueGitLedger.admissionPath launch.Id
+                    let rolePath = roleAdmissionPath launch.Id
+                    operationOrigin binding snapshot decision.AdmissionOperationId
+                        "WQ02.Mutate" [WorkQueueGitLedger.RecordPath; path; rolePath]
+                    |> Result.bind (fun (receipt, issued) ->
+                        if not (originalAdmissionRequest receipt launch) then
+                            Error(integrity "original admission semantic request mismatches pinned launch")
+                        else
+                            WorkQueueGitLedger.readAdmissionAt binding issued launch.Id
+                            |> Result.bind (function
+                                | Some (originalDecision, originalOid)
+                                    when originalOid = decisionOid && originalDecision = decision ->
+                                    readRoleAdmission binding snapshot launch.Id
+                                    |> Result.bind (fun (roleWitness, witnessOid) ->
+                                        readRoleAdmission binding issued launch.Id
+                                        |> Result.bind (fun (originalWitness, originalWitnessOid) ->
+                                            WorkQueueGitLedger.loadAt binding issued
+                                            |> Result.bind (fun issuedProject ->
+                                                readCatalogAt binding issued
+                                                |> Result.bind (fun (issuedCatalog, issuedCatalogOid, _) ->
+                                                    LedgerStore.computeBlobOid binding
+                                                        (JsonSerializer.Serialize(storedRole role))
+                                                    |> Result.bind (fun roleOid ->
+                                                        let issuedRole =
+                                                            issuedCatalog.Versions.TryFind launch.RoleId
+                                                            |> Option.bind (fun versions ->
+                                                                versions.TryFind launch.RoleVersion)
+                                                        let admittedLaunch =
+                                                            issuedProject.Launches.TryFind launch.Id
+                                                        if originalWitness <> roleWitness
+                                                           || originalWitnessOid <> witnessOid
+                                                           || roleWitness.SchemaVersion <> 1
+                                                           || roleWitness.ProjectId <> launch.ProjectId
+                                                           || roleWitness.LaunchId <> launch.Id
+                                                           || roleWitness.AccountTokenId <> launch.AccountTokenId
+                                                           || roleWitness.RoleId <> launch.RoleId
+                                                           || roleWitness.RoleVersion <> launch.RoleVersion
+                                                           || roleWitness.CatalogBlobOid <> issuedCatalogOid
+                                                           || roleWitness.RoleDefinitionOid <> roleOid
+                                                           || roleWitness.AdmissionOperationId <> decision.AdmissionOperationId
+                                                           || issuedRole <> Some role
+                                                           || (admittedLaunch |> Option.exists (fun admitted ->
+                                                               admitted.RoleId <> launch.RoleId
+                                                               || admitted.RoleVersion <> launch.RoleVersion
+                                                               || admitted.AccountTokenId <> launch.AccountTokenId))
+                                                           || admittedLaunch.IsNone then
+                                                            Error(integrity ("unproven role issuance at original admission: " + launch.Id))
+                                                        else Ok())))))
+                                | _ -> Error(integrity "original admission decision was rewritten")))
+                | _ -> Error(integrity ("missing authenticated original project admission: " + launch.Id)))
+
     let loadAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) =
         WorkQueueGitLedger.loadAt binding snapshot
         |> Result.bind (fun project ->
@@ -203,25 +405,21 @@ module WorkQueueRoleAuthority =
             |> Result.bind (function
                 | Some _, Some projectOid ->
                     readCatalogAt binding snapshot
-                    |> Result.bind (fun (catalog, catalogOid) ->
-                        // Including obsolete nonterminal sessions: no history may
-                        // disappear while any original session can still finish.
-                        let missing =
+                    |> Result.bind (fun (catalog, catalogOid, provisionId) ->
+                        verifyRoleHistory binding snapshot catalog provisionId
+                        |> Result.bind (fun () ->
+                            // Even a numerically matching legacy launch has no WQ04
+                            // authority without a role-specific admission at
+                            // the ORIGINAL project CAS commit.
                             project.Launches
-                            |> Map.toSeq |> Seq.map snd
-                            |> Seq.filter (fun launch ->
-                                match launch.State with
-                                | LaunchState.TerminalPendingRelease _ -> false
-                                | _ -> true)
-                            |> Seq.tryPick (fun (launch: Launch) ->
-                                match historical catalog launch.RoleId launch.RoleVersion with
-                                | Ok role when role.Enabled -> None
-                                | _ -> Some launch.Id)
-                        match missing with
-                        | Some id -> Error(LedgerIntegrityError ("WQ04 live launch lacks its original enabled role version: " + id))
-                        | None ->
-                            Ok { Project = project; Catalog = catalog
-                                 Proof =
+                            |> Map.toList
+                            |> List.map snd
+                            |> List.fold (fun state launch ->
+                                state |> Result.bind (fun () ->
+                                    verifyLaunchAdmission binding snapshot catalog launch)) (Ok ())
+                            |> Result.map (fun () ->
+                                { Project = project; Catalog = catalog
+                                  Proof =
                                     { ProjectId = binding.ProjectId.ToString("D")
                                       LedgerId = binding.LedgerId.ToString("D")
                                       Epoch = binding.Epoch
@@ -229,13 +427,14 @@ module WorkQueueRoleAuthority =
                                       ProjectBlobOid = projectOid
                                       ProjectVersion = project.Version
                                       CatalogBlobOid = catalogOid
-                                      CatalogRevision = catalog.Revision } })
+                                      CatalogRevision = catalog.Revision
+                                      ProvisionOperationId = provisionId } })))
                 | _ -> Error(LedgerIntegrityError "WQ04 project head/blob provenance incomplete.")))
 
     let load binding =
         LedgerStore.fetch binding |> Result.bind (loadAt binding)
 
-    let verifyAt binding snapshot proof =
+    let verifyAt binding snapshot (proof: RoleRevisionProof) =
         if proof.ProjectId <> (binding: LedgerBinding).ProjectId.ToString("D")
            || proof.LedgerId <> binding.LedgerId.ToString("D")
            || proof.Epoch <> binding.Epoch
@@ -352,11 +551,26 @@ module WorkQueueRoleAuthority =
                              | _ -> false) ->
                             historical view.Catalog launch.RoleId launch.RoleVersion
                             |> Result.bind (fun role ->
-                                if not (eligible project role work) then
-                                    Error(roleFailure "claimed queue not subscribed by historical pinned version")
-                                else
-                                    rematch view (candidates |> List.filter (fun w -> w.Id <> workId))
-                                        (live |> List.filter (fun other -> other.Id <> launchId)))
+                                // Candidate eligibility is weaker than the first
+                                // feasible deterministic outcome. Reject a caller
+                                // choosing an alternate eligible stage, even during
+                                // read-only preflight. This still does NOT prove
+                                // the actual Contracts.claimNext CAS outcome.
+                                let other = live |> List.filter (fun l -> l.Id <> launchId)
+                                let rec first = function
+                                    | [] -> Error(roleFailure "no feasible claim for pinned role")
+                                    | candidate :: rest when eligible project role candidate ->
+                                        match rematch view
+                                            (candidates |> List.filter (fun w -> w.Id <> candidate.Id))
+                                            other with
+                                        | Ok () -> Ok candidate.Id
+                                        | Error _ -> first rest
+                                    | _ :: rest -> first rest
+                                first candidates
+                                |> Result.bind (fun selected ->
+                                    if selected = workId && eligible project role work then Ok ()
+                                    else Error(roleFailure
+                                        "caller-selected work is not the first feasible pinned-role candidate")))
                         | _ -> Error(roleFailure "claim requires existing nonterminal launch and stage")
                     | ReconcileCredits -> rematch view candidates live
                     | RoleMessageDemand (roleId, messageId) ->
@@ -383,7 +597,8 @@ module WorkQueueRoleAuthority =
                         | None -> Error(roleFailure "first connect launch absent"))
         result |> Result.map (fun () ->
             { Proof = view.Proof; Use = useKind
-              RequiresCanonicalSourceAndAccountProof = true })
+              RequiresCanonicalSourceAndAccountProof = true
+              RequiresSameCasChosenWorkAndCreditProof = true })
 
     // This is the reusable joint-CAS guard. A later work-queue writer MUST call
     // it INSIDE LedgerStore.transact's planner and produce its project changes
@@ -391,6 +606,20 @@ module WorkQueueRoleAuthority =
     // or historical views can assert authorization.
     let inspectAt binding snapshot proof useKind =
         verifyAt binding snapshot proof |> Result.bind (fun view -> inspect view useKind)
+
+    // NO executable claim authority is available from this isolated role
+    // adapter. The eventual combined writer must run inside one project Git
+    // CAS planner, re-evaluate exact role history, account/source provenance,
+    // Contracts.claimNext's ACTUAL chosen work, claimed stage generation and
+    // all resulting credit assignments before publishing anything.
+    //
+    // In particular, even a successful inspectAt(ClaimWork ...) is NOT a
+    // permission, and WQ02's unversioned Project.Subscriptions cannot stand in
+    // for the pinned versioned role catalog. This method deliberately denies
+    // an attempted operational handoff until the joint writer exists.
+    let authorizeClaimAt _binding _snapshot _proof _launchId _workId =
+        Error(LedgerIntegrityError
+            "WQ04 claim denied: no same-CAS canonical selected-work/credit, role, source, account and generation writer.")
 
     let inspectFresh binding proof useKind =
         LedgerStore.fetch binding
@@ -405,14 +634,18 @@ module WorkQueueRoleAuthority =
         LedgerStore.transact binding (intent actor operationId "InitializeWQ04RoleCatalog" request)
             (fun snapshot ->
                 WorkQueueGitLedger.loadAt binding snapshot
-                |> Result.bind (fun _ ->
+                |> Result.bind (fun project ->
                     LedgerStore.readAt binding snapshot CatalogPath
                     |> Result.bind (function
                         | Some _, _ -> Error(InvalidBinding "WQ04 catalog already provisioned.")
+                        | None, None when not project.Launches.IsEmpty ->
+                            Error(LedgerIntegrityError
+                                "WQ04 role catalog cannot be backfilled after any legacy launch; independently authenticated migration unavailable.")
                         | None, None ->
                             let catalog = Producer.emptyRoleCatalog
                             Ok [{ Path = CatalogPath; ExpectedBlobOid = None
-                                  Content = encode ((binding: LedgerBinding).ProjectId.ToString("D")) catalog }]
+                                  Content = encode ((binding: LedgerBinding).ProjectId.ToString("D"))
+                                      (operationId.ToString("D")) catalog }]
                         | _ -> Error(LedgerIntegrityError "WQ04 inconsistent catalog blob."))))
 
     let configure binding actor operationId expectedCatalogRevision expectedPreviousVersion
@@ -426,11 +659,12 @@ module WorkQueueRoleAuthority =
                    role = storedRole definition |})
         LedgerStore.transact binding (intent actor operationId "ConfigureWQ04Role" request)
             (fun snapshot ->
-                WorkQueueGitLedger.loadAt binding snapshot
-                |> Result.bind (fun _ ->
-                    readCatalogAt binding snapshot
-                    |> Result.bind (fun (before, oid) ->
-                        Producer.configureRole expectedCatalogRevision expectedPreviousVersion
+                loadAt binding snapshot
+                |> Result.bind (fun view ->
+                    let before = view.Catalog
+                    let oid = view.Proof.CatalogBlobOid
+                    let provisionId = view.Proof.ProvisionOperationId
+                    Producer.configureRole expectedCatalogRevision expectedPreviousVersion
                             (operationId.ToString("D")) definition before
                         |> Result.mapError (function
                             | Rejection.CasConflict -> StaleEntityVersion "WQ04 role revision changed."
@@ -441,4 +675,5 @@ module WorkQueueRoleAuthority =
                                 Error(LedgerIntegrityError "WQ04 proposed catalog history is incomplete.")
                             else
                                 Ok [{ Path = CatalogPath; ExpectedBlobOid = Some oid
-                                      Content = encode ((binding: LedgerBinding).ProjectId.ToString("D")) after }]))))
+                                      Content = encode ((binding: LedgerBinding).ProjectId.ToString("D"))
+                                          provisionId after }])))

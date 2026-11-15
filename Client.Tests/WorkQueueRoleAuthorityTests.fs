@@ -169,46 +169,130 @@ type WorkQueueRoleAuthorityTests() =
             reject isStale (config b 1 1 (role 2 true ["review"])))
 
     [<Test>]
-    member _.PinnedV1ClaimsAndFirstConnectSurviveV2SubscriptionsButNewDemandUsesV2() =
+    member _.PinnedHistoricalVersionsRemainImmutableButLegacyAdmissionNeverBecomesAuthorized() =
         withTwoClones (fun a b ->
             init a
             config a 0 0 (role 1 true ["planning"; "role:Lead"]) |> success |> ignore
             let id = a.ProjectId.ToString("D")
             mutate a (PublishStage(stage id "planning-a" "planning" WorkKind.Planning "task-a"))
             mutate a (PublishStage(stage id "review-b" "review" WorkKind.FrozenReview "task-b"))
-            let oldLaunch = launch id "L-old" 1
-            WorkQueueRoleAuthority.inspect (WorkQueueRoleAuthority.load a |> success)
-                (AdmitNew oldLaunch) |> success |> ignore
-            mutate a (AdmitProject oldLaunch)
-            mutate a (DispatchOnce("L-old", DispatchState.Submitted))
-            let before = WorkQueueRoleAuthority.load a |> success
-            WorkQueueRoleAuthority.inspect before (FirstConnect "L-old") |> success |> ignore
+            let pendingV1 = launch id "L-old" 1
+            let initial = WorkQueueRoleAuthority.load a |> success
+            let preflight = WorkQueueRoleAuthority.inspect initial (AdmitNew pendingV1) |> success
+            Assert.That(preflight.RequiresCanonicalSourceAndAccountProof, Is.True)
+            Assert.That(preflight.RequiresSameCasChosenWorkAndCreditProof, Is.True)
             config b 1 1 (role 2 true ["review"]) |> success |> ignore
             let changed = WorkQueueRoleAuthority.load a |> success
-            Assert.That(changed.Catalog.Versions.["Lead"].[1].QueueSubscriptions = set ["planning"; "role:Lead"], Is.True)
-            Assert.That(changed.Catalog.Versions.["Lead"].[2].QueueSubscriptions = set ["review"], Is.True)
-            reject (function InvalidBinding _ -> true | _ -> false)
-                (WorkQueueRoleAuthority.inspect changed (ClaimWork("L-old", "planning-a")))
-            WorkQueueRoleAuthority.inspect changed (FirstConnect "L-old") |> success |> ignore
-            mutate a (InitializeAgent("L-old", "session-v1"))
-            let registered = WorkQueueRoleAuthority.load b |> success
-            WorkQueueRoleAuthority.inspect registered (ClaimWork("L-old", "planning-a"))
-            |> success |> ignore
-            reject (function InvalidBinding _ -> true | _ -> false)
-                (WorkQueueRoleAuthority.inspect registered (ClaimWork("L-old", "review-b")))
-            WorkQueueRoleAuthority.inspect registered (PlanNewDemand "Lead") |> success |> ignore
-            reject isStale (WorkQueueRoleAuthority.inspect registered (AdmitNew (launch id "new-stale" 1)))
-            WorkQueueRoleAuthority.inspect registered (AdmitNew (launch id "new-v2" 2))
+            Assert.That(
+                changed.Catalog.Versions.["Lead"].[1].QueueSubscriptions = set ["planning"; "role:Lead"],
+                Is.True)
+            Assert.That(
+                changed.Catalog.Versions.["Lead"].[2].QueueSubscriptions = set ["review"],
+                Is.True)
+            reject isStale (WorkQueueRoleAuthority.inspect changed (AdmitNew pendingV1))
+            WorkQueueRoleAuthority.inspect changed (AdmitNew (launch id "new-v2" 2))
             |> success |> ignore
             config a 2 2 (role 3 false ["review"]) |> success |> ignore
             let disabled = WorkQueueRoleAuthority.load b |> success
             reject (function InvalidBinding _ -> true | _ -> false)
                 (WorkQueueRoleAuthority.inspect disabled (PlanNewDemand "Lead"))
-            reject (function InvalidBinding _ -> true | _ -> false)
-                (WorkQueueRoleAuthority.inspect disabled (AdmitNew (launch id "new-disabled" 3)))
-            WorkQueueRoleAuthority.inspect disabled (ClaimWork("L-old", "planning-a"))
-            |> success |> ignore)
+            // WQ02's old, unversioned subscriptions are not role authority.
+            // This fixture writes a real Git-CAS admission but no role-specific
+            // SAME-CAS witness. It must stay denied forever.
+            mutate a (AdmitProject pendingV1)
+            reject isIntegrity (WorkQueueRoleAuthority.load a)
+            reject isIntegrity (WorkQueueRoleAuthority.load b)
+            mutate b (DispatchOnce("L-old", DispatchState.Submitted))
+            reject isIntegrity (WorkQueueRoleAuthority.load a)
+            reject isIntegrity
+                (WorkQueueRoleAuthority.configure a "fixture" (Guid.NewGuid()) 3 3
+                    (role 4 true ["planning"])))
 
+    [<Test>]
+    member _.LegacyLaunchBeforeCatalogCannotBeRetroactivelyProvisionedOrBackdated() =
+        withTwoClones (fun a b ->
+            let id = a.ProjectId.ToString("D")
+            mutate a (PublishStage(stage id "pre-catalog" "planning" WorkKind.Planning "task-legacy"))
+            mutate a (AdmitProject (launch id "legacy-L" 1))
+            reject isIntegrity
+                (WorkQueueRoleAuthority.initializeCatalog b "fixture" (Guid.NewGuid()))
+            reject (function InvalidBinding _ -> true | _ -> false)
+                (WorkQueueRoleAuthority.load a)
+            let snapshot = LedgerStore.fetch b |> success
+            let raw, _ = LedgerStore.readAt b snapshot WorkQueueRoleAuthority.CatalogPath |> success
+            Assert.That(raw.IsNone, Is.True))
+
+    [<Test>]
+    member _.ShapeValidHistoricalVersionRewriteAndReceiptSubstitutionFailAcrossClones() =
+        let corrupt rewrite =
+            withTwoClones (fun a b ->
+                init a
+                config a 0 0 (role 1 true ["planning"]) |> success |> ignore
+                config a 1 1 (role 2 true ["review"]) |> success |> ignore
+                let before = WorkQueueRoleAuthority.load b |> success
+                let snapshot = LedgerStore.fetch b |> success
+                let raw, oid =
+                    LedgerStore.readAt b snapshot WorkQueueRoleAuthority.CatalogPath |> success
+                let json = JsonNode.Parse(raw.Value).AsObject()
+                rewrite json
+                let altered = json.ToJsonString()
+                Assert.That(altered, Is.Not.EqualTo(raw.Value))
+                let intent =
+                    { OperationId = Guid.NewGuid(); Actor = "fixture"; Kind = "WQ04HistoryRewriteFixture"
+                      RequestJson = """{"schemaVersion":1,"action":"rewrite"}""" }
+                LedgerStore.transact b intent (fun _ ->
+                    Ok [{ Path = WorkQueueRoleAuthority.CatalogPath
+                          ExpectedBlobOid = oid; Content = altered }])
+                |> success |> ignore
+                reject isIntegrity (WorkQueueRoleAuthority.load a)
+                reject isIntegrity (WorkQueueRoleAuthority.load b)
+                reject isIntegrity
+                    (WorkQueueRoleAuthority.configure b "fixture" (Guid.NewGuid()) 2 2
+                        (role 3 true ["planning"]))
+                reject isStale
+                    (WorkQueueRoleAuthority.inspectFresh a before.Proof ReconcileCredits))
+        corrupt (fun json ->
+            json.["Versions"].AsArray().[0].AsObject().["Instructions"] <-
+                JsonValue.Create("FORGED historical version one"))
+        corrupt (fun json ->
+            json.["Receipts"].AsArray().[0].AsObject().["OperationId"] <-
+                JsonValue.Create(Guid.NewGuid().ToString("D")))
+
+    [<Test>]
+    member _.ActualLegacyClaimAndConcurrentRoleEditNeverBecomeOperationalClaimPermission() =
+        withTwoClones (fun a b ->
+            init a
+            config a 0 0 (role 1 true ["planning"]) |> success |> ignore
+            let id = a.ProjectId.ToString("D")
+            mutate a (PublishStage(stage id "stage-a" "planning" WorkKind.Planning "task-a"))
+            mutate a (PublishStage(stage id "stage-b" "planning" WorkKind.Planning "task-b"))
+            let old = WorkQueueRoleAuthority.load b |> success
+            let proposed = launch id "racing-L" 1
+            WorkQueueRoleAuthority.inspect old (AdmitNew proposed) |> success |> ignore
+            // Two independent clones race a real WQ02 admission and a version
+            // change; neither can manufacture an issuance-time WQ04 role witness.
+            let admission = Task.Run(fun () -> mutate a (AdmitProject proposed))
+            let revision = Task.Run(fun () ->
+                WorkQueueRoleAuthority.configure b "fixture" (Guid.NewGuid()) 1 1
+                    (role 2 true ["review"]))
+            Task.WaitAll([| admission :> Task; revision :> Task |])
+            Assert.That(admission.IsCompletedSuccessfully, Is.True)
+            if Result.isError revision.Result then
+                reject isIntegrity revision.Result
+            reject isIntegrity (WorkQueueRoleAuthority.load a)
+            reject isIntegrity (WorkQueueRoleAuthority.load b)
+            mutate b (DispatchOnce("racing-L", DispatchState.Submitted))
+            mutate b (InitializeAgent("racing-L", "fixture-session"))
+            // The legacy fixture may claim, but that creates no WQ04 permit.
+            mutate b (ClaimNext "racing-L")
+            reject isIntegrity (WorkQueueRoleAuthority.load a)
+            let latest = LedgerStore.fetch a |> success
+            reject isIntegrity
+                (WorkQueueRoleAuthority.authorizeClaimAt a latest old.Proof
+                    "racing-L" "stage-a")
+            reject isIntegrity
+                (WorkQueueRoleAuthority.authorizeClaimAt b latest old.Proof
+                    "racing-L" "stage-b"))
     [<Test>]
     member _.RoleMessageRequiresCurrentExplicitSubscriptionAndPendingIndexedWork() =
         withTwoClones (fun a b ->

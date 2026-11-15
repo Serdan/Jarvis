@@ -619,6 +619,16 @@ module PendingIntentJournal =
             finally
                 closeDirectoryFd(fd) |> ignore
 
+    // A first pending intent can create both ledger-v2/pending and its
+    // per-binding child. Fsyncing the child after rename does not make those
+    // directory links durable; parent entries must also be synchronized
+    // before the first remote Git access. Recheck on replay after failure.
+    let private syncPendingJournalAncestors (journal: string) =
+        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+            let pendingRoot = Path.GetDirectoryName journal
+            syncArchiveDirectory pendingRoot
+            syncArchiveDirectory (Path.GetDirectoryName pendingRoot)
+
     let private durableArchiveMove temporary destination folder =
         if OperatingSystem.IsWindows() then
             // MOVEFILE_WRITE_THROUGH = 0x00000008. No
@@ -830,16 +840,20 @@ module PendingIntentJournal =
             && normalizeCommandType existing.CommandType = normalizeCommandType newRecord.CommandType
             && existing.CommandSha256 = newRecord.CommandSha256
             && existing.CommandJson = newRecord.CommandJson
+        let confirmPersisted () =
+            readFile file |> Result.bind (fun existing ->
+                if matches existing then
+                    syncPendingJournalAncestors (Path.GetDirectoryName file)
+                    Ok ()
+                else Error(Client.ValidationError "Pending  operation UUID reused with changed input."))
         try
             if File.Exists(archivePath binding operationId) then
                 Error(Client.ValidationError "Pending intent was explicitly superseded; archived UUID cannot be reused.")
             elif File.Exists file then
                 // A previous rename could have succeeded with an unconfirmed
-                // directory fsync. Reconfirm before replay can reach Git.
+                // directory or ancestor fsync. Reconfirm before replay can reach Git.
                 syncArchiveDirectory (Path.GetDirectoryName file)
-                readFile file |> Result.bind (fun existing ->
-                    if matches existing then Ok ()
-                    else Error(Client.ValidationError "Pending  operation UUID reused with changed input."))
+                confirmPersisted ()
             else
                 let directory = Path.GetDirectoryName file
                 Directory.CreateDirectory(directory) |> ignore
@@ -866,9 +880,7 @@ module PendingIntentJournal =
                         // Destination existence does not prove a rename collision:
                         // fsync may have failed after the rename completed.
                         durableArchiveMove temp file directory
-                        readFile file |> Result.bind (fun existing ->
-                            if matches existing then Ok ()
-                            else Error(Client.ValidationError "Pending  operation UUID reused with changed input."))
+                        confirmPersisted ()
                     finally
                         if File.Exists temp then File.Delete temp
         with ex ->

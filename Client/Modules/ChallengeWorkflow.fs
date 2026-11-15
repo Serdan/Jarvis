@@ -634,7 +634,10 @@ module ChallengeWorkflow =
                                   PreviousGeneration = attempt.AssignmentGeneration
                                   NewGeneration = generation
                                   ReviewRequestId = null
-                                  ReviewDisposition = "Unchanged"; Evidence = null }
+                                  ReviewDisposition = "Unchanged"; Evidence = null
+                                  RequestingAgentId = null; TargetAgentId = null
+                                  PreviousAgentState = null; NewAgentState = null
+                                  PreviousAgentVersion = 0; NewAgentVersion = 0 }
                             writes <- [
                                 change file (Some waitOid) nextWait
                                 change attemptPath (Some attemptOid) nextAttempt
@@ -1329,7 +1332,10 @@ module ChallengeWorkflow =
           PreviousOwnerId = attempt.OwnerAgentId; NewOwnerId = attempt.OwnerAgentId
           PreviousGeneration = attempt.AssignmentGeneration
           NewGeneration = afterGeneration
-          ReviewRequestId = null; ReviewDisposition = "Unchanged"; Evidence = null }
+          ReviewRequestId = null; ReviewDisposition = "Unchanged"; Evidence = null
+          RequestingAgentId = null; TargetAgentId = null
+          PreviousAgentState = null; NewAgentState = null
+          PreviousAgentVersion = 0; NewAgentVersion = 0 }
 
     let private issue (task: ReviewTask) (attempt: ReviewAttempt) (actor: string)
                       (reason: string) sequence : AssignmentIssue =

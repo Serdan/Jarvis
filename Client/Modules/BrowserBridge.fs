@@ -755,9 +755,10 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                         | Ok _ -> return Ok "closed"
                         // The extension rechecks fresh-home/zero-turn at disposal.
                         // The earlier page result is not an enduring close authority.
-                        | Error "BrowserCloseTabError:CleanupSafetyChanged"
-                        | Error "BrowserCloseTabError:CleanupSafetyUnverified" ->
+                        | Error "BrowserCloseTabError:CleanupSafetyChanged" ->
                             return Ok "retained"
+                        // A missing/inconclusive safety probe is not an observed changed route.
+                        // Never close/retry, but surface the error with pinned registration.
                         | Error e ->
                             let safe = if e.Length > 100 then e.Substring(0, 100) else e
                             return Error("cleanupFailed:" + safe)

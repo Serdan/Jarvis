@@ -542,13 +542,15 @@ let definitiveLaunchCleanupFailureIsSurfacedWithoutRetry (scriptStatus: string) 
 // license to close later. The extension rechecks at the final disposal point,
 // including pending /c/ navigation that the old committed document cannot see.
 // The extension's deterministic harness supplies the timing-specific cases;
-// this composed bridge test verifies each denial is retained with no replay.
+// this composed bridge test distinguishes a verified changed conversation
+// (normal retention) from an unverified probe (explicit cleanup failure).
 [<TestCase("notSubmitted", "CleanupSafetyChanged", "pending-at-admission")>]
 [<TestCase("notSubmitted", "CleanupSafetyChanged", "pending-during-probe")>]
 [<TestCase("notSubmitted", "CleanupSafetyChanged", "pending-after-probe")>]
 [<TestCase("uiIncompatible", "CleanupSafetyChanged", "pending-after-probe")>]
 [<TestCase("notSubmitted", "CleanupSafetyUnverified", "inspection-unavailable")>]
-let composedLateConversationGuardRetainsTabWithoutRetry
+[<TestCase("uiIncompatible", "CleanupSafetyUnverified", "inspection-unavailable")>]
+let composedLateCleanupGuardRetainsTabWithoutRetry
     (scriptStatus: string, guardFailure: string, scenario: string) = task {
     let port = findPort()
     use bridge = new BrowserBridge.Service(port, "test-secret")
@@ -589,13 +591,18 @@ let composedLateConversationGuardRetainsTabWithoutRetry
         registrationGeneration = 3; error = guardFailure
     |}))
     match! launch.WaitAsync(TimeSpan.FromSeconds(3.0)) with
-    | Ok response when scriptStatus = "notSubmitted" ->
+    | Error (id, reason) when guardFailure = "CleanupSafetyUnverified" ->
+        Assert.That(id, Is.EqualTo("late-conversation"), scenario)
+        Assert.That(reason, Does.Contain("cleanupFailed:BrowserCloseTabError:CleanupSafetyUnverified"), scenario)
+        Assert.That(reason, Does.Contain(if scriptStatus = "uiIncompatible" then "UiIncompatible" else "NotSubmitted"), scenario)
+        Assert.That(reason, Does.Not.Contain("cleanup=retained"), scenario)
+    | Ok response when scriptStatus = "notSubmitted" && guardFailure = "CleanupSafetyChanged" ->
         use result = JsonDocument.Parse(response)
         Assert.That(result.RootElement.GetProperty("status").GetString(), Is.EqualTo("notSubmitted"), scenario)
         Assert.That(result.RootElement.GetProperty("cleanup").GetString(), Is.EqualTo("retained"), scenario)
         let scriptResult = result.RootElement.GetProperty("scriptResult")
         Assert.That(scriptResult.GetProperty("safeToDisposeCreatedTab").GetBoolean(), Is.True, scenario)
-    | Error (id, reason) when scriptStatus = "uiIncompatible" ->
+    | Error (id, reason) when scriptStatus = "uiIncompatible" && guardFailure = "CleanupSafetyChanged" ->
         Assert.That(id, Is.EqualTo("late-conversation"))
         Assert.That(reason, Does.Contain("cleanup=retained"))
     | _ -> Assert.Fail("Guarded cleanup must retain the tab without claiming closure")

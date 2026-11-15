@@ -900,7 +900,20 @@ module WorkQueueGitLedger =
         |> Result.bind (fun admissions ->
             terminalChanges [] terminals |> Result.map (fun terminal -> admissions @ terminal))
 
-    let private change (binding: LedgerBinding) (actor: string) (operationId: Guid) (expectedVersion: int) (now: int64) (mutation: WorkMutation) =
+    // Schema-1 WQ-02 projects have no canonical source/event/index or pinned
+    // versioned role provenance. They are inert CAS prototypes only. An arbitrary
+    // stage ID or a WQ-02 PublishStage receipt is never Scheduler authority.
+    // Fixture-only execution below preserves historical frozen WQ-02 tests.
+    let private requiresCanonicalAuthority = function
+        | PostMessage ({ Subject = Subject.Task _ }, None)
+        | AbortUnboundProjectAdmission _
+        | StopStalled _
+        | CancelUnclaimed _
+        | MarkSourceRecoveryBlocked _
+        | ProduceEvent _ -> false // ProduceEvent has its own unconditional hold.
+        | _ -> true
+
+    let private change inertFixture (binding: LedgerBinding) (actor: string) (operationId: Guid) (expectedVersion: int) (now: int64) (mutation: WorkMutation) =
         let request = JsonObject()
         request.Add("schemaVersion", JsonValue.Create(1))
         request.Add("expectedProjectVersion", JsonValue.Create(expectedVersion))
@@ -917,11 +930,20 @@ module WorkQueueGitLedger =
                     Error(StaleEntityVersion "Stale WQ-02 project version.")
                 | Some state ->
                     let op = operationId.ToString("D")
-                    let unverifiedWq04Stage =
-                        state.Works
-                        |> Map.exists (fun id _ -> id.StartsWith("wq04-", StringComparison.Ordinal))
                     let transition =
                         match mutation with
+                        | _ when inertFixture && state.Migration <> MigrationEpoch.Frozen ->
+                            Error(Rejection.IncompleteCoverage
+                                "WQ-02 fixture execution requires a durable Frozen project epoch")
+                        | PublishStage _ when not inertFixture ->
+                            Error(Rejection.IncompleteCoverage
+                                "WQ-04 stages require canonical producer authority, regardless of ID or kind")
+                        | PostMessage ({ Subject = Subject.Role _ }, _) when not inertFixture ->
+                            Error(Rejection.IncompleteCoverage
+                                "WQ-04 RoleMessage requires canonical message origin and pinned role authority")
+                        | _ when not inertFixture && requiresCanonicalAuthority mutation ->
+                            Error(Rejection.IncompleteCoverage
+                                "WQ-04 canonical source/index and versioned role admission proof unavailable")
                         | PublishStage stage ->
                             if stage.Id.StartsWith("wq04-", StringComparison.Ordinal) then
                                 Error(Rejection.IncompleteCoverage
@@ -950,10 +972,7 @@ module WorkQueueGitLedger =
                         | AdmitProject launch ->
                             // Account reservation is proven by the separate bridge before
                             // invoking this inert project-CAS adapter.
-                            if unverifiedWq04Stage then
-                                Error(Rejection.IncompleteCoverage
-                                    "cannot admit launch against unverified WQ-04 stages/role versions")
-                            elif not (validInitialLaunch binding launch)
+                            if not (validInitialLaunch binding launch)
                                || (state.Launches
                                    |> Map.exists (fun _ existing ->
                                        existing.AccountTokenId = launch.AccountTokenId)) then
@@ -977,9 +996,7 @@ module WorkQueueGitLedger =
                         | StopStalled (launch, generation, timeout) ->
                             Contracts.markStalled expectedVersion op launch generation now timeout state
                         | ClaimNext launch ->
-                            if unverifiedWq04Stage then
-                                Error(Rejection.IncompleteCoverage "cannot claim unverified WQ-04 demand")
-                            else Contracts.claimNext expectedVersion op launch state
+                            Contracts.claimNext expectedVersion op launch state
                         | CompleteOrdinary (launch, work) ->
                             match state.Works.TryFind work with
                             | Some stage when stage.Kind = WorkKind.Implementation
@@ -1101,7 +1118,7 @@ module WorkQueueGitLedger =
         let now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
         let result =
             validateMutationPayload mutation
-            |> Result.bind (fun () -> change binding actor operationId expectedVersion now mutation)
+            |> Result.bind (fun () -> change false binding actor operationId expectedVersion now mutation)
         match result, dropPublishedAck.Value with
         | Ok _, Some shouldDrop when shouldDrop operationId ->
             Error(OutcomeUnknown $"Injected lost WQ-02 post-publication acknowledgement {operationId:D}.")
@@ -1110,4 +1127,19 @@ module WorkQueueGitLedger =
     // Deterministic tests can replay adversarial interleavings with virtual time.
     let internal executeAt binding actor operationId expectedVersion now mutation =
         validateMutationPayload mutation
-        |> Result.bind (fun () -> change binding actor operationId expectedVersion now mutation)
+        |> Result.bind (fun () -> change false binding actor operationId expectedVersion now mutation)
+
+    // Only the explicitly named test seam can simulate the accepted WQ-02
+    // state machine. Its mutations are restricted to durable Frozen envelopes.
+    // Neither this internal method nor its receipts grant canonical origin.
+    let internal executeInertFixtureAt binding actor operationId expectedVersion now mutation =
+        validateMutationPayload mutation
+        |> Result.bind (fun () -> change true binding actor operationId expectedVersion now mutation)
+
+    let internal executeInertFixture binding actor operationId expectedVersion mutation =
+        let now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        let result = executeInertFixtureAt binding actor operationId expectedVersion now mutation
+        match result, dropPublishedAck.Value with
+        | Ok _, Some shouldDrop when shouldDrop operationId ->
+            Error(OutcomeUnknown $"Injected lost WQ-02 post-publication acknowledgement {operationId:D}.")
+        | _ -> result

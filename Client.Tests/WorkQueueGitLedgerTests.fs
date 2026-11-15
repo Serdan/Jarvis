@@ -115,7 +115,7 @@ type WorkQueueGitLedgerTests() =
     let startSourceClaim (a: LedgerBinding) (b: LedgerBinding) =
         let mutate client now mutation =
             let _, state = WorkQueueGitLedger.load client |> success
-            WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) state.Version now mutation
+            WorkQueueGitLedger.executeInertFixtureAt client "Worker" (Guid.NewGuid()) state.Version now mutation
             |> success |> ignore
         let projectId = a.ProjectId.ToString("D")
         let pinnedBase = git a.RepositoryPath [ "rev-parse"; "HEAD" ]
@@ -147,7 +147,7 @@ type WorkQueueGitLedgerTests() =
         mutate b 1003L (InitializeAgent ("L1", "session-one"))
         // An ordinary clone is not a generation-scoped writable source.
         let _, beforeClaim = WorkQueueGitLedger.load b |> success
-        match WorkQueueGitLedger.executeAt a "Worker" (Guid.NewGuid()) beforeClaim.Version
+        match WorkQueueGitLedger.executeInertFixtureAt a "Worker" (Guid.NewGuid()) beforeClaim.Version
                 1004L (ClaimNext "L1") with
         | Error(InvalidBinding _) -> ()
         | other -> Assert.Fail(sprintf "Initial source claim from shared checkout: %A" other)
@@ -200,14 +200,14 @@ type WorkQueueGitLedgerTests() =
             let secondStage = stage (a.ProjectId.ToString("D")) "review-B" []
             let operationId = Guid.NewGuid()
             let first =
-                WorkQueueGitLedger.executeAt a "Worker" operationId 0 2000L (PublishStage firstStage)
+                WorkQueueGitLedger.executeInertFixtureAt a "Worker" operationId 0 2000L (PublishStage firstStage)
                 |> success
             Assert.That(first.AlreadyApplied, Is.False)
-            match WorkQueueGitLedger.executeAt b "Worker" (Guid.NewGuid()) 0 2001L (PublishStage secondStage) with
+            match WorkQueueGitLedger.executeInertFixtureAt b "Worker" (Guid.NewGuid()) 0 2001L (PublishStage secondStage) with
             | Error(StaleEntityVersion _) -> ()
             | other -> Assert.Fail(sprintf "A stale clone must fail CAS: %A" other)
             let replay =
-                WorkQueueGitLedger.executeAt b "Worker" operationId 0 2000L (PublishStage firstStage)
+                WorkQueueGitLedger.executeInertFixtureAt b "Worker" operationId 0 2000L (PublishStage firstStage)
                 |> success
             Assert.That(replay.AlreadyApplied, Is.True)
             Assert.That(replay.Operation.OriginalResultHash, Is.EqualTo(first.Operation.OriginalResultHash))
@@ -225,7 +225,7 @@ type WorkQueueGitLedgerTests() =
             let published = plan (a.ProjectId.ToString("D")) "P" []
             let mutation = PublishStage published
             let operationId = Guid.NewGuid()
-            let first = WorkQueueGitLedger.execute a "Worker" operationId 0 mutation |> success
+            let first = WorkQueueGitLedger.executeInertFixture a "Worker" operationId 0 mutation |> success
             Assert.That(first.AlreadyApplied, Is.False)
             let firstHead = (LedgerStore.fetch a |> success).Commit
             let _, initial = WorkQueueGitLedger.load a |> success
@@ -233,7 +233,7 @@ type WorkQueueGitLedgerTests() =
             Assert.That(initial.Works.["P"].AvailableSequence, Is.EqualTo(1L))
             // Clone B treats the first response as lost and retries the public API later.
             Thread.Sleep(1300)
-            let replay = WorkQueueGitLedger.execute b "Worker" operationId 0 mutation |> success
+            let replay = WorkQueueGitLedger.executeInertFixture b "Worker" operationId 0 mutation |> success
             Assert.That(replay.AlreadyApplied, Is.True)
             Assert.That(replay.Operation, Is.EqualTo(first.Operation))
             Assert.That(replay.Operation.RequestHash, Is.EqualTo(first.Operation.RequestHash))
@@ -243,7 +243,7 @@ type WorkQueueGitLedgerTests() =
                 [ "Worker", 0, altered
                   "Other Worker", 0, mutation
                   "Worker", 1, mutation ] do
-                match WorkQueueGitLedger.execute b actor operationId version attempt with
+                match WorkQueueGitLedger.executeInertFixture b actor operationId version attempt with
                 | Error OperationIdReused -> ()
                 | other -> Assert.Fail(sprintf "Changed semantic replay must reject: %A" other)
             let finalHead = (LedgerStore.fetch b |> success).Commit
@@ -262,10 +262,10 @@ type WorkQueueGitLedgerTests() =
             WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid()) Map.empty |> success |> ignore
             let op = Guid.NewGuid()
             let original = stage (a.ProjectId.ToString("D")) "stage" []
-            WorkQueueGitLedger.executeAt a "Worker" op 0 2000L (PublishStage original)
+            WorkQueueGitLedger.executeInertFixtureAt a "Worker" op 0 2000L (PublishStage original)
             |> success |> ignore
             let changed = { original with Dependencies = Set.singleton "other" }
-            match WorkQueueGitLedger.executeAt b "Worker" op 0 2000L (PublishStage changed) with
+            match WorkQueueGitLedger.executeInertFixtureAt b "Worker" op 0 2000L (PublishStage changed) with
             | Error OperationIdReused -> ()
             | other -> Assert.Fail(sprintf "Mutation payload replay must reject: %A" other)
             let _, state = WorkQueueGitLedger.load b |> success
@@ -279,9 +279,9 @@ type WorkQueueGitLedgerTests() =
             let projectId = a.ProjectId.ToString("D")
             let predecessor = stage projectId "B" []
             let dependent = { stage projectId "D" [ "B" ] with AvailableSequence = 2L }
-            WorkQueueGitLedger.executeAt a "Worker" (Guid.NewGuid()) 0 1000L (PublishStage predecessor)
+            WorkQueueGitLedger.executeInertFixtureAt a "Worker" (Guid.NewGuid()) 0 1000L (PublishStage predecessor)
             |> success |> ignore
-            WorkQueueGitLedger.executeAt b "Worker" (Guid.NewGuid()) 1 1001L (PublishStage dependent)
+            WorkQueueGitLedger.executeInertFixtureAt b "Worker" (Guid.NewGuid()) 1 1001L (PublishStage dependent)
             |> success |> ignore
             let _, verified = WorkQueueGitLedger.load a |> success
             Assert.That(verified.Works.["D"].State, Is.EqualTo(WorkState.Blocked))
@@ -293,7 +293,7 @@ type WorkQueueGitLedgerTests() =
     member _.TwoCloneRegistrationClaimTerminalAndDependencyWake() =
         withClones (fun a b ->
             let write client version time mutation =
-                WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) version time mutation
+                WorkQueueGitLedger.executeInertFixtureAt client "Worker" (Guid.NewGuid()) version time mutation
                 |> success |> ignore
             let subscriptions = Map.ofList [ "Lead", set [ "planning" ] ]
             WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid()) subscriptions |> success |> ignore
@@ -304,7 +304,7 @@ type WorkQueueGitLedgerTests() =
             write a 3 1003L (DispatchOnce ("L", DispatchState.Submitted))
             let register = Guid.NewGuid()
             let registered =
-                WorkQueueGitLedger.executeAt a "Worker" register 4 1004L (InitializeAgent ("L", "session-1"))
+                WorkQueueGitLedger.executeInertFixtureAt a "Worker" register 4 1004L (InitializeAgent ("L", "session-1"))
                 |> success
             let _, afterRegistration = WorkQueueGitLedger.load b |> success
             let uuid =
@@ -312,23 +312,23 @@ type WorkQueueGitLedgerTests() =
                 | LaunchState.Registered(uuid, "session-1") -> uuid
                 | unexpected -> failwithf "First connect must be UUID-bound: %A" unexpected
             Assert.That(Guid.TryParse(uuid) |> fst, Is.True)
-            match WorkQueueGitLedger.executeAt b "Worker" (Guid.NewGuid()) 5 1005L
+            match WorkQueueGitLedger.executeInertFixtureAt b "Worker" (Guid.NewGuid()) 5 1005L
                     (InitializeAgent ("L", "distinct-session")) with
             | Error(InvalidBinding _) -> ()
             | unexpected -> Assert.Fail(sprintf "Distinct session must fail registration: %A" unexpected)
             let registeredReplay =
-                WorkQueueGitLedger.executeAt b "Worker" register 4 1004L (InitializeAgent ("L", "session-1"))
+                WorkQueueGitLedger.executeInertFixtureAt b "Worker" register 4 1004L (InitializeAgent ("L", "session-1"))
                 |> success
             Assert.That(registeredReplay.Operation.OriginalResultHash, Is.EqualTo(registered.Operation.OriginalResultHash))
             let claimOp = Guid.NewGuid()
             let claim =
-                WorkQueueGitLedger.executeAt a "Worker" claimOp 5 1006L (ClaimNext "L")
+                WorkQueueGitLedger.executeInertFixtureAt a "Worker" claimOp 5 1006L (ClaimNext "L")
                 |> success
-            match WorkQueueGitLedger.executeAt b "Worker" (Guid.NewGuid()) 5 1006L (ClaimNext "L") with
+            match WorkQueueGitLedger.executeInertFixtureAt b "Worker" (Guid.NewGuid()) 5 1006L (ClaimNext "L") with
             | Error(StaleEntityVersion _) -> ()
             | unexpected -> Assert.Fail(sprintf "Second primary claim must fail project CAS: %A" unexpected)
             let replay =
-                WorkQueueGitLedger.executeAt b "Worker" claimOp 5 1006L (ClaimNext "L")
+                WorkQueueGitLedger.executeInertFixtureAt b "Worker" claimOp 5 1006L (ClaimNext "L")
                 |> success
             Assert.That(replay.Operation.OriginalResultHash, Is.EqualTo(claim.Operation.OriginalResultHash))
             let _, claimed = WorkQueueGitLedger.load b |> success
@@ -337,7 +337,7 @@ type WorkQueueGitLedgerTests() =
             let previousSequence = claimed.NextAvailability
             let completeOp = Guid.NewGuid()
             let completed =
-                WorkQueueGitLedger.executeAt b "Worker" completeOp 6 4000L (CompleteOrdinary ("L", "B"))
+                WorkQueueGitLedger.executeInertFixtureAt b "Worker" completeOp 6 4000L (CompleteOrdinary ("L", "B"))
                 |> success
             let _, updated = WorkQueueGitLedger.load a |> success
             Assert.That(updated.Works.["B"].State, Is.EqualTo(WorkState.Completed))
@@ -346,7 +346,7 @@ type WorkQueueGitLedgerTests() =
             Assert.That(updated.Works.["D"].AvailableSequence, Is.GreaterThan(previousSequence))
             Assert.That(updated.Launches.["L"].State, Is.EqualTo(LaunchState.TerminalPendingRelease("terminal:" + completeOp.ToString("D"))))
             let completionReplay =
-                WorkQueueGitLedger.executeAt a "Worker" completeOp 6 4000L (CompleteOrdinary ("L", "B"))
+                WorkQueueGitLedger.executeInertFixtureAt a "Worker" completeOp 6 4000L (CompleteOrdinary ("L", "B"))
                 |> success
             Assert.That(completionReplay.Operation.OriginalResultHash, Is.EqualTo(completed.Operation.OriginalResultHash)))
 
@@ -354,7 +354,7 @@ type WorkQueueGitLedgerTests() =
     member _.DedicatedRolePrimaryRejectsAncillaryAndStaleMessageHandlerGeneration() =
         withClones (fun a b ->
             let write client version time mutation =
-                WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) version time mutation
+                WorkQueueGitLedger.executeInertFixtureAt client "Worker" (Guid.NewGuid()) version time mutation
                 |> success |> ignore
             WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid())
                 (Map.ofList [ "R", set [ "role:R" ] ]) |> success |> ignore
@@ -369,11 +369,11 @@ type WorkQueueGitLedgerTests() =
             write b 5 1005L (ClaimNext "L")
             let _, snapshot = WorkQueueGitLedger.load a |> success
             Assert.That(snapshot.Launches.["L"].PrimaryWorkId, Is.EqualTo(Some w1.Id))
-            match WorkQueueGitLedger.executeAt b "Worker" (Guid.NewGuid()) 6 1006L
+            match WorkQueueGitLedger.executeInertFixtureAt b "Worker" (Guid.NewGuid()) 6 1006L
                     (ClaimAncillary("L", "M2")) with
             | Error(InvalidBinding _) -> ()
             | unexpected -> Assert.Fail(sprintf "Dedicated Role primary must not be extended: %A" unexpected)
-            match WorkQueueGitLedger.executeAt a "Worker" (Guid.NewGuid()) 6 1007L
+            match WorkQueueGitLedger.executeInertFixtureAt a "Worker" (Guid.NewGuid()) 6 1007L
                     (CompleteMessage("L", w1.Id, "M1", 0, "reply")) with
             | Error(InvalidBinding _) -> ()
             | unexpected -> Assert.Fail(sprintf "Stale handler generation must reject: %A" unexpected)
@@ -389,7 +389,7 @@ type WorkQueueGitLedgerTests() =
         withClones (fun a b ->
             let mutate client now mutation =
                 let _, previous = WorkQueueGitLedger.load client |> success
-                WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) previous.Version now mutation
+                WorkQueueGitLedger.executeInertFixtureAt client "Worker" (Guid.NewGuid()) previous.Version now mutation
                 |> success |> ignore
             let id = a.ProjectId.ToString("D")
             let subs = Map.ofList [ "R", set [ "planning"; "role:R" ] ]
@@ -421,7 +421,7 @@ type WorkQueueGitLedgerTests() =
                 match claim.Gate with
                 | GateState.DependencyGatePending v -> v
                 | unexpected -> failwithf "Ancillary edit must fence handler: %A" unexpected
-            match WorkQueueGitLedger.executeAt a "Worker" (Guid.NewGuid()) gated.Version 1010L
+            match WorkQueueGitLedger.executeInertFixtureAt a "Worker" (Guid.NewGuid()) gated.Version 1010L
                     (CompleteAncillary ("L1", "M", 1, "premature")) with
             | Error(InvalidBinding _) -> ()
             | other -> Assert.Fail(sprintf "Gated handler may not reply: %A" other)
@@ -449,7 +449,7 @@ type WorkQueueGitLedgerTests() =
             mutate a 1021L (ClaimAncillary ("L1", "M"))
             let _, reclaimed = WorkQueueGitLedger.load a |> success
             Assert.That(reclaimed.Messages.["M"].HandlerGeneration, Is.EqualTo(3))
-            match WorkQueueGitLedger.executeAt b "Worker" (Guid.NewGuid()) reclaimed.Version 1022L
+            match WorkQueueGitLedger.executeInertFixtureAt b "Worker" (Guid.NewGuid()) reclaimed.Version 1022L
                     (CompleteAncillary ("L1", "M", 1, "stale")) with
             | Error(InvalidBinding _) -> ()
             | other -> Assert.Fail(sprintf "Stale handler generation must be fenced: %A" other)
@@ -472,7 +472,7 @@ type WorkQueueGitLedgerTests() =
             WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid()) Map.empty |> success |> ignore
             let untrusted = { plan (a.ProjectId.ToString("D")) "W" [] with
                                 AvailableAt = 91234567L; AvailableSequence = 12345L }
-            WorkQueueGitLedger.executeAt a "Worker" (Guid.NewGuid()) 0 2000L (PublishStage untrusted)
+            WorkQueueGitLedger.executeInertFixtureAt a "Worker" (Guid.NewGuid()) 0 2000L (PublishStage untrusted)
             |> success |> ignore
             let _, snapshot = WorkQueueGitLedger.load b |> success
             Assert.That(snapshot.Works.["W"].AvailableAt, Is.EqualTo(2000L))
@@ -484,12 +484,12 @@ type WorkQueueGitLedgerTests() =
         withClones (fun a b ->
             WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid()) Map.empty |> success |> ignore
             let victim = plan (a.ProjectId.ToString("D")) "victim" []
-            WorkQueueGitLedger.executeAt a "Worker" (Guid.NewGuid()) 0 1000L (PublishStage victim)
+            WorkQueueGitLedger.executeInertFixtureAt a "Worker" (Guid.NewGuid()) 0 1000L (PublishStage victim)
             |> success |> ignore
             let message =
                 { Id = "T"; Subject = Subject.Task "task"; Body = "passive"
                   State = MessageState.Pending; HandlerGeneration = 0; WorkId = None }
-            WorkQueueGitLedger.executeAt b "Worker" (Guid.NewGuid()) 1 1001L (PostMessage(message, None))
+            WorkQueueGitLedger.executeInertFixtureAt b "Worker" (Guid.NewGuid()) 1 1001L (PostMessage(message, None))
             |> success |> ignore
             let snapshot = LedgerStore.fetch a |> success
             let content, oid = LedgerStore.readAt a snapshot WorkQueueGitLedger.RecordPath |> success
@@ -528,7 +528,7 @@ type WorkQueueGitLedgerTests() =
                     ready.Signal() |> ignore
                     if not (gate.Wait(TimeSpan.FromSeconds(20.))) then
                         failwith "race gate expired"
-                    WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) 0 1000L
+                    WorkQueueGitLedger.executeInertFixtureAt client "Worker" (Guid.NewGuid()) 0 1000L
                         (PublishStage(plan (a.ProjectId.ToString("D")) label [])))
             let first = publish a "A"
             let second = publish b "B"
@@ -548,7 +548,7 @@ type WorkQueueGitLedgerTests() =
         withClones (fun a b ->
             let mutate client now mutation =
                 let _, state = WorkQueueGitLedger.load client |> success
-                WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) state.Version now mutation
+                WorkQueueGitLedger.executeInertFixtureAt client "Worker" (Guid.NewGuid()) state.Version now mutation
                 |> success
             let id = a.ProjectId.ToString("D")
             WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid())
@@ -564,7 +564,7 @@ type WorkQueueGitLedgerTests() =
             let olderSequence = before.Works.["B"].AvailableSequence
             let yieldOp = Guid.NewGuid()
             let write =
-                WorkQueueGitLedger.executeAt a "Worker" yieldOp before.Version 2000L
+                WorkQueueGitLedger.executeInertFixtureAt a "Worker" yieldOp before.Version 2000L
                     (YieldReadOnly ("L1", "P", 1)) |> success
             let _, after = WorkQueueGitLedger.load b |> success
             Assert.That(after.Works.["P"].State, Is.EqualTo(WorkState.Available))
@@ -574,12 +574,12 @@ type WorkQueueGitLedgerTests() =
             Assert.That(after.Launches.["L1"].State, Is.EqualTo(LaunchState.TerminalPendingRelease("yield:" + yieldOp.ToString("D"))))
             let order = Contracts.orderAvailable after |> success
             Assert.That((order |> List.map (fun w -> w.Id)) = [ "B"; "P" ], Is.True)
-            match WorkQueueGitLedger.executeAt b "Worker" (Guid.NewGuid()) after.Version 2001L
+            match WorkQueueGitLedger.executeInertFixtureAt b "Worker" (Guid.NewGuid()) after.Version 2001L
                     (CompleteOrdinary ("L1", "P")) with
             | Error(InvalidBinding _) -> ()
             | unexpected -> Assert.Fail(sprintf "Stale original primary completion must reject: %A" unexpected)
             let replay =
-                WorkQueueGitLedger.executeAt b "Worker" yieldOp before.Version 2000L
+                WorkQueueGitLedger.executeInertFixtureAt b "Worker" yieldOp before.Version 2000L
                     (YieldReadOnly ("L1", "P", 1)) |> success
             Assert.That(replay.Operation.OriginalResultHash, Is.EqualTo(write.Operation.OriginalResultHash)))
 
@@ -588,7 +588,7 @@ type WorkQueueGitLedgerTests() =
         withClones (fun a b ->
             let mutate client now mutation =
                 let _, state = WorkQueueGitLedger.load client |> success
-                WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) state.Version now mutation
+                WorkQueueGitLedger.executeInertFixtureAt client "Worker" (Guid.NewGuid()) state.Version now mutation
                 |> success |> ignore
             let id = a.ProjectId.ToString("D")
             WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid())
@@ -603,7 +603,7 @@ type WorkQueueGitLedgerTests() =
             Assert.That(primary.Launches.["L1"].PrimaryWorkId, Is.EqualTo(Some "P"))
             mutate b 1006L (SetHardPrerequisite ("P", "B"))
             let _, gated = WorkQueueGitLedger.load a |> success
-            match WorkQueueGitLedger.executeAt b "Worker" (Guid.NewGuid()) gated.Version 1007L
+            match WorkQueueGitLedger.executeInertFixtureAt b "Worker" (Guid.NewGuid()) gated.Version 1007L
                     (CompleteOrdinary ("L1", "P")) with
             | Error(InvalidBinding _) -> ()
             | other -> Assert.Fail(sprintf "Gated stage cannot complete: %A" other)
@@ -628,7 +628,7 @@ type WorkQueueGitLedgerTests() =
         withClones (fun a b ->
             let mutate client now mutation =
                 let _, state = WorkQueueGitLedger.load client |> success
-                WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) state.Version now mutation
+                WorkQueueGitLedger.executeInertFixtureAt client "Worker" (Guid.NewGuid()) state.Version now mutation
                 |> success |> ignore
             let id = a.ProjectId.ToString("D")
             WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid())
@@ -643,7 +643,7 @@ type WorkQueueGitLedgerTests() =
             let op = Guid.NewGuid()
             let sha = String.replicate 64 "a"
             let payload = CheckpointReadOnly("L", "P", 1, sha)
-            let written = WorkQueueGitLedger.executeAt b "Worker" op before.Version 1005L payload
+            let written = WorkQueueGitLedger.executeInertFixtureAt b "Worker" op before.Version 1005L payload
                           |> success
             let _, recorded = WorkQueueGitLedger.load a |> success
             Assert.That(recorded.Version, Is.EqualTo(before.Version + 1))
@@ -652,16 +652,16 @@ type WorkQueueGitLedgerTests() =
             | ProjectOperationPayload.OtherMutation evidence ->
                 Assert.That(evidence.Contains(sha), Is.True)
             | unexpected -> Assert.Fail(sprintf "Checkpoint must have typed immutable receipt: %A" unexpected)
-            let replay = WorkQueueGitLedger.executeAt a "Worker" op before.Version 1005L payload
+            let replay = WorkQueueGitLedger.executeInertFixtureAt a "Worker" op before.Version 1005L payload
                          |> success
             Assert.That(replay.Operation.OriginalResultHash, Is.EqualTo(written.Operation.OriginalResultHash))
-            match WorkQueueGitLedger.executeAt b "Worker" op before.Version 1005L
+            match WorkQueueGitLedger.executeInertFixtureAt b "Worker" op before.Version 1005L
                     (CheckpointReadOnly("L", "P", 1, String.replicate 64 "b")) with
             | Error OperationIdReused -> ()
             | unexpected -> Assert.Fail(sprintf "Changed checkpoint semantic payload must reject: %A" unexpected)
             mutate b 1006L (YieldReadOnly("L", "P", 1))
             let _, yielded = WorkQueueGitLedger.load a |> success
-            match WorkQueueGitLedger.executeAt a "Worker" (Guid.NewGuid()) yielded.Version 1007L payload with
+            match WorkQueueGitLedger.executeInertFixtureAt a "Worker" (Guid.NewGuid()) yielded.Version 1007L payload with
             | Error(InvalidBinding _) -> ()
             | unexpected -> Assert.Fail(sprintf "Stale read-only checkpoint generation must reject: %A" unexpected))
 
@@ -670,11 +670,11 @@ type WorkQueueGitLedgerTests() =
         withClones (fun a b ->
             let mutate client now mutation =
                 let _, prior = WorkQueueGitLedger.load client |> success
-                WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) prior.Version now mutation
+                WorkQueueGitLedger.executeInertFixtureAt client "Worker" (Guid.NewGuid()) prior.Version now mutation
                 |> success |> ignore
             let reject client now mutation =
                 let _, prior = WorkQueueGitLedger.load client |> success
-                match WorkQueueGitLedger.executeAt client "Attacker" (Guid.NewGuid()) prior.Version now mutation with
+                match WorkQueueGitLedger.executeInertFixtureAt client "Attacker" (Guid.NewGuid()) prior.Version now mutation with
                 | Error(InvalidBinding _) -> ()
                 | other -> Assert.Fail(sprintf "Forged waiver was admitted: %A" other)
                 let _, unchanged = WorkQueueGitLedger.load b |> success
@@ -724,7 +724,7 @@ type WorkQueueGitLedgerTests() =
         withClones (fun a b ->
             let mutate client now mutation =
                 let _, prior = WorkQueueGitLedger.load client |> success
-                WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) prior.Version now mutation
+                WorkQueueGitLedger.executeInertFixtureAt client "Worker" (Guid.NewGuid()) prior.Version now mutation
                 |> success |> ignore
             let id = a.ProjectId.ToString("D")
             WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid())
@@ -746,7 +746,7 @@ type WorkQueueGitLedgerTests() =
                   { reserved with AccountTokenId = "" } ]
             for bad in forged do
                 let _, prior = WorkQueueGitLedger.load b |> success
-                match WorkQueueGitLedger.executeAt b "Attacker" (Guid.NewGuid()) prior.Version 1001L
+                match WorkQueueGitLedger.executeInertFixtureAt b "Attacker" (Guid.NewGuid()) prior.Version 1001L
                         (AdmitProject bad) with
                 | Error(InvalidBinding _) -> ()
                 | other -> Assert.Fail(sprintf "Invalid initial launch was admitted: %A / %A" bad other)
@@ -754,7 +754,7 @@ type WorkQueueGitLedgerTests() =
                 Assert.That(untouched.Version, Is.EqualTo(prior.Version))
                 Assert.That(untouched.Launches.ContainsKey "L", Is.False)
             let _, noLaunch = WorkQueueGitLedger.load b |> success
-            match WorkQueueGitLedger.executeAt b "Attacker" (Guid.NewGuid()) noLaunch.Version 1002L
+            match WorkQueueGitLedger.executeInertFixtureAt b "Attacker" (Guid.NewGuid()) noLaunch.Version 1002L
                     (ClaimNext "L") with
             | Error(InvalidBinding _) -> ()
             | other -> Assert.Fail(sprintf "Forged launch obtained claim: %A" other)
@@ -775,7 +775,7 @@ type WorkQueueGitLedgerTests() =
         withClones (fun a b ->
             let mutate client now mutation =
                 let _, prior = WorkQueueGitLedger.load client |> success
-                WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) prior.Version now mutation
+                WorkQueueGitLedger.executeInertFixtureAt client "Worker" (Guid.NewGuid()) prior.Version now mutation
                 |> success |> ignore
             let id = a.ProjectId.ToString("D")
             let pinned = git a.RepositoryPath [ "rev-parse"; "HEAD" ]
@@ -797,7 +797,7 @@ type WorkQueueGitLedgerTests() =
                 (Map.ofList [ "Lead", set [ "implementation" ] ])
             |> success |> ignore
             // A missing lineage cannot enter the source-writing queue.
-            match WorkQueueGitLedger.executeAt a "Worker" (Guid.NewGuid()) 0 999L
+            match WorkQueueGitLedger.executeInertFixtureAt a "Worker" (Guid.NewGuid()) 0 999L
                     (PublishStage { implementation with SourceLineage = None }) with
             | Error(InvalidBinding _) -> ()
             | other -> Assert.Fail(sprintf "Source without lineage admitted: %A" other)
@@ -811,7 +811,7 @@ type WorkQueueGitLedgerTests() =
             let _, claimed = WorkQueueGitLedger.load a |> success
             Assert.That(claimed.Works.["I"].State, Is.EqualTo(WorkState.Claimed "L"))
             Assert.That(claimed.Works.["D"].State, Is.EqualTo(WorkState.Blocked))
-            match WorkQueueGitLedger.executeAt b "Attacker" (Guid.NewGuid()) claimed.Version 2000L
+            match WorkQueueGitLedger.executeInertFixtureAt b "Attacker" (Guid.NewGuid()) claimed.Version 2000L
                     (CompleteOrdinary ("L", "I")) with
             | Error(InvalidBinding _) -> ()
             | other -> Assert.Fail(sprintf "Unproven source completion was accepted: %A" other)
@@ -829,7 +829,7 @@ type WorkQueueGitLedgerTests() =
         withClones (fun a b ->
             let mutate client now mutation =
                 let _, prior = WorkQueueGitLedger.load client |> success
-                WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) prior.Version now mutation
+                WorkQueueGitLedger.executeInertFixtureAt client "Worker" (Guid.NewGuid()) prior.Version now mutation
                 |> success |> ignore
             let id = a.ProjectId.ToString("D")
             WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid())
@@ -840,7 +840,7 @@ type WorkQueueGitLedgerTests() =
             mutate a 1002L (DispatchOnce ("L", DispatchState.Submitted))
             mutate b 1003L (InitializeAgent ("L", "live-session"))
             let _, registered = WorkQueueGitLedger.load a |> success
-            match WorkQueueGitLedger.executeAt a "Attacker" (Guid.NewGuid()) registered.Version 1004L
+            match WorkQueueGitLedger.executeInertFixtureAt a "Attacker" (Guid.NewGuid()) registered.Version 1004L
                     (TerminalizeNoClaim "L") with
             | Error(InvalidBinding _) -> ()
             | other -> Assert.Fail(sprintf "Live no-claim release was minted: %A" other)
@@ -852,7 +852,7 @@ type WorkQueueGitLedgerTests() =
             mutate b 1005L (ClaimNext "L")
             let _, claimed = WorkQueueGitLedger.load a |> success
             Assert.That(claimed.Launches.["L"].PrimaryWorkId, Is.EqualTo(Some "P"))
-            match WorkQueueGitLedger.executeAt a "Attacker" (Guid.NewGuid()) claimed.Version 1006L
+            match WorkQueueGitLedger.executeInertFixtureAt a "Attacker" (Guid.NewGuid()) claimed.Version 1006L
                     (TerminalizeNoClaim "L") with
             | Error(InvalidBinding _) -> ()
             | other -> Assert.Fail(sprintf "Already-claimed launch terminalized: %A" other)
@@ -865,7 +865,7 @@ type WorkQueueGitLedgerTests() =
         withClones (fun a b ->
             let mutate client now mutation =
                 let _, prior = WorkQueueGitLedger.load client |> success
-                WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) prior.Version now mutation
+                WorkQueueGitLedger.executeInertFixtureAt client "Worker" (Guid.NewGuid()) prior.Version now mutation
                 |> success |> ignore
             let id = a.ProjectId.ToString("D")
             WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid())
@@ -880,7 +880,7 @@ type WorkQueueGitLedgerTests() =
             let lease = stopped.Launches.["L"].Lease.Value
             Assert.That(lease.StopRequested, Is.True)
             Assert.That(lease.Generation, Is.EqualTo(2))
-            match WorkQueueGitLedger.executeAt b "Attacker" (Guid.NewGuid()) stopped.Version 2100L
+            match WorkQueueGitLedger.executeInertFixtureAt b "Attacker" (Guid.NewGuid()) stopped.Version 2100L
                     (TerminalizeNoClaim "L") with
             | Error(InvalidBinding _) -> ()
             | other -> Assert.Fail(sprintf "Stopped lease was treated as terminal proof: %A" other)
@@ -896,9 +896,9 @@ type WorkQueueGitLedgerTests() =
         withClones (fun a b ->
             WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid()) Map.empty |> success |> ignore
             let id = a.ProjectId.ToString("D")
-            WorkQueueGitLedger.executeAt a "Worker" (Guid.NewGuid()) 0 1000L
+            WorkQueueGitLedger.executeInertFixtureAt a "Worker" (Guid.NewGuid()) 0 1000L
                 (PublishStage (plan id "B" [])) |> success |> ignore
-            WorkQueueGitLedger.executeAt b "Worker" (Guid.NewGuid()) 1 1001L
+            WorkQueueGitLedger.executeInertFixtureAt b "Worker" (Guid.NewGuid()) 1 1001L
                 (PublishStage (plan id "D" [ "B" ])) |> success |> ignore
             let snapshot = LedgerStore.fetch a |> success
             let payload, oid = LedgerStore.readAt a snapshot WorkQueueGitLedger.RecordPath |> success
@@ -948,7 +948,7 @@ type WorkQueueGitLedgerTests() =
             for index, bad in malformed |> List.indexed do
                 let snapshot, prior = WorkQueueGitLedger.load b |> success
                 let operationId = if index = 0 then rejectedOp else Guid.NewGuid()
-                match WorkQueueGitLedger.executeAt a "Attacker" operationId prior.Version (1000L + int64 index)
+                match WorkQueueGitLedger.executeInertFixtureAt a "Attacker" operationId prior.Version (1000L + int64 index)
                         (PublishStage bad) with
                 | Error(InvalidBinding _) -> ()
                 | other -> Assert.Fail(sprintf "Malformed nested stage %d was published: %A" index other)
@@ -960,14 +960,14 @@ type WorkQueueGitLedgerTests() =
             // A rejected UUID has no operation receipt: valid corrected publication
             // with the same UUID is not mistaken for a committed poison.
             let published =
-                WorkQueueGitLedger.executeAt b "Worker" rejectedOp 0 2000L (PublishStage valid)
+                WorkQueueGitLedger.executeInertFixtureAt b "Worker" rejectedOp 0 2000L (PublishStage valid)
                 |> success
             Assert.That(published.AlreadyApplied, Is.False)
             let _, afterPublish = WorkQueueGitLedger.load a |> success
             Assert.That(afterPublish.Works.["P"].QueueId, Is.EqualTo("planning"))
             let mutate client now payload =
                 let _, current = WorkQueueGitLedger.load client |> success
-                WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) current.Version now payload
+                WorkQueueGitLedger.executeInertFixtureAt client "Worker" (Guid.NewGuid()) current.Version now payload
                 |> success |> ignore
             mutate a 2001L (AdmitProject (launch id "L" "Lead"))
             mutate b 2002L (DispatchOnce ("L", DispatchState.Submitted))
@@ -1000,7 +1000,7 @@ type WorkQueueGitLedgerTests() =
             for index, payload in malformed |> List.indexed do
                 let snapshot, prior = WorkQueueGitLedger.load a |> success
                 let client = if index % 2 = 0 then b else a
-                match WorkQueueGitLedger.executeAt client "Attacker" (Guid.NewGuid()) prior.Version
+                match WorkQueueGitLedger.executeInertFixtureAt client "Attacker" (Guid.NewGuid()) prior.Version
                         (1000L + int64 index) payload with
                 | Error(InvalidBinding _) -> ()
                 | other -> Assert.Fail(sprintf "Malformed message %d was published: %A" index other)
@@ -1012,7 +1012,7 @@ type WorkQueueGitLedgerTests() =
                 Assert.That(unchanged.Works = prior.Works, Is.True)
             let mutate client now payload =
                 let _, current = WorkQueueGitLedger.load client |> success
-                WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) current.Version now payload
+                WorkQueueGitLedger.executeInertFixtureAt client "Worker" (Guid.NewGuid()) current.Version now payload
                 |> success |> ignore
             mutate a 2000L (PostMessage (passive, None))
             mutate b 2001L (PostMessage (role, Some roleWork))
@@ -1033,7 +1033,7 @@ type WorkQueueGitLedgerTests() =
             let expectedVersion = claimed.Version
             let duplicate =
                 { implementation with Id = "duplicate-I"; StageGeneration = 2 }
-            match WorkQueueGitLedger.executeAt b "Worker" (Guid.NewGuid()) expectedVersion
+            match WorkQueueGitLedger.executeInertFixtureAt b "Worker" (Guid.NewGuid()) expectedVersion
                     1005L (PublishStage duplicate) with
             | Error(InvalidBinding _) -> ()
             | other -> Assert.Fail(sprintf "Concurrent source writer was admitted: %A" other)
@@ -1043,7 +1043,7 @@ type WorkQueueGitLedgerTests() =
             let _, before = WorkQueueGitLedger.load b |> success
             // The Git data is clean and the WIP was pushed, but these facts
             // do not prove no late mutating process or host ref protection.
-            match WorkQueueGitLedger.executeAt owner "Worker" (Guid.NewGuid()) expectedVersion
+            match WorkQueueGitLedger.executeInertFixtureAt owner "Worker" (Guid.NewGuid()) expectedVersion
                     1006L (YieldSource proof) with
             | Error(InvalidBinding reason) ->
                 Assert.That(reason, Does.Contain("RecoveryBlocked"))
@@ -1127,7 +1127,7 @@ type WorkQueueGitLedgerTests() =
                   { good with PinnedBaseCommit = unrelated }
                   { good with TargetRef = "refs/heads/unknown" } ] do
                 let beforeSnapshot, before = WorkQueueGitLedger.load b |> success
-                match WorkQueueGitLedger.executeAt a "Worker" (Guid.NewGuid()) before.Version
+                match WorkQueueGitLedger.executeInertFixtureAt a "Worker" (Guid.NewGuid()) before.Version
                         1000L (PublishStage { initial with SourceLineage = Some invalid }) with
                 | Error(InvalidBinding _) -> ()
                 | other -> Assert.Fail(sprintf "Invalid initial source lineage published: %A" other)
@@ -1135,7 +1135,7 @@ type WorkQueueGitLedgerTests() =
                 Assert.That(afterSnapshot.Commit, Is.EqualTo(beforeSnapshot.Commit))
                 Assert.That(after.Version, Is.EqualTo(before.Version))
             let _, state = WorkQueueGitLedger.load b |> success
-            WorkQueueGitLedger.executeAt b "Worker" (Guid.NewGuid()) state.Version 1001L
+            WorkQueueGitLedger.executeInertFixtureAt b "Worker" (Guid.NewGuid()) state.Version 1001L
                 (PublishStage initial) |> success |> ignore
             let _, accepted = WorkQueueGitLedger.load a |> success
             Assert.That(accepted.Works.ContainsKey "initial", Is.True))
@@ -1148,7 +1148,7 @@ type WorkQueueGitLedgerTests() =
             let originalVersion = claimed.Version
             let rejected client mutation =
                 let _, before = WorkQueueGitLedger.load client |> success
-                match WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) before.Version
+                match WorkQueueGitLedger.executeInertFixtureAt client "Worker" (Guid.NewGuid()) before.Version
                         2000L mutation with
                 | Error(InvalidBinding _) -> ()
                 | other -> Assert.Fail(sprintf "Unsafe source handoff published: %A" other)
@@ -1166,7 +1166,7 @@ type WorkQueueGitLedgerTests() =
             rejected owner (YieldSource proof)
             // A conservative journal or unknown push outcome requires an
             // explicit durable RecoveryBlocked record before any requeue.
-            WorkQueueGitLedger.executeAt b "Worker" (Guid.NewGuid()) originalVersion 2001L
+            WorkQueueGitLedger.executeInertFixtureAt b "Worker" (Guid.NewGuid()) originalVersion 2001L
                 (MarkSourceRecoveryBlocked ("L1", "I", proof.ClaimGeneration, "mutating job not reconciled"))
             |> success |> ignore
             let _, blocked = WorkQueueGitLedger.load a |> success

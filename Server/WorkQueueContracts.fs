@@ -1622,11 +1622,22 @@ module Contracts =
                             |> reconcileCredits)
                 | _ -> Error(Rejection.InvalidState "stale primary work claim/yield generation")) project
 
-    let canDispatch (account: Account) (projects: Project list) =
+    // Preserve the WQ-02 pure migration/coverage simulation for its existing
+    // inert contract tests. These booleans are assertions, not evidence of a
+    // canonical producer source, review receipt or historical role version.
+    let canDispatchPrototype (account: Account) (projects: Project list) =
         account.Migration = MigrationEpoch.Activated
         && (projects |> List.forall (fun p ->
             p.Migration = MigrationEpoch.Activated
             && p.QueueCovered && p.GraphCovered && p.MessageCovered && p.SourceCovered))
+
+    // Fail closed for ALL Scheduler consumers until a later reviewed adapter
+    // binds immutable per-generation producer receipts, a complete canonical
+    // high-water/index, and versioned role admission to the *same* Git head.
+    // No combination of caller flags, altered stage IDs or migration labels
+    // can promote a WQ-02 prototype into executable source authority.
+    let canDispatch (_account: Account) (_projects: Project list) =
+        false
 
     // A deliberately small pure bridge fixture: a key belongs to a provider session, never a launch.
     type SessionKeys = Map<string, string>

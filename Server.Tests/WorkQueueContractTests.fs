@@ -521,10 +521,13 @@ let case_76_77_80_unknown_external_push_never_releases_token_or_downstream () =
 let case_45_46_48_49_migration_epoch_requires_every_project_activated () =
     let account = emptyAccount 1
     let project = empty ()
-    Assert.That(canDispatch account [ project ], Is.True)
-    Assert.That(canDispatch { account with Migration = MigrationEpoch.Preparing } [ project ], Is.False)
-    Assert.That(canDispatch account [ project; { project with Migration = MigrationEpoch.Validated } ], Is.False)
-    Assert.That(canDispatch account [ { project with SourceCovered = false } ], Is.False)
+    Assert.That(canDispatchPrototype account [ project ], Is.True)
+    Assert.That(canDispatchPrototype { account with Migration = MigrationEpoch.Preparing } [ project ], Is.False)
+    Assert.That(canDispatchPrototype account [ project; { project with Migration = MigrationEpoch.Validated } ], Is.False)
+    Assert.That(canDispatchPrototype account [ { project with SourceCovered = false } ], Is.False)
+    // No durable canonical producer/role receipt exists even when all legacy
+    // migration flags and fabricated coverage booleans claim readiness.
+    Assert.That(canDispatch account [ project ], Is.False)
 
 let private git folder args =
     let info = ProcessStartInfo("git")

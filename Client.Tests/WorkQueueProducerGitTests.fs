@@ -106,6 +106,27 @@ type WorkQueueProducerGitTests() =
           RoleCatalogRevision = revision
           ProjectHeadVerified = true; CrossProjectCovered = true }
 
+    let untrustedStage project id kind queue subject =
+        { Id = id; ProjectId = project; SubjectId = subject
+          Kind = kind; QueueId = queue; StageGeneration = 1
+          State = WorkState.Available; Domain = DomainState.Undecided
+          Gate = GateState.Clear; ClaimGeneration = 0
+          Dependencies = Set.empty; WaivedDependencies = Map.empty
+          AvailableAt = 0L; AvailableSequence = 0L
+          SourceLineage = None; Push = None; IntegrationAuthorized = false }
+
+    let launch project =
+        { Id = "L-legacy"; ProjectId = project; RoleId = "Lead"
+          RoleVersion = 1; AccountTokenId = "token-for-legacy"
+          State = LaunchState.ReservedUnregistered; Lease = None; Version = 0
+          Credit = None; PrimaryWorkId = None; EverClaimed = false
+          AncillaryMessages = Set.empty; DispatchCount = 0 }
+
+    let rejectUntrusted = function
+        | Error(LedgerIntegrityError reason)
+            when reason.Contains("WQ-04", StringComparison.Ordinal) -> ()
+        | other -> Assert.Fail(sprintf "Unverified legacy semantics escaped public fence: %A" other)
+
     [<Test>]
     member _.ForgedReviewAcceptedIntegrationAndChallengeCannotCrossProjectCAS() =
         withTwoClones (fun a b project ->
@@ -227,3 +248,88 @@ type WorkQueueProducerGitTests() =
             let _, fresh = WorkQueueGitLedger.load a |> success
             Assert.That(fresh.Version, Is.EqualTo(pA.Version))
             Assert.That(fresh.Works, Is.Empty))
+
+    [<Test>]
+    member _.RenamedFrozenReviewIntegrationPlanningAndRoleMessageCannotEnterPublicGitCAS() =
+        withTwoClones (fun a b project ->
+            let sources =
+                [ untrustedStage project "legacy-review-1" WorkKind.FrozenReview "review" "task-R"
+                  untrustedStage project "legacy-integration-1" WorkKind.Integration "integration" "task-I"
+                  untrustedStage project "anything-else" WorkKind.Planning "planning" "task-P"
+                  untrustedStage project "message-work-nonprefixed" (WorkKind.RoleMessage "msg-1") "role:Lead" "Lead" ]
+            let _, pa = WorkQueueGitLedger.load a |> success
+            let _, pb = WorkQueueGitLedger.load b |> success
+            for stage in sources do
+                rejectUntrusted
+                    (WorkQueueGitLedger.execute a "Lead" (Guid.NewGuid()) pa.Version (PublishStage stage))
+                rejectUntrusted
+                    (execute b "Lead" (Guid.NewGuid()) pb.Version 1L (PublishStage stage))
+            let roleMessage = message "msg-1" (Subject.Role "Lead")
+            rejectUntrusted
+                (WorkQueueGitLedger.execute a "Lead" (Guid.NewGuid()) pa.Version
+                    (PostMessage(roleMessage, Some sources.[3])))
+            rejectUntrusted
+                (execute b "Lead" (Guid.NewGuid()) pb.Version 2L
+                    (PostMessage(roleMessage, Some sources.[3])))
+            let _, finalA = WorkQueueGitLedger.load a |> success
+            let _, finalB = WorkQueueGitLedger.load b |> success
+            Assert.That(finalA.Version, Is.EqualTo(pa.Version))
+            Assert.That(finalB.Version, Is.EqualTo(pb.Version))
+            Assert.That(finalA.Works, Is.Empty)
+            Assert.That(finalA.Messages, Is.Empty))
+
+    [<Test>]
+    member _.PersistedRenamedFixtureWorkCannotGainLiveAdmissionClaimOrDispatchAcrossTwoClones() =
+        withTwoClones (fun a b project ->
+            // Simulate historical schema-1 WQ-02 data arriving before the new
+            // public fence, with no canonical event/review/role-origin receipts.
+            let _, initial = WorkQueueGitLedger.load a |> success
+            let historical =
+                [ untrustedStage project "old-review-x" WorkKind.FrozenReview "review" "task-R"
+                  untrustedStage project "old-integration-y" WorkKind.Integration "integration" "task-I"
+                  untrustedStage project "old-plan-z" WorkKind.Planning "planning" "task-P" ]
+            let _, stale = WorkQueueGitLedger.load b |> success
+            for stage in historical do
+                let _, current = WorkQueueGitLedger.load a |> success
+                WorkQueueGitLedger.executeInertFixtureAt a "fixture" (Guid.NewGuid()) current.Version 100L
+                    (PublishStage stage) |> success |> ignore
+            let roleMessage = message "role-legacy-msg" (Subject.Role "Lead")
+            let roleWork =
+                untrustedStage project "old-role-unverified" (WorkKind.RoleMessage roleMessage.Id)
+                    "role:Lead" "Lead"
+            let _, current = WorkQueueGitLedger.load a |> success
+            WorkQueueGitLedger.executeInertFixtureAt a "fixture" (Guid.NewGuid()) current.Version 101L
+                (PostMessage(roleMessage, Some roleWork)) |> success |> ignore
+            match WorkQueueGitLedger.executeInertFixtureAt b "fixture" (Guid.NewGuid()) stale.Version 102L
+                      (PublishStage (untrustedStage project "lost-stale-review" WorkKind.FrozenReview "review" "task-X")) with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Losing clone must not overwrite durable CAS: %A" other)
+            for binding in [ a; b ] do
+                let _, loaded = WorkQueueGitLedger.load binding |> success
+                Assert.That(loaded.Migration, Is.EqualTo(MigrationEpoch.Frozen))
+                Assert.That(loaded.Works.Count, Is.EqualTo(4))
+                Assert.That(loaded.Works.ContainsKey "lost-stale-review", Is.False)
+                for mutation in
+                    [ AdmitProject (launch project)
+                      DispatchOnce ("L-legacy", DispatchState.Submitted)
+                      InitializeAgent ("L-legacy", "unknown-session")
+                      ClaimNext "L-legacy"
+                      ClaimAncillary ("L-legacy", roleMessage.Id) ] do
+                    rejectUntrusted
+                        (WorkQueueGitLedger.execute binding "Scheduler" (Guid.NewGuid())
+                            loaded.Version mutation)
+                let _, after = WorkQueueGitLedger.load binding |> success
+                Assert.That(after, Is.EqualTo(loaded))
+                let fabricatedReady =
+                    { after with
+                        Migration = MigrationEpoch.Activated
+                        QueueCovered = true
+                        GraphCovered = true
+                        MessageCovered = true
+                        SourceCovered = true }
+                let account =
+                    { Version = 0; MaxConcurrentAgents = 1; Tokens = Map.empty
+                      Receipts = Map.empty; Migration = MigrationEpoch.Activated }
+                Assert.That(Contracts.canDispatch account [ fabricatedReady ], Is.False,
+                    "even forged migration/coverage flags do not grant Scheduler source authority")
+            Assert.That(initial.Works, Is.Empty))

@@ -282,8 +282,8 @@ module AccountAdmissionAdapter =
     // tombstone precede account release. A missing operation or uncertain fetch
     // NEVER releases capacity. The original and abort transitions compete on
     // the same launch-ID absence constraint.
-    let abortUnbound (account: AccountBinding) (project: LedgerBinding)
-                     (request: AccountAdmissionRequest) =
+    let private abortUnboundUsing executeMutation (account: AccountBinding) (project: LedgerBinding)
+                                  (request: AccountAdmissionRequest) =
         if not (valid request) then
             TokenRetained "Invalid stable admission, abort or release identity."
         else
@@ -325,7 +325,7 @@ module AccountAdmissionAdapter =
                             elif projectState.Receipts.ContainsKey (request.AdmissionOperationId.ToString("D")) then
                                 Error "Original project admission receipt exists."
                             else
-                                WorkQueueGitLedger.execute project request.Actor request.AbortOperationId
+                                executeMutation project request.Actor request.AbortOperationId
                                     projectState.Version
                                     (AbortUnboundProjectAdmission(launch, request.AdmissionOperationId.ToString("D")))
                                 |> Result.map ignore
@@ -360,8 +360,10 @@ module AccountAdmissionAdapter =
     // One global reservation across all projects, then project demand CAS.
     // A definitive lack of compatible work can be fenced by the separate C01
     // operation. Ambiguous account/project transport preserves the token.
-    let admit (account: AccountBinding) (project: LedgerBinding)
-              (request: AccountAdmissionRequest) =
+    let private admitUsing
+        (executeMutation: LedgerBinding -> string -> Guid -> int -> WorkMutation -> Result<Client.LedgerStore.LedgerWrite, Client.LedgerStore.LedgerFailure>)
+        abortUnboundFor (account: AccountBinding) (project: LedgerBinding)
+                           (request: AccountAdmissionRequest) =
         if not (valid request) then
             GlobalReservationRejected(InvalidAccountBinding "Invalid admission request.")
         else
@@ -381,7 +383,7 @@ module AccountAdmissionAdapter =
                     match projectState.Launches.TryFind launch.Id with
                     | Some existing when existing.State =
                         LaunchState.TerminalPendingRelease("abort:" + request.AbortOperationId.ToString("D")) ->
-                        abortUnbound account project request
+                        abortUnboundFor account project request
                     | Some existing when
                         (match existing.State with
                          | LaunchState.TerminalPendingRelease _
@@ -410,9 +412,29 @@ module AccountAdmissionAdapter =
                         | _ -> TokenRetained "No matching original immutable admission decision."
                     | Some _ -> TokenRetained "Project launch ID is already bound to another decision."
                     | None ->
-                        match WorkQueueGitLedger.execute project request.Actor request.AdmissionOperationId
+                        match executeMutation project request.Actor request.AdmissionOperationId
                                 projectState.Version (AdmitProject launch) with
                         | Ok written -> ProjectAdmitted written.CurrentHead
                         | Error(InvalidBinding reason) when reason.Contains("NoCompatibleMatching", StringComparison.Ordinal) ->
-                            abortUnbound account project request
+                            abortUnboundFor account project request
                         | Error e -> TokenRetained("Project CAS was not conclusively admitted: " + explain e)
+
+    // The accepted WQ-07 Git-CAS bridge remains available as an inert fixture
+    // for two-clone proof testing, but must not reserve even an account token
+    // from WQ-02's source-unverified project/role demand in production.
+    let admit (_account: AccountBinding) (_project: LedgerBinding)
+              (_request: AccountAdmissionRequest) =
+        TokenRetained "WQ-04 canonical source/index and pinned role admission authority unavailable; no token reserved."
+
+    let abortUnbound account project request =
+        abortUnboundUsing WorkQueueGitLedger.execute account project request
+
+    // Internal fixture-only entrypoints preserve original WQ-02/WQ-07 proof
+    // tests. Their project mutation executor requires Migration.Frozen.
+    let internal admitInertFixture account project request =
+        admitUsing WorkQueueGitLedger.executeInertFixture
+            (abortUnboundUsing WorkQueueGitLedger.executeInertFixture)
+            account project request
+
+    let internal abortUnboundInertFixture account project request =
+        abortUnboundUsing WorkQueueGitLedger.executeInertFixture account project request

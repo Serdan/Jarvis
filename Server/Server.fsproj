@@ -10,6 +10,7 @@
 
     <ItemGroup>
         <Content Include="Structure.md"/>
+        <Compile Include="WorkQueueContracts.fs"/>
         <Compile Include="JarvisOptions.fs"/>
         <Compile Include="Auth.fs"/>
         <Compile Include="HttpRateLimitProtection.fs"/>

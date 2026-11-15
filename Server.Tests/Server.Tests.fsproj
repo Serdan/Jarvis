@@ -13,6 +13,7 @@
         <Compile Include="ServiceTests.fs"/>
         <Compile Include="RoutingRetentionTests.fs"/>
         <Compile Include="McpCapacityTests.fs"/>
+        <Compile Include="WorkQueueContractTests.fs"/>
         <Compile Include="McpAuthenticationTests.fs"/>
         <Compile Include="Program.fs"/>
     </ItemGroup>

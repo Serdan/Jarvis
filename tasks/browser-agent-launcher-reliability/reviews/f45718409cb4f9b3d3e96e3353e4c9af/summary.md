@@ -17,3 +17,19 @@
 - `git diff --check`: clean. Source branch pushed and tracking remote exact commit.
 
 No deployment, client/browser restart, or merge was performed. Independent review and Lead-managed integration remain pending.
+
+## Independent Reviewer 2 findings — 2026-11-15
+
+**Verdict: Changes requested.** The pinned OpenTab epoch/window/permission guards and adopted-tab generation checks are good improvements, but authorization still fails closed incompletely during asynchronous assessment.
+
+**Verified tests at the exact frozen head:**
+- `node --test browser-extension/tests/bridge.test.cjs`: **43/43 passing**.
+- `node --test browser-extension/tests/chatgpt-launcher.test.cjs`: **29/29 passing**.
+- `dotnet test Client.Tests/Client.Tests.fsproj --no-restore --filter FullyQualifiedName~BrowserBridge --verbosity quiet`: **26/26 passing**.
+- Three **additional reviewer-only negative harness tests fail** without any submitted source change: (1) `executeJs` injects after user disables agent-created tabs during `assess`; (2) `captureDom` likewise injects after opt-out; (3) `openTab` revoked during its first permission check is silently dropped and misreported as a timeout/uncertain outcome.
+
+**Required review findings:**
+1. [P1: opt-out during assessment still permits script and DOM injection](findings/opt-out-assess-injection.md).
+2. [P2: definite opt-out during first host-permission check returns no OpenTab response](findings/open-revocation-silent-timeout.md).
+
+Keep the frozen snapshot unchanged; request fixes in a new source commit and resubmit for an independent review. No merge or deployment authorized by this verdict.

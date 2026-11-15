@@ -25,6 +25,7 @@
         <Content Include="Structure.md"/>
         <Compile Include="AssemblyInfo.fs"/>
         <Compile Include="Types.fs"/>
+        <Compile Include="..\Server\WorkQueueContracts.fs" Link="WorkQueueContracts.fs"/>
         <Compile Include="Misc.fs"/>
         <Compile Include="Effect.fs"/>
         <Compile Include="BuildInfo.fs"/>
@@ -66,6 +67,7 @@
         <Compile Include="Modules\\Worktrees.fs"/>
         <Compile Include="Modules\BoundedFifoCache.fs"/>
         <Compile Include="Modules\\LedgerStore.fs"/>
+        <Compile Include="Modules\WorkQueueGitLedger.fs"/>
         <Compile Include="Modules\RoleInstructions.fs"/>
         <Compile Include="Modules\\ReviewWorkflow.fs"/>
         <Compile Include="Modules\\ChallengeWorkflow.fs"/>

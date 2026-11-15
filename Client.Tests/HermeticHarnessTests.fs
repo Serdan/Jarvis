@@ -13,6 +13,7 @@ open Client
 type HermeticClientTestEnvironment() =
     let mutable ownedRoot : string option = None
     let mutable knownFolderOverride : IDisposable option = None
+    let mutable processHelperOverride : IDisposable option = None
     let mutable originalEnvironment : (string * string) list = []
 
     static member Under (root: string) (path: string) =
@@ -109,6 +110,8 @@ type HermeticClientTestEnvironment() =
           "GIT_COMMITTER_NAME"; "GIT_COMMITTER_EMAIL" ]
 
     member private _.Restore() =
+        processHelperOverride |> Option.iter (fun scope -> scope.Dispose())
+        processHelperOverride <- None
         knownFolderOverride |> Option.iter (fun scope -> scope.Dispose())
         knownFolderOverride <- None
         for key, value in originalEnvironment do
@@ -190,6 +193,13 @@ type HermeticClientTestEnvironment() =
             // replace Client-owned Windows known-folder resolution. The normal
             // executable has no environment-controlled path override.
             knownFolderOverride <- Some (ClientKnownFolders.installForTests root)
+            if OperatingSystem.IsWindows() then
+                // VSTest's testhost cannot handle Jarvis's internal process
+                // group command. Use the .NET 11 Release Client apphost built
+                // in this same ephemeral checkout, never an operator binary.
+                let repository = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", ".."))
+                let apphost = Path.Combine(repository, "Client", "bin", "Release", "net11.0", "JarvisClient.exe")
+                processHelperOverride <- Some (BoundedProcess.installTestHelperHost apphost)
 
             // Do not inherit even higher-precedence per-command Git identity,
             // configuration injection or repository/index overrides.
@@ -260,6 +270,29 @@ module HermeticHarnessTests =
         let devicePath = Path.Combine(root, "config", "Jarvis", "device-id")
         HermeticClientTestEnvironment.AssertPrivatePath root devicePath
         Assert.That(File.Exists devicePath, Is.True)
+
+    [<Test>]
+    let bounded_git_process_uses_scoped_client_helper_in_testhost () =
+        // On Windows VSTest owns Environment.ProcessPath. A bounded Git child
+        // must nevertheless use the built Jarvis apphost as group supervisor.
+        // This regression fails without the scoped test helper override.
+        let root = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_HERMETIC_ROOT")
+        HermeticClientTestEnvironment.AssertPrivatePath root (Path.Combine(root, "config"))
+        let result =
+            BoundedProcess.run
+                { Executable = "git"
+                  Args = [ "--version" ]
+                  WorkingDirectory = root
+                  Timeout = TimeSpan.FromSeconds 15.
+                  MaxOutputBytes = Some 1024
+                  StandardInput = BoundedProcess.ClosedInput
+                  ExtraEnvironment = []
+                  ConfigureStart = Some ProcessEnvironment.apply }
+        match result with
+        | Ok outcome ->
+            Assert.That(outcome.ExitCode, Is.EqualTo(0), outcome.StdErr)
+            Assert.That(outcome.StdOut, Does.Contain("git version"))
+        | Error error -> Assert.Fail($"Bounded disposable git command failed: {error}")
 
     let private createLinkedDirectory (link: string) (outside: string) =
         if OperatingSystem.IsWindows() then

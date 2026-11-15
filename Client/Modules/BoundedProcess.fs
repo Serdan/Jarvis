@@ -266,6 +266,30 @@ let private tryTerminateGroup pid job =
         // immediate child exits while descendants retain inherited pipes.
         Native.killUnixGroup pid |> ignore
 
+// VSTest's process host cannot interpret Jarvis's internal process-group
+// flag. Only the friend Client.Tests assembly may install this scoped helper
+// executable for Windows hermetic tests. Production never reads environment
+// variables to choose a different helper.
+let private helperGate = obj()
+let mutable private testHelperHost: string option = None
+
+let internal installTestHelperHost (apphost: string) : IDisposable =
+    if String.IsNullOrWhiteSpace apphost || not (Path.IsPathFullyQualified apphost) then
+        invalidArg (nameof apphost) "Test group-host executable must be absolute."
+    let absolute = Path.GetFullPath apphost
+    if not (File.Exists absolute) then
+        raise (FileNotFoundException("Missing built Jarvis Client process-group helper.", absolute))
+    lock helperGate (fun () ->
+        if testHelperHost.IsSome then invalidOp "Windows group-host test override already installed."
+        testHelperHost <- Some absolute)
+    let mutable disposed = false
+    { new IDisposable with
+        member _.Dispose() =
+            lock helperGate (fun () ->
+                if not disposed then
+                    disposed <- true
+                    testHelperHost <- None) }
+
 // Framework-dependent apphosts already know which managed assembly to run.
 // Only the general dotnet host needs a DLL path prepended to its arguments.
 let internal helperHostInvocation (hostPath: string) (assemblyPath: string) (args: string list) =
@@ -284,7 +308,9 @@ let private prepareCommand (command: Command) (windowsReadyName: string option) 
             else raise (FileNotFoundException "Linux bounded commands require the system setsid utility.")
         setsid, [ "--"; command.Executable ] @ command.Args
     elif OperatingSystem.IsMacOS() || OperatingSystem.IsWindows() then
-        let host = Environment.ProcessPath
+        let host =
+            lock helperGate (fun () ->
+                testHelperHost |> Option.defaultValue Environment.ProcessPath)
         if String.IsNullOrWhiteSpace host then
             raise (InvalidOperationException "Cannot locate the current Jarvis executable.")
         let dll = Assembly.GetExecutingAssembly().Location

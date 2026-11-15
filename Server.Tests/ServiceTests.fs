@@ -665,6 +665,7 @@ let ``WriteFile rejects invalid file write mode with actionable validation error
             "",
             Nullable(),
             "",
+            "",
             Unchecked.defaultof<ClientService>,
             Unchecked.defaultof<Microsoft.AspNetCore.Http.IHttpContextAccessor>)
         |> Async.AwaitTask
@@ -1596,6 +1597,7 @@ let client_request_abort_cancels_outstanding_device_correlation_without_faulting
         let recipient =
             { new Common.SignalR.IClientService with
                 member _.ReceiveMessage(_) = Task.CompletedTask
+                member _.ReceiveSourceCommand(_, _, _, _) = Task.CompletedTask
                 member _.ReceiveCommand(correlationId, _, _) =
                     if System.Threading.Interlocked.Increment(&dispatchCount) = 1 then
                         dispatched.TrySetResult(correlationId) |> ignore
@@ -1691,6 +1693,7 @@ let post_commit_uncertain_client_reply_remains_unknown_across_server_dispatch_an
         let recipient =
             { new Common.SignalR.IClientService with
                 member _.ReceiveMessage(_) = Task.CompletedTask
+                member _.ReceiveSourceCommand(_, _, _, _) = Task.CompletedTask
                 member _.ReceiveCommand(correlationId, commandJson, _) =
                     task {
                         let received = JsonSerializer.Deserialize<AgentCommand>(commandJson)
@@ -1923,6 +1926,7 @@ let private routedNotificationFixtureWithReceipt (sourceReceipt: AgentInboxActiv
         let recipient (connectionId: string) =
             { new Common.SignalR.IClientService with
                 member _.ReceiveMessage(_) = Task.CompletedTask
+                member _.ReceiveSourceCommand(_, _, _, _) = Task.CompletedTask
                 member _.InvalidateAgentStates(_, _) = Task.CompletedTask
                 member _.RecordAgentActivity(_, _, _) = Task.CompletedTask
                 member _.InvalidateAllAgentStates() = Task.CompletedTask
@@ -2200,6 +2204,7 @@ let browser_dom_mcp_tools_route_only_when_all_required_oauth_scopes_are_present 
     let recipient =
         { new Common.SignalR.IClientService with
             member _.ReceiveMessage(_) = Task.CompletedTask
+            member _.ReceiveSourceCommand(_, _, _, _) = Task.CompletedTask
             member _.ReceiveCommand(correlationId, commandJson, _) =
                 let command = JsonSerializer.Deserialize<AgentCommand>(commandJson)
                 lock dispatched (fun () -> dispatched.Add(command))
@@ -2325,6 +2330,7 @@ let attributed_tool_dispatch_reaches_both_user_devices_but_not_other_users_or_jo
     let recipient connection =
         { new Common.SignalR.IClientService with
             member _.ReceiveMessage(_) = Task.CompletedTask
+            member _.ReceiveSourceCommand(_, _, _, _) = Task.CompletedTask
             member _.ReceiveCommand(correlationId, _, _) =
                 System.Threading.Interlocked.Increment(&deliveredCommands) |> ignore
                 persistedBeforeRemoteExecution <-
@@ -2415,3 +2421,105 @@ let attributed_tool_dispatch_reaches_both_user_devices_but_not_other_users_or_jo
     Assert.That(deliveredCommands, Is.EqualTo(beforeFailure),
                 "After restart, a failed activity write still cannot dispatch a Manager tool.")
 }
+
+[<Test>]
+let ``source file UUID ingress refuses a fabricated or empty caller identity`` () =
+    let original = Guid.NewGuid()
+    match McpToolHelpers.parseSourceOriginalId (original.ToString("D")) with
+    | Ok(Some stable) -> Assert.That(stable, Is.EqualTo(original.ToString("D")))
+    | _ -> failwith "Original caller UUID was not preserved"
+    Assert.That((McpToolHelpers.parseSourceOriginalId "" = Ok None), Is.True)
+    match McpToolHelpers.parseSourceOriginalId "wrong-id" with
+    | Error reason -> Assert.That(reason, Does.Contain("original ID"))
+    | _ -> failwith "Malformed source UUID was accepted"
+    let result =
+        JarvisMcpTools.WriteFile(
+            "Project1", "Test Agent", "", "effect.txt", "content",
+            "Write", "", Nullable(), "", "not-a-uuid",
+            Unchecked.defaultof<ClientService>,
+            Unchecked.defaultof<Microsoft.AspNetCore.Http.IHttpContextAccessor>)
+        |> Async.AwaitTask
+        |> Async.RunSynchronously
+    Assert.That(result.IsError, Is.EqualTo(Nullable true))
+    let error = result.Content[0] :?> TextContentBlock
+    Assert.That(error.Text, Does.Contain("Original source operation ID"))
+
+[<Test>]
+let source_uuid_signalr_dispatch_preserves_caller_identity_and_legacy_receiver () =
+    task {
+        let users = UserService()
+        let user = "auth0|source-caller"
+        let connection = "source-conn"
+        users.TransportConnected(user, connection)
+        let registration =
+            users.Register(user,
+                { DeviceId = "source-device"
+                  DeviceName = "Source fixture"
+                  ProtocolVersion = AgentProtocol.version
+                  ClientVersion = "test"
+                  SupportedCommands = [ "WriteFile" ] }, connection)
+        let tracker = ClientResponseTracker()
+        let observed =
+            System.Collections.Concurrent.ConcurrentQueue<string * string * string>()
+        let mutable legacyDispatches = 0
+        let expected : AgentCommandResponse =
+            { Result = Some "ok"; Error = None; Instructions = []
+              AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+        let reply correlation =
+            tracker.Complete(correlation, user, connection, registration.Generation, expected)
+            |> ignore
+            Task.CompletedTask
+        let recipient =
+            { new Common.SignalR.IClientService with
+                member _.ReceiveMessage(_) = Task.CompletedTask
+                member _.ReceiveCommand(correlation, _, _) =
+                    System.Threading.Interlocked.Increment(&legacyDispatches) |> ignore
+                    reply correlation
+                member _.ReceiveSourceCommand(correlation, commandJson, actor, original) =
+                    observed.Enqueue((commandJson, actor, original))
+                    reply correlation
+                member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+                member _.RecordAgentActivity(_, _, _) = Task.CompletedTask
+                member _.InvalidateAllAgentStates() = Task.CompletedTask }
+        let clients =
+            { new Microsoft.AspNetCore.SignalR.IHubClients<Common.SignalR.IClientService> with
+                member _.All = recipient
+                member _.AllExcept(_) = recipient
+                member _.Client(_) = recipient
+                member _.Clients(_) = recipient
+                member _.Group(_) = recipient
+                member _.GroupExcept(_, _) = recipient
+                member _.Groups(_) = recipient
+                member _.User(_) = recipient
+                member _.Users(_) = recipient }
+        let hub =
+            { new Microsoft.AspNetCore.SignalR.IHubContext<HubService,Common.SignalR.IClientService> with
+                member _.Clients = clients
+                member _.Groups = Unchecked.defaultof<_> }
+        let http = Microsoft.AspNetCore.Http.HttpContextAccessor()
+        http.HttpContext <- Microsoft.AspNetCore.Http.DefaultHttpContext()
+        let service =
+            ClientService(hub, users, tracker, http,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
+        let command =
+            WriteFileCommand
+                { ProjectName = "Fixture::wq03-source-generation"
+                  FilePath = "effect.txt"; Content = "payload"
+                  FileWriteMode = FileWriteMode.Write
+                  ExpectedHash = None; CreateParents = Some false }
+        let original = Guid.NewGuid().ToString("D")
+        let! bound = service.SendCommandToUser(user, command, sourceOperationId = original)
+        Assert.That(bound, Is.EqualTo expected)
+        Assert.That(legacyDispatches, Is.Zero)
+        Assert.That(observed.Count, Is.EqualTo 1)
+        let json, actor, sentOriginal = observed.TryDequeue() |> function
+            | true, value -> value
+            | _ -> failwith "No original source command was dispatched"
+        Assert.That(actor, Is.Empty)
+        Assert.That(sentOriginal, Is.EqualTo original)
+        Assert.That(JsonSerializer.Deserialize<AgentCommand>(json), Is.EqualTo command)
+        let! legacy = service.SendCommandToUser(user, command)
+        Assert.That(legacy, Is.EqualTo expected)
+        Assert.That(legacyDispatches, Is.EqualTo 1)
+        Assert.That(observed.Count, Is.Zero)
+    }

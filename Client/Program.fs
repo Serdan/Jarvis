@@ -402,15 +402,19 @@ let private runClient args =
                 tui.Log $"MCP command {correlationId}: unhandledType={error.GetType().Name} recoveryReplyType={deliveryError.GetType().Name}"
         }
 
-    let receiveQueued correlationId commandJson agentId : Task =
+    let receiveQueuedWithSource correlationId commandJson agentId (originalId: string option) : Task =
         if dispatch.TrySubmit(
             correlationId,
             (fun () ->
-                Client.receiveCommandAndReplyWithTiming connection rt correlationId commandJson agentId
-                    (fun id commandMs replyMs delivered ->
+                let report id commandMs replyMs delivered =
                         if commandMs >= 200.0 || replyMs >= 1000.0 || not delivered then
                             tui.Log
-                                $"MCP stage {id}: commandMs={commandMs:F0} replyMs={replyMs:F0} replyAck={delivered}")),
+                                $"MCP stage {id}: commandMs={commandMs:F0} replyMs={replyMs:F0} replyAck={delivered}"
+                match originalId with
+                | Some original ->
+                    Client.receiveSourceCommandAndReplyWithTiming connection rt correlationId commandJson agentId original report
+                | None ->
+                    Client.receiveCommandAndReplyWithTiming connection rt correlationId commandJson agentId report),
             (fun error -> replyUnhandled correlationId commandJson error)) then
             Task.CompletedTask
         else
@@ -428,9 +432,15 @@ let private runClient args =
                     tui.Log $"MCP overload response {correlationId} delivery failed ({error.GetType().Name})."
             } :> Task
 
+    let receiveQueued correlationId commandJson agentId : Task =
+        receiveQueuedWithSource correlationId commandJson agentId None
+    let receiveSourceQueued correlationId commandJson agentId originalId : Task =
+        receiveQueuedWithSource correlationId commandJson agentId (Some originalId)
+
     ignoreAll {
         connection.On<string>("ReceiveMessage", Func<string, Task>(Client.receiveMessage rt))
         connection.On<string, string, string>("ReceiveCommand", Func<string, string, string, Task>(receiveQueued))
+        connection.On<string, string, string, string>("ReceiveSourceCommand", Func<string, string, string, string, Task>(receiveSourceQueued))
         connection.On<string, string array>("InvalidateAgentStates", Func<string, string array, Task>(fun project agentIds ->
             Client.invalidateAgentStates rt project agentIds
             Task.CompletedTask))

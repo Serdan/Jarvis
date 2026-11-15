@@ -774,7 +774,7 @@ module McpToolHelpers =
             result.Content.Add(textContent $"Jarvis taskId: {taskId} (generated; use this ID for subsequent task operations).")
             result
 
-    let send (client: ClientService) (http: IHttpContextAccessor) command =
+    let sendWithSourceOperationId (sourceOriginalId: string option) (client: ClientService) (http: IHttpContextAccessor) command =
         task {
             match Option.ofObj http.HttpContext with
             | None ->
@@ -921,7 +921,8 @@ module McpToolHelpers =
                             client.SendCommandToUser(userId, command,
                                                      ?conversationId = RequestDeviceRouting.session(),
                                                      ?deviceId = RequestDeviceRouting.deviceOverride(),
-                                                     ?agentId = RequestDeviceRouting.agentId())
+                                                     ?agentId = RequestDeviceRouting.agentId(),
+                                                     ?sourceOperationId = sourceOriginalId)
                     stopwatch.Stop()
                     finishOperation tracking response stopwatch.ElapsedMilliseconds
 
@@ -950,6 +951,20 @@ module McpToolHelpers =
                 | None ->
                     return authenticationErrorResult context (Some(String.concat " " scopes))
         }
+
+    // Existing MCP routes intentionally transport NO source identity.
+    let send (client: ClientService) (http: IHttpContextAccessor) command =
+        sendWithSourceOperationId None client http command
+
+    // Supplied by the ORIGINAL source caller, never server-minted or obtained
+    // from its SignalR correlation ID. Empty continues the existing legacy
+    // RPC and cannot be mistaken for a bound source receipt.
+    let parseSourceOriginalId (value: string) =
+        if String.IsNullOrWhiteSpace value then Ok None
+        else
+            match Guid.TryParse value with
+            | true, original when original <> Guid.Empty -> Ok(Some(original.ToString("D")))
+            | _ -> Error "Original source operation ID must be a nonempty canonical UUID; retry with the original ID."
 
     let getProfile (http: IHttpContextAccessor) =
         task {
@@ -2306,13 +2321,14 @@ type JarvisMcpTools =
         McpToolHelpers.send client http UpdateClientCommand
 
     [<McpServerTool(Title = "Write file", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Create, update or append to a file in the selected project workspace using configured local permissions. Requires client approval.")>]
-    static member WriteFile(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, content: string, [<Description("File write mode. Allowed values: Write, Append.")>] fileWriteMode: string, [<Description("Optional precondition: SHA-256 hash to require matching existing content, none to require a new file, or empty string for no precondition.")>] expectedHash: string, createParents: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member WriteFile(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, content: string, [<Description("File write mode. Allowed values: Write, Append.")>] fileWriteMode: string, [<Description("Optional precondition: SHA-256 hash to require matching existing content, none to require a new file, or empty string for no precondition.")>] expectedHash: string, createParents: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue(""); Description("EXPERIMENTAL nonproduction source file route: original caller-retained UUID. Omitting preserves the legacy RPC; never generate a new UUID on retry.")>] sourceOperationId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
-        match McpToolHelpers.parseFileWriteMode fileWriteMode with
-        | Error message ->
+        match McpToolHelpers.parseFileWriteMode fileWriteMode,
+              McpToolHelpers.parseSourceOriginalId sourceOperationId with
+        | Error message, _ | _, Error message ->
             Task.FromResult(McpToolHelpers.validationErrorResult message)
-        | Ok mode ->
-            McpToolHelpers.send client http (WriteFileCommand {
+        | Ok mode, Ok sourceId ->
+            McpToolHelpers.sendWithSourceOperationId sourceId client http (WriteFileCommand {
                 ProjectName = projectName
                 FilePath = filePath
                 Content = content
@@ -2321,17 +2337,20 @@ type JarvisMcpTools =
                 CreateParents = McpToolHelpers.optionOfNullableBool createParents })
 
     [<McpServerTool(Title = "Patch file", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Edit a project file using an atomic unified diff, with optional expected-hash checking and dry-run validation. Requires client approval.")>]
-    static member PatchFile(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, patch: string, expectedHash: string, dryRun: Nullable<bool>, fuzzyContextLines: Nullable<int>, returnContent: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member PatchFile(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, patch: string, expectedHash: string, dryRun: Nullable<bool>, fuzzyContextLines: Nullable<int>, returnContent: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue(""); Description("EXPERIMENTAL nonproduction source patch: original caller-retained UUID; never generate a new UUID on retry.")>] sourceOperationId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
-        McpToolHelpers.send client http (PatchFileCommand {
-            ProjectName = projectName
-            FilePath = filePath
-            ExpectedHash = McpToolHelpers.optionOfString expectedHash
-            Format = UnifiedDiff
-            Patch = patch
-            DryRun = McpToolHelpers.optionOfNullableBool dryRun
-            FuzzyContextLines = McpToolHelpers.optionOfNullable fuzzyContextLines
-            ReturnContent = McpToolHelpers.optionOfNullableBool returnContent })
+        match McpToolHelpers.parseSourceOriginalId sourceOperationId with
+        | Error message -> Task.FromResult(McpToolHelpers.validationErrorResult message)
+        | Ok sourceId ->
+            McpToolHelpers.sendWithSourceOperationId sourceId client http (PatchFileCommand {
+                ProjectName = projectName
+                FilePath = filePath
+                ExpectedHash = McpToolHelpers.optionOfString expectedHash
+                Format = UnifiedDiff
+                Patch = patch
+                DryRun = McpToolHelpers.optionOfNullableBool dryRun
+                FuzzyContextLines = McpToolHelpers.optionOfNullable fuzzyContextLines
+                ReturnContent = McpToolHelpers.optionOfNullableBool returnContent })
 
     [<McpServerTool(Title = "Run command", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Execute a bounded development command within the local Jarvis OS-permission sandbox for the selected project workspace. Commands run with the explicitly configured local account permissions and require client approval. Supply a short reason for the command.")>]
     static member RunCommand(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, executable: string, args: string array, [<Optional; DefaultParameterValue("")>] reason: string, workingDirectory: string, timeoutSeconds: Nullable<int>, maxOutputBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

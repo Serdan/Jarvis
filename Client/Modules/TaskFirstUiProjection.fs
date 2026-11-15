@@ -214,6 +214,8 @@ let private launchPhase now staleAfter (launch: Launch) =
                 Some "Heartbeat stale; recovery unproven"
             | Some lease, Some current when current < lease.LastSeenAt ->
                 Some "Clock precedes last heartbeat; liveness unknown"
+            | Some _, None -> Some "Observation clock absent; liveness unknown"
+            | Some _, Some _ when staleAfter <= 0L -> Some "Heartbeat threshold invalid; liveness unknown"
             | _ -> None
         "Registered", (if nonBlank uuid then Some uuid else None),
         (if not (nonBlank uuid) then Some "Registered UUID missing" else warning)
@@ -262,6 +264,9 @@ let private claimedState now staleAfter (project: Project) launchId =
                 RowState.StaleHeartbeat launchId
             | Some lease, Some current when current < lease.LastSeenAt ->
                 RowState.Uncertain "Clock predates verified heartbeat"
+            | Some _, None -> RowState.Uncertain "Observation clock absent; claimed lease liveness unverified"
+            | Some _, Some _ when staleAfter <= 0L ->
+                RowState.Uncertain "Heartbeat threshold invalid; claimed lease liveness unverified"
             | _ -> RowState.Active launchId
         | _ -> RowState.Uncertain "Claimed launch not verified registered"
 
@@ -272,25 +277,50 @@ let private blockedState (stage: WorkStage) =
         RowState.RecoveryHold "External effect observed; dependency gate pending"
     | GateState.SourceRecoveryBlocked reason ->
         RowState.RecoveryHold ("SourceRecoveryBlocked: " + reason)
-    | GateState.DependencyGatePending _ -> RowState.Blocked
+    | GateState.DependencyGatePending version ->
+        RowState.RecoveryHold (sprintf "DependencyGatePending graph v%d; hard prerequisite not cleared" version)
     | GateState.Clear ->
         match stage.State with
         | WorkState.GateException -> RowState.RecoveryHold "GateException; no implied authorization"
         | _ -> RowState.Blocked
 
-let private capacityView (account: Result<Account, string>) =
+// Account.Tokens is keyed by Launch.Id (not Launch.AccountTokenId). A read-only
+// preview cannot certify a cross-ledger CAS/high-water join on its own.
+let private capacityView (project: Project) (account: Result<Account, string>) =
     match account with
     | Error reason -> Evidence.Unknown ("Account capacity unverified: " + reason)
     | Ok state when state.MaxConcurrentAgents < 0 ->
         Evidence.Unknown "Negative account-global capacity limit"
+    | Ok state when not project.QueueCovered ->
+        Evidence.Unknown "Project launch index uncovered; account/project capacity join unverified"
     | Ok state ->
-        let occupied = state.Tokens |> Map.filter (fun _ released -> not released) |> Map.count
-        Evidence.Known
-            { Limit = state.MaxConcurrentAgents
-              Occupied = occupied
-              Free = max 0 (state.MaxConcurrentAgents - occupied)
-              Overcommitted = occupied > state.MaxConcurrentAgents
-              Migration = state.Migration }
+        let launches = project.Launches |> Map.toList |> List.map snd
+        let missingReservation =
+            launches
+            |> List.exists (fun launch ->
+                not (nonBlank launch.AccountTokenId)
+                || state.Tokens.TryFind launch.Id <> Some false)
+        let duplicatedAdmissions =
+            launches
+            |> List.map (fun launch -> launch.AccountTokenId)
+            |> List.countBy id
+            |> List.exists (fun (_, count) -> count > 1)
+        if missingReservation then
+            Evidence.Unknown "Account/project snapshot inconsistent: launch reservation absent or released"
+        elif duplicatedAdmissions then
+            Evidence.Unknown "Account/project snapshot inconsistent: duplicate admission identity"
+        elif not (List.isEmpty launches) then
+            // Even matching token IDs do not prove the two snapshots share an
+            // authoritative high-water boundary. Future adapters must supply it.
+            Evidence.Unknown "Account/project cross-ledger heads and high-water join unverified"
+        else
+            let occupied = state.Tokens |> Map.filter (fun _ released -> not released) |> Map.count
+            Evidence.Known
+                { Limit = state.MaxConcurrentAgents
+                  Occupied = occupied
+                  Free = max 0 (state.MaxConcurrentAgents - occupied)
+                  Overcommitted = occupied > state.MaxConcurrentAgents
+                  Migration = state.Migration }
 
 let private unknownDashboard reason capacity =
     { Next = Evidence.Unknown reason
@@ -306,9 +336,10 @@ let private unknownDashboard reason capacity =
 /// never an authority grant. All queue runnable views require WQ01/02 coverage.
 let projectDashboard projectId titles (projectResult: Result<Project, string>)
     (account: Result<Account, string>) now staleAfter : Dashboard =
-    let capacity = capacityView account
     match projectResult with
-    | Error reason -> unknownDashboard ("Project snapshot unverified: " + reason) capacity
+    | Error reason ->
+        unknownDashboard ("Project snapshot unverified: " + reason)
+            (Evidence.Unknown "Project/account capacity join unavailable")
     | Ok project ->
         let invalidIdentity =
             project.Works
@@ -317,7 +348,14 @@ let projectDashboard projectId titles (projectResult: Result<Project, string>)
                 || key <> stage.Id || stage.ProjectId <> projectId)
             || (project.Launches |> Map.exists (fun key launch ->
                 not (nonBlank key) || key <> launch.Id || launch.ProjectId <> projectId))
+            || (project.Messages |> Map.exists (fun key message ->
+                not (nonBlank key) || not (nonBlank message.Id) || key <> message.Id
+                || (match message.Subject with
+                    | Subject.Task id | Subject.Role id -> not (nonBlank id))))
             || not (nonBlank projectId)
+        let capacity =
+            if invalidIdentity then Evidence.Unknown "Project identity invalid; capacity join unverified"
+            else capacityView project account
         let threads =
             if project.MessageCovered && not invalidIdentity then Evidence.Known(threadRows titles project)
             else Evidence.Unknown "Message index/identity incomplete; not an empty conversation"
@@ -376,13 +414,14 @@ let projectDashboard projectId titles (projectResult: Result<Project, string>)
                     | WorkState.Claimed launch ->
                         let state =
                             match stage.Gate with
-                            | GateState.SourceRecoveryBlocked reason ->
-                                RowState.RecoveryHold ("SourceRecoveryBlocked: " + reason)
-                            | GateState.IntegrationGateHold _ ->
-                                RowState.RecoveryHold "IntegrationGateHold; original push uncertain"
-                            | GateState.ExternalEffectObservedPendingGate _ ->
-                                RowState.RecoveryHold "External push observed; gate unresolved"
-                            | _ -> claimedState now staleAfter project launch
+                            | GateState.Clear -> claimedState now staleAfter project launch
+                            | _ ->
+                                // A retained claim does not clear its dependency/source
+                                // gate, even with a fresh lease and an account token.
+                                match blockedState stage with
+                                | RowState.RecoveryHold reason ->
+                                    RowState.RecoveryHold ("Claim retained by " + launch + "; " + reason)
+                                | state -> state
                         Some(row titles project stage state)
                     | _ -> None)
                 |> List.sortBy (fun row -> fifoKey project project.Works.[row.WorkId])
@@ -393,9 +432,19 @@ let projectDashboard projectId titles (projectResult: Result<Project, string>)
                     && not (nextIds.Contains stage.Id)
                     && (match stage.State with
                         | WorkState.Available | WorkState.Blocked | WorkState.GateException -> true
+                        | WorkState.Claimed _ when stage.Gate <> GateState.Clear -> true
                         | _ -> false))
                 |> List.sortBy (fifoKey project)
-                |> List.map (fun stage -> row titles project stage (blockedState stage))
+                |> List.map (fun stage ->
+                    let status =
+                        match stage.State with
+                        | WorkState.Claimed launch ->
+                            RowState.RecoveryHold ("Claim retained by " + launch + "; " +
+                                (match blockedState stage with
+                                 | RowState.RecoveryHold reason -> reason
+                                 | _ -> "Canonical gate not clear"))
+                        | _ -> blockedState stage
+                    row titles project stage status)
             { Next = Evidence.Known(next |> List.map (fun stage -> row titles project stage RowState.Next))
               ActiveAndStalled = Evidence.Known active
               Blocked = Evidence.Known blocked

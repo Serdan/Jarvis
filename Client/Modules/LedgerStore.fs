@@ -1231,6 +1231,17 @@ module LedgerStore =
                 shard owned || (subscribed && shard triage) || path = recent
             readSelectedRecordsAt prefixes allowed binding snapshot |> Result.map stripOids
 
+    // Read only operator-owned pending shards and bounded recent outcomes.
+    // Never enumerate historical challenge records for the periodic TUI poll.
+    let readChallengeOperatorIndexRecordsAt binding snapshot =
+        let active = "records/challenge-index-operator-active"
+        let recent = "records/challenge-index-operator-recent.json"
+        let allowed (path: string) =
+            (path.StartsWith(active + "/", StringComparison.Ordinal)
+             && Regex.IsMatch(path.Substring(active.Length + 1), "^[a-f0-9]{2}[.]json$"))
+            || path = recent
+        readSelectedRecordsAt [ active; recent ] allowed binding snapshot |> Result.map stripOids
+
     // Read only canonical challenge blobs referenced by active indexes or
     // explicit blocked-dependency links. Use bounded Git argv and cat-file
     // batches; neither historical count nor index size multiplies processes
@@ -1242,6 +1253,27 @@ module LedgerStore =
         else
             ids
             |> List.map (fun id -> "challenges/" + id + "/challenge.json")
+            |> List.chunkBySize 128
+            |> List.fold (fun (state: Result<Map<string, string>, LedgerFailure>) paths ->
+                state |> Result.bind (fun accumulated ->
+                    let required = paths |> Set.ofList
+                    readSelectedRecordsAt paths (fun path -> Set.contains path required) binding snapshot
+                    |> Result.map (fun records ->
+                        records |> stripOids
+                        |> Map.fold (fun result path content -> Map.add path content result) accumulated)))
+                (Ok Map.empty)
+
+    // Read authenticated response provenance in bounded exact-path batches
+    // from the same verified snapshot as the operator challenge projection.
+    let readChallengeEventEntitiesAt binding snapshot (keys: (string * int64) list) =
+        if keys |> List.exists (fun (id, sequence) ->
+            not (Regex.IsMatch(id, "^[a-f0-9]{32}$")) || sequence <= 0L) then
+            Error(InvalidBinding "Invalid challenge event locator in operator index.")
+        else
+            keys
+            |> List.distinct
+            |> List.map (fun (id, sequence) ->
+                "challenges/" + id + "/events/" + string sequence + ".json")
             |> List.chunkBySize 128
             |> List.fold (fun (state: Result<Map<string, string>, LedgerFailure>) paths ->
                 state |> Result.bind (fun accumulated ->

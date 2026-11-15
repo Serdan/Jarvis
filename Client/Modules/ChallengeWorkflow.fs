@@ -111,6 +111,26 @@ type ChallengeRecentIndex =
     { IssuerAgentId: string
       TotalCurrentOutcomes: int
       Items: InboxChallengeItem list }
+
+// Operator views need full question text and authenticated response provenance.
+// Store only bounded locators; canonical records are read at the same snapshot.
+[<CLIMutable>]
+type OperatorChallengeRecentItem =
+    { ChallengeId: string
+      ConditionId: string
+      UpdatedAtUtc: string }
+
+[<CLIMutable>]
+type OperatorChallengeRecentIndex =
+    { ActiveChallengeCount: int
+      TotalCurrentOutcomes: int
+      Items: OperatorChallengeRecentItem list }
+
+[<CLIMutable>]
+type OperatorChallengeIndexCoverage =
+    { Version: int
+      CompletedAtUtc: string }
+
 [<RequireQualifiedAccess>]
 type ChallengeOwner =
     | Unassigned
@@ -330,6 +350,29 @@ module ChallengeWorkflow =
     let private recentPath actor =
         "records/challenge-index-recent/" + encodedActor actor + ".json"
 
+    let private operatorActiveShard (challengeId: string) =
+        "records/challenge-index-operator-active/" + challengeId.Substring(0, 2) + ".json"
+
+    let private operatorRecentPath = "records/challenge-index-operator-recent.json"
+    let private operatorCoveragePath = "records/challenge-index-operator-coverage.json"
+
+    let private hasOperatorPending (challenge: AgentChallenge) =
+        (challenge.Status = "Pending" || challenge.Status = "Blocked")
+        && (challenge.Conditions |> List.exists (fun condition ->
+            condition.Status = "Pending"
+            && ownerOf condition = Some ChallengeOwner.Operator))
+
+    let private operatorOutcomes (challenge: AgentChallenge) =
+        [ for condition in challenge.Conditions do
+            if ownerOf condition = Some ChallengeOwner.Operator
+               && (challenge.Status = "Cancelled" || condition.Status <> "Pending") then
+                yield
+                    { ChallengeId = challenge.ChallengeId
+                      ConditionId = condition.ConditionId
+                      UpdatedAtUtc =
+                        if challenge.Status = "Cancelled" then challenge.UpdatedAtUtc
+                        else condition.UpdatedAtUtc } ]
+
     let private readIndex<'t> binding snapshot file = result {
         let! contents, oid = LedgerStore.readAt binding snapshot file
         match contents, oid with
@@ -346,6 +389,20 @@ module ChallengeWorkflow =
             with ex ->
                 return! Error(LedgerIntegrityError ("Invalid challenge inbox index: " + ex.Message))
         | _ -> return! Error(LedgerIntegrityError ("Inconsistent challenge inbox index: " + file))
+    }
+
+    // A coverage marker is committed in the SAME CAS as a full historical
+    // projection. Absence is not an empty queue: older live operator questions
+    // may exist, so indexed readers must refuse to return incomplete data.
+    let private operatorCoverageAt binding snapshot = result {
+        let! value, _ = readIndex<OperatorChallengeIndexCoverage>
+                            binding snapshot operatorCoveragePath
+        match value with
+        | None -> return false
+        | Some marker when marker.Version = 1
+                           && not (String.IsNullOrWhiteSpace marker.CompletedAtUtc) ->
+            return true
+        | _ -> return! Error(LedgerIntegrityError "Invalid operator challenge index coverage marker.")
     }
 
     let private updateShard binding snapshot file challengeId includeChallenge = result {
@@ -396,6 +453,137 @@ module ChallengeWorkflow =
             return [ change file oid { prior with TotalCurrentOutcomes = total; Items = items } ]
     }
 
+// One-off, pinned-snapshot backfill for ledgers written before this index
+    // existed. A full rebuild is never part of the steady-state operator poll.
+    // Every canonical challenge is validated before the marker can be written.
+    // An in-flight challenge transition replaces its old snapshot body so the
+    // backfill and that transition commit their projection in one Git CAS.
+    let private bootstrapOperatorIndexesAt binding snapshot (replacement: AgentChallenge option) = result {
+        let! covered = operatorCoverageAt binding snapshot
+        if covered then
+            return! Error(StaleEntityVersion "Operator challenge index was already initialized.")
+        let! paths = LedgerStore.listAt binding snapshot "challenges"
+        let mutable ids: string list = []
+        for file in paths do
+            if file.EndsWith("/challenge.json", StringComparison.Ordinal) then
+                let parts = file.Split('/')
+                if parts.Length <> 3
+                   || (guidN parts[1]).IsNone
+                   || parts[1] <> (Guid.Parse parts[1]).ToString("N") then
+                    return! Error(LedgerIntegrityError "Invalid challenge identity during operator index backfill.")
+                ids <- parts[1] :: ids
+        let! bodies = LedgerStore.readChallengeEntitiesAt binding snapshot ids
+        let mutable all: Map<string, AgentChallenge> = Map.empty
+        for id in ids do
+            let file = "challenges/" + id + "/challenge.json"
+            match Map.tryFind file bodies with
+            | None -> return! Error(LedgerIntegrityError ("Missing challenge during operator backfill: " + id))
+            | Some body ->
+                try
+                    use doc = JsonDocument.Parse body
+                    let challenge = JsonSerializer.Deserialize<AgentChallenge>(body, options)
+                    if doc.RootElement.GetProperty("schemaVersion").GetInt32() <> 2
+                       || isNull (box challenge) || challenge.ChallengeId <> id
+                       || not (check challenge) then
+                        return! Error(LedgerIntegrityError ("Invalid canonical challenge during operator backfill: " + id))
+                    all <- Map.add id challenge all
+                with ex ->
+                    return! Error(LedgerIntegrityError ("Malformed canonical operator backfill challenge: " + ex.Message))
+        match replacement with
+        | Some current -> all <- Map.add current.ChallengeId current all
+        | None -> ()
+
+        let mutable active: Map<string, string list> = Map.empty
+        let mutable totalOutcomes = 0
+        let mutable latest: OperatorChallengeRecentItem list = []
+        for KeyValue(id, challenge) in all do
+            if hasOperatorPending challenge then
+                let file = operatorActiveShard id
+                active <- Map.add file (id :: (Map.tryFind file active |> Option.defaultValue [])) active
+            let outcomes = operatorOutcomes challenge
+            totalOutcomes <- totalOutcomes + outcomes.Length
+            if not (List.isEmpty outcomes) then
+                latest <-
+                    (outcomes @ latest)
+                    |> List.sortByDescending (fun item ->
+                        item.UpdatedAtUtc, item.ChallengeId, item.ConditionId)
+                    |> List.truncate 36
+
+        // Reconcile possible unmarked shards left by older partial releases.
+        // Never trust their contents to decide which historical IDs exist.
+        let! existing = LedgerStore.readChallengeOperatorIndexRecordsAt binding snapshot
+        let activePrefix = "records/challenge-index-operator-active/"
+        let oldPaths =
+            existing
+            |> Map.toSeq
+            |> Seq.choose (fun (file, _) ->
+                if file.StartsWith(activePrefix, StringComparison.Ordinal) then Some file else None)
+            |> Set.ofSeq
+        let desiredPaths = active |> Map.toSeq |> Seq.map fst |> Set.ofSeq
+        let mutable changes: LedgerFileChange list = []
+        for file in Set.union oldPaths desiredPaths do
+            let! previous, oid = readIndex<ChallengeActiveShard> binding snapshot file
+            let! before =
+                match previous with
+                | None -> Ok Set.empty
+                | Some shard when not (isNull (box shard.ChallengeIds))
+                                  && shard.ChallengeIds.Length = (shard.ChallengeIds |> Set.ofList |> Set.count)
+                                  && (shard.ChallengeIds |> List.forall (fun id ->
+                                      (guidN id).IsSome
+                                      && id.StartsWith(file.Substring(activePrefix.Length, 2), StringComparison.Ordinal))) ->
+                    Ok(Set.ofList shard.ChallengeIds)
+                | _ -> Error(LedgerIntegrityError ("Invalid operator shard during backfill: " + file))
+            let desired = Map.tryFind file active |> Option.defaultValue [] |> Set.ofList
+            if before <> desired then
+                changes <- change file oid { ChallengeIds = desired |> Set.toList } :: changes
+
+        let! _, recentOid = readIndex<OperatorChallengeRecentIndex>
+                                binding snapshot operatorRecentPath
+        let recent =
+            { ActiveChallengeCount = active |> Map.toSeq |> Seq.sumBy (fun (_, ids) -> ids.Length)
+              TotalCurrentOutcomes = totalOutcomes
+              Items = latest }
+        let coverage = { Version = 1; CompletedAtUtc = DateTimeOffset.UtcNow.ToString("O") }
+        return List.rev changes
+               @ [ change operatorRecentPath recentOid recent
+                   change operatorCoveragePath None coverage ]
+    }
+    let private updateOperatorRecent binding snapshot (before: AgentChallenge option)
+                                     (next: AgentChallenge) = result {
+        let oldItems = before |> Option.map operatorOutcomes |> Option.defaultValue []
+        let newItems = operatorOutcomes next
+        let wasActive = before |> Option.exists hasOperatorPending
+        let isActive = hasOperatorPending next
+        if oldItems = newItems && wasActive = isActive then return []
+        else
+            let! previous, oid = readIndex<OperatorChallengeRecentIndex>
+                                     binding snapshot operatorRecentPath
+            let! prior =
+                match previous with
+                | Some index when index.ActiveChallengeCount >= 0
+                                  && index.TotalCurrentOutcomes >= 0
+                                  && not (isNull (box index.Items))
+                                  && index.Items.Length <= 36
+                                  && index.TotalCurrentOutcomes >= index.Items.Length ->
+                    Ok index
+                | None -> Error(LedgerIntegrityError "Covered operator recent challenge index is missing.")
+                | _ -> Error(LedgerIntegrityError "Invalid operator recent challenge index.")
+            let total = prior.TotalCurrentOutcomes - oldItems.Length + newItems.Length
+            let activeCount = prior.ActiveChallengeCount
+                              - (if wasActive then 1 else 0)
+                              + (if isActive then 1 else 0)
+            if total < 0 || activeCount < 0 then
+                return! Error(LedgerIntegrityError "Inconsistent operator challenge index counts.")
+            let items =
+                (newItems @ (prior.Items |> List.filter (fun item ->
+                    item.ChallengeId <> next.ChallengeId)))
+                |> List.sortByDescending (fun item ->
+                    item.UpdatedAtUtc, item.ChallengeId, item.ConditionId)
+                |> List.truncate 36
+            return [ change operatorRecentPath oid
+                         { ActiveChallengeCount = activeCount; TotalCurrentOutcomes = total; Items = items } ]
+    }
+
     let private indexWrites binding snapshot (before: AgentChallenge option)
                             (next: AgentChallenge) = result {
         let oldOwners = before |> Option.map activeOwners |> Option.defaultValue Set.empty
@@ -412,13 +600,55 @@ module ChallengeWorkflow =
             let! writes = updateShard binding snapshot (triageShard next.ChallengeId)
                               next.ChallengeId newTriage
             changes <- writes @ changes
+        let! covered = operatorCoverageAt binding snapshot
+        let! operatorWrites =
+            if not covered then
+                // Also protect known-ID replies before the TUI has run its
+                // one-time migration. Snapshot and transition commit together.
+                bootstrapOperatorIndexesAt binding snapshot (Some next)
+            else result {
+                let oldOperator = before |> Option.exists hasOperatorPending
+                let newOperator = hasOperatorPending next
+                let! shard =
+                    if oldOperator <> newOperator then
+                        updateShard binding snapshot (operatorActiveShard next.ChallengeId)
+                            next.ChallengeId newOperator
+                    else Ok []
+                let! recent = updateOperatorRecent binding snapshot before next
+                return shard @ recent
+            }
         let! recent = updateRecent binding snapshot before next
-        return List.rev changes @ recent
+        return List.rev changes @ recent @ operatorWrites
     }
 
     let private changed binding operationId actor kind payload
                         (plan: LedgerSnapshot -> Result<LedgerFileChange list, LedgerFailure>) =
         LedgerStore.transact binding (intent operationId actor kind payload) plan
+
+    /// The authenticated local operator UI initializes a legacy ledger once
+    /// before it can display indexed actions. CAS retries recompute from the
+    /// current verified snapshot; missing coverage is never an empty queue.
+    let ensureOperatorIndex binding = result {
+        let! snapshot = LedgerStore.fetch binding
+        let! covered = operatorCoverageAt binding snapshot
+        if not covered then
+            let id = Guid.NewGuid()
+            let migration =
+                changed binding id "operator-index-bootstrap"
+                    "BackfillOperatorChallengeIndex" {| coverageVersion = 1 |}
+                    (fun current -> bootstrapOperatorIndexesAt binding current None)
+            match migration with
+            | Ok _ -> ()
+            | Error error ->
+                // Concurrent migration or uncertain push: only a verified
+                // coverage marker can turn this into success.
+                let verified =
+                    LedgerStore.fetch binding
+                    |> Result.bind (operatorCoverageAt binding)
+                match verified with
+                | Ok true -> ()
+                | _ -> return! Error error
+    }
 
     /// An explicit, per-agent project subscription controls visibility of
     /// unassigned conditions. No Lead-name privilege and no notification state.
@@ -975,86 +1205,156 @@ module ChallengeWorkflow =
     /// not treat the human as a registered agent or a subscriber.
     let listOperator binding projectName = result {
         let! snapshot = LedgerStore.fetch binding
-        // Explicit operator-panel retrieval, never part of a routine agent inbox.
-        // Read canonical challenge records in bounded Git blob batches from
-        // a single verified ledger snapshot.
-        let! paths = LedgerStore.listAt binding snapshot "challenges"
-        let mutable names: string list = []
-        for item in paths do
-            if item.EndsWith("/challenge.json", StringComparison.Ordinal) then
-                let components = item.Split('/')
-                if components.Length <> 3 || (guidN components[1]).IsNone then
-                    return! Error(LedgerIntegrityError "Invalid operator challenge identity in ledger tree.")
-                names <- components[1] :: names
-        let mutable challenges: AgentChallenge list = []
-        for batch in names |> List.sort |> List.chunkBySize 128 do
-            let! bodies = LedgerStore.readChallengeEntitiesAt binding snapshot batch
-            for id in batch do
-                let file = "challenges/" + id + "/challenge.json"
-                match Map.tryFind file bodies with
-                | None -> return! Error(LedgerIntegrityError ("Missing operator challenge record: " + id))
-                | Some body ->
-                    try
-                        use doc = JsonDocument.Parse body
-                        let challenge = JsonSerializer.Deserialize<AgentChallenge>(body, options)
-                        if doc.RootElement.GetProperty("schemaVersion").GetInt32() <> 2
-                           || isNull (box challenge) || challenge.ChallengeId <> id
-                           || not (check challenge) then
-                            return! Error(LedgerIntegrityError ("Invalid operator challenge record: " + id))
-                        challenges <- challenge :: challenges
-                    with ex ->
-                        return! Error(LedgerIntegrityError ("Malformed operator challenge record: " + ex.Message))
+        let! covered = operatorCoverageAt binding snapshot
+        if not covered then
+            return! Error(LedgerIntegrityError
+                "Operator Challenge index needs one-time migration before a complete queue can be read.")
+        // Only indexed active operator IDs and bounded recent outcome locators
+        // are read. No historical canonical challenge enumeration on TUI polls.
+        let! indexBodies = LedgerStore.readChallengeOperatorIndexRecordsAt binding snapshot
+        let activePrefix = "records/challenge-index-operator-active/"
+        let mutable activeIds: Set<string> = Set.empty
+        for KeyValue(file, body) in indexBodies do
+            if file.StartsWith(activePrefix, StringComparison.Ordinal) then
+                try
+                    use doc = JsonDocument.Parse body
+                    let shard = JsonSerializer.Deserialize<ChallengeActiveShard>(body, options)
+                    let bucket = file.Substring(activePrefix.Length, 2)
+                    if doc.RootElement.GetProperty("schemaVersion").GetInt32() <> 2
+                       || isNull (box shard) || isNull (box shard.ChallengeIds)
+                       || shard.ChallengeIds.Length <> (shard.ChallengeIds |> Set.ofList |> Set.count)
+                       || (shard.ChallengeIds |> List.exists (fun id ->
+                           (guidN id).IsNone || not (id.StartsWith(bucket, StringComparison.Ordinal)))) then
+                        return! Error(LedgerIntegrityError ("Invalid operator active challenge shard: " + file))
+                    activeIds <- Set.union activeIds (shard.ChallengeIds |> Set.ofList)
+                with ex ->
+                    return! Error(LedgerIntegrityError ("Malformed operator challenge shard: " + ex.Message))
+            elif file <> operatorRecentPath then
+                return! Error(LedgerIntegrityError ("Unexpected operator challenge index path: " + file))
+
+        let! recentIndex =
+            match Map.tryFind operatorRecentPath indexBodies with
+            | None -> Error(LedgerIntegrityError "Covered operator recent challenge index is missing.")
+            | Some body ->
+                try
+                    use doc = JsonDocument.Parse body
+                    let value = JsonSerializer.Deserialize<OperatorChallengeRecentIndex>(body, options)
+                    if doc.RootElement.GetProperty("schemaVersion").GetInt32() <> 2
+                       || isNull (box value) || isNull (box value.Items)
+                       || value.ActiveChallengeCount < 0
+                       || value.Items.Length > 36 || value.TotalCurrentOutcomes < value.Items.Length
+                       || (value.Items |> List.exists (fun item ->
+                           isNull (box item) || (guidN item.ChallengeId).IsNone
+                           || (guidN item.ConditionId).IsNone
+                           || String.IsNullOrWhiteSpace item.UpdatedAtUtc))
+                       || (value.Items |> List.distinctBy (fun item ->
+                           item.ChallengeId, item.ConditionId) |> List.length) <> value.Items.Length then
+                        Error(LedgerIntegrityError "Invalid operator recent challenge index.")
+                    else Ok value
+                with ex ->
+                    Error(LedgerIntegrityError ("Malformed operator recent challenge index: " + ex.Message))
+
+        // Active count and sharded identities are committed atomically.
+        // A missing shard must not silently hide pending operator action.
+        if recentIndex.ActiveChallengeCount <> activeIds.Count then
+            return! Error(LedgerIntegrityError "Operator active index count does not match its shards.")
+
+        let requested =
+            Set.union activeIds (recentIndex.Items |> List.map _.ChallengeId |> Set.ofList)
+            |> Set.toList
+        let! bodies = LedgerStore.readChallengeEntitiesAt binding snapshot requested
+        let mutable current: Map<string, AgentChallenge> = Map.empty
+        for id in requested do
+            let file = "challenges/" + id + "/challenge.json"
+            match Map.tryFind file bodies with
+            | None -> return! Error(LedgerIntegrityError ("Indexed operator challenge is missing: " + id))
+            | Some body ->
+                try
+                    use doc = JsonDocument.Parse body
+                    let challenge = JsonSerializer.Deserialize<AgentChallenge>(body, options)
+                    if doc.RootElement.GetProperty("schemaVersion").GetInt32() <> 2
+                       || isNull (box challenge) || challenge.ChallengeId <> id
+                       || not (check challenge) then
+                        return! Error(LedgerIntegrityError ("Invalid indexed operator challenge: " + id))
+                    current <- Map.add id challenge current
+                with ex ->
+                    return! Error(LedgerIntegrityError ("Malformed indexed operator challenge: " + ex.Message))
+
+        // A read model cannot grant authority: verify ownership and current
+        // status against canonical state from the same snapshot.
+        for id in requested do
+            if hasOperatorPending current[id] <> Set.contains id activeIds then
+                return! Error(LedgerIntegrityError ("Stale or missing operator active index entry: " + id))
+        for item in recentIndex.Items do
+            if not (operatorOutcomes current[item.ChallengeId] |> List.contains item) then
+                return! Error(LedgerIntegrityError ("Stale or misowned operator outcome: " + item.ChallengeId))
+
+        let visible =
+            ([ for id in activeIds do
+                let challenge = current[id]
+                for condition in challenge.Conditions do
+                    if condition.Status = "Pending"
+                       && ownerOf condition = Some ChallengeOwner.Operator then
+                        yield id, condition.ConditionId ]
+             @ [ for item in recentIndex.Items -> item.ChallengeId, item.ConditionId ])
+            |> List.distinct
+        let responseKeys =
+            [ for (id, conditionId) in visible do
+                let condition = current[id].Conditions |> List.find (fun item ->
+                    item.ConditionId = conditionId)
+                if condition.Status = "Satisfied" && condition.ResponseEventSequence > 0L then
+                    yield id, condition.ResponseEventSequence ]
+        let! eventBodies = LedgerStore.readChallengeEventEntitiesAt binding snapshot responseKeys
         let mutable entries: OperatorChallengeEntry list = []
-        for challenge in challenges do
-            for condition in challenge.Conditions do
-                if ownerOf condition = Some ChallengeOwner.Operator then
-                    let! respondedBy, respondedAt =
-                        if condition.Status <> "Satisfied" || condition.ResponseEventSequence = 0L then
-                            Ok("", "")
-                        else
-                            let challengeGuid = Guid.Parse challenge.ChallengeId
-                            result {
-                                let! content, _ = LedgerStore.readAt binding snapshot
-                                                      (eventPath challengeGuid condition.ResponseEventSequence)
-                                match content with
-                                | None -> return! Error(LedgerIntegrityError "Missing operator response audit event.")
-                                | Some body ->
-                                    try
-                                        use json = JsonDocument.Parse(body)
-                                        if json.RootElement.GetProperty("schemaVersion").GetInt32() <> 2 then
-                                            return! Error(LedgerIntegrityError "Invalid operator response event schema.")
-                                        let event = JsonSerializer.Deserialize<ChallengeEvent>(body, options)
-                                        if isNull (box event)
-                                           || event.ChallengeId <> challenge.ChallengeId
-                                           || event.ConditionId <> condition.ConditionId
-                                           || event.Sequence <> condition.ResponseEventSequence
-                                           || event.Action <> "RespondOperatorCondition"
-                                           || not (event.ActorId.StartsWith("operator:", StringComparison.Ordinal))
-                                           || String.IsNullOrWhiteSpace event.OccurredAtUtc
-                                           || event.OccurredAtUtc <> condition.UpdatedAtUtc
-                                           || event.Evidence <> condition.Evidence then
-                                            return! Error(LedgerIntegrityError "Operator response event does not match canonical condition.")
-                                        return event.ActorId, event.OccurredAtUtc
-                                    with ex ->
-                                        return! Error(LedgerIntegrityError ("Unable to verify operator response provenance: " + ex.Message))
-                            }
-                    entries <-
-                        { ProjectName = projectName
-                          ChallengeId = challenge.ChallengeId
-                          ConditionId = condition.ConditionId
-                          IssuerAgentId = challenge.IssuerAgentId
-                          Title = challenge.Title
-                          TaskId = challenge.TaskId
-                          Question = condition.Description
-                          ChallengeStatus = challenge.Status
-                          ConditionStatus = condition.Status
-                          Version = challenge.Version
-                          Evidence = condition.Evidence
-                          CreatedAtUtc = challenge.CreatedAtUtc
-                          UpdatedAtUtc = condition.UpdatedAtUtc
-                          RespondedBy = respondedBy
-                          RespondedAtUtc = respondedAt
-                          ResponseEventSequence = condition.ResponseEventSequence } :: entries
+        for (id, conditionId) in visible do
+            let challenge = current[id]
+            let condition = challenge.Conditions |> List.find (fun item ->
+                item.ConditionId = conditionId)
+            let! respondedBy, respondedAt =
+                if condition.Status <> "Satisfied" then Ok("", "")
+                elif condition.ResponseEventSequence <= 0L then
+                    Error(LedgerIntegrityError "Satisfied operator condition lacks response provenance.")
+                else
+                    let file = eventPath (Guid.Parse id) condition.ResponseEventSequence
+                    match Map.tryFind file eventBodies with
+                    | None -> Error(LedgerIntegrityError "Missing operator response audit event.")
+                    | Some body ->
+                        try
+                            use doc = JsonDocument.Parse(body)
+                            let event = JsonSerializer.Deserialize<ChallengeEvent>(body, options)
+                            if doc.RootElement.GetProperty("schemaVersion").GetInt32() <> 2
+                               || isNull (box event)
+                               || event.ChallengeId <> challenge.ChallengeId
+                               || event.ConditionId <> condition.ConditionId
+                               || event.Sequence <> condition.ResponseEventSequence
+                               || event.Action <> "RespondOperatorCondition"
+                               || not (event.ActorId.StartsWith("operator:", StringComparison.Ordinal))
+                               || String.IsNullOrWhiteSpace event.OccurredAtUtc
+                               || event.OccurredAtUtc <> condition.UpdatedAtUtc
+                               || event.Evidence <> condition.Evidence then
+                                Error(LedgerIntegrityError "Operator response event does not match canonical condition.")
+                            else Ok(event.ActorId, event.OccurredAtUtc)
+                        with ex ->
+                            Error(LedgerIntegrityError ("Unable to verify operator response provenance: " + ex.Message))
+            entries <-
+                { ProjectName = projectName
+                  ChallengeId = challenge.ChallengeId
+                  ConditionId = condition.ConditionId
+                  IssuerAgentId = challenge.IssuerAgentId
+                  Title = challenge.Title
+                  TaskId = challenge.TaskId
+                  Question = condition.Description
+                  ChallengeStatus = challenge.Status
+                  ConditionStatus = condition.Status
+                  Version = challenge.Version
+                  Evidence = condition.Evidence
+                  CreatedAtUtc = challenge.CreatedAtUtc
+                  UpdatedAtUtc =
+                    if challenge.Status = "Cancelled" then challenge.UpdatedAtUtc
+                    else condition.UpdatedAtUtc
+                  RespondedBy = respondedBy
+                  RespondedAtUtc = respondedAt
+                  ResponseEventSequence = condition.ResponseEventSequence } :: entries
         return List.rev entries
     }
 

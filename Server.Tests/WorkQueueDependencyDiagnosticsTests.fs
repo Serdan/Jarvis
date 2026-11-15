@@ -75,7 +75,7 @@ let disjoint_cycles_and_acyclic_tail_are_not_conflated () =
         |> analyse
     Assert.That(
         result.CycleWarnings,
-        Is.EqualTo(box 
+        Is.EqualTo(box
             [ { Members = [ "A"; "B" ]; WitnessEdges = [ "A", "B"; "B", "A" ] }
               { Members = [ "D" ]; WitnessEdges = [ "D", "D" ] } ])
     )
@@ -113,7 +113,7 @@ let waived_hard_edges_remain_in_diagnostic_graph () =
         { stage "A" [ "B" ] with
             WaivedDependencies = Map.ofList [ "B", "verified-waiver" ] }
     let result = graph [ a; stage "B" [ "A" ] ] |> analyse
-    Assert.That(result.CycleWarnings, Is.EqualTo(box 
+    Assert.That(result.CycleWarnings, Is.EqualTo(box
         [ { Members = [ "A"; "B" ]; WitnessEdges = [ "A", "B"; "B", "A" ] } ]))
 
 [<Test>]
@@ -134,7 +134,7 @@ let missing_prerequisite_stages_fail_closed_with_sorted_exact_witnesses () =
     let error = WorkQueueDependencyDiagnostics.analyze 37 true works |> rejected
     Assert.That(
         error,
-        Is.EqualTo(box 
+        Is.EqualTo(box
             "dependency graph v37 incomplete: missing hard prerequisite stage generation(s): A -> later, A -> unknown, Z -> later, Z -> none"))
     let combined = WorkQueueDependencyDiagnostics.analyze 38 false works |> rejected
     Assert.That(combined, Does.Contain("unverified graph high-water/index"))
@@ -151,7 +151,7 @@ let stage_generations_are_distinct_from_shared_task_identity () =
     let a = { stage "task:gen1" [ "task:gen2" ] with SubjectId = "task" }
     let b = { stage "task:gen2" [ "task:gen1" ] with SubjectId = "task" }
     let result = graph [ b; a ] |> analyse
-    Assert.That(result.CycleWarnings, Is.EqualTo(box 
+    Assert.That(result.CycleWarnings, Is.EqualTo(box
         [ { Members = [ "task:gen1"; "task:gen2" ];
             WitnessEdges = [ "task:gen1", "task:gen2"; "task:gen2", "task:gen1" ] } ]))
 
@@ -168,8 +168,8 @@ let insertion_order_and_repeated_reads_have_identical_ordered_results () =
     let reordered = analyse reverse
     Assert.That(first, Is.EqualTo(box again))
     Assert.That(first, Is.EqualTo(box reordered))
-    Assert.That(first.HardEdges, Is.EqualTo(box 
+    Assert.That(first.HardEdges, Is.EqualTo(box
         [ "A", "B"; "A", "D"; "B", "C"; "C", "A"; "C", "D" ]))
-    Assert.That(first.CycleWarnings, Is.EqualTo(box 
+    Assert.That(first.CycleWarnings, Is.EqualTo(box
         [ { Members = [ "A"; "B"; "C" ];
             WitnessEdges = [ "A", "B"; "B", "C"; "C", "A" ] } ]))

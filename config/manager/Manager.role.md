@@ -72,16 +72,17 @@ At the start of every pass:
    task/attempt/generation as `assignmentKey`. Relaunching the same assignment
    requires verified Ready/Stopped stateEnteredAtUtc newer than the attributed
    activity: a stale Ready label alone cannot prove a yield.
-   For reviewers, canonical claim completion/release across verified ledger
-   heads permits the next unclaimed review only with the ordered
-   claim/activity proof and no newer attributed call. If a reviewer explicitly yields
-   while keeping a claim, verify the positive reviewer-specific yield event
-   before using `reviewerYieldAtUtc` / `ExplicitAttributedReviewerYield`;
-   then resume that same reviewer under `ResumeVerifiedPausedReview`. If no
-   reliable completion/yield evidence exists, fail closed rather than launch
-   a duplicate. Any manual clearing of an uncertain reservation needs an
-   explicit, recorded operator recovery reason, including any observed
-   taskless reviewer session that cannot be conclusively ended automatically.
+   For reviewers, canonical claim completion/release proves the **claim**
+   resolved, not that the previously launched browser turn ended. Even ordered
+   H1/H2 heads cannot prove quiescence when a review decision occurs between
+   Manager's activity read and later canonical-head read. Before another launch,
+   require an independently attributed reviewer-session yield after this launch
+   and no earlier than the latest activity, or positive operator-confirmed
+   tab closure. A reviewer who yielded with a still-claimed review can resume
+   under ResumeVerifiedPausedReview. If no verifiable session-end event exists,
+   fail closed and surface the dependency to Lead. Manual clearing requires an
+   explicit recorded recovery reason and actual confirmation that the observed
+   reviewer browser session ended.
 8. Do not notify named reviewers or use notifications for routine work.
    Eligible reviewers claim from the shared frozen review queue. Use canonical
    task, review, challenge and assignment mechanisms for coordination.

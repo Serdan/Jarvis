@@ -214,6 +214,7 @@ export function validateJournal(journal, projectName) {
     // operator release moves a finished reviewer record to cleared.
     if (rec.status === "review-finished" ||
         (rec.status === "cleared" && rec.completionEvidence !== undefined)) {
+      // Accept historical claim-resolved labels but never trust them as session end.
       assert(rec.kind === "reviewer" &&
         ["CanonicalReviewClaimResolved", "ExplicitReviewerYield"].includes(rec.completionEvidence) &&
         /^[0-9a-f]{40,64}$/.test(rec.completionLedgerHead ?? ""),
@@ -250,42 +251,42 @@ function yieldedAfterActivity(agent, activityAtUtc) {
 }
 
 
-function reviewerSessionEnd(rec, agent, currentClaims, snapshot) {
+// A review decision releases a claim, not a browser session. Even an
+// H1 activity read followed by H2 claim resolution can race with decide_review
+// while the reviewer is still in the old tab. Only a positively attributed
+// explicit yield (or a separately confirmed operator closure) ends the session.
+function reviewerSessionEnd(rec, agent) {
   const yieldAt = agent?.reviewerYieldAtUtc;
   const latestActivity = agent?.lastAttributedActivityAtUtc;
-  // Taskless reviewers do not have an implementation Ready transition.
-  // Only a separately verified, explicit reviewer yield after THIS launch
-  // can resume a still-claimed review. A generic tool call is not a yield.
-  if (yieldAt && Date.parse(yieldAt) > Date.parse(rec.reservedAtUtc) &&
+  if (yieldAt && latestActivity &&
+      Date.parse(yieldAt) > Date.parse(rec.reservedAtUtc) &&
       Date.parse(yieldAt) >= Date.parse(rec.observedAtUtc) &&
-      (latestActivity == null || Date.parse(latestActivity) <= Date.parse(yieldAt))) {
+      Date.parse(latestActivity) <= Date.parse(yieldAt)) {
     return "ExplicitReviewerYield";
-  }
-  // A claim observed in an earlier authoritative head and now absent from
-  // an exhaustive later head was decided/released. Missing old journal
-  // evidence or equal-head contradictory claims cannot prove completion.
-  if (rec.observedClaimIds?.length && currentClaims.length === 0 &&
-      snapshot.ledgerHead !== rec.claimSeenLedgerHead) {
-    return "CanonicalReviewClaimResolved";
   }
   return null;
 }
 
-// An explicit reviewer yield or operator recovery is evidence at a point in
-// time, not a permanent lease release. Activity after that boundary means the
-// previous browser session might have resumed while its claim is still active.
+// A yield or operator recovery is a point-in-time boundary, not a lease.
+// A newer attributed call invalidates it, including after journal restart.
+// Historical CanonicalReviewClaimResolved records remain accepted by journal
+// validation but are NOT session-end evidence without a later explicit yield.
 function reviewerPauseStillProven(rec, agent, snapshot, ended) {
-  const activityAt = agent?.lastAttributedActivityAtUtc == null ? -Infinity :
+  const activityAt = agent?.lastAttributedActivityAtUtc == null ? null :
     Date.parse(agent.lastAttributedActivityAtUtc);
+  if (activityAt === null) return false; // Missing attribution fails closed.
   const capturedAt = Date.parse(snapshot.capturedAtUtc);
-  if (ended === "ExplicitReviewerYield" || rec.reviewerSessionCleared === true) {
-    // Preserve the attributed yield time over journal restarts. A legacy
-    // terminal record without this field needs fresh canonical yield proof;
-    // completedAtUtc is not the same as the actual yield boundary.
-    const yieldTimes = [rec.explicitYieldAtUtc, agent?.reviewerYieldAtUtc]
-      .filter(time => typeof time === "string")
-      .map(time => Date.parse(time))
-      .filter(time => time >= Date.parse(rec.observedAtUtc) && time <= capturedAt);
+  // An activity stream regressed behind this session's observed call is
+  // incomplete; do not mistake an old yield for proof of quiescence.
+  if (activityAt < Date.parse(rec.observedAtUtc)) return false;
+  if (ended === "ExplicitReviewerYield" || rec.status === "review-finished" ||
+      rec.reviewerSessionCleared === true) {
+    const yieldTimes = [
+      rec.completionEvidence === "ExplicitReviewerYield" ? rec.explicitYieldAtUtc : null,
+      agent?.reviewerYieldAtUtc
+    ].filter(time => typeof time === "string").map(time => Date.parse(time))
+      .filter(time => time > Date.parse(rec.reservedAtUtc) &&
+        time >= Date.parse(rec.observedAtUtc) && time <= capturedAt);
     if (yieldTimes.some(time => activityAt <= time)) return true;
   }
   if (rec.reviewerSessionCleared === true) {
@@ -295,49 +296,11 @@ function reviewerPauseStillProven(rec, agent, snapshot, ended) {
   return false;
 }
 
-// Terminal labels prove that a reviewer session ended only at a point in time.
-// Even with zero claims, a later attributed call can mean the old tab resumed.
+// A terminal journal label is insufficient: old versions recorded canonical
+// claim resolution as review-finished even while the tab was still running.
 function reviewerSessionResumedAfterEnd(rec, agent, snapshot) {
   if (rec.status !== "review-finished" && rec.reviewerSessionCleared !== true) return false;
-  // Missing/regressed attribution cannot prove the old browser session ended.
-  if (agent?.lastAttributedActivityAtUtc == null) return true;
-  const activityAt = Date.parse(agent.lastAttributedActivityAtUtc);
-  const observedAt = Date.parse(rec.observedAtUtc);
-  const capturedAt = Date.parse(snapshot.capturedAtUtc);
-  const orderedClaimActivity = rec.claimActivityProvenance === "PostActivityVerifiedReviewHead" ?
-    rec.claimObservedActivityAtUtc : null;
-  // A previously read claim head plus a newer activity sample is not ordered
-  // evidence: the tool call might be AFTER the canonical claim resolution.
-  // Old journals without this proof remain guarded until an actual later
-  // reviewer yield or an operator-confirmed tab closure.
-  if (rec.completionEvidence === "CanonicalReviewClaimResolved" && !orderedClaimActivity) {
-    const laterEnds = [agent.reviewerYieldAtUtc,
-      rec.reviewerSessionCleared === true ? rec.releasedAtUtc : null];
-    return !laterEnds.some(time => typeof time === "string" &&
-      Date.parse(time) >= observedAt && Date.parse(time) >= activityAt &&
-      Date.parse(time) <= capturedAt);
-  }
-  if (activityAt < Date.parse(orderedClaimActivity ?? rec.observedAtUtc)) return true;
-  if (activityAt <= observedAt) return false;
-  const endTimes = [];
-  if (rec.status === "review-finished") {
-    if (rec.completionEvidence === "ExplicitReviewerYield") endTimes.push(rec.explicitYieldAtUtc);
-    else if (rec.completionEvidence === "CanonicalReviewClaimResolved") {
-      // Claim disappearance is known only between ledger snapshots; the
-      // Manager's completedAtUtc is not an authoritative decision timestamp.
-      // Activity newly seen during that interval may be post-resolution.
-      // Only a claim head explicitly re-read after this tool call can bound
-      // the later canonical decision against old session activity.
-      endTimes.push(orderedClaimActivity);
-    }
-  }
-  if (rec.reviewerSessionCleared === true) endTimes.push(rec.releasedAtUtc);
-  endTimes.push(agent.reviewerYieldAtUtc);
-  // A later explicit yield can end resumed activity. Missing or old evidence
-  // never establishes an end merely because the agent reports Stopped.
-  return !endTimes.some(time => typeof time === "string" &&
-    Date.parse(time) >= observedAt && Date.parse(time) <= capturedAt &&
-    Date.parse(time) >= activityAt);
+  return !reviewerPauseStillProven(rec, agent, snapshot, rec.completionEvidence);
 }
 
 export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
@@ -373,7 +336,7 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
 
   // A reviewer may be NeedsWork/Stopped while working on a frozen claim.
   // Keep observed reviewer sessions and their capacity until a positive
-  // review resolution or explicitly attributed cooperative yield.
+  // independently attributed cooperative yield or confirmed tab closure.
   for (const rec of records) {
     const agent = agents.get(rec.agentId);
     if (LIVE_RECORDS.has(rec.status) || rec.status === "observed") {
@@ -396,7 +359,7 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
         updated.claimActivityProvenance = "PostActivityVerifiedReviewHead";
         updated.claimActivityProofLedgerHead = snapshot.ledgerHead;
       }
-      const ended = reviewerSessionEnd(updated, agent, claims, snapshot);
+      const ended = reviewerSessionEnd(updated, agent);
       if (ended) {
         reviewerSessionEnds.set(rec.launchId, ended);
         // Make dry-run and normal planning enforce the same session boundary,
@@ -441,7 +404,7 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
           observedClaimIds: claims,
           claimSeenLedgerHead: claims.length ? snapshot.ledgerHead : undefined
         };
-        const ended = reviewerSessionEnd(updated, agent, claims, snapshot);
+        const ended = reviewerSessionEnd(updated, agent);
         if (ended) reviewerSessionEnds.set(rec.launchId, ended);
         else {
           unresolvedReviewers.add(rec.agentId);

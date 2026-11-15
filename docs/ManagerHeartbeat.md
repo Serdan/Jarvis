@@ -158,8 +158,10 @@ review is claimed. A reviewer with a claimed review occupies reviewer
 capacity even if its task slot is free. An `observed` reviewer journal
 record also occupies capacity, even without a currently seen claim, until
 separate completion evidence is established. The journal retains claims
-seen across passes and process restarts. A terminal review-finished or
-operator-cleared record is proof only at its recorded end boundary. If a
+seen across passes and process restarts. A review-finished record based on an explicit attributed yield, or an
+operator-cleared record based on confirmed tab closure, is evidence only at
+its recorded end boundary; legacy claim-resolved terminal labels do not
+establish session termination. If a
 later verified tool call occurs in that old browser session, count it as
 unresolved and suppress a duplicate launch even if zero reviews are claimed.
 A later explicitly attributed reviewer yield or audited operator recovery
@@ -169,19 +171,23 @@ records with `claimObservedActivityAtUtc` but without the corresponding
 must remain guarded; restarting the Manager does not upgrade their authority.
 
 A later **verified different ledger head** where a previously Claimed review
-is no longer Claimed proves its canonical decision/release. That decision
-permits a subsequent session only when the last attributed reviewer activity
-was positively established **before** a still-claimed canonical head, with no
-newer attributed call afterward. Review resolution alone is *not* proof the
-old browser tab stopped. Missing ordering, an unchanged head, incomplete
-enumeration, or activity newer than the ordered claim observation leaves the
-old session unresolved (even when zero claims remain). An explicit later yield
-or audited operator recovery can independently establish an end. If a session
-claims and resolves entirely between Manager snapshots, do not fabricate the
-missing transition.
+is no longer Claimed proves its canonical decision/release **only**. It never
+proves that the reviewer has ended the browser turn: a review can be decided
+after the Manager samples activity but before its next canonical head read.
+Even perfectly ordered H1 claim/activity provenance cannot bridge that
+session-termination race. Keep the observed launch unresolved, consuming
+reviewer capacity, until a separately and positively attributed explicit
+reviewer-session yield (later than the launch and no earlier than the latest
+activity) or an audited operator confirmation that the tab ended. An unchanged
+head, incomplete enumeration, missing yield, or contradictory activity
+evidence must fail closed, even if zero claims remain. Legacy
+`CanonicalReviewClaimResolved` journal labels are *not* session-end proof.
+If a session claims and resolves entirely between Manager snapshots, do not
+fabricate the missing transition.
 
-A reviewer claim/activity ordering barrier is required before the planner
-uses observed claimed-review state as an activity lower bound. First fetch the
+When recording claim/activity provenance, verify its ordering explicitly.
+This evidence tracks claimed-review state; it never substitutes for yield.
+First fetch the
 positively attributed reviewer tool-call event and record when that activity
 query **completed**. Only **after it returns**, start a *fresh*
 `task_overview` read, verify the exhaustive Claimed review set at its
@@ -289,10 +295,11 @@ replan. A successful browser submission is not proof the agent called Jarvis.
 Retain dispatched/uncertain reservations until positive attributed activity
 or explicit operator recovery. Verified Ready/Stopped stateEnteredAtUtc after
 such activity proves the worker later yielded and can resume the same task.
-For taskless reviewers, observed activity alone never releases reviewer
-capacity: canonical claim resolution or independently verified explicit
-reviewer yield is required. Preserve the journal until a positive end
-condition, including across restarts.
+For taskless reviewers, neither observed activity nor canonical claim
+resolution releases the browser-session capacity. Require independently
+verified explicit reviewer yield or positively confirmed tab closure, and
+preserve unresolved journal evidence across restarts. If no attributable
+session-end signal exists, fail closed and raise that dependency to Lead.
 
 ## Start the one Manager idle heartbeat (only after approval)
 

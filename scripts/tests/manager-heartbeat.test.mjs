@@ -510,7 +510,7 @@ test("taskless reviewer claim remains active across heartbeats and journal resta
   assert.equal(restarted.records[0].status, "observed");
 });
 
-test("resolved canonical claim at a later verified head frees reviewer for other work", () => {
+test("canonical claim resolution is not a reviewer browser-session end", () => {
   const c = reviewerOnlyConfig();
   c.budgets.reviewer = 1;
   const j = journal();
@@ -532,10 +532,25 @@ test("resolved canonical claim at a later verified head frees reviewer for other
   resolved.claimedReviews = [];
   delete resolved.agents[3].claimActivityProof;
   const r = decide(c, resolved, j, resolved.capturedAtUtc);
-  assert.equal(j.records[0].status, "review-finished");
-  assert.equal(j.records[0].completionEvidence, "CanonicalReviewClaimResolved");
-  assert.deepEqual(r.reservations.map(x => x.agentId), ["Reviewer 1"]);
-  assert.equal(decide(c, resolved, j, resolved.capturedAtUtc).reservations.length, 0);
+  assert.equal(j.records[0].status, "observed");
+  assert.equal(j.records[0].completionEvidence, undefined);
+  assert.equal(r.reservations.length, 0);
+  const restarted = structuredClone(j);
+  assert.equal(decide(c, resolved, restarted, resolved.capturedAtUtc).reservations.length, 0);
+
+  // Canonical claim resolution precedes an actual yield. Only the latter
+  // establishes session quiescence and permits an unclaimed-review launch.
+  const yielded = structuredClone(resolved);
+  yielded.capturedAtUtc = "2026-11-15T02:05:00Z";
+  yielded.agents[3].reviewerYieldAtUtc = "2026-11-15T02:04:00Z";
+  yielded.agents[3].reviewerYieldEvidence = "ExplicitAttributedReviewerYield";
+  reviewerObserved(yielded, "2026-11-15T02:04:00Z");
+  assert.deepEqual(decide(c, yielded, restarted, yielded.capturedAtUtc)
+    .reservations.map(x => [x.agentId, x.reason]),
+    [["Reviewer 1", "UnclaimedFrozenReview"]]);
+  assert.equal(restarted.records[0].status, "review-finished");
+  assert.equal(restarted.records[0].completionEvidence, "ExplicitReviewerYield");
+  assert.equal(decide(c, yielded, restarted, yielded.capturedAtUtc).reservations.length, 0);
 });
 
 test("explicit attributed reviewer yield resumes an existing claimed review once", () => {
@@ -733,8 +748,8 @@ test("activity after an already resolved review still blocks taskless duplicate"
   resolved.claimedReviews = [];
   resolved.capturedAtUtc = "2026-11-15T02:03:00Z";
   decide({ ...c, enabled: false }, resolved, j, resolved.capturedAtUtc);
-  assert.equal(j.records[0].status, "review-finished");
-  assert.equal(j.records[0].completionEvidence, "CanonicalReviewClaimResolved");
+  assert.equal(j.records[0].status, "observed");
+  assert.equal(j.records[0].completionEvidence, undefined);
 
   const restarted = JSON.parse(JSON.stringify(j));
   const activeAgain = structuredClone(resolved);
@@ -774,7 +789,7 @@ test("missing or regressed activity attribution after resolution remains uncerta
   delete resolved.agents[3].claimActivityProof;
   resolved.capturedAtUtc = "2026-11-15T02:03:00Z";
   decide({ ...c, enabled: false }, resolved, j, resolved.capturedAtUtc);
-  assert.equal(j.records[0].status, "review-finished");
+  assert.equal(j.records[0].status, "observed");
 
   const missing = structuredClone(resolved);
   missing.capturedAtUtc = "2026-11-15T02:04:00Z";
@@ -787,8 +802,8 @@ test("missing or regressed activity attribution after resolution remains uncerta
   assert.equal(decide(c, regressed, structuredClone(j), regressed.capturedAtUtc)
     .reservations.length, 0);
 
-  assert.deepEqual(decide(c, resolved, structuredClone(j), resolved.capturedAtUtc)
-    .reservations.map(r => r.agentId), ["Reviewer 1"]);
+  assert.equal(decide(c, resolved, structuredClone(j), resolved.capturedAtUtc)
+    .reservations.length, 0);
 });
 
 test("new attributed activity before first review-resolution observation blocks duplicate across restart", () => {
@@ -822,8 +837,8 @@ test("new attributed activity before first review-resolution observation blocks 
     .reservations.length, 0);
   assert.deepEqual(dryJournal, j);
   const blocked = decide(c, resolved, j, resolved.capturedAtUtc);
-  assert.equal(j.records[0].status, "review-finished");
-  assert.equal(j.records[0].completionEvidence, "CanonicalReviewClaimResolved");
+  assert.equal(j.records[0].status, "observed");
+  assert.equal(j.records[0].completionEvidence, undefined);
   assert.equal(blocked.reservations.length, 0);
   assert.equal(blocked.counts.reviewer, 1);
 
@@ -853,7 +868,7 @@ test("new attributed activity before first review-resolution observation blocks 
     .reservations.map(r => r.reason), ["UnclaimedFrozenReview"]);
 });
 
-test("claim-present evidence for later activity preserves safe canonical relaunch", () => {
+test("ordered H1 claim evidence cannot stand in for a post-decision reviewer yield", () => {
   const c = reviewerOnlyConfig();
   c.budgets.reviewer = 1;
   const j = journal();
@@ -885,8 +900,16 @@ test("claim-present evidence for later activity preserves safe canonical relaunc
   delete resolved.agents[3].claimActivityProof;
   resolved.capturedAtUtc = "2026-11-15T02:03:00Z";
   const r = decide(c, resolved, j, resolved.capturedAtUtc);
-  assert.equal(j.records[0].status, "review-finished");
-  assert.deepEqual(r.reservations.map(x => x.agentId), ["Reviewer 1"]);
+  assert.equal(j.records[0].status, "observed");
+  assert.equal(r.reservations.length, 0);
+
+  const yielded = structuredClone(resolved);
+  yielded.capturedAtUtc = "2026-11-15T02:05:00Z";
+  yielded.agents[3].reviewerYieldAtUtc = "2026-11-15T02:04:00Z";
+  yielded.agents[3].reviewerYieldEvidence = "ExplicitAttributedReviewerYield";
+  reviewerObserved(yielded, "2026-11-15T02:04:00Z");
+  assert.deepEqual(decide(c, yielded, j, yielded.capturedAtUtc)
+    .reservations.map(x => x.agentId), ["Reviewer 1"]);
 });
 
 test("operator reviewer recovery is invalidated by later attributed activity", () => {
@@ -1073,7 +1096,7 @@ test("unordered claim head and later activity cannot clear the old reviewer sess
   const live = decide(c, resolved, j, resolved.capturedAtUtc);
   assert.equal(live.reservations.length, 0);
   assert.equal(live.counts.reviewer, 1);
-  assert.equal(j.records[0].status, "review-finished");
+  assert.equal(j.records[0].status, "observed");
   const restarted = JSON.parse(JSON.stringify(j));
   assert.equal(decide(c, resolved, restarted, resolved.capturedAtUtc).reservations.length, 0);
 
@@ -1083,6 +1106,76 @@ test("unordered claim head and later activity cannot clear the old reviewer sess
   yielded.agents[3].reviewerYieldAtUtc = "2026-11-15T02:04:00Z";
   yielded.agents[3].reviewerYieldEvidence = "ExplicitAttributedReviewerYield";
   assert.deepEqual(decide(c, yielded, restarted, yielded.capturedAtUtc)
+    .reservations.map(r => r.reason), ["UnclaimedFrozenReview"]);
+});
+
+test("decision between activity read and H2 head cannot relaunch a still-running reviewer", () => {
+  const c = reviewerOnlyConfig();
+  c.budgets.reviewer = 1;
+  const j = journal();
+  const initial = snapshot();
+  initial.unclaimedReviewCount = 2;
+  assert.deepEqual(decide(c, initial, j, NOW).reservations.map(r => r.agentId),
+    ["Reviewer 1"]);
+
+  const h1 = snapshot();
+  h1.capturedAtUtc = "2026-11-15T02:01:00Z";
+  h1.claimedReviews = [REVIEW];
+  h1.unclaimedReviewCount = 1;
+  reviewerObserved(h1, "2026-11-15T02:00:30Z");
+  claimRecheckedAfterActivity(h1);
+  assert.equal(decide(c, h1, j, h1.capturedAtUtc).reservations.length, 0);
+
+  // Valid interleaving: Manager's last activity read ends at 02:02:05;
+  // reviewer decides A at 02:02:10, but stays in the same browser turn;
+  // Manager starts H2 at 02:02:20 and sees claim A disappear.
+  const order = { activityRead: "2026-11-15T02:02:05Z",
+    decision: "2026-11-15T02:02:10Z", h2Read: "2026-11-15T02:02:20Z" };
+  assert.ok(Date.parse(order.activityRead) < Date.parse(order.decision));
+  assert.ok(Date.parse(order.decision) < Date.parse(order.h2Read));
+  const h2 = structuredClone(h1);
+  h2.capturedAtUtc = "2026-11-15T02:02:30Z";
+  h2.ledgerHead = NEXT_HEAD;
+  h2.claimedReviews = [];
+  delete h2.agents[3].claimActivityProof;
+  const before = structuredClone(j);
+  const dryRun = decide(c, h2, j, h2.capturedAtUtc, true);
+  assert.equal(dryRun.reservations.length, 0);
+  assert.deepEqual(j, before);
+  const live = decide(c, h2, j, h2.capturedAtUtc);
+  assert.equal(live.reservations.length, 0);
+  assert.equal(live.counts.reviewer, 1);
+  assert.equal(j.records[0].status, "observed");
+  assert.equal(j.records[0].completionEvidence, undefined);
+  const restarted = structuredClone(j);
+  assert.equal(decide(c, h2, restarted, h2.capturedAtUtc).reservations.length, 0);
+
+  // A second reviewer still has capacity when the configured bound permits.
+  const other = { ...c, budgets: { ...c.budgets, reviewer: 2 } };
+  assert.deepEqual(decide(other, h2, structuredClone(j), h2.capturedAtUtc)
+    .reservations.map(r => r.agentId), ["Reviewer 2"]);
+
+  // A legacy restart may already have persisted a false terminal label.
+  // Even with the old ordered H1 proof, it must fail closed until a yield.
+  const legacy = structuredClone(j);
+  Object.assign(legacy.records[0], {
+    status: "review-finished",
+    completionEvidence: "CanonicalReviewClaimResolved",
+    completionLedgerHead: NEXT_HEAD,
+    completedAtUtc: h2.capturedAtUtc
+  });
+  assert.equal(decide(c, h2, legacy, h2.capturedAtUtc).reservations.length, 0);
+
+  const yielded = structuredClone(h2);
+  yielded.capturedAtUtc = "2026-11-15T02:04:00Z";
+  yielded.agents[3].reviewerYieldAtUtc = "2026-11-15T02:03:00Z";
+  yielded.agents[3].reviewerYieldEvidence = "ExplicitAttributedReviewerYield";
+  reviewerObserved(yielded, "2026-11-15T02:03:00Z");
+  const safe = decide(c, yielded, j, yielded.capturedAtUtc);
+  assert.deepEqual(safe.reservations.map(r => [r.agentId, r.reason]),
+    [["Reviewer 1", "UnclaimedFrozenReview"]]);
+  assert.equal(j.records[0].completionEvidence, "ExplicitReviewerYield");
+  assert.deepEqual(decide(c, yielded, legacy, yielded.capturedAtUtc)
     .reservations.map(r => r.reason), ["UnclaimedFrozenReview"]);
 });
 
@@ -1154,4 +1247,48 @@ test("claim/activity ordering proof rejects stale and reversed reads", () => {
   afterDecision.claimedReviews = [];
   assert.throws(() => decide(c, afterDecision, journal(), s.capturedAtUtc),
     /requires a claim/);
+});
+
+test("regressed attributed activity cannot reuse a previously yielded reviewer session", () => {
+  const c = reviewerOnlyConfig();
+  c.budgets.reviewer = 1;
+  const j = journal();
+  const initial = snapshot();
+  initial.unclaimedReviewCount = 1;
+  decide(c, initial, j, NOW);
+
+  const active = snapshot();
+  active.capturedAtUtc = "2026-11-15T02:01:00Z";
+  active.unclaimedReviewCount = 1;
+  reviewerObserved(active, "2026-11-15T02:00:30Z");
+  decide(c, active, j, active.capturedAtUtc);
+  assert.equal(j.records[0].status, "observed");
+
+  const yielded = structuredClone(active);
+  yielded.capturedAtUtc = "2026-11-15T02:04:00Z";
+  reviewerObserved(yielded, "2026-11-15T02:03:00Z");
+  yielded.agents[3].reviewerYieldAtUtc = "2026-11-15T02:03:00Z";
+  yielded.agents[3].reviewerYieldEvidence = "ExplicitAttributedReviewerYield";
+  decide({ ...c, enabled: false }, yielded, j, yielded.capturedAtUtc);
+  assert.equal(j.records[0].completionEvidence, "ExplicitReviewerYield");
+
+  // A restarted attribution stream cannot roll back behind the very call
+  // that established this session; the gap may conceal post-yield activity.
+  const restarted = structuredClone(j);
+  const regressed = structuredClone(yielded);
+  regressed.capturedAtUtc = "2026-11-15T02:05:00Z";
+  reviewerObserved(regressed, "2026-11-15T02:00:15Z");
+  const before = structuredClone(restarted);
+  assert.equal(decide(c, regressed, restarted, regressed.capturedAtUtc, true)
+    .reservations.length, 0);
+  assert.deepEqual(restarted, before);
+  const blocked = decide(c, regressed, restarted, regressed.capturedAtUtc);
+  assert.equal(blocked.reservations.length, 0);
+  assert.equal(blocked.counts.reviewer, 1);
+
+  // Normal attribution restored with an actual known yield permits relaunch.
+  const healthy = structuredClone(yielded);
+  healthy.capturedAtUtc = "2026-11-15T02:06:00Z";
+  assert.deepEqual(decide(c, healthy, restarted, healthy.capturedAtUtc)
+    .reservations.map(r => r.agentId), ["Reviewer 1"]);
 });

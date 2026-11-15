@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"browser-launcher-restored-draft-send-race","title":"[P2] Fix browser one-shot launcher restored-draft send-state race","version":2,"lifecycle":"Open","specVersion":2,"attemptId":null}
+{"schemaVersion":2,"taskId":"browser-launcher-restored-draft-send-race","title":"[P1] Fix browser launcher restored-draft Send race and failed-tab cleanup","version":3,"lifecycle":"Open","specVersion":3,"attemptId":null}

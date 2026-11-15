@@ -299,3 +299,167 @@ let rendererUsesTaskTitlesAndExplicitReadOnlyLabel () =
     Assert.That(output, Does.Contain("Review fixes"))
     Assert.That(output, Does.Contain("Role: Lead"))
     Assert.That(output, Does.Not.Contain("Post message now"))
+
+
+// Reviewer4 ChangesRequested seq3686: use the accepted *real* hard-edge
+// mutation, not a fabricated tuple of claimed work plus dependency gate.
+[<Test>]
+let claimedDependencyGateMutationIsHeldAtFreshAndStaleClocks () =
+    let claimed = { stage "A" [] with State = WorkState.Claimed "L" }
+    let prerequisite = stage "B" []
+    let lease = { LastSeenAt = 190L; Generation = 1; StopRequested = false }
+    let registered = launch "L" (LaunchState.Registered("uuid-L", "session-L")) (Some lease)
+    let p =
+        { snapshot [ claimed; prerequisite ] with
+            Launches = Map.ofList [ "L", registered ] }
+    let gated =
+        match Contracts.setHardPrerequisite p.Version "add-hard-edge-reviewer4" "A" "B" 200L p with
+        | Ok next -> next
+        | Error error -> failwithf "Accepted canonical setHardPrerequisite rejected fixture: %A" error
+    Assert.That(gated.Works.["A"].State, Is.EqualTo(WorkState.Claimed "L"))
+    Assert.That(gated.Works.["A"].Gate, Is.EqualTo(GateState.DependencyGatePending gated.GraphVersion))
+    let accountWithReservation = { account with Tokens = Map.ofList [ "L", false ] }
+    for clock in [ Some 200L; Some 260L; None ] do
+        let result = projectDashboard "P" Map.empty (Ok gated) (Ok accountWithReservation) clock 50L
+        let claimedRow = result.ActiveAndStalled |> known |> List.find (fun row -> row.WorkId = "A")
+        match claimedRow.State with
+        | RowState.RecoveryHold reason ->
+            Assert.That(reason, Does.Contain("Claim retained by L"))
+            Assert.That(reason, Does.Contain("DependencyGatePending"))
+        | state -> Assert.Fail(sprintf "Claimed work with non-clear gate appeared healthy: %A" state)
+        Assert.That(blockedIds result, Does.Contain("A"))
+        Assert.That((result.QueueHealth |> known).Blocked, Is.EqualTo(1))
+        Assert.That(nextIds result, Does.Not.Contain("A"))
+        let output = renderPreview result |> String.concat "\n"
+        Assert.That(output, Does.Contain("HELD"))
+        Assert.That(output, Does.Not.Contain("ACTIVE claimed by L"))
+        Assert.That((result.Capacity |> known).Occupied, Is.EqualTo(1))
+
+// The gate itself takes precedence over lease/clock health: STOP, stale
+// heartbeat and a missing clock must not relabel a held claim as ACTIVE.
+[<Test>]
+let everyNonclearClaimedGateIsHeldAndCountedAcrossLeaseStates () =
+    let claimed = { stage "A" [] with State = WorkState.Claimed "L" }
+    let registered =
+        launch "L" (LaunchState.Registered("uuid-L", "session-L"))
+            (Some { LastSeenAt = 100L; Generation = 1; StopRequested = false })
+    let p = { snapshot [ claimed ] with Launches = Map.ofList [ "L", registered ] }
+    let accountWithReservation = { account with Tokens = Map.ofList [ "L", false ] }
+    let cases =
+        [ GateState.DependencyGatePending 2, "DependencyGatePending"
+          GateState.IntegrationGateHold(2, "original-push"), "IntegrationGateHold"
+          GateState.ExternalEffectObservedPendingGate(2, "original-push", "sha"), "External effect"
+          GateState.SourceRecoveryBlocked "journal unknown", "SourceRecoveryBlocked" ]
+    for gate, expectedReason in cases do
+        for now in [ Some 101L; Some 260L; None ] do
+            let projected = { p with Works = Map.ofList [ "A", { claimed with Gate = gate } ] }
+            let result =
+                projectDashboard "P" Map.empty (Ok projected) (Ok accountWithReservation) now 50L
+            match (result.ActiveAndStalled |> known |> List.exactlyOne).State with
+            | RowState.RecoveryHold reason ->
+                Assert.That(reason, Does.Contain("Claim retained by L"))
+                Assert.That(reason, Does.Contain(expectedReason))
+            | state -> Assert.Fail(sprintf "Non-clear gate %A rendered as %A" gate state)
+            Assert.That(blockedIds result, Is.EqualTo(box [ "A" ]))
+            Assert.That((result.QueueHealth |> known).Blocked, Is.EqualTo(1))
+            Assert.That(nextIds result, Is.Empty)
+
+[<Test>]
+let missingClockOrInvalidLivenessThresholdCanNeverShowClaimActive () =
+    let claimed = { stage "A" [] with State = WorkState.Claimed "L" }
+    let registered =
+        launch "L" (LaunchState.Registered("uuid-L", "session-L"))
+            (Some { LastSeenAt = 190L; Generation = 1; StopRequested = false })
+    let p = { snapshot [ claimed ] with Launches = Map.ofList [ "L", registered ] }
+    let accountWithReservation = { account with Tokens = Map.ofList [ "L", false ] }
+    for clock, threshold in [ None, 50L; Some 200L, 0L; Some 200L, -1L ] do
+        let result = projectDashboard "P" Map.empty (Ok p) (Ok accountWithReservation) clock threshold
+        match (result.ActiveAndStalled |> known |> List.exactlyOne).State with
+        | RowState.Uncertain _ -> ()
+        | state -> Assert.Fail(sprintf "Clock/threshold uncertainty showed %A" state)
+        Assert.That((result.Launches |> known |> List.exactlyOne).RecoveryWarning.IsSome, Is.True)
+
+[<Test>]
+let messageIndexMismatchDuplicateCanonicalIdsAndBlankSubjectsAreUnknown () =
+    let canonical = message "canonical-id" (Subject.Role "Lead") MessageState.Pending
+    let badIndexes =
+        [ Map.ofList [ "wrong-map-key", canonical ]
+          Map.ofList [ "first", canonical; "second", canonical ]
+          Map.ofList [ "", { canonical with Id = "" } ]
+          Map.ofList [ "canonical-id", { canonical with Subject = Subject.Task "" } ]
+          Map.ofList [ "canonical-id", { canonical with Subject = Subject.Role "   " } ] ]
+    for messages in badIndexes do
+        let result = view { snapshot [] with Messages = messages; MessageCovered = true }
+        unknown result.Threads
+        let output = renderPreview result |> String.concat "\n"
+        Assert.That(output, Does.Contain("Message index/identity incomplete"))
+        Assert.That(output, Does.Not.Contain("canonical-id [Pending]"))
+    let valid = view { snapshot [] with Messages = Map.ofList [ canonical.Id, canonical ] }
+    Assert.That((valid.Threads |> known).Length, Is.GreaterThan(0))
+
+[<Test>]
+let missingReleasedOrDuplicateAccountTokensCannotLookLikeFreeCapacity () =
+    let registered = launch "L" (LaunchState.Registered("uuid-L", "session-L")) None
+    let project = { snapshot [] with Launches = Map.ofList [ "L", registered ] }
+    let missing = projectDashboard "P" Map.empty (Ok project) (Ok account) (Some 200L) 50L
+    unknown missing.Capacity
+    let output = renderPreview missing |> String.concat "\n"
+    Assert.That(output, Does.Contain("Account-global capacity\n  UNKNOWN"))
+    Assert.That(output, Does.Not.Contain("0/3 occupied; 3 free"))
+    let released = { account with Tokens = Map.ofList [ "L", true ] }
+    unknown (projectDashboard "P" Map.empty (Ok project) (Ok released) None 50L).Capacity
+    let noAdmission =
+        { project with
+            Launches = Map.ofList [ "L", { registered with AccountTokenId = " " } ] }
+    unknown (projectDashboard "P" Map.empty (Ok noAdmission) (Ok account) None 50L).Capacity
+    let another = launch "L2" LaunchState.ReservedUnregistered None
+    let duplicate =
+        { project with
+            Launches =
+                Map.ofList [ "L", registered; "L2", { another with AccountTokenId = registered.AccountTokenId } ] }
+    let tokens = { account with Tokens = Map.ofList [ "L", false; "L2", false ] }
+    unknown (projectDashboard "P" Map.empty (Ok duplicate) (Ok tokens) None 50L).Capacity
+    unknown (projectDashboard "P" Map.empty (Ok { project with QueueCovered = false })
+                (Ok tokens) None 50L).Capacity
+
+[<Test>]
+let consistentAndTerminalReleaseSnapshotsPreserveAccurateCapacityAccounting () =
+    let registered = launch "L" (LaunchState.Registered("uuid-L", "session-L")) None
+    let project = { snapshot [] with Launches = Map.ofList [ "L", registered ] }
+    let accountWithOtherProject =
+        { account with Tokens = Map.ofList [ "L", false; "other-project", false ] }
+    let knownLive =
+        projectDashboard "P" Map.empty (Ok project) (Ok accountWithOtherProject) None 50L
+    Assert.That((knownLive.Capacity |> known).Occupied, Is.EqualTo(2))
+    Assert.That((knownLive.Capacity |> known).Free, Is.EqualTo(1))
+    let terminal = { registered with State = LaunchState.TerminalPendingRelease "terminal-proof" }
+    let fullyReleased =
+        { project with Launches = Map.ofList [ "L", terminal ] }
+    let accountReleased = { account with Tokens = Map.ofList [ "L", true ] }
+    let completed =
+        projectDashboard "P" Map.empty (Ok fullyReleased) (Ok accountReleased) None 50L
+    Assert.That((completed.Capacity |> known).Occupied, Is.EqualTo(0))
+    Assert.That((completed.Capacity |> known).Free, Is.EqualTo(3))
+    unknown (projectDashboard "P" Map.empty (Error "project ledger unknown") (Ok account)
+                None 50L).Capacity
+
+
+[<Test>]
+let terminalRendererEscapesUntrustedMessageControlCharacters () =
+    let original = message "message" (Subject.Role "Lead") (MessageState.Handled "\u001b[31mreply")
+    let item = { original with Body = "body\u001b[32mNEXT\n  forged green row" }
+    let project = { snapshot [] with Messages = Map.ofList [ item.Id, item ] }
+    let result = view project
+    let rendered = renderPreview result |> String.concat "\n"
+    Assert.That(rendered, Does.Contain("forged green row"))
+    let remainingEscapeOffsets =
+        rendered
+        |> Seq.indexed
+        |> Seq.choose (fun (offset, ch) -> if int ch = 27 then Some offset else None)
+        |> Seq.toList
+    Assert.That(remainingEscapeOffsets, Is.Empty, "No terminal ESC codepoint may survive preview encoding")
+    Assert.That(rendered, Does.Not.Contain("NEXT\n  forged"))
+    Assert.That((result.Threads |> known).Length, Is.GreaterThan(0))
+    // Source DTO retains the canonical body; only terminal preview is escaped.
+    Assert.That((result.Threads |> known |> List.find (fun r -> r.Subject = Subject.Role "Lead"))
+                    .MessagesByCanonicalId.Head.Body, Is.EqualTo(item.Body))

@@ -214,6 +214,8 @@ let private launchPhase now staleAfter (launch: Launch) =
                 Some "Heartbeat stale; recovery unproven"
             | Some lease, Some current when current < lease.LastSeenAt ->
                 Some "Clock precedes last heartbeat; liveness unknown"
+            | Some _, None -> Some "Clock unavailable; liveness unknown"
+            | Some _, Some _ when staleAfter <= 0L -> Some "Heartbeat threshold unavailable; liveness unknown"
             | _ -> None
         "Registered", (if nonBlank uuid then Some uuid else None),
         (if not (nonBlank uuid) then Some "Registered UUID missing" else warning)
@@ -262,35 +264,80 @@ let private claimedState now staleAfter (project: Project) launchId =
                 RowState.StaleHeartbeat launchId
             | Some lease, Some current when current < lease.LastSeenAt ->
                 RowState.Uncertain "Clock predates verified heartbeat"
+            | Some _, None -> RowState.Uncertain "Clock unavailable; claimed liveness unverified"
+            | Some _, Some _ when staleAfter <= 0L ->
+                RowState.Uncertain "Heartbeat threshold unavailable; claimed liveness unverified"
             | _ -> RowState.Active launchId
         | _ -> RowState.Uncertain "Claimed launch not verified registered"
 
-let private blockedState (stage: WorkStage) =
+let private gateHoldReason (stage: WorkStage) =
     match stage.Gate with
-    | GateState.IntegrationGateHold _ -> RowState.RecoveryHold "IntegrationGateHold; original push must be reconciled"
+    | GateState.Clear -> None
+    | GateState.DependencyGatePending graphVersion ->
+        Some(sprintf "DependencyGatePending graph v%d; hard prerequisite unresolved" graphVersion)
+    | GateState.IntegrationGateHold _ ->
+        Some "IntegrationGateHold; original push must be reconciled"
     | GateState.ExternalEffectObservedPendingGate _ ->
-        RowState.RecoveryHold "External effect observed; dependency gate pending"
+        Some "External effect observed; dependency gate pending"
     | GateState.SourceRecoveryBlocked reason ->
-        RowState.RecoveryHold ("SourceRecoveryBlocked: " + reason)
-    | GateState.DependencyGatePending _ -> RowState.Blocked
-    | GateState.Clear ->
+        Some("SourceRecoveryBlocked: " + reason)
+
+let private claimedRowState now staleAfter (project: Project) (stage: WorkStage) launchId =
+    match gateHoldReason stage with
+    | Some reason -> RowState.RecoveryHold(sprintf "Claim retained by %s; %s" launchId reason)
+    | None -> claimedState now staleAfter project launchId
+
+let private blockedState (stage: WorkStage) =
+    match gateHoldReason stage with
+    | Some reason -> RowState.RecoveryHold reason
+    | None ->
         match stage.State with
         | WorkState.GateException -> RowState.RecoveryHold "GateException; no implied authorization"
         | _ -> RowState.Blocked
 
-let private capacityView (account: Result<Account, string>) =
+// A caller may provide two independently readable but contradictory ledger
+// snapshots. Every visible project launch must reconcile with an account-global
+// reservation; even a Known value is only a read-only preview, not a CAS grant.
+let private capacityView (project: Project) invalidIdentity (account: Result<Account, string>) =
     match account with
     | Error reason -> Evidence.Unknown ("Account capacity unverified: " + reason)
     | Ok state when state.MaxConcurrentAgents < 0 ->
         Evidence.Unknown "Negative account-global capacity limit"
+    | Ok _ when invalidIdentity || not project.QueueCovered ->
+        Evidence.Unknown "Project launch index unverified; account/project capacity join unknown"
     | Ok state ->
-        let occupied = state.Tokens |> Map.filter (fun _ released -> not released) |> Map.count
-        Evidence.Known
-            { Limit = state.MaxConcurrentAgents
-              Occupied = occupied
-              Free = max 0 (state.MaxConcurrentAgents - occupied)
-              Overcommitted = occupied > state.MaxConcurrentAgents
-              Migration = state.Migration }
+        let launches = project.Launches |> Map.toList |> List.map snd
+        let duplicateAdmissionTokens =
+            launches
+            |> List.map (fun launch -> launch.AccountTokenId)
+            |> List.countBy id
+            |> List.exists (fun (_, count) -> count > 1)
+        let contradictoryLaunch =
+            launches
+            |> List.tryPick (fun launch ->
+                if not (nonBlank launch.AccountTokenId) then
+                    Some(sprintf "Launch %s has no canonical account admission identity" launch.Id)
+                else
+                    // The accepted WQ01/02 Account.Tokens map is keyed by
+                    // Launch.Id; AccountTokenId is separate admission evidence.
+                    match Map.tryFind launch.Id state.Tokens with
+                    | None -> Some(sprintf "Launch %s is missing its account-global reservation" launch.Id)
+                    | Some true ->
+                        match launch.State with
+                        | LaunchState.TerminalPendingRelease _ -> None
+                        | _ -> Some(sprintf "Launch %s remains live but its account token is released" launch.Id)
+                    | Some false -> None)
+        match duplicateAdmissionTokens, contradictoryLaunch with
+        | true, _ -> Evidence.Unknown "Multiple project launches claim the same account admission identity"
+        | _, Some reason -> Evidence.Unknown("Account/project ledger snapshots inconsistent: " + reason)
+        | false, None ->
+            let occupied = state.Tokens |> Map.filter (fun _ released -> not released) |> Map.count
+            Evidence.Known
+                { Limit = state.MaxConcurrentAgents
+                  Occupied = occupied
+                  Free = max 0 (state.MaxConcurrentAgents - occupied)
+                  Overcommitted = occupied > state.MaxConcurrentAgents
+                  Migration = state.Migration }
 
 let private unknownDashboard reason capacity =
     { Next = Evidence.Unknown reason
@@ -306,9 +353,10 @@ let private unknownDashboard reason capacity =
 /// never an authority grant. All queue runnable views require WQ01/02 coverage.
 let projectDashboard projectId titles (projectResult: Result<Project, string>)
     (account: Result<Account, string>) now staleAfter : Dashboard =
-    let capacity = capacityView account
     match projectResult with
-    | Error reason -> unknownDashboard ("Project snapshot unverified: " + reason) capacity
+    | Error reason ->
+        unknownDashboard ("Project snapshot unverified: " + reason)
+            (Evidence.Unknown("Project snapshot unverified; account/project capacity join unknown: " + reason))
     | Ok project ->
         let invalidIdentity =
             project.Works
@@ -318,8 +366,16 @@ let projectDashboard projectId titles (projectResult: Result<Project, string>)
             || (project.Launches |> Map.exists (fun key launch ->
                 not (nonBlank key) || key <> launch.Id || launch.ProjectId <> projectId))
             || not (nonBlank projectId)
+        let invalidMessages =
+            project.Messages
+            |> Map.exists (fun key message ->
+                not (nonBlank key) || not (nonBlank message.Id) || key <> message.Id
+                || (match message.Subject with
+                    | Subject.Task id | Subject.Role id -> not (nonBlank id)))
+        let capacity = capacityView project invalidIdentity account
         let threads =
-            if project.MessageCovered && not invalidIdentity then Evidence.Known(threadRows titles project)
+            if project.MessageCovered && not invalidIdentity && not invalidMessages then
+                Evidence.Known(threadRows titles project)
             else Evidence.Unknown "Message index/identity incomplete; not an empty conversation"
         let launches =
             if project.QueueCovered && not invalidIdentity then
@@ -374,16 +430,7 @@ let projectDashboard projectId titles (projectResult: Result<Project, string>)
                 |> List.choose (fun stage ->
                     match stage.State with
                     | WorkState.Claimed launch ->
-                        let state =
-                            match stage.Gate with
-                            | GateState.SourceRecoveryBlocked reason ->
-                                RowState.RecoveryHold ("SourceRecoveryBlocked: " + reason)
-                            | GateState.IntegrationGateHold _ ->
-                                RowState.RecoveryHold "IntegrationGateHold; original push uncertain"
-                            | GateState.ExternalEffectObservedPendingGate _ ->
-                                RowState.RecoveryHold "External push observed; gate unresolved"
-                            | _ -> claimedState now staleAfter project launch
-                        Some(row titles project stage state)
+                        Some(row titles project stage (claimedRowState now staleAfter project stage launch))
                     | _ -> None)
                 |> List.sortBy (fun row -> fifoKey project project.Works.[row.WorkId])
             let blocked =
@@ -391,11 +438,18 @@ let projectDashboard projectId titles (projectResult: Result<Project, string>)
                 |> List.filter (fun stage ->
                     Contracts.isUnfinished stage
                     && not (nextIds.Contains stage.Id)
-                    && (match stage.State with
-                        | WorkState.Available | WorkState.Blocked | WorkState.GateException -> true
+                    && (match stage.State, stage.Gate with
+                        | WorkState.Claimed _, GateState.Clear -> false
+                        | WorkState.Claimed _, _ -> true
+                        | (WorkState.Available | WorkState.Blocked | WorkState.GateException), _ -> true
                         | _ -> false))
                 |> List.sortBy (fifoKey project)
-                |> List.map (fun stage -> row titles project stage (blockedState stage))
+                |> List.map (fun stage ->
+                    let state =
+                        match stage.State with
+                        | WorkState.Claimed launch -> claimedRowState now staleAfter project stage launch
+                        | _ -> blockedState stage
+                    row titles project stage state)
             { Next = Evidence.Known(next |> List.map (fun stage -> row titles project stage RowState.Next))
               ActiveAndStalled = Evidence.Known active
               Blocked = Evidence.Known blocked
@@ -435,6 +489,19 @@ let private statusText = function
     | RowState.RecoveryHold reason -> "HELD: " + reason
     | RowState.Uncertain reason -> "UNKNOWN: " + reason
 
+// Terminal-ready does not mean that canonical bodies or titles are safe for
+// terminal control sequences. Keep the canonical records intact and sanitize
+// only the disposable preview rendering, including Unicode format controls.
+let private terminalSafe (value: string) =
+    if isNull value then "(null)"
+    else
+        value
+        |> Seq.map (fun ch ->
+            if Char.IsControl ch || Char.GetUnicodeCategory ch = Globalization.UnicodeCategory.Format
+            then ' ' else ch)
+        |> Array.ofSeq
+        |> String
+
 let private section heading render evidence =
     match evidence with
     | Evidence.Unknown reason -> [ heading; "  UNKNOWN - " + reason ]
@@ -465,7 +532,9 @@ let renderPreview (view: Dashboard) =
                 (if List.isEmpty thread.MessagesByCanonicalId then
                     [ "    (no messages in verified snapshot)" ]
                  else thread.MessagesByCanonicalId |> List.map (fun message ->
-                    sprintf "    %s [%s] %s" message.MessageId message.State message.Body)))) view.Threads
+                    sprintf "    %s [%s] %s"
+                        (terminalSafe message.MessageId) (terminalSafe message.State)
+                        (terminalSafe message.Body))))) view.Threads
     let launches =
         section "Launch and recovery state" (List.map (fun launch ->
             let uuid = launch.AgentUuid |> Option.map (fun id -> " | UUID: " + id) |> Option.defaultValue ""

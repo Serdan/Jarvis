@@ -85,6 +85,7 @@ jobs:
           }
           if (Test-Path -LiteralPath $forged) { throw "Direct VSTest wrote inside the forbidden profile root" }
           Write-Output "Forged profile root rejected before writes: exit=$code; root-exists=false"
+          exit 0 # Nonzero VSTest exit was asserted; clear LASTEXITCODE for this step.
 
       - name: Full bounded Client.Tests .NET 11 Release
         shell: pwsh

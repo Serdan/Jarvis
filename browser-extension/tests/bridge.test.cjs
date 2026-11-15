@@ -23,6 +23,7 @@ function createHarness(initialStorage = {}, initialSession = {}) {
   let hostPermissionGranted = true;
   let failNextPermissionQuery = false;
   let permissionHook = null;
+  let windowQueryHook = null;
   let failNextTabQuery = false;
   let nextTabQueryHook = null;
   let failNextRegistryWrite = false;
@@ -102,7 +103,11 @@ function createHarness(initialStorage = {}, initialSession = {}) {
       onRemoved: { addListener: cb => { listeners.removed = cb; } }
     },
     windows: {
-      get: async id => { if (![1, 2].includes(id)) throw Error("Missing window"); return { id, incognito: false }; },
+      get: async id => {
+        if (windowQueryHook) await windowQueryHook();
+        if (![1, 2].includes(id)) throw Error("Missing window");
+        return { id, incognito: false };
+      },
       onRemoved: { addListener: cb => { listeners.windowRemoved = cb; } }
     },
     webNavigation: { onHistoryStateUpdated: { addListener: cb => { listeners.history = cb; } } },
@@ -149,6 +154,7 @@ function createHarness(initialStorage = {}, initialSession = {}) {
     userScripts: chrome.userScripts,
     setHostPermissionGranted: granted => { hostPermissionGranted = granted; },
     beforeNextPermissionCheck: fn => { permissionHook = fn; },
+    onWindowQuery: fn => { windowQueryHook = fn; },
     failPermissionQueryOnce: () => { failNextPermissionQuery = true; },
     failTabQueryOnce: () => { failNextTabQuery = true; },
     beforeNextTabQuery: fn => { nextTabQueryHook = fn; },
@@ -912,6 +918,85 @@ test("window generation change during async permission check cannot create tab",
     url: "https://example.test/chat", alias: "test", ...original });
   assert.equal(ws.sent.find(m => m.requestId === "permission-race").error, "WindowRegistrationChanged");
   assert.equal(h.createdTabs.length, 0, "Generation must be rechecked after permission await");
+});
+
+test("revoking agent-created tabs during final window lookup cannot create tab", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("registerWindow", { windowId: 1, alias: "agents" });
+  await h.message("setAgentCreatedTabs", { allowed: true });
+  await h.message("pair", { port: 43822, secret: "b".repeat(64) });
+  await tick(); await tick();
+  const ws = h.sockets[0];
+  await h.deliver(ws, { kind: "challenge", nonce: "d".repeat(64) });
+  await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  const pin = await windowPin(h);
+  let windowQueries = 0;
+  h.onWindowQuery(async () => {
+    if (++windowQueries !== 2) return;
+    h.onWindowQuery(null);
+    const revoked = await h.message("setAgentCreatedTabs", { allowed: false });
+    assert.equal(revoked.ok, true);
+  });
+  await h.deliver(ws, { kind: "openTab", requestId: "revoked-during-lookup",
+    connectionId: "epoch-1", url: "https://example.test/chat", alias: "must-not-open", ...pin });
+  assert.equal(windowQueries, 2, "Revocation must happen in the final window lookup");
+  assert.equal((await h.message("getState")).allowAgentCreatedTabs, false);
+  assert.equal(ws.sent.find(m => m.requestId === "revoked-during-lookup")?.error,
+    "AgentCreatedTabsDisabled");
+  assert.equal(h.createdTabs.length, 0, "A revoked opt-in forbids tab creation");
+});
+
+test("re-enabling opt-in during final window lookup does not authorize stale open", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("registerWindow", { windowId: 1, alias: "agents" });
+  await h.message("setAgentCreatedTabs", { allowed: true });
+  await h.message("pair", { port: 43822, secret: "b".repeat(64) });
+  await tick(); await tick();
+  const ws = h.sockets[0];
+  await h.deliver(ws, { kind: "challenge", nonce: "d".repeat(64) });
+  await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  const pin = await windowPin(h);
+  let windowQueries = 0;
+  h.onWindowQuery(async () => {
+    if (++windowQueries !== 2) return;
+    h.onWindowQuery(null);
+    assert.equal((await h.message("setAgentCreatedTabs", { allowed: false })).ok, true);
+    assert.equal((await h.message("setAgentCreatedTabs", { allowed: true })).ok, true);
+  });
+  await h.deliver(ws, { kind: "openTab", requestId: "stale-opt-in",
+    connectionId: "epoch-1", url: "https://example.test/chat", alias: "must-not-open", ...pin });
+  assert.equal(windowQueries, 2);
+  assert.equal((await h.message("getState")).allowAgentCreatedTabs, true);
+  assert.equal(ws.sent.find(m => m.requestId === "stale-opt-in")?.error,
+    "AgentCreatedTabsAuthorizationChanged");
+  assert.equal(h.createdTabs.length, 0, "Fresh opt-in must not revive the old request");
+});
+
+test("unpairing during final window lookup prevents any created tab", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("registerWindow", { windowId: 1, alias: "agents" });
+  await h.message("setAgentCreatedTabs", { allowed: true });
+  await h.message("pair", { port: 43822, secret: "b".repeat(64) });
+  await tick(); await tick();
+  const ws = h.sockets[0];
+  await h.deliver(ws, { kind: "challenge", nonce: "d".repeat(64) });
+  await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  const pin = await windowPin(h);
+  let windowQueries = 0;
+  h.onWindowQuery(async () => {
+    if (++windowQueries !== 2) return;
+    h.onWindowQuery(null);
+    assert.equal((await h.message("unpair")).ok, true);
+  });
+  await h.deliver(ws, { kind: "openTab", requestId: "unpaired-during-lookup",
+    connectionId: "epoch-1", url: "https://example.test/chat", alias: "must-not-open", ...pin });
+  assert.equal(windowQueries, 2);
+  assert.equal((await h.message("getState")).paired, false);
+  assert.equal(h.createdTabs.length, 0, "Disconnected requests cannot create tabs");
+  assert.equal(ws.sent.some(m => m.requestId === "unpaired-during-lookup" && m.kind === "tabOpened"), false);
 });
 
 test("manually re-registered created tab rejects pinned execution and retains user tab", async () => {

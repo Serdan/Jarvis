@@ -25,6 +25,7 @@ let sessionEpoch = null;
 let configuredPort = 43822;
 let secret = "";
 let allowAgentCreatedTabs = false;
+let agentTabAuthorizationEpoch = 0;
 let openQueue = Promise.resolve();
 let registryWriteQueue = Promise.resolve();
 let initPromise = null;
@@ -588,6 +589,7 @@ async function openNewTab(message) {
   const { requestId } = message;
   const requestSocket = socket;
   const requestConnection = connectionId;
+  const requestAuthorizationEpoch = agentTabAuthorizationEpoch;
   const respond = payload => {
     if (socket === requestSocket && connected && connectionId === requestConnection) {
       send({ requestId, connectionId: requestConnection, ...payload });
@@ -630,6 +632,12 @@ async function openNewTab(message) {
     // revoked the selected window in the interim. This is the last async check
     // before tabs.create, and it must reject any identity/generation change.
     const currentWindow = await validWindow(message.windowRegistration);
+    // The final window check awaits Chrome. Do not create a tab if the operator
+    // revoked (even briefly) the opt-in or this request lost its connection.
+    if (socket !== requestSocket || !connected || connectionId !== requestConnection) return;
+    if (!allowAgentCreatedTabs) return reject("AgentCreatedTabsDisabled");
+    if (agentTabAuthorizationEpoch !== requestAuthorizationEpoch)
+      return reject("AgentCreatedTabsAuthorizationChanged");
     if (!currentWindow || currentWindow !== window ||
         currentWindow.registrationId !== message.windowRegistration ||
         currentWindow.generation !== expectedGeneration ||
@@ -811,6 +819,8 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
     }
     if (message.kind === "setAgentCreatedTabs") {
       if (typeof message.allowed !== "boolean") throw new Error("Invalid setting");
+      // A disable/re-enable cycle must not revive an in-flight OpenTab.
+      agentTabAuthorizationEpoch++;
       allowAgentCreatedTabs = message.allowed;
       await chrome.storage.local.set({ [OPEN_TABS_KEY]: allowAgentCreatedTabs });
       if (!allowAgentCreatedTabs) {

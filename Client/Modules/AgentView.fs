@@ -36,6 +36,8 @@ type AgentRow =
 
 type ProjectCounts =
     { Tracked: int
+      UnclaimedReviews: int
+      /// Total outstanding reviews (unclaimed plus claimed).
       PendingReviews: int
       Unread: int
       Working: int
@@ -79,9 +81,10 @@ let rows (snapshot: Snapshot) =
     |> List.sortBy (fun item ->
         item.Project.ToLowerInvariant(), agentSortKey item.Agent, item.Key)
 
-let projectCounts (agents: AgentRow list) pendingReviews =
+let projectCountsWithReviews (agents: AgentRow list) unclaimedReviews pendingReviews =
     let count state = agents |> List.sumBy (fun row -> if row.State = state then 1 else 0)
     { Tracked = agents.Length
+      UnclaimedReviews = unclaimedReviews
       PendingReviews = pendingReviews
       Unread = agents |> List.sumBy _.PendingNotifications
       Working = count "Working"
@@ -89,8 +92,12 @@ let projectCounts (agents: AgentRow list) pendingReviews =
       Waiting = count "NeedsWork"
       Parked = count "Parked" }
 
+/// Aggregate-only callers lack claim-state information.
+let projectCounts (agents: AgentRow list) pendingReviews =
+    projectCountsWithReviews agents 0 pendingReviews
+
 let private zeroCounts =
-    { Tracked = 0; PendingReviews = 0; Unread = 0
+    { Tracked = 0; UnclaimedReviews = 0; PendingReviews = 0; Unread = 0
       Working = 0; Ready = 0; Waiting = 0; Parked = 0 }
 
 let totalCounts (snapshot: Snapshot) =
@@ -98,6 +105,7 @@ let totalCounts (snapshot: Snapshot) =
     |> List.choose _.Counts
     |> List.fold (fun sum item ->
         { Tracked = sum.Tracked + item.Tracked
+          UnclaimedReviews = sum.UnclaimedReviews + item.UnclaimedReviews
           PendingReviews = sum.PendingReviews + item.PendingReviews
           Unread = sum.Unread + item.Unread
           Working = sum.Working + item.Working
@@ -202,8 +210,8 @@ let projectStatusLine width displayName (project: ProjectSummary) =
         | None when project.Status = TemporarilyUnavailable -> "TEMPORARILY UNAVAILABLE (counts unknown)"
         | None -> "UNAVAILABLE (counts unknown)"
         | Some c ->
-            sprintf "Tracked %d | Review %d | Unread %d | Working %d | Ready %d | Waiting %d | Parked %d"
-                c.Tracked c.PendingReviews c.Unread c.Working c.Ready c.Waiting c.Parked
+            sprintf "Tracked %d | Reviews %d/%d | Unread %d | Working %d | Ready %d | Waiting %d | Parked %d"
+                c.Tracked c.UnclaimedReviews c.PendingReviews c.Unread c.Working c.Ready c.Waiting c.Parked
     let full = label + " | " + status + detail
     if full.Length <= width then full
     else
@@ -213,8 +221,8 @@ let projectStatusLine width displayName (project: ProjectSummary) =
             | None -> "UNAVAILABLE (counts unknown)"
             | Some c ->
                 (if project.Status = Stale then "STALE " else "")
-                + sprintf "T%d Rev%d U%d W%d Rd%d Wait%d P%d"
-                    c.Tracked c.PendingReviews c.Unread c.Working c.Ready c.Waiting c.Parked
+                + sprintf "T%d Rev%d/%d U%d W%d Rd%d Wait%d P%d"
+                    c.Tracked c.UnclaimedReviews c.PendingReviews c.Unread c.Working c.Ready c.Waiting c.Parked
         let budget = max 0 (width - compact.Length - 3)
         if budget > 0 then fitProjectLabel budget displayName + " | " + compact |> clip width
         else clip width compact
@@ -236,7 +244,7 @@ let projectStatusLines width displayName (project: ProjectSummary) =
             | None -> ["UNAVAILABLE"; "counts unknown"]
             | Some c ->
                 [ if project.Status = Stale then "STALE"
-                  sprintf "T%d" c.Tracked; sprintf "Rev%d" c.PendingReviews
+                  sprintf "T%d" c.Tracked; sprintf "Rev%d/%d" c.UnclaimedReviews c.PendingReviews
                   sprintf "U%d" c.Unread; sprintf "W%d" c.Working
                   sprintf "Rd%d" c.Ready; sprintf "Wait%d" c.Waiting
                   sprintf "P%d" c.Parked ]

@@ -437,11 +437,13 @@ module WorkQueueGitLedger =
     // All state and the complete original semantic command become a single
     // versioned project Git tree alongside LedgerStore's immutable operation receipt.
     // A competing clone must replay its planner against the winning remote head.
+    // Clock time is transition context, not semantic request identity:
+    // delayed retries of the same UUID must recover the original receipt.
+    // The winning transition retains its witness in persisted project state.
     let private change (binding: LedgerBinding) (actor: string) (operationId: Guid) (expectedVersion: int) (now: int64) (mutation: WorkMutation) =
         let request = JsonObject()
         request.Add("schemaVersion", JsonValue.Create(1))
         request.Add("expectedProjectVersion", JsonValue.Create(expectedVersion))
-        request.Add("serverWitnessMillis", JsonValue.Create(now))
         request.Add("mutation", JsonNode.Parse(CanonicalCodec.encode mutation))
         let intent =
             { OperationId = operationId; Actor = actor; Kind = "WQ02.Mutate"
@@ -553,8 +555,9 @@ module WorkQueueGitLedger =
                             [ { Path = RecordPath; ExpectedBlobOid = oid
                                 Content = raw } ]))))
 
-    // The timestamp is captured within this trusted client call and committed
-    // into the immutable payload; server clock witness must be added before live cutover.
+    // The timestamp is captured for the winning transition's persisted state,
+    // but is excluded from the original command's stable semantic identity.
+    // Server clock authority must be added before live cutover.
     let execute binding actor operationId expectedVersion mutation =
         let now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
         validateMutationPayload mutation

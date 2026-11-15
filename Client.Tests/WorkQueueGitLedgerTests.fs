@@ -133,6 +133,46 @@ type WorkQueueGitLedgerTests() =
             Assert.That(verified.Works.ContainsKey "review-B", Is.False))
 
     [<Test>]
+    member _.PublicExecuteDelayedOriginalUuidReplayRetainsWitnessAndReceiptAcrossClones() =
+        withClones (fun a b ->
+            WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid())
+                (Map.ofList [ "Lead", set [ "planning" ] ])
+            |> success |> ignore
+            let published = plan (a.ProjectId.ToString("D")) "P" []
+            let mutation = PublishStage published
+            let operationId = Guid.NewGuid()
+            let first = WorkQueueGitLedger.execute a "Worker" operationId 0 mutation |> success
+            Assert.That(first.AlreadyApplied, Is.False)
+            let firstHead = (LedgerStore.fetch a |> success).Commit
+            let _, initial = WorkQueueGitLedger.load a |> success
+            Assert.That(initial.Works.["P"].AvailableAt, Is.GreaterThan(0L))
+            Assert.That(initial.Works.["P"].AvailableSequence, Is.EqualTo(1L))
+            // Clone B treats the first response as lost and retries the public API later.
+            Thread.Sleep(1300)
+            let replay = WorkQueueGitLedger.execute b "Worker" operationId 0 mutation |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That(replay.Operation, Is.EqualTo(first.Operation))
+            Assert.That(replay.Operation.RequestHash, Is.EqualTo(first.Operation.RequestHash))
+            Assert.That(replay.Operation.OriginalResultJson, Is.EqualTo(first.Operation.OriginalResultJson))
+            let altered = PublishStage { published with SubjectId = "different-task" }
+            for actor, version, attempt in
+                [ "Worker", 0, altered
+                  "Other Worker", 0, mutation
+                  "Worker", 1, mutation ] do
+                match WorkQueueGitLedger.execute b actor operationId version attempt with
+                | Error OperationIdReused -> ()
+                | other -> Assert.Fail(sprintf "Changed semantic replay must reject: %A" other)
+            let finalHead = (LedgerStore.fetch b |> success).Commit
+            Assert.That(finalHead, Is.EqualTo(firstHead))
+            let _, after = WorkQueueGitLedger.load b |> success
+            Assert.That(after, Is.EqualTo(initial))
+            Assert.That(after.Version, Is.EqualTo(1))
+            Assert.That(after.Receipts.Count, Is.EqualTo(1))
+            Assert.That(after.NextAvailability, Is.EqualTo(1L))
+            Assert.That(after.Works.["P"].AvailableAt, Is.EqualTo(initial.Works.["P"].AvailableAt))
+            Assert.That(after.Works.["P"].AvailableSequence, Is.EqualTo(1L)))
+
+    [<Test>]
     member _.OperationIdReusedWithChangedNestedPrerequisiteIsRejected() =
         withClones (fun a b ->
             WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid()) Map.empty |> success |> ignore

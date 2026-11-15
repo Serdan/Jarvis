@@ -947,6 +947,65 @@ module Contracts =
                     | _ -> Error(Rejection.InvalidState "ancillary work lost its handler claim")
             | _ -> Error(Rejection.InvalidState "no live ancillary message handler")) project
 
+    // A new hard prerequisite may gate an ancillary Role handler while its
+    // launch still owns an unrelated primary task. Requeue that handler under
+    // the same project CAS without terminalizing the primary or its token.
+    // The stage claim generation is the handler generation for a Role message.
+    let resolveAncillaryDependencyGate expected op launchId messageId workId
+                                       expectedLaunchVersion expectedClaimGeneration expectedGateVersion now project =
+        projectCas expected op
+            (fullInput "resolve-ancillary-dependency"
+                (launchId, messageId, workId, expectedLaunchVersion, expectedClaimGeneration, expectedGateVersion, now))
+            (fun current ->
+                match current.Launches.TryFind launchId,
+                      current.Messages.TryFind messageId,
+                      current.Works.TryFind workId with
+                | Some launch, Some message, Some work ->
+                    let activePrimary =
+                        match launch.State, launch.PrimaryWorkId with
+                        | LaunchState.Registered _, Some primaryId when primaryId <> workId ->
+                            match current.Works.TryFind primaryId with
+                            | Some primary -> primary.State = WorkState.Claimed launchId
+                            | None -> false
+                        | _ -> false
+                    if not activePrimary || launch.Version <> expectedLaunchVersion
+                       || not (launch.AncillaryMessages.Contains messageId)
+                       || message.State <> MessageState.ClaimedAncillary launchId
+                       || message.WorkId <> Some workId
+                       || work.Kind <> WorkKind.RoleMessage messageId
+                       || work.State <> WorkState.Claimed launchId
+                       || work.ClaimGeneration <> expectedClaimGeneration
+                       || work.Gate <> GateState.DependencyGatePending expectedGateVersion
+                       || current.GraphVersion < expectedGateVersion then
+                        Error(Rejection.InvalidState "stale ancillary claim/launch/gate generation")
+                    elif work.SourceLineage.IsSome || work.Push.IsSome
+                         || work.Domain <> DomainState.Undecided
+                         || work.IntegrationAuthorized then
+                        Error Rejection.UnsafeExternalEffect
+                    else
+                        let satisfied = hardDependenciesSatisfied current work
+                        let sequence =
+                            if satisfied then current.NextAvailability + 1L
+                            else current.NextAvailability
+                        let released =
+                            { work with
+                                State = if satisfied then WorkState.Available else WorkState.Blocked
+                                Gate = GateState.Clear
+                                ClaimGeneration = work.ClaimGeneration + 1
+                                AvailableSequence = if satisfied then sequence else work.AvailableSequence
+                                AvailableAt = if satisfied then now else work.AvailableAt }
+                        let next =
+                            { current with
+                                Works = current.Works.Add(workId, released)
+                                Messages = current.Messages.Add(messageId, { message with State = MessageState.Pending })
+                                Launches = current.Launches.Add(launchId,
+                                    { launch with
+                                        AncillaryMessages = launch.AncillaryMessages.Remove messageId
+                                        Version = launch.Version + 1 })
+                                NextAvailability = sequence }
+                        projectDependenciesChanged now next
+                | _ -> Error(Rejection.InvalidState "no live ancillary gate handler")) project
+
     let startOriginalPush expected op launchId workId pushOperation acceptedSourceSha targetRef project =
         projectCas expected op ("push-intent|" + launchId + "|" + workId + "|" + pushOperation
                                 + "|" + acceptedSourceSha + "|" + targetRef) (fun current ->

@@ -1178,3 +1178,174 @@ let wq01_ancillary_gate_waiver_and_terminal_edge_race_preserve_launch_credits ()
     let unsafe = { gated with Works = gated.Works.Add("role-msg:M", fakeSource) }
     rejected Rejection.UnsafeExternalEffect
         (completeOrdinary unsafe.Version "unsafe-source-terminal" "L" "Plan" 12000L unsafe)
+
+// Review #4: a gated ancillary Role handler must be independently recoverable
+// while its unrelated primary Plan remains Claimed by the same registered launch.
+let private resolveAncillaryW (p: Project) op now =
+    let w = p.Works.["role-msg:M"]
+    let launch = p.Launches.["L"]
+    let gateVersion =
+        match w.Gate with
+        | GateState.DependencyGatePending graph -> graph
+        | gate -> failwithf "Expected pending ancillary gate, got %A" gate
+    resolveAncillaryDependencyGate p.Version op "L" "M" w.Id
+        launch.Version w.ClaimGeneration gateVersion now p
+
+let private completeAncillaryBWhilePlanLives (p: Project) op now =
+    let claimed =
+        p |> fun p -> admit p "WorkerB" "Worker"
+          |> fun p -> submit p "WorkerB"
+          |> fun p -> initialize p "WorkerB"
+          |> fun p -> claim p "WorkerB"
+    Assert.That(claimed.Launches.["WorkerB"].PrimaryWorkId, Is.EqualTo(Some "B"))
+    completeOrdinary claimed.Version op "WorkerB" "B" now claimed |> success
+
+[<Test>]
+let wq01_ancillary_gate_resolves_after_prerequisite_completes_while_plan_still_active () =
+    let _, gated = wq01ClaimedAncillaryWithNewHardEdge ()
+    let waiting = completeAncillaryBWhilePlanLives gated "finish-B-before-Plan" 12000L
+    Assert.That(waiting.Works.["Plan"].State, Is.EqualTo(WorkState.Claimed "L"))
+    Assert.That(waiting.Works.["role-msg:M"].Gate,
+                Is.EqualTo(GateState.DependencyGatePending gated.GraphVersion))
+    rejected Rejection.DependencyGatePending
+        (completeAncillaryMessage waiting.Version "cannot-answer-unresolved" "L" "M" "reply" 12001L waiting)
+    let original = waiting.Works.["role-msg:M"]
+    let originalLaunch = waiting.Launches.["L"]
+    let resolved = resolveAncillaryW waiting "resolve-completed-B" 13000L |> success
+    let revived = resolved.Works.["role-msg:M"]
+    Assert.That(revived.State, Is.EqualTo(WorkState.Available))
+    Assert.That(revived.Gate, Is.EqualTo(GateState.Clear))
+    Assert.That(revived.ClaimGeneration, Is.EqualTo(original.ClaimGeneration + 1))
+    Assert.That(revived.AvailableAt, Is.EqualTo(13000L))
+    Assert.That(revived.AvailableSequence, Is.GreaterThan(original.AvailableSequence))
+    Assert.That(resolved.NextAvailability, Is.EqualTo(revived.AvailableSequence))
+    Assert.That(resolved.Messages.["M"].State, Is.EqualTo(MessageState.Pending))
+    Assert.That(resolved.Launches.["L"].AncillaryMessages, Is.Empty)
+    Assert.That(resolved.Launches.["L"].PrimaryWorkId, Is.EqualTo(Some "Plan"))
+    Assert.That(resolved.Works.["Plan"], Is.EqualTo(waiting.Works.["Plan"]))
+    Assert.That(resolved.Launches.["L"].State, Is.EqualTo(originalLaunch.State))
+    Assert.That(resolved.Launches.["L"].Lease, Is.EqualTo(originalLaunch.Lease))
+    Assert.That(resolved.Launches.["L"].AccountTokenId, Is.EqualTo(originalLaunch.AccountTokenId))
+    Assert.That(resolved.Works.["D"].State, Is.EqualTo(WorkState.Blocked))
+    let replay = resolveAncillaryDependencyGate waiting.Version "resolve-completed-B" "L" "M" "role-msg:M"
+                     originalLaunch.Version original.ClaimGeneration gated.GraphVersion 13000L resolved |> success
+    Assert.That(replay, Is.EqualTo(resolved))
+    rejected Rejection.OperationIdReused
+        (resolveAncillaryDependencyGate waiting.Version "resolve-completed-B" "L" "M" "role-msg:M"
+            originalLaunch.Version original.ClaimGeneration gated.GraphVersion 13001L resolved)
+    rejected (Rejection.InvalidState "no live ancillary message handler")
+        (completeAncillaryMessage resolved.Version "invalid-old-claim" "L" "M" "reply" 14000L resolved)
+    let reclaimed = claimAncillaryMessage resolved.Version "reclaim-M-while-Plan-live" "L" "M" resolved |> success
+    Assert.That(reclaimed.Works.["role-msg:M"].ClaimGeneration, Is.EqualTo(revived.ClaimGeneration + 1))
+    let answered = completeAncillaryMessage reclaimed.Version "answer-M-after-resolve" "L" "M" "reply" 15000L reclaimed |> success
+    Assert.That(answered.Messages.["M"].State, Is.EqualTo(MessageState.Handled "reply"))
+    Assert.That(answered.Works.["role-msg:M"].State, Is.EqualTo(WorkState.Completed))
+    Assert.That(answered.Works.["D"].State, Is.EqualTo(WorkState.Available))
+    Assert.That(answered.Works.["Plan"].State, Is.EqualTo(WorkState.Claimed "L"))
+    Assert.That(answered.Launches.["L"].State, Is.EqualTo(originalLaunch.State))
+
+[<Test>]
+let wq01_ancillary_gate_can_block_independently_then_wake_only_after_B_completion () =
+    let _, gated = wq01ClaimedAncillaryWithNewHardEdge ()
+    let oldWork = gated.Works.["role-msg:M"]
+    let released = resolveAncillaryW gated "release-unmet-ancillary" 8000L |> success
+    Assert.That(released.Works.["role-msg:M"].State, Is.EqualTo(WorkState.Blocked))
+    Assert.That(released.Works.["role-msg:M"].Gate, Is.EqualTo(GateState.Clear))
+    Assert.That(released.Works.["role-msg:M"].AvailableSequence, Is.EqualTo(oldWork.AvailableSequence))
+    Assert.That(released.NextAvailability, Is.EqualTo(gated.NextAvailability))
+    Assert.That(released.Messages.["M"].State, Is.EqualTo(MessageState.Pending))
+    Assert.That(released.Works.["D"].State, Is.EqualTo(WorkState.Blocked))
+    Assert.That(released.Works.["Plan"].State, Is.EqualTo(WorkState.Claimed "L"))
+    Assert.That(orderAvailable released |> success |> List.exists (fun w -> w.Id = "role-msg:M"), Is.False)
+    let woken = completeAncillaryBWhilePlanLives released "finish-B-after-independent-release" 9000L
+    Assert.That(woken.Works.["role-msg:M"].State, Is.EqualTo(WorkState.Available))
+    Assert.That(woken.Works.["role-msg:M"].AvailableAt, Is.EqualTo(9000L))
+    Assert.That(woken.Works.["role-msg:M"].AvailableSequence, Is.GreaterThan(oldWork.AvailableSequence))
+    Assert.That(woken.Works.["D"].State, Is.EqualTo(WorkState.Blocked))
+    Assert.That(woken.Works.["Plan"].State, Is.EqualTo(WorkState.Claimed "L"))
+    let reclaimed = claimAncillaryMessage woken.Version "claim-woken-W" "L" "M" woken |> success
+    let completed = completeAncillaryMessage reclaimed.Version "answer-after-B" "L" "M" "reply" 10000L reclaimed |> success
+    Assert.That(completed.Works.["D"].State, Is.EqualTo(WorkState.Available))
+    Assert.That(completed.Works.["Plan"].State, Is.EqualTo(WorkState.Claimed "L"))
+
+[<Test>]
+let wq01_ancillary_gate_verified_waiver_recovers_before_primary_terminal () =
+    let _, gated = wq01ClaimedAncillaryWithNewHardEdge ()
+    rejected Rejection.MissingProof
+        (waiveHardPrerequisite gated.Version "bad-waiver-while-primary" "role-msg:M" "B"
+            { waiver "role-msg:M" ["B"] with CanonicallyVerified = false } 11000L gated)
+    let waived =
+        waiveHardPrerequisite gated.Version "verified-waiver-before-Plan" "role-msg:M" "B"
+            (waiver "role-msg:M" ["B"]) 11000L gated |> success
+    Assert.That(waived.Works.["role-msg:M"].Gate,
+                Is.EqualTo(GateState.DependencyGatePending gated.GraphVersion))
+    let resolved = resolveAncillaryW waived "resolve-waived-ancillary" 12000L |> success
+    Assert.That(resolved.Works.["B"].State, Is.EqualTo(WorkState.Available))
+    Assert.That(resolved.Works.["role-msg:M"].State, Is.EqualTo(WorkState.Available))
+    Assert.That(resolved.Works.["role-msg:M"].AvailableAt, Is.EqualTo(12000L))
+    Assert.That(resolved.Works.["Plan"].State, Is.EqualTo(WorkState.Claimed "L"))
+    Assert.That(resolved.Works.["D"].State, Is.EqualTo(WorkState.Blocked))
+    let reclaimed = claimAncillaryMessage resolved.Version "claim-waived-W" "L" "M" resolved |> success
+    let replied = completeAncillaryMessage reclaimed.Version "answer-waived-W" "L" "M" "reply" 13000L reclaimed |> success
+    Assert.That(replied.Messages.["M"].State, Is.EqualTo(MessageState.Handled "reply"))
+    Assert.That(replied.Works.["D"].State, Is.EqualTo(WorkState.Available))
+    Assert.That(replied.Works.["B"].State, Is.EqualTo(WorkState.Available))
+    Assert.That(replied.Launches.["L"].PrimaryWorkId, Is.EqualTo(Some "Plan"))
+
+[<Test>]
+let wq01_ancillary_gate_cas_races_and_source_fence_preserve_primary_and_token () =
+    let before, gated = wq01ClaimedAncillaryWithNewHardEdge ()
+    let original = gated.Works.["role-msg:M"]
+    let launch = gated.Launches.["L"]
+    let resolved = resolveAncillaryW gated "resolve-before-Plan-terminal" 8000L |> success
+    rejected Rejection.CasConflict
+        (completeOrdinary gated.Version "stale-primary-completion" "L" "Plan" 9000L resolved)
+    let primaryTerminal =
+        completeOrdinary resolved.Version "terminal-after-resolver" "L" "Plan" 9000L resolved |> success
+    Assert.That(primaryTerminal.Launches.["L"].State,
+                Is.EqualTo(LaunchState.TerminalPendingRelease "terminal:terminal-after-resolver"))
+    Assert.That(primaryTerminal.Works.["role-msg:M"].State, Is.EqualTo(WorkState.Blocked))
+    Assert.That(primaryTerminal.Launches.["L"].AncillaryMessages, Is.Empty)
+    let terminalFirst = completeOrdinary gated.Version "terminal-before-resolver" "L" "Plan" 9000L gated |> success
+    Assert.That(terminalFirst.Works.["role-msg:M"].State, Is.EqualTo(WorkState.Blocked))
+    rejected Rejection.CasConflict
+        (resolveAncillaryDependencyGate gated.Version "stale-resolver-after-terminal" "L" "M" "role-msg:M"
+            launch.Version original.ClaimGeneration gated.GraphVersion 9001L terminalFirst)
+    rejected (Rejection.InvalidState "stale ancillary claim/launch/gate generation")
+        (resolveAncillaryDependencyGate terminalFirst.Version "new-resolver-after-terminal" "L" "M" "role-msg:M"
+            launch.Version original.ClaimGeneration gated.GraphVersion 9001L terminalFirst)
+    rejected (Rejection.InvalidState "stale ancillary claim/launch/gate generation")
+        (resolveAncillaryDependencyGate gated.Version "bad-claim-generation" "L" "M" "role-msg:M"
+            launch.Version (original.ClaimGeneration - 1) gated.GraphVersion 9001L gated)
+    rejected (Rejection.InvalidState "stale ancillary claim/launch/gate generation")
+        (resolveAncillaryDependencyGate gated.Version "bad-gate-generation" "L" "M" "role-msg:M"
+            launch.Version original.ClaimGeneration (gated.GraphVersion + 1) 9001L gated)
+    rejected Rejection.CasConflict
+        (resolveAncillaryDependencyGate before.Version "stale-two-client-snapshot" "L" "M" "role-msg:M"
+            launch.Version original.ClaimGeneration gated.GraphVersion 9001L gated)
+    let invalidSource = { original with SourceLineage = Some sourceLineage }
+    let unsafe = { gated with Works = gated.Works.Add(original.Id, invalidSource) }
+    rejected Rejection.UnsafeExternalEffect
+        (resolveAncillaryW unsafe "unsafe-source-ancillary" 10000L)
+
+[<Test>]
+let wq01_ancillary_resolve_rematches_unclaimed_credits_without_new_token () =
+    let _, gated = wq01ClaimedAncillaryWithNewHardEdge ()
+    let credited =
+        gated
+        |> fun p -> publish p (stage "OtherPlan" WorkKind.Planning "planning" 5L [] WorkState.Available)
+        |> fun p -> admit p "OtherLead" "Lead"
+    Assert.That(credited.Launches.["OtherLead"].Credit, Is.EqualTo(Some "OtherPlan"))
+    let withB = completeAncillaryBWhilePlanLives credited "B-while-credited" 11000L
+    let account = reserveGlobal (emptyAccount 2).Version "global:L" "L" (emptyAccount 2) |> success
+    let account = reserveGlobal account.Version "global:OtherLead" "OtherLead" account |> success
+    Assert.That(account.Tokens.Count, Is.EqualTo(2))
+    let resolved = resolveAncillaryW withB "release-W-with-credits" 12000L |> success
+    let credit = resolved.Launches.["OtherLead"].Credit
+    Assert.That(credit.IsSome, Is.True)
+    Assert.That(credit |> Option.map (fun id -> resolved.Works.[id].State), Is.EqualTo(Some WorkState.Available))
+    Assert.That(resolved.Launches.["L"].Credit, Is.EqualTo(None))
+    Assert.That(resolved.Launches.["L"].PrimaryWorkId, Is.EqualTo(Some "Plan"))
+    Assert.That(resolved.Launches.["L"].AccountTokenId, Is.EqualTo(credited.Launches.["L"].AccountTokenId))
+    Assert.That(resolved.Works.["Plan"].State, Is.EqualTo(WorkState.Claimed "L"))
+    Assert.That(account.Tokens.Count, Is.EqualTo(2))

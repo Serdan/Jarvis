@@ -68,6 +68,7 @@
         <Compile Include="Modules\BoundedFifoCache.fs"/>
         <Compile Include="Modules\\LedgerStore.fs"/>
         <Compile Include="Modules\WorkQueueGitLedger.fs"/>
+        <Compile Include="Modules\AccountCapacityLedger.fs"/>
         <Compile Include="Modules\RoleInstructions.fs"/>
         <Compile Include="Modules\\ReviewWorkflow.fs"/>
         <Compile Include="Modules\\ChallengeWorkflow.fs"/>

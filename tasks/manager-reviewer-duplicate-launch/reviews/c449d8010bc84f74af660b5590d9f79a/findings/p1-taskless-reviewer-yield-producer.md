@@ -1,0 +1,13 @@
+# P1 — No attributable yield path for taskless reviewers
+
+**Frozen source:** `70c6916225a4dce99a4baeda9983cdf21fe15ded`
+
+**Location:** `scripts/manager-heartbeat.mjs:256–303, 342–450, 490–503`; `docs/ManagerHeartbeat.md:220–236`.
+
+**Problem:** This change correctly refuses to treat a review decision as proof of browser-session termination. However, the only automatic transition out of an observed taskless reviewer session requires `snapshot.agents[].reviewerYieldAtUtc` with `ExplicitAttributedReviewerYield`. Neither this branch nor the existing Jarvis reviewer lifecycle produces a positively attributed **taskless reviewer-session yield event**. Reviewers claim independently from the queue and have **no Working task assignment**: the live `Reviewer 2` inbox showed `CurrentAssignment: null`, `Execution: Stopped`, while a review was available. The existing `yield_agent` API only yields an assigned Working task and requires `taskId`; it cannot record completion of a taskless, claimed-review browser turn. The available client-activity API does not identify an explicit reviewer session-yield event either. The new tests construct `reviewerYieldAtUtc` directly rather than exercising a real producer.
+
+**Consequence:** After the first positively observed reviewer launch, a successful `decide_review` and subsequent taskless reviewer turn completion leave its journal record `observed` and `unresolvedReviewers` populated. It continues to consume reviewer capacity and suppress later launches indefinitely across restarts, even when no claimed reviews remain. The `ResumeVerifiedPausedReview` path is unreachable without manual operator `release`. The fail-closed behavior prevents unsafe duplicates but silently turns ordinary reviewer throughput into operator-assisted recovery, contrary to the automated reviewer scheduling/resume requirement.
+
+**Required fix:** Introduce an actual, independently attributable reviewer-turn completion/yield signal (e.g. a canonical taskless `yield_review_session` event or verified browser session closure bound to `launchId` and reviewer identity); wire Manager's snapshot production to that signal, and add an end-to-end test using the real producer through a claim, verdict, yield, journal restart, and relaunch. Until then, describe manual release as a required limitation and do not present automatic reviewer resumption as functional.
+
+**Evidence:** Frozen Node suite: 47/47 passed, but only validates planner behavior under manually constructed evidence; `docs/AgentCommandSurface.md:20–33` documents that unassigned agents stay unassigned and `yield_agent` applies to assigned agents.

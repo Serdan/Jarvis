@@ -164,6 +164,7 @@ type ProjectTerminalRecord =
 
 type WorkMutation =
     | PublishStage of WorkStage
+    | ProduceEvent of QueueProducerEvent
     | PostMessage of SubjectMessage * WorkStage option
     | AdmitProject of Launch
     | AbortUnboundProjectAdmission of Launch * originalAdmissionOperationId: string
@@ -177,6 +178,7 @@ type WorkMutation =
     | ClaimAncillary of launchId: string * messageId: string
     | CompleteAncillary of launchId: string * messageId: string * handlerGeneration: int * replyId: string
     | SetHardPrerequisite of workId: string * prerequisite: string
+    | RemoveHardPrerequisite of workId: string * prerequisite: string
     | CancelUnclaimed of workId: string * reason: string
     | TerminalizeNoClaim of launchId: string
     | YieldReadOnly of launchId: string * workId: string * expectedClaimGeneration: int
@@ -922,6 +924,12 @@ module WorkQueueGitLedger =
                                 Error(Rejection.InvalidState "invalid published stage generation")
                             else
                                 Contracts.publishStage expectedVersion op (witnessNewStage state now stage) state
+                        | ProduceEvent event ->
+                            // The typed canonical source event and derived
+                            // work/message generation share one project CAS.
+                            if event.ProjectId <> binding.ProjectId.ToString("D") then
+                                Error(Rejection.InvalidState "producer source belongs to another project")
+                            else WorkQueueProducers.applyEvent expectedVersion op now event state
                         | PostMessage (message, roleWork) ->
                             if not (validMessagePayload message)
                                || (roleWork |> Option.exists (validInitialStage >> not)) then
@@ -972,6 +980,8 @@ module WorkQueueGitLedger =
                             Contracts.completeAncillaryMessage expectedVersion op launch message generation reply now state
                         | SetHardPrerequisite (work, prerequisite) ->
                             Contracts.setHardPrerequisite expectedVersion op work prerequisite now state
+                        | RemoveHardPrerequisite (work, prerequisite) ->
+                            Contracts.removeHardPrerequisite expectedVersion op work prerequisite now state
                         | CancelUnclaimed (work, reason) ->
                             Contracts.cancelUnclaimedStage expectedVersion op work reason now state
                         | TerminalizeNoClaim _ ->
@@ -1032,6 +1042,21 @@ module WorkQueueGitLedger =
                                 match stage.Kind, stage.SourceLineage with
                                 | WorkKind.Implementation, Some lineage -> verifyInitialSource binding lineage
                                 | _ -> Ok()
+                            | ProduceEvent event ->
+                                // Check source-writing generations against the
+                                // approved Git remote before publishing CAS.
+                                match changed.Works.TryFind(WorkQueueProducers.workId event) with
+                                | Some produced ->
+                                    match produced.Kind, produced.SourceLineage with
+                                    | WorkKind.Implementation, Some lineage -> verifyInitialSource binding lineage
+                                    | _ -> Ok()
+                                | None ->
+                                    match event.Origin with
+                                    | QueueProducerOrigin.OperatorMessage message ->
+                                        match message.Subject with
+                                        | Subject.Task _ -> Ok()
+                                        | _ -> Error(sourceReject "role producer did not publish work")
+                                    | _ -> Error(sourceReject "producer did not publish work")
                             | YieldSource checkpoint ->
                                 match state.Works.TryFind checkpoint.WorkId with
                                 | Some prior ->

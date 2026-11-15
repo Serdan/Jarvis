@@ -15,6 +15,7 @@
         <Compile Include="McpCapacityTests.fs"/>
         <Compile Include="WorkQueueContractTests.fs"/>
         <Compile Include="WorkQueueDependencyDiagnosticsTests.fs"/>
+        <Compile Include="WorkQueueProducerTests.fs"/>
         <Compile Include="McpAuthenticationTests.fs"/>
         <Compile Include="Program.fs"/>
     </ItemGroup>

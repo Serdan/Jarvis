@@ -1,0 +1,19 @@
+# C02 — P1 — Prepared Manager handoff abort races a late global swap
+
+**Frozen source:** `ef486f4617d211db0719924626ae3b05bc1f40ca`, `docs/specs/work-queues-and-ephemeral-executions.md`, §§7–8, 12, specifically lines 175–183 and 240–248; acceptance 31, 35.
+
+**What is fixed.** `PrepareManagerHandoff` now *first* commits a project-side Manager generation fence and pending child demand, and only then may `TerminalManagerSlotHandoff` swap the one global token. This remedies B02's original unfenced post-transfer dispatch race. Stable IDs, verified receipts and uncertain-submit handling are also correct design choices.
+
+**Residual gap.** The project-prepared/account-unswapped recovery branch permits cancellation of pending child demand and release of Manager's token **after verifying that no transfer occurred** (line 246). That verification is a snapshot, not an exclusion of a future swap. The account swap only specifies validating the immutable original project **prepare receipt** (line 243), not a durable global choice between swap and abort. The launch state machine has no `TerminalPreparedHandoff -> TerminalPendingRelease/Aborted` transition or distinct abort receipt, although the recovery prose refers to releasing Manager via a terminal receipt. The prepared receipt remains historically valid even if a later project CAS cancels the pending child.
+
+**Concrete race.** P commits `PrepareManagerHandoff(M,C)`; G still holds M's token. Recovery R observes G unswapped, then commits project cancellation of C. Meanwhile S, delayed after reading the original immutable P prepare receipt, performs the global M->C swap. R's proposed release of M now fails because M no longer owns the token; C has a global reservation but a cancelled project demand and cannot be dispatched. If R's flow relies on its earlier G observation, it can make the wrong terminal decision. G's CAS prevents *simultaneous* M release and C swap from both succeeding, but does not itself define recovery of this split-brain **project cancellation / globally swapped child** state. Merely re-reading the same immutable prepare receipt cannot prove the pending child is still viable.
+
+**Required contract.** Serialize the final **swap-versus-abort** decision under the global token's single CAS/operation-ID domain, with immutable disposition receipts keyed by the handoff ID and child/Manager launch IDs. For prepared-only abort, settle/record that account decision before project-side child cancellation; distinguish its terminal Manager receipt and its no-token child cancellation. If swap won, recovery must treat C as token owner and either confirm its still-valid project demand/dispatch or terminalize C and release *C's* token after a verified project receipt. Define project `TerminalPreparedHandoff` abort/finalize transitions, and state how stale swap attempts are rejected after account abort, including lost replies and replay. A historical project prepare receipt alone must never authorize a new swap after a canonical abort decision.
+
+**Add negative-space tests:**
+1. Two reconcilers race prepared-only **abort** with delayed global **swap** after the abort side's initial G read. One global disposition wins; project and global states converge without orphaned C token.
+2. Crash after global abort decision but before project child-demand cancellation; replay completes cancellation and releases no token twice.
+3. Crash after global swap but before P child dispatch eligibility; simultaneous project invalidation/cancel must terminalize and release the **child**, not the Manager, or deterministically resume the original submit.
+4. Replay/reorder of old preparation receipt after abort cannot resurrect child dispatch nor transfer an already released Manager token.
+
+**Disposition:** Blocking residual two-ledger recovery contract. No criticism of the corrected fence-before-swap normal path; no implementation/deployment requested.

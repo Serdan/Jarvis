@@ -10,7 +10,7 @@ let private fixture action =
     let root = Path.Combine(Path.GetTempPath(), "jarvis-project-creation-" + Guid.NewGuid().ToString("N"))
     Directory.CreateDirectory(root) |> ignore
     try action root (GitCommandTests.TestContext root)
-    finally Directory.Delete(root, true)
+    finally HermeticClientTestEnvironment.DeleteTestTree root
 
 let private command name git cfg agents ledger remote ack =
     { Name = name; InitializeGit = git

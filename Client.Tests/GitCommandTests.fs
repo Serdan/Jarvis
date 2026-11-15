@@ -62,7 +62,7 @@ let ``getGitStatus reports untracked file`` () =
             result.StdOut.Contains("new.txt") |> shouldEqual true
         | Error error -> Assert.Fail($"Expected GetGitStatus Ok, got {error}")
     finally
-        Directory.Delete(root, true)
+        HermeticClientTestEnvironment.DeleteTestTree root
 
 [<Test>]
 let ``getGitDiff reports modified tracked file`` () =
@@ -85,7 +85,7 @@ let ``getGitDiff reports modified tracked file`` () =
             result.StdOut.Contains("+after") |> shouldEqual true
         | Error error -> Assert.Fail($"Expected GetGitDiff Ok, got {error}")
     finally
-        Directory.Delete(root, true)
+        HermeticClientTestEnvironment.DeleteTestTree root
 
 [<Test>]
 let ``gitCommit stages selected path and returns hash`` () =
@@ -108,7 +108,7 @@ let ``gitCommit stages selected path and returns hash`` () =
             result.CommitHash.Length |> shouldEqual 40
         | Error error -> Assert.Fail($"Expected GitCommit Ok, got {error}")
     finally
-        Directory.Delete(root, true)
+        HermeticClientTestEnvironment.DeleteTestTree root
 
 [<Test>]
 let ``gitCommit leaves unrelated staged changes out of commit`` () =
@@ -154,7 +154,7 @@ let ``gitCommit leaves unrelated staged changes out of commit`` () =
 
         stagedPaths |> shouldContain "unrelated.txt"
     finally
-        Directory.Delete(root, true)
+        HermeticClientTestEnvironment.DeleteTestTree root
 
 [<Test>]
 let ``empty gitCommit refuses unrelated staged changes`` () =
@@ -183,4 +183,4 @@ let ``empty gitCommit refuses unrelated staged changes`` () =
             message.Contains("staged changes") |> shouldEqual true
         | other -> Assert.Fail($"Expected ValidationError, got {other}")
     finally
-        Directory.Delete(root, true)
+        HermeticClientTestEnvironment.DeleteTestTree root

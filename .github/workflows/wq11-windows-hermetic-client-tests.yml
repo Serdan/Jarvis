@@ -11,7 +11,7 @@ permissions:
 jobs:
   windows-client-tests:
     runs-on: windows-latest
-    timeout-minutes: 35
+    timeout-minutes: 50
     env:
       DOTNET_CLI_TELEMETRY_OPTOUT: "1"
       DOTNET_NOLOGO: "1"
@@ -49,10 +49,49 @@ jobs:
           dotnet fsi scripts/test-client-hermetic.fsx -- --scratch-parent "$env:RUNNER_TEMP" --no-build --filter "FullyQualifiedName~HermeticHarnessTests" --timeout-seconds 180 --self-test-git-sentinel
           if ($LASTEXITCODE -ne 0) { throw "Focused hermetic tests failed" }
 
+      - name: Direct testhost must reject forged profile root before writes
+        shell: pwsh
+        run: |
+          # The hosted Windows account is ephemeral. Never create the forged
+          # profile location: rejection must happen before any Client write.
+          $profile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+          $forged = Join-Path $profile ("jarvis-client-tests-" + [Guid]::NewGuid().ToString("N"))
+          if (Test-Path -LiteralPath $forged) { throw "Unsafe negative fixture already exists" }
+          $mapping = @{
+            JARVIS_CLIENT_TEST_HERMETIC_ROOT = $forged
+            JARVIS_CLIENT_TEST_DISPOSABLE_PARENT = $profile
+            HOME = (Join-Path $forged "home")
+            USERPROFILE = (Join-Path $forged "home")
+            APPDATA = (Join-Path $forged "config")
+            LOCALAPPDATA = (Join-Path $forged "data")
+          }
+          $saved = @{}
+          foreach ($key in $mapping.Keys) {
+            $saved[$key] = [Environment]::GetEnvironmentVariable($key, "Process")
+            [Environment]::SetEnvironmentVariable($key, $mapping[$key], "Process")
+          }
+          try {
+            $PSNativeCommandUseErrorActionPreference = $false
+            $binary = "Client.Tests/bin/Release/net11.0"
+            $output = (& dotnet vstest "$binary/Client.Tests.dll" /Framework:net11.0 "/TestAdapterPath:$binary" "/TestCaseFilter:FullyQualifiedName~HermeticHarnessTests" 2>&1 | Out-String)
+            $code = $LASTEXITCODE
+          } finally {
+            foreach ($key in $saved.Keys) {
+              [Environment]::SetEnvironmentVariable($key, $saved[$key], "Process")
+            }
+          }
+          Write-Output $output
+          if ($code -eq 0) { throw "Unsafe profile root was accepted by direct VSTest" }
+          if ($output -notmatch "Refusing Windows Client.Tests root overlapping an actual OS profile folder") {
+            throw "Direct VSTest failed without the expected native-profile provenance rejection (exit $code)"
+          }
+          if (Test-Path -LiteralPath $forged) { throw "Direct VSTest wrote inside the forbidden profile root" }
+          Write-Output "Forged profile root rejected before writes: exit=$code; root-exists=false"
+
       - name: Full bounded Client.Tests .NET 11 Release
         shell: pwsh
         run: |
-          dotnet fsi scripts/test-client-hermetic.fsx -- --scratch-parent "$env:RUNNER_TEMP" --no-build --timeout-seconds 900
+          dotnet fsi scripts/test-client-hermetic.fsx -- --scratch-parent "$env:RUNNER_TEMP" --no-build --timeout-seconds 1800
           if ($LASTEXITCODE -ne 0) { throw "Full hermetic suite failed" }
 
       - name: Two concurrent isolated Windows testhosts

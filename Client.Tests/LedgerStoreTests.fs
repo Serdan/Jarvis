@@ -140,7 +140,7 @@ type LedgerStoreTests() =
             Assert.That(git one [ "status"; "--porcelain" ], Is.Empty)
             Assert.That(git two [ "status"; "--porcelain" ], Is.Empty)
         finally
-            Directory.Delete(root, true)
+            HermeticClientTestEnvironment.DeleteTestTree root
 
     [<Test>]
     member _.ConcurrentWritersAndRewriteDetection() =
@@ -190,7 +190,7 @@ type LedgerStoreTests() =
             | Error(LedgerIntegrityError _) -> ()
             | result -> Assert.Fail(sprintf "Expected rewrite rejection, got %A" result)
         finally
-            Directory.Delete(root, true)
+            HermeticClientTestEnvironment.DeleteTestTree root
 
 
     [<Test>]
@@ -257,7 +257,7 @@ type LedgerStoreTests() =
             for path, originalHead in sources do
                 Assert.That(git path [ "rev-parse"; "HEAD" ], Is.EqualTo(originalHead))
                 Assert.That(git path [ "status"; "--porcelain" ], Is.Empty)
-        finally Directory.Delete(root, true)
+        finally HermeticClientTestEnvironment.DeleteTestTree root
 
     [<Test>]
     member _.ConcurrentFetchDoesNotUpdateRemoteTrackingRefsOrFetchHead() =
@@ -311,7 +311,7 @@ type LedgerStoreTests() =
             Assert.That(File.ReadAllText(fetchHeadPath), Is.EqualTo("sentinel fetch head\n"),
                         "Read-only fetches must not write the shared FETCH_HEAD file")
         finally
-            Directory.Delete(root, true)
+            HermeticClientTestEnvironment.DeleteTestTree root
 
     [<Test>]
     member _.ConcurrentReadersAcrossRemoteAdvanceKeepTrustedCacheMonotonic() =
@@ -369,4 +369,4 @@ type LedgerStoreTests() =
             Assert.That(git repo [ "rev-parse"; cacheRef ], Is.EqualTo(latest.CurrentHead),
                         "A stale fetch must not overwrite a newer trusted cache head")
         finally
-            Directory.Delete(root, true)
+            HermeticClientTestEnvironment.DeleteTestTree root

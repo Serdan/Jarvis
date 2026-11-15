@@ -3,8 +3,14 @@ namespace global
 open System
 open System.Diagnostics
 open System.IO
+open System.Runtime.InteropServices
 open NUnit.Framework
 open Client
+
+// Query Windows token-owned known folders, not environment mappings.
+module private WindowsKnownFolderNative =
+    [<DllImport("shell32.dll", ExactSpelling = true)>]
+    extern int SHGetKnownFolderPath(Guid& folderId, uint32 flags, nativeint token, nativeint& path)
 
 /// Global NUnit fixture: neither wrapped nor direct Client.Tests runs may use
 /// the operator's config, activity, ledger, temporary paths, or Git identity.
@@ -24,6 +30,65 @@ type HermeticClientTestEnvironment() =
                 else StringComparison.Ordinal
             let prefix = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)) + string Path.DirectorySeparatorChar
             Path.GetFullPath(path).StartsWith(prefix, comparison)
+
+    /// The testhost independently checks protected paths; caller-provided
+    /// HOME, USERPROFILE, APPDATA and LOCALAPPDATA do not attest provenance.
+    /// Pure validation permits synthetic-profile tests with no operator I/O.
+    static member AssertOutsideProtectedFolders (root: string) (protectedFolders: string list) =
+        if String.IsNullOrWhiteSpace root || not (Path.IsPathFullyQualified root) then
+            raise (UnauthorizedAccessException("Windows Client.Tests root must be absolute."))
+        let full = Path.TrimEndingDirectorySeparator(Path.GetFullPath root)
+        let prefix = "jarvis-client-tests-"
+        let leaf = Path.GetFileName full
+        if not (leaf.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) then
+            raise (UnauthorizedAccessException("Windows Client.Tests root must be a named disposable child."))
+        match Guid.TryParseExact(leaf.Substring(prefix.Length), "N") with
+        | true, _ -> ()
+        | _ -> raise (UnauthorizedAccessException("Windows Client.Tests root requires a unique disposable ID."))
+        let sameOrUnder (ancestor: string) (candidate: string) =
+            let ancestor = Path.TrimEndingDirectorySeparator(Path.GetFullPath ancestor)
+            let candidate = Path.TrimEndingDirectorySeparator(Path.GetFullPath candidate)
+            String.Equals(ancestor, candidate, StringComparison.OrdinalIgnoreCase) ||
+            candidate.StartsWith(ancestor + string Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+        if List.isEmpty protectedFolders then
+            raise (UnauthorizedAccessException("Windows Client.Tests could not attest OS profile folders."))
+        for protectedFolder in protectedFolders do
+            if String.IsNullOrWhiteSpace protectedFolder ||
+               not (Path.IsPathFullyQualified protectedFolder) ||
+               sameOrUnder protectedFolder full ||
+               sameOrUnder full protectedFolder then
+                raise (UnauthorizedAccessException("Refusing Windows Client.Tests root overlapping an actual OS profile folder."))
+
+    /// Run before installing Client overrides or any Client persistence.
+    /// SHGetKnownFolderPath obtains the current token's real profile folders,
+    /// independent of the synthetic environment supplied to the testhost.
+    static member AssertWindowsDisposableRoot (root: string) =
+        let parentValue = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_DISPOSABLE_PARENT")
+        if String.IsNullOrWhiteSpace parentValue || not (Path.IsPathFullyQualified parentValue) then
+            raise (UnauthorizedAccessException("Windows Client.Tests requires an explicitly attested disposable parent."))
+        let parent = Path.TrimEndingDirectorySeparator(Path.GetFullPath parentValue)
+        let rootParent = Path.GetDirectoryName(Path.TrimEndingDirectorySeparator(Path.GetFullPath root))
+        if not (String.Equals(parent, rootParent, StringComparison.OrdinalIgnoreCase)) then
+            raise (UnauthorizedAccessException("Windows Client.Tests root is not a direct child of its disposable parent."))
+        let nativeFolder (textId: string) =
+            let mutable folderId = Guid(textId)
+            let mutable pointer = IntPtr.Zero
+            // KF_FLAG_DONT_VERIFY: inspect identity without creating folders.
+            let result = WindowsKnownFolderNative.SHGetKnownFolderPath(&folderId, 0x4000u, IntPtr.Zero, &pointer)
+            if result <> 0 || pointer = IntPtr.Zero then
+                raise (UnauthorizedAccessException("Windows Client.Tests could not resolve actual OS profile folders."))
+            try
+                let path = Marshal.PtrToStringUni(pointer)
+                if String.IsNullOrWhiteSpace path then
+                    raise (UnauthorizedAccessException("Windows Client.Tests obtained an empty OS profile folder."))
+                path
+            finally Marshal.FreeCoTaskMem(pointer)
+        let actualFolders =
+            [ nativeFolder "5E6C858F-0E22-4760-9AFE-EA3317B67173" // Profile
+              nativeFolder "3EB685DB-65F9-4CF6-A03A-E3EF65729F3D" // RoamingAppData
+              nativeFolder "F1B32785-6FBA-4FCF-9D55-7B8E7F157091" ] // LocalAppData
+        HermeticClientTestEnvironment.AssertOutsideProtectedFolders root actualFolders
+        HermeticClientTestEnvironment.AssertPrivatePath parent root
 
     /// Lexical containment is insufficient: reject any symlink/junction/reparse
     /// component from the sandbox root through the requested path. Never follow
@@ -95,6 +160,15 @@ type HermeticClientTestEnvironment() =
                 File.Delete(candidate)
         if Directory.Exists path then remove path
 
+    /// Shared cleanup for Git fixtures. Git for Windows marks loose objects
+    /// read-only; Directory.Delete(path, true) is not portable. Every target
+    /// must be an already verified descendant of this testhost's scratch.
+    static member DeleteTestTree (path: string) =
+        let scratch = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_HERMETIC_ROOT")
+        if String.IsNullOrWhiteSpace scratch then
+            raise (UnauthorizedAccessException("No hermetic root for test fixture cleanup."))
+        HermeticClientTestEnvironment.DeletePrivateTree scratch path
+
     static member private Layout (root: string) =
         [ "HOME", "home"; "USERPROFILE", "home"
           "XDG_CONFIG_HOME", "config"; "XDG_DATA_HOME", "data"
@@ -137,6 +211,8 @@ type HermeticClientTestEnvironment() =
                 created
             else Path.GetFullPath(externallyManaged)
         try
+            if OperatingSystem.IsWindows() then
+                HermeticClientTestEnvironment.AssertWindowsDisposableRoot root
             let layout = HermeticClientTestEnvironment.Layout root
             let gitConfig = Path.Combine(root, "gitconfig")
             HermeticClientTestEnvironment.AssertPrivatePath root gitConfig
@@ -151,7 +227,8 @@ type HermeticClientTestEnvironment() =
                 |> Seq.toList
             let tracked =
                 (layout |> List.map fst) @
-                [ "JARVIS_CLIENT_TEST_HERMETIC_ROOT" ] @
+                [ "JARVIS_CLIENT_TEST_HERMETIC_ROOT"
+                  "JARVIS_CLIENT_TEST_DISPOSABLE_PARENT" ] @
                 HermeticClientTestEnvironment.GitIdentity @ gitVariables
                 |> List.distinct
             originalEnvironment <-
@@ -237,6 +314,34 @@ type HermeticClientTestEnvironment() =
     member this.AfterAll() = this.Restore()
 
 module HermeticHarnessTests =
+    [<Test>]
+    let forged_disposable_root_inside_synthetic_profile_is_rejected_before_any_writes () =
+        // No operator profile is opened: every synthetic path belongs to this
+        // invocation's already isolated test sandbox.
+        let scratch = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_HERMETIC_ROOT")
+        let fakeProfile = Path.Combine(scratch, "synthetic-os-profile")
+        let forged = Path.Combine(fakeProfile, "jarvis-client-tests-" + Guid.NewGuid().ToString("N"))
+        let fakeAppData = Path.Combine(fakeProfile, "AppData", "Roaming")
+        let fakeLocalAppData = Path.Combine(fakeProfile, "AppData", "Local")
+        Assert.Throws<UnauthorizedAccessException>(
+            TestDelegate(fun () ->
+                HermeticClientTestEnvironment.AssertOutsideProtectedFolders
+                    forged [ fakeProfile; fakeAppData; fakeLocalAppData ]))
+        |> ignore
+        Assert.That(Directory.Exists forged, Is.False, "Provenance rejection must precede test writes.")
+
+    [<Test>]
+    let read_only_git_object_is_cleaned_inside_disposable_fixture () =
+        let scratch = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_HERMETIC_ROOT")
+        let fixture = Path.Combine(scratch, "git-cleanup-" + Guid.NewGuid().ToString("N"))
+        let objects = Path.Combine(fixture, ".git", "objects", "ab")
+        Directory.CreateDirectory(objects) |> ignore
+        let objectFile = Path.Combine(objects, "abcdef")
+        File.WriteAllText(objectFile, "test")
+        File.SetAttributes(objectFile, File.GetAttributes(objectFile) ||| FileAttributes.ReadOnly)
+        HermeticClientTestEnvironment.DeleteTestTree fixture
+        Assert.That(Directory.Exists fixture, Is.False)
+
     [<Test>]
     let client_test_config_is_disposable_and_not_the_live_jarvis_config () =
         let root = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_HERMETIC_ROOT")

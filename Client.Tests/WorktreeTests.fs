@@ -19,7 +19,7 @@ let private withRepo action =
         GitCommandTests.expectGitSuccess context [ "commit"; "-m"; "Initial" ]
         action root project context
     finally
-        if Directory.Exists root then Directory.Delete(root, true)
+        if Directory.Exists root then HermeticClientTestEnvironment.DeleteTestTree root
 
 [<Test>]
 let ``porcelain parser retains worktree flags and paths`` () =

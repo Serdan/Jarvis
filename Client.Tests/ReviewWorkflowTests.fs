@@ -86,7 +86,7 @@ type ReviewWorkflowTests() =
                     Path.Combine(Path.GetDirectoryName pendingConfig, "pending",
                                  Path.GetFileNameWithoutExtension pendingConfig)
                 if Directory.Exists pendingDir then Directory.Delete(pendingDir, true)
-            Directory.Delete(root, true)
+            HermeticClientTestEnvironment.DeleteTestTree root
 
     [<Test>]
     member _.AdministrativeActorIsRecordedInReceiptAssignmentAndClosureEvent() =

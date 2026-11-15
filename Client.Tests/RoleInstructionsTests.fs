@@ -69,7 +69,7 @@ type RoleInstructionsTests() =
                         Path.Combine(root, checkout))
                 if File.Exists config then File.Delete config
                 if File.Exists(config + ".lock") then File.Delete(config + ".lock")
-            Directory.Delete(root, true)
+            HermeticClientTestEnvironment.DeleteTestTree root
 
     [<Test>]
     member _.SharedRoleAndDistinctAgentInstructionsAreIndependentOfTaskAssignment() =

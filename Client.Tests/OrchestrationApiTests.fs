@@ -48,7 +48,7 @@ let disabledReadAndWriteDoNotTouchV1Tasks () =
         Assert.That(Directory.Exists(Path.Combine(project, "docs", "tasks")), Is.False)
         Assert.That(GitCommandTests.gitOutput context [ "status"; "--porcelain" ], Is.Empty)
     finally
-        Directory.Delete(root, true)
+        HermeticClientTestEnvironment.DeleteTestTree root
 
 [<Test>]
 let ledgerBindingsStayInUserConfigAndAreCheckoutSpecific () =
@@ -131,7 +131,7 @@ let ledgerTaskSetupAndInboxRefuseUnconfiguredCheckout () =
         | other -> Assert.Fail(sprintf "Expected unconfigured  task write to fail: %A" other)
         Assert.That(File.Exists(Client.OrchestrationApi.LedgerBindingConfig.pathForRoot project), Is.False)
         Assert.That(GitCommandTests.gitOutput context [ "status"; "--porcelain" ], Is.Empty)
-    finally Directory.Delete(root, true)
+    finally HermeticClientTestEnvironment.DeleteTestTree root
 
 [<Test>]
 let ledgerTaskMutationsRequireGitWritePermission () =
@@ -217,7 +217,7 @@ let ledgerOperationStatusUsesReadOnlyTypedLedgerCommand () =
             Assert.That(message, Does.Contain(" ledger disabled"))
         | other -> Assert.Fail(sprintf "Unbound operation lookup must fail closed: %A" other)
         Assert.That(File.Exists(Client.OrchestrationApi.LedgerBindingConfig.pathForRoot project), Is.False)
-    finally Directory.Delete(root, true)
+    finally HermeticClientTestEnvironment.DeleteTestTree root
 
 
 [<Test>]
@@ -307,7 +307,7 @@ let trustBindingSharingContentionReturnsTypedErrorWithoutBlockingDashboard () =
     finally
         if File.Exists path then File.Delete(path)
         if File.Exists(path + ".lock") then File.Delete(path + ".lock")
-        Directory.Delete(root, true)
+        HermeticClientTestEnvironment.DeleteTestTree root
 
 
 [<Test>]
@@ -357,7 +357,7 @@ let missingMalformedOrMismatchedBindingIsNotTransientContention () =
     finally
         if File.Exists(bindingPath) then File.Delete(bindingPath)
         if File.Exists(bindingPath + ".lock") then File.Delete(bindingPath + ".lock")
-        Directory.Delete(root, true)
+        HermeticClientTestEnvironment.DeleteTestTree root
 
 
 [<Test>]
@@ -385,4 +385,4 @@ let unreadableTrustBindingReportsPermissionDeniedInsteadOfMalformedData () =
                 File.SetUnixFileMode(path, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
                 File.Delete(path)
             if File.Exists(path + ".lock") then File.Delete(path + ".lock")
-            Directory.Delete(root, true)
+            HermeticClientTestEnvironment.DeleteTestTree root

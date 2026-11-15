@@ -66,7 +66,7 @@ type ChallengeTests() =
                 ReviewWorkflow.registerAgent a (Guid.NewGuid()) actor |> ok |> ignore
             run a b
         finally
-            Directory.Delete(root, true)
+            HermeticClientTestEnvironment.DeleteTestTree root
 
     let definitions =
         [ { OwnerKind = ""; OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "Integrate accepted changes" }

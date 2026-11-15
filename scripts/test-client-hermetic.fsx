@@ -17,8 +17,8 @@ let args =
 let rec parse timeout scratchParent forwarded = function
     | "--timeout-seconds" :: value :: tail ->
         match Int32.TryParse value with
-        | true, seconds when seconds >= 10 && seconds <= 900 -> parse seconds scratchParent forwarded tail
-        | _ -> failwith "Timeout must be between 10 and 900 seconds."
+        | true, seconds when seconds >= 10 && seconds <= 1800 -> parse seconds scratchParent forwarded tail
+        | _ -> failwith "Timeout must be between 10 and 1800 seconds."
     | "--scratch-parent" :: value :: tail -> parse timeout (Some value) forwarded tail
     | head :: tail -> parse timeout scratchParent (head :: forwarded) tail
     | [] -> timeout, scratchParent, List.rev forwarded
@@ -262,6 +262,7 @@ try
           "GIT_COMMITTER_EMAIL", "jarvis-test@example.invalid"
           "LOCALAPPDATA", data
           "JARVIS_CLIENT_TEST_HERMETIC_ROOT", tempDirectory
+          "JARVIS_CLIENT_TEST_DISPOSABLE_PARENT", Path.GetDirectoryName(tempDirectory)
           "NUGET_PACKAGES", Path.Combine(cache, "nuget")
           "DOTNET_CLI_TELEMETRY_OPTOUT", "1"
           "DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1"

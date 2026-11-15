@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"p1-restore-stateless-jarvis-server","title":"[P1] Prove disposable server state; fix SQLite-backed idle correctness dependency","version":3,"lifecycle":"Open","specVersion":3,"attemptId":null}
+{"schemaVersion":2,"taskId":"p1-restore-stateless-jarvis-server","title":"[P1] Prove disposable server state; fix SQLite-backed idle correctness dependency","version":4,"lifecycle":"InProgress","specVersion":3,"attemptId":"842b60bf1c5f4125ac3c52eb62af269d"}

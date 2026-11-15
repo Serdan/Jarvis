@@ -259,48 +259,95 @@ module WorkQueueRoleAuthority =
             && JsonSerializer.Deserialize<StoredRole>(body.GetProperty("role").GetRawText())
                = storedRole role)
 
-    // Cross-head proof: the canonical current JSON is only a projection. For
-    // every role version, locate the immutable operation's ORIGINAL Git commit
-    // and compare that commit's issued role and receipt to today's bytes.
-    // Shape-valid rewrites of earlier roles/receipt mappings are rejected.
+    // The current JSON is only a projection. Trace *every* catalog mutation
+    // along the verified Git head's first-parent history, including issued
+    // revisions that a later CAS might omit by restoring an authentic v1 blob.
+    let private catalogChangeHistory (binding: LedgerBinding) (snapshot: LedgerSnapshot) =
+        BoundedProcess.run
+            { Executable = "git"
+              Args = [ "log"; "--first-parent"; "--format=%H"; snapshot.Commit; "--"; CatalogPath ]
+              WorkingDirectory = binding.RepositoryPath
+              Timeout = TimeSpan.FromSeconds 30.
+              MaxOutputBytes = Some(1024 * 1024)
+              StandardInput = BoundedProcess.ClosedInput
+              ExtraEnvironment = [ "GIT_TERMINAL_PROMPT", "0" ]
+              ConfigureStart = None }
+        |> function
+            | Error _ -> Error(LedgerHistoryUnavailable "WQ04 cannot inspect complete role-catalog Git history.")
+            | Ok result when result.TimedOut || result.ExitCode <> 0 ->
+                Error(LedgerHistoryUnavailable "WQ04 role-catalog Git history unavailable or timed out.")
+            | Ok result ->
+                let commits =
+                    result.StdOut.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    |> Array.map (fun value -> value.Trim())
+                if commits.Length = 0
+                   || (commits |> Array.exists (fun oid ->
+                       not (System.Text.RegularExpressions.Regex.IsMatch(
+                           oid, "^[0-9a-f]{40}([0-9a-f]{24})?$")))) then
+                    Error(integrity "catalog lacks a complete, valid first-parent issuance history")
+                else Ok(commits |> Array.rev |> Array.toList)
+
+    // Each catalog mutation must originate from its own immutable WQ04
+    // operation: an empty provision followed by exactly one role revision per
+    // transition, preserving all earlier definitions and receipts byte-for-byte.
+    // This makes an unauthorized writer, tail deletion or epoch reset fail
+    // closed, even if the latest JSON is internally valid and was once issued.
     let private verifyRoleHistory (binding: LedgerBinding) (snapshot: LedgerSnapshot)
                                   (catalog: RoleCatalog) (provisionId: string) =
-        operationOrigin binding snapshot provisionId "InitializeWQ04RoleCatalog" [CatalogPath]
-        |> Result.bind (fun (receipt, origin) ->
-            if not (requestMatches receipt (fun body ->
-                body.GetProperty("schemaVersion").GetInt32() = 1
-                && body.GetProperty("command").GetString() = "InitializeWQ04RoleCatalog")) then
-                Error(integrity "original provision operation does not match its canonical request")
-            else
-                readCatalogAt binding origin
-                |> Result.bind (fun (initial, _, originalProvision) ->
-                    WorkQueueGitLedger.loadAt binding origin
-                    |> Result.bind (fun project ->
-                        if originalProvision <> provisionId
-                           || initial.Revision <> 0
-                           || not initial.Current.IsEmpty
-                           || not initial.Versions.IsEmpty
-                           || not initial.Receipts.IsEmpty
-                           || not project.Launches.IsEmpty then
-                            Error(integrity "catalog was not originally provisioned empty before any launch")
-                        else Ok())))
-        |> Result.bind (fun () ->
-            catalog.Receipts
-            |> Map.toList
-            |> List.fold (fun result (opId, role) ->
-                result |> Result.bind (fun () ->
-                    operationOrigin binding snapshot opId "ConfigureWQ04Role" [CatalogPath]
-                    |> Result.bind (fun (receipt, issued) ->
-                        readCatalogAt binding issued
-                        |> Result.bind (fun (original, _, originalProvision) ->
-                            if originalProvision <> provisionId
-                               || not (originalRoleRequest receipt original.Revision role)
-                               || original.Receipts.TryFind opId <> Some role
-                               || (original.Versions.TryFind role.RoleId
-                                   |> Option.bind (fun history -> history.TryFind role.Version)) <> Some role
-                               || original.Revision < role.Version then
-                                Error(integrity ("role version or issuance receipt rewritten: " + role.RoleId))
-                            else Ok())))) (Ok ()))
+        catalogChangeHistory binding snapshot
+        |> Result.bind (function
+            | [] -> Error(integrity "no authenticated provision transition")
+            | provisionCommit :: subsequentCommits ->
+                operationOrigin binding snapshot provisionId "InitializeWQ04RoleCatalog" [CatalogPath]
+                |> Result.bind (fun (receipt, origin) ->
+                    if origin.Commit <> provisionCommit
+                       || not (requestMatches receipt (fun body ->
+                           body.GetProperty("schemaVersion").GetInt32() = 1
+                           && body.GetProperty("command").GetString() = "InitializeWQ04RoleCatalog")) then
+                        Error(integrity "original provision is not the first authenticated catalog change")
+                    else
+                        readCatalogAt binding origin
+                        |> Result.bind (fun (initial, _, originalProvision) ->
+                            WorkQueueGitLedger.loadAt binding origin
+                            |> Result.bind (fun project ->
+                                if originalProvision <> provisionId
+                                   || initial.Revision <> 0
+                                   || not initial.Current.IsEmpty
+                                   || not initial.Versions.IsEmpty
+                                   || not initial.Receipts.IsEmpty
+                                   || not project.Launches.IsEmpty then
+                                    Error(integrity "catalog was not originally provisioned empty before any launch")
+                                else Ok initial)))
+                |> Result.bind (fun initial ->
+                    subsequentCommits
+                    |> List.fold (fun (state: Result<RoleCatalog, LedgerFailure>) commit ->
+                        state |> Result.bind (fun (before: RoleCatalog) ->
+                            readCatalogAt binding { snapshot with Commit = commit }
+                            |> Result.bind (fun ((after: RoleCatalog), _, originalProvision) ->
+                                let additions =
+                                    after.Receipts
+                                    |> Map.toList
+                                    |> List.filter (fun (id, _) -> not (before.Receipts.ContainsKey id))
+                                match additions with
+                                | [ (id, role) ] when
+                                    originalProvision = provisionId
+                                    && after.Revision = before.Revision + 1 ->
+                                    operationOrigin binding snapshot id "ConfigureWQ04Role" [CatalogPath]
+                                    |> Result.bind (fun (receipt, issued) ->
+                                        let priorVersion =
+                                            before.Current.TryFind role.RoleId |> Option.defaultValue 0
+                                        match Producer.configureRole before.Revision priorVersion id role before with
+                                        | Ok expected when
+                                            issued.Commit = commit
+                                            && originalRoleRequest receipt after.Revision role
+                                            && after = expected -> Ok after
+                                        | _ -> Error(integrity "catalog revision or prior history was replaced at issuance"))
+                                | _ -> Error(integrity "catalog transition omitted, reset, or rewrote issued role history"))))
+                        (Ok initial)
+                    |> Result.bind (fun latest ->
+                        if latest <> catalog || latest.Revision <> subsequentCommits.Length then
+                            Error(integrity "current role catalog differs from complete issued high-water")
+                        else Ok ())))
 
     let private originalAdmissionRequest (operation: LedgerOperation) (launch: Launch) =
         requestMatches operation (fun body ->

@@ -259,6 +259,73 @@ type WorkQueueRoleAuthorityTests() =
                 JsonValue.Create(Guid.NewGuid().ToString("D")))
 
     [<Test>]
+    member _.AuthenticIssuedV1TailRewindAndEmptyEpochResetFailAcrossTwoClones() =
+        let rollback toEmpty =
+            withTwoClones (fun a b ->
+                init a
+                let atProvision = LedgerStore.fetch a |> success
+                let emptyRaw, emptyOid =
+                    LedgerStore.readAt a atProvision WorkQueueRoleAuthority.CatalogPath |> success
+                config a 0 0 (role 1 true ["planning"]) |> success |> ignore
+                let id = a.ProjectId.ToString("D")
+                mutate a (PublishStage(stage id "p-available" "planning" WorkKind.Planning "task-available"))
+                let enabled = WorkQueueRoleAuthority.load b |> success
+                WorkQueueRoleAuthority.inspect enabled (PlanNewDemand "Lead") |> success |> ignore
+                let beforeV2 = LedgerStore.fetch b |> success
+                let v1Raw, v1Oid =
+                    LedgerStore.readAt b beforeV2 WorkQueueRoleAuthority.CatalogPath |> success
+                let disableOp = Guid.NewGuid()
+                let disabledRole = role 2 false ["planning"]
+                WorkQueueRoleAuthority.configure b "fixture" disableOp 1 1 disabledRole
+                |> success |> ignore
+                let disabled = WorkQueueRoleAuthority.load a |> success
+                reject (function InvalidBinding _ -> true | _ -> false)
+                    (WorkQueueRoleAuthority.inspect disabled (PlanNewDemand "Lead"))
+                let headV2 = LedgerStore.fetch a |> success
+                let _, v2Oid =
+                    LedgerStore.readAt a headV2 WorkQueueRoleAuthority.CatalogPath |> success
+                // An authentic original blob is restored through a normal CAS.
+                // Its current revision/receipts are internally consistent, but
+                // Git still contains the original disabled-v2 issuance.
+                let restoredRaw, restoredOid, restoredRevision =
+                    if toEmpty then emptyRaw.Value, emptyOid.Value, 0
+                    else v1Raw.Value, v1Oid.Value, 1
+                let fixture =
+                    { OperationId = Guid.NewGuid(); Actor = "fixture"
+                      Kind = "WQ04AuthenticCatalogRollbackFixture"
+                      RequestJson = """{"schemaVersion":1,"action":"authentic-rollback"}""" }
+                LedgerStore.transact a fixture (fun _ ->
+                    Ok [{ Path = WorkQueueRoleAuthority.CatalogPath
+                          ExpectedBlobOid = v2Oid; Content = restoredRaw }])
+                |> success |> ignore
+                let rewound = LedgerStore.fetch b |> success
+                let rawAtRewind, _ =
+                    LedgerStore.readAt b rewound WorkQueueRoleAuthority.CatalogPath |> success
+                Assert.That(rawAtRewind, Is.EqualTo(Some restoredRaw),
+                    "Fixture must preserve the exact original role-catalog bytes.")
+                reject isIntegrity (WorkQueueRoleAuthority.load a)
+                reject isIntegrity (WorkQueueRoleAuthority.load b)
+                let fabricatedFreshProof =
+                    { enabled.Proof with Head = rewound.Commit
+                                         CatalogBlobOid = restoredOid
+                                         CatalogRevision = restoredRevision }
+                reject isIntegrity
+                    (WorkQueueRoleAuthority.inspectFresh a fabricatedFreshProof (PlanNewDemand "Lead"))
+                reject isStale
+                    (WorkQueueRoleAuthority.inspectFresh b enabled.Proof (PlanNewDemand "Lead"))
+                // The true v2 UUID stays applied; replays cannot reissue v1
+                // or erase the later immutable receipt.
+                let replay =
+                    WorkQueueRoleAuthority.configure a "fixture" disableOp 1 1 disabledRole
+                    |> success
+                Assert.That(replay.AlreadyApplied, Is.True)
+                reject isIntegrity
+                    (WorkQueueRoleAuthority.configure b "fixture" (Guid.NewGuid()) restoredRevision
+                        restoredRevision (role (restoredRevision + 1) true ["planning"])))
+        rollback false
+        rollback true
+
+    [<Test>]
     member _.ActualLegacyClaimAndConcurrentRoleEditNeverBecomeOperationalClaimPermission() =
         withTwoClones (fun a b ->
             init a

@@ -593,6 +593,15 @@ module PendingIntentJournal =
                                                  SetLastError = true)>]
     extern bool private moveArchiveWriteThrough(string source, string destination, uint32 flags)
 
+    // Scoped deterministic fault after rename and before a successful fsync.
+    let private activeDirectorySyncFault = System.Threading.AsyncLocal<(string -> unit)>()
+
+    let internal withDirectorySyncFault inject action =
+        let previous = activeDirectorySyncFault.Value
+        activeDirectorySyncFault.Value <- inject
+        try action ()
+        finally activeDirectorySyncFault.Value <- previous
+
     let private syncArchiveDirectory folder =
         if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
             // O_RDONLY = 0 on POSIX. Opening an existing directory with this
@@ -602,6 +611,8 @@ module PendingIntentJournal =
                 let err = System.Runtime.InteropServices.Marshal.GetLastPInvokeError()
                 raise (IOException($"Cannot open archived-intent directory for durable sync (errno {err})."))
             try
+                let inject = activeDirectorySyncFault.Value
+                if not (isNull (box inject)) then inject folder
                 if syncDirectoryFd(fd) <> 0 then
                     let err = System.Runtime.InteropServices.Marshal.GetLastPInvokeError()
                     raise (IOException($"Cannot fsync archived-intent directory (errno {err})."))
@@ -823,6 +834,9 @@ module PendingIntentJournal =
             if File.Exists(archivePath binding operationId) then
                 Error(Client.ValidationError "Pending intent was explicitly superseded; archived UUID cannot be reused.")
             elif File.Exists file then
+                // A previous rename could have succeeded with an unconfirmed
+                // directory fsync. Reconfirm before replay can reach Git.
+                syncArchiveDirectory (Path.GetDirectoryName file)
                 readFile file |> Result.bind (fun existing ->
                     if matches existing then Ok ()
                     else Error(Client.ValidationError "Pending  operation UUID reused with changed input."))
@@ -849,8 +863,9 @@ module PendingIntentJournal =
                             let bytes = UTF8Encoding(false).GetBytes(JsonSerializer.Serialize(newRecord))
                             stream.Write(bytes, 0, bytes.Length)
                             stream.Flush(true)
-                        try durableArchiveMove temp file directory
-                        with :? IOException when File.Exists file -> ()
+                        // Destination existence does not prove a rename collision:
+                        // fsync may have failed after the rename completed.
+                        durableArchiveMove temp file directory
                         readFile file |> Result.bind (fun existing ->
                             if matches existing then Ok ()
                             else Error(Client.ValidationError "Pending  operation UUID reused with changed input."))

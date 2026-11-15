@@ -1,0 +1,1 @@
+Retrospective and instruction-first Worker/Reviewer/Lead proposal; two contrasting cases and current-task dry run; Critical Senior Dev comparison designed but independent six-call live experiment intentionally pending.

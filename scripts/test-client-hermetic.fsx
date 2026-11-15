@@ -24,7 +24,16 @@ let rec parse timeout forwarded = function
 
 let timeout, suppliedArgs = parse 240 [] args
 let injectSetupFailure = suppliedArgs |> List.contains "--self-test-failed-setup"
-let forwarded = suppliedArgs |> List.filter ((<>) "--self-test-failed-setup")
+let injectGitIdentitySentinel = suppliedArgs |> List.contains "--self-test-git-sentinel"
+let forwarded =
+    suppliedArgs
+    |> List.filter (fun arg ->
+        arg <> "--self-test-failed-setup" && arg <> "--self-test-git-sentinel")
+
+// Windows Shell known folders do not follow APPDATA/LOCALAPPDATA overrides.
+// Do not run any testhost there until a disposable known-folder resolver exists.
+if not (OperatingSystem.IsLinux()) then
+    failwith "Hermetic Client.Tests runner is Linux-only until Windows/macOS known-folder isolation is implemented."
 let captureTail (reader: StreamReader) =
     task {
         // Never retain the unbounded output of a failing or chatty test process.
@@ -100,6 +109,25 @@ try
     start.ArgumentList.Add("75s")
     for arg in forwarded do start.ArgumentList.Add(arg)
 
+    // Exercise inherited-Git-identity failure with synthetic sentinels only.
+    if injectGitIdentitySentinel then
+        for key, value in
+            [ "GIT_AUTHOR_NAME", "LEAK_SENTINEL_AUTHOR"
+              "GIT_AUTHOR_EMAIL", "sentinel-author@example.invalid"
+              "GIT_COMMITTER_NAME", "LEAK_SENTINEL_COMMITTER"
+              "GIT_COMMITTER_EMAIL", "sentinel-committer@example.invalid"
+              "GIT_CONFIG_COUNT", "1"
+              "GIT_CONFIG_KEY_0", "user.name"
+              "GIT_CONFIG_VALUE_0", "LEAK_SENTINEL_CONFIG" ] do
+            start.Environment[key] <- value
+
+    // GIT_AUTHOR_*, GIT_COMMITTER_*, GIT_CONFIG_COUNT and repository/index
+    // overrides all outrank or bypass a disposable GIT_CONFIG_GLOBAL.
+    // Strip every inherited Git override, then install only test values.
+    for key in start.Environment.Keys |> Seq.toArray do
+        if key.StartsWith("GIT_", StringComparison.OrdinalIgnoreCase) then
+            start.Environment.Remove(key) |> ignore
+
     for (key, value) in
         [ "HOME", home
           "USERPROFILE", home
@@ -114,6 +142,11 @@ try
           "TMP", temp
           "APPDATA", config
           "GIT_CONFIG_GLOBAL", gitConfig
+          "GIT_CONFIG_NOSYSTEM", "1"
+          "GIT_AUTHOR_NAME", "Jarvis Test"
+          "GIT_AUTHOR_EMAIL", "jarvis-test@example.invalid"
+          "GIT_COMMITTER_NAME", "Jarvis Test"
+          "GIT_COMMITTER_EMAIL", "jarvis-test@example.invalid"
           "LOCALAPPDATA", data
           "JARVIS_CLIENT_TEST_HERMETIC_ROOT", tempDirectory
           "DOTNET_CLI_TELEMETRY_OPTOUT", "1"

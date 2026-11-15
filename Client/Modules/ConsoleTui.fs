@@ -1146,11 +1146,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         let partial = if unavailable = 0 then "" else sprintf " [PARTIAL: %d unavailable]" unavailable
         let partial = partial + (if stale = 0 then "" else sprintf " [STALE: %d projects]" stale)
         let full =
-            sprintf "Tracked: %d | Review: %d | Unread: %d | Working: %d | Ready: %d | Waiting: %d | Parked: %d"
-                totals.Tracked totals.PendingReviews totals.Unread totals.Working totals.Ready totals.Waiting totals.Parked
+            sprintf "Tracked: %d | Reviews: %d/%d | Unread: %d | Working: %d | Ready: %d | Waiting: %d | Parked: %d"
+                totals.Tracked totals.UnclaimedReviews totals.PendingReviews totals.Unread totals.Working totals.Ready totals.Waiting totals.Parked
         let concise =
-            sprintf "Total T%d Rev%d U%d W%d Rd%d Wait%d P%d"
-                totals.Tracked totals.PendingReviews totals.Unread totals.Working totals.Ready totals.Waiting totals.Parked
+            sprintf "Total T%d Rev%d/%d U%d W%d Rd%d Wait%d P%d"
+                totals.Tracked totals.UnclaimedReviews totals.PendingReviews totals.Unread totals.Working totals.Ready totals.Waiting totals.Parked
         if draw.Height >= 22 then draw.WriteLine "------"
         let summary = if (full + partial).Length <= width && draw.Height >= 22 then full else concise
         let summaryLine =
@@ -1161,13 +1161,13 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         if projects.Length > 0 then
             let heading =
                 if width < 55 then
-                    if projectPageCount = 1 then "Projects (totals)"
+                    if projectPageCount = 1 then "Projects (reviews U/T)"
                     else sprintf "Projects [%d/%d] ([/])" (agentProjectPage + 1) projectPageCount
                 else
                     let pagination =
                         if projectPageCount = 1 then ""
                         else sprintf "  [%d/%d, [ ] pages]" (agentProjectPage + 1) projectPageCount
-                    "Projects (whole-project totals)" + pagination
+                    "Projects (reviews unclaimed/total)" + pagination
             draw.WriteLine (trim heading width)
             for index = projectFirst to projectLast - 1 do
                 let project, lines = projectItems[index]

@@ -540,6 +540,68 @@ type ReviewWorkflowTests() =
             Assert.That(document.Content, Does.Contain("closer look")))
 
     [<Test>]
+    member _.ProjectReviewQueueTracksUnclaimedClaimedAndTerminalReviewRecordsAtRefresh() =
+        withFixture (fun one two first second _ sourceRef newCommit _ ->
+            let head = newCommit "Review queue counts" "frozen source for review counts"
+            let taskId = "queue-count-task"
+            let taskReview = Guid.NewGuid()
+            let independentReview = Guid.NewGuid()
+            let completedReview = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Author"
+                taskReview sourceRef head "Task review" "" "" |> success |> ignore
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) "_reviews" "Author"
+                independentReview "" head "Independent review" "" "" |> success |> ignore
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) "_reviews" "Author"
+                completedReview "" head "Completed historical review" "" "" |> success |> ignore
+            ReviewWorkflow.claimBranchReview first (Guid.NewGuid()) "_reviews"
+                completedReview "Reviewer" 1 |> success |> ignore
+            ReviewWorkflow.decideBranchReview first (Guid.NewGuid()) "_reviews"
+                completedReview "Reviewer" 2 Accept |> success |> ignore
+
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let oneConfig = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            let twoConfig = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot two
+            try
+                let ledgerHead = (LedgerStore.fetch first |> success).Commit
+                for project in ["owner"; "reviewer"] do
+                    Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                        project context first.ProjectId first.LedgerId first.Epoch
+                        first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl ledgerHead true
+                    |> success |> ignore
+                let check (unclaimed: int) (total: int) =
+                    let snapshot = Client.AgentDashboard.load context |> success
+                    Assert.That(snapshot.Projects.Length, Is.EqualTo(1),
+                                "Two checkouts with one canonical ledger must not duplicate a review queue.")
+                    let counts = (Client.AgentView.totalCounts snapshot)
+                    Assert.That(counts.UnclaimedReviews, Is.EqualTo(unclaimed))
+                    Assert.That(counts.PendingReviews, Is.EqualTo(total))
+                    let projectCounts = snapshot.Projects.Head.Counts.Value
+                    Assert.That(projectCounts.UnclaimedReviews, Is.EqualTo(unclaimed))
+                    Assert.That(projectCounts.PendingReviews, Is.EqualTo(total))
+                    snapshot
+                check 2 2 |> ignore // Completed historical review is excluded.
+                ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId
+                    taskReview "Reviewer" 1 |> success |> ignore
+                check 1 2 |> ignore
+                ReviewWorkflow.releaseBranchReview first (Guid.NewGuid()) taskId
+                    taskReview "Reviewer" 2 |> success |> ignore
+                check 2 2 |> ignore
+                ReviewWorkflow.claimBranchReview first (Guid.NewGuid()) "_reviews"
+                    independentReview "Reviewer" 1 |> success |> ignore
+                check 1 2 |> ignore
+                ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) "_reviews"
+                    independentReview "Reviewer" 2 RequestChanges |> success |> ignore
+                check 1 1 |> ignore
+                ReviewWorkflow.withdrawBranchReview first (Guid.NewGuid()) taskId
+                    taskReview "Author" 3 |> success |> ignore
+                let empty = check 0 0
+                Assert.That(empty.Projects.Head.Counts.IsSome, Is.True,
+                            "Zero outstanding reviews must remain distinguishable from unavailable.")
+            finally
+                if File.Exists oneConfig then File.Delete oneConfig
+                if File.Exists twoConfig then File.Delete twoConfig)
+
+    [<Test>]
     member _.ReviewClaimCanBeReleasedAndReplacedWithoutMovingSnapshotRefs() =
         withFixture (fun one _ first second _ sourceRef newCommit _ ->
             let taskId = "review-release"

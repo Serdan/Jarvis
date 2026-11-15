@@ -262,11 +262,39 @@ let projectStatusLinesBoundWidthsAndKeepUnavailableSeparateFromZero () =
         let line = projectStatusLine width name empty
         Assert.That(line.Length, Is.LessThanOrEqualTo(width))
         Assert.That((projectStatusLine width name offline).Length, Is.LessThanOrEqualTo(width))
-    Assert.That(projectStatusLine 120 empty.Project empty, Does.Contain("Tracked 0"))
+    Assert.That(projectStatusLine 180 empty.Project empty, Does.Contain("Tracked 0"))
     Assert.That(projectStatusLine 120 offline.Project offline, Does.Contain("UNAVAILABLE (counts unknown)"))
     let compactLine = projectStatusLine 60 empty.Project empty
-    for token in ["T0"; "Rev0"; "U0"; "W0"; "Rd0"; "Wait0"; "P0"] do
+    for token in ["T0"; "Rev0/0"; "U0"; "W0"; "Rd0"; "Wait0"; "P0"] do
         Assert.That(compactLine, Does.Contain(token))
+
+[<Test>]
+let projectReviewQueueSummaryDisplaysUnclaimedAndTotalAtAllSupportedWidths () =
+    let project =
+        { Project = "A Very Long Project Name With Review Backlog"
+          Aliases = ["A Very Long Project Name With Review Backlog"]
+          Identity = "project-id:ledger-id:1"
+          Counts = Some (projectCountsWithReviews [] 17 29)
+          Status = Fresh
+          Error = None }
+    for width in [1; 12; 24; 40; 54; 55; 65; 120; 160] do
+        let lines = projectStatusLines width project.Project project
+        Assert.That(lines, Is.Not.Empty)
+        for line in lines do Assert.That(line.Length, Is.LessThanOrEqualTo(width))
+        if width >= 12 && width < 55 then
+            Assert.That(String.concat " " lines, Does.Contain("Rev17/29"), $"Width {width}")
+        elif width >= 55 then
+            let line = projectStatusLine width project.Project project
+            Assert.That(line.Contains("Rev17/29") || line.Contains("Reviews 17/29"), Is.True,
+                        $"Width {width}: {line}")
+    let total = totalCounts { snapshot [] with Projects = [project] }
+    Assert.That(total.UnclaimedReviews, Is.EqualTo(17))
+    Assert.That(total.PendingReviews, Is.EqualTo(29))
+    let stale = { project with Status = Stale }
+    Assert.That(String.concat " " (projectStatusLines 24 stale.Project stale), Does.Contain("STALE"))
+    let offline = { project with Status = Unavailable; Counts = None }
+    Assert.That(String.concat " " (projectStatusLines 24 offline.Project offline),
+                Does.Contain("UNAVAILABLE"))
 
 [<Test>]
 let partialProjectTotalsNeverTreatUnavailableAsZero () =
@@ -298,7 +326,7 @@ let narrowProjectStatusWrapsAllCountersWithoutDroppingTheProjectLabel () =
         Assert.That(lines.Head, Does.StartWith("#"))
         for line in lines do Assert.That(line.Length, Is.LessThanOrEqualTo(width))
         let joined = String.concat " " lines
-        for token in ["T1"; "Rev2"; "U0"; "W1"; "Rd0"; "Wait0"; "P0"] do
+        for token in ["T1"; "Rev0/2"; "U0"; "W1"; "Rd0"; "Wait0"; "P0"] do
             Assert.That(joined, Does.Contain(token))
     let unavailable = { entry with Counts = None; Status = Unavailable; Error = Some "Remote unreachable" }
     let offlineLines = projectStatusLines 24 unavailable.Project unavailable

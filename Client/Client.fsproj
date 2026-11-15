@@ -67,6 +67,7 @@
         <Compile Include="Modules\\Worktrees.fs"/>
         <Compile Include="Modules\BoundedFifoCache.fs"/>
         <Compile Include="Modules\\LedgerStore.fs"/>
+        <Compile Include="Modules\SourceEffectJournal.fs"/>
         <Compile Include="Modules\WorkQueueGitLedger.fs"/>
         <Compile Include="Modules\AccountCapacityLedger.fs"/>
         <Compile Include="Modules\AccountAdmissionAdapter.fs"/>
@@ -90,6 +91,7 @@
 
     <ItemGroup>
         <PackageReference Include="Kehlet.FSharp.IO" Version="1.1.0"/>
+        <PackageReference Include="Microsoft.Data.Sqlite" Version="11.0.0"/>
         <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="11.0.0"/>
     </ItemGroup>
 

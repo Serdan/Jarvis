@@ -49,6 +49,18 @@ type HermeticClientTestEnvironment() =
             candidate <- Path.Combine(candidate, segment)
             rejectLink candidate
 
+    /// Linux owner-only 0700 directories and 0600 files are required for
+    /// externally managed scratch roots as well as direct NUnit-owned roots.
+    /// With no group/other access, fixture paths cannot be shared accidentally.
+    static member AssertOwnerOnly (path: string) (isDirectory: bool) =
+        let expected =
+            if isDirectory then
+                UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute
+            else
+                UnixFileMode.UserRead ||| UnixFileMode.UserWrite
+        if File.GetUnixFileMode(path) <> expected then
+            raise (UnauthorizedAccessException("Hermetic Client.Tests requires owner-only scratch permissions."))
+
     static member private Layout (root: string) =
         [ "HOME", "home"; "USERPROFILE", "home"
           "XDG_CONFIG_HOME", "config"; "XDG_DATA_HOME", "data"
@@ -88,6 +100,10 @@ type HermeticClientTestEnvironment() =
             let layout = HermeticClientTestEnvironment.Layout root
             let gitConfig = Path.Combine(root, "gitconfig")
             HermeticClientTestEnvironment.AssertPrivatePath root gitConfig
+            if ownedRoot.IsSome then
+                File.SetUnixFileMode(root,
+                    UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+            HermeticClientTestEnvironment.AssertOwnerOnly root true
             let gitVariables =
                 Environment.GetEnvironmentVariables().Keys
                 |> Seq.cast<string>
@@ -125,10 +141,12 @@ type HermeticClientTestEnvironment() =
                    not (Directory.Exists actual) then
                     raise (UnauthorizedAccessException($"Refusing non-hermetic Client.Tests mapping: {key}."))
                 HermeticClientTestEnvironment.AssertPrivatePath root actual
+                HermeticClientTestEnvironment.AssertOwnerOnly actual true
 
             if not (File.Exists gitConfig) then
                 raise (UnauthorizedAccessException("Hermetic Git config is missing."))
             HermeticClientTestEnvironment.AssertPrivatePath root gitConfig
+            HermeticClientTestEnvironment.AssertOwnerOnly gitConfig false
             // Do not inherit even higher-precedence per-command Git identity,
             // configuration injection or repository/index overrides.
             for key in gitVariables do
@@ -181,6 +199,13 @@ module HermeticHarnessTests =
             let normal = Path.Combine(root, "safe", "config.json")
             Directory.CreateDirectory(Path.GetDirectoryName normal) |> ignore
             HermeticClientTestEnvironment.AssertPrivatePath root normal
+            let weakPermissions = Path.Combine(root, "weak-permissions")
+            Directory.CreateDirectory(weakPermissions) |> ignore
+            File.SetUnixFileMode(weakPermissions,
+                UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute ||| UnixFileMode.GroupRead)
+            Assert.Throws<UnauthorizedAccessException>(
+                TestDelegate(fun () -> HermeticClientTestEnvironment.AssertOwnerOnly weakPermissions true))
+            |> ignore
             for name in [ "config"; "data" ] do
                 let link = Path.Combine(root, name)
                 Directory.CreateSymbolicLink(link, outside) |> ignore

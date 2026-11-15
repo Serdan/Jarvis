@@ -52,6 +52,11 @@ let captureTail (reader: StreamReader) =
 
 let sourceRoot = Path.GetFullPath(Path.Combine(__SOURCE_DIRECTORY__, ".."))
 let tempDirectory = Directory.CreateTempSubdirectory("jarvis-client-tests-").FullName
+// Direct/external NUnit fixtures attest that the root and every layout
+// directory are owner-only. Set a known private mode before child startup.
+if OperatingSystem.IsLinux() then
+    File.SetUnixFileMode(tempDirectory,
+        UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
 printfn "Hermetic Client.Tests: scratch id %s" (Path.GetFileName tempDirectory)
 let makeDirectory child =
     let path = Path.Combine(tempDirectory, child)

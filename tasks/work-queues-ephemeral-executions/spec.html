@@ -1,0 +1,27 @@
+<h1>[Architecture epic] Durable work queues and ephemeral agent activations</h1>
+<p><strong>Status:</strong> Proposed design; this is a coordinating implementation epic, not approval to deploy or a single worker-sized assignment.</p>
+<p><strong>Canonical source specification:</strong> <a href="https://github.com/Serdan/Jarvis/blob/e737c2da901ae4073f7ecc066781f428020ffdd1/docs/specs/work-queues-and-ephemeral-executions.md">docs/specs/work-queues-and-ephemeral-executions.md</a>, docs-only commit <code>e737c2da901ae4073f7ecc066781f428020ffdd1</code> on <code>refs/heads/docs/work-queues-ephemeral-activations</code>. Read the entire spec before subdividing. This exact revision is immutable reference; any accepted spec revision must be separately pinned and communicated.</p>
+<h2>Architecture to implement</h2><ul>
+<li>Replace persistent worker-to-task assignments, Waiting/NeedsWork and Parked availability with durable work items and disposable role-based activations. Retain tasks and their audit/spec/checkpoint history.</li>
+<li>Provide durable role subscriptions for planning, implementation, review, integration and relevant challenge follow-up. Subscriptions are routing conventions, not agent permissions; all agents under the owner's account share account-level permissions.</li>
+<li>Each launched execution claims an eligible work item atomically. Checkpoints, final yield, block and completion operate on the work item/activation, not permanent worker IDs. Yield must atomically checkpoint and free unfinished work. Another worker/session can continue.</li>
+<li>Manager launches bounded role sessions from eligible queue depth; each claims within the session. Retain durable one-shot browser submission and no-blind-retry uncertainty handling, 5-worker/3-reviewer limits pending operator revision, and terminal session evidence before reusing capacity.</li>
+<li>Generalize existing canonical frozen reviews, integration submissions, challenge dependencies and Lead planning into queue producers/subjects. Preserve exact accepted source SHA, immutable evidence, and idempotent source integration.</li>
+</ul>
+<h2>Delivery plan and gates</h2><ol>
+<li>Independent review and acceptance of the proposed spec. Resolve design ambiguities before code.</li>
+<li>Build pure planner fixtures and canonical Git queue/claim/activation/checkpoint lifecycle; write two-client atomic-CAS, stale-turn and idempotence tests.</li>
+<li>Implement role subscriptions and deterministic task/review/integration/challenge producers, including complete index coverage checks and blocked wakeups.</li>
+<li>Refactor Manager/browser bootstrap from persistent worker names to role demand and per-execution claims; verify launch uncertainties and no duplicate active sessions.</li>
+<li>Migrate existing task attempt ownership, old checkpoints, review claims and UI/TUI projections with an explicit checked conversion, preserving history.</li>
+<li>Rehearse disposable conversion and rollback, .NET 11 Release and Node tests, then separately seek operator authorization for matching production client/server update and controlled activation.</li>
+</ol>
+<h2>Non-negotiable acceptance</h2><ul>
+<li>Five available tasks + five worker slots allow five unique claims across arbitrarily labeled sessions; ten simultaneous claims across two clones still yield at most five winners.</li>
+<li>Yield preserves source and checkpoint and makes unfinished work available to a different worker with no ownership-transfer command. Obsolete activations cannot mutate canonical work state.</li>
+<li>Claim resolution alone never proves reviewer execution ended; no duplicate reviewer session may be launched until terminal yield/verified recovery.</li>
+<li>ChangesRequested requeues correction once; Accepted produces a single exact frozen-SHA integration item; ambiguous merge/push is reconciled before retry.</li>
+<li>Challenges retain durable dependencies, blocked work releases execution slot, and wakeup is idempotent. Failed/unknown queue index coverage must not read as empty.</li>
+<li>All existing canonical records and history survive conversion. Main/source deployment is a separately authorized operational step.</li>
+</ul>
+<p><strong>Coordination:</strong> Lead should decompose this epic into narrow reviewable tasks, not assign this epic to a worker in one turn. Respect current independent frozen review and exact-commit integration workflow, .NET 11 Release validation and project AGENTS.md. Do not use Codex through Jarvis. Do not deploy, restart, register unattended schedules, or enable Manager as part of design/task creation.</p>

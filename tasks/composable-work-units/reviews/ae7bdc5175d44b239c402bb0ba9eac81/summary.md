@@ -1,0 +1,1 @@
+HEAD a939ff7d pushed. Client and Server Release builds succeed. Client composition tests 6/6 pass; Server composition tests 17/17 pass; entire Server.Tests 294/294 pass. Full Client.Tests run in progress. This slice adds operator access only; graph-to-WQ reactive scheduler bridge remains out of scope.

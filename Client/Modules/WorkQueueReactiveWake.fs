@@ -78,14 +78,29 @@ module WorkQueueReactiveWake =
         && Some intent.SourceRequestHash = candidate.SourceRequestHash
         && candidate.SourceHead.IsSome
         && candidate.OriginBlobOid.IsSome
-        && candidate.SourceCommit.IsSome
+        // WQ02 task-created planning demand has a pinned canonical origin
+        // but no external source commit; a SHA is not a universal prerequisite.
         && validUuid intent.LaunchId
         && validUuid intent.OriginalBrowserOperationId
 
     let private blockingIssues (report: SchedulerHostPreviewReport) =
+        // The bound preview has no browser journal by default. Canonical
+        // project/account authority can nevertheless prove a historical launch
+        // terminal with its identity-matched account token released.
+        // Unsettled launches and other evidence gaps remain blocking.
+        let settledHistory =
+            report.ExistingLaunches
+            |> List.filter (fun launch ->
+                launch.State = "TerminalPendingRelease"
+                && launch.AccountTokenStatus = "Released")
+            |> List.map (fun launch -> launch.LaunchId)
+            |> Set.ofList
         report.Issues
         |> List.filter (fun issue ->
-            issue.Code <> "DispatchDisabled" && issue.Code <> "CapacityFull")
+            issue.Code <> "DispatchDisabled"
+            && issue.Code <> "CapacityFull"
+            && not ((issue.Code = "BrowserJournalUnknown" || issue.Code = "BrowserJournalMissing")
+                    && settledHistory.Contains issue.Record))
 
     /// Holds only a bounded, optional local duplicate hint. Safe after restart:
     /// all durable identity and replay/outcome recovery belong to the injected
@@ -96,6 +111,7 @@ module WorkQueueReactiveWake =
         let sync = obj ()
         let recent = ResizeArray<Guid>()
         let unknownOriginals = ResizeArray<Guid>()
+        let inFlight = System.Collections.Generic.HashSet<Guid>()
         let recentLimit = 128
 
         let remember (history: ResizeArray<Guid>) operationId =
@@ -156,11 +172,11 @@ module WorkQueueReactiveWake =
                                     | Some candidate ->
                                         if candidate.SourceOperationId.IsNone
                                            || candidate.SourceRequestHash.IsNone
-                                           || candidate.OriginBlobOid.IsNone
-                                           || candidate.SourceCommit.IsNone then
+                                           || candidate.SourceHead.IsNone
+                                           || candidate.OriginBlobOid.IsNone then
                                             WorkWakeResult.Unknown(
                                                 "SourceProofMissing",
-                                                "Recover the original canonical source receipt, OID and commit; do not fabricate a launch ID.")
+                                                "Recover the original canonical source operation, request hash, pinned head and origin OID; do not fabricate a launch ID.")
                                         else
                                             match plan first with
                                             | Error error ->
@@ -207,10 +223,16 @@ module WorkQueueReactiveWake =
                                                                 "OriginalOperationUnknown",
                                                                 "Reconcile original browser operation " + intent.OriginalBrowserOperationId +
                                                                 " from its durable journal before any further execution.")
-                                                        elif recent.Contains original then
+                                                        elif recent.Contains original || inFlight.Contains original then
                                                             WorkWakeResult.Coalesced intent
                                                         else
-                                                            match execute intent with
+                                                            // External executor callbacks can synchronously
+                                                            // re-enter this monitor on the same thread.
+                                                            inFlight.Add original |> ignore
+                                                            let outcome =
+                                                                try execute intent
+                                                                finally inFlight.Remove original |> ignore
+                                                            match outcome with
                                                             | WorkExecutorResult.Applied
                                                             | WorkExecutorResult.AlreadyApplied ->
                                                                 remember recent original

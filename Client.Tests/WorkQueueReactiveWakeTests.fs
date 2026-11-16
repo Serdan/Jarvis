@@ -216,3 +216,69 @@ type WorkQueueReactiveWakeTests() =
         | WorkWakeResult.NeedsAttention("OriginalLaunchExists", _) -> ()
         | other -> Assert.Fail(sprintf "Original launch must be recovered: %A" other)
         Assert.That(effects, Is.Zero)
+    
+    [<Test>]
+    member _.SettledReleasedLaunchDoesNotBlockIndependentWorkWithoutHistoricalBrowserJournal() =
+        let historic: PreviewLaunch =
+            { LaunchId = "99999999-9999-4999-8999-999999999999"
+              RoleId = "Worker"; RoleVersion = 4
+              Credit = Some "previous-work"; State = "TerminalPendingRelease"
+              AccountTokenStatus = "Released"
+              AdmissionOperationId = Some "past-admission"
+              AdmissionKind = Some "AdmissionWon"
+              OriginalBrowserOperationId = None
+              OriginalBrowserOutcome = "Unknown"; OriginalBrowserReceipt = None }
+        let issue =
+            { Code = "BrowserJournalUnknown"; Record = historic.LaunchId
+              NextAction = "Original WQ03 journal not provisioned." }
+        let current = report ()
+        let settled =
+            { current with ExistingLaunches = [historic]; Issues = issue :: current.Issues }
+        let mutable effects = 0
+        let worker =
+            WorkQueueReactiveWake.Coordinator(
+                ports (fun () -> settled)
+                    (fun _ -> effects <- effects + 1; WorkExecutorResult.Applied),
+                enabled = true)
+        match worker.Wake [WorkWakeTrigger.CapacityReleased] with
+        | WorkWakeResult.Reconciled _ -> ()
+        | other -> Assert.Fail(sprintf "Settled history must not block successor Work: %A" other)
+        Assert.That(effects, Is.EqualTo(1))
+
+        let unresolved = { historic with State = "SubmittedUnregistered(OutcomeUnknown)" }
+        let unsettled =
+            { settled with ExistingLaunches = [unresolved] }
+        let denied =
+            WorkQueueReactiveWake.Coordinator(
+                ports (fun () -> unsettled)
+                    (fun _ -> effects <- effects + 1; WorkExecutorResult.Applied),
+                enabled = true)
+        match denied.Wake [WorkWakeTrigger.CapacityReleased] with
+        | WorkWakeResult.NeedsAttention("BrowserJournalUnknown", _) -> ()
+        | other -> Assert.Fail(sprintf "Unresolved historical effect must fail closed: %A" other)
+        Assert.That(effects, Is.EqualTo(1))
+
+    [<Test>]
+    member _.SameThreadReentrantWakeCoalescesBeforeExecutorReturns() =
+        let mutable calls = 0
+        let mutable nested: WorkWakeResult option = None
+        let mutable wakeNested: unit -> WorkWakeResult = fun () -> WorkWakeResult.Dormant
+        let coordinator =
+            WorkQueueReactiveWake.Coordinator(
+                ports report (fun _ ->
+                    calls <- calls + 1
+                    if calls = 1 then nested <- Some(wakeNested ())
+                    WorkExecutorResult.Applied),
+                enabled = true)
+        wakeNested <- fun () -> coordinator.Wake [ WorkWakeTrigger.CapacityReleased ]
+        match coordinator.Wake [ WorkWakeTrigger.WorkTransitionCommitted ] with
+        | WorkWakeResult.Reconciled _ -> ()
+        | other -> Assert.Fail(sprintf "Expected first execution to reconcile: %A" other)
+        match nested with
+        | Some(WorkWakeResult.Coalesced _) -> ()
+        | other -> Assert.Fail(sprintf "Nested synchronous wake must coalesce: %A" other)
+        Assert.That(calls, Is.EqualTo(1))
+        match coordinator.Wake [ WorkWakeTrigger.ManualReconcile ] with
+        | WorkWakeResult.Coalesced _ -> ()
+        | other -> Assert.Fail(sprintf "Definitive success must remain coalesced: %A" other)
+        Assert.That(calls, Is.EqualTo(1))

@@ -1,0 +1,69 @@
+<h1>Composable Work Units: Project / System / Feature</h1>
+<p><strong>Purpose:</strong> Introduce a durable, recursive work model in Jarvis. The unit of organization and progress is work, not a persistent agent. This task captures the design decisions agreed with the operator on 2026-11-16 and asks for their implementation as an independently scoped follow-on to the already-running Agent =&gt; Work migration.</p>
+<h2>Boundaries and relationship to existing work</h2>
+<ul>
+<li><strong>Do not reimplement Agent =&gt; Work.</strong> That migration is already in progress under <code>work-queues-ephemeral-executions</code>. Build on its durable work, claims, scheduler, and execution concepts after examining their actual interfaces.</li>
+<li>Use the existing canonical, versioned Git-backed Jarvis ledger and proven task/review/integration mechanisms where they fit. Avoid parallel sources of truth and duplicate lifecycle machinery.</li>
+<li>Related but distinct concern: <code>scope-drift-overengineering</code> addresses runaway scope and architectural drift. The present task is the composable work graph and its semantics.</li>
+</ul>
+<h2>Decided conceptual model</h2>
+<ul>
+<li><strong>One composable unit of work</strong> with common identity, durable state, specification, history, and verifiable outcome. Domain-facing names are <strong>Project</strong>, <strong>System</strong>, and <strong>Feature</strong>; avoid Agile-specific epics, sprints, story points, and organizational hierarchy as foundational terminology.</li>
+<li>A <strong>Feature</strong> is a well-scoped implementable outcome; a <strong>System</strong> groups related work around a coherent functional boundary; a <strong>Project</strong> is the top-level objective. Systems may contain subsystems recursively. Favor common work-node machinery over three unrelated workflow engines.</li>
+<li>Every level is first-class, not just a folder: it has its own description, intent/goal, scope, acceptance criteria, constraints, decisions, evidence, history, and (where appropriate) child work. The parent outcome requires independent validation.</li>
+<li><strong>Child completion does not imply parent acceptance.</strong> A completed set of features can still fail system-level acceptance; a collection of completed systems can fail project-level acceptance. A parent may need further corrective children after such a failure.</li>
+<li>Work carries persistent identity and history; LLM sessions are ephemeral executions of bounded slices. Execution/session identifiers are for provenance and concurrency, not human-like task ownership. Integration and review are schedulable work, not permanent people or singleton offices.</li>
+</ul>
+<h2>Composition and relationships</h2>
+<ul>
+<li>Support parent/child composition and meaningful directed dependencies (especially <em>blocks</em> / <em>blocked by</em>) between work units, including across system boundaries; reject dependency cycles.</li>
+<li>Optionally support non-blocking <em>related to</em> links, kept separate from scheduling dependencies.</li>
+<li>Explicitly distinguish organizational containment from dependency, shared code ownership, and integration ordering. Do not infer blocking from shared parentage.</li>
+<li>Start with the simplest coherent containment model; decide whether multi-parent composition is necessary based on real use cases. Cross-system dependencies must not require multi-parent containment.</li>
+</ul>
+<h2>Readiness, progress and acceptance</h2>
+<ul>
+<li>Jarvis should answer queries such as: 'How far along is the Scheduling system?', 'What is blocking completion?', 'What is ready now?', 'What remains to validate?', and 'What can integrate?'. Traverse dependencies to identify root blockers and active execution/verification states, <strong>not permanent agent owners</strong>.</li>
+<li>Derive progress from authoritative child-work states, never manually maintained percentages. Display closed/active/blocked/cancelled distinctions; cancelled scope must not silently distort the denominator. Distinguish execution finished, review accepted, integrated, and parent acceptance (existing <code>CloseTask</code> by itself does not verify review or integration).</li>
+<li>Each work unit's acceptance criteria must be testable/inspectable with appropriate evidence. Parent acceptance should be an explicit independently verifiable transition; do not assume 100% children closed means done.</li>
+<li>Keep the enduring identity of a system distinct from a particular accepted target state or release; adding future work should not automatically rewrite history or erase prior acceptance.</li>
+</ul>
+<h2>Elastic execution and integration</h2>
+<ul>
+<li>The scheduler dispatches ready work based on current need and capacity, including planning, implementation, review, integration, and validation. No fixed '10 workers per system', dedicated permanent Lead, or singleton project integrator.</li>
+<li>Implementation may occur on per-feature branches; validated changes can flow through optional system/subsystem integration branches and onward to the project branch, according to actual boundaries. Do not force unnecessary branch layers for small units.</li>
+<li>Multiple integration sessions can prepare and verify promotions concurrently, including promotions toward <code>main</code>. The Git ref update itself is atomic; stale-head conflicts require refresh and appropriate revalidation. Meaningful semantic compatibility must be tested even for textually clean merges.</li>
+<li>Favor maximizing <strong>verified, integrated progress</strong>, not raw session count. Avoid speculative complex scheduling heuristics until supported by observable bottlenecks.</li>
+</ul>
+<h2>Preserving intent and engineering judgment</h2>
+<ul>
+<li>Preserve authoritative objectives, constraints and acceptance criteria across decomposition. Keep assumptions distinguishable from accepted requirements, and record important decisions/revisions with rationale and provenance. An execution checkpoint must not silently promote an assumption into project intent.</li>
+<li>Fresh verification at parent boundaries should check that the implemented composition fulfills the parent's intended outcome, not merely that children passed their local tests. Surface semantic drift and propose explicit spec changes rather than quietly rewriting goals.</li>
+<li>Inherit relevant project/system engineering constraints into descendant work. Seek the <strong>smallest coherent solution</strong>: neither a hardcoded local patch ignoring domain context nor a speculative mega-framework. Favor reuse of actual existing capabilities.</li>
+<li>For Jarvis specifically, execution sessions are trusted under the user's existing trust policy. Do not invent fictitious per-agent security principals or build elaborate permission frameworks as part of this work. Maintain real user/device and Git correctness boundaries already in place.</li>
+</ul>
+<h2>Implementation direction / non-decisions</h2>
+<ul>
+<li>First inspect and fit the new model to the ongoing work-queue migration and canonical ledger; record a minimal schema and API plan. Any proposed design choices not described here should be made explicitly, not treated as previous operator decisions.</li>
+<li>Provide essential operations for creating/updating composite units, attaching/detaching children, maintaining dependency edges, and retrieving a consistent recursive overview with blocker/readiness and completion evidence. Exact MCP names and storage encoding remain implementation decisions.</li>
+<li>Make changes versioned and auditable using existing ledger conventions. Concurrency protection should safeguard actual invariants, without resurrecting permanent agent ownership or overengineering speculative failure paths.</li>
+<li>Use coherent bounded implementation slices as required; the parent task should retain the enduring design and completion objective. Do not introduce separate Agile process vocabulary or a full project-management application.</li>
+</ul>
+<h2>Acceptance criteria</h2>
+<ol>
+<li>A Project/System/Feature work graph, including nested Systems, can be represented durably and reloaded consistently from canonical Jarvis state; specifications and acceptance criteria exist at all levels.</li>
+<li>Containment and cross-unit blocking dependencies can be updated with versioned/auditable operations. Invalid references and dependency cycles are handled clearly.</li>
+<li>Queries expose derived status, readiness, blockers, review/integration state and progress at each level without requiring persistent agent ownership.</li>
+<li>Closing all children does not automatically accept the parent. Parent acceptance can be evaluated with its own evidence; unfinished or newly discovered corrective work remains visible.</li>
+<li>Concurrent execution, review and integration operate through the existing Agent =&gt; Work scheduling/claims system without singleton 'Lead' assumptions. Candidate promotions use safe Git semantics and appropriate validation.</li>
+<li>Tests cover recursion, cross-system dependencies, lifecycle/progress edge cases, parent acceptance, and concurrent reads/mutations relevant to the chosen design.</li>
+<li>Documentation explains the conceptual model, operator queries, and which facts are authoritative versus inferred.</li>
+</ol>
+<h2>Open questions to resolve during design</h2>
+<ul>
+<li>How to represent a system's enduring identity versus versioned accepted target states/releases.</li>
+<li>Whether a unit can have multiple structural parents or should have one parent plus arbitrary relationship edges.</li>
+<li>Whether acceptance and integration are explicit work transitions, derived states, or separate verification work units in the new queue contracts.</li>
+<li>How to choose optional branching/integration boundaries without rigidly coupling them to every work-node nesting level.</li>
+<li>How much traceability/provenance to encode in the MVP versus build incrementally using existing specs, history and review evidence.</li>
+</ul>

@@ -19,7 +19,7 @@ open Client.LedgerStore
 // The existing task/orchestration handlers are intentionally not redirected here.
 // Account-global admission, production clock attestation and migration are separate gates.
 
-module private CanonicalCodec =
+module internal CanonicalCodec =
     let private publicStatic = BindingFlags.Public ||| BindingFlags.Static
     let private mapOfSeq =
         typeof<Map<string, int>>.Assembly.GetType("Microsoft.FSharp.Collections.MapModule", true).GetMethods(publicStatic)
@@ -922,7 +922,7 @@ module WorkQueueGitLedger =
                          && marker.EndsWith(":" + op, StringComparison.Ordinal)
                          && launch.Version > old.Version -> Some launch
                 | _ -> None)
-        let rec terminalChanges accumulated remaining =
+        let rec terminalChanges accumulated (remaining: Launch list) =
             match remaining with
             | [] -> Ok(List.rev accumulated)
             | launch :: rest ->

@@ -67,6 +67,7 @@
         <Compile Include="WorkQueueCrossProjectPlannerTests.fs"/>
         <Compile Include="WorkQueueReactiveWakeTests.fs"/>
         <Compile Include="WorkQueueSchedulerHostLoopTests.fs"/>
+        <Compile Include="WorkQueueSchedulerHeadBindingTests.fs"/>
         <Compile Include="WorkQueueReactiveWakeGitTests.fs"/>
         <Compile Include="WorkQueueAcceptedAdaptersCapOneSmokeTests.fs"/>
         <Compile Include="WorkQueueWorkReplacementVerticalSliceTests.fs"/>

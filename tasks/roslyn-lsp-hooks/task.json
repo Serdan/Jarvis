@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"roslyn-lsp-hooks","title":"Integrate persistent Roslyn LSP sessions with configurable code-quality hooks","version":2,"lifecycle":"Open","specVersion":2,"attemptId":null}
+{"schemaVersion":2,"taskId":"roslyn-lsp-hooks","title":"Integrate persistent Roslyn LSP sessions with configurable code-quality hooks","version":3,"lifecycle":"InProgress","specVersion":2,"attemptId":"53f17cc84e0b4b4a952c291bdc8d310a"}

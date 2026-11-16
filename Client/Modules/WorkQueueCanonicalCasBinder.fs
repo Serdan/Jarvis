@@ -5,6 +5,7 @@ open System.Text.Json
 open Client.LedgerStore
 open Client.WorkQueueGitLedger
 open Client.WorkQueueCanonicalSourceEvidence
+open Client.WorkQueueRoleAuthority
 
 // No positive authority is representable in this module. The accepted
 // canonical-event reader proves an original *orchestration* Git event, not a
@@ -27,6 +28,7 @@ type MissingAuthority =
     | CanonicalHeadChanged of expected: string * observed: string
     | CanonicalEventRejected of string
     | SourceEffectsUncovered of string
+    | RoleEvidenceRejected of string
     | RoleAdmissionUncovered of string
     | SameCasProducerUnproved of string
 
@@ -36,29 +38,41 @@ type CanonicalBindAssessment =
     | RecoveryBlocked of MissingAuthority list
 
 module WorkQueueCanonicalCasBinder =
-    [<Literal>]
-    let private CatalogPath = "records/work-queue/role-catalog.json"
-
     let private roleGaps (binding: LedgerBinding) (snapshot: LedgerSnapshot) scope =
         match scope with
         | NoRoleTransition -> []
         | NewRoleDemand (roleId, roleVersion)
         | PinnedLaunchRole (_, roleId, roleVersion) ->
+            // Verify actual original role issuance and admission at this pinned
+            // CAS snapshot. A catalog path, number or legacy subscription is
+            // not authority; nor is the result a permission to produce work.
+            let uncovered =
+                [RoleAdmissionUncovered
+                    "Historical role preflight is not the executable same-CAS selected-work, account-credit and producer writer."]
             if String.IsNullOrWhiteSpace roleId || roleId = "Manager" || roleVersion < 1 then
-                [RoleAdmissionUncovered "Invalid/non-versioned role demand is never admission authority."]
+                RoleEvidenceRejected "Invalid role identity or revision." :: uncovered
             else
-                // Presence of catalog bytes is not an authorization: the
-                // Worker11 proposal has a pinned preflight, not the required
-                // integrated SAME-CAS decision over role, work and credits.
-                let detail =
-                    match LedgerStore.readAt binding snapshot CatalogPath with
-                    | Ok (None, None) ->
-                        "No historical role catalog is provisioned at the verified project head."
-                    | Ok (Some _, Some _) ->
-                        "Role catalog exists, but its versioned admission/rematch/claim predicate is not an integrated SAME-CAS writer."
-                    | Ok _ -> "Role catalog path/blob provenance is inconsistent."
-                    | Error error -> "Role catalog cannot be read safely: " + string error
-                [RoleAdmissionUncovered detail]
+                match WorkQueueRoleAuthority.loadAt binding snapshot with
+                | Error error -> RoleEvidenceRejected(string error) :: uncovered
+                | Ok view ->
+                    let rejected =
+                        match scope with
+                        | NewRoleDemand _ ->
+                            let selected =
+                                view.Catalog.Versions.TryFind roleId
+                                |> Option.bind (fun versions -> versions.TryFind roleVersion)
+                            match view.Catalog.Current.TryFind roleId, selected with
+                            | Some latest, Some role when latest = roleVersion && role.Enabled -> []
+                            | _ -> [RoleEvidenceRejected
+                                        "New demand requires the current enabled, originally issued role revision."]
+                        | PinnedLaunchRole (launchId, _, _) ->
+                            match view.Project.Launches.TryFind launchId with
+                            | Some launch when launch.RoleId = roleId
+                                               && launch.RoleVersion = roleVersion -> []
+                            | _ -> [RoleEvidenceRejected
+                                        "Pinned launch role/version lacks authenticated original admission."]
+                        | NoRoleTransition -> []
+                    rejected @ uncovered
 
     let private eventGaps (binding: LedgerBinding) (snapshot: LedgerSnapshot)
                           (request: CanonicalBindRequest) =

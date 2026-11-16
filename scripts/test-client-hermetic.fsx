@@ -37,11 +37,12 @@ let timeout, scratchParent, suppliedArgs = parse 240 None [] args
 let injectSetupFailure = suppliedArgs |> List.contains "--self-test-failed-setup"
 let injectGitIdentitySentinel = suppliedArgs |> List.contains "--self-test-git-sentinel"
 let injectRootCreationFailure = suppliedArgs |> List.contains "--self-test-after-root-creation"
+let injectCleanupLock = suppliedArgs |> List.contains "--self-test-locked-cleanup"
 let forwarded =
     suppliedArgs
     |> List.filter (fun arg ->
         arg <> "--self-test-failed-setup" && arg <> "--self-test-git-sentinel"
-        && arg <> "--self-test-after-root-creation")
+        && arg <> "--self-test-after-root-creation" && arg <> "--self-test-locked-cleanup")
 
 // A Windows test runner must be given a pre-existing, disposable directory
 // OUTSIDE the operator profile. Never create scratch under ambient Windows
@@ -190,7 +191,42 @@ let rec deleteDisposableTree (path: string) =
             File.SetAttributes(path, attributes &&& ~~~FileAttributes.ReadOnly)
         File.Delete(path)
 
+// A killed Windows testhost may leave a descendant's ledger lock open
+// briefly after the direct child exits. Retry only transient I/O locks, with
+// an independent root identity and owner/ACL check before every traversal.
+let cleanDisposableTree (path: string) =
+    let elapsed = Stopwatch.StartNew()
+    let mutable retries = 0
+    let rec remove () =
+        if Directory.Exists(path) then
+            if OperatingSystem.IsWindows() then
+                WindowsDisposableGuard.assertNoLinkedAncestors path
+                WindowsDisposableGuard.assertOwnerOnly path true true
+            try
+                deleteDisposableTree path
+            with
+            | :? IOException when OperatingSystem.IsWindows()
+                                  && elapsed.Elapsed < TimeSpan.FromSeconds 20. ->
+                retries <- retries + 1
+                System.Threading.Thread.Sleep(200)
+                remove ()
+    remove ()
+    if retries > 0 then
+        printfn "Hermetic Client.Tests: delayed Windows lock release required %d cleanup retries." retries
+    if Directory.Exists(path) then
+        failwith "Hermetic Client.Tests: scratch cleanup did not remove the private root."
+
+
 try
+    if injectCleanupLock then
+        if not (OperatingSystem.IsWindows()) then
+            failwith "Locked cleanup regression is Windows-only."
+        let held = new FileStream(Path.Combine(tempDirectory, "delayed-release.lock"),
+                                  FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None)
+        Task.Run(fun () ->
+            System.Threading.Thread.Sleep(1200)
+            held.Dispose()) |> ignore
+        failwith "Intentional transient Windows lock before hermetic cleanup."
     if OperatingSystem.IsLinux() then
         File.SetUnixFileMode(tempDirectory,
             UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
@@ -387,20 +423,19 @@ try
             else 2
         if exitCode = 2 then
             eprintfn "Hermetic Client.Tests: no executed test count was reported (FAIL, not PASS)."
-        printfn "Hermetic Client.Tests: exit %d; executed tests %d; disposable environment removed." exitCode testCount
+        printfn "Hermetic Client.Tests: child exit result %d; executed tests %d; cleanup pending." exitCode testCount
         Environment.ExitCode <- exitCode
     else
         Environment.ExitCode <- 124
 finally
     // A failed setup, test failure, cancellation or timeout must not retain
     // activity, bindings, test output or private temporary credentials.
-    if Directory.Exists(tempDirectory) then
-        // A foreign DACL or substituted scratch root is never safe to clean.
-        if OperatingSystem.IsWindows() then
-            WindowsDisposableGuard.assertNoLinkedAncestors tempDirectory
-            WindowsDisposableGuard.assertOwnerOnly tempDirectory true true
-        deleteDisposableTree tempDirectory
-    printfn "Hermetic Client.Tests: scratch cleanup verified = %b" (not (Directory.Exists tempDirectory))
+    try
+        cleanDisposableTree tempDirectory
+        printfn "Hermetic Client.Tests: scratch cleanup verified = true"
+    with cleanupFailure ->
+        eprintfn "Hermetic Client.Tests: scratch cleanup verified = false (%s)" cleanupFailure.Message
+        reraise()
     if injectSetupFailure then
         eprintfn "Hermetic Client.Tests: scratch cleanup verified = %b" (not (Directory.Exists tempDirectory))
 

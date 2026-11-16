@@ -11,6 +11,7 @@ open System.Text.Json
 open System.Text.Json.Nodes
 open System.Text.RegularExpressions
 open Microsoft.FSharp.Reflection
+open FsToolkit.ErrorHandling
 open Jarvis.WorkQueues
 open Client.LedgerStore
 
@@ -190,6 +191,31 @@ type WorkMutation =
     // Integration, account and live source-job journal transitions remain
     // unavailable: a production cutover requires a separate authorized bridge.
 
+// Immutable, inspectable provenance in the same project Git CAS as the work stage.
+// This is an observation, not a global permission or a scheduler launch token.
+type CanonicalWorkOrigin =
+    { SchemaVersion: int
+      ProjectId: string
+      WorkId: string
+      SourceHead: string
+      SourceHighWater: int64
+      SourceOperationId: string
+      SourceOperationSequence: int64
+      SourceOperationKind: string
+      SourceOperationActor: string
+      SourceRequestHash: string
+      SourceOriginHead: string
+      SourceEntityPath: string
+      SourceEntityBlobOid: string
+      SourceEntitySha256: string
+      SourceSelector: string
+      SourceRef: string
+      SourceCommit: string
+      RoleId: string
+      RoleVersion: int
+      AccountCreditStatus: string
+      Ambiguity: string }
+
 module WorkQueueGitLedger =
     // Test-only seam at the publication/acknowledgement boundary. The real
     // project CAS and immutable witnesses commit first; the caller then loses
@@ -223,6 +249,12 @@ module WorkQueueGitLedger =
                     else Ok(Some(decoded, oid))
                 with ex -> Error(LedgerIntegrityError ("Malformed WQ-07 witness: " + ex.Message))
             | _ -> Error(LedgerIntegrityError "Incomplete WQ-07 witness object."))
+
+    let originPath workId =
+        "records/work-queue/origins/" + CanonicalCodec.digest workId + ".json"
+
+    let readOriginAt binding snapshot workId =
+        readCanonical<CanonicalWorkOrigin> binding snapshot (originPath workId)
 
     let readAdmissionAt binding snapshot launchId =
         readCanonical<ProjectAdmissionRecord> binding snapshot (admissionPath launchId)
@@ -899,6 +931,94 @@ module WorkQueueGitLedger =
         admissionChanges
         |> Result.bind (fun admissions ->
             terminalChanges [] terminals |> Result.map (fun terminal -> admissions @ terminal))
+
+    /// Positive WQ-04 project-only stage producer. The typed source event has
+    /// already been verified against its original Git operation by the higher
+    /// level binder. Recheck its complete receipt, original entity and the
+    /// *same* pinned head in the winning project Git transaction. This commits
+    /// the immutable origin and next work atomically, without reserving a token
+    /// or activating any scheduler. Conflicts and uncertain pushes remain
+    /// visible to the caller for ordinary agent reconciliation.
+    let internal publishCanonicalEvent (binding: LedgerBinding) (actor: string) (operationId: Guid)
+                                       (expectedVersion: int) (now: int64) (origin: CanonicalWorkOrigin)
+                                       (event: QueueProducerEvent) =
+        let request = JsonObject()
+        request.Add("schemaVersion", JsonValue.Create(1))
+        request.Add("expectedProjectVersion", JsonValue.Create(expectedVersion))
+        request.Add("event", JsonNode.Parse(CanonicalCodec.encode event))
+        request.Add("origin", JsonNode.Parse(CanonicalCodec.encode origin))
+        let intent =
+            { OperationId = operationId; Actor = actor; Kind = "WQ04.PracticalProducer"
+              RequestJson = request.ToJsonString() }
+        LedgerStore.transact binding intent (fun snapshot -> result {
+            if origin.SchemaVersion <> 1
+               || origin.ProjectId <> binding.ProjectId.ToString("D")
+               || event.ProjectId <> origin.ProjectId
+               || origin.WorkId <> WorkQueueProducers.workId event
+               || String.IsNullOrWhiteSpace origin.SourceOperationId
+               || String.IsNullOrWhiteSpace origin.SourceRequestHash
+               || String.IsNullOrWhiteSpace origin.SourceEntityPath
+               || String.IsNullOrWhiteSpace origin.SourceSelector
+               || origin.AccountCreditStatus <> "NotReserved"
+               || origin.RoleId <> "" || origin.RoleVersion <> 0 then
+                return! Error(InvalidBinding "WQ04 producer identity or project-only scope is invalid.")
+            if origin.SourceHead <> snapshot.Commit
+               || origin.SourceHighWater <> snapshot.Header.NextSequence - 1L then
+                return! Error(StaleEntityVersion
+                    (sprintf "WQ04 source head/high-water changed. Expected %s / %d; observed %s / %d. Refresh before retry."
+                        origin.SourceHead origin.SourceHighWater snapshot.Commit (snapshot.Header.NextSequence - 1L)))
+            let! project, oid = readPinned binding snapshot
+            let! state =
+                match project with
+                | Some value -> Ok value
+                | None -> Error(InvalidBinding "WQ04 project has not been initialized.")
+            if state.Version <> expectedVersion then
+                return! Error(StaleEntityVersion
+                    (sprintf "WQ04 project version conflict: expected %d, observed %d." expectedVersion state.Version))
+            let! sourceOperationId =
+                match Guid.TryParse origin.SourceOperationId with
+                | true, id when id <> Guid.Empty -> Ok id
+                | _ -> Error(InvalidBinding "WQ04 original operation UUID is missing.")
+            let! maybeOperation = LedgerStore.getOperationAt binding snapshot sourceOperationId
+            let! original =
+                match maybeOperation with
+                | Some value -> Ok value
+                | None -> Error(LedgerIntegrityError "WQ04 original source operation is absent at this head.")
+            if original.OperationId <> origin.SourceOperationId
+               || original.Sequence <> origin.SourceOperationSequence
+               || original.Type <> origin.SourceOperationKind
+               || original.Actor <> origin.SourceOperationActor
+               || original.RequestHash <> origin.SourceRequestHash then
+                return! Error(LedgerIntegrityError "WQ04 original operation identity/request hash changed.")
+            let! sourceHead = LedgerStore.getOperationOriginAt binding snapshot original
+            if sourceHead <> origin.SourceOriginHead then
+                return! Error(LedgerIntegrityError "WQ04 original operation commit changed.")
+            let! sourceSnapshot = LedgerStore.verifiedHistoricalSnapshot binding sourceHead
+            let! originalRaw, originalOid = LedgerStore.readAt binding sourceSnapshot origin.SourceEntityPath
+            match originalRaw, originalOid with
+            | Some raw, Some blobOid when blobOid = origin.SourceEntityBlobOid
+                                         && CanonicalCodec.digest raw = origin.SourceEntitySha256 -> ()
+            | _ -> return! Error(LedgerIntegrityError "WQ04 original source entity/receipt differs from its historical commit.")
+            let! existing = readOriginAt binding snapshot origin.WorkId
+            if existing.IsSome then
+                return! Error(StaleEntityVersion
+                    ("WQ04 stage already has a canonical origin: " + originPath origin.WorkId))
+            let! projected = WorkQueueProducers.projectEvent state event |> Result.mapError failure
+            let! stage =
+                match projected with
+                | ProducedProjection.Work work -> Ok work
+                | _ -> Error(InvalidBinding "WQ04 practical producer currently accepts task/review/integration work only.")
+            if not (validInitialStage stage) then
+                return! Error(InvalidBinding "WQ04 malformed canonical stage.")
+            let staged = witnessNewStage state now stage
+            let! next = Contracts.publishStage expectedVersion (operationId.ToString("D")) staged state
+                        |> Result.mapError failure
+            let! stateContent = validatedContent binding next
+            return
+                [ { Path = RecordPath; ExpectedBlobOid = oid; Content = stateContent }
+                  { Path = originPath origin.WorkId; ExpectedBlobOid = None
+                    Content = CanonicalCodec.encode origin } ]
+        })
 
     // Schema-1 WQ-02 projects have no canonical source/event/index or pinned
     // versioned role provenance. They are inert CAS prototypes only. An arbitrary

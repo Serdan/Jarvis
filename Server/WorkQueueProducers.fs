@@ -376,13 +376,13 @@ module WorkQueueProducers =
         |> List.sortBy (fun launch -> launch.Id)
         |> List.forall (fun launch -> augment launch.Id (HashSet<string>(StringComparer.Ordinal)))
 
-    let selectRoleDemand (coverage: ProducerCoverage) (catalog: RoleCatalog)
-                         (project: Project) roleId =
-        verifyCoverage project catalog coverage
-        |> Result.bind (fun () ->
-            match catalog.Current.TryFind roleId with
-            | None -> Error Rejection.NoCompatibleMatching
-            | Some version -> pinnedRole catalog roleId version)
+    // The selection below is pure. A pinned catalog is verified by the
+    // client Git adapter before this read-only ranking is actionable.
+    let private selectFromPinnedCatalog (catalog: RoleCatalog)
+                                        (project: Project) roleId =
+        (match catalog.Current.TryFind roleId with
+         | None -> Error Rejection.NoCompatibleMatching
+         | Some version -> pinnedRole catalog roleId version)
         |> Result.bind (fun role ->
             Contracts.orderAvailable project
             |> Result.bind (fun ordered ->
@@ -433,3 +433,17 @@ module WorkQueueProducers =
                                 else
                                     choose (stage.Id :: skipped) rest
                         choose [] eligible))
+
+    // Historical speculative high-water preflight is kept for legacy callers.
+    let selectRoleDemand (coverage: ProducerCoverage) (catalog: RoleCatalog)
+                         (project: Project) roleId =
+        verifyCoverage project catalog coverage
+        |> Result.bind (fun () -> selectFromPinnedCatalog catalog project roleId)
+
+    /// Functional read-only demand projection: real queue state and a Git-pinned
+    /// role catalog, not caller-supplied imaginary cross-ledger indexes. The
+    /// result is information for an agent, never an account token or launch.
+    let selectRoleDemandPractical (catalog: RoleCatalog) (project: Project) roleId =
+        if not catalog.Covered || not project.QueueCovered || not project.GraphCovered then
+            Error(Rejection.IncompleteCoverage "project queue, graph or role catalog is missing")
+        else selectFromPinnedCatalog catalog project roleId

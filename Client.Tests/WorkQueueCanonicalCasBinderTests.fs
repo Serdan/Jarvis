@@ -81,7 +81,11 @@ type WorkQueueCanonicalCasBinderTests() =
             let a, b = binding first, binding second
             LedgerStore.initialize a true |> ok |> ignore
             ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Lead" |> ok |> ignore
-            WorkQueueGitLedger.initialize a "Lead" (Guid.NewGuid()) Map.empty |> ok |> ignore
+            let subscriptions =
+                Map.ofList [ "Planner", set [ "planning" ]
+                             "Reviewer", set [ "review" ]
+                             "Integrator", set [ "integration" ] ]
+            WorkQueueGitLedger.initialize a "Lead" (Guid.NewGuid()) subscriptions |> ok |> ignore
             let taskId = "binder-original"
             ReviewWorkflow.createTask a (Guid.NewGuid()) taskId taskId |> ok |> ignore
             let _, taskRecord, _ = ReviewWorkflow.getTask a taskId |> ok
@@ -101,6 +105,18 @@ type WorkQueueCanonicalCasBinderTests() =
             work a b request
         finally
             try Directory.Delete(root, true) with _ -> ()
+
+    let requestFor binding (write: LedgerWrite) selector =
+        let snapshot = LedgerStore.fetch binding |> ok
+        let project = WorkQueueGitLedger.loadAt binding snapshot |> ok
+        { SourceAnchor =
+            { SnapshotHead = snapshot.Commit
+              SnapshotHighWater = snapshot.Header.NextSequence - 1L
+              OriginalOperationId = Guid.Parse write.Operation.OperationId
+              OriginalRequestHash = write.Operation.RequestHash }
+          SourceEvent = selector
+          ExpectedProjectVersion = project.Version
+          RoleScope = NoRoleTransition }
 
     [<Test>]
     member _.ValidOriginalCanonicalEventStillCannotProduceOrClaim() =
@@ -238,4 +254,137 @@ type WorkQueueCanonicalCasBinderTests() =
             let after = LedgerStore.fetch a |> ok
             Assert.That(after.Commit, Is.EqualTo(before.Commit))
             Assert.That(after.Header.NextSequence, Is.EqualTo(before.Header.NextSequence))
+        )
+
+    [<Test>]
+    member _.PracticalTaskProducerPublishesImmutableOriginAndRunsThroughFixtureClaim() =
+        withClones (fun a b _ ->
+            let task = "practical-task"
+            let created = ReviewWorkflow.createTask a (Guid.NewGuid()) task "Practical" |> ok
+            let request = requestFor b created (TaskCreated task)
+            let publishedId = Guid.NewGuid()
+            WorkQueueCanonicalCasBinder.publishPractical b "Lead" publishedId request |> ok |> ignore
+            let snapshot, project = WorkQueueGitLedger.load b |> ok
+            let work = project.Works |> Map.toList |> List.map snd
+                       |> List.find (fun work -> work.SubjectId = task)
+            Assert.That(work.Kind, Is.EqualTo(WorkKind.Planning))
+            Assert.That(work.QueueId, Is.EqualTo("planning"))
+            Assert.That(work.State, Is.EqualTo(WorkState.Available))
+            Assert.That(work.AvailableSequence, Is.GreaterThan(0L))
+            let origin, _ =
+                WorkQueueGitLedger.readOriginAt b snapshot work.Id |> ok |> Option.get
+            Assert.That(origin.SourceOperationId, Is.EqualTo(created.Operation.OperationId))
+            Assert.That(origin.SourceOperationKind, Is.EqualTo("CreateTask"))
+            Assert.That(origin.WorkId, Is.EqualTo(work.Id))
+            Assert.That(origin.SourceHead, Is.EqualTo(request.SourceAnchor.SnapshotHead))
+            Assert.That(origin.AccountCreditStatus, Is.EqualTo("NotReserved"))
+            // An already applied UUID with original payload must replay once.
+            // A competing UUID or stale pinned head cannot create second work.
+            let replay =
+                WorkQueueCanonicalCasBinder.publishPractical b "Lead" publishedId request
+            match replay with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail(sprintf "Original producer UUID replay failed: %A" error)
+            for altered in
+                [ { request with SourceEvent = TaskCreated "forged-task" }
+                  { request with RoleScope = NewRoleDemand("Planner", 1) } ] do
+                match WorkQueueCanonicalCasBinder.publishPractical b "Lead" publishedId altered with
+                | Error OperationIdReused -> ()
+                | other -> Assert.Fail(sprintf "Changed input reused producer UUID: %A" other)
+            match WorkQueueCanonicalCasBinder.publishPractical a "Lead" (Guid.NewGuid()) request with
+            | Error _ -> ()
+            | Ok _ -> Assert.Fail("Stale clone published the same task twice.")
+            let later = requestFor b created (TaskCreated task)
+            match WorkQueueCanonicalCasBinder.publishPractical b "Lead" (Guid.NewGuid()) later with
+            | Error _ -> ()
+            | Ok _ -> Assert.Fail("Second operation published a duplicate stage.")
+            let snapshotAfter, same = WorkQueueGitLedger.load b |> ok
+            Assert.That(same.Works.Count, Is.EqualTo(1))
+            Assert.That(snapshotAfter.Header.NextSequence, Is.EqualTo(snapshot.Header.NextSequence))
+            // Versioned, Git-pinned practical role ranking is a read-only
+            // feasibility result. It is not a launch/admission permission.
+            WorkQueueRoleAuthority.initializeCatalog a "Lead" (Guid.NewGuid()) |> ok |> ignore
+            let role : RoleConfiguration =
+                { RoleId = "Planner"; Version = 1; Enabled = true
+                  Instructions = "Plan queued tasks"
+                  QueueSubscriptions = set [ "planning" ] }
+            WorkQueueRoleAuthority.configure a "Lead" (Guid.NewGuid()) 0 0 role |> ok |> ignore
+            let demand = WorkQueueRoleAuthority.selectPracticalDemand b "Planner" |> ok
+            Assert.That(demand.Chosen.IsSome, Is.True)
+            let chosen = demand.Chosen.Value
+            Assert.That(chosen.WorkId, Is.EqualTo(work.Id))
+            Assert.That(chosen.RoleId, Is.EqualTo("Planner"))
+            Assert.That(chosen.RoleVersion, Is.EqualTo(1))
+            // A real claim/completion, in an explicitly frozen disposable
+            // WQ-02 fixture, demonstrates the projected planning work is valid.
+            let launch : Launch =
+                { Id = "practical-planner-launch"; ProjectId = b.ProjectId.ToString("D")
+                  RoleId = "Planner"; RoleVersion = 1; AccountTokenId = Guid.NewGuid().ToString("D")
+                  State = LaunchState.ReservedUnregistered; Lease = None; Version = 0
+                  Credit = None; PrimaryWorkId = None; EverClaimed = false
+                  AncillaryMessages = Set.empty; DispatchCount = 0 }
+            let mutate mutation =
+                let _, current = WorkQueueGitLedger.load b |> ok
+                WorkQueueGitLedger.executeInertFixtureAt b "Lead" (Guid.NewGuid())
+                    current.Version 100L mutation |> ok |> ignore
+            mutate (AdmitProject launch)
+            mutate (DispatchOnce(launch.Id, DispatchState.Submitted))
+            mutate (InitializeAgent(launch.Id, "practical-fixture-session"))
+            mutate (ClaimNext launch.Id)
+            let _, claimed = WorkQueueGitLedger.load b |> ok
+            Assert.That(claimed.Works.[work.Id].State, Is.EqualTo(WorkState.Claimed launch.Id))
+            mutate (CompleteOrdinary(launch.Id, work.Id))
+            let _, completed = WorkQueueGitLedger.load b |> ok
+            Assert.That(completed.Works.[work.Id].State, Is.EqualTo(WorkState.Completed))
+        )
+
+    [<Test>]
+    member _.PracticalReviewAndIntegrationPreserveImmutableHardDependency() =
+        withClones (fun a b _ ->
+            let task = "practical-review"
+            ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Owner" |> ok |> ignore
+            ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Reviewer" |> ok |> ignore
+            let sourceSha = git a.RepositoryPath [ "rev-parse"; "HEAD" ]
+            let sourceRef = "refs/heads/main"
+            ReviewWorkflow.createTask a (Guid.NewGuid()) task task |> ok |> ignore
+            let reviewId = Guid.NewGuid()
+            let submittedReview =
+                ReviewWorkflow.submitBranchReview a (Guid.NewGuid()) task "Owner" reviewId
+                    sourceRef sourceSha "Review immutable commit" "task-bound" sourceRef |> ok
+            let originalReview =
+                ReviewWorkflow.getBranchReviewAt b (LedgerStore.fetch b |> ok) task reviewId |> ok
+            let reviewRequest =
+                requestFor b submittedReview
+                    (ReviewSubmitted(task, reviewId, originalReview.ReviewRef, 1, sourceSha, sourceRef))
+            WorkQueueCanonicalCasBinder.publishPractical b "Lead" (Guid.NewGuid()) reviewRequest
+                |> ok |> ignore
+            let snapshot, queue = WorkQueueGitLedger.load b |> ok
+            let reviewStage =
+                queue.Works |> Map.toList |> List.map snd
+                |> List.find (fun item -> item.Kind = WorkKind.FrozenReview)
+            Assert.That(reviewStage.SubjectId, Is.EqualTo(task))
+            let reviewOrigin, _ =
+                WorkQueueGitLedger.readOriginAt b snapshot reviewStage.Id |> ok |> Option.get
+            Assert.That(reviewOrigin.SourceCommit, Is.EqualTo(sourceSha))
+            ReviewWorkflow.claimBranchReview a (Guid.NewGuid()) task reviewId "Reviewer" 1
+                |> ok |> ignore
+            ReviewWorkflow.decideBranchReview a (Guid.NewGuid()) task reviewId "Reviewer" 2 Accept
+                |> ok |> ignore
+            let integrationId = Guid.NewGuid()
+            let submitted =
+                ReviewWorkflow.submitIntegration a (Guid.NewGuid()) task "Owner" integrationId
+                    sourceRef sourceSha (reviewId.ToString("N")) sourceRef |> ok
+            let integrationRequest =
+                requestFor b submitted
+                    (IntegrationState(task, integrationId, reviewId, sourceSha, sourceRef, "Pending"))
+            WorkQueueCanonicalCasBinder.publishPractical b "Lead" (Guid.NewGuid()) integrationRequest
+                |> ok |> ignore
+            let _, nextQueue = WorkQueueGitLedger.load b |> ok
+            let integration =
+                nextQueue.Works |> Map.toList |> List.map snd
+                |> List.find (fun item -> item.Kind = WorkKind.Integration)
+            Assert.That(integration.State, Is.EqualTo(WorkState.Blocked))
+            Assert.That(integration.Dependencies, Does.Contain(reviewStage.Id))
+            Assert.That(integration.SubjectId, Is.EqualTo(task))
+            Assert.That(nextQueue.Works.Count, Is.EqualTo(2))
         )

@@ -679,7 +679,9 @@ module LedgerStore =
                                 match readHeader binding head with
                                 | Error error -> Error error
                                 | Ok header ->
-                                    let expectedOld = trusted |> Option.defaultValue (String.replicate 40 "0")
+                                    // Git's CAS "nonexistent old ref" sentinel must match the
+                                    // repository object format (40 SHA-1 or 64 SHA-256 hex digits).
+                                    let expectedOld = trusted |> Option.defaultValue (String.replicate head.Length "0")
                                     match git repo [ "update-ref"; (cacheRef binding); head; expectedOld ] with
                                     | Error error -> Error error
                                     | Ok updated when updated.ExitCode = 0 -> Ok { Commit = head; Header = header }

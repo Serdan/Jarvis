@@ -202,6 +202,25 @@ type OperatorConversationWriteCommand =
       Reason: string
       ExpectedBlobOid: string }
 
+/// Work-first tool requests retain canonical Work/ephemeral Launch identities,
+/// never the permanent legacy Agent assignment identifier.
+type WorkQueueReadCommand =
+    { ProjectName: string
+      Action: string
+      Category: string
+      WorkId: string }
+
+type WorkQueueWriteCommand =
+    { ProjectName: string
+      Action: string
+      ActorId: string
+      OperationId: string
+      LaunchId: string
+      WorkId: string
+      ExpectedProjectVersion: int
+      ClaimGeneration: int
+      EvidenceSha256: string }
+
 type TaskReadCommand =
     { ProjectName: string
       AgentId: string
@@ -833,6 +852,8 @@ type AgentCommand =
     | RemoveWorktreeCommand of RemoveWorktreeCommand
     | OperatorConversationReadCommand of OperatorConversationReadCommand
     | OperatorConversationWriteCommand of OperatorConversationWriteCommand
+    | WorkQueueReadCommand of WorkQueueReadCommand
+    | WorkQueueWriteCommand of WorkQueueWriteCommand
     | TaskReadCommand of TaskReadCommand
     | ObserveAgentCommand of ObserveAgentRequest
     | TaskWriteCommand of TaskWriteCommand
@@ -899,6 +920,7 @@ module AgentCommandInfo =
         let raw =
             match command with
             | OperatorConversationWriteCommand cmd -> cmd.OperationId
+            | WorkQueueWriteCommand cmd -> cmd.OperationId
             | TaskWriteCommand cmd -> cmd.OperationId
             | CrossProjectNotificationCommand envelope -> envelope.Notification.OperationId
             | ChallengeWriteCommand cmd -> cmd.OperationId
@@ -939,6 +961,8 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand _ -> "RemoveWorktreeCommand"
         | OperatorConversationReadCommand _ -> "OperatorConversationReadCommand"
         | OperatorConversationWriteCommand _ -> "OperatorConversationWriteCommand"
+        | WorkQueueReadCommand _ -> "WorkQueueReadCommand"
+        | WorkQueueWriteCommand _ -> "WorkQueueWriteCommand"
         | TaskReadCommand _ -> "TaskReadCommand"
         | ObserveAgentCommand _ -> "ObserveAgentCommand"
         | TaskWriteCommand _
@@ -986,6 +1010,8 @@ module AgentCommandInfo =
     /// agent or a job-status poll). Used by clients and server activity hints.
     let isAgentActivity = function
         | ObserveAgentCommand _
+        | WorkQueueReadCommand _
+        | WorkQueueWriteCommand _
         | GetJobResultCommand _
         | ListJobsCommand _
         | GetClientActivityCommand _ -> false
@@ -1033,6 +1059,8 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand _ -> "RemoveWorktree"
         | OperatorConversationReadCommand _ -> "OperatorConversationRead"
         | OperatorConversationWriteCommand _ -> "OperatorConversationWrite"
+        | WorkQueueReadCommand _ -> "WorkQueueRead"
+        | WorkQueueWriteCommand _ -> "WorkQueueWrite"
         | TaskReadCommand _ -> "TaskRead"
         | ObserveAgentCommand _ -> "ObserveAgent"
         | TaskWriteCommand _
@@ -1121,6 +1149,8 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand cmd -> Some cmd.ProjectName
         | OperatorConversationReadCommand cmd -> Some cmd.ProjectName
         | OperatorConversationWriteCommand cmd -> Some cmd.ProjectName
+        | WorkQueueReadCommand cmd -> Some cmd.ProjectName
+        | WorkQueueWriteCommand cmd -> Some cmd.ProjectName
         | TaskReadCommand cmd -> Some cmd.ProjectName
         | ObserveAgentCommand cmd -> Some cmd.ProjectName
         | TaskWriteCommand cmd -> Some cmd.ProjectName
@@ -1239,6 +1269,8 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand cmd -> Some(compact cmd.WorktreePath)
         | OperatorConversationReadCommand cmd -> Some(compact cmd.Action)
         | OperatorConversationWriteCommand cmd -> Some(compact cmd.Action)
+        | WorkQueueReadCommand cmd -> Some(compact cmd.Action)
+        | WorkQueueWriteCommand cmd -> Some(compact cmd.Action)
         | TaskReadCommand cmd -> Some(compact cmd.AgentId)
         | ObserveAgentCommand cmd -> Some(compact cmd.TargetAgentId)
         | TaskWriteCommand cmd
@@ -1312,6 +1344,8 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand cmd -> Some(truncate 64 cmd.WorktreePath)
         | OperatorConversationReadCommand cmd -> Some(truncate 64 cmd.Action)
         | OperatorConversationWriteCommand cmd -> Some(truncate 64 cmd.Action)
+        | WorkQueueReadCommand cmd -> Some(truncate 64 cmd.Action)
+        | WorkQueueWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | TaskReadCommand cmd -> Some(truncate 64 cmd.AgentId)
         | ObserveAgentCommand cmd -> Some(truncate 64 cmd.TargetAgentId)
         | TaskWriteCommand cmd
@@ -1427,6 +1461,8 @@ module AgentProtocol =
           definition "InspectWorktreeRemoval" "Checks registered worktree removal safety." [ ReadOnly ] false false false
           definition "OperatorConversationRead" "Inspect an approved Git-backed Task/Role operator conversation or an original operation receipt." [ ReadOnly; NetworkAccess ] false false false
           definition "OperatorConversationWrite" "Explicit operator conversation Post/Claim/Handle/Release/Repair, with original UUID and Git CAS." [ VersionControlWrite; NetworkAccess ] true true false
+          definition "WorkQueueRead" "Read pinned canonical Work queue, dependency and ephemeral claim evidence; no launch authorization." [ ReadOnly; NetworkAccess ] false false false
+          definition "WorkQueueWrite" "Typed default-off Work claim/checkpoint/complete boundary; never creates a legacy Agent owner." [ VersionControlWrite; NetworkAccess ] true true false
           definition "TaskRead" "Reads a registered agent inbox from a single ledger snapshot." [ ReadOnly; NetworkAccess ] false false false
           definition "ObserveAgent" "Read an explicitly named target agent without attributing tool activity or beginning a Ready turn. Observer identity is independently verified." [ ReadOnly; NetworkAccess ] false false false
           definition "TaskWrite" "Creates/assigns/starts tasks and binds immutable review base." [ VersionControlWrite; NetworkAccess ] true true false

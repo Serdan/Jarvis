@@ -3084,3 +3084,24 @@ module OperatorConversationApi =
     let write (cmd: OperatorConversationWriteCommand) rt =
         LedgerBindingConfig.load cmd.ProjectName rt
         |> Result.bind (writeWithBinding cmd)
+
+// Authenticated Work-first MCP/Client facade, separate from legacy Agent
+// lifecycle. Work is always read at one trusted WQ02 project Git head.
+module WorkQueueApi =
+    let private mapError result =
+        result |> Result.mapError LedgerErrors.toEffect
+
+    let read (cmd: WorkQueueReadCommand) rt =
+        LedgerBindingConfig.load cmd.ProjectName rt
+        |> Result.bind (fun binding ->
+            Client.WorkQueueToolFacade.WorkQueueToolFacade.readWithBinding
+                binding cmd.Action cmd.Category cmd.WorkId
+            |> mapError |> Result.map box)
+
+    let write (cmd: WorkQueueWriteCommand) rt =
+        LedgerBindingConfig.load cmd.ProjectName rt
+        |> Result.bind (fun binding ->
+            Client.WorkQueueToolFacade.WorkQueueToolFacade.transitionWithBinding binding
+                cmd.Action cmd.ActorId cmd.OperationId cmd.LaunchId cmd.WorkId
+                cmd.ExpectedProjectVersion cmd.ClaimGeneration cmd.EvidenceSha256
+            |> mapError |> Result.map box)

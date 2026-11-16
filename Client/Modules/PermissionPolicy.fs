@@ -117,6 +117,7 @@ let private requiresConfirmation command =
     | GetWorktreeCommand _
     | InspectWorktreeRemovalCommand _
     | OperatorConversationReadCommand _
+    | WorkQueueReadCommand _
     | TaskReadCommand _
     | ChallengeReadCommand _
     | ObserveAgentCommand _
@@ -206,6 +207,11 @@ let private requiresConfirmation command =
              else [ VersionControlWrite; NetworkAccess ]) [] (Some "git")
             [ cmd.SubjectKind; cmd.SubjectId; cmd.OperationId ]
             ("Explicit operator conversation " + cmd.Action + " (manual Git CAS)") false
+    | WorkQueueWriteCommand cmd ->
+        confirmation ("WorkQueue" + cmd.Action) (Some cmd.ProjectName)
+            [ VersionControlWrite; NetworkAccess ] [] (Some "git")
+            [ cmd.WorkId; cmd.LaunchId; cmd.OperationId ]
+            ("Default-off Work transition " + cmd.Action) false
     | ChallengeWriteCommand cmd ->
         confirmation "ChallengeWrite" (Some cmd.ProjectName) [ VersionControlWrite; NetworkAccess ]
             [] None [ cmd.Action ] "Persist durable challenge transition" false

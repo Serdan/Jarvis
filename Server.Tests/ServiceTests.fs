@@ -505,7 +505,8 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     // Canonical orchestration and operator conversations use versioned internal wire commands.
     let ledgerWire = set [ "TaskRead"; "TaskWrite"; "ReviewRead"; "ReviewWrite";
                           "LedgerRead"; "LedgerWrite"; "ChallengeRead"; "ChallengeWrite";
-                          "OperatorConversationRead"; "OperatorConversationWrite" ]
+                          "OperatorConversationRead"; "OperatorConversationWrite";
+                          "WorkQueueRead"; "WorkQueueWrite" ]
     let orchestrationTools =
         set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "GetNotificationPreferences"; "GetResponseAlerts"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
               "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"
@@ -524,6 +525,8 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "ListOperatorConversation"; "RawOperatorConversation"; "InspectOperatorConversationOperation"
               "PostOperatorConversationMessage"; "ClaimOperatorConversationMessage"
               "HandleOperatorConversationMessage"; "ReleaseOperatorConversationMessage"; "RepairOperatorConversation"
+              // WorkQueueRead/Write expose five authenticated facade methods, not raw wire tools.
+              "ListWork"; "GetWork"; "ClaimNextWork"; "CheckpointWork"; "CompleteWork"
               ]
     // Retired wire cases are deleted; public CreateTask/AssignTask are canonical ledger tools.
     unionNames |> shouldEqual catalogNames
@@ -608,8 +611,9 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
             methodInfo.GetParameters()
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
     // Preserve role/instruction aliases, Challenges, taskless execution and
-    // recipient-notification public methods, all with device routing.
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 88)
+    // recipient notifications and composition APIs, plus five public Work aliases
+    // over two hidden WorkQueue wire commands, all with device routing.
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 88 + (5 - 2))
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -1094,7 +1098,11 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
               for name in [ "PostOperatorConversationMessage"; "ClaimOperatorConversationMessage";
                             "HandleOperatorConversationMessage"; "ReleaseOperatorConversationMessage";
                             "RepairOperatorConversation" ] ->
-                  name, original["OperatorConversationWrite"] ]
+                  name, original["OperatorConversationWrite"]
+              for name in [ "ListWork"; "GetWork" ] ->
+                  name, original["WorkQueueRead"]
+              for name in [ "ClaimNextWork"; "CheckpointWork"; "CompleteWork" ] ->
+                  name, original["WorkQueueWrite"] ]
         aliases |> List.fold (fun map (key, value) -> Map.add key value map) original
 
     let methods =

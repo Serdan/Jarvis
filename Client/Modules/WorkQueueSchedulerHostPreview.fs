@@ -433,7 +433,7 @@ module WorkQueueSchedulerHostPreview =
           LedgerId: string
           Epoch: int }
 
-    let private accountBinding (path: string) : Result<AccountBinding, string> =
+    let accountBinding (path: string) : Result<AccountBinding, string> =
         try
             let record =
                 JsonSerializer.Deserialize<AccountPreviewBindingFile>(

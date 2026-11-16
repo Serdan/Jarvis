@@ -543,6 +543,8 @@ let main args =
         printfn "%s" (ClientConfig.configPath())
         0
     elif args.Length > 0 && args[0] = "config" then runConfigCommand args
+    elif args.Length > 1 && args[0] = "scheduler" && args[1] = "preview-global" then
+        Client.WorkQueueCrossProjectHostPreview.WorkQueueCrossProjectHostPreview.run (args |> Array.toList)
     elif args.Length > 0 && args[0] = "scheduler" then
         Client.WorkQueueSchedulerHostPreview.WorkQueueSchedulerHostPreview.run (args |> Array.toList)
     elif args.Length > 0 && args[0] = "conversation" then

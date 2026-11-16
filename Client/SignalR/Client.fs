@@ -128,6 +128,8 @@ let private mayReceiveResponseAlert = function
     // agent's ordinary tool usage. They must never consume a message.
     | ObserveAgentCommand _ -> false
     | OperatorConversationReadCommand _ -> false
+    | WorkQueueReadCommand _
+    | WorkQueueWriteCommand _ -> false
     | TaskReadCommand cmd when cmd.Action = "GetResponseAlerts" -> false
     | TaskWriteCommand cmd when cmd.Action = "QueueResponseAlert"
                                  || cmd.Action = "ClearResponseAlert" -> false
@@ -764,6 +766,10 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
         rt |> OrchestrationApi.OperatorConversationApi.read cmd |> serialize'
     | OperatorConversationWriteCommand cmd ->
         rt |> OrchestrationApi.OperatorConversationApi.write cmd |> serialize'
+    | WorkQueueReadCommand cmd ->
+        rt |> OrchestrationApi.WorkQueueApi.read cmd |> serialize'
+    | WorkQueueWriteCommand cmd ->
+        rt |> OrchestrationApi.WorkQueueApi.write cmd |> serialize'
     | TaskReadCommand cmd -> rt |> OrchestrationApi.TaskApi.read cmd |> serialize'
     | ObserveAgentCommand cmd ->
         rt |> OrchestrationApi.AgentObservationApi.observe cmd

@@ -153,3 +153,47 @@ emits `DispatchDisabled` in `ReadOnlyDryRun` with `CanDispatch=false`,
 include the mandatory diagnostic, and exercise deletion, duplication, head
 mismatch and adverse issues. Real operator captures still require the separate
 WQ08 command and independently trusted disposable account/project bindings.
+
+## Fixture-only prepared-state adapter (WQ10 follow-on)
+
+`prepare.py` is a **disabled-by-default, non-production typed evidence adapter**, not an extension of the read-only inspector. It never edits `state.json`, `ledger.json`, the canonical `records/work-queue/project.json`, any legacy task/agent/Manager record, or the original `jarvis-account-admission` / `jarvis-orchestration` branches. It cannot reserve tokens, launch a role, claim work, send a browser request, start a Scheduler, retire Manager, or activate an epoch.
+
+Only run against **exactly two disposable bare project authorities and one disposable bare account authority**, all beneath a dedicated directory in the OS temporary directory. The fixture repositories must have **no configured remotes**. Create a marker `<disposable-root>/.wq10-disposable-fixture` containing exactly `WQ10_DISPOSABLE_FIXTURE_V1`. The marker and explicit `--apply-disposable` are both mandatory; no production override exists. The root must not be a symlink to a real authority. These guards prevent casual misuse but are not a substitute for operator review or an OS sandbox.
+
+First run the accepted Release inspector against a pinned `manifest.json`, save its **unmodified JSON report**, review it independently, and pin its exact file bytes as SHA-256. The adapter re-runs the inspector and requires the same report, `OFFLINE_READ_ONLY`, `PREVIEW_READY_FOR_REVIEW`, `NOT_AUTHORIZED`, frozen/legacy account phase, no blocked findings and exact project heads. A SHA pin is an **operator-supplied assertion**, not a signed review or authentication receipt.
+
+```sh
+dotnet build tools/Wq10MigrationPreview/Wq10MigrationPreview.csproj -c Release
+dotnet tools/Wq10MigrationPreview/bin/Release/net11.0/Wq10MigrationPreview.dll \
+  /tmp/wq10-disposable/manifest.json > /tmp/wq10-disposable/reviewed-preflight.json
+sha256sum /tmp/wq10-disposable/reviewed-preflight.json
+
+python3 tools/Wq10MigrationPreview/prepare.py prepare \
+  --disposable-root /tmp/wq10-disposable \
+  --manifest /tmp/wq10-disposable/manifest.json \
+  --report /tmp/wq10-disposable/reviewed-preflight.json \
+  --reviewed-sha256 '<reviewed-SHA-256>' \
+  --operation-id '44444444-4444-4444-4444-444444444444' \
+  --apply-disposable
+
+python3 tools/Wq10MigrationPreview/prepare.py abort \
+  --disposable-root /tmp/wq10-disposable \
+  --operation-id '44444444-4444-4444-4444-444444444444' \
+  --apply-disposable
+```
+
+The adapter backs up each original branch as a verified Git bundle before staging. It writes a minimal **non-runnable migration-sidecar only** on `refs/heads/wq10-prepared/<original-operation-UUID>`, with each new commit parented to its original frozen head. Original refs are never moved. For each authority it saves the before/after Git diff, exact commit, backup SHA-256, report SHA-256 and a resumable local receipt at `<root>/wq10-preparations/<UUID>/receipt.json`. Staging uses an atomic per-repository Git `update-ref --stdin` transaction that verifies the original head and creates the new ref without force. Project sidecars retain old task/attempt/ref/commit, agent, review, integration and message evidence; all proposed stages are **Blocked** with unknown role, origin receipt, dependency graph and generation. No runnable canonical stage is published. The account sidecar is staged last and references the exact two project sidecar commits; this is provenance evidence, **not** an atomic cross-ledger commit.
+
+Reusing the same UUID and same reviewed input returns the same staging commits; changed content, other preparations, missing source refs/SHAs, incomplete original history or a competing head produce `NO_GO`. If a cross-ledger step fails, the local receipt reports partial status, and the operator uses `abort` with the **original** UUID. Abort removes only matching staging refs by exact commit CAS, retains the original bundles/diffs and never rewinds an original authority ref. Inspect an unknown outcome before replay or abort; do not regenerate operation IDs or force an update.
+
+**What this does not prove:** the accepted account ledger has no reviewed `Preparing` migration CAS/receipt operation; the canonical Work project ledger has no safe offline `Prepared` conversion transaction; source-origin receipt identity/role mapping, producer high-water, verified dependency/FIFO state and authenticated review approval are not established by this adapter. Its only successful status is `ADAPTER_ONLY_NOT_PREPARED`; `canonicalPrepared=false`, `schedulerEnabled=false`, and `productionCutover=NOT_AUTHORIZED` remain explicit. A production cutover requires new independently reviewed typed bindings, real provenance proof and separate human authorization, never this script.
+
+**Evidence write boundary:** Backups and diffs use only fixed authority filenames (`project-1.bundle`, `project-2.diff`, `account.bundle`, etc.), not arbitrary project display names. Path-like, blank, duplicate/casefold-equivalent or account-reserved project names are rejected. The adapter checks every resolved output path and refuses symlinks, unexpected files or attempts to overwrite unjournaled diff evidence.
+
+**Interrupted preparation and safe abort:** Repeating `prepare` with the same original UUID and exact reviewed manifest/report must independently reconstruct the identical full staged commit before it can adopt an unjournaled ref. To recover a crash after staging CAS but before persisting `preparedHead`, replay `prepare` with those original pinned inputs, then run `abort`. Abort first checks every authority tip against its exact recorded `preparedHead` and refuses to delete any unrecognized sibling or unverifiable ref. Known refs are removed by exact Git CAS only. Preserve all original branches, backups, receipts and diffs; never choose a new UUID to conceal an unknown outcome.
+
+Run the hermetic regression suite with:
+
+```sh
+python3 -m unittest discover -s tools/Wq10MigrationPreview/tests -v
+```

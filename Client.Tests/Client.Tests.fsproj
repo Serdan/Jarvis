@@ -38,6 +38,8 @@
         <Compile Include="LedgerStoreTests.fs"/>
         <Compile Include="WorkQueueGitLedgerTests.fs"/>
         <Compile Include="WorkCompositionLedgerTests.fs"/>
+        <Compile Include="WorkCompositionQueueBinderTests.fs"/>
+        <Compile Include="WorkQueueToolFacadeTests.fs"/>
         <Compile Include="TaskFirstUiProjectionTests.fs"/>
         <Compile Include="TaskFirstUiSnapshotAdapterTests.fs"/>
         <!-- Deferred WQ06 transport fixtures currently lack the canonical WQ04 producer
@@ -54,6 +56,7 @@
         <Compile Include="SourceEffectHostBindingTests.fs"/>
         <Compile Include="AccountCapacityLedgerTests.fs"/>
         <Compile Include="AccountAdmissionAdapterTests.fs"/>
+        <Compile Include="WorkQueueCanonicalMigrationPrepareTests.fs"/>
         <Compile Include="RoleInstructionsTests.fs"/>
         <Compile Include="ReviewWorkflowTests.fs"/>
         <Compile Include="ChallengeWorkflowTests.fs"/>
@@ -64,10 +67,21 @@
         <Compile Include="OriginalBrowserJournalTests.fs"/>
         <Compile Include="WorkQueueSchedulerHostPreviewTests.fs"/>
         <Compile Include="WorkQueueCrossProjectPlannerTests.fs"/>
+        <Compile Include="WorkQueueReactiveWakeTests.fs"/>
+        <Compile Include="WorkQueueSchedulerHostLoopTests.fs"/>
+        <Compile Include="WorkQueueSchedulerHeadBindingTests.fs"/>
+        <Compile Include="WorkQueueReactiveWakeGitTests.fs"/>
         <Compile Include="WorkQueueAcceptedAdaptersCapOneSmokeTests.fs"/>
+        <Compile Include="WorkQueueWorkReplacementVerticalSliceTests.fs"/>
+        <Compile Include="WorkQueueCrossProjectHostPreviewTests.fs"/>
+        <Compile Include="WorkQueueDurableLaunchIntentTests.fs"/>
+        <Compile Include="WorkQueueVerifiedDispatchAdapterTests.fs"/>
+        <Compile Include="WorkQueueNativeLifecycleCasTests.fs"/>
         <Compile Include="WorkingTurnGuidanceTests.fs"/>
         <Compile Include="OrchestrationApiTests.fs"/>
         <Compile Include="AgentViewTests.fs"/>
+        <Compile Include="WorkDashboardViewTests.fs"/>
+        <Compile Include="WorkQueueDashboardReadBindingTests.fs"/>
         <Compile Include="AgentDashboardCacheTests.fs"/>
         <Compile Include="TerminalMouseTests.fs"/>
         <Compile Include="TerminalLayoutTests.fs"/>

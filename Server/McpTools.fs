@@ -87,6 +87,21 @@ module private OperatorConversationCommands =
           ExpectedVersion = 0; MessageId = ""; HandlerGeneration = 0
           ReplyId = ""; Text = ""; Reason = ""; ExpectedBlobOid = "" }
 
+// Transport-only authenticated Work-first seam; live mutations remain default-off.
+module private WorkQueueCommands =
+    let read project action category workId =
+        WorkQueueReadCommand
+            { ProjectName = project; Action = action; Category = category; WorkId = workId }
+
+    let write (http: IHttpContextAccessor) project action operationId launchId workId
+              expectedProjectVersion claimGeneration evidenceSha256 =
+        WorkQueueWriteCommand
+            { ProjectName = project; Action = action
+              ActorId = OperatorConversationCommands.actor http
+              OperationId = operationId; LaunchId = launchId; WorkId = workId
+              ExpectedProjectVersion = expectedProjectVersion
+              ClaimGeneration = claimGeneration; EvidenceSha256 = evidenceSha256 }
+
 module private TaskCommands =
     // Compatibility wire value for administrative calls lacking a caller field.
     // This is NOT the audit actor. The local TaskApi resolves provenance from
@@ -374,7 +389,11 @@ module McpToolHelpers =
           for name in [ "PostOperatorConversationMessage"; "ClaimOperatorConversationMessage";
                         "HandleOperatorConversationMessage"; "ReleaseOperatorConversationMessage";
                         "RepairOperatorConversation" ] ->
-              fromWire "OperatorConversationWrite" name ]
+              fromWire "OperatorConversationWrite" name
+          for name in [ "ListWork"; "GetWork" ] ->
+              fromWire "WorkQueueRead" name
+          for name in [ "ClaimNextWork"; "CheckpointWork"; "CompleteWork" ] ->
+              fromWire "WorkQueueWrite" name ]
 
     let mcpListCommandsResult : ListCommandsResult =
         { ProtocolVersion = AgentProtocol.version
@@ -386,7 +405,9 @@ module McpToolHelpers =
                  && capability.Name <> "LedgerRead" && capability.Name <> "LedgerWrite"
                  && capability.Name <> "ChallengeRead" && capability.Name <> "ChallengeWrite"
                  && capability.Name <> "OperatorConversationRead"
-                 && capability.Name <> "OperatorConversationWrite"))
+                 && capability.Name <> "OperatorConversationWrite"
+                 && capability.Name <> "WorkQueueRead"
+                 && capability.Name <> "WorkQueueWrite"))
             @ ledgerAliasCapabilities
             @ [ serverLocalCapability
                     "GetProfile"
@@ -600,6 +621,7 @@ module McpToolHelpers =
         | GetWorktreeCommand _
         | InspectWorktreeRemovalCommand _
         | OperatorConversationReadCommand _
+        | WorkQueueReadCommand _
         | TaskReadCommand _
         | ChallengeReadCommand _
         | ObserveAgentCommand _
@@ -648,6 +670,7 @@ module McpToolHelpers =
         | CreateProjectCommand _
         | RemoveWorktreeCommand _
         | OperatorConversationWriteCommand _
+        | WorkQueueWriteCommand _
         | TaskWriteCommand _
         | CrossProjectNotificationCommand _
         | ChallengeWriteCommand _
@@ -775,6 +798,10 @@ module McpToolHelpers =
         | OperatorConversationWriteCommand cmd ->
             let id, generated = resolveOperationId cmd.OperationId
             OperatorConversationWriteCommand { cmd with OperationId = id },
+            (if generated then Some id else None)
+        | WorkQueueWriteCommand cmd ->
+            let id, generated = resolveOperationId cmd.OperationId
+            WorkQueueWriteCommand { cmd with OperationId = id },
             (if generated then Some id else None)
         | TaskWriteCommand cmd ->
             let id, generated = resolveOperationId cmd.OperationId
@@ -2881,3 +2908,70 @@ type JarvisMcpTools =
         McpToolHelpers.send client http
             (OperatorConversationWriteCommand
                 { cmd with ExpectedBlobOid = expectedBlobOid; Reason = reason; Text = replacementJson })
+
+    // Work-first authenticated tools. These never use the caller's legacy agentId
+    // as durable Work ownership. Reads are active; writes are typed and return
+    // RejectedMissingBinding until the verified WQ03/WQ04 CAS seam is installed.
+    [<McpServerTool(Title = "List canonical Work", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]""");
+      Description("Read pinned canonical Work, available/blocked/active classification, exact dependency generations and coverage. Queue availability is not a capacity or launch permit.")>]
+    static member ListWork(
+        projectName: string, agentId: string,
+        [<Optional; DefaultParameterValue("All")>] category: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        McpToolHelpers.send client http
+            (WorkQueueCommands.read projectName "List" category "")
+
+    [<McpServerTool(Title = "Get canonical Work", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]""");
+      Description("Inspect one Work ID at a verified project Git head with stage/claim version, dependency graph reasons, launch/session evidence and explicit missing bindings.")>]
+    static member GetWork(
+        projectName: string, agentId: string, workId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        McpToolHelpers.send client http
+            (WorkQueueCommands.read projectName "Get" "All" workId)
+
+    [<McpServerTool(Title = "Claim next canonical Work (default off)", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("Typed fail-closed Work-first claim boundary. Requires verified ephemeral launch and same-CAS role/source/account binding not yet installed. Returns exact missing binding, no legacy Agent assignment.")>]
+    static member ClaimNextWork(
+        projectName: string, agentId: string, launchId: string, expectedProjectVersion: int,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        McpToolHelpers.send client http
+            (WorkQueueCommands.write http projectName "ClaimNext" operationId
+                launchId "" expectedProjectVersion 0 "")
+
+    [<McpServerTool(Title = "Checkpoint canonical Work (default off)", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("Typed fail-closed checkpoint with exact Work/claim generation and SHA-256 evidence. No mutation until verified session/source journal bound.")>]
+    static member CheckpointWork(
+        projectName: string, agentId: string, launchId: string, workId: string,
+        expectedProjectVersion: int, claimGeneration: int, evidenceSha256: string,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        McpToolHelpers.send client http
+            (WorkQueueCommands.write http projectName "Checkpoint" operationId
+                launchId workId expectedProjectVersion claimGeneration evidenceSha256)
+
+    [<McpServerTool(Title = "Complete canonical Work (default off)", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("Typed fail-closed terminal Work boundary tied to ephemeral session evidence; never equates execution terminal with Accepted or Integrated.")>]
+    static member CompleteWork(
+        projectName: string, agentId: string, launchId: string, workId: string,
+        expectedProjectVersion: int, claimGeneration: int, evidenceSha256: string,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        McpToolHelpers.send client http
+            (WorkQueueCommands.write http projectName "Complete" operationId
+                launchId workId expectedProjectVersion claimGeneration evidenceSha256)

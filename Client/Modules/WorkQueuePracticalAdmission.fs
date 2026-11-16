@@ -158,6 +158,11 @@ module WorkQueuePracticalAdmission =
         let launchId = request.LaunchId.ToString("D")
         let admissionId = request.AdmissionOperationId.ToString("D")
         let decisionPath = WorkQueueGitLedger.admissionPath launchId
+        let credentialPath = WorkQueueGitLedger.credentialPath launchId
+        let legacyPaths = [| WorkQueueGitLedger.RecordPath; decisionPath;
+                             WorkQueueRoleAuthority.roleAdmissionPath launchId |]
+        let credentialPaths = [| WorkQueueGitLedger.RecordPath; decisionPath; credentialPath;
+                                 WorkQueueRoleAuthority.roleAdmissionPath launchId |]
         let rolePath = WorkQueueRoleAuthority.roleAdmissionPath launchId
         let! maybeOperation =
             LedgerStore.getOperationAt binding snapshot request.AdmissionOperationId
@@ -166,7 +171,8 @@ module WorkQueuePracticalAdmission =
             | Some original when original.Type = "WQ02.Mutate"
                                  && original.OperationId = admissionId
                                  && original.Actor = request.Actor
-                                 && original.Paths = [| WorkQueueGitLedger.RecordPath; decisionPath; rolePath |] ->
+                                 && (original.Paths = legacyPaths ||
+                                     original.Paths = credentialPaths) ->
                 Ok original
             | _ -> Error(invalid "Original admission command/paths are missing or have different identity.")
         let! sourceCommit = LedgerStore.getOperationOriginAt binding snapshot operation
@@ -183,6 +189,19 @@ module WorkQueuePracticalAdmission =
                                         && record.AdmissionOperationId = admissionId
                                         && record.AbortOperationId = "" -> Ok record
                 | _ -> Error(invalid "Original immutable admission decision is absent."))
+        // The immutable secret verifier must belong to this SAME original
+        // admission commit and match its account token. No later credential
+        // record can be retroactively attached to a legacy launch.
+        let! _ =
+            if operation.Paths = credentialPaths then
+                WorkQueueGitLedger.readCredentialAt binding issuedHead launchId
+                |> Result.bind (function
+                    | Some (record, _) when record.SchemaVersion = 1
+                                            && record.ProjectId = binding.ProjectId.ToString("D")
+                                            && record.LaunchId = launchId
+                                            && record.AccountTokenId = admissionId -> Ok ()
+                    | _ -> Error(invalid "Original Work credential verifier is absent or foreign."))
+            else Ok ()
         match originalProject.Launches.TryFind decision.LaunchId with
         | Some original when original.Credit = Some demand.WorkId
                              && original.AccountTokenId = decision.AccountTokenId
@@ -192,15 +211,34 @@ module WorkQueuePracticalAdmission =
         | _ -> return! Error(invalid "Original issuing CAS selected another work ID or versioned role.")
     }
 
+    let private verifyIssuedCredentialAt (binding: LedgerBinding) snapshot launchId
+                                         (credential: IssuedWorkCredential option) =
+        WorkQueueGitLedger.readCredentialAt binding snapshot launchId
+        |> Result.bind (fun stored ->
+            match credential, stored with
+            | None, None -> Ok ()
+            | Some issued, Some (verifier, _)
+                when not (isNull (box issued))
+                     && issued.LaunchId = launchId
+                     && verifier.SchemaVersion = 1
+                     && verifier.ProjectId = binding.ProjectId.ToString("D")
+                     && verifier.LaunchId = launchId
+                     && verifier.SecretSha256 = issued.VerifierSha256 -> Ok ()
+            | _ -> Error(invalid "Original admission credential does not match its Git verifier."))
+
     // This opt-in is intentionally not callable from a timer or live dispatch
     // registration. WQ07 first reserves globally, then this project CAS binds
     // the exact WQ04 role/source and WQ02 chosen credit. An uncertain global or
     // project write is never retried with a different operation ID.
-    let admitExplicit (explicitEnabled: bool) (account: AccountBinding)
+    let private admitExplicitCore (credential: IssuedWorkCredential option)
+                      (explicitEnabled: bool) (account: AccountBinding)
                       (project: LedgerBinding) (request: AccountAdmissionRequest)
                       (demand: PracticalAdmissionDemand) =
         if not explicitEnabled then
             TokenRetained "WQ04 practical admission is disabled by default."
+        elif credential |> Option.exists (fun issued ->
+            isNull (box issued) || issued.LaunchId <> request.LaunchId.ToString("D")) then
+            TokenRetained "Work credential issuance is scoped to a different launch."
         elif String.IsNullOrWhiteSpace demand.WorkId || String.IsNullOrWhiteSpace demand.OriginBlobOid then
             TokenRetained "Missing exact pinned canonical work/origin assertion."
         else
@@ -219,6 +257,7 @@ module WorkQueuePracticalAdmission =
                        || already.RoleVersion <> request.RoleVersion then
                         return! Error(invalid "Original replay has a different launch/credit/role.")
                     do! originalCreditAt project snapshot request demand
+                    do! verifyIssuedCredentialAt project snapshot (request.LaunchId.ToString("D")) credential
                     do! sourceAt project snapshot state demand false
                     return "verified replay"
                 | None ->
@@ -230,11 +269,17 @@ module WorkQueuePracticalAdmission =
                 let execute binding actor operationId version mutation =
                     match mutation with
                     | AdmitProject launch ->
-                        WorkQueueGitLedger.executePinnedRoleAdmission binding actor operationId
-                            version launch demand.WorkId (fun snapshot state -> result {
+                        let pinnedAt snapshot state = result {
                                 do! sameAccountToken account binding request
                                 return! verifyPinnedAt binding snapshot state request demand
-                            })
+                            }
+                        match credential with
+                        | None ->
+                            WorkQueueGitLedger.executePinnedRoleAdmission binding actor operationId
+                                version launch demand.WorkId pinnedAt
+                        | Some issued ->
+                            WorkQueueGitLedger.executePinnedRoleCredentialAdmission binding actor operationId
+                                version launch demand.WorkId issued pinnedAt
                     | _ -> Error(invalid "Only exact original project admission is allowed.")
                 let outcome =
                     AccountAdmissionAdapter.admitUsing execute
@@ -253,6 +298,7 @@ module WorkQueuePracticalAdmission =
                             | _ -> Error(invalid "Original replay launch credit or role identity differs.")
                         let! snapshot = LedgerStore.fetch project
                         do! originalCreditAt project snapshot request demand
+                        do! verifyIssuedCredentialAt project snapshot (request.LaunchId.ToString("D")) credential
                         do! sourceAt project snapshot view.Project demand false
                         return launch
                     }
@@ -260,3 +306,15 @@ module WorkQueuePracticalAdmission =
                     | Ok _ -> ProjectAdmitted head
                     | Error reason -> TokenRetained(sprintf "Original admission replay needs repair: %A" reason)
                 | other -> other
+
+    // Preserve the legacy entry point for existing callers. No downgrade is
+    // accepted when an original launch has a credential verifier.
+    let admitExplicit enabled account project request demand =
+        admitExplicitCore None enabled account project request demand
+
+    // Opt-in, host-owned reservation. The issued secret exists only in the
+    // caller's transient delivery object; Git stores its digest in the same
+    // winning project CAS as WQ04 role/source/account admission.
+    let admitExplicitWithCredential enabled account project request demand
+                                    (issued: IssuedWorkCredential) =
+        admitExplicitCore (Some issued) enabled account project request demand

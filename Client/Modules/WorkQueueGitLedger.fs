@@ -163,14 +163,40 @@ type ProjectTerminalRecord =
       TerminalKind: string
       LaunchGeneration: int64 }
 
+// Immutable verifier is stored in the SAME Git CAS as a successful admission;
+// the launch state supplies the lifecycle. The preimage never enters Git.
+type WorkCredentialVerifier =
+    { SchemaVersion: int
+      ProjectId: string
+      LaunchId: string
+      AccountTokenId: string
+      SecretSha256: string }
+
+[<Sealed>]
+type IssuedWorkCredential private (launchId: string, secret: string) =
+    member _.LaunchId = launchId
+    member _.VerifierSha256 = CanonicalCodec.digest secret
+    // Only the approved launch bridge should call this transient delivery seam.
+    member _.RevealForPrivateDelivery() = secret
+    override _.ToString() = "IssuedWorkCredential(<redacted>)"
+    static member Issue(launchId: string) =
+        match Guid.TryParse launchId with
+        | true, id when id <> Guid.Empty ->
+            let secret = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
+                             .TrimEnd('=').Replace('+', '-').Replace('/', '_')
+            IssuedWorkCredential(launchId, secret)
+        | _ -> invalidArg (nameof launchId) "Expected nonempty launch UUID."
+
 type WorkMutation =
     | PublishStage of WorkStage
     | ProduceEvent of QueueProducerEvent
     | PostMessage of SubjectMessage * WorkStage option
     | AdmitProject of Launch
+    | AdmitCredentialProject of launch: Launch * verifierSha256: string
     | AbortUnboundProjectAdmission of Launch * originalAdmissionOperationId: string
     | DispatchOnce of launchId: string * outcome: DispatchState
     | InitializeAgent of launchId: string * sessionKey: string
+    | InitializeCredential of launchId: string
     | Heartbeat of launchId: string * leaseGeneration: int
     | StopStalled of launchId: string * leaseGeneration: int * stalledAfter: int64
     | ClaimNext of launchId: string
@@ -192,6 +218,18 @@ type WorkMutation =
     | ResolveAncillaryGate of launchId: string * messageId: string * workId: string * expectedLaunchVersion: int * expectedClaimGeneration: int * expectedGraphVersion: int
     // Integration, account and live source-job journal transitions remain
     // unavailable: a production cutover requires a separate authorized bridge.
+
+// Work-native actions never accept a caller-controlled agent ID or role.
+// The credential selects the only effective launch before a mutation is made.
+type CredentialWorkAction =
+    | FirstConnect
+    | ClaimPrimary
+    | HeartbeatLease of leaseGeneration: int
+    | Checkpoint of workId: string * claimGeneration: int * summarySha256: string
+    | CompleteReadOnly of workId: string * claimGeneration: int * evidenceSha256: string
+    | FinishOrdinary of workId: string
+    | ClaimMessage of messageId: string
+    | FinishMessage of workId: string * messageId: string * handlerGeneration: int * replyId: string
 
 // Immutable, inspectable provenance in the same project Git CAS as the work stage.
 // This is an observation, not a global permission or a scheduler launch token.
@@ -236,6 +274,9 @@ module WorkQueueGitLedger =
     let admissionPath launchId =
         "records/work-queue/admissions/" + CanonicalCodec.digest launchId + ".json"
 
+    let credentialPath launchId =
+        "records/work-queue/credentials/" + CanonicalCodec.digest launchId + ".json"
+
     let terminalPath launchId =
         "records/work-queue/terminals/" + CanonicalCodec.digest launchId + ".json"
 
@@ -260,6 +301,9 @@ module WorkQueueGitLedger =
 
     let readAdmissionAt binding snapshot launchId =
         readCanonical<ProjectAdmissionRecord> binding snapshot (admissionPath launchId)
+
+    let readCredentialAt binding snapshot launchId =
+        readCanonical<WorkCredentialVerifier> binding snapshot (credentialPath launchId)
 
     let readTerminalAt binding snapshot launchId =
         readCanonical<ProjectTerminalRecord> binding snapshot (terminalPath launchId)
@@ -901,6 +945,7 @@ module WorkQueueGitLedger =
         let decision =
             match mutation with
             | AdmitProject launch -> Some(launch, "AdmissionWon", op, "")
+            | AdmitCredentialProject (launch, _) -> Some(launch, "AdmissionWon", op, "")
             | AbortUnboundProjectAdmission (launch, original) ->
                 Some(launch, "AbortOnlyUnbound", original, op)
             | _ -> None
@@ -919,6 +964,25 @@ module WorkQueueGitLedger =
                     | None ->
                         Ok [ { Path = admissionPath launch.Id; ExpectedBlobOid = None
                                Content = CanonicalCodec.encode record } ])
+        let credentialChanges =
+            match mutation with
+            | AdmitCredentialProject (launch, digest) ->
+                if digest.Length <> 64 ||
+                   not (digest |> Seq.forall (fun c ->
+                       (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) then
+                    Error(InvalidBinding "Work credential verifier must be a lowercase SHA-256 digest.")
+                else
+                    readCredentialAt binding snapshot launch.Id
+                    |> Result.bind (function
+                        | Some _ -> Error(LedgerIntegrityError "Work credential verifier already exists.")
+                        | None ->
+                            let record =
+                                { SchemaVersion = 1; ProjectId = project
+                                  LaunchId = launch.Id; AccountTokenId = launch.AccountTokenId
+                                  SecretSha256 = digest }
+                            Ok [ { Path = credentialPath launch.Id; ExpectedBlobOid = None
+                                   Content = CanonicalCodec.encode record } ])
+            | _ -> Ok []
         let terminals =
             after.Launches
             |> Map.toList
@@ -958,7 +1022,9 @@ module WorkQueueGitLedger =
                     | _ -> Error(LedgerIntegrityError "Terminal launch lacks its original project admission decision."))
         admissionChanges
         |> Result.bind (fun admissions ->
-            terminalChanges [] terminals |> Result.map (fun terminal -> admissions @ terminal))
+            credentialChanges
+            |> Result.bind (fun credentials ->
+                terminalChanges [] terminals |> Result.map (fun terminal -> admissions @ credentials @ terminal)))
 
     /// Positive WQ-04 project-only stage producer. The typed source event has
     /// already been verified against its original Git operation by the higher
@@ -1146,7 +1212,8 @@ module WorkQueueGitLedger =
                             else
                                 Contracts.postMessage expectedVersion op message
                                     (roleWork |> Option.map (witnessNewStage state now)) state
-                        | AdmitProject launch ->
+                        | AdmitProject launch
+                        | AdmitCredentialProject (launch, _) ->
                             // Account reservation is proven by the separate bridge before
                             // invoking this inert project-CAS adapter.
                             if not (validInitialLaunch binding launch)
@@ -1168,7 +1235,15 @@ module WorkQueueGitLedger =
                             | _ -> Error Rejection.MissingProof
                         | DispatchOnce (launch, outcome) -> Contracts.dispatchOnce expectedVersion op launch outcome state
                         | InitializeAgent (launch, sessionKey) ->
-                            Contracts.initializeAgent expectedVersion op launch sessionKey (Guid.NewGuid().ToString("D")) now state
+                            // Old Agent transport has no bearer: it cannot register a
+                            // launch whose immutable Work verifier is present.
+                            match readCredentialAt binding snapshot launch with
+                            | Ok None ->
+                                Contracts.initializeAgent expectedVersion op launch sessionKey (Guid.NewGuid().ToString("D")) now state
+                            | _ -> Error Rejection.MissingProof
+                        | InitializeCredential launch ->
+                            if verifiedLifecycle.IsNone then Error Rejection.MissingProof
+                            else Contracts.initializeCredential expectedVersion op launch now state
                         | Heartbeat (launch, generation) -> Contracts.heartbeat expectedVersion op launch generation now state
                         | StopStalled (launch, generation, timeout) ->
                             Contracts.markStalled expectedVersion op launch generation now timeout state
@@ -1338,10 +1413,14 @@ module WorkQueueGitLedger =
     // versioned-role witnesses in the SAME CAS. The caller must reverify pinned
     // source, role and account evidence inside this planner. Normal WQ02
     // execute remains fail-closed for production AdmitProject.
-    let internal executePinnedRoleAdmission (binding: LedgerBinding) (actor: string) (operationId: Guid)
+    let private executePinnedRoleAdmissionCore credentialVerifier
+             (binding: LedgerBinding) (actor: string) (operationId: Guid)
              (expectedVersion: int) (launch: Launch) (expectedWorkId: string)
              (validateAt: LedgerSnapshot -> Project -> Result<string, LedgerFailure>) =
-        let mutation = AdmitProject launch
+        let mutation =
+            match credentialVerifier with
+            | Some digest -> AdmitCredentialProject(launch, digest)
+            | None -> AdmitProject launch
         let request = JsonObject()
         request.Add("schemaVersion", JsonValue.Create(1))
         request.Add("expectedProjectVersion", JsonValue.Create(expectedVersion))
@@ -1384,7 +1463,7 @@ module WorkQueueGitLedger =
                         return! Error(LedgerIntegrityError "Role-admission path already exists.")
                     let! content = validatedContent binding next
                     let! admission = witnessChanges binding snapshot state next mutation operationId
-                    if admission.Length <> 1 then
+                    if admission.Length <> (if credentialVerifier.IsSome then 2 else 1) then
                         return! Error(LedgerIntegrityError "Original project admission witness is incomplete.")
                     return
                         { Path = RecordPath; ExpectedBlobOid = oid; Content = content }
@@ -1395,6 +1474,26 @@ module WorkQueueGitLedger =
         | Ok _, Some shouldDrop when shouldDrop operationId ->
             Error(OutcomeUnknown $"Injected lost WQ04 admission acknowledgement {operationId:D}.")
         | _ -> result
+
+    // Preserve the historic, explicitly legacy admission contract unchanged.
+    let internal executePinnedRoleAdmission binding actor operationId expectedVersion
+            launch expectedWorkId validateAt =
+        executePinnedRoleAdmissionCore None binding actor operationId expectedVersion
+            launch expectedWorkId validateAt
+
+    // An approved launcher issues once, keeps the bearer only in volatile
+    // execution-delivery state, and binds its verifier to the WQ04/WQ07
+    // admission decision atomically. A lost original send is reconciled via
+    // the original intent; the secret is NEVER reconstructed from the hash.
+    let internal executePinnedRoleCredentialAdmission binding actor operationId expectedVersion
+            (launch: Launch) expectedWorkId
+            (credential: IssuedWorkCredential)
+            (validateAt: LedgerSnapshot -> Project -> Result<string, LedgerFailure>) =
+        if isNull (box credential) || credential.LaunchId <> launch.Id then
+            Error(InvalidBinding "Issued Work credential does not match the reserved launch.")
+        else
+            executePinnedRoleAdmissionCore (Some credential.VerifierSha256) binding actor
+                operationId expectedVersion launch expectedWorkId validateAt
 
     // Deterministic tests can replay adversarial interleavings with virtual time.
     let internal executeAt binding actor operationId expectedVersion now mutation =
@@ -1433,3 +1532,80 @@ module WorkQueueGitLedger =
         | Ok _, Some shouldDrop when shouldDrop operationId ->
             Error(OutcomeUnknown $"Injected lost WQ-02 post-publication acknowledgement {operationId:D}.")
         | _ -> result
+
+
+    // The only Work-native fixture mutation entrypoint. Credentials are
+    // ephemeral arguments, NOT part of WorkMutation, operation receipts or logs.
+    // This logic can be hosted by the approved relay without server-local state.
+    let private credentialMutation launchId action =
+        match action with
+        | CredentialWorkAction.FirstConnect -> InitializeCredential launchId
+        | CredentialWorkAction.ClaimPrimary -> ClaimNext launchId
+        | CredentialWorkAction.HeartbeatLease generation -> Heartbeat(launchId, generation)
+        | CredentialWorkAction.Checkpoint (workId, generation, digest) ->
+            CheckpointReadOnly(launchId, workId, generation, digest)
+        | CredentialWorkAction.CompleteReadOnly (workId, generation, digest) ->
+            CompleteVerifiedReadOnly(launchId, workId, generation, digest)
+        | CredentialWorkAction.FinishOrdinary workId -> CompleteOrdinary(launchId, workId)
+        | CredentialWorkAction.ClaimMessage messageId -> ClaimAncillary(launchId, messageId)
+        | CredentialWorkAction.FinishMessage (workId, messageId, generation, replyId) ->
+            CompleteMessage(launchId, workId, messageId, generation, replyId)
+
+    let private verifyBearerAt (binding: LedgerBinding) snapshot (state: Project)
+                               launchId (bearer: string) (operationId: Guid)
+                               (action: CredentialWorkAction) =
+        let denied = InvalidBinding "Work execution credential or launch lifecycle rejected."
+        let validEncoding =
+            not (isNull bearer) && bearer.Length = 43
+            && Regex.IsMatch(bearer, "^[a-zA-Z0-9_-]{43}$")
+        // Hash the candidate independently of the public launch label;
+        // compare fixed-size digests in constant time.
+        if not validEncoding then Error denied
+        else
+            let presented = SHA256.HashData(Encoding.UTF8.GetBytes bearer)
+            readCredentialAt binding snapshot launchId
+            |> Result.bind (function
+                | Some (verifier, _) ->
+                    match state.Launches.TryFind launchId with
+                    | Some launch when verifier.SchemaVersion = 1
+                                       && verifier.ProjectId = binding.ProjectId.ToString("D")
+                                       && verifier.LaunchId = launchId
+                                       && verifier.AccountTokenId = launch.AccountTokenId
+                                       && launch.ProjectId = verifier.ProjectId
+                                       && Regex.IsMatch(verifier.SecretSha256, "^[a-f0-9]{64}$") ->
+                        let known = Convert.FromHexString(verifier.SecretSha256)
+                        let authenticated = CryptographicOperations.FixedTimeEquals(presented, known)
+                        let marker = "work-credential-v1:" + launchId
+                        let registered =
+                            match launch.State, launch.Lease with
+                            | LaunchState.Registered (id, value), Some lease
+                                when id = launchId && value = marker && not lease.StopRequested -> true
+                            | _ -> false
+                        let eligible =
+                            match action, launch.State with
+                            | CredentialWorkAction.FirstConnect, LaunchState.SubmittedUnregistered DispatchState.Submitted
+                            | CredentialWorkAction.FirstConnect, LaunchState.SubmittedUnregistered DispatchState.OutcomeUnknown -> true
+                            | _, _ -> registered
+                        // An exact previously committed operation can be replayed
+                        // after terminal/STOP, but no new operation may mutate.
+                        let replay = state.Receipts.ContainsKey(operationId.ToString("D"))
+                        if authenticated && (eligible || replay) then Ok ()
+                        else Error denied
+                    | _ -> Error denied
+                | None -> Error denied)
+
+    // Fixture gate deliberately remains disconnected from public Agent tools.
+    // Both the preflight and the winning Git CAS re-read the same persisted
+    // verifier: stale snapshots, restarted relays and two clones fail closed.
+    let internal executeCredentialFixtureAt (binding: LedgerBinding) actor
+            (operationId: Guid) expectedVersion now launchId bearer action =
+        let mutation = credentialMutation launchId action
+        load binding
+        |> Result.bind (fun (head, state) ->
+            verifyBearerAt binding head state launchId bearer operationId action)
+        |> Result.bind (fun () ->
+            let verifyWinningCas snapshot before _ =
+                verifyBearerAt binding snapshot before launchId bearer operationId action
+            validateMutationPayload mutation
+            |> Result.bind (fun () ->
+                change true (Some verifyWinningCas) binding actor operationId expectedVersion now mutation))

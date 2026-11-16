@@ -286,7 +286,7 @@ let private serialize<'a> (value: 'a) =
     with e ->
         e |> ExceptionError |> Error
 
-type private DispatchedResult =
+type internal DispatchedResult =
     { Payload: string
       ChangedAgentIds: string list }
 
@@ -303,7 +303,8 @@ let private serialize'<'a> (result: Result<'a, Client.EffectError>) =
             { Payload = payload; ChangedAgentIds = changedAgentIds }))
     |> ValueTask<_>
 
-let private toAgentResponse command instructions stateChanges inboxActivation response =
+// Shared with the regression suite so it exercises the actual transport guard.
+let internal toAgentResponse command instructions stateChanges inboxActivation response =
     match response with
     | Error error ->
         { Result = None

@@ -21,13 +21,25 @@ No manually maintained percent, implied parent acceptance, or permanent human/LL
 
 `Client/Modules/WorkCompositionGitLedger.fs` stores a single small canonical envelope at `records/work-composition/graph.json` **in the same existing project Git orphan ledger** as task specifications, reviews, integration receipts, WQ state and operation receipts. This is not a second ledger or database. It uses the same `LedgerStore.transact` CAS machinery, immutable operation ID, semantic request JSON, verified remote snapshot, per-blob compare-and-swap, canonical record serialization, project identity and state hash.
 
-Every graph mutation reloads and validates the winner's exact ledger head. A stale `expectedGraphVersion` fails instead of rewriting a concurrent update. A retry with the same operation UUID recovers the winning receipt. `loadOverviews` reads composition and WQ state at **one pinned head**, with no split snapshot. Legacy work remains unchanged; an absent graph means no composition has been authored, not a fabricated migration.
+Every graph mutation reloads and validates the winner's exact ledger head. A stale `expectedGraphVersion` fails instead of rewriting a concurrent update. A retry with the same operation UUID recovers the winning receipt. `loadOverviews` and the bounded `loadOverviewPage` read composition and WQ state at **one pinned head**, with no split snapshot; a pagination cursor fails closed if the head changed. Legacy work remains unchanged; an absent graph means no composition has been authored, not a fabricated migration.
 
 Acceptance is a separate independently verifiable operation. The generic `execute` **rejects** `Accept` as unverified. The internal `executeVerifiedAcceptance` requires a validator executed **inside the same Git-CAS planner** against its exact snapshot. A caller-supplied string is not evidence.
 
 `WorkCompositionAcceptanceAdapter.acceptIntegrated` supplies an initial constrained validator: the unit must link to a canonical validation task, whose frozen review was accepted by a different reviewer and whose managed exact-commit integration receipt is `Integrated`. The review purpose binds the unit ID, kind, structural parent, spec version and canonical specification **plus its current composition closure**: direct child IDs, child spec versions, cancellation reasons and current accepted proof versions/evidence, and prerequisite proof versions/evidence. Child proofs transitively bind descendants. Adding or re-accepting a child changes the parent's reviewed target even after the child becomes complete; the old integrated receipt cannot be replayed as renewed parent acceptance. Unrelated graph mutations do not spuriously invalidate the review. Both review and integration are read from the same verified ledger snapshot as the graph mutation. This reuses the existing review and integration state machine; it does not create a new verification queue. A parent requires its **own** linked validation task and acceptance review, not merely accepted children.
 
-This adapter is library-level only: operator MCP commands and scheduler activation remain unwired. It deliberately does not infer that any completed child, generic accepted review, or unintegrated change satisfies independent parent acceptance.
+The branch wires three client-backed MCP operator operations through the existing TaskRead/TaskWrite transport:
+
+- `GetWorkComposition(projectName, agentId, unitId?, cursor?, pageSize?)` returns bounded canonical unit specifications plus derived overviews from one verified head, including snapshot/version and next cursor.
+- `MutateWorkComposition(projectName, agentId, expectedGraphVersion, mutationJson, operationId?)` interprets explicit JSON actions `Create`, `Revise`, `Move`, `Require`, `Unrequire`, `Cancel`, `Reopen`; `Create` requires `unitId`, `kind`, `title`, `goal`, `scope`, and `acceptanceCriteria`. `Revise` also requires `expectedSpecVersion`; dependencies use `prerequisiteId`. Linked canonical task IDs are optional while designing work.
+- `AcceptWorkCompositionIntegrated(projectName, agentId, unitId, expectedGraphVersion, expectedSpecVersion, submissionId, operationId?)` invokes the same-head verified review/integration adapter, not a caller-supplied acceptance string.
+
+Example mutation JSON:
+
+```json
+{"action":"Create","unitId":"scheduling","kind":"System","parentId":"project","title":"Scheduling","goal":"Dispatch ready work","scope":"Work selection","acceptanceCriteria":["Two dependencies must be accepted before dispatch"],"constraints":["Git ledger remains authoritative"]}
+```
+
+These methods are source-implemented, not yet reviewed/deployed. They do not infer that any completed child, generic accepted review, or unintegrated change satisfies independent parent acceptance. Scheduler activation remains unwired.
 
 ## Readiness and remaining integration work
 
@@ -35,10 +47,10 @@ The pure graph is a prerequisite and acceptance **description**, not an independ
 
 To complete the task's end-to-end acceptance criteria, next slices must:
 
-1. Expose the constrained integration-evidence acceptance pathway through the operator surface and extend evidence classes only where independently verifiable. Link graph nodes to their authoritative Task/stage identity, including validation coverage for parent-level criteria beyond merely closing children.
+1. Extend the existing operator acceptance pathway to other evidence classes only where independently verifiable. Link graph nodes to authoritative Task/stage identities, including validation coverage for parent-level criteria beyond merely closing children.
 2. Add a reconciled, same-project-CAS bridge that derives actual WQ hard-stage prerequisites and readiness from accepted graph nodes, without double-publishing a stage or allowing a stale/incomplete projection to dispatch. Graph edits that introduce unsatisfied dependencies to claimed work must use existing WQ dependency-gate and external-push fence contracts.
 3. Wire graph mutation/acceptance to scheduler wake and durable event high-water handling; prove lazy activation with **two prerequisites**, one-at-a-time completion, one bounded execution per available claim, process restart recovery, and child work created by a running execution.
-4. Expose the bounded operator mutation/query commands and consistent recursive blocker/readiness overview through the existing client/MCP command surface. Cover cross-System recursion, cancelled scope, status, progress, review and integration with real repositories.
+4. Independently review/deploy the newly authored bounded operator commands and test their live MCP route with real repositories; current unit-level queries include status, progress, blockers, review/integration stage IDs, and cancelled scope.
 5. Validate concurrent integration promotion against actual Git heads and semantic compatibility, using existing reviews and safe atomic ref updates. No fixed branch layer and no singleton Integrator.
 
 The current branch is deliberately *not* connected to production scheduler activation. An unverified work-unit graph must not authorize claims. No new server-owned persistent authority, agent permission framework, or project-management process machinery is proposed.
@@ -51,7 +63,7 @@ The current branch is deliberately *not* connected to production scheduler activ
 - Does a newly discovered child erase prior release evidence? **No; it invalidates only current target acceptance.**
 - Can cross-System blockers be expressed without multiple parents? **Yes.**
 - Does the graph itself create a runnable session or bypass WQ claim/lease accounting? **No.**
-- Is canonical acceptance validation plus reactive activation fully end-to-end? **Not yet; integrated review evidence has a bounded adapter, but operator exposure and dependency activation are still pending.**
+- Is canonical acceptance validation plus reactive activation fully end-to-end? **Not yet; the operator surface is implemented on this branch, but live deployment, dependency activation, and scheduler/restart fixtures remain pending.**
 
 ## Testing
 

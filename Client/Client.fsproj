@@ -78,6 +78,7 @@
         <Compile Include="Modules\WorkCompositionGitLedger.fs"/>
         <Compile Include="Modules\WorkQueueRoleAuthority.fs"/>
         <Compile Include="Modules\WorkQueueToolFacade.fs"/>
+        <Compile Include="Modules\WorkQueueDashboardReadBinding.fs"/>
         <Compile Include="Modules\WorkQueueConversationTransport.fs"/>
         <Compile Include="Modules\WorkQueueOperatorConversations.fs"/>
         <Compile Include="Modules\AccountCapacityLedger.fs"/>
@@ -86,6 +87,7 @@
         <Compile Include="Modules\RoleInstructions.fs"/>
         <Compile Include="Modules\\ReviewWorkflow.fs"/>
         <Compile Include="Modules\WorkCompositionAcceptanceAdapter.fs"/>
+        <Compile Include="Modules\WorkCompositionOperatorInputs.fs"/>
         <Compile Include="Modules\WorkCompositionQueueBinder.fs"/>
         <Compile Include="Modules\WorkCompositionQueueTransaction.fs"/>
         <Compile Include="Modules\\WorkQueueReviewIntegrationAdapter.fs"/>

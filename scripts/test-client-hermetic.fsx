@@ -94,6 +94,7 @@ let captureTail (reader: StreamReader) =
         let tail = StringBuilder()
         let currentLine = StringBuilder()
         let mutable completed = 0
+        let progressClock = Stopwatch.StartNew()
         let buffer = Array.zeroCreate<char> 4096
         let mutable finished = false
         while not finished do
@@ -113,9 +114,11 @@ let captureTail (reader: StreamReader) =
                         if failed || line.StartsWith("Passed ", StringComparison.OrdinalIgnoreCase)
                                   || line.StartsWith("Skipped ", StringComparison.OrdinalIgnoreCase) then
                             completed <- completed + 1
-                            if failed || completed = 1 || completed % 10 = 0 then
+                            // Preserve every per-case result for the current suite.
+                            // Sample larger runs to avoid unbounded progress logs.
+                            if failed || completed <= 1000 || completed % 10 = 0 then
                                 let excerpt = if line.Length > 180 then line.Substring(0, 180) else line
-                                printfn "Hermetic Client.Tests: progress completed %d (local stream); %s" completed excerpt
+                                printfn "Hermetic Client.Tests: progress completed %d (local stream); +%.1fs %s" completed progressClock.Elapsed.TotalSeconds excerpt
                     elif ch <> '\r' && currentLine.Length < 512 then
                         currentLine.Append(ch) |> ignore
         return tail.ToString()

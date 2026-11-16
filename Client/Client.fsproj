@@ -107,6 +107,7 @@
         <Compile Include="Modules\WorkQueueSchedulerHostLoop.fs"/>
         <Compile Include="Modules\WorkQueueSchedulerHeadBinding.fs"/>
         <Compile Include="Modules\WorkQueueVerifiedDispatchAdapter.fs"/>
+        <Compile Include="Modules\WorkQueueNativeCredentialDispatchAdapter.fs"/>
         <Compile Include="Modules\WorkQueueNativeLifecycleCas.fs"/>
         <Compile Include="Modules\\WorkQueueOperatorConversationCli.fs"/>
         <Compile Include="Modules\TaskFirstUiSnapshotAdapter.fs"/>

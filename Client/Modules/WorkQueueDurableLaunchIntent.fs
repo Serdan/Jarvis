@@ -459,11 +459,13 @@ module WorkQueueDurableLaunchIntent =
     // Explicit WQ07/WQ04 admission boundary for a *stored* original, not a
     // scheduler registration. It reserves at most one global token and checks
     // the immutable WQ04 source again. No browser/provider callback exists.
-    let admitPreparedExplicit enabled (context: DurableIntentContext)
-                              (stored: DurablePlanningLaunchIntent) actor =
+    let private admitPreparedCore (credential: IssuedWorkCredential option) enabled
+                                  (context: DurableIntentContext)
+                                  (stored: DurablePlanningLaunchIntent) actor =
         let retained why = TokenRetained("WQ12 held: " + why)
         if not enabled then retained "Default-off admission."
         elif not (nonBlank actor) then retained "Missing actor."
+        elif credential |> Option.exists (fun issued -> isNull (box issued) || issued.LaunchId <> stored.LaunchId) then retained "Credential does not match original launch."
         elif not context.CompleteProjectSet || context.Projects.Length < 2
              || (context.Projects |> List.map (fun item -> item.Binding.ProjectId)
                  |> Set.ofList |> Set.count) <> context.Projects.Length then
@@ -547,6 +549,19 @@ module WorkQueueDurableLaunchIntent =
                         let demand: PracticalAdmissionDemand =
                             { WorkId = original.WorkId
                               OriginBlobOid = original.OriginBlobOid }
-                        WorkQueuePracticalAdmission.admitExplicit true
-                            context.Account selected.Binding request demand
+                        match credential with
+                        | None ->
+                            WorkQueuePracticalAdmission.admitExplicit true
+                                context.Account selected.Binding request demand
+                        | Some issued ->
+                            WorkQueuePracticalAdmission.admitExplicitWithCredential true
+                                context.Account selected.Binding request demand issued
                 | _ -> retained "Canonical prepared intent changed or is unreconciled."
+
+    // The canonical prepared identity is the only authority for issuance.
+    let admitPreparedExplicit enabled context stored actor =
+        admitPreparedCore None enabled context stored actor
+
+    // Transient, opt-in launcher only. No public scheduler or MCP entrypoint.
+    let internal admitPreparedWithCredentialExplicit enabled context stored actor issued =
+        admitPreparedCore (Some issued) enabled context stored actor

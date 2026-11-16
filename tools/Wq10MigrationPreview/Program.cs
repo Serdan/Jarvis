@@ -296,8 +296,9 @@ internal static class Program
                 .Where(s => s.Length > 0).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
             var commits = attempts.SelectMany(a => new[] { Str(a, "baseCommit"), Str(a, "sourceCommit") })
                 .Where(s => s.Length > 0).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
-            // A task's canonical history includes completed predecessors and successor stages.
-            // Distinct stage generations/kinds/source-writer lineages are not duplicates.
+            // Immutable work IDs distinguish stages, including repeated reviews at the same generation.
+            // Only concurrent unfinished Implementation stages with an explicit shared source-writer
+            // lineage conflict under WorkQueueContracts.publishStage; generation is not a unique ID.
             var existingStages = (works?.Where(w => Str(w.Value, "subjectId") == taskId ||
                                                    Str(w.Value, "subjectId") == "task-" + taskId)
                 .OrderBy(w => w.Key, StringComparer.Ordinal)
@@ -309,8 +310,8 @@ internal static class Program
                         Str(lineage, "repositoryId"), Str(lineage, "taskId"),
                         Str(lineage, "targetRef"), Str(lineage, "lineageId"));
                 }).ToArray()) ?? [];
-            var identities = new Dictionary<(string Kind, int Generation, string Repo, string Task,
-                string Target, string Lineage), string>();
+            var unfinishedWriters = new Dictionary<(string Repo, string Task, string Target,
+                string Lineage), string>();
             foreach (var stage in existingStages)
             {
                 if (stage.Kind.Length == 0 || stage.StageGeneration < 1)
@@ -321,14 +322,18 @@ internal static class Program
                             "Inspect immutable stage kind and generation before duplicate screening"));
                     continue;
                 }
-                var identity = (stage.Kind, stage.StageGeneration, stage.RepositoryId,
-                    stage.SourceTaskId, stage.TargetRef, stage.LineageId);
-                if (identities.TryGetValue(identity, out var earlierId))
+                if (stage.Kind != "Implementation" || (stage.State is "Completed" or "Cancelled")
+                    || stage.RepositoryId.Length == 0 || stage.SourceTaskId.Length == 0
+                    || stage.TargetRef.Length == 0 || stage.LineageId.Length == 0)
+                    continue;
+                var writer = (stage.RepositoryId, stage.SourceTaskId, stage.TargetRef,
+                    stage.LineageId);
+                if (unfinishedWriters.TryGetValue(writer, out var earlierId))
                     findings.Add(new("BLOCKER", "DUPLICATE_CANONICAL_STAGE",
-                        $"{context}/{taskId}: {earlierId} and {stage.WorkId} share {stage.Kind} generation {stage.StageGeneration} and source lineage",
-                        "Inspect immutable work IDs, stage generations, lineage and origin receipts; do not auto-merge"));
+                        $"{context}/{taskId}: {earlierId} and {stage.WorkId} are concurrent unfinished Implementation source writers with the same lineage",
+                        "Inspect immutable work IDs, source-writer lineage and origin receipts; do not auto-merge"));
                 else
-                    identities.Add(identity, stage.WorkId);
+                    unfinishedWriters.Add(writer, stage.WorkId);
             }
             var already = existingStages.Length > 0;
             if (active.Length > 0)

@@ -255,10 +255,35 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual([s["kind"] for s in report["projects"][0]["tasks"][0]["existingStages"]],
                          ["Implementation", "FrozenReview"])
 
-    def test_genuinely_duplicate_canonical_stage_halts_conversion(self):
+    def test_distinct_frozen_reviews_with_same_generation_are_not_duplicates(self):
+        first = self.work_stage("review-first", 1, kind="FrozenReview", state="Completed")
+        second = self.work_stage("review-second", 1, kind="FrozenReview", state="Available")
+        del first["sourceLineage"]
+        del second["sourceLineage"]
         self.with_queue(works={
-            "W1": self.work_stage("W1", 1, state="Completed"),
-            "W2": self.work_stage("W2", 1, state="Completed")
+            "review-first": first,
+            "review-second": second,
+        }, covered=True, with_origin=True)
+        account_head, project_head = self.account.head, self.project.head
+        report = self.preview(markdown=True)
+        self.assertEqual(report["readiness"], "PREVIEW_READY_FOR_REVIEW")
+        self.assertEqual([f["code"] for f in report["findings"] if f["severity"] == "BLOCKER"], [])
+        stages = report["projects"][0]["tasks"][0]["existingStages"]
+        self.assertEqual(
+            [(s["workId"], s["kind"], s["stageGeneration"], s["state"]) for s in stages],
+            [("review-first", "FrozenReview", 1, "Completed"),
+             ("review-second", "FrozenReview", 1, "Available")],
+        )
+        markdown = (self.root / "report.md").read_text()
+        self.assertIn("Canonical review-first: FrozenReview generation 1", markdown)
+        self.assertIn("Canonical review-second: FrozenReview generation 1", markdown)
+        self.assertEqual(self.account.head, account_head)
+        self.assertEqual(self.project.head, project_head)
+
+    def test_concurrent_source_writers_with_same_lineage_halt_conversion(self):
+        self.with_queue(works={
+            "W1": self.work_stage("W1", 1, state="Available"),
+            "W2": self.work_stage("W2", 2, state="Available")
         }, covered=True, with_origin=True)
         report = self.preview()
         self.assertEqual(report["readiness"], "NO_GO")

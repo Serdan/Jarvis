@@ -93,6 +93,15 @@ let private checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.Pro
                     Sha256 = ""; Content = content } ]
             | None -> []
 
+// A read can still mutate the original Agent ledger via automatic activation
+// or one-shot response-alert consumption. Verify that *side effect* separately
+// so Frozen historical reads remain available without reviving old writers.
+let private oldSideEffectsAllowed (rt: Runtime) (selected: ProjectPaths.ProjectTarget) =
+    let project = selected |> ProjectPaths.ProjectTarget.projectId |> ProjectPaths.ProjectId.value
+    LegacyWriterProtocolFence.LegacyWriterProtocolFence.implicitLegacyActivityAllowed
+        (fun name -> OrchestrationApi.LedgerBindingConfig.load name rt
+                     |> Result.mapError (sprintf "%A")) project
+
 // Response alerts are distinct from cached Working-turn timing guidance.
 // A fresh canonical ledger read on each eligible response makes alerts
 // visible across devices and restarts, even if an invalidation push was lost.
@@ -102,6 +111,7 @@ let private checkResponseAlerts (rt: Runtime) agentId (target: ProjectPaths.Proj
     else
         match target with
         | None -> []
+        | Some selected when not (oldSideEffectsAllowed rt selected) -> []
         | Some selected ->
             let project = selected |> ProjectPaths.ProjectTarget.projectId |> ProjectPaths.ProjectId.value
             match OrchestrationApi.LedgerBindingConfig.load project rt with
@@ -189,6 +199,7 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
     else
         match target with
         | None -> Ok ([], None)
+        | Some target when not (oldSideEffectsAllowed rt target) -> Ok ([], None)
         | Some target ->
             let projectId = ProjectPaths.ProjectTarget.projectId target
             let project = ProjectPaths.ProjectId.value projectId
@@ -918,7 +929,15 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
 
         let! response =
             task {
-                match resolution with
+                // Re-check the verified original Git migration epoch before
+                // direct dispatch, including non-SignalR local entrypoints.
+                let gatedResolution =
+                    match LegacyWriterProtocolFence.LegacyWriterProtocolFence.checkHost
+                            (fun name -> OrchestrationApi.LedgerBindingConfig.load name rt
+                                         |> Result.mapError (sprintf "%A")) command with
+                    | Error reason -> Error(Client.ValidationError reason)
+                    | Ok () -> resolution
+                match gatedResolution with
                 | Error error ->
                     return Error error
                 | Ok(authorizationCommand, resolvedTask) ->
@@ -1101,6 +1120,16 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                                      || not (String.IsNullOrWhiteSpace taskless.TaskId)) ->
                             Error(Client.ValidationError "Taskless execution requires the initiating agent identity and no task ID.")
                         | _ -> classifyProject command
+                    // An AgentInbox is a write-capable read: fence before
+                    // implicit Ready->Working activation or response-alert
+                    // consumption, never after dispatch.
+                    let project =
+                        project |> Result.bind (fun scope ->
+                            LegacyWriterProtocolFence.LegacyWriterProtocolFence.checkHost
+                                (fun name -> OrchestrationApi.LedgerBindingConfig.load name rt
+                                             |> Result.mapError (sprintf "%A")) command
+                            |> Result.map (fun () -> scope)
+                            |> Result.mapError Client.ValidationError)
                     match project with
                     | Error error -> return Error error
                     | Ok scope ->

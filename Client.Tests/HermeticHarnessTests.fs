@@ -366,42 +366,21 @@ module HermeticHarnessTests =
     let failed_windows_root_acquisition_removes_created_root_before_testhost () =
         if not (OperatingSystem.IsWindows()) then
             Assert.Ignore("Native Windows scratch acquisition requires Windows.")
-        let disposableParent = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_DISPOSABLE_PARENT")
-        Assert.That(Directory.Exists(disposableParent), Is.True)
-        // Invoke only the setup-failure path: this cannot spawn a nested VSTest.
-        let repository =
-            Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", ".."))
-        let start = ProcessStartInfo("dotnet")
-        start.UseShellExecute <- false
-        start.RedirectStandardOutput <- true
-        start.RedirectStandardError <- true
-        start.WorkingDirectory <- repository
-        for arg in
-            [ "fsi"; "scripts/test-client-hermetic.fsx"; "--"
-              "--scratch-parent"; disposableParent; "--self-test-after-root-creation" ] do
-            start.ArgumentList.Add(arg)
-        use child = new Process(StartInfo = start)
-        Assert.That(child.Start(), Is.True)
-        let stdout = child.StandardOutput.ReadToEndAsync()
-        let stderr = child.StandardError.ReadToEndAsync()
-        if not (child.WaitForExit(60000)) then
-            child.Kill(true)
-            child.WaitForExit()
-            Assert.Fail("Root-creation failure injection did not exit in 60 seconds.")
-        let output = stdout.Result
-        let errors = stderr.Result
-        Assert.That(child.ExitCode, Is.EqualTo(1), errors)
-        let prefix = "Hermetic Client.Tests: failed root acquisition "
-        let rootLine =
-            output.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
-            |> Array.tryFind (fun line -> line.StartsWith(prefix, StringComparison.Ordinal))
-        Assert.That(rootLine.IsSome, Is.True, output + errors)
-        let allocated = rootLine.Value.Substring(prefix.Length)
-        Assert.That(Path.GetFileName(allocated), Does.StartWith("jarvis-client-tests-"))
-        Assert.That(HermeticClientTestEnvironment.Under disposableParent allocated, Is.True)
-        Assert.That(Directory.Exists(allocated), Is.False)
-        Assert.That(output, Does.Contain("scratch cleanup verified = true"))
-        Assert.That(output, Does.Not.Contain("child executable"))
+        // NUnit intentionally remaps APPDATA to a synthetic test directory;
+        // launching a nested FSI process would then fail native known-folder
+        // identity preflight rather than testing post-creation cleanup.
+        // Exercise the very same acquisition function used by the parent
+        // harness directly, entirely inside this attested private root.
+        let scratch = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_HERMETIC_ROOT")
+        WindowsDisposableGuard.assertOwnerOnly scratch true true
+        let candidate = Path.Combine(scratch, "jarvis-client-tests-" + Guid.NewGuid().ToString("N"))
+        let failure = Assert.Throws<Exception>(
+            TestDelegate(fun () ->
+                WindowsDisposableGuard.acquirePrivateRoot candidate true |> ignore))
+        Assert.That(failure.Message, Does.Contain("failure injected"))
+        Assert.That(HermeticClientTestEnvironment.Under scratch candidate, Is.True)
+        Assert.That(Directory.Exists(candidate), Is.False)
+        Assert.That(File.Exists(candidate), Is.False)
 
     [<Test>]
     let forged_disposable_root_inside_synthetic_profile_is_rejected_before_any_writes () =

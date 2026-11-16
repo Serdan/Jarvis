@@ -208,3 +208,27 @@ module WindowsDisposableGuard =
             failwith "Hermetic root-creation failure injected before ACL verification."
         assertOwnerOnly created.FullName true true
         created
+
+    /// The parent harness and its negative regression use the same guarded
+    /// acquisition boundary. The root contains no children at this point:
+    /// delete non-recursively only after independently verifying ownership,
+    /// DACL protection and linked-path exclusion.
+    let acquirePrivateRoot (path: string) (injectAfterCreate: bool) =
+        try
+            let created = createPrivateRoot path injectAfterCreate
+            if created.Attributes.HasFlag(FileAttributes.ReparsePoint) then
+                deny "Refusing a linked disposable Client.Tests scratch root."
+            created
+        with original ->
+            if Directory.Exists path then
+                try
+                    assertNoLinkedAncestors path
+                    assertOwnerOnly path true true
+                    Directory.Delete(path)
+                    printfn "Hermetic Client.Tests: failed root acquisition %s" path
+                    printfn "Hermetic Client.Tests: scratch cleanup verified = %b" (not (Directory.Exists path))
+                with cleanupError ->
+                    raise (AggregateException(
+                        "Hermetic root allocation failed and safe scratch cleanup could not be verified.",
+                        original, cleanupError))
+            reraise()

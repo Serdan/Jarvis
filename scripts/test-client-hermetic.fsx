@@ -133,7 +133,7 @@ let tempDirectory =
         try
             let created =
                 if OperatingSystem.IsWindows() then
-                    WindowsDisposableGuard.createPrivateRoot path injectRootCreationFailure
+                    WindowsDisposableGuard.acquirePrivateRoot path injectRootCreationFailure
                 else Directory.CreateDirectory(path)
             if injectRootCreationFailure && not (OperatingSystem.IsWindows()) then
                 failwith "Hermetic root-creation failure injected after allocation."

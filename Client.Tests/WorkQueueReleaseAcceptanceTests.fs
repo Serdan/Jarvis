@@ -11,6 +11,11 @@ open Client.LedgerStore
 open Client.WorkQueueGitLedger
 open Client.WorkQueueOperatorConversations
 open Client.SourceEffectJournal
+open Client.ReviewWorkflow
+open Client.WorkQueueReceiptProducer
+open Client.WorkQueueRoleAuthority
+open Client.WorkQueueSchedulerHostPreview
+open Client.AccountCapacityLedger
 
 // WQ-11 offline acceptance smoke. All remote refs, project ledgers and journals
 // are disposable. The WQ-02 fixture path below is explicitly NOT a wired
@@ -298,3 +303,112 @@ type WorkQueueReleaseAcceptanceTests() =
             Assert.That(observed.MissingOriginalOperations = [ missing ], Is.True)
             Assert.That(observed.UninstrumentedRoutes, Is.Not.Empty)
             Assert.That(observed.BlockReasons, Is.Not.Empty))
+
+    [<Test>]
+    member _.OriginalCreateTaskReceiptReachesRealSchedulerPreviewWithDisposableCapOne() =
+        withTwoClones (fun a b ->
+            // Account and project are independent orphan authorities on the same
+            // disposable bare Git remote; neither is a configured live account.
+            let accountId, accountLedgerId = Guid.NewGuid(), Guid.NewGuid()
+            let accountBinding (project: LedgerBinding) : AccountBinding =
+                { RepositoryPath = project.RepositoryPath
+                  RemoteName = project.RemoteName
+                  ApprovedFetchUrl = project.ApprovedFetchUrl
+                  ApprovedPushUrl = project.ApprovedPushUrl
+                  AccountId = accountId
+                  LedgerId = accountLedgerId
+                  Epoch = 1 }
+            let accountA, accountB = accountBinding a, accountBinding b
+            AccountCapacityLedger.initialize accountA 1 |> ok |> ignore
+
+            ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Lead" |> ok |> ignore
+            WorkQueueRoleAuthority.initializeCatalog a "Lead" (Guid.NewGuid()) |> ok |> ignore
+            let role: RoleConfiguration =
+                { RoleId = "Planner"; Version = 1; Enabled = true
+                  Instructions = "Inspect genuine planning demand"
+                  QueueSubscriptions = set [ "planning" ] }
+            WorkQueueRoleAuthority.configure a "Lead" (Guid.NewGuid()) 0 0 role |> ok |> ignore
+
+            // WQ02 original operation, WQ04 explicit producer, and immutable
+            // origin are all real writes performed via the normal Git adapters.
+            let taskId, sourceOp, producerOp =
+                "wq11-wired-task", Guid.NewGuid(), Guid.NewGuid()
+            let created = ReviewWorkflow.createTask a sourceOp taskId "Connected smoke task" |> ok
+            Assert.That(created.Operation.Type, Is.EqualTo("CreateTask"))
+            Assert.That(created.Operation.OperationId, Is.EqualTo(sourceOp.ToString("D")))
+            let planned = WorkQueueReceiptProducer.preview b sourceOp |> ok
+            Assert.That(planned.Status, Is.EqualTo("ReadyToProduce"))
+            Assert.That(planned.SourceOperationKind, Is.EqualTo("CreateTask"))
+            let published = WorkQueueReceiptProducer.produce b "Lead" producerOp sourceOp |> ok
+            Assert.That(published.AlreadyApplied, Is.False)
+
+            // A second checkout independently fetches canonical work and origin;
+            // it has not been fed any in-memory producer projection.
+            let projectHead, project = WorkQueueGitLedger.load a |> ok
+            Assert.That(project.Works.Count, Is.EqualTo(1))
+            let work = project.Works.[planned.StageId]
+            Assert.That(work.Kind, Is.EqualTo(WorkKind.Planning))
+            Assert.That(work.State, Is.EqualTo(WorkState.Available))
+            let origin, originOid =
+                WorkQueueGitLedger.readOriginAt a projectHead work.Id |> ok |> Option.get
+            Assert.That(origin.SourceOperationId, Is.EqualTo(sourceOp.ToString("D")))
+            Assert.That(origin.SourceOperationKind, Is.EqualTo("CreateTask"))
+            Assert.That(origin.SourceRequestHash, Is.EqualTo(created.Operation.RequestHash))
+            Assert.That(origin.WorkId, Is.EqualTo(work.Id))
+
+            // WQ08 realReadPorts reads independently verified project/account
+            // Git heads and versioned WQ04 role state. No fake preview ports.
+            let beforeAccount = (AccountCapacityLedger.fetch accountA |> ok).Head
+            let report = WorkQueueSchedulerHostPreview.preview accountB a "Planner"
+            Assert.That(report.Mode, Is.EqualTo("ReadOnlyDryRun"))
+            Assert.That(report.CanDispatch, Is.False)
+            Assert.That(report.AccountHead, Is.EqualTo(Some beforeAccount))
+            Assert.That(report.ProjectHead, Is.EqualTo(Some projectHead.Commit))
+            Assert.That(report.MaxConcurrentAgents, Is.EqualTo(Some 1))
+            Assert.That(report.OccupiedAgents, Is.EqualTo(Some 0))
+            Assert.That(report.AvailableSlots, Is.EqualTo(Some 1))
+            Assert.That(report.SelectedRoleVersion, Is.EqualTo(Some 1))
+            Assert.That(report.EligibleWork, Does.Contain(work.Id))
+            let candidate = report.WouldLaunch |> Option.get
+            Assert.That(candidate.WorkId, Is.EqualTo(work.Id))
+            Assert.That(candidate.SourceOperationId, Is.EqualTo(Some(sourceOp.ToString("D"))))
+            Assert.That(candidate.SourceRequestHash, Is.EqualTo(Some created.Operation.RequestHash))
+            Assert.That(candidate.OriginBlobOid, Is.EqualTo(Some originOid))
+            Assert.That(report.Issues |> List.exists (fun x ->
+                x.Code = "SourceReceiptMissing" || x.Code = "DemandUnknown"
+                || x.Code = "ProjectUnknown" || x.Code = "AccountUnknown"), Is.False)
+            Assert.That((AccountCapacityLedger.fetch accountB |> ok).Head, Is.EqualTo(beforeAccount))
+            Assert.That((LedgerStore.fetch b |> ok).Commit, Is.EqualTo(projectHead.Commit))
+
+            // The same genuinely disposable account authority can be filled.
+            // Demand remains visible but a second slot no longer exists.
+            let projectAuthority =
+                { ProjectId = a.ProjectId; LedgerId = a.LedgerId
+                  Epoch = a.Epoch; ApprovedFetchUrl = a.ApprovedFetchUrl
+                  ApprovedPushUrl = a.ApprovedPushUrl }
+            AccountCapacityLedger.reserve accountA (Guid.NewGuid()) "Fixture"
+                (Guid.NewGuid()) projectAuthority "Planner" 1L |> ok |> ignore
+            let full = WorkQueueSchedulerHostPreview.preview accountB a "Planner"
+            Assert.That(full.OccupiedAgents, Is.EqualTo(Some 1))
+            Assert.That(full.AvailableSlots, Is.EqualTo(Some 0))
+            Assert.That(full.WouldLaunch |> Option.map _.WorkId, Is.EqualTo(Some work.Id))
+            Assert.That(full.Issues |> List.exists (fun x -> x.Code = "CapacityFull"), Is.True)
+            Assert.That(full.CanDispatch, Is.False)
+            Assert.That(project.Launches.IsEmpty, Is.True)
+
+            // Replaying both original UUIDs survives later Git heads; changing
+            // the stable operation payload is not silently accepted as a retry.
+            let sourceReplay =
+                ReviewWorkflow.createTask b sourceOp taskId "Connected smoke task" |> ok
+            Assert.That(sourceReplay.AlreadyApplied, Is.True)
+            let producerReplay =
+                WorkQueueReceiptProducer.produce a "Lead" producerOp sourceOp |> ok
+            Assert.That(producerReplay.AlreadyApplied, Is.True)
+            match ReviewWorkflow.createTask b sourceOp taskId "Changed payload" with
+            | Error OperationIdReused -> ()
+            | other -> Assert.Fail(sprintf "Changed CreateTask UUID was not rejected: %A" other)
+            let _, finalProject = WorkQueueGitLedger.load b |> ok
+            Assert.That(finalProject.Works.Count, Is.EqualTo(1))
+            Assert.That(finalProject.Launches.IsEmpty, Is.True)
+            Assert.That(git a.RepositoryPath [ "status"; "--porcelain" ], Is.Empty)
+            Assert.That(git b.RepositoryPath [ "status"; "--porcelain" ], Is.Empty))

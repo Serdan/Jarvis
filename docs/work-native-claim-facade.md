@@ -22,6 +22,13 @@ at the **same Git head**. Each result supplies:
 * claimed launch ID and, when registered in WQ02, the ephemeral session UUID;
   liveness is explicitly **UNKNOWN** until an authenticated WQ03 session journal
   is joined. No permanent Agent ID is promoted into durable Work ownership.
+A claimed Work item does **not** become Active merely because its launch's
+primary Work ID matches. WQ09 recovery-held claims (source, integration, or
+external-effect gates) are Blocked, even though WQ09 also includes them in
+ActiveAndStalled. Clear claims without verified heartbeat timing remain Unknown;
+stop-requested claims are Blocked, and invalidated/terminal-pending launches
+remain Unknown. The Active category requires WQ09's verified-live row state,
+which this default-off read does not establish without a trusted clock.
 Available results preserve canonical WQ02 blocker-first/FIFO ranking from WQ09;
 they are not re-sorted by timestamps when prerequisite stages block other Work.
 
@@ -86,6 +93,8 @@ isolated **Frozen** WQ02 ledger. It covers pinned coherent Work views, ready
 versus blocked and prerequisite generations, missing source/role coverage
 being explicit, refusal with original UUID and no Git writes, and WQ02
 competing claim CAS with one winner plus original operation receipt replay.
+Negative-space regressions cover recovery-held claims, stopped and
+terminal-uncertain launches, and Blocked versus Active category filtering.
 The public production claim adapter is never activated by these fixtures.
 
 No files in the concurrently owned Scheduler, graph, preview, Windows harness

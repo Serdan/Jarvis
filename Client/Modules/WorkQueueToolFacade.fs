@@ -98,7 +98,8 @@ module WorkQueueToolFacade =
               WaiverReceipt = waiver; Reason = reason }
 
     let private classification (project: Project) (next: Set<string>)
-                               (blocked: Set<string>) coverage (stage: WorkStage) =
+                               (blocked: Set<string>) (claimed: Map<string, RowState>)
+                               coverage (stage: WorkStage) =
         let fallback = if coverage = "Verified" then [] else [coverage]
         match stage.State with
         | WorkState.Completed -> "Terminal", fallback
@@ -109,7 +110,23 @@ module WorkQueueToolFacade =
             | None -> "Unknown", fallback @ ["Claimed launch missing from pinned project snapshot"]
             | Some owner when owner.PrimaryWorkId <> Some stage.Id ->
                 "Unknown", fallback @ ["Launch primary Work ID does not match this claim"]
-            | Some _ -> "Active", fallback
+            // WQ09 includes recovery-held claims in both ActiveAndStalled and
+            // Blocked; preserve inconsistent links as Unknown, but a valid
+            // claim under a recovery gate is Blocked, never Active.
+            | Some _ when blocked.Contains stage.Id -> "Blocked", []
+            | Some _ ->
+                // A primary-Work link proves a claim, not a live session.
+                // WQ09's row state requires reliable heartbeat evidence before
+                // calling a claim Active; the current read supplies no clock.
+                match claimed.TryFind stage.Id with
+                | Some (RowState.Active id) when id = launch -> "Active", []
+                | Some (RowState.StopRecovery _) ->
+                    "Blocked", ["Claimed launch has a stop request pending recovery"]
+                | Some (RowState.RecoveryHold reason) -> "Blocked", [reason]
+                | Some (RowState.StaleHeartbeat _) ->
+                    "Unknown", ["Claimed launch heartbeat is stale; recovery required"]
+                | Some (RowState.Uncertain reason) -> "Unknown", [reason]
+                | _ -> "Unknown", ["Claimed launch has no verified live WQ09 row"]
         | _ when next.Contains stage.Id -> "Available", []
         | _ when blocked.Contains stage.Id -> "Blocked", []
         | _ -> "Unknown", ["Unclassified by verified WQ09 projection at graph v" + string project.GraphVersion]
@@ -121,14 +138,17 @@ module WorkQueueToolFacade =
             projectDashboard projectId Map.empty (Ok project)
                 (Error "Account/project cross-ledger admission proof is not joined")
                 None 0L
-        let next, blocked, coverage =
-            match dashboard.Next, dashboard.Blocked, dashboard.QueueHealth with
-            | Evidence.Known ready, Evidence.Known held, Evidence.Known _ ->
+        let next, blocked, claimed, coverage =
+            match dashboard.Next, dashboard.Blocked, dashboard.ActiveAndStalled, dashboard.QueueHealth with
+            | Evidence.Known ready, Evidence.Known held, Evidence.Known claimedRows, Evidence.Known _ ->
                 Set.ofList (ready |> List.map (fun row -> row.WorkId)),
-                Set.ofList (held |> List.map (fun row -> row.WorkId)), "Verified"
-            | Evidence.Unknown reason, _, _
-            | _, Evidence.Unknown reason, _
-            | _, _, Evidence.Unknown reason -> Set.empty, Set.empty, "UNKNOWN: " + reason
+                Set.ofList (held |> List.map (fun row -> row.WorkId)),
+                (claimedRows |> List.map (fun row -> row.WorkId, row.State) |> Map.ofList), "Verified"
+            | Evidence.Unknown reason, _, _, _
+            | _, Evidence.Unknown reason, _, _
+            | _, _, Evidence.Unknown reason, _
+            | _, _, _, Evidence.Unknown reason ->
+                Set.empty, Set.empty, Map.empty, "UNKNOWN: " + reason
         // WQ09's Next retains blocker-first FIFO from the canonical WQ02
         // contract; the tool must not reorder it by raw availability timestamps.
         let nextPositions =
@@ -155,7 +175,7 @@ module WorkQueueToolFacade =
             |> List.map snd
             |> List.sortBy rank
             |> List.map (fun stage ->
-                let category, notes = classification project next blocked coverage stage
+                let category, notes = classification project next blocked claimed coverage stage
                 let launchId =
                     match stage.State with
                     | WorkState.Claimed id -> Some id

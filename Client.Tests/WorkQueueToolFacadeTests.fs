@@ -151,14 +151,92 @@ type WorkQueueToolFacadeTests() =
             Assert.That(replay.Operation.OriginalResultHash, Is.EqualTo(winning.Operation.OriginalResultHash))
             Assert.That(replay.AlreadyApplied, Is.True)
             let active = WorkQueueToolFacade.readWithBinding b "List" "Active" "" |> success
-            Assert.That(active.Work.Length, Is.EqualTo(1))
-            let row = active.Work.Head
+            Assert.That(active.Work, Is.Empty, "A matching claim is not verified liveness")
+            let uncertain = WorkQueueToolFacade.readWithBinding b "List" "Unknown" "" |> success
+            Assert.That(uncertain.Work.Length, Is.EqualTo(1))
+            let row = uncertain.Work.Head
             Assert.That(row.WorkId, Is.EqualTo("P"))
             Assert.That(row.ClaimLaunchId, Is.EqualTo(Some "L1"))
             Assert.That(row.SessionUuid.IsSome, Is.True)
             Assert.That(row.Liveness, Does.Contain("UNKNOWN"))
+            Assert.That(row.Reasons |> List.exists (fun reason -> reason.Contains("liveness unverified")),
+                        Is.True)
             Assert.That(row.ClaimEnabled, Is.False)
             Assert.That(row.Domain, Is.EqualTo("Undecided")))
+
+    [<Test>]
+    member _.RecoveryHeldClaimsRemainBlockedAheadOfMatchingLaunch() =
+        let projectId = "P"
+        let heldGateCases =
+            [ GateState.SourceRecoveryBlocked "unreconciled source push"
+              GateState.IntegrationGateHold (0, "push-1")
+              GateState.ExternalEffectObservedPendingGate (0, "push-1", "remote-sha") ]
+        let owner =
+            { launch projectId with
+                State = LaunchState.Registered ("ephemeral-session", "session-key")
+                Lease = Some { LastSeenAt = 1000L; Generation = 1; StopRequested = false }
+                PrimaryWorkId = Some "W"; EverClaimed = true }
+        for gate in heldGateCases do
+            let claimed =
+                { stage projectId "W" [] with
+                    State = WorkState.Claimed "L1"; Gate = gate; ClaimGeneration = 1 }
+            let project =
+                { Contracts.emptyProject (Map.ofList ["Lead", Set.singleton "planning"]) with
+                    Works = Map.ofList ["W", claimed]
+                    Launches = Map.ofList ["L1", owner] }
+            let view = WorkQueueToolFacade.inspectAt projectId "head" project (Error "no roles")
+            Assert.That(view.Coverage, Is.EqualTo("Verified"))
+            let row = view.Work.Head
+            Assert.That(row.Category, Is.EqualTo("Blocked"), sprintf "Gate %A" gate)
+            Assert.That(row.ClaimLaunchId, Is.EqualTo(Some "L1"))
+            Assert.That(row.Reasons |> List.exists (fun reason -> reason.StartsWith("Gate:")),
+                        Is.True)
+            Assert.That(view.Work |> List.filter (fun item -> item.Category = "Blocked") |> List.length,
+                        Is.EqualTo(1))
+            Assert.That(view.Work |> List.filter (fun item -> item.Category = "Active"), Is.Empty)
+            let dashboard =
+                Client.TaskFirstUiProjection.projectDashboard projectId Map.empty (Ok project)
+                    (Error "unbound account") None 0L
+            match dashboard.Blocked with
+            | Client.TaskFirstUiProjection.Evidence.Known rows ->
+                Assert.That(rows |> List.exists (fun item -> item.WorkId = "W"), Is.True)
+            | _ -> Assert.Fail("WQ09 must have a verified blocked row")
+            let mismatched =
+                { project with
+                    Launches = Map.ofList ["L1", { owner with PrimaryWorkId = Some "other-work" }] }
+            let unknown =
+                (WorkQueueToolFacade.inspectAt projectId "head" mismatched (Error "no roles")).Work.Head
+            Assert.That(unknown.Category, Is.EqualTo("Unknown"),
+                        "Recovery gate must not mask a contradictory claim link")
+            Assert.That(unknown.Reasons, Does.Contain("Launch primary Work ID does not match this claim"))
+
+    [<Test>]
+    member _.StopAndTerminalUncertaintyNeverBecomeActiveFromClaimLink() =
+        let projectId = "P"
+        let claimed =
+            { stage projectId "W" [] with
+                State = WorkState.Claimed "L1"; ClaimGeneration = 1 }
+        let registered = LaunchState.Registered ("ephemeral-session", "session-key")
+        let cases =
+            [ registered, true, "Blocked"
+              registered, false, "Unknown"
+              LaunchState.TerminalPendingRelease "terminal-receipt", false, "Unknown"
+              LaunchState.DemandInvalidatedPendingTerminal registered, false, "Unknown" ]
+        for launchState, stopRequested, expectedCategory in cases do
+            let owner =
+                { launch projectId with
+                    State = launchState
+                    Lease = Some { LastSeenAt = 1000L; Generation = 1; StopRequested = stopRequested }
+                    PrimaryWorkId = Some "W"; EverClaimed = true }
+            let project =
+                { Contracts.emptyProject (Map.ofList ["Lead", Set.singleton "planning"]) with
+                    Works = Map.ofList ["W", claimed]
+                    Launches = Map.ofList ["L1", owner] }
+            let row =
+                (WorkQueueToolFacade.inspectAt projectId "head" project (Error "no roles")).Work.Head
+            Assert.That(row.Category, Is.EqualTo(expectedCategory),
+                        sprintf "Launch %A stop=%b" launchState stopRequested)
+            Assert.That(row.Reasons, Is.Not.Empty)
 
     [<Test>]
     member _.AvailableWorkPreservesCanonicalBlockingFirstPriorityAcrossFifo() =

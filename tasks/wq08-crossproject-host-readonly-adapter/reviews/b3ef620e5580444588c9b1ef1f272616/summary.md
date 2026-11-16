@@ -1,0 +1,1 @@
+Release .NET 11 build clean (0 errors); targeted 41/41 NUnit tests pass (six new host, existing WQ08 planner, existing single-project preview). Branch clean and pushed; source 5218ff0c1dd6c66698008c9a5efe86f8bc815489. New CLI scheduler preview-global and operator runbook. No account CAS, project CAS, browser submit, launch, timer, or deployment.

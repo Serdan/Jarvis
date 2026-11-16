@@ -1,6 +1,6 @@
 # Composable work units: Project / System / Feature
 
-Status: first implementation slice, **not a production rollout**. Canonical task: `composable-work-units` (2026-11-16). The Agent-to-Work migration under `work-queues-ephemeral-executions` remains the only source for schedulable execution, review, and integration stages.
+Status: incremental implementation, **not a production rollout**. Canonical task: `composable-work-units` (2026-11-16). The Agent-to-Work migration under `work-queues-ephemeral-executions` remains the only source for schedulable execution, review, and integration stages.
 
 ## Semantics and scope
 
@@ -23,7 +23,11 @@ No manually maintained percent, implied parent acceptance, or permanent human/LL
 
 Every graph mutation reloads and validates the winner's exact ledger head. A stale `expectedGraphVersion` fails instead of rewriting a concurrent update. A retry with the same operation UUID recovers the winning receipt. `loadOverviews` reads composition and WQ state at **one pinned head**, with no split snapshot. Legacy work remains unchanged; an absent graph means no composition has been authored, not a fabricated migration.
 
-Acceptance is a separate independently verifiable operation. The default public `execute` **rejects** `Accept` as unverified. The internal `executeVerifiedAcceptance` requires a validator supplied by the canonical task/review/integration adapter and executed **inside the same Git-CAS planner** against its exact snapshot. A caller-supplied string is not evidence. Until that adapter is wired, the domain's pure acceptance transitions are useful for tests/modeling but cannot be published through the normal ledger API.
+Acceptance is a separate independently verifiable operation. The generic `execute` **rejects** `Accept` as unverified. The internal `executeVerifiedAcceptance` requires a validator executed **inside the same Git-CAS planner** against its exact snapshot. A caller-supplied string is not evidence.
+
+`WorkCompositionAcceptanceAdapter.acceptIntegrated` supplies an initial constrained validator: the unit must link to a canonical validation task, whose frozen review was accepted by a different reviewer and whose managed exact-commit integration receipt is `Integrated`. The review purpose is a digest of the unit ID, spec version, and canonical specification, so a past approved commit cannot become proof for a revised target. Both review and integration are read from the same verified ledger snapshot as the graph mutation. This reuses the existing review and integration state machine; it does not create a new verification queue. A parent requires its **own** linked validation task and acceptance review, not merely accepted children.
+
+This adapter is library-level only: operator MCP commands and scheduler activation remain unwired. It deliberately does not infer that any completed child, generic accepted review, or unintegrated change satisfies independent parent acceptance.
 
 ## Readiness and remaining integration work
 
@@ -31,7 +35,7 @@ The pure graph is a prerequisite and acceptance **description**, not an independ
 
 To complete the task's end-to-end acceptance criteria, next slices must:
 
-1. Bind graph nodes to their authoritative Task/stage identity and validate acceptance receipts (including parent-specific verification) against canonical review, test and integration evidence. Prevent accepting a node solely because children have closed.
+1. Expose the constrained integration-evidence acceptance pathway through the operator surface and extend evidence classes only where independently verifiable. Link graph nodes to their authoritative Task/stage identity, including validation coverage for parent-level criteria beyond merely closing children.
 2. Add a reconciled, same-project-CAS bridge that derives actual WQ hard-stage prerequisites and readiness from accepted graph nodes, without double-publishing a stage or allowing a stale/incomplete projection to dispatch. Graph edits that introduce unsatisfied dependencies to claimed work must use existing WQ dependency-gate and external-push fence contracts.
 3. Wire graph mutation/acceptance to scheduler wake and durable event high-water handling; prove lazy activation with **two prerequisites**, one-at-a-time completion, one bounded execution per available claim, process restart recovery, and child work created by a running execution.
 4. Expose the bounded operator mutation/query commands and consistent recursive blocker/readiness overview through the existing client/MCP command surface. Cover cross-System recursion, cancelled scope, status, progress, review and integration with real repositories.
@@ -47,8 +51,8 @@ The current branch is deliberately *not* connected to production scheduler activ
 - Does a newly discovered child erase prior release evidence? **No; it invalidates only current target acceptance.**
 - Can cross-System blockers be expressed without multiple parents? **Yes.**
 - Does the graph itself create a runnable session or bypass WQ claim/lease accounting? **No.**
-- Is canonical acceptance validation plus reactive activation fully end-to-end? **Not yet.**
+- Is canonical acceptance validation plus reactive activation fully end-to-end? **Not yet; integrated review evidence has a bounded adapter, but operator exposure and dependency activation are still pending.**
 
 ## Testing
 
-`Server.Tests/WorkCompositionTests.fs` exercises nested containment, cross-System blocking, cross-edge cycles, independent parent acceptance, stale target invalidation, prerequisite revisions, cancellation, optimistic graph version conflicts, and missing WQ coverage. Negative-space tests also cover non-clear gates, incomplete/missing and unsatisfied hard-stage prerequisites, and frozen migration; a positive case is explicitly only locally `ReadyForAdmission`. Client Git adapter and scheduler end-to-end fixtures must be expanded as the bridges are connected.
+`Server.Tests/WorkCompositionTests.fs` exercises nested containment, cross-System blocking, cross-edge cycles, independent parent acceptance, stale target invalidation, prerequisite revisions, cancellation, optimistic graph version conflicts, and missing WQ coverage. Negative-space tests also cover non-clear gates, incomplete/missing and unsatisfied hard-stage prerequisites, and frozen migration; a positive case is explicitly only locally `ReadyForAdmission`. Client two-clone tests cover managed review and integration evidence, rejection of pending integration, idempotent acceptance, corrective children, and spec revisions. Scheduler end-to-end fixtures are still required.

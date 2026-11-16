@@ -6,6 +6,8 @@ open System.IO
 open NUnit.Framework
 open Client.LedgerStore
 open Client.WorkCompositionGitLedger
+open Client.WorkCompositionAcceptanceAdapter
+open Client.ReviewWorkflow
 open Jarvis.WorkQueues
 
 let private succeed = function
@@ -106,3 +108,111 @@ let ``acceptance mutation rejects unaudited evidence and missing WQ coverage is 
         let overviews = WorkCompositionGitLedger.loadOverviews second |> succeed
         let task = overviews |> List.find (fun view -> view.Id = "task")
         Assert.That(task.Phase, Is.EqualTo(WorkUnitPhase.Unverified)))
+
+[<Test>]
+let ``composition acceptance requires exact independently reviewed and integrated source proof`` () =
+    withTwoClones (fun first second ->
+        let owner = "Owner"
+        let reviewer = "Reviewer"
+        let taskId = "project-acceptance-validation"
+        ReviewWorkflow.registerAgent first (Guid.NewGuid()) owner |> succeed |> ignore
+        ReviewWorkflow.registerAgent first (Guid.NewGuid()) reviewer |> succeed |> ignore
+        ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Independent project acceptance" |> succeed |> ignore
+        WorkCompositionGitLedger.execute first owner (Guid.NewGuid()) 0
+            (WorkCompositionMutation.Create("project", WorkUnitKind.Project, None,
+                                            spec "Project" (Some taskId)))
+        |> succeed |> ignore
+        let _, initial = WorkCompositionGitLedger.load second |> succeed
+        let purpose = WorkCompositionAcceptanceAdapter.reviewPurpose initial.Units.["project"]
+
+        git first.RepositoryPath [ "config"; "user.name"; "Fixture" ] |> ignore
+        git first.RepositoryPath [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+        git first.RepositoryPath [ "checkout"; "-b"; "feature/composition-acceptance" ] |> ignore
+        File.WriteAllText(Path.Combine(first.RepositoryPath, "verification.txt"),
+                          "Independently verified project acceptance")
+        git first.RepositoryPath [ "add"; "verification.txt" ] |> ignore
+        git first.RepositoryPath [ "commit"; "-m"; "Acceptance evidence for project" ] |> ignore
+        let acceptedSha = git first.RepositoryPath [ "rev-parse"; "HEAD" ]
+        let reviewId = Guid.NewGuid()
+        let sourceRef = "refs/heads/feature/composition-acceptance"
+        let targetRef = "refs/heads/main"
+        ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId owner
+            reviewId sourceRef acceptedSha "Validate project acceptance criteria"
+            purpose targetRef |> succeed |> ignore
+        ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId reviewId reviewer 1
+        |> succeed |> ignore
+        ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId reviewId reviewer 2 Accept
+        |> succeed |> ignore
+        let submissionId = Guid.NewGuid()
+        ReviewWorkflow.submitIntegration second (Guid.NewGuid()) taskId owner
+            submissionId "" "" (reviewId.ToString("N")) targetRef |> succeed |> ignore
+
+        // A review accepted by its own author is not independent acceptance.
+        let selfReviewId = Guid.NewGuid()
+        ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId owner
+            selfReviewId sourceRef acceptedSha "Self-reviewed project"
+            purpose targetRef |> succeed |> ignore
+        ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId selfReviewId owner 1
+        |> succeed |> ignore
+        ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId selfReviewId owner 2 Accept
+        |> succeed |> ignore
+        let selfSubmissionId = Guid.NewGuid()
+        ReviewWorkflow.submitIntegration second (Guid.NewGuid()) taskId owner
+            selfSubmissionId "" "" (selfReviewId.ToString("N")) targetRef |> succeed |> ignore
+
+        // Accepted review alone cannot accept work that has not integrated.
+        match WorkCompositionAcceptanceAdapter.acceptIntegrated second owner
+                  (Guid.NewGuid()) initial.Version "project" 1 submissionId with
+        | Error(InvalidBinding _) -> ()
+        | other -> Assert.Fail(sprintf "Expected pending-integration rejection: %A" other)
+
+        git first.RepositoryPath [ "checkout"; "main" ] |> ignore
+        git first.RepositoryPath [ "merge"; "--ff-only"; acceptedSha ] |> ignore
+        git first.RepositoryPath [ "push"; "origin"; "main" ] |> ignore
+        ReviewWorkflow.completeIntegration second (Guid.NewGuid()) taskId reviewer
+            submissionId acceptedSha |> succeed |> ignore
+        ReviewWorkflow.completeIntegration second (Guid.NewGuid()) taskId reviewer
+            selfSubmissionId acceptedSha |> succeed |> ignore
+        match WorkCompositionAcceptanceAdapter.acceptIntegrated second owner
+                  (Guid.NewGuid()) initial.Version "project" 1 selfSubmissionId with
+        | Error(InvalidBinding _) -> ()
+        | other -> Assert.Fail(sprintf "Expected same-author review rejection: %A" other)
+
+        let acceptanceOp = Guid.NewGuid()
+        let accepted =
+            WorkCompositionAcceptanceAdapter.acceptIntegrated second owner acceptanceOp
+                initial.Version "project" 1 submissionId |> succeed
+        Assert.That(accepted.AlreadyApplied, Is.False)
+        let duplicate =
+            WorkCompositionAcceptanceAdapter.acceptIntegrated first owner acceptanceOp
+                initial.Version "project" 1 submissionId |> succeed
+        Assert.That(duplicate.AlreadyApplied, Is.True)
+        let _, acceptedGraph = WorkCompositionGitLedger.load first |> succeed
+        Assert.That(WorkComposition.currentAcceptance acceptedGraph "project" |> Option.isSome, Is.True)
+        Assert.That(acceptedGraph.Units.["project"].Acceptances.Count, Is.EqualTo(1))
+
+        // Corrective work retains historical proof, but the parent requires
+        // fresh acceptance, not only a reopened or closed child task.
+        WorkCompositionGitLedger.execute first owner (Guid.NewGuid()) acceptedGraph.Version
+            (WorkCompositionMutation.Create("correction", WorkUnitKind.Feature, Some "project",
+                                            spec "Correction" None))
+        |> succeed |> ignore
+        let _, withChild = WorkCompositionGitLedger.load second |> succeed
+        Assert.That(WorkComposition.currentAcceptance withChild "project" |> Option.isNone, Is.True)
+        match WorkCompositionAcceptanceAdapter.acceptIntegrated second owner
+                  (Guid.NewGuid()) withChild.Version "project" 1 submissionId with
+        | Error(InvalidBinding message) ->
+            Assert.That(message, Does.Contain("IncompleteChildren"))
+        | other -> Assert.Fail(sprintf "Expected independent child acceptance check: %A" other)
+
+        // The exact same integrated review cannot be reinterpreted as proof
+        // for a newer target specification.
+        WorkCompositionGitLedger.execute second owner (Guid.NewGuid()) withChild.Version
+            (WorkCompositionMutation.Revise("project", 1,
+                { withChild.Units.["project"].Spec with Scope = "New goal boundary" }))
+        |> succeed |> ignore
+        let _, revised = WorkCompositionGitLedger.load first |> succeed
+        match WorkCompositionAcceptanceAdapter.acceptIntegrated first owner
+                  (Guid.NewGuid()) revised.Version "project" 2 submissionId with
+        | Error(InvalidBinding _) -> ()
+        | other -> Assert.Fail(sprintf "Expected stale target-review rejection: %A" other))

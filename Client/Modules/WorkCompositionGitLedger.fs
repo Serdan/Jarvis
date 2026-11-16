@@ -121,7 +121,7 @@ module WorkCompositionGitLedger =
                 let evidenceCheck =
                     match mutation, verifier with
                     | WorkCompositionMutation.Accept (id, _, receipt), Some verify ->
-                        verify snapshot id receipt
+                        verify snapshot graph id receipt
                     | WorkCompositionMutation.Accept _, None ->
                         Error(InvalidBinding "Composition acceptance requires independently verified canonical evidence.")
                     | _ -> Ok ()

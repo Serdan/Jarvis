@@ -152,7 +152,7 @@ let ``writeFile creates missing parent directories when requested`` () =
 
         match writeFile cmd context with
         | Error error -> Assert.Fail($"Expected WriteFile Ok, got {error}")
-        | Ok() ->
+        | Ok None ->
             let fullPath = Path.Combine(root, "Project1", relativePath)
 
             if not (File.Exists fullPath) then
@@ -178,7 +178,7 @@ let ``writeFile creates a new file when expectedHash is none`` () =
               CreateParents = Some true }
 
         match writeFile cmd context with
-        | Ok () ->
+        | Ok None ->
             let path = Path.Combine(root, "Project1", relativePath)
             Assert.That(File.ReadAllText path, Is.EqualTo("created with absent precondition"))
         | Error error -> Assert.Fail($"Expected successful new file creation, got {error}")

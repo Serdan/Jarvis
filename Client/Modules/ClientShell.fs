@@ -215,6 +215,21 @@ module private Core =
     let private git source args maxOutputBytes =
         run source None "git" args (Some defaultTimeoutSeconds) maxOutputBytes
 
+    let private gitPaths source args =
+        effect {
+            let! result = git source args (Some(1024 * 1024))
+            if result.ExitCode <> 0 || result.TimedOut || result.Truncated then
+                return!
+                    Client.ValidationError(
+                        "Cannot inspect the Git commit selection: " +
+                        if result.TimedOut then "Git timed out." else result.StdErr)
+                    |> Effect.ofError
+            else
+                return
+                    result.StdOut.Split([| char 0 |], StringSplitOptions.RemoveEmptyEntries)
+                    |> Array.toList
+        }
+
     let getGitStatusFor source =
         git source [ "status"; "--short"; "--branch" ] None
 
@@ -247,6 +262,36 @@ module private Core =
                             (Ok [])
                         |> Result.map List.rev
 
+                let! (FolderPath root) = resolveSourceWorkingDirectory source None
+                let! configured = fun _ ->
+                    CodeQualityHooks.load root |> Result.mapError Client.ValidationError
+                let preCommitEnabled =
+                    not safePaths.IsEmpty
+                    && (configured |> List.exists (fun hook -> hook.Trigger = CodeQualityHooks.PreCommit))
+                do!
+                    if preCommitEnabled then fun _ -> CodeQualityHooks.requireApproval root
+                    else fun _ -> Ok()
+
+                // --only commits working-tree versions, whereas Git's index
+                // may hold an intentionally partial version. Never silently
+                // turn such a partial staging decision into a full-file fix.
+                let! indexBefore =
+                    if preCommitEnabled then
+                        gitPaths source ([ "diff"; "--cached"; "--name-only"; "-z"; "--" ] @ safePaths)
+                    else fun _ -> Ok []
+                let! dirtyBefore =
+                    if preCommitEnabled then
+                        gitPaths source ([ "diff"; "--name-only"; "-z"; "--" ] @ safePaths)
+                    else fun _ -> Ok []
+                let partial = Set.intersect (Set.ofList indexBefore) (Set.ofList dirtyBefore)
+                do!
+                    if not partial.IsEmpty then
+                        Client.ValidationError(
+                            "Pre-commit hooks refuse selected paths with both staged and unstaged " +
+                            "changes (partial staging): " + String.Join(", ", partial))
+                        |> Effect.ofError
+                    else fun _ -> Ok()
+
                 let! addResult =
                     if safePaths.IsEmpty then
                         fun _ -> Ok None
@@ -271,6 +316,23 @@ module private Core =
                 | Some result when result.ExitCode <> 0 ->
                     return! Client.GenericError result.StdErr |> Effect.ofError
                 | _ ->
+                    let! hookReports =
+                        if preCommitEnabled then
+                            effect {
+                                // Git add has resolved the requested paths
+                                // against the current index. Only those
+                                // tracked selected changes are hook inputs.
+                                let! selected =
+                                    gitPaths source
+                                        ([ "diff"; "--cached"; "--name-only"; "-z"; "--" ] @ safePaths)
+                                let present =
+                                    selected
+                                    |> List.filter (fun path -> File.Exists(Path.Combine(root, path)))
+                                return! fun _ ->
+                                    CodeQualityHooks.run root CodeQualityHooks.PreCommit present
+                            }
+                        else fun _ -> Ok None
+
                     let commitArgs =
                         [ yield "commit"
                           if cmd.AllowEmpty then yield "--allow-empty"
@@ -298,7 +360,8 @@ module private Core =
                             { CommitHash = hash
                               Summary = commitResult.StdOut.Trim()
                               StdOut = commitResult.StdOut
-                              StdErr = commitResult.StdErr }
+                              StdErr = commitResult.StdErr
+                              Hooks = hookReports }
         }
 
 let runCommand cmd = Core.runCommand cmd

@@ -1192,9 +1192,66 @@ module private Core =
                                   BeforeHash = beforeHash |> Option.defaultValue (Hash.sha256 content)
                                   AfterHash = Some afterHash
                                   Content = if returnContent then Some applied.Content else None
-                                  Diagnostics = applied.Diagnostics }
+                                  Diagnostics = applied.Diagnostics
+                                  Hooks = None }
                         })
             }
+
+let private hookRoot source : IO<'rt, FolderPath> =
+    match source with
+    | Selected project -> fun _ -> Ok(ProjectPaths.ResolvedProject.sourceRoot project)
+    | Named name -> ProjectPaths.resolveProjectRoot name
+    | Global -> fun _ -> Error(Client.ValidationError "Global source cannot run repository hooks.")
+
+let private withAfterWriteHooks source path skip (operation: IO<'rt, 'a>) =
+    effect {
+        let! (FolderPath root) = hookRoot source
+        let! configured = fun _ ->
+            CodeQualityHooks.load root |> Result.mapError Client.ValidationError
+        let active = configured |> List.exists (fun hook -> hook.Trigger = CodeQualityHooks.AfterWrite)
+        // Refuse an unapproved project before publishing an edit, rather than
+        // reporting a hook failure after the source was already changed.
+        do!
+            if not skip && active then fun _ -> CodeQualityHooks.requireApproval root
+            else fun _ -> Ok()
+        let! result = operation
+        if skip then return result, None
+        else
+            let! hooks = fun _ -> CodeQualityHooks.run root CodeQualityHooks.AfterWrite [ path ]
+            return result, hooks
+    }
+
+let private writeWithHooks source (cmd: WriteFileCommand) =
+    effect {
+        let! _, hooks =
+            withAfterWriteHooks source cmd.FilePath false
+                (Core.writeFile source cmd.FilePath cmd.Content cmd.FileWriteMode cmd.ExpectedHash cmd.CreateParents)
+        return hooks
+    }
+
+let private patchWithHooks source (cmd: PatchFileCommand) =
+    effect {
+        let! patched, hooks =
+            withAfterWriteHooks source cmd.FilePath (cmd.DryRun = Some true)
+                (Core.patchFile source cmd.FilePath cmd.ExpectedHash cmd.Format cmd.Patch
+                    cmd.DryRun cmd.FuzzyContextLines cmd.ReturnContent)
+        match hooks with
+        | None -> return patched
+        | Some outcome ->
+            let! (FolderPath root) = hookRoot source
+            let! content = fun _ ->
+                try
+                    let absolute = Path.GetFullPath(Path.Combine(root, cmd.FilePath))
+                    if not (ProjectPaths.isPathInRoot root absolute) then
+                        Error(Client.PermissionDenied "Hook output is outside the selected checkout.")
+                    else Ok(File.ReadAllText absolute)
+                with ex -> Error(Client.ExceptionError ex)
+            return
+                { patched with
+                    Hooks = Some outcome
+                    AfterHash = Some(Hash.sha256 content)
+                    Content = if cmd.ReturnContent = Some true then Some content else None }
+    }
 
 let listCommands rt = Core.listCommands rt
 let listProjects rt = Core.listProjects rt
@@ -1236,11 +1293,11 @@ let exportFile (cmd: ExportFileCommand) : IO<'rt, ExportFilePayload> =
 let readImage (cmd: ReadImageCommand) : IO<'rt, ReadImageResult> =
     Core.readImage (projectSource cmd.ProjectName) cmd.FilePath
 
-let writeFile (cmd: WriteFileCommand) : IO<'rt, unit> =
-    Core.writeFile (projectSource cmd.ProjectName) cmd.FilePath cmd.Content cmd.FileWriteMode cmd.ExpectedHash cmd.CreateParents
+let writeFile (cmd: WriteFileCommand) : IO<'rt, CodeQualityHookSummary option> =
+    writeWithHooks (projectSource cmd.ProjectName) cmd
 
 let patchFile (cmd: PatchFileCommand) : IO<'rt, PatchFileResult> =
-    Core.patchFile (projectSource cmd.ProjectName) cmd.FilePath cmd.ExpectedHash cmd.Format cmd.Patch cmd.DryRun cmd.FuzzyContextLines cmd.ReturnContent
+    patchWithHooks (projectSource cmd.ProjectName) cmd
 
 
 // Already resolved checkouts are accepted by source handlers without parsing
@@ -1270,6 +1327,6 @@ let exportFileIn project (cmd: ExportFileCommand) =
 let readImageIn project (cmd: ReadImageCommand) =
     Core.readImage (Selected project) cmd.FilePath
 let writeFileIn project (cmd: WriteFileCommand) =
-    Core.writeFile (Selected project) cmd.FilePath cmd.Content cmd.FileWriteMode cmd.ExpectedHash cmd.CreateParents
+    writeWithHooks (Selected project) cmd
 let patchFileIn project (cmd: PatchFileCommand) =
-    Core.patchFile (Selected project) cmd.FilePath cmd.ExpectedHash cmd.Format cmd.Patch cmd.DryRun cmd.FuzzyContextLines cmd.ReturnContent
+    patchWithHooks (Selected project) cmd

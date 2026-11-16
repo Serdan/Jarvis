@@ -206,6 +206,9 @@ let removeWorktree (cmd: RemoveWorktreeCommand) =
         if not inspection.CanRemove then
             return! Client.ValidationError(String.concat "; " inspection.Reasons) |> Effect.ofError
         else
+            // Release Roslyn workspace handles before Git removes the checkout.
+            // A later formatting request recreates its session if removal fails.
+            RoslynLsp.disposeCheckout inspection.Worktree.Path
             let! removal = git cmd.ProjectName [ "worktree"; "remove"; inspection.Worktree.Path ]
             if removal.ExitCode <> 0 || removal.TimedOut then
                 return! Client.ValidationError($"Worktree removal failed: {removal.StdErr}") |> Effect.ofError

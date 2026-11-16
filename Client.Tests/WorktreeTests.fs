@@ -155,7 +155,7 @@ let ``existing file and Git commands accept registered worktree selector`` () =
                   { ProjectName = "Project1::selector"; FilePath = "created-through-file-tool.txt"
                     Content = "linked worktree only"; FileWriteMode = Write
                     ExpectedHash = None; CreateParents = None } context with
-        | Ok () -> ()
+        | Ok None -> ()
         | Error e -> Assert.Fail($"Registered worktree edit failed: {e}")
         File.ReadAllText(Path.Combine(created.Path, "created-through-file-tool.txt"))
         |> shouldEqual "linked worktree only"

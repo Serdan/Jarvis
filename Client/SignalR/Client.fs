@@ -771,7 +771,22 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
         match resolved with
         | Some context -> rt |> OrchestrationApi.TaskApi.writeForContext context cmd |> serialize'
         | None -> Error(Client.ValidationError "Task-spec source checkout was not resolved.") |> serialize'
-    | TaskWriteCommand cmd -> rt |> OrchestrationApi.TaskApi.write cmd |> serialize'
+    | TaskWriteCommand cmd ->
+        let response = rt |> OrchestrationApi.TaskApi.write cmd
+        // A ResumeAgent with no known checkout should never block on Roslyn
+        // solution loading. A worktree-scoped resume can prewarm its own
+        // persistent LSP client asynchronously; otherwise the first edit
+        // initializes the appropriate checkout context.
+        match response, resolved with
+        | Ok _, Some project when cmd.Action = "ResumeAgent" ->
+            let checkout = project |> ProjectPaths.ResolvedProject.target |> ProjectPaths.ProjectTarget.checkout
+            match checkout with
+            | ProjectPaths.Registered _ ->
+                let (Client.FolderPath root) = ProjectPaths.ResolvedProject.sourceRoot project
+                CodeQualityHooks.prewarm root
+            | ProjectPaths.Main -> ()
+        | _ -> ()
+        response |> serialize'
     | CrossProjectNotificationCommand _ ->
         Error(Client.ValidationError "Forwarded notification must be normalized before client dispatch.") |> serialize'
     | ChallengeReadCommand cmd -> rt |> OrchestrationApi.ChallengeApi.read cmd |> serialize'

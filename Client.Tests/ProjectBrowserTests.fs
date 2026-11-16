@@ -224,7 +224,7 @@ let ``writeFile should write new content to file`` () =
           CreateParents = None }
 
     let result = writeFile cmd fakeContext
-    result |> shouldEqual (Ok())
+    result |> shouldEqual (Ok None)
 
 [<Test>]
 let ``appendToFile should add content to existing file`` () =
@@ -237,7 +237,7 @@ let ``appendToFile should add content to existing file`` () =
           CreateParents = None }
 
     let result = writeFile cmd fakeContext
-    result |> shouldEqual (Ok())
+    result |> shouldEqual (Ok None)
 
 [<Test>]
 let ``patchFile should modify specific text`` () =

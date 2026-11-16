@@ -184,3 +184,64 @@ let ``empty gitCommit refuses unrelated staged changes`` () =
         | other -> Assert.Fail($"Expected ValidationError, got {other}")
     finally
         Directory.Delete(root, true)
+
+[<Test; NonParallelizable>]
+let ``pre-commit hook refuses selected partial staging without disturbing the index`` () =
+    let root, project = createTempProject ()
+    let previous = Environment.GetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS")
+    try
+        let context = TestContext root
+        initRepo context
+        let source = Path.Combine(project, "Selected.cs")
+        let unrelated = Path.Combine(project, "other.txt")
+        File.WriteAllText(source, "class C { }\n")
+        File.WriteAllText(unrelated, "initial\n")
+        expectGitSuccess context [ "add"; "--"; "Selected.cs"; "other.txt" ]
+        expectGitSuccess context [ "commit"; "-m"; "Initial" ]
+
+        File.WriteAllText(source, "class C { int A; }\n")
+        expectGitSuccess context [ "add"; "--"; "Selected.cs" ]
+        File.WriteAllText(source, "class C { int A; int B; }\n")
+        File.WriteAllText(unrelated, "unrelated staged change\n")
+        expectGitSuccess context [ "add"; "--"; "other.txt" ]
+        File.WriteAllText(
+            Path.Combine(project, ".jarvis.json"),
+            """{"codeQuality":{"hooks":[{"enabled":true,"name":"csharp-precommit","trigger":"pre-commit","adapter":"roslyn-format","extensions":[".cs"],"failure":"blocking"}]}}""")
+
+        Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", project)
+        let commit =
+            { ProjectName = "Project1"; Paths = [ "Selected.cs" ]
+              Message = "Selected only"; Body = None; AllowEmpty = false }
+        match gitCommit commit context with
+        | Error(Client.ValidationError message) ->
+            message.Contains("partial staging") |> shouldEqual true
+        | other -> Assert.Fail(sprintf "Expected staged/unstaged conflict, got %A" other)
+
+        gitOutput context [ "show"; "HEAD:Selected.cs" ] |> shouldEqual "class C { }"
+        let staged = gitOutput context [ "diff"; "--cached"; "--name-only" ]
+        staged.Contains("Selected.cs") |> shouldEqual true
+        staged.Contains("other.txt") |> shouldEqual true
+        File.ReadAllText(source) |> shouldEqual "class C { int A; int B; }\n"
+    finally
+        Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", previous)
+        Directory.Delete(root, true)
+
+[<Test>]
+let ``unapproved pre-commit hooks fail before staging any changes`` () =
+    let root, project = createTempProject ()
+    try
+        let context = TestContext root
+        initRepo context
+        File.WriteAllText(
+            Path.Combine(project, ".jarvis.json"),
+            """{"codeQuality":{"hooks":[{"enabled":true,"name":"csharp-precommit","trigger":"pre-commit","adapter":"roslyn-format"}]}}""")
+        File.WriteAllText(Path.Combine(project, "New.cs"), "class C {}\n")
+        let commit =
+            { ProjectName = "Project1"; Paths = [ "New.cs" ]
+              Message = "Refuse untrusted"; Body = None; AllowEmpty = false }
+        match gitCommit commit context with
+        | Error(Client.PermissionDenied _) -> ()
+        | other -> Assert.Fail(sprintf "Expected untrusted checkout rejection, got %A" other)
+        gitOutput context [ "diff"; "--cached"; "--name-only" ] |> shouldEqual ""
+    finally
+        Directory.Delete(root, true)

@@ -1,0 +1,134 @@
+module CodeQualityHooksTests
+
+open System
+open System.IO
+open System.Text.Json
+open Client
+open Client.CodeQualityHooks
+open Client.RoslynLsp
+open NUnit.Framework
+open FsUnitTyped
+
+let private withTempRoot action =
+    let root = Path.Combine(Path.GetTempPath(), "jarvis-quality-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(root) |> ignore
+    try action root
+    finally Directory.Delete(root, true)
+
+let private config (root: string) (text: string) =
+    File.WriteAllText(Path.Combine(root, ".jarvis.json"), text)
+
+let private edits (content: string) (json: string) =
+    use document = JsonDocument.Parse(json)
+    applyTextEdits content document.RootElement
+
+[<Test>]
+let ``code quality is disabled in a repository without hooks`` () =
+    withTempRoot (fun root ->
+        load root |> shouldEqual (Ok [])
+        run root AfterWrite [ "Program.cs" ] |> shouldEqual (Ok None))
+
+[<Test>]
+let ``declared hooks remain disabled until explicitly enabled`` () =
+    withTempRoot (fun root ->
+        config root """{"codeQuality":{"hooks":[{"name":"format","adapter":"roslyn-format","trigger":"after-write"}]}}"""
+        load root |> shouldEqual (Ok []))
+
+[<Test>]
+let ``enabled Roslyn hook preserves scope, policy, and opt in`` () =
+    withTempRoot (fun root ->
+        config root """{"codeQuality":{"hooks":[{"enabled":true,"name":"format-csharp","adapter":"roslyn-format","trigger":"pre-commit","extensions":[".cs"],"autoFix":false,"failure":"advisory"}]}}"""
+        match load root with
+        | Ok [ hook ] ->
+            hook.Name |> shouldEqual "format-csharp"
+            hook.Trigger |> shouldEqual PreCommit
+            hook.AutoFix |> shouldEqual false
+            hook.Policy |> shouldEqual Advisory
+            hook.Extensions |> shouldEqual [ ".cs" ]
+        | other -> Assert.Fail(sprintf "Unexpected config %A" other))
+
+[<TestCase("fake-executable")>]
+[<TestCase("shell")>]
+let ``unsafe adapters cannot be configured by a repository`` adapter =
+    withTempRoot (fun root ->
+        config root (sprintf """{"codeQuality":{"hooks":[{"enabled":true,"name":"unsafe","adapter":"%s","trigger":"after-write"}]}}""" adapter)
+        match load root with
+        | Error message -> message.Contains("untrusted") |> shouldEqual true
+        | other -> Assert.Fail(sprintf "Expected rejection, got %A" other))
+
+[<Test>]
+let ``arbitrary executable fields are rejected rather than interpreted`` () =
+    withTempRoot (fun root ->
+        config root """{"codeQuality":{"hooks":[{"enabled":true,"name":"unsafe","adapter":"roslyn-format","trigger":"after-write","executable":"sh","args":["-c","echo unsafe"]}]}}"""
+        match load root with
+        | Error message -> message.Contains("shell") |> shouldEqual true
+        | other -> Assert.Fail(sprintf "Expected rejection, got %A" other))
+
+[<Test>]
+let ``unsafe extension globs are rejected`` () =
+    withTempRoot (fun root ->
+        config root """{"codeQuality":{"hooks":[{"enabled":true,"name":"unsafe","adapter":"roslyn-format","trigger":"after-write","extensions":["**/*"]}]}}"""
+        match load root with
+        | Error message -> message.Contains("extensions") |> shouldEqual true
+        | other -> Assert.Fail(sprintf "Expected rejection, got %A" other))
+
+[<Test>]
+let ``repository config alone cannot approve launching project analyzers`` () =
+    withTempRoot (fun root ->
+        match requireApproval root with
+        | Error(Client.PermissionDenied message) ->
+            message.Contains("JARVIS_APPROVED_CODE_QUALITY_ROOTS") |> shouldEqual true
+        | other -> Assert.Fail(sprintf "Expected unapproved checkout, got %A" other))
+
+[<Test; NonParallelizable>]
+let ``operator approval is specific to the exact checkout, not siblings`` () =
+    withTempRoot (fun root ->
+        let previous = Environment.GetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS")
+        try
+            let first = Path.Combine(root, "one")
+            let second = Path.Combine(root, "two")
+            Directory.CreateDirectory(first) |> ignore
+            Directory.CreateDirectory(second) |> ignore
+            Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", first)
+            requireApproval first |> shouldEqual (Ok ())
+            match requireApproval second with
+            | Error(Client.PermissionDenied _) -> ()
+            | other -> Assert.Fail(sprintf "Unexpected sibling approval: %A" other)
+        finally
+            Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", previous))
+
+[<Test>]
+let ``UTF16 Roslyn edits preserve non-BMP characters`` () =
+    let original = "a\U0001f600b\nz"
+    let json =
+        """[{"range":{"start":{"line":0,"character":1},"end":{"line":0,"character":3}},"newText":"X"}]"""
+    edits original json |> shouldEqual (Ok("aXb\nz", 1))
+
+[<Test>]
+let ``Roslyn edits preserve CRLF between lines`` () =
+    let original = "first\r\nlast\r\n"
+    let json =
+        """[{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":1}},"newText":"L"}]"""
+    edits original json |> shouldEqual (Ok("first\r\nLast\r\n", 1))
+
+[<Test>]
+let ``multiple non-overlapping Roslyn edits are applied in original document coordinates`` () =
+    let json =
+        """[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"newText":"A"},{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":1}},"newText":"B"}]"""
+    edits "a\nb" json |> shouldEqual (Ok("A\nB", 2))
+
+[<Test>]
+let ``overlapping Roslyn edits fail closed`` () =
+    let json =
+        """[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":2}},"newText":"X"},{"range":{"start":{"line":0,"character":1},"end":{"line":0,"character":3}},"newText":"Y"}]"""
+    match edits "abcdef" json with
+    | Error message -> message.Contains("Overlapping") |> shouldEqual true
+    | other -> Assert.Fail(sprintf "Expected conflict, got %A" other)
+
+[<Test>]
+let ``out-of-range Roslyn edits fail without partial output`` () =
+    let json =
+        """[{"range":{"start":{"line":4,"character":0},"end":{"line":4,"character":1}},"newText":"X"}]"""
+    match edits "one\ntwo" json with
+    | Error message -> message.Contains("outside") |> shouldEqual true
+    | other -> Assert.Fail(sprintf "Expected range rejection, got %A" other)

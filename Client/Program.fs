@@ -509,6 +509,7 @@ let private runClient args =
             do! dispatch.Complete().WaitAsync(TimeSpan.FromMinutes 2.0)
         with :? TimeoutException ->
             tui.Log "MCP dispatch shutdown exceeded two minutes; some command outcomes may be uncertain."
+        RoslynLsp.disposeAll()
         scheduler |> Option.iter (fun service -> (service :> IDisposable).Dispose())
         browser |> Option.iter (fun bridge -> (bridge :> IDisposable).Dispose())
         do! connection.DisposeAsync()

@@ -518,6 +518,21 @@ type PatchHunkDiagnostic =
       ExpectedContext: string list
       ActualContext: string list }
 
+/// Structured, repo-opt-in client code-quality hook result.
+type CodeQualityHookReport =
+    { Hook: string
+      Path: string
+      Status: string
+      Message: string
+      Modified: bool
+      FormattingEdits: int
+      Diagnostics: string list }
+
+type CodeQualityHookSummary =
+    { Trigger: string
+      Reports: CodeQualityHookReport list
+      ModifiedFiles: string list }
+
 type PatchFileResult =
     { Applied: bool
       DryRun: bool
@@ -527,7 +542,8 @@ type PatchFileResult =
       BeforeHash: string
       AfterHash: string option
       Content: string option
-      Diagnostics: PatchHunkDiagnostic list }
+      Diagnostics: PatchHunkDiagnostic list
+      Hooks: CodeQualityHookSummary option }
 
 type PatchFileCommand =
     { ProjectName: string
@@ -625,7 +641,8 @@ type GitCommitResult =
     { CommitHash: string
       Summary: string
       StdOut: string
-      StdErr: string }
+      StdErr: string
+      Hooks: CodeQualityHookSummary option }
 
 type StartJobCommand =
     { ProjectName: string

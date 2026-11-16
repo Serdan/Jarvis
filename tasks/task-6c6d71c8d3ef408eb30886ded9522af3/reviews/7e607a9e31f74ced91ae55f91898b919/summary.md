@@ -1,0 +1,1 @@
+Commit adds authenticated global roster discovery, Git-verified client providers, ephemeral server cache, failover, stale/offline displays, machine filter, cross-device last seen. Release solution build passes; 9 cache tests and 4 targeted client tests pass. Full suite reached 120s command limit without a complete result.

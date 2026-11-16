@@ -17,7 +17,8 @@
 SDK `dotnet --version` = **11.0.100**.
 - `dotnet test Client.Tests/Client.Tests.fsproj -c Release --filter FullyQualifiedName~WorkComposition --no-restore --verbosity minimal` -> **12 passed, 0 failed, 0 skipped**, net11.0. Includes amplified stage payload pagination passing the actual SignalR transport guard.
 - `dotnet test Server.Tests/Server.Tests.fsproj -c Release --no-restore --verbosity minimal` -> **294 passed, 0 failed, 0 skipped**, net11.0.
-- Full Client.Tests suite launched independently afterward, outcome not yet asserted in this document.
+- `dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-build --no-restore --filter "FullyQualifiedName~WorkCompositionQueueBinder|FullyQualifiedName~WorkQueueToolFacade" --verbosity minimal` -> **12 passed, 0 failed, 0 skipped**, net11.0; directly exercises the accepted composition binder and main Work facade together.
+- Full `Client.Tests` suite (`-c Release --no-build --no-restore`) independently attempted but **timed out after 240 seconds**, without a test summary (ExitCode -1, TimedOut true). Its output reported activity-persistence `UnauthorizedAccessException` / `InvalidDataException`; this is inconclusive and must **not** be described as a full-suite pass or proof of a merge regression. The merge-specific tests above passed.
 
 ## Scope boundary
 No observed conflict-resolution defects in these three files. Accepting this merge does **not** certify an original WQ04/WQ02 positive same-CAS writer, readiness activation, or production migration/cutover: those gates remain separate NO-GO reviews. No hosted GitHub Actions, Codex, production mutation, or main push.

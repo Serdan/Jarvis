@@ -1,0 +1,9 @@
+# P1 — Parent acceptance can reuse stale review evidence after child changes
+
+**Location:** `Client/Modules/WorkCompositionAcceptanceAdapter.fs` (`reviewPurpose`, `checkAt`); `Server/WorkComposition.fs` (`WorkCompositionMutation.Create`, `currentAcceptanceIn`, `Accept`).
+
+`reviewPurpose` hashes only the unit ID, its own `SpecVersion`, and its `Spec`. Creating a child under an already-reviewed parent does not increment the parent spec version, although `currentAcceptanceIn` deliberately invalidates its acceptance when its child-acceptance snapshot changes. Consequently, after that new child has itself been accepted, `acceptIntegrated` will authorize the *same prior* parent review and managed integration receipt: the parent purpose digest still matches, the integration remains `Integrated`, and `Accept` now sees complete children. No independent reviewer has examined whether the newly composed parent satisfies its acceptance criteria.
+
+This also applies when an existing child's accepted target changes without the parent spec changing. The new two-clone test verifies rejection only while the corrective child is **incomplete**; it does not continue to accept the child and then attempt to replay the old parent submission.
+
+**Required correction:** Bind a parent's review target to the relevant composition snapshot (child/dependency identities and current accepted proof versions, with explicit graph/target provenance), or enforce equivalent invalidation/re-review whenever that closure changes. Add a negative test demonstrating that an old accepted/integrated parent receipt is rejected **after** newly added or revised child work is accepted, and a positive test that fresh parent evidence succeeds. A closed child must not implicitly reauthorize an old parent approval.

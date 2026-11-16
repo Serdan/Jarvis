@@ -2967,3 +2967,102 @@ module OperatorChallengeApi =
                                 authenticatedOperator request.ChallengeId request.ConditionId
                                 request.ExpectedVersion request.Response
                             |> mapError))
+
+
+// Normal Jarvis tool routing for the accepted manual WQ06 Git-backed operator
+// threads. This is separate from WQ04 Scheduler and WQ03 source-effect authority.
+module OperatorConversationApi =
+    let private mapError (result: Result<'a, LedgerStore.LedgerFailure>) =
+        result |> Result.mapError LedgerErrors.toEffect
+
+    let private operationId (text: string) =
+        match Guid.TryParse text with
+        | true, id when id <> Guid.Empty -> Ok id
+        | _ -> Error(Client.ValidationError "Original caller-stable operation UUID is required.")
+
+    // Defense-in-depth format validation, not independent authentication:
+    // only the MCP server can attest an actor from the JWT subject.
+    let private serverActorFormat (actor: string) =
+        not (isNull actor) && actor.Length = 73
+        && actor.StartsWith("operator:", StringComparison.Ordinal)
+        && (actor.Substring(9) |> Seq.forall (fun c ->
+            (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+
+    let readWithBinding (cmd: OperatorConversationReadCommand)
+                        (binding: LedgerStore.LedgerBinding) : Result<obj, EffectError> =
+        match cmd.Action with
+        | "List" ->
+            WorkQueueOperatorConversations.WorkQueueOperatorConversations.read
+                binding cmd.SubjectKind cmd.SubjectId
+            |> mapError |> Result.map box
+        | "Raw" ->
+            WorkQueueOperatorConversations.WorkQueueOperatorConversations.inspectRaw
+                binding cmd.SubjectKind cmd.SubjectId
+            |> mapError
+            |> Result.map (fun (head, blob, content) ->
+                box {| verifiedGitHead = head; blobOid = blob; content = content |})
+        | "Inspect" ->
+            operationId cmd.OperationId
+            |> Result.bind (fun uuid ->
+                WorkQueueOperatorConversations.WorkQueueOperatorConversations.inspectOperation
+                    binding uuid
+                |> mapError
+                |> Result.map (fun observed ->
+                    match observed.Operation with
+                    | Some receipt ->
+                        box {| status = "Applied"
+                               verifiedGitHead = observed.VerifiedGitHead
+                               operationId = receipt.OperationId
+                               action = receipt.Type
+                               actor = receipt.Actor
+                               sequence = receipt.Sequence
+                               requestHash = receipt.RequestHash
+                               paths = receipt.Paths |}
+                    | None ->
+                        box {| status = "NotFoundAtVerifiedHead"
+                               verifiedGitHead = observed.VerifiedGitHead
+                               operationId = cmd.OperationId
+                               warning = "Absence at a verified head does not prove a timed-out push cannot arrive." |}))
+        | _ -> Error(Client.ValidationError "Unsupported operator-conversation read operation.")
+
+    let writeWithBinding (cmd: OperatorConversationWriteCommand)
+                         (binding: LedgerStore.LedgerBinding) : Result<obj, EffectError> =
+        if not (serverActorFormat cmd.ActorId) then
+            Error(Client.PermissionDenied "A server-authenticated operator identity is required.")
+        else
+            operationId cmd.OperationId
+            |> Result.bind (fun uuid ->
+                let result =
+                    match cmd.Action with
+                    | "Post" ->
+                        WorkQueueOperatorConversations.WorkQueueOperatorConversations.post
+                            binding cmd.ActorId uuid cmd.ExpectedVersion
+                            cmd.SubjectKind cmd.SubjectId cmd.MessageId cmd.Text
+                    | "Claim" ->
+                        WorkQueueOperatorConversations.WorkQueueOperatorConversations.claim
+                            binding cmd.ActorId uuid cmd.ExpectedVersion
+                            cmd.SubjectKind cmd.SubjectId cmd.MessageId
+                    | "Handle" ->
+                        WorkQueueOperatorConversations.WorkQueueOperatorConversations.handle
+                            binding cmd.ActorId uuid cmd.ExpectedVersion
+                            cmd.SubjectKind cmd.SubjectId cmd.MessageId cmd.HandlerGeneration
+                            cmd.ReplyId cmd.Text
+                    | "Release" ->
+                        WorkQueueOperatorConversations.WorkQueueOperatorConversations.release
+                            binding cmd.ActorId uuid cmd.ExpectedVersion
+                            cmd.SubjectKind cmd.SubjectId cmd.MessageId cmd.HandlerGeneration
+                            cmd.Reason
+                    | "Repair" ->
+                        WorkQueueOperatorConversations.WorkQueueOperatorConversations.repair
+                            binding cmd.ActorId uuid
+                            cmd.SubjectKind cmd.SubjectId cmd.ExpectedBlobOid cmd.Reason cmd.Text
+                    | _ -> Error(LedgerStore.InvalidBinding "Unsupported operator-conversation write action.")
+                result |> mapError |> Result.map box)
+
+    let read (cmd: OperatorConversationReadCommand) rt =
+        LedgerBindingConfig.load cmd.ProjectName rt
+        |> Result.bind (readWithBinding cmd)
+
+    let write (cmd: OperatorConversationWriteCommand) rt =
+        LedgerBindingConfig.load cmd.ProjectName rt
+        |> Result.bind (writeWithBinding cmd)

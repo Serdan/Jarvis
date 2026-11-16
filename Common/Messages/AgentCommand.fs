@@ -179,6 +179,29 @@ type RemoveWorktreeCommand =
       TargetRef: string option }
 
 
+/// Manual operator conversations use only the approved project Git ledger.
+type OperatorConversationReadCommand =
+    { ProjectName: string
+      Action: string
+      SubjectKind: string
+      SubjectId: string
+      OperationId: string }
+
+type OperatorConversationWriteCommand =
+    { ProjectName: string
+      Action: string
+      ActorId: string
+      OperationId: string
+      SubjectKind: string
+      SubjectId: string
+      ExpectedVersion: int
+      MessageId: string
+      HandlerGeneration: int
+      ReplyId: string
+      Text: string
+      Reason: string
+      ExpectedBlobOid: string }
+
 type TaskReadCommand =
     { ProjectName: string
       AgentId: string
@@ -808,6 +831,8 @@ type AgentCommand =
     | CreateWorktreeCommand of CreateWorktreeCommand
     | InspectWorktreeRemovalCommand of InspectWorktreeRemovalCommand
     | RemoveWorktreeCommand of RemoveWorktreeCommand
+    | OperatorConversationReadCommand of OperatorConversationReadCommand
+    | OperatorConversationWriteCommand of OperatorConversationWriteCommand
     | TaskReadCommand of TaskReadCommand
     | ObserveAgentCommand of ObserveAgentRequest
     | TaskWriteCommand of TaskWriteCommand
@@ -873,6 +898,7 @@ module AgentCommandInfo =
     let recoveryOperationId command =
         let raw =
             match command with
+            | OperatorConversationWriteCommand cmd -> cmd.OperationId
             | TaskWriteCommand cmd -> cmd.OperationId
             | CrossProjectNotificationCommand envelope -> envelope.Notification.OperationId
             | ChallengeWriteCommand cmd -> cmd.OperationId
@@ -911,6 +937,8 @@ module AgentCommandInfo =
         | CreateWorktreeCommand _ -> "CreateWorktreeCommand"
         | InspectWorktreeRemovalCommand _ -> "InspectWorktreeRemovalCommand"
         | RemoveWorktreeCommand _ -> "RemoveWorktreeCommand"
+        | OperatorConversationReadCommand _ -> "OperatorConversationReadCommand"
+        | OperatorConversationWriteCommand _ -> "OperatorConversationWriteCommand"
         | TaskReadCommand _ -> "TaskReadCommand"
         | ObserveAgentCommand _ -> "ObserveAgentCommand"
         | TaskWriteCommand _
@@ -1003,6 +1031,8 @@ module AgentCommandInfo =
         | CreateWorktreeCommand _ -> "CreateWorktree"
         | InspectWorktreeRemovalCommand _ -> "InspectWorktreeRemoval"
         | RemoveWorktreeCommand _ -> "RemoveWorktree"
+        | OperatorConversationReadCommand _ -> "OperatorConversationRead"
+        | OperatorConversationWriteCommand _ -> "OperatorConversationWrite"
         | TaskReadCommand _ -> "TaskRead"
         | ObserveAgentCommand _ -> "ObserveAgent"
         | TaskWriteCommand _
@@ -1089,6 +1119,8 @@ module AgentCommandInfo =
         | CreateWorktreeCommand cmd -> Some cmd.ProjectName
         | InspectWorktreeRemovalCommand cmd -> Some cmd.ProjectName
         | RemoveWorktreeCommand cmd -> Some cmd.ProjectName
+        | OperatorConversationReadCommand cmd -> Some cmd.ProjectName
+        | OperatorConversationWriteCommand cmd -> Some cmd.ProjectName
         | TaskReadCommand cmd -> Some cmd.ProjectName
         | ObserveAgentCommand cmd -> Some cmd.ProjectName
         | TaskWriteCommand cmd -> Some cmd.ProjectName
@@ -1205,6 +1237,8 @@ module AgentCommandInfo =
         | CreateWorktreeCommand cmd -> Some(compact cmd.Name)
         | InspectWorktreeRemovalCommand cmd -> Some(compact cmd.WorktreePath)
         | RemoveWorktreeCommand cmd -> Some(compact cmd.WorktreePath)
+        | OperatorConversationReadCommand cmd -> Some(compact cmd.Action)
+        | OperatorConversationWriteCommand cmd -> Some(compact cmd.Action)
         | TaskReadCommand cmd -> Some(compact cmd.AgentId)
         | ObserveAgentCommand cmd -> Some(compact cmd.TargetAgentId)
         | TaskWriteCommand cmd
@@ -1276,6 +1310,8 @@ module AgentCommandInfo =
         | CreateWorktreeCommand cmd -> Some(truncate 64 cmd.Name)
         | InspectWorktreeRemovalCommand cmd -> Some(truncate 64 cmd.WorktreePath)
         | RemoveWorktreeCommand cmd -> Some(truncate 64 cmd.WorktreePath)
+        | OperatorConversationReadCommand cmd -> Some(truncate 64 cmd.Action)
+        | OperatorConversationWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | TaskReadCommand cmd -> Some(truncate 64 cmd.AgentId)
         | ObserveAgentCommand cmd -> Some(truncate 64 cmd.TargetAgentId)
         | TaskWriteCommand cmd
@@ -1343,7 +1379,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.66"
+    let version = "3.67"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -1389,6 +1425,8 @@ module AgentProtocol =
           definition "GetWorktree" "Inspects a registered Git worktree." [ ReadOnly ] false false false
           definition "CreateWorktree" "Creates an isolated Git worktree and branch." [ VersionControlWrite ] true true false
           definition "InspectWorktreeRemoval" "Checks registered worktree removal safety." [ ReadOnly ] false false false
+          definition "OperatorConversationRead" "Inspect an approved Git-backed Task/Role operator conversation or an original operation receipt." [ ReadOnly; NetworkAccess ] false false false
+          definition "OperatorConversationWrite" "Explicit operator conversation Post/Claim/Handle/Release/Repair, with original UUID and Git CAS." [ VersionControlWrite; NetworkAccess ] true true false
           definition "TaskRead" "Reads a registered agent inbox from a single ledger snapshot." [ ReadOnly; NetworkAccess ] false false false
           definition "ObserveAgent" "Read an explicitly named target agent without attributing tool activity or beginning a Ready turn. Observer identity is independently verified." [ ReadOnly; NetworkAccess ] false false false
           definition "TaskWrite" "Creates/assigns/starts tasks and binds immutable review base." [ VersionControlWrite; NetworkAccess ] true true false

@@ -991,7 +991,7 @@ let auth_issuer_normalizes_auth0_domain () =
     let options =
         { Auth0Domain = "dev-kn4j3jz3qv2cvw05.eu.auth0.com"
           Audience = "https://jarvis2.kehlet.dev"
-          OpenAIAppsChallenge = "" }
+          OpenAIAppsChallenge = ""; EnableOperatorConversations = false }
 
     Auth.issuer options |> shouldEqual "https://dev-kn4j3jz3qv2cvw05.eu.auth0.com/"
 
@@ -1000,7 +1000,7 @@ let auth_accepts_exactly_the_legacy_and_trailing_slash_api_audiences () =
     let options =
         { Auth0Domain = "example.eu.auth0.com"
           Audience = "https://jarvis2.kehlet.dev"
-          OpenAIAppsChallenge = "" }
+          OpenAIAppsChallenge = ""; EnableOperatorConversations = false }
     Auth.validAudiences options
     |> shouldEqual [| "https://jarvis2.kehlet.dev"; "https://jarvis2.kehlet.dev/" |]
 
@@ -1222,7 +1222,7 @@ let mcp_profile_tool_returns_chatgpt_compatible_authentication_challenge () =
         Microsoft.Extensions.Options.Options.Create(
             { Auth0Domain = "dev-kn4j3jz3qv2cvw05.eu.auth0.com"
               Audience = "https://jarvis2.kehlet.dev"
-              OpenAIAppsChallenge = "" }
+              OpenAIAppsChallenge = ""; EnableOperatorConversations = false }
         )
     )
     |> ignore
@@ -2236,7 +2236,7 @@ let browser_dom_mcp_tools_route_only_when_all_required_oauth_scopes_are_present 
     Microsoft.Extensions.DependencyInjection.ServiceCollectionServiceExtensions.AddSingleton<Microsoft.Extensions.Options.IOptions<JarvisOptions>>(
         services,
         Microsoft.Extensions.Options.Options.Create(
-            { Auth0Domain = "auth.example"; Audience = "https://example.test"; OpenAIAppsChallenge = "" }))
+            { Auth0Domain = "auth.example"; Audience = "https://example.test"; OpenAIAppsChallenge = ""; EnableOperatorConversations = false }))
     |> ignore
     use provider =
         Microsoft.Extensions.DependencyInjection.ServiceCollectionContainerBuilderExtensions.BuildServiceProvider(services)
@@ -2587,3 +2587,54 @@ let source_uuid_signalr_dispatch_preserves_caller_identity_and_legacy_receiver (
         Assert.That(legacyDispatches, Is.EqualTo 1)
         Assert.That(observed.Count, Is.Zero)
     }
+
+
+[<Test>]
+let wq06_manual_conversation_mcp_is_default_off_and_enforces_git_write_scope () =
+    let call enabled scopes =
+        let services =
+            Microsoft.Extensions.DependencyInjection.ServiceCollection()
+            :> Microsoft.Extensions.DependencyInjection.IServiceCollection
+        Microsoft.Extensions.DependencyInjection.ServiceCollectionServiceExtensions.AddSingleton<Microsoft.Extensions.Options.IOptions<JarvisOptions>>(
+            services,
+            Microsoft.Extensions.Options.Options.Create(
+                { Auth0Domain = "auth.example"; Audience = "https://example.test"
+                  OpenAIAppsChallenge = ""; EnableOperatorConversations = enabled }))
+        |> ignore
+        use provider =
+            Microsoft.Extensions.DependencyInjection.ServiceCollectionContainerBuilderExtensions.BuildServiceProvider(services)
+        let context = Microsoft.AspNetCore.Http.DefaultHttpContext()
+        context.RequestServices <- provider
+        context.User <-
+            System.Security.Claims.ClaimsPrincipal(
+                System.Security.Claims.ClaimsIdentity(
+                    [ System.Security.Claims.Claim("sub", "auth0|verified-operator")
+                      System.Security.Claims.Claim("scope", String.concat " " scopes) ], "test"))
+        let accessor = Microsoft.AspNetCore.Http.HttpContextAccessor()
+        accessor.HttpContext <- context
+        // Both failures must happen before dispatch; no client required.
+        JarvisMcpTools.PostOperatorConversationMessage(
+            "Jarvis", "Worker 8", "Task", "sample-task", 0,
+            Guid.NewGuid().ToString("D"), "A manually posted question.",
+            "", "", Unchecked.defaultof<ClientService>, accessor)
+        |> Async.AwaitTask
+        |> Async.RunSynchronously
+    let errorText (result: CallToolResult) =
+        result.Content
+        |> Seq.choose (function
+            | :? TextContentBlock as block -> Some block.Text
+            | _ -> None)
+        |> String.concat "\n"
+    let disabled = call false [ Auth.WorkspaceRead; Auth.GitWrite ]
+    Assert.That(disabled.IsError, Is.EqualTo(Nullable true))
+    Assert.That(errorText disabled, Does.Contain("disabled"))
+    let missingGitWrite = call true [ Auth.WorkspaceRead ]
+    Assert.That(missingGitWrite.IsError, Is.EqualTo(Nullable true))
+    Assert.That(errorText missingGitWrite, Does.Contain(Auth.GitWrite))
+    for methodName in [ "ListOperatorConversation"; "RawOperatorConversation"
+                        "InspectOperatorConversationOperation"
+                        "PostOperatorConversationMessage"; "ClaimOperatorConversationMessage"
+                        "HandleOperatorConversationMessage"; "ReleaseOperatorConversationMessage"
+                        "RepairOperatorConversation" ] do
+        Assert.That(typeof<JarvisMcpTools>.GetMethod(methodName), Is.Not.Null,
+                    "The public WQ06 MCP method must be explicitly registered: " + methodName)

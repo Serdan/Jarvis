@@ -20,7 +20,10 @@ let private getConfiguredOptions (configuration: IConfiguration) =
     let options =
         { Auth0Domain = configuration["Auth0Domain"]
           Audience = configuration["Audience"]
-          OpenAIAppsChallenge = configuration["OpenAIAppsChallenge"] }
+          OpenAIAppsChallenge = configuration["OpenAIAppsChallenge"]
+          EnableOperatorConversations =
+              String.Equals(configuration["EnableOperatorConversations"], "true",
+                            StringComparison.OrdinalIgnoreCase) }
 
     if String.IsNullOrWhiteSpace(options.Auth0Domain) then
         invalidOp "Auth0Domain is required."

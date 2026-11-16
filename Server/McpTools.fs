@@ -65,6 +65,28 @@ module private ReviewCommands =
           Content = ""
           ExpectedBlobOid = "" }
 
+module private OperatorConversationCommands =
+    let read project action kind subject operationId =
+        OperatorConversationReadCommand
+            { ProjectName = project; Action = action
+              SubjectKind = kind; SubjectId = subject; OperationId = operationId }
+
+    // Authenticated JWT subject is the audit authority. No free-text MCP actor
+    // field, user-supplied filesystem path or inferred role permission.
+    let actor (http: IHttpContextAccessor) =
+        match Option.ofObj http.HttpContext with
+        | Some context ->
+            match Auth.tryUserId context.User with
+            | Some user -> "operator:" + Auth.profileId user
+            | None -> ""
+        | None -> ""
+
+    let write (http: IHttpContextAccessor) project action operationId kind subject =
+        { ProjectName = project; Action = action; ActorId = actor http
+          OperationId = operationId; SubjectKind = kind; SubjectId = subject
+          ExpectedVersion = 0; MessageId = ""; HandlerGeneration = 0
+          ReplyId = ""; Text = ""; Reason = ""; ExpectedBlobOid = "" }
+
 module private TaskCommands =
     // Compatibility wire value for administrative calls lacking a caller field.
     // This is NOT the audit actor. The local TaskApi resolves provenance from
@@ -356,7 +378,9 @@ module McpToolHelpers =
                  capability.Name <> "ReviewRead" && capability.Name <> "ReviewWrite"
                  && capability.Name <> "TaskRead" && capability.Name <> "TaskWrite"
                  && capability.Name <> "LedgerRead" && capability.Name <> "LedgerWrite"
-                 && capability.Name <> "ChallengeRead" && capability.Name <> "ChallengeWrite"))
+                 && capability.Name <> "ChallengeRead" && capability.Name <> "ChallengeWrite"
+                 && capability.Name <> "OperatorConversationRead"
+                 && capability.Name <> "OperatorConversationWrite"))
             @ ledgerAliasCapabilities
             @ [ serverLocalCapability
                     "GetProfile"
@@ -569,6 +593,7 @@ module McpToolHelpers =
         | ListWorktreesCommand _
         | GetWorktreeCommand _
         | InspectWorktreeRemovalCommand _
+        | OperatorConversationReadCommand _
         | TaskReadCommand _
         | ChallengeReadCommand _
         | ObserveAgentCommand _
@@ -616,6 +641,7 @@ module McpToolHelpers =
         | CreateWorktreeCommand _
         | CreateProjectCommand _
         | RemoveWorktreeCommand _
+        | OperatorConversationWriteCommand _
         | TaskWriteCommand _
         | CrossProjectNotificationCommand _
         | ChallengeWriteCommand _
@@ -740,6 +766,10 @@ module McpToolHelpers =
 
     let private ensureOperationId command =
         match command with
+        | OperatorConversationWriteCommand cmd ->
+            let id, generated = resolveOperationId cmd.OperationId
+            OperatorConversationWriteCommand { cmd with OperationId = id },
+            (if generated then Some id else None)
         | TaskWriteCommand cmd ->
             let id, generated = resolveOperationId cmd.OperationId
             TaskWriteCommand { cmd with OperationId = id }, (if generated then Some id else None)
@@ -788,6 +818,13 @@ module McpToolHelpers =
                 return errorResult (PermissionDenied "The MCP request is missing its HTTP context.")
             | Some _ when RequestDeviceRouting.invalidAgentId() ->
                 return errorResult (ValidationFailed "agentId must be a nonempty string of at most 256 characters.")
+            | Some context
+                when (match command with
+                      | OperatorConversationReadCommand _
+                      | OperatorConversationWriteCommand _ -> true
+                      | _ -> false)
+                     && not (context.RequestServices.GetRequiredService<IOptions<JarvisOptions>>().Value.EnableOperatorConversations) ->
+                return errorResult (PermissionDenied "Operator conversations are disabled until explicitly enabled by the operator.")
             | Some context ->
                 let command, generatedId = ensureOperationId command
                 let command, generatedTaskId =
@@ -2705,3 +2742,118 @@ type JarvisMcpTools =
                 ExpectedAgentVersion = expectedAgentVersion
                 AssignmentGeneration = assignmentGeneration }
         McpToolHelpers.send client http (ChallengeWriteCommand body)
+
+
+    // WQ06 opt-in manual Task/Role conversations. The server authenticates
+    // OAuth caller identity; the client independently checks its approved
+    // project Git binding. The default-off flag is enforced by send().
+    [<McpServerTool(Title = "List Task/Role operator conversation", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]""");
+      Description("Read one approved Git-backed Task/Role thread: pending/claimed/handled messages, replies, handler generation, thread version and verified Git head. Passive read; does not claim.")>]
+    static member ListOperatorConversation(
+        projectName: string, agentId: string, subjectKind: string, subjectId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        McpToolHelpers.send client http
+            (OperatorConversationCommands.read projectName "List" subjectKind subjectId "")
+
+    [<McpServerTool(Title = "Inspect raw Task/Role operator thread", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]""");
+      Description("Inspect raw Git document even if malformed, including verified head and backup blob SHA for an explicit audited repair. Does not change content.")>]
+    static member RawOperatorConversation(
+        projectName: string, agentId: string, subjectKind: string, subjectId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        McpToolHelpers.send client http
+            (OperatorConversationCommands.read projectName "Raw" subjectKind subjectId "")
+
+    [<McpServerTool(Title = "Inspect original Task/Role conversation operation", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]""");
+      Description("Lookup original caller-stable UUID receipt at verified Git head; NotFoundAtVerifiedHead does not prove a timed-out write will not arrive. Reuse the exact UUID and original command to retry.")>]
+    static member InspectOperatorConversationOperation(
+        projectName: string, agentId: string, operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        McpToolHelpers.send client http
+            (OperatorConversationCommands.read projectName "Inspect" "" "" operationId)
+
+    [<McpServerTool(Title = "Post operator Task/Role message", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("Post one explicit message to Task/Role thread with stable message ID and expected version. Actor is OAuth-bound, not caller supplied. Reuse original operationId and all parameters after unknown acknowledgement; never creates Scheduler demand.")>]
+    static member PostOperatorConversationMessage(
+        projectName: string, agentId: string, subjectKind: string, subjectId: string,
+        expectedVersion: int, messageId: string, body: string,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        let cmd = OperatorConversationCommands.write http projectName "Post" operationId subjectKind subjectId
+        McpToolHelpers.send client http
+            (OperatorConversationWriteCommand
+                { cmd with ExpectedVersion = expectedVersion; MessageId = messageId; Text = body })
+
+    [<McpServerTool(Title = "Claim operator Task/Role message", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("CAS-claim a pending Task/Role message under authenticated caller ID. Read current thread version; one ordinary Git CAS winner, conflicting loser remains visible.")>]
+    static member ClaimOperatorConversationMessage(
+        projectName: string, agentId: string, subjectKind: string, subjectId: string,
+        expectedVersion: int, messageId: string,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        let cmd = OperatorConversationCommands.write http projectName "Claim" operationId subjectKind subjectId
+        McpToolHelpers.send client http
+            (OperatorConversationWriteCommand
+                { cmd with ExpectedVersion = expectedVersion; MessageId = messageId })
+
+    [<McpServerTool(Title = "Handle operator Task/Role message", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("Record immutable reply and Handled state at exact Git thread version and handler generation for the authenticated claimant. Original reply/receipt survive lost acknowledgements.")>]
+    static member HandleOperatorConversationMessage(
+        projectName: string, agentId: string, subjectKind: string, subjectId: string,
+        expectedVersion: int, messageId: string, handlerGeneration: int,
+        replyId: string, replyBody: string,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        let cmd = OperatorConversationCommands.write http projectName "Handle" operationId subjectKind subjectId
+        McpToolHelpers.send client http
+            (OperatorConversationWriteCommand
+                { cmd with ExpectedVersion = expectedVersion; MessageId = messageId
+                           HandlerGeneration = handlerGeneration; ReplyId = replyId; Text = replyBody })
+
+    [<McpServerTool(Title = "Release operator Task/Role message claim", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("Explicitly return a claimed message to Pending at expected version and generation with durable reason; never silently expires a handler. Subsequent claim increments generation.")>]
+    static member ReleaseOperatorConversationMessage(
+        projectName: string, agentId: string, subjectKind: string, subjectId: string,
+        expectedVersion: int, messageId: string, handlerGeneration: int, reason: string,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        let cmd = OperatorConversationCommands.write http projectName "Release" operationId subjectKind subjectId
+        McpToolHelpers.send client http
+            (OperatorConversationWriteCommand
+                { cmd with ExpectedVersion = expectedVersion; MessageId = messageId
+                           HandlerGeneration = handlerGeneration; Reason = reason })
+
+    [<McpServerTool(Title = "Repair operator Task/Role thread explicitly", ReadOnly = false, Destructive = true, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("EXPLICIT AUDITED REPAIR ONLY: after raw inspection and a visible diff, replace one JSON document iff exact prior blob SHA still matches; record backup Git head, actor, reason and replacement hash. No automatic fix or migration.")>]
+    static member RepairOperatorConversation(
+        projectName: string, agentId: string, subjectKind: string, subjectId: string,
+        expectedBlobOid: string, reason: string, replacementJson: string,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        let cmd = OperatorConversationCommands.write http projectName "Repair" operationId subjectKind subjectId
+        McpToolHelpers.send client http
+            (OperatorConversationWriteCommand
+                { cmd with ExpectedBlobOid = expectedBlobOid; Reason = reason; Text = replacementJson })

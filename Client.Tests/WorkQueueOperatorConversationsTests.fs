@@ -3,6 +3,9 @@ module Client.Tests.WorkQueueOperatorConversationsTests
 open System
 open System.Diagnostics
 open System.IO
+open System.Text.Json
+open Common
+open Client.OrchestrationApi
 open NUnit.Framework
 open Client.LedgerStore
 open Client.WorkQueueOperatorConversations
@@ -229,3 +232,94 @@ type WorkQueueOperatorConversationsTests() =
             Assert.That(note.Value, Does.Contain(oid))
             Assert.That(note.Value, Does.Contain(head))
             Assert.That(note.Value, Does.Contain("Restore from a malformed legacy merge")))
+
+
+    [<Test>]
+    member _.AuthenticatedJarvisWireAdapterPostsClaimsHandlesAndReconcilesOriginalUuid() =
+        let actor = "operator:" + String.replicate 64 "a"
+        let readCommand action kind subject operationId : OperatorConversationReadCommand =
+            { ProjectName = "fixture"; Action = action; SubjectKind = kind
+              SubjectId = subject; OperationId = operationId }
+        let writeCommand action (op: Guid) version kind subject messageId : OperatorConversationWriteCommand =
+            { ProjectName = "fixture"; Action = action; ActorId = actor
+              OperationId = op.ToString("D"); SubjectKind = kind; SubjectId = subject
+              ExpectedVersion = version; MessageId = messageId; HandlerGeneration = 0
+              ReplyId = ""; Text = ""; Reason = ""; ExpectedBlobOid = "" }
+        let apply binding cmd =
+            OperatorConversationApi.writeWithBinding cmd binding |> success :?> OperatorReceipt
+        let snapshot binding kind subject =
+            OperatorConversationApi.readWithBinding (readCommand "List" kind subject "") binding
+            |> success :?> OperatorThreadSnapshot
+        withClones (fun a b ->
+            let subject = "task-operator-adapter"
+            let messageId = id().ToString("D")
+            let originalOperation = id()
+            let post =
+                { writeCommand "Post" originalOperation 0 "Task" subject messageId with
+                    Text = "Please review the evidence." }
+            let created = apply a post
+            let observer = snapshot b "Task" subject
+            Assert.That(observer.Thread.Version, Is.EqualTo(1))
+            Assert.That(observer.Thread.Messages.[0].Status, Is.EqualTo("Pending"))
+            Assert.That((snapshot b "Task" subject).Thread.Version, Is.EqualTo(1),
+                        "Reading a manual conversation must be passive.")
+            let operation =
+                OperatorConversationApi.readWithBinding
+                    (readCommand "Inspect" "" "" (originalOperation.ToString("D"))) b |> success
+            Assert.That(JsonSerializer.Serialize(operation), Does.Contain("Applied"))
+            let replay = apply b post
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That(replay.LedgerSequence, Is.EqualTo(created.LedgerSequence))
+            let claim = writeCommand "Claim" (id()) 1 "Task" subject messageId
+            apply b claim |> ignore
+            let secondClaim = writeCommand "Claim" (id()) 1 "Task" subject messageId
+            match OperatorConversationApi.writeWithBinding secondClaim a with
+            | Error error -> Assert.That(sprintf "%A" error, Does.Contain("StaleEntityVersion"))
+            | Ok _ -> Assert.Fail("Two handlers cannot claim the same generation.")
+            let replyId = id().ToString("D")
+            let handle =
+                { writeCommand "Handle" (id()) 2 "Task" subject messageId with
+                    HandlerGeneration = 1; ReplyId = replyId; Text = "Reviewed and accepted." }
+            apply a handle |> ignore
+            let final = snapshot b "Task" subject
+            Assert.That(final.Thread.Version, Is.EqualTo(3))
+            Assert.That(final.Thread.Messages.[0].Status, Is.EqualTo("Handled"))
+            Assert.That(final.Thread.Messages.[0].ReplyId, Is.EqualTo(replyId))
+            Assert.That(final.Thread.Messages.[0].ReplyBody, Is.EqualTo("Reviewed and accepted."))
+            let wrongActor = { writeCommand "Post" (id()) 0 "Role" "Lead" "new-message" with
+                                ActorId = "arbitrary-administrator"; Text = "Must be refused." }
+            match OperatorConversationApi.writeWithBinding wrongActor b with
+            | Error error -> Assert.That(sprintf "%A" error, Does.Contain("PermissionDenied"))
+            | Ok _ -> Assert.Fail("Caller-supplied actor labels must be refused.")
+            let unapprovedIdentity = { a with ProjectId = Guid.NewGuid() }
+            match OperatorConversationApi.readWithBinding
+                      (readCommand "List" "Task" subject "") unapprovedIdentity with
+            | Error _ -> ()
+            | Ok _ -> Assert.Fail("Mismatched Git ledger identity must be rejected."))
+
+    [<Test>]
+    member _.AuthenticatedJarvisWireAdapterFencesReleasedHandlerGeneration() =
+        let actor = "operator:" + String.replicate 64 "a"
+        let write action (op: Guid) version generation messageId : OperatorConversationWriteCommand =
+            { ProjectName = "fixture"; Action = action; ActorId = actor
+              OperationId = op.ToString("D"); SubjectKind = "Role"; SubjectId = "Lead"
+              ExpectedVersion = version; MessageId = messageId; HandlerGeneration = generation
+              ReplyId = ""; Text = ""; Reason = ""; ExpectedBlobOid = "" }
+        let apply binding cmd =
+            OperatorConversationApi.writeWithBinding cmd binding |> success |> ignore
+        withClones (fun a b ->
+            let mid = id().ToString("D")
+            apply a { write "Post" (id()) 0 0 mid with Text = "Decision needed." }
+            apply b (write "Claim" (id()) 1 0 mid)
+            apply a { write "Release" (id()) 2 1 mid with Reason = "Original handler stopped." }
+            apply b (write "Claim" (id()) 3 0 mid)
+            match OperatorConversationApi.writeWithBinding
+                { write "Handle" (id()) 4 1 mid with
+                    ReplyId = id().ToString("D"); Text = "Stale response." } a with
+            | Error error -> Assert.That(sprintf "%A" error, Does.Contain("StaleEntityVersion"))
+            | Ok _ -> Assert.Fail("Old handler generation must not complete a reclaimed message.")
+            apply b { write "Handle" (id()) 4 2 mid with
+                          ReplyId = id().ToString("D"); Text = "Current response." }
+            let current = WorkQueueOperatorConversations.read a "Role" "Lead" |> success
+            Assert.That(current.Thread.Messages.[0].HandlerGeneration, Is.EqualTo(2))
+            Assert.That(current.Thread.Messages.[0].ReplyBody, Is.EqualTo("Current response.")))

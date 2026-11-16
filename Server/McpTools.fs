@@ -348,7 +348,7 @@ module McpToolHelpers =
     let private challengeWriteMethods =
         [ "CreateChallenge"; "SetChallengeSubscription"; "AssignChallengeCondition"; "SplitChallengeCondition"
           "ResolveChallengeCondition"; "ReopenChallengeCondition"
-          "CancelChallenge"; "BlockOnChallenges"; "RequeueChallengeBlockedAttempt" ]
+          "CancelChallenge"; "BlockOnChallenges"; "BlockOnReviewDependencies"; "RequeueChallengeBlockedAttempt" ]
 
     let private ledgerAliasCapabilities =
         let fromWire wireName publicName =

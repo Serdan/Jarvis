@@ -188,7 +188,7 @@ let write_tools_expose_optional_operation_ids () =
                 Some (methodInfo.Name, id)
             | _ -> None)
     // Preserve challenge-domain, taskless and recipient-notification writes.
-    Assert.That(writeMethods.Length, Is.EqualTo(62), String.concat ", " (writeMethods |> Array.map fst))
+    Assert.That(writeMethods.Length, Is.EqualTo(63), String.concat ", " (writeMethods |> Array.map fst))
     for newTool in [ "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork" ] do
         Assert.That(writeMethods |> Array.exists (fun (name, _) -> name = newTool), Is.True,
                     $"Taskless lifecycle tool {newTool} missing from the public MCP surface.")

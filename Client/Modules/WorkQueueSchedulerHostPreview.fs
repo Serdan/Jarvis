@@ -296,14 +296,20 @@ module WorkQueueSchedulerHostPreview =
                         with ex -> Error ex.Message
                     let browserId, outcome, receipt =
                         match browser with
-                        | Ok(Some entry) when entry.Intent.LaunchId = launch.Id ->
+                        | Ok(Some entry) when entry.Intent.LaunchId = launch.Id
+                                              && entry.Intent.ProjectId = launch.ProjectId
+                                              && entry.Intent.RoleId = launch.RoleId
+                                              && entry.Intent.RoleVersion = launch.RoleVersion ->
                             let status, receipt = browserOutcome entry.Outcome
                             Some entry.Intent.OperationId, status, receipt
                         | Ok(Some entry) ->
                             add "BrowserIdentityConflict" launch.Id
                                 ("Original browser operation " + entry.Intent.OperationId
-                                 + " belongs to launch " + entry.Intent.LaunchId
-                                 + "; preserve its journal and inspect the mismatched ID before retry.")
+                                 + " names project/launch " + entry.Intent.ProjectId + "/" + entry.Intent.LaunchId
+                                 + " and role/version " + entry.Intent.RoleId + "/" + string entry.Intent.RoleVersion
+                                 + "; expected " + launch.ProjectId + "/" + launch.Id
+                                 + " and " + launch.RoleId + "/" + string launch.RoleVersion
+                                 + ". Preserve its journal and inspect the mismatched identity before retry.")
                             Some entry.Intent.OperationId, "IdentityConflict", None
                         | Ok None ->
                             add "BrowserJournalMissing" launch.Id

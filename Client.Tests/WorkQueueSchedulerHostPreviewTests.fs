@@ -317,3 +317,47 @@ type WorkQueueSchedulerHostPreviewTests() =
             issue.Code = "BrowserIdentityConflict"
             && issue.NextAction.Contains(browserOp)), Is.True)
         Assert.That(report.CanDispatch, Is.False)
+
+    [<Test>]
+    member _.ForeignProjectWithSameLaunchIdCannotSupplyAcceptedBrowserReceipt() =
+        let launchId = "55555555-5555-4555-8555-555555555555"
+        let foreignProject = "foreign-project"
+        let originalOp = "foreign-project-original-browser-operation"
+        let launch: Launch =
+            { Id = launchId; ProjectId = projectId; RoleId = "Worker"; RoleVersion = 4
+              AccountTokenId = "77777777-7777-4777-8777-777777777777"
+              State = LaunchState.SubmittedUnregistered DispatchState.OutcomeUnknown
+              Lease = None; Version = 1; Credit = Some stage.Id; PrimaryWorkId = None
+              EverClaimed = false; AncillaryMessages = Set.empty; DispatchCount = 1 }
+        let original: OriginalBrowserJournalEntry =
+            { Intent =
+                { LaunchId = launchId; ProjectId = foreignProject; WorkId = stage.Id
+                  WorkGeneration = 2; RoleId = "Worker"; RoleVersion = 4
+                  RequestFingerprint = "foreign-fingerprint"; OperationId = originalOp
+                  Provenance =
+                    { AccountHead = accountHead; ProjectHead = projectHead
+                      SourceRef = None; SourceCommit = None } }
+              Outcome = Some(OriginalBrowserOutcome.Accepted "foreign-accepted-receipt") }
+        let project = { empty with Launches = Map.ofList [ launchId, launch ] }
+        let withBrowser journal = ports project true (fun id ->
+            if id = launchId then Ok(Some journal) else Ok None)
+
+        let report = WorkQueueSchedulerHostPreview.previewWith (withBrowser original) "Worker"
+        let visible = report.ExistingLaunches.Head
+        Assert.That(visible.OriginalBrowserOperationId, Is.EqualTo(Some originalOp))
+        Assert.That(visible.OriginalBrowserOutcome, Is.EqualTo("IdentityConflict"))
+        Assert.That(visible.OriginalBrowserReceipt, Is.EqualTo(None))
+        Assert.That(report.Issues |> List.exists (fun issue ->
+            issue.Code = "BrowserIdentityConflict"
+            && issue.NextAction.Contains(originalOp)
+            && issue.NextAction.Contains(foreignProject)), Is.True)
+        Assert.That(report.CanDispatch, Is.False)
+
+        let sameProject = { original with Intent = { original.Intent with ProjectId = projectId } }
+        let valid = WorkQueueSchedulerHostPreview.previewWith (withBrowser sameProject) "Worker"
+        Assert.That(valid.ExistingLaunches.Head.OriginalBrowserOutcome, Is.EqualTo("Accepted"))
+        Assert.That(valid.ExistingLaunches.Head.OriginalBrowserReceipt, Is.EqualTo(Some "foreign-accepted-receipt"))
+        let wrongRole = { sameProject with Intent = { sameProject.Intent with RoleVersion = 5 } }
+        let mismatched = WorkQueueSchedulerHostPreview.previewWith (withBrowser wrongRole) "Worker"
+        Assert.That(mismatched.ExistingLaunches.Head.OriginalBrowserOutcome, Is.EqualTo("IdentityConflict"))
+        Assert.That(mismatched.ExistingLaunches.Head.OriginalBrowserReceipt, Is.EqualTo(None))

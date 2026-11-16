@@ -342,3 +342,26 @@ type WorkQueueCrossProjectPlannerTests() =
         Assert.That(result.Decision, Is.EqualTo(PlannerDecision.NeedsAttention))
         Assert.That(result.Issues |> List.exists (fun e ->
             e.Code = "AccountTokenIdentityInvalid"), Is.True)
+
+    [<Test>]
+    member _.SettledHistoryFromRetiredProjectDoesNotOccupyOrRequireCurrentPin() =
+        let retired = project "99999999-9999-4999-8999-999999999999"
+        let oldToken = token retired "99999999-aaaa-4aaa-8aaa-999999999999" "Released"
+        let active = existing pA launchA (Some browserA)
+                         PlannerLaunchPhase.Registered
+                         (PlannerBrowserEvidence.Accepted "accepted")
+        let result = report (account [|oldToken; token pA launchA "Held"|])
+                            [pA; pB] roles [b] [active]
+        Assert.That(result.Decision, Is.EqualTo(PlannerDecision.NoCapacity))
+        Assert.That(result.OccupiedAgents, Is.EqualTo(Some 1))
+        Assert.That(result.Issues |> List.exists (fun entry ->
+            entry.Code = "AccountTokenProjectUnknown"), Is.False)
+
+    [<Test>]
+    member _.UnsettledTokenForUnapprovedProjectRemainsUnknown() =
+        let missing = project "99999999-9999-4999-8999-999999999999"
+        let unsettled = token missing "99999999-aaaa-4aaa-8aaa-999999999999" "Held"
+        let result = report (account [|unsettled|]) [pA; pB] roles [b] []
+        Assert.That(result.Decision, Is.EqualTo(PlannerDecision.Unknown))
+        Assert.That(result.Issues |> List.exists (fun entry ->
+            entry.Code = "AccountTokenProjectUnknown"), Is.True)

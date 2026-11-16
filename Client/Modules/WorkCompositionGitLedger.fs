@@ -25,7 +25,7 @@ module WorkCompositionGitLedger =
     let private codec = CanonicalCodec.encode
     let private validText (value: string) = not (String.IsNullOrWhiteSpace value)
 
-    let private structurallyCoherent (graph: WorkCompositionGraph) =
+    let internal structurallyCoherent (graph: WorkCompositionGraph) =
         let known id = graph.Units.ContainsKey id
         let validProof (unit: CompositeWorkUnit) acceptanceKey (proof: WorkUnitAcceptance) =
             acceptanceKey = string proof.GraphVersion
@@ -53,7 +53,7 @@ module WorkCompositionGitLedger =
                 && (unit.Acceptances
                     |> Map.forall (validProof unit))))
 
-    let private envelope (binding: LedgerBinding) graph =
+    let internal envelope (binding: LedgerBinding) graph =
         { SchemaVersion = 1
           ProjectId = binding.ProjectId.ToString("D")
           StateHash = CanonicalCodec.digest (codec graph)
@@ -109,6 +109,63 @@ module WorkCompositionGitLedger =
             StaleEntityVersion ("Composition specification changed: " + unitId)
         | _ -> InvalidBinding ("Rejected composition transition: " + string error)
 
+    // Once a frozen composition/WQ02 stage has been positively bound, every
+    // *ordinary* graph mutation must preserve the queue gate in the same
+    // original Git CAS. This is a defensive stage revoker, NOT role admission.
+    // The immutable WQ02 receipt marks only stages entered through the
+    // separately reviewed frozen binding seam.
+    let private queueRevocations binding snapshot (operationId: Guid) (nextGraph: WorkCompositionGraph) =
+        LedgerStore.readAt binding snapshot WorkQueueGitLedger.RecordPath
+        |> Result.bind (fun (raw, queueOid) ->
+            match raw with
+            | None -> Ok []
+            | Some _ ->
+                WorkQueueGitLedger.loadAt binding snapshot
+                |> Result.bind (fun queue ->
+                    let installed (stage: WorkStage) =
+                        let receipt =
+                            "WorkCompositionQueue.FrozenStage|" + stage.Id + "|"
+                            + string stage.StageGeneration
+                        queue.Receipts
+                        |> Map.exists (fun _ payload ->
+                            match payload with
+                            | ProjectOperationPayload.OtherMutation value -> value = receipt
+                            | _ -> false)
+                    let broken (stage: WorkStage) =
+                        nextGraph.Units
+                        |> Map.exists (fun _ unit ->
+                            unit.Spec.LinkedTaskId = Some stage.SubjectId
+                            && (unit.CancellationReason.IsSome
+                                || (unit.HardPrerequisites
+                                    |> Set.exists (fun id ->
+                                        WorkComposition.currentAcceptance nextGraph id |> Option.isNone))))
+                    let affected =
+                        queue.Works
+                        |> Map.toList
+                        |> List.choose (fun (_, stage) ->
+                            if installed stage && broken stage then Some stage else None)
+                    if affected.IsEmpty then Ok []
+                    elif queue.Migration <> MigrationEpoch.Frozen
+                         || not queue.Launches.IsEmpty
+                         || affected |> List.exists (fun stage ->
+                             stage.State <> WorkState.Available && stage.State <> WorkState.Blocked) then
+                        Error(InvalidBinding "Composition correction requires recovery of a live or claimed WQ02 stage.")
+                    else
+                        let updates =
+                            (queue.Works, affected)
+                            ||> List.fold (fun works stage ->
+                                works.Add(stage.Id,
+                                    { stage with State = WorkState.Blocked
+                                                 AvailableAt = 0L; AvailableSequence = 0L }))
+                        let changed =
+                            { queue with Version = queue.Version + 1; Works = updates
+                                         Receipts = queue.Receipts.Add(operationId.ToString("D"),
+                                             ProjectOperationPayload.OtherMutation "Composition.AutoRevoke") }
+                        WorkQueueGitLedger.validatedContent binding changed
+                        |> Result.map (fun content ->
+                            [ { Path = WorkQueueGitLedger.RecordPath
+                                ExpectedBlobOid = queueOid; Content = content } ])))
+
     // Evidence is a reference to existing canonical review/integration/test
     // receipts, never an unverified caller assertion. Normal mutation rejects
     // acceptance until its verifier is bound into the same Git-CAS planner.
@@ -140,9 +197,10 @@ module WorkCompositionGitLedger =
                         if not (structurallyCoherent next) then
                             Error(LedgerIntegrityError "Composition candidate failed structural integrity checks.")
                         else
-                            Ok [ { Path = RecordPath
-                                   ExpectedBlobOid = oid
-                                   Content = codec (envelope binding next) } ]))))
+                            queueRevocations binding snapshot operationId next
+                            |> Result.map (fun revocations ->
+                                { Path = RecordPath; ExpectedBlobOid = oid
+                                  Content = codec (envelope binding next) } :: revocations)))))
 
     let execute binding actor (operationId: Guid) expectedVersion mutation =
         transactWithVerifier binding actor operationId expectedVersion mutation None

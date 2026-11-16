@@ -39,6 +39,7 @@
         <Compile Include="WorkQueueGitLedgerTests.fs"/>
         <Compile Include="WorkCompositionLedgerTests.fs"/>
         <Compile Include="WorkCompositionQueueBinderTests.fs"/>
+        <Compile Include="WorkCompositionQueueTransactionTests.fs"/>
         <Compile Include="WorkQueueToolFacadeTests.fs"/>
         <Compile Include="TaskFirstUiProjectionTests.fs"/>
         <Compile Include="TaskFirstUiSnapshotAdapterTests.fs"/>

@@ -751,7 +751,7 @@ module WorkQueueGitLedger =
 
     // Check the exact proposed Git bytes against their decoded projection
     // before granting the CAS writer permission to publish them.
-    let private validatedContent binding (state: Project) =
+    let internal validatedContent binding (state: Project) =
         try
             if not (structurallyCoherent binding state) then
                 Error(InvalidBinding "WQ-02 canonical candidate is structurally incomplete.")

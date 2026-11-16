@@ -86,6 +86,7 @@
         <Compile Include="Modules\\WorkQueueCanonicalCasBinder.fs"/>
         <Compile Include="Modules\\OrchestrationApi.fs"/>
         <Compile Include="Modules\\WorkQueueReceiptProducer.fs"/>
+        <Compile Include="Modules\\WorkQueuePracticalAdmission.fs"/>
         <Compile Include="..\Server\WorkQueueSchedulerInert.fs" Link="WorkQueueSchedulerInert.fs"/>
         <Compile Include="..\Server\WorkQueueSchedulerPrototype.fs" Link="WorkQueueSchedulerPrototype.fs"/>
         <Compile Include="Modules\WorkQueueSchedulerHostPreview.fs"/>

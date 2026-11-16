@@ -5,6 +5,7 @@ open Jarvis.WorkQueues
 open Client.LedgerStore
 open Client.WorkQueueGitLedger
 open Client.AccountCapacityLedger
+open Client.WorkQueueRoleAuthority
 
 // This module is deliberately not called by a live Scheduler or migration path.
 // Both bindings must have been established from independently trusted identities.
@@ -44,17 +45,28 @@ module AccountAdmissionAdapter =
         |> Result.bind (function
             | None -> Error "Missing exact immutable WQ-02 operation."
             | Some operation when operation.Type = "WQ02.Mutate"
-                                  && operation.Paths = [| WorkQueueGitLedger.RecordPath; witnessPath |] ->
+                                  && (operation.Paths = [| WorkQueueGitLedger.RecordPath; witnessPath |]
+                                      || (witnessPath.Contains("/admissions/", StringComparison.Ordinal)
+                                          && operation.Paths =
+                                             [| WorkQueueGitLedger.RecordPath; witnessPath
+                                                witnessPath.Replace("/admissions/", "/role-admissions/",
+                                                                    StringComparison.Ordinal) |])) ->
                 LedgerStore.getOperationOriginAt binding snapshot operation
                 |> Result.mapError explain
                 |> Result.bind (fun origin ->
                     let atOrigin = { snapshot with Commit = origin }
-                    match LedgerStore.readAt binding snapshot witnessPath,
+                    let roleVerified =
+                        if operation.Paths.Length = 3 then
+                            WorkQueueRoleAuthority.loadAt binding snapshot
+                            |> Result.map ignore |> Result.mapError explain
+                        else Ok ()
+                    match roleVerified, LedgerStore.readAt binding snapshot witnessPath,
                           LedgerStore.readAt binding atOrigin witnessPath with
-                    | Ok(Some current, Some currentOid), Ok(Some original, Some originalOid)
+                    | Ok (), Ok(Some current, Some currentOid), Ok(Some original, Some originalOid)
                         when currentOid = originalOid && current = original ->
                         Ok(atOrigin, currentOid, operation)
-                    | Error e, _ | _, Error e -> Error(explain e)
+                    | Error e, _, _ -> Error e
+                    | _, Error e, _ | _, _, Error e -> Error(explain e)
                     | _ -> Error "Witness was replaced, missing or not created by its operation.")
             | Some _ -> Error "Operation did not atomically write the exact WQ-02 witness." )
 
@@ -360,7 +372,7 @@ module AccountAdmissionAdapter =
     // One global reservation across all projects, then project demand CAS.
     // A definitive lack of compatible work can be fenced by the separate C01
     // operation. Ambiguous account/project transport preserves the token.
-    let private admitUsing
+    let internal admitUsing
         (executeMutation: LedgerBinding -> string -> Guid -> int -> WorkMutation -> Result<Client.LedgerStore.LedgerWrite, Client.LedgerStore.LedgerFailure>)
         abortUnboundFor (account: AccountBinding) (project: LedgerBinding)
                            (request: AccountAdmissionRequest) =

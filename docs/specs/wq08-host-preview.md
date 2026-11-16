@@ -46,6 +46,19 @@ skipped candidate work, an informational `wouldLaunch` candidate, existing
 launch states, original dispatch/browser ID/outcome when the read port supplies
 it, and `issues[]` with the exact unresolved records and next actions.
 
+The read-only launch diagnostics also compare each visible project launch against
+the fetched account-global token by launch ID, project/ledger identity and epoch,
+role revision and original admission operation, reporting `accountTokenStatus` and actionable
+`AccountTokenMissing`, `AccountTokenIdentityConflict`,
+`AccountTokenDuplicate` or `AccountTokenReleasedWhileActive` findings. An
+account read failure reports `Unknown`, not absence. A WQ-04 origin whose
+stored project/work identity or original operation/request identity disagrees
+with the selected demand raises `SourceReceiptIdentityConflict` while retaining
+the original source fields for inspection. The 64-launch display limit applies
+to the selected role; other roles' history does not cause a false truncation
+warning. These diagnostics are observational, not automatic repair or
+admission decisions.
+
 **Importantly**, an origin stored at a verified project head is a recorded
 source claim, not independently authenticated upstream source authority. The
 preview does not assert that source/current role/account/project observations

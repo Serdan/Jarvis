@@ -1,0 +1,10 @@
+# Blocking acceptance gap — fake provider is not the source of first connection
+
+**Frozen source:** `b8a886a3de2298b392693f6054ee256d57015bf2`
+**Location:** `Client.Tests/WorkQueueReleaseAcceptanceTests.fs:523-559`; `docs/WorkQueueWQ11FakeProviderSmoke.md:38-46,95-97`.
+
+`submitFakeOnce` writes an original Git marker and increments an in-memory `providerSubmissions` counter. It never invokes a fake-provider launch function or returns any provider response. The test then synthesizes `sessionKey` independently (line 534) and directly calls `WorkQueueGitLedger.executeInertFixture ... InitializeAgent` (line 549). A broken or entirely absent provider-to-first-connect handoff cannot fail this test. The documentation says the in-process fake provider yields the session key, which the current implementation does not establish.
+
+The WQ04 demand, WQ07 cap-one admission, WQ02 state transitions, terminal proof, token release, and cross-clone replay do have useful real Git evidence. The specific requested positive step *original fake launch -> first connection via the existing WQ01 contract* is currently simulated as disconnected state changes rather than exercised as a path.
+
+**Small correction:** Keep everything default-off and disposable. Make a minimal in-process fake launch callback/function consume the selected launch/work identity and return its unique session/first-connect result on the original (non-replay) invocation. Feed that result, rather than a separately synthesized string, to `InitializeAgent`; assert the callback executes once and no replay re-invokes it. No production Scheduler, browser, universal fencing or real external provider is needed. If there is genuinely no interface to bind this, explicitly document that exact missing boundary and narrow the claim instead of calling it an exercised fake-provider first connect.

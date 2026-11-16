@@ -5,6 +5,8 @@ open System.Diagnostics
 open System.IO
 open Client.LedgerStore
 open Client.WorkQueueGitLedger
+open Client.WorkQueueRoleAuthority
+open Client.WorkQueueToolFacade
 open Client.WorkDashboardView
 open Client.WorkQueueDashboardReadBinding
 open Jarvis.WorkQueues
@@ -32,7 +34,7 @@ let private git folder arguments =
     Assert.That(command.ExitCode, Is.EqualTo(0), error)
     output.Trim()
 
-let private fixture root tag =
+let private fixture root tag rolePresent =
     let remote = Path.Combine(root, tag + ".git")
     let clone = Path.Combine(root, tag)
     git root [ "init"; "--bare"; "--initial-branch=main"; remote ] |> ignore
@@ -53,14 +55,24 @@ let private fixture root tag =
     LedgerStore.initialize binding true |> success |> ignore
     WorkQueueGitLedger.initialize binding "Fixture" (Guid.NewGuid())
         (Map.ofList [ "Lead", Set.singleton "planning" ]) |> success |> ignore
+    if rolePresent then
+        WorkQueueRoleAuthority.initializeCatalog binding "Fixture" (Guid.NewGuid())
+        |> success |> ignore
+        WorkQueueRoleAuthority.configure binding "Fixture" (Guid.NewGuid()) 0 0
+            { RoleId = "Lead"; Version = 1; Instructions = "Fixture pinned role"
+              Enabled = true; QueueSubscriptions = Set.singleton "planning" }
+        |> success |> ignore
     { Binding = binding; Remote = remote }
 
-let private withProjects action =
+let private withProjectsWithRoles alphaRole betaRole action =
     let root = Path.Combine(Path.GetTempPath(), "jarvis-work-read-ui-" + Guid.NewGuid().ToString("N"))
     Directory.CreateDirectory(root) |> ignore
-    try action (fixture root "alpha") (fixture root "beta")
+    try action (fixture root "alpha" alphaRole) (fixture root "beta" betaRole)
     finally
         try Directory.Delete(root, true) with _ -> ()
+
+let private withProjects action =
+    withProjectsWithRoles true true action
 
 let private identity name (p: ProjectFixture) : ApprovedProjectIdentity =
     { ProjectId = p.Binding.ProjectId; DisplayName = name }
@@ -124,6 +136,35 @@ let twoApprovedProjectRemotesLoadExactHeadsAndCanonicalWorkWithoutDispatch () =
                     Is.EqualTo("Blocked"))
         Assert.That(rendered |> List.forall (fun r ->
             r.Details |> List.exists (fun line -> line.Contains("not owner"))), Is.True))
+
+[<Test>]
+let healthyQueueWithoutPinnedWq04RoleProofIsLocalUnknown () =
+    withProjectsWithRoles true false (fun a b ->
+        publish a 0 "approved" []
+        publish b 0 "role-unproved" []
+        // WQ02/WQ09 can prove the queue while WQ04 is independently unavailable.
+        let unproved = WorkQueueToolFacade.readWithBinding b.Binding "List" "All" "" |> success
+        Assert.That(unproved.Coverage, Is.EqualTo("Verified"))
+        Assert.That(unproved.RoleAuthority, Does.StartWith("UNKNOWN"))
+        let sources = load (authority a b) |> success
+        Assert.That(sources.Length, Is.EqualTo(2))
+        Assert.That(sources[0].Snapshot.IsOk, Is.True)
+        let alphaHead = (LedgerStore.fetch a.Binding |> success).Commit
+        Assert.That((sources[0].Snapshot |> success).VerifiedGitHead, Is.EqualTo(alphaHead))
+        match sources[1].Snapshot with
+        | Ok _ -> Assert.Fail("Verified queue coverage alone cannot prove WQ04 role authority.")
+        | Error reason ->
+            Assert.That(reason, Does.Contain("UNKNOWN"))
+            Assert.That(reason, Does.Contain("WQ04 role authority"))
+        let rows = allRows sources
+        Assert.That(rows |> List.exists (fun row ->
+            row.Project = "Alpha" && row.WorkId = "approved"), Is.True)
+        let unknownRows = rows |> List.filter (fun row -> row.Project = "Zulu")
+        Assert.That(unknownRows.Length, Is.EqualTo(1))
+        Assert.That(unknownRows.Head.WorkId, Is.EqualTo("(unbound)"))
+        Assert.That(unknownRows.Head.Status, Does.Contain("NotReady"))
+        Assert.That(unknownRows.Head.Details |> List.exists (fun detail ->
+            detail.Contains("UNKNOWN")), Is.True))
 
 [<Test>]
 let offlineProjectRetainsPerProjectErrorAndOtherApprovedProjectRemainsVisible () =

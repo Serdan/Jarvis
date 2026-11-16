@@ -2,6 +2,7 @@ module Client.WorkQueueDashboardReadBinding
 
 open System
 open System.Collections.Generic
+open System.Globalization
 open System.IO
 open Client.LedgerStore
 open Client.WorkQueueToolFacade
@@ -90,6 +91,25 @@ let private validHead (head: string) =
     && head.Length = 40
     && head |> Seq.forall Uri.IsHexDigit
 
+// WQ02 queue coverage and WQ04 role provenance are independent evidence.
+// Only the facade's exact positive, same-head WQ04 observation is accepted;
+// "UNKNOWN" or arbitrary non-mismatch text is not role authority.
+let private hasPinnedRoleProof (view: WorkToolSnapshot) =
+    let prefix = "Pinned WQ04 catalog revision "
+    let suffix = " at " + view.VerifiedGitHead + " (observation only)"
+    if String.IsNullOrWhiteSpace view.RoleAuthority
+       || not (view.RoleAuthority.StartsWith(prefix, StringComparison.Ordinal))
+       || not (view.RoleAuthority.EndsWith(suffix, StringComparison.Ordinal))
+       || view.RoleAuthority.Length <= prefix.Length + suffix.Length then
+        false
+    else
+        let revision =
+            view.RoleAuthority.Substring(prefix.Length,
+                view.RoleAuthority.Length - prefix.Length - suffix.Length)
+        match Int32.TryParse(revision, NumberStyles.None, CultureInfo.InvariantCulture) with
+        | true, value -> value >= 0
+        | false, _ -> false
+
 let private toSnapshot (binding: LedgerBinding) (view: WorkToolSnapshot) : Result<Snapshot, string> =
     if view.ProjectId <> binding.ProjectId.ToString("D") then
         Error "UNKNOWN: Work snapshot project identity differs from approved Git binding."
@@ -99,8 +119,8 @@ let private toSnapshot (binding: LedgerBinding) (view: WorkToolSnapshot) : Resul
         Error "UNKNOWN: Work read provider is not strictly read-only."
     elif view.Coverage <> "Verified" then
         Error ("UNKNOWN: incomplete pinned Work coverage: " + view.Coverage)
-    elif view.RoleAuthority.Contains("mismatch", StringComparison.OrdinalIgnoreCase) then
-        Error ("UNKNOWN: inconsistent pinned role authority: " + view.RoleAuthority)
+    elif not (hasPinnedRoleProof view) then
+        Error ("UNKNOWN: missing or inconsistent pinned WQ04 role authority: " + view.RoleAuthority)
     else
         Ok { ProjectId = view.ProjectId
              VerifiedGitHead = view.VerifiedGitHead

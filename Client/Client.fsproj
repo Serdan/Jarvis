@@ -91,6 +91,7 @@
         <Compile Include="..\Server\WorkQueueSchedulerPrototype.fs" Link="WorkQueueSchedulerPrototype.fs"/>
         <Compile Include="Modules\OriginalBrowserJournal.fs"/>
         <Compile Include="Modules\WorkQueueSchedulerHostPreview.fs"/>
+        <Compile Include="Modules\WorkQueueCrossProjectPlanner.fs"/>
         <Compile Include="Modules\\WorkQueueOperatorConversationCli.fs"/>
         <Compile Include="Modules\TaskFirstUiSnapshotAdapter.fs"/>
         <Compile Include="Modules\SourceEffectHostBinding.fs"/>

@@ -1,6 +1,7 @@
 module Client.WorkQueueVerifiedDispatchAdapter
 
 open System
+open System.Text.Json
 open FsToolkit.ErrorHandling
 open Jarvis.WorkQueues
 open Jarvis.WorkQueues.WorkQueueProducers
@@ -189,6 +190,85 @@ module WorkQueueVerifiedDispatchAdapter =
         return capacity, head, origin, oid
     }
 
+    // The WQ03 UUID is enrolled by the local host, never inferred from an actor,
+    // root path or caller-supplied boolean. Bind it to one immutable WQ02 Git
+    // record using a create-only CAS *before* the original fake-provider call.
+    // Independent trusted SQLite roots cannot each win this same launch claim.
+    let private originalHostClaimPath (request: AccountAdmissionRequest) =
+        "records/wq11-original-hosts/" + request.LaunchId.ToString("N") + ".json"
+
+    let private originalHostClaimBody hostId (selected: PlannerCandidate)
+                                      (request: AccountAdmissionRequest) =
+        JsonSerializer.Serialize(
+            {| schemaVersion = 1
+               launchId = selected.LaunchId
+               projectId = selected.ProjectId
+               workId = selected.WorkId
+               workGeneration = selected.WorkGeneration
+               roleId = selected.RoleId
+               roleVersion = selected.RoleVersion
+               admissionOperationId = request.AdmissionOperationId.ToString("D")
+               originalOperationId = selected.OriginalBrowserOperationId
+               sourceRequestHash = selected.Source.RequestHash
+               journalHostId = hostId |})
+
+    let private verifyOriginalHostClaim (project: LedgerBinding)
+                                        (journal: OriginalBrowserJournalStore)
+                                        (selected: PlannerCandidate)
+                                        (request: AccountAdmissionRequest) =
+        match OriginalBrowserJournal.trustedHostId journal with
+        | Error failure -> Error("WQ03 host continuity unavailable: " + failure)
+        | Ok hostId ->
+            let path = originalHostClaimPath request
+            let expected = originalHostClaimBody hostId selected request
+            match LedgerStore.fetch project with
+            | Error failure -> Error("Cannot verify canonical original-send claim head: " + explain failure)
+            | Ok head ->
+                match LedgerStore.readAt project head path with
+                | Error failure -> Error("Cannot read canonical original-send claim: " + explain failure)
+                | Ok(Some content, Some oid) when content = expected ->
+                    match LedgerStore.getOperationAt project head
+                            (Guid.Parse selected.OriginalBrowserOperationId) with
+                    | Ok(Some operation) when
+                        operation.Type = "PutRecord"
+                        && operation.Path = path
+                        && operation.BlobOid = oid
+                        && operation.Paths = [| path |] ->
+                        Ok ()
+                    | _ -> Error "Canonical original-send claim is missing its immutable creating operation."
+                | Ok(Some _, _) ->
+                    Error "Canonical original-send claim belongs to a foreign journal host or launch identity."
+                | _ -> Error "Canonical original-send claim is absent; original send is not authorized."
+
+    let private claimOriginalHost (project: LedgerBinding)
+                                  (journal: OriginalBrowserJournalStore)
+                                  (selected: PlannerCandidate)
+                                  (request: AccountAdmissionRequest) =
+        match OriginalBrowserJournal.trustedHostId journal with
+        | Error failure -> Error("WQ03 host continuity unavailable: " + failure)
+        | Ok hostId ->
+            let change: LedgerRecordChange =
+                { OperationId = Guid.Parse selected.OriginalBrowserOperationId
+                  Actor = request.Actor
+                  Path = originalHostClaimPath request
+                  ExpectedBlobOid = None
+                  Content = originalHostClaimBody hostId selected request }
+            match LedgerStore.putRecord project change with
+            | Ok write when not write.AlreadyApplied ->
+                // Confirm at an independently fetched head, not merely a local
+                // optimistic commit. A lost acknowledgement never grants send.
+                verifyOriginalHostClaim project journal selected request
+            | Ok _ ->
+                Error "Canonical original-send claim already existed; only a durable WQ03 original marker permits replay."
+            | Error failure ->
+                // The push may have committed despite an error. Even when it
+                // matches this host, a second caller cannot infer it is first.
+                match verifyOriginalHostClaim project journal selected request with
+                | Ok () ->
+                    Error "Canonical claim is already present or its acknowledgement was lost; never resend without WQ03 marker."
+                | Error why ->
+                    Error("Canonical original-send pre-send CAS rejected (" + explain failure + "): " + why)
+
     // A failed CAS acknowledgment can already have committed. An existing
     // original receipt is evidence only for this exact stable operation; the
     // caller additionally verifies the resulting launch phase.
@@ -344,7 +424,11 @@ module WorkQueueVerifiedDispatchAdapter =
         report phase detail verified accountHead (Some head.Commit) originOid action
             selected request dispatchId connectId
 
-    let dispatchFakeOnly explicitEnabled (planner: PlannerReport)
+    // Test gates are inert by default; two disposable clients can synchronize
+    // at both authority boundaries to reproduce the cross-host race.
+    let dispatchFakeOnlyWithGates (beforeAdmission: unit -> unit)
+                                  (beforeOriginalClaim: unit -> unit)
+                                  explicitEnabled (planner: PlannerReport)
                          (account: AccountBinding) (project: LedgerBinding)
                          journalRoot (selected: PlannerCandidate)
                          (request: AccountAdmissionRequest)
@@ -373,6 +457,11 @@ module WorkQueueVerifiedDispatchAdapter =
                     | Error failure ->
                         output FakeDispatchPhase.RepairNeeded ("Original one-shot read unresolved: " + failure)
                             false None (Some head.Commit) None (Some repairText)
+                    | Ok(Some entry) when
+                        verifyOriginalHostClaim project journal selected request <> Ok () ->
+                        output FakeDispatchPhase.RepairNeeded
+                            "WQ03 replay lacks the matching immutable canonical original-send host claim."
+                            false None (Some head.Commit) None (Some repairText)
                     | Ok(Some entry) ->
                         if entry.Intent.OperationId <> selected.OriginalBrowserOperationId
                            || entry.Intent.ProjectId <> selected.ProjectId
@@ -397,6 +486,7 @@ module WorkQueueVerifiedDispatchAdapter =
                             output (if full then FakeDispatchPhase.AtCapacity else FakeDispatchPhase.NotReady)
                                 why false planner.AccountHead (Some head.Commit) None None
                         | Ok (_, _, origin, originOid) ->
+                            beforeAdmission()
                             let demand : PracticalAdmissionDemand =
                                 { WorkId = selected.WorkId; OriginBlobOid = originOid }
                             match WorkQueuePracticalAdmission.admitExplicit true account project request demand with
@@ -419,6 +509,7 @@ module WorkQueueVerifiedDispatchAdapter =
                                             true (Some reserved.Head) (Some projectHead.Commit)
                                             (Some originOid) (Some repairText)
                                     else
+                                        beforeOriginalClaim()
                                         let intent: OriginalBrowserIntent =
                                             { LaunchId = selected.LaunchId
                                               ProjectId = selected.ProjectId
@@ -438,7 +529,13 @@ module WorkQueueVerifiedDispatchAdapter =
                                         let out phase detail repair =
                                             output phase detail true accountHead projectHeadText
                                                 (Some originOid) repair
-                                        match OriginalBrowserJournal.tryMarkOriginal journal intent with
+                                        // A canonical create-only CAS must win before any local
+                                        // WQ03 marker or fake provider callback is authorized.
+                                        let mark =
+                                            match claimOriginalHost project journal selected request with
+                                            | Ok () -> OriginalBrowserJournal.tryMarkOriginal journal intent
+                                            | Error reason -> Error("WQ11 canonical original-send authority: " + reason)
+                                        match mark with
                                         | Error error ->
                                             out FakeDispatchPhase.RepairNeeded
                                                 ("WQ03 pre-send marker not confirmed: " + error) (Some repairText)
@@ -542,6 +639,11 @@ module WorkQueueVerifiedDispatchAdapter =
     // No timer-driven completion. The test fixture explicitly supplies stable
     // claim and terminal UUIDs; WQ02 authoritatively chooses the claim and
     // publishes the terminal witness before WQ07 can release the held token.
+    let dispatchFakeOnly explicitEnabled planner account project journalRoot
+                         selected request dispatchId firstConnectId fakeProvider =
+        dispatchFakeOnlyWithGates ignore ignore explicitEnabled planner account
+            project journalRoot selected request dispatchId firstConnectId fakeProvider
+
     let completeFakeOnly explicitEnabled (account: AccountBinding) (project: LedgerBinding)
                          journalRoot (selected: PlannerCandidate)
                          (request: AccountAdmissionRequest) claimId terminalId =

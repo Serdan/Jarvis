@@ -1,8 +1,11 @@
 module Client.Tests.WorkQueueVerifiedDispatchAdapterTests
 
 open System
+open System.Collections.Concurrent
 open System.Diagnostics
 open System.IO
+open System.Threading
+open System.Threading.Tasks
 open NUnit.Framework
 open Jarvis.WorkQueues
 open Client.LedgerStore
@@ -414,3 +417,89 @@ type WorkQueueVerifiedDispatchAdapterTests() =
                                  journalRoot selected req (Guid.NewGuid()) (Guid.NewGuid())
             Assert.That(noTerminal.Phase, Is.EqualTo FakeDispatchPhase.RepairNeeded)
             Assert.That(AccountCapacityLedger.occupied (AccountCapacityLedger.fetch account1 |> ok).State, Is.EqualTo 1))
+
+
+    [<Test>]
+    member _.TwoTrustedJournalHostsConcurrentSameLaunchHaveOneCanonicalOriginalSend() =
+        withAuthorities (fun (a1, a2) (b1, b2) (account1, account2) journalRoot ->
+            let foreignRoot = Path.Combine(Path.GetDirectoryName journalRoot, "trusted-originals-second")
+            Directory.CreateDirectory(foreignRoot) |> ignore
+            OriginalBrowserJournal.provisionTrustedHostRoot foreignRoot |> ok |> ignore
+            let work, _ = produce a1 a2 "two-host-original-A"
+            let req = request ()
+            let selected = candidate a2 req (Guid.NewGuid()) work.Id
+            let plan = ranking a2 b2 account2 journalRoot [selected]
+            Assert.That(plan.Decision, Is.EqualTo(PlannerDecision.WouldLaunch selected))
+            let dispatch, connect = Guid.NewGuid(), Guid.NewGuid()
+            let callbacks = ConcurrentBag<string>()
+            let provider (intent: OriginalBrowserIntent) =
+                callbacks.Add(intent.OperationId)
+                FakeOriginalReply.Accepted
+                    { LaunchId = intent.LaunchId; WorkId = intent.WorkId
+                      Receipt = "single-fake-receipt"; SessionKey = "single-fake-session" }
+            use admissionReady = new CountdownEvent(2)
+            use releaseAdmission = new ManualResetEventSlim(false)
+            use claimReady = new CountdownEvent(2)
+            use releaseClaim = new ManualResetEventSlim(false)
+            let gate (ready: CountdownEvent) (release: ManualResetEventSlim) name () =
+                ready.Signal() |> ignore
+                if not (release.Wait(TimeSpan.FromSeconds(45.0))) then
+                    failwith ("Timed out at WQ11 two-client " + name + " barrier")
+            let dispatchFrom account project root =
+                WorkQueueVerifiedDispatchAdapter.dispatchFakeOnlyWithGates
+                    (gate admissionReady releaseAdmission "pre-admission")
+                    (gate claimReady releaseClaim "pre-original-claim")
+                    true plan account project root selected req dispatch connect provider
+            let first = Task.Run(fun () -> dispatchFrom account1 a1 journalRoot)
+            let second = Task.Run(fun () -> dispatchFrom account2 a2 foreignRoot)
+            try
+                Assert.That(admissionReady.Wait(TimeSpan.FromSeconds(45.0)), Is.True,
+                            "Both independent clients must pass verified selection before WQ07 admission.")
+                releaseAdmission.Set()
+                Assert.That(claimReady.Wait(TimeSpan.FromSeconds(45.0)), Is.True,
+                            "Both clients must replay the same WQ07/WQ02 admission and reach pre-send CAS.")
+                releaseClaim.Set()
+                Assert.That(Task.WaitAll([| first :> Task; second :> Task |], 90000), Is.True)
+                let results = [first.Result; second.Result]
+                Assert.That(callbacks.Count, Is.EqualTo 1,
+                            "Two independently trusted SQLite roots must not each send the same original.")
+                Assert.That(results |> List.filter (fun r -> r.Phase = FakeDispatchPhase.Registered)
+                                    |> List.length, Is.EqualTo 1)
+                Assert.That(results |> List.filter (fun r -> r.Phase = FakeDispatchPhase.RepairNeeded)
+                                    |> List.length, Is.EqualTo 1)
+                let winningRoot, losingRoot =
+                    if first.Result.Phase = FakeDispatchPhase.Registered then journalRoot, foreignRoot
+                    else foreignRoot, journalRoot
+                let winningJournal = OriginalBrowserJournal.openExisting winningRoot |> ok
+                let losingJournal = OriginalBrowserJournal.openExisting losingRoot |> ok
+                Assert.That((OriginalBrowserJournal.findByLaunch winningJournal selected.LaunchId |> ok).IsSome,
+                            Is.True, "Winning host has durable original intent.")
+                Assert.That((OriginalBrowserJournal.findByLaunch losingJournal selected.LaunchId |> ok).IsNone,
+                            Is.True, "Rejected foreign host must not mark an original.")
+                let hostId = OriginalBrowserJournal.trustedHostId winningJournal |> ok
+                let head = LedgerStore.fetch a2 |> ok
+                let record, oid =
+                    LedgerStore.readAt a2 head
+                        ("records/wq11-original-hosts/" + req.LaunchId.ToString("N") + ".json")
+                    |> ok
+                Assert.That(record.IsSome && oid.IsSome, Is.True)
+                Assert.That(record.Value, Does.Contain hostId)
+                let sameHostReplay =
+                    WorkQueueVerifiedDispatchAdapter.dispatchFakeOnly true plan account2 a2
+                        winningRoot selected req dispatch connect provider
+                Assert.That(sameHostReplay.Phase, Is.EqualTo FakeDispatchPhase.Registered,
+                            sameHostReplay.Detail)
+                let foreignReplay =
+                    WorkQueueVerifiedDispatchAdapter.dispatchFakeOnly true plan account1 a1
+                        losingRoot selected req dispatch connect provider
+                Assert.That(foreignReplay.Phase, Is.EqualTo FakeDispatchPhase.RepairNeeded)
+                let missingHost =
+                    WorkQueueVerifiedDispatchAdapter.dispatchFakeOnly true plan account2 a2
+                        "" selected req dispatch connect provider
+                Assert.That(missingHost.Phase, Is.EqualTo FakeDispatchPhase.RepairNeeded)
+                Assert.That(callbacks.Count, Is.EqualTo 1, "No replay or foreign host can resend.")
+                Assert.That(AccountCapacityLedger.occupied (AccountCapacityLedger.fetch account1 |> ok).State,
+                            Is.EqualTo 1, "One WQ07 credit remains held for the single registered launch.")
+            finally
+                releaseAdmission.Set()
+                releaseClaim.Set())

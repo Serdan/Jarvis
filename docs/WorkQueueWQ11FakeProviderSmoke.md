@@ -35,26 +35,28 @@ checks both source working trees are clean.
    WQ04-selected work. Independently fetch the account token; its launch,
    project-ledger authority, role and version, and original admission UUID
    must match. Cap=1 denies a simultaneous second fake admission.
-3. **Original send + first connection**: create a stable, replayable original
-   fake-provider marker as a real `LedgerStore.transact` operation *before*
-   invoking the in-process fake provider. Save the original launch/work
-   identity, WQ04 source UUID/hash and marker UUID. The provider has no
-   external effects and yields only an ephemeral test session key. Invoke
-   `WorkQueueGitLedger.executeInertFixture` for `DispatchOnce` and
-   `InitializeAgent`; these execute the existing WQ01 transition contracts.
-   Replaying the exact original marker, dispatch and first-connect UUIDs from
-   the other clone must not cause a second fake send or registration.
+3. **Original send + first connection**: write a stable, replayable
+   `LedgerStore.transact` marker *before* invoking the default-off fake-provider
+   callback. The callback consumes the selected launch UUID and WQ04 work ID,
+   returning those same identities plus a fresh ephemeral session key only
+   for the first non-replay invocation. `connectIfReturned` checks both
+   returned identities and routes that result into WQ01 `InitializeAgent`;
+   without a provider result there is no call to `InitializeAgent`.
+   `DispatchOnce` and `InitializeAgent` still use existing WQ02 Git fixture
+   adapters and WQ01 transitions. Original marker replay skips the callback;
+   replaying the dispatch/first-connect UUIDs remains idempotent.
 4. **Claim, terminal, release**: perform `ClaimNext` and `CompleteOrdinary`
    through WQ02's real Git adapters; verify the completed stage and immutable
    WQ02 project-terminal record from an independent clone. Use the accepted
    `AccountAdmissionAdapter.releaseTerminal` with its current-project proof
    verifier to release the original global token, replay its release UUID,
    and observe cap=1 available again from the opposite account clone.
-5. **Unknown original**: test a distinct later original fake send whose
-   response is lost. Its durable marker remains readable from the other clone
-   with `OutcomeUnknown` WQ02 dispatch state; replay must not invoke the fake
-   provider again. Its global token stays held for manual reconciliation and
-   is **not** silently released.
+5. **Unknown original**: the later original invokes the fake provider once
+   with a missing response; the test explicitly verifies the absent result
+   cannot reach `InitializeAgent`. Its durable marker remains readable from
+   the other clone with `OutcomeUnknown` WQ02 dispatch state; replay cannot
+   invoke the callback or initialize another agent. Its global token stays
+   held for manual reconciliation and is **not** silently released.
 
 ## Validation
 
@@ -70,12 +72,22 @@ For surrounding WQ11 regressions, also run the existing acceptance, canonical
 CAS binder, Scheduler preview and WQ07 account adapter tests. Record the
 exact commands and observed pass/fail counts in the frozen review.
 
-Observed on 2026-11-16 using .NET 11 and Release configuration: **41 passed,
-0 failed, 0 skipped** for
-`FullyQualifiedName~WorkQueueReleaseAcceptanceTests|FullyQualifiedName~AccountAdmissionAdapterTests|FullyQualifiedName~WorkQueueSchedulerHostPreviewTests|FullyQualifiedName~WorkQueueCanonicalCasBinderTests`.
-The focused `CanonicalDemandLaunchesFakeProviderFirstConnectThenReleasesCapOne`
-also passed before the final helper was tightened; the final 41-test pass
-includes the tightened durable-marker-based fake-send-once behavior.
+Predecessor review on 2026-11-16 independently observed **41 passed, 0
+failed, 0 skipped** for the adjacent Release selection above, but found its
+provider counter disconnected from the first-connect result. That result is
+historical and is **not** acceptance evidence for the corrected callback.
+Fresh correction verification on 2026-11-16 on .NET 11 Release in the
+isolated `fix/wq11-fake-provider-handoff-worker7` worktree:
+
+- Focused test with `-c Release --no-restore --filter
+  'FullyQualifiedName~CanonicalDemandLaunchesFakeProviderFirstConnectThenReleasesCapOne'`:
+  **1 passed, 0 failed, 0 skipped**, exit code 0.
+- Adjacent test selection with `-c Release --no-build --no-restore --filter
+  'FullyQualifiedName~WorkQueueReleaseAcceptanceTests|FullyQualifiedName~AccountAdmissionAdapterTests|FullyQualifiedName~WorkQueueSchedulerHostPreviewTests|FullyQualifiedName~WorkQueueCanonicalCasBinderTests'`:
+  **43 passed, 0 failed, 0 skipped**, exit code 0.
+
+Both runs exercised the corrected source. The test also checks its two
+disposable Git working trees are clean before fixture cleanup.
 
 ## What this does **not** prove
 
@@ -92,9 +104,9 @@ includes the tightened durable-marker-based fake-send-once behavior.
 - **Not a real browser send or original WQ03 journal.** The test's deliberately
   small fake original marker is a local Git operation, not the live browser
   extension's send, confirmation, recovery, or WQ03 one-shot host journal.
-- **Not a real first connection.** Only a fake in-process provider supplies
-  a disposable session key to WQ01 `InitializeAgent`; no genuine browser,
-  transport, interactive agent, or remote account was launched.
+- **Not a real external first connection.** The callback's in-process fake
+  result feeds the WQ01 `InitializeAgent` state transition, not a genuine
+  browser, transport, interactive agent, or remote account launch.
 - **Not the cross-project Scheduler.** WQ08 is read-only one-project demand
   selection. Complete cross-project priority, admission, timers, and cutover
   remain unavailable; production `CanDispatch` is intentionally false.

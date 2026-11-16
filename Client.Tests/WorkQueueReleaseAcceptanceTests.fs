@@ -521,23 +521,54 @@ type WorkQueueReleaseAcceptanceTests() =
                         Is.EqualTo(1))
 
             let mutable providerSubmissions = 0
-            let submitFakeOnce binding originalOp launch work source hash =
+            // The in-process fake provider consumes the original selected
+            // identity and is the sole source of first-connect data. A stable
+            // Git-original replay does not invoke it or return a response.
+            let submitFakeOnce binding originalOp (launch: Guid) (work: string)
+                               (source: Guid) (hash: string)
+                               (provider: Guid -> string -> Guid -> string -> (Guid * string * string) option) =
                 let marker = fakeOriginalMarker binding originalOp launch work source hash
-                // A Git receipt replay skips the provider invocation itself.
-                if not marker.AlreadyApplied then
-                    providerSubmissions <- providerSubmissions + 1
-                marker
+                let firstConnect =
+                    if marker.AlreadyApplied then None
+                    else
+                        providerSubmissions <- providerSubmissions + 1
+                        provider launch work source hash
+                marker, firstConnect
+
+            let fakeProvider (launch: Guid) (work: string) (source: Guid) (hash: string) =
+                Assert.That(launch, Is.EqualTo(first.LaunchId))
+                Assert.That(work, Is.EqualTo(candidate.WorkId))
+                Assert.That(source, Is.EqualTo(sourceOp))
+                Assert.That(hash, Is.EqualTo(created.Operation.RequestHash))
+                Some (launch, work, "disposable-fake-provider-" + Guid.NewGuid().ToString("N"))
+
+            let connectIfReturned binding operationId (firstConnect: (Guid * string * string) option) =
+                match firstConnect with
+                | None -> false
+                | Some (providerLaunch, providerWork, sessionKey) ->
+                    let providerLaunchId = providerLaunch.ToString("D")
+                    let _, state = WorkQueueGitLedger.load binding |> ok
+                    Assert.That(state.Launches.[providerLaunchId].Credit,
+                                Is.EqualTo(Some providerWork))
+                    mutate binding operationId (InitializeAgent(providerLaunchId, sessionKey))
+                    |> ignore
+                    true
+
             let originalOp = Guid.NewGuid()
-            let original = submitFakeOnce a originalOp first.LaunchId workId
-                               sourceOp created.Operation.RequestHash
+            let original, firstConnect = submitFakeOnce a originalOp first.LaunchId workId
+                                            sourceOp created.Operation.RequestHash fakeProvider
             Assert.That(original.AlreadyApplied, Is.False)
-            let sessionKey = "disposable-fake-provider-" + Guid.NewGuid().ToString("N")
+            Assert.That(firstConnect.IsSome, Is.True, "Original fake provider must return first-connect data")
+            let responseLaunch, responseWork, sessionKey = firstConnect |> Option.get
+            Assert.That(responseLaunch, Is.EqualTo(first.LaunchId))
+            Assert.That(responseWork, Is.EqualTo(workId))
             let dispatchOp = Guid.NewGuid()
             let dispatched = mutate b dispatchOp (DispatchOnce(launchId, DispatchState.Submitted))
             Assert.That(dispatched.AlreadyApplied, Is.False)
-            let replayMarker = submitFakeOnce b originalOp first.LaunchId workId
-                                   sourceOp created.Operation.RequestHash
+            let replayMarker, replayFirstConnect = submitFakeOnce b originalOp first.LaunchId workId
+                                                       sourceOp created.Operation.RequestHash fakeProvider
             Assert.That(replayMarker.AlreadyApplied, Is.True)
+            Assert.That(replayFirstConnect.IsNone, Is.True)
             let replayDispatch =
                 WorkQueueGitLedger.executeInertFixture a "WQ11 FakeProvider"
                     dispatchOp admitted.Version (DispatchOnce(launchId, DispatchState.Submitted)) |> ok
@@ -546,7 +577,7 @@ type WorkQueueReleaseAcceptanceTests() =
 
             let _, beforeConnect = WorkQueueGitLedger.load a |> ok
             let firstConnectOp = Guid.NewGuid()
-            mutate b firstConnectOp (InitializeAgent(launchId, sessionKey)) |> ignore
+            Assert.That(connectIfReturned b firstConnectOp firstConnect, Is.True)
             let _, connected = WorkQueueGitLedger.load a |> ok
             match connected.Launches.[launchId].State with
             | LaunchState.Registered(uuid, observedSession) ->
@@ -557,7 +588,9 @@ type WorkQueueReleaseAcceptanceTests() =
                 WorkQueueGitLedger.executeInertFixture a "WQ11 FakeProvider"
                     firstConnectOp beforeConnect.Version (InitializeAgent(launchId, sessionKey)) |> ok
             Assert.That(replayConnect.AlreadyApplied, Is.True)
-
+            let _, afterReplayConnect = WorkQueueGitLedger.load b |> ok
+            Assert.That(afterReplayConnect.Launches.[launchId].State,
+                        Is.EqualTo(connected.Launches.[launchId].State))
             mutate a (Guid.NewGuid()) (ClaimNext launchId) |> ignore
             let _, claimed = WorkQueueGitLedger.load b |> ok
             Assert.That(claimed.Works.[workId].State, Is.EqualTo(WorkState.Claimed launchId))
@@ -612,18 +645,26 @@ type WorkQueueReleaseAcceptanceTests() =
             | ProjectAdmitted _ -> ()
             | other -> Assert.Fail(sprintf "Released cap was not reusable: %A" other)
             let unknownOp = Guid.NewGuid()
-            let unknownMarker = submitFakeOnce b unknownOp second.LaunchId work2
-                                    source2 created2.Operation.RequestHash
+            // This original reaches a broken/no-return provider. No session
+            // result means the WQ01 connection adapter must not be invoked.
+            let noReturnProvider (_: Guid) (_: string) (_: Guid) (_: string) : (Guid * string * string) option = None
+            let unknownMarker, missingFirstConnect = submitFakeOnce b unknownOp second.LaunchId work2
+                                                         source2 created2.Operation.RequestHash noReturnProvider
             Assert.That(unknownMarker.AlreadyApplied, Is.False)
-            // Simulated response loss after the one fake provider invocation.
+            Assert.That(missingFirstConnect.IsNone, Is.True)
             mutate a (Guid.NewGuid())
                 (DispatchOnce(second.LaunchId.ToString("D"), DispatchState.OutcomeUnknown)) |> ignore
-            let unknownReplay = submitFakeOnce a unknownOp second.LaunchId work2
-                                    source2 created2.Operation.RequestHash
+            let forbiddenConnectOp = Guid.NewGuid()
+            Assert.That(connectIfReturned a forbiddenConnectOp missingFirstConnect, Is.False)
+            let unknownReplay, replayMissing = submitFakeOnce a unknownOp second.LaunchId work2
+                                                   source2 created2.Operation.RequestHash noReturnProvider
             Assert.That(unknownReplay.AlreadyApplied, Is.True)
+            Assert.That(replayMissing.IsNone, Is.True)
             let snapshot = LedgerStore.fetch a |> ok
             let persisted = LedgerStore.getOperationAt a snapshot unknownOp |> ok
             Assert.That(persisted.IsSome, Is.True)
+            let forbiddenConnect = LedgerStore.getOperationAt a snapshot forbiddenConnectOp |> ok
+            Assert.That(forbiddenConnect.IsNone, Is.True)
             let _, unresolved = WorkQueueGitLedger.load a |> ok
             Assert.That(unresolved.Launches.[second.LaunchId.ToString("D")].State,
                         Is.EqualTo(LaunchState.SubmittedUnregistered DispatchState.OutcomeUnknown))

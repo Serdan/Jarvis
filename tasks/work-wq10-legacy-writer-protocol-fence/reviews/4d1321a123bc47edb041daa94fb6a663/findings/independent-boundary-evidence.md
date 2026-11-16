@@ -1,0 +1,33 @@
+# Reviewer 3 independent source-boundary findings
+
+**Frozen review:** 4d1321a123bc47edb041daa94fb6a663  
+**Exact source:** 2ce8a258d8e5d1579bc005df978b235a3192aee9  
+**Base:** 04b90e0cc43f8939f2c0722ea03d085f3244925b  
+**Disposition:** Accepted for the *default-off, host-scoped, authenticated command-pipeline negative guard only*. **NOT production old-writer/fleet/cutover GO.**
+
+## Verified implementation scope
+
+1. `Client/Modules/LegacyWriterProtocolFence.fs:68-100` classifies legacy TaskWrite (including register, assignment, attempt/Agent lifecycle, role/instruction and integration), ReviewWrite, ChallengeWrite, cross-project legacy notification, old intent retry and ScheduleExecution/legacy BrowserSchedule as mutations. Only explicit CompositionMutate/CompositionAcceptIntegrated and WorkQueue/OperatorConversation command families are Work-native; Abandon/Supersede pending intents remain explicit audited recovery. The typed classification does not give a waiver to an agent label, operation UUID or arbitrary legacy action.
+2. `Client/SignalR/Client.fs:1128` checks the host fence after project/actor scope validation and **before** `activateReadyOnActivity` at 1153; `Client/SignalR/Client.fs:935` checks again at the common source-dispatch boundary before permission and `dispatch`. The other source-side old writes `ReviewWorkflow.activateReadyAgent` and `ReviewWorkflow.takeResponseAlerts` are separately guarded in `oldSideEffectsAllowed` at 99, used at 114/202. Thus ordinary historical reads need not revive an old Agent. The write-capable `AgentInbox` is denied when fenced (not offered as a fully read-only API).
+3. `LegacyWriterProtocolFence.fs:199-275` defaults OFF without the host environment binding; enabled path parses a bounded local, non-symlink host file, resolves existing configured trusted project binding, then uses fresh `AccountCapacityLedger.fetch` and `LedgerStore.fetch`, checking original account/project identity, exact account/project expected heads and project WQ02 migration state. Frozen/Preparing/Validated/Activated on both sides produces `OldWriterFenced`; unreadable/bad/stale/mismatched proof produces `OldWriterFenceUnknown`, also DENY. `LegacyActive` account phase deliberately short-circuits to allow legacy behavior; project Frozen alone is **not** a fence. `Aborted` requires explicit reconciliation.
+4. Default-OFF and LegacyActive old RegisterAgent behavior, historical Agent reads and Work-native allowance are exercised. Positive old fenced denials have no original write callback and leave the original project remote ref unchanged.
+
+## Independent local .NET 11 Release evidence
+
+Frozen clean registered worktree `legacy-writer-fence-worker4-20261116` at exact 2ce8a258; six changed files; `git diff --check 04b90e0..2ce8a25` exit 0; final `git status --short --branch` clean.
+
+- `dotnet test Client.Tests/Client.Tests.fsproj -c Release --filter FullyQualifiedName~LegacyWriterProtocolFenceTests --no-restore`: **5/5 passed**. Two Git remotes (original WQ07 account and WQ02 project), two distinct clones each; legacy writes before account freeze, Frozen and Preparing denials, original Git head and Agent record preservation, protocol/account/project stale-head and foreign authority failure, operator recovery versus intent replay, host trust check.
+- `dotnet test Client.Tests/Client.Tests.fsproj -c Release --filter FullyQualifiedName~DispatchProbeTests --no-restore`: **13/13 passed**, actual SignalR dispatch/queue regression tests.
+- `dotnet test Client.Tests/Client.Tests.fsproj -c Release --filter Name~SignalR --no-restore`: **17/17 passed**, adjacent SignalR dispatch compatibility tests.
+- An initial `FullyQualifiedName~SignalRDispatchTests` filter found **zero** cases and is **not counted as a pass**; the corrected fixture namespace is `DispatchProbeTests`.
+- All commands were local Release tests, not hosted Actions/Codex. No production migration, Manager/Scheduler activation or other source edits were made.
+
+## Explicit evidence boundaries and remaining holes
+
+1. **Not an original winning CAS fence.** The account/project Git authorities are separately fetched, and approval precedes a potentially later legacy Git transaction. Concurrent already-admitted writers, stale old clients, disconnected clients and direct original Git access can still win. There is no production old-writer high-water, journal witness, minimum deployed protocol/fleet witness, trusted Freeze signer or account-project roster. Cross-ledger partial recovery is not solved.
+2. **Not every in-process or external writer is covered.** Direct `ReviewWorkflow`, `ChallengeWorkflow`, `RoleInstructions` and `LedgerStore.transact` library callers bypass the SignalR guard. Source scripts and external Git writes are outside it. Previously persisted schedules and background execution/rearming bypass the new schedule-*creation* check. Existing `AfterAgentIdle` being disabled for missing durable activity is a separate safety property, not proof of Scheduler retirement.
+3. **Unclassified command-administration scope.** `LedgerWriteCommand` falls into `HistoricalRead` at `LegacyWriterProtocolFence.fs:100` despite `OrchestrationApi.LedgerApi.write` offering BindExistingLedger, InitializeLedger and RebindLedgerRemote; these are distinct operator trust/binding mutations, not old Agent state writes, but are **not guarded by this fence**. Schedule cancellation commands are likewise outside its write classifier. Before any operational rollout, classify/authorize these deliberately rather than treating the command list as fleet-wide exhaustive.
+4. **Host-scoping caveat.** An enabled single-project host binding fails closed for legacy writes to *other* projects (`HostFenceProjectMismatch`); it is a process-wide scope, not a transparent per-project opt-in. On the configured project, account `LegacyActive` intentionally permits writers without enforcing pinned expected heads. Production operators must not infer universal fencing from the host binding.
+5. **Test ceiling.** The new two-clone tests directly invoke `decideWithScope`, `protectWithScope` and `checkHost`; they do not drive two authenticated runtime SignalR clients with the host binding enabled through both new call sites. Adjacent SignalR tests exercise the default-off dispatcher, not the enabled end-to-end migration transition. Required prior to any production fence assertion.
+
+**Acceptance means this narrow source-level default-off guard is fit to integrate for further controlled testing. It does not unblock operational writer exclusion, WQ10 migration, Work Scheduler, Manager, or cutover.**

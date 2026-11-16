@@ -185,19 +185,21 @@ module WorkQueueSchedulerHostPreview =
                             with ex -> Error ex.Message
                         let head, sourceRef, commit, operation, requestHash, oid =
                             match source with
-                            | Ok (Some(origin, blob)) ->
-                                if origin.ProjectId <> pinned.Proof.ProjectId
-                                   || origin.WorkId <> demand.WorkId
-                                   || String.IsNullOrWhiteSpace origin.SourceOperationId
-                                   || String.IsNullOrWhiteSpace origin.SourceRequestHash then
-                                    add "SourceReceiptIdentityConflict" demand.WorkId
-                                        ("The WQ04 origin at project head " + snapshot.Commit
-                                         + " disagrees with selected work or lacks original IDs. "
-                                         + "Inspect the immutable source record before launch.")
+                            | Ok (Some(origin, blob))
+                                when origin.ProjectId = pinned.Proof.ProjectId
+                                     && origin.WorkId = demand.WorkId
+                                     && not (String.IsNullOrWhiteSpace origin.SourceOperationId)
+                                     && not (String.IsNullOrWhiteSpace origin.SourceRequestHash) ->
                                 Some origin.SourceHead,
                                 (if String.IsNullOrWhiteSpace origin.SourceRef then None else Some origin.SourceRef),
                                 (if String.IsNullOrWhiteSpace origin.SourceCommit then None else Some origin.SourceCommit),
                                 Some origin.SourceOperationId, Some origin.SourceRequestHash, Some blob
+                            | Ok (Some(origin, _)) ->
+                                add "SourceReceiptIdentityConflict" demand.WorkId
+                                    ("WQ04 origin for " + demand.WorkId + " at " + snapshot.Commit
+                                     + " names project/work " + origin.ProjectId + "/" + origin.WorkId
+                                     + "; inspect immutable source record and original IDs before launch.")
+                                None, None, None, None, None, None
                             | Ok None ->
                                 add "SourceReceiptMissing" demand.WorkId
                                     ("Read WQ04 origin for work " + demand.WorkId
@@ -268,8 +270,19 @@ module WorkQueueSchedulerHostPreview =
                         with ex -> Error ex.Message
                     let admissionId, kind =
                         match admission with
-                        | Ok(Some(record, _)) ->
+                        | Ok(Some(record, _))
+                            when record.ProjectId = launch.ProjectId
+                                 && record.LaunchId = launch.Id
+                                 && record.AccountTokenId = launch.AccountTokenId ->
                             Some record.AdmissionOperationId, Some record.Kind
+                        | Ok(Some(record, _)) ->
+                            add "AdmissionReceiptIdentityConflict" launch.Id
+                                ("Stored admission witness names project/launch "
+                                 + record.ProjectId + "/" + record.LaunchId
+                                 + " and token " + record.AccountTokenId
+                                 + "; preserve original admission " + record.AdmissionOperationId
+                                 + " and inspect Git witness before reconciliation.")
+                            Some record.AdmissionOperationId, Some("IdentityConflict: " + record.Kind)
                         | Ok None ->
                             add "AdmissionReceiptMissing" launch.Id
                                 "Inspect original project admission or C01 tombstone at its verified Git head."
@@ -283,13 +296,21 @@ module WorkQueueSchedulerHostPreview =
                         with ex -> Error ex.Message
                     let browserId, outcome, receipt =
                         match browser with
-                        | Ok(Some entry) when entry.Intent.LaunchId = launch.Id ->
+                        | Ok(Some entry) when entry.Intent.LaunchId = launch.Id
+                                              && entry.Intent.ProjectId = launch.ProjectId
+                                              && entry.Intent.RoleId = launch.RoleId
+                                              && entry.Intent.RoleVersion = launch.RoleVersion ->
                             let status, receipt = browserOutcome entry.Outcome
                             Some entry.Intent.OperationId, status, receipt
-                        | Ok(Some _) ->
+                        | Ok(Some entry) ->
                             add "BrowserIdentityConflict" launch.Id
-                                "Preserve original browser journal; investigate mismatched launch ID before any retry."
-                            None, "IdentityConflict", None
+                                ("Original browser operation " + entry.Intent.OperationId
+                                 + " names project/launch " + entry.Intent.ProjectId + "/" + entry.Intent.LaunchId
+                                 + " and role/version " + entry.Intent.RoleId + "/" + string entry.Intent.RoleVersion
+                                 + "; expected " + launch.ProjectId + "/" + launch.Id
+                                 + " and " + launch.RoleId + "/" + string launch.RoleVersion
+                                 + ". Preserve its journal and inspect the mismatched identity before retry.")
+                            Some entry.Intent.OperationId, "IdentityConflict", None
                         | Ok None ->
                             add "BrowserJournalMissing" launch.Id
                                 "Locate original WQ03 one-shot marker and receipt; absence is not proof of no effect."

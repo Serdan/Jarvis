@@ -273,6 +273,8 @@ let private claimedState now staleAfter (project: Project) launchId =
 let private gateHoldReason (stage: WorkStage) =
     match stage.Gate with
     | GateState.Clear -> None
+    | GateState.CompositionHold (unitId, specVersion) ->
+        Some(sprintf "CompositionHold %s spec v%d; verified graph acceptance required" unitId specVersion)
     | GateState.DependencyGatePending graphVersion ->
         Some(sprintf "DependencyGatePending graph v%d; hard prerequisite unresolved" graphVersion)
     | GateState.IntegrationGateHold _ ->

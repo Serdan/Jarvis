@@ -71,7 +71,7 @@ module WorkCompositionAcceptanceAdapter =
               Prerequisites = prerequisites }
         "WorkComposition.Acceptance." + CanonicalCodec.digest (CanonicalCodec.encode target)
 
-    let private checkAt (binding: LedgerBinding) (snapshot: LedgerSnapshot)
+    let internal checkAt (binding: LedgerBinding) (snapshot: LedgerSnapshot)
                         (graph: WorkCompositionGraph) (unitId: string) (receipt: string) =
         result {
             let! unit =

@@ -209,6 +209,14 @@ module WorkComposition =
     let validate (graph: WorkCompositionGraph) : Result<unit, WorkCompositionError> =
         let nodes = graph.Units |> Map.toList |> List.map snd
         let roots = nodes |> List.filter (fun unit -> unit.Kind = WorkUnitKind.Project)
+        // Each canonical task has exactly one composition owner. This must be
+        // checked on every graph mutation, not just when a WQ04 stage is born:
+        // otherwise a new blocked feature can share an already-Available stage.
+        let duplicateLinkedTask =
+            nodes
+            |> List.choose (fun unit -> unit.Spec.LinkedTaskId |> Option.map (fun taskId -> taskId, unit.Id))
+            |> List.groupBy fst
+            |> List.tryPick (fun (taskId, owners) -> if List.length owners > 1 then Some taskId else None)
         let inconsistent =
             nodes
             |> List.tryFind (fun unit -> unit.SpecVersion < 1 || not (nonBlank unit.Id)
@@ -217,6 +225,8 @@ module WorkComposition =
         | Some unit -> Error(WorkCompositionError.InvalidSpec ("Invalid unit identity/version: " + unit.Id))
         | None when List.length roots > 1 ->
             Error(WorkCompositionError.InvalidParent "A project graph must have a single root.")
+        | None when duplicateLinkedTask.IsSome ->
+            Error(WorkCompositionError.InvalidSpec ("Canonical task has multiple composition owners: " + duplicateLinkedTask.Value))
         | None ->
             nodes
             |> List.tryPick (fun unit ->

@@ -187,11 +187,12 @@ let write_tools_expose_optional_operation_ids () =
                               "RetryPendingIntent"; "SupersedePendingIntent"; "AbandonPendingIntent" ]) ->
                 Some (methodInfo.Name, id)
             | _ -> None)
-    // Preserve challenge-domain, taskless and recipient-notification writes.
-    Assert.That(writeMethods.Length, Is.EqualTo(62), String.concat ", " (writeMethods |> Array.map fst))
-    for newTool in [ "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork" ] do
+    // Preserve challenge-domain, taskless, notification, and default-off Work writes.
+    Assert.That(writeMethods.Length, Is.EqualTo(65), String.concat ", " (writeMethods |> Array.map fst))
+    for newTool in [ "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork"
+                     "ClaimNextWork"; "CheckpointWork"; "CompleteWork" ] do
         Assert.That(writeMethods |> Array.exists (fun (name, _) -> name = newTool), Is.True,
-                    $"Taskless lifecycle tool {newTool} missing from the public MCP surface.")
+                    $"Lifecycle tool {newTool} missing from the public MCP surface.")
     for name, id in writeMethods do
         Assert.That(id.IsOptional, Is.True, $"operationId is required on {name}")
         Assert.That(id.DefaultValue, Is.EqualTo(""), $"operationId default differs on {name}")

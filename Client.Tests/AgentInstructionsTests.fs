@@ -12,7 +12,9 @@ let private workspace test =
     let root = Path.Combine(Path.GetTempPath(), "jarvis-instructions-" + Guid.NewGuid().ToString("N"))
     Directory.CreateDirectory(Path.Combine(root, "Demo")) |> ignore
     try test root (Runtime(root))
-    finally if Directory.Exists root then Directory.Delete(root, true)
+    finally
+        // Windows Git worktree loose objects are sometimes read-only.
+        if Directory.Exists root then HermeticClientTestEnvironment.DeleteTestTree root
 
 let private create root name (content: string) =
     let path = Path.Combine(root, name)
@@ -149,6 +151,8 @@ let reject_symlinked_agents () =
         with
         | :? UnauthorizedAccessException -> Assert.Ignore("Symlinks unavailable")
         | :? PlatformNotSupportedException -> Assert.Ignore("Symlinks unsupported")
+        | :? IOException as ex when OperatingSystem.IsWindows() && (ex.HResult &&& 0xFFFF) = 1314 ->
+            Assert.Ignore("Windows symlink privilege unavailable")
         match resolve rt (command "a.cs") with
         | Error(Client.PermissionDenied _) -> ()
         | other -> Assert.Fail(sprintf "Expected link rejection: %A" other))

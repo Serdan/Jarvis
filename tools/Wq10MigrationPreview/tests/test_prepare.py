@@ -369,6 +369,45 @@ class PreparedAdapterTests(unittest.TestCase):
         for _, repo, _ in self.all_authorities():
             self.assertIsNone(maybe_ref(repo, STAGING_REF))
 
+    def test_committed_checkout_symlinks_never_write_outside_fixture(self):
+        relpath = "records/work-queue/prepared-adapter/" + OPERATION + ".json"
+        # Each symlink is committed to a bare authority before stage_commit;
+        # the checkout therefore inherits the adversarial path from Git.
+        for index, component in enumerate((
+                "records",
+                "records/work-queue",
+                "records/work-queue/prepared-adapter",
+                relpath)):
+            with self.subTest(component=component), tempfile.TemporaryDirectory(
+                    prefix="wq10-outside-fixture-") as outside_dir:
+                outside = pathlib.Path(outside_dir)
+                protected = outside / "protected.txt"
+                protected.write_text("unchanged", encoding="utf-8")
+                project = LedgerFixture(
+                    self.root, f"symlink-{index}", "jarvis-orchestration",
+                    {"ledger.json": {"schemaVersion": 3, "nextSequence": 1}})
+                link = project.first / component
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.symlink_to(protected if component == relpath else outside,
+                                target_is_directory=component != relpath)
+                git(project.first, "add", "--", component)
+                git(project.first, "-c", "user.name=Fixture",
+                    "-c", "user.email=fixture@example.test",
+                    "commit", "-m", "commit adversarial record symlink")
+                git(project.first, "push", "origin",
+                    f"HEAD:refs/heads/{project.branch}")
+                original = project.head
+                self.assertEqual(git(project.remote, "ls-tree",
+                                     original, component).split()[1], "blob")
+                with self.assertRaises(PreparationError) as error:
+                    stage_commit(self.root, project.remote, original, relpath,
+                                 {"operationId": OPERATION})
+                self.assertEqual(error.exception.code, "STAGED_PATH_SYMLINK")
+                self.assertEqual(protected.read_text(encoding="utf-8"), "unchanged")
+                self.assertEqual(list(outside.iterdir()), [protected])
+                self.assertEqual(project.head, original)
+                self.assertIsNone(maybe_ref(project.remote, STAGING_REF))
+
     def test_abort_refuses_unreviewed_same_parent_sibling_before_any_delete(self):
         first, prepared = self.command()
         self.assertEqual(first.returncode, 0, first.stderr)

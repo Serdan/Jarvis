@@ -248,17 +248,51 @@ def account_sidecar(account: dict, operation_id: str, report_sha: str,
     }
 
 
+def checked_stage_target(checkout: Path, relpath: str) -> Path:
+    """Never follow record-path symlinks inherited from an untrusted Git tree.
+
+    The checkout is private, but its contents come from a caller-supplied bare
+    repository. Validate each component *before* creating the next directory;
+    checking the final path or relying on git add happens too late.
+    """
+    parts = relpath.split("/")
+    if (not parts or any(part in ("", ".", "..") for part in parts)
+            or "\\" in relpath or "\0" in relpath or Path(relpath).is_absolute()):
+        fail("STAGED_PATH_INVALID", "Use a canonical relative adapter record path")
+    boundary = checkout.resolve(strict=True)
+    parent = checkout
+    for component in parts[:-1]:
+        parent = parent / component
+        if parent.is_symlink():
+            fail("STAGED_PATH_SYMLINK",
+                 f"Refuse checked-out symlink at {parent.relative_to(checkout)}")
+        if parent.exists():
+            if not parent.is_dir():
+                fail("ADAPTER_PATH_COLLISION",
+                     f"Non-directory component in fixture record path: {relpath}")
+        else:
+            parent.mkdir()
+        if parent.is_symlink() or not parent.resolve(strict=True).is_relative_to(boundary):
+            fail("STAGED_PATH_SYMLINK",
+                 f"Refuse escaped checked-out path at {parent.relative_to(checkout)}")
+    target = parent / parts[-1]
+    if target.is_symlink() or not target.resolve().is_relative_to(boundary):
+        fail("STAGED_PATH_SYMLINK", f"Refuse checked-out symlink at {relpath}")
+    if target.exists():
+        fail("ADAPTER_PATH_COLLISION", f"Unexpected existing fixture path: {relpath}")
+    return target
+
+
 def stage_commit(root: Path, repo: Path, head: str, relpath: str, record: dict) -> str:
     # Commit-tree in a private clone; import only objects, then CAS a NEW ref.
     with tempfile.TemporaryDirectory(prefix="wq10-stage-", dir=root) as tmp:
         checkout = Path(tmp) / "checkout"
         run_git(None, "clone", "--quiet", "--no-checkout", str(repo), str(checkout))
         run_git(checkout, "checkout", "--quiet", "--detach", head)
-        target = checkout / relpath
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists():
-            fail("ADAPTER_PATH_COLLISION", f"Unexpected existing fixture path: {relpath}")
-        target.write_text(pretty(record), encoding="utf-8")
+        target = checked_stage_target(checkout, relpath)
+        # Exclusive creation refuses a final symlink appearing after validation.
+        with target.open("x", encoding="utf-8") as output:
+            output.write(pretty(record))
         run_git(checkout, "add", "--", relpath)
         environment = {
             "GIT_AUTHOR_NAME": "WQ10 fixture",

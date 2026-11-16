@@ -1,0 +1,1 @@
+.NET 11 Release disposable WQ06 client CAS/replay 7/7; Server.Tests 277/277 passed on source worktree; git diff --check clean. Exact commit 084f6143; two-file test/docs-only change. Main already includes default-off typed adapter; connected live catalog currently lacks WQ06 aliases.

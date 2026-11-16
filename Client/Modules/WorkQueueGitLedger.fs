@@ -320,8 +320,15 @@ module WorkQueueGitLedger =
             | [| line |] ->
                 match line.Split('\t') with
                 | [| sha; exactRef |] when exactRef = refName && sha = expectedSha -> Ok()
-                | _ -> Error(sourceReject "remote ref does not identify the exact immutable SHA")
-            | _ -> Error(sourceReject "expected one exact remote WIP ref"))
+                | [| sha; exactRef |] when exactRef = refName ->
+                    Error(sourceReject (sprintf
+                        "remote ref %s points to %s, expected %s; inspect/fetch before retrying a non-force push or recording recovery"
+                        refName sha expectedSha))
+                | _ -> Error(sourceReject ("unexpected remote ref response for " + refName))
+            | [||] -> Error(sourceReject (sprintf
+                "remote ref %s is absent (expected %s); original push may be pending or failed: inspect its operation before retry"
+                refName expectedSha))
+            | _ -> Error(sourceReject ("ambiguous remote response for " + refName)))
 
     // First-generation stages must have a trustworthy source binding and a
     // real pinned base reachable on the approved target, before any claim.
@@ -443,13 +450,25 @@ module WorkQueueGitLedger =
                         if dirty = "" then Ok()
                         else Error(sourceReject "dirty generation checkout; RecoveryBlocked required")))
 
-    // Source jobs and original pushes are not yet journaled by an authoritative
-    // WQ03 host bridge, and Git fetch/ls-remote cannot attest branch protection
-    // or retention. Never infer their safety from a clean checkout or a string
-    // supplied by the worker. Keep source handoff disabled/fail-closed.
-    let private verifySourceExternalEffectsAndRefProtection () =
-        Error(sourceReject
-            "RecoveryBlocked: authoritative mutating-job and original-push journals are unavailable; host-enforced immutable WIP ref retention is not attested")
+    // Preserve what the original push reported without confusing its reply
+    // with the observed remote state. For a lost acknowledgement, a fresh
+    // ls-remote can establish that the expected continuation is currently
+    // reachable; the unknown dispatch outcome remains visible to successors.
+    // This inert adapter does not claim that host refs are immutable or jobs
+    // have globally terminated. Unresolved work is recorded as RecoveryBlocked.
+    let private validSourcePushObservation (checkpoint: SourceCheckpoint) =
+        nonBlank checkpoint.PushOperationId
+        && checkpoint.PushOperationId.Length <= 256
+        && nonBlank checkpoint.PushCommand
+        && checkpoint.PushCommand.Length <= 2048
+        && validGitSha checkpoint.ObservedRemoteSha
+        && checkpoint.ObservedRemoteSha = checkpoint.ContinuationSha
+        && nonBlank checkpoint.RecoveryNote
+        && checkpoint.RecoveryNote.Length <= 8192
+        && (match checkpoint.PushOutcome with
+            | PushOutcome.Unknown -> true
+            | PushOutcome.Observed sha -> sha = checkpoint.ObservedRemoteSha
+            | PushOutcome.DefinitiveNoEffect -> false)
 
     // No caller-controlled "reachability verified" boolean is accepted.
     // The source worktree must contain the committed WIP, be entirely clean,
@@ -468,6 +487,7 @@ module WorkQueueGitLedger =
                || not (validGitSha checkpoint.ContinuationSha)
                || not (validGitSha lineage.PinnedBaseCommit)
                || checkpoint.RepositoryId <> sourceRepositoryId binding
+               || not (validSourcePushObservation checkpoint)
                || checkpoint.Summary.Length > 8192
                || checkpoint.NextAction.Length > 8192
                || checkpoint.TestEvidence.Length > 8192 then
@@ -608,6 +628,7 @@ module WorkQueueGitLedger =
                 not (String.IsNullOrWhiteSpace receipt)
         let validRecordedHandoff operationId (checkpoint: SourceCheckpoint) =
             nonBlank checkpoint.WorkId
+            && validSourcePushObservation checkpoint
             && validSourceRefPart checkpoint.WorkId
             && validSourceRefPart checkpoint.LaunchId
             && nonBlank checkpoint.AgentUuid
@@ -1084,7 +1105,6 @@ module WorkQueueGitLedger =
                                 match state.Works.TryFind checkpoint.WorkId with
                                 | Some prior ->
                                     verifySourceHandoff binding prior checkpoint
-                                    |> Result.bind (fun () -> verifySourceExternalEffectsAndRefProtection ())
                                 | None -> Error(sourceReject "missing source stage")
                             | ClaimNext launchId ->
                                 match changed.Launches.TryFind launchId with

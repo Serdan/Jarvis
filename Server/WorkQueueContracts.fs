@@ -109,8 +109,9 @@ type SourceLineage =
       ContinuationSha: string option
       Generation: int }
 
-// Portable immutable context: the adapter independently verifies this exact
-// ref/SHA on the approved remote before it may enter the project Git ledger.
+// Portable source context. Keep the original push outcome separate from the
+// independently observed remote SHA to reconcile lost acknowledgements.
+// The adapter still checks the remote before publishing this checkpoint.
 type SourceCheckpoint =
     { WorkId: string
       LaunchId: string
@@ -125,6 +126,11 @@ type SourceCheckpoint =
       LineageGeneration: int
       ContinuationRef: string
       ContinuationSha: string
+      PushOperationId: string
+      PushCommand: string
+      PushOutcome: PushOutcome
+      ObservedRemoteSha: string
+      RecoveryNote: string
       Summary: string
       NextAction: string
       TestEvidence: string }
@@ -1474,10 +1480,11 @@ module Contracts =
             | Some _, Some true -> Ok current
             | _ -> Error Rejection.MissingProof) account
 
-    // WQ-03: A source writer can leave its claim only with an immutable
-    // generation-bound checkpoint. The caller is the Git adapter, which must
-    // have independently verified the remote WIP ref/SHA, clean worktree and
-    // absence of unresolved mutating side effects before this project CAS.
+    // WQ-03: A source writer can leave its claim with a committed, generation-
+    // bound checkpoint. The Git adapter independently verifies current remote
+    // ref/SHA, clean checkout and ancestry. Original push outcomes stay in the
+    // checkpoint (including Unknown); unresolved external processes remain
+    // an explicit agent-managed recovery decision, not invented proof.
     let yieldSource expected op (checkpoint: SourceCheckpoint) now project =
         projectCasTyped expected op (ProjectOperationPayload.SourceHandoff checkpoint)
             (fun current ->

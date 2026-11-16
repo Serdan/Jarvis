@@ -1,65 +1,29 @@
-# WQ-03 source handoff: host safety dependencies (not yet satisfied)
+# WQ-03 portable source handoff: practical workflow and recovery
 
-Status: **fail closed; do not activate Scheduler/source-writing handoff**.
+Status: **isolated/inert adapter; no production scheduler activation or migration**. The operator's 2026-11-16 simplification directive supersedes the former rule that every WIP ref must have host-enforced immutable retention and every possible external process must have a globally complete journal before a useful source handoff is permitted. Keep these stronger measures optional unless a concrete failure makes them proportionate.
 
-WQ-03's project Git CAS can fence a stale claim and check a remote WIP SHA.
-It cannot, by itself, prove that the remote will retain that commit, that a
-different account-authorized process cannot overwrite/delete its ref, or that
-all physical source mutations and original pushes have terminated. A positive
-`ls-remote` or clean `git status` is not protection or job reconciliation.
+## Normal handoff (A to B)
 
-## Required before a successful YieldSource is permitted
+1. Work in a separate Git-registered generation worktree. Commit all tracked and untracked work that belongs in the continuation; confirm the worktree is clean. Keep the source branch, target ref, pinned base SHA and generation.
+2. Assign a stable **original push operation ID** *before* attempting the push. Record the exact Git command (for example `git push origin HEAD:refs/heads/jarvis-wip/I/L1-g1`), attempted commit SHA, captured exit status/response or **Unknown** if acknowledgement was lost. Use ordinary non-force Git push; do not overwrite a diverged remote tip.
+3. Inspect `git ls-remote --refs <approved-fetch-url> <wip-ref>` from the trusted source binding. Record the observed remote SHA separately from the push's reported outcome. A lost acknowledgement remains `PushOutcome.Unknown` even if an independent read later observes the expected SHA.
+4. Submit `YieldSource` with a `SourceCheckpoint` recording `RepositoryId`, `TargetRef`, `PinnedBaseCommit`, `ContinuationRef`, `ContinuationSha`, `PushOperationId`, `PushCommand`, `PushOutcome`, `ObservedRemoteSha`, `RecoveryNote`, summary, next action and test evidence. The adapter checks the actual approved remote ref, local HEAD, cleanliness and ancestry before the Git ledger publishes it.
+5. The successor fetches the recorded WIP ref and verifies it still equals the checkpoint SHA, creates its own isolated generation worktree at that SHA, and claims the next stage through the canonical project ledger. The original checkpoint and task conversation remain accessible.
 
-1. **Host-enforced immutable source retention.** The trusted Git host/operator
-   must install an immutable, generation-scoped `refs/heads/jarvis-wip/**`
-   policy. Ref creation must be create-only; update/force-push and deletion
-   must be rejected, including for this agent's effective credential and any
-   configured bypass roles. Retention must outlive all unfinished stages,
-   checkpoints and successor claims that reference the SHA; disable pruning
-   that could remove the only reachable continuation object. Configuration
-   needs an independently checked host-side ruleset/policy version and effective
-   credential/bypass evidence, not a caller assertion or a local Git ref read.
-   For GitHub, confirm the ruleset actually applies to the entire nested WIP
-   namespace and blocks both updates and deletions for the active credential.
-   Do not attempt destructive probes on a production ref merely to infer policy.
-2. **Host-owned complete effect journal.** Every permitted mutating job/process,
-   source git push/merge and retry must acquire a durable original operation ID
-   before dispatch, bound to exact project, work ID, launch UUID, claim
-   generation, repository identity, worktree identity and target/ref. The
-   authoritative reconciler must prove the original process terminal and any
-   remote push outcome settled, not merely absent at one observation. A client
-   restart, missing journal or incomplete coverage is **RecoveryBlocked**.
-   Unknown pushes retain original IDs and source/worktree/token fences; negative
-   current remote ancestry is not proof that the push will never land.
-3. **Atomic source admission and succession.** Each source claim needs a clean,
-   Git-registered detached, generation-scoped worktree at the exact pinned
-   base or independently fetched continuation SHA *before* ClaimNext's project
-   CAS can issue actionable work. Do not reuse a predecessor worktree or clone.
-   Initial publication must validate the approved repository identity and
-   base commit against the remote target. Late old session project writes are
-   generation-fenced; account-authorized physical writes require worktree and
-   effect-journal isolation as above.
+**Meaning of proof:** an exact remote observation establishes *current reachability*, not permanent immutability, that the original push reply was received, or termination of every background process. The source path remains inert until the operator authorizes production activation.
 
-## Current implementation boundary
+## Missing WIP, lost acknowledgement, non-fast-forward, or unknown process
 
-`WorkQueueGitLedger` validates initial approved-remote base ancestry and
-generation-pinned source checkout before project publication/claim.
-`YieldSource` still inspects local HEAD/status/commit ancestry and WIP
-remote tip, **then rejects** normal requeue because host protection and the
-complete journal are not yet available to this isolated adapter. An agent may
-record `MarkSourceRecoveryBlocked` without releasing its claim; that
-self-reported record is not a substitute for the missing independent proofs.
-Neither the WQ-03 adapter nor any tests imply that a local bare Git remote or
-GitHub branch is protected. The source bridge remains inert.
+Do not infer failure from a lost reply or success from a source commit alone. First inspect the original operation ID/command and any available process result, then query the remote and compare the observed SHA with the local continuation and prior checkpoint. If current remote equals the expected SHA, a lost acknowledgement may be reconciled via `PushOutcome.Unknown` plus the independently observed SHA; retain the Unknown outcome in the checkpoint rather than rewriting history.
 
-## Validation/activation gate
+If the remote ref is absent, diverged or cannot be read, keep both known SHAs and the failed command/output. A non-fast-forward push must be visible, with the **actual remote SHA** shown; fetch both sides and decide whether to incorporate the other work, use a new continuation ref or repair the record. Never default to force push, delete a remote ref to escape a conflict, or fabricate an observed success. For a genuinely unknown external process, inspect it before retrying and keep the current claim `SourceRecoveryBlocked` until an authorized agent records a reasoned resolution.
 
-- Deterministic two-clone tests: forged repository, missing/non-ancestor base,
-  ordinary stale successor clone, correctly pinned detached successor, dirty
-  checkout, drifted WIP ref, and clean source with absent authoritative host
-  evidence.
-- Local .NET 11 Release tests; independent exact frozen review after code changes.
-- Operator/Lead must supply verified host policy + durable journal bridge,
-  additional real host-policy negative tests, a reviewed replacement for the
-  temporary fail-closed gate, and explicit cutover authorization. No GitHub
-  Actions, deployment or production migration are part of this change.
+`MarkSourceRecoveryBlocked` accepts a durable reason; include at least the original push operation ID, command, attempted local SHA, WIP ref, observed remote SHA (or `missing/unknown`), captured failure/uncertainty, and exact next recovery action. This is intentionally inspectable text, not a blanket permanent lock. A new authorized repair can resolve the issue after examining the evidence.
+
+## Authorized direct repair of inconsistent Git ledger records
+
+If canonical records themselves are inconsistent, an authorized agent may directly correct them with an auditable Git change rather than waiting for code enforcement to be relaxed. Record the current remote ledger head as a **backup SHA**, preserve the original command/receipt and relevant source ref tips, make the smallest coherent edit (including canonical state hash/receipt relationships if applicable), review `git diff`, and commit a **repair note** explaining what was observed and why the record changed. Use normal Git ancestry/CAS semantics; on conflict fetch and reconcile instead of overwriting unseen changes. Preserve the original broken state via the backup SHA and make the new state independently readable by another clone. Do not bypass the recorded operator authorization required for production rollout.
+
+## Acceptance checks
+
+Two-clone disposable Git tests cover: committed A-to-B source continuation with task message and checkpoint preserved, independent recovery after a lost push acknowledgement, explicit non-fast-forward with both SHAs retained, missing WIP, dirty checkout, drifted WIP, and a durable unknown-operation recovery reason. Run .NET 11 Release tests and request a new independent frozen review before Lead integration. No hosted Actions, Codex via Jarvis, deployments, restarts or scheduler activation.

@@ -29,6 +29,20 @@ type WorkQueueGitLedgerTests() =
         Assert.That(runner.ExitCode, Is.EqualTo(0), error)
         output.Trim()
 
+    let gitFailure directory args =
+        use runner = new Process()
+        runner.StartInfo.FileName <- "git"
+        runner.StartInfo.WorkingDirectory <- directory
+        runner.StartInfo.RedirectStandardOutput <- true
+        runner.StartInfo.RedirectStandardError <- true
+        for argument in args do runner.StartInfo.ArgumentList.Add(argument)
+        Assert.That(runner.Start(), Is.True)
+        let output = runner.StandardOutput.ReadToEnd()
+        let error = runner.StandardError.ReadToEnd()
+        runner.WaitForExit()
+        Assert.That(runner.ExitCode, Is.Not.EqualTo(0), output)
+        error
+
     let success = function
         | Ok result -> result
         | Error failure -> failwithf "WQ-02 Git CAS failed: %A" failure
@@ -185,6 +199,11 @@ type WorkQueueGitLedgerTests() =
           LineageGeneration = lineage.Generation
           ContinuationRef = remoteRef
           ContinuationSha = sha
+          PushOperationId = Guid.NewGuid().ToString("D")
+          PushCommand = "git push origin HEAD:" + remoteRef
+          PushOutcome = PushOutcome.Observed sha
+          ObservedRemoteSha = sha
+          RecoveryNote = "Inspect original operation ID and fetch remote ref before any retry; never force push"
           Summary = "Completed source slice and committed all tracked and untracked work"
           NextAction = "Resume task from immutable WIP and run Release tests"
           TestEvidence = "NUnit deterministic two-clone WQ03 fixture" }
@@ -1027,7 +1046,7 @@ type WorkQueueGitLedgerTests() =
             Assert.That(recovered.Receipts.Count, Is.EqualTo(recovered.Version)))
 
     [<Test>]
-    member _.SourceYieldFailsClosedWithoutAuthoritativeJobJournalAndProtectedWipRetention() =
+    member _.SourceYieldPreservesCommittedWipCheckpointAndSuccessorGenerationAcrossClones() =
         withClones (fun a b ->
             let owner, implementation, lineage, uuid, claimed = startSourceClaim a b
             let expectedVersion = claimed.Version
@@ -1040,30 +1059,87 @@ type WorkQueueGitLedgerTests() =
             let sha, remoteRef = commitSourceWip owner "I" "L1" claimed.Works.["I"].ClaimGeneration
             git owner.RepositoryPath [ "push"; "origin"; "HEAD:" + remoteRef ] |> ignore
             let proof = checkpointSource lineage uuid claimed sha remoteRef
+            WorkQueueGitLedger.executeInertFixtureAt owner "Worker" (Guid.NewGuid()) expectedVersion
+                1006L (YieldSource proof) |> success |> ignore
+            let _, after = WorkQueueGitLedger.load b |> success
+            Assert.That(after.Works.["I"].State, Is.EqualTo(WorkState.Available))
+            Assert.That(after.Works.["I"].ClaimGeneration, Is.EqualTo(proof.ClaimGeneration + 1))
+            Assert.That(after.Works.["I"].SourceLineage.Value.ContinuationSha, Is.EqualTo(Some sha))
+            Assert.That(after.Messages.["source-thread-note"].Body,
+                        Is.EqualTo("Original task thread survives source generation handoff"))
+            Assert.That(WorkQueueGitLedger.latestSourceHandoff after "I", Is.EqualTo(Some proof))
+            let mutate client now mutation =
+                let _, current = WorkQueueGitLedger.load client |> success
+                WorkQueueGitLedger.executeInertFixtureAt client "Worker" (Guid.NewGuid())
+                    current.Version now mutation |> success |> ignore
+            mutate b 1007L (AdmitProject (launch (a.ProjectId.ToString("D")) "L2" "Worker"))
+            mutate a 1008L (DispatchOnce ("L2", DispatchState.Submitted))
+            mutate b 1009L (InitializeAgent ("L2", "session-two"))
+            git b.RepositoryPath [ "fetch"; "--no-tags"; "origin"; remoteRef ] |> ignore
+            let successor = pinnedSourceWorktree b "I" "L2" (after.Works.["I"].ClaimGeneration + 1) sha
+            mutate successor 1010L (ClaimNext "L2")
+            let _, resumed = WorkQueueGitLedger.load a |> success
+            Assert.That(resumed.Works.["I"].State, Is.EqualTo(WorkState.Claimed "L2"))
+            Assert.That(resumed.Works.["I"].SourceLineage.Value.ContinuationSha, Is.EqualTo(Some sha))
+            Assert.That(WorkQueueGitLedger.latestSourceHandoff resumed "I", Is.EqualTo(Some proof)))
+
+    [<Test>]
+    member _.LostPushAcknowledgementIsReconciledWithoutInventingOriginalSuccess() =
+        withClones (fun a b ->
+            let owner, _, lineage, uuid, claimed = startSourceClaim a b
+            let sha, remoteRef = commitSourceWip owner "I" "L1" claimed.Works.["I"].ClaimGeneration
+            // Simulate a successful server-side push whose client reply vanished.
+            git owner.RepositoryPath [ "push"; "origin"; "HEAD:" + remoteRef ] |> ignore
+            let proof =
+                { checkpointSource lineage uuid claimed sha remoteRef with
+                    PushOutcome = PushOutcome.Unknown
+                    RecoveryNote = "Lost acknowledgement; independent ls-remote observed exact SHA; original command remains Unknown" }
+            WorkQueueGitLedger.executeInertFixtureAt owner "Worker" (Guid.NewGuid()) claimed.Version
+                1010L (YieldSource proof) |> success |> ignore
+            let _, persisted = WorkQueueGitLedger.load b |> success
+            let handoff = WorkQueueGitLedger.latestSourceHandoff persisted "I"
+            Assert.That(handoff, Is.EqualTo(Some proof))
+            Assert.That(proof.PushOutcome, Is.EqualTo(PushOutcome.Unknown))
+            Assert.That(proof.ObservedRemoteSha, Is.EqualTo(sha))
+            Assert.That(proof.PushCommand, Does.Contain(remoteRef))
+            Assert.That(proof.PushOperationId, Is.Not.Empty))
+
+    [<Test>]
+    member _.NonFastForwardConflictShowsRemoteShaAndPreservesBothBranchesForRecovery() =
+        withClones (fun a b ->
+            let owner, _, lineage, uuid, claimed = startSourceClaim a b
+            let sha, remoteRef = commitSourceWip owner "I" "L1" claimed.Works.["I"].ClaimGeneration
+            let tree = git b.RepositoryPath [ "rev-parse"; "HEAD^{tree}" ]
+            let competing =
+                git b.RepositoryPath
+                    [ "-c"; "user.name=Fixture"; "-c"; "user.email=fixture@example.test";
+                      "commit-tree"; tree; "-p"; lineage.PinnedBaseCommit; "-m"; "competing writer" ]
+            git b.RepositoryPath [ "push"; "origin"; competing + ":" + remoteRef ] |> ignore
+            let failure = gitFailure owner.RepositoryPath [ "push"; "origin"; "HEAD:" + remoteRef ]
+            Assert.That(failure, Does.Contain("rejected").IgnoreCase)
+            Assert.That(failure, Does.Contain("fetch first").IgnoreCase)
+            let proof =
+                { checkpointSource lineage uuid claimed sha remoteRef with
+                    PushOutcome = PushOutcome.Unknown }
             let _, before = WorkQueueGitLedger.load b |> success
-            // The Git data is clean and the WIP was pushed, but these facts
-            // do not prove no late mutating process or host ref protection.
-            match WorkQueueGitLedger.executeInertFixtureAt owner "Worker" (Guid.NewGuid()) expectedVersion
-                    1006L (YieldSource proof) with
-            | Error(InvalidBinding reason) ->
-                Assert.That(reason, Does.Contain("RecoveryBlocked"))
-                Assert.That(reason, Does.Contain("journal"))
-                Assert.That(reason, Does.Contain("retention"))
-            | other -> Assert.Fail(sprintf "Unattested source handoff requeued: %A" other)
-            let afterHead, after = WorkQueueGitLedger.load a |> success
-            Assert.That(afterHead.Commit, Is.EqualTo((fst (WorkQueueGitLedger.load b |> success)).Commit))
-            Assert.That(after.Version, Is.EqualTo(before.Version))
-            Assert.That(after.Works.["I"].State, Is.EqualTo(WorkState.Claimed "L1"))
-            Assert.That(after.Works.["I"].ClaimGeneration, Is.EqualTo(proof.ClaimGeneration))
-            Assert.That(WorkQueueGitLedger.latestSourceHandoff after "I", Is.EqualTo(None))
-            // Deliberately unprotected local bare remotes permit both
-            // destructive operations. The adapter therefore cannot assert
-            // that ls-remote alone is immutable/retained host proof.
-            git owner.RepositoryPath
-                [ "push"; "--force"; "origin"; lineage.PinnedBaseCommit + ":" + remoteRef ] |> ignore
-            git owner.RepositoryPath [ "push"; "origin"; "--delete"; remoteRef ] |> ignore
-            let _, stillHeld = WorkQueueGitLedger.load b |> success
-            Assert.That(stillHeld.Works.["I"].State, Is.EqualTo(WorkState.Claimed "L1")))
+            match WorkQueueGitLedger.executeInertFixtureAt owner "Worker" (Guid.NewGuid())
+                    before.Version 1010L (YieldSource proof) with
+            | Error(InvalidBinding error) ->
+                Assert.That(error, Does.Contain(competing))
+                Assert.That(error, Does.Contain(sha))
+            | other -> Assert.Fail(sprintf "Conflicting WIP was silently published: %A" other)
+            let reason =
+                sprintf "PushConflict operation=%s command=%s expected=%s observed=%s; %s; fetch and reconcile, never force"
+                    proof.PushOperationId proof.PushCommand sha competing failure
+            WorkQueueGitLedger.executeInertFixtureAt b "Worker" (Guid.NewGuid()) before.Version
+                1011L (MarkSourceRecoveryBlocked ("L1", "I", proof.ClaimGeneration, reason))
+                |> success |> ignore
+            let _, blocked = WorkQueueGitLedger.load a |> success
+            Assert.That(blocked.Works.["I"].Gate, Is.EqualTo(GateState.SourceRecoveryBlocked reason))
+            Assert.That(WorkQueueGitLedger.latestSourceHandoff blocked "I", Is.EqualTo(None))
+            Assert.That(git owner.RepositoryPath [ "rev-parse"; "HEAD" ], Is.EqualTo(sha))
+            Assert.That(git b.RepositoryPath [ "ls-remote"; "origin"; remoteRef ],
+                        Does.Contain(competing)))
 
     [<Test>]
     member _.PinnedSuccessorVerifierRejectsStaleCloneDirtyCheckoutAndWipDrift() =
@@ -1140,7 +1216,7 @@ type WorkQueueGitLedgerTests() =
             let _, accepted = WorkQueueGitLedger.load a |> success
             Assert.That(accepted.Works.ContainsKey "initial", Is.True))
     [<Test>]
-    member _.MissingRemoteWipDirtyCheckoutAndUnknownJobRemainClaimedRecoveryBlocked() =
+    member _.MissingRemoteWipDirtyCheckoutAndUnknownOriginalOperationRemainRecoverable() =
         withClones (fun a b ->
             let owner, _, lineage, uuid, claimed = startSourceClaim a b
             let sha, remoteRef = commitSourceWip owner "I" "L1" claimed.Works.["I"].ClaimGeneration
@@ -1161,17 +1237,20 @@ type WorkQueueGitLedgerTests() =
             File.WriteAllText(Path.Combine(owner.RepositoryPath, "forgotten-untracked.txt"), "dirty source")
             rejected owner (YieldSource proof)
             File.Delete(Path.Combine(owner.RepositoryPath, "forgotten-untracked.txt"))
-            // Clean HEAD cannot release a claim without independently
-            // reconciled original push/job journals and protected ref policy.
-            rejected owner (YieldSource proof)
-            // A conservative journal or unknown push outcome requires an
-            // explicit durable RecoveryBlocked record before any requeue.
+            // The original process was never reconciled; report what is known
+            // and retain the claim for an agent to resolve instead of silently
+            // pretending that a read-only remote check settled every process.
+            let recovery =
+                sprintf "Unknown original operation %s; command=%s; remote=%s observed=%s; inspect original process, fetch, and add audited repair note"
+                    proof.PushOperationId proof.PushCommand remoteRef sha
             WorkQueueGitLedger.executeInertFixtureAt b "Worker" (Guid.NewGuid()) originalVersion 2001L
-                (MarkSourceRecoveryBlocked ("L1", "I", proof.ClaimGeneration, "mutating job not reconciled"))
+                (MarkSourceRecoveryBlocked ("L1", "I", proof.ClaimGeneration, recovery))
             |> success |> ignore
             let _, blocked = WorkQueueGitLedger.load a |> success
             Assert.That(blocked.Works.["I"].Gate,
-                        Is.EqualTo(GateState.SourceRecoveryBlocked "mutating job not reconciled"))
+                        Is.EqualTo(GateState.SourceRecoveryBlocked recovery))
+            Assert.That(recovery, Does.Contain(proof.PushOperationId))
+            Assert.That(recovery, Does.Contain(remoteRef))
             Assert.That(blocked.Works.["I"].State, Is.EqualTo(WorkState.Claimed "L1"))
             Assert.That(blocked.Works.["I"].ClaimGeneration, Is.EqualTo(proof.ClaimGeneration))
             match blocked.Launches.["L1"].State with

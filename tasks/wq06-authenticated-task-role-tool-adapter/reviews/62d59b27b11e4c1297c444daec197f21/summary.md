@@ -1,1 +1,11 @@
-.NET 11 Release disposable WQ06 client CAS/replay 7/7; Server.Tests 277/277 passed on source worktree; git diff --check clean. Exact commit 084f6143; two-file test/docs-only change. Main already includes default-off typed adapter; connected live catalog currently lacks WQ06 aliases.
+# Reviewer 2 — Accepted frozen WQ-06 test/documentation addition
+
+**Reviewed:** `084f6143009596d47485931d9b0637dcab398747`, base `275dce20cd0d3b51bb8369d27cdb6f03a8942691`. Verified the registered isolated source worktree HEAD exactly matched the frozen SHA, the worktree was clean after tests, and `git diff --check` passed. Delta is limited to `Server.Tests/ServiceTests.fs` (one positive authenticated server transport test) and `docs/specs/wq06-operator-conversations.md` (explicit observed live-registration gap).
+
+**Independent .NET 11 Release evidence:**
+- `dotnet test Server.Tests/Server.Tests.fsproj -c Release --no-restore --filter FullyQualifiedName~wq06_authenticated_mcp_post_forwards_only_oauth_derived_actor_and_original_uuid --nologo --verbosity minimal`: exit 0, 1 passed/0 failed/0 skipped, no timeout.
+- `dotnet test Server.Tests/Server.Tests.fsproj -c Release --no-restore --filter FullyQualifiedName~wq06_manual_conversation_mcp_is_default_off_and_enforces_git_write_scope --nologo --verbosity quiet`: exit 0, 1 passed/0 failed/0 skipped, no timeout.
+
+**Assessment:** The added positive test constructs a Git-write-scoped authenticated claims principal, registers the disposable client connection, dispatches through the public MCP method, and asserts the serialized wire command derives `ActorId` from the OAuth subject rather than the caller's `agentId`, preserving the caller-supplied original operation UUID, stable message ID, subject and expected version. Existing negative server tests gate default-off and absent `git:write`; existing client two-clone tests cover Git CAS/replay and stale handler generation. No further issues found in this narrow test/docs delta.
+
+**Boundary:** This accepts the **source test/documentation change only**, not live operator-conversation availability or full Task/Role end-to-end integration. The live MCP catalog was observed lacking WQ-06 aliases. No deployment, restart, default-off enablement, production message, or live Git mutation was performed in this review. Worker 8 reported client 7/7 and Server.Tests 277/277, but Reviewer 2 independently reran only the two focused server cases above. Lead remains responsible for any later integration/activation.

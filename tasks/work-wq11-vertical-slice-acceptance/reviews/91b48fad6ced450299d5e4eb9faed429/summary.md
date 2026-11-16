@@ -1,0 +1,1 @@
+WQ11 new two-project, one-account cap-one disposable Git fixture and go/no-go runbook; .NET 11 Release executed 51/51 tests (new 1, adjacent 12+38), clean isolated source. Verify missing composition evidence verifier, Work-native claim/session bindings and WQ08 immutable lineage are reported NO-GO rather than treated as production-ready. No live effects or migration.

@@ -67,6 +67,18 @@ type WorkQueueSchedulerHostPreviewTests() =
     let gitSnapshot =
         { Commit = projectHead; Header = Unchecked.defaultof<LedgerHeader> }
 
+    let canonicalOrigin: CanonicalWorkOrigin =
+        { SchemaVersion = 1; ProjectId = projectId; WorkId = stage.Id
+          SourceHead = projectHead; SourceHighWater = 9L
+          SourceOperationId = "source-operation-1"; SourceOperationSequence = 4L
+          SourceOperationKind = "ImplementationReady"; SourceOperationActor = "fixture"
+          SourceRequestHash = "source-request-hash"; SourceOriginHead = projectHead
+          SourceEntityPath = "tasks/task-1/task.json"; SourceEntityBlobOid = "source-blob"
+          SourceEntitySha256 = "source-content-hash"; SourceSelector = "ImplementationReady"
+          SourceRef = "refs/heads/task-1"; SourceCommit = "1234567890abcdef1234567890abcdef12345678"
+          RoleId = "Worker"; RoleVersion = 4
+          AccountCreditStatus = "NoCredit"; Ambiguity = "" }
+
     let ports project held (readOriginal: string -> Result<OriginalBrowserJournalEntry option,string>) : SchedulerHostPreviewPorts =
         { ReadAccount = fun () -> Ok(account held)
           ReadProject = fun () -> Ok(gitSnapshot, pinned project)
@@ -96,17 +108,7 @@ type WorkQueueSchedulerHostPreviewTests() =
     [<Test>]
     member _.RecordedSourceShaAndReceiptAreVisibleWithoutPromotingThemToAuthority() =
         let sha = "1234567890abcdef1234567890abcdef12345678"
-        let origin: CanonicalWorkOrigin =
-            { SchemaVersion = 1; ProjectId = projectId; WorkId = stage.Id
-              SourceHead = projectHead; SourceHighWater = 9L
-              SourceOperationId = "source-operation-1"; SourceOperationSequence = 4L
-              SourceOperationKind = "ImplementationReady"; SourceOperationActor = "fixture"
-              SourceRequestHash = "source-request-hash"; SourceOriginHead = projectHead
-              SourceEntityPath = "tasks/task-1/task.json"; SourceEntityBlobOid = "source-blob"
-              SourceEntitySha256 = "source-content-hash"; SourceSelector = "ImplementationReady"
-              SourceRef = "refs/heads/task-1"; SourceCommit = sha
-              RoleId = "Worker"; RoleVersion = 4
-              AccountCreditStatus = "NoCredit"; Ambiguity = "" }
+        let origin = { canonicalOrigin with SourceCommit = sha }
         let original = ports empty false (fun _ -> Ok None)
         let withOrigin =
             { original with
@@ -192,3 +194,78 @@ type WorkQueueSchedulerHostPreviewTests() =
             issue.Code = "AccountUnknown" && issue.NextAction.Contains("account remote unavailable")), Is.True)
         Assert.That(report.Issues |> List.exists (fun issue ->
             issue.Code = "ProjectUnknown" && issue.NextAction.Contains("project checkout stale")), Is.True)
+
+    [<Test>]
+    member _.SourceOriginIdentityConflictIsVisibleWithoutTrustingBorrowedReceipt() =
+        let mismatched = { canonicalOrigin with ProjectId = "wrong-project"; WorkId = "wrong-work" }
+        let original = ports empty false (fun _ -> Ok None)
+        let withOrigin = { original with ReadOrigin = fun _ _ -> Ok(Some(mismatched, "unexpected-source-oid")) }
+        let report = WorkQueueSchedulerHostPreview.previewWith withOrigin "Worker"
+        Assert.That(report.Issues |> List.exists (fun e ->
+            e.Code = "SourceReceiptIdentityConflict"
+            && e.Record = stage.Id), Is.True)
+        Assert.That(report.CanDispatch, Is.False)
+
+    [<Test>]
+    member _.AccountTokenStatusMatchesExistingLaunchWithoutChangingGlobalCapacity() =
+        let launchId = "55555555-5555-4555-8555-555555555555"
+        let originalAdmission = "77777777-7777-4777-8777-777777777777"
+        let launch: Launch =
+            { Id = launchId; ProjectId = projectId; RoleId = "Worker"; RoleVersion = 4
+              AccountTokenId = originalAdmission; State = LaunchState.ReservedUnregistered
+              Lease = None; Version = 0; Credit = None; PrimaryWorkId = None
+              EverClaimed = false; AncillaryMessages = Set.empty; DispatchCount = 0 }
+        let project = { empty with Launches = Map.ofList [ launchId, launch ] }
+        let original = ports project true (fun _ -> Ok None)
+        let report = WorkQueueSchedulerHostPreview.previewWith original "Worker"
+        Assert.That(report.ExistingLaunches.Head.AccountTokenStatus, Is.EqualTo("Held"))
+        Assert.That(report.Issues |> List.exists (fun e ->
+            e.Code = "AccountTokenMissing" || e.Code = "AccountTokenIdentityConflict"), Is.False)
+        Assert.That(report.AvailableSlots, Is.EqualTo(Some 0))
+        Assert.That(report.CanDispatch, Is.False)
+
+        let originalAccount = account true
+        let wrongTokens =
+            originalAccount.State.Tokens
+            |> Array.map (fun t -> { t with ProjectLedgerId = "different-ledger" })
+        let wrongState = { originalAccount.State with Tokens = wrongTokens }
+        let mismatched = { originalAccount with State = wrongState }
+        let wrongLedger = WorkQueueSchedulerHostPreview.previewWith
+                              { original with ReadAccount = fun () -> Ok mismatched } "Worker"
+        Assert.That(wrongLedger.ExistingLaunches.Head.AccountTokenStatus, Is.EqualTo("IdentityConflict"))
+        Assert.That(wrongLedger.Issues |> List.exists (fun e ->
+            e.Code = "AccountTokenIdentityConflict"), Is.True)
+
+        let releasedTokens =
+            originalAccount.State.Tokens
+            |> Array.map (fun t -> { t with Status = "Released" })
+        let releasedState = { originalAccount.State with Tokens = releasedTokens }
+        let released = { originalAccount with State = releasedState }
+        let afterRelease = WorkQueueSchedulerHostPreview.previewWith
+                               { original with ReadAccount = fun () -> Ok released } "Worker"
+        Assert.That(afterRelease.ExistingLaunches.Head.AccountTokenStatus, Is.EqualTo("Released"))
+        Assert.That(afterRelease.Issues |> List.exists (fun e ->
+            e.Code = "AccountTokenReleasedWhileActive"), Is.True)
+        Assert.That(afterRelease.CanDispatch, Is.False)
+
+    [<Test>]
+    member _.MissingAccountTokenAndDifferentRoleHistoryAreNotSilentlyConflated() =
+        let launchId = "not-reserved"
+        let launch: Launch =
+            { Id = launchId; ProjectId = projectId; RoleId = "Worker"; RoleVersion = 4
+              AccountTokenId = "original-admission"; State = LaunchState.ReservedUnregistered
+              Lease = None; Version = 0; Credit = None; PrimaryWorkId = None
+              EverClaimed = false; AncillaryMessages = Set.empty; DispatchCount = 0 }
+        let otherRole =
+            [ 1 .. 65 ]
+            |> List.map (fun n ->
+                let id = "reviewer-history-" + string n
+                id, { launch with Id = id; RoleId = "Reviewer" })
+        let project = { empty with Launches = Map.ofList ((launchId, launch) :: otherRole) }
+        let report = WorkQueueSchedulerHostPreview.previewWith
+                         (ports project false (fun _ -> Ok None)) "Worker"
+        Assert.That(report.ExistingLaunches.Length, Is.EqualTo(1))
+        Assert.That(report.ExistingLaunches.Head.AccountTokenStatus, Is.EqualTo("Missing"))
+        Assert.That(report.Issues |> List.exists (fun e -> e.Code = "AccountTokenMissing"), Is.True)
+        Assert.That(report.Issues |> List.exists (fun e -> e.Code = "LaunchListTruncated"), Is.False)
+        Assert.That(report.CanDispatch, Is.False)

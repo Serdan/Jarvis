@@ -39,6 +39,7 @@ type PreviewLaunch =
       RoleVersion: int
       Credit: string option
       State: string
+      AccountTokenStatus: string
       AdmissionOperationId: string option
       AdmissionKind: string option
       OriginalBrowserOperationId: string option
@@ -185,6 +186,14 @@ module WorkQueueSchedulerHostPreview =
                         let head, sourceRef, commit, operation, requestHash, oid =
                             match source with
                             | Ok (Some(origin, blob)) ->
+                                if origin.ProjectId <> pinned.Proof.ProjectId
+                                   || origin.WorkId <> demand.WorkId
+                                   || String.IsNullOrWhiteSpace origin.SourceOperationId
+                                   || String.IsNullOrWhiteSpace origin.SourceRequestHash then
+                                    add "SourceReceiptIdentityConflict" demand.WorkId
+                                        ("The WQ04 origin at project head " + snapshot.Commit
+                                         + " disagrees with selected work or lacks original IDs. "
+                                         + "Inspect the immutable source record before launch.")
                                 Some origin.SourceHead,
                                 (if String.IsNullOrWhiteSpace origin.SourceRef then None else Some origin.SourceRef),
                                 (if String.IsNullOrWhiteSpace origin.SourceCommit then None else Some origin.SourceCommit),
@@ -212,13 +221,48 @@ module WorkQueueSchedulerHostPreview =
                               SourceRequestHash = requestHash
                               OriginBlobOid = oid }
 
-            launches <-
+            let roleLaunches =
                 pinned.Project.Launches
                 |> Map.toList
                 |> List.map snd
                 |> List.filter (fun launch -> launch.RoleId = roleId)
+            launches <-
+                roleLaunches
                 |> List.truncate 64
                 |> List.map (fun launch ->
+                    let accountTokenStatus =
+                        match account with
+                        | Error _ -> "Unknown"
+                        | Ok snapshot ->
+                            match snapshot.State.Tokens |> Array.filter (fun token -> token.LaunchId = launch.Id) with
+                            | [||] ->
+                                add "AccountTokenMissing" launch.Id
+                                    ("No account-global token for this project launch at account head "
+                                     + snapshot.Head + "; inspect original reservation before release or retry.")
+                                "Missing"
+                            | [| token |] when token.ProjectId = launch.ProjectId
+                                               && token.ProjectLedgerId = pinned.Proof.LedgerId
+                                               && token.ProjectLedgerEpoch = pinned.Proof.Epoch
+                                               && token.RoleId = launch.RoleId
+                                               && token.RoleConfigVersion = int64 launch.RoleVersion
+                                               && token.AdmissionOperationId = launch.AccountTokenId ->
+                                match launch.State, token.Status with
+                                | LaunchState.ReservedUnregistered, "Released"
+                                | LaunchState.SubmittedUnregistered _, "Released"
+                                | LaunchState.Registered _, "Released"
+                                | LaunchState.DemandInvalidatedPendingTerminal _, "Released" ->
+                                    add "AccountTokenReleasedWhileActive" launch.Id
+                                        "Project launch is not terminal but account capacity was released; inspect original heads and receipts."
+                                | _ -> ()
+                                token.Status
+                            | [| _ |] ->
+                                add "AccountTokenIdentityConflict" launch.Id
+                                    "Account token project/ledger, role/version or admission ID differs; preserve both original records."
+                                "IdentityConflict"
+                            | _ ->
+                                add "AccountTokenDuplicate" launch.Id
+                                    "Multiple account-global tokens claim this launch ID; inspect original account Git records."
+                                "Duplicate"
                     let admission =
                         try ports.ReadAdmission snapshot launch.Id
                         with ex -> Error ex.Message
@@ -259,14 +303,15 @@ module WorkQueueSchedulerHostPreview =
                       RoleVersion = launch.RoleVersion
                       Credit = launch.Credit
                       State = publicLaunchState launch.State
+                      AccountTokenStatus = accountTokenStatus
                       AdmissionOperationId = admissionId
                       AdmissionKind = kind
                       OriginalBrowserOperationId = browserId
                       OriginalBrowserOutcome = outcome
                       OriginalBrowserReceipt = receipt })
-            if pinned.Project.Launches.Count > 64 then
+            if roleLaunches.Length > 64 then
                 add "LaunchListTruncated" snapshot.Commit
-                    "Inspect project ledger directly for remaining launch states."
+                    "Inspect project ledger directly for remaining launches matching this role."
 
         // Even when this preview can identify a candidate and free capacity,
         // no executable launch ID/one-shot operation is fabricated.

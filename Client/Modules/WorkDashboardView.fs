@@ -94,8 +94,9 @@ let fit width value =
 
 let private validHead (head: string) =
     not (String.IsNullOrWhiteSpace head)
-    && head.Length = 40
-    && head |> Seq.forall Uri.IsHexDigit
+    // A verified project Git head can be a lowercase SHA-1 or SHA-256 OID.
+    && (head.Length = 40 || head.Length = 64)
+    && (head |> Seq.forall (fun c -> (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
 
 let private rank = function
     | "Available" -> 0

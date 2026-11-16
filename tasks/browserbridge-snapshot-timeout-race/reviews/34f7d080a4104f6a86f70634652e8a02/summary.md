@@ -16,6 +16,6 @@ Commit `c1ac0d00ac5fd7add442d8ed16dafa0ad8ec3d04`, branch `refs/heads/fix/browse
 - Baseline focused Release run (before patch): 1/1 passed; intermittent fault not reproduced in isolation.
 - Patched .NET 11 Release focused tests (new silent-capture and existing slow-chunk test): 2/2 in initial build, then 4 further runs of 2/2 = **10/10 test executions**.
 - Patched BrowserBridge Release suite: **45/45 passed**.
-- Baseline full Client.Tests Release run with 240-second ceiling timed out; output showed unrelated `ActivityLog.fs` activity-persistence `InvalidDataException`/`UnauthorizedAccessException` diagnostics. Full patched suite is separately running; its status must be recorded without attributing unrelated failures to BrowserBridge.
+- Baseline full Client.Tests Release run with 240-second ceiling timed out; output showed unrelated `ActivityLog.fs` activity-persistence `InvalidDataException`/`UnauthorizedAccessException` diagnostics. The patched full Client.Tests Release run also timed out at the same 240-second ceiling, emitting the same activity-persistence diagnostics. Neither run completed, so a full-suite pass is **not** claimed. This limitation should be tracked separately from the passing 45-test BrowserBridge suite; no causation from the snapshot change is established.
 
 No integration, deployment, or restart performed. Review this exact frozen commit; integration belongs to Lead only after an Accepted verdict.

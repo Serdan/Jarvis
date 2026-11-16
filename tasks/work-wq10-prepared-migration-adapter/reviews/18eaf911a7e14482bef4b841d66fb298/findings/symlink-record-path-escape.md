@@ -1,0 +1,12 @@
+# [P1] Checked-out Git symlink escapes the disposable fixture write boundary before staging fails
+
+**Frozen source:** `7305fc733185cd14367b972a30b1294b047703de`
+**Location:** `tools/Wq10MigrationPreview/prepare.py:251-262` (`stage_commit`).
+
+`validate_repo` checks that the authority is a distinct bare Git repository under the marked disposable root, and `checked_output` validates backup/diff/receipt paths. But `stage_commit` clones an *untrusted Git tree* to a temporary checkout and constructs `checkout / relpath` without checking for checked-out symlinks along the destination path. `target.parent.mkdir(parents=True, exist_ok=True)` and `target.write_text(...)` follow an inherited Git symlink such as `records -> /tmp/another-directory`. That creates directories and files *outside* the disposable fixture root, despite `--apply-disposable` and explicit boundary checks elsewhere. The later `git add -- records/...json` correctly refuses a path beyond a symlink, but the forbidden filesystem write has already happened.
+
+**Independently reproduced on the exact frozen source:** Created a temporary worktree containing a committed Git symlink `records` pointing to an independent temporary directory outside the marked fixture root; cloned it as a bare authority beneath that root. Called `prepare.stage_commit(root, repo, head, "records/work-queue/prepared-adapter/<uuid>.json", record)`. It failed with `GIT_FAILED: ... pathspec ... is beyond a symbolic link`, **but** `write_outside_checkout=True` and `outside_fixture_root=True`, and the external file contained the emitted JSON record. All test paths were fresh disposable /tmp directories; no real user files were touched.
+
+**Impact:** Source-controlled symlinks in cloned authorities can redirect writes outside the authorized fixture boundary. The safe-repository and evidence-output validation do not protect this checkout path.
+
+**Required correction:** Avoid writing through any symlink from the staged Git tree. Validate the *entire* checkout destination ancestry and reject symlinked components **before mkdir/write**, or construct the new Git tree with object/tree plumbing without materializing unchecked paths. Do not rely on `git add` to catch this after effects. Add an adversarial fixture test with a committed symlink at `records` (and/or `records/work-queue`) pointing outside the disposable root; assert the operation fails without creating or changing any external path.

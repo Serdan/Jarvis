@@ -174,6 +174,7 @@ type WorkMutation =
     | Heartbeat of launchId: string * leaseGeneration: int
     | StopStalled of launchId: string * leaseGeneration: int * stalledAfter: int64
     | ClaimNext of launchId: string
+    | ClaimVerifiedWork of launchId: string * workId: string * expectedStageGeneration: int * resultingClaimGeneration: int
     | CompleteOrdinary of launchId: string * workId: string
     | CompleteMessage of launchId: string * workId: string * messageId: string * handlerGeneration: int * replyId: string
     | ClaimAncillary of launchId: string * messageId: string
@@ -184,6 +185,7 @@ type WorkMutation =
     | TerminalizeNoClaim of launchId: string
     | YieldReadOnly of launchId: string * workId: string * expectedClaimGeneration: int
     | CheckpointReadOnly of launchId: string * workId: string * expectedClaimGeneration: int * summarySha256: string
+    | CompleteVerifiedReadOnly of launchId: string * workId: string * expectedClaimGeneration: int * terminalEvidenceSha256: string
     | YieldSource of SourceCheckpoint
     | MarkSourceRecoveryBlocked of launchId: string * workId: string * expectedClaimGeneration: int * reason: string
     | ResolveReadOnlyGate of launchId: string * workId: string * expectedClaimGeneration: int
@@ -1054,7 +1056,11 @@ module WorkQueueGitLedger =
         | ProduceEvent _ -> false // ProduceEvent has its own unconditional hold.
         | _ -> true
 
-    let private change inertFixture (binding: LedgerBinding) (actor: string) (operationId: Guid) (expectedVersion: int) (now: int64) (mutation: WorkMutation) =
+    // Opt-in disposable Work lifecycle checks run inside the winning project
+    // Git CAS, against both the original and resulting canonical stages.
+    let private change inertFixture
+            (verifiedLifecycle: (LedgerSnapshot -> Project -> Project -> Result<unit, LedgerFailure>) option)
+            (binding: LedgerBinding) (actor: string) (operationId: Guid) (expectedVersion: int) (now: int64) (mutation: WorkMutation) =
         let request = JsonObject()
         request.Add("schemaVersion", JsonValue.Create(1))
         request.Add("expectedProjectVersion", JsonValue.Create(expectedVersion))
@@ -1138,6 +1144,16 @@ module WorkQueueGitLedger =
                             Contracts.markStalled expectedVersion op launch generation now timeout state
                         | ClaimNext launch ->
                             Contracts.claimNext expectedVersion op launch state
+                        | ClaimVerifiedWork (launch, work, stageGeneration, claimGeneration) ->
+                            match state.Works.TryFind work, state.Launches.TryFind launch with
+                            | Some stage, Some owner
+                                when stage.StageGeneration = stageGeneration
+                                     && stage.ClaimGeneration + 1 = claimGeneration
+                                     && stage.State = WorkState.Available
+                                     && owner.Credit = Some work
+                                     && not owner.EverClaimed ->
+                                Contracts.claimNext expectedVersion op launch state
+                            | _ -> Error(Rejection.InvalidState "stale selected Work/stage/claim or credit")
                         | CompleteOrdinary (launch, work) ->
                             match state.Works.TryFind work with
                             | Some stage when stage.Kind = WorkKind.Implementation
@@ -1190,6 +1206,23 @@ module WorkQueueGitLedger =
                                          Version = state.Version + 1
                                          Receipts = state.Receipts.Add(op, ProjectOperationPayload.OtherMutation evidence) }
                             | _ -> Error(Rejection.InvalidState "stale/read-write checkpoint generation")
+                        | CompleteVerifiedReadOnly (launch, work, claimGeneration, evidenceSha) ->
+                            match state.Launches.TryFind launch, state.Works.TryFind work with
+                            | Some owner, Some claimed
+                                when owner.PrimaryWorkId = Some work
+                                     && (match owner.State with LaunchState.Registered _ -> true | _ -> false)
+                                     && claimed.State = WorkState.Claimed launch
+                                     && claimed.ClaimGeneration = claimGeneration
+                                     && claimed.Kind = WorkKind.Planning
+                                     && claimed.Domain = DomainState.Undecided
+                                     && claimed.SourceLineage.IsNone
+                                     && claimed.Push.IsNone
+                                     && not claimed.IntegrationAuthorized
+                                     && not (isNull evidenceSha)
+                                     && Regex.IsMatch(evidenceSha, "^[a-f0-9]{64}$") ->
+                                Contracts.completeOrdinary expectedVersion op launch work now state
+                            | _ -> Error(Rejection.InvalidState
+                                           "read-only completion requires matching claimed generation and terminal evidence")
                         | ResolveReadOnlyGate (launch, work, claimGeneration) ->
                             match state.Works.TryFind work with
                             | Some claimed when claimed.State = WorkState.Claimed launch
@@ -1206,6 +1239,10 @@ module WorkQueueGitLedger =
                     transition
                     |> Result.mapError failure
                     |> Result.bind (fun changed ->
+                        let lifecycleProof =
+                            match verifiedLifecycle with
+                            | Some verify -> verify snapshot state changed
+                            | None -> Ok ()
                         // Verify against the *approved remote* inside the
                         // original Git-ledger transaction before publication.
                         // Receipt replay bypasses this planner on another
@@ -1226,7 +1263,8 @@ module WorkQueueGitLedger =
                                 | Some prior ->
                                     verifySourceHandoff binding prior checkpoint
                                 | None -> Error(sourceReject "missing source stage")
-                            | ClaimNext launchId ->
+                            | ClaimNext launchId
+                            | ClaimVerifiedWork (launchId, _, _, _) ->
                                 match changed.Launches.TryFind launchId with
                                 | Some launch ->
                                     match launch.PrimaryWorkId with
@@ -1243,7 +1281,8 @@ module WorkQueueGitLedger =
                                     | None -> Error(sourceReject "claim has no primary work")
                                 | None -> Error(sourceReject "claimed launch disappeared")
                             | _ -> Ok()
-                        sourceProof
+                        lifecycleProof
+                        |> Result.bind (fun () -> sourceProof)
                         |> Result.bind (fun () -> validatedContent binding changed)
                         |> Result.bind (fun raw ->
                             witnessChanges binding snapshot state changed mutation operationId
@@ -1258,7 +1297,7 @@ module WorkQueueGitLedger =
         let now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
         let result =
             validateMutationPayload mutation
-            |> Result.bind (fun () -> change false binding actor operationId expectedVersion now mutation)
+            |> Result.bind (fun () -> change false None binding actor operationId expectedVersion now mutation)
         match result, dropPublishedAck.Value with
         | Ok _, Some shouldDrop when shouldDrop operationId ->
             Error(OutcomeUnknown $"Injected lost WQ-02 post-publication acknowledgement {operationId:D}.")
@@ -1330,14 +1369,32 @@ module WorkQueueGitLedger =
     // Deterministic tests can replay adversarial interleavings with virtual time.
     let internal executeAt binding actor operationId expectedVersion now mutation =
         validateMutationPayload mutation
-        |> Result.bind (fun () -> change false binding actor operationId expectedVersion now mutation)
+        |> Result.bind (fun () -> change false None binding actor operationId expectedVersion now mutation)
 
     // Only the explicitly named test seam can simulate the accepted WQ-02
     // state machine. Its mutations are restricted to durable Frozen envelopes.
     // Neither this internal method nor its receipts grant canonical origin.
     let internal executeInertFixtureAt binding actor operationId expectedVersion now mutation =
         validateMutationPayload mutation
-        |> Result.bind (fun () -> change true binding actor operationId expectedVersion now mutation)
+        |> Result.bind (fun () -> change true None binding actor operationId expectedVersion now mutation)
+
+    // This seam is for explicit disposable Frozen Work fixtures only. A trusted
+    // caller must validate WQ03 original/execution continuity, WQ04 role/source
+    // and WQ07 held credit in the CAS planner, including the resulting chosen
+    // Work. No live dispatch or public MCP command calls this function.
+    let internal executePinnedDisposableLifecycle binding actor operationId expectedVersion
+            now mutation (verifyAtCas: LedgerSnapshot -> Project -> Project -> Result<unit, LedgerFailure>) =
+        let supported =
+            match mutation with
+            | ClaimVerifiedWork _ | CheckpointReadOnly _ | CompleteVerifiedReadOnly _ -> true
+            | _ -> false
+        if not supported || isNull (box verifyAtCas) then
+            Error(InvalidBinding
+                "Disposable Work CAS accepts only an evidence-verified claim, read-only checkpoint or completion.")
+        else
+            validateMutationPayload mutation
+            |> Result.bind (fun () ->
+                change true (Some verifyAtCas) binding actor operationId expectedVersion now mutation)
 
     let internal executeInertFixture binding actor operationId expectedVersion mutation =
         let now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()

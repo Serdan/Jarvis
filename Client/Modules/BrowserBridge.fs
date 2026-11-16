@@ -246,7 +246,8 @@ type Service(port: int, pairingSecret: string) =
                 try socket.Abort() with _ -> ()
     }
 
-    let requestSnapshotFrame (conn: Connection) (requestId: string) (frame: string) (timeoutMs: int) = task {
+    let requestSnapshotFrame (conn: Connection) (requestId: string) (frame: string)
+                             (timeoutMs: int) (timeoutError: string) = task {
         if conn.Pending.Count >= 4 then return Error "BridgeBusy"
         else
             let pending = TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously)
@@ -258,7 +259,7 @@ type Service(port: int, pairingSecret: string) =
                         let! response = pending.Task.WaitAsync(TimeSpan.FromMilliseconds(float timeoutMs))
                         return Ok response
                     with
-                    | :? TimeoutException -> return Error "SnapshotTransportTimeout"
+                    | :? TimeoutException -> return Error timeoutError
                     | ex -> return Error("SnapshotTransportFailure:" + ex.GetType().Name)
                 finally
                     let mutable removed = Unchecked.defaultof<TaskCompletionSource<string>>
@@ -558,10 +559,12 @@ type Service(port: int, pairingSecret: string) =
                                registrationId = registrationId; registrationGeneration = generation;
                                timeoutMs = timeoutMs; mode = mode;
                                wait = waitDoc.RootElement.Clone(); captureSelector = captureSelector |}
+                        // The capture wait consumes the caller's remaining deadline;
+                        // its timer is not an independent transport timeout.
                         let! received =
                             let remaining = remainingMs()
                             if remaining <= 0 then Task.FromResult(Error "SnapshotDeadlineExceeded")
-                            else requestSnapshotFrame conn requestId frame remaining
+                            else requestSnapshotFrame conn requestId frame remaining "SnapshotDeadlineExceeded"
                         match received with
                         | Error e when remainingMs() <= 0 -> return Error "SnapshotDeadlineExceeded"
                         | Error e -> return Error e
@@ -621,10 +624,15 @@ type Service(port: int, pairingSecret: string) =
                                                     let chunkFrame = serialize {| version = ProtocolVersion; kind = "snapshotChunk";
                                                            requestId = chunkRequestId; connectionId = conn.Id;
                                                            snapshotId = snapshotId; offset = offset |}
+                                                    let remaining = remainingMs()
                                                     let! chunkResult =
-                                                        let remaining = remainingMs()
                                                         if remaining <= 0 then Task.FromResult(Error "SnapshotDeadlineExceeded")
-                                                        else requestSnapshotFrame conn chunkRequestId chunkFrame (min remaining 10000)
+                                                        else
+                                                            let deadlineBounded = remaining <= 10000
+                                                            requestSnapshotFrame conn chunkRequestId chunkFrame
+                                                                (min remaining 10000)
+                                                                (if deadlineBounded then "SnapshotDeadlineExceeded"
+                                                                 else "SnapshotTransportTimeout")
                                                     match chunkResult with
                                                     | Error _ when remainingMs() <= 0 -> error <- Some "SnapshotDeadlineExceeded"
                                                     | Error e -> error <- Some e

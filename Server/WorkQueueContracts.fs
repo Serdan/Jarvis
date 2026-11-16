@@ -703,6 +703,33 @@ module Contracts =
                         Ok { current with Launches = current.Launches.Add(launchId, updated) }
                 | _ -> Error(Rejection.InvalidState "unsubmitted launch cannot register")) project
 
+    // Only the credential-verified Work CAS adapter may invoke this transition.
+    // launchId is the execution identity. Neither a new agent UUID nor the
+    // bearer token is written to canonical state or operation receipts.
+    let initializeCredential expected op launchId now project =
+        projectCas expected op ("initialize-work|" + launchId) (fun current ->
+            match current.Launches.TryFind launchId with
+            | None -> Error(Rejection.InvalidState "unknown launch")
+            | Some launch ->
+                let marker = "work-credential-v1:" + launchId
+                match launch.State with
+                | LaunchState.Registered (id, key) when id = launchId && key = marker ->
+                    match launch.Lease with
+                    | Some lease when not lease.StopRequested -> Ok current
+                    | _ -> Error Rejection.Terminal
+                | LaunchState.Registered _ -> Error Rejection.AlreadyRegistered
+                | LaunchState.TerminalPendingRelease _
+                | LaunchState.DemandInvalidatedPendingTerminal _ -> Error Rejection.Terminal
+                | LaunchState.SubmittedUnregistered DispatchState.Submitted
+                | LaunchState.SubmittedUnregistered DispatchState.OutcomeUnknown ->
+                    let updated =
+                        { launch with
+                            State = LaunchState.Registered(launchId, marker)
+                            Lease = Some { LastSeenAt = now; Generation = 1; StopRequested = false }
+                            Version = launch.Version + 1 }
+                    Ok { current with Launches = current.Launches.Add(launchId, updated) }
+                | _ -> Error(Rejection.InvalidState "unsubmitted launch cannot register")) project
+
     let heartbeat expected op launchId expectedLeaseGeneration now project =
         projectCas expected op ("heartbeat|" + launchId + "|" + string expectedLeaseGeneration + "|" + string now) (fun current ->
             match current.Launches.TryFind launchId with

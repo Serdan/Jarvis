@@ -40,23 +40,33 @@ module AccountAdmissionAdapter =
     // still be identical at the latest independently fetched, trusted head.
     let private verifyOrigin (binding: LedgerBinding) (snapshot: LedgerSnapshot)
                              (operationId: Guid) (witnessPath: string) =
+        // Original role admission writes exactly three paths, or four
+        // when its credential verifier is issued by that same Git CAS.
+        // Neither form applies to terminal or arbitrary witness paths.
+        let rolePaths, credentialPaths =
+            let rolePath =
+                witnessPath.Replace("/admissions/", "/role-admissions/", StringComparison.Ordinal)
+            let credentialPath =
+                witnessPath.Replace("/admissions/", "/credentials/", StringComparison.Ordinal)
+            [| WorkQueueGitLedger.RecordPath; witnessPath; rolePath |],
+            [| WorkQueueGitLedger.RecordPath; witnessPath; credentialPath; rolePath |]
+        let isAdmission =
+            witnessPath.StartsWith("records/work-queue/admissions/", StringComparison.Ordinal)
         LedgerStore.getOperationAt binding snapshot operationId
         |> Result.mapError explain
         |> Result.bind (function
             | None -> Error "Missing exact immutable WQ-02 operation."
             | Some operation when operation.Type = "WQ02.Mutate"
                                   && (operation.Paths = [| WorkQueueGitLedger.RecordPath; witnessPath |]
-                                      || (witnessPath.Contains("/admissions/", StringComparison.Ordinal)
-                                          && operation.Paths =
-                                             [| WorkQueueGitLedger.RecordPath; witnessPath
-                                                witnessPath.Replace("/admissions/", "/role-admissions/",
-                                                                    StringComparison.Ordinal) |])) ->
+                                      || (isAdmission
+                                          && (operation.Paths = rolePaths
+                                              || operation.Paths = credentialPaths))) ->
                 LedgerStore.getOperationOriginAt binding snapshot operation
                 |> Result.mapError explain
                 |> Result.bind (fun origin ->
                     let atOrigin = { snapshot with Commit = origin }
                     let roleVerified =
-                        if operation.Paths.Length = 3 then
+                        if operation.Paths = rolePaths || operation.Paths = credentialPaths then
                             WorkQueueRoleAuthority.loadAt binding snapshot
                             |> Result.map ignore |> Result.mapError explain
                         else Ok ()

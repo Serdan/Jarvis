@@ -1,0 +1,16 @@
+# Reviewer 2 — independent default-off Work-native Git-CAS verification
+
+Frozen source: `1923cca4ae7061f6c230a416036524074795bdd4`; baseline: `53105d3eaa1b476fadfe5470e962b4c5796fe8f9`.
+
+**Verdict recommendation: Accepted for the expressly disposable-only, default-off fixture. No production cutover authorization.** No blocking finding remains in the declared scope.
+
+## Review evidence
+
+- **Prior P1 Frozen production-mutation concern:** The opaque `NativeDisposableAuthority.AuthorizeFreshScratch` checks OS-temp nonce-named local project/account bare remotes, absence of existing ledger refs, canonical remote identities, and creates fresh nonce markers (WorkQueueNativeLifecycleCas.fs:43-129). `transitionDisposable` requires explicit enablement and exact marker/remote matches *before* entering Git mutation (401-427). Production `execute` still runs `change false None`; only the internal `executePinnedDisposableLifecycle` runs the Frozen test seam with the verifying callback (WorkQueueGitLedger.fs:1296-1300, 1378-1398). Searching the frozen Client and Server tree found no production call or MCP registration for either new entrypoint. The test mirrors a fully initialized Frozen project and proves rejection without head movement.
+- **Winning-CAS source, role, credit, session, and terminal checks:** The callback runs inside the pinned project Git-CAS planner against both original and resulting Work. It checks immutable WQ04 origin and role/admission history, held independent WQ07 token, exact WQ03 host-claim `PutRecord` at that head, accepted local original, WQ02 dispatch/first-connect receipts, authenticated ephemeral session and unexpired lease, and actual selected Work/claim generation (WorkQueueNativeLifecycleCas.fs:161-371). Checkpoint changes no ownership; completion is restricted to read-only Planning Work with authenticated terminal-evidence verification (372-394). No review acceptance, integration, domain finalization, or token release follows automatically.
+- **Git idempotency:** `ClaimVerifiedWork` persists the stage and claim-generation selection as part of the semantic request; the existing `LedgerStore.transact` returns a matching operation UUID receipt without replanning, rejects altered same-UUID payload, validates entity blob OIDs and pushes to the approved Git ref (LedgerStore.fs:2140-2220; WorkQueueGitLedger.fs:1147-1156).
+- **Independently rerun .NET 11 Release:** `dotnet test Client.Tests/Client.Tests.fsproj -c Release --filter FullyQualifiedName~WorkQueueNativeLifecycleCasTests --no-restore`: 3/3 passed. `dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-build --filter FullyQualifiedName~WorkQueueToolFacadeTests`: 7/7 passed. Source worktree: `worker12-work-native-lifecycle-cas-20261116`, verified at frozen head; no source edits. Existing non-fatal F# warnings only.
+
+## Boundary retained
+
+`INativeWorkSessionJournal` is a fake-provider injected port, *not* a proven production session/terminal source. Live source-writing Work, authenticated terminal reconciliation and separate verified WQ07 release remain unimplemented. As the submitted design explicitly states, this acceptance does not permit enabling a production scheduler, MCP mutation, browser effects, or Work cutover. Additional independent tests and review are needed for those future changes.

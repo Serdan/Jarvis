@@ -1,6 +1,9 @@
 module Client.WorkQueueNativeLifecycleCas
 
 open System
+open System.Diagnostics
+open System.IO
+open System.Security.Cryptography
 open System.Text.Json
 open Jarvis.WorkQueues
 open Client.LedgerStore
@@ -34,9 +37,101 @@ type NativeWorkAction =
     | Checkpoint of claimGeneration: int * summarySha256: string
     | Complete of claimGeneration: int * terminalEvidenceSha256: string
 
+// This nominal scope cannot be constructed or altered by a public Work call.
+// Its test-only issuer verifies fresh scratch remotes before either ledger exists.
+[<Sealed; AllowNullLiteral>]
+type NativeDisposableAuthority private (project: LedgerBinding, account: AccountBinding, nonce: string) =
+    member internal _.Matches(candidateProject: LedgerBinding, candidateAccount: AccountBinding) =
+        let same (a: string) (b: string) =
+            String.Equals(a, b, StringComparison.Ordinal)
+        let matchesProject =
+            project.ProjectId = candidateProject.ProjectId &&
+            project.LedgerId = candidateProject.LedgerId &&
+            project.Epoch = candidateProject.Epoch &&
+            same project.RemoteName candidateProject.RemoteName &&
+            same project.ApprovedFetchUrl candidateProject.ApprovedFetchUrl &&
+            same project.ApprovedPushUrl candidateProject.ApprovedPushUrl
+        let matchesAccount =
+            account.AccountId = candidateAccount.AccountId &&
+            account.LedgerId = candidateAccount.LedgerId &&
+            account.Epoch = candidateAccount.Epoch &&
+            same account.RemoteName candidateAccount.RemoteName &&
+            same account.ApprovedFetchUrl candidateAccount.ApprovedFetchUrl &&
+            same account.ApprovedPushUrl candidateAccount.ApprovedPushUrl
+        let marked (remote: string) =
+            try
+                isNull (DirectoryInfo(remote).LinkTarget) &&
+                same (File.ReadAllText(Path.Combine(remote, "info", "jarvis-native-disposable-authority"))) nonce
+            with _ -> false
+        matchesProject && matchesAccount &&
+        marked project.ApprovedPushUrl && marked account.ApprovedPushUrl
+
+    // The guarded issuer is part of the sealed type, not a free-standing
+    // constructor that another production call site could invoke directly.
+    static member internal AuthorizeFreshScratch(project: LedgerBinding, account: AccountBinding)
+            : Result<NativeDisposableAuthority, LedgerFailure> =
+        let reject text = InvalidBinding ("WQ-native disposable CAS: " + text)
+        let noLedgerRef (bare: string) =
+            use gitProbe = new Process()
+            gitProbe.StartInfo.FileName <- "git"
+            gitProbe.StartInfo.UseShellExecute <- false
+            gitProbe.StartInfo.CreateNoWindow <- true
+            for arg in ["--git-dir"; bare; "show-ref"; "--verify"; "--quiet";
+                        "refs/heads/jarvis-orchestration"] do
+                gitProbe.StartInfo.ArgumentList.Add arg
+            if not (gitProbe.Start()) then false
+            elif not (gitProbe.WaitForExit(10000)) then
+                gitProbe.Kill()
+                false
+            else gitProbe.ExitCode = 1
+        try
+            let pBare = Path.GetFullPath project.ApprovedPushUrl
+            let aBare = Path.GetFullPath account.ApprovedPushUrl
+            let root = Path.GetDirectoryName pBare
+            let temp = Path.TrimEndingDirectorySeparator(Path.GetFullPath(Path.GetTempPath()))
+            let name = Path.GetFileName root
+            let suffix =
+                if name.StartsWith("work-native-cas-", StringComparison.Ordinal) then
+                    name.Substring("work-native-cas-".Length)
+                else ""
+            let validNonceFolder =
+                match Guid.TryParseExact(suffix, "N") with
+                | true, id when id <> Guid.Empty -> true
+                | _ -> false
+            let valid =
+                validNonceFolder &&
+                String.Equals(Path.GetDirectoryName root, temp, StringComparison.Ordinal) &&
+                String.Equals(pBare, Path.Combine(root, "project.git"), StringComparison.Ordinal) &&
+                String.Equals(aBare, Path.Combine(root, "account.git"), StringComparison.Ordinal) &&
+                project.ApprovedFetchUrl = project.ApprovedPushUrl &&
+                account.ApprovedFetchUrl = account.ApprovedPushUrl &&
+                project.RemoteName = "origin" && account.RemoteName = "origin" &&
+                project.ProjectId <> Guid.Empty && project.LedgerId <> Guid.Empty &&
+                account.AccountId <> Guid.Empty && account.LedgerId <> Guid.Empty &&
+                project.Epoch > 0 && account.Epoch > 0 &&
+                isNull (DirectoryInfo(root).LinkTarget) &&
+                isNull (DirectoryInfo(pBare).LinkTarget) &&
+                isNull (DirectoryInfo(aBare).LinkTarget) &&
+                Directory.Exists(Path.Combine(pBare, "objects")) &&
+                Directory.Exists(Path.Combine(aBare, "objects"))
+            if not valid || not (noLedgerRef pBare && noLedgerRef aBare) then
+                Error(reject "Scratch authority requires fresh local test remotes; initialized or production ledgers are forbidden.")
+            else
+                let nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(32))
+                // CreateNew prevents scope reissuance after fixture setup.
+                for remote in [pBare; aBare] do
+                    use file = new FileStream(
+                        Path.Combine(remote, "info", "jarvis-native-disposable-authority"),
+                        FileMode.CreateNew, FileAccess.Write, FileShare.None)
+                    use writer = new StreamWriter(file)
+                    writer.Write(nonce)
+                Ok(NativeDisposableAuthority(project, account, nonce))
+        with ex -> Error(reject ("Cannot issue verified scratch authority: " + ex.Message))
+
 type NativeLifecycleBinding =
     { Project: LedgerBinding
       Account: AccountBinding
+      DisposableAuthority: NativeDisposableAuthority
       OriginalJournalRoot: string
       Selected: PlannerCandidate
       Admission: AccountAdmissionRequest
@@ -47,6 +142,12 @@ type NativeLifecycleBinding =
 module WorkQueueNativeLifecycleCas =
     let private reject text = InvalidBinding ("WQ-native disposable CAS: " + text)
     let private required test text = if test then Ok () else Error (reject text)
+
+    // Internal fixture entrypoint; only the guarded sealed-type issuer can
+    // construct an authority. No production tool route calls this function.
+    let internal authorizeFreshScratch project account =
+        NativeDisposableAuthority.AuthorizeFreshScratch(project, account)
+
     let private validSha (value: string) =
         not (isNull value) && value.Length = 64 &&
         (value |> Seq.forall (fun c -> (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
@@ -301,6 +402,10 @@ module WorkQueueNativeLifecycleCas =
                              (actor: string) (operationId: Guid) expectedProjectVersion
                              (action: NativeWorkAction) : Result<WorkToolTransition, LedgerFailure> = result {
         do! required enabled "No production Work mutation route is installed; disposable opt-in is disabled."
+        do! required (not (isNull (box binding)) &&
+                      not (isNull binding.DisposableAuthority) &&
+                      binding.DisposableAuthority.Matches(binding.Project, binding.Account))
+             "No verified fresh scratch authority for this project and account binding; Frozen production Work is immutable."
         do! required (not (isNull (box binding)) &&
                       not (isNull (box binding.SessionJournal)) &&
                       not (String.IsNullOrWhiteSpace binding.OriginalJournalRoot) &&

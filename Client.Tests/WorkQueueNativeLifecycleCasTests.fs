@@ -70,6 +70,10 @@ let private fixture action =
               ApprovedFetchUrl = aRemote; ApprovedPushUrl = aRemote
               AccountId = accountId; LedgerId = accountLedger; Epoch = 1 }
         let pa, pb, aa, ab = project pA, project pB, account aA, account aB
+        // Issued before either ledger exists. No existing Frozen project can
+        // obtain the nominal scratch capability from an enabled boolean.
+        let scratchAuthority =
+            WorkQueueNativeLifecycleCas.authorizeFreshScratch pa aa |> ok
         LedgerStore.initialize pa true |> ok |> ignore
         LedgerStore.fetch pb |> ok |> ignore
         WorkQueueGitLedger.initialize pa "Native Test" (Guid.NewGuid())
@@ -179,6 +183,7 @@ let private fixture action =
                     else Error "terminal receipt not authenticated" }
         let bound project account journal : NativeLifecycleBinding =
             { Project = project; Account = account
+              DisposableAuthority = scratchAuthority
               OriginalJournalRoot = journal
               Selected = selected; Admission = req
               DispatchOperationId = dispatchId
@@ -338,3 +343,48 @@ type WorkQueueNativeLifecycleCasTests() =
             | Error _ -> ()
             | Ok applied -> Assert.Fail(sprintf "Unverified terminal was applied: %A" applied)
             Assert.That((LedgerStore.fetch pa |> ok).Commit, Is.EqualTo before.Commit))
+
+    [<Test>]
+    member _.FrozenProductionLikeBindingIsRejectedBeforeAnyGitMutation() =
+        fixture (fun pa pb aa ab selected req bound sha ->
+            let root = Path.GetDirectoryName pa.RepositoryPath
+            // A fresh mirror of the fully initialized frozen ledger preserves
+            // the Work, role, original host and operation receipts. Only the
+            // remote authority differs: this is not the issued scratch ledger.
+            let mirror = Path.Combine(root, "production-like.git")
+            let checkout = Path.Combine(root, "production-like-client")
+            git root ["clone"; "--mirror"; pa.ApprovedPushUrl; mirror] |> ignore
+            git root ["clone"; mirror; checkout] |> ignore
+            let production =
+                { pa with RepositoryPath = checkout
+                          ApprovedFetchUrl = mirror; ApprovedPushUrl = mirror }
+            let before = LedgerStore.fetch production |> ok
+            let _, state = WorkQueueGitLedger.load production |> ok
+            Assert.That(state.Migration, Is.EqualTo(MigrationEpoch.Frozen))
+            Assert.That(state.Works.[selected.WorkId].State, Is.EqualTo WorkState.Available)
+            Assert.That(state.Launches.[selected.LaunchId].Credit,
+                        Is.EqualTo(Some selected.WorkId))
+            // No new authority can be issued after the source project and
+            // account ledgers have entered their existing Frozen state.
+            match WorkQueueNativeLifecycleCas.authorizeFreshScratch pa aa with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Already initialized ledger minted scratch authority: %A" other)
+            let journal = Path.Combine(root, "originals")
+            let otherwiseValid = bound production aa journal
+            let v = state.Version
+            match WorkQueueNativeLifecycleCas.transitionDisposable true otherwiseValid actor
+                    (Guid.NewGuid()) v (Claim 1) with
+            | Error(InvalidBinding reason) when reason.Contains "scratch authority" -> ()
+            | other -> Assert.Fail(sprintf "Real Frozen binding must fail before CAS: %A" other)
+            Assert.That((LedgerStore.fetch production |> ok).Commit, Is.EqualTo before.Commit)
+            // Even the original approved scratch remote is protected when
+            // caller has no opaque authority, despite all other evidence.
+            let valid = bound pa aa journal
+            let noAuthority =
+                { valid with DisposableAuthority = Unchecked.defaultof<_> }
+            let originalBefore = (LedgerStore.fetch pa |> ok).Commit
+            match WorkQueueNativeLifecycleCas.transitionDisposable true noAuthority actor
+                    (Guid.NewGuid()) v (Claim 1) with
+            | Error(InvalidBinding reason) when reason.Contains "scratch authority" -> ()
+            | other -> Assert.Fail(sprintf "Missing authority must fail closed: %A" other)
+            Assert.That((LedgerStore.fetch pa |> ok).Commit, Is.EqualTo originalBefore))

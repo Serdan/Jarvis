@@ -1,0 +1,7 @@
+# P2 — Released historical tokens incorrectly require retired project snapshots
+
+**Frozen source:** `5218ff0c1dd6c66698008c9a5efe86f8bc815489`, `Client/Modules/WorkQueueCrossProjectHostPreview.fs:362-372`.
+
+The comment says every *outstanding* account token requires a corresponding pinned project, but the loop checks **every** token including `Status = "Released"`. Releases are durable history: `AccountCapacityLedger.fs:645-650` changes `Status` to `Released` while retaining the token and its verified `ReleaseProof`. An account with two currently approved projects A/B and a valid historical *released* token from a retired/removed project C therefore yields `AccountTokenProjectMissing`, sets `projectionGap`, and suppresses `SimulatedWinner` indefinitely, even with no held capacity from C. The accepted planner also marks absent-project tokens regardless of released status (`WorkQueueCrossProjectPlanner.fs:313-319`), so this discrepancy must be reconciled consistently rather than simply omitting the host diagnostic while leaving planner unknown.
+
+Only held/unsettled tokens require a live approved project snapshot for safe **current** capacity and scheduling projection. Treat released historical tokens as settled, retain their release proof as audit history, and test a released token from a no-longer-approved project alongside a held token from a current project. Do not infer release from missing projects or unknown statuses.

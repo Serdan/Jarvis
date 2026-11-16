@@ -543,4 +543,6 @@ let main args =
         printfn "%s" (ClientConfig.configPath())
         0
     elif args.Length > 0 && args[0] = "config" then runConfigCommand args
+    elif args.Length > 0 && args[0] = "conversation" then
+        Client.WorkQueueOperatorConversationCli.WorkQueueOperatorConversationCli.run (args |> Array.toList)
     else runClient args

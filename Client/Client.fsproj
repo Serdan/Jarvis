@@ -74,6 +74,8 @@
         <Compile Include="Modules\SourceEffectRouteBridge.fs"/>
         <Compile Include="Modules\WorkQueueGitLedger.fs"/>
         <Compile Include="Modules\WorkQueueRoleAuthority.fs"/>
+        <Compile Include="Modules\WorkQueueConversationTransport.fs"/>
+        <Compile Include="Modules\WorkQueueOperatorConversations.fs"/>
         <Compile Include="Modules\AccountCapacityLedger.fs"/>
         <Compile Include="Modules\AccountAdmissionAdapter.fs"/>
         <Compile Include="Modules\RoleInstructions.fs"/>
@@ -83,6 +85,7 @@
         <Compile Include="Modules\\WorkQueueCanonicalSourceEvidence.fs"/>
         <Compile Include="Modules\\WorkQueueCanonicalCasBinder.fs"/>
         <Compile Include="Modules\\OrchestrationApi.fs"/>
+        <Compile Include="Modules\\WorkQueueOperatorConversationCli.fs"/>
         <Compile Include="Modules\SourceEffectHostBinding.fs"/>
         <Compile Include="Modules\ProjectCreation.fs"/>
         <Compile Include="Modules\AgentDashboard.fs"/>

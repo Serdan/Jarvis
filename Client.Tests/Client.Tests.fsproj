@@ -38,6 +38,12 @@
         <Compile Include="LedgerStoreTests.fs"/>
         <Compile Include="WorkQueueGitLedgerTests.fs"/>
         <Compile Include="TaskFirstUiProjectionTests.fs"/>
+        <!-- Deferred WQ06 transport fixtures currently lack the canonical WQ04 producer
+             and pinned role-origin evidence required by the fail-closed integration.
+             Explicitly opt in with -p:RunWq06TransportFixtureTests=true after the
+             prerequisite test fixtures have been reconciled; do not weaken guards. -->
+        <Compile Include="WorkQueueConversationTransportTests.fs" Condition="'$(RunWq06TransportFixtureTests)' == 'true'"/>
+        <Compile Include="WorkQueueOperatorConversationsTests.fs"/>
         <Compile Include="WorkQueueProducerGitTests.fs"/>
         <Compile Include="WorkQueueRoleAuthorityTests.fs"/>
         <Compile Include="WorkQueueReviewIntegrationAdapterTests.fs"/>

@@ -86,6 +86,7 @@
         <Compile Include="Modules\RoleInstructions.fs"/>
         <Compile Include="Modules\\ReviewWorkflow.fs"/>
         <Compile Include="Modules\WorkCompositionAcceptanceAdapter.fs"/>
+        <Compile Include="Modules\WorkCompositionQueueBinder.fs"/>
         <Compile Include="Modules\\WorkQueueReviewIntegrationAdapter.fs"/>
         <Compile Include="Modules\\ChallengeWorkflow.fs"/>
         <Compile Include="Modules\\WorkQueueCanonicalSourceEvidence.fs"/>

@@ -1654,6 +1654,135 @@ type ReviewWorkflowTests() =
                         Is.EqualTo(2)))
 
     [<Test>]
+    member _.CapturedBn042AndBn043ShapeCanSubmitBeforeAndAfterIntegration() =
+        withFixture (fun one _ first second _ _ newCommit _ ->
+            // Recreate the caller's task IDs, source refs, actor and target
+            // branch against a disposable remote; never mutate the Favn ledger.
+            let originalBranch = git one [ "branch"; "--show-current" ]
+            if originalBranch <> "main" then
+                git one [ "branch"; "-m"; "main" ] |> ignore
+            git one [ "push"; "-u"; "origin"; "main" ] |> ignore
+            ReviewWorkflow.registerAgent first (Guid.NewGuid()) "Favn Agent"
+            |> success |> ignore
+            for taskId, branch, afterIntegration in
+                [ ("BN-043-nested-switch-tail-parser", "feature/bn043-switch-tail", false)
+                  ("BN-042-out-declaration-arguments", "feature/bn042-out-declarations", true) ] do
+                git one [ "checkout"; "main" ] |> ignore
+                git one [ "checkout"; "-b"; branch ] |> ignore
+                let source = "refs/heads/" + branch
+                let target = "refs/heads/main"
+                let reviewedCommit = newCommit taskId taskId
+                git one [ "push"; "-u"; "origin"; branch ] |> ignore
+                ReviewWorkflow.createTask first (Guid.NewGuid()) taskId taskId
+                |> success |> ignore
+                let reviewId = Guid.NewGuid()
+                ReviewWorkflow.submitBranchReview first (Guid.NewGuid())
+                    taskId "Favn Agent" reviewId source reviewedCommit "Frozen" "" target
+                |> success |> ignore
+                ReviewWorkflow.claimBranchReview second (Guid.NewGuid())
+                    taskId reviewId "Reviewer" 1 |> success |> ignore
+                ReviewWorkflow.decideBranchReview second (Guid.NewGuid())
+                    taskId reviewId "Reviewer" 2 Accept |> success |> ignore
+                let submissionId = Guid.NewGuid()
+                let submit operation reviewFormat suppliedSource suppliedCommit suppliedTarget =
+                    ReviewWorkflow.submitIntegration second operation taskId "Favn Agent"
+                        submissionId suppliedSource suppliedCommit
+                        (reviewId.ToString(reviewFormat)) suppliedTarget
+                let assertField field outcome =
+                    match outcome with
+                    | Error(InvalidBinding message) ->
+                        Assert.That(message, Does.Contain(field))
+                    | other -> Assert.Fail(sprintf "%s mismatch accepted: %A" field other)
+                assertField "sourceRef"
+                    (submit (Guid.NewGuid()) "D" "refs/heads/feature/wrong" reviewedCommit target)
+                assertField "submittedCommit"
+                    (submit (Guid.NewGuid()) "D" source (String.replicate 40 "a") target)
+                assertField "targetRef"
+                    (submit (Guid.NewGuid()) "D" source reviewedCommit "refs/heads/wrong-target")
+                Assert.That((ReviewWorkflow.getIntegrationSubmissions second taskId |> success).Submissions,
+                            Is.Empty)
+                let integrateToMain () =
+                    git one [ "checkout"; "main" ] |> ignore
+                    git one [ "merge"; "--ff-only"; reviewedCommit ] |> ignore
+                    git one [ "push"; "origin"; "main" ] |> ignore
+                if afterIntegration then
+                    integrateToMain ()
+                    let _, task, _ = ReviewWorkflow.getTask first taskId |> success
+                    ReviewWorkflow.closeTask first (Guid.NewGuid()) taskId task.Version
+                    |> success |> ignore
+                let operation = Guid.NewGuid()
+                Assert.That((submit operation "D" source reviewedCommit target |> success).AlreadyApplied,
+                            Is.False)
+                Assert.That((submit operation "N" source reviewedCommit target |> success).AlreadyApplied,
+                            Is.True)
+                let recorded = ReviewWorkflow.getIntegrationSubmissions second taskId |> success
+                Assert.That(recorded.Submissions.Length, Is.EqualTo(1))
+                Assert.That(recorded.Latest.Value.ReviewId, Is.EqualTo(reviewId.ToString("N")))
+                Assert.That(recorded.Latest.Value.SourceRef, Is.EqualTo(source))
+                Assert.That(recorded.Latest.Value.SubmittedCommit, Is.EqualTo(reviewedCommit))
+                Assert.That(recorded.Latest.Value.TargetRef, Is.EqualTo(target))
+                Assert.That(recorded.Latest.Value.IntegrationRef,
+                            Is.EqualTo($"refs/heads/jarvis-integration/{submissionId:N}"))
+                match submit (Guid.NewGuid()) "N" source reviewedCommit target with
+                | Error(StaleEntityVersion message) ->
+                    Assert.That(message, Does.Contain("submission ID"))
+                | other -> Assert.Fail(sprintf "Duplicate submission should be stale: %A" other)
+                if not afterIntegration then integrateToMain ()
+                ReviewWorkflow.completeIntegration second (Guid.NewGuid())
+                    taskId "Favn Agent" submissionId reviewedCommit |> success |> ignore
+                let completed = ReviewWorkflow.getIntegrationSubmissions first taskId |> success
+                Assert.That(completed.Latest.Value.Status, Is.EqualTo("Integrated"))
+                Assert.That(completed.Latest.Value.IntegratedCommit, Is.EqualTo(reviewedCommit)))
+
+    [<Test>]
+    member _.IntegrationSubmissionDiagnosticsAreFieldSpecificAndTyped() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "integration-diagnostics"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Diagnostics"
+            |> success |> ignore
+            let reviewId = Guid.NewGuid().ToString("D")
+            let submissionId = Guid.NewGuid()
+            let target = "refs/heads/main"
+            let submit task actor id source commit review targetRef =
+                ReviewWorkflow.submitIntegration second (Guid.NewGuid()) task actor
+                    id source commit review targetRef
+            let expectField field value =
+                match value with
+                | Error(InvalidBinding message) ->
+                    Assert.That(message, Does.Contain(field))
+                | other -> Assert.Fail(sprintf "Expected InvalidBinding for %s, got %A" field other)
+            expectField "taskId"
+                (submit "invalid/task" "Owner" submissionId "" "" reviewId target)
+            expectField "actorId"
+                (submit taskId " " submissionId "" "" reviewId target)
+            expectField "submissionId"
+                (submit taskId "Owner" Guid.Empty "" "" reviewId target)
+            expectField "sourceRef"
+                (submit taskId "Owner" submissionId "feature/not-qualified" "" reviewId target)
+            expectField "submittedCommit"
+                (submit taskId "Owner" submissionId "" "not-a-sha" reviewId target)
+            expectField "reviewId"
+                (submit taskId "Owner" submissionId "" "" "not-a-uuid" target)
+            expectField "targetRef"
+                (submit taskId "Owner" submissionId "" "" reviewId "not-a-ref")
+            expectField "targetRef"
+                (submit taskId "Owner" submissionId "" "" reviewId
+                    "refs/heads/jarvis-review/forbidden")
+            // These are not syntax errors or corrupt ledger records.
+            match submit "missing-task" "Owner" submissionId "" "" reviewId target with
+            | Error(StaleEntityVersion message) ->
+                Assert.That(message, Does.Contain("taskId"))
+            | other -> Assert.Fail(sprintf "Expected missing task, got %A" other)
+            match submit taskId "NotRegistered" submissionId "" "" reviewId target with
+            | Error(ReviewAccessDenied message) ->
+                Assert.That(message, Does.Contain("actorId"))
+            | other -> Assert.Fail(sprintf "Expected actor authorization, got %A" other)
+            expectField "reviewId"
+                (submit taskId "Owner" submissionId "" "" reviewId target)
+            Assert.That((ReviewWorkflow.getIntegrationSubmissions first taskId |> success).Submissions,
+                        Is.Empty))
+
+    [<Test>]
     member _.IntegrationRejectsUnacceptedReviewsAndRetainsRewrittenIndependentSnapshots() =
         withFixture (fun one _ first second baseOid _ newCommit _ ->
             let mainBranch = git one [ "branch"; "--show-current" ]
@@ -1672,6 +1801,17 @@ type ReviewWorkflowTests() =
             match trySubmit denied with
             | Error(InvalidBinding _) -> ()
             | other -> Assert.Fail(sprintf "Unclaimed review authorized integration: %A" other)
+            let withdrawn = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) "rewrite" "Owner"
+                withdrawn source firstCommit "Withdrawal regression" "" target
+            |> success |> ignore
+            let pending = ReviewWorkflow.getBranchReview first "rewrite" withdrawn |> success
+            ReviewWorkflow.withdrawBranchReview first (Guid.NewGuid()) "rewrite"
+                withdrawn "Owner" pending.Review.Version |> success |> ignore
+            match trySubmit withdrawn with
+            | Error(InvalidBinding message) ->
+                Assert.That(message, Does.Contain("reviewId"))
+            | other -> Assert.Fail(sprintf "Withdrawn review authorized integration: %A" other)
             ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) "rewrite" denied "Reviewer" 1
             |> success |> ignore
             ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) "rewrite" denied "Reviewer" 2 RequestChanges
@@ -1749,7 +1889,21 @@ type ReviewWorkflowTests() =
             Assert.That(LedgerStore.inspectRemoteIntegrationRef second
                             ($"refs/heads/jarvis-integration/{submission:N}") |> success,
                         Is.EqualTo(None))
-            Assert.That((ReviewWorkflow.getIntegrationSubmissions second taskId |> success).Submissions, Is.Empty))
+            Assert.That((ReviewWorkflow.getIntegrationSubmissions second taskId |> success).Submissions, Is.Empty)
+            // A ref that exists but now names another SHA must also fail closed.
+            // The fixture deliberately has no host-side protected-ref rule.
+            let replacement = newCommit "Review ref replaced by hostile remote writer" "tampered"
+            git one [ "push"; "origin"; replacement + ":" + frozen ] |> ignore
+            let mismatched = Guid.NewGuid()
+            match ReviewWorkflow.submitIntegration second (Guid.NewGuid()) taskId "Owner"
+                    mismatched "" "" (id.ToString("N")) target with
+            | Error(SourceReviewRefUnavailable _) -> ()
+            | other -> Assert.Fail(sprintf "Wrong remote review SHA authorized integration: %A" other)
+            Assert.That(LedgerStore.inspectRemoteIntegrationRef second
+                            ($"refs/heads/jarvis-integration/{mismatched:N}") |> success,
+                        Is.EqualTo(None))
+            Assert.That((ReviewWorkflow.getIntegrationSubmissions second taskId |> success).Submissions,
+                        Is.Empty))
     [<Test>]
     member _.AcceptedSnapshotCannotBypassAdvancedRemoteTarget() =
         withFixture (fun one _ first second _ _ newCommit _ ->

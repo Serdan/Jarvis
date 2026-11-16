@@ -92,6 +92,7 @@
         <Compile Include="Modules\OriginalBrowserJournal.fs"/>
         <Compile Include="Modules\WorkQueueSchedulerHostPreview.fs"/>
         <Compile Include="Modules\WorkQueueCrossProjectPlanner.fs"/>
+        <Compile Include="Modules\WorkQueueVerifiedDispatchAdapter.fs"/>
         <Compile Include="Modules\\WorkQueueOperatorConversationCli.fs"/>
         <Compile Include="Modules\TaskFirstUiSnapshotAdapter.fs"/>
         <Compile Include="Modules\SourceEffectHostBinding.fs"/>

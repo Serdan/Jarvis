@@ -77,6 +77,7 @@
         <Compile Include="WorkQueueCrossProjectHostPreviewTests.fs"/>
         <Compile Include="WorkQueueDurableLaunchIntentTests.fs"/>
         <Compile Include="WorkQueueVerifiedDispatchAdapterTests.fs"/>
+        <Compile Include="WorkQueueNativeCredentialDispatchAdapterTests.fs"/>
         <Compile Include="WorkQueueNativeLifecycleCasTests.fs"/>
         <Compile Include="WorkingTurnGuidanceTests.fs"/>
         <Compile Include="OrchestrationApiTests.fs"/>

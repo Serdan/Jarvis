@@ -1,0 +1,1 @@
+Source 9e8dc76784dd88ebabda467441fc0525aed0fb4e. Fixes earlier P1 held authority mismatch/missing launch and P2 historical released retired-project tokens. Adds six targeted tests including SHA/ledger-ID/epoch variants. .NET11 Release: WorkQueueCrossProject 35/35, WorkQueueSchedulerHostPreview 12/12; git diff --check clean.

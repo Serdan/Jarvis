@@ -114,6 +114,11 @@ for reviews.
   WQ04/WQ03 production gates. Its historical positive tests against the
   guarded production path still fail pending a fixture/authority integration;
   do not reinterpret them as passing or weaken guards to satisfy them.
+- The four `WorkQueueConversationTransportTests.fs` cases therefore remain
+  excluded from the default `Client.Tests` compile/run. They are opt-in with
+  `-p:RunWq06TransportFixtureTests=true` for prerequisite fixture work, not a
+  passing validation suite. Restore default coverage only after valid canonical
+  producer and pinned role-origin evidence is supplied.
 - A subject document has the ledger's 64-KiB bounded-file limit; overflow
   errors must be surfaced. For sustained production volume, decide on
   per-message append-only records and a cursor/index before enabling

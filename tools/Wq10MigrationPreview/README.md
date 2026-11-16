@@ -75,7 +75,10 @@ the operator command in `docs/specs/wq08-host-preview.md`. Never point the
 rehearsal at a live production ledger. Both read paths report exact Git heads;
 the harness checks them against one operator-supplied WQ10 manifest, along
 with global cap/held/available, role version, `canDispatch=false`,
-provenance on a required candidate, and all reported WQ08 issues. A missing
+provenance on a mandatory selected candidate, its matching task-stage inventory,
+and the exact WQ04 work-origin Git blob at the inspected project head.
+The wrapper only reads local pinned Git blobs; it never writes or fetches.
+All reported WQ08 issues are classified. A missing
 or contradictory observation is `NO_GO`, not an empty ledger.
 
 The wrapper takes one `rehearsal.json` (all paths relative to it):
@@ -90,8 +93,7 @@ The wrapper takes one `rehearsal.json` (all paths relative to it):
       "schedulerPreviews": {
         "Alpha": "prepared-alpha-scheduler.json",
         "Beta": "prepared-beta-scheduler.json"
-      },
-      "requireCandidate": true
+      }
     },
     {
       "name": "blocked-original-uncertainty",
@@ -114,9 +116,13 @@ python3 -m unittest discover -s tools/Wq10MigrationPreview/tests -v
 For a `PREPARED_FOR_REVIEW` rehearsal, both project phases must be
 consistent with the account, every original-ID inventory explicit, old Manager
 and client writer fences evidenced, and the WQ08 preview verified at **the
-same exact heads**. `AccountNotActivated` is an expected *read-only*
-observation, never permission to activate. All other Scheduler issues are
-reported as blockers until independently reconciled. The output also records
+same exact heads**. The actual WQ08 host *always* emits `DispatchDisabled`;
+the wrapper expects it exactly once, at the inspected project head, only with
+`Mode=ReadOnlyDryRun` and `CanDispatch=false`. `AccountNotActivated` is
+expected exactly once for a nonactivated account at the inspected account head,
+never permission to activate. Missing, duplicated, mismatched or unknown
+diagnostics, adverse capacity/identity issues, and noninert previews are blockers.
+The output also records
 pending Task/Role messages, Manager/agent states, held launch IDs, original
 uncertain browser and Git operation IDs, and a manual backup/diff/receipt path.
 
@@ -127,3 +133,23 @@ capture genuine host CLI output for an operator rehearsal. The live WQ03
 original browser journal reader and cross-ledger atomic cutover mechanism are
 not supplied by this wrapper. **A green rehearsal is not a production GO**;
 all cases remain `productionCutover=NOT_AUTHORIZED`.
+
+The `requireCandidate` manifest bypass has been retired. `wouldLaunch=null`
+is an explicit non-green `NO_GO` / audit-only observation even if an
+untrusted caller supplies `requireCandidate=false`. To report
+`PREPARED_FOR_REVIEW`, a candidate must be present in the WQ08 eligible
+set and in the pinned canonical queue, agree with the independently inventoried
+legacy task stage, generation and source-writer lineage, and match the original
+immutable WQ04 source operation/request, source ref/SHA and versioned role.
+The recorded WQ04 origin is read from
+`records/work-queue/origins/<SHA256(workId)>.json` at the **same pinned Git
+commit**, and its real Git blob OID must match `wouldLaunch.originBlobOid`.
+An absent origin or mismatch is `SOURCE_PROVENANCE_UNVERIFIED`, not a
+positive inference from caller-provided strings.
+
+The unit-test previews remain *source-backed host-contract fixtures*, not live
+captured WQ08 outputs: tests assert the actual WQ08 source unconditionally
+emits `DispatchDisabled` in `ReadOnlyDryRun` with `CanDispatch=false`,
+include the mandatory diagnostic, and exercise deletion, duplication, head
+mismatch and adverse issues. Real operator captures still require the separate
+WQ08 command and independently trusted disposable account/project bindings.

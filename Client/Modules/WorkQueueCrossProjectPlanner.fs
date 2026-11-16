@@ -117,15 +117,28 @@ type FakeOnlyCrossProjectPorts =
 module WorkQueueCrossProjectPlanner =
     let private nonBlank (value: string) = not (String.IsNullOrWhiteSpace value)
 
-    let private validUuid (value: string) =
+    // Compare UUID identities, not their caller-provided textual spellings.
+    // Keep the originals untouched in returned candidates, launches and issues.
+    let private uuidIdentity (value: string) =
         match Guid.TryParse value with
-        | true, id -> id <> Guid.Empty
-        | _ -> false
+        | true, id when id <> Guid.Empty -> Some id
+        | _ -> None
+
+    let private validUuid value = uuidIdentity value |> Option.isSome
 
     let private issue code record action =
         { Code = code; Record = record; NextAction = action }
 
     let private compareOrdinal a b = StringComparer.Ordinal.Compare(a, b)
+
+    let private duplicateUuidSpellings (values: string list) =
+        values
+        |> List.groupBy uuidIdentity
+        |> List.choose (fun (_, group) ->
+            if List.length group > 1 then
+                group |> List.sortWith compareOrdinal |> String.concat ", " |> Some
+            else None)
+        |> List.sortWith compareOrdinal
 
     let private report account decision launches issues =
         { Mode = "FakeOnlyReadOnly"
@@ -229,13 +242,11 @@ module WorkQueueCrossProjectPlanner =
                     "Reload the exact role definition, catalog blob and project head."
             | _ -> ()
 
-        if candidates |> List.map (fun candidate -> candidate.LaunchId) |> Set.ofList |> Set.count
-           <> candidates.Length then
-            markProblem "DuplicateLaunchIntent" "Candidate launch UUIDs"
+        for originals in candidates |> List.map (fun candidate -> candidate.LaunchId) |> duplicateUuidSpellings do
+            markProblem "DuplicateLaunchIntent" originals
                 "Resolve duplicate durable launch intents without minting replacement IDs."
-        if candidates |> List.map (fun candidate -> candidate.OriginalBrowserOperationId) |> Set.ofList |> Set.count
-           <> candidates.Length then
-            markProblem "DuplicateBrowserIntent" "Original browser UUIDs"
+        for originals in candidates |> List.map (fun candidate -> candidate.OriginalBrowserOperationId) |> duplicateUuidSpellings do
+            markProblem "DuplicateBrowserIntent" originals
                 "Recover original one-shot intents; do not substitute a fresh operation UUID."
         for candidate in candidates do
             let key = candidate.ProjectId + "/" + candidate.WorkId
@@ -275,24 +286,27 @@ module WorkQueueCrossProjectPlanner =
                 markUnknown "SourceReceiptUnknown" key
                     "Inspect the original immutable source operation, request hash and head."
 
-        if launches |> List.map (fun launch -> launch.LaunchId) |> Set.ofList |> Set.count
-           <> launches.Length then
-            markProblem "DuplicateExistingLaunch" "Existing launch records"
+        for originals in launches |> List.map (fun launch -> launch.LaunchId) |> duplicateUuidSpellings do
+            markProblem "DuplicateExistingLaunch" originals
                 "Resolve contradictory launch records before planning a new one."
         if launches |> List.exists (fun launch ->
             not (validUuid launch.LaunchId)
             || not (nonBlank launch.RoleId)
-            || launch.RoleVersion <= 0) then
+            || launch.RoleVersion <= 0
+            || (launch.OriginalBrowserOperationId |> Option.exists (validUuid >> not))) then
             markProblem "ExistingLaunchIdentityInvalid" "Existing launch records"
                 "Read the original project launch identities and pinned role versions."
 
         let tokens =
             if isNull (box account.State) || isNull account.State.Tokens then [||]
             else account.State.Tokens
-        let tokensByLaunch = tokens |> Array.groupBy (fun t -> t.LaunchId) |> Map.ofArray
-        let launchesById = launches |> List.map (fun launch -> launch.LaunchId, launch) |> Map.ofList
+        if tokens |> Array.exists (fun token -> not (validUuid token.LaunchId)) then
+            markProblem "AccountTokenIdentityInvalid" "Account tokens"
+                "Recover the original account launch UUID before planning."
+        let tokensByLaunch = tokens |> Array.groupBy (fun t -> uuidIdentity t.LaunchId) |> Map.ofArray
+        let launchesById = launches |> List.map (fun launch -> uuidIdentity launch.LaunchId, launch) |> Map.ofList
         for token in tokens do
-            match projectById.TryFind token.ProjectId, launchesById.TryFind token.LaunchId with
+            match projectById.TryFind token.ProjectId, launchesById.TryFind (uuidIdentity token.LaunchId) with
             | None, _ ->
                 markUnknown "AccountTokenProjectUnknown" token.LaunchId
                     "Read the complete pinned project set for the original account token."
@@ -314,7 +328,7 @@ module WorkQueueCrossProjectPlanner =
                         "Inspect the account receipt before treating this slot as free."
             | _ -> ()
         for launch in launches do
-            let token = tokensByLaunch.TryFind launch.LaunchId
+            let token = tokensByLaunch.TryFind (uuidIdentity launch.LaunchId)
             match projectById.TryFind launch.ProjectId, token with
             | None, _ ->
                 markUnknown "LaunchProjectUnknown" launch.LaunchId
@@ -353,14 +367,15 @@ module WorkQueueCrossProjectPlanner =
 
         let existingBrowserIds =
             launches
-            |> List.choose (fun launch -> launch.OriginalBrowserOperationId)
+            |> List.choose (fun launch -> launch.OriginalBrowserOperationId |> Option.bind uuidIdentity)
             |> Set.ofList
         for candidate in candidates do
-            if launchesById.ContainsKey candidate.LaunchId
-               || tokensByLaunch.ContainsKey candidate.LaunchId then
+            if launchesById.ContainsKey (uuidIdentity candidate.LaunchId)
+               || tokensByLaunch.ContainsKey (uuidIdentity candidate.LaunchId) then
                 markProblem "LaunchIdAlreadyUsed" candidate.LaunchId
                     "Reconcile the original launch intent; do not allocate a new UUID to retry it."
-            if existingBrowserIds.Contains candidate.OriginalBrowserOperationId then
+            if uuidIdentity candidate.OriginalBrowserOperationId
+               |> Option.exists (fun browserId -> existingBrowserIds.Contains browserId) then
                 markProblem "BrowserOperationIdAlreadyUsed" candidate.OriginalBrowserOperationId
                     "Recover the original one-shot operation; never reassign it to a different launch."
 

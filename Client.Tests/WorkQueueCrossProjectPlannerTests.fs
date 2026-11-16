@@ -277,3 +277,68 @@ type WorkQueueCrossProjectPlannerTests() =
         let second = report (account [||]) [pB; pA] (List.rev roles) [staleB; staleA] []
         Assert.That(first.Decision, Is.EqualTo(PlannerDecision.NeedsAttention))
         Assert.That(second, Is.EqualTo(first))
+
+    [<Test>]
+    member _.ReleasedTerminalLaunchCannotBeReusedWithUppercaseGuidAlias() =
+        let terminal = existing pA launchA (Some browserA)
+                           PlannerLaunchPhase.TerminalPendingRelease
+                           (PlannerBrowserEvidence.Accepted "historical")
+        let alias = { a with LaunchId = launchA.ToUpperInvariant(); OriginalBrowserOperationId = browserB }
+        let result = report (account [|token pA launchA "Released"|])
+                            [pA] [role pA "Worker" 4] [alias] [terminal]
+        Assert.That(result.Decision, Is.EqualTo(PlannerDecision.NeedsAttention))
+        Assert.That(result.Issues |> List.exists (fun e ->
+            e.Code = "LaunchIdAlreadyUsed" && e.Record = alias.LaunchId), Is.True)
+        Assert.That(result.VisibleLaunches.Head.LaunchId, Is.EqualTo(launchA))
+        Assert.That(result.CanDispatch, Is.False)
+
+    [<Test>]
+    member _.ReleasedBrowserOperationCannotBeReusedWithBracedGuidAlias() =
+        let terminal = existing pA launchA (Some browserA)
+                           PlannerLaunchPhase.TerminalPendingRelease
+                           (PlannerBrowserEvidence.Accepted "historical")
+        let alias = { b with OriginalBrowserOperationId = "{" + browserA.ToUpperInvariant() + "}" }
+        let result = report (account [|token pA launchA "Released"|])
+                            [pA; pB] roles [alias] [terminal]
+        Assert.That(result.Decision, Is.EqualTo(PlannerDecision.NeedsAttention))
+        Assert.That(result.Issues |> List.exists (fun e ->
+            e.Code = "BrowserOperationIdAlreadyUsed"
+            && e.Record = alias.OriginalBrowserOperationId), Is.True)
+        Assert.That(result.VisibleLaunches.Head.OriginalBrowserOperationId, Is.EqualTo(Some browserA))
+
+    [<Test>]
+    member _.TwoCandidateLaunchAliasesConflictAndKeepOriginalSpellings() =
+        let alias = { b with LaunchId = Guid.Parse(launchA).ToString("N").ToUpperInvariant() }
+        let result = report (account [||]) [pA; pB] roles [a; alias] []
+        Assert.That(result.Decision, Is.EqualTo(PlannerDecision.NeedsAttention))
+        Assert.That(result.Issues |> List.exists (fun e ->
+            e.Code = "DuplicateLaunchIntent"
+            && e.Record.Contains(launchA) && e.Record.Contains(alias.LaunchId)), Is.True)
+
+    [<Test>]
+    member _.TwoCandidateBrowserAliasesConflictAndKeepOriginalSpellings() =
+        let alias = { b with OriginalBrowserOperationId = Guid.Parse(browserA).ToString("N").ToUpperInvariant() }
+        let result = report (account [||]) [pA; pB] roles [a; alias] []
+        Assert.That(result.Decision, Is.EqualTo(PlannerDecision.NeedsAttention))
+        Assert.That(result.Issues |> List.exists (fun e ->
+            e.Code = "DuplicateBrowserIntent"
+            && e.Record.Contains(browserA) && e.Record.Contains(alias.OriginalBrowserOperationId)), Is.True)
+
+    [<Test>]
+    member _.ReleasedAccountTokenAliasStillMatchesHistoricalLaunch() =
+        let terminal = existing pA launchA (Some browserA)
+                           PlannerLaunchPhase.TerminalPendingRelease
+                           (PlannerBrowserEvidence.Accepted "historical")
+        let upperToken = token pA (launchA.ToUpperInvariant()) "Released"
+        let result = report (account [|upperToken|]) [pA; pB] roles [b] [terminal]
+        Assert.That(result.Decision |> chosen, Is.EqualTo(Some b))
+        Assert.That(result.Issues, Is.Empty)
+        Assert.That(result.CanDispatch, Is.False)
+
+    [<Test>]
+    member _.InvalidReleasedAccountTokenUuidCannotPassAsCleanEvidence() =
+        let malformed = token pA "not-a-uuid" "Released"
+        let result = report (account [|malformed|]) [pA] [role pA "Worker" 4] [a] []
+        Assert.That(result.Decision, Is.EqualTo(PlannerDecision.NeedsAttention))
+        Assert.That(result.Issues |> List.exists (fun e ->
+            e.Code = "AccountTokenIdentityInvalid"), Is.True)

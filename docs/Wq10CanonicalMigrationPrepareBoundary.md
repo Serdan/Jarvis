@@ -1,8 +1,10 @@
 # WQ10 canonical Prepared binding: default-off, fail-closed
 
-Status: RECOVERY_BLOCKED, not Prepared. This is an isolated typed
-assessment over the accepted WQ07 account and WQ02 project Git CAS
-authorities. It is not a writer, a migration, or a production cutover.
+Status: project RECOVERY_BLOCKED, not Prepared. The read-only canonical
+assessment remains inert. A separate, explicitly invoked WQ07 account-only
+Preparing CAS now exists for host-signed private disposable fixtures; it is
+not configured on a production host and does not establish project Prepared,
+account Validated/Activated, a Scheduler permit or a real migration.
 
 Source: Client/Modules/WorkQueueCanonicalMigrationPrepare.fs
 Tests: Client.Tests/WorkQueueCanonicalMigrationPrepareTests.fs
@@ -42,11 +44,13 @@ The assessment reports separate typed gaps for pinned heads, versions,
 high-water, migration phase, held global tokens, outstanding launches,
 queue/graph/message/source coverage and remote validation failures.
 
-No canonical transaction is attempted. The module does not call reserve,
-release, setCapacity, execute, LedgerStore.transact or git push.
-The existing fetch readers can internally invoke update-ref, but only against
-the fresh private ephemeral clones; they never update the supplied clones
-or any canonical account/project authority.
+The original `inspect` and `attemptCanonicalPrepare` entrypoints remain
+read-only; they do not call reserve, release, setCapacity, execute,
+LedgerStore.transact or git push. The separate opt-in
+`attemptAccountPreparing` uses the same private clone checks but can perform
+one WQ07 account-only canonical lease push after independent signature checks.
+The read-only entrypoints only update Git caches in private ephemeral clones
+and never update supplied clones or account/project bare authorities.
 Account/project authoritative before/after diffs are empty for this adapter,
 including repeated original UUID, competing head changes and read failures.
 A competing writer can move its authority; the adapter observes conflict,
@@ -55,11 +59,13 @@ WIP and operation histories remain inspectable.
 
 ## Missing typed authorization and transaction contracts
 
-1. WQ07 AccountCapacityState.MigrationPhase recognizes the strings
-   LegacyActive, Frozen, Preparing, Validated, Activated and Aborted, but
-   the accepted writer API has no authenticated Freeze/Preparing epoch CAS
-   or immutable migration receipt. The state lacks fixed participant set,
-   pinned project heads, min connected-client protocol and operator approval.
+1. WQ07 AccountCapacityState.MigrationPhase recognizes LegacyActive, Frozen,
+   Preparing, Validated, Activated and Aborted. WQ07 now has an assembly-internal
+   pinned-head Preparing CAS and immutable original-operation receipt for
+   independently signed **private disposable fixtures only**. No operational
+   authenticated Freeze writer, deployed signer/trust-anchor provisioning,
+   connected-client/fence evidence producer, or production migration approval
+   yet exists. No production Preparing credential or protocol is configured.
 2. WQ02 MigrationEpoch is Frozen, Preparing, Validated or Activated. It
    lacks Prepared(epoch, baseHead, indexCoverage, conversionReceipt);
    WorkMutation has no PrepareProjectEpoch transaction. A new transaction
@@ -102,6 +108,61 @@ contents before/after the attempt and verify remote refs never move.
 These private scratch and recursive metadata checks are defense in depth for
 an approved disposable fixture, not a production trust system or a substitute
 for a host-level sandbox against malicious code running as the same OS user.
-A future canonical writer still requires authenticated authority binding,
-fencing and reviewed transaction receipts plus process-level isolation.
-No live migration is authorized.
+The account Preparing lease is confined to the approved disposable bare
+account authority, but filesystem checks alone are not an OS sandbox against
+malicious same-user races. A production migration still requires authenticated
+authority binding, an independently operational old-writer fence, full project
+same-CAS Prepared writers, reviewed transaction receipts, cross-remote crash
+recovery, and process-level isolation. No live migration is authorized.
+
+## WQ07 account-only Preparing CAS (default-off fixture port)
+
+`WorkQueueCanonicalMigrationPrepare.attemptAccountPreparing` is a distinct,
+typed account-only transaction port. It is never called by
+`inspect`/`attemptCanonicalPrepare` and has no Scheduler, Work dispatch,
+Manager-retirement, deployment, or project-CAS integration.
+
+A candidate is bound to the exact original UUID and actor, frozen account
+head and StateVersion, account ID/ledger/epoch/fetch-push identity, SHA-256 of
+the offline preflight report, fixed **two-project** participant roster
+(project/ledger/epoch/authority digest/frozen Git head/version/source
+high-water), and minimum connected-client protocol. These are canonicalized
+in a length-prefixed, sorted, deterministic statement SHA-256; no raw remote
+credential URL is persisted. Three independent ECDSA public keys, provisioned
+outside the command, verify role-separated signatures of that exact statement
+and the distinct protocol report, old-writer fence report, and operator
+decision evidence hashes. A caller boolean, report string or generic source
+name cannot authorize the transaction.
+
+The accepted path is restricted to the same exact-marked, private temporary
+disposable root with bare account and two bare project authorities, no
+traversal/symlink/object-alternate redirects, a fresh private clone, and
+explicit `AttemptOnDisposable` mode. It checks current canonical Frozen
+account/project heads, full zero-held-slot account capacity, zero outstanding
+project launches and available queue/graph/message/source coverage. WQ07's
+existing immutable operation receipt records the full signed request and
+account-only result in the same exact-parent lease CAS that moves the
+account's `MigrationPhase` to `Preparing`. A different concurrent UUID
+cannot silently rebase on the winning epoch. The identical original UUID
+recovers its receipt after lost transport acknowledgment or replay; a reused
+UUID with different signed payload is rejected. No second account token
+is manufactured and old account tokens/releases/refs are retained.
+
+The result always reports separately `AccountPreparing` or
+`AccountRecoveryBlocked`, and `ProjectPreparedNotEstablished`. Even a
+successful disposable account-only CAS is **never** joint Prepared,
+Validated or Activated. A stale original, mismatched roster or signatures,
+foreign/duplicate trust key, unknown source/fence proof, phase change, held
+global slot, or unapproved authority remains blocked, with no fallback to
+unspecified credentials. The preexisting WQ10 assessor remains default-off
+and read-only.
+
+**Unresolved production dependencies:** an authenticated Frozen account epoch
+writer; separately administered operator signer and approval records; a
+connected-client protocol reporter; a verified old-API/Manager/legacy scheduler
+write fence with continuous high-water; independently reconciled project WQ02
+Prepared conversions (including legacy source and role index proof); and
+cross-remote partial-crash journals plus separate activation approval.
+Fixture-generated signing keys demonstrate transaction semantics but are
+not real operational approvals. The private fixture API must not be wired
+to production, even if an operator supplies a plausible signature bundle.

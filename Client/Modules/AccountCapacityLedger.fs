@@ -20,6 +20,11 @@ type AccountFailure =
     | AccountCapacityFull of occupied: int * limit: int
     | AccountResizeBelowOccupancy of occupied: int
     | AccountConfigVersionChanged of actual: int64
+    | AccountHeadChanged of expected: string * actual: string
+    | AccountStateVersionChanged of actual: int64
+    | AccountMigrationNotFrozen of actual: string
+    | AccountMigrationOutstandingSlots of count: int
+    | AccountMigrationWritesFenced of phase: string
     | AccountLaunchExists
     | AccountLaunchMissing
     | AccountLaunchAlreadyReleased
@@ -118,6 +123,47 @@ type AccountWrite =
     { Receipt: AccountOperationReceipt
       CurrentHead: string
       AlreadyApplied: bool }
+
+// The original WQ07 operation receipt is the immutable Git provenance for
+// this payload. Source-bound participants and three independently signed
+// witnesses are carried by the canonical request/result, not a mutable
+// sidecar or a project Prepared/dispatch authorization.
+[<CLIMutable>]
+type AccountMigrationParticipant =
+    { ProjectId: string
+      LedgerId: string
+      LedgerEpoch: int
+      AuthoritySha256: string
+      FrozenHead: string
+      ProjectVersion: int
+      SourceHighWater: int64 }
+
+[<CLIMutable>]
+type AccountMigrationSignedWitness =
+    { EvidenceSha256: string
+      SignatureBase64: string
+      SignerPublicKeySha256: string }
+
+[<CLIMutable>]
+type AccountMigrationPreparingReceipt =
+    { SchemaVersion: int
+      OriginalOperationId: string
+      Actor: string
+      AccountId: string
+      LedgerId: string
+      Epoch: int
+      PreviousAccountHead: string
+      PreviousStateVersion: int64
+      ParticipantRoster: AccountMigrationParticipant array
+      ParticipantRosterSha256: string
+      ReviewedReportSha256: string
+      MinConnectedClientProtocol: int
+      StatementSha256: string
+      ClientProtocolWitness: AccountMigrationSignedWitness
+      OldWriterFenceWitness: AccountMigrationSignedWitness
+      OperatorApprovalWitness: AccountMigrationSignedWitness
+      AccountStatus: string
+      ProjectStatus: string }
 
 // Controlled, dynamically scoped Git transport test seam. No production caller
 // binds it; it permits deterministic post-publication uncertainty and stale
@@ -221,7 +267,15 @@ module AccountCapacityLedger =
                         "GIT_AUTHOR_EMAIL", "jarvis-account@localhost"
                         "GIT_COMMITTER_NAME", "Jarvis Account Admission"
                         "GIT_COMMITTER_EMAIL", "jarvis-account@localhost" ] @ environment
-                  ConfigureStart = None }
+                  ConfigureStart = Some(fun start ->
+                      // Never inherit metadata redirects into the approved
+                      // WQ07 repository. The explicit isolated index passed
+                      // through ExtraEnvironment is applied after this hook.
+                      for key in
+                          [ "GIT_DIR"; "GIT_WORK_TREE"; "GIT_COMMON_DIR"
+                            "GIT_OBJECT_DIRECTORY"; "GIT_ALTERNATE_OBJECT_DIRECTORIES"
+                            "GIT_INDEX_FILE"; "GIT_NAMESPACE" ] do
+                          start.Environment.Remove(key) |> ignore) }
             |> function
                 | Ok output when not output.TimedOut ->
                     Ok { Code = output.ExitCode; Out = output.StdOut.TrimEnd('\n', '\r'); Err = output.StdErr }
@@ -373,7 +427,7 @@ module AccountCapacityLedger =
     let fetch binding = fetchRetry 8 binding
 
     let private writeTree b parent (files: (string * string) list) =
-        let index = Path.Combine(Path.GetTempPath(), $"jarvis-account-{Guid.NewGuid():N}.index")
+        let index = Path.Combine(b.RepositoryPath, ".git", $"jarvis-account-{Guid.NewGuid():N}.index")
         try
             let first =
                 match parent with
@@ -477,7 +531,7 @@ module AccountCapacityLedger =
                                 | Error(InvalidAccountBinding message) -> Error(InvalidAccountBinding message)
                                 | Error _ -> Error(AccountOutcomeUnknown Guid.Empty)))))
 
-    let private transact (b: AccountBinding) operationId actor kind requestJson
+    let private transact (b: AccountBinding) operationId actor kind requestJson expectedHead
                          (plan: AccountCapacityState -> Result<AccountCapacityState * string, AccountFailure>) =
         if operationId = Guid.Empty || String.IsNullOrWhiteSpace actor
            || String.IsNullOrWhiteSpace kind then
@@ -496,7 +550,11 @@ module AccountCapacityLedger =
                                 Ok { Receipt = old; CurrentHead = snapshot.Head; AlreadyApplied = true }
                             | Some _ -> Error AccountOperationIdReused
                             | None ->
-                                plan snapshot.State |> Result.bind (fun (updated, resultJson) ->
+                                (match expectedHead with
+                                 | Some expected when snapshot.Head <> expected ->
+                                     Error(AccountHeadChanged(expected, snapshot.Head))
+                                 | _ -> plan snapshot.State)
+                                |> Result.bind (fun (updated, resultJson) ->
                                     let next =
                                         { updated with StateVersion = snapshot.State.StateVersion + 1L
                                                        NextSequence = snapshot.State.NextSequence + 1L }
@@ -556,6 +614,127 @@ module AccountCapacityLedger =
     let occupied (s: AccountCapacityState) =
         s.Tokens |> Array.sumBy (fun t -> if t.Status = "Held" then 1 else 0)
 
+    // Defense in depth at the *actual Git writer*, independently of the
+    // higher-level assessor. No direct internal caller can use a production,
+    // unmarked, redirected, or ordinary account clone as a Preparing target.
+    let private approvedDisposableAccountSink (rootRaw: string) (b: AccountBinding) =
+        try
+            let explicitPath (raw: string) =
+                not (String.IsNullOrWhiteSpace raw)
+                && Path.IsPathFullyQualified raw
+                && (raw.Split([| '/'; '\\' |], StringSplitOptions.RemoveEmptyEntries)
+                    |> Array.forall ((<>) ".."))
+            let rec noReparseAncestors (path: string) =
+                let attrs = File.GetAttributes path
+                not (attrs.HasFlag FileAttributes.ReparsePoint)
+                && (let parent = Path.GetDirectoryName path
+                    isNull parent || parent = path || noReparseAncestors parent)
+            let rec noMetadataRedirects directory =
+                Directory.Exists directory && noReparseAncestors directory
+                && (Directory.EnumerateFileSystemEntries directory
+                    |> Seq.forall (fun item ->
+                        let attrs = File.GetAttributes item
+                        not (attrs.HasFlag FileAttributes.ReparsePoint)
+                        && (not (attrs.HasFlag FileAttributes.Directory)
+                            || noMetadataRedirects item)))
+            if not (explicitPath rootRaw) || not (explicitPath b.RepositoryPath)
+               || not (explicitPath b.ApprovedFetchUrl)
+               || not (explicitPath b.ApprovedPushUrl) then false
+            else
+                let root = Path.GetFullPath rootRaw
+                let temp = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar)
+                let inside candidate =
+                    let full = Path.GetFullPath candidate
+                    full.StartsWith(root + string Path.DirectorySeparatorChar, StringComparison.Ordinal)
+                    && Directory.Exists full && noReparseAncestors full
+                let scope = Path.GetDirectoryName b.RepositoryPath
+                let marker = Path.Combine(root, ".wq10-disposable-fixture")
+                let bare authority =
+                    inside authority && noMetadataRedirects authority
+                    && File.Exists(Path.Combine(authority, "HEAD"))
+                    && File.Exists(Path.Combine(authority, "config"))
+                    && Directory.Exists(Path.Combine(authority, "refs"))
+                    && Directory.Exists(Path.Combine(authority, "objects"))
+                    && not (File.Exists(Path.Combine(authority, "objects", "info", "alternates")))
+                let permissionsOk =
+                    if OperatingSystem.IsWindows() then true
+                    else
+                        let rootMode = File.GetUnixFileMode root
+                        let scopeMode = File.GetUnixFileMode scope
+                        let unsafeRoot = UnixFileMode.GroupWrite ||| UnixFileMode.OtherWrite
+                        let unsafeScope =
+                            UnixFileMode.GroupRead ||| UnixFileMode.GroupWrite ||| UnixFileMode.GroupExecute
+                            ||| UnixFileMode.OtherRead ||| UnixFileMode.OtherWrite ||| UnixFileMode.OtherExecute
+                        (rootMode &&& unsafeRoot) = UnixFileMode.None
+                        && (scopeMode &&& unsafeScope) = UnixFileMode.None
+                root.StartsWith(temp + string Path.DirectorySeparatorChar, StringComparison.Ordinal)
+                && Directory.Exists root && noReparseAncestors root
+                && File.Exists marker && noReparseAncestors marker
+                && File.ReadAllText(marker) = "WQ10_DISPOSABLE_FIXTURE_V1"
+                && inside scope && inside b.RepositoryPath
+                && Path.GetFileName(scope).StartsWith("wq10-private-", StringComparison.Ordinal)
+                && Path.GetFileName b.RepositoryPath = "account"
+                && permissionsOk
+                && noMetadataRedirects(Path.Combine(b.RepositoryPath, ".git"))
+                && not (File.Exists(Path.Combine(b.RepositoryPath, ".git", "objects", "info", "alternates")))
+                && not (File.Exists(Path.Combine(b.RepositoryPath, ".git", "commondir")))
+                && bare b.ApprovedFetchUrl && bare b.ApprovedPushUrl
+        with _ -> false
+
+    // Assembly-internal on purpose. Only the WQ10 verified disposable port
+    // may use this CAS; no public unchecked Preparing API or approval boolean.
+    // The original request is stable through retries and pins its previous
+    // head so a loser cannot silently re-plan against the winning epoch.
+    let internal prepareAccountForVerifiedDisposable disposableRoot (b: AccountBinding)
+                                                      (receipt: AccountMigrationPreparingReceipt) =
+        let sha256 = Regex("^[0-9a-f]{64}$", RegexOptions.Compiled)
+        let validWitness (w: AccountMigrationSignedWitness) =
+            not (isNull (box w))
+            && sha256.IsMatch(defaultArg (Option.ofObj w.EvidenceSha256) "")
+            && sha256.IsMatch(defaultArg (Option.ofObj w.SignerPublicKeySha256) "")
+            && not (String.IsNullOrWhiteSpace w.SignatureBase64)
+        let mutable operationId = Guid.Empty
+        if not (approvedDisposableAccountSink disposableRoot b)
+           || isNull (box receipt)
+           || not (Guid.TryParse(receipt.OriginalOperationId, &operationId))
+           || operationId = Guid.Empty
+           || String.IsNullOrWhiteSpace receipt.Actor
+           || receipt.SchemaVersion <> 1
+           || receipt.AccountId <> string b.AccountId
+           || receipt.LedgerId <> string b.LedgerId
+           || receipt.Epoch <> b.Epoch
+           || not (validOid receipt.PreviousAccountHead)
+           || receipt.PreviousStateVersion < 1L
+           || receipt.MinConnectedClientProtocol < 1
+           || isNull receipt.ParticipantRoster
+           || receipt.ParticipantRoster.Length <> 2
+           || ((receipt.ParticipantRoster |> Array.map _.ProjectId |> Array.distinct |> Array.length) <> 2)
+           || (receipt.ParticipantRoster |> Array.exists (fun p ->
+                isNull (box p) || String.IsNullOrWhiteSpace p.ProjectId
+                || String.IsNullOrWhiteSpace p.LedgerId || p.LedgerEpoch < 1
+                || not (sha256.IsMatch(defaultArg (Option.ofObj p.AuthoritySha256) ""))
+                || not (validOid p.FrozenHead) || p.ProjectVersion < 0 || p.SourceHighWater < 0L))
+           || not (sha256.IsMatch(defaultArg (Option.ofObj receipt.ParticipantRosterSha256) ""))
+           || not (sha256.IsMatch(defaultArg (Option.ofObj receipt.ReviewedReportSha256) ""))
+           || not (sha256.IsMatch(defaultArg (Option.ofObj receipt.StatementSha256) ""))
+           || not (validWitness receipt.ClientProtocolWitness)
+           || not (validWitness receipt.OldWriterFenceWitness)
+           || not (validWitness receipt.OperatorApprovalWitness)
+           || receipt.AccountStatus <> "AccountPreparing"
+           || receipt.ProjectStatus <> "ProjectPreparedNotEstablished" then
+            Error(InvalidAccountBinding "An exact source-bound Preparing receipt is required")
+        else
+            transact b operationId receipt.Actor "AccountMigrationPreparing"
+                (json receipt) (Some receipt.PreviousAccountHead) (fun state ->
+                    if state.StateVersion <> receipt.PreviousStateVersion then
+                        Error(AccountStateVersionChanged state.StateVersion)
+                    elif state.MigrationPhase <> "Frozen" then
+                        Error(AccountMigrationNotFrozen state.MigrationPhase)
+                    elif occupied state <> 0 then
+                        Error(AccountMigrationOutstandingSlots(occupied state))
+                    else
+                        Ok({ state with MigrationPhase = "Preparing" }, json receipt))
+
     let reserve (b: AccountBinding) operationId actor launchId (project: ProjectLedgerAuthority) roleId roleConfigVersion =
         if isNull (box project) || launchId = Guid.Empty
            || project.ProjectId = Guid.Empty || project.LedgerId = Guid.Empty
@@ -571,8 +750,10 @@ module AccountCapacityLedger =
                         projectAuthoritySha256 = authority
                         roleId = roleId; roleConfigVersion = roleConfigVersion
                         admissionEpoch = b.Epoch |}
-            transact b operationId actor "ReserveGlobalAgentSlot" request (fun state ->
-                if state.Tokens |> Array.exists (fun t -> t.LaunchId = string launchId) then
+            transact b operationId actor "ReserveGlobalAgentSlot" request None (fun state ->
+                if state.MigrationPhase <> "LegacyActive" && state.MigrationPhase <> "Activated" then
+                    Error(AccountMigrationWritesFenced state.MigrationPhase)
+                elif state.Tokens |> Array.exists (fun t -> t.LaunchId = string launchId) then
                     Error AccountLaunchExists
                 elif occupied state >= state.MaxConcurrentAgents then
                     Error(AccountCapacityFull(occupied state, state.MaxConcurrentAgents))
@@ -594,8 +775,10 @@ module AccountCapacityLedger =
             Error(InvalidAccountBinding "Positive capacity and expected config version required")
         else
             let request = json {| expectedConfigVersion = expectedConfigVersion; newLimit = newLimit |}
-            transact b operationId actor "SetGlobalAgentCapacity" request (fun state ->
-                if state.ConfigVersion <> expectedConfigVersion then
+            transact b operationId actor "SetGlobalAgentCapacity" request None (fun state ->
+                if state.MigrationPhase <> "LegacyActive" && state.MigrationPhase <> "Activated" then
+                    Error(AccountMigrationWritesFenced state.MigrationPhase)
+                elif state.ConfigVersion <> expectedConfigVersion then
                     Error(AccountConfigVersionChanged state.ConfigVersion)
                 elif newLimit < occupied state then
                     Error(AccountResizeBelowOccupancy(occupied state))
@@ -617,7 +800,7 @@ module AccountCapacityLedger =
                 json {| launchId = string locator.LaunchId; projectId = string locator.ProjectId
                         admissionOperationId = string locator.AdmissionOperationId
                         terminalOperationId = string locator.TerminalOperationId |}
-            transact b operationId actor "ReleaseGlobalAgentSlot" request (fun state ->
+            transact b operationId actor "ReleaseGlobalAgentSlot" request None (fun state ->
                 match state.Tokens |> Array.tryFind (fun t -> t.LaunchId = string locator.LaunchId) with
                 | None -> Error AccountLaunchMissing
                 | Some token when token.Status = "Released" -> Error AccountLaunchAlreadyReleased

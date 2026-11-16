@@ -412,7 +412,9 @@ module HermeticHarnessTests =
             WindowsDisposableGuard.assertOwnerOnly isolated true false
             let info = DirectoryInfo(isolated)
             let security = FileSystemAclExtensions.GetAccessControl(info)
-            security.SetAccessRuleProtection(true, false)
+            // Preserve the inherited private owner grant. Disabling inheritance
+            // here would leave an empty DACL when the injected grant is purged.
+            Assert.That(security.AreAccessRulesProtected, Is.False)
             let everyone = SecurityIdentifier(WellKnownSidType.WorldSid, null)
             security.AddAccessRule(
                 FileSystemAccessRule(everyone, FileSystemRights.ReadAndExecute,

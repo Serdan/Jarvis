@@ -380,12 +380,11 @@ module WorkQueueCanonicalMigrationPrepare =
     let attemptCanonicalPrepare request : Result<unit, CanonicalPrepareAssessment> =
         Error(inspect request)
 
-    // Account-only canonical Preparing port. Three different host-pinned
-    // public keys must independently attest (1) connected client protocol,
-    // (2) an old-writer fence and (3) the operator's approval. Trust anchors
-    // are NOT fields of the request. No public raw account writer is exposed.
-    // The production host has intentionally not provisioned these keys.
-    type PinnedAccountPreparingKeys =
+    // The shipping public API has no trust-key argument and no installed
+    // host anchors. Only the assembly-internal hermetic fixture seam below
+    // can exercise verified transaction mechanics. Never treat test signers
+    // as operational trust anchors.
+    type internal PinnedAccountPreparingKeys =
         { ClientProtocolPublicKeySpki: byte array
           OldWriterFencePublicKeySpki: byte array
           OperatorApprovalPublicKeySpki: byte array }
@@ -397,6 +396,8 @@ module WorkQueueCanonicalMigrationPrepare =
           ClientProtocolReportSha256: string
           OldWriterFenceReportSha256: string
           OperatorDecisionSha256: string
+          OriginalSourceCheckpoints: AccountMigrationOriginalSourceCheckpoint array
+          OriginalSourceCoverageWitness: AccountMigrationSignedWitness
           ClientProtocolWitness: AccountMigrationSignedWitness
           OldWriterFenceWitness: AccountMigrationSignedWitness
           OperatorApprovalWitness: AccountMigrationSignedWitness }
@@ -454,9 +455,26 @@ module WorkQueueCanonicalMigrationPrepare =
               string p.ProjectVersion; string p.SourceHighWater ])
         |> frame |> sha256String
 
-    // Separate from signed proof documents; a signer witnesses this exact
-    // operation, both frozen project authorities, previous account head/version,
-    // preflight digest, protocol minimum, and both independent evidence digests.
+    // Original journal identity and source-effect high-water are separate
+    // from the NEW canonical project NextSequence. An independently trusted
+    // legacy fence/coverage signer must attest them for both frozen heads.
+    let accountPreparingCoverageSha256 (command: AccountPreparingCommand) =
+        let checkpoints =
+            if isNull command.OriginalSourceCheckpoints then [||]
+            else command.OriginalSourceCheckpoints
+        ( "jarvis-original-source-journal-coverage-v1"
+          :: command.Target.ReviewedOfflineReportSha256
+          :: (checkpoints
+              |> Array.sortBy (fun c -> c.ProjectId)
+              |> Array.toList
+              |> List.collect (fun c ->
+                  [ c.ProjectId; c.FrozenProjectHead; c.OriginalJournalId
+                    string c.OriginalJournalHighWater
+                    string c.OriginalSourceEffectHighWater ])))
+        |> frame |> sha256String
+
+    // Separate from signed proof documents; the canonical statement binds
+    // the exact original legacy journals and source-effect high-water too.
     let private statementDigest (command: AccountPreparingCommand) rosterSha =
         let target = command.Target
         let b = target.Account
@@ -468,6 +486,7 @@ module WorkQueueCanonicalMigrationPrepare =
               target.ExpectedAccountHead
               string command.ExpectedAccountStateVersion
               rosterSha; target.ReviewedOfflineReportSha256
+              accountPreparingCoverageSha256 command
               string command.MinConnectedClientProtocol
               command.ClientProtocolReportSha256
               command.OldWriterFenceReportSha256 ]
@@ -502,37 +521,43 @@ module WorkQueueCanonicalMigrationPrepare =
                     HashAlgorithmName.SHA256)
             with _ -> false
 
-    let private accountOnlyGap = function
-        // These gaps concern later project same-CAS conversion and cross-remote
-        // authorization. Account Preparing does not imply any of them succeeded.
+    let private accountOnlyGap coverageVerified = function
+        // These require later project conversion, but are not account-only
+        // first-time prerequisites when independently signed evidence exists.
         | CanonicalPrepareGap.AuthenticatedOfflineReviewMissing
         | CanonicalPrepareGap.AuthenticatedOldWriterFenceMissing
-        | CanonicalPrepareGap.OriginalJournalsAndSourceHighWaterMissing
         | CanonicalPrepareGap.VerifiedRoleDependencyAndIndexConversionMissing
         | CanonicalPrepareGap.AccountPreparingCasUnavailable
         | CanonicalPrepareGap.ProjectPreparedCasUnavailable
         | CanonicalPrepareGap.CrossLedgerPartialReceiptRecoveryUnavailable -> false
-        // A successful original replay sees Preparing and a changed account
-        // head. The ledger itself verifies the exact immutable original UUID
-        // before allowing replay; a different original fails pinned-head CAS.
-        | CanonicalPrepareGap.AccountNotFrozen "Preparing"
-        | CanonicalPrepareGap.AccountHeadChanged _ -> false
+        // Never waive the ORIGINAL journals/high-water merely because the
+        // new canonical ledger has a NextSequence or an arbitrary report hash.
+        | CanonicalPrepareGap.OriginalJournalsAndSourceHighWaterMissing ->
+            not coverageVerified
         | _ -> true
 
-    let attemptAccountPreparing (keys: PinnedAccountPreparingKeys)
-                                (command: AccountPreparingCommand) : AccountPreparingOutcome =
-        let blocked reasons =
-            { Account = AccountPreparingState.AccountRecoveryBlocked reasons
-              Projects = ProjectPreparedState.ProjectPreparedNotEstablished
-              SchedulerEnabled = false
-              ProductionCutoverAuthorized = false }
+    let private blockedAccount reasons : AccountPreparingOutcome =
+        { Account = AccountPreparingState.AccountRecoveryBlocked reasons
+          Projects = ProjectPreparedState.ProjectPreparedNotEstablished
+          SchedulerEnabled = false
+          ProductionCutoverAuthorized = false }
+
+    // The only PUBLIC entrypoint. There is presently no independent host or
+    // operator trust-anchor provisioning, so caller-generated signatures can
+    // never enable a CAS. Future host integration must resolve immutable
+    // anchors and original-source attestation OUTSIDE the Preparing request.
+    let attemptAccountPreparing (_command: AccountPreparingCommand) : AccountPreparingOutcome =
+        blockedAccount
+            [ "Account Preparing blocked: independent host-pinned protocol, legacy-journal/fence and operator approval trust anchors are not provisioned." ]
+
+    // Assembly-INTERNAL fixture executor, used solely by Client.Tests to
+    // verify hypothetical pinned-host receipt mechanics on marked private
+    // disposable Git authorities. It is deliberately not a shipping API.
+    let internal attemptAccountPreparingWithFixtureTrustAnchors
+        (keys: PinnedAccountPreparingKeys)
+        (command: AccountPreparingCommand) : AccountPreparingOutcome =
         try
             let target = command.Target
-            // Default-off is a *mode*, never an approval. This boundary is
-            // unavailable for nonprivate, nonmarked, production-like remotes.
-            let assessment = inspect target
-            let violations =
-                assessment.Missing |> List.filter accountOnlyGap |> List.map (sprintf "%A")
             let invalid =
                 [ if target.Mode <> CanonicalPrepareMode.AttemptOnDisposable then
                       "Account Preparing remains disabled without an explicit disposable attempt."
@@ -549,26 +574,49 @@ module WorkQueueCanonicalMigrationPrepare =
                      || isNull keys.OldWriterFencePublicKeySpki
                      || isNull keys.OperatorApprovalPublicKeySpki then
                       "Independent host-pinned verification keys were not provisioned." ]
-            if not violations.IsEmpty || not invalid.IsEmpty then
-                blocked (invalid @ violations)
+            if not invalid.IsEmpty then blockedAccount invalid
             else
                 let roster = participants target
                 let rosterSha = rosterDigest roster
                 let statementSha = statementDigest command rosterSha
+                let coverageSha = accountPreparingCoverageSha256 command
+                let checkpoints = command.OriginalSourceCheckpoints
+                let expectedCheckpoints =
+                    roster
+                    |> Array.map (fun p -> p.ProjectId, p.FrozenHead)
+                    |> Set.ofArray
+                let validCoverage =
+                    not (isNull checkpoints) && checkpoints.Length = 2
+                    && (checkpoints
+                        |> Array.map (fun c -> c.ProjectId, c.FrozenProjectHead)
+                        |> Set.ofArray) = expectedCheckpoints
+                    && (checkpoints |> Array.forall (fun c ->
+                        let mutable parsed = Guid.Empty
+                        not (isNull (box c)) && Guid.TryParse(c.OriginalJournalId, &parsed)
+                        && parsed <> Guid.Empty
+                        && c.OriginalJournalHighWater >= 0L
+                        && c.OriginalSourceEffectHighWater >= 0L))
                 let keyDigests =
                     [ keys.ClientProtocolPublicKeySpki; keys.OldWriterFencePublicKeySpki
                       keys.OperatorApprovalPublicKeySpki ]
-                    |> List.map (fun key -> Convert.ToHexString(SHA256.HashData(key)))
+                    |> List.map (fun key -> Convert.ToHexString(SHA256.HashData key))
                 let evidenceValid =
                     keyDigests |> List.distinct |> List.length = 3
+                    && verifyWitness keys.OldWriterFencePublicKeySpki
+                           "original-journal-coverage" statementSha coverageSha
+                           command.OriginalSourceCoverageWitness
                     && verifyWitness keys.ClientProtocolPublicKeySpki "client-protocol"
                            statementSha command.ClientProtocolReportSha256 command.ClientProtocolWitness
                     && verifyWitness keys.OldWriterFencePublicKeySpki "old-writer-fence"
                            statementSha command.OldWriterFenceReportSha256 command.OldWriterFenceWitness
                     && verifyWitness keys.OperatorApprovalPublicKeySpki "operator-approval"
                            statementSha command.OperatorDecisionSha256 command.OperatorApprovalWitness
-                if not evidenceValid then
-                    blocked [ "Missing, foreign, stale or mismatched independently signed protocol/fence/operator evidence." ]
+                if not validCoverage then
+                    blockedAccount
+                        [ "OriginalJournalsAndSourceHighWaterMissing: independently attested original journal IDs, source-effect high-water and both frozen heads are required." ]
+                elif not evidenceValid then
+                    blockedAccount
+                        [ "Missing, foreign, stale or mismatched independently signed protocol/fence/operator/original-source evidence." ]
                 else
                     let b = target.Account
                     let receipt =
@@ -583,6 +631,9 @@ module WorkQueueCanonicalMigrationPrepare =
                           ParticipantRoster = roster
                           ParticipantRosterSha256 = rosterSha
                           ReviewedReportSha256 = target.ReviewedOfflineReportSha256
+                          OriginalSourceCheckpoints = checkpoints
+                          OriginalSourceCoverageSha256 = coverageSha
+                          OriginalSourceCoverageWitness = command.OriginalSourceCoverageWitness
                           MinConnectedClientProtocol = command.MinConnectedClientProtocol
                           StatementSha256 = statementSha
                           ClientProtocolWitness = command.ClientProtocolWitness
@@ -591,21 +642,50 @@ module WorkQueueCanonicalMigrationPrepare =
                           AccountStatus = "AccountPreparing"
                           ProjectStatus = "ProjectPreparedNotEstablished" }
                     match approvedRoot target with
-                    | Error reason -> blocked [ reason ]
+                    | Error reason ->
+                        blockedAccount [ sprintf "%A" (CanonicalPrepareGap.UnapprovedDisposableAuthority reason) ]
                     | Ok root ->
-                        // Recreate the private scratch *after* signed preflight;
-                        // only this cloned binding ever executes the WQ07 CAS.
-                        let result =
+                        let execute =
                             withPrivateReadBindings root target (fun account _ ->
-                                AccountCapacityLedger.prepareAccountForVerifiedDisposable root account receipt)
-                        match result with
+                                // The lower-level account writer accepts ONLY an
+                                // authenticated capability, never raw receipt shape.
+                                match AccountCapacityLedger.authenticateDisposablePreparingReceipt
+                                          keys.ClientProtocolPublicKeySpki
+                                          keys.OldWriterFencePublicKeySpki
+                                          keys.OperatorApprovalPublicKeySpki receipt with
+                                | Error failure -> Error failure
+                                | Ok authenticated ->
+                                    // WQ07 receipt lookup must happen BEFORE any
+                                    // mutable current-project Frozen/head checks.
+                                    // A committed exact original can recover after
+                                    // legitimate project progress or lost ack.
+                                    match AccountCapacityLedger.readOperation account target.OperationId with
+                                    | Error failure -> Error failure
+                                    | Ok (_, Some _) ->
+                                        AccountCapacityLedger.prepareAccountForVerifiedDisposable
+                                            root account authenticated
+                                    | Ok (_, None) ->
+                                        let assessment = inspect target
+                                        let violations =
+                                            assessment.Missing
+                                            |> List.filter (accountOnlyGap validCoverage)
+                                            |> List.map (sprintf "%A")
+                                        if not violations.IsEmpty then
+                                            Error(InvalidAccountBinding(
+                                                "First-time account Preparing preflight blocked: "
+                                                + String.concat "; " violations))
+                                        else
+                                            AccountCapacityLedger.prepareAccountForVerifiedDisposable
+                                                root account authenticated)
+                        match execute with
                         | Ok write ->
                             { Account = AccountPreparingState.AccountPreparing(receipt, write)
                               Projects = ProjectPreparedState.ProjectPreparedNotEstablished
                               SchedulerEnabled = false
                               ProductionCutoverAuthorized = false }
                         | Error error ->
-                            blocked [ "Account Preparing CAS blocked: " + string error
-                                      "Recover uncertain outcomes with the original operation UUID and immutable WQ07 receipt; never mint a replacement UUID blindly." ]
+                            blockedAccount
+                                [ "Account Preparing CAS blocked: " + string error
+                                  "Recover uncertain outcomes with the original UUID; never mint a replacement blindly." ]
         with ex ->
-            blocked [ "Disposable account Preparing refused: " + ex.GetType().Name ]
+            blockedAccount [ "Disposable account Preparing refused: " + ex.GetType().Name ]

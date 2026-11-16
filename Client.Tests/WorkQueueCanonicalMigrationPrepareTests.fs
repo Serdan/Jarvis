@@ -185,6 +185,11 @@ type WorkQueueCanonicalMigrationPrepareTests() =
               OldWriterFencePublicKeySpki = key fence
               OperatorApprovalPublicKeySpki = key approval }
         let previousVersion = (AccountCapacityLedger.fetch fixture.AccountA |> success).State.StateVersion
+        // Stable identities across retries. This is a hermetic simulation of
+        // independently inventoried legacy journals, NOT real host evidence.
+        let journalIds =
+            [ fixture.ProjectA.ProjectId, Guid.NewGuid()
+              fixture.ProjectB.ProjectId, Guid.NewGuid() ] |> Map.ofList
         let sha (bytes: byte array) = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant()
         let sign (signer: ECDsa) role statement evidence =
             { EvidenceSha256 = evidence
@@ -194,7 +199,19 @@ type WorkQueueCanonicalMigrationPrepareTests() =
                           role statement evidence, HashAlgorithmName.SHA256)
                   |> Convert.ToBase64String
               SignerPublicKeySha256 = sha (key signer) }
-        let make target =
+        let makeWithCoverage (target: CanonicalPrepareRequest) (overrideCheckpoints: AccountMigrationOriginalSourceCheckpoint array option) =
+            let checkpoints =
+                match overrideCheckpoints with
+                | Some supplied -> supplied
+                | None ->
+                    target.Projects
+                    |> List.map (fun project ->
+                        { ProjectId = string project.Binding.ProjectId
+                          FrozenProjectHead = project.ExpectedHead
+                          OriginalJournalId = string journalIds[project.Binding.ProjectId]
+                          OriginalJournalHighWater = 0L
+                          OriginalSourceEffectHighWater = 0L })
+                    |> List.toArray
             let blank = { EvidenceSha256 = String('0', 64)
                           SignatureBase64 = ""
                           SignerPublicKeySha256 = String('0', 64) }
@@ -205,15 +222,21 @@ type WorkQueueCanonicalMigrationPrepareTests() =
                   ClientProtocolReportSha256 = String('b', 64)
                   OldWriterFenceReportSha256 = String('c', 64)
                   OperatorDecisionSha256 = String('d', 64)
+                  OriginalSourceCheckpoints = checkpoints
+                  OriginalSourceCoverageWitness = blank
                   ClientProtocolWitness = blank
                   OldWriterFenceWitness = blank
                   OperatorApprovalWitness = blank }
             let statement = WorkQueueCanonicalMigrationPrepare.accountPreparingStatementSha256 raw
+            let coverage = WorkQueueCanonicalMigrationPrepare.accountPreparingCoverageSha256 raw
             { raw with
+                OriginalSourceCoverageWitness =
+                    sign fence "original-journal-coverage" statement coverage
                 ClientProtocolWitness = sign protocol "client-protocol" statement raw.ClientProtocolReportSha256
                 OldWriterFenceWitness = sign fence "old-writer-fence" statement raw.OldWriterFenceReportSha256
                 OperatorApprovalWitness = sign approval "operator-approval" statement raw.OperatorDecisionSha256 }
-        action keys make
+        let make (target: CanonicalPrepareRequest) = makeWithCoverage target None
+        action keys make (fun target checkpoints -> makeWithCoverage target (Some checkpoints))
 
     let preparing (result: WorkQueueCanonicalMigrationPrepare.AccountPreparingOutcome) : AccountMigrationPreparingReceipt * AccountWrite =
         Assert.That(result.Projects,
@@ -394,9 +417,9 @@ type WorkQueueCanonicalMigrationPrepareTests() =
             freezeDisposableAccount fixture
             let original = snapshotRemoteHeads fixture
             let target = request fixture CanonicalPrepareMode.AttemptOnDisposable
-            withSignedPreparing fixture (fun keys sign ->
+            withSignedPreparing fixture (fun keys sign signWithCoverage ->
                 let command = sign target
-                let first = WorkQueueCanonicalMigrationPrepare.attemptAccountPreparing keys command
+                let first = WorkQueueCanonicalMigrationPrepare.attemptAccountPreparingWithFixtureTrustAnchors keys command
                             |> preparing
                 let receipt, write = first
                 Assert.That(write.AlreadyApplied, Is.False)
@@ -420,7 +443,7 @@ type WorkQueueCanonicalMigrationPrepareTests() =
                 Assert.That(immutable.Kind, Is.EqualTo("AccountMigrationPreparing"))
                 let anotherClone =
                     { command with Target = { target with Account = fixture.AccountB } }
-                let replay = WorkQueueCanonicalMigrationPrepare.attemptAccountPreparing keys anotherClone
+                let replay = WorkQueueCanonicalMigrationPrepare.attemptAccountPreparingWithFixtureTrustAnchors keys anotherClone
                              |> preparing
                 Assert.That((snd replay).AlreadyApplied, Is.True)
                 Assert.That((fst replay).StatementSha256, Is.EqualTo(receipt.StatementSha256))
@@ -432,22 +455,22 @@ type WorkQueueCanonicalMigrationPrepareTests() =
         withClones (fun fixture ->
             freezeDisposableAccount fixture
             let baseline = request fixture CanonicalPrepareMode.AttemptOnDisposable
-            withSignedPreparing fixture (fun keys sign ->
+            withSignedPreparing fixture (fun keys sign signWithCoverage ->
                 let first = sign baseline
                 let another =
                     sign { baseline with OperationId = Guid.NewGuid(); Account = fixture.AccountB }
-                WorkQueueCanonicalMigrationPrepare.attemptAccountPreparing keys first
+                WorkQueueCanonicalMigrationPrepare.attemptAccountPreparingWithFixtureTrustAnchors keys first
                 |> preparing |> ignore
                 let winningHeads = snapshotRemoteHeads fixture
                 let losingReasons =
-                    WorkQueueCanonicalMigrationPrepare.attemptAccountPreparing keys another
+                    WorkQueueCanonicalMigrationPrepare.attemptAccountPreparingWithFixtureTrustAnchors keys another
                     |> accountBlocked
                 Assert.That(losingReasons |> List.exists (fun r ->
                     r.Contains("AccountHeadChanged")), Is.True,
                     "The losing original must be rejected against its pinned prior head.")
                 let reused = sign { baseline with ReviewedOfflineReportSha256 = String('e', 64) }
                 let reuseReasons =
-                    WorkQueueCanonicalMigrationPrepare.attemptAccountPreparing keys reused
+                    WorkQueueCanonicalMigrationPrepare.attemptAccountPreparingWithFixtureTrustAnchors keys reused
                     |> accountBlocked
                 Assert.That(reuseReasons |> List.exists (fun r ->
                     r.Contains("AccountOperationIdReused")), Is.True,
@@ -460,7 +483,7 @@ type WorkQueueCanonicalMigrationPrepareTests() =
                         MinConnectedClientProtocol = first.MinConnectedClientProtocol + 1 }
                 for changed in [ alteredActor; alteredProtocol ] do
                     let reasons =
-                        WorkQueueCanonicalMigrationPrepare.attemptAccountPreparing keys changed
+                        WorkQueueCanonicalMigrationPrepare.attemptAccountPreparingWithFixtureTrustAnchors keys changed
                         |> accountBlocked
                     Assert.That(reasons |> List.exists (fun r ->
                         r.Contains("AccountOperationIdReused")
@@ -472,7 +495,7 @@ type WorkQueueCanonicalMigrationPrepareTests() =
                             baseline.Projects |> List.mapi (fun i p ->
                                 if i = 0 then { p with ExpectedHead = String('f', 40) }
                                 else p) }
-                WorkQueueCanonicalMigrationPrepare.attemptAccountPreparing keys (sign alteredProjectHead)
+                WorkQueueCanonicalMigrationPrepare.attemptAccountPreparingWithFixtureTrustAnchors keys (sign alteredProjectHead)
                 |> accountBlocked |> ignore
                 Assert.That(snapshotRemoteHeads fixture = winningHeads, Is.True)))
 
@@ -481,7 +504,7 @@ type WorkQueueCanonicalMigrationPrepareTests() =
         withClones (fun fixture ->
             freezeDisposableAccount fixture
             let target = request fixture CanonicalPrepareMode.AttemptOnDisposable
-            withSignedPreparing fixture (fun keys sign ->
+            withSignedPreparing fixture (fun keys sign signWithCoverage ->
                 let hooks =
                     { BeforeLeasePush = fun _ _ -> ()
                       GitCommand = fun args ->
@@ -491,7 +514,7 @@ type WorkQueueCanonicalMigrationPrepareTests() =
                           else AccountGitTestFault.PassThrough }
                 let result =
                     AccountCapacityLedger.withTestInterposition hooks (fun () ->
-                        WorkQueueCanonicalMigrationPrepare.attemptAccountPreparing keys (sign target))
+                        WorkQueueCanonicalMigrationPrepare.attemptAccountPreparingWithFixtureTrustAnchors keys (sign target))
                     |> preparing
                 Assert.That((snd result).Receipt.OperationId, Is.EqualTo(string target.OperationId))
                 Assert.That((AccountCapacityLedger.fetch fixture.AccountB |> success).State.MigrationPhase,
@@ -507,24 +530,24 @@ type WorkQueueCanonicalMigrationPrepareTests() =
             freezeDisposableAccount fixture
             let start = snapshotRemoteHeads fixture
             let target = request fixture CanonicalPrepareMode.AttemptOnDisposable
-            withSignedPreparing fixture (fun keys sign ->
+            withSignedPreparing fixture (fun keys sign signWithCoverage ->
                 let cmd = sign target
                 let badApproval =
                     { cmd with
                         OperatorApprovalWitness =
                             { cmd.OperatorApprovalWitness with SignatureBase64 = "AA==" } }
-                WorkQueueCanonicalMigrationPrepare.attemptAccountPreparing keys badApproval
+                WorkQueueCanonicalMigrationPrepare.attemptAccountPreparingWithFixtureTrustAnchors keys badApproval
                 |> accountBlocked |> ignore
                 let forgedProtocol =
                     { cmd with MinConnectedClientProtocol = cmd.MinConnectedClientProtocol + 1 }
-                WorkQueueCanonicalMigrationPrepare.attemptAccountPreparing keys forgedProtocol
+                WorkQueueCanonicalMigrationPrepare.attemptAccountPreparingWithFixtureTrustAnchors keys forgedProtocol
                 |> accountBlocked |> ignore
                 let disabled = sign { target with Mode = CanonicalPrepareMode.InspectOnly }
-                WorkQueueCanonicalMigrationPrepare.attemptAccountPreparing keys disabled
+                WorkQueueCanonicalMigrationPrepare.attemptAccountPreparingWithFixtureTrustAnchors keys disabled
                 |> accountBlocked |> ignore
                 let foreign =
                     { keys with OperatorApprovalPublicKeySpki = keys.ClientProtocolPublicKeySpki }
-                WorkQueueCanonicalMigrationPrepare.attemptAccountPreparing foreign cmd
+                WorkQueueCanonicalMigrationPrepare.attemptAccountPreparingWithFixtureTrustAnchors foreign cmd
                 |> accountBlocked |> ignore
                 Assert.That(snapshotRemoteHeads fixture = start, Is.True)))
 
@@ -541,16 +564,16 @@ type WorkQueueCanonicalMigrationPrepareTests() =
             freezeDisposableAccount fixture
             let target = request fixture CanonicalPrepareMode.AttemptOnDisposable
             let original = snapshotRemoteHeads fixture
-            withSignedPreparing fixture (fun keys sign ->
+            withSignedPreparing fixture (fun keys sign signWithCoverage ->
                 let held = sign target
                 let heldReasons =
-                    WorkQueueCanonicalMigrationPrepare.attemptAccountPreparing keys held
+                    WorkQueueCanonicalMigrationPrepare.attemptAccountPreparingWithFixtureTrustAnchors keys held
                     |> accountBlocked
                 Assert.That(heldReasons |> List.exists (fun r ->
                     r.Contains("AccountCapacityOccupied")), Is.True)
                 Assert.That(snapshotRemoteHeads fixture = original, Is.True)
                 let staleTarget = { target with ExpectedAccountHead = String('f', 40) }
-                WorkQueueCanonicalMigrationPrepare.attemptAccountPreparing keys (sign staleTarget)
+                WorkQueueCanonicalMigrationPrepare.attemptAccountPreparingWithFixtureTrustAnchors keys (sign staleTarget)
                 |> accountBlocked |> ignore
                 Assert.That(snapshotRemoteHeads fixture = original, Is.True)))
 
@@ -582,17 +605,90 @@ type WorkQueueCanonicalMigrationPrepareTests() =
         withClones (fun fixture ->
             let before = snapshotRemoteHeads fixture
             let target = request fixture CanonicalPrepareMode.AttemptOnDisposable
-            withSignedPreparing fixture (fun keys sign ->
+            withSignedPreparing fixture (fun keys sign signWithCoverage ->
                 let unfrozenReasons =
-                    WorkQueueCanonicalMigrationPrepare.attemptAccountPreparing keys (sign target)
+                    WorkQueueCanonicalMigrationPrepare.attemptAccountPreparingWithFixtureTrustAnchors keys (sign target)
                     |> accountBlocked
                 Assert.That(unfrozenReasons |> List.exists (fun r ->
                     r.Contains("AccountNotFrozen")), Is.True)
                 let otherRoot =
                     { target with DisposableRoot = Path.GetTempPath() }
                 let unapprovedReasons =
-                    WorkQueueCanonicalMigrationPrepare.attemptAccountPreparing keys (sign otherRoot)
+                    WorkQueueCanonicalMigrationPrepare.attemptAccountPreparingWithFixtureTrustAnchors keys (sign otherRoot)
                     |> accountBlocked
                 Assert.That(unapprovedReasons |> List.exists (fun r ->
                     r.Contains("UnapprovedDisposableAuthority")), Is.True)
                 Assert.That(snapshotRemoteHeads fixture = before, Is.True)))
+
+    [<Test>]
+    member _.CallerGeneratedSelfSignedKeysCannotAuthorizePublicAccountPreparing() =
+        withClones (fun fixture ->
+            freezeDisposableAccount fixture
+            let target = request fixture CanonicalPrepareMode.AttemptOnDisposable
+            let original = snapshotRemoteHeads fixture
+            withSignedPreparing fixture (fun _keys sign _ ->
+                // Three syntactically valid, self-generated signer key pairs
+                // must NOT authorize through the ordinary public entrypoint.
+                let command = sign target
+                let reasons =
+                    WorkQueueCanonicalMigrationPrepare.attemptAccountPreparing command
+                    |> accountBlocked
+                Assert.That(reasons |> List.exists (fun reason ->
+                    reason.Contains("not provisioned")), Is.True)
+                assertNoCanonicalWrite fixture original))
+
+    [<Test>]
+    member _.SignedMissingLegacyJournalAndUnknownSourceHighWaterCannotMoveAccount() =
+        withClones (fun fixture ->
+            freezeDisposableAccount fixture
+            let target = request fixture CanonicalPrepareMode.AttemptOnDisposable
+            let original = snapshotRemoteHeads fixture
+            withSignedPreparing fixture (fun keys sign signWithCoverage ->
+                let good = sign target
+                let missing = signWithCoverage target [||]
+                let unknown =
+                    good.OriginalSourceCheckpoints
+                    |> Array.map (fun checkpoint ->
+                        { checkpoint with OriginalSourceEffectHighWater = -1L })
+                    |> signWithCoverage target
+                for command in [ missing; unknown ] do
+                    let reasons =
+                        WorkQueueCanonicalMigrationPrepare.attemptAccountPreparingWithFixtureTrustAnchors
+                            keys command |> accountBlocked
+                    Assert.That(reasons |> List.exists (fun reason ->
+                        reason.Contains("OriginalJournalsAndSourceHighWaterMissing")), Is.True)
+                    assertNoCanonicalWrite fixture original))
+
+    [<Test>]
+    member _.LostAcknowledgmentThenLegitimateProjectProgressRecoversOriginalReceiptReadOnly() =
+        withClones (fun fixture ->
+            freezeDisposableAccount fixture
+            let target = request fixture CanonicalPrepareMode.AttemptOnDisposable
+            withSignedPreparing fixture (fun keys sign _ ->
+                let command = sign target
+                let hooks =
+                    { BeforeLeasePush = fun _ _ -> ()
+                      GitCommand = fun args ->
+                          if args |> List.exists (fun arg ->
+                              arg.StartsWith("--force-with-lease=" + AccountCapacityLedger.AccountRef)) then
+                              AccountGitTestFault.ExecuteThenLoseAcknowledgment
+                          else AccountGitTestFault.PassThrough }
+                let first =
+                    AccountCapacityLedger.withTestInterposition hooks (fun () ->
+                        WorkQueueCanonicalMigrationPrepare.attemptAccountPreparingWithFixtureTrustAnchors
+                            keys command) |> preparing
+                Assert.That((snd first).AlreadyApplied, Is.False)
+                ReviewWorkflow.registerAgent fixture.ProjectAOther
+                    (Guid.NewGuid()) "Independent project progress" |> success |> ignore
+                let afterProgress = snapshotRemoteHeads fixture
+                let retry =
+                    { command with Target = { target with Account = fixture.AccountB } }
+                let recovered =
+                    WorkQueueCanonicalMigrationPrepare.attemptAccountPreparingWithFixtureTrustAnchors
+                        keys retry |> preparing
+                Assert.That((snd recovered).AlreadyApplied, Is.True)
+                Assert.That((fst recovered).StatementSha256, Is.EqualTo((fst first).StatementSha256))
+                Assert.That(snapshotRemoteHeads fixture = afterProgress, Is.True,
+                    "Exact original receipt recovery must not rewrite any account or project ref.")
+                Assert.That((AccountCapacityLedger.fetch fixture.AccountB |> success).State.MigrationPhase,
+                    Is.EqualTo("Preparing"))))

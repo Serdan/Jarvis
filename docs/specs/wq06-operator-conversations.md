@@ -185,3 +185,32 @@ isolation. Run with `.NET 11` in Release, for example:
 ```bash
 dotnet test Client.Tests/Client.Tests.fsproj -c Release --filter FullyQualifiedName~WorkQueueOperatorConversationsTests
 ```
+
+
+## Observed live MCP registration gap (2026-11-16)
+
+At the 2026-11-16 check, the authenticated, connected Jarvis `ListCommands`
+response reported protocol `3.64` but **did not advertise any of the eight**
+`*OperatorConversation*` aliases. The available connected MCP tool catalog
+likewise did not expose a callable Task/Role conversation method. In contrast,
+the checked-in source at `main` (`275dce20`) includes the typed server
+methods, `ledgerAliasCapabilities` entries, default-off server configuration,
+client routing, and disposable Git-CAS tests. The source catalog entries are
+not conditional on `EnableOperatorConversations`; actual method execution is
+guarded by that flag.
+
+This is an **observed registration/availability gap**, not evidence of a
+working live operator endpoint. The check cannot distinguish a stale deployed
+server binary, a stale exposed MCP schema, or another version/capability mismatch.
+It does not authorize a deployment, restart, config change, or real message
+push. The local `.NET 11 Release` tests exercise the source path, not the
+current live connected Jarvis deployment.
+
+Before a future operator-authorized enablement, verify that matching
+server/client builds expose all eight named methods through the authenticated
+tool catalog, explicitly configure the normally false
+`EnableOperatorConversations` flag, confirm the approved project Git ledger
+binding, and perform a **disposable**, authenticated list/post/claim/handle/
+inspect replay test first. Preserve original operation UUIDs and the
+verified-head/Unknown evidence at every transport boundary. Do not treat the
+manual Task/Role thread as Scheduler demand or automatic role authority.

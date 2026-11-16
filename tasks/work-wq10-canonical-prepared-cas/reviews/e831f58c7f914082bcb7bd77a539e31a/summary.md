@@ -1,1 +1,19 @@
-Follow-up to ChangesRequested c02a37d037b1435a841343d44f6e913b. Commit c96fa642: recursive no-link Git metadata verification; per-inspection isolated 0700 Git clones without inherited Git config/templates or local hardlinks for all WQ07/WQ02 fetches; no direct writes to supplied clones or canonical authorities. .NET11 Release native focused 11/11; Python WQ10 49/49; .NET11 Release inspector build clean; git diff --check clean. Typed result stays recovery-blocked and default-off; production authorization gaps unchanged.
+# Reviewer 4 — WQ10 P1 symlink-escape re-review
+
+**Verdict: ACCEPT** frozen commit `c96fa642553823b9f2fc4b117cd5632485da59ab` against `53105d3eaa1b476fadfe5470e962b4c5796fe8f9`.
+
+## Evidence
+
+- `Client/Modules/WorkQueueCanonicalMigrationPrepare.fs`: supplied clone/bare metadata recursively rejects symlinks and junctions, object alternates and shared-worktree redirection; authority paths and marker are confined to explicit disposable scratch.
+- `isolatedClone` creates fresh, unpredictable, private clones with no checkout, no local hardlinks, an empty template, sanitized `GIT_*` environment and disabled system/global config. The existing fetch readers use those bindings, not the caller-supplied clone metadata.
+- `attemptCanonicalPrepare` always returns a typed blocked assessment, and Prepared, SchedulerEnabled and ProductionCutoverAuthorized remain false. Missing authenticated Preparing/Prepared CAS, old-writer fence, source/role coverage and partial-receipt recovery are explicit.
+- **Independently run:** `dotnet test Client.Tests/Client.Tests.fsproj -c Release --filter FullyQualifiedName~WorkQueueCanonicalMigrationPrepareTests --no-restore`: **11/11 passed** (.NET 11 Release); frozen-range `git diff --check`: clean.
+- Submitter also reported Python WQ10 **49/49** and inspector Release build clean; these were not rerun in this independent check.
+
+The prior P1 nested clone and bare-authority metadata escape is addressed **for this approved-disposable-fixture, assessment-only scope**. No canonical writer, migration authorization, production activation, or scheduler handoff is approved by this verdict.
+
+## Nonblocking follow-up
+
+Negative tests currently compare outside-directory **file-name sets**, not byte hashes of existing files; strengthen negative-space regression coverage by hashing file contents too. This private-clone design is not an OS sandbox for a hostile same-user-controlled bare repository; future production migration requires a separate authenticated and isolated authority/write design.
+
+No blocking source finding remains within the frozen WQ10 security re-review scope.

@@ -4,6 +4,9 @@ open System
 open System.Diagnostics
 open System.IO
 open System.Runtime.InteropServices
+open System.Security.AccessControl
+open System.Security.Principal
+open Jarvis.Testing
 open NUnit.Framework
 open Client
 
@@ -124,6 +127,9 @@ type HermeticClientTestEnvironment() =
               nativeFolder "3EB685DB-65F9-4CF6-A03A-E3EF65729F3D" // RoamingAppData
               nativeFolder "F1B32785-6FBA-4FCF-9D55-7B8E7F157091" ] // LocalAppData
         HermeticClientTestEnvironment.AssertOutsideProtectedFolders root actualFolders
+        // Independently repeat the parent process's token/physical-identity
+        // check; environmental mappings cannot authorize testhost writes.
+        WindowsDisposableGuard.attestScratchParent parent |> ignore
         HermeticClientTestEnvironment.AssertPrivatePath parent root
 
     /// Lexical containment is insufficient: reject any symlink/junction/reparse
@@ -171,7 +177,13 @@ type HermeticClientTestEnvironment() =
                 UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute
             else
                 UnixFileMode.UserRead ||| UnixFileMode.UserWrite
-        if not (OperatingSystem.IsWindows()) && File.GetUnixFileMode(path) <> expected then
+        if OperatingSystem.IsWindows() then
+            let root = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_HERMETIC_ROOT")
+            let rootPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath root)
+            let currentPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath path)
+            WindowsDisposableGuard.assertOwnerOnly path isDirectory
+                (String.Equals(rootPath, currentPath, StringComparison.OrdinalIgnoreCase))
+        elif File.GetUnixFileMode(path) <> expected then
             raise (UnauthorizedAccessException("Hermetic Client.Tests requires owner-only scratch permissions."))
 
     /// Windows Git makes loose objects read-only. Dispose only verified test
@@ -373,6 +385,60 @@ module HermeticHarnessTests =
         Assert.That(Directory.Exists forged, Is.False, "Provenance rejection must precede test writes.")
 
     [<Test>]
+    let preallocation_parent_gate_rejects_fake_native_profile_without_any_writes () =
+        // This pure gate is used by the parent FSI process before creation.
+        // Use synthetic paths only; never probe the actual operator profile.
+        let scratch = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_HERMETIC_ROOT")
+        let syntheticNativeProfile = Path.Combine(scratch, "synthetic-native-profile")
+        let forgedParent = Path.Combine(syntheticNativeProfile, "AppData", "Local")
+        let wouldCreate = Path.Combine(forgedParent, "jarvis-client-tests-" + Guid.NewGuid().ToString("N"))
+        Assert.Throws<UnauthorizedAccessException>(
+            TestDelegate(fun () ->
+                WindowsDisposableGuard.assertOutsideProtectedFolders forgedParent
+                    [syntheticNativeProfile]))
+        |> ignore
+        Assert.That(Directory.Exists wouldCreate, Is.False,
+                    "Native profile rejection must precede even the first scratch write.")
+
+    [<Test>]
+    let windows_private_acl_rejects_broad_inherited_or_explicit_grants () =
+        if not (OperatingSystem.IsWindows()) then
+            Assert.Ignore("Native NTFS ACL validation requires Windows.")
+        let root = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_HERMETIC_ROOT")
+        WindowsDisposableGuard.assertOwnerOnly root true true
+        let isolated = Path.Combine(root, "acl-adversarial-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(isolated) |> ignore
+        try
+            WindowsDisposableGuard.assertOwnerOnly isolated true false
+            let info = DirectoryInfo(isolated)
+            let security = FileSystemAclExtensions.GetAccessControl(info)
+            security.SetAccessRuleProtection(true, false)
+            let everyone = SecurityIdentifier(WellKnownSidType.WorldSid, null)
+            security.AddAccessRule(
+                FileSystemAccessRule(everyone, FileSystemRights.ReadAndExecute,
+                                     AccessControlType.Allow))
+            FileSystemAclExtensions.SetAccessControl(info, security)
+            Assert.Throws<UnauthorizedAccessException>(
+                TestDelegate(fun () ->
+                    WindowsDisposableGuard.assertOwnerOnly isolated true false))
+            |> ignore
+        finally
+            // This child remains beneath a proven private parent; restore its
+            // safe inherited DACL before invoking normal bounded teardown.
+            let info = DirectoryInfo(isolated)
+            let user = WindowsIdentity.GetCurrent().User
+            let security = DirectorySecurity()
+            security.SetOwner(user)
+            security.SetAccessRuleProtection(true, false)
+            security.AddAccessRule(
+                FileSystemAccessRule(user, FileSystemRights.FullControl,
+                                     InheritanceFlags.ContainerInherit ||| InheritanceFlags.ObjectInherit,
+                                     PropagationFlags.None, AccessControlType.Allow))
+            FileSystemAclExtensions.SetAccessControl(info, security)
+            WindowsDisposableGuard.assertOwnerOnly isolated true true
+            Directory.Delete(isolated)
+
+    [<Test>]
     let synthetic_home_under_disposable_root_does_not_masquerade_as_real_profile () =
         let scratch = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_HERMETIC_ROOT")
         let root = Path.Combine(scratch, "jarvis-client-tests-" + Guid.NewGuid().ToString("N"))
@@ -467,6 +533,27 @@ module HermeticHarnessTests =
             Assert.That(child.ExitCode, Is.EqualTo(0), output + error)
         else
             Directory.CreateSymbolicLink(link, outside) |> ignore
+
+    [<Test>]
+    let windows_parent_attestation_rejects_junction_alias_before_scratch_creation () =
+        if not (OperatingSystem.IsWindows()) then
+            Assert.Ignore("Native Windows junction preflight requires Windows.")
+        let root = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_HERMETIC_ROOT")
+        let target = Path.Combine(root, "target-parent-" + Guid.NewGuid().ToString("N"))
+        let alias = Path.Combine(root, "linked-parent-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(target) |> ignore
+        createLinkedDirectory alias target
+        let notCreated = Path.Combine(target, "jarvis-client-tests-" + Guid.NewGuid().ToString("N"))
+        try
+            Assert.Throws<UnauthorizedAccessException>(
+                TestDelegate(fun () ->
+                    WindowsDisposableGuard.attestScratchParent alias |> ignore))
+            |> ignore
+            Assert.That(Directory.Exists(notCreated), Is.False,
+                        "Junction preflight must not allocate or write behind an alias.")
+        finally
+            Directory.Delete(alias)
+            Directory.Delete(target)
 
     [<Test>]
     let linked_config_and_activity_ancestors_are_rejected_without_outside_writes () =

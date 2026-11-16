@@ -1,3 +1,7 @@
+#r "System.IO.FileSystem.AccessControl"
+#r "System.Security.AccessControl"
+#r "System.Security.Principal.Windows"
+#load "../Client.Tests/HermeticWindowsGuard.fs"
 // Run with: dotnet fsi scripts/test-client-hermetic.fsx -- [dotnet test options]
 // Each invocation receives a disposable HOME, XDG, local app data and temp tree.
 // The test process is a child: the invoking Jarvis/.NET process keeps its normal environment.
@@ -7,6 +11,7 @@ open System.IO
 open System.Threading.Tasks
 open System.Text.RegularExpressions
 open System.Text
+open Jarvis.Testing
 
 let args =
     fsi.CommandLineArgs
@@ -69,14 +74,11 @@ let validateScratchParent (path: string) =
         if String.IsNullOrWhiteSpace parent || parent = ancestor then
             checking <- false
         else ancestor <- parent
+    // Token-derived native profile and GUID-volume physical path exclusions
+    // must succeed in THIS parent process, before scratch allocation or writes.
     if OperatingSystem.IsWindows() then
-        for protectedPath in
-            [ Environment.GetFolderPath Environment.SpecialFolder.UserProfile
-              Environment.GetFolderPath Environment.SpecialFolder.ApplicationData
-              Environment.GetFolderPath Environment.SpecialFolder.LocalApplicationData ] do
-            if sameOrUnder protectedPath full then
-                failwith "Hermetic scratch parent must be outside the real Windows user profile."
-    full
+        WindowsDisposableGuard.attestScratchParent full
+    else full
 
 let scratchLocation = scratchParent |> Option.map validateScratchParent
 let captureTail (reader: StreamReader) =
@@ -104,7 +106,10 @@ let tempDirectory =
         let path = Path.Combine(parent, $"jarvis-client-tests-{Guid.NewGuid():N}")
         if File.Exists path || Directory.Exists path then
             failwith "Refusing an already occupied disposable Client.Tests scratch name."
-        let created = Directory.CreateDirectory(path)
+        let created =
+            if OperatingSystem.IsWindows() then
+                WindowsDisposableGuard.createPrivateRoot path
+            else Directory.CreateDirectory(path)
         if created.Attributes.HasFlag(FileAttributes.ReparsePoint) then
             failwith "Refusing a linked disposable Client.Tests scratch root."
         created.FullName
@@ -119,6 +124,8 @@ printfn "Hermetic Client.Tests: scratch path %s" tempDirectory
 let makeDirectory child =
     let path = Path.Combine(tempDirectory, child)
     Directory.CreateDirectory(path) |> ignore
+    if OperatingSystem.IsWindows() then
+        WindowsDisposableGuard.assertOwnerOnly path true false
     path
 
 // Windows Git object files can be ReadOnly. Recursive Directory.Delete leaves
@@ -162,6 +169,8 @@ try
         "[user]\n\tname = Jarvis Test\n\temail = jarvis-test@example.invalid\n"
         + (if OperatingSystem.IsWindows() then "[core]\n\tlongpaths = true\n" else "")
     File.WriteAllText(gitConfig, gitConfigContents)
+    if OperatingSystem.IsWindows() then
+        WindowsDisposableGuard.assertOwnerOnly gitConfig false false
     if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
         File.SetUnixFileMode(gitConfig, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
     if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
@@ -336,6 +345,10 @@ finally
     // A failed setup, test failure, cancellation or timeout must not retain
     // activity, bindings, test output or private temporary credentials.
     if Directory.Exists(tempDirectory) then
+        // A foreign DACL or substituted scratch root is never safe to clean.
+        if OperatingSystem.IsWindows() then
+            WindowsDisposableGuard.assertNoLinkedAncestors tempDirectory
+            WindowsDisposableGuard.assertOwnerOnly tempDirectory true true
         deleteDisposableTree tempDirectory
     printfn "Hermetic Client.Tests: scratch cleanup verified = %b" (not (Directory.Exists tempDirectory))
     if injectSetupFailure then

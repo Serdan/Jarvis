@@ -1,0 +1,1 @@
+Versioned recursive Project/System/Feature graph, cross-system hard prerequisites, explicit parent evidence snapshots, recursive progress, single-project Git CAS persistence. Server 11/11 and two-client ledger 2/2 focused tests pass; public acceptance remains fail-closed; scheduler wake, verified evidence binding and production APIs not yet wired.

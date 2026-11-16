@@ -1027,6 +1027,28 @@ let snapshotExportDeadlineStopsSlowChunksWithoutPublishing () = task {
 
 
 [<Test>]
+let snapshotCaptureDeadlineClassifiesUnansweredRequest () = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let! client, _ = handshake port "test-secret"
+    use socket = client
+    do! send socket """{"version":2,"kind":"capabilities","features":["domSnapshotV1"]}"""
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"silent-tab-01","alias":"no-reply","availability":"ready","registrationGeneration":1}]}"""
+    do! waitUntil (fun () -> bridge.ListTabs() |> Result.exists (fun x -> x.Contains("silent-tab-01")))
+    let capture = bridge.CaptureDom("no-reply", """{"kind":"immediate"}""", "", 200, None)
+    let! request = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property request "kind", Is.EqualTo("captureDom"))
+    // The transport wait uses the caller's remaining budget; no independent
+    // transport deadline exists here, regardless of timer scheduling.
+    let! outcome = capture
+    match outcome with
+    | Error reason -> Assert.That(reason, Is.EqualTo("SnapshotDeadlineExceeded"))
+    | Ok _ -> Assert.Fail("A silent extension must not return a DOM snapshot")
+}
+
+
+[<Test>]
 let twoExtensionsKeepIndependentRegistriesAndRouteByOwner () = task {
     let port = findPort()
     use bridge = new BrowserBridge.Service(port, "test-secret")

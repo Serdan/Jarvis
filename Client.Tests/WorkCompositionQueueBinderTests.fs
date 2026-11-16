@@ -9,6 +9,8 @@ open Client.LedgerStore
 open Client.WorkQueueGitLedger
 open Client.WorkCompositionGitLedger
 open Client.WorkCompositionQueueBinder
+open Client.ReviewWorkflow
+open Client.WorkQueueReceiptProducer
 open Jarvis.WorkQueues
 
 [<TestFixture>]
@@ -213,3 +215,65 @@ type WorkCompositionQueueBinderTests() =
             let after = LedgerStore.fetch second |> ok
             Assert.That(after.Commit, Is.EqualTo(fresh.Commit))
             Assert.That(LedgerStore.getOperationAt second after bindId |> ok, Is.EqualTo(None)))
+
+
+    [<Test>]
+    member _.OriginalWq04ProducerCannotSatisfySameHeadRoleAndSourceLineageContract() =
+        withClones (fun first second _ request ->
+            // Exercise the real WQ04 canonical producer and its immutable
+            // original CreateTask receipt rather than an invented stage origin.
+            let taskOperation = Guid.NewGuid()
+            ReviewWorkflow.createTask first taskOperation "delivery-task" "Original WQ04 task"
+            |> ok |> ignore
+            let producerOperation = Guid.NewGuid()
+            WorkQueueReceiptProducer.produce second "Fixture" producerOperation taskOperation
+            |> ok |> ignore
+
+            let head, project = WorkQueueGitLedger.load first |> ok
+            let stage =
+                project.Works
+                |> Map.toList
+                |> List.map snd
+                |> List.filter (fun work -> work.SubjectId = "delivery-task"
+                                             && work.Id <> request.WorkId)
+                |> List.exactlyOne
+            let origin, originOid =
+                WorkQueueGitLedger.readOriginAt first head stage.Id
+                |> ok |> Option.get
+
+            // WQ04.PracticalProducer deliberately uses NoRoleTransition and
+            // does not carry original source/role lineage for TaskRequested.
+            Assert.That(origin.SourceOperationId, Is.EqualTo(taskOperation.ToString("D")))
+            Assert.That(origin.SourceOperationKind, Is.EqualTo("CreateTask"))
+            Assert.That(origin.RoleId, Is.Empty)
+            Assert.That(origin.RoleVersion, Is.Zero)
+            Assert.That(origin.SourceRef, Is.Empty)
+            Assert.That(origin.SourceCommit, Is.Empty)
+            Assert.That(stage.State, Is.EqualTo(WorkState.Available))
+
+            let original: CompositionQueueBindRequest =
+                { request with
+                    SnapshotHead = head.Commit
+                    ExpectedProjectVersion = project.Version
+                    WorkId = stage.Id
+                    StageGeneration = stage.StageGeneration
+                    SameHeadWorkOriginOid = originOid }
+            let blockers = WorkCompositionQueueBinder.inspect second original |> issues
+            Assert.That(blockers |> List.exists (function
+                | UnprovenRoleOrSource _ -> true
+                | _ -> false), Is.True)
+            Assert.That(blockers |> List.exists (function
+                | UnacceptedDependency "prerequisite" -> true
+                | _ -> false), Is.True)
+            Assert.That(blockers |> List.exists (function
+                | ContradictoryReadiness id when id = stage.Id -> true
+                | _ -> false), Is.True)
+            Assert.That(hasAtomic blockers, Is.True)
+
+            let attemptId = Guid.NewGuid()
+            assertDenied (WorkCompositionQueueBinder.attemptUnderCas
+                second "Fixture" attemptId original)
+            let after = LedgerStore.fetch first |> ok
+            Assert.That(after.Commit, Is.EqualTo(head.Commit))
+            Assert.That(after.Header.NextSequence, Is.EqualTo(head.Header.NextSequence))
+            Assert.That(LedgerStore.getOperationAt first after attemptId |> ok, Is.EqualTo(None)))

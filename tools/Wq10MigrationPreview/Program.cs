@@ -53,9 +53,11 @@ internal static class Program
     }
 
     private sealed record Finding(string Severity, string Code, string Context, string NextAction);
+    private sealed record CanonicalStage(string WorkId, string Kind, int StageGeneration, string State,
+        string RepositoryId, string SourceTaskId, string TargetRef, string LineageId);
     private sealed record LegacyTask(string TaskId, string Title, string Lifecycle,
         string HistoricalPath, string[] Attempts, string[] SourceRefs, string[] SourceCommits,
-        string ProposedWorkId, string Disposition);
+        CanonicalStage[] ExistingStages, string ProposedWorkId, string Disposition);
     private sealed record Message(string MessageId, string Subject, string State, string WorkId);
     private sealed record LegacyAgent(string AgentId, string Execution, string AssignmentTaskId);
     private sealed record LegacyReview(string ReviewId, string TaskId, string Status,
@@ -243,13 +245,6 @@ internal static class Program
                         "Inspect exact producer/index high-water and canonical coverage receipts"));
         var messages = Field(state, "messages") as JsonObject;
         var launches = Field(state, "launches") as JsonObject;
-        var migratedSubjects = new HashSet<string>(StringComparer.Ordinal);
-        if (works is not null)
-            foreach (var work in works)
-            {
-                var subject = Str(work.Value, "subjectId");
-                if (subject.Length > 0) migratedSubjects.Add(subject);
-            }
         long? originSourceHighWater = null;
         var originPaths = paths.Where(p =>
             p.StartsWith("records/work-queue/origins/", StringComparison.Ordinal)
@@ -301,12 +296,41 @@ internal static class Program
                 .Where(s => s.Length > 0).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
             var commits = attempts.SelectMany(a => new[] { Str(a, "baseCommit"), Str(a, "sourceCommit") })
                 .Where(s => s.Length > 0).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
-            var duplicateCount = works?.Count(w =>
-                Str(w.Value, "subjectId") == taskId || Str(w.Value, "subjectId") == "task-" + taskId) ?? 0;
-            var already = duplicateCount > 0 || migratedSubjects.Contains(taskId) || migratedSubjects.Contains("task-" + taskId);
-            if (duplicateCount > 1)
-                findings.Add(new("BLOCKER", "MULTIPLE_CANONICAL_STAGES", context + "/" + taskId,
-                    "Inspect duplicate stages and exact origin receipts; do not auto-merge them"));
+            // A task's canonical history includes completed predecessors and successor stages.
+            // Distinct stage generations/kinds/source-writer lineages are not duplicates.
+            var existingStages = (works?.Where(w => Str(w.Value, "subjectId") == taskId ||
+                                                   Str(w.Value, "subjectId") == "task-" + taskId)
+                .OrderBy(w => w.Key, StringComparer.Ordinal)
+                .Select(w =>
+                {
+                    var lineage = Field(w.Value, "sourceLineage");
+                    return new CanonicalStage(w.Key, Case(Field(w.Value, "kind")),
+                        Int(w.Value, "stageGeneration"), Case(Field(w.Value, "state")),
+                        Str(lineage, "repositoryId"), Str(lineage, "taskId"),
+                        Str(lineage, "targetRef"), Str(lineage, "lineageId"));
+                }).ToArray()) ?? [];
+            var identities = new Dictionary<(string Kind, int Generation, string Repo, string Task,
+                string Target, string Lineage), string>();
+            foreach (var stage in existingStages)
+            {
+                if (stage.Kind.Length == 0 || stage.StageGeneration < 1)
+                {
+                    if (existingStages.Length > 1)
+                        findings.Add(new("BLOCKER", "CANONICAL_STAGE_IDENTITY_UNVERIFIED",
+                            $"{context}/{taskId}/{stage.WorkId}",
+                            "Inspect immutable stage kind and generation before duplicate screening"));
+                    continue;
+                }
+                var identity = (stage.Kind, stage.StageGeneration, stage.RepositoryId,
+                    stage.SourceTaskId, stage.TargetRef, stage.LineageId);
+                if (identities.TryGetValue(identity, out var earlierId))
+                    findings.Add(new("BLOCKER", "DUPLICATE_CANONICAL_STAGE",
+                        $"{context}/{taskId}: {earlierId} and {stage.WorkId} share {stage.Kind} generation {stage.StageGeneration} and source lineage",
+                        "Inspect immutable work IDs, stage generations, lineage and origin receipts; do not auto-merge"));
+                else
+                    identities.Add(identity, stage.WorkId);
+            }
+            var already = existingStages.Length > 0;
             if (active.Length > 0)
                 findings.Add(new("BLOCKER", "LEGACY_ATTEMPT_ACTIVE", context + "/" + taskId,
                     "Settle active claims, source effects, checkpoints, and original owner before staging"));
@@ -317,7 +341,7 @@ internal static class Program
                 Encoding.UTF8.GetBytes(context + "\n" + taskId))).ToLowerInvariant()[..20];
             tasks.Add(new(taskId, Str(task, "title"), lifecycle, path,
                 (attemptsByPath.GetValueOrDefault(taskId) ?? []).Order(StringComparer.Ordinal).ToArray(),
-                refs, commits, proposedId, already ? "ALREADY_PRESENT" : "PROPOSE"));
+                refs, commits, existingStages, proposedId, already ? "ALREADY_PRESENT" : "PROPOSE"));
         }
 
         var msgList = new List<Message>();
@@ -585,7 +609,11 @@ internal static class Program
             b.AppendLine($"Ledger next sequence: {p.LedgerNextSequence}; maximum observed work-origin source high-water: {p.OriginSourceHighWater?.ToString() ?? "UNVERIFIED"} (not proof of complete coverage).");
             b.AppendLine($"Historical operation receipts: {p.HistoricalOperations}; agents: {p.HistoricalAgents}; reviews: {p.HistoricalReviews}; integrations: {p.HistoricalIntegrations}; alerts: {p.HistoricalNotifications}.");
             foreach (var task in p.Tasks)
+            {
                 b.AppendLine($"- {task.TaskId} ({task.Lifecycle}): {task.Disposition}; proposed {task.ProposedWorkId}; source refs: {string.Join(", ", task.SourceRefs)}; commits: {string.Join(", ", task.SourceCommits)}");
+                foreach (var stage in task.ExistingStages)
+                    b.AppendLine($"  - Canonical {stage.WorkId}: {stage.Kind} generation {stage.StageGeneration} ({stage.State}); lineage {stage.RepositoryId}/{stage.SourceTaskId}/{stage.TargetRef}/{stage.LineageId}");
+            }
             foreach (var m in p.Messages)
                 b.AppendLine($"- Message {m.MessageId}: {m.Subject}, {m.State}, work {m.WorkId}");
             foreach (var a in p.Agents)

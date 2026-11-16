@@ -124,7 +124,22 @@ class PreviewTests(unittest.TestCase):
             (self.root / "report.md").write_text(markdown_result.stdout, encoding="utf-8")
         return json.loads(result.stdout)
 
-    def with_queue(self, works=None, messages=None, migration="Frozen", covered=False):
+    @staticmethod
+    def work_stage(work_id, generation, kind="Implementation", state="Completed",
+                   lineage_id="lineage-T1"):
+        return {
+            "id": work_id, "subjectId": "T1",
+            "kind": {"case": kind, "fields": []},
+            "stageGeneration": generation,
+            "state": {"case": state, "fields": []},
+            "sourceLineage": {
+                "repositoryId": "repo-T1", "taskId": "T1",
+                "targetRef": "refs/heads/main", "lineageId": lineage_id
+            }
+        }
+
+    def with_queue(self, works=None, messages=None, migration="Frozen", covered=False,
+                   with_origin=False):
         queue = {
             "schemaVersion": 1, "projectId": "cccccccc-cccc-cccc-cccc-cccccccccccc",
             "state": {
@@ -135,7 +150,10 @@ class PreviewTests(unittest.TestCase):
         if covered:
             queue["state"].update({field: True for field in
                                    ("queueCovered", "graphCovered", "messageCovered", "sourceCovered")})
-        self.project.commit({"records/work-queue/project.json": queue}, "queue fixture")
+        records = {"records/work-queue/project.json": queue}
+        if with_origin:
+            records["records/work-queue/origins/task-T1.json"] = {"sourceHighWater": 7}
+        self.project.commit(records, "queue fixture")
         self.manifest["projects"][0]["head"] = self.project.head
 
     def set_account_phase(self, phase):
@@ -208,14 +226,46 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual(report["projects"][0]["currentRefTip"], self.project.head)
         self.assertIn("REF_HEAD_CHANGED", [f["code"] for f in report["findings"]])
 
-    def test_multiple_existing_canonical_stages_halt_conversion(self):
+    def test_completed_predecessor_and_available_successor_are_not_duplicates(self):
         self.with_queue(works={
-            "W1": {"subjectId": "T1"}, "W2": {"subjectId": "T1"}
-        })
+            "W1": self.work_stage("W1", 1, state="Completed"),
+            "W2": self.work_stage("W2", 2, state="Available")
+        }, covered=True, with_origin=True)
+        account_head, project_head = self.account.head, self.project.head
+        report = self.preview(markdown=True)
+        self.assertEqual(report["readiness"], "PREVIEW_READY_FOR_REVIEW")
+        self.assertEqual([f["code"] for f in report["findings"] if f["severity"] == "BLOCKER"], [])
+        task = report["projects"][0]["tasks"][0]
+        self.assertEqual(task["disposition"], "ALREADY_PRESENT")
+        self.assertEqual([(s["workId"], s["stageGeneration"]) for s in task["existingStages"]],
+                         [("W1", 1), ("W2", 2)])
+        markdown = (self.root / "report.md").read_text()
+        self.assertIn("Canonical W1: Implementation generation 1", markdown)
+        self.assertIn("Canonical W2: Implementation generation 2", markdown)
+        self.assertEqual(self.account.head, account_head)
+        self.assertEqual(self.project.head, project_head)
+
+    def test_completed_implementation_and_review_successor_are_not_duplicates(self):
+        self.with_queue(works={
+            "W1": self.work_stage("W1", 1, kind="Implementation", state="Completed"),
+            "W2": self.work_stage("W2", 1, kind="FrozenReview", state="Available")
+        }, covered=True, with_origin=True)
+        report = self.preview()
+        self.assertEqual(report["readiness"], "PREVIEW_READY_FOR_REVIEW")
+        self.assertEqual([s["kind"] for s in report["projects"][0]["tasks"][0]["existingStages"]],
+                         ["Implementation", "FrozenReview"])
+
+    def test_genuinely_duplicate_canonical_stage_halts_conversion(self):
+        self.with_queue(works={
+            "W1": self.work_stage("W1", 1, state="Completed"),
+            "W2": self.work_stage("W2", 1, state="Completed")
+        }, covered=True, with_origin=True)
         report = self.preview()
         self.assertEqual(report["readiness"], "NO_GO")
-        self.assertIn("MULTIPLE_CANONICAL_STAGES",
-                      [f["code"] for f in report["findings"]])
+        self.assertEqual([f["code"] for f in report["findings"] if f["severity"] == "BLOCKER"],
+                         ["DUPLICATE_CANONICAL_STAGE"])
+        self.assertIn("W1 and W2", next(f["context"] for f in report["findings"]
+                                      if f["code"] == "DUPLICATE_CANONICAL_STAGE"))
 
     def test_claimed_review_unsettled_integration_and_working_agent(self):
         self.project.commit({

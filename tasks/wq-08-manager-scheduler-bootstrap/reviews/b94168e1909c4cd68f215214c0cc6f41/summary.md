@@ -1,0 +1,1 @@
+Two files only. Foreign WQ04 source receipts no longer populate candidate SHA/operation fields; mismatched admission/browser witnesses preserve original operation IDs and surface actionable conflicts. New .NET11 Release Client regression assertions; 10 focused tests passed. No production dispatch activation.

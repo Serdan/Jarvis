@@ -8,19 +8,68 @@ open Client.WorkQueueGitLedger
 open Client.ReviewWorkflow
 open Jarvis.WorkQueues
 
+// A parent review binds the current composition closure, not just its spec.
+// New or re-accepted descendants invalidate old approval evidence.
+type AcceptanceProofTarget =
+    { SpecVersion: int
+      GraphVersion: int
+      EvidenceRef: string }
+
+type ChildAcceptanceTarget =
+    { SpecVersion: int
+      CancellationReason: string option
+      CurrentAcceptance: AcceptanceProofTarget option }
+
+type ReviewAcceptanceTarget =
+    { UnitId: string
+      Kind: WorkUnitKind
+      ParentId: string option
+      SpecVersion: int
+      SpecHash: string
+      Children: Map<string, ChildAcceptanceTarget>
+      Prerequisites: Map<string, AcceptanceProofTarget option> }
+
 // The composition graph is not a second review or integration workflow.
 // Validation uses the existing canonical receipts at the same verified Git
 // ledger snapshot as the compare-and-swap graph mutation.
 module WorkCompositionAcceptanceAdapter =
     let private nonBlank (value: string) = not (String.IsNullOrWhiteSpace value)
 
-    // The review purpose binds the independent review to one exact unit target.
-    // A subsequent spec revision requires a new acceptance review, even when
-    // the same implementation commit remains reachable from the target branch.
-    let reviewPurpose (unit: CompositeWorkUnit) =
-        let specHash = CanonicalCodec.digest (CanonicalCodec.encode unit.Spec)
-        let target = sprintf "%s\n%d\n%s" unit.Id unit.SpecVersion specHash
-        "WorkComposition.Acceptance." + CanonicalCodec.digest target
+    let private proofTarget (proof: WorkUnitAcceptance) =
+        { SpecVersion = proof.SpecVersion
+          GraphVersion = proof.GraphVersion
+          EvidenceRef = proof.EvidenceRef }
+
+    // Reviewed target includes the composition closure: immediate children
+    // and prerequisite proof versions also bind the transitive descendants.
+    // Unrelated graph mutations do not stale this target.
+    let reviewPurpose (graph: WorkCompositionGraph) (unit: CompositeWorkUnit) =
+        let children =
+            graph.Units
+            |> Map.toList
+            |> List.choose (fun (id, child) ->
+                if child.ParentId = Some unit.Id then
+                    Some(id,
+                         { SpecVersion = child.SpecVersion
+                           CancellationReason = child.CancellationReason
+                           CurrentAcceptance =
+                             WorkComposition.currentAcceptance graph id |> Option.map proofTarget })
+                else None)
+            |> Map.ofList
+        let prerequisites =
+            unit.HardPrerequisites
+            |> Seq.map (fun id ->
+                id, WorkComposition.currentAcceptance graph id |> Option.map proofTarget)
+            |> Map.ofSeq
+        let target: ReviewAcceptanceTarget =
+            { UnitId = unit.Id
+              Kind = unit.Kind
+              ParentId = unit.ParentId
+              SpecVersion = unit.SpecVersion
+              SpecHash = CanonicalCodec.digest (CanonicalCodec.encode unit.Spec)
+              Children = children
+              Prerequisites = prerequisites }
+        "WorkComposition.Acceptance." + CanonicalCodec.digest (CanonicalCodec.encode target)
 
     let private checkAt (binding: LedgerBinding) (snapshot: LedgerSnapshot)
                         (graph: WorkCompositionGraph) (unitId: string) (receipt: string) =
@@ -62,7 +111,7 @@ module WorkCompositionAcceptanceAdapter =
                 && submission.CreatedSequence > review.DecisionSequence
                 && review.ReviewedHeadOid = submission.SubmittedCommit
                 && review.Status = "Accepted"
-                && review.Kind = reviewPurpose unit
+                && review.Kind = reviewPurpose graph unit
                 && review.DecisionSequence > review.CreatedSequence
                 && nonBlank review.ReviewerId
                 && nonBlank review.OwnerAgentId

@@ -123,7 +123,7 @@ let ``composition acceptance requires exact independently reviewed and integrate
                                             spec "Project" (Some taskId)))
         |> succeed |> ignore
         let _, initial = WorkCompositionGitLedger.load second |> succeed
-        let purpose = WorkCompositionAcceptanceAdapter.reviewPurpose initial.Units.["project"]
+        let purpose = WorkCompositionAcceptanceAdapter.reviewPurpose initial initial.Units.["project"]
 
         git first.RepositoryPath [ "config"; "user.name"; "Fixture" ] |> ignore
         git first.RepositoryPath [ "config"; "user.email"; "fixture@example.test" ] |> ignore
@@ -191,28 +191,97 @@ let ``composition acceptance requires exact independently reviewed and integrate
         Assert.That(WorkComposition.currentAcceptance acceptedGraph "project" |> Option.isSome, Is.True)
         Assert.That(acceptedGraph.Units.["project"].Acceptances.Count, Is.EqualTo(1))
 
-        // Corrective work retains historical proof, but the parent requires
-        // fresh acceptance, not only a reopened or closed child task.
+        // Adding corrective work retains the historical proof, but changes
+        // the effective parent target even though its own spec is unchanged.
+        let correctionTaskId = "correction-acceptance-validation"
+        ReviewWorkflow.createTask first (Guid.NewGuid()) correctionTaskId
+            "Independently verify corrective feature" |> succeed |> ignore
         WorkCompositionGitLedger.execute first owner (Guid.NewGuid()) acceptedGraph.Version
             (WorkCompositionMutation.Create("correction", WorkUnitKind.Feature, Some "project",
-                                            spec "Correction" None))
+                                            spec "Correction" (Some correctionTaskId)))
         |> succeed |> ignore
         let _, withChild = WorkCompositionGitLedger.load second |> succeed
         Assert.That(WorkComposition.currentAcceptance withChild "project" |> Option.isNone, Is.True)
+        Assert.That(
+            WorkCompositionAcceptanceAdapter.reviewPurpose withChild withChild.Units.["project"],
+            Is.Not.EqualTo(purpose))
         match WorkCompositionAcceptanceAdapter.acceptIntegrated second owner
                   (Guid.NewGuid()) withChild.Version "project" 1 submissionId with
-        | Error(InvalidBinding message) ->
-            Assert.That(message, Does.Contain("IncompleteChildren"))
-        | other -> Assert.Fail(sprintf "Expected independent child acceptance check: %A" other)
+        | Error(InvalidBinding _) -> ()
+        | other -> Assert.Fail(sprintf "Expected review to become stale after adding child: %A" other)
 
-        // The exact same integrated review cannot be reinterpreted as proof
-        // for a newer target specification.
-        WorkCompositionGitLedger.execute second owner (Guid.NewGuid()) withChild.Version
+        // Independently review, integrate and accept the child. Once all
+        // children are complete the *old* parent review must still fail.
+        git first.RepositoryPath [ "checkout"; "-b"; "feature/composition-correction" ] |> ignore
+        File.WriteAllText(Path.Combine(first.RepositoryPath, "correction-verification.txt"),
+                          "Independently verified corrective feature")
+        git first.RepositoryPath [ "add"; "correction-verification.txt" ] |> ignore
+        git first.RepositoryPath [ "commit"; "-m"; "Verify corrective feature" ] |> ignore
+        let correctionSha = git first.RepositoryPath [ "rev-parse"; "HEAD" ]
+        let correctionRef = "refs/heads/feature/composition-correction"
+        let correctionPurpose =
+            WorkCompositionAcceptanceAdapter.reviewPurpose withChild withChild.Units.["correction"]
+        let correctionReviewId = Guid.NewGuid()
+        ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) correctionTaskId owner
+            correctionReviewId correctionRef correctionSha "Validate corrective feature"
+            correctionPurpose targetRef |> succeed |> ignore
+        ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) correctionTaskId
+            correctionReviewId reviewer 1 |> succeed |> ignore
+        ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) correctionTaskId
+            correctionReviewId reviewer 2 Accept |> succeed |> ignore
+        let correctionSubmissionId = Guid.NewGuid()
+        ReviewWorkflow.submitIntegration second (Guid.NewGuid()) correctionTaskId owner
+            correctionSubmissionId "" "" (correctionReviewId.ToString("N")) targetRef
+        |> succeed |> ignore
+        git first.RepositoryPath [ "checkout"; "main" ] |> ignore
+        git first.RepositoryPath [ "merge"; "--ff-only"; correctionSha ] |> ignore
+        git first.RepositoryPath [ "push"; "origin"; "main" ] |> ignore
+        ReviewWorkflow.completeIntegration second (Guid.NewGuid()) correctionTaskId reviewer
+            correctionSubmissionId correctionSha |> succeed |> ignore
+        WorkCompositionAcceptanceAdapter.acceptIntegrated second owner (Guid.NewGuid())
+            withChild.Version "correction" 1 correctionSubmissionId |> succeed |> ignore
+        let _, withAcceptedChild = WorkCompositionGitLedger.load first |> succeed
+        let childProof = WorkComposition.currentAcceptance withAcceptedChild "correction" |> Option.get
+        Assert.That(WorkComposition.currentAcceptance withAcceptedChild "project" |> Option.isNone, Is.True)
+        match WorkCompositionAcceptanceAdapter.acceptIntegrated first owner
+                  (Guid.NewGuid()) withAcceptedChild.Version "project" 1 submissionId with
+        | Error(InvalidBinding _) -> ()
+        | other -> Assert.Fail(sprintf "Old parent review replayed after accepted child: %A" other)
+
+        // Fresh, independent parent review now binds the newly accepted child
+        // revision, and can authorize a new parent acceptance target.
+        let freshPurpose =
+            WorkCompositionAcceptanceAdapter.reviewPurpose
+                withAcceptedChild withAcceptedChild.Units.["project"]
+        let freshReviewId = Guid.NewGuid()
+        ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId owner
+            freshReviewId correctionRef correctionSha "Validate composed project outcome"
+            freshPurpose targetRef |> succeed |> ignore
+        ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId
+            freshReviewId reviewer 1 |> succeed |> ignore
+        ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId
+            freshReviewId reviewer 2 Accept |> succeed |> ignore
+        let freshSubmissionId = Guid.NewGuid()
+        ReviewWorkflow.submitIntegration second (Guid.NewGuid()) taskId owner
+            freshSubmissionId "" "" (freshReviewId.ToString("N")) targetRef
+        |> succeed |> ignore
+        ReviewWorkflow.completeIntegration second (Guid.NewGuid()) taskId reviewer
+            freshSubmissionId correctionSha |> succeed |> ignore
+        WorkCompositionAcceptanceAdapter.acceptIntegrated first owner (Guid.NewGuid())
+            withAcceptedChild.Version "project" 1 freshSubmissionId |> succeed |> ignore
+        let _, refreshed = WorkCompositionGitLedger.load second |> succeed
+        let parentProof = WorkComposition.currentAcceptance refreshed "project" |> Option.get
+        Assert.That(parentProof.ChildAcceptances.["correction"], Is.EqualTo(childProof.GraphVersion))
+        Assert.That(refreshed.Units.["project"].Acceptances.Count, Is.EqualTo(2))
+
+        // A later change to the parent's *own* specification also invalidates
+        // the new acceptance, without deleting historical target receipts.
+        WorkCompositionGitLedger.execute second owner (Guid.NewGuid()) refreshed.Version
             (WorkCompositionMutation.Revise("project", 1,
-                { withChild.Units.["project"].Spec with Scope = "New goal boundary" }))
+                { refreshed.Units.["project"].Spec with Scope = "New goal boundary" }))
         |> succeed |> ignore
         let _, revised = WorkCompositionGitLedger.load first |> succeed
         match WorkCompositionAcceptanceAdapter.acceptIntegrated first owner
-                  (Guid.NewGuid()) revised.Version "project" 2 submissionId with
+                  (Guid.NewGuid()) revised.Version "project" 2 freshSubmissionId with
         | Error(InvalidBinding _) -> ()
         | other -> Assert.Fail(sprintf "Expected stale target-review rejection: %A" other))

@@ -16,3 +16,7 @@
 
 ## Evidence boundary
 Accepted original Reviewer 3 scope remains the narrow host-selected authenticated command-path default-off fence. Direct `ReviewWorkflow`/`ChallengeWorkflow`/`RoleInstructions`/`LedgerStore.transact` writes, old/foreign clients, external Git writers, previously scheduled/rearmed actions, cross-ledger check-to-CAS races, trusted Freeze signer, minimum fleet protocol witness, original writer high-water and complete operator repair/cutover gates remain **NO-GO**. This merge does not activate any fence, Scheduler or migration cutover.
+
+## Independent Reviewer 3 adjudication (exact frozen b10d836c)
+
+**Accepted, merge-resolution scope only.** Independently verified both immutable parents, only the `Client.Tests.fsproj` two-include conflict, unmodified accepted-fence and main native-credential/Prepared/Agent-free source files, both parent diff-checks, and a final clean worktree. Independently executed .NET 11 Release: focused Client 28/28, SignalR 17/17, DispatchProbe 13/13, explicit fence 5/5, standalone Agent-free 4/4, full Server 294/294; all pass, with overlapping counts. Detailed source and command evidence in `findings/independent-two-parent-verification.md` (review document committed at seq 5329). No independent full unfiltered Client pass is asserted. **All production fleet-wide writer-fence / original high-water / old-client / direct-ledger-write / Scheduler / migration cutover NO-GO limitations remain.**

@@ -19,11 +19,16 @@ let args =
     |> Array.toList
     |> function | "--" :: tail -> tail | rest -> rest
 
+// Native Git-backed Windows fixtures run substantially slower than Linux.
+// Allow an explicitly requested bounded deadline for full Windows acceptance;
+// keep the short default and the non-Windows ceiling unchanged.
+let maxTimeoutSeconds = if OperatingSystem.IsWindows() then 21600 else 1800
+
 let rec parse timeout scratchParent forwarded = function
     | "--timeout-seconds" :: value :: tail ->
         match Int32.TryParse value with
-        | true, seconds when seconds >= 10 && seconds <= 1800 -> parse seconds scratchParent forwarded tail
-        | _ -> failwith "Timeout must be between 10 and 1800 seconds."
+        | true, seconds when seconds >= 10 && seconds <= maxTimeoutSeconds -> parse seconds scratchParent forwarded tail
+        | _ -> failwith $"Timeout must be between 10 and {maxTimeoutSeconds} seconds."
     | "--scratch-parent" :: value :: tail -> parse timeout (Some value) forwarded tail
     | head :: tail -> parse timeout scratchParent (head :: forwarded) tail
     | [] -> timeout, scratchParent, List.rev forwarded

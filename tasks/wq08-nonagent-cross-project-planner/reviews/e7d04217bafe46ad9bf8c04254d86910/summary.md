@@ -1,0 +1,1 @@
+Commit 0e369b3e: new fake-only planner module and 17 focused .NET 11 Release tests (17 passed, 0 failed); source ref pushed. Full Client.Tests run timed out at 240 seconds during concurrent workloads; do not infer full-suite pass. No live admission/browser dispatch/account writes or CanDispatch activation.

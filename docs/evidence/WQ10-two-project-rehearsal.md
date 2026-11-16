@@ -1,10 +1,10 @@
 # WQ10 — disposable two-project offline cutover rehearsal
 
 **Date:** 2026-11-16
-**Task:** `wq10-offline-rehearsal-review-fix` (Worker 9; corrects the earlier rehearsal)
-**Source baseline:** `b061ca525358f8616562e8911e3fbd6158c0b6d1` (verified `main` at corrective worktree creation)
-**Branch:** `refs/heads/fix/wq10-host-provenance-review-worker9-20261116`
-**Rejected historical source:** `3bf142f22fc7a54b5e4c0b69e42f3b10e29f5376` (independent review 61318cb215db4d9b85ceadb75eaa1b8e; not integrated)
+**Task:** `wq10-source-writer-target-ref-review-fix` (Worker 9; second-review source-lineage correction)
+**Source baseline:** `6fcd0f8812b3957b2d4dd6c9baf754c9dd00d303` (verified `main` when isolated branch was created)
+**Branch:** `refs/heads/fix/wq10-target-ref-lineage-worker9-20261116`
+**Rejected historical sources:** `3bf142f22fc7a54b5e4c0b69e42f3b10e29f5376` (review 61318cb215db4d9b85ceadb75eaa1b8e) and `62d9b0f400a1e1c01519f73af1a6faeae963b2e7` (review 6d59b6f4ad284d2eb17a46c990e88a6c); neither integrated
 **Production disposition:** **NO GO / NOT AUTHORIZED**
 
 ## Scope and evidence boundaries
@@ -39,9 +39,9 @@ The host preview never calls a provider or authorizes dispatch.
 ## P1 review corrections — fail-closed gate
 
 The earlier independent review rejected the frozen rehearsal source for two
-confirmed P1 defects. This corrected branch cherry-picks that historical source
-into an isolated worktree based on later verified `main`, then corrects it;
-neither the rejected source nor this branch was integrated into `main` here.
+confirmed P1 defects. The first correction addressed those findings but received
+a second P1 source-lineage finding. This branch replays the two rehearsal commits
+onto later verified `main`, then adds the second-review fix in isolation.
 
 1. **Host diagnostic compatibility:** The real WQ08 `previewWith` always appends
    `DispatchDisabled`. A matching single issue is now an expected inert
@@ -69,6 +69,31 @@ change a candidate work ID, generation, queue, role, ref, commit, original
 operation ID/request hash, exact origin blob and pinned origin content.
 A fake green WQ08 issue array with omitted `DispatchDisabled` also yields
 `NO_GO`.
+
+## P1 second independent review correction — original source-writer identity
+
+Review `6d59b6f4ad284d2eb17a46c990e88a6c` (ChangesRequested seq4563)
+reproduced a false green despite the prior source-origin checks: Alpha's
+canonical `W-Alpha.sourceLineage.targetRef=refs/heads/unrelated` contradicted
+the independently inventoried original attempt's `targetRef=refs/heads/main`.
+The original WQ10 inspector's `sourceRefs` combines source and target refs for
+display; a nonempty canonical target or membership in that flattened list is
+not an identity proof. `sourceProvenanceVerified=true` was therefore false.
+
+The corrected rehearsal re-reads **each inventoried legacy attempt** directly
+from the same pinned project Git head, checks attempt path/task identity, and
+requires one original attempt to witness the complete target ref + source ref +
+source commit tuple. It independently reconciles the attempt's source repository
+fingerprint (using recorded approved fetch/push endpoints) against the canonical
+WQ03 repository fingerprint, and checks lineage ID when available in the
+original attempt. Missing, split, contradictory, or incomplete evidence yields
+`SOURCE_PROVENANCE_UNVERIFIED` / `NO_GO`, with exact refs and head in diagnostics.
+Matching independent identity remains `PREPARED_FOR_REVIEW` in offline fixtures.
+
+Five additional regression tests cover the exact two-project targetRef mismatch,
+the matching positive case, an original attempt with no targetRef, split tuples
+assembled from separate attempts, and wrong/missing source repository evidence.
+No `requireCandidate=false` bypass or adverse WQ08 issue tolerance is added.
 
 ## Executable matrix: two separate pinned offline cases
 
@@ -128,13 +153,13 @@ folder **outside** all clones before their cleanup.
    Scheduler enabling, deployment and restart require separate operator
    authority and a demonstrated compatible-client fence.
 
-## Validation at source baseline
+## Validation at corrected source (2026-11-16)
 
 | Command | Observed result |
 |---|---|
 | `dotnet build tools/Wq10MigrationPreview/Wq10MigrationPreview.csproj -c Release` | Exit 0; .NET 11 Release build; **0 warnings, 0 errors** |
-| `python3 -m unittest discover -s tools/Wq10MigrationPreview/tests -v` | Exit 0; **27 passed / 0 failed**. Includes 16 inspector tests and 11 rehearsal tests (two-project bypass, host diagnostic and provenance adversarial regressions) |
-| `dotnet test Client.Tests/Client.Tests.fsproj -c Release --filter 'FullyQualifiedName~WorkQueueSchedulerHostPreviewTests' --logger 'console;verbosity=minimal'` | Exit 0; **12 passed / 0 failed / 0 skipped** under .NET 11 Release |
+| `python3 -m unittest discover -s tools/Wq10MigrationPreview/tests` | Exit 0; **32 passed / 0 failed**. Includes 16 inspector tests and 16 rehearsal tests with original-writer target and repository identity regressions |
+| `dotnet test Client.Tests/Client.Tests.fsproj -c Release --filter 'FullyQualifiedName~WorkQueueSchedulerHostPreviewTests' --logger 'console;verbosity=minimal'` | Exit 0; **12 passed / 0 failed / 0 skipped** under .NET 11 Release (existing F# compiler warnings in unrelated Client/Client.Tests code) |
 
 The Python runner tests exact head pinning, clean-clone nonmutation, green and
 blocked matrix generation, original uncertain IDs, old-writer drift, cap-one

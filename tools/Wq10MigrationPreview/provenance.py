@@ -50,6 +50,82 @@ def git_json_at(snapshot, path):
     return result, blob
 
 
+def verify_source_writer(task, snapshot, work_id, lineage, candidate):
+    """Reconcile the writer tuple with original attempts, not aggregated refs.
+
+    The inspector's sourceRefs combines sourceRef and targetRef for display.
+    That union cannot prove which original attempt supplied a target.
+    """
+    task_id = task.get("taskId")
+    paths = task.get("attempts")
+    if not isinstance(paths, list) or not paths:
+        return [f"{work_id}: no independently inventoried legacy attempts for {task_id}"]
+
+    attempts = []
+    failures = []
+    prefix = f"tasks/{task_id}/attempts/"
+    for path in paths:
+        if (not isinstance(path, str) or not path.startswith(prefix) or
+                not re.fullmatch(r"[0-9a-f]{32}\.json", path[len(prefix):])):
+            failures.append(f"{work_id}: invalid inventoried attempt path {path!r}")
+            continue
+        try:
+            original, _ = git_json_at(snapshot, path)
+        except (ValueError, KeyError, OSError, subprocess.TimeoutExpired) as ex:
+            failures.append(f"{work_id}: original attempt {path}: {ex}")
+            continue
+        attempt_id = field(original, "attemptId")
+        if (field(original, "taskId") != task_id or not isinstance(attempt_id, str) or
+                attempt_id.replace("-", "").lower() + ".json" != path[len(prefix):]):
+            failures.append(f"{work_id}: original attempt identity disagrees with {path}")
+            continue
+        attempts.append(original)
+
+    target = field(lineage, "targetRef")
+    original_targets = sorted({ref for attempt in attempts
+                               if isinstance(ref := field(attempt, "targetRef"), str) and ref})
+    if target not in original_targets:
+        failures.append(f"{work_id}: canonical source-writer targetRef {target!r} differs from "
+                        f"original attempt targetRefs {original_targets!r} at pinned {snapshot['head']}")
+
+    # The target, source ref and commit must coexist on ONE original attempt.
+    # Flattened independent lists can manufacture a false witness.
+    matching = [attempt for attempt in attempts
+                if field(attempt, "targetRef") == target and
+                field(attempt, "sourceRef") == candidate.get("sourceRef") and
+                field(attempt, "sourceCommit") == candidate.get("sourceCommit")]
+    if not matching:
+        failures.append(f"{work_id}: no original attempt at pinned {snapshot['head']} "
+                        f"matches targetRef={target!r}, sourceRef={candidate.get('sourceRef')!r}, "
+                        f"sourceCommit={candidate.get('sourceCommit')!r} as one source-writer tuple")
+
+    for attempt in matching:
+        attempt_id = field(attempt, "attemptId")
+        fetch = field(attempt, "sourceRemote")
+        push = field(attempt, "sourcePushRemote")
+        repository = field(attempt, "sourceRepositoryId")
+        if not all(isinstance(value, str) and value for value in (fetch, push, repository)):
+            failures.append(f"{work_id}: original attempt {attempt_id} lacks independently "
+                            "verifiable source repository endpoints/identity")
+            continue
+
+        def fingerprint(prefix):
+            return hashlib.sha256(f"{prefix}\n{fetch}\n{push}".encode("utf-8")).hexdigest()
+
+        expected_legacy = fingerprint("jarvis-source-repository-v1")
+        expected_queue = fingerprint("wq03-source-git-v1")
+        if repository != expected_legacy or field(lineage, "repositoryId") != expected_queue:
+            failures.append(f"{work_id}: source repository identity differs for original "
+                            f"attempt {attempt_id}: canonical={field(lineage, 'repositoryId')!r}, "
+                            f"expected={expected_queue!r}, legacy={repository!r}, "
+                            f"expectedLegacy={expected_legacy!r}")
+        original_lineage = field(attempt, "lineageId")
+        if original_lineage is not None and original_lineage != field(lineage, "lineageId"):
+            failures.append(f"{work_id}: original attempt {attempt_id} lineageId "
+                            f"{original_lineage!r} differs from canonical {field(lineage, 'lineageId')!r}")
+    return failures
+
+
 def verify_candidate(project, snapshot, preview):
     """Check WQ08 selected work against WQ10 inventory and immutable WQ04 origin."""
     candidate = preview.get("wouldLaunch")
@@ -124,12 +200,7 @@ def verify_candidate(project, snapshot, preview):
                 stage.get("kind") == field(field(work, "kind"), "case") and
                 stage.get("state") == field(field(work, "state"), "case"),
                 "inspector stage disagrees with pinned canonical work")
-        if task.get("sourceRefs"):
-            require(candidate.get("sourceRef") in task["sourceRefs"],
-                    "candidate source ref absent from inspected legacy attempt")
-        if task.get("sourceCommits"):
-            require(candidate.get("sourceCommit") in task["sourceCommits"],
-                    "candidate source commit absent from inspected legacy attempt")
+        failures.extend(verify_source_writer(task, snapshot, work_id, lineage, candidate))
 
     require(candidate.get("roleId") == preview.get("roleId") == field(origin, "RoleId") and
             type(candidate.get("roleVersion")) is int and candidate["roleVersion"] > 0 and

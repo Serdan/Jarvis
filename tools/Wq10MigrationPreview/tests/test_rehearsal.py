@@ -41,6 +41,12 @@ class RehearsalTests(unittest.TestCase):
             ("Beta", "T-beta", "dddddddd-dddd-dddd-dddd-dddddddddddd")
         ):
             work_id = f"W-{name}"
+            source_fetch = f"https://offline.example.invalid/{name.lower()}/source.git"
+            source_push = f"https://offline.example.invalid/{name.lower()}/push.git"
+            legacy_repository = hashlib.sha256(
+                f"jarvis-source-repository-v1\n{source_fetch}\n{source_push}".encode()).hexdigest()
+            queue_repository = hashlib.sha256(
+                f"wq03-source-git-v1\n{source_fetch}\n{source_push}".encode()).hexdigest()
             origin_path = "records/work-queue/origins/" + hashlib.sha256(work_id.encode()).hexdigest() + ".json"
             if not hasattr(self, "origin_paths"):
                 self.origin_paths = {}
@@ -72,7 +78,9 @@ class RehearsalTests(unittest.TestCase):
                 f"tasks/{task_id}/attempts/11111111111111111111111111111111.json": {
                     "taskId": task_id, "attemptId": "11111111111111111111111111111111",
                     "phase": "Finished", "sourceRef": f"refs/heads/feature/{task_id}",
-                    "sourceCommit": "1" * 40, "ownerAgentId": "Worker 1"
+                    "sourceCommit": "1" * 40, "ownerAgentId": "Worker 1",
+                    "targetRef": "refs/heads/main", "sourceRepositoryId": legacy_repository,
+                    "sourceRemote": source_fetch, "sourcePushRemote": source_push
                 },
                 "agents/Manager.json": {
                     "agentId": "Manager", "execution": "Stopped"
@@ -91,7 +99,7 @@ class RehearsalTests(unittest.TestCase):
                             "subjectId": task_id, "stageGeneration": 1,
                             "kind": {"case": "Implementation", "fields": []},
                             "state": {"case": "Available", "fields": []},
-                            "sourceLineage": {"repositoryId": f"repo-{name}",
+                            "sourceLineage": {"repositoryId": queue_repository,
                                               "taskId": task_id, "targetRef": "refs/heads/main",
                                               "lineageId": f"origin-{task_id}"}
                         }},
@@ -441,6 +449,88 @@ class RehearsalTests(unittest.TestCase):
         # The expected blob OID is correct, but the actual source identity isn't.
         self.assertIn("candidate sourceOperationId differs",
                       str(result["blockers"]))
+
+
+    def test_matching_original_source_writer_tuple_is_prepared(self):
+        case = self.run_rehearsal([self.manifest("matching-writer")])["cases"][0]
+        self.assertEqual(case["rehearsalVerdict"], "PREPARED_FOR_REVIEW")
+        self.assertEqual(case["productionCutover"], "NOT_AUTHORIZED")
+        self.assertEqual(case["blockers"], [])
+        self.assertEqual(len(case["projectMatrix"]), 2)
+        self.assertTrue(all(row["scheduler"]["sourceProvenanceVerified"]
+                            for row in case["projectMatrix"]))
+
+    def test_reviewer_exact_two_project_target_ref_mismatch_is_no_go(self):
+        alpha = self.projects["Alpha"]
+        queue = json.loads((alpha.first / "records/work-queue/project.json").read_text())
+        queue["state"]["works"]["W-Alpha"]["sourceLineage"]["targetRef"] = "refs/heads/unrelated"
+        alpha.commit({"records/work-queue/project.json": queue}, "adversarial writer target mismatch")
+        case = self.run_rehearsal([self.manifest("reviewer-target-ref-mismatch")])["cases"][0]
+        self.assertEqual(case["rehearsalVerdict"], "NO_GO")
+        self.assertEqual(case["productionCutover"], "NOT_AUTHORIZED")
+        self.assertIn("SOURCE_PROVENANCE_UNVERIFIED",
+                      [finding["code"] for finding in case["blockers"]])
+        rows = {row["project"]: row for row in case["projectMatrix"]}
+        self.assertFalse(rows["Alpha"]["scheduler"]["sourceProvenanceVerified"])
+        self.assertTrue(rows["Beta"]["scheduler"]["sourceProvenanceVerified"])
+        details = str(rows["Alpha"]["scheduler"]["sourceProvenanceFindings"])
+        self.assertIn("refs/heads/unrelated", details)
+        self.assertIn("refs/heads/main", details)
+        self.assertIn(alpha.head, details)
+
+    def test_missing_original_attempt_target_is_unknown_no_go(self):
+        alpha = self.projects["Alpha"]
+        path = "tasks/T-alpha/attempts/11111111111111111111111111111111.json"
+        attempt = json.loads((alpha.first / path).read_text())
+        del attempt["targetRef"]
+        alpha.commit({path: attempt}, "remove independent target")
+        case = self.run_rehearsal([self.manifest("target-unknown")])["cases"][0]
+        self.assertEqual(case["rehearsalVerdict"], "NO_GO")
+        alpha_row = next(row for row in case["projectMatrix"] if row["project"] == "Alpha")
+        self.assertIn("original attempt targetRefs []",
+                      str(alpha_row["scheduler"]["sourceProvenanceFindings"]))
+
+    def test_original_attempts_cannot_contribute_split_identity_tuple(self):
+        alpha = self.projects["Alpha"]
+        first = "tasks/T-alpha/attempts/11111111111111111111111111111111.json"
+        original = json.loads((alpha.first / first).read_text())
+        original["targetRef"] = "refs/heads/other"
+        second = "tasks/T-alpha/attempts/22222222222222222222222222222222.json"
+        other = dict(original)
+        other["attemptId"] = "22222222222222222222222222222222"
+        other["targetRef"] = "refs/heads/main"
+        other["sourceRef"] = "refs/heads/feature/unrelated"
+        other["sourceCommit"] = "8" * 40
+        alpha.commit({first: original, second: other}, "split original writer tuple")
+        case = self.run_rehearsal([self.manifest("split-writer")])["cases"][0]
+        self.assertEqual(case["rehearsalVerdict"], "NO_GO")
+        alpha_row = next(row for row in case["projectMatrix"] if row["project"] == "Alpha")
+        self.assertIn("as one source-writer tuple",
+                      str(alpha_row["scheduler"]["sourceProvenanceFindings"]))
+
+    def test_repository_identity_mismatch_and_missing_evidence_fail_closed(self):
+        for defect in ("wrong-remote", "missing-repository-id"):
+            with self.subTest(defect=defect):
+                # Restore the canonical endpoint before testing an independent missing-ID case.
+                alpha = self.projects["Alpha"]
+                path = "tasks/T-alpha/attempts/11111111111111111111111111111111.json"
+                attempt = json.loads((alpha.first / path).read_text())
+                if defect == "wrong-remote":
+                    attempt["sourceRemote"] = "https://offline.example.invalid/unrelated.git"
+                else:
+                    attempt["sourceRemote"] = "https://offline.example.invalid/alpha/source.git"
+                    attempt.pop("sourceRepositoryId", None)
+                alpha.commit({path: attempt}, "contradict independent source repository")
+                case = self.run_rehearsal([self.manifest("repo-" + defect)])["cases"][0]
+                self.assertEqual(case["rehearsalVerdict"], "NO_GO")
+                row = next(r for r in case["projectMatrix"] if r["project"] == "Alpha")
+                self.assertFalse(row["scheduler"]["sourceProvenanceVerified"])
+                if defect == "wrong-remote":
+                    self.assertIn("source repository identity differs",
+                                  str(row["scheduler"]["sourceProvenanceFindings"]))
+                else:
+                    self.assertIn("lacks independently verifiable source repository",
+                                  str(row["scheduler"]["sourceProvenanceFindings"]))
 
 
 if __name__ == "__main__":

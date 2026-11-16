@@ -1264,6 +1264,69 @@ module WorkQueueGitLedger =
             Error(OutcomeUnknown $"Injected lost WQ-02 post-publication acknowledgement {operationId:D}.")
         | _ -> result
 
+    // Default-off WQ04/WQ07 admission boundary. The only transition this seam
+    // can publish is a project launch with both immutable original WQ02 and
+    // versioned-role witnesses in the SAME CAS. The caller must reverify pinned
+    // source, role and account evidence inside this planner. Normal WQ02
+    // execute remains fail-closed for production AdmitProject.
+    let internal executePinnedRoleAdmission (binding: LedgerBinding) (actor: string) (operationId: Guid)
+             (expectedVersion: int) (launch: Launch) (expectedWorkId: string)
+             (validateAt: LedgerSnapshot -> Project -> Result<string, LedgerFailure>) =
+        let mutation = AdmitProject launch
+        let request = JsonObject()
+        request.Add("schemaVersion", JsonValue.Create(1))
+        request.Add("expectedProjectVersion", JsonValue.Create(expectedVersion))
+        request.Add("mutation", JsonNode.Parse(CanonicalCodec.encode mutation))
+        let intent =
+            { OperationId = operationId; Actor = actor; Kind = "WQ02.Mutate"
+              RequestJson = request.ToJsonString() }
+        let result =
+            validateMutationPayload mutation
+            |> Result.bind (fun () ->
+                LedgerStore.transact binding intent (fun snapshot -> result {
+                    let! previous, oid = readPinned binding snapshot
+                    let! state =
+                        match previous with
+                        | Some value -> Ok value
+                        | None -> Error(InvalidBinding "WQ02 project is not initialized.")
+                    if state.Version <> expectedVersion then
+                        return! Error(StaleEntityVersion "Stale WQ02 project version.")
+                    if not (validInitialLaunch binding launch)
+                       || (state.Launches |> Map.exists (fun _ item ->
+                           item.AccountTokenId = launch.AccountTokenId)) then
+                        return! Error(InvalidBinding "Invalid or duplicate WQ04 launch identity.")
+                    if String.IsNullOrWhiteSpace expectedWorkId then
+                        return! Error(InvalidBinding "WQ04 selected work identity is absent.")
+                    let! roleWitnessContent = validateAt snapshot state
+                    if String.IsNullOrWhiteSpace roleWitnessContent then
+                        return! Error(LedgerIntegrityError "Missing WQ04 original role-admission witness.")
+                    let! next =
+                        Contracts.admitProject expectedVersion (operationId.ToString("D")) launch state
+                        |> Result.mapError failure
+                    match next.Launches.TryFind launch.Id with
+                    | Some admitted when admitted.Credit = Some expectedWorkId -> ()
+                    | _ ->
+                        return! Error(StaleEntityVersion
+                            "WQ02 actual credit differs from the WQ04 pinned source/work selection.")
+                    let rolePath = (admissionPath launch.Id).Replace(
+                                        "/admissions/", "/role-admissions/", StringComparison.Ordinal)
+                    let! prior, priorOid = LedgerStore.readAt binding snapshot rolePath
+                    if prior.IsSome || priorOid.IsSome then
+                        return! Error(LedgerIntegrityError "Role-admission path already exists.")
+                    let! content = validatedContent binding next
+                    let! admission = witnessChanges binding snapshot state next mutation operationId
+                    if admission.Length <> 1 then
+                        return! Error(LedgerIntegrityError "Original project admission witness is incomplete.")
+                    return
+                        { Path = RecordPath; ExpectedBlobOid = oid; Content = content }
+                        :: (admission @
+                            [ { Path = rolePath; ExpectedBlobOid = None; Content = roleWitnessContent } ])
+                }))
+        match result, dropPublishedAck.Value with
+        | Ok _, Some shouldDrop when shouldDrop operationId ->
+            Error(OutcomeUnknown $"Injected lost WQ04 admission acknowledgement {operationId:D}.")
+        | _ -> result
+
     // Deterministic tests can replay adversarial interleavings with virtual time.
     let internal executeAt binding actor operationId expectedVersion now mutation =
         validateMutationPayload mutation

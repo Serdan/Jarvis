@@ -58,6 +58,7 @@
         <Compile Include="ChallengeWorkflowTests.fs"/>
         <Compile Include="WorkQueueCanonicalSourceEvidenceTests.fs"/>
         <Compile Include="WorkQueueCanonicalCasBinderTests.fs"/>
+        <Compile Include="WorkQueuePracticalAdmissionTests.fs"/>
         <Compile Include="WorkQueueReleaseAcceptanceTests.fs"/>
         <Compile Include="OriginalBrowserJournalTests.fs"/>
         <Compile Include="WorkQueueSchedulerHostPreviewTests.fs"/>

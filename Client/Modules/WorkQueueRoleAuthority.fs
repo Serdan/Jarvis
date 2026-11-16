@@ -3,6 +3,7 @@ module Client.WorkQueueRoleAuthority
 open System
 open System.Collections.Generic
 open System.Text.Json
+open FsToolkit.ErrorHandling
 open Jarvis.WorkQueues
 open Client.LedgerStore
 open Client.WorkQueueGitLedger
@@ -378,7 +379,7 @@ module WorkQueueRoleAuthority =
 
     // Legacy WQ02 admissions, even if made after a role catalog was created,
     // never become WQ04-authorized by backfilling a matching numeric version.
-    let private verifyLaunchAdmission (binding: LedgerBinding) (snapshot: LedgerSnapshot)
+    let private verifyAdmittedLaunch (binding: LedgerBinding) (snapshot: LedgerSnapshot)
                                       (catalog: RoleCatalog) (launch: Launch) =
         match historical catalog launch.RoleId launch.RoleVersion with
         | Error error -> Error error
@@ -444,6 +445,88 @@ module WorkQueueRoleAuthority =
                                                         else Ok())))))
                                 | _ -> Error(integrity "original admission decision was rewritten")))
                 | _ -> Error(integrity ("missing authenticated original project admission: " + launch.Id)))
+
+    // C01's exclusive unbound tombstone is NOT a role admission. It has no
+    // runnable credit and therefore cannot have a role-admission witness.
+    // Authenticate its original WQ02 abort CAS instead, preserving the ability
+    // to inspect/recover the project after a verified global-token release.
+    let private verifyAbortedLaunch (binding: LedgerBinding) (snapshot: LedgerSnapshot)
+                                   (launch: Launch) = result {
+        let! abortId =
+            match launch.State with
+            | LaunchState.TerminalPendingRelease marker
+                when marker.StartsWith("abort:", StringComparison.Ordinal) ->
+                match Guid.TryParse(marker.Substring("abort:".Length)) with
+                | true, value when value <> Guid.Empty -> Ok(value.ToString("D"))
+                | _ -> Error(integrity "unbound abort has malformed terminal UUID")
+            | _ -> Error(integrity "C01 verification requires a terminal abort tombstone")
+        let projectId = binding.ProjectId.ToString("D")
+        if launch.ProjectId <> projectId || launch.Version <> 0 || launch.RoleVersion < 1
+           || String.IsNullOrWhiteSpace launch.RoleId
+           || launch.Credit.IsSome || launch.PrimaryWorkId.IsSome || launch.Lease.IsSome
+           || launch.EverClaimed || launch.DispatchCount <> 0 then
+            return! Error(integrity "unbound abort is not an inert no-session tombstone")
+        let! decision, decisionOid =
+            WorkQueueGitLedger.readAdmissionAt binding snapshot launch.Id
+            |> Result.bind (function
+                | Some (record, oid) when record.SchemaVersion = 1
+                                          && record.ProjectId = projectId
+                                          && record.LaunchId = launch.Id
+                                          && record.AccountTokenId = launch.AccountTokenId
+                                          && record.AdmissionOperationId = launch.AccountTokenId
+                                          && record.AbortOperationId = abortId
+                                          && record.Kind = "AbortOnlyUnbound" -> Ok(record, oid)
+                | _ -> Error(integrity "missing immutable original C01 abort-only decision"))
+        let witnessPath = WorkQueueGitLedger.admissionPath launch.Id
+        let! operation, issued =
+            operationOrigin binding snapshot abortId "WQ02.Mutate"
+                [WorkQueueGitLedger.RecordPath; witnessPath]
+        if operation.Paths <> [|WorkQueueGitLedger.RecordPath; witnessPath|] then
+            return! Error(integrity "C01 abort operation wrote unexpected paths")
+        if not (requestMatches operation (fun body ->
+            let mutation = body.GetProperty("mutation")
+            let fields = mutation.GetProperty("fields").EnumerateArray() |> Seq.toArray
+            mutation.GetProperty("case").GetString() = "AbortUnboundProjectAdmission"
+            && body.GetProperty("schemaVersion").GetInt32() = 1
+            && fields.Length = 2
+            && fields.[1].GetString() = decision.AdmissionOperationId
+            && fields.[0].GetProperty("Id").GetString() = launch.Id
+            && fields.[0].GetProperty("ProjectId").GetString() = projectId
+            && fields.[0].GetProperty("AccountTokenId").GetString() = launch.AccountTokenId
+            && fields.[0].GetProperty("RoleId").GetString() = launch.RoleId
+            && fields.[0].GetProperty("RoleVersion").GetInt32() = launch.RoleVersion
+            && fields.[0].GetProperty("Version").GetInt32() = 0
+            && fields.[0].GetProperty("State").GetProperty("case").GetString() = "ReservedUnregistered")) then
+            return! Error(integrity "original C01 command does not match the unbound launch identity")
+        let! originalDecision, originalOid =
+            WorkQueueGitLedger.readAdmissionAt binding issued launch.Id
+            |> Result.bind (function
+                | Some evidence -> Ok evidence
+                | _ -> Error(integrity "original C01 commit omitted abort-only decision"))
+        if originalOid <> decisionOid || originalDecision <> decision then
+            return! Error(integrity "C01 abort-only decision changed after its original CAS")
+        let! originalState = WorkQueueGitLedger.loadAt binding issued
+        match originalState.Launches.TryFind launch.Id,
+              originalState.Receipts.TryFind abortId with
+        | Some original, Some(ProjectOperationPayload.OtherMutation text)
+            when original = launch
+                 && text = "abort-unbound|" + launch.Id
+                 && not (originalState.Receipts.ContainsKey decision.AdmissionOperationId) ->
+            let! roleWitness = LedgerStore.readAt binding snapshot (roleAdmissionPath launch.Id)
+            if roleWitness <> (None, None) then
+                return! Error(integrity "C01 no-session tombstone contains a forged role admission")
+            return ()
+        | _ ->
+            return! Error(integrity "original C01 project state lacks exclusive abort-only tombstone")
+    }
+
+    let private verifyLaunchAdmission (binding: LedgerBinding) (snapshot: LedgerSnapshot)
+                                      (catalog: RoleCatalog) (launch: Launch) =
+        match launch.State with
+        | LaunchState.TerminalPendingRelease marker
+            when marker.StartsWith("abort:", StringComparison.Ordinal) ->
+            verifyAbortedLaunch binding snapshot launch
+        | _ -> verifyAdmittedLaunch binding snapshot catalog launch
 
     let loadAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) =
         WorkQueueGitLedger.loadAt binding snapshot

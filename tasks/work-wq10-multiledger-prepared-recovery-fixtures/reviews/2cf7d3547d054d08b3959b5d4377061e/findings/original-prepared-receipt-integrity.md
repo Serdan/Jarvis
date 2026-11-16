@@ -1,0 +1,18 @@
+# P1 — valid post-Prepared receipt rewrite passes original-UUID recovery
+
+**Frozen source:** `34b06e396ede89e58fdfa5b641300e262ce5ec44`; independent r2 review `2cf7d3547d054d08b3959b5d4377061e`.
+
+The previous malformed/absent receipt problem is partially repaired, but the revised final inspection still does not bind the **current** project Prepared receipt to the **original** WQ02 CAS operation result.
+
+## Source-level reproduction
+
+1. Complete the normal marked disposable account/A/B Prepared fixture. The project `LedgerStore.transact` original UUID operation records `OriginalResultJson.changes[]`, including `records/work-queue/project-prepared.json` and its exact `contentSha256` (`Client/Modules/LedgerStore.fs:1056-1067,2159-2200`).
+2. From the independent second clone, read the current `ProjectPreparedReceipt`, change only `OriginalOperationRequestHashes` to an empty map (or `GraphVersion` to an incorrect value), then `LedgerStore.putRecord` the canonical re-encoded receipt at `ReceiptPath` with the expected old blob OID and a new writer UUID. All identity, account head, conversion links, queue, graph and `LegacyCoverageSha256` remain unchanged. The new fixture itself demonstrates that this path accepts a later independent CAS rewrite (`Client.Tests/WorkQueueMultiLedgerPreparedRecoveryTests.fs:330-344`), but writes `{}` so it exercises only parse failure.
+3. Replay the **original** account/project UUIDs. `LedgerStore.transact` returns `AlreadyApplied` without executing the prepare plan or recreating the original receipt (`Client/Modules/LedgerStore.fs:2159-2161`). `WorkQueueProjectMigrationPrepare.inspect` validates only a subset of receipt fields and a self-consistent `LegacyCoverageSha256` (`Client/Modules/WorkQueueProjectMigrationPrepare.fs:445-486`): it does not compare current receipt content with the original signed operation's recorded SHA, and does not validate `OriginalOperationRequestHashes` or `GraphVersion`.
+4. The WQ10 `matchesReceipt` check likewise checks only selected identity fields (`Client/Modules/WorkQueueMultiLedgerPreparedRecovery.fs:121-134`). Its new `inspectWholeQueueInert` checks the unchanged queue, not the receipt (`:136-162`). Therefore B remains `PreparedInert`, `AllProjectsInertPrepared=true`, and the replay returns `Failure=None` (`:214-243,304-325`), despite a changed original operation-history witness or graph version.
+
+## Required fix and regression
+
+At the *observed current project snapshot*, read the original project operation by its unchanged UUID and verify its type/actor/request binding plus the immutable `OriginalResultJson.changes[]` content SHA for `ReceiptPath` against the current exact receipt JSON. Fail `RecoveryBlocked` when the receipt changed or the original operation cannot be verified; preserve the observed head, already-committed original transactions and operator repair instructions. Do not turn a later, syntactically valid independently written receipt into proof of the original CAS outcome. Add a two-clone negative that rewrites a **valid, canonical** receipt's `OriginalOperationRequestHashes` or `GraphVersion`, replays the same original UUID, observes `AlreadyApplied`, and asserts explicit failure. Verify historical operation blobs remain immutable.
+
+**Scope:** P1 in the default-off disposable recovery correctness claim only. No live migration, host authority, Scheduler/Manager activation, or production cutover is inferred or authorized. The whole-queue inertness remediation is otherwise supported by the source and tests.

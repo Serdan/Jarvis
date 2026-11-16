@@ -110,6 +110,17 @@ type WorkQueueSchedulerHeadBindingTests() =
                     (projectIds
                      |> List.map (fun id -> id, Map.ofList ["Worker", set ["implementation"]])
                      |> Map.ofList)
+                  // Independent test fixture approval is pinned to exact WQ04
+                  // catalog identities after completing their legitimate setup.
+                  ApprovedRoleCatalogs =
+                    (writers
+                     |> List.map (fun writer ->
+                         let snapshot = LedgerStore.fetch writer |> succeed
+                         let pinned = WorkQueueRoleAuthority.loadAt writer snapshot |> succeed
+                         writer.ProjectId,
+                         { BlobOid = pinned.Proof.CatalogBlobOid
+                           Revision = pinned.Proof.CatalogRevision })
+                     |> Map.ofList)
                   AuthorityDescription = "Explicit disposable test-only operator approval" }
             let scope ab bs =
                 { Account = ab
@@ -209,6 +220,10 @@ type WorkQueueSchedulerHeadBindingTests() =
                 Observer({ data.ReaderScope with Membership = Some badMember },
                          enabled = true, ports = poisoned)
             assertUnknown (mismatched.Scan true)
+            let missingCatalog =
+                { data.ReaderScope.Membership.Value with ApprovedRoleCatalogs = Map.empty }
+            assertUnknown (Observer({ data.ReaderScope with Membership = Some missingCatalog },
+                                    enabled = true, ports = poisoned).Scan false)
             let duplicateAlias =
                 { data.ReaderScope with
                     Projects =
@@ -272,6 +287,81 @@ type WorkQueueSchedulerHeadBindingTests() =
             WorkQueueRoleAuthority.configure project "fixture" (Guid.NewGuid()) 1 1 next
             |> succeed |> ignore
             assertUnknown (observer.Scan false))
+
+    [<TestCase("version")>]
+    [<TestCase("disabled")>]
+    [<TestCase("instructions")>]
+    member _.SameSubscriptionRoleCatalogChangesBlockHostsUntilIndependentlyReapproved(changeKind: string) =
+        fixture (fun data ->
+            let observer = Observer(data.ReaderScope, enabled = true)
+            Assert.That(hints (observer.Scan false) |> List.length, Is.EqualTo(2))
+            let project = data.ProjectWriters.Head
+            let next: RoleConfiguration =
+                { RoleId = "Worker"; Version = 2
+                  Enabled = changeKind <> "disabled"
+                  QueueSubscriptions = set ["implementation"]
+                  Instructions =
+                    if changeKind = "instructions" then "Changed worker instructions"
+                    else "Fixture worker" }
+            WorkQueueRoleAuthority.configure project "fixture" (Guid.NewGuid()) 1 1 next
+            |> succeed |> ignore
+
+            // A fresh Git head with identical subscriptions is NOT renewed
+            // operator approval of the changed version/enablement/instructions.
+            match observer.ReadAll() with
+            | Error reason -> Assert.That(reason, Does.Contain("RoleCatalogApprovalChanged"))
+            | Ok _ -> Assert.Fail("A changed WQ04 role catalog must invalidate old approval.")
+            Assert.That(observer.ReadVerifiedHeads project.ProjectId |> Result.isError, Is.True)
+            assertUnknown (observer.Scan false)
+            let mutable hostReads, wakes = 0, 0
+            let hostPorts: SchedulerHostPorts =
+                { ReadVerifiedHeads = fun () ->
+                    hostReads <- hostReads + 1
+                    Error "Host must not run with stale role approval."
+                  Wake = fun _ ->
+                    wakes <- wakes + 1
+                    failwith "Coordinator must not wake with stale role approval."
+                  Report = ignore
+                  Delay = fun _ _ -> Task.CompletedTask }
+            use first = new WorkQueueSchedulerHostLoop.Host(hostPorts, enabled = true)
+            use second = new WorkQueueSchedulerHostLoop.Host(hostPorts, enabled = true)
+            let hosts =
+                [ data.ProjectReaders.[0].ProjectId, first
+                  data.ProjectReaders.[1].ProjectId, second ] |> Map.ofList
+            match runOneManualStep observer hosts false with
+            | SchedulerManualStep.NeedsAttention("VerifiedHeadReadUnknown", reason) ->
+                Assert.That(reason, Does.Contain("RoleCatalogApprovalChanged"))
+            | other ->
+                Assert.Fail(sprintf "Stale role approval must block all host callbacks: %A" other)
+            Assert.That(hostReads, Is.Zero)
+            Assert.That(wakes, Is.Zero)
+
+            // Only a separately supplied, explicitly renewed catalog identity
+            // allows this revised role configuration through the read boundary.
+            let pinned = WorkQueueRoleAuthority.loadAt project (LedgerStore.fetch project |> succeed)
+                         |> succeed
+            let membership = data.ReaderScope.Membership.Value
+            let renewed =
+                { membership with
+                    ApprovedRoleCatalogs =
+                        membership.ApprovedRoleCatalogs.Add(project.ProjectId,
+                            { BlobOid = pinned.Proof.CatalogBlobOid
+                              Revision = pinned.Proof.CatalogRevision }) }
+            let reapproved =
+                Observer({ data.ReaderScope with Membership = Some renewed }, enabled = true)
+            Assert.That(reapproved.ReadAll() |> Result.isOk, Is.True))
+
+    [<Test>]
+    member _.NullProjectScopeNeverThrowsOrInvokesManualHost() =
+        fixture (fun data ->
+            let incomplete =
+                { data.ReaderScope with Projects = Unchecked.defaultof<_> }
+            let observer = Observer(incomplete, enabled = true)
+            match runOneManualStep observer Map.empty false with
+            | SchedulerManualStep.NeedsAttention("VerifiedHeadReadUnknown", reason) ->
+                Assert.That(reason, Does.Contain("ProjectMembershipUnknown"))
+            | other ->
+                Assert.Fail(sprintf "Missing project scope must fail closed: %A" other))
 
     [<Test>]
     member _.ManualStepUsesOnlyApprovedHostsAndNeverCallsPlannerOrProviderWithoutProvenance() =

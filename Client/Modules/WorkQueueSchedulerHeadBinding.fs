@@ -14,6 +14,12 @@ type ApprovedSchedulerProject =
     { Alias: string
       Binding: LedgerBinding }
 
+// An independently approved exact WQ04 catalog identity. Subscription names
+// alone cannot authorize a later role version, enablement or instruction edit.
+type ApprovedSchedulerRoleCatalog =
+    { BlobOid: string
+      Revision: int }
+
 type SchedulerMembershipEvidence =
     { AccountId: Guid
       // This is the COMPLETE approved set, not a filter over discovered projects.
@@ -21,6 +27,7 @@ type SchedulerMembershipEvidence =
       // All current roles and their exact subscriptions must be accounted for.
       // A changed role catalog requires renewed approval before a host callback.
       RoleSubscriptions: Map<Guid, Map<string, Set<string>>>
+      ApprovedRoleCatalogs: Map<Guid, ApprovedSchedulerRoleCatalog>
       AuthorityDescription: string }
 
 type SchedulerHeadScope =
@@ -113,7 +120,8 @@ let private validateScope (scope: SchedulerHeadScope) =
         | None ->
             Error "ProjectMembershipUnknown: no independently approved complete account/project/role membership evidence."
         | Some membership when isNull (box membership)
-                               || isNull (box membership.RoleSubscriptions) ->
+                               || isNull (box membership.RoleSubscriptions)
+                               || isNull (box membership.ApprovedRoleCatalogs) ->
             Error "ProjectMembershipUnknown: complete role authority is absent."
         | Some membership when membership.AccountId <> scope.Account.AccountId
                                || not (nonBlank membership.AuthorityDescription) ->
@@ -137,8 +145,17 @@ let private validateScope (scope: SchedulerHeadScope) =
                 let remotes = projects |> List.map (fun p -> p.Binding.ApprovedFetchUrl)
                 let approvedIds =
                     membership.RoleSubscriptions |> Map.toSeq |> Seq.map fst |> Set.ofSeq
-                if Set.ofList ids <> membership.ProjectIds || approvedIds <> membership.ProjectIds then
+                let catalogIds =
+                    membership.ApprovedRoleCatalogs |> Map.toSeq |> Seq.map fst |> Set.ofSeq
+                if Set.ofList ids <> membership.ProjectIds
+                   || approvedIds <> membership.ProjectIds
+                   || catalogIds <> membership.ProjectIds then
                     Error "ProjectMembershipMismatch: approved project IDs and role source must exactly cover configured bindings."
+                elif membership.ApprovedRoleCatalogs
+                     |> Map.exists (fun _ catalog ->
+                         isNull (box catalog) || not (validOid catalog.BlobOid)
+                         || catalog.Revision < 1) then
+                    Error "RoleCatalogApprovalUnknown: every approved project needs a valid exact WQ04 catalog blob and revision."
                 elif ids.Length <> (ids |> List.distinct |> List.length)
                      || aliases.Length <> (aliases |> List.distinct |> List.length)
                      || remotes.Length <> (remotes |> List.distinct |> List.length) then
@@ -185,9 +202,16 @@ let private verifyProject (membership: SchedulerMembershipEvidence)
          || pinned.Proof.Epoch <> binding.Epoch then
         Error(sprintf "ProjectIdentityConflict: %s has inconsistent project/ledger/ref/head/role provenance." approved.Alias)
     else
-        match membership.RoleSubscriptions.TryFind binding.ProjectId with
-        | None -> Error(sprintf "RoleMembershipUnknown: no approved role set for %s." approved.Alias)
-        | Some approvedRoles ->
+        match membership.RoleSubscriptions.TryFind binding.ProjectId,
+              membership.ApprovedRoleCatalogs.TryFind binding.ProjectId with
+        | None, _ | _, None ->
+            Error(sprintf "RoleMembershipUnknown: no complete approved WQ04 role/catalog set for %s." approved.Alias)
+        | Some _, Some catalog
+            when pinned.Proof.CatalogBlobOid <> catalog.BlobOid
+                 || pinned.Proof.CatalogRevision <> catalog.Revision
+                 || pinned.Catalog.Revision <> catalog.Revision ->
+            Error(sprintf "RoleCatalogApprovalChanged: %s has a different WQ04 role catalog; renew independent approval before host reconciliation." approved.Alias)
+        | Some approvedRoles, Some _ ->
             let current = pinned.Catalog.Current
             let currentIds = current |> Map.toSeq |> Seq.map fst |> Set.ofSeq
             let approvedIds = approvedRoles |> Map.toSeq |> Seq.map fst |> Set.ofSeq
@@ -316,7 +340,10 @@ type Observer(scope: SchedulerHeadScope, ?enabled: bool, ?ports: SchedulerHeadRe
     member _.IsEnabled = enabled
 
     member _.ProjectIds =
-        scope.Projects |> List.map (fun p -> p.Binding.ProjectId) |> Set.ofList
+        // Never expose a project set as approved before validating all
+        // membership and catalog evidence, including missing/null scope.
+        validateScope scope
+        |> Result.map (fun membership -> membership.ProjectIds)
 
     member _.ReadAll() =
         if not enabled then
@@ -373,12 +400,7 @@ type Observer(scope: SchedulerHeadScope, ?enabled: bool, ?ports: SchedulerHeadRe
 let runOneManualStep (observer: Observer)
                      (hosts: Map<Guid, WorkQueueSchedulerHostLoop.Host>)
                      (forceFullRescan: bool) =
-    if not observer.IsEnabled then SchedulerManualStep.Disabled
-    elif observer.ProjectIds <> (hosts |> Map.toSeq |> Seq.map fst |> Set.ofSeq) then
-        SchedulerManualStep.NeedsAttention(
-            "HostMembershipMismatch",
-            "Supply an exact host for every explicitly approved project; do not silently skip or discover projects.")
-    else
+    let scanAndRun () =
         match observer.Scan forceFullRescan with
         | SchedulerHeadScan.Disabled -> SchedulerManualStep.Disabled
         | SchedulerHeadScan.NeedsAttention(code, action) ->
@@ -390,3 +412,16 @@ let runOneManualStep (observer: Observer)
                 hint.ProjectId,
                 hosts.[hint.ProjectId].RunOnce [hint.Trigger])
             |> SchedulerManualStep.Reconciled
+    if isNull (box observer) then
+        SchedulerManualStep.NeedsAttention("HeadObserverUnknown", "Supply a valid explicitly approved observer.")
+    elif not observer.IsEnabled then SchedulerManualStep.Disabled
+    else
+        match observer.ProjectIds with
+        | Error reason ->
+            SchedulerManualStep.NeedsAttention("VerifiedHeadReadUnknown", reason)
+        | Ok projectIds when isNull (box hosts)
+                             || projectIds <> (hosts |> Map.toSeq |> Seq.map fst |> Set.ofSeq) ->
+            SchedulerManualStep.NeedsAttention(
+                "HostMembershipMismatch",
+                "Supply an exact host for every explicitly approved project; do not silently skip or discover projects.")
+        | Ok _ -> scanAndRun ()

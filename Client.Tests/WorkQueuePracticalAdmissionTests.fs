@@ -311,4 +311,30 @@ type WorkQueuePracticalAdmissionTests() =
             match WorkQueueGitLedger.executeInertFixtureAt b "legacy" (Guid.NewGuid())
                     dispatched.Version 110L (InitializeAgent(launchId, "stolen-legacy-session")) with
             | Error(InvalidBinding _) -> ()
-            | other -> Assert.Fail(sprintf "Legacy registration bypassed Work credential: %A" other))
+            | other -> Assert.Fail(sprintf "Legacy registration bypassed Work credential: %A" other)
+
+            // A credentialed original admission must also remain verifiable
+            // by the account-release witness after the launch is terminal.
+            // This follows the credential fixture path, not InitializeAgent.
+            let bearer = issued.RevealForPrivateDelivery()
+            WorkQueueGitLedger.executeCredentialFixtureAt a "WQ04 Disposable" (Guid.NewGuid())
+                dispatched.Version 111L launchId bearer CredentialWorkAction.FirstConnect
+            |> ok |> ignore
+            let _, registered = WorkQueueGitLedger.load b |> ok
+            WorkQueueGitLedger.executeCredentialFixtureAt b "WQ04 Disposable" (Guid.NewGuid())
+                registered.Version 112L launchId bearer CredentialWorkAction.ClaimPrimary
+            |> ok |> ignore
+            let _, claimed = WorkQueueGitLedger.load a |> ok
+            let terminalOperation = Guid.NewGuid()
+            WorkQueueGitLedger.executeCredentialFixtureAt a "WQ04 Disposable" terminalOperation
+                claimed.Version 113L launchId bearer (CredentialWorkAction.FinishOrdinary selected.WorkId)
+            |> ok |> ignore
+            let locator: ProjectTerminalLocator =
+                { ProjectId = a.ProjectId; LaunchId = first.LaunchId
+                  AdmissionOperationId = first.AdmissionOperationId
+                  TerminalOperationId = terminalOperation }
+            let release = AccountAdmissionAdapter.releaseTerminal accountB b "WQ04 Disposable"
+                              first.ReleaseOperationId locator |> ok
+            Assert.That(release.AlreadyApplied, Is.False)
+            Assert.That(AccountCapacityLedger.occupied (AccountCapacityLedger.fetch accountA |> ok).State,
+                        Is.Zero))

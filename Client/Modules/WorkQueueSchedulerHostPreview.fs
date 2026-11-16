@@ -11,6 +11,7 @@ open Client.WorkQueueGitLedger
 open Client.WorkQueueRoleAuthority
 open Client.AccountCapacityLedger
 open Client.OrchestrationApi
+open Client.OriginalBrowserJournal
 
 // An explicit read-only view over actual, independently trusted project/account
 // Git authorities. No timer, live Scheduler, capacity reservation or browser
@@ -67,8 +68,9 @@ type SchedulerHostPreviewReport =
 
 // Injectable read seams keep preview deterministic and permit two-client tests.
 // The production binding below only reads verified Git state and never writes.
-// ReadOriginal is intentionally unbound until a WQ03 original browser journal
-// has an audited, client-owned read adapter. Missing journal is not no-effect.
+// The WQ03 original browser journal is default-off. Only an explicitly opened,
+// trusted, client-local store can supply original evidence. Missing journal is
+// never proof of no effect.
 type SchedulerHostPreviewPorts =
     { ReadAccount: unit -> Result<AccountSnapshot, string>
       ReadProject: unit -> Result<LedgerSnapshot * PinnedRoleView, string>
@@ -392,7 +394,8 @@ module WorkQueueSchedulerHostPreview =
           ExistingLaunches = launches
           Issues = List.ofSeq issues }
 
-    let realReadPorts (account: AccountBinding) (project: LedgerBinding) =
+    let realReadPortsWithOriginal (account: AccountBinding) (project: LedgerBinding)
+                                  (original: OriginalBrowserJournalStore option) =
         { ReadAccount = fun () ->
               AccountCapacityLedger.fetch account |> Result.mapError (sprintf "%A")
           ReadProject = fun () ->
@@ -407,8 +410,15 @@ module WorkQueueSchedulerHostPreview =
           ReadAdmission = fun snapshot launchId ->
               WorkQueueGitLedger.readAdmissionAt project snapshot launchId
               |> Result.mapError (sprintf "%A")
-          ReadOriginal = fun _ ->
-              Error "WQ03 original browser one-shot journal has no approved read adapter yet." }
+          ReadOriginal = fun launchId ->
+              match original with
+              | None -> Error "WQ03 original browser journal binding is not provisioned or approved."
+              | Some store -> OriginalBrowserJournal.findByLaunch store launchId }
+
+    // Existing callers, including the CLI dry-run, stay fail-closed until the
+    // operator explicitly supplies an opened local journal binding.
+    let realReadPorts (account: AccountBinding) (project: LedgerBinding) =
+        realReadPortsWithOriginal account project None
 
     let preview (account: AccountBinding) (project: LedgerBinding) roleId =
         previewWith (realReadPorts account project) roleId

@@ -88,6 +88,7 @@
         <Compile Include="Modules\\WorkQueueReceiptProducer.fs"/>
         <Compile Include="..\Server\WorkQueueSchedulerInert.fs" Link="WorkQueueSchedulerInert.fs"/>
         <Compile Include="..\Server\WorkQueueSchedulerPrototype.fs" Link="WorkQueueSchedulerPrototype.fs"/>
+        <Compile Include="Modules\OriginalBrowserJournal.fs"/>
         <Compile Include="Modules\WorkQueueSchedulerHostPreview.fs"/>
         <Compile Include="Modules\\WorkQueueOperatorConversationCli.fs"/>
         <Compile Include="Modules\SourceEffectHostBinding.fs"/>

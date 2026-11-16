@@ -1,0 +1,253 @@
+module Client.Tests.WorkQueueReservationPermissionsTests
+
+open System
+open System.Diagnostics
+open System.IO
+open NUnit.Framework
+open Jarvis.WorkQueues
+open Client.LedgerStore
+open Client.WorkQueueGitLedger
+open Client.WorkQueueReservationPermissions
+
+[<TestFixture>]
+type WorkQueueReservationPermissionsTests() =
+    let ok = function
+        | Ok value -> value
+        | Error error -> failwithf "Reservation fixture failed: %A" error
+
+    let deny = function
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail "Unauthorized reservation operation was accepted."
+
+    let git cwd command =
+        use gitProcess = new Process()
+        gitProcess.StartInfo.FileName <- "git"
+        gitProcess.StartInfo.WorkingDirectory <- cwd
+        gitProcess.StartInfo.UseShellExecute <- false
+        gitProcess.StartInfo.RedirectStandardOutput <- true
+        gitProcess.StartInfo.RedirectStandardError <- true
+        for arg in command do gitProcess.StartInfo.ArgumentList.Add arg
+        Assert.That(gitProcess.Start(), Is.True)
+        let output = gitProcess.StandardOutput.ReadToEnd()
+        let error = gitProcess.StandardError.ReadToEnd()
+        Assert.That(gitProcess.WaitForExit(30000), Is.True)
+        Assert.That(gitProcess.ExitCode, Is.EqualTo(0), error)
+        output.Trim()
+
+    let withClones operation =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-reservation-grants-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory root |> ignore
+        try
+            let bare = Path.Combine(root, "remote.git")
+            let aPath, bPath = Path.Combine(root, "a"), Path.Combine(root, "b")
+            git root ["init"; "--bare"; "--initial-branch=main"; bare] |> ignore
+            git root ["clone"; bare; aPath] |> ignore
+            File.WriteAllText(Path.Combine(aPath, "source.txt"), "reservation fixture")
+            git aPath ["add"; "source.txt"] |> ignore
+            git aPath ["-c"; "user.name=Fixture"; "-c"; "user.email=fixture@example.test";
+                       "commit"; "-m"; "fixture"] |> ignore
+            git aPath ["push"; "-u"; "origin"; "HEAD"] |> ignore
+            git root ["clone"; bare; bPath] |> ignore
+            let projectId, ledgerId = Guid.NewGuid(), Guid.NewGuid()
+            let binding path : LedgerBinding =
+                { RepositoryPath = path; RemoteName = "origin"
+                  ApprovedFetchUrl = bare; ApprovedPushUrl = bare
+                  ProjectId = projectId; LedgerId = ledgerId; Epoch = 1 }
+            let a, b = binding aPath, binding bPath
+            LedgerStore.initialize a true |> ok |> ignore
+            LedgerStore.fetch b |> ok |> ignore
+            WorkQueueGitLedger.initialize a "fixture" (Guid.NewGuid())
+                (Map.ofList ["Worker", set ["planning"]]) |> ok |> ignore
+            operation a b
+        finally
+            try Directory.Delete(root, true) with _ -> ()
+
+    let plan project workId =
+        { Id = workId; ProjectId = project; SubjectId = "task-" + workId
+          Kind = WorkKind.Planning; QueueId = "planning"
+          StageGeneration = 1; State = WorkState.Available
+          Domain = DomainState.Undecided; Gate = GateState.Clear
+          ClaimGeneration = 0; Dependencies = Set.empty; WaivedDependencies = Map.empty
+          AvailableAt = 0L; AvailableSequence = 0L; SourceLineage = None
+          Push = None; IntegrationAuthorized = false }
+
+    let reserved project launchId =
+        { Id = launchId; ProjectId = project; RoleId = "Worker"; RoleVersion = 1
+          AccountTokenId = Guid.NewGuid().ToString("D")
+          State = LaunchState.ReservedUnregistered; Lease = None
+          Version = 0; Credit = None; PrimaryWorkId = None
+          EverClaimed = false; AncillaryMessages = Set.empty; DispatchCount = 0 }
+
+    let mutate binding now mutation =
+        let _, project = WorkQueueGitLedger.load binding |> ok
+        WorkQueueGitLedger.executeInertFixtureAt binding "fixture" (Guid.NewGuid())
+            project.Version now mutation |> ok |> ignore
+
+    let setup (a: LedgerBinding) (b: LedgerBinding) =
+        let home = a.ProjectId.ToString("D")
+        let launch = Guid.NewGuid().ToString("D")
+        let work = "plan-reservation"
+        let credential = IssuedWorkCredential.Issue launch
+        mutate a 100L (PublishStage(plan home work))
+        mutate b 101L (AdmitCredentialProject(reserved home launch, credential.VerifierSha256))
+        mutate a 102L (DispatchOnce(launch, DispatchState.Submitted))
+        home, work, launch, credential.RevealForPrivateDelivery()
+
+    let operator = "operator:" + String.replicate 64 "a"
+    let families =
+        set [ ReservationOperationFamily.ContextRead
+              ReservationOperationFamily.Implementation
+              ReservationOperationFamily.Prerequisite ]
+
+    let revision home launch work number allowed =
+        { LaunchId = launch; ExpectedRevision = number; ExpectedWorkId = work
+          ReadProjectIds = set [home; "public-project-context"]
+          Families = allowed; SourceWorktree = None
+          ExpiresAtUnixMs = 5000L; Revoked = false
+          OperatorApprovalId = "signed-host-approval-id" }
+
+    let approve (binding: LedgerBinding) now scope =
+        WorkQueueReservationPermissions.reviseAt binding operator (Guid.NewGuid()) now scope
+        |> ok |> ignore
+
+    let register (binding: LedgerBinding) launch bearer =
+        let _, project = WorkQueueGitLedger.load binding |> ok
+        WorkQueueGitLedger.executeCredentialFixtureAt binding "credential-fixture" (Guid.NewGuid())
+            project.Version 120L launch bearer CredentialWorkAction.FirstConnect
+        |> ok |> ignore
+
+    let permission (binding: LedgerBinding) launch work family rev =
+        let _, project = WorkQueueGitLedger.load binding |> ok
+        let owner = project.Launches.[launch]
+        let lease = owner.Lease.Value
+        { LaunchId = launch; TargetProjectId = binding.ProjectId.ToString("D")
+          TargetWorkId = work; Family = family; SourceRef = None; SourceWorktree = None
+          ExpectedRevision = rev; ExpectedLaunchVersion = owner.Version
+          ExpectedLeaseGeneration = lease.Generation }
+
+    [<Test>]
+    member _.TwoCloneScopeIsCredentialBoundAndCrossProjectMutationDoesNotInheritReadAccess() =
+        withClones (fun a b ->
+            let home, work, launch, bearer = setup a b
+            approve a 110L (revision home launch work 0 families)
+            let _, head = WorkQueueGitLedger.load b |> ok
+            register b launch bearer
+            let read = permission a launch work ReservationOperationFamily.ContextRead 1
+            let foreignContext = { read with TargetProjectId = "public-project-context" }
+            WorkQueueReservationPermissions.checkAt a 130L bearer foreignContext |> ok |> ignore
+
+            let edit = permission b launch work ReservationOperationFamily.Implementation 1
+            WorkQueueReservationPermissions.checkAt b 131L bearer edit |> ok |> ignore
+            let foreignEdit = { edit with TargetProjectId = "public-project-context" }
+            WorkQueueReservationPermissions.checkAt a 132L bearer foreignEdit |> deny
+            let wrongWork = { edit with TargetWorkId = "unrelated-backlog" }
+            WorkQueueReservationPermissions.checkAt b 133L bearer wrongWork |> deny
+            let wrongTree = { edit with SourceWorktree = Some "other-worker-tree" }
+            WorkQueueReservationPermissions.checkAt a 134L bearer wrongTree |> deny
+            let elevated = { edit with Family = ReservationOperationFamily.Integration }
+            WorkQueueReservationPermissions.checkAt a 135L bearer elevated |> deny
+            let scheduling = { edit with Family = ReservationOperationFamily.SchedulingAdmin }
+            WorkQueueReservationPermissions.checkAt b 136L bearer scheduling |> deny
+            WorkQueueReservationPermissions.checkAt a 137L (IssuedWorkCredential.Issue(launch).RevealForPrivateDelivery()) edit
+            |> deny
+            let snapshot, _ = WorkQueueGitLedger.load b |> ok
+            let grant, _ = WorkQueueReservationPermissions.readScopeAt b snapshot launch |> ok |> Option.get
+            Assert.That(grant.WorkId, Is.EqualTo(work))
+            Assert.That(grant.Revision, Is.EqualTo(1))
+            Assert.That(grant.RevisionOperationId, Is.Not.Empty)
+            let raw, _ = LedgerStore.readAt b snapshot (WorkQueueReservationPermissions.scopePath launch) |> ok
+            Assert.That(raw.Value.Contains(bearer), Is.False)
+            let history, _ = LedgerStore.readAt b snapshot (WorkQueueReservationPermissions.revisionPath launch 1) |> ok
+            Assert.That(history.Value, Is.EqualTo(raw.Value)))
+
+    [<Test>]
+    member _.CompetingGrantRevisionAndLeaseGenerationFailClosedOnBothClones() =
+        withClones (fun a b ->
+            let home, work, launch, bearer = setup a b
+            let baseGrant = revision home launch work 0 families
+            approve a 110L baseGrant
+            WorkQueueReservationPermissions.reviseAt b operator (Guid.NewGuid()) 111L baseGrant
+            |> deny
+            register b launch bearer
+            let old = permission a launch work ReservationOperationFamily.Implementation 1
+            let next = { revision home launch work 1 (set [ReservationOperationFamily.ContextRead;
+                                                           ReservationOperationFamily.Prerequisite])
+                         with OperatorApprovalId = "operator-reduced-execution" }
+            approve b 140L next
+            WorkQueueReservationPermissions.checkAt a 141L bearer old |> deny
+            let newPermission = { old with ExpectedRevision = 2 }
+            WorkQueueReservationPermissions.checkAt b 142L bearer newPermission |> deny
+            let prereq = { newPermission with Family = ReservationOperationFamily.Prerequisite }
+            WorkQueueReservationPermissions.checkAt a 143L bearer prereq |> ok |> ignore
+            let staleLease = { prereq with ExpectedLeaseGeneration = 0 }
+            WorkQueueReservationPermissions.checkAt b 144L bearer staleLease |> deny
+            let staleLaunch = { prereq with ExpectedLaunchVersion = 0 }
+            WorkQueueReservationPermissions.checkAt a 145L bearer staleLaunch |> deny
+            WorkQueueReservationPermissions.checkAt b 5000L bearer prereq |> deny
+            approve a 200L { next with ExpectedRevision = 2; Revoked = true;
+                                        OperatorApprovalId = "operator-revocation" }
+            WorkQueueReservationPermissions.checkAt b 201L bearer
+                { prereq with ExpectedRevision = 3 } |> deny)
+
+    [<Test>]
+    member _.SignificantBlockerIsEvidenceLinkedProposalWithoutQueueOrGraphMutation() =
+        withClones (fun a b ->
+            let home, work, launch, bearer = setup a b
+            approve a 110L (revision home launch work 0 families)
+            register b launch bearer
+            let beforeHead, before = WorkQueueGitLedger.load a |> ok
+            let request = permission b launch work ReservationOperationFamily.Prerequisite 1
+            let operation = Guid.NewGuid()
+            let evidence = String.replicate 64 "f"
+            WorkQueueReservationPermissions.proposePrerequisiteAt a "credential-fixture" operation
+                150L bearer request before.GraphVersion ReservationBlockerKind.Significant
+                "fix-dependency" evidence "Significant dependency requires independent Work"
+            |> ok |> ignore
+            let afterHead, after = WorkQueueGitLedger.load b |> ok
+            Assert.That(after.GraphVersion, Is.EqualTo(before.GraphVersion))
+            Assert.That(after.Works.ContainsKey "fix-dependency", Is.False)
+            let proposal, _ = WorkQueueReservationPermissions.readProposalAt b afterHead operation
+                                |> ok |> Option.get
+            Assert.That(proposal.LaunchId, Is.EqualTo(launch))
+            Assert.That(proposal.OwningWorkId, Is.EqualTo(work))
+            Assert.That(proposal.Status, Is.EqualTo("ProposedOnlyNotRunnable"))
+            Assert.That(proposal.EvidenceSha256, Is.EqualTo(evidence))
+            WorkQueueReservationPermissions.proposePrerequisiteAt b "credential-fixture" (Guid.NewGuid())
+                151L bearer request (before.GraphVersion + 1) ReservationBlockerKind.OutsideDelegation
+                "wrong-graph" evidence "Outside delegated engineering scope"
+            |> deny
+            let wrong = { request with TargetWorkId = "other-owner" }
+            WorkQueueReservationPermissions.proposePrerequisiteAt b "credential-fixture" (Guid.NewGuid())
+                152L bearer wrong before.GraphVersion ReservationBlockerKind.OutsideDelegation
+                "different-work" evidence "Wrong work owner"
+            |> deny)
+
+    [<Test>]
+    member _.ClaimAndCheckpointVerifyScopeInsideWinningGitCasAndRejectCrossLaunchBearers() =
+        withClones (fun a b ->
+            let home, work, launch, bearer = setup a b
+            approve a 110L (revision home launch work 0 families)
+            register b launch bearer
+            let request = permission a launch work ReservationOperationFamily.Implementation 1
+            let _, before = WorkQueueGitLedger.load b |> ok
+            WorkQueueReservationPermissions.claimFixtureAt b "credential-fixture"
+                (Guid.NewGuid()) before.Version 160L bearer request 1 1
+            |> ok |> ignore
+            let _, claimed = WorkQueueGitLedger.load a |> ok
+            Assert.That(claimed.Works.[work].State, Is.EqualTo(WorkState.Claimed launch))
+            let stale = permission b launch work ReservationOperationFamily.Implementation 1
+            let digest = String.replicate 64 "c"
+            WorkQueueReservationPermissions.checkpointFixtureAt a "credential-fixture"
+                (Guid.NewGuid()) claimed.Version 170L bearer stale 1 digest
+            |> ok |> ignore
+            let _, after = WorkQueueGitLedger.load b |> ok
+            let wrongToken = IssuedWorkCredential.Issue(launch).RevealForPrivateDelivery()
+            WorkQueueReservationPermissions.checkpointFixtureAt b "credential-fixture"
+                (Guid.NewGuid()) after.Version 171L wrongToken
+                (permission b launch work ReservationOperationFamily.Implementation 1) 1 digest
+            |> deny
+            WorkQueueReservationPermissions.checkpointFixtureAt b "credential-fixture"
+                (Guid.NewGuid()) after.Version 172L bearer
+                { (permission b launch work ReservationOperationFamily.Implementation 1)
+                  with ExpectedLeaseGeneration = 0 } 1 digest
+            |> deny)

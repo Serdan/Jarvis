@@ -75,6 +75,7 @@
         <Compile Include="Modules\SourceEffectJournal.fs"/>
         <Compile Include="Modules\SourceEffectRouteBridge.fs"/>
         <Compile Include="Modules\WorkQueueGitLedger.fs"/>
+        <Compile Include="Modules\WorkQueueReservationPermissions.fs"/>
         <Compile Include="Modules\WorkCompositionGitLedger.fs"/>
         <Compile Include="Modules\WorkQueueRoleAuthority.fs"/>
         <Compile Include="Modules\WorkQueueToolFacade.fs"/>

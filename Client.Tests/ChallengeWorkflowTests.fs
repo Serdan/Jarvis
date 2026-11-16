@@ -9,7 +9,10 @@ open Client.ReviewWorkflow
 open Client.ChallengeWorkflow
 open NUnit.Framework
 
+// Each case mirrors an immutable template into its own private Git remote.
+// Allow sibling cases to run concurrently; no test shares a writable ledger.
 [<TestFixture>]
+[<Parallelizable(ParallelScope.Children)>]
 type ChallengeTests() =
     let git dir args =
         use p = new Process()

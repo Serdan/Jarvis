@@ -1,0 +1,11 @@
+# P1 — Missing WQ04 role authority is accepted as a verified project snapshot
+
+**Frozen source:** `f25f4ad28e559483af275bce09387238f4276c9f` (base `ee50af8b68694e0e5fda1c28a251d07db3363aab`).
+
+**Locations:** `Client/Modules/WorkQueueDashboardReadBinding.fs:93-113` (especially 102-103); existing canonical `Client/Modules/WorkQueueToolFacade.fs:136-171, 212-232`; downstream `Client/Modules/WorkDashboardView.fs:108-118, 199-205`.
+
+The facade deliberately computes queue `Coverage = "Verified"` independently from `WorkQueueRoleAuthority.loadAt`. If role evidence is missing/unreadable, the same `readWithBinding` result contains `RoleAuthority = "UNKNOWN: WQ04 role provenance unavailable: ..."` while still returning `Ok` and queue coverage `Verified` (`WorkQueueToolFacade.inspectAt`, lines 163-171). In the new `toSnapshot`, only a role string containing `"mismatch"` is rejected. `UNKNOWN: ... unavailable` passes and becomes a successful `ProjectSource.Snapshot = Ok`.
+
+This fails the task's explicit requirement to reject unproved pinned role/source authority and expose a project-local `UNKNOWN / NotReady` when an approved project's evidence is incomplete. The UI's `Available` display path first sees `ClaimEnabled = false` and shows `NotReady (queue available)`, not the missing-role `UNKNOWN`; the project-level fallback in `projectRows` also keys off coverage/head/read-only rather than role authority. The role problem appears only as detail text instead of a properly failed verified project load. There is **no dispatch escalation** because this adapter is read-only, but the UI misstates evidence completeness.
+
+**Required correction:** Require a positive pinned role-authority proof for every `Ok` project snapshot (ideally structured evidence from `WorkQueueToolFacade`, not substring matching); otherwise return a per-project `Error "UNKNOWN: ..."`, retaining other approved projects' observations. Add a two-authority hermetic regression where one WQ02 project graph/head is healthy but `WorkQueueRoleAuthority.loadAt` fails, asserting that only that project's dashboard source is `Error/UNKNOWN` and no last-good rows or ready summary are accepted. Keep default-off/read-only behavior unchanged.

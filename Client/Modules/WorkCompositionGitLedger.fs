@@ -1,6 +1,9 @@
 module Client.WorkCompositionGitLedger
 
 open System
+open System.Text
+open System.Text.Json
+open Common
 open Client.LedgerStore
 open Client.WorkQueueGitLedger
 open Jarvis.WorkQueues
@@ -18,12 +21,27 @@ type CompositionCommand =
       ExpectedGraphVersion: int
       Mutation: WorkCompositionMutation }
 
+type CompositionViewItem =
+    { Unit: CompositeWorkUnit
+      Overview: WorkUnitOverview }
+
+type CompositionViewPage =
+    { SnapshotCommit: string
+      GraphVersion: int
+      TotalUnits: int
+      Items: CompositionViewItem list
+      NextCursor: string option }
+
 module WorkCompositionGitLedger =
     [<Literal>]
     let RecordPath = "records/work-composition/graph.json"
 
     let private codec = CanonicalCodec.encode
     let private validText (value: string) = not (String.IsNullOrWhiteSpace value)
+    // Composition pages share the 900 KiB command response with instruction
+    // layers. Reserve half of that allowance for the outer envelope.
+    // Unit counts cannot bound repeated stage IDs from one linked WQ task.
+    let private pageByteBudget = AgentProtocol.maxResponseBytes / 2
 
     let private structurallyCoherent (graph: WorkCompositionGraph) =
         let known id = graph.Units.ContainsKey id
@@ -101,6 +119,82 @@ module WorkCompositionGitLedger =
                         |> Result.map (fun queue ->
                             WorkComposition.allOverviews graph (Some queue)))))
 
+    // Specs, acceptance proofs and stage projections share one verified Git
+    // snapshot. A continuation is pinned to that head, never a moving offset.
+    let loadOverviewPage binding (unitId: string) pageSize (cursor: string) =
+        if pageSize < 0 || pageSize > 100 then
+            Error(InvalidBinding "Composition page size must be between 0 and 100 (0 uses 50).")
+        else
+            LedgerStore.fetch binding
+            |> Result.bind (fun snapshot ->
+                loadAt binding snapshot
+                |> Result.bind (fun (graph, _) ->
+                    let parseCursor () =
+                        if String.IsNullOrWhiteSpace cursor then Ok 0
+                        elif validText unitId then
+                            Error(InvalidBinding "Single-unit queries do not accept a cursor.")
+                        else
+                            match cursor.Split(':', 2) with
+                            | [| head; offset |] when head = snapshot.Commit ->
+                                match Int32.TryParse offset with
+                                | true, value when value > 0 -> Ok value
+                                | _ -> Error(InvalidBinding "Malformed composition continuation cursor.")
+                            | [| _; _ |] ->
+                                Error(StaleEntityVersion "Composition snapshot changed during pagination.")
+                            | _ -> Error(InvalidBinding "Malformed composition continuation cursor.")
+                    parseCursor ()
+                    |> Result.bind (fun start ->
+                        LedgerStore.readAt binding snapshot WorkQueueGitLedger.RecordPath
+                        |> Result.bind (fun (raw, _) ->
+                            match raw with
+                            | None -> Ok None
+                            | Some _ ->
+                                WorkQueueGitLedger.loadAt binding snapshot |> Result.map Some)
+                        |> Result.bind (fun queue ->
+                            let units =
+                                graph.Units
+                                |> Map.toList
+                                |> List.filter (fun (id, _) -> not (validText unitId) || id = unitId)
+                            if validText unitId && units.IsEmpty then
+                                Error(InvalidBinding ("Unknown composition unit: " + unitId))
+                            elif start >= units.Length && start <> 0 then
+                                Error(InvalidBinding "Composition continuation offset is outside the graph.")
+                            else
+                                let size = if pageSize = 0 then 50 else pageSize
+                                let continuation offset =
+                                    if offset < units.Length then
+                                        Some(snapshot.Commit + ":" + string offset)
+                                    else None
+                                let page items offset =
+                                    { SnapshotCommit = snapshot.Commit
+                                      GraphVersion = graph.Version
+                                      TotalUnits = units.Length
+                                      Items = items
+                                      NextCursor = continuation offset }
+                                // Measure serialized bytes as well as unit count. A
+                                // shared task can repeat its WQ stage IDs in each
+                                // composition unit's derived overview.
+                                let rec collect remaining reversedItems count =
+                                    match remaining with
+                                    | [] -> Ok(page (List.rev reversedItems) (start + count))
+                                    | _ when count >= size ->
+                                        Ok(page (List.rev reversedItems) (start + count))
+                                    | (id, unit) :: rest ->
+                                        match WorkComposition.overview graph queue id with
+                                        | None ->
+                                            Error(LedgerIntegrityError ("Missing composition overview: " + id))
+                                        | Some overview ->
+                                            let item = { Unit = unit; Overview = overview }
+                                            let candidate = page (List.rev (item :: reversedItems)) (start + count + 1)
+                                            if Encoding.UTF8.GetByteCount(JsonSerializer.Serialize candidate) <= pageByteBudget then
+                                                collect rest (item :: reversedItems) (count + 1)
+                                            elif count = 0 then
+                                                Error(InvalidBinding (
+                                                    "Composition unit " + id +
+                                                    " exceeds the safe single-unit response budget; inspect its canonical records directly."))
+                                            else
+                                                Ok(page (List.rev reversedItems) (start + count))
+                                collect (List.skip start units) [] 0))))
     let private rejected error =
         match error with
         | WorkCompositionError.StaleGraph (expected, actual) ->

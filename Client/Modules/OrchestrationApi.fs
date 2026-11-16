@@ -2374,6 +2374,9 @@ module TaskApi =
             | "GetIntegrationSubmissions" ->
                 ReviewWorkflow.ReviewWorkflow.getIntegrationSubmissions binding cmd.TaskId
                 |> mapError |> Result.map box
+            | "GetCompositionOverview" ->
+                WorkCompositionGitLedger.WorkCompositionGitLedger.loadOverviewPage binding cmd.TaskId cmd.PageSize cmd.Cursor
+                |> mapError |> Result.map box
             | "AgentInbox" ->
                 LedgerStore.LedgerStore.fetch binding
                 |> Result.bind (fun snapshot ->
@@ -2437,6 +2440,21 @@ module TaskApi =
                             let withAdministrativeActor action =
                                 administrativeActor binding operationId cmd.SessionId |> Result.bind action
                             match cmd.Action with
+                            | "CompositionMutate" ->
+                                match WorkCompositionOperatorInputs.WorkCompositionOperatorInputs.parseMutation cmd.Html with
+                                | Error message -> Error(Client.ValidationError message)
+                                | Ok mutation ->
+                                    withAdministrativeActor (fun actor ->
+                                        WorkCompositionGitLedger.WorkCompositionGitLedger.execute
+                                            binding actor operationId cmd.ExpectedVersion mutation
+                                        |> mapError)
+                            | "CompositionAcceptIntegrated" ->
+                                guid "submissionId" cmd.Reason
+                                |> Result.bind (fun submissionId ->
+                                    withAdministrativeActor (fun actor ->
+                                        WorkCompositionAcceptanceAdapter.WorkCompositionAcceptanceAdapter.acceptIntegrated
+                                            binding actor operationId cmd.ExpectedVersion cmd.TaskId cmd.ExpectedTaskVersion submissionId
+                                        |> mapError))
                             | "SubmitIntegration" ->
                                 guid "submissionId" cmd.AttemptId
                                 |> Result.bind (fun submissionId ->

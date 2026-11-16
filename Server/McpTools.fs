@@ -338,7 +338,7 @@ module McpToolHelpers =
           OutputSchemaJson = None }
 
     let private ledgerTaskReadMethods = [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint";  "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec";
-                                         "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"; "GetNotificationPreferences"; "GetResponseAlerts" ]
+                                         "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"; "GetNotificationPreferences"; "GetResponseAlerts"; "GetWorkComposition" ]
     let private ledgerTaskWriteMethods =
         [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
           "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
@@ -346,7 +346,7 @@ module McpToolHelpers =
           "SetAgentState"; "CorrectAgentWorkingState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"
           "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"
           "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"
-          "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec" ]
+          "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec"; "MutateWorkComposition"; "AcceptWorkCompositionIntegrated" ]
 
     let private ledgerReadMethods =
         [ "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations"; "PendingOperationSummary"; "PendingOperationsPage"; "InspectPendingOperation" ]
@@ -1692,6 +1692,24 @@ type JarvisMcpTools =
         let cmd = TaskCommands.write projectName "CloseTask" operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedTaskVersion = expectedTaskVersion })
 
+    [<McpServerTool(Title = "get work composition", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read work unit specifications and derived status from one verified Git snapshot. unitId selects one; otherwise use bounded pagination. A changed head invalidates the cursor.")>]
+    static member GetWorkComposition(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] unitId: string, [<Optional; DefaultParameterValue("")>] cursor: string, [<Optional; DefaultParameterValue(0)>] pageSize: int, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (TaskReadCommand { ProjectName = projectName; AgentId = agentId; Action = "GetCompositionOverview"
+                               TaskId = unitId; AssignmentGeneration = 0; CheckpointSequence = 0L
+                               Cursor = cursor; PageSize = pageSize; BeforeOid = null; AfterOid = null; RelativePath = null })
+
+    [<McpServerTool(Title = "mutate work composition", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Versioned Git-CAS mutation of Project/System/Feature units. mutationJson is a JSON object with action Create, Revise, Move, Require, Unrequire, Cancel or Reopen and unitId. Create/Revise take title, goal, scope, acceptanceCriteria array, constraints array, linkedTaskId, parentId; Create needs kind and Revise expectedSpecVersion. Require/Unrequire use prerequisiteId; Cancel uses reason. Cannot accept unverified evidence.")>]
+    static member MutateWorkComposition(projectName: string, agentId: string, expectedGraphVersion: int, mutationJson: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "CompositionMutate" operationId "" TaskCommands.legacyAdministrativePlaceholder
+        McpToolHelpers.send client http
+            (TaskWriteCommand { cmd with ExpectedVersion = expectedGraphVersion; Html = mutationJson })
+
+    [<McpServerTool(Title = "accept integrated work unit", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Accept a work unit against a linked task's independently accepted review and integrated exact-commit receipt. Validation is performed within the same Git-CAS snapshot. Children do not implicitly accept their parent.")>]
+    static member AcceptWorkCompositionIntegrated(projectName: string, agentId: string, unitId: string, expectedGraphVersion: int, expectedSpecVersion: int, submissionId: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "CompositionAcceptIntegrated" operationId unitId TaskCommands.legacyAdministrativePlaceholder
+        McpToolHelpers.send client http
+            (TaskWriteCommand { cmd with ExpectedVersion = expectedGraphVersion; ExpectedTaskVersion = expectedSpecVersion; Reason = submissionId })
     [<McpServerTool(Title = "agent inbox", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("SELF-INBOX ONLY: reading your own inbox may automatically activate a Ready assignment into Working and update last-seen. To inspect another agent with no activity/state changes, use ObserveAgent(projectName, agentId, targetAgentId). The response reports the canonical state after any activation.")>]
     static member AgentInbox(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (TaskReadCommand { ProjectName = projectName; AgentId = agentId; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })

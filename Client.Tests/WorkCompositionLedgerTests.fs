@@ -3,6 +3,9 @@ module Client.Tests.WorkCompositionLedgerTests
 open System
 open System.Diagnostics
 open System.IO
+open System.Text
+open System.Text.Json
+open Common
 open NUnit.Framework
 open Client.LedgerStore
 open Client.WorkQueueGitLedger
@@ -412,3 +415,127 @@ let ``composition operator overview pages pin specs and stages to one verified G
         match WorkCompositionGitLedger.loadOverviewPage second "missing" 10 "" with
         | Error(InvalidBinding _) -> ()
         | other -> Assert.Fail(sprintf "Expected missing-unit error: %A" other))
+
+[<Test>]
+let ``composition operator byte pages survive shared WQ stage amplification through transport guard`` () =
+    withTwoClones (fun first second ->
+        let sharedTask = "shared-validation-task"
+        let projectId = first.ProjectId.ToString("D")
+        let step (graph: WorkCompositionGraph) mutation =
+            match WorkComposition.apply graph.Version mutation graph with
+            | Ok next -> next
+            | Error error -> failwithf "Invalid composition fixture: %A" error
+        let graph =
+            [ 0 .. 84 ]
+            |> List.fold (fun graph index ->
+                let id = sprintf "f%03d" index
+                let tinySpec =
+                    { spec id (Some sharedTask) with Goal = "g"; Scope = "s"
+                                                     AcceptanceCriteria = Set.singleton "c" }
+                step graph (WorkCompositionMutation.Create(
+                    id, WorkUnitKind.Feature, Some "project", tinySpec)))
+                (step WorkComposition.empty (WorkCompositionMutation.Create(
+                    "project", WorkUnitKind.Project, None, spec "Project" None)))
+
+        // Each stage is stored only once in a legal WQ record, but appears
+        // once per feature in the derived overview. No fabricated oversized
+        // graph/spec/acceptance history is required for amplification.
+        WorkQueueGitLedger.initialize first "Fixture" (Guid.NewGuid()) Map.empty
+        |> succeed |> ignore
+        let _, initialQueue = WorkQueueGitLedger.load first |> succeed
+        let stages =
+            [ 0 .. 79 ]
+            |> List.map (fun index ->
+                let id = sprintf "review-%03d-" index + String.replicate 130 "x"
+                id,
+                { Id = id
+                  ProjectId = projectId
+                  SubjectId = sharedTask
+                  Kind = WorkKind.FrozenReview
+                  QueueId = "review"
+                  StageGeneration = 1
+                  State = WorkState.Available
+                  Domain = DomainState.Undecided
+                  Gate = GateState.Clear
+                  ClaimGeneration = 0
+                  Dependencies = Set.empty
+                  WaivedDependencies = Map.empty
+                  AvailableAt = 1000L
+                  AvailableSequence = int64 (index + 1)
+                  SourceLineage = None
+                  Push = None
+                  IntegrationAuthorized = false })
+            |> Map.ofList
+        let queue = { initialQueue with Works = stages; NextAvailability = 80L }
+        let graphEnvelope: CompositionEnvelope =
+            { SchemaVersion = 1; ProjectId = projectId
+              StateHash = CanonicalCodec.digest (CanonicalCodec.encode graph)
+              Graph = graph }
+        let queueEnvelope: ProjectEnvelope =
+            { SchemaVersion = 1; ProjectId = projectId
+              StateHash = CanonicalCodec.digest (CanonicalCodec.encode queue)
+              State = queue }
+        let graphRaw = CanonicalCodec.encode graphEnvelope
+        let queueRaw = CanonicalCodec.encode queueEnvelope
+        Assert.That(Encoding.UTF8.GetByteCount graphRaw, Is.LessThan(64 * 1024))
+        Assert.That(Encoding.UTF8.GetByteCount queueRaw, Is.LessThan(64 * 1024))
+
+        let snapshot = LedgerStore.fetch first |> succeed
+        let _, queueOid =
+            LedgerStore.readAt first snapshot WorkQueueGitLedger.RecordPath |> succeed
+        let fixtureIntent: LedgerIntent =
+            { OperationId = Guid.NewGuid(); Actor = "Fixture"
+              Kind = "Fixture.CompositionAmplification"
+              RequestJson = "{}" }
+        LedgerStore.transact first fixtureIntent (fun _ ->
+            Ok [ { Path = WorkCompositionGitLedger.RecordPath
+                   ExpectedBlobOid = None; Content = graphRaw }
+                 { Path = WorkQueueGitLedger.RecordPath
+                   ExpectedBlobOid = queueOid; Content = queueRaw } ])
+        |> succeed |> ignore
+
+        let pinned = LedgerStore.fetch second |> succeed
+        let persistedGraph, _ = WorkCompositionGitLedger.loadAt second pinned |> succeed
+        let persistedQueue = WorkQueueGitLedger.loadAt second pinned |> succeed
+        let allItems: CompositionViewItem list =
+            persistedGraph.Units
+            |> Map.toList
+            |> List.map (fun (id, unit) ->
+                { Unit = unit
+                  Overview = WorkComposition.overview persistedGraph (Some persistedQueue) id
+                             |> Option.get })
+        let unbounded: CompositionViewPage =
+            { SnapshotCommit = pinned.Commit
+              GraphVersion = persistedGraph.Version
+              TotalUnits = allItems.Length
+              Items = allItems
+              NextCursor = None }
+        let throughTransport (page: CompositionViewPage) =
+            let dispatched: Client.SignalR.Client.DispatchedResult =
+                { Payload = JsonSerializer.Serialize page
+                  ChangedAgentIds = [] }
+            Client.SignalR.Client.toAgentResponse ListCommandsCommand [] [] None (Ok dispatched)
+
+        match (throughTransport unbounded).Error with
+        | Some (OutputTruncated _) -> ()
+        | other -> Assert.Fail(sprintf "Amplified unpaged result bypassed the real transport guard: %A" other)
+
+        let rec readAll cursor seen pages =
+            let page = WorkCompositionGitLedger.loadOverviewPage second "" 100 cursor |> succeed
+            Assert.That(page.SnapshotCommit, Is.EqualTo(pinned.Commit))
+            Assert.That(page.Items.Length, Is.GreaterThan(0))
+            Assert.That((throughTransport page).Error.IsNone, Is.True,
+                        "A valid composition page must pass Client.SignalR.Client.toAgentResponse")
+            let ids = page.Items |> List.map (fun item -> item.Unit.Id)
+            match page.NextCursor with
+            | None -> seen @ ids, pages + 1
+            | Some next ->
+                Assert.That(next.StartsWith(pinned.Commit + ":"), Is.True)
+                readAll next (seen @ ids) (pages + 1)
+        let ids, pageCount = readAll "" [] 0
+        Assert.That(pageCount, Is.GreaterThan(1), "The count-only page must split by bytes")
+        Assert.That(ids.Length, Is.EqualTo(graph.Units.Count))
+        Assert.That(Set.ofList ids = (graph.Units |> Map.toSeq |> Seq.map fst |> Set.ofSeq), Is.True)
+        let single = WorkCompositionGitLedger.loadOverviewPage second "f000" 100 "" |> succeed
+        Assert.That(single.Items.Head.Overview.ReviewStages.Length, Is.EqualTo(80))
+        Assert.That((throughTransport single).Error.IsNone, Is.True))

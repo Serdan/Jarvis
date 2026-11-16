@@ -724,3 +724,12 @@ module WorkQueueRoleAuthority =
                                 Ok [{ Path = CatalogPath; ExpectedBlobOid = Some oid
                                       Content = encode ((binding: LedgerBinding).ProjectId.ToString("D"))
                                           provisionId after }])))
+
+    /// Versioned read-only role demand, based on one verified canonical Git
+    /// snapshot. No caller high-water or admission grant is manufactured.
+    let selectPracticalDemand binding roleId =
+        load binding
+        |> Result.bind (fun pinned ->
+            Producer.selectRoleDemandPractical pinned.Catalog pinned.Project roleId
+            |> Result.mapError (fun rejected ->
+                InvalidBinding (sprintf "WQ04 practical role demand: %A" rejected)))

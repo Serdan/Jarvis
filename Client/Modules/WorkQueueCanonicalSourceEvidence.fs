@@ -15,7 +15,10 @@ open Client.RoleInstructions
 // P1 WQ04: a read-only bridge, deliberately separate from the mutable WQ04 producer.
 // A caller-supplied name, "source index", counter or witness flag is never authority.
 type SourceEventSelector =
+    | TaskCreated of taskId: string
     | TaskTransition of taskId: string * attemptId: string * action: string * generation: int
+    | ReviewSubmitted of taskId: string * reviewId: Guid * reviewRef: string
+                         * sourceVersion: int * reviewedSha: string * targetRef: string
     | AcceptedReview of taskId: string * reviewId: Guid * reviewRef: string
                       * sourceVersion: int * decisionVersion: int * reviewedSha: string * targetRef: string
     | ChallengeTransition of taskId: string * challengeId: Guid * action: string
@@ -24,7 +27,9 @@ type SourceEventSelector =
     | RoleMembership of agentId: string * roleId: string * configVersion: int * roleVersion: int
 
 type CanonicalEventValue =
+    | CreatedTask of ReviewTask
     | Lifecycle of TaskLifecycleEvent
+    | ReviewRequested of BranchReview
     | ReviewVerdict of BranchReview
     | Challenge of ChallengeEvent
     | Integration of IntegrationSubmission
@@ -80,7 +85,9 @@ module WorkQueueCanonicalSourceEvidence =
     let private asGuidN (id: Guid) = id.ToString("N")
 
     let private entityPath = function
+        | TaskCreated task -> sprintf "tasks/%s/task.json" task
         | TaskTransition (task, _, _, _) -> sprintf "tasks/%s/lifecycle/%%SEQ%%.json" task
+        | ReviewSubmitted (task, id, _, _, _, _)
         | AcceptedReview (task, id, _, _, _, _, _) ->
             sprintf "tasks/%s/reviews/%s/review.json" task (asGuidN id)
         | ChallengeTransition (_, id, _) ->
@@ -186,6 +193,18 @@ module WorkQueueCanonicalSourceEvidence =
         let reject () = Error(invalid "Typed event identity, decision or source ancestry is inconsistent.")
         let sameOrStale test = if test then Ok () else Error(stale "Canonical event was superseded.")
         match selector with
+        | TaskCreated task ->
+            match required<ReviewTask> originRaw, required<ReviewTask> currentRaw with
+            | Ok created, Ok current
+                when operation.Type = "CreateTask"
+                     && created.TaskId = task && created.Version = 1
+                     && created.SpecVersion = 1 && created.Lifecycle = "Open"
+                     && isNull created.AttemptId
+                     && current.TaskId = task && current.Version >= created.Version
+                     && current.Lifecycle = "Open" && isNull current.AttemptId ->
+                Ok(CreatedTask created)
+            | Error e, _ | _, Error e -> Error e
+            | _ -> reject ()
         | TaskTransition (task, attempt, action, generation) ->
             match required<TaskLifecycleEvent> originRaw with
             | Error e -> Error e
@@ -207,6 +226,28 @@ module WorkQueueCanonicalSourceEvidence =
                             return! reject ()
                         return Lifecycle item
                     }
+        | ReviewSubmitted (task, id, expectedRef, sourceVersion, sha, target) ->
+            match required<BranchReview> originRaw, required<BranchReview> currentRaw with
+            | Ok first, Ok current ->
+                let managed = sprintf "refs/heads/jarvis-review/%s/%s/r%d" task (asGuidN id) sourceVersion
+                if operation.Type <> "SubmitBranchReview"
+                   || first.ReviewId <> asGuidN id || first.TaskId <> task
+                   || first.Status <> "Unclaimed" || first.Version <> 1
+                   || first.SourceVersion <> sourceVersion || first.ReviewRef <> managed
+                   || first.ReviewRef <> expectedRef || first.CreatedSequence <> operation.Sequence
+                   || first.OwnerAgentId <> operation.Actor
+                   || first.ReviewedHeadOid <> sha || not (LedgerStore.validSourceCommitOid sha)
+                   || first.TargetRef <> target then reject ()
+                else
+                    match sameOrStale
+                            (current.ReviewId = first.ReviewId && current.TaskId = task
+                             && current.SourceVersion = first.SourceVersion
+                             && current.ReviewRef = first.ReviewRef
+                             && current.ReviewedHeadOid = sha && current.TargetRef = target
+                             && current.Status = "Unclaimed" && current.Version = first.Version) with
+                    | Ok () -> Ok(ReviewRequested current)
+                    | Error e -> Error e
+            | Error e, _ | _, Error e -> Error e
         | AcceptedReview (task, id, expectedRef, sourceVersion, decisionVersion, sha, target) ->
             match required<BranchReview> originRaw, required<BranchReview> currentRaw with
             | Ok prior, Ok current ->
@@ -342,7 +383,9 @@ module WorkQueueCanonicalSourceEvidence =
             return! Error(stale "High-water or canonical head drifted; refresh both from Git.")
         let taskId =
             match selector with
+            | TaskCreated task
             | TaskTransition (task, _, _, _)
+            | ReviewSubmitted (task, _, _, _, _, _)
             | AcceptedReview (task, _, _, _, _, _, _)
             | ChallengeTransition (task, _, _)
             | IntegrationState (task, _, _, _, _, _) -> Some task

@@ -14,6 +14,20 @@
 <li><strong>Child completion does not imply parent acceptance.</strong> A completed set of features can still fail system-level acceptance; a collection of completed systems can fail project-level acceptance. A parent may need further corrective children after such a failure.</li>
 <li>Work carries persistent identity and history; LLM sessions are ephemeral executions of bounded slices. Execution/session identifiers are for provenance and concurrency, not human-like task ownership. Integration and review are schedulable work, not permanent people or singleton offices.</li>
 </ul>
+<h2>Declarative, lazy, reactive work model (guiding architecture)</h2>
+<p><strong>Core insight:</strong> Treat Jarvis as a <strong>lazy, reactive interpreter of engineering objectives</strong>. A work unit is a durable, declarative specification of an outcome, not a running process and not a persistent agent. The system should separate <em>describing the computation</em> from <em>executing it</em>. A fully specified System or Feature may remain dormant for weeks without any assigned session or allocated execution resources; when its prerequisite work reaches the specified evidence/acceptance state and capacity becomes available, Jarvis recognizes readiness and starts appropriate execution automatically. Completing that work can transitively unlock other work.</p>
+<p><strong>Useful functional model (conceptual, not a purity guarantee):</strong></p>
+<pre>Evaluate(Spec, DependencyResults, DurableState)
+    -&gt; (NextState, Artifacts, Evidence, NewWork)</pre>
+<ul>
+<li><strong>Declarative semantics:</strong> Specs state desired outcomes and acceptance criteria; dependency edges state prerequisites; readiness is derived from authoritative durable state. The work unit need not know when to wake, who will run it, or retain a live agent. Runnable work is selected by a scheduler based on readiness, policy, and available capacity.</li>
+<li><strong>Lazy/reactive activation:</strong> Work that cannot run remains inert, rather than consuming an agent slot. Every relevant committed state transition (dependency acceptance/integration, new work, capacity release, changed constraints) can trigger reevaluation. Do not require a human or persistent Lead to notice and restart the work.</li>
+<li><strong>Recursive/higher-order composition:</strong> A work unit can discover and create smaller units of work and their explicit dependencies; those units follow the same readiness/evaluation rules. New work must be justified by parent intent and recorded as an explicit, versioned graph change, not silently added scope.</li>
+<li><strong>Functional core, imperative shell:</strong> Keep graph evaluation, dependency resolution, acceptance/status derivation and scheduling decisions as predictable, testable state-to-decision computations where practical. Put effects (LLM calls, files, command execution, reviews, commits, branch promotion) behind explicit actions whose results become durable evidence and state transitions. Reuse existing Jarvis ledger/queue contracts instead of inventing a second runtime.</li>
+<li><strong>Do not mistake the analogy for literal purity:</strong> LLM calls are not referentially transparent or deterministic, and repository mutations are real side effects. Persist sufficient inputs, decisions, outputs and evidence to make history auditable; use existing version/claim/commit controls for concurrency, while resisting speculative transactional infrastructure. Deterministic readiness does not require deterministic intelligence.</li>
+<li><strong>Composable autonomy:</strong> A dormant specification plus known dependencies is sufficient to drive future execution. The system may scale across many independent features and systems, each activated only when needed, with no persistent agent identity or singleton managerial bottleneck.</li>
+</ul>
+<p><strong>Design review question:</strong> Does the proposed implementation preserve the separation between a declarative work description, a deterministic/inspectable readiness decision, a bounded ephemeral execution, and the durable recording of its effects? Avoid designs that reintroduce person-like agents as the repository of context, or rely on manually coordinating dependent work.</p>
 <h2>Composition and relationships</h2>
 <ul>
 <li>Support parent/child composition and meaningful directed dependencies (especially <em>blocks</em> / <em>blocked by</em>) between work units, including across system boundaries; reject dependency cycles.</li>
@@ -58,6 +72,7 @@
 <li>Concurrent execution, review and integration operate through the existing Agent =&gt; Work scheduling/claims system without singleton 'Lead' assumptions. Candidate promotions use safe Git semantics and appropriate validation.</li>
 <li>Tests cover recursion, cross-system dependencies, lifecycle/progress edge cases, parent acceptance, and concurrent reads/mutations relevant to the chosen design.</li>
 <li>Documentation explains the conceptual model, operator queries, and which facts are authoritative versus inferred.</li>
+<li>Demonstrate reactive activation end to end: a specified unit with unsatisfied prerequisites consumes no execution slot; completing only one of two prerequisites does not dispatch it; when all required acceptance/integration evidence arrives, it becomes runnable without manual intervention, receives at most the appropriate bounded executions under concurrent scheduler evaluation, and behaves consistently after restart. A unit created by another execution follows the same rules.</li>
 </ol>
 <h2>Open questions to resolve during design</h2>
 <ul>

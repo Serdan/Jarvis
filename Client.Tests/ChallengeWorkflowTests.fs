@@ -36,34 +36,34 @@ type ChallengeTests() =
         | Error(ReviewAccessDenied _) -> ()
         | other -> Assert.Fail(sprintf "Expected challenge access denied: %A" other)
 
+    // Register fixture agents once, then mirror that verified canonical ledger
+    // into a fresh, private Git remote for each test. No test shares writes.
+    let mutable templateRoot = ""
+    let mutable templateBare = ""
+    let templateProjectId = Guid.NewGuid()
+    let templateLedgerId = Guid.NewGuid()
+    let binding remote location =
+        { RepositoryPath = location
+          RemoteName = "origin"; ApprovedFetchUrl = remote; ApprovedPushUrl = remote
+          ProjectId = templateProjectId; LedgerId = templateLedgerId; Epoch = 1 }
+
     let withFixture (run: LedgerBinding -> LedgerBinding -> unit) =
         let root = Path.Combine(Path.GetTempPath(), "jarvis-challenges-" + Guid.NewGuid().ToString("N"))
-        Directory.CreateDirectory root |> ignore
         try
+            Directory.CreateDirectory root |> ignore
+            if String.IsNullOrWhiteSpace templateBare then
+                failwith "Challenge fixture template was not initialized."
             let bare = Path.Combine(root, "remote.git")
             let one = Path.Combine(root, "one")
             let two = Path.Combine(root, "two")
-            git root [ "init"; "--bare"; bare ] |> ignore
+            git root [ "clone"; "--mirror"; "--no-hardlinks"; templateBare; bare ] |> ignore
             git root [ "clone"; bare; one ] |> ignore
             git one [ "config"; "user.name"; "Fixture" ] |> ignore
             git one [ "config"; "user.email"; "fixture@example.test" ] |> ignore
-            File.WriteAllText(Path.Combine(one, "source.txt"), "baseline")
-            git one [ "add"; "source.txt" ] |> ignore
-            git one [ "commit"; "-m"; "baseline" ] |> ignore
-            git one [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
             git root [ "clone"; bare; two ] |> ignore
             git two [ "config"; "user.name"; "Fixture" ] |> ignore
             git two [ "config"; "user.email"; "fixture@example.test" ] |> ignore
-            let project = Guid.NewGuid()
-            let ledger = Guid.NewGuid()
-            let binding location =
-                { RepositoryPath = location
-                  RemoteName = "origin"; ApprovedFetchUrl = bare; ApprovedPushUrl = bare
-                  ProjectId = project; LedgerId = ledger; Epoch = 1 }
-            let a, b = binding one, binding two
-            LedgerStore.initialize a true |> ok |> ignore
-            for actor in [ "Agent 3"; "Lead"; "Agent 8"; "Intruder" ] do
-                ReviewWorkflow.registerAgent a (Guid.NewGuid()) actor |> ok |> ignore
+            let a, b = binding bare one, binding bare two
             run a b
         finally
             HermeticClientTestEnvironment.DeleteTestTree root
@@ -138,6 +138,39 @@ type ChallengeTests() =
                    ExpectedBlobOid = None; Content = audit } ])
         |> ok |> ignore
         challengeId, conditionId
+
+    [<OneTimeSetUp>]
+    member _.CreateFixtureTemplate() =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-challenges-template-" + Guid.NewGuid().ToString("N"))
+        try
+            Directory.CreateDirectory root |> ignore
+            let bare = Path.Combine(root, "remote.git")
+            let one = Path.Combine(root, "one")
+            git root [ "init"; "--bare"; bare ] |> ignore
+            git root [ "clone"; bare; one ] |> ignore
+            git one [ "config"; "user.name"; "Fixture" ] |> ignore
+            git one [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+            File.WriteAllText(Path.Combine(one, "source.txt"), "baseline")
+            git one [ "add"; "source.txt" ] |> ignore
+            git one [ "commit"; "-m"; "baseline" ] |> ignore
+            git one [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
+            let seeded = binding bare one
+            LedgerStore.initialize seeded true |> ok |> ignore
+            for actor in [ "Agent 3"; "Lead"; "Agent 8"; "Intruder" ] do
+                ReviewWorkflow.registerAgent seeded (Guid.NewGuid()) actor |> ok |> ignore
+            templateBare <- bare
+            templateRoot <- root
+        with _ ->
+            HermeticClientTestEnvironment.DeleteTestTree root
+            reraise()
+
+    [<OneTimeTearDown>]
+    member _.DeleteFixtureTemplate() =
+        if not (String.IsNullOrWhiteSpace templateRoot) then
+            HermeticClientTestEnvironment.DeleteTestTree templateRoot
+            templateRoot <- ""
+            templateBare <- ""
+
     [<Test>]
     member _.TwoOwnersCompleteOnlyAfterAllConditionsWithoutNotifications() =
         withFixture (fun a b ->

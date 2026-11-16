@@ -83,6 +83,7 @@
         <Compile Include="Modules\WorkQueueConversationTransport.fs"/>
         <Compile Include="Modules\WorkQueueOperatorConversations.fs"/>
         <Compile Include="Modules\AccountCapacityLedger.fs"/>
+        <Compile Include="Modules\LegacyWriterProtocolFence.fs"/>
         <Compile Include="Modules\AccountAdmissionAdapter.fs"/>
         <Compile Include="Modules\WorkQueueCanonicalMigrationPrepare.fs"/>
         <Compile Include="Modules\WorkQueueProjectMigrationPrepare.fs"/>

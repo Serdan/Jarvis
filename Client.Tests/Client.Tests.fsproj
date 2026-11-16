@@ -59,6 +59,7 @@
         <Compile Include="AccountCapacityLedgerTests.fs"/>
         <Compile Include="AccountAdmissionAdapterTests.fs"/>
         <Compile Include="WorkQueueCanonicalMigrationPrepareTests.fs"/>
+        <Compile Include="LegacyWriterProtocolFenceTests.fs"/>
         <Compile Include="WorkQueueProjectMigrationPrepareTests.fs"/>
         <Compile Include="RoleInstructionsTests.fs"/>
         <Compile Include="ReviewWorkflowTests.fs"/>

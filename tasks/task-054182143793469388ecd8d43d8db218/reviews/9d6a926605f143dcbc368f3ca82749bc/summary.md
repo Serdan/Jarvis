@@ -1,1 +1,9 @@
-Per-kind agent-scoped unread MCP indicators; durable typed challenge events and acknowledgements; cross-project source-only metadata; focused and challenge test suites pass.
+# Independent review — per-kind unread notification indicators
+
+**Frozen source:** `90ec35f124a2ed0e4c8c7b9c3cd3729ddc0ad094`, against `b277cd0d1b850b97ad81d889e2278aaef74e74ae`.
+
+**Verdict: ChangesRequested (P2).** See `findings/legacy-ack-drops-kind.md`: the new challenge notification's `kind` and `eventType` are additive members in existing schemaVersion 2, which older clients silently ignore. Their still-valid `AcknowledgeNotification` CAS writer reconstructs the old notification record with only eight legacy fields and permanently drops the new type metadata. A new reader then falsely interprets the historic challenge event as a direct agent message. The runbook's backwards-compatibility claim omits this mutation path. Require an old-client-safe schema/writer upgrade barrier and an explicit cross-version acknowledgement test before integrating.
+
+**Positive evidence:** inspected response enrichment, source-only cross-project metadata, recipient-scoped project-level count projection, existing notification acknowledgement/legacy decoding, and typed challenge event CAS writes. The new count cache is snapshot-based with explicit invalidation and bounded 30-second refresh; no notification content or duplicate original tool payload is introduced. Independent .NET 11 Release tests: `FullyQualifiedName~NotificationIndicatorTests|FullyQualifiedName~ChallengeWorkflowTests` **40/40 passed**; full `Server.Tests` **278/278 passed**. These tests do not cover the old-client acknowledgement path.
+
+**Integration recommendation:** do not integrate this exact SHA until legacy acknowledgement preserves typed kind/event semantics or old clients fail closed on typed notifications. Resubmit a new frozen commit/review with migration evidence.

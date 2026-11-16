@@ -203,3 +203,77 @@ let ``missing queue coverage does not imply runnable work`` () =
     Assert.That(phase graph (Some queue) "task", Is.EqualTo(Some WorkUnitPhase.AwaitingPublication))
     Assert.That(phase graph (Some { queue with GraphCovered = false }) "task",
                 Is.EqualTo(Some WorkUnitPhase.Unverified))
+
+
+let private queueStage id subject state dependencies : WorkStage =
+    { Id = id
+      ProjectId = "Jarvis"
+      SubjectId = subject
+      Kind = WorkKind.Implementation
+      QueueId = "implementation"
+      StageGeneration = 1
+      State = state
+      Domain = DomainState.Undecided
+      Gate = GateState.Clear
+      ClaimGeneration = 0
+      Dependencies = dependencies
+      WaivedDependencies = Map.empty
+      AvailableAt = 1L
+      AvailableSequence = 1L
+      SourceLineage = None
+      Push = None
+      IntegrationAuthorized = false }
+
+let private queueWith stages =
+    let project = Jarvis.WorkQueues.Contracts.emptyProject Map.empty
+    { project with Works = stages |> List.map (fun (stage: WorkStage) -> stage.Id, stage) |> Map.ofList }
+
+[<Test>]
+let ``available stages are ready for project admission only when WQ selector accepts them`` () =
+    let graph =
+        initial ()
+        |> fun g -> feature g "feature" "project" (Some "canonical-task")
+    let stage = queueStage "stage" "canonical-task" WorkState.Available Set.empty
+    let queue = queueWith [ stage ]
+    Assert.That(phase graph (Some queue) "feature", Is.EqualTo(Some WorkUnitPhase.ReadyForAdmission))
+    let status = (overview graph (Some queue) "project").Value
+    Assert.That(status.Progress.ReadyForAdmission, Is.EqualTo(1))
+    Assert.That(status.Progress.Blocked, Is.EqualTo(0))
+
+[<Test>]
+let ``available stage under non-clear gate is not locally ready`` () =
+    let graph =
+        initial ()
+        |> fun g -> feature g "feature" "project" (Some "canonical-task")
+    let stage = queueStage "stage" "canonical-task" WorkState.Available Set.empty
+    for gate in [ GateState.DependencyGatePending 3
+                  GateState.IntegrationGateHold(3, "push")
+                  GateState.SourceRecoveryBlocked "source must be reconciled" ] do
+        let queue = queueWith [ { stage with Gate = gate } ]
+        Assert.That(phase graph (Some queue) "feature", Is.EqualTo(Some WorkUnitPhase.Blocked),
+                    sprintf "Gate %A must exclude admission" gate)
+
+[<Test>]
+let ``incomplete or unsatisfied hard stage graph does not imply readiness`` () =
+    let graph =
+        initial ()
+        |> fun g -> feature g "feature" "project" (Some "canonical-task")
+    let upstream = queueStage "upstream" "different-task" WorkState.Available Set.empty
+    let dependent = queueStage "stage" "canonical-task" WorkState.Available (Set.singleton "upstream")
+    let unfinished = queueWith [ upstream; dependent ]
+    Assert.That(phase graph (Some unfinished) "feature", Is.EqualTo(Some WorkUnitPhase.Blocked))
+    let completed = queueWith [ { upstream with State = WorkState.Completed }; dependent ]
+    Assert.That(phase graph (Some completed) "feature", Is.EqualTo(Some WorkUnitPhase.ReadyForAdmission))
+    let missing = queueWith [ dependent ]
+    Assert.That(phase graph (Some missing) "feature", Is.EqualTo(Some WorkUnitPhase.Unverified))
+    let incomplete = { completed with GraphCovered = false }
+    Assert.That(phase graph (Some incomplete) "feature", Is.EqualTo(Some WorkUnitPhase.Unverified))
+
+[<Test>]
+let ``frozen project migration never admits an available work stage`` () =
+    let graph =
+        initial ()
+        |> fun g -> feature g "feature" "project" (Some "canonical-task")
+    let stage = queueStage "stage" "canonical-task" WorkState.Available Set.empty
+    let frozen = { queueWith [ stage ] with Migration = MigrationEpoch.Frozen }
+    Assert.That(phase graph (Some frozen) "feature", Is.EqualTo(Some WorkUnitPhase.Blocked))

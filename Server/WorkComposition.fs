@@ -75,7 +75,8 @@ type WorkUnitPhase =
     | Cancelled
     | Blocked
     | Executing
-    | Runnable
+    // Project-local queue eligibility, not global admission or authorization to launch.
+    | ReadyForAdmission
     | AwaitingAcceptance
     | AwaitingChildren
     | AwaitingPublication
@@ -86,7 +87,7 @@ type WorkUnitProgress =
       Accepted: int
       Blocked: int
       Executing: int
-      Runnable: int
+      ReadyForAdmission: int
       Awaiting: int
       Cancelled: int }
 
@@ -365,12 +366,16 @@ module WorkComposition =
             |> List.filter (fun stage -> stage.SubjectId = taskId)
         | _ -> []
 
-    let private isQueueVerified (queue: Project option) =
+    // This is the canonical WQ project selector: coverage, hard-stage
+    // prerequisites and non-clear gate checks are not duplicated here.
+    // Candidates still need independent account-wide admission and provenance.
+    let private eligibleStageIds (queue: Project option) =
         match queue with
         | Some project ->
-            project.QueueCovered && project.GraphCovered &&
-            project.SourceCovered && project.MessageCovered
-        | None -> false
+            Contracts.orderAvailable project
+            |> Result.toOption
+            |> Option.map (List.map (fun stage -> stage.Id) >> Set.ofList)
+        | None -> None
 
     let private unmet graph (unit: CompositeWorkUnit) =
         unit.HardPrerequisites
@@ -383,9 +388,9 @@ module WorkComposition =
             if child.CancellationReason.IsNone && (currentAcceptance graph child.Id).IsNone
             then Some child.Id else None)
 
-    // The projection never turns a graph edge into scheduler authorization.
-    // Runnable requires an already authoritative Available work stage and
-    // complete queue coverage. Publishing a stage is a separate Git-CAS effect.
+    // ReadyForAdmission means only local project queue eligibility. It is
+    // not global scheduler, role, capacity, migration or launch authorization.
+    // Publishing a stage is a separate Git-CAS effect.
     let phase graph queue id =
         match graph.Units.TryFind id with
         | None -> None
@@ -393,18 +398,22 @@ module WorkComposition =
         | Some unit when (currentAcceptance graph id).IsSome -> Some WorkUnitPhase.Accepted
         | Some unit ->
             let blocked = unmet graph unit
+            let candidates = eligibleStageIds queue
             if not blocked.IsEmpty then Some WorkUnitPhase.Blocked
-            elif unit.Spec.LinkedTaskId.IsSome && not (isQueueVerified queue) then
+            elif unit.Spec.LinkedTaskId.IsSome && candidates.IsNone then
                 Some WorkUnitPhase.Unverified
             else
                 let stages = stageKinds queue unit
                 if stages |> List.exists (fun stage ->
                     match stage.State with WorkState.Claimed _ -> true | _ -> false) then
                     Some WorkUnitPhase.Executing
-                elif stages |> List.exists (fun stage -> stage.State = WorkState.Available) then
-                    Some WorkUnitPhase.Runnable
+                elif (queue |> Option.exists (fun project -> project.Migration = MigrationEpoch.Activated))
+                     && (stages |> List.exists (fun stage ->
+                         candidates |> Option.exists (fun ids -> ids.Contains stage.Id))) then
+                    Some WorkUnitPhase.ReadyForAdmission
                 elif stages |> List.exists (fun stage -> stage.State = WorkState.Blocked
-                                                        || stage.State = WorkState.GateException) then
+                                                        || stage.State = WorkState.GateException
+                                                        || stage.State = WorkState.Available) then
                     Some WorkUnitPhase.Blocked
                 elif not (waitingChildren graph id).IsEmpty then
                     Some WorkUnitPhase.AwaitingChildren
@@ -444,11 +453,11 @@ module WorkComposition =
                   Accepted = count WorkUnitPhase.Accepted
                   Blocked = count WorkUnitPhase.Blocked
                   Executing = count WorkUnitPhase.Executing
-                  Runnable = count WorkUnitPhase.Runnable
+                  ReadyForAdmission = count WorkUnitPhase.ReadyForAdmission
                   Awaiting =
                     descendants.Length - cancelled - count WorkUnitPhase.Accepted -
                     count WorkUnitPhase.Blocked - count WorkUnitPhase.Executing -
-                    count WorkUnitPhase.Runnable
+                    count WorkUnitPhase.ReadyForAdmission
                   Cancelled = cancelled } })
 
     let allOverviews graph queue =

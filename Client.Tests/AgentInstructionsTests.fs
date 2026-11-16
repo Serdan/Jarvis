@@ -490,6 +490,8 @@ let registered_worktrees_resolve_distinct_instructions_from_actual_checkout_root
         with
         | :? UnauthorizedAccessException -> ()
         | :? PlatformNotSupportedException -> ()
+        | :? IOException as ex when OperatingSystem.IsWindows() && (ex.HResult &&& 0xFFFF) = 1314 ->
+            () // Missing Windows symlink privilege; all worktree checks above still ran.
     )
 
 [<Test>]

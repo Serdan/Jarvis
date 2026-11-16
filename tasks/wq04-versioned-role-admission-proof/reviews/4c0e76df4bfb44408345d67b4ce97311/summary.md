@@ -1,0 +1,1 @@
+Parents ed358380 and accepted d44f40e. Only F# compile-list conflict resolved. Release Client.Tests build passes. Audit role history, high-water, same-CAS fail-closed, and full tests. Inert only.

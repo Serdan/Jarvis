@@ -88,11 +88,22 @@ type WorkQueueMultiLedgerPreparedRecoveryTests() =
         git binding.RepositoryPath
             [ "push"; "origin"; "HEAD:" + AccountCapacityLedger.AccountRef ] |> ignore
 
+    // Entity reads deliberately reject ops/ paths. Hash those immutable
+    // operation blobs at the exact Git snapshot and separately verify their
+    // signed UUID/request hashes through LedgerStore.getOperationAt.
+    let historicalBlob (binding: LedgerBinding) (snapshot: LedgerSnapshot) (path: string) =
+        if path.StartsWith("ops/", StringComparison.Ordinal) then
+            git binding.RepositoryPath [ "rev-parse"; snapshot.Commit + ":" + path ]
+        else
+            let _, oid = LedgerStore.readAt binding snapshot path |> ok
+            oid |> Option.get
+
     let seedOriginal (first: LedgerBinding) slug =
         let worker, reviewer, task = "Original " + slug, "Reviewer " + slug, slug + "-legacy-task"
-        let agentOp, taskOp, reviewOp, managerOp = Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid()
+        let agentOp, reviewerOp, taskOp, reviewOp, managerOp =
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid()
         ReviewWorkflow.registerAgent first agentOp worker |> ok |> ignore
-        ReviewWorkflow.registerAgent first (Guid.NewGuid()) reviewer |> ok |> ignore
+        ReviewWorkflow.registerAgent first reviewerOp reviewer |> ok |> ignore
         ReviewWorkflow.createTask first taskOp task "Immutable legacy task" |> ok |> ignore
         let branch = "refs/heads/feature/" + slug + "-original-source"
         git first.RepositoryPath [ "checkout"; "-b"; "feature/" + slug + "-original-source" ] |> ignore
@@ -111,9 +122,15 @@ type WorkQueueMultiLedgerPreparedRecoveryTests() =
               Content = """{"legacyManager":"frozen","runnable":false}""" }
         |> ok |> ignore
         let beforeJournal = LedgerStore.fetch first |> ok
+        // Cover ALL original operation receipts, including initialization,
+        // reviewer registration and legacy Manager operations, not a sample.
+        let originalIds = LedgerStore.getOperationIdsAt first beforeJournal |> ok
+        Assert.That(originalIds.Contains(reviewerOp.ToString("N")), Is.True)
         let originals =
-            [ agentOp; taskOp; reviewOp; managerOp ]
-            |> List.map (fun id ->
+            originalIds
+            |> Set.toList
+            |> List.map (fun key ->
+                let id = Guid.ParseExact(key, "N")
                 let op = LedgerStore.getOperationAt first beforeJournal id |> ok |> Option.get
                 id.ToString("D"), op.RequestHash, op.Sequence)
         let journalId = Guid.NewGuid()
@@ -130,15 +147,19 @@ type WorkQueueMultiLedgerPreparedRecoveryTests() =
               ExpectedBlobOid = None; Content = CanonicalCodec.encode journal }
         |> ok |> ignore
         let snapshot = LedgerStore.fetch first |> ok
+        let operationPaths =
+            originalIds
+            |> Set.toList
+            |> List.map (fun key -> sprintf "ops/%s/%s.json" (key.Substring(0, 2)) key)
         let paths =
             [ "agents"; "tasks"; "records/roles" ]
             |> List.collect (fun dir -> LedgerStore.listAt first snapshot dir |> ok)
-            |> fun enumerated -> managerPath :: WorkQueueProjectMigrationPrepare.FixtureJournalPath :: enumerated
+            |> fun enumerated ->
+                managerPath :: WorkQueueProjectMigrationPrepare.FixtureJournalPath :: (operationPaths @ enumerated)
             |> List.distinct
         let history =
-            paths |> List.map (fun path ->
-                let _, blob = LedgerStore.readAt first snapshot path |> ok
-                path, blob |> Option.get) |> Map.ofList
+            paths |> List.map (fun path -> path, historicalBlob first snapshot path)
+            |> Map.ofList
         journalId, journal, history, sourceSha, branch
 
     let withFixture action =
@@ -293,11 +314,64 @@ type WorkQueueMultiLedgerPreparedRecoveryTests() =
     let verifyHistorical lab project =
         let snapshot = LedgerStore.fetch project.Second |> ok
         for KeyValue(path, originalOid) in project.FrozenHistory do
-            let _, after = LedgerStore.readAt project.Second snapshot path |> ok
-            Assert.That(after, Is.EqualTo(Some originalOid), path)
+            let after = historicalBlob project.Second snapshot path
+            Assert.That(after, Is.EqualTo(originalOid), path)
         let source =
             git lab.Root [ "--git-dir=" + project.Bare; "rev-parse"; project.HistoricalSourceRef ]
         Assert.That(source, Is.EqualTo(project.HistoricalSourceSha))
+        for KeyValue(id, hash) in project.Journal.OriginalRequestHashes do
+            let operation =
+                LedgerStore.getOperationAt project.Second snapshot (Guid.Parse id)
+                |> ok |> Option.get
+            Assert.That(operation.RequestHash, Is.EqualTo(hash), id)
+
+    // Independent later project Git CAS. It does not alter the original WQ10
+    // Prepared operation UUID, and intentionally does not fabricate authority.
+    let damagePreparedReceipt project =
+        let snapshot = LedgerStore.fetch project.Second |> ok
+        let _, oid =
+            LedgerStore.readAt project.Second snapshot WorkQueueProjectMigrationPrepare.ReceiptPath |> ok
+        Assert.That(oid.IsSome, Is.True)
+        LedgerStore.putRecord project.Second
+            { OperationId = Guid.NewGuid()
+              Actor = "independent disposable writer"
+              Path = WorkQueueProjectMigrationPrepare.ReceiptPath
+              ExpectedBlobOid = oid
+              Content = "{}" }
+        |> ok |> ignore
+
+    let addUnrelatedAvailableStage project =
+        let snapshot = LedgerStore.fetch project.Second |> ok
+        let queue = WorkQueueGitLedger.loadAt project.Second snapshot |> ok
+        let template = queue.Works |> Map.toList |> List.head |> snd
+        let stage =
+            { template with
+                Id = "unrelated-disposable-runnable-stage"
+                SubjectId = "unrelated-disposable-task"
+                QueueId = "unrelated:independent-writer"
+                State = WorkState.Available
+                Gate = GateState.Clear
+                AvailableAt = 1L
+                AvailableSequence = queue.NextAvailability + 1L }
+        let changed =
+            { queue with
+                NextAvailability = queue.NextAvailability + 1L
+                Works = queue.Works.Add(stage.Id, stage) }
+        let envelope: ProjectEnvelope =
+            { SchemaVersion = 1
+              ProjectId = project.Second.ProjectId.ToString("D")
+              State = changed
+              StateHash = CanonicalCodec.digest (CanonicalCodec.encode changed) }
+        let _, oid = LedgerStore.readAt project.Second snapshot WorkQueueGitLedger.RecordPath |> ok
+        LedgerStore.putRecord project.Second
+            { OperationId = Guid.NewGuid()
+              Actor = "independent disposable WQ02 writer"
+              Path = WorkQueueGitLedger.RecordPath
+              ExpectedBlobOid = oid
+              Content = CanonicalCodec.encode envelope }
+        |> ok |> ignore
+        let observed = WorkQueueGitLedger.load project.Second |> ok |> snd
+        Assert.That(Contracts.orderAvailable observed |> ok, Is.Not.Empty)
 
     let verifyInert project =
         let snapshot = LedgerStore.fetch project.Second |> ok
@@ -489,3 +563,47 @@ type WorkQueueMultiLedgerPreparedRecoveryTests() =
             for p in [f.A;f.B] do
                 verifyInert p
                 verifyHistorical f p)
+
+    [<Test>]
+    member _.OriginalUuidReplayCannotHideLaterChangedPreparedReceipt() =
+        withFixture (fun f ->
+            let first = WorkQueueMultiLedgerPreparedRecovery.attemptOnDisposableFixture f.Plan |> succeeded
+            Assert.That(first.Failure.IsNone, Is.True)
+            let second = otherClones f
+            let replay =
+                WorkQueueMultiLedgerPreparedRecovery.attemptOnDisposableFixtureWithInterposition
+                    second (fun () -> damagePreparedReceipt f.B) |> succeeded
+            Assert.That(replay.AccountWrite.Value.AlreadyApplied, Is.True)
+            Assert.That(replay.ProjectWrites.Count, Is.EqualTo(2))
+            Assert.That(replay.ProjectWrites |> Map.forall (fun _ receipt -> receipt.AlreadyApplied), Is.True)
+            Assert.That(replay.Failure.IsSome, Is.True, "AlreadyApplied is not current three-ledger success")
+            Assert.That(replay.Recovery.AccountOriginalReceiptVerified, Is.True)
+            Assert.That(replay.Recovery.AllProjectsInertPrepared, Is.False)
+            Assert.That(replay.Recovery.Projects[1].Status,
+                        Is.AnyOf("RecoveryBlocked", "Unreadable"))
+            Assert.That(replay.Recovery.Projects[1].ObservedHead,
+                        Is.EqualTo(Some((LedgerStore.fetch f.B.Second |> ok).Commit)))
+            verifyHistorical f f.A
+            verifyHistorical f f.B)
+
+    [<Test>]
+    member _.UnrelatedRunnableWorkAfterPreparedMustBlockRecovery() =
+        withFixture (fun f ->
+            let first = WorkQueueMultiLedgerPreparedRecovery.attemptOnDisposableFixture f.Plan |> succeeded
+            Assert.That(first.Failure.IsNone, Is.True)
+            addUnrelatedAvailableStage f.A
+            // The original conversion receipt/stage remains valid. The old
+            // project-only inspector cannot see the unrelated runnable stage.
+            match WorkQueueProjectMigrationPrepare.inspect f.A.Second f.AccountB |> ok with
+            | ProjectPreparedInspection.ProjectOnly _ -> ()
+            | other -> Assert.Fail(sprintf "Expected original conversion to remain intact: %A" other)
+            let recovery = WorkQueueMultiLedgerPreparedRecovery.inspect (otherClones f)
+            Assert.That(recovery.AccountOriginalReceiptVerified, Is.True)
+            Assert.That(recovery.AllProjectsInertPrepared, Is.False)
+            Assert.That(recovery.Projects[0].Status, Is.EqualTo("RecoveryBlocked"))
+            let replay = WorkQueueMultiLedgerPreparedRecovery.attemptOnDisposableFixture (otherClones f) |> succeeded
+            Assert.That(replay.Failure.IsSome, Is.True)
+            Assert.That(replay.ProjectWrites |> Map.forall (fun _ write -> write.AlreadyApplied), Is.True)
+            Assert.That(replay.Recovery.Projects[0].Status, Is.EqualTo("RecoveryBlocked"))
+            verifyHistorical f f.A
+            verifyHistorical f f.B)

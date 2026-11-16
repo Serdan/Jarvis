@@ -2,6 +2,7 @@ module Client.WorkQueueMultiLedgerPreparedRecovery
 
 open System
 open System.Text.Json
+open Jarvis.WorkQueues
 open Client.AccountCapacityLedger
 open Client.LedgerStore
 open Client.WorkQueueGitLedger
@@ -129,6 +130,35 @@ module WorkQueueMultiLedgerPreparedRecovery =
         && receipt.ReviewedReportSha256 = (target plan).ReviewedOfflineReportSha256
         && not receipt.RuntimeAuthorized
 
+    // Prepared conversion validates its own linked stages, not unrelated
+    // WQ02 work added in a later Git CAS. A recovery claim covers the whole
+    // current queue, including launches and every possible runnable stage.
+    let private inspectWholeQueueInert (binding: LedgerBinding) =
+        match LedgerStore.fetch binding with
+        | Error error -> Error(sprintf "Cannot reread current project queue: %A" error)
+        | Ok snapshot ->
+            match WorkQueueGitLedger.loadAt binding snapshot with
+            | Error error -> Error(sprintf "Cannot verify current project queue: %A" error)
+            | Ok queue ->
+                let everyStageInert =
+                    queue.Works
+                    |> Map.forall (fun _ stage ->
+                        not stage.IntegrationAuthorized
+                        && (match stage.State with
+                            | WorkState.Blocked -> stage.Gate <> GateState.Clear
+                            | WorkState.Completed | WorkState.Cancelled -> true
+                            | WorkState.Available | WorkState.Claimed _
+                            | WorkState.GateException -> false))
+                let noAvailable =
+                    match Contracts.orderAvailable queue with
+                    | Ok stages -> List.isEmpty stages
+                    | Error _ -> false
+                if queue.Migration = MigrationEpoch.Preparing
+                   && queue.Launches.IsEmpty && everyStageInert && noAvailable then
+                    Ok snapshot.Commit
+                else
+                    Error "Current WQ02 queue is not wholly inert: a non-held/authorized stage, launch, or invalid ordering remains."
+
     // Recovery only reads the three original Git authorities. Project-only
     // success is intentionally NEVER an executable Work queue or cutover.
     let internal inspect (plan: MultiLedgerPreparePlan) : MultiLedgerRecovery =
@@ -187,7 +217,10 @@ module WorkQueueMultiLedgerPreparedRecovery =
                     match WorkQueueProjectMigrationPrepare.inspect p.Target.Binding (account plan) with
                     | Ok ProjectPreparedInspection.NotPrepared -> "NotPrepared", None, None
                     | Ok (ProjectPreparedInspection.ProjectOnly r) when matchesReceipt plan p r ->
-                        "PreparedInert", Some r, None
+                        match inspectWholeQueueInert p.Target.Binding with
+                        | Ok head when Some head = observed -> "PreparedInert", Some r, None
+                        | Ok _ -> "RecoveryBlocked", Some r, Some "Project head moved during recovery inspection; reread the canonical authorities."
+                        | Error reason -> "RecoveryBlocked", Some r, Some reason
                     | Ok (ProjectPreparedInspection.AccountHeadDiverged(r, head)) when matchesReceipt plan p r ->
                         "AccountHeadDiverged", Some r, Some("Account head moved to " + head)
                     | Ok (ProjectPreparedInspection.RecoveryBlocked reason) ->
@@ -274,8 +307,19 @@ module WorkQueueMultiLedgerPreparedRecovery =
                                 if index = 0 then
                                     try afterA ()
                                     with ex -> failure <- Some("Fixture interposition failed: " + ex.Message)
+                // Idempotent AlreadyApplied UUID receipts are not proof that the
+                // current three Git heads still contain a verified inert state.
+                let recovery = inspect plan
+                let finalFailure =
+                    match failure with
+                    | Some _ -> failure
+                    | None when not recovery.AccountOriginalReceiptVerified ->
+                        Some "Partial WQ10 recovery: the current account Preparing receipt/head is not verified."
+                    | None when not recovery.AllProjectsInertPrepared ->
+                        Some "Partial WQ10 recovery: both original project receipts and fully inert queues are not verified."
+                    | None -> None
                 Ok { AccountWrite = Some write; ProjectWrites = writes
-                     Failure = failure; Recovery = inspect plan }
+                     Failure = finalFailure; Recovery = recovery }
 
     let internal attemptOnDisposableFixture plan =
         attemptOnDisposableFixtureWithInterposition plan ignore

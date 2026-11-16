@@ -188,6 +188,10 @@ Reusing the same UUID and same reviewed input returns the same staging commits; 
 
 **What this does not prove:** the accepted account ledger has no reviewed `Preparing` migration CAS/receipt operation; the canonical Work project ledger has no safe offline `Prepared` conversion transaction; source-origin receipt identity/role mapping, producer high-water, verified dependency/FIFO state and authenticated review approval are not established by this adapter. Its only successful status is `ADAPTER_ONLY_NOT_PREPARED`; `canonicalPrepared=false`, `schedulerEnabled=false`, and `productionCutover=NOT_AUTHORIZED` remain explicit. A production cutover requires new independently reviewed typed bindings, real provenance proof and separate human authorization, never this script.
 
+**Evidence write boundary:** Backups and diffs use only fixed authority filenames (`project-1.bundle`, `project-2.diff`, `account.bundle`, etc.), not arbitrary project display names. Path-like, blank, duplicate/casefold-equivalent or account-reserved project names are rejected. The adapter checks every resolved output path and refuses symlinks, unexpected files or attempts to overwrite unjournaled diff evidence.
+
+**Interrupted preparation and safe abort:** Repeating `prepare` with the same original UUID and exact reviewed manifest/report must independently reconstruct the identical full staged commit before it can adopt an unjournaled ref. To recover a crash after staging CAS but before persisting `preparedHead`, replay `prepare` with those original pinned inputs, then run `abort`. Abort first checks every authority tip against its exact recorded `preparedHead` and refuses to delete any unrecognized sibling or unverifiable ref. Known refs are removed by exact Git CAS only. Preserve all original branches, backups, receipts and diffs; never choose a new UUID to conceal an unknown outcome.
+
 Run the hermetic regression suite with:
 
 ```sh

@@ -114,6 +114,29 @@ def validate_repo(root: Path, input_repo: str, used: set[Path]) -> Path:
     return repo
 
 
+def operation_directory(root: Path, operation_id: str) -> Path:
+    """Do not follow symlinks in the fixture evidence write path."""
+    parent = root / "wq10-preparations"
+    work = parent / operation_id
+    if (parent.is_symlink() or work.is_symlink()
+            or work.resolve() != work or root not in work.parents):
+        fail("FIXTURE_WRITE_BOUNDARY_INVALID",
+             "Remove the symlink or escaped preparation directory; preserve existing evidence")
+    return work
+
+
+def checked_output(work: Path, filename: str) -> Path:
+    """Authorize only fixed evidence filenames wholly inside the operation directory."""
+    if not re.fullmatch(r"(?:account|project-[12])\.(?:bundle|diff)|receipt\.(?:json|tmp)", filename):
+        fail("FIXTURE_WRITE_BOUNDARY_INVALID", "Use only canonical authority evidence filenames")
+    path = work / filename
+    if (work.resolve() != work or work not in path.parents
+            or path.is_symlink() or path.resolve() != path):
+        fail("FIXTURE_WRITE_BOUNDARY_INVALID",
+             f"Preserve unexpected evidence or symlink at {path}; never escape fixture operation")
+    return path
+
+
 def verified_report(manifest_path: Path, report_path: Path, reviewed_sha: str) -> tuple[dict, dict, str]:
     raw = report_path.read_bytes()
     actual_sha = digest(raw)
@@ -268,7 +291,8 @@ def cas_create(repo: Path, original_ref: str, original_head: str,
 
 
 def atomic_json(path: Path, value: dict) -> None:
-    candidate = path.with_suffix(".tmp")
+    path = checked_output(path.parent, path.name)
+    candidate = checked_output(path.parent, path.with_suffix(".tmp").name)
     candidate.write_text(pretty(value), encoding="utf-8")
     os.replace(candidate, path)
 
@@ -276,17 +300,28 @@ def atomic_json(path: Path, value: dict) -> None:
 def make_specs(root: Path, manifest: dict, report: dict,
                operation_id: str, report_sha: str, input_sha: str) -> list[dict]:
     used: set[Path] = set()
+    names = [item.get("name") for item in manifest["projects"]]
+    if any(not isinstance(name, str) or not name or name != name.strip()
+           or name.casefold() == "account" or name in (".", "..")
+           or any(character in name for character in ("/", "\\", "\0"))
+           or any(ord(character) < 32 for character in name)
+           for name in names):
+        fail("UNSAFE_PROJECT_NAME",
+             "Use nonblank project names without paths, controls, or the reserved account identity")
+    if len({name.casefold() for name in names}) != 2:
+        fail("PROJECT_IDENTITY_DUPLICATED", "Use two distinct project identities")
     by_name = {p["name"]: p for p in report["projects"]}
     if len(by_name) != 2:
         fail("PROJECT_IDENTITY_DUPLICATED", "Review the unique pinned project identities")
     specs = []
-    for item in sorted(manifest["projects"], key=lambda entry: entry["name"]):
+    for index, item in enumerate(sorted(manifest["projects"], key=lambda entry: entry["name"]), 1):
         name = item["name"]
         if name not in by_name or item["head"] != by_name[name]["head"]:
             fail("PREFLIGHT_PROJECT_MISMATCH", "Reconcile the exact project identity and pinned SHA")
         repo = validate_repo(root, item["repo"], used)
         sidecar = project_sidecar(by_name[name], operation_id, report_sha, input_sha)
         specs.append({"name": name, "repo": str(repo), "originalRef": item["ref"],
+                      "authorityKey": f"project-{index}",
                       "originalHead": item["head"],
                       "path": f"records/work-queue/prepared-adapter/{operation_id}.json",
                       "record": sidecar})
@@ -295,6 +330,7 @@ def make_specs(root: Path, manifest: dict, report: dict,
         fail("PREFLIGHT_ACCOUNT_MISMATCH", "Reconcile exact account SHA")
     repo = validate_repo(root, item["repo"], used)
     specs.append({"name": "account", "repo": str(repo), "originalRef": item["ref"],
+                  "authorityKey": "account",
                   "originalHead": item["head"],
                   "path": f"records/wq10-prepared-adapter/{operation_id}.json",
                   "record": account_sidecar(report["account"], operation_id,
@@ -326,9 +362,9 @@ def prepare(args: argparse.Namespace) -> dict:
     input_sha = digest(canonical({"manifest": manifest, "report": report}).encode("utf-8"))
     specs = make_specs(root, manifest, report, operation_id, report_sha, input_sha)
     staging_ref = REF_PREFIX + operation_id
-    work = root / "wq10-preparations" / operation_id
+    work = operation_directory(root, operation_id)
     work.mkdir(parents=True, exist_ok=True)
-    receipt_path = work / "receipt.json"
+    receipt_path = checked_output(work, "receipt.json")
     if receipt_path.exists():
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         if receipt.get("operationId") != operation_id or receipt.get("inputSha256") != input_sha:
@@ -347,19 +383,23 @@ def prepare(args: argparse.Namespace) -> dict:
         name = spec["name"]
         repo = Path(spec["repo"])
         prior = existing.get(name)
+        expected_backup = checked_output(work, f"{spec['authorityKey']}.bundle")
         if prior:
-            if any(prior[k] != spec[k] for k in ("repo", "originalRef", "originalHead", "path")):
+            if (any(prior[k] != spec[k] for k in
+                    ("repo", "originalRef", "originalHead", "path", "authorityKey"))
+                    or prior["backup"] != str(expected_backup)):
                 fail("OPERATION_ID_REUSED", "Original fixture authority differs from the stored receipt")
-            backup = Path(prior["backup"])
+            backup = expected_backup
             if not backup.exists() or digest(backup.read_bytes()) != prior["backupSha256"]:
                 fail("BACKUP_MISSING", "Restore the exact original Git bundle before resuming")
             continue
-        backup = work / f"{name}.bundle"
+        backup = expected_backup
         if backup.exists():
             fail("UNJOURNALED_BACKUP", "Inspect existing original bundle before retrying")
         run_git(repo, "bundle", "create", str(backup), spec["originalRef"])
         run_git(repo, "bundle", "verify", str(backup))
         entry = {k: spec[k] for k in ("name", "repo", "originalRef", "originalHead", "path")}
+        entry["authorityKey"] = spec["authorityKey"]
         entry.update({"backup": str(backup), "backupSha256": digest(backup.read_bytes()),
                       "preparedHead": None, "diff": None, "diffSha256": None})
         receipt["authorities"].append(entry)
@@ -386,6 +426,9 @@ def prepare(args: argparse.Namespace) -> dict:
                     item["preparedHead"] = project_head
             staged = ref_tip(repo, staging_ref)
             if staged:
+                if prior["preparedHead"] and staged != prior["preparedHead"]:
+                    fail("PREPARED_REF_MISMATCH",
+                         f"{name}: staged ref no longer matches its receipt; preserve the unknown commit")
                 # Detect retries with changed payloads even if the local receipt
                 # was lost after an atomic Git CAS.
                 payload = run_git(repo, "show", staged + ":" + spec["path"]).stdout
@@ -394,15 +437,28 @@ def prepare(args: argparse.Namespace) -> dict:
                          f"{name}: original operation UUID already staged different content")
                 if run_git(repo, "rev-parse", staged + "^").stdout.strip() != spec["originalHead"]:
                     fail("PREPARED_PARENT_MISMATCH", "Inspect and quarantine the unexpected prepared ref")
+                # A crash after ref CAS but before receipt persistence is only
+                # recoverable by regenerating the exact deterministic commit.
+                # Matching IDs and parent alone cannot authorize a sibling tip.
+                if staged != stage_commit(root, repo, spec["originalHead"], spec["path"], spec["record"]):
+                    fail("PREPARED_REF_MISMATCH",
+                         f"{name}: staged commit differs from reviewed evidence; preserve it")
             else:
                 staged = stage_commit(root, repo, spec["originalHead"], spec["path"], spec["record"])
                 cas_create(repo, spec["originalRef"], spec["originalHead"], staging_ref, staged)
             diff = run_git(repo, "diff", "--no-ext-diff",
                            spec["originalHead"], staged, "--").stdout
-            diff_path = work / f"{name}.diff"
-            diff_path.write_text(diff, encoding="utf-8")
+            diff_path = checked_output(work, f"{spec['authorityKey']}.diff")
+            diff_sha = digest(diff.encode("utf-8"))
+            if (prior["diff"] not in (None, str(diff_path))
+                    or prior["diffSha256"] not in (None, diff_sha)
+                    or (diff_path.exists() and diff_path.read_text(encoding="utf-8") != diff)):
+                fail("UNEXPECTED_DIFF_EVIDENCE",
+                     f"{name}: preserve and reconcile unrecognized diff instead of overwriting it")
+            if not diff_path.exists():
+                diff_path.write_text(diff, encoding="utf-8")
             prior.update({"preparedHead": staged, "diff": str(diff_path),
-                          "diffSha256": digest(diff.encode("utf-8"))})
+                          "diffSha256": diff_sha})
             atomic_json(receipt_path, receipt)
     except PreparationError:
         receipt["status"] = "PARTIAL_ADAPTER_ONLY"
@@ -427,7 +483,7 @@ def abort(args: argparse.Namespace) -> dict:
     operation_id = str(uuid.UUID(args.operation_id))
     if operation_id != args.operation_id:
         fail("INVALID_OPERATION_ID", "Use the original canonical lowercase UUID")
-    receipt_path = root / "wq10-preparations" / operation_id / "receipt.json"
+    receipt_path = checked_output(operation_directory(root, operation_id), "receipt.json")
     if not receipt_path.is_file():
         fail("RECEIPT_MISSING", "Recover the original durable fixture receipt, not a guessed operation")
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -435,19 +491,38 @@ def abort(args: argparse.Namespace) -> dict:
         fail("RECEIPT_ID_MISMATCH", "Inspect the original operation receipt")
     staging_ref = REF_PREFIX + operation_id
     used: set[Path] = set()
+    verified_refs = []
+    # Verify every observed authority before removing any ref. Unknown sibling
+    # commits must not trigger a partial abort elsewhere.
     for entry in reversed(receipt["authorities"]):
         repo = validate_repo(root, entry["repo"], used)
         current = ref_tip(repo, staging_ref)
         if current is None:
             continue
+        expected = entry.get("preparedHead")
+        if not expected:
+            fail("ABORT_UNJOURNALED_STAGING",
+                 f"{entry['name']}: replay prepare with the same reviewed inputs and UUID to "
+                 "reconstruct/record the exact staged commit before aborting; do not guess")
+        if current != expected:
+            fail("ABORT_REF_MISMATCH",
+                 f"{entry['name']}: expected {expected}, observed {current}; "
+                 "preserve this unknown ref and reconcile the competing writer")
         payload = json.loads(run_git(repo, "show", current + ":" + entry["path"]).stdout)
         if (payload.get("operationId") != operation_id
                 or payload.get("inputSha256") != receipt["inputSha256"]
                 or run_git(repo, "rev-parse", current + "^").stdout.strip() != entry["originalHead"]):
             fail("ABORT_REF_MISMATCH",
                  f"{entry['name']}: preserve unknown ref and inspect its original lineage")
-        run_git(repo, "update-ref", "--stdin",
-                input_text=f"start\ndelete {staging_ref} {current}\nprepare\ncommit\n")
+        verified_refs.append((repo, current))
+    for repo, current in verified_refs:
+        removed = run_git(repo, "update-ref", "--stdin",
+                          input_text=f"start\ndelete {staging_ref} {current}\nprepare\ncommit\n",
+                          check=False)
+        if removed.returncode:
+            fail("ABORT_UNCERTAIN",
+                 f"Git CAS rejected deletion of {staging_ref}; inspect changed ref and replay the "
+                 "same operation only after reconciliation")
         if ref_tip(repo, staging_ref) is not None:
             fail("ABORT_UNCERTAIN", "Re-read the fixture staging ref; do not retry with a new UUID")
     receipt["status"] = "ABORTED"

@@ -12,7 +12,7 @@ from test_preview import LedgerFixture, git, APP
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 PREPARE = ROOT / "tools/Wq10MigrationPreview/prepare.py"
 sys.path.insert(0, str(PREPARE.parent))
-from prepare import cas_create, PreparationError
+from prepare import cas_create, PreparationError, stage_commit
 
 OPERATION = "44444444-4444-4444-4444-444444444444"
 STAGING_REF = "refs/heads/wq10-prepared/" + OPERATION
@@ -286,6 +286,129 @@ class PreparedAdapterTests(unittest.TestCase):
         result, failure = self.command()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(failure["code"], "PREFLIGHT_REPORT_CHANGED")
+        for _, repo, _ in self.all_authorities():
+            self.assertIsNone(maybe_ref(repo, STAGING_REF))
+
+    def test_untrusted_display_names_cannot_escape_fixture_outputs(self):
+        witness = self.root / "escaped.diff"
+        witness.write_text("unrelated evidence", encoding="utf-8")
+        for name in ("../../escaped", "Alpha/child", r"..\child", "", "account",
+                     "ACCOUNT", ".", "..", "Alpha\nchild"):
+            with self.subTest(name=name):
+                self.manifest["projects"][0]["name"] = name
+                if not name:
+                    with self.assertRaises(AssertionError):
+                        self.refresh_report()  # The inspector itself rejects blank identities.
+                    continue
+                self.refresh_report()
+                result, failure = self.command()
+                self.assertNotEqual(result.returncode, 0)
+                if self.report["readiness"] == "PREVIEW_READY_FOR_REVIEW":
+                    self.assertEqual(failure["code"], "UNSAFE_PROJECT_NAME")
+                self.assertEqual(witness.read_text(encoding="utf-8"), "unrelated evidence")
+                self.assertFalse((self.root / "escaped.bundle").exists())
+                self.assertFalse((self.root / "wq10-preparations").exists())
+                for _, repo, _ in self.all_authorities():
+                    self.assertIsNone(maybe_ref(repo, STAGING_REF))
+
+    def test_case_insensitive_project_duplicate_rejected(self):
+        self.manifest["projects"][0]["name"] = "beta"
+        self.refresh_report()
+        result, failure = self.command()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(failure["code"], "PROJECT_IDENTITY_DUPLICATED")
+        self.assertFalse((self.root / "wq10-preparations").exists())
+
+    def test_human_display_name_uses_fixed_authority_evidence_files(self):
+        self.manifest["projects"][0]["name"] = "Alpha (draft)"
+        self.refresh_report()
+        result, prepared = self.command()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        operation_dir = self.root / "wq10-preparations" / OPERATION
+        receipt = json.loads(pathlib.Path(prepared["receipt"]).read_text(encoding="utf-8"))
+        self.assertEqual({item["authorityKey"] for item in receipt["authorities"]},
+                         {"project-1", "project-2", "account"})
+        for item in receipt["authorities"]:
+            self.assertEqual(pathlib.Path(item["backup"]).parent, operation_dir)
+            self.assertEqual(pathlib.Path(item["backup"]).name, item["authorityKey"] + ".bundle")
+            self.assertEqual(pathlib.Path(item["diff"]).name, item["authorityKey"] + ".diff")
+
+    def test_symlinked_backup_cannot_overwrite_outside_evidence(self):
+        protected = self.root / "protected-bundle"
+        protected.write_text("preserve me", encoding="utf-8")
+        work = self.root / "wq10-preparations" / OPERATION
+        work.mkdir(parents=True)
+        (work / "project-1.bundle").symlink_to(protected)
+        result, failure = self.command()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(failure["code"], "FIXTURE_WRITE_BOUNDARY_INVALID")
+        self.assertEqual(protected.read_text(encoding="utf-8"), "preserve me")
+        for _, repo, _ in self.all_authorities():
+            self.assertIsNone(maybe_ref(repo, STAGING_REF))
+
+    def test_unjournaled_diff_collision_is_never_overwritten(self):
+        work = self.root / "wq10-preparations" / OPERATION
+        work.mkdir(parents=True)
+        collision = work / "project-1.diff"
+        collision.write_text("third-party evidence", encoding="utf-8")
+        result, failure = self.command()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(failure["code"], "UNEXPECTED_DIFF_EVIDENCE")
+        self.assertEqual(collision.read_text(encoding="utf-8"), "third-party evidence")
+        for name, repo, ref in self.all_authorities():
+            self.assertEqual(maybe_ref(repo, ref), self.originals[name])
+
+    def test_symlinked_operation_directory_is_not_followed(self):
+        other = self.root / "other-evidence"
+        other.mkdir()
+        (self.root / "wq10-preparations").symlink_to(other, target_is_directory=True)
+        result, failure = self.command()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(failure["code"], "FIXTURE_WRITE_BOUNDARY_INVALID")
+        self.assertEqual(list(other.iterdir()), [])
+        for _, repo, _ in self.all_authorities():
+            self.assertIsNone(maybe_ref(repo, STAGING_REF))
+
+    def test_abort_refuses_unreviewed_same_parent_sibling_before_any_delete(self):
+        first, prepared = self.command()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        original_staged = {name: maybe_ref(repo, STAGING_REF)
+                           for name, repo, _ in self.all_authorities()}
+        _, beta = self.projects[1]
+        sidecar_path = "records/work-queue/prepared-adapter/" + OPERATION + ".json"
+        payload = json.loads(git(beta.remote, "show",
+                                 original_staged["Beta"] + ":" + sidecar_path))
+        payload["extraEvidence"] = {"unreviewed": True}
+        sibling = stage_commit(self.root, beta.remote, beta.head, sidecar_path, payload)
+        git(beta.remote, "update-ref", STAGING_REF, sibling, original_staged["Beta"])
+        rejected, failure = self.command(action="abort")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(failure["code"], "ABORT_REF_MISMATCH")
+        for name, repo, ref in self.all_authorities():
+            self.assertEqual(maybe_ref(repo, STAGING_REF),
+                             sibling if name == "Beta" else original_staged[name])
+            self.assertEqual(maybe_ref(repo, ref), self.originals[name])
+        receipt = json.loads(pathlib.Path(prepared["receipt"]).read_text(encoding="utf-8"))
+        self.assertNotEqual(receipt["status"], "ABORTED")
+
+    def test_abort_requires_exact_recovery_after_unjournaled_ref(self):
+        first, prepared = self.command()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        receipt_path = pathlib.Path(prepared["receipt"])
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["authorities"][0]["preparedHead"] = None
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        staged = {name: maybe_ref(repo, STAGING_REF) for name, repo, _ in self.all_authorities()}
+        rejected, failure = self.command(action="abort")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(failure["code"], "ABORT_UNJOURNALED_STAGING")
+        for name, repo, _ in self.all_authorities():
+            self.assertEqual(maybe_ref(repo, STAGING_REF), staged[name])
+        recovered, _ = self.command()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        aborted, answer = self.command(action="abort")
+        self.assertEqual(aborted.returncode, 0, aborted.stderr)
+        self.assertEqual(answer["status"], "ABORTED")
         for _, repo, _ in self.all_authorities():
             self.assertIsNone(maybe_ref(repo, STAGING_REF))
 

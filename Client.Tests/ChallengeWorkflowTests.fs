@@ -77,12 +77,21 @@ type ChallengeTests() =
 
     let get binding actor id = ChallengeWorkflow.get binding actor id |> ok
 
-    // Inspect raw canonical paths, not just pending inbox items, so a bad
-    // challenge emitter cannot hide notifications by targeting another agent,
-    // acknowledging them, or interacting with notification block/mute state.
+    // Legacy invariants exclude direct discretionary messages. Typed challenge
+    // notices are now intentionally written with challenge transactions; their
+    // recipient identity, kind and acknowledgements have separate tests below.
     let notices binding =
         let snapshot = LedgerStore.fetch binding |> ok
         LedgerStore.listAt binding snapshot "notifications" |> ok
+        |> List.filter (fun path ->
+            match LedgerStore.readAt binding snapshot path with
+            | Ok(Some body, _) ->
+                use document = System.Text.Json.JsonDocument.Parse body
+                let mutable kind = Unchecked.defaultof<System.Text.Json.JsonElement>
+                not (document.RootElement.TryGetProperty("kind", &kind)
+                     && kind.ValueKind = System.Text.Json.JsonValueKind.String
+                     && kind.GetString() = "challenge")
+            | _ -> true)
 
     let assignment binding task =
         ReviewWorkflow.createTask binding (Guid.NewGuid()) task task |> ok |> ignore
@@ -1565,4 +1574,44 @@ type ChallengeTests() =
             // corrupt projection, so the outstanding question still exists.
             let old = ChallengeWorkflow.getOperatorPage a legacyId 16 0L "" |> ok
             Assert.That(old.Challenge.Status, Is.EqualTo("Pending"))
+        )
+
+
+    [<Test>]
+    member _.ChallengeActionsEmitRecipientScopedDurableTypedNoticesAndAcknowledgeExactly() =
+        withFixture (fun a b ->
+            let operation = Guid.NewGuid()
+            let created =
+                ChallengeWorkflow.create a operation "Agent 3" "Notification routing" "" definitions |> ok
+            let unread binding =
+                let snapshot = LedgerStore.fetch binding |> ok
+                ReviewWorkflow.unreadNotificationCountsAt binding snapshot |> ok
+            let initial = unread b
+            Assert.That(initial["Lead"]["challenge"], Is.EqualTo(1))
+            Assert.That(initial["Agent 8"]["challenge"], Is.EqualTo(1))
+            Assert.That(initial.ContainsKey "Agent 3", Is.False)
+            let replay =
+                ChallengeWorkflow.create b operation "Agent 3" "Notification routing" "" definitions |> ok
+            Assert.That(replay.Receipt.AlreadyApplied, Is.True)
+            let afterReplay = unread a
+            Assert.That(afterReplay["Lead"]["challenge"], Is.EqualTo(1))
+            let snapshot = LedgerStore.fetch a |> ok
+            let pending = ReviewWorkflow.pendingNotifications a snapshot "Lead" |> ok
+            Assert.That(pending.Length, Is.EqualTo(1))
+            Assert.That(pending.Head.Kind, Is.EqualTo("challenge"))
+            Assert.That(pending.Head.EventType, Is.EqualTo("assigned"))
+            Assert.That(pending.Head.ToAgentId, Is.EqualTo("Lead"))
+            ReviewWorkflow.acknowledgeNotification b (Guid.NewGuid()) "Lead"
+                (Guid.Parse pending.Head.NotificationId) |> ok |> ignore
+            Assert.That((unread a).ContainsKey "Lead", Is.False)
+            ChallengeWorkflow.resolve a (Guid.NewGuid()) "Agent 8" created.ChallengeId
+                created.ConditionIds.Tail.Head 1 "benchmark passed" "" |> ok |> ignore
+            let after = unread b
+            Assert.That(after["Agent 3"]["challenge"], Is.EqualTo(1))
+            Assert.That(after["Agent 8"]["challenge"], Is.EqualTo(1))
+            let ownerNotices =
+                ReviewWorkflow.pendingNotifications b (LedgerStore.fetch b |> ok) "Agent 3" |> ok
+            Assert.That(ownerNotices.Length, Is.EqualTo(1))
+            Assert.That(ownerNotices.Head.EventType, Is.EqualTo("resolved"))
+            Assert.That(ownerNotices.Head.FromAgentId, Is.EqualTo("Agent 8"))
         )

@@ -28,7 +28,7 @@ module CommandDispatchRecovery =
           // Only the forwarded source effects are confirmed. Destination
           // effects remain UNKNOWN under the typed UncertainOutcome.
           AgentStateChanges = sourceChanges
-          InboxActivation = sourceActivation; PendingJob = None }
+          InboxActivation = sourceActivation; NotificationCounts = null; PendingJob = None }
 
 // A command must leave SignalR's receive callback before any local work
 // starts. Even Task-returning callbacks serialize subsequent notifications.

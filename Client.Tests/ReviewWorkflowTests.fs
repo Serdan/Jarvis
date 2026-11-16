@@ -5744,7 +5744,8 @@ type ReviewWorkflowTests() =
                            FromProjectName = ""; ToAgentId = (if i % 11 = 0 then "Owner" else "Reviewer")
                            TaskId = taskId; Message = "historical"
                            CreatedAtUtc = "2026-01-01T00:00:00Z"
-                           AcknowledgedAtUtc = (if i % 2 = 0 then null else "2026-01-02T00:00:00Z") }
+                           AcknowledgedAtUtc = (if i % 2 = 0 then null else "2026-01-02T00:00:00Z")
+                           Kind = "message"; EventType = "direct" }
                            : AgentNotification)
                     // Task specifications are intentionally irrelevant to the
                     // inbox. Include sizeable blobs to catch accidental reads.
@@ -6177,7 +6178,7 @@ type ReviewWorkflowTests() =
                         [{ Scope = "project"; Path = "owner/AGENTS.md"; Sha256 = ""
                            Content = "Original completion instruction" }]
                       AgentStateChanges = [{ ProjectName = "owner"; AgentId = actor }]
-                      InboxActivation = None; PendingJob = None }
+                      InboxActivation = None; NotificationCounts = null; PendingJob = None }
                 let startPromoted (blocked: System.Threading.Tasks.TaskCompletionSource<Common.AgentCommandResponse>) =
                     let pending =
                         Client.SignalR.Client.executeOrPromoteWith runtime (serialize slowCommand)
@@ -6202,7 +6203,7 @@ type ReviewWorkflowTests() =
                     let response : Common.AgentCommandResponse =
                         { Result = Some(System.Text.Json.JsonSerializer.Serialize(stored jobId))
                           Error = None; Instructions = []; AgentStateChanges = []
-                          InboxActivation = None; PendingJob = None }
+                          InboxActivation = None; NotificationCounts = null; PendingJob = None }
                     Client.SignalR.Client.executeOrPromoteWith runtime (serialize command)
                         actor TimeSpan.Zero (fun _ _ -> System.Threading.Tasks.Task.FromResult response)
                     |> await

@@ -67,6 +67,7 @@
         <Compile Include="OrchestrationApiTests.fs"/>
         <Compile Include="AgentViewTests.fs"/>
         <Compile Include="AgentDashboardCacheTests.fs"/>
+        <Compile Include="NotificationIndicatorTests.fs"/>
         <Compile Include="TerminalMouseTests.fs"/>
         <Compile Include="TerminalLayoutTests.fs"/>
         <Compile Include="TerminalFrameTests.fs"/>

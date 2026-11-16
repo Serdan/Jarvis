@@ -201,6 +201,30 @@ module ChallengeWorkflow =
         { OperationId = operationId; Actor = actor
           Kind = kind; RequestJson = json payload }
 
+    // Durable, typed challenge events are *not* discretionary NotifyAgent messages.
+    // Their IDs are deterministic per operation, event kind, challenge and recipient
+    // so a retried CAS cannot duplicate a recipient's unread indicator. The
+    // canonical challenge transition and notice commit atomically.
+    let private challengeNotices (operationId: Guid) (actor: string) (challengeId: string)
+                                 (eventType: string) (recipients: string list)
+                                 (timestamp: string) =
+        recipients
+        |> List.filter (fun recipient -> agentId recipient && recipient <> actor)
+        |> List.distinct
+        |> List.map (fun recipient ->
+            let key = operationId.ToString("N") + ":" + challengeId + ":" + eventType + ":" + recipient
+            let bytes = SHA256.HashData(Encoding.UTF8.GetBytes key)
+            let id = Guid(bytes.AsSpan(0, 16)).ToString("N")
+            let notice : AgentNotification =
+                { NotificationId = id
+                  FromAgentId = actor; FromProjectName = ""
+                  ToAgentId = recipient; TaskId = ""
+                  Message = "Challenge " + challengeId + ": " + eventType
+                  CreatedAtUtc = timestamp; AcknowledgedAtUtc = null
+                  Kind = "challenge"; EventType = eventType }
+            change ("notifications/" + id + ".json") None notice)
+
+
     // UUIDs are reproducible from a caller-stable operation ID. Retried Create
     // operations retain the identical challenge AND condition IDs on every client.
     let private conditionId (challengeId: Guid) (index: int) =
@@ -743,8 +767,15 @@ module ChallengeWorkflow =
                           Evidence = ""; Reason = ""; Sequence = snapshot.Header.NextSequence
                           OccurredAtUtc = timestamp }
                     let! indexes = indexWrites binding snapshot None entity
+                    let owners =
+                        conditions |> List.choose (fun condition ->
+                            match ownerOf condition with
+                            | Some(ChallengeOwner.Agent recipient) -> Some recipient
+                            | _ -> None)
+                    let notices = challengeNotices operationId issuer entity.ChallengeId "assigned" owners timestamp
                     return [ change (path challengeId) None entity
-                             change (eventPath challengeId snapshot.Header.NextSequence) None event ] @ indexes
+                             change (eventPath challengeId snapshot.Header.NextSequence) None event ]
+                           @ notices @ indexes
                 })
             created |> Result.map (fun receipt ->
                 { ChallengeId = challengeId.ToString("N")
@@ -975,9 +1006,35 @@ module ChallengeWorkflow =
                               Evidence = evidence
                               Reason = reason; Sequence = snapshot.Header.NextSequence
                               OccurredAtUtc = timestamp }
-                        // The one Git ledger transaction records only challenge
-                        // state and its immutable event. Notification settings,
-                        // recipient blocks, and delivery cannot affect progress.
+                        // Changes to challenge work are recorded atomically with
+                        // recipient-specific typed indicators. Recipient mutes and
+                        // discretionary message blocks cannot suppress the work.
+                        let recipients, eventType =
+                            match kind with
+                            | "ResolveChallengeCondition" ->
+                                [challenge.IssuerAgentId],
+                                (if target |> Option.exists (fun c ->
+                                    nextConditions |> List.exists (fun next ->
+                                        next.ConditionId = c.ConditionId && next.Status = "Blocked"))
+                                 then "blocked" else "resolved")
+                            | "RespondOperatorCondition" -> [challenge.IssuerAgentId], "operator-responded"
+                            | "ReopenChallengeCondition" ->
+                                (match target with
+                                 | Some condition ->
+                                     match ownerOf condition with
+                                     | Some(ChallengeOwner.Agent owner) -> [owner]
+                                     | _ -> []
+                                 | None -> []), "reopened"
+                            | "CancelChallenge" ->
+                                (challenge.Conditions |> List.choose (fun c ->
+                                    if c.Status = "Pending" then
+                                        match ownerOf c with
+                                        | Some(ChallengeOwner.Agent owner) -> Some owner
+                                        | _ -> None
+                                    else None)), "cancelled"
+                            | _ -> [], "updated"
+                        let notices =
+                            challengeNotices operationId actor challenge.ChallengeId eventType recipients timestamp
                         let! wakeups =
                             if nextStatus = "Satisfied" && priorState <> "Satisfied" then
                                 wakeDependents binding snapshot operationId actor nextRecord timestamp
@@ -985,7 +1042,7 @@ module ChallengeWorkflow =
                         let! indexes = indexWrites binding snapshot (Some challenge) nextRecord
                         return [ change (path id) (Some blob) nextRecord
                                  change (eventPath id snapshot.Header.NextSequence) None event ]
-                               @ wakeups @ indexes
+                               @ notices @ wakeups @ indexes
                     })
 
     // Caller is the authenticated local TUI, never a remote agent command.
@@ -1053,8 +1110,11 @@ module ChallengeWorkflow =
                           Evidence = ""; Reason = ""; Sequence = snapshot.Header.NextSequence
                           OccurredAtUtc = timestamp }
                     let! indexes = indexWrites binding snapshot (Some challenge) updated
+                    let notices =
+                        challengeNotices operationId actor challengeId "assigned" [newOwner] timestamp
                     return [ change (path id) (Some blob) updated
-                             change (eventPath id snapshot.Header.NextSequence) None event ] @ indexes
+                             change (eventPath id snapshot.Header.NextSequence) None event ]
+                           @ notices @ indexes
                 })
 
 
@@ -1151,8 +1211,15 @@ module ChallengeWorkflow =
                               Sequence = snapshot.Header.NextSequence
                               OccurredAtUtc = timestamp }
                         let! indexes = indexWrites binding snapshot (Some challenge) revised
+                        let owners =
+                            replacement |> List.choose (fun condition ->
+                                match ownerOf condition with
+                                | Some(ChallengeOwner.Agent recipient) -> Some recipient
+                                | _ -> None)
+                        let notices = challengeNotices operationId actor challengeId "split" owners timestamp
                         return [ change (path id) (Some blob) revised
-                                 change (eventPath id snapshot.Header.NextSequence) None audit ] @ indexes
+                                 change (eventPath id snapshot.Header.NextSequence) None audit ]
+                               @ notices @ indexes
                     })
             result |> Result.map (fun receipt ->
                 { ChallengeId = id.ToString("N"); ConditionIds = ids; Receipt = receipt })

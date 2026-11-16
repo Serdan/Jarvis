@@ -22,7 +22,8 @@ let private notification id agent fromAgent task message created acknowledged =
        TaskId = task
        Message = message
        CreatedAtUtc = created
-       AcknowledgedAtUtc = acknowledged } : AgentNotification)
+       AcknowledgedAtUtc = acknowledged
+       Kind = "message"; EventType = "direct" } : AgentNotification)
 
 let private entry (notice: AgentNotification) =
     let content = JsonSerializer.Serialize(notice, jsonOptions)

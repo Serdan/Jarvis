@@ -1377,6 +1377,15 @@ module LedgerStore =
     let readAgentInboxRecordsAt binding snapshot =
         readViewRecordsAt true false binding snapshot |> Result.map stripOids
 
+    /// Immutable, batched projection of notification records only. Shared blob
+    /// cache avoids reparsing unchanged Git objects on a refreshed snapshot.
+    let readNotificationRecordsAt binding snapshot =
+        readSelectedRecordsAt [ "notifications" ]
+            (fun path -> path.StartsWith("notifications/", StringComparison.Ordinal)
+                         && path.EndsWith(".json", StringComparison.Ordinal))
+            binding snapshot
+        |> Result.map stripOids
+
     // Challenge inbox projections consult only scoped materialized indexes.
     // Prefixes cannot escape the caller's encoded agent key. Missing indexes
     // are an empty projection, not a reason to scan immutable challenge history.

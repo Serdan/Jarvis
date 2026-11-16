@@ -783,6 +783,9 @@ type AgentCommandResponse =
       Instructions: InstructionDocument list
       AgentStateChanges: AgentStateChange list
       InboxActivation: AgentInboxActivation option
+      /// Recipient-scoped unread counts from the canonical project ledger, if available.
+      /// Null on older clients and for responses without an agent/project identity.
+      NotificationCounts: System.Collections.Generic.Dictionary<string, int>
       PendingJob: ToolJobHandle option }
 
 /// Internal server-to-client envelope for verified source-side mutation

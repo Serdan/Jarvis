@@ -365,6 +365,7 @@ let private completedToolResponse payload : AgentCommandResponse =
       Instructions = []
       AgentStateChanges = [ { ProjectName = "Project1"; AgentId = "Worker 1" } ]
       InboxActivation = None
+      NotificationCounts = null
       PendingJob = None }
 
 [<Test>]
@@ -876,7 +877,7 @@ let forwardedNotificationJobKeepsSourceAndDestinationEvidenceThroughTerminalPoll
                       Error = if outcomeIsFailure then Some(Conflict "destination failed") else None
                       Instructions = []
                       AgentStateChanges = [ { ProjectName = "Project1"; AgentId = "Receiver" } ]
-                      InboxActivation = None; PendingJob = None }
+                      InboxActivation = None; NotificationCounts = null; PendingJob = None }
                 deferred.SetResult destination
                 let _, completion = registered
                 let terminal = completion.WaitAsync(TimeSpan.FromSeconds 4.).GetAwaiter().GetResult()

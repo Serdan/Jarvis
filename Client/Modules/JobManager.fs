@@ -346,6 +346,7 @@ module private ToolOperations =
           Instructions = []
           AgentStateChanges = []
           InboxActivation = None
+          NotificationCounts = null
           PendingJob = None }
 
     // Once execution begins an exception cannot prove that a mutation did not
@@ -360,6 +361,7 @@ module private ToolOperations =
           // The typed UncertainOutcome marks completeness UNKNOWN, never zero.
           AgentStateChanges = []
           InboxActivation = None
+          NotificationCounts = null
           PendingJob = None }
 
     let private complete (entry: ToolOperationRecord) (response: AgentCommandResponse) =

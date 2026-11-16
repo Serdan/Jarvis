@@ -1,6 +1,8 @@
 module Client.SignalR.Client
 
 open System
+open System.Collections.Concurrent
+open System.Collections.Generic
 open System.Diagnostics
 open System.IO
 open System.Runtime.CompilerServices
@@ -22,6 +24,37 @@ let receiveMessage (rt: Runtime) message =
 // Working state for ordinary calls to avoid one remote git fetch per tool.
 let private workingGuidanceCaches = ConditionalWeakTable<Runtime, WorkingTurnGuidance.AgentCache>()
 let private instructionDeliveryCaches = ConditionalWeakTable<Runtime, AgentInstructions.DeliveryCache>()
+
+// A bounded-staleness projection of the *verified* project ledger. The value is
+// keyed by canonical project, not worktree/device/session. Any failed refresh
+// is retried on the next response; failures are never advertised as zero.
+type private NotificationCountEntry =
+    { Gate: obj
+      mutable CheckedAt: DateTimeOffset
+      mutable Counts: Map<string, Map<string, int>> option }
+
+type private NotificationCountCache() =
+    let entries = ConcurrentDictionary<ProjectPaths.ProjectId, NotificationCountEntry>()
+    let ttl = TimeSpan.FromSeconds 30.
+
+    member _.Get(now: DateTimeOffset, project: ProjectPaths.ProjectId,
+                 load: unit -> Map<string, Map<string, int>> option) =
+        let entry = entries.GetOrAdd(project, fun _ ->
+            { Gate = obj(); CheckedAt = DateTimeOffset.MinValue; Counts = None })
+        lock entry.Gate (fun () ->
+            if now < entry.CheckedAt || now - entry.CheckedAt >= ttl then
+                let current = load()
+                entry.Counts <- current
+                entry.CheckedAt <- if current.IsSome then now else DateTimeOffset.MinValue
+            entry.Counts)
+
+    member _.Invalidate(project: ProjectPaths.ProjectId) =
+        entries.TryRemove(project) |> ignore
+
+    member _.InvalidateAll() = entries.Clear()
+
+let private notificationCaches = ConditionalWeakTable<Runtime, NotificationCountCache>()
+
 let invalidateAgentStates (rt: Runtime) (projectName: string) (agentIds: string array) =
     // Server notifications only carry the logical project identity. Worktree
     // selectors share the canonical ledger/assignment cache by ProjectId.
@@ -29,8 +62,11 @@ let invalidateAgentStates (rt: Runtime) (projectName: string) (agentIds: string 
     | Ok target ->
         let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
             WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+        let projectId = ProjectPaths.ProjectTarget.projectId target
+        // A canonical ledger write can change unread counts without changing
+        // agent execution state; invalidate the project projection on any hint.
+        notificationCaches.GetValue(rt, fun _ -> NotificationCountCache()).Invalidate(projectId)
         if not (isNull agentIds) then
-            let projectId = ProjectPaths.ProjectTarget.projectId target
             for agentId in agentIds |> Array.filter (String.IsNullOrWhiteSpace >> not) |> Array.distinct do
                 cache.Invalidate(projectId, agentId)
     | Error _ -> ()
@@ -40,6 +76,7 @@ let invalidateAllAgentStates (rt: Runtime) =
     let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
         WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
     cache.InvalidateAll()
+    notificationCaches.GetValue(rt, fun _ -> NotificationCountCache()).InvalidateAll()
 // Only commands addressing repository source are checkout selectors.
 // Message/activity project fields are literal history labels, not paths.
 type private CommandProject =
@@ -119,6 +156,34 @@ let private checkResponseAlerts (rt: Runtime) agentId (target: ProjectPaths.Proj
                           Path = $"jarvis/response-alert/{alert.AlertId}"
                           Sha256 = ""
                           Content = "JARVIS OPERATOR ALERT (one-shot coordination instruction):\n" + alert.Message })
+
+/// The recipient-only read model is computed from a verified snapshot and
+/// never mutates inbox state, pending acknowledgements, or agent last-seen.
+let private unreadNotificationCounts (rt: Runtime) (agentId: string)
+                                     (target: ProjectPaths.ProjectTarget option) =
+    if String.IsNullOrWhiteSpace agentId then null
+    else
+        match target with
+        | None -> null
+        | Some selected ->
+            let projectId = ProjectPaths.ProjectTarget.projectId selected
+            let cache = notificationCaches.GetValue(rt, fun _ -> NotificationCountCache())
+            let values =
+                cache.Get(DateTimeOffset.UtcNow, projectId, fun () ->
+                    let project = ProjectPaths.ProjectId.value projectId
+                    match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt with
+                    | Error _ -> None
+                    | Ok (binding, snapshot) ->
+                        match ReviewWorkflow.ReviewWorkflow.unreadNotificationCountsAt binding snapshot with
+                        | Ok counts -> Some counts
+                        | Error _ -> None)
+            match values |> Option.bind (Map.tryFind agentId) with
+            | Some kinds when not kinds.IsEmpty ->
+                let result = Dictionary<string, int>(StringComparer.Ordinal)
+                for KeyValue(kind, count) in kinds do
+                    if count > 0 then result.Add(kind, count)
+                if result.Count = 0 then null else result
+            | _ -> null
 
 let private mayReceiveResponseAlert = function
     // Neither a source-ledger health probe nor a cross-project notification
@@ -309,6 +374,7 @@ let private toAgentResponse command instructions stateChanges inboxActivation re
           Instructions = instructions
           AgentStateChanges = stateChanges
           InboxActivation = inboxActivation
+          NotificationCounts = null
           PendingJob = None }
     | Ok (dispatched: DispatchedResult) ->
         let payload = dispatched.Payload
@@ -332,6 +398,7 @@ let private toAgentResponse command instructions stateChanges inboxActivation re
               Instructions = instructions
               AgentStateChanges = stateChanges
               InboxActivation = inboxActivation
+              NotificationCounts = null
               PendingJob = None }
         else
             { Result = None
@@ -339,6 +406,7 @@ let private toAgentResponse command instructions stateChanges inboxActivation re
               Instructions = instructions
               AgentStateChanges = stateChanges
               InboxActivation = inboxActivation
+              NotificationCounts = null
               PendingJob = None }
 
 let private unwrapProjectName (ProjectName name) = name
@@ -1197,6 +1265,27 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
 let private withVisibleResponseAlerts (rt: Runtime) (agentId: string)
                                       (command: AgentCommand option)
                                       (response: AgentCommandResponse) =
+    // This client may have just committed a notification or challenge event.
+    // Invalidate before projecting the call's own counts. The server also
+    // best-effort invalidates other registered devices; TTL covers missed hints.
+    if response.PendingJob.IsNone && response.Error.IsNone && response.Result.IsSome then
+        match command with
+        | Some(TaskWriteCommand cmd)
+            when cmd.Action = "NotifyAgent" || cmd.Action = "AcknowledgeNotification" ->
+            match classifyProject (TaskWriteCommand cmd) with
+            | Ok scope ->
+                projectTarget scope |> Option.iter (fun selected ->
+                    let project = ProjectPaths.ProjectTarget.projectId selected
+                    notificationCaches.GetValue(rt, fun _ -> NotificationCountCache()).Invalidate(project))
+            | Error _ -> ()
+        | Some(ChallengeWriteCommand cmd) ->
+            match classifyProject (ChallengeWriteCommand cmd) with
+            | Ok scope ->
+                projectTarget scope |> Option.iter (fun selected ->
+                    let project = ProjectPaths.ProjectTarget.projectId selected
+                    notificationCaches.GetValue(rt, fun _ -> NotificationCountCache()).Invalidate(project))
+            | Error _ -> ()
+        | _ -> ()
     let alerts =
         match command with
         | Some original when mayReceiveResponseAlert original ->
@@ -1205,7 +1294,14 @@ let private withVisibleResponseAlerts (rt: Runtime) (agentId: string)
             | Error _ -> []
         | _ -> []
     let existing = if isNull (box response.Instructions) then [] else response.Instructions
-    { response with Instructions = alerts @ existing }
+    let counts =
+        match command with
+        | Some original when mayReceiveResponseAlert original ->
+            match classifyProject original with
+            | Ok scope -> unreadNotificationCounts rt agentId (projectTarget scope)
+            | Error _ -> null
+        | _ -> null
+    { response with Instructions = alerts @ existing; NotificationCounts = counts }
 
 // Bounded, client-owned execution begins before the deadline. An HTTP
 // request and SignalR delivery may end without cancelling this operation.
@@ -1289,6 +1385,7 @@ let executeOrPromoteWith (rt: Runtime) (commandJson: string) (agentId: string)
                           Instructions = []
                           AgentStateChanges = []
                           InboxActivation = None
+                          NotificationCounts = null
                           PendingJob = None }
                         |> withVisibleResponseAlerts rt agentId (Some command)
                 | Ok operation ->
@@ -1308,6 +1405,7 @@ let executeOrPromoteWith (rt: Runtime) (commandJson: string) (agentId: string)
                               // "not yet known", never "there were no writes".
                               AgentStateChanges = Unchecked.defaultof<_>
                               InboxActivation = None
+                              NotificationCounts = null
                               PendingJob = Some handle }
                             |> withVisibleResponseAlerts rt agentId (Some command)
             | Error _ ->

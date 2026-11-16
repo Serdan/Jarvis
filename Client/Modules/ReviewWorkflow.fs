@@ -260,7 +260,10 @@ type AgentNotification =
       TaskId: string
       Message: string
       CreatedAtUtc: string
-      AcknowledgedAtUtc: string }
+      AcknowledgedAtUtc: string
+      /// Broad workflow category, independent of the detailed event type.
+      Kind: string
+      EventType: string }
 
 [<CLIMutable>]
 type BlockedNotificationSender =
@@ -495,11 +498,10 @@ module ReviewWorkflow =
                     required |> Array.forall (fun property ->
                         let mutable memberValue = Unchecked.defaultof<JsonElement>
                         root.TryGetProperty(property, &memberValue)
-                        // FromProjectName was added after schema v2 notifications
-                        // were already stored. Missing means same-project; all
-                        // other notification members remain mandatory.
+                        // Legacy schema-2 notifications omit these additive members.
+                        // Missing kind/eventType means a direct agent message.
                         || (typeof<'t> = typeof<AgentNotification>
-                            && property = "fromProjectName")
+                            && List.contains property [ "fromProjectName"; "kind"; "eventType" ])
                         || (typeof<'t> = typeof<TaskLifecycleEvent>
                             && List.contains property
                                 [ "requestingAgentId"; "targetAgentId"
@@ -691,9 +693,12 @@ module ReviewWorkflow =
                 let parsed =
                     if typeof<'t> = typeof<AgentNotification> && not (isNull (box parsed)) then
                         let notification = unbox<AgentNotification>(box parsed)
-                        if isNull notification.FromProjectName then
-                            unbox<'t>(box { notification with FromProjectName = "" })
-                        else parsed
+                        let normalized =
+                            { notification with
+                                FromProjectName = if isNull notification.FromProjectName then "" else notification.FromProjectName
+                                Kind = if String.IsNullOrWhiteSpace notification.Kind then "message" else notification.Kind
+                                EventType = if String.IsNullOrWhiteSpace notification.EventType then "direct" else notification.EventType }
+                        unbox<'t>(box normalized)
                     else parsed
                 if isNull (box parsed) then
                     Error(LedgerIntegrityError $"Null ledger entity: {path}")
@@ -1496,7 +1501,8 @@ module ReviewWorkflow =
                           TaskId = if isNull taskId then "" else taskId
                           Message = message
                           CreatedAtUtc = DateTimeOffset.UtcNow.ToString("O")
-                          AcknowledgedAtUtc = null }
+                          AcknowledgedAtUtc = null
+                          Kind = "message"; EventType = "direct" }
                       return [ change (notificationPath operationId) None notification ]
                 })
 
@@ -1636,6 +1642,32 @@ module ReviewWorkflow =
                 | _ -> return! Error(LedgerIntegrityError "Invalid notification identity.")
         return pending |> List.sortBy (fun n -> n.CreatedAtUtc, n.NotificationId)
     }
+
+    /// A snapshot-derived read model, not a second notification store. Parse
+    /// one batched immutable notification view and reduce *only* unread entries.
+    /// Legacy records without kind/eventType deserialize as message/direct.
+    let unreadNotificationCountsFromRecords (records: Map<string, string>) = result {
+        let mutable byAgent : Map<string, Map<string, int>> = Map.empty
+        for KeyValue(path, body) in records do
+            let! notification = decodeEntity<AgentNotification> path body
+            match Guid.TryParseExact(notification.NotificationId, "N") with
+            | true, parsed when path = notificationPath parsed
+                                && validAgent notification.FromAgentId
+                                && validAgent notification.ToAgentId
+                                && Regex.IsMatch(notification.Kind, "^[a-z][a-z0-9_-]{0,31}$")
+                                && not (String.IsNullOrWhiteSpace notification.EventType) ->
+                if String.IsNullOrWhiteSpace notification.AcknowledgedAtUtc then
+                    let kinds = Map.tryFind notification.ToAgentId byAgent |> Option.defaultValue Map.empty
+                    let count = Map.tryFind notification.Kind kinds |> Option.defaultValue 0
+                    byAgent <- Map.add notification.ToAgentId
+                                   (Map.add notification.Kind (count + 1) kinds) byAgent
+            | _ -> return! Error(LedgerIntegrityError "Invalid notification kind or identity.")
+        return byAgent
+    }
+
+    let unreadNotificationCountsAt binding snapshot =
+        LedgerStore.readNotificationRecordsAt binding snapshot
+        |> Result.bind unreadNotificationCountsFromRecords
 
     let registerAgentAs binding actor operationId agentId =
         if not (validAgent agentId) then Error(InvalidBinding "Invalid agent ID.")

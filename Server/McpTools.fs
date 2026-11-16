@@ -450,17 +450,15 @@ module McpToolHelpers =
     /// The separate activation receipt is richer only when the ledger has
     /// actually confirmed the requesting agent's Ready -> Working transition.
     let attachStateEffects (response: AgentCommandResponse) (result: CallToolResult) =
-        if response.PendingJob.IsSome then result
-        else
+        let metadata = if isNull result.Meta then JsonObject() else result.Meta
+        let details = JsonObject()
+        if response.PendingJob.IsNone then
             let changes =
                 if isNull (box response.AgentStateChanges) then [] else response.AgentStateChanges
-            let details = JsonObject()
-            let metadata = if isNull result.Meta then JsonObject() else result.Meta
             match response.Error with
             | Some(UncertainOutcome info) ->
                 details["agentStateChangesStatus"] <- JsonSerializer.SerializeToNode "unknown"
                 metadata["jarvis/agent_state_changes_status"] <- JsonSerializer.SerializeToNode "unknown"
-                // Known partial evidence, if present, is explicitly NOT complete.
                 if not changes.IsEmpty then
                     details["knownAgentStateChanges"] <- JsonSerializer.SerializeToNode changes
                     metadata["jarvis/known_agent_state_changes"] <- JsonSerializer.SerializeToNode changes
@@ -479,6 +477,22 @@ module McpToolHelpers =
             | Some activation ->
                 details["agentInboxActivation"] <- JsonSerializer.SerializeToNode activation
                 metadata["jarvis/inbox_activation"] <- JsonSerializer.SerializeToNode activation
+
+        // One compact auxiliary envelope shared by successful and failed MCP
+        // calls. Never wrap or duplicate the original result payload, which
+        // may be a media block or an error. Older clients omit these counts.
+        let notifications = JsonObject()
+        if not (isNull response.NotificationCounts) then
+            for KeyValue(kind, count) in response.NotificationCounts |> Seq.truncate 16 do
+                if count > 0 && count <= 1000000
+                   && System.Text.RegularExpressions.Regex.IsMatch(
+                       kind, "^[a-z][a-z0-9_-]{0,31}$") then
+                    notifications[kind] <- JsonValue.Create(count)
+        if notifications.Count > 0 then
+            details["notifications"] <- notifications
+            metadata["jarvis/notifications"] <- notifications.DeepClone()
+        if details.Count = 0 then result
+        else
             result.Meta <- metadata
             if isNull result.Content then result.Content <- ResizeArray<ContentBlock>()
             result.Content.Add(textContent (details.ToJsonString()))
@@ -500,6 +514,9 @@ module McpToolHelpers =
                 (source @ final.AgentStateChanges) |> List.distinct
         { final with
             AgentStateChanges = changes
+            // Destination counts must never cross the source actor's scope.
+            // The source probe alone verified this caller's own project ledger.
+            NotificationCounts = prior.NotificationCounts
             InboxActivation =
                 if final.PendingJob.IsSome then None
                 else
@@ -531,7 +548,8 @@ module McpToolHelpers =
                             // original alerts. Fresh poll-time alerts are in latest.
                             if isNull (box original.Instructions) then [] else
                                 original.Instructions |> List.filter (fun item -> item.Scope <> "response-alert")
-                        { original with Instructions = latest @ originalGuidance }
+                        { original with Instructions = latest @ originalGuidance
+                                        NotificationCounts = response.NotificationCounts }
                     | None -> response
             with _ -> response
         | _ -> response
@@ -895,6 +913,7 @@ module McpToolHelpers =
                                             Result = None
                                             Error = Some(ExecutionFailed
                                                 "Source validation job has no bound device; cannot safely poll a different candidate.")
+                                            NotificationCounts = null
                                             PendingJob = None
                                             AgentStateChanges = [] }
                                 | Some originalDevice ->
@@ -977,6 +996,32 @@ module McpToolHelpers =
                     finishOperation tracking response stopwatch.ElapsedMilliseconds
 
                     do! publishChanges response
+                    // A recipient's unread projection can change without any
+                    // ReviewAgent state transition. Reuse the authenticated,
+                    // user-scoped best-effort SignalR invalidation transport.
+                    // The client evicts the *entire canonical project* count
+                    // projection on this hint. A missed hint is covered by TTL.
+                    if response.PendingJob.IsNone && response.Error.IsNone && response.Result.IsSome then
+                        let affected =
+                            match command with
+                            | TaskWriteCommand cmd when cmd.Action = "NotifyAgent" ->
+                                Some(cmd.ProjectName, cmd.OwnerId)
+                            | TaskWriteCommand cmd when cmd.Action = "AcknowledgeNotification" ->
+                                Some(cmd.ProjectName, cmd.ActorId)
+                            | ChallengeWriteCommand cmd ->
+                                Some(cmd.ProjectName, cmd.ActorId)
+                            | _ -> None
+                        match affected with
+                        | Some(project, recipient) when not (String.IsNullOrWhiteSpace project)
+                                                        && not (String.IsNullOrWhiteSpace recipient) ->
+                            try
+                                do! client.InvalidateAgentStatesForUser(userId, project, [| recipient |])
+                            with ex ->
+                                let factory = context.RequestServices.GetService<ILoggerFactory>()
+                                if not (isNull factory) then
+                                    factory.CreateLogger("Jarvis.NotificationCountInvalidation")
+                                        .LogWarning(ex, "Could not send nonauthoritative notification-count invalidation hint.")
+                        | _ -> ()
                     let evidence = completedToolEvidence command response
                     // Terminal evidence is returned to the polling caller. It
                     // is not a new mutation: repeated polls must not replay

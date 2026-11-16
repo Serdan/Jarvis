@@ -411,7 +411,7 @@ let private runClient args =
             let rejected : AgentCommandResponse =
                 { Result = None
                   Error = Some(ExecutionFailed "Jarvis client dispatch capacity exhausted; this command was not executed.")
-                  Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                  Instructions = []; AgentStateChanges = []; InboxActivation = None; NotificationCounts = null; PendingJob = None }
             task {
                 try
                     do! connection.SendCoreAsync("SendClientResponse", [| box correlationId; box rejected |], CancellationToken.None)

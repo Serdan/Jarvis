@@ -286,3 +286,82 @@ type WorkQueueCrossProjectHostPreviewTests() =
             value.ProjectId = projectA && value.Head = Some(head projectA)), Is.True)
         Assert.That(result.Issues |> List.exists (fun value ->
             value.Code = "ProjectReadUnknown" && value.NextAction.Contains "remote unreachable"), Is.True)
+
+    [<Test>]
+    member _.ContradictoryHeldProjectAuthorityCannotProduceGlobalWinner() =
+        let live = launch projectA (LaunchState.Registered("agent", "session"))
+        let pinnedA = projectPort projectA [a] [live]
+                          (Some(journal projectA (Some(OriginalBrowserOutcome.Accepted "accepted"))))
+        let contradictions =
+            [ { token projectA with ProjectAuthoritySha256 = "contradictory-approved-project-hash" }
+              { token projectA with ProjectLedgerId = ledgerId projectB }
+              { token projectA with ProjectLedgerEpoch = 2 } ]
+        for conflictingToken in contradictions do
+            let result = run (account [|conflictingToken|]) [pinnedA; portB]
+            Assert.That(result.ProjectSetComplete, Is.False)
+            Assert.That(result.SimulatedWinner.IsNone, Is.True)
+            Assert.That(result.OccupiedAgents, Is.EqualTo(Some 1))
+            Assert.That(result.Planner.Issues |> List.exists (fun entry ->
+                entry.Code = "AccountProjectIdentityMismatch"), Is.True)
+            Assert.That(result.Issues |> List.exists (fun entry ->
+                entry.Code = "AccountAuthorityInconsistent"), Is.True)
+            Assert.That(result.CanDispatch, Is.False)
+
+    [<Test>]
+    member _.HeldAccountTokenWithoutOriginalPinnedLaunchIsNotGlobalWinner() =
+        let result = run (account [|token projectA|]) [portA; portB]
+        Assert.That(result.ProjectSetComplete, Is.False)
+        Assert.That(result.SimulatedWinner.IsNone, Is.True)
+        Assert.That(result.Planner.Issues |> List.exists (fun entry ->
+            entry.Code = "AccountTokenLaunchUnknown"), Is.True)
+        Assert.That(result.Issues |> List.exists (fun entry ->
+            entry.Code = "AccountAuthorityInconsistent"), Is.True)
+
+    [<Test>]
+    member _.ReleasedRetiredProjectHistoryDoesNotBlockCurrentGlobalPreview() =
+        let retiredProject = "99999999-9999-4999-8999-999999999999"
+        let retiredLaunch = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let releaseProof: AccountTerminalProof =
+            { ProjectId = retiredProject
+              LaunchId = retiredLaunch
+              AdmissionOperationId = admission
+              ProjectLedgerId = ledgerId retiredProject
+              ProjectLedgerEpoch = 1
+              ProjectAuthoritySha256 = "sha-" + retiredProject
+              ProjectHead = String.replicate 40 "f"
+              TerminalOperationId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+              TerminalBlobOid = String.replicate 40 "d"
+              TerminalKind = "LaunchTerminal"
+              LaunchGeneration = 1L }
+        let retired =
+            { token retiredProject with
+                LaunchId = retiredLaunch
+                Status = "Released"
+                ReleaseProof = releaseProof }
+        let live = launch projectA (LaunchState.Registered("agent", "session"))
+        let pinnedA = projectPort projectA [a] [live]
+                          (Some(journal projectA (Some(OriginalBrowserOutcome.Accepted "accepted"))))
+        let result = run (account [|retired; token projectA|]) [pinnedA; portB]
+        Assert.That(result.ProjectSetComplete, Is.True)
+        Assert.That(result.SimulatedWinner.IsSome, Is.True)
+        Assert.That(result.OccupiedAgents, Is.EqualTo(Some 1))
+        Assert.That(result.AvailableSlots, Is.EqualTo(Some 0))
+        Assert.That(result.Issues |> List.exists (fun entry ->
+            entry.Code = "AccountTokenProjectMissing"), Is.False)
+        Assert.That(result.Planner.Issues |> List.exists (fun entry ->
+            entry.Code = "AccountTokenProjectUnknown"), Is.False)
+        Assert.That(result.CanDispatch, Is.False)
+
+    [<Test>]
+    member _.UnknownStatusFromUnapprovedProjectIsNeverAssumedReleased() =
+        let retiredProject = "99999999-9999-4999-8999-999999999999"
+        let uncertain = { token retiredProject with
+                            LaunchId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+                            Status = "Unknown" }
+        let result = run (account [|uncertain|]) [portA; portB]
+        Assert.That(result.ProjectSetComplete, Is.False)
+        Assert.That(result.SimulatedWinner.IsNone, Is.True)
+        Assert.That(result.Issues |> List.exists (fun entry ->
+            entry.Code = "AccountTokenProjectMissing"), Is.True)
+        Assert.That(result.Planner.Issues |> List.exists (fun entry ->
+            entry.Code = "AccountTokenProjectUnknown"), Is.True)

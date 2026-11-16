@@ -312,6 +312,11 @@ module WorkQueueCrossProjectPlanner =
         let launchesById = launches |> List.map (fun launch -> uuidIdentity launch.LaunchId, launch) |> Map.ofList
         for token in tokens do
             match projectById.TryFind token.ProjectId, launchesById.TryFind (uuidIdentity token.LaunchId) with
+            | None, _ when token.Status = "Released" ->
+                // Settled historical capacity does not require the retired
+                // project's current approved snapshot. Preserve the token for
+                // identity/UUID collision checks and audit history.
+                ()
             | None, _ ->
                 markUnknown "AccountTokenProjectUnknown" token.LaunchId
                     "Read the complete pinned project set for the original account token."

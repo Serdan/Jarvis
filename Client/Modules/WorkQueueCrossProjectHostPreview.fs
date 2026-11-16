@@ -359,13 +359,14 @@ module WorkQueueCrossProjectHostPreview =
             add "DuplicateProject" "Project set"
                 "Remove duplicate or contradictory project IDs before comparing global demand."
 
-        // Every outstanding account token needs its original project snapshot.
-        // Without one, neither global occupancy nor a global choice is complete.
+        // Only unsettled account reservations require a currently approved
+        // project snapshot. Released tokens are retained audit history and do
+        // not imply that a retired project remains in the active project set.
         match account with
         | Ok snapshot ->
             let known = projects |> Seq.map _.ProjectId |> Set.ofSeq
             for token in snapshot.State.Tokens do
-                if not (known.Contains token.ProjectId) then
+                if token.Status <> "Released" && not (known.Contains token.ProjectId) then
                     projectionGap <- true
                     add "AccountTokenProjectMissing" token.LaunchId
                         "Add the original approved project for this account token; do not infer release."
@@ -391,8 +392,32 @@ module WorkQueueCrossProjectHostPreview =
             add "NoDurablePreSendIntent" "Projected candidates"
                 "WQ04 demand alone has no original launch/browser UUID. This is a simulation, not a runnable reservation or send."
 
+        // The fake-only planner deliberately rejects candidate launch/browser
+        // identities absent from this read-only preview. Those issues must not
+        // erase a simulated demand winner. Contradictory or incomplete
+        // account/project/launch authority makes a global projection invalid.
+        let accountAuthorityInconsistent =
+            planner.Issues
+            |> List.exists (fun value ->
+                match value.Code with
+                | "AccountTokenIdentityInvalid"
+                | "AccountTokenProjectUnknown"
+                | "AccountTokenLaunchUnknown"
+                | "AccountProjectIdentityMismatch"
+                | "AccountTokenStatusUnknown"
+                | "DuplicateAccountToken"
+                | "LaunchAccountTokenMissing"
+                | "LaunchProjectUnknown"
+                | "ActiveLaunchTokenReleased"
+                | "DuplicateExistingLaunch"
+                | "ExistingLaunchIdentityInvalid" -> true
+                | _ -> false)
+        if accountAuthorityInconsistent then
+            add "AccountAuthorityInconsistent" "Global selection"
+                "Reconcile original account token, project authority and launch identity issues before trusting a global selection."
+        let selectionComplete = complete && not accountAuthorityInconsistent
         let winner =
-            if complete && account.IsOk then
+            if selectionComplete && account.IsOk then
                 candidates
                 |> Seq.toList
                 |> WorkQueueCrossProjectPlanner.rankCandidates
@@ -401,7 +426,7 @@ module WorkQueueCrossProjectHostPreview =
             else None
         { Mode = "RealCrossProjectReadOnlyDefaultOff"
           CanDispatch = false
-          ProjectSetComplete = complete
+          ProjectSetComplete = selectionComplete
           AccountHead = planner.AccountHead
           MaxConcurrentAgents = planner.MaxConcurrentAgents
           OccupiedAgents = planner.OccupiedAgents

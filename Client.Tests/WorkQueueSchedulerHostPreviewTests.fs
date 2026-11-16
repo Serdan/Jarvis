@@ -205,6 +205,11 @@ type WorkQueueSchedulerHostPreviewTests() =
             e.Code = "SourceReceiptIdentityConflict"
             && e.Record = stage.Id), Is.True)
         Assert.That(report.CanDispatch, Is.False)
+        let selected = report.WouldLaunch |> Option.get
+        Assert.That(selected.SourceCommit, Is.EqualTo(None))
+        Assert.That(selected.SourceOperationId, Is.EqualTo(None))
+        Assert.That(selected.SourceRequestHash, Is.EqualTo(None))
+        Assert.That(selected.OriginBlobOid, Is.EqualTo(None))
 
     [<Test>]
     member _.AccountTokenStatusMatchesExistingLaunchWithoutChangingGlobalCapacity() =
@@ -268,4 +273,47 @@ type WorkQueueSchedulerHostPreviewTests() =
         Assert.That(report.ExistingLaunches.Head.AccountTokenStatus, Is.EqualTo("Missing"))
         Assert.That(report.Issues |> List.exists (fun e -> e.Code = "AccountTokenMissing"), Is.True)
         Assert.That(report.Issues |> List.exists (fun e -> e.Code = "LaunchListTruncated"), Is.False)
+        Assert.That(report.CanDispatch, Is.False)
+
+    [<Test>]
+    member _.ConflictingAdmissionAndBrowserWitnessesExposeOriginalIdsForRepair() =
+        let launchId = "55555555-5555-4555-8555-555555555555"
+        let admissionOp = "foreign-admission-operation"
+        let browserOp = "original-browser-operation"
+        let launch: Launch =
+            { Id = launchId; ProjectId = projectId; RoleId = "Worker"; RoleVersion = 4
+              AccountTokenId = "77777777-7777-4777-8777-777777777777"
+              State = LaunchState.SubmittedUnregistered DispatchState.OutcomeUnknown
+              Lease = None; Version = 1; Credit = Some stage.Id; PrimaryWorkId = None
+              EverClaimed = false; AncillaryMessages = Set.empty; DispatchCount = 1 }
+        let foreignAdmission: ProjectAdmissionRecord =
+            { SchemaVersion = 1; ProjectId = "foreign-project"; LaunchId = "foreign-launch"
+              AccountTokenId = "foreign-token"; AdmissionOperationId = admissionOp
+              Kind = "AdmissionWon"; AbortOperationId = "" }
+        let foreignBrowser: OriginalBrowserJournalEntry =
+            { Intent =
+                { LaunchId = "foreign-launch"; ProjectId = projectId; WorkId = stage.Id
+                  WorkGeneration = 2; RoleId = "Worker"; RoleVersion = 4
+                  RequestFingerprint = "original-fingerprint"; OperationId = browserOp
+                  Provenance =
+                    { AccountHead = accountHead; ProjectHead = projectHead
+                      SourceRef = None; SourceCommit = None } }
+              Outcome = Some(OriginalBrowserOutcome.Unknown "original timeout") }
+        let withLaunch = { empty with Launches = Map.ofList [ launchId, launch ] }
+        let original = ports withLaunch true (fun _ -> Ok(Some foreignBrowser))
+        let withWitness =
+            { original with
+                ReadAdmission = fun _ _ -> Ok(Some(foreignAdmission, "foreign-blob")) }
+        let report = WorkQueueSchedulerHostPreview.previewWith withWitness "Worker"
+        let observed = report.ExistingLaunches.Head
+        Assert.That(observed.AdmissionOperationId, Is.EqualTo(Some admissionOp))
+        Assert.That(observed.AdmissionKind, Is.EqualTo(Some "IdentityConflict: AdmissionWon"))
+        Assert.That(observed.OriginalBrowserOperationId, Is.EqualTo(Some browserOp))
+        Assert.That(observed.OriginalBrowserOutcome, Is.EqualTo("IdentityConflict"))
+        Assert.That(report.Issues |> List.exists (fun issue ->
+            issue.Code = "AdmissionReceiptIdentityConflict"
+            && issue.NextAction.Contains(admissionOp)), Is.True)
+        Assert.That(report.Issues |> List.exists (fun issue ->
+            issue.Code = "BrowserIdentityConflict"
+            && issue.NextAction.Contains(browserOp)), Is.True)
         Assert.That(report.CanDispatch, Is.False)

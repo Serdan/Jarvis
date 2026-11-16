@@ -502,9 +502,10 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "ListTasks"; "UpdateTask"; "ClaimTask"; "CheckpointTask"
               "CompleteTask"; "GetTaskHistory"; "CompareWorktreeTasks"; "GetAgentAssignment"
               "AcknowledgeTask"; "GetOrchestrationSnapshot"; "RetireWorktree"; "BeginTask" ]
-    // Orphan-ledger MCP tools route through eight versioned internal wire commands.
+    // Canonical orchestration and operator conversations use versioned internal wire commands.
     let ledgerWire = set [ "TaskRead"; "TaskWrite"; "ReviewRead"; "ReviewWrite";
-                          "LedgerRead"; "LedgerWrite"; "ChallengeRead"; "ChallengeWrite" ]
+                          "LedgerRead"; "LedgerWrite"; "ChallengeRead"; "ChallengeWrite";
+                          "OperatorConversationRead"; "OperatorConversationWrite" ]
     let orchestrationTools =
         set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "GetNotificationPreferences"; "GetResponseAlerts"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
               "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"
@@ -520,6 +521,9 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "AcknowledgePendingOperation"; "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"
               "CreateChallenge"; "SetChallengeSubscription"; "AssignChallengeCondition"; "SplitChallengeCondition"; "ListChallenges"; "GetChallenge"; "ResolveChallengeCondition"
               "ReopenChallengeCondition"; "CancelChallenge"; "BlockOnChallenges"; "RequeueChallengeBlockedAttempt"
+              "ListOperatorConversation"; "RawOperatorConversation"; "InspectOperatorConversationOperation"
+              "PostOperatorConversationMessage"; "ClaimOperatorConversationMessage"
+              "HandleOperatorConversationMessage"; "ReleaseOperatorConversationMessage"; "RepairOperatorConversation"
               ]
     // Retired wire cases are deleted; public CreateTask/AssignTask are canonical ledger tools.
     unionNames |> shouldEqual catalogNames
@@ -605,7 +609,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
     // Preserve role/instruction aliases, Challenges, taskless execution and
     // recipient-notification public methods, all with device routing.
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 79)
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 85)
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -1084,7 +1088,13 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
               for name in [ "CreateChallenge"; "SetChallengeSubscription"; "AssignChallengeCondition"; "SplitChallengeCondition"
                             "ResolveChallengeCondition"; "ReopenChallengeCondition"
                             "CancelChallenge"; "BlockOnChallenges"; "RequeueChallengeBlockedAttempt" ] ->
-                  name, original["ChallengeWrite"] ]
+                  name, original["ChallengeWrite"]
+              for name in [ "ListOperatorConversation"; "RawOperatorConversation"; "InspectOperatorConversationOperation" ] ->
+                  name, original["OperatorConversationRead"]
+              for name in [ "PostOperatorConversationMessage"; "ClaimOperatorConversationMessage";
+                            "HandleOperatorConversationMessage"; "ReleaseOperatorConversationMessage";
+                            "RepairOperatorConversation" ] ->
+                  name, original["OperatorConversationWrite"] ]
         aliases |> List.fold (fun map (key, value) -> Map.add key value map) original
 
     let methods =
@@ -1112,7 +1122,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
                 | name -> failwith $"Unexpected server-local MCP tool: {name}"
 
         attribute.ReadOnly |> shouldEqual readOnly
-        attribute.Destructive |> shouldEqual false
+        attribute.Destructive |> shouldEqual (methodInfo.Name = "RepairOperatorConversation")
         attribute.OpenWorld |> shouldEqual false
 
         let securityMeta =
@@ -1520,7 +1530,7 @@ let cross_project_routing_error_distinguishes_absent_device_from_protocol_mismat
 
 
 [<Test>]
-let ``all Jarvis MCP tools declare non-destructive closed-world metadata`` () =
+let ``Jarvis MCP tools declare closed-world metadata and only explicit repair is destructive`` () =
     let tools =
         typeof<JarvisMcpTools>.GetMethods()
         |> Array.choose (fun methodInfo ->
@@ -1529,7 +1539,7 @@ let ``all Jarvis MCP tools declare non-destructive closed-world metadata`` () =
             | _ -> None)
     Assert.That(tools.Length, Is.GreaterThan(0))
     for name, attribute in tools do
-        Assert.That(attribute.Destructive, Is.False, name)
+        Assert.That(attribute.Destructive, Is.EqualTo((name = "RepairOperatorConversation")), name)
         Assert.That(attribute.OpenWorld, Is.False, name)
 
 

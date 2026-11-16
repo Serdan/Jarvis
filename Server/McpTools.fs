@@ -368,7 +368,13 @@ module McpToolHelpers =
           for name in ledgerReviewMethods -> fromWire "ReviewRead" name
           for name in ledgerReviewWriteMethods -> fromWire "ReviewWrite" name
           for name in challengeReadMethods -> fromWire "ChallengeRead" name
-          for name in challengeWriteMethods -> fromWire "ChallengeWrite" name ]
+          for name in challengeWriteMethods -> fromWire "ChallengeWrite" name
+          for name in [ "ListOperatorConversation"; "RawOperatorConversation"; "InspectOperatorConversationOperation" ] ->
+              fromWire "OperatorConversationRead" name
+          for name in [ "PostOperatorConversationMessage"; "ClaimOperatorConversationMessage";
+                        "HandleOperatorConversationMessage"; "ReleaseOperatorConversationMessage";
+                        "RepairOperatorConversation" ] ->
+              fromWire "OperatorConversationWrite" name ]
 
     let mcpListCommandsResult : ListCommandsResult =
         { ProtocolVersion = AgentProtocol.version

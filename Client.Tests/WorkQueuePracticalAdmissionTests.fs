@@ -325,6 +325,11 @@ type WorkQueuePracticalAdmissionTests() =
                 registered.Version 112L launchId bearer CredentialWorkAction.ClaimPrimary
             |> ok |> ignore
             let _, claimed = WorkQueueGitLedger.load a |> ok
+            // Original four-path admission remains replayable after its
+            // credit has been claimed; replay must use the issuing CAS.
+            match WorkQueuePracticalAdmission.admitExplicitWithCredential true accountB b first selected issued with
+            | ProjectAdmitted _ -> ()
+            | other -> Assert.Fail(sprintf "Claimed credential admission replay failed: %A" other)
             let terminalOperation = Guid.NewGuid()
             WorkQueueGitLedger.executeCredentialFixtureAt a "WQ04 Disposable" terminalOperation
                 claimed.Version 113L launchId bearer (CredentialWorkAction.FinishOrdinary selected.WorkId)

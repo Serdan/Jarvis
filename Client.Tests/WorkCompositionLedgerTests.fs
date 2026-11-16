@@ -5,6 +5,7 @@ open System.Diagnostics
 open System.IO
 open NUnit.Framework
 open Client.LedgerStore
+open Client.WorkQueueGitLedger
 open Client.WorkCompositionGitLedger
 open Client.WorkCompositionAcceptanceAdapter
 open Client.ReviewWorkflow
@@ -285,3 +286,59 @@ let ``composition acceptance requires exact independently reviewed and integrate
                   (Guid.NewGuid()) revised.Version "project" 2 freshSubmissionId with
         | Error(InvalidBinding _) -> ()
         | other -> Assert.Fail(sprintf "Expected stale target-review rejection: %A" other))
+
+[<Test>]
+let historicalCancellationProofLedgerRoundTrip () =
+    withTwoClones (fun first second ->
+        let step mutation (graph: WorkCompositionGraph) =
+            match WorkComposition.apply graph.Version mutation graph with
+            | Ok next -> next
+            | Error error -> failwithf "Invalid composition test fixture: %A" error
+
+        // The pure model records a cancellation at -SpecVersion. Reopening
+        // and re-cancelling yields -2 rather than the initial -1. Construct
+        // the proven state directly to exercise ledger loading independently
+        // of the production-only verified acceptance adapter.
+        let accepted =
+            WorkComposition.empty
+            |> step (WorkCompositionMutation.Create(
+                "project", WorkUnitKind.Project, None, spec "Project" None))
+            |> step (WorkCompositionMutation.Create(
+                "child", WorkUnitKind.Feature, Some "project", spec "Child" None))
+            |> step (WorkCompositionMutation.Cancel("child", "Initial exclusion"))
+            |> step (WorkCompositionMutation.Reopen "child")
+            |> step (WorkCompositionMutation.Cancel("child", "Revised exclusion"))
+            |> step (WorkCompositionMutation.Accept("project", 1, "integration:fixture"))
+        let originalProof = WorkComposition.currentAcceptance accepted "project" |> Option.get
+        Assert.That(originalProof.ChildAcceptances.["child"], Is.EqualTo(-2))
+
+        let envelope: CompositionEnvelope =
+            { SchemaVersion = 1
+              ProjectId = first.ProjectId.ToString("D")
+              StateHash = CanonicalCodec.digest (CanonicalCodec.encode accepted)
+              Graph = accepted }
+        let intent: LedgerIntent =
+            { OperationId = Guid.NewGuid()
+              Actor = "Fixture"
+              Kind = "Fixture.CompositionRoundTrip"
+              RequestJson = CanonicalCodec.encode accepted }
+        LedgerStore.transact first intent (fun _ ->
+            Ok [ { Path = WorkCompositionGitLedger.RecordPath
+                   ExpectedBlobOid = None
+                   Content = CanonicalCodec.encode envelope } ])
+        |> succeed |> ignore
+
+        let _, reloaded = WorkCompositionGitLedger.load second |> succeed
+        Assert.That(WorkComposition.currentAcceptance reloaded "project" |> Option.isSome, Is.True)
+        Assert.That(reloaded.Units.["project"].Acceptances.Count, Is.EqualTo(1))
+
+        // A subsequent legitimate CAS mutation must also preserve history,
+        // while making the old parent target no longer current.
+        WorkCompositionGitLedger.execute second "Fixture" (Guid.NewGuid()) reloaded.Version
+            (WorkCompositionMutation.Create(
+                "correction", WorkUnitKind.Feature, Some "project", spec "Correction" None))
+        |> succeed |> ignore
+        let _, withCorrection = WorkCompositionGitLedger.load first |> succeed
+        Assert.That(WorkComposition.currentAcceptance withCorrection "project" |> Option.isNone, Is.True)
+        Assert.That(withCorrection.Units.["project"].Acceptances.[string originalProof.GraphVersion],
+                    Is.EqualTo(originalProof)))

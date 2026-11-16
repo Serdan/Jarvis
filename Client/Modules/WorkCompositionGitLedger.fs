@@ -35,7 +35,14 @@ module WorkCompositionGitLedger =
             && proof.GraphVersion <= graph.Version
             && validText proof.EvidenceRef
             && (proof.ChildAcceptances
-                |> Map.forall (fun childId version -> known childId && (version = -1 || version > 0)))
+                |> Map.forall (fun childId version ->
+                    match graph.Units.TryFind childId with
+                    | None -> false
+                    | Some child ->
+                        // Cancellation proofs are -SpecVersion; a reopened child
+                        // can later be cancelled at version 2 or higher.
+                        // Preserve valid historical proof versions.
+                        version > 0 || (version < 0 && version >= -child.SpecVersion)))
             && (proof.PrerequisiteAcceptances
                 |> Map.forall (fun dependencyId version -> known dependencyId && version > 0))
         graph.Version >= 0

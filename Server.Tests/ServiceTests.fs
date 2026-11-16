@@ -2422,6 +2422,11 @@ let stalled_cross_device_activity_hints_drop_without_unbounded_tasks_or_blocking
                 tracker.Complete(correlationId, "alice", connection,
                                  registrations[connection], accepted) |> ignore
                 Task.CompletedTask
+            member _.ReceiveSourceCommand(correlationId, _, _, _) =
+                System.Threading.Interlocked.Increment(&commands) |> ignore
+                tracker.Complete(correlationId, "alice", connection,
+                                 registrations[connection], accepted) |> ignore
+                Task.CompletedTask
             member _.InvalidateAgentStates(_, _) = Task.CompletedTask
             member _.InvalidateAllAgentStates() = Task.CompletedTask
             member _.RecordAgentActivity(_, _, _) =

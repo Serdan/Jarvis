@@ -130,6 +130,13 @@ module WorkComposition =
         |> List.choose (fun (_, unit) ->
             if unit.ParentId = Some parentId then Some unit else None)
 
+    // Child proofs use positive acceptance graph versions for completed work,
+    // and negative spec versions for cancellations. A reopened or revised
+    // cancelled child must never match an ancestor's historical proof again.
+    // Reopen bumps SpecVersion before a cancellation reason can change.
+    let private cancelledChildProofVersion (child: CompositeWorkUnit) =
+        -child.SpecVersion
+
     // Acceptances are immutable target snapshots, not a mutable "done" bit.
     // A newly attached child, changed specification or changed child evidence
     // invalidates current acceptance without erasing the old accepted target.
@@ -154,7 +161,7 @@ module WorkComposition =
                             children graph id
                             |> List.map (fun child ->
                                 match child.CancellationReason with
-                                | Some _ -> Some(child.Id, -1)
+                                | Some _ -> Some(child.Id, cancelledChildProofVersion child)
                                 | None ->
                                     currentAcceptanceIn graph (Set.add id visited) child.Id
                                     |> Option.map (fun proof -> child.Id, proof.GraphVersion))
@@ -313,7 +320,7 @@ module WorkComposition =
                                 children graph id
                                 |> List.map (fun child ->
                                     child.Id,
-                                    (if child.CancellationReason.IsSome then -1
+                                    (if child.CancellationReason.IsSome then cancelledChildProofVersion child
                                      else (currentAcceptance graph child.Id).Value.GraphVersion))
                                 |> Map.ofList
                             let proof =

@@ -251,6 +251,16 @@ module OriginalBrowserJournal =
             verifyInventory store connection None
             store)
 
+    // Stable, locally provisioned identity, verified against both continuity
+    // anchors. A caller-provided path or actor label is not a host identity.
+    // This opaque UUID can be bound to a canonical pre-send Git claim without
+    // publishing the host's local filesystem path.
+    let trustedHostId store : Result<string,string> =
+        protect (fun () ->
+            use connection = connect true store
+            verifyInventory store connection None
+            store.JournalId)
+
     let private selectColumns =
         "operation_uuid,operation_id,launch_id,project_id,work_id,work_generation," +
         "role_id,role_version,request_fingerprint,account_head,project_head," +

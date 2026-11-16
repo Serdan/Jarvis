@@ -42,7 +42,7 @@ let disabledReadAndWriteDoNotTouchV1Tasks () =
               DocumentPath = ""; Content = ""; ExpectedBlobOid = "" }
         match Client.OrchestrationApi.ReviewApi.write mutation context with
         | Error(Client.ValidationError message) ->
-            Assert.That(message, Does.Contain(" ledger disabled"))
+            Assert.That(message, Does.Contain(" ledger has no approved local binding"))
         | other -> Assert.Fail(sprintf "Expected disabled  write, got %A" other)
         Assert.That(File.Exists(bindingPath), Is.False)
         Assert.That(Directory.Exists(Path.Combine(project, "docs", "tasks")), Is.False)
@@ -127,7 +127,7 @@ let ledgerTaskSetupAndInboxRefuseUnconfiguredCheckout () =
               DecisionSequence = 0L; Evidence = ""; SessionId = "" }
         match Client.OrchestrationApi.TaskApi.write mutation context with
         | Error(Client.ValidationError message) ->
-            Assert.That(message, Does.Contain(" ledger disabled"))
+            Assert.That(message, Does.Contain(" ledger has no approved local binding"))
         | other -> Assert.Fail(sprintf "Expected unconfigured  task write to fail: %A" other)
         Assert.That(File.Exists(Client.OrchestrationApi.LedgerBindingConfig.pathForRoot project), Is.False)
         Assert.That(GitCommandTests.gitOutput context [ "status"; "--porcelain" ], Is.Empty)

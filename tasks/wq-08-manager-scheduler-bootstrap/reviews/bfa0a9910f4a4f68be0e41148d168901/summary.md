@@ -13,6 +13,7 @@ No blocking defects found in the **isolated, default-off prototype**. Inspected 
 ## Independent validation
 - `dotnet test Server.Tests/Server.Tests.fsproj -c Release --no-restore --filter FullyQualifiedName~WorkQueueSchedulerPrototypeTests`: **12/12 passed**.
 - `dotnet test Server.Tests/Server.Tests.fsproj -c Release --no-restore`: **275/275 passed**.
+- `dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-restore --filter FullyQualifiedName~WorkQueue`: **67/67 passed**, including client work-queue Git/CAS regressions.
 - Reviewed the original browser exception/unknown/no-effect cases, C01-before-commit and lost-after-commit tests, and evidence retention on project/journal CAS failures.
 
 ## Boundary for subsequent integration (not blocking this review)

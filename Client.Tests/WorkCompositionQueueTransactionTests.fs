@@ -368,6 +368,92 @@ type WorkCompositionQueueTransactionTests() =
                             queueAfter.Works.[workId] graphAfter, Is.False))
 
     [<Test>]
+    member _.DuplicateTaskLinkAfterReleaseIsRejectedOnCreateAndReviseAcrossTwoClones() =
+        withClones (fun a b workId ->
+            let accepted = approvedChild a b
+            WorkCompositionQueueTransaction.acceptAndRelease a "Fixture" (Guid.NewGuid())
+                (request a workId accepted) |> ok |> ignore
+            let released = LedgerStore.fetch b |> ok
+            let originalGraph, _ = WorkCompositionGitLedger.loadAt b released |> ok
+            let originalQueue = WorkQueueGitLedger.loadAt b released |> ok
+            Assert.That(originalQueue.Works.[workId].State, Is.EqualTo(WorkState.Available))
+
+            // Clone B cannot create a second owner of an already released
+            // original WQ04 task. Neither graph nor queue may commit.
+            let duplicateCreate =
+                WorkCompositionMutation.Create("duplicate-link", WorkUnitKind.Feature,
+                    Some "foundation", spec "Duplicate link" (Some "delivery-task"))
+            let rejectedCreateId = Guid.NewGuid()
+            failWithoutCommit b rejectedCreateId (fun () ->
+                WorkCompositionGitLedger.execute b "Fixture" rejectedCreateId
+                    originalGraph.Version duplicateCreate)
+
+            // An unrelated feature can still be created. Clone A advances
+            // the original head; clone B must fence a stale competing UUID.
+            let unlinkedCreate =
+                WorkCompositionMutation.Create("duplicate-link", WorkUnitKind.Feature,
+                    Some "foundation", spec "Duplicate link" None)
+            let createId = Guid.NewGuid()
+            WorkCompositionGitLedger.execute a "Fixture" createId
+                originalGraph.Version unlinkedCreate |> ok |> ignore
+            let staleId = Guid.NewGuid()
+            let priorStale = LedgerStore.fetch b |> ok
+            match WorkCompositionGitLedger.execute b "Fixture" staleId
+                    originalGraph.Version duplicateCreate with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Stale-head duplicate was not fenced: %A" other)
+            let afterStale = LedgerStore.fetch b |> ok
+            Assert.That(afterStale.Commit, Is.EqualTo(priorStale.Commit))
+            Assert.That(LedgerStore.getOperationAt b afterStale staleId |> ok |> Option.isNone,
+                        Is.True)
+
+            // Require an unaccepted system in the other branch: this second
+            // feature is now graph-Blocked, but is NOT linked to the old task.
+            let withNewUnit = WorkCompositionGitLedger.load b |> ok |> snd
+            let blockedMutation = WorkCompositionMutation.Require("duplicate-link", "delivery")
+            let requireId = Guid.NewGuid()
+            let required = WorkCompositionGitLedger.execute b "Fixture" requireId
+                               withNewUnit.Version blockedMutation |> ok
+            Assert.That(required.AlreadyApplied, Is.False)
+            let replay = WorkCompositionGitLedger.execute a "Fixture" requireId
+                             withNewUnit.Version blockedMutation |> ok
+            Assert.That(replay.AlreadyApplied, Is.True)
+
+            // Revise is the other entry point for introducing an owner:
+            // neither independent clone can smuggle a duplicate link into
+            // the graph after an ordinary Require.
+            let blockedGraph = WorkCompositionGitLedger.load a |> ok |> snd
+            let secondUnit = blockedGraph.Units.["duplicate-link"]
+            let duplicateRevision =
+                WorkCompositionMutation.Revise("duplicate-link", secondUnit.SpecVersion,
+                    { secondUnit.Spec with LinkedTaskId = Some "delivery-task" })
+            let rejectedRevisionId = Guid.NewGuid()
+            failWithoutCommit a rejectedRevisionId (fun () ->
+                WorkCompositionGitLedger.execute a "Fixture" rejectedRevisionId
+                    blockedGraph.Version duplicateRevision)
+            failWithoutCommit b rejectedRevisionId (fun () ->
+                WorkCompositionGitLedger.execute b "Fixture" rejectedRevisionId
+                    blockedGraph.Version duplicateRevision)
+
+            let canonical = LedgerStore.fetch b |> ok
+            let graph, _ = WorkCompositionGitLedger.loadAt b canonical |> ok
+            let queue = WorkQueueGitLedger.loadAt b canonical |> ok
+            Assert.That(canonical.Header.NextSequence,
+                        Is.EqualTo(released.Header.NextSequence + 2L))
+            Assert.That(graph.Units.["duplicate-link"].Spec.LinkedTaskId, Is.EqualTo(None))
+            Assert.That(WorkComposition.phase graph (Some queue) "duplicate-link",
+                        Is.EqualTo(Some WorkUnitPhase.Blocked))
+            Assert.That(graph.Units.["dependent"].Spec.LinkedTaskId,
+                        Is.EqualTo(Some "delivery-task"))
+            Assert.That(queue.Works.[workId].State, Is.EqualTo(WorkState.Available))
+            Assert.That(LedgerStore.getOperationAt b canonical rejectedCreateId |> ok |> Option.isNone,
+                        Is.True)
+            Assert.That(LedgerStore.getOperationAt b canonical staleId |> ok |> Option.isNone,
+                        Is.True)
+            Assert.That(LedgerStore.getOperationAt b canonical rejectedRevisionId |> ok |> Option.isNone,
+                        Is.True))
+
+    [<Test>]
     member _.UnrelatedGraphEditDoesNotRevokeVerifiedOriginalBinding() =
         withClones (fun a b workId ->
             let accepted = approvedChild a b

@@ -46,6 +46,34 @@ let ``nested systems with cross-system dependencies do not imply shared ownershi
     Assert.That(phase graph None "f2", Is.EqualTo(Some WorkUnitPhase.AwaitingPublication))
 
 [<Test>]
+let ``a canonical linked task has exactly one graph owner across create and revise`` () =
+    let graph =
+        initial ()
+        |> fun g -> system g "system" "project"
+        |> fun g -> feature g "first" "system" (Some "same-task")
+    let duplicateCreate =
+        WorkCompositionMutation.Create("second", WorkUnitKind.Feature,
+            Some "system", spec "second" (Some "same-task"))
+    match apply graph.Version duplicateCreate graph with
+    | Error(WorkCompositionError.InvalidSpec reason) ->
+        Assert.That(reason, Does.Contain("multiple composition owners"))
+    | other -> Assert.Fail(sprintf "Duplicate create was not rejected: %A" other)
+
+    let unlinked = feature graph "second" "system" None
+    let revisedSpec =
+        { unlinked.Units.["second"].Spec with LinkedTaskId = Some "same-task" }
+    match apply unlinked.Version (WorkCompositionMutation.Revise("second", 1, revisedSpec)) unlinked with
+    | Error(WorkCompositionError.InvalidSpec reason) ->
+        Assert.That(reason, Does.Contain("same-task"))
+    | other -> Assert.Fail(sprintf "Duplicate revise was not rejected: %A" other)
+
+    // Also refuse a malformed imported graph; callers cannot bypass
+    // the invariant by constructing a snapshot instead of using apply.
+    let revisedUnit = { unlinked.Units.["second"] with Spec = revisedSpec }
+    let malformed = { unlinked with Units = unlinked.Units.Add("second", revisedUnit) }
+    Assert.That(validate malformed |> Result.isError, Is.True)
+
+[<Test>]
 let ``dependency and containment cycles reject the mutation`` () =
     let g =
         initial ()

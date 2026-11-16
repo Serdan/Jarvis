@@ -85,6 +85,7 @@
         <Compile Include="Modules\LegacyWriterProtocolFence.fs"/>
         <Compile Include="Modules\AccountAdmissionAdapter.fs"/>
         <Compile Include="Modules\WorkQueueCanonicalMigrationPrepare.fs"/>
+        <Compile Include="Modules\WorkQueueProjectMigrationPrepare.fs"/>
         <Compile Include="Modules\RoleInstructions.fs"/>
         <Compile Include="Modules\\ReviewWorkflow.fs"/>
         <Compile Include="Modules\WorkCompositionAcceptanceAdapter.fs"/>
@@ -108,6 +109,7 @@
         <Compile Include="Modules\WorkQueueSchedulerHostLoop.fs"/>
         <Compile Include="Modules\WorkQueueSchedulerHeadBinding.fs"/>
         <Compile Include="Modules\WorkQueueVerifiedDispatchAdapter.fs"/>
+        <Compile Include="Modules\WorkQueueNativeCredentialDispatchAdapter.fs"/>
         <Compile Include="Modules\WorkQueueNativeLifecycleCas.fs"/>
         <Compile Include="Modules\\WorkQueueOperatorConversationCli.fs"/>
         <Compile Include="Modules\TaskFirstUiSnapshotAdapter.fs"/>

@@ -547,6 +547,8 @@ let main args =
         Client.WorkQueueSchedulerHostPreview.WorkQueueSchedulerHostPreview.run (args |> Array.toList)
     elif args.Length > 0 && args[0] = "conversation" then
         Client.WorkQueueOperatorConversationCli.WorkQueueOperatorConversationCli.run (args |> Array.toList)
+    elif args.Length > 0 && args[0] = "tasks" then
+        Client.TaskFirstUiSnapshotAdapter.TaskFirstUiSnapshotAdapter.run (args |> Array.toList)
     elif args.Length > 0 && args[0] = "queue-producer" then
         Client.WorkQueueReceiptProducer.WorkQueueReceiptProducer.run (args |> Array.toList)
     else runClient args

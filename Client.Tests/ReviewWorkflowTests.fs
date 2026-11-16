@@ -8,7 +8,13 @@ open Client.ReviewWorkflow
 open NUnit.Framework
 
 [<TestFixture>]
+[<Parallelizable(ParallelScope.Children)>]
 type ReviewWorkflowTests() =
+    // Seed immutable source and canonical agent registration once; each test
+    // mirrors this template into a distinct private Git remote before writing.
+    let mutable templateRoot = ""
+    let mutable templateBare = ""
+    let templateProjectId, templateLedgerId = Guid.NewGuid(), Guid.NewGuid()
     let git dir args =
         use proc = new Process()
         proc.StartInfo.FileName <- "git"
@@ -35,32 +41,25 @@ type ReviewWorkflowTests() =
         let root = Path.Combine(Path.GetTempPath(), "jarvis-review-ledger-" + Guid.NewGuid().ToString("N"))
         Directory.CreateDirectory(root) |> ignore
         try
+            if String.IsNullOrWhiteSpace templateBare then
+                failwith "Review fixture template was not initialized."
             let bare = Path.Combine(root, "remote.git")
             let one = Path.Combine(root, "owner")
             let two = Path.Combine(root, "reviewer")
-            git root [ "init"; "--bare"; bare ] |> ignore
+            git root [ "clone"; "--mirror"; "--no-hardlinks"; templateBare; bare ] |> ignore
             git root [ "clone"; bare; one ] |> ignore
             for clone in [ one ] do
                 git clone [ "config"; "user.name"; " Fixture" ] |> ignore
                 git clone [ "config"; "user.email"; "fixture@example.test" ] |> ignore
-            File.WriteAllText(Path.Combine(one, "source.txt"), "base")
-            git one [ "add"; "source.txt" ] |> ignore
-            git one [ "commit"; "-m"; "task base" ] |> ignore
-            git one [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
             git root [ "clone"; bare; two ] |> ignore
             git two [ "config"; "user.name"; " Fixture" ] |> ignore
             git two [ "config"; "user.email"; "fixture@example.test" ] |> ignore
-            let projectId = Guid.NewGuid()
-            let ledgerId = Guid.NewGuid()
             let binding path =
                 { RepositoryPath = path; RemoteName = "origin"
                   ApprovedFetchUrl = bare; ApprovedPushUrl = bare
-                  ProjectId = projectId; LedgerId = ledgerId; Epoch = 1 }
+                  ProjectId = templateProjectId; LedgerId = templateLedgerId; Epoch = 1 }
             let first = binding one
             let second = binding two
-            LedgerStore.initialize first true |> success |> ignore
-            for id in [ "Owner"; "Reviewer" ] do
-                ReviewWorkflow.registerAgent first (Guid.NewGuid()) id |> success |> ignore
             let baseOid = git one [ "rev-parse"; "HEAD" ]
             let sourceRef = "refs/heads/" + git one [ "branch"; "--show-current" ]
             let newCommit (title: string) (content: string) =
@@ -87,6 +86,41 @@ type ReviewWorkflowTests() =
                                  Path.GetFileNameWithoutExtension pendingConfig)
                 if Directory.Exists pendingDir then Directory.Delete(pendingDir, true)
             HermeticClientTestEnvironment.DeleteTestTree root
+
+    [<OneTimeSetUp>]
+    member _.CreateFixtureTemplate() =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-review-template-" + Guid.NewGuid().ToString("N"))
+        try
+            Directory.CreateDirectory(root) |> ignore
+            let bare = Path.Combine(root, "remote.git")
+            let one = Path.Combine(root, "owner")
+            git root [ "init"; "--bare"; bare ] |> ignore
+            git root [ "clone"; bare; one ] |> ignore
+            git one [ "config"; "user.name"; " Fixture" ] |> ignore
+            git one [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+            File.WriteAllText(Path.Combine(one, "source.txt"), "base")
+            git one [ "add"; "source.txt" ] |> ignore
+            git one [ "commit"; "-m"; "task base" ] |> ignore
+            git one [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
+            let binding =
+                { RepositoryPath = one; RemoteName = "origin"
+                  ApprovedFetchUrl = bare; ApprovedPushUrl = bare
+                  ProjectId = templateProjectId; LedgerId = templateLedgerId; Epoch = 1 }
+            LedgerStore.initialize binding true |> success |> ignore
+            for id in [ "Owner"; "Reviewer" ] do
+                ReviewWorkflow.registerAgent binding (Guid.NewGuid()) id |> success |> ignore
+            templateBare <- bare
+            templateRoot <- root
+        with _ ->
+            HermeticClientTestEnvironment.DeleteTestTree root
+            reraise()
+
+    [<OneTimeTearDown>]
+    member _.DeleteFixtureTemplate() =
+        if not (String.IsNullOrWhiteSpace templateRoot) then
+            HermeticClientTestEnvironment.DeleteTestTree templateRoot
+            templateRoot <- ""
+            templateBare <- ""
 
     [<Test>]
     member _.AdministrativeActorIsRecordedInReceiptAssignmentAndClosureEvent() =

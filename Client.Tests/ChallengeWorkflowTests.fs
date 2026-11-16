@@ -10,7 +10,6 @@ open Client.ChallengeWorkflow
 open NUnit.Framework
 
 [<TestFixture>]
-[<Parallelizable(ParallelScope.Children)>]
 type ChallengeTests() =
     let git dir args =
         use p = new Process()

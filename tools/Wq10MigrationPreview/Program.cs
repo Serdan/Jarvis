@@ -121,6 +121,9 @@ internal static class Program
                 throw new InvalidDataException("Project names must be unique, nonblank identities.");
             projects.Add(InspectProject(project, findings));
         }
+        if (account is not null)
+            foreach (var project in projects)
+                CheckMigrationPhase(account.MigrationPhase, project.Name, project.QueueMigration, findings);
 
         var observations = input.Observations ?? new Observations();
         CheckProof(observations.LegacyManagerStopped, "MANAGER_NOT_SETTLED",
@@ -132,6 +135,9 @@ internal static class Program
         CheckProof(observations.ClientProtocolsCompatible, "PROTOCOL_UNVERIFIED",
             "Client protocol compatibility not demonstrated",
             "Confirm the minimum protocol across every connected device", findings);
+        CheckEvidenceInventory(observations.PendingOperations, "pendingOperations", findings);
+        CheckEvidenceInventory(observations.InFlightSourceJobs, "inFlightSourceJobs", findings);
+        CheckEvidenceInventory(observations.UncertainBrowserSubmissions, "uncertainBrowserSubmissions", findings);
         var pending = (observations.PendingOperations ?? []).OrderBy(o => o.Project, StringComparer.Ordinal)
             .ThenBy(o => o.Id, StringComparer.Ordinal).ToArray();
         foreach (var op in pending)
@@ -158,10 +164,22 @@ internal static class Program
         var blockers = findings.Count(f => f.Severity == "BLOCKER");
         var readiness = blockers == 0 ? "PREVIEW_READY_FOR_REVIEW" : "NO_GO";
         var planned = projects.Select(p =>
-            $"{p.Name}: keep {p.Head}; propose inert Prepared(epoch {account?.Epoch ?? 0}), " +
+            $"{p.Name}: keep {p.Head}; " +
+            (account?.MigrationPhase is "Activated" or "Validated"
+                ? $"observed {p.QueueMigration} (no new preparation proposed after validation/activation)"
+                : p.QueueMigration == "Prepared"
+                    ? "already Prepared (verify original account-migration-epoch receipt)"
+                    : "propose inert Prepared (account migration epoch/receipt not yet established)") + ", " +
             $"{p.Tasks.Count(t => t.Disposition == "PROPOSE")} stage candidate(s), " +
             $"{p.Tasks.Count(t => t.Disposition == "ALREADY_PRESENT")} already present; no FIFO witness assigned")
-            .Prepend($"Account: keep {account?.Head ?? "UNAVAILABLE"}; propose Preparing only, not Activated")
+            .Prepend(account?.MigrationPhase switch
+            {
+                "Activated" => $"Account: keep {account.Head}; already Activated; audit only, never re-prepare or roll back",
+                "Validated" => $"Account: keep {account.Head}; already Validated; inspect receipts before authorization",
+                "Preparing" => $"Account: keep {account.Head}; already Preparing; inspect current receipts",
+                "Aborted" => $"Account: keep {account.Head}; Aborted; no automatic restart",
+                _ => $"Account: keep {account?.Head ?? "UNAVAILABLE"}; propose inert Preparing only, not Activated"
+            })
             .ToArray();
         var repairs = new[]
         {
@@ -398,6 +416,31 @@ internal static class Program
     }
 
     private static bool IsSettled(string value) => value is "Applied" or "Resolved" or "Settled";
+    private static void CheckEvidenceInventory(Array? inventory, string field, List<Finding> findings)
+    {
+        if (inventory is null)
+            findings.Add(new("BLOCKER", "EVIDENCE_INVENTORY_MISSING", "observations." + field + " (omitted/null)",
+                "Inspect the original owner/client journal and explicitly supply an array; [] asserts it was inventoried and empty"));
+    }
+
+    private static void CheckMigrationPhase(string accountPhase, string projectName, string projectPhase,
+        List<Finding> findings)
+    {
+        // These are migration phases, not unrelated Git ledger identity epochs.
+        // An absent canonical queue is valid for untouched legacy preview,
+        // but never evidence that an Activated account has prepared its project.
+        var compatible = accountPhase switch
+        {
+            "LegacyActive" or "Frozen" or "Aborted" => projectPhase is "" or "Frozen",
+            "Preparing" or "Validated" or "Activated" => projectPhase == "Prepared",
+            _ => false
+        };
+        if (!compatible)
+            findings.Add(new("BLOCKER", "MIGRATION_PHASE_MISMATCH",
+                $"{projectName}: account {accountPhase}, project {(projectPhase.Length == 0 ? "UNVERIFIED" : projectPhase)}",
+                "Reconcile account migration phase and each project Prepared receipt before any activation"));
+    }
+
     private static void CheckProof(bool? value, string code, string context, string action, List<Finding> findings)
     {
         if (value != true)

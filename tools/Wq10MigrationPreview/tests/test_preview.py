@@ -124,16 +124,25 @@ class PreviewTests(unittest.TestCase):
             (self.root / "report.md").write_text(markdown_result.stdout, encoding="utf-8")
         return json.loads(result.stdout)
 
-    def with_queue(self, works=None, messages=None):
+    def with_queue(self, works=None, messages=None, migration="Frozen", covered=False):
         queue = {
             "schemaVersion": 1, "projectId": "cccccccc-cccc-cccc-cccc-cccccccccccc",
             "state": {
-                "migration": {"case": "Frozen", "fields": []},
+                "migration": {"case": migration, "fields": []},
                 "works": works or {}, "messages": messages or {}, "launches": {}
             }
         }
+        if covered:
+            queue["state"].update({field: True for field in
+                                   ("queueCovered", "graphCovered", "messageCovered", "sourceCovered")})
         self.project.commit({"records/work-queue/project.json": queue}, "queue fixture")
         self.manifest["projects"][0]["head"] = self.project.head
+
+    def set_account_phase(self, phase):
+        state = json.loads((self.account.first / "state.json").read_text(encoding="utf-8"))
+        state["migrationPhase"] = phase
+        self.account.commit({"state.json": state}, f"account phase {phase}")
+        self.manifest["account"]["head"] = self.account.head
 
     def test_ordinary_legacy_preview_retains_source_and_evidence(self):
         before_account, before_project = self.account.head, self.project.head
@@ -275,6 +284,59 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual(report["readiness"], "NO_GO")
         self.assertTrue({"MANAGER_NOT_SETTLED", "OLD_WRITERS_UNFENCED", "PROTOCOL_UNVERIFIED"}
                         <= {f["code"] for f in report["findings"]})
+
+
+    def test_omitted_and_null_evidence_inventories_are_not_empty_proofs(self):
+        observations = self.manifest["observations"]
+        fields = ("pendingOperations", "inFlightSourceJobs", "uncertainBrowserSubmissions")
+        for field in fields:
+            del observations[field]
+        report = self.preview()
+        self.assertEqual(report["readiness"], "NO_GO")
+        missing = [f["context"] for f in report["findings"]
+                   if f["code"] == "EVIDENCE_INVENTORY_MISSING"]
+        self.assertEqual(sorted(missing), sorted(f"observations.{field} (omitted/null)" for field in fields))
+        self.assertEqual(report["pendingOperations"], [])
+        self.assertEqual(report["inFlightSourceJobs"], [])
+        self.assertEqual(report["uncertainBrowserSubmissions"], [])
+        for field in fields:
+            observations[field] = None
+        report = self.preview()
+        self.assertEqual(len([f for f in report["findings"]
+                              if f["code"] == "EVIDENCE_INVENTORY_MISSING"]), 3)
+        for field in fields:
+            observations[field] = []
+        self.assertEqual(self.preview()["readiness"], "PREVIEW_READY_FOR_REVIEW")
+
+    def test_activated_account_with_frozen_project_blocks_partial_migration(self):
+        self.with_queue(migration="Frozen", covered=True)
+        self.set_account_phase("Activated")
+        report = self.preview()
+        self.assertEqual(report["readiness"], "NO_GO")
+        self.assertEqual([f["code"] for f in report["findings"] if f["severity"] == "BLOCKER"],
+                         ["MIGRATION_PHASE_MISMATCH"])
+        self.assertEqual(report["account"]["migrationPhase"], "Activated")
+        self.assertEqual(report["projects"][0]["queueMigration"], "Frozen")
+        self.assertIn("already Activated", report["preparedStatePreview"][0])
+        self.assertNotIn("propose Preparing", report["preparedStatePreview"][0])
+        self.assertIn("no new preparation", report["preparedStatePreview"][1])
+
+    def test_activated_account_with_prepared_project_is_audit_only(self):
+        self.with_queue(migration="Prepared", covered=True)
+        self.set_account_phase("Activated")
+        report = self.preview()
+        self.assertEqual(report["readiness"], "PREVIEW_READY_FOR_REVIEW")
+        self.assertEqual(report["projects"][0]["queueMigration"], "Prepared")
+        self.assertIn("already Activated", report["preparedStatePreview"][0])
+        self.assertIn("no new preparation", report["preparedStatePreview"][1])
+
+    def test_preparing_account_with_frozen_project_is_incomplete(self):
+        self.with_queue(migration="Frozen", covered=True)
+        self.set_account_phase("Preparing")
+        report = self.preview()
+        self.assertEqual(report["readiness"], "NO_GO")
+        self.assertIn("MIGRATION_PHASE_MISMATCH", [f["code"] for f in report["findings"]])
+        self.assertIn("already Preparing", report["preparedStatePreview"][0])
 
 
 if __name__ == "__main__":

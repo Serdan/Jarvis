@@ -522,3 +522,75 @@ type WorkCompositionQueueTransactionTests() =
             Assert.That(after.Works.[workId].State, Is.EqualTo(WorkState.Blocked))
             Assert.That(after.Works.[workId].Gate,
                         Is.EqualTo(GateState.CompositionHold("dependent", dependent.SpecVersion))))
+
+    [<Test>]
+    member _.CancelledParentMustNotReleaseHeldOriginalWq04StageWhenPrerequisiteBecomesAccepted() =
+        withClones (fun a b workId ->
+            let approved = approvedChild a b
+            let graph = WorkCompositionGitLedger.load a |> ok |> snd
+            WorkCompositionGitLedger.execute a "Fixture" (Guid.NewGuid()) graph.Version
+                (WorkCompositionMutation.Cancel("delivery", "Cancel parent"))
+            |> ok |> ignore
+            let before = LedgerStore.fetch b |> ok
+            let held = WorkQueueGitLedger.loadAt b before |> ok
+            Assert.That(held.Works.[workId].State, Is.EqualTo(WorkState.Blocked))
+            Assert.That(held.Works.[workId].Gate,
+                        Is.EqualTo(GateState.CompositionHold("dependent", 2)))
+            let attemptId = Guid.NewGuid()
+            let frozen = request b workId approved
+            failWithoutCommit b attemptId (fun () ->
+                WorkCompositionQueueTransaction.acceptAndRelease b "Fixture" attemptId frozen)
+            let after = LedgerStore.fetch a |> ok
+            let finalGraph, _ = WorkCompositionGitLedger.loadAt a after |> ok
+            let finalQueue = WorkQueueGitLedger.loadAt a after |> ok
+            Assert.That(WorkComposition.currentAcceptance finalGraph "prerequisite", Is.EqualTo(None))
+            Assert.That(finalQueue.Works.[workId].State, Is.EqualTo(WorkState.Blocked))
+            Assert.That(finalQueue.Works.[workId].Gate,
+                        Is.EqualTo(GateState.CompositionHold("dependent", 2)))
+            Assert.That(Contracts.orderAvailable finalQueue |> ok
+                        |> List.exists (fun stage -> stage.Id = workId), Is.False))
+
+    [<Test>]
+    member _.ReopenedAndRecancelledParentCannotResurrectStaleOriginalWq04Binding() =
+        withClones (fun a b workId ->
+            let approved = approvedChild a b
+            let oldHead = request a workId approved
+            let graph = WorkCompositionGitLedger.load a |> ok |> snd
+            WorkCompositionGitLedger.execute a "Fixture" (Guid.NewGuid()) graph.Version
+                (WorkCompositionMutation.Cancel("delivery", "Cancel parent"))
+            |> ok |> ignore
+            let staleId = Guid.NewGuid()
+            failWithoutCommit b staleId (fun () ->
+                WorkCompositionQueueTransaction.acceptAndRelease b "Fixture" staleId oldHead)
+            let cancelled = WorkCompositionGitLedger.load b |> ok |> snd
+            WorkCompositionGitLedger.execute b "Fixture" (Guid.NewGuid()) cancelled.Version
+                (WorkCompositionMutation.Reopen "delivery")
+            |> ok |> ignore
+            // Reopening does not restore original immutable source-context
+            // provenance. Only a new WQ04 stage birth can update that binding.
+            let reopened = request a workId approved
+            let releaseId = Guid.NewGuid()
+            failWithoutCommit b releaseId (fun () ->
+                WorkCompositionQueueTransaction.acceptAndRelease b "Fixture" releaseId reopened)
+            let reopenedHead = LedgerStore.fetch b |> ok
+            let reopenedGraph, _ = WorkCompositionGitLedger.loadAt b reopenedHead |> ok
+            let reopenedQueue = WorkQueueGitLedger.loadAt b reopenedHead |> ok
+            let link = WorkCompositionGitLedger.readStageLinkAt b reopenedHead workId
+                       |> ok |> Option.get
+            Assert.That(WorkCompositionGitLedger.stageLinkStillCurrent
+                            link reopenedQueue.Works.[workId] reopenedGraph, Is.False)
+            Assert.That(reopenedQueue.Works.[workId].State, Is.EqualTo(WorkState.Blocked))
+            WorkCompositionGitLedger.execute a "Fixture" (Guid.NewGuid()) reopenedGraph.Version
+                (WorkCompositionMutation.Cancel("delivery", "Recancel parent"))
+            |> ok |> ignore
+            let recancelledId = Guid.NewGuid()
+            failWithoutCommit b recancelledId (fun () ->
+                WorkCompositionQueueTransaction.acceptAndRelease b "Fixture"
+                    recancelledId (request b workId approved))
+            let final = LedgerStore.fetch b |> ok
+            let blocked = WorkQueueGitLedger.loadAt b final |> ok
+            Assert.That(blocked.Works.[workId].State, Is.EqualTo(WorkState.Blocked))
+            Assert.That(blocked.Works.[workId].Gate,
+                        Is.EqualTo(GateState.CompositionHold("dependent", 2)))
+            Assert.That(Contracts.orderAvailable blocked |> ok
+                        |> List.exists (fun stage -> stage.Id = workId), Is.False))

@@ -218,6 +218,11 @@ module WorkCompositionQueueTransaction =
             if dependent.HardPrerequisites
                |> Set.exists (fun id -> WorkComposition.currentAcceptance nextGraph id |> Option.isNone) then
                 return! Error(reject "other hard composition prerequisites remain unaccepted")
+            // The original WQ04 graph gate includes cancelled ancestors, not
+            // only the dependent's own cancellation and prerequisite closure.
+            // Refuse before clearing the hold in this same original Git CAS.
+            if WorkCompositionGitLedger.graphBlocked nextGraph dependent then
+                return! Error(reject "dependent graph remains blocked after prerequisite acceptance")
             if stage.Dependencies
                |> Set.exists (fun id -> not (Contracts.isSatisfied queue id)) then
                 return! Error(reject "independent WQ02 hard-stage prerequisites remain unfulfilled")

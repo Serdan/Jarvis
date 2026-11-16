@@ -29,7 +29,9 @@ let ``recent command export is concise and chronological`` () =
     let entries =
         [ first; second ]
 
-    ActivityExport.formatRecent entries
+    // StringBuilder.AppendLine uses the host's line endings. Compare the
+    // exported text exactly, apart from the Windows CRLF representation.
+    (ActivityExport.formatRecent entries).Replace("\r\n", "\n")
     |> shouldEqual
         "Jarvis recent commands (2, oldest to newest)\n[18:31:47] #Wayfold SearchText\n  Detail: \"CreatureRenderer\"\n  Status: Completed | 7 ms | 2 matches\n\n[18:32:01] #Jarvis RunCommand\n  Reason: Verify tests\n  Detail: dotnet test\n  Status: Completed | 812 ms | exit 0"
 

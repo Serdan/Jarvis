@@ -58,6 +58,7 @@
         <Compile Include="WorkQueueCanonicalSourceEvidenceTests.fs"/>
         <Compile Include="WorkQueueCanonicalCasBinderTests.fs"/>
         <Compile Include="WorkQueueReleaseAcceptanceTests.fs"/>
+        <Compile Include="WorkQueueSchedulerHostPreviewTests.fs"/>
         <Compile Include="WorkingTurnGuidanceTests.fs"/>
         <Compile Include="OrchestrationApiTests.fs"/>
         <Compile Include="AgentViewTests.fs"/>

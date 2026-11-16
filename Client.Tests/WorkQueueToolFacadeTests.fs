@@ -168,7 +168,8 @@ type WorkQueueToolFacadeTests() =
     member _.RecoveryHeldClaimsRemainBlockedAheadOfMatchingLaunch() =
         let projectId = "P"
         let heldGateCases =
-            [ GateState.SourceRecoveryBlocked "unreconciled source push"
+            [ GateState.DependencyGatePending 0
+              GateState.SourceRecoveryBlocked "unreconciled source push"
               GateState.IntegrationGateHold (0, "push-1")
               GateState.ExternalEffectObservedPendingGate (0, "push-1", "remote-sha") ]
         let owner =

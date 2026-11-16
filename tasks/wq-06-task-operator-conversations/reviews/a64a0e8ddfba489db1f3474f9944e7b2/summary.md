@@ -1,0 +1,1 @@
+Corrects review 3b992a2446f14da8b7c02254cb62b849 P1: transport tests missing WQ04 producer/pinned role evidence no longer run by default; explicit opt-in with deferred reason. Production code/guards untouched. .NET11 Release 5/5 operator tests and 118/118 Server WorkQueue tests pass. Review exact eb47d434; full Client default suite running separately.

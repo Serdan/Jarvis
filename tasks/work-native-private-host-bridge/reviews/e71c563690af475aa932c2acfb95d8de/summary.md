@@ -21,3 +21,5 @@
 ## Scope of verdict
 
 **No source-blocking finding in the bounded NO-GO change.** This does **not** establish live private credential delivery, genuine provider-authenticated execution identity, Work first-connect, production migration, scheduler activation or fleet-wide legacy writer fencing. Keep production Work launch **NO-GO**, no hosted GitHub Actions, no live sends and no cutover. These limitations are explicitly documented rather than hidden by the fake provider.
+
+**Additional independent adjacent regression (completed after initial decision):** `dotnet vstest` filtered to original durable launch intent, Work-native lifecycle CAS, verified dispatch and project Git ledger tests: **40/40 passed** under .NET 11 Release on the same exact frozen worktree. The verdict and production NO-GO boundary are unchanged.

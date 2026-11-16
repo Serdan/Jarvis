@@ -1,0 +1,30 @@
+# Reviewer 4 independent audit — final WQ09 / WQ04 role / P1 server rollup
+
+**Recommendation: Accepted**, frozen exact `c27d6df0d90be4f28bde764539f3f3b2ef7aaaf3`, task `wq-09-task-first-client-ui`, request `ef49a1a45e7d4fda84296178b889d72c`. Base is the current-main source `ed358380400efaefcc3b95de9f03f8d1ad2678c5`. This is an **inert integration-source review**, not permission for live Scheduler, UI switch, claim/launch, production migration, deployment, or main push.
+
+## Independently checked ancestry and accepted boundaries
+
+- **WQ09:** `1d87393fa5e7f99da2605b641844768c78d348e4` is canonical **Accepted** by Reviewer 2 at seq3917, task-bound review `df851e83facd437ebeb46ed620dc0616`. Frozen rollup carries `Client/Modules/TaskFirstUiProjection.fs` and `Client.Tests/TaskFirstUiProjectionTests.fs` byte-identically. The projection has no live client call site outside its compilation unit/tests; project-file compile inclusion is not a UI switch.
+- **WQ04 historical role authority:** `9a09028ad0c4e2392ca755634a7a3c7328574924` is canonical **Accepted** by Reviewer 3 at seq3922, review `4c0e76df4bfb44408345d67b4ce97311`. `WorkQueueRoleAuthority.fs` and its test module remain byte-identical; project files add the required compile includes. No new live admission or Scheduler dispatch wiring appeared.
+- **P1 server:** `b934e37c7a92ce51c22a33865c51781d97b6bdd3` is canonical **Accepted** by Reviewer 1 at seq3912, review `dd8fb566dc1c4509914514cef6ac307e`. The merged server retains lazy, bounded optional SQLite diagnostics, isolates lock/hang/corruption, and does not treat a missing activity watermark as idle proof.
+- Source graph: `d0a9c40a` merges accepted WQ09, `490ce464` merges accepted role authority, `59f0637d` merges accepted P1 server, and `c27d6df0` adds final compatible test stubs. The branch and frozen review ref both identify the same exact final SHA.
+- `git diff --check ed358380..c27d6df0` returned clean. Frozen worktree `integration/wq09-role-stateless-rollup-20261116` remained clean after tests.
+
+## Integration seams and negative-space audit
+
+1. **WQ09 projection:** Existing accepted tests exercise claimed nonclear dependency gates at fresh/stale leases, SCC/self-loop path visibility, uncovered graph `Unknown`, malformed message indices and blank IDs, terminal-safe titles/IDs, unmatched cross-ledger account snapshots conservatively `Unknown`, and two-clone stale/reordered versions. No evidence that combined compilation turns those source-evidence deficits into a runnable or free-capacity claim.
+2. **Historical role provenance:** Accepted module and tests unchanged; adversarial tests include retroactive catalog provisioning, erased/replaced historical versions, shape-valid history/receipt substitution, split actor labels, same-CAS races, two-clone role revisions and legacy claims. These fail closed without a current source/historical authority proof.
+3. **Server SQLite isolation:** `Server/Program.fs` no longer opens database as a readiness dependency; `OptionalFeedbackStore` offloads optional diagnostics with a single-flight/background timeout, bounded database/page/disk budget and non-destructive recovery. Hub reporting uses best-effort post; authentication, client command routing and Git-CAS dispatch do not depend on telemetry availability. Server tests include corrupt/missing/unwritable files, true writer lock, simulated hang, disk quota, two clients and restart.
+4. **Idle authority:** `Client/Program.fs` supplies explicit `ActivityProofUnavailable` for `AfterAgentIdle`; old server `GetAgentActivity` callers also receive a failure instead of interpreting empty SQLite as idle. `BrowserSchedules.fs` treats `Ok None` as missing proof, rather than a runnable due interval. This deliberately suspends idle-based scheduling while preserving Once/Every scheduling; no unauthorized activation is implied.
+5. **Source-operation boundary:** The server merge preserves preexisting WQ03 `ReceiveSourceCommand` SignalR contract and optional caller-retained original UUID on nonproduction WriteFile/PatchFile, without minting a new ID from correlation. Legacy `ReceiveCommand` remains separate. `c27d6df0` reconciles the interface's test stubs; the added source/legacy dispatch negative test exercises both paths. This is neither WQ03 host-effect completion proof nor production cutover.
+
+## Independent Release evidence
+
+- `dotnet build Client.Tests/Client.Tests.fsproj --configuration Release --no-restore --verbosity quiet` — **success**, 0 errors, 3 warnings.
+- `dotnet test Client.Tests/Client.Tests.fsproj --configuration Release --no-build --no-restore --filter 'FullyQualifiedName~TaskFirstUiProjectionTests|FullyQualifiedName~WorkQueueRoleAuthorityTests|FullyQualifiedName~BrowserSchedulesTests|FullyQualifiedName~SourceEffectRouteBridgeTests|FullyQualifiedName~WorkQueueProducerGitTests'` — **75/75 passed**, .NET 11 Release, ~24 s. Includes two-clone provenance/role tests, WQ09 malicious/unknown input cases, missing activity proof and source-operation routing.
+- `dotnet test Server.Tests/Server.Tests.fsproj --configuration Release --no-restore` — **263/263 passed**, .NET 11 Release, 0 failures, 0 skips, ~9 s test execution; server and test project rebuilt.
+- I did **not** rerun the entire 887-test Client suite: the Lead's submission reported that broader run exceeded its 180 s bound. The independently compiled and executed focused cross-component suites plus full server suite are the evidence asserted here; no unsupported claim of all-Client-suite coverage.
+
+## Final disposition and scope
+
+**No blocking regression identified in this frozen composition. Recommend canonical Accepted for exact `c27d6df0`.** This validates source compatibility, accepted byte-preservation, negative-space safety and locally bounded tests. It does not authorize production scheduler enablement, source host mutation, UI switch, account capacity claim, deployment, migration, hosted Actions, main push, or Codex. Those remain separately gated and require explicit operator authority.

@@ -5,11 +5,13 @@ open System.Diagnostics
 open System.IO
 open System.Threading.Tasks
 open NUnit.Framework
+open Jarvis.WorkQueues
 open Client.LedgerStore
 open Client.ReviewWorkflow
 open Client.WorkQueueGitLedger
 open Client.WorkQueueCanonicalSourceEvidence
 open Client.WorkQueueCanonicalCasBinder
+open Client.WorkQueueRoleAuthority
 
 [<TestFixture>]
 type WorkQueueCanonicalCasBinderTests() =
@@ -46,6 +48,8 @@ type WorkQueueCanonicalCasBinderTests() =
         issues |> List.exists (function SourceEffectsUncovered _ -> true | _ -> false)
     let hasRoleGap issues =
         issues |> List.exists (function RoleAdmissionUncovered _ -> true | _ -> false)
+    let hasRoleEvidenceRejection issues =
+        issues |> List.exists (function RoleEvidenceRejected _ -> true | _ -> false)
     let hasEventRejection issues =
         issues |> List.exists (function CanonicalEventRejected _ -> true | _ -> false)
     let hasStaleHead issues =
@@ -172,4 +176,66 @@ type WorkQueueCanonicalCasBinderTests() =
             let storedB = LedgerStore.getOperationAt b snapshot operationB |> ok
             Assert.That(Option.isNone storedA, Is.True)
             Assert.That(Option.isNone storedB, Is.True)
+        )
+
+    [<Test>]
+    member _.HistoricalRoleVersionIsEvidenceNotAnUntrustedClaimOrProducerPermit() =
+        withClones (fun a b original ->
+            let asCurrent (request: CanonicalBindRequest) =
+                let snapshot = LedgerStore.fetch b |> ok
+                let _, project = WorkQueueGitLedger.load b |> ok
+                { request with
+                    SourceAnchor =
+                        { request.SourceAnchor with
+                            SnapshotHead = snapshot.Commit
+                            SnapshotHighWater = snapshot.Header.NextSequence - 1L }
+                    ExpectedProjectVersion = project.Version }
+            let desired = { original with RoleScope = NewRoleDemand("Reviewer", 1) }
+            let absent = WorkQueueCanonicalCasBinder.inspect b desired |> gaps
+            Assert.That(hasRoleEvidenceRejection absent, Is.True,
+                        "Legacy subscriptions and a claimed version cannot substitute for historical role issuance.")
+            WorkQueueRoleAuthority.initializeCatalog a "Lead" (Guid.NewGuid()) |> ok |> ignore
+            let revision1 : RoleConfiguration =
+                { RoleId = "Reviewer"; Version = 1; Enabled = true
+                  Instructions = "Review immutable commits"
+                  QueueSubscriptions = set ["review"] }
+            WorkQueueRoleAuthority.configure a "Lead" (Guid.NewGuid()) 0 0 revision1 |> ok |> ignore
+            let valid = asCurrent desired
+            let assessed = WorkQueueCanonicalCasBinder.inspect b valid |> gaps
+            Assert.That(hasRoleEvidenceRejection assessed, Is.False,
+                        "A genuine originally issued enabled role version should pass only its read-only evidence check.")
+            Assert.That(hasRoleGap assessed, Is.True)
+            Assert.That(hasCasGap assessed, Is.True)
+            // Even genuine, enabled historical-role evidence cannot turn a
+            // read-only preflight into a WorkStage producer or ledger receipt.
+            let beforeValidAttempt = LedgerStore.fetch b |> ok
+            denied (WorkQueueCanonicalCasBinder.attemptUnderCas b "Lead" (Guid.NewGuid()) valid)
+            let afterValidAttempt = LedgerStore.fetch b |> ok
+            Assert.That(afterValidAttempt.Commit, Is.EqualTo(beforeValidAttempt.Commit))
+            let fabricatedLaunch =
+                { valid with RoleScope = PinnedLaunchRole("never-admitted", "Reviewer", 1) }
+            Assert.That(hasRoleEvidenceRejection
+                            (WorkQueueCanonicalCasBinder.inspect b fabricatedLaunch |> gaps), Is.True)
+            let fabricatedRevision =
+                { valid with RoleScope = NewRoleDemand("Reviewer", 42) }
+            Assert.That(hasRoleEvidenceRejection
+                            (WorkQueueCanonicalCasBinder.inspect b fabricatedRevision |> gaps), Is.True)
+            // Clone A disables Reviewer at revision 2 after clone B's valid
+            // pinned original-event/role snapshot. This must invalidate the
+            // old assertion, and neither side may publish a queue receipt.
+            WorkQueueRoleAuthority.configure a "Lead" (Guid.NewGuid()) 1 1
+                { revision1 with Version = 2; Enabled = false } |> ok |> ignore
+            let afterDisable = asCurrent desired
+            Assert.That(hasRoleEvidenceRejection
+                            (WorkQueueCanonicalCasBinder.inspect b afterDisable |> gaps), Is.True)
+            Assert.That(hasRoleEvidenceRejection
+                            (WorkQueueCanonicalCasBinder.inspect b
+                                { afterDisable with RoleScope = NewRoleDemand("Reviewer", 2) } |> gaps), Is.True)
+            Assert.That(hasStaleHead
+                            (WorkQueueCanonicalCasBinder.inspect b valid |> gaps), Is.True)
+            let before = LedgerStore.fetch b |> ok
+            denied (WorkQueueCanonicalCasBinder.attemptUnderCas b "Lead" (Guid.NewGuid()) afterDisable)
+            let after = LedgerStore.fetch a |> ok
+            Assert.That(after.Commit, Is.EqualTo(before.Commit))
+            Assert.That(after.Header.NextSequence, Is.EqualTo(before.Header.NextSequence))
         )

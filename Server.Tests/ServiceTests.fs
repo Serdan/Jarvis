@@ -520,7 +520,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "PendingOperationSummary"; "PendingOperationsPage"; "InspectPendingOperation"
               "AcknowledgePendingOperation"; "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"
               "CreateChallenge"; "SetChallengeSubscription"; "AssignChallengeCondition"; "SplitChallengeCondition"; "ListChallenges"; "GetChallenge"; "ResolveChallengeCondition"
-              "ReopenChallengeCondition"; "CancelChallenge"; "BlockOnChallenges"; "RequeueChallengeBlockedAttempt"
+              "ReopenChallengeCondition"; "CancelChallenge"; "BlockOnChallenges"; "BlockOnReviewDependencies"; "RequeueChallengeBlockedAttempt"
               "ListOperatorConversation"; "RawOperatorConversation"; "InspectOperatorConversationOperation"
               "PostOperatorConversationMessage"; "ClaimOperatorConversationMessage"
               "HandleOperatorConversationMessage"; "ReleaseOperatorConversationMessage"; "RepairOperatorConversation"
@@ -1087,7 +1087,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
                   name, original["ChallengeRead"]
               for name in [ "CreateChallenge"; "SetChallengeSubscription"; "AssignChallengeCondition"; "SplitChallengeCondition"
                             "ResolveChallengeCondition"; "ReopenChallengeCondition"
-                            "CancelChallenge"; "BlockOnChallenges"; "RequeueChallengeBlockedAttempt" ] ->
+                            "CancelChallenge"; "BlockOnChallenges"; "BlockOnReviewDependencies"; "RequeueChallengeBlockedAttempt" ] ->
                   name, original["ChallengeWrite"]
               for name in [ "ListOperatorConversation"; "RawOperatorConversation"; "InspectOperatorConversationOperation" ] ->
                   name, original["OperatorConversationRead"]

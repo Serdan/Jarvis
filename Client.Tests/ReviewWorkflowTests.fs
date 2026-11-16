@@ -6376,7 +6376,7 @@ type ReviewWorkflowTests() =
                           OperationId = Guid.NewGuid().ToString("D")
                           Action = "Cancel"; ChallengeId = issued.ChallengeId
                           ConditionId = ""; ExpectedVersion = 1; Title = ""; TaskId = ""
-                          AttemptId = ""; DependencyChallengeIds = []
+                          AttemptId = ""; DependencyChallengeIds = []; DependencyReviewIds = []
                           ExpectedTaskVersion = 0; ExpectedAttemptVersion = 0
                           ExpectedAgentVersion = 0; AssignmentGeneration = 0
                           Conditions = []; Evidence = ""; Reason = "forged actor"; Outcome = ""

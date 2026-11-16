@@ -276,6 +276,7 @@ type ChallengeWriteCommand =
       TaskId: string
       AttemptId: string
       DependencyChallengeIds: string list
+      DependencyReviewIds: string list
       ExpectedTaskVersion: int
       ExpectedAttemptVersion: int
       ExpectedAgentVersion: int

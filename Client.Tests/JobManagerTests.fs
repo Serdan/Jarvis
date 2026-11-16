@@ -650,7 +650,7 @@ let challengeWriteUsesStableAutoJobAndRecoveryIdentity () =
               OperationId = operationId; Action = "Cancel"
               ChallengeId = Guid.NewGuid().ToString("N"); ConditionId = ""
               ExpectedVersion = 1; Title = ""; TaskId = ""; AttemptId = ""
-              DependencyChallengeIds = []; ExpectedTaskVersion = 0
+              DependencyChallengeIds = []; DependencyReviewIds = []; ExpectedTaskVersion = 0
               ExpectedAttemptVersion = 0; ExpectedAgentVersion = 0
               AssignmentGeneration = 0; Conditions = []
               Evidence = ""; Reason = "test"; Outcome = ""

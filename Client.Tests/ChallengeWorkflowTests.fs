@@ -98,6 +98,15 @@ type ChallengeTests() =
         taskRecord.Version, attempt.Version, inbox.Agent.Version, attemptId
 
 
+    let requestReview binding task =
+        let branch = git binding.RepositoryPath [ "symbolic-ref"; "--short"; "HEAD" ]
+        let head = git binding.RepositoryPath [ "rev-parse"; "HEAD" ]
+        let id = Guid.NewGuid()
+        ReviewWorkflow.submitBranchReview binding (Guid.NewGuid()) task "Agent 3" id
+            ("refs/heads/" + branch) head "Frozen independent review" "" ""
+        |> ok |> ignore
+        id.ToString("N")
+
     // Publish canonical schema-2 records through the real CAS ledger, but omit
     // the operator index exactly as the pre-index implementation did. The
     // immutable Created event and advancing ledger sequence are preserved.
@@ -685,6 +694,281 @@ type ChallengeTests() =
             Assert.That(notices b, Is.Empty)
         )
 
+
+    [<Test>]
+    member _.ReviewChangesRequestedWakesOwnerWhileIndependentQueueAndFeedbackSurvive() =
+        withFixture (fun a b ->
+            let task = "review-wait-changes"
+            let tv, pv, av, attemptId = assignment a task
+            let reviewId = requestReview b task
+            let blockOp = Guid.NewGuid()
+            ChallengeWorkflow.blockOnDependencies a blockOp "Agent 3" task attemptId
+                tv pv av 1 "Waiting for independent reviewer" [] [ reviewId ] |> ok |> ignore
+            let blocked = ReviewWorkflow.getAgentInbox b "Agent 3" |> ok
+            Assert.That(blocked.Agent.State, Is.EqualTo("NeedsWork"))
+            Assert.That(blocked.BlockedChallengeWaits.Head.ReviewIds, Is.EquivalentTo([ reviewId ]))
+            Assert.That(blocked.AwaitedReviews.Head.Status, Is.EqualTo("Unclaimed"))
+            let queue = ReviewWorkflow.branchReviewerQueue a "Lead" |> ok |> snd
+            Assert.That(queue |> List.exists (fun r -> r.ReviewId = reviewId), Is.True)
+            ReviewWorkflow.claimBranchReview a (Guid.NewGuid()) task (Guid.Parse reviewId) "Lead" 1
+            |> ok |> ignore
+            let claimed = ReviewWorkflow.getAgentInbox b "Agent 3" |> ok
+            Assert.That(claimed.Agent.State, Is.EqualTo("NeedsWork"))
+            Assert.That(claimed.Blocked.Length, Is.EqualTo(1))
+            let decisionOp = Guid.NewGuid()
+            ReviewWorkflow.decideBranchReview b decisionOp task (Guid.Parse reviewId) "Lead" 2 RequestChanges
+            |> ok |> ignore
+            Assert.That((ReviewWorkflow.decideBranchReview a decisionOp task (Guid.Parse reviewId)
+                            "Lead" 2 RequestChanges |> ok).AlreadyApplied, Is.True)
+            let ready = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
+            Assert.That(ready.RunnableQueue.Head.Attempt.AssignmentGeneration, Is.EqualTo(2))
+            Assert.That(ready.Blocked, Is.Empty)
+            Assert.That(ready.AwaitedReviews.Head.ReviewId, Is.EqualTo(reviewId))
+            Assert.That(ready.AwaitedReviews.Head.Status, Is.EqualTo("ChangesRequested"))
+            Assert.That(ready.UnacknowledgedFeedback.Head.RequestId, Is.EqualTo(reviewId))
+            Assert.That(ready.UnacknowledgedFeedback.Head.Status, Is.EqualTo("ChangesRequested"))
+            Assert.That((ReviewWorkflow.getTask b task |> ok |> fun (_, t, _) -> t.Lifecycle),
+                        Is.EqualTo("InProgress"))
+            Assert.That(notices a, Is.Empty)
+        )
+
+    [<Test>]
+    member _.WithdrawnReviewEndsWaitAndRemainsVisibleWithoutFeedbackNotice() =
+        withFixture (fun a b ->
+            let task = "review-wait-withdrawn"
+            let tv, pv, av, attemptId = assignment a task
+            let reviewId = requestReview b task
+            ChallengeWorkflow.blockOnDependencies a (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "Waiting for withdrawable review" [] [ reviewId ] |> ok |> ignore
+            ReviewWorkflow.withdrawBranchReview b (Guid.NewGuid()) task (Guid.Parse reviewId) "Agent 3" 1
+            |> ok |> ignore
+            let ready = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
+            Assert.That(ready.AwaitedReviews.Head.ReviewId, Is.EqualTo(reviewId))
+            Assert.That(ready.AwaitedReviews.Head.Status, Is.EqualTo("Withdrawn"))
+            Assert.That(ready.UnacknowledgedFeedback, Is.Empty)
+            Assert.That(ready.RunnableQueue.Head.Attempt.AssignmentGeneration, Is.EqualTo(2))
+            Assert.That(notices a, Is.Empty)
+        )
+
+    [<Test>]
+    member _.MixedReviewAndChallengePrerequisitesUseAllAndIgnorePartialResolution() =
+        withFixture (fun a b ->
+            let task = "review-plus-challenge"
+            let tv, pv, av, attemptId = assignment a task
+            let reviewId = requestReview b task
+            let challenge =
+                ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "Independent benchmark gate" task
+                    [ { OwnerKind = ""; OwnerAgentId = "Lead"; SuggestedAgentId = ""
+                        Description = "Verify build" } ] |> ok
+            ChallengeWorkflow.blockOnDependencies b (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "Both review and benchmark" [ challenge.ChallengeId ] [ reviewId ]
+            |> ok |> ignore
+            ReviewWorkflow.claimBranchReview a (Guid.NewGuid()) task (Guid.Parse reviewId) "Lead" 1
+            |> ok |> ignore
+            ReviewWorkflow.decideBranchReview b (Guid.NewGuid()) task (Guid.Parse reviewId) "Lead" 2 Accept
+            |> ok |> ignore
+            let partial = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(partial.Agent.State, Is.EqualTo("NeedsWork"))
+            Assert.That(partial.BlockedChallengeWaits.Head.Status, Is.EqualTo("Waiting"))
+            ChallengeWorkflow.resolve b (Guid.NewGuid()) "Lead" challenge.ChallengeId
+                challenge.ConditionIds.Head 1 "benchmark-pass" "" |> ok |> ignore
+            let ready = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
+            Assert.That(ready.RunnableQueue.Head.Attempt.AssignmentGeneration, Is.EqualTo(2))
+            Assert.That(ready.AwaitedReviews.Head.Status, Is.EqualTo("Accepted"))
+            Assert.That(notices b, Is.Empty)
+        )
+
+    [<Test>]
+    member _.TerminalReviewBeforeBlockNeverCreatesAnUnwakeableWait() =
+        withFixture (fun a b ->
+            let task = "already-terminal-review"
+            let tv, pv, av, attemptId = assignment a task
+            let reviewId = requestReview b task
+            ReviewWorkflow.withdrawBranchReview a (Guid.NewGuid()) task (Guid.Parse reviewId) "Agent 3" 1
+            |> ok |> ignore
+            failStale (ChallengeWorkflow.blockOnDependencies b (Guid.NewGuid()) "Agent 3"
+                           task attemptId tv pv av 1 "Too late to block" [] [ reviewId ])
+            let stillWorking = ReviewWorkflow.getAgentInbox b "Agent 3" |> ok
+            Assert.That(stillWorking.Agent.State, Is.EqualTo("Working"))
+            Assert.That(stillWorking.Blocked, Is.Empty)
+            Assert.That(notices a, Is.Empty)
+        )
+
+    [<Test>]
+    member _.ReviewWakePersistsEligibilityWhileOwnerIsWorkingElsewhere() =
+        withFixture (fun a b ->
+            let task = "review-eligible"
+            let tv, pv, av, attemptId = assignment a task
+            let reviewId = requestReview b task
+            ChallengeWorkflow.blockOnDependencies a (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "Await independent review" [] [ reviewId ] |> ok |> ignore
+            let busyTask = "busy-during-review"
+            let _, _, _, busyAttemptId = assignment b busyTask
+            ReviewWorkflow.claimBranchReview a (Guid.NewGuid()) task (Guid.Parse reviewId) "Lead" 1
+            |> ok |> ignore
+            ReviewWorkflow.decideBranchReview b (Guid.NewGuid()) task (Guid.Parse reviewId) "Lead" 2 Accept
+            |> ok |> ignore
+            let eligible = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(eligible.Agent.State, Is.EqualTo("Working"))
+            Assert.That(eligible.Agent.CurrentAssignment.AttemptId, Is.EqualTo(busyAttemptId))
+            Assert.That(eligible.BlockedChallengeWaits.Head.Status, Is.EqualTo("Eligible"))
+            ReviewWorkflow.completeAgentWork b (Guid.NewGuid()) busyTask "Agent 3" 0 0 0
+                "Other work finished" |> ok |> ignore
+            let ready = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
+            Assert.That(ready.Agent.CurrentAssignment.AttemptId, Is.EqualTo(attemptId))
+            Assert.That(ready.BlockedChallengeWaits, Is.Empty)
+            Assert.That(ready.AwaitedReviews.Head.Status, Is.EqualTo("Accepted"))
+            Assert.That(notices b, Is.Empty)
+        )
+
+    [<Test>]
+    member _.ReviewClaimReleaseAndUnrelatedVerdictNeverWakeAnotherReviewWait() =
+        withFixture (fun a b ->
+            let task = "unrelated-review-ignored"
+            let tv, pv, av, attemptId = assignment a task
+            let awaited = requestReview b task
+            let unrelated = requestReview a task
+            ChallengeWorkflow.blockOnDependencies b (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "Only wait for specific review" [] [ awaited ] |> ok |> ignore
+            ReviewWorkflow.claimBranchReview a (Guid.NewGuid()) task (Guid.Parse awaited) "Lead" 1
+            |> ok |> ignore
+            ReviewWorkflow.releaseBranchReview b (Guid.NewGuid()) task (Guid.Parse awaited) "Lead" 2
+            |> ok |> ignore
+            let afterRelease = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(afterRelease.Agent.State, Is.EqualTo("NeedsWork"))
+            Assert.That(afterRelease.BlockedChallengeWaits.Head.Status, Is.EqualTo("Waiting"))
+            ReviewWorkflow.claimBranchReview a (Guid.NewGuid()) task (Guid.Parse unrelated) "Lead" 1
+            |> ok |> ignore
+            ReviewWorkflow.decideBranchReview b (Guid.NewGuid()) task (Guid.Parse unrelated)
+                "Lead" 2 Accept |> ok |> ignore
+            let afterUnrelated = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(afterUnrelated.Agent.State, Is.EqualTo("NeedsWork"))
+            Assert.That(afterUnrelated.BlockedChallengeWaits.Head.Status, Is.EqualTo("Waiting"))
+            ReviewWorkflow.claimBranchReview b (Guid.NewGuid()) task (Guid.Parse awaited) "Lead" 3
+            |> ok |> ignore
+            ReviewWorkflow.decideBranchReview a (Guid.NewGuid()) task (Guid.Parse awaited)
+                "Lead" 4 RequestChanges |> ok |> ignore
+            let ready = ReviewWorkflow.getAgentInbox b "Agent 3" |> ok
+            Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
+            Assert.That(ready.AwaitedReviews.Head.ReviewId, Is.EqualTo(awaited))
+            Assert.That(ready.AwaitedReviews.Head.Status, Is.EqualTo("ChangesRequested"))
+            Assert.That(ready.RunnableQueue.Head.Attempt.AssignmentGeneration, Is.EqualTo(2))
+            Assert.That(notices a, Is.Empty)
+        )
+
+    [<Test>]
+    member _.ReviewSubmittedWithoutOptionalBlockLeavesOwnerWorking() =
+        withFixture (fun a b ->
+            let task = "review-no-block"
+            let _, _, _, _ = assignment a task
+            let reviewId = requestReview b task
+            ReviewWorkflow.claimBranchReview b (Guid.NewGuid()) task (Guid.Parse reviewId) "Lead" 1
+            |> ok |> ignore
+            ReviewWorkflow.decideBranchReview a (Guid.NewGuid()) task (Guid.Parse reviewId)
+                "Lead" 2 RequestChanges |> ok |> ignore
+            let working = ReviewWorkflow.getAgentInbox b "Agent 3" |> ok
+            Assert.That(working.Agent.State, Is.EqualTo("Working"))
+            Assert.That(working.Blocked, Is.Empty)
+            Assert.That(working.BlockedChallengeWaits, Is.Empty)
+            Assert.That(working.UnacknowledgedFeedback.Head.RequestId, Is.EqualTo(reviewId))
+            Assert.That(notices b, Is.Empty)
+        )
+
+    [<Test>]
+    member _.ParkedOwnerKeepsTerminalReviewEligibilityUntilExplicitUnpark() =
+        withFixture (fun a b ->
+            let task = "review-parked"
+            let tv, pv, av, attemptId = assignment a task
+            let reviewId = requestReview b task
+            ChallengeWorkflow.blockOnDependencies b (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "Await review while paused" [] [ reviewId ] |> ok |> ignore
+            let unassigned = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            ReviewWorkflow.parkAgent b (Guid.NewGuid()) "Agent 3"
+                unassigned.Agent.Version "Operator pause" |> ok |> ignore
+            ReviewWorkflow.claimBranchReview a (Guid.NewGuid()) task (Guid.Parse reviewId) "Lead" 1
+            |> ok |> ignore
+            ReviewWorkflow.decideBranchReview b (Guid.NewGuid()) task (Guid.Parse reviewId)
+                "Lead" 2 Accept |> ok |> ignore
+            let parked = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(parked.Agent.State, Is.EqualTo("Parked"))
+            Assert.That(parked.Agent.CurrentAssignment, Is.Null)
+            Assert.That(parked.BlockedChallengeWaits.Head.Status, Is.EqualTo("Eligible"))
+            ReviewWorkflow.setAgentAdministrativeStateAs a "Orchestrator" (Guid.NewGuid())
+                "Agent 3" "NeedsWork" parked.Agent.Version "Resume paused owner"
+            |> ok |> ignore
+            let ready = ReviewWorkflow.getAgentInbox b "Agent 3" |> ok
+            Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
+            Assert.That(ready.Agent.CurrentAssignment.AttemptId, Is.EqualTo(attemptId))
+            Assert.That(ready.AwaitedReviews.Head.Status, Is.EqualTo("Accepted"))
+            Assert.That(ready.RunnableQueue.Head.Attempt.AssignmentGeneration, Is.EqualTo(2))
+            Assert.That(notices a, Is.Empty)
+        )
+
+    [<Test>]
+    member _.CancellingBlockedAttemptPreventsReviewDecisionFromResurrectingIt() =
+        withFixture (fun a b ->
+            let task = "review-cancelled-attempt"
+            let tv, pv, av, attemptId = assignment a task
+            let reviewId = requestReview b task
+            ChallengeWorkflow.blockOnDependencies a (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "Waiting before cancellation" [] [ reviewId ] |> ok |> ignore
+            let blocked = ReviewWorkflow.getAgentInbox b "Agent 3" |> ok
+            ReviewWorkflow.changeAttemptAdministration a (Guid.NewGuid()) task "CancelTask"
+                tv (pv + 1) blocked.Agent.Version 1 "Task cancelled" |> ok |> ignore
+            ReviewWorkflow.claimBranchReview b (Guid.NewGuid()) task (Guid.Parse reviewId) "Lead" 1
+            |> ok |> ignore
+            ReviewWorkflow.decideBranchReview a (Guid.NewGuid()) task (Guid.Parse reviewId)
+                "Lead" 2 Accept |> ok |> ignore
+            let owner = ReviewWorkflow.getAgentInbox b "Agent 3" |> ok
+            let _, cancelledTask, cancelledAttempt = ReviewWorkflow.getTask a task |> ok
+            Assert.That(cancelledTask.Lifecycle, Is.EqualTo("Cancelled"))
+            Assert.That(cancelledAttempt.Value.Phase, Is.EqualTo("Abandoned"))
+            Assert.That(owner.Agent.State, Is.EqualTo("NeedsWork"))
+            Assert.That(owner.Agent.CurrentAssignment, Is.Null)
+            Assert.That(owner.RunnableQueue, Is.Empty)
+            Assert.That(notices b, Is.Empty)
+        )
+
+    [<Test>]
+    member _.SimultaneousReviewDecisionAndBlockEitherWakeOrRejectAlreadyTerminal() =
+        withFixture (fun a b ->
+            let task = "review-decision-race"
+            let tv, pv, av, attemptId = assignment a task
+            let reviewId = requestReview b task
+            ReviewWorkflow.claimBranchReview a (Guid.NewGuid()) task (Guid.Parse reviewId) "Lead" 1
+            |> ok |> ignore
+            use gate = new System.Threading.ManualResetEventSlim(false)
+            let block =
+                System.Threading.Tasks.Task.Run(fun () ->
+                    gate.Wait()
+                    ChallengeWorkflow.blockOnDependencies b (Guid.NewGuid()) "Agent 3" task
+                        attemptId tv pv av 1 "Racing with review" [] [ reviewId ])
+            let decide =
+                System.Threading.Tasks.Task.Run(fun () ->
+                    gate.Wait()
+                    ReviewWorkflow.decideBranchReview a (Guid.NewGuid()) task
+                        (Guid.Parse reviewId) "Lead" 2 Accept)
+            gate.Set()
+            let blockOutcome = block.GetAwaiter().GetResult()
+            decide.GetAwaiter().GetResult() |> ok |> ignore
+            let owner = ReviewWorkflow.getAgentInbox b "Agent 3" |> ok
+            match blockOutcome with
+            | Ok _ ->
+                Assert.That(owner.Agent.State, Is.EqualTo("Ready"))
+                Assert.That(owner.RunnableQueue.Head.Attempt.AssignmentGeneration, Is.EqualTo(2))
+                Assert.That(owner.Blocked, Is.Empty)
+            | Error(StaleEntityVersion _) ->
+                Assert.That(owner.Agent.State, Is.EqualTo("Working"))
+                Assert.That(owner.Blocked, Is.Empty)
+            | Error error -> Assert.Fail(sprintf "Unexpected race outcome: %A" error)
+            Assert.That(owner.Agent.State, Is.Not.EqualTo("NeedsWork"),
+                "Review completion must never strand an attempt on an already-terminal prerequisite.")
+            Assert.That(notices a, Is.Empty)
+        )
 
     [<Test>]
     member _.SatisfiedDependenciesRemainEligibleUntilBusyOwnerReleasesTheirSlot() =

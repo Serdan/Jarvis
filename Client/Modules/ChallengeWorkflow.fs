@@ -771,118 +771,10 @@ module ChallengeWorkflow =
     }
 
     let private wakeDependents binding snapshot (operationId: Guid) actor
-                               (completed: AgentChallenge) timestamp = result {
-        let prefix = ReviewWorkflow.challengeWaitIndexPrefix completed.ChallengeId
-        let! paths = LedgerStore.listAt binding snapshot prefix
-        let linkedWaits =
-            paths
-            |> List.filter (fun p -> p.EndsWith(".json", StringComparison.Ordinal))
-            |> List.sort
-        let mutable writes : LedgerFileChange list = []
-        let mutable claimedOwners = Set.empty<string>
-        for indexPath in linkedWaits do
-            let! locator, _ = pinned<AttemptChallengeWaitIndex> binding snapshot indexPath 2
-            if indexPath <> ReviewWorkflow.waitIndexPath prefix locator.TaskId locator.AttemptId locator.AssignmentGeneration
-               || locator.AssignmentGeneration < 1 then
-                return! Error(LedgerIntegrityError "Challenge wait-index identity mismatch.")
-            let file = $"tasks/{locator.TaskId}/attempts/{locator.AttemptId}/challenge-wait.json"
-            let! wait, waitOid = pinned<AttemptChallengeWait> binding snapshot file 2
-            if file <> $"tasks/{wait.TaskId}/attempts/{wait.AttemptId}/challenge-wait.json" then
-                return! Error(LedgerIntegrityError "Challenge wait identity/path mismatch.")
-            if wait.Status = "Waiting" && wait.OwnerAgentId = locator.OwnerAgentId
-               && List.contains completed.ChallengeId wait.ChallengeIds then
-                let mutable allSatisfied = true
-                for dependency in wait.ChallengeIds do
-                    match guidN dependency with
-                    | None -> return! Error(LedgerIntegrityError "Invalid stored dependency UUID.")
-                    | Some id ->
-                        let! linked =
-                            if dependency = completed.ChallengeId then Ok completed
-                            else readChallenge binding snapshot id |> Result.map fst
-                        if linked.Status <> "Satisfied" then allSatisfied <- false
-                if allSatisfied then
-                    let taskPath = $"tasks/{wait.TaskId}/task.json"
-                    let attemptPath = $"tasks/{wait.TaskId}/attempts/{wait.AttemptId}.json"
-                    let! task, _ = pinned<ReviewTask> binding snapshot taskPath 2
-                    let! attempt, attemptOid = pinned<ReviewAttempt> binding snapshot attemptPath 3
-                    let! owner, ownerOid =
-                        pinned<ReviewAgent> binding snapshot (agentPath wait.OwnerAgentId) 3
-                    // Terminal or superseded attempt links are inert.
-                    if task.TaskId = wait.TaskId && task.Lifecycle = "InProgress"
-                       && task.AttemptId = wait.AttemptId && attempt.TaskId = wait.TaskId
-                       && attempt.AttemptId = wait.AttemptId
-                       && attempt.AssignmentGeneration = locator.AssignmentGeneration
-                       && attempt.OwnerAgentId = wait.OwnerAgentId
-                       && attempt.Phase = "Blocked" then
-                        let free =
-                            isNull (box owner.CurrentAssignment)
-                            && owner.Execution = "Stopped"
-                            && owner.UnassignedDisposition = "NeedsWork"
-                            && not (Set.contains owner.AgentId claimedOwners)
-                        if free then
-                            let sequence = snapshot.Header.NextSequence
-                            let generation = attempt.AssignmentGeneration + 1
-                            let reason = "All explicitly linked challenges satisfied"
-                            let nextAttempt =
-                                { attempt with Version = attempt.Version + 1
-                                               Phase = "Queued"
-                                               AssignmentGeneration = generation
-                                               IssuedSequence = sequence }
-                            let nextOwner =
-                                { owner with Version = owner.Version + 1
-                                             CurrentAssignment = { TaskId = wait.TaskId; AttemptId = wait.AttemptId }
-                                             Execution = "Stopped"; UnassignedDisposition = null
-                                             StateReason = reason; StateSequence = sequence
-                                             StateEnteredAtUtc = timestamp
-                                             WorkingTurnStartedAtUtc = null
-                                             ActiveSessionId = null; AssociatedSessionIds = [] }
-                            let nextWait =
-                                { wait with Version = wait.Version + 1
-                                            Status = "Requeued"; RequeuedAtUtc = timestamp }
-                            let issue : AssignmentIssue =
-                                { TaskId = wait.TaskId; AttemptId = wait.AttemptId
-                                  Generation = generation; OwnerAgentId = wait.OwnerAgentId
-                                  IssuerId = actor; IssuedSequence = sequence
-                                  Instructions = reason; Reason = "ChallengeUnblock"
-                                  SpecBlobOid = nextAttempt.SpecBlobOid
-                                  SourceBaseCommit = nextAttempt.BaseCommit
-                                  TargetRef = nextAttempt.TargetRef
-                                  SourceRepositoryId = nextAttempt.SourceRepositoryId
-                                  SourceRemote = nextAttempt.SourceRemote
-                                  SourcePushRemote = nextAttempt.SourcePushRemote
-                                  SourceRef = nextAttempt.SourceRef
-                                  PreviousGeneration = attempt.AssignmentGeneration }
-                            let audit : TaskLifecycleEvent =
-                                { TaskId = wait.TaskId; AttemptId = wait.AttemptId
-                                  OperationId = operationId.ToString("D")
-                                  Sequence = sequence; Action = "RequeueChallengeBlockedAttempt"
-                                  ActorId = actor; Reason = reason
-                                  PreviousLifecycle = task.Lifecycle; NewLifecycle = task.Lifecycle
-                                  PreviousPhase = attempt.Phase; NewPhase = "Queued"
-                                  PreviousOwnerId = attempt.OwnerAgentId
-                                  NewOwnerId = attempt.OwnerAgentId
-                                  PreviousGeneration = attempt.AssignmentGeneration
-                                  NewGeneration = generation
-                                  ReviewRequestId = null
-                                  ReviewDisposition = "Unchanged"; Evidence = null
-                                  RequestingAgentId = null; TargetAgentId = null
-                                  PreviousAgentState = null; NewAgentState = null
-                                  PreviousAgentVersion = 0; NewAgentVersion = 0 }
-                            writes <- [
-                                change file (Some waitOid) nextWait
-                                change attemptPath (Some attemptOid) nextAttempt
-                                change (agentPath owner.AgentId) (Some ownerOid) nextOwner
-                                change ($"tasks/{wait.TaskId}/attempts/{wait.AttemptId}/assignments/{generation}.json") None issue
-                                change ($"tasks/{wait.TaskId}/lifecycle/{sequence}.json") None audit
-                            ] @ writes
-                            claimedOwners <- Set.add owner.AgentId claimedOwners
-                        else
-                            // Persist wake eligibility while the owner is occupied;
-                            // it can be reconciled when their slot is later released.
-                            writes <- change file (Some waitOid)
-                                          { wait with Version = wait.Version + 1; Status = "Eligible" } :: writes
-        return List.rev writes
-    }
+                               (completed: AgentChallenge) timestamp =
+        ReviewWorkflow.wakeDependencyWaits binding snapshot operationId actor
+            (ReviewWorkflow.CompletedChallenge completed.ChallengeId) timestamp
+
     let private update binding operationId actor challengeId conditionId expectedVersion kind
                        evidence reason =
         match guidN challengeId with
@@ -1678,11 +1570,16 @@ module ChallengeWorkflow =
     /// one, or several existing challenges. All state changes form ONE ledger
     /// CAS transaction; no scheduler, hidden agent activation or separate
     /// notification is introduced.
-    let blockAttempt binding operationId actor task attemptId
-                     expectedTaskVersion expectedAttemptVersion expectedAgentVersion
-                     generation reason (challengeIds: string list) =
+    let blockOnDependencies binding operationId actor task attemptId
+                            expectedTaskVersion expectedAttemptVersion expectedAgentVersion
+                            generation reason (challengeIds: string list) (reviewIds: string list) =
         let requested =
             if isNull (box challengeIds) then [] else challengeIds
+        let requestedReviews =
+            if isNull (box reviewIds) then [] else reviewIds
+        let normalizedReviews =
+            requestedReviews
+            |> List.choose (fun raw -> guidN raw |> Option.map (fun id -> id.ToString("N")))
         // Normalize UUID spelling BEFORE checking uniqueness or storing
         // dependencies; case differences cannot represent distinct challenges.
         let normalized =
@@ -1695,16 +1592,16 @@ module ChallengeWorkflow =
            || expectedTaskVersion < 1 || expectedAttemptVersion < 1
            || expectedAgentVersion < 1 || not (text 2048 reason)
            || requested.Length <> normalized.Length
-           || normalized.Length > 16
-           || normalized.Length <> (normalized |> List.distinct |> List.length) then
-            Error(InvalidBinding "Block requires valid actor/task/attempt, exact versions, reason, and <=16 distinct challenge IDs.")
+           || normalized.Length + normalizedReviews.Length > 16
+           || normalized.Length <> (normalized |> List.distinct |> List.length)
+           || requestedReviews.Length <> normalizedReviews.Length
+           || normalizedReviews.Length <> (normalizedReviews |> List.distinct |> List.length) then
+            Error(InvalidBinding "Block requires exact versions, reason, and <=16 distinct challenge/review UUIDs.")
         else
-            changed binding operationId actor "WaitOnChallenges"
-                {| taskId = task; attemptId = attemptId; reason = reason; challengeIds = normalized
-                   expectedTaskVersion = expectedTaskVersion
-                   expectedAttemptVersion = expectedAttemptVersion
-                   expectedAgentVersion = expectedAgentVersion; generation = generation |}
-                (fun snapshot -> result {
+            let action = if List.isEmpty normalizedReviews then "WaitOnChallenges" else "WaitOnDependencies"
+            let commit payload =
+                changed binding operationId actor action payload
+                    (fun snapshot -> result {
                     let! currentTask, attempt, attemptOid, agent, agentOid =
                         validatedAttempt binding snapshot actor task attemptId
                             expectedTaskVersion expectedAttemptVersion expectedAgentVersion generation
@@ -1730,7 +1627,8 @@ module ChallengeWorkflow =
                     // wakeup event. Never strand a task on an empty effective
                     // dependency set; callers may use the explicit manual wait
                     // (no dependencies) instead.
-                    let mutable hasOutstandingDependency = List.isEmpty normalized
+                    let mutable hasOutstandingDependency =
+                        List.isEmpty normalized && List.isEmpty normalizedReviews
                     for dependency in normalized do
                         let! linked, _ = readChallenge binding snapshot (Guid.ParseExact(dependency, "N"))
                         if not (accessible actor linked) then
@@ -1741,6 +1639,15 @@ module ChallengeWorkflow =
                             return! Error(StaleEntityVersion "Linked challenge was cancelled or belongs to another task.")
                         if linked.Status <> "Satisfied" then
                             hasOutstandingDependency <- true
+                    for reviewId in normalizedReviews do
+                        let file = $"tasks/{task}/reviews/{reviewId}/review.json"
+                        let! linked, _ = pinned<BranchReview> binding snapshot file 3
+                        if linked.TaskId <> task || linked.ReviewId <> reviewId then
+                            return! Error(LedgerIntegrityError "Review prerequisite identity mismatch.")
+                        if linked.OwnerAgentId <> actor then
+                            return! Error(ReviewAccessDenied "An attempt owner may only wait on their own review request.")
+                        if not (List.contains linked.Status [ "Accepted"; "ChangesRequested"; "Withdrawn" ]) then
+                            hasOutstandingDependency <- true
                     if not hasOutstandingDependency then
                         return! Error(StaleEntityVersion
                             "All linked challenges are already Satisfied; there is nothing to wait for.")
@@ -1748,14 +1655,14 @@ module ChallengeWorkflow =
                     let wait : AttemptChallengeWait =
                         { TaskId = task; AttemptId = attemptId; OwnerAgentId = actor
                           Reason = reason; ChallengeIds = normalized
-                          Status = "Waiting"
+                          ReviewIds = normalizedReviews; Status = "Waiting"
                           Version = priorWait |> Option.map (fun p -> p.Version + 1) |> Option.defaultValue 1
                           BlockedAtUtc = timestamp; RequeuedAtUtc = null }
                     let locator : AttemptChallengeWaitIndex =
                         { TaskId = task; AttemptId = attemptId; OwnerAgentId = actor
                           AssignmentGeneration = generation }
                     let indexWrites =
-                        if List.isEmpty normalized then []
+                        if List.isEmpty normalized && List.isEmpty normalizedReviews then []
                         else
                             let ownerIndex =
                                 ReviewWorkflow.waitIndexPath
@@ -1765,6 +1672,11 @@ module ChallengeWorkflow =
                                   change
                                       (ReviewWorkflow.waitIndexPath
                                           (ReviewWorkflow.challengeWaitIndexPrefix dependency)
+                                          task attemptId generation) None locator ] @
+                            [ for reviewId in normalizedReviews ->
+                                  change
+                                      (ReviewWorkflow.waitIndexPath
+                                          (ReviewWorkflow.reviewWaitIndexPrefix task reviewId)
                                           task attemptId generation) None locator ]
                     let blockedAttempt =
                         { attempt with Version = attempt.Version + 1; Phase = "Blocked" }
@@ -1779,7 +1691,7 @@ module ChallengeWorkflow =
                             ActiveSessionId = null; AssociatedSessionIds = [] }
                     let audit =
                         lifecycle currentTask attempt operationId actor
-                            "WaitOnChallenges" reason "Blocked"
+                            action reason "Blocked"
                             generation snapshot.Header.NextSequence
                     // Blocking this assignment frees the owner just like an
                     // explicit completion. Reconcile an older satisfied wait
@@ -1791,7 +1703,31 @@ module ChallengeWorkflow =
                           change ($"tasks/{task}/attempts/{attemptId}.json") (Some attemptOid) blockedAttempt
                           change (agentPath actor) (Some agentOid) nextAgent
                           change ($"tasks/{task}/lifecycle/{snapshot.Header.NextSequence}.json") None audit ] @ indexWrites @ wakeups
-                })
+                    })
+            // Retain the preexisting challenge-only request payload exactly:
+            // pending/deduplicated operation IDs remain replayable across a
+            // client upgrade rather than acquiring a different request hash.
+            if List.isEmpty normalizedReviews then
+                commit
+                    {| taskId = task; attemptId = attemptId; reason = reason; challengeIds = normalized
+                       expectedTaskVersion = expectedTaskVersion
+                       expectedAttemptVersion = expectedAttemptVersion
+                       expectedAgentVersion = expectedAgentVersion; generation = generation |}
+            else
+                commit
+                    {| taskId = task; attemptId = attemptId; reason = reason
+                       challengeIds = normalized; reviewIds = normalizedReviews
+                       expectedTaskVersion = expectedTaskVersion
+                       expectedAttemptVersion = expectedAttemptVersion
+                       expectedAgentVersion = expectedAgentVersion; generation = generation |}
+
+    // Preserve the existing direct API for challenge-only callers.
+    let blockAttempt binding operationId actor task attemptId
+                     expectedTaskVersion expectedAttemptVersion expectedAgentVersion
+                     generation reason (challengeIds: string list) =
+        blockOnDependencies binding operationId actor task attemptId
+            expectedTaskVersion expectedAttemptVersion expectedAgentVersion
+            generation reason challengeIds []
 
     /// Explicit recovery supports manual waits and legacy Waiting records;
     /// the same pinned snapshot verifies EVERY dependency before transitioning
@@ -1825,14 +1761,12 @@ module ChallengeWorkflow =
                     if wait.TaskId <> task || wait.AttemptId <> attemptId ||
                        wait.OwnerAgentId <> actor || wait.Status <> "Waiting" then
                         return! Error(StaleEntityVersion "Attempt's challenge dependency wait is missing or already requeued.")
-                    for dependency in wait.ChallengeIds do
-                        match guidN dependency with
-                        | None -> return! Error(LedgerIntegrityError "Invalid stored challenge dependency ID.")
-                        | Some id ->
-                            let! linked, _ = readChallenge binding snapshot id
-                            if linked.Status <> "Satisfied" then
-                                return! Error(StaleEntityVersion
-                                    ($"Challenge {dependency} is {linked.Status}; all must be Satisfied before requeue."))
+                    if not (List.isEmpty wait.ChallengeIds
+                            && List.isEmpty (ReviewWorkflow.waitReviewIds wait)) then
+                        let! complete =
+                            ReviewWorkflow.waitDependenciesComplete binding snapshot None None wait
+                        if not complete then
+                            return! Error(StaleEntityVersion "All linked challenges and reviews must be complete before requeue.")
                     let sequence = snapshot.Header.NextSequence
                     let timestamp = DateTimeOffset.UtcNow.ToString("O")
                     let nextGen = generation + 1

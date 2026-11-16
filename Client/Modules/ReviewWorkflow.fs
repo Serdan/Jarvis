@@ -349,6 +349,8 @@ type AttemptChallengeWait =
       OwnerAgentId: string
       Reason: string
       ChallengeIds: string list
+      // Optional for pre-review-wait schema-v2 records. ALL prerequisites apply.
+      ReviewIds: string list
       Status: string
       Version: int
       BlockedAtUtc: string
@@ -392,6 +394,7 @@ type AgentInbox =
       Parked: InboxTask list
       Blocked: InboxTask list
       BlockedChallengeWaits: AttemptChallengeWait list
+      AwaitedReviews: BranchReview list
       ChallengeSubscribed: bool
       ChallengeAssigned: InboxChallengeItem list
       ChallengeTriage: InboxChallengeItem list
@@ -500,6 +503,8 @@ module ReviewWorkflow =
                         // other notification members remain mandatory.
                         || (typeof<'t> = typeof<AgentNotification>
                             && property = "fromProjectName")
+                        || (typeof<'t> = typeof<AttemptChallengeWait>
+                            && property = "reviewIds")
                         || (typeof<'t> = typeof<TaskLifecycleEvent>
                             && List.contains property
                                 [ "requestingAgentId"; "targetAgentId"
@@ -537,11 +542,11 @@ module ReviewWorkflow =
                     | "ReviewFeedbackNotice" -> status "status" [ "Accepted"; "ChangesRequested" ]
                     | "AgentCheckpoint" -> status "kind" [ "Yield"; "Completion"; "Recovery"; "Progress"; "Submission"; "Revision" ]
                     | "TaskLifecycleEvent" ->
-                        status "action" [ "WaitOnChallenges"; "RequeueChallengeBlockedAttempt";
+                        status "action" [ "WaitOnChallenges"; "WaitOnDependencies"; "RequeueChallengeBlockedAttempt"; "RequeueReviewBlockedAttempt";
                                           "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "CancelTask";
                                           "AbandonAttempt"; "TransferOwner"; "CloseTask"; "ReopenTask"; "CorrectAgentWorkingState" ]
                     | "AssignmentIssue" ->
-                        status "reason" [ "ChallengeUnblock"; "Assignment"; "ReviewChanges"; "CompletionRequeue"; "Recovery"; "ExplicitReissue"; "AdministrativeResume"; "OwnershipTransfer"; "SpecAdoption" ]
+                        status "reason" [ "ChallengeUnblock"; "ReviewUnblock"; "Assignment"; "ReviewChanges"; "CompletionRequeue"; "Recovery"; "ExplicitReissue"; "AdministrativeResume"; "OwnershipTransfer"; "SpecAdoption" ]
                     | "AssignmentReceipt" -> true
                     | _ -> true
                 if not unique then Error "Duplicate entity JSON member."
@@ -598,6 +603,8 @@ module ReviewWorkflow =
     // owner rather than scanning historical task records at every transition.
     let internal challengeWaitIndexPrefix challengeId =
         $"challenge-waits/by-challenge/{challengeId}"
+    let internal reviewWaitIndexPrefix taskId reviewId =
+        $"challenge-waits/by-review/{taskId}/{reviewId}"
     let internal ownerWaitIndexPrefix (ownerId: string) =
         let safe =
             Convert.ToBase64String(Encoding.UTF8.GetBytes ownerId)
@@ -694,6 +701,11 @@ module ReviewWorkflow =
                         if isNull notification.FromProjectName then
                             unbox<'t>(box { notification with FromProjectName = "" })
                         else parsed
+                    elif typeof<'t> = typeof<AttemptChallengeWait> && not (isNull (box parsed)) then
+                        let wait = unbox<AttemptChallengeWait>(box parsed)
+                        if isNull (box wait.ReviewIds) then
+                            unbox<'t>(box { wait with ReviewIds = [] })
+                        else parsed
                     else parsed
                 if isNull (box parsed) then
                     Error(LedgerIntegrityError $"Null ledger entity: {path}")
@@ -768,6 +780,75 @@ module ReviewWorkflow =
             return issuance
         }
 
+    let internal waitReviewIds (wait: AttemptChallengeWait) =
+        if isNull (box wait.ReviewIds) then [] else wait.ReviewIds
+
+    // All dependency checks use one pinned ledger snapshot. A terminal record
+    // currently being written may be supplied as an override by the same CAS
+    // transaction, so a decision/block race cannot miss its final wakeup.
+    let private challengeSatisfiedAt binding snapshot (justCompleted: string option) challengeId = result {
+        match Guid.TryParseExact(challengeId, "N") with
+        | false, _ -> return! Error(LedgerIntegrityError "Invalid stored challenge dependency UUID.")
+        | true, _ ->
+            if justCompleted = Some challengeId then return true
+            else
+                let file = $"challenges/{challengeId}/challenge.json"
+                let! content, blob = LedgerStore.readAt binding snapshot file
+                match content, blob with
+                | Some body, Some _ ->
+                    try
+                        use doc = JsonDocument.Parse(body)
+                        let root = doc.RootElement
+                        let conditions =
+                            root.GetProperty("conditions").EnumerateArray()
+                            |> Seq.map (fun c -> c.GetProperty("status").GetString())
+                            |> Seq.toList
+                        let state = root.GetProperty("status").GetString()
+                        if root.GetProperty("schemaVersion").GetInt32() <> 2
+                           || root.GetProperty("challengeId").GetString() <> challengeId
+                           || root.GetProperty("completionPolicy").GetString() <> "All"
+                           || List.isEmpty conditions
+                           || (state = "Satisfied" && not (conditions |> List.forall ((=) "Satisfied"))) then
+                            return! Error(LedgerIntegrityError "Dependency challenge identity mismatch.")
+                        return state = "Satisfied"
+                    with ex ->
+                        return! Error(LedgerIntegrityError ("Invalid dependency challenge: " + ex.Message))
+                | _ -> return! Error(LedgerIntegrityError "Dependency challenge is missing.")
+    }
+
+    let private reviewCompletedAt binding snapshot (justCompleted: (string * string * string) option)
+                                  taskId reviewId = result {
+        match Guid.TryParseExact(reviewId, "N") with
+        | false, _ -> return! Error(LedgerIntegrityError "Invalid stored review dependency UUID.")
+        | true, _ ->
+            let! status =
+                match justCompleted with
+                | Some (updatedTask, updatedReview, updatedStatus)
+                    when updatedTask = taskId && updatedReview = reviewId -> Ok updatedStatus
+                | _ ->
+                    required<BranchReview> binding snapshot (branchReviewPath taskId reviewId)
+                    |> Result.bind (fun (review, _) ->
+                        if review.TaskId <> taskId || review.ReviewId <> reviewId then
+                            Error(LedgerIntegrityError "Review dependency identity mismatch.")
+                        else Ok review.Status)
+            return List.contains status [ "Accepted"; "ChangesRequested"; "Withdrawn" ]
+    }
+
+    let internal waitDependenciesComplete binding snapshot justChallenge justReview
+                                          (wait: AttemptChallengeWait) = result {
+        let challengeIds =
+            if isNull (box wait.ChallengeIds) then [] else wait.ChallengeIds
+        let reviewIds = waitReviewIds wait
+        let mutable complete = not (List.isEmpty challengeIds && List.isEmpty reviewIds)
+        for challengeId in challengeIds do
+            let! satisfied = challengeSatisfiedAt binding snapshot justChallenge challengeId
+            if not satisfied then complete <- false
+        for reviewId in reviewIds do
+            let! terminal = reviewCompletedAt binding snapshot justReview wait.TaskId reviewId
+            if not terminal then complete <- false
+        return complete
+    }
+
     // Called by canonical agent-slot release transitions. Eligibility is
     // durable; release requeues at most one blocked attempt and never preempts
     // an occupied owner or enters Working.
@@ -809,35 +890,8 @@ module ReviewWorkflow =
                            && attempt.AttemptId = wait.AttemptId
                            && attempt.AssignmentGeneration = locator.AssignmentGeneration
                            && attempt.OwnerAgentId = ownerId && attempt.Phase = "Blocked" then
-                            let mutable satisfied = not (List.isEmpty wait.ChallengeIds)
-                            for dependency in wait.ChallengeIds do
-                                match Guid.TryParseExact(dependency, "N") with
-                                | false, _ -> return! Error(LedgerIntegrityError "Invalid stored challenge UUID.")
-                                | true, id ->
-                                    let path = "challenges/" + id.ToString("N") + "/challenge.json"
-                                    let! content, oid = LedgerStore.readAt binding snapshot path
-                                    match content, oid with
-                                    | Some body, Some _ ->
-                                        try
-                                            use doc = JsonDocument.Parse(body)
-                                            let root = doc.RootElement
-                                            let conditions =
-                                                root.GetProperty("conditions").EnumerateArray()
-                                                |> Seq.map (fun c -> c.GetProperty("status").GetString())
-                                                |> Seq.toList
-                                            let state = root.GetProperty("status").GetString()
-                                            if root.GetProperty("schemaVersion").GetInt32() <> 2
-                                               || root.GetProperty("challengeId").GetString() <> dependency
-                                               || root.GetProperty("completionPolicy").GetString() <> "All"
-                                               || List.isEmpty conditions
-                                               || (state = "Satisfied"
-                                                   && not (conditions |> List.forall ((=) "Satisfied"))) then
-                                                return! Error(LedgerIntegrityError "Dependency challenge identity mismatch.")
-                                            if state <> "Satisfied" then
-                                                satisfied <- false
-                                        with ex ->
-                                            return! Error(LedgerIntegrityError ("Invalid dependency challenge: " + ex.Message))
-                                    | _ -> return! Error(LedgerIntegrityError "Dependency challenge is missing.")
+                            let! satisfied =
+                                waitDependenciesComplete binding snapshot None None wait
                             if satisfied then
                                 let sequence = snapshot.Header.NextSequence
                                 let timestamp = DateTimeOffset.UtcNow.ToString("O")
@@ -883,6 +937,122 @@ module ReviewWorkflow =
                                 claimed <- true
             return updated, writes
     }
+    // One wake path for challenge satisfaction and review terminal outcomes.
+    // The reverse index selects candidates, while the canonical wait, attempt,
+    // owner and all prerequisites are rechecked in the same CAS transaction.
+    type CompletedWaitDependency =
+        | CompletedChallenge of challengeId: string
+        | CompletedReview of taskId: string * reviewId: string * status: string
+
+    let internal wakeDependencyWaits binding snapshot (operationId: Guid) actor
+                                     completion timestamp = result {
+        let prefix, justChallenge, justReview, dependencyId, reason, issueReason, auditAction =
+            match completion with
+            | CompletedChallenge id ->
+                challengeWaitIndexPrefix id, Some id, None, id,
+                "All explicitly linked dependencies completed",
+                "ChallengeUnblock", "RequeueChallengeBlockedAttempt"
+            | CompletedReview (taskId, id, status) ->
+                reviewWaitIndexPrefix taskId id, None, Some(taskId, id, status), id,
+                "All explicitly linked dependencies completed",
+                "ReviewUnblock", "RequeueReviewBlockedAttempt"
+        let! paths = LedgerStore.listAt binding snapshot prefix
+        let linked = paths |> List.filter (fun p -> p.EndsWith(".json", StringComparison.Ordinal))
+                           |> List.sort
+        let mutable writes : LedgerFileChange list = []
+        let mutable claimedOwners = Set.empty<string>
+        for indexPath in linked do
+            let! locator, _ = required<AttemptChallengeWaitIndex> binding snapshot indexPath
+            if indexPath <> waitIndexPath prefix locator.TaskId locator.AttemptId locator.AssignmentGeneration
+               || locator.AssignmentGeneration < 1 then
+                return! Error(LedgerIntegrityError "Dependency wait-index identity mismatch.")
+            let file = challengeWaitPath locator.TaskId locator.AttemptId
+            let! wait, waitOid = required<AttemptChallengeWait> binding snapshot file
+            if file <> challengeWaitPath wait.TaskId wait.AttemptId then
+                return! Error(LedgerIntegrityError "Dependency wait identity/path mismatch.")
+            let linkedToEvent =
+                match completion with
+                | CompletedChallenge _ -> List.contains dependencyId wait.ChallengeIds
+                | CompletedReview (taskId, _, _) ->
+                    wait.TaskId = taskId && List.contains dependencyId (waitReviewIds wait)
+            if wait.Status = "Waiting" && wait.OwnerAgentId = locator.OwnerAgentId
+               && wait.TaskId = locator.TaskId && wait.AttemptId = locator.AttemptId
+               && linkedToEvent then
+                let! complete =
+                    waitDependenciesComplete binding snapshot justChallenge justReview wait
+                if complete then
+                    let! task, _ = required<ReviewTask> binding snapshot (taskPath wait.TaskId)
+                    let! attempt, attemptOid =
+                        required<ReviewAttempt> binding snapshot (attemptPath wait.TaskId wait.AttemptId)
+                    let! owner, ownerOid =
+                        required<ReviewAgent> binding snapshot (agentPath wait.OwnerAgentId)
+                    // A cancelled, superseded, closed or replaced attempt is inert.
+                    if task.TaskId = wait.TaskId && task.Lifecycle = "InProgress"
+                       && task.AttemptId = wait.AttemptId && attempt.TaskId = wait.TaskId
+                       && attempt.AttemptId = wait.AttemptId
+                       && attempt.AssignmentGeneration = locator.AssignmentGeneration
+                       && attempt.OwnerAgentId = wait.OwnerAgentId && attempt.Phase = "Blocked" then
+                        let free =
+                            isNull (box owner.CurrentAssignment) && owner.Execution = "Stopped"
+                            && owner.UnassignedDisposition = "NeedsWork"
+                            && not (Set.contains owner.AgentId claimedOwners)
+                        if free then
+                            let sequence = snapshot.Header.NextSequence
+                            let generation = attempt.AssignmentGeneration + 1
+                            let nextAttempt =
+                                { attempt with Version = attempt.Version + 1
+                                               Phase = "Queued"
+                                               AssignmentGeneration = generation
+                                               IssuedSequence = sequence }
+                            let nextOwner =
+                                { owner with Version = owner.Version + 1
+                                             CurrentAssignment = { TaskId = wait.TaskId; AttemptId = wait.AttemptId }
+                                             Execution = "Stopped"; UnassignedDisposition = null
+                                             StateReason = reason; StateSequence = sequence
+                                             StateEnteredAtUtc = timestamp
+                                             WorkingTurnStartedAtUtc = null
+                                             ActiveSessionId = null; AssociatedSessionIds = [] }
+                            let nextWait =
+                                { wait with Version = wait.Version + 1
+                                            Status = "Requeued"; RequeuedAtUtc = timestamp }
+                            let reviewId, reviewDisposition =
+                                match completion with
+                                | CompletedChallenge _ -> null, "Unchanged"
+                                | CompletedReview (_, id, status) -> id, status
+                            let audit : TaskLifecycleEvent =
+                                { TaskId = wait.TaskId; AttemptId = wait.AttemptId
+                                  OperationId = operationId.ToString("D")
+                                  Sequence = sequence; Action = auditAction
+                                  ActorId = actor; Reason = reason
+                                  PreviousLifecycle = task.Lifecycle; NewLifecycle = task.Lifecycle
+                                  PreviousPhase = "Blocked"; NewPhase = "Queued"
+                                  PreviousOwnerId = wait.OwnerAgentId
+                                  NewOwnerId = wait.OwnerAgentId
+                                  PreviousGeneration = attempt.AssignmentGeneration
+                                  NewGeneration = generation
+                                  ReviewRequestId = reviewId
+                                  ReviewDisposition = reviewDisposition; Evidence = null
+                                  RequestingAgentId = null; TargetAgentId = null
+                                  PreviousAgentState = null; NewAgentState = null
+                                  PreviousAgentVersion = 0; NewAgentVersion = 0 }
+                            writes <- [
+                                change file (Some waitOid) nextWait
+                                change (attemptPath wait.TaskId wait.AttemptId) (Some attemptOid) nextAttempt
+                                change (agentPath owner.AgentId) (Some ownerOid) nextOwner
+                                change (issuePath wait.TaskId wait.AttemptId generation) None
+                                    (issue wait.TaskId nextAttempt generation actor issueReason reason sequence)
+                                change (lifecycleEventPath wait.TaskId sequence) None audit
+                            ] @ writes
+                            claimedOwners <- Set.add owner.AgentId claimedOwners
+                        else
+                            // Another assignment or an explicit Parked state
+                            // cannot be preempted. Owner-slot release reconciles
+                            // the durable Eligible wait later.
+                            writes <- change file (Some waitOid)
+                                          { wait with Version = wait.Version + 1; Status = "Eligible" } :: writes
+        return List.rev writes
+    }
+
     let createTaskWithSpecAs binding actor operationId taskId title html =
         if not (validTaskId taskId) || not (validText 512 title)
            || not (validTaskHtml html) then
@@ -3260,8 +3430,31 @@ module ReviewWorkflow =
                                || not (List.contains record.Status [ "Waiting"; "Eligible" ]) then
                                 return! Error(LedgerIntegrityError "Blocked challenge dependency record disagrees with its attempt.")
                             blockedWaits <- record :: blockedWaits
+                    // Preserve the exact status of linked reviews in ordinary
+                    // self-inbox even after a Withdrawn review wakes its owner
+                    // (withdrawals have no UnacknowledgedFeedback notice).
+                    let mutable awaitedReviews = []
+                    for entry in owned do
+                        let! waiting = read<AttemptChallengeWait> binding snapshot
+                                           (challengeWaitPath entry.Task.TaskId entry.Attempt.AttemptId)
+                        match waiting with
+                        | Some (wait, _) when wait.OwnerAgentId = agentId
+                                              && wait.TaskId = entry.Task.TaskId
+                                              && wait.AttemptId = entry.Attempt.AttemptId ->
+                            for reviewId in waitReviewIds wait do
+                                let! review =
+                                    requiredFromRecords<BranchReview> records
+                                        (branchReviewPath wait.TaskId reviewId)
+                                if review.TaskId <> wait.TaskId || review.ReviewId <> reviewId
+                                   || review.OwnerAgentId <> agentId then
+                                    return! Error(LedgerIntegrityError "Awaited review identity mismatch.")
+                                awaitedReviews <- review :: awaitedReviews
+                        | _ -> ()
                     let reviewOrder (review: BranchReview) =
                         review.CreatedSequence, review.TaskId, review.ReviewId
+                    let awaitedReviews =
+                        awaitedReviews |> List.distinctBy (fun r -> r.TaskId, r.ReviewId)
+                                       |> List.sortBy reviewOrder
                     let pending = pending |> List.sortBy reviewOrder
                     let available = available |> List.sortBy reviewOrder
                     return
@@ -3275,6 +3468,7 @@ module ReviewWorkflow =
                           Parked = parked
                           Blocked = blocked
                           BlockedChallengeWaits = List.rev blockedWaits
+                          AwaitedReviews = awaitedReviews
                           ChallengeSubscribed = false
                           ChallengeAssigned = []
                           ChallengeTriage = []
@@ -3486,10 +3680,13 @@ module ReviewWorkflow =
                     if review.Status <> "Claimed" || review.Version <> expectedVersion
                        || review.ReviewerId <> reviewerId then
                         return! Error(ReviewVersionConflict "Review claim has changed.")
+                    let! wakeups =
+                        wakeDependencyWaits binding snapshot operationId reviewerId
+                            (CompletedReview(taskId, id, status)) (DateTimeOffset.UtcNow.ToString("O"))
                     return [ change (branchReviewPath taskId id) (Some oid)
                                 { review with Version = review.Version + 1; Status = status
                                               DecisionSequence = snapshot.Header.NextSequence
-                                              Acknowledged = false } ]
+                                              Acknowledged = false } ] @ wakeups
                 })
 
     let acknowledgeBranchReview binding operationId taskId ownerId decisionSequence =
@@ -3547,8 +3744,11 @@ module ReviewWorkflow =
                        || not (List.contains review.Status [ "Unclaimed"; "Claimed" ])
                        then
                         return! Error(ReviewVersionConflict "Review status or version changed.")
+                    let! wakeups =
+                        wakeDependencyWaits binding snapshot operationId actorId
+                            (CompletedReview(taskId, id, "Withdrawn")) (DateTimeOffset.UtcNow.ToString("O"))
                     return [ change (branchReviewPath taskId id) (Some oid)
-                                { review with Version = review.Version + 1; Status = "Withdrawn" } ]
+                                { review with Version = review.Version + 1; Status = "Withdrawn" } ] @ wakeups
                 })
 
     let branchReviewerQueue binding reviewerId =

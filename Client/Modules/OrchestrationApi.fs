@@ -2761,10 +2761,10 @@ module ChallengeApi =
                                         cmd.ChallengeId cmd.ExpectedVersion cmd.Reason
                                     |> mapError
                                 | "BlockAttempt" ->
-                                    ChallengeWorkflow.ChallengeWorkflow.blockAttempt binding operationId cmd.ActorId
+                                    ChallengeWorkflow.ChallengeWorkflow.blockOnDependencies binding operationId cmd.ActorId
                                         cmd.TaskId cmd.AttemptId
                                         cmd.ExpectedTaskVersion cmd.ExpectedAttemptVersion cmd.ExpectedAgentVersion
-                                        cmd.AssignmentGeneration cmd.Reason cmd.DependencyChallengeIds
+                                        cmd.AssignmentGeneration cmd.Reason cmd.DependencyChallengeIds cmd.DependencyReviewIds
                                     |> mapError
                                 | "RequeueAttempt" ->
                                     ChallengeWorkflow.ChallengeWorkflow.requeueAttempt binding operationId cmd.ActorId

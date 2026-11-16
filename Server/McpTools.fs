@@ -2551,7 +2551,7 @@ type JarvisMcpTools =
         { ProjectName = projectName; ActorId = agentId; Action = action
           OperationId = operationId; ChallengeId = ""; ConditionId = ""
           ExpectedVersion = 0; Title = ""; TaskId = ""
-          AttemptId = ""; DependencyChallengeIds = []
+          AttemptId = ""; DependencyChallengeIds = []; DependencyReviewIds = []
           ExpectedTaskVersion = 0; ExpectedAttemptVersion = 0
           ExpectedAgentVersion = 0; AssignmentGeneration = 0
           Conditions = []; Evidence = ""; Reason = ""; Outcome = ""
@@ -2722,6 +2722,30 @@ type JarvisMcpTools =
             { cmd with
                 TaskId = taskId; AttemptId = attemptId; Reason = reason
                 DependencyChallengeIds = if isNull challengeIds then [] else challengeIds |> Array.toList
+                ExpectedTaskVersion = expectedTaskVersion
+                ExpectedAttemptVersion = expectedAttemptVersion
+                ExpectedAgentVersion = expectedAgentVersion
+                AssignmentGeneration = assignmentGeneration }
+        McpToolHelpers.send client http (ChallengeWriteCommand body)
+
+    [<McpServerTool(Title = "block on review dependencies", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("Optionally release your active implementation slot while waiting for one or more exact review request UUIDs, with optional challenge UUIDs. ALL prerequisites must complete. Review claims and decisions remain independent in the normal reviewer queue. Accepted, ChangesRequested and Withdrawn all complete a review prerequisite and requeue the eligible owner Ready; nothing automatically merges or closes. Requires exact task, attempt, agent versions and generation. No extra yield is needed.")>]
+    static member BlockOnReviewDependencies(
+        projectName: string, taskId: string, attemptId: string, agentId: string,
+        reason: string, reviewIds: string array, challengeIds: string array,
+        expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int,
+        assignmentGeneration: int,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        let cmd = JarvisMcpTools.ChallengeWrite(projectName, agentId, "BlockAttempt", operationId)
+        let body =
+            { cmd with
+                TaskId = taskId; AttemptId = attemptId; Reason = reason
+                DependencyChallengeIds = if isNull challengeIds then [] else challengeIds |> Array.toList
+                DependencyReviewIds = if isNull reviewIds then [] else reviewIds |> Array.toList
                 ExpectedTaskVersion = expectedTaskVersion
                 ExpectedAttemptVersion = expectedAttemptVersion
                 ExpectedAgentVersion = expectedAgentVersion

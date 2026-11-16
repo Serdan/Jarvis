@@ -32,7 +32,11 @@ type AgentRow =
       LatestNotification: string option
       /// Project aliases that can unambiguously identify local tool-call activity.
       /// The canonical Key is for selection and must not be reused for presence.
-      ActivityKeys: string list }
+      ActivityKeys: string list
+      /// Server-observed transient activity; absent after server restart.
+      LastSeenAt: DateTimeOffset option
+      LastSeenDevice: string option
+      Machines: string list }
 
 type ProjectCounts =
     { Tracked: int
@@ -294,7 +298,8 @@ let activityProject (target: ProjectPaths.ProjectTarget) =
 
 /// Seen timestamps come from explicit agent-attributed tool calls, not sessions.
 let lastSeenAt (agent: AgentRow) (seen: IDictionary<string, DateTimeOffset>) =
-    let mutable latest = None
+    // Global rows have no local activity keys: unknown remains unknown after restart.
+    let mutable latest = agent.LastSeenAt
     for key in agent.ActivityKeys do
         match seen.TryGetValue key with
         | true, timestamp ->
@@ -318,10 +323,21 @@ let private matchesTerms (terms: ActivityFilter.Terms) (row: AgentRow) =
     && (terms.Agents |> List.forall (fun term -> FilterSelectors.matchesAgentTerm term row.Agent))
     && ActivityFilter.matchesTerms { terms with Projects = []; Agents = [] } None searchable
 
-let visibleRows filter snapshot =
-    let terms = ActivityFilter.parseTerms filter
+let visibleRows (filter: string) (snapshot: Snapshot) =
+    // Optional explicit runtime provenance filter, independent of agent identity.
+    let words = filter.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+    let machine, general =
+        words |> Array.partition (fun (word: string) ->
+            word.StartsWith("machine:", StringComparison.OrdinalIgnoreCase))
+    let machines = machine |> Array.map (fun (word: string) -> word.Substring("machine:".Length))
+    let terms = ActivityFilter.parseTerms (String.concat " " general)
     rows snapshot
-    |> List.filter (fun row -> row.State <> "Parked" && matchesTerms terms row)
+    |> List.filter (fun row ->
+        row.State <> "Parked"
+        && matchesTerms terms row
+        && (machines |> Array.forall (fun (machine: string) ->
+            row.Machines |> List.exists (fun name ->
+                name.Contains(machine, StringComparison.OrdinalIgnoreCase)))))
 
 let displayState state = if state = "NeedsWork" then "Waiting" else state
 
@@ -441,3 +457,18 @@ let preserveTransientProjects (previous: Snapshot option) (latest: Snapshot) =
                     if row.ProjectLabel.EndsWith(" [STALE]", StringComparison.Ordinal) then row
                     else { row with ProjectLabel = row.ProjectLabel + " [STALE]" })
             { latest with Projects = projects; Agents = latest.Agents @ rows }
+
+/// Keep the last verified roster visible when the operator's server link is
+/// lost. A disconnected cache must never be presented as current.
+let offline (snapshot: Snapshot) (reason: string) =
+    let projects =
+        snapshot.Projects
+        |> List.map (fun project ->
+            { project with
+                Status = if project.Counts.IsSome then Stale else Unavailable
+                Error = Some reason })
+    { snapshot with
+        Projects = projects
+        Agents = snapshot.Agents |> List.map (fun row ->
+            if row.ProjectLabel.EndsWith(" [STALE]", StringComparison.Ordinal) then row
+            else { row with ProjectLabel = row.ProjectLabel + " [STALE]" }) }

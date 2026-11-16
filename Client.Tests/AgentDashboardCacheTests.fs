@@ -262,7 +262,10 @@ let private agentRow project name state unread =
        ReviewContext = None
        PendingNotifications = unread
        LatestNotification = None
-       ActivityKeys = [project + "::" + name] } : AgentView.AgentRow)
+       ActivityKeys = [project + "::" + name]
+       LastSeenAt = None
+       LastSeenDevice = None
+       Machines = [] } : AgentView.AgentRow)
 
 let private availableCounts project identity head agents unclaimed reviews : AgentDashboard.ProjectResult =
     { Project = project
@@ -529,3 +532,51 @@ let transientAliasesOfOneVerifiedLedgerDoNotDuplicateProjectTotals () =
     Assert.That(counts.Tracked, Is.EqualTo(1))
     Assert.That(counts.Unread, Is.EqualTo(2))
     Assert.That(counts.PendingReviews, Is.EqualTo(3))
+
+
+[<Test>]
+let globalRosterHydrationPreservesIndependentSameNamedLedgersAndActivity () =
+    let firstId = "a5db4af0dde4452eb337994e534abdf3:0edf788fb25e4b08ac5795cceea7d9c2:1"
+    let secondId = "b5db4af0dde4452eb337994e534abdf3:1edf788fb25e4b08ac5795cceea7d9c2:1"
+    let agent id =
+        ({ AgentId = id
+           State = "Ready"
+           StateEnteredAtUtc = Nullable<DateTimeOffset>()
+           StateReason = ""
+           Focus = Unchecked.defaultof<Common.SignalR.AgentRosterFocus>
+           RoleIds = [| "worker" |]
+           Activity = ""
+           ReviewContext = ""
+           PendingNotifications = 1
+           LatestNotification = "Review finished" }
+          : Common.SignalR.AgentRosterAgent)
+    let ledger id name agents =
+        ({ Identity = id; Head = String.replicate 40 "f"
+           ProjectName = name; Aliases = [| name |]
+           Agents = agents
+           UnclaimedReviews = 1; PendingReviews = 2 }
+          : Common.SignalR.AgentRosterLedger)
+    let entry id status agents =
+        ({ Identity = id; ProjectName = "Jarvis"; Aliases = [| "Jarvis" |]
+           Status = status; Error = ""; ProviderMachines = [| "Laptop" |]
+           Data = ledger id "Jarvis" agents }
+          : Common.SignalR.AgentRosterLedgerView)
+    let observed = DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero)
+    let view : Common.SignalR.AgentRosterView =
+        { Ledgers = [| entry firstId "Fresh" [| agent "Worker 7" |]
+                       entry secondId "Stale" [| agent "Worker 7" |] |]
+          Activity = [| { Identity = firstId; AgentId = "Worker 7"
+                          LastSeenAtUtc = observed; DeviceName = "Laptop" } |]
+          ServerNowUtc = observed }
+    let result = AgentDashboard.fromGlobalRoster view
+    Assert.That(result.Projects.Length, Is.EqualTo(2))
+    Assert.That(result.Agents.Length, Is.EqualTo(2))
+    Assert.That(result.Agents |> List.map _.Key |> List.distinct |> List.length, Is.EqualTo(2))
+    Assert.That(result.Projects |> List.map _.Identity |> List.distinct |> List.length, Is.EqualTo(2))
+    Assert.That(result.Agents |> List.map _.PendingNotifications |> List.sum, Is.EqualTo(2))
+    let known = result.Agents |> List.find (fun row -> row.Key.StartsWith(firstId))
+    let unknown = result.Agents |> List.find (fun row -> row.Key.StartsWith(secondId))
+    Assert.That(known.LastSeenAt, Is.EqualTo(Some observed))
+    Assert.That(known.LastSeenDevice, Is.EqualTo(Some "Laptop"))
+    Assert.That(unknown.LastSeenAt, Is.EqualTo(None))
+    Assert.That(result.Projects |> List.exists (fun p -> p.Status = AgentView.Stale), Is.True)

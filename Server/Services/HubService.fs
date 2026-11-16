@@ -8,7 +8,7 @@ open Microsoft.AspNetCore.SignalR
 open Microsoft.Extensions.Logging
 open Server
 
-type HubService(users: UserService, tracker: ClientResponseTracker, store: OptionalFeedbackStore, logger: ILogger<HubService>) =
+type HubService(users: UserService, tracker: ClientResponseTracker, store: OptionalFeedbackStore, roster: AgentRosterCache, logger: ILogger<HubService>) =
     inherit Hub<IClientService>()
 
     member private this.UserId =
@@ -105,10 +105,19 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Optio
         )
 
         users.Disconnect(this.Context.ConnectionId, reason)
-        base.OnDisconnectedAsync(error)
+        let refreshes =
+            roster.Disconnect(this.UserId, this.Context.ConnectionId)
+            |> List.map (fun dispatch ->
+                this.Clients.Client(dispatch.ConnectionId).RefreshAgentRoster(dispatch.Request))
+        let baseDisconnect = base.OnDisconnectedAsync(error)
+        Task.WhenAll(seq {
+            yield baseDisconnect
+            yield! refreshes
+        })
 
     member this.Connect(registration: ClientRegistration) =
         let result = users.Register(this.UserId, registration, this.Context.ConnectionId)
+        roster.ForgetDevice(this.UserId, registration.DeviceId)
         this.RecordConnectionEvent(
             "Registered",
             Some registration.DeviceId,
@@ -136,6 +145,42 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Optio
             Task.FromException<AgentActivitySnapshot>(
                 UnauthorizedAccessException("A registered Jarvis client is required to verify Manager activity."))
 
+    member private this.ActiveRosterSession() =
+        match users.GetSessionByConnection(this.Context.ConnectionId) with
+        | ValueSome session when session.State = Registered
+                                 && session.ConnectionId = Some this.Context.ConnectionId -> session
+        | _ -> raise (UnauthorizedAccessException("A registered Jarvis client is required for roster data."))
+
+    member private this.DispatchRoster(refreshes: RosterDispatch list) =
+        refreshes
+        |> List.map (fun dispatch ->
+            this.Clients.Client(dispatch.ConnectionId).RefreshAgentRoster(dispatch.Request))
+        |> Task.WhenAll
+
+    member this.AnnounceAgentLedgers(claims: AgentRosterClaim array) =
+        let session = this.ActiveRosterSession()
+        roster.Advertise(this.UserId, this.Context.ConnectionId, session.DeviceId,
+                         session.DeviceName, session.Generation, claims)
+        |> this.DispatchRoster
+
+    member this.SubmitAgentRoster(response: AgentRosterRefreshResponse) =
+        this.ActiveRosterSession() |> ignore
+        match roster.Complete(this.UserId, this.Context.ConnectionId, response) with
+        | Some dispatch -> this.DispatchRoster [dispatch]
+        | None -> Task.CompletedTask
+
+    member this.GetAgentRoster() =
+        this.ActiveRosterSession() |> ignore
+        task {
+            let refreshes = roster.RefreshDue(this.UserId)
+            if not refreshes.IsEmpty then
+                try
+                    do! this.DispatchRoster refreshes
+                with ex ->
+                    logger.LogWarning(ex, "Optional Agent roster refresh dispatch failed")
+            return roster.View(this.UserId)
+        }
+
     member this.SendClientResponse(correlationId: string, response: AgentCommandResponse) =
         users.TouchConnection(this.Context.ConnectionId)
         match users.GetSessionByConnection(this.Context.ConnectionId) with
@@ -150,5 +195,11 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Optio
         member this.Connect(registration) = this.Connect(registration)
 
         member this.GetAgentActivity(projectName, agentId) = this.GetAgentActivity(projectName, agentId)
+
+        member this.AnnounceAgentLedgers(claims) = this.AnnounceAgentLedgers(claims)
+
+        member this.SubmitAgentRoster(response) = this.SubmitAgentRoster(response)
+
+        member this.GetAgentRoster() = this.GetAgentRoster()
 
         member this.SendClientResponse(correlationId, result) = this.SendClientResponse(correlationId, result)

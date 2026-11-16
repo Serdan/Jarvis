@@ -117,6 +117,7 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
 
     services
         .AddSingleton<UserService>()
+        .AddSingleton<AgentRosterCache>()
         .AddSingleton<ClientResponseTracker>()
         .AddSingleton<ExportStore>(fun _ -> new ExportStore())
         // SQLite is optional diagnostics. Its initialization, lock acquisition

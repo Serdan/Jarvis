@@ -1042,8 +1042,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 if not row.RoleIds.IsEmpty then writeDetailField width "Roles" (String.concat ", " row.RoleIds)
                 row.Activity |> Option.iter (writeDetailField width "Activity")
                 row.ReviewContext |> Option.iter (writeDetailField width "Review")
+                if not row.Machines.IsEmpty then
+                    writeDetailField width "Connected machines" (String.concat ", " row.Machines)
                 seenAt row
                 |> Option.iter (fun seen -> writeDetailField width "Last seen" (seen.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")))
+                row.LastSeenDevice |> Option.iter (writeDetailField width "Last active machine")
                 if row.PendingNotifications > 0 then
                     writeDetailField width "Unread notifications" (string row.PendingNotifications)
                     row.LatestNotification |> Option.iter (writeDetailField width "Latest message")

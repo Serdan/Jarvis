@@ -15,3 +15,5 @@ type IClientService =
     abstract InvalidateAllAgentStates: unit -> Task
     /// Authenticated cross-device activity hint; never a canonical agent-state mutation.
     abstract RecordAgentActivity: projectName: string * agentId: string * observedAtUtc: System.DateTimeOffset -> Task
+    /// Ask one connected, ledger-owning client to refresh one canonical ledger.
+    abstract RefreshAgentRoster: request: AgentRosterRefreshRequest -> Task

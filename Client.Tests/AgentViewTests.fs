@@ -21,7 +21,10 @@ let private record project agent state task =
       ReviewContext = None
       PendingNotifications = 0
       LatestNotification = None
-      ActivityKeys = [project + "::" + agent] }
+      ActivityKeys = [project + "::" + agent]
+      LastSeenAt = None
+      LastSeenDevice = None
+      Machines = [] }
 
 let private focused =
     { TaskId = "320"
@@ -461,3 +464,49 @@ let missingNumericAndMultiwordAgentSelectorsNeverTurnIntoTaskText () =
     Assert.That(selected withSameProject "#Wayfold@Worker 1" =
                     Set.singleton "Wayfold::Worker 1", Is.True)
     Assert.That(selected withSameProject "#Wayfold@Worker 10", Is.Empty)
+
+
+[<Test>]
+let optionalMachineFilterUsesRuntimeProvenanceNotAgentIdentity () =
+    let alpha =
+        { record "Jarvis" "Worker 7" "Ready" None with
+            Machines = [ "Laptop"; "Desktop" ] }
+    let beta =
+        { record "Wayfold" "Worker 7" "Working" None with
+            Machines = [ "Kruso" ] }
+    let data = snapshot [ alpha; beta ]
+    visibleRows "machine:laptop" data |> List.map _.Project
+    |> shouldEqual [ "Jarvis" ]
+    visibleRows "machine:kruso" data |> List.map _.Project
+    |> shouldEqual [ "Wayfold" ]
+    visibleRows "machine:unknown" data |> shouldEqual []
+
+[<Test>]
+let remoteLastSeenDoesNotReadPersistedLocalMachineCache () =
+    let at = DateTimeOffset(2026, 11, 16, 8, 30, 0, TimeSpan.Zero)
+    let agent =
+        { record "Jarvis" "Worker 7" "Ready" None with
+            ActivityKeys = []
+            LastSeenAt = Some at
+            LastSeenDevice = Some "Kruso" }
+    let local = System.Collections.Generic.Dictionary<string, DateTimeOffset>()
+    local["Jarvis::Worker 7"] <- at.AddHours(2.)
+    lastSeenAt agent local |> shouldEqual (Some at)
+    lastSeenAt { agent with LastSeenAt = None } local |> shouldEqual None
+
+[<Test>]
+let offlineSnapshotMarksCachedLedgerRowsAndStatusStale () =
+    let agent = record "Jarvis" "Owner" "Ready" None
+    let project =
+        { Project = "Jarvis"
+          Aliases = [ "Jarvis" ]
+          Identity = "canonical:ledger:1"
+          Counts = Some(projectCounts [ agent ] 0)
+          Status = Fresh
+          Error = None }
+    let current =
+        { snapshot [ agent ] with Projects = [ project ] }
+    let result = offline current "Disconnected from server"
+    result.Projects.Head.Status |> shouldEqual Stale
+    result.Projects.Head.Error |> shouldEqual (Some "Disconnected from server")
+    result.Agents.Head.ProjectLabel |> shouldEqual "Jarvis [STALE]"

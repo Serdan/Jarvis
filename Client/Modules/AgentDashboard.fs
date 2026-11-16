@@ -5,6 +5,7 @@ open System.Collections.Concurrent
 open System.Collections.Generic
 open System.IO
 open System.Text.Json
+open Common.SignalR
 open Client.LedgerStore
 open Client.ReviewWorkflow
 open Client.RoleInstructions
@@ -229,7 +230,10 @@ let private projectSnapshot project identity binding snapshot =
                                    |> Option.map (fun review -> $"#{review.ReviewId} {review.Kind}")
                                PendingNotifications = notification.Pending
                                LatestNotification = notification.Latest
-                               ActivityKeys = [] } : AgentView.AgentRow)))
+                               ActivityKeys = []
+                               LastSeenAt = None
+                               LastSeenDevice = None
+                               Machines = [] } : AgentView.AgentRow)))
                 match firstError rows with
                 | Some error -> Error error
                 | None ->
@@ -428,3 +432,185 @@ let load rt =
                     Some { Project = project; Aliases = [project]; Result = Error reason }
                 | _ -> None)
         Ok (snapshotFromResults (Array.append fetched failures |> Array.toList))
+
+
+/// Discover trusted local ledger identities without fetching Git. The server
+/// deduplicates these claims across devices and chooses one refresh provider.
+let discoverClaims rt : Result<AgentRosterClaim array, string> =
+    match ProjectBrowser.listGitProjects rt with
+    | Error error -> Error (string error)
+    | Ok projects ->
+        let members =
+            projects
+            |> Seq.choose (fun (ProjectName project) ->
+                match inspectProject project rt with
+                | Ok (Some (binding, _)) -> Some (bindingIdentity binding, project)
+                | _ -> None)
+            |> Seq.groupBy fst
+            |> Seq.map (fun (identity, values) ->
+                let aliases =
+                    values |> Seq.map snd |> Seq.distinct |> Seq.sort |> Seq.toArray
+                { Identity = identity
+                  ProjectName = aliases[0]
+                  Aliases = aliases })
+            |> Seq.toArray
+        Ok members
+
+/// One verified Git fetch per requested ledger. The prior server-observed head
+/// is checked for ancestry by the owning client, so a lagging provider cannot
+/// replace a newer snapshot with an older commit.
+let readForRoster (request: AgentRosterRefreshRequest) rt : AgentRosterRefreshResponse =
+    let failed error =
+        { RequestId = request.RequestId; Identity = request.Identity
+          Data = Unchecked.defaultof<_>; Error = error }
+    try
+        match discoverClaims rt with
+        | Error error -> failed error
+        | Ok claims ->
+            match claims |> Array.tryFind (fun c ->
+                c.Identity = request.Identity && c.ProjectName = request.ProjectName) with
+            | None -> failed "Ledger advertisement no longer matches a trusted local binding."
+            | Some claim ->
+                match inspectProject claim.ProjectName rt with
+                | Error error -> failed (failureMessage error)
+                | Ok None -> failed "Local ledger binding disappeared."
+                | Ok (Some (binding, head)) ->
+                    let read = refreshGroup request.Identity
+                                   [| claim.ProjectName, binding, head |] rt
+                    match read.Result with
+                    | Error error -> failed (failureMessage error)
+                    | Ok data ->
+                        let monotonic =
+                            if String.IsNullOrWhiteSpace request.PreviousHead then Ok ()
+                            else
+                                LedgerStore.verifyTrustedHead binding request.PreviousHead data.Head
+                                |> Result.mapError string
+                        match monotonic with
+                        | Error error -> failed ("Snapshot ancestry could not be proven: " + error)
+                        | Ok () ->
+                            let wireFocus (focus: AgentView.TaskFocus option) =
+                                match focus with
+                                | None -> Unchecked.defaultof<AgentRosterFocus>
+                                | Some focus ->
+                                    { TaskId = focus.TaskId
+                                      Title = focus.Title
+                                      Lifecycle = focus.Lifecycle
+                                      Phase = focus.Phase
+                                      SourceRef = focus.SourceRef |> Option.defaultValue ""
+                                      BaseCommit = focus.BaseCommit |> Option.defaultValue ""
+                                      AssignmentGeneration = focus.AssignmentGeneration }
+                            let agents =
+                                data.Agents
+                                |> List.map (fun row ->
+                                    { AgentId = row.Agent
+                                      State = row.State
+                                      StateEnteredAtUtc = row.StateEnteredAt |> Option.toNullable
+                                      StateReason = row.StateReason |> Option.defaultValue ""
+                                      Focus = wireFocus row.Focus
+                                      RoleIds = row.RoleIds |> List.toArray
+                                      Activity = row.Activity |> Option.defaultValue ""
+                                      ReviewContext = row.ReviewContext |> Option.defaultValue ""
+                                      PendingNotifications = row.PendingNotifications
+                                      LatestNotification = row.LatestNotification |> Option.defaultValue "" })
+                                |> List.toArray
+                            { RequestId = request.RequestId; Identity = request.Identity
+                              Error = ""
+                              Data =
+                                { Identity = request.Identity; Head = data.Head
+                                  ProjectName = claim.ProjectName; Aliases = claim.Aliases
+                                  Agents = agents; UnclaimedReviews = data.UnclaimedReviews
+                                  PendingReviews = data.PendingReviews } }
+    with ex ->
+        failed ("Client roster inspection failed: " + ex.Message)
+
+/// Rehydrate a display-only snapshot; never use these data to authorize local
+/// operations. Missing remote last-seen data stays unknown, even if a local
+/// activity file contains timestamps from a previous server lifetime.
+let fromGlobalRoster (view: AgentRosterView) : AgentView.Snapshot =
+    let status (entry: AgentRosterLedgerView) =
+        match entry.Status with
+        | "Fresh" -> AgentView.Fresh
+        | "Refreshing" -> AgentView.TemporarilyUnavailable
+        | "Stale" -> AgentView.Stale
+        | _ -> AgentView.Unavailable
+    let counts (entry: AgentRosterLedgerView) =
+        if isNull (box entry.Data) then None
+        else
+            let agents = entry.Data.Agents
+            let count state = agents |> Array.sumBy (fun a -> if a.State = state then 1 else 0)
+            Some ({ Tracked = agents.Length
+                    UnclaimedReviews = entry.Data.UnclaimedReviews
+                    PendingReviews = entry.Data.PendingReviews
+                    Unread = agents |> Array.sumBy _.PendingNotifications
+                    Working = count "Working"
+                    Ready = count "Ready"
+                    Waiting = count "NeedsWork"
+                    Parked = count "Parked" } : AgentView.ProjectCounts)
+    let summaries =
+        view.Ledgers
+        |> Array.map (fun entry ->
+            ({ Project = entry.ProjectName
+               Aliases = entry.Aliases |> Array.toList
+               Identity = entry.Identity
+               Counts = counts entry
+               Status = status entry
+               Error = if String.IsNullOrWhiteSpace entry.Error then None else Some entry.Error }
+                : AgentView.ProjectSummary))
+        |> Array.toList
+    let skeleton : AgentView.Snapshot =
+        { Agents = []; Projects = summaries; Issues = []; RefreshedAt = view.ServerNowUtc }
+    let devices =
+        view.Activity
+        |> Array.map (fun item -> (item.Identity, item.AgentId), item)
+        |> Map.ofArray
+    let rows =
+        view.Ledgers
+        |> Array.collect (fun ledger ->
+            if isNull (box ledger.Data) then [||]
+            else
+                let summary = summaries |> List.find (fun s -> s.Identity = ledger.Identity)
+                let projectLabel =
+                    let label = AgentView.projectDisplayName skeleton summary
+                    if summary.Status = AgentView.Fresh then label
+                    else label + " [STALE]"
+                ledger.Data.Agents
+                |> Array.map (fun agent ->
+                    let activity = devices |> Map.tryFind (ledger.Identity, agent.AgentId)
+                    let focus =
+                        if isNull (box agent.Focus) then None
+                        else
+                            Some ({ TaskId = agent.Focus.TaskId
+                                    Title = agent.Focus.Title
+                                    Lifecycle = agent.Focus.Lifecycle
+                                    Phase = agent.Focus.Phase
+                                    SourceRef = Option.ofObj agent.Focus.SourceRef
+                                                |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                                    BaseCommit = Option.ofObj agent.Focus.BaseCommit
+                                                 |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                                    AssignmentGeneration = agent.Focus.AssignmentGeneration }
+                                   : AgentView.TaskFocus)
+                    ({ Key = ledger.Identity + "::" + agent.AgentId
+                       Agent = agent.AgentId
+                       Project = ledger.ProjectName
+                       ProjectLabel = projectLabel
+                       ProjectAliases = ledger.Aliases |> Array.toList
+                       State = agent.State
+                       StateEnteredAt = if agent.StateEnteredAtUtc.HasValue then
+                                            Some agent.StateEnteredAtUtc.Value else None
+                       StateReason = Option.ofObj agent.StateReason
+                                     |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                       Focus = focus
+                       RoleIds = agent.RoleIds |> Array.toList
+                       Activity = Option.ofObj agent.Activity
+                                  |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                       ReviewContext = Option.ofObj agent.ReviewContext
+                                       |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                       PendingNotifications = agent.PendingNotifications
+                       LatestNotification = Option.ofObj agent.LatestNotification
+                                            |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                       ActivityKeys = []
+                       LastSeenAt = activity |> Option.map _.LastSeenAtUtc
+                       LastSeenDevice = activity |> Option.map _.DeviceName
+                       Machines = ledger.ProviderMachines |> Array.toList } : AgentView.AgentRow)))
+        |> Array.toList
+    { skeleton with Agents = rows }

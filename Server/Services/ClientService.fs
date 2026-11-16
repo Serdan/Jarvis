@@ -165,7 +165,7 @@ module AgentStateInvalidationRouting =
                 project, (changes |> List.map _.AgentId |> List.distinct |> List.toArray))
 
 
-type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker, http: IHttpContextAccessor, logger: ILogger<ClientService>) =
+type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker, roster: AgentRosterCache, http: IHttpContextAccessor, logger: ILogger<ClientService>) =
     // Cross-device hints are nonauthoritative. Allow only one pending batch
     // globally: a hung SignalR recipient cannot create an unbounded backlog
     // of tasks, closures or device snapshots under sustained MCP traffic.
@@ -328,7 +328,9 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                             when not (String.IsNullOrWhiteSpace actor) &&
                                  not (String.IsNullOrWhiteSpace project) &&
                                  AgentCommandInfo.isAgentActivity command ->
-                            this.RecordAgentActivityForUser(userId, project, actor, DateTimeOffset.UtcNow)
+                            let seenAt = DateTimeOffset.UtcNow
+                            roster.RecordActivity(userId, session.DeviceId, project, actor, seenAt)
+                            this.RecordAgentActivityForUser(userId, project, actor, seenAt)
                             |> ignore
                         | _ -> ()
                         try

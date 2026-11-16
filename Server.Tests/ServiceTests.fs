@@ -338,7 +338,7 @@ let ``client service rejects commands not negotiated by the registered client`` 
         )
         |> ignore
 
-        let client = ClientService(Unchecked.defaultof<_>, users, ClientResponseTracker(),
+        let client = ClientService(Unchecked.defaultof<_>, users, ClientResponseTracker(), AgentRosterCache(),
                                    Microsoft.AspNetCore.Http.HttpContextAccessor(),
                                    Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
         let command =
@@ -1606,6 +1606,7 @@ let client_request_abort_cancels_outstanding_device_correlation_without_faulting
             TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously)
         let recipient =
             { new Common.SignalR.IClientService with
+                member _.RefreshAgentRoster(_) = Task.CompletedTask
                 member _.ReceiveMessage(_) = Task.CompletedTask
                 member _.ReceiveSourceCommand(_, _, _, _) = Task.CompletedTask
                 member _.ReceiveCommand(correlationId, _, _) =
@@ -1637,7 +1638,7 @@ let client_request_abort_cancels_outstanding_device_correlation_without_faulting
         context.RequestAborted <- abort.Token
         let http = Microsoft.AspNetCore.Http.HttpContextAccessor()
         http.HttpContext <- context
-        let service = ClientService(hub, users, tracker, http, Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
+        let service = ClientService(hub, users, tracker, AgentRosterCache(), http, Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
         let pending = service.SendCommandToUser(user, ListProjectsCommand)
         let! correlationId = dispatched.Task.WaitAsync(TimeSpan.FromSeconds(4.))
         abort.Cancel()
@@ -1702,6 +1703,7 @@ let post_commit_uncertain_client_reply_remains_unknown_across_server_dispatch_an
         let mutable cacheInvalidations = 0
         let recipient =
             { new Common.SignalR.IClientService with
+                member _.RefreshAgentRoster(_) = Task.CompletedTask
                 member _.ReceiveMessage(_) = Task.CompletedTask
                 member _.ReceiveSourceCommand(_, _, _, _) = Task.CompletedTask
                 member _.ReceiveCommand(correlationId, commandJson, _) =
@@ -1745,7 +1747,7 @@ let post_commit_uncertain_client_reply_remains_unknown_across_server_dispatch_an
         let http = Microsoft.AspNetCore.Http.HttpContextAccessor()
         http.HttpContext <- Microsoft.AspNetCore.Http.DefaultHttpContext()
         let service =
-            ClientService(hub, users, tracker, http,
+            ClientService(hub, users, tracker, AgentRosterCache(), http,
                 Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
         let! response = service.SendCommandToUser(user, request)
         Assert.That(working, Is.True, "The injected activation committed before the response error.")
@@ -1935,6 +1937,7 @@ let private routedNotificationFixtureWithReceipt (sourceReceipt: AgentInboxActiv
         Assert.That(users.SelectConversationDevice(userId, "route-test", "first"), Is.True)
         let recipient (connectionId: string) =
             { new Common.SignalR.IClientService with
+                member _.RefreshAgentRoster(_) = Task.CompletedTask
                 member _.ReceiveMessage(_) = Task.CompletedTask
                 member _.ReceiveSourceCommand(_, _, _, _) = Task.CompletedTask
                 member _.InvalidateAgentStates(_, _) = Task.CompletedTask
@@ -1967,7 +1970,7 @@ let private routedNotificationFixtureWithReceipt (sourceReceipt: AgentInboxActiv
                 member _.Groups = Unchecked.defaultof<_> }
         let http = Microsoft.AspNetCore.Http.HttpContextAccessor()
         http.HttpContext <- Microsoft.AspNetCore.Http.DefaultHttpContext()
-        let service = ClientService(hub, users, tracker, http,
+        let service = ClientService(hub, users, tracker, AgentRosterCache(), http,
             Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
         let notification : TaskWriteCommand =
             { ProjectName = "Wayfold"; Action = "NotifyAgent"; OperationId = Guid.NewGuid().ToString("D")
@@ -2213,6 +2216,7 @@ let browser_dom_mcp_tools_route_only_when_all_required_oauth_scopes_are_present 
     let dispatched = ResizeArray<AgentCommand>()
     let recipient =
         { new Common.SignalR.IClientService with
+            member _.RefreshAgentRoster(_) = Task.CompletedTask
             member _.ReceiveMessage(_) = Task.CompletedTask
             member _.ReceiveSourceCommand(_, _, _, _) = Task.CompletedTask
             member _.ReceiveCommand(correlationId, commandJson, _) =
@@ -2254,7 +2258,7 @@ let browser_dom_mcp_tools_route_only_when_all_required_oauth_scopes_are_present 
     context.RequestServices <- provider
     let accessor = Microsoft.AspNetCore.Http.HttpContextAccessor()
     accessor.HttpContext <- context
-    let client = ClientService(hub, users, tracker, accessor, Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
+    let client = ClientService(hub, users, tracker, AgentRosterCache(), accessor, Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
 
     let setScopes scopes =
         let identity =
@@ -2335,6 +2339,7 @@ let attributed_tool_dispatch_survives_missing_sqlite_and_notifies_only_user_devi
                      AgentStateChanges = []; InboxActivation = None; PendingJob = None }
     let recipient connection =
         { new Common.SignalR.IClientService with
+            member _.RefreshAgentRoster(_) = Task.CompletedTask
             member _.ReceiveMessage(_) = Task.CompletedTask
             member _.ReceiveSourceCommand(_, _, _, _) = Task.CompletedTask
             member _.ReceiveCommand(correlationId, _, _) =
@@ -2364,7 +2369,7 @@ let attributed_tool_dispatch_survives_missing_sqlite_and_notifies_only_user_devi
             member _.Groups = Unchecked.defaultof<_> }
     let accessor = Microsoft.AspNetCore.Http.HttpContextAccessor()
     accessor.HttpContext <- Microsoft.AspNetCore.Http.DefaultHttpContext()
-    let service = ClientService(hub, users, tracker, accessor,
+    let service = ClientService(hub, users, tracker, AgentRosterCache(), accessor,
         Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
     let run =
         RunCommandCommand
@@ -2393,7 +2398,7 @@ let attributed_tool_dispatch_survives_missing_sqlite_and_notifies_only_user_devi
     // Missing or corrupt SQLite is irrelevant to tool dispatch; simulated
     // server service replacement retains in-memory session routing here.
     let beforeRestart = deliveredCommands
-    let restartedService = ClientService(hub, users, tracker, accessor,
+    let restartedService = ClientService(hub, users, tracker, AgentRosterCache(), accessor,
         Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
     let! afterRestart =
         restartedService.SendCommandToUser("alice", run, deviceId = "laptop", agentId = "Manager")
@@ -2426,6 +2431,7 @@ let stalled_cross_device_activity_hints_drop_without_unbounded_tasks_or_blocking
           AgentStateChanges = []; InboxActivation = None; PendingJob = None }
     let recipient connection =
         { new IClientService with
+            member _.RefreshAgentRoster(_) = Task.CompletedTask
             member _.ReceiveMessage(_) = Task.CompletedTask
             member _.ReceiveCommand(correlationId, _, _) =
                 System.Threading.Interlocked.Increment(&commands) |> ignore
@@ -2460,7 +2466,7 @@ let stalled_cross_device_activity_hints_drop_without_unbounded_tasks_or_blocking
             member _.Groups = Unchecked.defaultof<_> }
     let accessor = Microsoft.AspNetCore.Http.HttpContextAccessor()
     accessor.HttpContext <- Microsoft.AspNetCore.Http.DefaultHttpContext()
-    let service = ClientService(hub, users, tracker, accessor,
+    let service = ClientService(hub, users, tracker, AgentRosterCache(), accessor,
         Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
 
     let! first = service.RecordAgentActivityForUser("alice", "Jarvis", "Manager", DateTimeOffset.UtcNow)
@@ -2545,6 +2551,7 @@ let source_uuid_signalr_dispatch_preserves_caller_identity_and_legacy_receiver (
             Task.CompletedTask
         let recipient =
             { new Common.SignalR.IClientService with
+                member _.RefreshAgentRoster(_) = Task.CompletedTask
                 member _.ReceiveMessage(_) = Task.CompletedTask
                 member _.ReceiveCommand(correlation, _, _) =
                     System.Threading.Interlocked.Increment(&legacyDispatches) |> ignore
@@ -2573,7 +2580,7 @@ let source_uuid_signalr_dispatch_preserves_caller_identity_and_legacy_receiver (
         let http = Microsoft.AspNetCore.Http.HttpContextAccessor()
         http.HttpContext <- Microsoft.AspNetCore.Http.DefaultHttpContext()
         let service =
-            ClientService(hub, users, tracker, http,
+            ClientService(hub, users, tracker, AgentRosterCache(), http,
                 Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
         let command =
             WriteFileCommand
@@ -2676,6 +2683,7 @@ let wq06_authenticated_mcp_post_forwards_only_oauth_derived_actor_and_original_u
             Task.CompletedTask
         let recipient =
             { new IClientService with
+                member _.RefreshAgentRoster(_) = Task.CompletedTask
                 member _.ReceiveMessage(_) = Task.CompletedTask
                 member _.ReceiveCommand(correlation, commandJson, _) =
                     forwardedJson <- commandJson
@@ -2725,7 +2733,7 @@ let wq06_authenticated_mcp_post_forwards_only_oauth_derived_actor_and_original_u
         let accessor = Microsoft.AspNetCore.Http.HttpContextAccessor()
         accessor.HttpContext <- context
         let service =
-            ClientService(hub, users, tracker, accessor,
+            ClientService(hub, users, tracker, AgentRosterCache(), accessor,
                 Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
 
         let originalOperationId = Guid.NewGuid().ToString("D")

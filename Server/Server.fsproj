@@ -26,6 +26,7 @@
         <Compile Include="HttpRateLimitProtection.fs"/>
         <Compile Include="Services\ClientResponseTracker.fs"/>
         <Compile Include="Services\UserService.fs"/>
+        <Compile Include="Services\AgentRosterCache.fs"/>
         <Compile Include="Services\ExportStore.fs"/>
         <Compile Include="Services\FeedbackStore.fs"/>
         <Compile Include="Services\OptionalFeedbackStore.fs"/>

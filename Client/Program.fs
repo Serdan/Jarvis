@@ -352,6 +352,49 @@ let private runClient args =
     connection.KeepAliveInterval <- TimeSpan.FromSeconds 10.0
     connection.ServerTimeout <- TimeSpan.FromSeconds 60.0
 
+    // Global dashboard data is an authenticated, disposable server projection.
+    // The TUI refresh runs off-thread, so the synchronous access contract
+    // never blocks the terminal event loop.
+    let globalSnapshotGate = obj()
+    let mutable lastGlobalSnapshot: AgentView.Snapshot option = None
+    let loadGlobalRoster () =
+        let fallback reason =
+            lock globalSnapshotGate (fun () ->
+                match lastGlobalSnapshot with
+                | Some previous -> Ok (AgentView.offline previous reason)
+                | None -> Error reason)
+        if connection.State <> HubConnectionState.Connected || not registered then
+            fallback "Global roster unavailable: Jarvis server is disconnected."
+        else
+            try
+                let request =
+                    HubConnectionExtensions.InvokeCoreAsync<AgentRosterView>(
+                        connection, "GetAgentRoster", [||], CancellationToken.None)
+                let view = request.WaitAsync(TimeSpan.FromSeconds 12.).GetAwaiter().GetResult()
+                let snapshot = AgentDashboard.fromGlobalRoster view
+                lock globalSnapshotGate (fun () -> lastGlobalSnapshot <- Some snapshot)
+                Ok snapshot
+            with ex ->
+                fallback ("Global roster refresh failed: " + ex.Message)
+    tui.SetAgentAccess { Load = loadGlobalRoster }
+
+    let rosterSemaphore = new SemaphoreSlim(2, 2)
+    let refreshGlobalLedger (request: AgentRosterRefreshRequest) : Task =
+        Task.Run(Func<Task>(fun () ->
+            task {
+                do! rosterSemaphore.WaitAsync()
+                try
+                    let response = AgentDashboard.readForRoster request rt
+                    if connection.State = HubConnectionState.Connected then
+                        let! sent = connection.invokeAsync("SubmitAgentRoster", response)
+                        match sent with
+                        | Ok () -> ()
+                        | Error error ->
+                            tui.Log $"Global roster response delivery failed ({error.GetType().Name})."
+                finally
+                    rosterSemaphore.Release() |> ignore
+            } :> Task))
+
     // Server SQLite is intentionally disposable and cannot prove cross-device
     // agent inactivity. Keep AfterAgentIdle inert until a verified durable
     // client/Git activity source exists. Once/Every are unaffected.
@@ -438,6 +481,8 @@ let private runClient args =
             Func<string, string, DateTimeOffset, Task>(fun project agent seenAtUtc ->
                 tui.RecordAgentSeenAt(project, agent, seenAtUtc)
                 Task.CompletedTask))
+        connection.On<AgentRosterRefreshRequest>("RefreshAgentRoster",
+            Func<AgentRosterRefreshRequest, Task>(refreshGlobalLedger))
     }
 
     connection.add_Closed(
@@ -458,6 +503,7 @@ let private runClient args =
         let inputLoop = tui.RunInputLoop(cts.Token)
         let deviceId = DeviceIdentity.getOrCreate ()
         let mutable connectionFailureCount = 0
+        let mutable nextRosterAnnouncement = DateTimeOffset.MinValue
 
         Console.CancelKeyPress.AddHandler(ConsoleCancelEventHandler(fun _ args ->
             args.Cancel <- true
@@ -487,14 +533,30 @@ let private runClient args =
                         connectionFailureCount <- 0
                         let! isRegistered = register tui connection deviceId resolveMachineName
                         registered <- isRegistered
-                        if isRegistered then Client.invalidateAllAgentStates rt
+                        if isRegistered then
+                            Client.invalidateAllAgentStates rt
+                            nextRosterAnnouncement <- DateTimeOffset.MinValue
                     else
                         connectionFailureCount <- connectionFailureCount + 1
 
             elif connection.State = HubConnectionState.Connected && not registered then
                 let! isRegistered = register tui connection deviceId resolveMachineName
                 registered <- isRegistered
-                if isRegistered then Client.invalidateAllAgentStates rt
+                if isRegistered then
+                    Client.invalidateAllAgentStates rt
+                    nextRosterAnnouncement <- DateTimeOffset.MinValue
+
+            if registered && connection.State = HubConnectionState.Connected
+               && DateTimeOffset.UtcNow >= nextRosterAnnouncement then
+                nextRosterAnnouncement <- DateTimeOffset.UtcNow.AddSeconds(15.)
+                match AgentDashboard.discoverClaims rt with
+                | Error error -> tui.Log ("Global roster discovery: " + error)
+                | Ok claims ->
+                    let! announced = connection.invokeAsync("AnnounceAgentLedgers", claims)
+                    match announced with
+                    | Ok () -> ()
+                    | Error ex ->
+                        tui.Log $"Global roster announcement failed ({ex.GetType().Name})."
 
             if not tui.ShouldQuit then
                 try

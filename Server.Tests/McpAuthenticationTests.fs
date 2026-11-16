@@ -183,11 +183,12 @@ let write_tools_expose_optional_operation_ids () =
             match methodInfo.GetParameters() |> Array.tryFind (fun p -> p.Name = "operationId") with
             | Some id when not (List.contains methodInfo.Name
                             [ "GetOperationStatus"; "AcknowledgePendingOperation";
-                              "InspectPendingOperation"; "RetryPendingIntent"; "SupersedePendingIntent"; "AbandonPendingIntent" ]) ->
+                              "InspectPendingOperation"; "InspectOperatorConversationOperation";
+                              "RetryPendingIntent"; "SupersedePendingIntent"; "AbandonPendingIntent" ]) ->
                 Some (methodInfo.Name, id)
             | _ -> None)
     // Preserve challenge-domain, taskless and recipient-notification writes.
-    Assert.That(writeMethods.Length, Is.EqualTo(57), String.concat ", " (writeMethods |> Array.map fst))
+    Assert.That(writeMethods.Length, Is.EqualTo(62), String.concat ", " (writeMethods |> Array.map fst))
     for newTool in [ "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork" ] do
         Assert.That(writeMethods |> Array.exists (fun (name, _) -> name = newTool), Is.True,
                     $"Taskless lifecycle tool {newTool} missing from the public MCP surface.")
@@ -196,7 +197,8 @@ let write_tools_expose_optional_operation_ids () =
         Assert.That(id.DefaultValue, Is.EqualTo(""), $"operationId default differs on {name}")
 
     for selector in [ "GetOperationStatus"; "AcknowledgePendingOperation";
-                      "InspectPendingOperation"; "RetryPendingIntent"; "SupersedePendingIntent"; "AbandonPendingIntent" ] do
+                      "InspectPendingOperation"; "InspectOperatorConversationOperation";
+                      "RetryPendingIntent"; "SupersedePendingIntent"; "AbandonPendingIntent" ] do
         let id = typeof<Server.JarvisMcpTools>.GetMethod(selector).GetParameters()
                  |> Array.find (fun parameter -> parameter.Name = "operationId")
         Assert.That(id.IsOptional, Is.False, $"Selector ID must remain required: {selector}")

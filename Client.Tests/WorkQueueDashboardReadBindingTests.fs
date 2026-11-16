@@ -34,10 +34,11 @@ let private git folder arguments =
     Assert.That(command.ExitCode, Is.EqualTo(0), error)
     output.Trim()
 
-let private fixture root tag rolePresent =
+let private fixtureWithObjectFormat root tag rolePresent objectFormat =
     let remote = Path.Combine(root, tag + ".git")
     let clone = Path.Combine(root, tag)
-    git root [ "init"; "--bare"; "--initial-branch=main"; remote ] |> ignore
+    let format = if objectFormat = "sha256" then [ "--object-format=sha256" ] else []
+    git root ([ "init"; "--bare"; "--initial-branch=main" ] @ format @ [ remote ]) |> ignore
     git root [ "clone"; remote; clone ] |> ignore
     File.WriteAllText(Path.Combine(clone, "source.txt"), "Approved " + tag)
     git clone [ "add"; "source.txt" ] |> ignore
@@ -64,6 +65,9 @@ let private fixture root tag rolePresent =
         |> success |> ignore
     { Binding = binding; Remote = remote }
 
+let private fixture root tag rolePresent =
+    fixtureWithObjectFormat root tag rolePresent "sha1"
+
 let private withProjectsWithRoles alphaRole betaRole action =
     let root = Path.Combine(Path.GetTempPath(), "jarvis-work-read-ui-" + Guid.NewGuid().ToString("N"))
     Directory.CreateDirectory(root) |> ignore
@@ -73,6 +77,13 @@ let private withProjectsWithRoles alphaRole betaRole action =
 
 let private withProjects action =
     withProjectsWithRoles true true action
+
+let private withSha256Project action =
+    let root = Path.Combine(Path.GetTempPath(), "jarvis-work-read-ui-sha256-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(root) |> ignore
+    try action (fixtureWithObjectFormat root "sha256" true "sha256")
+    finally
+        try Directory.Delete(root, true) with _ -> ()
 
 let private identity name (p: ProjectFixture) : ApprovedProjectIdentity =
     { ProjectId = p.Binding.ProjectId; DisplayName = name }
@@ -244,3 +255,66 @@ let missingHostAuthorityPortCannotBindAnyProductionWork () =
     match thrown.Load() with
     | Ok _ -> Assert.Fail("Failed registry must not become an empty success.")
     | Error reason -> Assert.That(reason, Does.Contain("unavailable"))
+
+[<Test>]
+let sha256VerifiedGitHeadLoadsCanonicalWorkThroughHostPort () =
+    withSha256Project (fun project ->
+        publish project 0 "sha256-ready" []
+        let approved =
+            { AccountId = "sha256-account"
+              MembershipComplete = true
+              Projects = [ identity "SHA-256 project" project ]
+              Bindings = [ project.Binding ] }
+        let expected = (LedgerStore.fetch project.Binding |> success).Commit
+        Assert.That(expected.Length, Is.EqualTo(64), "Fixture must really use SHA-256 Git objects")
+        Assert.That(expected, Does.Match("^[0-9a-f]{64}$"))
+        let sources = (createAccess (fun () -> Ok approved)).Load() |> success
+        Assert.That(sources.Length, Is.EqualTo(1))
+        match sources.Head.Snapshot with
+        | Error reason -> Assert.Fail("Verified SHA-256 Work snapshot incorrectly rejected: " + reason)
+        | Ok snapshot ->
+            Assert.That(snapshot.VerifiedGitHead, Is.EqualTo(expected))
+            Assert.That(snapshot.Coverage, Is.EqualTo("Verified"))
+            Assert.That(snapshot.ReadOnly, Is.True)
+            Assert.That(snapshot.Work |> List.map _.WorkId = [ "sha256-ready" ], Is.True)
+            Assert.That(snapshot.Work |> List.forall (fun item ->
+                item.SubjectTitle.IsNone && not item.ClaimEnabled), Is.True)
+        let rendered = allRows sources
+        Assert.That(rendered.Length, Is.EqualTo(1))
+        Assert.That(rendered.Head.WorkId, Is.EqualTo("sha256-ready"))
+        Assert.That(rendered.Head.Status, Is.EqualTo("NotReady (queue available)")))
+
+[<Test>]
+let malformedGitHeadLengthsNonHexAndUppercaseStayLocalUnknownThroughLoad () =
+    withProjects (fun a b ->
+        publish a 0 "healthy" []
+        publish b 0 "must-not-leak" []
+        // Corrupt the disposable *remote* ref, not the cached local checkout:
+        // Load must fetch/verify each approved head anew and fail only this project.
+        let remoteHead = Path.Combine(b.Remote, "refs", "heads", "jarvis-orchestration")
+        Assert.That(File.Exists(remoteHead), Is.True)
+        let original = File.ReadAllText(remoteHead).Trim()
+        Assert.That(original, Does.Match("^[0-9a-f]{40}$"))
+        let malformedHeads =
+            [ String.replicate 39 "a"  // truncated SHA-1
+              String.replicate 41 "a"  // overlong SHA-1, not SHA-256
+              String.replicate 63 "a"  // truncated SHA-256
+              String.replicate 65 "a"  // overlong SHA-256
+              String.replicate 39 "a" + "g" // non-hex
+              "A" + String.replicate 39 "a" ] // uppercase is not a canonical OID
+        for malformed in malformedHeads do
+            File.WriteAllText(remoteHead, malformed + "\n")
+            let sources = (createAccess (fun () -> Ok (authority a b))).Load() |> success
+            Assert.That(sources.Length, Is.EqualTo(2))
+            Assert.That(sources[0].Snapshot.IsOk, Is.True,
+                        "Unrelated project must stay readable when another head is malformed")
+            match sources[1].Snapshot with
+            | Ok _ -> Assert.Fail("Malformed remote Git head was accepted: " + malformed)
+            | Error reason -> Assert.That(reason, Does.Contain("UNKNOWN"))
+            let rendered = allRows sources
+            Assert.That(rendered |> List.exists (fun row ->
+                row.Project = "Alpha" && row.WorkId = "healthy"), Is.True)
+            Assert.That(rendered |> List.exists (fun row ->
+                row.Project = "Zulu" && row.Status.Contains("NotReady")), Is.True)
+            Assert.That(rendered |> List.exists (fun row ->
+                row.Project = "Zulu" && row.WorkId = "must-not-leak"), Is.False))

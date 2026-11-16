@@ -88,8 +88,9 @@ let private toRow (item: WorkToolRow) : WorkRow =
 
 let private validHead (head: string) =
     not (String.IsNullOrWhiteSpace head)
-    && head.Length = 40
-    && head |> Seq.forall Uri.IsHexDigit
+    // Match LedgerStore's Git object-ID grammar: lowercase SHA-1 or SHA-256.
+    && (head.Length = 40 || head.Length = 64)
+    && (head |> Seq.forall (fun c -> (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
 
 // WQ02 queue coverage and WQ04 role provenance are independent evidence.
 // Only the facade's exact positive, same-head WQ04 observation is accepted;

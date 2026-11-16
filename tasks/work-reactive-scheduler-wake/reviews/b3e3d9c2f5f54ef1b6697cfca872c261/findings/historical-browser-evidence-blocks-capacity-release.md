@@ -1,0 +1,11 @@
+# [P1] Normal historical launches permanently block future wake through the default bound reader
+
+**Frozen commit:** `b3e3d9c2f5f5fef1b6697cfca872c26177d1d6d1`
+
+**Location:** `Client/Modules/WorkQueueReactiveWake.fs`, `WorkQueueReactiveWake.boundRead` and `blockingIssues` / `Coordinator.Wake`. Dependency: existing `Client/Modules/WorkQueueSchedulerHostPreview.fs` (`realReadPorts`, `previewWith`).
+
+`boundRead` always invokes `WorkQueueSchedulerHostPreview.preview account project roleId`, whose real ports use `realReadPortsWithOriginal ... None`. For each launch in the selected role's project history—even an already terminal launch with a corresponding released account token—the preview calls `ReadOriginal`. With no journal bound, this returns `Error`, and the preview appends `BrowserJournalUnknown`. `blockingIssues` excludes only `DispatchDisabled` and `CapacityFull`; thus `Coordinator.Wake` returns `NeedsAttention("BrowserJournalUnknown", ...)` before invoking `Plan`, even when a *different, new* Work unit is eligible and capacity is free. Unlike the first-launch fixture, a project with ordinary successful historical launches cannot make forward progress through the provided bound reader. This contradicts capacity-release/reactive-wake acceptance.
+
+**Required correction:** Keep missing original evidence fail-closed for any launch whose effect remains unresolved, but do not make independently proven *settled* launch history an unconditional blocker to distinct new Work. Either open an approved durable journal through an explicit read seam with the required identity checks, or partition settled history from unresolved effects using canonical project/account proof. Never infer absent evidence as no effect for unresolved launches. Add a disposable Git-backed regression with a verified completed/released launch followed by an eligible new Work unit and a fake executor; also assert unresolved original outcome still blocks.
+
+**Evidence:** Source inspection of frozen commit and base preview; nine existing targeted .NET 11 Release tests pass, but the sole Git-backed test contains no prior launch and the remaining tests inject a synthetic report with `ExistingLaunches = []`.

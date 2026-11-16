@@ -55,6 +55,7 @@
         <Compile Include="SourceEffectHostBindingTests.fs"/>
         <Compile Include="AccountCapacityLedgerTests.fs"/>
         <Compile Include="AccountAdmissionAdapterTests.fs"/>
+        <Compile Include="WorkQueueCanonicalMigrationPrepareTests.fs"/>
         <Compile Include="RoleInstructionsTests.fs"/>
         <Compile Include="ReviewWorkflowTests.fs"/>
         <Compile Include="ChallengeWorkflowTests.fs"/>

@@ -1,0 +1,11 @@
+# P2 — Exact-UUID recovery is incorrectly gated on current project heads
+
+**Frozen commit:** `4307675a4b7b81310c57f2a375fab998790ac462`
+
+**Locations:** `Client/Modules/WorkQueueCanonicalMigrationPrepare.fs:505-535, 593-609`; `Client/Modules/AccountCapacityLedger.fs:545-551`.
+
+The account transaction supports idempotent recovery by finding the immutable original operation receipt **before** checking the pinned account head. However, `attemptAccountPreparing` calls the full two-project `inspect` first. `accountOnlyGap` suppresses `AccountHeadChanged` and account phase `Preparing`, but it still treats `ProjectHeadChanged`, `ProjectVersionChanged`, `ProjectHighWaterChanged` and `ProjectNotFrozen` as fatal even on a repeat of an already committed *same original UUID*. If the account CAS succeeds and its response is lost, then either project's head advances (including a legitimate independently progressed project step), the exact original retry returns `AccountRecoveryBlocked` without attempting WQ07's receipt lookup. The API can no longer report its own already-applied account receipt even though it is present in immutable account Git history.
+
+The product deliberately separates account Preparing from ProjectPreparedNotEstablished, so project progress after the account CAS must not erase the ability to reconcile the account's original result. No second write should be attempted, and no joint Prepared or dispatch authorization should be inferred.
+
+**Required correction:** Check for an existing original WQ07 account operation receipt, verify its exact canonical request/signature/authority identity, and return a read-only recovered account outcome **before applying mutable current-project eligibility rules to a new CAS**. Retain strict project checks for first-time execution. Add a fixture test: initial Preparing succeeds; inject lost acknowledgement; advance a project authority; retry original UUID; verify receipt recovery, no further account/ref write, and Projects remains NotEstablished.

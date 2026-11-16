@@ -16,6 +16,7 @@ open Client.WorkQueueReceiptProducer
 open Client.WorkQueueRoleAuthority
 open Client.WorkQueueSchedulerHostPreview
 open Client.AccountCapacityLedger
+open Client.AccountAdmissionAdapter
 
 // WQ-11 offline acceptance smoke. All remote refs, project ledgers and journals
 // are disposable. The WQ-02 fixture path below is explicitly NOT a wired
@@ -410,5 +411,224 @@ type WorkQueueReleaseAcceptanceTests() =
             let _, finalProject = WorkQueueGitLedger.load b |> ok
             Assert.That(finalProject.Works.Count, Is.EqualTo(1))
             Assert.That(finalProject.Launches.IsEmpty, Is.True)
+            Assert.That(git a.RepositoryPath [ "status"; "--porcelain" ], Is.Empty)
+            Assert.That(git b.RepositoryPath [ "status"; "--porcelain" ], Is.Empty))
+
+    [<Test>]
+    member _.CanonicalDemandLaunchesFakeProviderFirstConnectThenReleasesCapOne() =
+        withTwoClones (fun a b ->
+            // Explicit, disposable, default-off bridge: all project/account
+            // writes use genuine Git adapters. Only the external provider is
+            // replaced. No browser, live Scheduler, or real account binding.
+            let accountId, accountLedgerId = Guid.NewGuid(), Guid.NewGuid()
+            let accountBinding (project: LedgerBinding) : AccountBinding =
+                { RepositoryPath = project.RepositoryPath; RemoteName = project.RemoteName
+                  ApprovedFetchUrl = project.ApprovedFetchUrl
+                  ApprovedPushUrl = project.ApprovedPushUrl
+                  AccountId = accountId; LedgerId = accountLedgerId; Epoch = 1 }
+            let accountA, accountB = accountBinding a, accountBinding b
+            AccountCapacityLedger.initialize accountA 1 |> ok |> ignore
+
+            ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Lead" |> ok |> ignore
+            WorkQueueRoleAuthority.initializeCatalog a "Lead" (Guid.NewGuid()) |> ok |> ignore
+            let role: RoleConfiguration =
+                { RoleId = "Lead"; Version = 1; Enabled = true
+                  Instructions = "Perform disposable planning"
+                  QueueSubscriptions = set [ "planning" ] }
+            WorkQueueRoleAuthority.configure a "Lead" (Guid.NewGuid()) 0 0 role |> ok |> ignore
+
+            let produce source producer taskId =
+                let sourceOp, producerOp = Guid.NewGuid(), Guid.NewGuid()
+                let created = ReviewWorkflow.createTask source sourceOp taskId "Fake provider test" |> ok
+                let planned = WorkQueueReceiptProducer.preview producer sourceOp |> ok
+                Assert.That(planned.Status, Is.EqualTo("ReadyToProduce"))
+                let published = WorkQueueReceiptProducer.produce producer "Lead" producerOp sourceOp |> ok
+                Assert.That(published.AlreadyApplied, Is.False)
+                created, planned.StageId, sourceOp, producerOp
+
+            let request () : AccountAdmissionRequest =
+                { Actor = "WQ11 FakeProvider"
+                  LaunchId = Guid.NewGuid()
+                  AdmissionOperationId = Guid.NewGuid()
+                  AbortOperationId = Guid.NewGuid()
+                  ReleaseOperationId = Guid.NewGuid()
+                  RoleId = "Lead"; RoleVersion = 1 }
+
+            let mutate binding operationId change =
+                let _, project = WorkQueueGitLedger.load binding |> ok
+                WorkQueueGitLedger.executeInertFixture binding "WQ11 FakeProvider"
+                    operationId project.Version change |> ok
+
+            // The marker is an original, durable project-Git operation, not a
+            // caller-authored successful WQ02 state. It is written BEFORE the
+            // in-process fake provider is invoked; replay never re-sends.
+            // This is strictly a test-only original journal, not WQ03 live
+            // browser-original coverage.
+            let fakeOriginalMarker binding (op: Guid) (launchId: Guid) workId (sourceOp: Guid) sourceHash =
+                let path = sprintf "records/wq11-fake-provider/%s.json" (launchId.ToString("N"))
+                let content =
+                    System.Text.Json.JsonSerializer.Serialize(
+                        {| SchemaVersion = 1
+                           LaunchId = launchId.ToString("D")
+                           WorkId = workId
+                           SourceOperationId = sourceOp.ToString("D")
+                           SourceRequestHash = sourceHash
+                           OriginalOperationId = op.ToString("D")
+                           Outcome = "MarkerPresentOutcomeUnknown" |})
+                let intent : LedgerIntent =
+                    { OperationId = op; Actor = "WQ11 FakeProvider"
+                      Kind = "WQ11.FakeProviderOriginal"; RequestJson = content }
+                LedgerStore.transact binding intent (fun _ ->
+                    Ok [ { Path = path; ExpectedBlobOid = None; Content = content } ])
+                |> ok
+
+            let created, workId, sourceOp, producerOp =
+                produce a b "wq11-fake-provider-first-connect"
+            let visible = WorkQueueSchedulerHostPreview.preview accountB a "Lead"
+            Assert.That(visible.CanDispatch, Is.False)
+            Assert.That(visible.AvailableSlots, Is.EqualTo(Some 1))
+            let candidate = visible.WouldLaunch |> Option.get
+            Assert.That(candidate.WorkId, Is.EqualTo(workId))
+            Assert.That(candidate.RoleVersion, Is.EqualTo(1))
+            Assert.That(candidate.SourceOperationId, Is.EqualTo(Some(sourceOp.ToString("D"))))
+            Assert.That(candidate.SourceRequestHash, Is.EqualTo(Some created.Operation.RequestHash))
+            Assert.That(candidate.OriginBlobOid.IsSome, Is.True)
+
+            let first = request ()
+            match AccountAdmissionAdapter.admitInertFixture accountA a first with
+            | ProjectAdmitted _ -> ()
+            | other -> Assert.Fail(sprintf "Real Git adapter did not admit selected demand: %A" other)
+            let _, admitted = WorkQueueGitLedger.load b |> ok
+            let launchId = first.LaunchId.ToString("D")
+            let launch = admitted.Launches.[launchId]
+            Assert.That(launch.Credit, Is.EqualTo(Some workId))
+            Assert.That(launch.RoleId, Is.EqualTo(candidate.RoleId))
+            Assert.That(launch.RoleVersion, Is.EqualTo(candidate.RoleVersion))
+            Assert.That(launch.AccountTokenId, Is.EqualTo(first.AdmissionOperationId.ToString("D")))
+            let accountSnapshot = AccountCapacityLedger.fetch accountB |> ok
+            let token = accountSnapshot.State.Tokens |> Array.exactlyOne
+            Assert.That(token.LaunchId, Is.EqualTo(launchId))
+            Assert.That(token.RoleId, Is.EqualTo(candidate.RoleId))
+            Assert.That(token.RoleConfigVersion, Is.EqualTo(int64 candidate.RoleVersion))
+            Assert.That(token.ProjectId, Is.EqualTo(a.ProjectId.ToString("D")))
+            Assert.That(token.Status, Is.EqualTo("Held"))
+
+            let second = request ()
+            match AccountAdmissionAdapter.admitInertFixture accountB b second with
+            | GlobalReservationRejected(AccountCapacityFull(1, 1)) -> ()
+            | other -> Assert.Fail(sprintf "Cap=1 admitted a simultaneous second fake provider: %A" other)
+            Assert.That((AccountCapacityLedger.fetch accountA |> ok).State.Tokens.Length,
+                        Is.EqualTo(1))
+
+            let mutable providerSubmissions = 0
+            let submitFakeOnce binding originalOp launch work source hash =
+                let marker = fakeOriginalMarker binding originalOp launch work source hash
+                // A Git receipt replay skips the provider invocation itself.
+                if not marker.AlreadyApplied then
+                    providerSubmissions <- providerSubmissions + 1
+                marker
+            let originalOp = Guid.NewGuid()
+            let original = submitFakeOnce a originalOp first.LaunchId workId
+                               sourceOp created.Operation.RequestHash
+            Assert.That(original.AlreadyApplied, Is.False)
+            let sessionKey = "disposable-fake-provider-" + Guid.NewGuid().ToString("N")
+            let dispatchOp = Guid.NewGuid()
+            let dispatched = mutate b dispatchOp (DispatchOnce(launchId, DispatchState.Submitted))
+            Assert.That(dispatched.AlreadyApplied, Is.False)
+            let replayMarker = submitFakeOnce b originalOp first.LaunchId workId
+                                   sourceOp created.Operation.RequestHash
+            Assert.That(replayMarker.AlreadyApplied, Is.True)
+            let replayDispatch =
+                WorkQueueGitLedger.executeInertFixture a "WQ11 FakeProvider"
+                    dispatchOp admitted.Version (DispatchOnce(launchId, DispatchState.Submitted)) |> ok
+            Assert.That(replayDispatch.AlreadyApplied, Is.True)
+            Assert.That(providerSubmissions, Is.EqualTo(1))
+
+            let _, beforeConnect = WorkQueueGitLedger.load a |> ok
+            let firstConnectOp = Guid.NewGuid()
+            mutate b firstConnectOp (InitializeAgent(launchId, sessionKey)) |> ignore
+            let _, connected = WorkQueueGitLedger.load a |> ok
+            match connected.Launches.[launchId].State with
+            | LaunchState.Registered(uuid, observedSession) ->
+                Assert.That(Guid.Parse(uuid), Is.Not.EqualTo(Guid.Empty))
+                Assert.That(observedSession, Is.EqualTo(sessionKey))
+            | other -> Assert.Fail(sprintf "WQ01 first connection did not register: %A" other)
+            let replayConnect =
+                WorkQueueGitLedger.executeInertFixture a "WQ11 FakeProvider"
+                    firstConnectOp beforeConnect.Version (InitializeAgent(launchId, sessionKey)) |> ok
+            Assert.That(replayConnect.AlreadyApplied, Is.True)
+
+            mutate a (Guid.NewGuid()) (ClaimNext launchId) |> ignore
+            let _, claimed = WorkQueueGitLedger.load b |> ok
+            Assert.That(claimed.Works.[workId].State, Is.EqualTo(WorkState.Claimed launchId))
+            Assert.That(claimed.Launches.[launchId].PrimaryWorkId, Is.EqualTo(Some workId))
+            let terminalOp = Guid.NewGuid()
+            mutate b terminalOp (CompleteOrdinary(launchId, workId)) |> ignore
+            let terminalHead, completed = WorkQueueGitLedger.load a |> ok
+            Assert.That(completed.Works.[workId].State, Is.EqualTo(WorkState.Completed))
+            Assert.That(completed.Launches.[launchId].State,
+                        Is.EqualTo(LaunchState.TerminalPendingRelease(
+                            "terminal:" + terminalOp.ToString("D"))))
+            let terminalRecord = WorkQueueGitLedger.readTerminalAt a terminalHead launchId |> ok
+            Assert.That(terminalRecord.IsSome, Is.True)
+            let locator: ProjectTerminalLocator =
+                { ProjectId = a.ProjectId; LaunchId = first.LaunchId
+                  AdmissionOperationId = first.AdmissionOperationId
+                  TerminalOperationId = terminalOp }
+            let released = AccountAdmissionAdapter.releaseTerminal accountA a
+                               "WQ11 FakeProvider" first.ReleaseOperationId locator |> ok
+            Assert.That(released.AlreadyApplied, Is.False)
+            let releaseReplay = AccountAdmissionAdapter.releaseTerminal accountB b
+                                    "WQ11 FakeProvider" first.ReleaseOperationId locator |> ok
+            Assert.That(releaseReplay.AlreadyApplied, Is.True)
+            Assert.That(AccountCapacityLedger.occupied (AccountCapacityLedger.fetch accountB |> ok).State,
+                        Is.Zero)
+            let restored = WorkQueueSchedulerHostPreview.preview accountA b "Lead"
+            Assert.That(restored.CanDispatch, Is.False)
+            Assert.That(restored.AvailableSlots, Is.EqualTo(Some 1))
+            // This was a WQ02 inert fixture admission, not a WQ04 same-CAS
+            // role-authorized writer. WQ08 must preserve the missing original
+            // role-specific witness as a visible hold even after completion.
+            Assert.That(restored.Issues |> List.exists (fun issue -> issue.Code = "ProjectUnknown"),
+                        Is.True)
+
+            // Cap is usable again, yet an unknown original never authorizes
+            // a repeat send or a release without a verified terminal.
+            let created2, work2, source2, _ =
+                produce b a "wq11-fake-provider-unknown-original"
+            let selected2 = WorkQueueSchedulerHostPreview.preview accountA b "Lead"
+            let _, secondWorkState = WorkQueueGitLedger.load a |> ok
+            Assert.That(secondWorkState.Works.[work2].State, Is.EqualTo(WorkState.Available))
+            Assert.That(selected2.CanDispatch, Is.False)
+            Assert.That(selected2.WouldLaunch.IsNone, Is.True)
+            Assert.That(selected2.Issues |> List.exists (fun issue ->
+                issue.Code = "ProjectUnknown"
+                && issue.NextAction.Contains("role", StringComparison.OrdinalIgnoreCase)),
+                Is.True)
+            // The second recovery probe is deliberately still fixture-only.
+            // It does NOT interpret the read-only, failing WQ04 preview as a
+            // launch authorization.
+            match AccountAdmissionAdapter.admitInertFixture accountB b second with
+            | ProjectAdmitted _ -> ()
+            | other -> Assert.Fail(sprintf "Released cap was not reusable: %A" other)
+            let unknownOp = Guid.NewGuid()
+            let unknownMarker = submitFakeOnce b unknownOp second.LaunchId work2
+                                    source2 created2.Operation.RequestHash
+            Assert.That(unknownMarker.AlreadyApplied, Is.False)
+            // Simulated response loss after the one fake provider invocation.
+            mutate a (Guid.NewGuid())
+                (DispatchOnce(second.LaunchId.ToString("D"), DispatchState.OutcomeUnknown)) |> ignore
+            let unknownReplay = submitFakeOnce a unknownOp second.LaunchId work2
+                                    source2 created2.Operation.RequestHash
+            Assert.That(unknownReplay.AlreadyApplied, Is.True)
+            let snapshot = LedgerStore.fetch a |> ok
+            let persisted = LedgerStore.getOperationAt a snapshot unknownOp |> ok
+            Assert.That(persisted.IsSome, Is.True)
+            let _, unresolved = WorkQueueGitLedger.load a |> ok
+            Assert.That(unresolved.Launches.[second.LaunchId.ToString("D")].State,
+                        Is.EqualTo(LaunchState.SubmittedUnregistered DispatchState.OutcomeUnknown))
+            Assert.That(providerSubmissions, Is.EqualTo(2))
+            Assert.That(AccountCapacityLedger.occupied (AccountCapacityLedger.fetch accountA |> ok).State,
+                        Is.EqualTo(1))
             Assert.That(git a.RepositoryPath [ "status"; "--porcelain" ], Is.Empty)
             Assert.That(git b.RepositoryPath [ "status"; "--porcelain" ], Is.Empty))

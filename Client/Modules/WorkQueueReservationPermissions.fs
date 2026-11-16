@@ -1,6 +1,7 @@
 module Client.WorkQueueReservationPermissions
 
 open System
+open System.IO
 open System.Security.Cryptography
 open System.Text
 open System.Text.Json.Nodes
@@ -35,8 +36,15 @@ type ReservationScopeGrant =
       LaunchVersionAtApproval: int
       ReadProjectIds: Set<string>
       Families: Set<ReservationOperationFamily>
+      // WQ03 source continuation is not the approved integration target.
       SourceRef: string option
+      SourceSha: string option
+      TargetRef: string option
+      SourceRepositoryId: string option
+      SourceLineageGeneration: int option
+      SourceClaimGeneration: int option
       SourceWorktree: string option
+      SourceCheckoutPath: string option
       ApprovedAtUnixMs: int64
       ExpiresAtUnixMs: int64
       Revoked: bool
@@ -63,6 +71,10 @@ type ReservationPermissionRequest =
       TargetWorkId: string
       Family: ReservationOperationFamily
       SourceRef: string option
+      SourceSha: string option
+      TargetRef: string option
+      SourceRepositoryId: string option
+      SourceClaimGeneration: int option
       SourceWorktree: string option
       ExpectedRevision: int
       ExpectedLaunchVersion: int
@@ -147,12 +159,75 @@ module WorkQueueReservationPermissions =
         | Some value -> Ok value
         | None -> Error error
 
+    // The grant is minted from the canonical WQ02 stage and WQ03-verified local
+    // source checkout, never a caller-selected role, worktree name or destination.
+    type private PinnedSource =
+        { SourceRef: string option
+          SourceSha: string
+          TargetRef: string
+          RepositoryId: string
+          LineageGeneration: int
+          ClaimGeneration: int
+          WorktreeName: string
+          CheckoutPath: string }
+
+    let private generationForSource (launch: Launch) (stage: WorkStage) =
+        match stage.State with
+        | WorkState.Available -> Ok(stage.ClaimGeneration + 1)
+        | WorkState.Claimed owner when owner = launch.Id && stage.ClaimGeneration > 0 ->
+            Ok stage.ClaimGeneration
+        | _ ->
+            Error(InvalidBinding "Source scope requires available Work or this launch's current claim.")
+
+    // The sourceBinding is a host-selected checkout handle, NOT a user claim.
+    // WQ03 enforces the registered linked/detached worktree, exact HEAD, clean
+    // status, source remote identity and generation-scoped name. The actual
+    // worktree must be checked again by any eventual source-operation adapter.
+    let private pinSource (ledger: LedgerBinding) (sourceBinding: LedgerBinding option)
+            (launch: Launch) (stage: WorkStage) selectedName = result {
+        let! lineage =
+            stage.SourceLineage
+            |> requireSome (InvalidBinding "Source stage lacks canonical WQ03 lineage.")
+        let! claimGeneration = generationForSource launch stage
+        let expectedName = sprintf "wq03-%s-%s-g%d" stage.Id launch.Id claimGeneration
+        let! checkout =
+            sourceBinding
+            |> requireSome (InvalidBinding "Source grant needs a host-bound registered checkout.")
+        let root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(checkout.RepositoryPath))
+        if selectedName <> Some expectedName
+           || Path.GetFileName(root) <> expectedName
+           || checkout.ProjectId <> ledger.ProjectId
+           || checkout.LedgerId <> ledger.LedgerId
+           || checkout.Epoch <> ledger.Epoch
+           || checkout.ApprovedFetchUrl <> ledger.ApprovedFetchUrl
+           || checkout.ApprovedPushUrl <> ledger.ApprovedPushUrl
+           || checkout.RemoteName <> ledger.RemoteName
+           || lineage.RepositoryId <> WorkQueueGitLedger.sourceRepositoryId ledger
+           || lineage.RepositoryId <> WorkQueueGitLedger.sourceRepositoryId checkout
+           || (stage.Kind = WorkKind.Integration
+               && (lineage.ReachableRef.IsNone || lineage.ContinuationSha.IsNone)) then
+            return! Error(InvalidBinding
+                "Source grant does not match original Work/launch/claim-generation checkout or continuation.")
+        do! WorkQueueGitLedger.verifySourceClaimCheckout checkout launch.Id
+                { stage with ClaimGeneration = claimGeneration }
+        return
+            { SourceRef = lineage.ReachableRef
+              SourceSha = lineage.ContinuationSha |> Option.defaultValue lineage.PinnedBaseCommit
+              TargetRef = lineage.TargetRef
+              RepositoryId = lineage.RepositoryId
+              LineageGeneration = lineage.Generation
+              ClaimGeneration = claimGeneration
+              WorktreeName = expectedName
+              CheckoutPath = root }
+    }
+
     // An operator-approved revision is independently auditable in the canonical
     // Git ledger. This method must ONLY be invoked by an OAuth-authenticated
     // operator adapter, never directly by an execution credential. The actor is
     // an adapter assertion, not proof by itself; no public route exposes it.
-    let internal reviseAt (binding: LedgerBinding) (trustedActor: string)
-            (operationId: Guid) (now: int64) (request: ReservationScopeRevision) =
+    let internal reviseWithSourceAt (binding: LedgerBinding) (sourceBinding: LedgerBinding option)
+            (trustedActor: string) (operationId: Guid) (now: int64)
+            (request: ReservationScopeRevision) =
         if not (operatorActor trustedActor)
            || operationId = Guid.Empty
            || String.IsNullOrWhiteSpace request.OperatorApprovalId
@@ -216,34 +291,50 @@ module WorkQueueReservationPermissions =
                        || not (request.Families.Contains ReservationOperationFamily.ContextRead)
                        || not (request.ReadProjectIds.Contains (projectId binding))) then
                     return! Error(InvalidBinding "Requested operation family exceeds pinned Work authority.")
-                // An integration reservation needs both the canonical integration
-                // stage authorization and an explicit exact source-ref binding.
-                let sourceRef = stage.SourceLineage |> Option.map (fun lineage -> lineage.TargetRef)
-                if request.Families.Contains ReservationOperationFamily.Integration
-                   && (not stage.IntegrationAuthorized || sourceRef.IsNone
-                       || request.SourceWorktree.IsNone) then
-                    return! Error(InvalidBinding "Integration grant requires authorized source lineage and worktree.")
-                if request.Families.Contains ReservationOperationFamily.Implementation
-                   && stage.Kind = WorkKind.Implementation
-                   && (sourceRef.IsNone || request.SourceWorktree.IsNone) then
-                    return! Error(InvalidBinding "Source implementation grant requires a pinned source worktree.")
+                // Source authority is derived inside the winning original Git
+                // CAS from the canonical Work and a real WQ03 checkout. The
+                // approved target ref is NOT a continuation/source ref.
+                let needsSource =
+                    not request.Revoked
+                    && ((stage.Kind = WorkKind.Implementation
+                         && request.Families.Contains ReservationOperationFamily.Implementation)
+                        || (stage.Kind = WorkKind.Integration
+                            && request.Families.Contains ReservationOperationFamily.Integration))
+                let! source =
+                    if needsSource then
+                        if stage.Kind = WorkKind.Integration && not stage.IntegrationAuthorized then
+                            Error(InvalidBinding "Integration source authority is not canonically approved.")
+                        else
+                            pinSource binding sourceBinding launch stage request.SourceWorktree
+                            |> Result.map Some
+                    else
+                        if request.SourceWorktree.IsSome then
+                            Error(InvalidBinding "Non-source or revoked grant cannot select a checkout.")
+                        else Ok None
                 let revision = existingVersion + 1
                 let record =
-                    { SchemaVersion = 1; Revision = revision
+                    { SchemaVersion = 2; Revision = revision
                       ProjectId = projectId binding; LaunchId = launch.Id
                       AccountTokenId = launch.AccountTokenId; WorkId = workId
                       WorkStageGeneration = stage.StageGeneration
                       LaunchVersionAtApproval = launch.Version
                       ReadProjectIds = request.ReadProjectIds
                       Families = (if request.Revoked then Set.empty else request.Families)
-                      SourceRef = sourceRef; SourceWorktree = request.SourceWorktree
+                      SourceRef = source |> Option.bind (fun x -> x.SourceRef)
+                      SourceSha = source |> Option.map (fun x -> x.SourceSha)
+                      TargetRef = source |> Option.map (fun x -> x.TargetRef)
+                      SourceRepositoryId = source |> Option.map (fun x -> x.RepositoryId)
+                      SourceLineageGeneration = source |> Option.map (fun x -> x.LineageGeneration)
+                      SourceClaimGeneration = source |> Option.map (fun x -> x.ClaimGeneration)
+                      SourceWorktree = source |> Option.map (fun x -> x.WorktreeName)
+                      SourceCheckoutPath = source |> Option.map (fun x -> x.CheckoutPath)
                       ApprovedAtUnixMs = now; ExpiresAtUnixMs = request.ExpiresAtUnixMs
                       Revoked = request.Revoked; OperatorActor = trustedActor
                       OperatorApprovalId = request.OperatorApprovalId
                       RevisionOperationId = operationId.ToString("D") }
                 let! older =
                     match existing with
-                    | Some (prior, oid) when prior.SchemaVersion = 1
+                    | Some (prior, oid) when prior.SchemaVersion = 2
                                               && prior.ProjectId = projectId binding
                                               && prior.LaunchId = launch.Id
                                               && prior.AccountTokenId = launch.AccountTokenId
@@ -260,6 +351,9 @@ module WorkQueueReservationPermissions =
                         Content = CanonicalCodec.encode record } ]
             })
 
+    let internal reviseAt binding trustedActor operationId now request =
+        reviseWithSourceAt binding None trustedActor operationId now request
+
     let private denied (request: ReservationPermissionRequest) why =
         Error(InvalidBinding (sprintf
             "Reservation %A denied for project %s Work %s: %s. Request an operator-approved scope revision or record a separate linked prerequisite."
@@ -268,13 +362,14 @@ module WorkQueueReservationPermissions =
     // Evaluate at the same VERIFIED Git snapshot used for the actual mutation.
     // Callers MUST derive Family and source targets from the invoked operation,
     // not from self-declared role or model-provided permission claims.
-    let authorizeAt (binding: LedgerBinding) snapshot (project: Project)
-            (now: int64) (bearer: string) (request: ReservationPermissionRequest) = result {
+    let internal authorizeWithSourceAt (binding: LedgerBinding) (sourceBinding: LedgerBinding option)
+            snapshot (project: Project) (now: int64) (bearer: string)
+            (request: ReservationPermissionRequest) = result {
         let! current = readScopeAt binding snapshot request.LaunchId
         let! verifier = WorkQueueGitLedger.readCredentialAt binding snapshot request.LaunchId
         let! grant =
             match current with
-            | Some (value, _) when value.SchemaVersion = 1 -> Ok value
+            | Some (value, _) when value.SchemaVersion = 2 -> Ok value
             | _ -> denied request "No approved current grant"
         let! credential =
             match verifier with
@@ -330,11 +425,45 @@ module WorkQueueReservationPermissions =
             if request.TargetProjectId <> grant.ProjectId
                || request.TargetWorkId <> grant.WorkId then
                 return! denied request "Mutation is outside the assigned project or Work"
-            if request.SourceRef <> grant.SourceRef
-               || request.SourceWorktree <> grant.SourceWorktree then
-                return! denied request "Source ref or worktree differs from approved scope"
+            let sourceOperation =
+                (stage.Kind = WorkKind.Implementation
+                 && request.Family = ReservationOperationFamily.Implementation)
+                || (stage.Kind = WorkKind.Integration
+                    && request.Family = ReservationOperationFamily.Integration)
+            if sourceOperation then
+                // Recheck the original Work generation and physical WQ03 source
+                // checkout at the operation boundary; comparing strings alone
+                // would allow a different but valid reservation's worktree.
+                let! pinned =
+                    pinSource binding sourceBinding launch stage grant.SourceWorktree
+                    |> Result.mapError (fun _ ->
+                        InvalidBinding "Source checkout is not WQ03-pinned to this reservation.")
+                if grant.SourceRef <> pinned.SourceRef
+                   || grant.SourceSha <> Some pinned.SourceSha
+                   || grant.TargetRef <> Some pinned.TargetRef
+                   || grant.SourceRepositoryId <> Some pinned.RepositoryId
+                   || grant.SourceLineageGeneration <> Some pinned.LineageGeneration
+                   || grant.SourceClaimGeneration <> Some pinned.ClaimGeneration
+                   || grant.SourceWorktree <> Some pinned.WorktreeName
+                   || grant.SourceCheckoutPath <> Some pinned.CheckoutPath
+                   || request.SourceRef <> pinned.SourceRef
+                   || request.SourceSha <> Some pinned.SourceSha
+                   || request.TargetRef <> Some pinned.TargetRef
+                   || request.SourceRepositoryId <> Some pinned.RepositoryId
+                   || request.SourceClaimGeneration <> Some pinned.ClaimGeneration
+                   || request.SourceWorktree <> Some pinned.WorktreeName then
+                    return! denied request "Source checkout/continuation differs from original WQ03 scope"
+            else if request.SourceRef.IsSome || request.SourceSha.IsSome
+                    || request.TargetRef.IsSome || request.SourceRepositoryId.IsSome
+                    || request.SourceClaimGeneration.IsSome || request.SourceWorktree.IsSome then
+                return! denied request "Non-source mutation cannot select source authority"
         return grant
     }
+
+    // Without a host-selected WQ03 checkout, source operations fail closed.
+    // Planning grants remain usable on the existing non-source fixture path.
+    let authorizeAt binding snapshot project now bearer request =
+        authorizeWithSourceAt binding None snapshot project now bearer request
 
     // Authenticated, bounded read permission can include other projects, but
     // a mutation always requires a credential bound to its owning project.
@@ -343,11 +472,17 @@ module WorkQueueReservationPermissions =
         |> Result.bind (fun (snapshot, project) ->
             authorizeAt binding snapshot project now bearer request)
 
+    let internal checkSourceAt binding sourceBinding now bearer request =
+        WorkQueueGitLedger.load binding
+        |> Result.bind (fun (snapshot, project) ->
+            authorizeWithSourceAt binding (Some sourceBinding) snapshot project now bearer request)
+
     // Claim and read-only checkpoint are the two non-source fixture transitions
     // that already have an independent winning-CAS validation callback in WQ02.
     // No public Agent/Work MCP route can invoke these until live cutover approval.
-    let internal claimFixtureAt binding actor (operationId: Guid) expectedVersion now
-            bearer (request: ReservationPermissionRequest) expectedStageGeneration resultingClaimGeneration =
+    let internal claimWithSourceFixtureAt binding (sourceBinding: LedgerBinding option)
+            actor (operationId: Guid) expectedVersion now bearer
+            (request: ReservationPermissionRequest) expectedStageGeneration resultingClaimGeneration =
         let mutation =
             ClaimVerifiedWork(request.LaunchId, request.TargetWorkId,
                               expectedStageGeneration, resultingClaimGeneration)
@@ -356,7 +491,7 @@ module WorkQueueReservationPermissions =
                && request.Family <> ReservationOperationFamily.Review
                && request.Family <> ReservationOperationFamily.Integration then
                 return! denied request "Claim family does not match delegated Work"
-            let! grant = authorizeAt binding snapshot before now bearer request
+            let! grant = authorizeWithSourceAt binding sourceBinding snapshot before now bearer request
             let! (prior: WorkStage) =
                 before.Works.TryFind grant.WorkId
                 |> requireSome (InvalidBinding "Claimed Work missing at winning CAS.")
@@ -379,6 +514,16 @@ module WorkQueueReservationPermissions =
         }
         WorkQueueGitLedger.executePinnedDisposableLifecycle binding actor operationId
             expectedVersion now mutation verify
+
+    let internal claimFixtureAt binding actor operationId expectedVersion now
+            bearer request expectedStageGeneration resultingClaimGeneration =
+        claimWithSourceFixtureAt binding None actor operationId expectedVersion now
+            bearer request expectedStageGeneration resultingClaimGeneration
+
+    let internal claimSourceFixtureAt binding actor operationId expectedVersion now
+            bearer request expectedStageGeneration resultingClaimGeneration =
+        claimWithSourceFixtureAt binding (Some binding) actor operationId expectedVersion now
+            bearer request expectedStageGeneration resultingClaimGeneration
 
     let internal checkpointFixtureAt binding actor (operationId: Guid) expectedVersion now
             bearer (request: ReservationPermissionRequest) expectedClaimGeneration evidenceSha =

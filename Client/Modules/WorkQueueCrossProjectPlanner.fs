@@ -3,10 +3,10 @@ module Client.WorkQueueCrossProjectPlanner
 open System
 open Client.AccountCapacityLedger
 
-// WQ08: a FAKE-ONLY, read-only cross-project orchestration seam.
-// There is intentionally no production adapter, browser transport, CAS writer,
-// timer, launch allocator, or CanDispatch transition in this module.
-// Callers must not treat either the injected evidence or a WouldLaunch as authority.
+// WQ08: a pure read-only cross-project planner with fake-only launch intents.
+// The real default-off host may inject pinned *observations*, but this module
+// has no browser transport, CAS writer, timer or launch allocator. Neither a
+// simulated projection nor a WouldLaunch is execution authority.
 type PlannerProject =
     { ProjectId: string
       LedgerId: string
@@ -104,9 +104,9 @@ type PlannerReport =
       VisibleLaunches: PlannerExistingLaunch list
       Issues: PlannerIssue list }
 
-// Injected ports are intentionally *not* bound to real account/project
-// authorities. WQ03 original-browser and WQ04/WQ07 pinned-admission adapters
-// must be independently reviewed before any future executable integration.
+// Injected ports carry observations, not authorization. The host adapter may
+// use trusted read-only Git/project/WQ03 evidence, but executable WQ04/WQ07
+// pinned admission remains a separate, independently reviewed cutover.
 type FakeOnlyCrossProjectPorts =
     { ReadAccount: unit -> Result<AccountSnapshot, string>
       ReadProjects: unit -> Result<PlannerProjectSet, string>
@@ -177,6 +177,11 @@ module WorkQueueCrossProjectPlanner =
               compare left.RoleVersion right.RoleVersion
               compareOrdinal left.LaunchId right.LaunchId ]
         compareInOrder |> List.tryFind ((<>) 0) |> Option.defaultValue 0
+
+    // Shared deterministic ranking for a real host's inert demand projection.
+    // Ranking neither allocates launch IDs nor authorizes dispatch.
+    let rankCandidates (candidates: PlannerCandidate list) =
+        candidates |> List.sortWith compareCandidates
 
     let private plan (account: AccountSnapshot) (set: PlannerProjectSet)
                      (roles: PlannerRole list) (candidates: PlannerCandidate list)

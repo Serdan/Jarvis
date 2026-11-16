@@ -190,7 +190,7 @@ module WindowsDisposableGuard =
 
     /// Atomic security descriptor at creation time: no moment with inherited
     /// world-readable access before a post-creation ACL rewrite.
-    let createPrivateRoot (path: string) =
+    let createPrivateRoot (path: string) (injectAfterCreate: bool) =
         if File.Exists path || Directory.Exists path then
             deny "Disposable Windows scratch root name is already occupied."
         let user = currentUser()
@@ -202,5 +202,9 @@ module WindowsDisposableGuard =
                                  InheritanceFlags.ContainerInherit ||| InheritanceFlags.ObjectInherit,
                                  PropagationFlags.None, AccessControlType.Allow))
         let created = FileSystemAclExtensions.CreateDirectory(security, path)
+        // Exercise parent acquisition cleanup immediately after OS allocation,
+        // before a post-create attestation failure could leave a private root.
+        if injectAfterCreate then
+            failwith "Hermetic root-creation failure injected before ACL verification."
         assertOwnerOnly created.FullName true true
         created

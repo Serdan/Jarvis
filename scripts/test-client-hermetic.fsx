@@ -36,10 +36,12 @@ let rec parse timeout scratchParent forwarded = function
 let timeout, scratchParent, suppliedArgs = parse 240 None [] args
 let injectSetupFailure = suppliedArgs |> List.contains "--self-test-failed-setup"
 let injectGitIdentitySentinel = suppliedArgs |> List.contains "--self-test-git-sentinel"
+let injectRootCreationFailure = suppliedArgs |> List.contains "--self-test-after-root-creation"
 let forwarded =
     suppliedArgs
     |> List.filter (fun arg ->
-        arg <> "--self-test-failed-setup" && arg <> "--self-test-git-sentinel")
+        arg <> "--self-test-failed-setup" && arg <> "--self-test-git-sentinel"
+        && arg <> "--self-test-after-root-creation")
 
 // A Windows test runner must be given a pre-existing, disposable directory
 // OUTSIDE the operator profile. Never create scratch under ambient Windows
@@ -90,6 +92,8 @@ let captureTail (reader: StreamReader) =
     task {
         // Never retain the unbounded output of a failing or chatty test process.
         let tail = StringBuilder()
+        let currentLine = StringBuilder()
+        let mutable completed = 0
         let buffer = Array.zeroCreate<char> 4096
         let mutable finished = false
         while not finished do
@@ -99,6 +103,21 @@ let captureTail (reader: StreamReader) =
                 tail.Append(buffer, 0, count) |> ignore
                 if tail.Length > 24000 then
                     tail.Remove(0, tail.Length - 24000) |> ignore
+                // Surface bounded completion progress while the child runs.
+                for i in 0 .. count - 1 do
+                    let ch = buffer[i]
+                    if ch = '\n' then
+                        let line = currentLine.ToString().Trim()
+                        currentLine.Clear() |> ignore
+                        let failed = line.StartsWith("Failed ", StringComparison.OrdinalIgnoreCase)
+                        if failed || line.StartsWith("Passed ", StringComparison.OrdinalIgnoreCase)
+                                  || line.StartsWith("Skipped ", StringComparison.OrdinalIgnoreCase) then
+                            completed <- completed + 1
+                            if failed || completed = 1 || completed % 10 = 0 then
+                                let excerpt = if line.Length > 180 then line.Substring(0, 180) else line
+                                printfn "Hermetic Client.Tests: progress completed %d (local stream); %s" completed excerpt
+                    elif ch <> '\r' && currentLine.Length < 512 then
+                        currentLine.Append(ch) |> ignore
         return tail.ToString()
     }
 
@@ -111,21 +130,36 @@ let tempDirectory =
         let path = Path.Combine(parent, $"jarvis-client-tests-{Guid.NewGuid():N}")
         if File.Exists path || Directory.Exists path then
             failwith "Refusing an already occupied disposable Client.Tests scratch name."
-        let created =
-            if OperatingSystem.IsWindows() then
-                WindowsDisposableGuard.createPrivateRoot path
-            else Directory.CreateDirectory(path)
-        if created.Attributes.HasFlag(FileAttributes.ReparsePoint) then
-            failwith "Refusing a linked disposable Client.Tests scratch root."
-        created.FullName
+        try
+            let created =
+                if OperatingSystem.IsWindows() then
+                    WindowsDisposableGuard.createPrivateRoot path injectRootCreationFailure
+                else Directory.CreateDirectory(path)
+            if injectRootCreationFailure && not (OperatingSystem.IsWindows()) then
+                failwith "Hermetic root-creation failure injected after allocation."
+            if created.Attributes.HasFlag(FileAttributes.ReparsePoint) then
+                failwith "Refusing a linked disposable Client.Tests scratch root."
+            created.FullName
+        with original ->
+            // Acquisition happens before the main try/finally. At this point
+            // nothing has been placed inside the root: delete non-recursively,
+            // and only if independent ownership/link checks permit it.
+            if Directory.Exists path then
+                try
+                    if OperatingSystem.IsWindows() then
+                        WindowsDisposableGuard.assertNoLinkedAncestors path
+                        WindowsDisposableGuard.assertOwnerOnly path true true
+                    Directory.Delete(path)
+                    printfn "Hermetic Client.Tests: failed root acquisition %s" path
+                    printfn "Hermetic Client.Tests: scratch cleanup verified = %b" (not (Directory.Exists path))
+                with cleanupError ->
+                    raise (AggregateException(
+                        "Hermetic root allocation failed and safe scratch cleanup could not be verified.",
+                        original, cleanupError))
+            reraise()
     | None -> Directory.CreateTempSubdirectory("jarvis-client-tests-").FullName
 // Direct/external NUnit fixtures attest that the root and every layout
 // directory are owner-only. Set a known private mode before child startup.
-if OperatingSystem.IsLinux() then
-    File.SetUnixFileMode(tempDirectory,
-        UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
-printfn "Hermetic Client.Tests: scratch id %s" (Path.GetFileName tempDirectory)
-printfn "Hermetic Client.Tests: scratch path %s" tempDirectory
 let makeDirectory child =
     let path = Path.Combine(tempDirectory, child)
     Directory.CreateDirectory(path) |> ignore
@@ -154,6 +188,11 @@ let rec deleteDisposableTree (path: string) =
         File.Delete(path)
 
 try
+    if OperatingSystem.IsLinux() then
+        File.SetUnixFileMode(tempDirectory,
+            UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+    printfn "Hermetic Client.Tests: scratch id %s" (Path.GetFileName tempDirectory)
+    printfn "Hermetic Client.Tests: scratch path %s" tempDirectory
     // Avoid ever inheriting the operator's Jarvis config, activity, identity,
     // binding or local file-edit locks. Set environment BEFORE starting testhost.
     let home = makeDirectory "home"
@@ -212,6 +251,9 @@ try
         start.ArgumentList.Add("/ResultsDirectory:" + results)
         start.ArgumentList.Add("/Logger:console;verbosity=normal")
         start.ArgumentList.Add("/TestAdapterPath:" + binaryDirectory)
+        // Bound an individual stuck fixture; collect test sequence, not memory.
+        // The host is terminated and FSI still owns final private cleanup.
+        start.ArgumentList.Add("/Blame:CollectHangDump;TestTimeout=180s;HangDumpType=none")
         let rec forward = function
             | [] -> ()
             | "--no-build" :: tail

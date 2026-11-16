@@ -1,0 +1,13 @@
+# P1 — the one-shot original-send gate is local to one journal root, not to the admitted Work
+
+**Frozen source:** `9eaa4e353c3ebc8a6df664ea5e23a9ccfb550dbb`
+
+**Locations:** `Client/Modules/WorkQueueVerifiedDispatchAdapter.fs:367-450` (especially 372-393 and 402-452), `Client/Modules/OriginalBrowserJournal.fs:232-252,330-355`, `Client/Modules/AccountAdmissionAdapter.fs:375-429`, `Client/Modules/AccountCapacityLedger.fs:480-499`.
+
+The code admits or replays **one** WQ07 token and WQ02 launch, but checks/marks the WQ03 original only in the caller-provided local `journalRoot`. Two independent client processes can have separately provisioned, individually trusted journal roots. Each can enter `dispatchFakeOnly` while the launch is absent and both preflights are still valid. WQ07 `reserve` replays the same stable operation receipt; WQ02 `admitUsing` explicitly returns `ProjectAdmitted` for the same already-admitted launch/role/operation. Both clients can then pass the winning-admission recheck, call `tryMarkOriginal` on **different SQLite databases**, each receive `Marked`, and each invoke its own callback. Nothing in the shared project/account Git authorities elects one journal host or records a globally exclusive original-send claim before the callback.
+
+This violates the acceptance requirement of exactly one original fake-provider callback across independent consumers. The current tests exercise independent Git checkouts but use one shared `journalRoot` and invoke the competing candidate after the first admission, so they cannot expose the same-launch concurrent/different-host race.
+
+**Requested correction:** Make the original-send authority single-valued across independent clients: bind the admitted launch to one approved journal host in canonical evidence and fail closed on any other host, or add a separately CAS-fenced, durable original-send claim before invoking the provider. Keep the WQ03 local journal for crash continuity. Add a barrier-controlled two-client regression with the same stable launch/admission/original IDs, two *separately provisioned* roots, and assertions that no more than one callback runs, regardless of which client wins or replays. If cross-host execution is intentionally unsupported in this slice, enforce and document that restriction rather than relying on all callers to happen to share a root.
+
+**Scope qualification:** This is a fake-only, default-off adapter today, not an observed live-browser duplicate. It blocks the advertised one-shot property before production wiring; it does not undermine the same-root serial replay tests, which pass.

@@ -19,6 +19,17 @@ async function execute(args) {
   const notSubmitted = reason => ({
     status: "notSubmitted", reason, safeToDisposeCreatedTab: safeToDisposeCreatedTab()
   });
+  // This page-facing USER_SCRIPT entrypoint can never authenticate a Work
+  // execution or receive a private bearer. Reject unknown fields rather than
+  // accidentally treating credential/bootstrap arguments as a supported API.
+  // Callers must NOT place secrets in argsJson even when this check rejects it.
+  // Preserve the historically ignored non-secret prior-send hint; it is
+  // not evidence of a private host execution and has no send effect.
+  const permittedArgs = new Set(["prompt", "timeoutMs", "confirmedSubmittedPrompts"]);
+  if (!args || typeof args !== "object" || Array.isArray(args) ||
+      Object.keys(args).some(key => !permittedArgs.has(key))) {
+    return notSubmitted("UnsupportedPrivateBootstrapArguments");
+  }
   if (typeof prompt !== "string" || !prompt.trim() || prompt.length > 24000) {
     return notSubmitted("InvalidPrompt");
   }

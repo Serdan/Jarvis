@@ -1,0 +1,11 @@
+# P1 — Caller chooses the supposed host-pinned approval authorities
+
+**Frozen commit:** `4307675a4b7b81310c57f2a375fab998790ac462`
+
+**Locations:** `Client/Modules/WorkQueueCanonicalMigrationPrepare.fs:383-391, 522-569, 598-600`; `Client/Modules/AccountCapacityLedger.fs:688-725`; `Client.Tests/WorkQueueCanonicalMigrationPrepareTests.fs:159-235`.
+
+`attemptAccountPreparing` accepts `PinnedAccountPreparingKeys` as a normal caller-supplied argument, and the three signatures are checked solely against those same argument keys. Any in-process caller can create three ECDSA pairs, choose arbitrary 64-hex-character protocol/fence/operator evidence digests, sign `accountPreparingStatementSha256`, and pass the three public keys as `keys`; this is exactly how the successful fixture tests build their proof. There is no independent host-controlled key registry, immutable key selection, authority identity, or verified operator approval capability enforcing who may supply those keys. The lower-level `prepareAccountForVerifiedDisposable` additionally checks only witness shape, not their cryptographic validity or their trust origin.
+
+The physical Git sink is intentionally confined to explicitly marked private disposable authorities; this finding **does not** claim a production ref can be moved. However, even for that bounded port, the advertised independently authorized Preparing action is self-authorizable by its caller, contrary to the task's separately verified approval requirement. `AttemptOnDisposable` is only a mode and must not become approval.
+
+**Required correction:** Resolve the three trust anchors from independently provisioned, host-owned policy outside the Preparing request/caller, fail closed when they are unprovisioned, and ensure the only write entrypoint cannot be called with unauthenticated receipts. Alternatively expose a typed *no-write/blocked* port until that authority exists. Add a negative test with caller-created keys and self-signed syntactically valid reports that demonstrably cannot issue an account Preparing CAS unless those exact keys were separately authorized.

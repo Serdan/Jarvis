@@ -208,6 +208,24 @@ module RoleInstructions =
             | Some(role, oid) -> return role, oid
             | None -> return! Error(StaleEntityVersion $"Missing referenced role: {roleId}")
         }
+    // Registration prepares this write against the SAME verified ledger snapshot
+    // as the new agent and optional assignment. It must not perform a separate
+    // role transaction or trust a role read from an earlier snapshot.
+    let initialRegistrationRoleChange binding snapshot actor agentId roleId =
+        if not (isAgentId agentId) || not (isRoleId roleId)
+           || String.IsNullOrWhiteSpace actor then
+            Error(InvalidBinding "Invalid initial role attachment.")
+        else result {
+            let! _ = ensureRole binding snapshot roleId
+            let! existing = readConfigAt binding snapshot agentId
+            if existing.IsSome then
+                return! Error(LedgerIntegrityError "An unregistered agent already has instruction configuration.")
+            let next =
+                { AgentId = agentId; RoleIds = [roleId]; Instructions = ""
+                  Version = 1; UpdatedBy = actor
+                  UpdatedSequence = snapshot.Header.NextSequence }
+            return change (configPath agentId) None (entityJson next)
+        }
 
     let private priorConfig binding snapshot agentId expectedVersion =
         result {

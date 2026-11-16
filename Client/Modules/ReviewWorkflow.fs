@@ -1660,6 +1660,105 @@ module ReviewWorkflow =
     let registerAgent binding operationId agentId =
         registerAgentAs binding legacyAdministrativeActor operationId agentId
 
+    // Prepare the canonical assignment as pure writes against one ledger head.
+    // Both an already-registered owner and a newly registered agent use exactly
+    // the same task/spec validation, issuance, and Ready-state transition.
+    let private queuedAssignmentChanges binding snapshot actor taskId attemptId ownerId
+                                       (agent: ReviewAgent) agentOid =
+        result {
+            let! task, taskOid = required<ReviewTask> binding snapshot (taskPath taskId)
+            let! content, blob = LedgerStore.readAt binding snapshot (specPath taskId)
+            let! pinnedOid =
+                match content, blob with
+                | Some html, Some oid when validTaskHtml html -> Ok oid
+                | _ -> Error(LedgerIntegrityError "Canonical task spec is missing or invalid.")
+            if task.TaskId <> taskId || task.SpecVersion < 1 then
+                return! Error(LedgerIntegrityError "Canonical task identity or spec version is invalid.")
+            if task.Lifecycle <> "Open" || not (String.IsNullOrWhiteSpace task.AttemptId) then
+                return! Error(StaleEntityVersion "Task already has an implementation owner.")
+            if not (List.contains agent.State [ "Parked"; "NeedsWork" ])
+               || not (isNull (box agent.CurrentAssignment))
+               || not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
+                return! Error(AgentBusy "Agent must be unassigned (Needs work or Parked) before receiving an assignment.")
+            let attempt =
+                { TaskId = taskId; AttemptId = attemptId; Version = 1
+                  OwnerAgentId = ownerId; Phase = "Queued"
+                  AssignmentGeneration = 1; Priority = 0
+                  IssuedSequence = snapshot.Header.NextSequence
+                  SpecBlobOid = pinnedOid
+                  BaseCommit = null; TargetRef = null
+                  SourceRepositoryId = null; SourceRemote = null
+                  SourcePushRemote = null; SourceRef = null }
+            let ready =
+                { (assigned taskId attemptId (resetSessions agent)) with
+                    Version = agent.Version + 1
+                    StateReason = $"Assigned task {taskId}; awaiting operator start"
+                    StateSequence = snapshot.Header.NextSequence }
+            return
+                [ change (taskPath taskId) (Some taskOid)
+                    { task with Version = task.Version + 1; Lifecycle = "InProgress"; AttemptId = attemptId }
+                  change (attemptPath taskId attemptId) None attempt
+                  change (issuePath taskId attemptId 1) None
+                    (issue taskId attempt 1 actor "Assignment"
+                        $"Implement task {taskId} against the pinned task specification."
+                        snapshot.Header.NextSequence)
+                  change (agentPath ownerId) agentOid ready ]
+        }
+
+    // Derive the attempted assignment from the durable operation identity.
+    // A retry after a lost response cannot invent a different attempt UUID.
+    let registrationAttemptId (operationId: Guid) agentId taskId =
+        let digestBytes =
+            SHA256.HashData(Encoding.UTF8.GetBytes(
+                "RegisterAgentAttempt:" + operationId.ToString("N") + ":" + agentId + ":" + taskId))
+            |> Array.take 16
+        Guid(digestBytes).ToString("N")
+
+    // The optional setup path is one Git transaction. Keep bare registration on
+    // its historic request hash so old callers and pending-operation replay are
+    // unaffected by the additional arguments.
+    let registerAgentWithSetupAs binding actor operationId agentId roleId taskId =
+        if String.IsNullOrEmpty roleId && String.IsNullOrEmpty taskId then
+            registerAgentAs binding actor operationId agentId
+        elif not (validAgent agentId) || String.IsNullOrWhiteSpace actor
+             || (not (String.IsNullOrEmpty taskId) && not (validTaskId taskId)) then
+            Error(InvalidBinding "Invalid agent registration or initial task ID.")
+        else
+            let attemptId = registrationAttemptId operationId agentId taskId
+            LedgerStore.transact binding
+                (intent operationId actor "RegisterAgent"
+                    {| agentId = agentId; roleId = roleId; taskId = taskId |})
+                (fun snapshot -> result {
+                    let! existing = read<ReviewAgent> binding snapshot (agentPath agentId)
+                    if existing.IsSome then
+                        return! Error(StaleEntityVersion "Agent already registered.")
+                    let agent =
+                        { AgentId = agentId; Version = 1
+                          CurrentAssignment = Unchecked.defaultof<AgentAssignment>
+                          Execution = "Stopped"; UnassignedDisposition = "Parked"
+                          StateReason = "Registered without an assignment"
+                          StateSequence = snapshot.Header.NextSequence
+                          StateEnteredAtUtc = DateTimeOffset.UtcNow.ToString("O")
+                          WorkingTurnStartedAtUtc = null; ActiveSessionId = null
+                          AssociatedSessionIds = [] }
+                    let! roleChanges =
+                        if String.IsNullOrEmpty roleId then Ok []
+                        else
+                            RoleInstructions.initialRegistrationRoleChange
+                                binding snapshot actor agentId roleId
+                            |> Result.map List.singleton
+                    if String.IsNullOrEmpty taskId then
+                        return change (agentPath agentId) None agent :: roleChanges
+                    else
+                        let! writes =
+                            queuedAssignmentChanges binding snapshot actor taskId attemptId
+                                agentId agent None
+                        return writes @ roleChanges
+                })
+
+    let registerAgentWithSetup binding operationId agentId roleId taskId =
+        registerAgentWithSetupAs binding legacyAdministrativeActor operationId agentId roleId taskId
+
     // Taskless execution is explicit and independent of roles and attempts.
     // The agent record and durable operation arbitrate concurrent devices.
     let startTasklessWork binding operationId agentId expectedAgentVersion activity =
@@ -1736,42 +1835,11 @@ module ReviewWorkflow =
             LedgerStore.transact binding
                 (intent operationId actor "AssignTask"
                     {| taskId = taskId; attemptId = attemptId; ownerId = ownerId |})
-                (fun snapshot ->
-                    result {
-                        let! task, taskOid = required<ReviewTask> binding snapshot (taskPath taskId)
-                        let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
-                        let! specContent, specOid = LedgerStore.readAt binding snapshot (specPath taskId)
-                        if specContent.IsNone || specOid.IsNone then
-                            return! Error(LedgerIntegrityError "Canonical task spec is missing.")
-                        if task.Lifecycle <> "Open" || not (String.IsNullOrWhiteSpace task.AttemptId) then
-                            return! Error(StaleEntityVersion "Task already has an implementation owner.")
-                        if not (List.contains agent.State [ "Parked"; "NeedsWork" ])
-                           || not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
-                            return! Error(AgentBusy "Agent must be unassigned (Needs work or Parked) before receiving an assignment.")
-                        let attempt =
-                            { TaskId = taskId; AttemptId = attemptIdText; Version = 1
-                              OwnerAgentId = ownerId; Phase = "Queued"
-                              AssignmentGeneration = 1; Priority = 0
-                              IssuedSequence = snapshot.Header.NextSequence
-                              SpecBlobOid = specOid.Value
-                              BaseCommit = null; TargetRef = null
-                              SourceRepositoryId = null; SourceRemote = null
-                              SourcePushRemote = null; SourceRef = null
-                              }
-                        return
-                            [ change (taskPath taskId) (Some taskOid)
-                                { task with Version = task.Version + 1; Lifecycle = "InProgress"; AttemptId = attemptIdText }
-                              change (attemptPath taskId attemptIdText) None attempt
-                              change (issuePath taskId attemptIdText 1) None
-                                (issue taskId attempt 1 actor "Assignment"
-                                    $"Implement task {taskId} against the pinned task specification."
-                                    snapshot.Header.NextSequence)
-                              change (agentPath ownerId) (Some agentOid)
-                                { (assigned taskId attemptIdText (resetSessions agent)) with
-                                    Version = agent.Version + 1
-                                    StateReason = $"Assigned task {taskId}; awaiting operator start"
-                                    StateSequence = snapshot.Header.NextSequence } ]
-                    })
+                (fun snapshot -> result {
+                    let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                    return! queuedAssignmentChanges binding snapshot actor taskId attemptIdText
+                                ownerId agent (Some agentOid)
+                })
 
     let assignTask binding operationId taskId attemptId ownerId =
         assignTaskAs binding legacyAdministrativeActor operationId taskId attemptId ownerId

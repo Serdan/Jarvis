@@ -1686,10 +1686,12 @@ type JarvisMcpTools =
         let cmd = TaskCommands.write projectName (if pinned then "ReviseTaskSpecPinned" else "ReviseTaskSpec") operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedTaskVersion; BaseOid = expectedSpecBlobOid; Title = title; Html = html })
 
-    [<McpServerTool(Title = "register agent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Register an agent in the canonical ledger with no assignment, Stopped execution and explicit Parked disposition.")>]
-    static member RegisterAgent(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "RegisterAgent" operationId "" agentId
-        McpToolHelpers.send client http (TaskWriteCommand cmd)
+    [<McpServerTool(Title = "register agent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Atomically register an agent with an optional existing role and optional Open task. Without a task the agent is Stopped/Parked; with a task it is Ready, not Working. No browser launch.")>]
+    static member RegisterAgent(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] roleId: string, [<Optional; DefaultParameterValue("")>] taskId: string, client: ClientService, http: IHttpContextAccessor) =
+        // TaskWriteCommand already has both slots: TaskId is the optional
+        // initial task, OwnerId the optional initial role for RegisterAgent.
+        let cmd = TaskCommands.write projectName "RegisterAgent" operationId taskId agentId
+        McpToolHelpers.send client http (TaskWriteCommand { cmd with OwnerId = roleId })
 
     [<McpServerTool(Title = "get role", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a versioned shared role, including content and Git ledger blob provenance.")>]
     static member GetRole(projectName: string, agentId: string, roleId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

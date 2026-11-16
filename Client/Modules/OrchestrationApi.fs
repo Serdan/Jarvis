@@ -1025,7 +1025,20 @@ module PendingIntentJournal =
                 | "TaskWrite", "AdoptTaskSpec" ->
                     attempt @ [ "ExpectedTaskVersion", "expectedTaskVersion"
                                 "BaseOid", "expectedCurrentSpecOid"; "Summary", "instructions" ]
-                | "TaskWrite", "RegisterAgent" -> [ "ActorId", "agentId" ]
+                | "TaskWrite", "RegisterAgent" ->
+                    // Historic bare registration has only agentId in its
+                    // immutable intent. Optional setup must match all supplied
+                    // role/task identities, including when an older receipt
+                    // omits those fields altogether.
+                    let supplied key =
+                        commandProperty own key
+                        |> Option.exists (String.IsNullOrWhiteSpace >> not)
+                    let recorded key =
+                        commandProperty remote key
+                        |> Option.exists (String.IsNullOrWhiteSpace >> not)
+                    [ "ActorId", "agentId" ]
+                    @ (if supplied "OwnerId" || recorded "roleId" then [ "OwnerId", "roleId" ] else [])
+                    @ (if supplied "TaskId" || recorded "taskId" then [ "TaskId", "taskId" ] else [])
                 | "TaskWrite", (("StartTasklessWork" | "YieldTasklessWork") as action) ->
                     [ "ActorId", "agentId"; "ExpectedAgentVersion", "expectedAgentVersion"
                       "Summary", (if action = "StartTasklessWork" then "activity" else "summary") ]
@@ -2028,12 +2041,18 @@ module PendingIntentJournal =
 module OperationResponse =
     // Keep canonical agent state effects available in the client transport
     // without extracting them from presentation JSON or exposing extra MCP fields.
+    type RegistrationSetup =
+        { roleId: string
+          taskId: string
+          attemptId: string }
     type Presented =
         { operation: LedgerStore.LedgerOperation
           head: string
           alreadyApplied: bool
           originalResult: JsonElement
           notificationDelivery: Client.ReviewWorkflow.NotificationDelivery option
+          [<System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)>]
+          registrationSetup: RegistrationSetup option
           [<System.Text.Json.Serialization.JsonIgnore>]
           changedAgentIds: string list }
 
@@ -2045,9 +2064,14 @@ module OperationResponse =
               alreadyApplied = write.AlreadyApplied
               originalResult = document.RootElement.Clone()
               notificationDelivery = notification
+              registrationSetup = None
               changedAgentIds = LedgerStore.LedgerStore.changedAgentIds write }
 
     let present write = presentWithNotification None write
+
+    let presentRegistration write roleId taskId attemptId =
+        let current = present write :?> Presented
+        box { current with registrationSetup = Some { roleId = roleId; taskId = taskId; attemptId = attemptId } }
 
 module LedgerApi =
     let private id label (raw: string) =
@@ -2509,8 +2533,8 @@ module TaskApi =
                                             cmd.ExpectedAgentVersion cmd.AssignmentGeneration cmd.BaseOid cmd.Summary |> mapError)
                             | "RegisterAgent" ->
                                 withAdministrativeActor (fun actor ->
-                                    ReviewWorkflow.ReviewWorkflow.registerAgentAs binding actor operationId cmd.ActorId
-                                    |> mapError)
+                                    ReviewWorkflow.ReviewWorkflow.registerAgentWithSetupAs binding actor operationId
+                                        cmd.ActorId cmd.OwnerId cmd.TaskId |> mapError)
                             | "StartTasklessWork" ->
                                 ReviewWorkflow.ReviewWorkflow.startTasklessWork binding operationId
                                     cmd.ActorId cmd.ExpectedAgentVersion cmd.Summary |> mapError
@@ -2663,6 +2687,14 @@ module TaskApi =
                             |> mapError
                             |> Result.map (fun delivery ->
                                 OperationResponse.presentWithNotification (Some delivery) write)
+                        elif cmd.Action = "RegisterAgent"
+                             && (not (String.IsNullOrEmpty cmd.OwnerId)
+                                 || not (String.IsNullOrEmpty cmd.TaskId)) then
+                            let attemptId =
+                                if String.IsNullOrEmpty cmd.TaskId then null
+                                else ReviewWorkflow.ReviewWorkflow.registrationAttemptId
+                                        operationId cmd.ActorId cmd.TaskId
+                            Ok(OperationResponse.presentRegistration write cmd.OwnerId cmd.TaskId attemptId)
                         else Ok(OperationResponse.present write))))
 
 

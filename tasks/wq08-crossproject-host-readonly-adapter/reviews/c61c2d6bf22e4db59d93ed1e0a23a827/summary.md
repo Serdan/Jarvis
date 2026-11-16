@@ -1,1 +1,7 @@
-Source 9e8dc76784dd88ebabda467441fc0525aed0fb4e. Fixes earlier P1 held authority mismatch/missing launch and P2 historical released retired-project tokens. Adds six targeted tests including SHA/ledger-ID/epoch variants. .NET11 Release: WorkQueueCrossProject 35/35, WorkQueueSchedulerHostPreview 12/12; git diff --check clean.
+# Independent review — WQ08 host r2
+
+**Verdict: Accepted.** Frozen source `9e8dc76784dd88ebabda467441fc0525aed0fb4e`; prior rejected source `5218ff0c1dd6c66698008c9a5efe86f8bc815489`.
+
+Both previously reported issues are resolved within the intended read-only scope. The host now gates `ProjectSetComplete` and `SimulatedWinner` on pinned account/launch authority contradictions (`AccountProjectIdentityMismatch`, missing held launch, duplicate/token/status inconsistencies) without falsely requiring retired *released* tokens in the current approved project set. The pure planner likewise treats settled historical tokens as history while continuing to fail closed for unsettled unknown projects. Added negative-space tests cover SHA/ledger-id/epoch contradictions, absent launch, retired released token plus full cap, and unknown unsettled token. Existing unknown-WQ03/lineage/role/cap tests remain present; `CanDispatch=false`, no pre-send IDs, no account CAS/browser send/timer path was added.
+
+**Independent verification:** exact SHA diff inspected, `git diff --check` exit 0, .NET 11 Release `FullyQualifiedName~WorkQueueCrossProject|FullyQualifiedName~WorkQueueSchedulerHostPreview`: **47 passed, 0 failed, 0 skipped**. No blocking findings in r2. Acceptance concerns this inert preview only; it does not authorize production scheduler activation or integration by this reviewer.

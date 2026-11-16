@@ -361,3 +361,56 @@ type WorkQueueSchedulerHostPreviewTests() =
         let mismatched = WorkQueueSchedulerHostPreview.previewWith (withBrowser wrongRole) "Worker"
         Assert.That(mismatched.ExistingLaunches.Head.OriginalBrowserOutcome, Is.EqualTo("IdentityConflict"))
         Assert.That(mismatched.ExistingLaunches.Head.OriginalBrowserReceipt, Is.EqualTo(None))
+
+    [<Test>]
+    member _.BoundedPreviewShowsUnknownAndUnreleasedLaunchesBeforeSettledHistory() =
+        let baseline: Launch =
+            { Id = "placeholder"; ProjectId = projectId; RoleId = "Worker"; RoleVersion = 4
+              AccountTokenId = "admit-placeholder"
+              State = LaunchState.TerminalPendingRelease "terminal-placeholder"
+              Lease = None; Version = 2; Credit = None; PrimaryWorkId = None
+              EverClaimed = false; AncillaryMessages = Set.empty; DispatchCount = 0 }
+        let historical =
+            [ 1 .. 70 ]
+            |> List.map (fun i ->
+                let id = sprintf "a-history-%03d" i
+                id, { baseline with Id = id; AccountTokenId = "admit-" + id })
+        let unknown =
+            "z-original-unknown",
+            { baseline with
+                Id = "z-original-unknown"; AccountTokenId = "admit-z-original-unknown"
+                State = LaunchState.SubmittedUnregistered DispatchState.OutcomeUnknown
+                Credit = Some stage.Id; DispatchCount = 1 }
+        let releasePending =
+            "y-release-pending",
+            { baseline with
+                Id = "y-release-pending"; AccountTokenId = "admit-y-release-pending" }
+        let entries = historical @ [ unknown; releasePending ]
+        let template = (account true).State.Tokens.[0]
+        let accountTokens =
+            entries
+            |> List.map (fun (id, launch) ->
+                { template with LaunchId = id; AdmissionOperationId = launch.AccountTokenId
+                                Status = if id.StartsWith("a-history-") then "Released" else "Held" })
+            |> List.toArray
+        let baseAccount = account false
+        let withTokens =
+            { baseAccount with
+                State = { baseAccount.State with MaxConcurrentAgents = 2; Tokens = accountTokens } }
+        let mutable browserReads = []
+        let reader id =
+            browserReads <- id :: browserReads
+            Ok None
+        let setup = ports { empty with Launches = Map.ofList entries } false reader
+        let report = WorkQueueSchedulerHostPreview.previewWith
+                         { setup with ReadAccount = fun () -> Ok withTokens } "Worker"
+        Assert.That(report.ExistingLaunches.Length, Is.EqualTo(64))
+        Assert.That(report.ExistingLaunches.[0].LaunchId, Is.EqualTo("z-original-unknown"))
+        Assert.That(report.ExistingLaunches.[1].LaunchId, Is.EqualTo("y-release-pending"))
+        Assert.That(report.ExistingLaunches.[0].AccountTokenStatus, Is.EqualTo("Held"))
+        Assert.That(report.ExistingLaunches.[1].AccountTokenStatus, Is.EqualTo("Held"))
+        Assert.That(report.Issues |> List.exists (fun e ->
+            e.Code = "LaunchListTruncated" && e.NextAction.Contains("64 of 72")), Is.True)
+        Assert.That(browserReads.Length, Is.EqualTo(64))
+        Assert.That(report.CanDispatch, Is.False)
+

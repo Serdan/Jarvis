@@ -228,21 +228,55 @@ module WorkQueueSchedulerHostPreview =
                 |> Map.toList
                 |> List.map snd
                 |> List.filter (fun launch -> launch.RoleId = roleId)
+            // Historical terminal launches remain in Git. In a bounded
+            // preview, their lexical IDs must not hide unresolved sessions.
+            // Terminal project state alone is insufficient: only a matching
+            // released account token makes it settled history.
+            let tokensByLaunch =
+                match account with
+                | Error _ -> Map.empty
+                | Ok snapshot ->
+                    snapshot.State.Tokens
+                    |> Array.groupBy (fun token -> token.LaunchId)
+                    |> Map.ofArray
+            let settledHistory (launch: Launch) =
+                match launch.State, tokensByLaunch.TryFind launch.Id with
+                | LaunchState.TerminalPendingRelease _, Some [| token |] ->
+                    token.Status = "Released"
+                    && token.ProjectId = launch.ProjectId
+                    && token.ProjectLedgerId = pinned.Proof.LedgerId
+                    && token.ProjectLedgerEpoch = pinned.Proof.Epoch
+                    && token.RoleId = launch.RoleId
+                    && token.RoleConfigVersion = int64 launch.RoleVersion
+                    && token.AdmissionOperationId = launch.AccountTokenId
+                | _ -> false
+            let launchPriority launch =
+                let settled = if settledHistory launch then 1 else 0
+                let stateRank =
+                    match launch.State with
+                    | LaunchState.SubmittedUnregistered DispatchState.OutcomeUnknown -> 0
+                    | LaunchState.DemandInvalidatedPendingTerminal _ -> 1
+                    | LaunchState.TerminalPendingRelease _ -> 2
+                    | LaunchState.Registered _ -> 3
+                    | LaunchState.SubmittedUnregistered _ -> 4
+                    | LaunchState.ReservedUnregistered -> 5
+                settled, stateRank, launch.Id
             launches <-
                 roleLaunches
+                |> List.sortBy launchPriority
                 |> List.truncate 64
                 |> List.map (fun launch ->
                     let accountTokenStatus =
                         match account with
                         | Error _ -> "Unknown"
                         | Ok snapshot ->
-                            match snapshot.State.Tokens |> Array.filter (fun token -> token.LaunchId = launch.Id) with
-                            | [||] ->
+                            match tokensByLaunch.TryFind launch.Id with
+                            | None ->
                                 add "AccountTokenMissing" launch.Id
                                     ("No account-global token for this project launch at account head "
                                      + snapshot.Head + "; inspect original reservation before release or retry.")
                                 "Missing"
-                            | [| token |] when token.ProjectId = launch.ProjectId
+                            | Some [| token |] when token.ProjectId = launch.ProjectId
                                                && token.ProjectLedgerId = pinned.Proof.LedgerId
                                                && token.ProjectLedgerEpoch = pinned.Proof.Epoch
                                                && token.RoleId = launch.RoleId
@@ -257,11 +291,11 @@ module WorkQueueSchedulerHostPreview =
                                         "Project launch is not terminal but account capacity was released; inspect original heads and receipts."
                                 | _ -> ()
                                 token.Status
-                            | [| _ |] ->
+                            | Some [| _ |] ->
                                 add "AccountTokenIdentityConflict" launch.Id
                                     "Account token project/ledger, role/version or admission ID differs; preserve both original records."
                                 "IdentityConflict"
-                            | _ ->
+                            | Some _ ->
                                 add "AccountTokenDuplicate" launch.Id
                                     "Multiple account-global tokens claim this launch ID; inspect original account Git records."
                                 "Duplicate"
@@ -332,7 +366,9 @@ module WorkQueueSchedulerHostPreview =
                       OriginalBrowserReceipt = receipt })
             if roleLaunches.Length > 64 then
                 add "LaunchListTruncated" snapshot.Commit
-                    "Inspect project ledger directly for remaining launches matching this role."
+                    ("Showing 64 of " + string roleLaunches.Length
+                     + " launches for this role (unresolved/active first). "
+                     + "Inspect the full project ledger for any omitted launches, including unresolved overflow.")
 
         // Even when this preview can identify a candidate and free capacity,
         // no executable launch ID/one-shot operation is fabricated.

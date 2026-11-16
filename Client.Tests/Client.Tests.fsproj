@@ -63,6 +63,8 @@
         <Compile Include="OriginalBrowserJournalTests.fs"/>
         <Compile Include="WorkQueueSchedulerHostPreviewTests.fs"/>
         <Compile Include="WorkQueueCrossProjectPlannerTests.fs"/>
+        <Compile Include="WorkQueueReactiveWakeTests.fs"/>
+        <Compile Include="WorkQueueReactiveWakeGitTests.fs"/>
         <Compile Include="WorkQueueAcceptedAdaptersCapOneSmokeTests.fs"/>
         <Compile Include="WorkingTurnGuidanceTests.fs"/>
         <Compile Include="OrchestrationApiTests.fs"/>

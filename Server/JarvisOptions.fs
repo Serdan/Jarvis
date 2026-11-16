@@ -4,4 +4,5 @@ namespace Server
 type JarvisOptions =
     { Auth0Domain: string
       Audience: string
-      OpenAIAppsChallenge: string }
+      OpenAIAppsChallenge: string
+      EnableOperatorConversations: bool }

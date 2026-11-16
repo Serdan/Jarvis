@@ -1,11 +1,11 @@
 # WQ06: manually operated Task / Role conversations (isolated)
 
-Status: **development-only, not production Scheduler authority**. This implementation is
-additive to the approved Git ledger and does not change WQ02/WQ04 canonical
-work, source effects, role admission, or their protective guards. It is a
-practical, inspectable Task/Role inbox while the existing transport remains
-inert pending separate integration. Do not dual-write the same operator
-message into both paths.
+Status: **manual, authenticated MCP adapter opt-in; not production Scheduler
+authority**. This remains additive to the approved Git ledger and independent
+of WQ02/WQ04 work, source effects, role admission and their guards. The Jarvis
+MCP surface is **disabled by default** until an operator sets
+`EnableOperatorConversations=true` in the server configuration. Do not
+dual-write the same operator message into this and automatic transport.
 
 ## Storage and state
 
@@ -72,6 +72,51 @@ This returns the message to Pending, preserving the audit; a subsequent
 claim increases the generation. Do not release merely because a message
 seems slow: check the handler and its outcome first.
 
+## Authenticated Jarvis tools (opt-in, no autonomous execution)
+
+The new MCP methods require an approved matching Jarvis server/client and
+`EnableOperatorConversations=true` server configuration. The checked-in
+setting is `false`; this change does **not** deploy, enable, or launch them.
+No scheduling, launch credits, WQ04 transport, or WQ02 migration is authorized.
+
+The server derives actor/handler identity from the authenticated OAuth subject
+(`operator:<sha256-sub>`). No MCP argument can select an arbitrary actor,
+local repository ROOT, Git remote, or trusted ledger path. The client resolves
+the project through its existing approved ledger binding. Identity is
+OAuth-account scoped; multiple agents using one account share an operator
+handler label. The explicit claim generation is still a concurrency fence.
+
+Read-only methods require `workspace:read`; writes require `git:write` and
+local version-control authorization. All are project-scoped:
+
+- `ListOperatorConversation`: passive Task/Role thread read, including
+  Pending/Claimed/Handled, reply, audit, handler generation and verified Git
+  head and per-thread CAS version.
+- `RawOperatorConversation`: raw Git JSON, verified head and backup blob SHA
+  even for malformed content, for explicit repair inspection.
+- `InspectOperatorConversationOperation`: original UUID receipt, Applied or
+  NotFoundAtVerifiedHead. Absence at a verified head does not prove a timed-out
+  write can never arrive.
+- `PostOperatorConversationMessage`: add Pending message at expected thread
+  version with stable message ID; no Scheduler demand.
+- `ClaimOperatorConversationMessage`: claim one Pending message by Git CAS
+  under the authenticated actor, increment handler generation.
+- `HandleOperatorConversationMessage`: record immutable reply at expected
+  thread version and current handler generation, with stable reply ID.
+- `ReleaseOperatorConversationMessage`: explicitly release a claim under
+  expected version and generation with an audit reason; no automatic timeout.
+- `RepairOperatorConversation`: replace a JSON document only at its exact
+  original blob SHA, with reason and separate immutable repair audit. Review
+  the raw before/after diff; it does not auto-correct the document.
+
+All actions take `projectName`, `agentId` (Jarvis routing label), subject
+kind `Task` or `Role` and subject ID as applicable. Mutations take
+`expectedVersion`, action-specific message/reply IDs and the original
+`operationId`. For a new write the UUID can be omitted and returned by
+Jarvis. For an unknown outcome, retry the **identical** UUID, actor and
+parameters; inspect the original receipt first. The server-derived actor
+cannot be overridden. Git remains the sole durable conversation store.
+
 ## Direct repair and visible diff
 
 The privileged repair path intentionally edits the Git-backed conversation
@@ -107,9 +152,8 @@ for reviews.
 
 ## Constraints and follow-on integration
 
-- This is a **manual** Task/Role conversation queue, not registered server
-  MCP endpoints, not automatic scheduling, and not an authorized migration
-  of the WQ02 project state machine.
+- This is a **manual** Task/Role queue with **default-disabled** authenticated
+  MCP endpoints; not automatic scheduling or a WQ02 state-machine migration.
 - Existing `WorkQueueConversationTransport.fs` retains its fail-closed
   WQ04/WQ03 production gates. Its historical positive tests against the
   guarded production path still fail pending a fixture/authority integration;

@@ -127,6 +127,7 @@ let private mayReceiveResponseAlert = function
     // Observer and operator inspection are administrative, not the target
     // agent's ordinary tool usage. They must never consume a message.
     | ObserveAgentCommand _ -> false
+    | OperatorConversationReadCommand _ -> false
     | TaskReadCommand cmd when cmd.Action = "GetResponseAlerts" -> false
     | TaskWriteCommand cmd when cmd.Action = "QueueResponseAlert"
                                  || cmd.Action = "ClearResponseAlert" -> false
@@ -166,6 +167,10 @@ let private activatesAgent (agentId: string) command =
     // Challenge inspection is observational. ReadOnly MCP methods must
     // never activate a Ready assignment or change canonical ledger state.
     | ChallengeReadCommand _ -> false
+    // Manual operator-conversation tools are observational/external to task
+    // activation, even when the same agent later handles a thread.
+    | OperatorConversationReadCommand _
+    | OperatorConversationWriteCommand _ -> false
     // Blocking an assigned task needs to preserve the exact supplied attempt
     // and agent CAS versions. It is an explicit lifecycle transition, not a
     // cheap read that should implicitly start Ready->Working first.
@@ -754,6 +759,10 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
     | CreateWorktreeCommand cmd -> rt |> Worktrees.createWorktree cmd |> serialize'
     | InspectWorktreeRemovalCommand cmd -> rt |> Worktrees.inspectRemoval cmd |> serialize'
     | RemoveWorktreeCommand cmd -> rt |> Worktrees.removeWorktree cmd |> serialize'
+    | OperatorConversationReadCommand cmd ->
+        rt |> OrchestrationApi.OperatorConversationApi.read cmd |> serialize'
+    | OperatorConversationWriteCommand cmd ->
+        rt |> OrchestrationApi.OperatorConversationApi.write cmd |> serialize'
     | TaskReadCommand cmd -> rt |> OrchestrationApi.TaskApi.read cmd |> serialize'
     | ObserveAgentCommand cmd ->
         rt |> OrchestrationApi.AgentObservationApi.observe cmd

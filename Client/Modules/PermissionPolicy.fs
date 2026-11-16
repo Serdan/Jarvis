@@ -116,6 +116,7 @@ let private requiresConfirmation command =
     | ListWorktreesCommand _
     | GetWorktreeCommand _
     | InspectWorktreeRemovalCommand _
+    | OperatorConversationReadCommand _
     | TaskReadCommand _
     | ChallengeReadCommand _
     | ObserveAgentCommand _
@@ -199,6 +200,12 @@ let private requiresConfirmation command =
         confirmation "RunProjectTask" (Some cmd.ProjectName) [ ProcessExecution ] [] None [ cmd.TaskName ] $"Run project task {cmd.TaskName}" false
     | RemoveWorktreeCommand cmd ->
         confirmation "RemoveWorktree" (Some cmd.ProjectName) [ VersionControlWrite; Destructive ] [] (Some "git") [ cmd.WorktreePath ] $"Remove worktree {cmd.WorktreePath}" false
+    | OperatorConversationWriteCommand cmd ->
+        confirmation ("OperatorConversation" + cmd.Action) (Some cmd.ProjectName)
+            (if cmd.Action = "Repair" then [ VersionControlWrite; NetworkAccess; Destructive ]
+             else [ VersionControlWrite; NetworkAccess ]) [] (Some "git")
+            [ cmd.SubjectKind; cmd.SubjectId; cmd.OperationId ]
+            ("Explicit operator conversation " + cmd.Action + " (manual Git CAS)") false
     | ChallengeWriteCommand cmd ->
         confirmation "ChallengeWrite" (Some cmd.ProjectName) [ VersionControlWrite; NetworkAccess ]
             [] None [ cmd.Action ] "Persist durable challenge transition" false

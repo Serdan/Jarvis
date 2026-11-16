@@ -426,14 +426,11 @@ module HermeticHarnessTests =
             // This child remains beneath a proven private parent; restore its
             // safe inherited DACL before invoking normal bounded teardown.
             let info = DirectoryInfo(isolated)
-            let user = WindowsIdentity.GetCurrent().User
-            let security = DirectorySecurity()
-            security.SetOwner(user)
-            security.SetAccessRuleProtection(true, false)
-            security.AddAccessRule(
-                FileSystemAccessRule(user, FileSystemRights.FullControl,
-                                     InheritanceFlags.ContainerInherit ||| InheritanceFlags.ObjectInherit,
-                                     PropagationFlags.None, AccessControlType.Allow))
+            let security = FileSystemAclExtensions.GetAccessControl(info)
+            // Modify only DACL access, not the owner. Replacing a descriptor
+            // and setting its owner requires privileges a disposable user
+            // must not need, and caused an UnauthorizedAccessException.
+            security.PurgeAccessRules(SecurityIdentifier(WellKnownSidType.WorldSid, null))
             FileSystemAclExtensions.SetAccessControl(info, security)
             WindowsDisposableGuard.assertOwnerOnly isolated true true
             Directory.Delete(isolated)

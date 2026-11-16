@@ -1,0 +1,1 @@
+Per-kind agent-scoped unread MCP indicators; durable typed challenge events and acknowledgements; cross-project source-only metadata; focused and challenge test suites pass.

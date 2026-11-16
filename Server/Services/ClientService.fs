@@ -165,11 +165,11 @@ module AgentStateInvalidationRouting =
                 project, (changes |> List.map _.AgentId |> List.distinct |> List.toArray))
 
 
-type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker, http: IHttpContextAccessor, logger: ILogger<ClientService>, store: FeedbackStore) =
-    // Preserve the test-only construction path; production DI chooses the
-    // longer constructor with a persistent activity store.
-    new(ctx, users, tracker, http, logger) =
-        ClientService(ctx, users, tracker, http, logger, Unchecked.defaultof<FeedbackStore>)
+type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker, http: IHttpContextAccessor, logger: ILogger<ClientService>) =
+    // Cross-device hints are nonauthoritative. Allow only one pending batch
+    // globally: a hung SignalR recipient cannot create an unbounded backlog
+    // of tasks, closures or device snapshots under sustained MCP traffic.
+    let mutable activityHintBatchInFlight = 0
 
     member this.SendMessageToAll(message) = ctx.Clients.All.ReceiveMessage(message)
 
@@ -185,25 +185,41 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                 ctx.Clients.Client(connectionId).InvalidateAgentStates(projectName, unique))
             |> Task.WhenAll
 
-    // Lightweight authenticated activity hints, not ledger writes. Deliver to
-    // every connected device of this user so idle deadlines share observation.
+    // Best-effort hints for displays and local deadlines; never use this as
+    // authoritative cross-device proof for AfterAgentIdle. This method cannot
+    // touch the disposable server DB or delay an MCP command.
     member _.RecordAgentActivityForUser(userId: string, projectName: string,
                                         agentId: string, observedAtUtc: DateTimeOffset) : Task =
         if String.IsNullOrWhiteSpace projectName || String.IsNullOrWhiteSpace agentId then
             Task.CompletedTask
+        elif Interlocked.CompareExchange(&activityHintBatchInFlight, 1, 0) <> 0 then
+            // Drop rather than enqueue: hints cannot prove agent idleness.
+            Task.CompletedTask
         else
             let separator = projectName.IndexOf("::", StringComparison.Ordinal)
             let project = if separator < 0 then projectName else projectName.Substring(0, separator)
-            // Durable before best-effort SignalR hints. Failed hint delivery
-            // cannot lose an activity update: the next verified query sees it.
-            if obj.ReferenceEquals(box store, null) then
-                invalidOp "Attributed agent activity cannot be verified without durable persistence."
-            store.RecordAttributedAgentActivity(userId, project, agentId, observedAtUtc)
-            users.ListDevices(userId)
-            |> AgentStateInvalidationRouting.recipients
-            |> Array.map (fun connectionId ->
-                ctx.Clients.Client(connectionId).RecordAgentActivity(project, agentId, observedAtUtc))
-            |> Task.WhenAll
+            try
+                Task.Run(Func<Task>(fun () ->
+                    task {
+                        try
+                            try
+                                do!
+                                    users.ListDevices(userId)
+                                    |> AgentStateInvalidationRouting.recipients
+                                    |> Array.map (fun connectionId ->
+                                        ctx.Clients.Client(connectionId).RecordAgentActivity(project, agentId, observedAtUtc))
+                                    |> Task.WhenAll
+                            with ex ->
+                                logger.LogWarning(ex, "Optional cross-device activity hint failed")
+                        finally
+                            // If a send never completes, the one in-flight
+                            // batch remains held and later hints are dropped.
+                            Interlocked.Exchange(&activityHintBatchInFlight, 0) |> ignore
+                    } :> Task)) |> ignore
+            with ex ->
+                Interlocked.Exchange(&activityHintBatchInFlight, 0) |> ignore
+                logger.LogWarning(ex, "Optional cross-device activity hint could not be queued")
+            Task.CompletedTask
 
     // A client exception after a possible mutation cannot identify all
     // affected agents. Invalidate every cached agent for THIS authenticated
@@ -305,53 +321,29 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
 
                         let mutable replyStartedAt = None
                         let dispatchAt = Stopwatch.GetTimestamp()
-                        // Persist the original attributed caller's activity
-                        // BEFORE the command can start executing on another
-                        // device. Hints are best-effort; the SQLite watermark
-                        // is what the Manager clock verifies before launch.
-                        let mutable activityPersistenceFailed = false
-                        let activityHints =
-                            match agentId, AgentCommandInfo.projectName command with
-                            | Some actor, Some project
-                                when not (String.IsNullOrWhiteSpace actor) &&
-                                     not (String.IsNullOrWhiteSpace project) &&
-                                     AgentCommandInfo.isAgentActivity command ->
-                                try Some(this.RecordAgentActivityForUser(userId, project, actor, DateTimeOffset.UtcNow))
-                                with ex ->
-                                    // No activity watermark means no safe Manager idle
-                                    // verification. Reject BEFORE any remote execution:
-                                    // an in-memory poison flag cannot survive restart.
-                                    logger.LogError(ex, "Attribution persistence failed; refusing command dispatch")
-                                    activityPersistenceFailed <- true
-                                    None
-                            | _ -> None
-                        if activityPersistenceFailed then
-                            tracker.Cancel(correlationId)
-                            report "activity-persistence-failed"
-                            return
-                                { Result = None
-                                  Error = Some(ExecutionFailed
-                                      "Attributed agent activity could not be persisted; command was not dispatched.")
-                                  Instructions = []; AgentStateChanges = sourceChanges
-                                  InboxActivation = sourceActivation; PendingJob = None }
-                        else
-                            try
-                                // Never synthesize the original source UUID from this
-                                // correlation ID; the caller owns it across retries.
+                        // Optional diagnostic hints never authorize AfterAgentIdle
+                        // or block client Git-CAS and process commands.
+                        match agentId, AgentCommandInfo.projectName command with
+                        | Some actor, Some project
+                            when not (String.IsNullOrWhiteSpace actor) &&
+                                 not (String.IsNullOrWhiteSpace project) &&
+                                 AgentCommandInfo.isAgentActivity command ->
+                            this.RecordAgentActivityForUser(userId, project, actor, DateTimeOffset.UtcNow)
+                            |> ignore
+                        | _ -> ()
+                        try
+                                // Preserve the original source operation UUID across
+                                // client hops; correlation IDs are not authority.
                                 let dispatch =
                                     match sourceOperationId with
-                                    | Some original -> client.ReceiveSourceCommand(
-                                        correlationId, commandJson, defaultArg agentId "", original)
-                                    | None -> client.ReceiveCommand(correlationId, commandJson, defaultArg agentId "")
+                                    | Some original ->
+                                        client.ReceiveSourceCommand(
+                                            correlationId, commandJson, defaultArg agentId "", original)
+                                    | None ->
+                                        client.ReceiveCommand(correlationId, commandJson, defaultArg agentId "")
                                 do! dispatch.WaitAsync(requestAborted)
                                 sendMs <- Stopwatch.GetElapsedTime(dispatchAt).TotalMilliseconds
                                 users.RecordDispatchSuccess(userId, connectionId)
-                                match activityHints with
-                                | Some hints ->
-                                    try do! hints
-                                    with ex ->
-                                        logger.LogWarning(ex, "Unable to publish cross-device agent activity hint")
-                                | None -> ()
 
                                 let awaitReplyAt = Stopwatch.GetTimestamp()
                                 replyStartedAt <- Some awaitReplyAt
@@ -380,7 +372,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                             )
                                           Instructions = []; AgentStateChanges = sourceChanges
                                           InboxActivation = sourceActivation; PendingJob = None }
-                            with ex ->
+                        with ex ->
                                 match replyStartedAt with
                                 | Some started when replyMs = 0.0 ->
                                     replyMs <- Stopwatch.GetElapsedTime(started).TotalMilliseconds

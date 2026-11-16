@@ -2304,7 +2304,7 @@ let browser_dom_mcp_tools_route_only_when_all_required_oauth_scopes_are_present 
 }
 
 [<Test>]
-let attributed_tool_dispatch_reaches_both_user_devices_but_not_other_users_or_job_polls () = task {
+let attributed_tool_dispatch_survives_missing_sqlite_and_notifies_only_user_devices () = task {
     let users = UserService()
     let registrations = System.Collections.Generic.Dictionary<string, int64>()
     let register user device connection =
@@ -2319,10 +2319,6 @@ let attributed_tool_dispatch_reaches_both_user_devices_but_not_other_users_or_jo
     register "alice" "laptop" "laptop-connection"
     register "bob" "foreign" "foreign-connection"
     let tracker = ClientResponseTracker()
-    let activityDb = System.IO.Path.Combine(System.IO.Path.GetTempPath(),
-                        "jarvis-dispatch-activity-" + Guid.NewGuid().ToString("N") + ".db")
-    use activityStore = new FeedbackStore(activityDb)
-    let mutable persistedBeforeRemoteExecution = false
     let mutable deliveredCommands = 0
     let received = System.Collections.Concurrent.ConcurrentQueue<string * string * string * DateTimeOffset>()
     let expected = { Result = Some "ok"; Error = None; Instructions = []
@@ -2333,8 +2329,6 @@ let attributed_tool_dispatch_reaches_both_user_devices_but_not_other_users_or_jo
             member _.ReceiveSourceCommand(_, _, _, _) = Task.CompletedTask
             member _.ReceiveCommand(correlationId, _, _) =
                 System.Threading.Interlocked.Increment(&deliveredCommands) |> ignore
-                persistedBeforeRemoteExecution <-
-                    activityStore.GetAttributedAgentActivity("alice", "Jarvis", "Manager").IsSome
                 tracker.Complete(correlationId, "alice", connection, registrations[connection], expected)
                 |> ignore
                 Task.CompletedTask
@@ -2361,19 +2355,17 @@ let attributed_tool_dispatch_reaches_both_user_devices_but_not_other_users_or_jo
     let accessor = Microsoft.AspNetCore.Http.HttpContextAccessor()
     accessor.HttpContext <- Microsoft.AspNetCore.Http.DefaultHttpContext()
     let service = ClientService(hub, users, tracker, accessor,
-        Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance, activityStore)
+        Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
     let run =
         RunCommandCommand
             { ProjectName = "Jarvis::branch"; Executable = "dotnet"; Args = [ "--version" ]
               Reason = None; WorkingDirectory = None; TimeoutSeconds = None; MaxOutputBytes = None }
     let! result = service.SendCommandToUser("alice", run, deviceId = "desktop", agentId = "Manager")
     Assert.That(result.Result, Is.EqualTo(Some "ok"))
-    Assert.That(persistedBeforeRemoteExecution, Is.True,
-                "Authenticated caller activity must be durable before the client command begins.")
-    let verified =
-        activityStore.GetAttributedAgentActivity("alice", "Jarvis", "Manager")
-    Assert.That(verified.IsSome, Is.True)
-    Assert.That(activityStore.GetAttributedAgentActivity("bob", "Jarvis", "Manager"), Is.EqualTo(None))
+    // Hints run off the MCP request thread and may arrive slightly later.
+    let hintDeadline = System.Diagnostics.Stopwatch.StartNew()
+    while received.Count < 2 && hintDeadline.Elapsed < TimeSpan.FromSeconds(2.) do
+        do! Task.Delay(10)
     let notifications = received.ToArray()
     Assert.That(notifications.Length, Is.EqualTo(2))
     let observedDevices = notifications |> Array.map (fun (connection, _, _, _) -> connection) |> Set.ofArray
@@ -2388,38 +2380,105 @@ let attributed_tool_dispatch_reaches_both_user_devices_but_not_other_users_or_jo
     let! result2 = service.SendCommandToUser("alice", poll, deviceId = "desktop", agentId = "Manager")
     Assert.That(result2.Result, Is.EqualTo(Some "ok"))
     Assert.That(received.Count, Is.EqualTo(2), "Job polling must not reset Manager idle clock")
-    Assert.That(activityStore.GetAttributedAgentActivity("alice", "Jarvis", "Manager"),
-                Is.EqualTo(verified), "Job polling must not modify the durable activity watermark.")
-
-    // SQLite can reject a write after an old watermark was previously saved.
-    // Reject the invocation before ReceiveCommand: an in-memory poison marker
-    // alone would disappear after restart, making the old stamp unsafe.
-    use sqlite = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=" + activityDb)
-    sqlite.Open()
-    use deny = sqlite.CreateCommand()
-    deny.CommandText <-
-        """CREATE TRIGGER fail_agent_write BEFORE INSERT ON attributed_agent_activity
-           BEGIN SELECT RAISE(ABORT, 'injected attributed activity persistence failure'); END;"""
-    deny.ExecuteNonQuery() |> ignore
-    let beforeFailure = deliveredCommands
-    let! blocked = service.SendCommandToUser("alice", run, deviceId = "desktop", agentId = "Manager")
-    match blocked.Error with
-    | Some (ExecutionFailed message) -> Assert.That(message, Does.Contain("not dispatched"))
-    | _ -> Assert.Fail("An attributed command must fail closed when SQLite refuses its watermark.")
-    Assert.That(deliveredCommands, Is.EqualTo(beforeFailure),
-                "No remote command may execute without a durable activity watermark.")
-
-    use restartedStore = new FeedbackStore(activityDb)
-    Assert.That(restartedStore.GetAttributedAgentActivity("alice", "Jarvis", "Manager"),
-                Is.EqualTo(verified),
-                "Restart can retain the old stamp only because the failed call never executed.")
+    // Missing or corrupt SQLite is irrelevant to tool dispatch; simulated
+    // server service replacement retains in-memory session routing here.
+    let beforeRestart = deliveredCommands
     let restartedService = ClientService(hub, users, tracker, accessor,
-        Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance, restartedStore)
-    let! blockedAfterRestart =
-        restartedService.SendCommandToUser("alice", run, deviceId = "desktop", agentId = "Manager")
-    Assert.That(blockedAfterRestart.Error.IsSome, Is.True)
-    Assert.That(deliveredCommands, Is.EqualTo(beforeFailure),
-                "After restart, a failed activity write still cannot dispatch a Manager tool.")
+        Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
+    let! afterRestart =
+        restartedService.SendCommandToUser("alice", run, deviceId = "laptop", agentId = "Manager")
+    Assert.That(afterRestart.Result, Is.EqualTo(Some "ok"))
+    Assert.That(deliveredCommands, Is.EqualTo(beforeRestart + 1))
+}
+
+[<Test>]
+let stalled_cross_device_activity_hints_drop_without_unbounded_tasks_or_blocking_commands () = task {
+    let users = UserService()
+    let registrations = System.Collections.Generic.Dictionary<string, int64>()
+    for connection in [ "first"; "second" ] do
+        users.TransportConnected("alice", connection)
+        let registered =
+            users.Register("alice",
+                { DeviceId = connection; DeviceName = connection
+                  ProtocolVersion = AgentProtocol.version; ClientVersion = "test"
+                  SupportedCommands = [ "RunCommand" ] }, connection)
+        registrations[connection] <- registered.Generation
+
+    let tracker = ClientResponseTracker()
+    let mutable hintSends = 0
+    let mutable commands = 0
+    let firstBatchStarted =
+        TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let releaseHints =
+        TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let accepted =
+        { Result = Some "ok"; Error = None; Instructions = []
+          AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+    let recipient connection =
+        { new IClientService with
+            member _.ReceiveMessage(_) = Task.CompletedTask
+            member _.ReceiveCommand(correlationId, _, _) =
+                System.Threading.Interlocked.Increment(&commands) |> ignore
+                tracker.Complete(correlationId, "alice", connection,
+                                 registrations[connection], accepted) |> ignore
+                Task.CompletedTask
+            member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+            member _.InvalidateAllAgentStates() = Task.CompletedTask
+            member _.RecordAgentActivity(_, _, _) =
+                if System.Threading.Interlocked.Increment(&hintSends) = 2 then
+                    firstBatchStarted.TrySetResult(()) |> ignore
+                releaseHints.Task :> Task }
+    let clients =
+        { new Microsoft.AspNetCore.SignalR.IHubClients<IClientService> with
+            member _.All = recipient "first"
+            member _.AllExcept(_) = recipient "first"
+            member _.Client(connection) = recipient connection
+            member _.Clients(_) = recipient "first"
+            member _.Group(_) = recipient "first"
+            member _.GroupExcept(_, _) = recipient "first"
+            member _.Groups(_) = recipient "first"
+            member _.User(_) = recipient "first"
+            member _.Users(_) = recipient "first" }
+    let hub =
+        { new Microsoft.AspNetCore.SignalR.IHubContext<HubService, IClientService> with
+            member _.Clients = clients
+            member _.Groups = Unchecked.defaultof<_> }
+    let accessor = Microsoft.AspNetCore.Http.HttpContextAccessor()
+    accessor.HttpContext <- Microsoft.AspNetCore.Http.DefaultHttpContext()
+    let service = ClientService(hub, users, tracker, accessor,
+        Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
+
+    let! first = service.RecordAgentActivityForUser("alice", "Jarvis", "Manager", DateTimeOffset.UtcNow)
+    do! firstBatchStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.))
+    let timer = System.Diagnostics.Stopwatch.StartNew()
+    for _ in 1 .. 3000 do
+        let hint = service.RecordAgentActivityForUser("alice", "Jarvis", "Manager", DateTimeOffset.UtcNow)
+        Assert.That(hint.IsCompletedSuccessfully, Is.True)
+    Assert.That(timer.Elapsed, Is.LessThan(TimeSpan.FromSeconds(2.)))
+    Assert.That(System.Threading.Volatile.Read(&hintSends), Is.EqualTo(2),
+                "Only the first two device sends may be retained while both recipients are stalled.")
+
+    // Real attributed commands still travel through SignalR and return the
+    // client's verified response even when the optional hint batch is stuck.
+    let command =
+        RunCommandCommand
+            { ProjectName = "Jarvis"; Executable = "dotnet"; Args = [ "--version" ]
+              Reason = None; WorkingDirectory = None
+              TimeoutSeconds = None; MaxOutputBytes = None }
+    let! result = service.SendCommandToUser("alice", command, deviceId = "first", agentId = "Manager")
+    Assert.That(result.Result, Is.EqualTo(Some "ok"))
+    Assert.That(commands, Is.EqualTo(1))
+    Assert.That(System.Threading.Volatile.Read(&hintSends), Is.EqualTo(2))
+
+    releaseHints.TrySetResult(()) |> ignore
+    let retryDeadline = System.Diagnostics.Stopwatch.StartNew()
+    while System.Threading.Volatile.Read(&hintSends) = 2 &&
+          retryDeadline.Elapsed < TimeSpan.FromSeconds(2.) do
+        service.RecordAgentActivityForUser("alice", "Jarvis", "Manager", DateTimeOffset.UtcNow)
+        |> ignore
+        do! Task.Delay(10)
+    Assert.That(System.Threading.Volatile.Read(&hintSends), Is.EqualTo(4),
+                "After the blocked batch settles, a new bounded hint batch may run.")
 }
 
 [<Test>]

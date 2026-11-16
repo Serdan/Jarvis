@@ -102,23 +102,30 @@ module FeedbackValidation =
     let status value = canonical statuses "status" value
     let isClosed value = value = "Resolved" || value = "WontFix"
 
-type FeedbackStore(databasePath: string, ?telemetryRetention: TimeSpan) =
+type FeedbackStore(databasePath: string, ?telemetryRetention: TimeSpan, ?runPruneTimer: bool,
+                   ?maxDatabaseBytes: int64) =
     let telemetryRetention = defaultArg telemetryRetention (TimeSpan.FromDays 30.0)
     do if telemetryRetention <= TimeSpan.Zero then invalidArg "telemetryRetention" "Must be positive"
+    // This disposable diagnostics database cannot grow new SQLite pages indefinitely.
+    // The optional wrapper quarantines oversized pre-existing files before opening.
+    let maxDatabaseBytes = defaultArg maxDatabaseBytes (16L * 1024L * 1024L)
+    do if maxDatabaseBytes < 128L * 1024L then invalidArg "maxDatabaseBytes" "Must be at least 128 KiB"
     let connectionString =
         let builder = SqliteConnectionStringBuilder()
         builder.DataSource <- databasePath
         builder.Mode <- SqliteOpenMode.ReadWriteCreate
         builder.Cache <- SqliteCacheMode.Shared
+        // Best-effort diagnostics must never hold a SQLite lock indefinitely.
+        builder.DefaultTimeout <- 1
         builder.ToString()
 
     let dbValue = function
         | Some value -> box value
         | None -> box DBNull.Value
 
-    // Fail closed for an agent whose most recent accepted tool activity
-    // could not be persisted. A later successful write repairs the watermark.
-    // This is only a safety guard; the durable values remain in SQLite.
+    // Legacy attributed-activity diagnostics: production no longer reads
+    // SQLite as AfterAgentIdle authority. Never restore scheduling from these
+    // rows, including after a server restart or database replacement.
     let unverifiedActivity = ConcurrentDictionary<struct (string * string * string), byte>()
 
     let optionText (reader: SqliteDataReader) ordinal =
@@ -129,6 +136,21 @@ type FeedbackStore(databasePath: string, ?telemetryRetention: TimeSpan) =
     let openConnection () =
         let connection = new SqliteConnection(connectionString)
         connection.Open()
+
+        use size = connection.CreateCommand()
+        size.CommandText <- "PRAGMA page_size;"
+        let pageSize = Convert.ToInt64(size.ExecuteScalar())
+        use pageLimit = connection.CreateCommand()
+        pageLimit.CommandText <- $"PRAGMA max_page_count = {max 1L (maxDatabaseBytes / pageSize)};"
+        pageLimit.ExecuteScalar() |> ignore
+        // Checkpoints keep WAL space small normally. A blocked checkpoint can
+        // outlive this limit, so OptionalFeedbackStore also checks sidecar sizes.
+        use checkpoint = connection.CreateCommand()
+        checkpoint.CommandText <- "PRAGMA wal_autocheckpoint = 64;"
+        checkpoint.ExecuteScalar() |> ignore
+        use journalLimit = connection.CreateCommand()
+        journalLimit.CommandText <- "PRAGMA journal_size_limit = 1048576;"
+        journalLimit.ExecuteScalar() |> ignore
 
         use foreignKeys = connection.CreateCommand()
         foreignKeys.CommandText <- "PRAGMA foreign_keys = ON;"
@@ -215,9 +237,9 @@ CREATE TABLE IF NOT EXISTS connection_events (
 CREATE INDEX IF NOT EXISTS ix_connection_events_user_created
     ON connection_events(user_id, created_at DESC);
 
--- Authoritative, authenticated, user-scoped activity watermarks for
--- AfterAgentIdle scheduling. Not canonical agent lifecycle state and never
--- written by observer queries or another agent's read.
+-- Legacy, NONAUTHORITATIVE attributed activity diagnostics, retained in
+-- existing databases without destructive migration. A reset/lost row must
+-- NEVER be interpreted as agent inactivity or authorize AfterAgentIdle.
 CREATE TABLE IF NOT EXISTS attributed_agent_activity (
     user_id TEXT NOT NULL,
     project_name TEXT NOT NULL,
@@ -251,7 +273,10 @@ CREATE TABLE IF NOT EXISTS attributed_agent_activity (
         for table in [ "connection_events"; "operations" ] do
             use command = connection.CreateCommand()
             command.Transaction <- transaction
-            command.CommandText <- $"DELETE FROM {table} WHERE created_at < $cutoff;"
+            // Each pass has a finite write/lock budget, even for legacy files
+            // containing years of old data.
+            command.CommandText <-
+                $"DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE created_at < $cutoff LIMIT 128);"
             addParameter command "$cutoff" (cutoff.ToString("O"))
             command.ExecuteNonQuery() |> ignore
         transaction.Commit()
@@ -259,14 +284,16 @@ CREATE TABLE IF NOT EXISTS attributed_agent_activity (
     do initialize()
     do pruneTelemetry DateTimeOffset.UtcNow
     let pruneTimer =
-        new Timer(TimerCallback(fun _ ->
-            try pruneTelemetry DateTimeOffset.UtcNow
-            with _ -> ()), null, TimeSpan.FromHours 1.0, TimeSpan.FromHours 1.0)
+        if defaultArg runPruneTimer true then
+            Some(new Timer(TimerCallback(fun _ ->
+                try pruneTelemetry DateTimeOffset.UtcNow
+                with _ -> ()), null, TimeSpan.FromHours 1.0, TimeSpan.FromHours 1.0))
+        else None
 
     member _.PruneTelemetry(now: DateTimeOffset) = pruneTelemetry now
 
     interface IDisposable with
-        member _.Dispose() = pruneTimer.Dispose()
+        member _.Dispose() = pruneTimer |> Option.iter (fun timer -> timer.Dispose())
 
     member _.DatabasePath = databasePath
 
@@ -410,10 +437,12 @@ LIMIT $limit;
         projectName: string option,
         serverVersion: string,
         clientVersion: string option,
-        protocolVersion: string option
+        protocolVersion: string option,
+        ?operationId: string,
+        ?startedAt: DateTimeOffset
     ) =
-        let startedAt = DateTimeOffset.UtcNow
-        let operationId = Guid.NewGuid().ToString("N")
+        let startedAt = defaultArg startedAt DateTimeOffset.UtcNow
+        let operationId = defaultArg operationId (Guid.NewGuid().ToString("N"))
 
         use connection = openConnection()
         use command = connection.CreateCommand()

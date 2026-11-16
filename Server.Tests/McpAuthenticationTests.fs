@@ -103,39 +103,75 @@ let unauthenticated_mcp_requests_get_http_oauth_challenge_but_resource_metadata_
 
 
 [<Test>]
-let server_does_not_serve_readiness_routes_when_feedback_database_cannot_initialize () =
+let server_authentication_and_routing_start_with_missing_corrupt_or_unavailable_sqlite () =
     let configuration = DirectoryInfo(AppContext.BaseDirectory).Parent.Name
     let serverDll =
         Path.Combine(repositoryRoot (), "Server", "bin", configuration,
                      DirectoryInfo(AppContext.BaseDirectory).Name, "JarvisServer.dll")
     Assert.That(File.Exists(serverDll), Is.True)
-    let tempDirectory = Path.Combine(Path.GetTempPath(), "jarvis-server-readiness-" + Guid.NewGuid().ToString("N"))
-    Directory.CreateDirectory(tempDirectory) |> ignore
-    // Passing a directory as the database filename must fail SQLite startup.
-    let invalidDatabasePath = Path.Combine(tempDirectory, "is-a-directory")
-    Directory.CreateDirectory(invalidDatabasePath) |> ignore
-    let start = ProcessStartInfo("dotnet")
-    start.ArgumentList.Add(serverDll)
-    start.UseShellExecute <- false
-    start.CreateNoWindow <- true
-    start.RedirectStandardError <- true
-    start.Environment["ASPNETCORE_URLS"] <- $"http://127.0.0.1:{unusedLoopbackPort ()}"
-    start.Environment["ASPNETCORE_ENVIRONMENT"] <- "Development"
-    start.Environment["JarvisAuth0Domain"] <- "dev-kn4j3jz3qv2cvw05.eu.auth0.com"
-    start.Environment["JarvisAudience"] <- "https://jarvis2.kehlet.dev"
-    start.Environment["JarvisDatabasePath"] <- invalidDatabasePath
-    use server = Process.Start(start)
+    let temporary = Path.Combine(Path.GetTempPath(), "jarvis-server-stateless-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(temporary) |> ignore
+    let isDirectory = Path.Combine(temporary, "db-is-directory")
+    Directory.CreateDirectory(isDirectory) |> ignore
+    let corrupt = Path.Combine(temporary, "corrupt.db")
+    File.WriteAllBytes(corrupt, [| 1uy; 2uy; 3uy; 4uy; 5uy |])
+    let originalCorrupt = File.ReadAllBytes(corrupt)
+
+    // Each case represents a fresh server process: SQLite must never be a
+    // precondition for OAuth metadata, MCP challenge, or SignalR routing.
+    let scenarios = [ "missing configuration", None
+                      "database is directory", Some isDirectory
+                      "database corrupt", Some corrupt ]
     try
-        let exited = server.WaitForExit(10000)
-        Assert.That(exited, Is.True, "Server must not begin accepting traffic with an unusable database.")
-        Assert.That(server.ExitCode, Is.Not.EqualTo(0))
-        let diagnostic = server.StandardError.ReadToEnd()
-        Assert.That(diagnostic, Does.Contain("SQLite"))
+        for label, path in scenarios do
+            let endpoint = $"http://127.0.0.1:{unusedLoopbackPort ()}"
+            let start = ProcessStartInfo("dotnet")
+            start.ArgumentList.Add(serverDll)
+            start.UseShellExecute <- false
+            start.CreateNoWindow <- true
+            start.Environment["ASPNETCORE_URLS"] <- endpoint
+            start.Environment["ASPNETCORE_ENVIRONMENT"] <- "Development"
+            start.Environment["JarvisAuth0Domain"] <- "dev-kn4j3jz3qv2cvw05.eu.auth0.com"
+            start.Environment["JarvisAudience"] <- "https://jarvis2.kehlet.dev"
+            match path with
+            | Some configured -> start.Environment["JarvisDatabasePath"] <- configured
+            | None -> start.Environment.Remove("JarvisDatabasePath") |> ignore
+
+            use server = Process.Start(start)
+            try
+                use http = new HttpClient()
+                http.Timeout <- TimeSpan.FromSeconds 2.
+                let deadline = Stopwatch.StartNew()
+                let mutable ready = false
+                while not ready && deadline.Elapsed < TimeSpan.FromSeconds 12. && not server.HasExited do
+                    try
+                        use response =
+                            http.GetAsync(endpoint + "/.well-known/oauth-protected-resource").GetAwaiter().GetResult()
+                        ready <- response.StatusCode = HttpStatusCode.OK
+                    with
+                    | :? HttpRequestException
+                    | :? TaskCanceledException -> ()
+                    if not ready then Thread.Sleep 100
+                Assert.That(ready, Is.True, $"Server OAuth readiness must survive {label}.")
+                let init = """{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"stateless","version":"1"}}}"""
+                use request = new HttpRequestMessage(HttpMethod.Post, endpoint + "/mcp")
+                request.Content <- new StringContent(init, System.Text.Encoding.UTF8, "application/json")
+                request.Headers.TryAddWithoutValidation("Accept", "application/json, text/event-stream") |> ignore
+                use response = http.SendAsync(request).GetAwaiter().GetResult()
+                Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.Unauthorized),
+                            $"MCP authentication must survive {label}.")
+                use negotiate = new HttpRequestMessage(HttpMethod.Post, endpoint + "/client/negotiate?negotiateVersion=1")
+                use negotiated = http.SendAsync(negotiate).GetAwaiter().GetResult()
+                Assert.That(negotiated.StatusCode, Is.EqualTo(HttpStatusCode.Unauthorized),
+                            $"SignalR authentication must survive {label}.")
+            finally
+                if not server.HasExited then
+                    server.Kill(true)
+                    server.WaitForExit(3000) |> ignore
+        Assert.That(File.ReadAllBytes(corrupt) = originalCorrupt, Is.True,
+                    "Startup must not repair, replace, migrate or delete an existing corrupt database.")
     finally
-        if not server.HasExited then
-            server.Kill(true)
-            server.WaitForExit(3000) |> ignore
-        try Directory.Delete(tempDirectory, true) with _ -> ()
+        try Directory.Delete(temporary, true) with _ -> ()
 
 [<Test>]
 let write_tools_expose_optional_operation_ids () =

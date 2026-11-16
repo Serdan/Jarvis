@@ -363,6 +363,7 @@ let explicitUtcAndBrowserActionsUseSameScheduleStore () =
 let staleManagerAttemptRequiresThirtyMinutesAndRejectsLateResult () = task {
     let dir,path = temp()
     let mutable clock = DateTimeOffset.UtcNow
+    let verifiedLastSeen = clock
     let firstGate = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
     let mutable calls = 0
     let executor (_: BrowserSchedules.ScheduledAction) = task {
@@ -372,7 +373,7 @@ let staleManagerAttemptRequiresThirtyMinutesAndRejectsLateResult () = task {
     }
     try
         use store = new BrowserSchedules.Service(path, executor, now=(fun () -> clock), pollMs=25,
-                                                 verifyIdleActivity=(fun _ _ -> Task.FromResult(Ok None)))
+                                                 verifyIdleActivity=(fun _ _ -> Task.FromResult(Ok(Some verifiedLastSeen))))
         let config =
             { commandSchedule "manager-stale" "AfterAgentIdle" with
                 RunAfterSeconds = None; IdleAgentId = Some "Manager"; IdleSeconds = Some 60 }
@@ -551,6 +552,7 @@ let replacingPendingIdleScheduleCannotReuseOlderAgentsVerifiedSnapshot () = task
 let replacingWaitingIdleScheduleCannotReuseOlderAgentsVerifiedSnapshot () = task {
     let dir,path = temp()
     let mutable clock = DateTimeOffset.UtcNow
+    let verifiedLastSeen = clock
     let waitingVerificationStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
     let releaseOld = TaskCompletionSource<Result<DateTimeOffset option,string>>(TaskCreationOptions.RunContinuationsAsynchronously)
     let mutable oldVerifications = 0
@@ -559,7 +561,7 @@ let replacingWaitingIdleScheduleCannotReuseOlderAgentsVerifiedSnapshot () = task
     let verify _ agent = task {
         if agent = "Manager A" then
             let count = System.Threading.Interlocked.Increment(&oldVerifications)
-            if count = 1 then return Ok None
+            if count <= 2 then return Ok (Some verifiedLastSeen)
             else
                 waitingVerificationStarted.TrySetResult(()) |> ignore
                 return! releaseOld.Task
@@ -599,6 +601,7 @@ let replacingWaitingIdleScheduleCannotReuseOlderAgentsVerifiedSnapshot () = task
 let submittedManagerWithoutFirstToolCallRecoversAfterThirtyMinutesAcrossRestart () = task {
     let dir,path = temp()
     let mutable clock = DateTimeOffset.UtcNow
+    let verifiedLastSeen = clock
     let mutable launches = 0
     let execute (_:BrowserSchedules.ScheduledAction) = task {
         System.Threading.Interlocked.Increment(&launches) |> ignore
@@ -607,7 +610,7 @@ let submittedManagerWithoutFirstToolCallRecoversAfterThirtyMinutesAcrossRestart 
     try
         let firstRun () = task {
             use first = new BrowserSchedules.Service(path, execute, now=(fun () -> clock),
-                                                     pollMs=25, verifyIdleActivity=(fun _ _ -> Task.FromResult(Ok None)))
+                                                     pollMs=25, verifyIdleActivity=(fun _ _ -> Task.FromResult(Ok(Some verifiedLastSeen))))
             let cmd =
                 { commandSchedule "manager-silent" "AfterAgentIdle" with
                     RunAfterSeconds = None; IdleAgentId = Some "Manager"; IdleSeconds = Some 60 }
@@ -619,7 +622,7 @@ let submittedManagerWithoutFirstToolCallRecoversAfterThirtyMinutesAcrossRestart 
         do! firstRun()
         clock <- clock.AddMinutes(29.)
         use restored = new BrowserSchedules.Service(path, execute, now=(fun () -> clock),
-                                                     pollMs=25, verifyIdleActivity=(fun _ _ -> Task.FromResult(Ok None)))
+                                                     pollMs=25, verifyIdleActivity=(fun _ _ -> Task.FromResult(Ok(Some verifiedLastSeen))))
         restored.Start()
         do! Task.Delay(150)
         Assert.That(launches, Is.EqualTo(1), "No replacement before the silent-launch stale cutoff.")
@@ -628,6 +631,61 @@ let submittedManagerWithoutFirstToolCallRecoversAfterThirtyMinutesAcrossRestart 
         clock <- clock.AddMinutes(1.)
         do! Task.Delay(150)
         Assert.That(launches, Is.EqualTo(2), "Recovery is bounded by the next 30-minute stale cutoff.")
+    finally
+        Directory.Delete(dir, true)
+}
+
+[<Test>]
+let missingCrossDeviceActivityProofBlocksBothClientsAndRestartedIdleSchedules () = task {
+    let dir,path = temp()
+    let otherPath = Path.Combine(dir, "other-client-schedules.json")
+    let mutable clock = DateTimeOffset.UtcNow
+    let original = clock
+    let mutable launches = 0
+    let mutable verified: DateTimeOffset option = Some original
+    let execute (_: BrowserSchedules.ScheduledAction) = task {
+        System.Threading.Interlocked.Increment(&launches) |> ignore
+        return Ok "UNSAFE idle launch"
+    }
+    let verify _ _ = Task.FromResult(Ok verified)
+    let create path =
+        new BrowserSchedules.Service(path, execute, now=(fun () -> clock), pollMs=25,
+            agentLastSeen=(fun _ _ -> Some original), verifyIdleActivity=verify)
+    let cmd =
+        { commandSchedule "manager-no-proof" "AfterAgentIdle" with
+            RunAfterSeconds = None; IdleAgentId = Some "Manager"; IdleSeconds = Some 60 }
+    try
+        let firstSession () = task {
+            use clientA = create path
+            use clientB = create otherPath
+            Assert.That(clientA.ScheduleExecution(cmd).IsOk, Is.True)
+            Assert.That(clientB.ScheduleExecution(cmd).IsOk, Is.True)
+            clientA.Start()
+            clientB.Start()
+
+            // The server loses its DB or misses the last activity sample.
+            // Local hints and an elapsed due timer are not enough to launch.
+            verified <- None
+            clock <- original.AddSeconds(120.)
+            do! Task.Delay(200)
+            Assert.That(launches, Is.Zero)
+            Assert.That(clientA.List(), Does.Contain("ActivityProofUnavailable"))
+            Assert.That(clientB.List(), Does.Contain("ActivityProofUnavailable"))
+        }
+        do! firstSession()
+
+        // Both independent client schedule files outlive the server's state.
+        // Restart with an empty activity source; a stale due date still cannot
+        // become an authorization to execute.
+        use restartedA = create path
+        use restartedB = create otherPath
+        restartedA.Start()
+        restartedB.Start()
+        clock <- clock.AddHours(2.)
+        do! Task.Delay(200)
+        Assert.That(launches, Is.Zero)
+        Assert.That(restartedA.List(), Does.Contain("ActivityProofUnavailable"))
+        Assert.That(restartedB.List(), Does.Contain("ActivityProofUnavailable"))
     finally
         Directory.Delete(dir, true)
 }

@@ -1,0 +1,11 @@
+# [P1] Project display names escape the disposable preparation directory and cause arbitrary local writes
+
+**Frozen commit:** `377782ae44c14db8a9467abf105bf69a88e4215f`
+
+**Location:** `tools/Wq10MigrationPreview/prepare.py`, `make_specs` (project `name` from reviewed report/manifest), `prepare` (lines 357 and 402–403: `work / f"{name}.bundle"` and `work / f"{name}.diff"`). Upstream `tools/Wq10MigrationPreview/Program.cs` currently validates project names only as unique and nonblank (lines 120–123), not as safe filesystem components.
+
+The adapter validates **repository paths** as beneath the marked disposable root, but uses the unvalidated project display name as a relative backup/diff filename without a containment check. A project named `../../escaped` passes the accepted inspector (`readiness=PREVIEW_READY_FOR_REVIEW`). The fixture-only `prepare` command completes with `ADAPTER_ONLY_NOT_PREPARED` yet creates its Git backup at `<disposable-root>/escaped.bundle`, outside `<disposable-root>/wq10-preparations/<operation-UUID>/`. With an additional `../`, names can traverse outside the guarded disposable root entirely; `.diff` uses `write_text` and can overwrite an existing target. The marker and `--apply-disposable` therefore do not actually constrain all writes to disposable fixture space.
+
+**Independently reproduced** using the frozen `test_prepare.PreparedAdapterTests` fixture, changing only `manifest['projects'][0]['name'] = '../../escaped'` before generating a fresh preflight report: `preflight_readiness=PREVIEW_READY_FOR_REVIEW`, `prepare_exit=0`, and `bundle_outside_operation_dir=True`. All files in the proof remained inside the disposable test root; no external real file was touched.
+
+**Fix:** Derive backup/diff filenames from fixed or safely encoded authority IDs (e.g., `project-1.bundle`, `project-2.bundle`, `account.bundle`) rather than display names. Assert the fully resolved output paths are descendants of the operation directory before every filesystem write. Reject duplicate/reserved authority keys such as project name `account`, which otherwise collide with the account receipt key. Add adversarial tests for `../`, slash, empty/reserved and duplicate names, and verify no mutations escape the fixture root.

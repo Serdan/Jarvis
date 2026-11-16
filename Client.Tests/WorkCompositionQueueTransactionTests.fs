@@ -94,7 +94,8 @@ type WorkCompositionQueueTransactionTests() =
             |> List.iteri (fun expected mutation ->
                 WorkCompositionGitLedger.execute a "Fixture" (Guid.NewGuid()) expected mutation
                 |> ok |> ignore)
-            WorkQueueReceiptProducer.produce b "Fixture" (Guid.NewGuid()) dependentTaskOp
+            let producerOperationId = Guid.NewGuid()
+            WorkQueueReceiptProducer.produce b "Fixture" producerOperationId dependentTaskOp
             |> ok |> ignore
             let _, queue = WorkQueueGitLedger.load a |> ok
             let stage =
@@ -110,6 +111,15 @@ type WorkCompositionQueueTransactionTests() =
             Assert.That(origin.SourceRef, Is.Empty)
             Assert.That(origin.SourceCommit, Is.Empty)
             Assert.That(origin.SourceOperationId, Is.EqualTo(dependentTaskOp.ToString("D")))
+            let originalProducer = LedgerStore.getOperationAt a snapshot producerOperationId
+                                   |> ok |> Option.get
+            Assert.That(originalProducer.Paths,
+                        Does.Contain("records/work-composition/stage-links/" + stage.Id + ".json"))
+            Assert.That(originalProducer.Paths, Does.Contain(WorkQueueGitLedger.RecordPath))
+            let link = WorkCompositionGitLedger.readStageLinkAt a snapshot stage.Id |> ok |> Option.get
+            Assert.That(link.UnitId, Is.EqualTo("dependent"))
+            Assert.That(link.SubjectId, Is.EqualTo("delivery-task"))
+            Assert.That(link.SpecVersion, Is.EqualTo(2))
             action a b stage.Id
         finally
             try Directory.Delete(root, true) with _ -> ()
@@ -183,9 +193,9 @@ type WorkCompositionQueueTransactionTests() =
             Assert.That(WorkComposition.phase graph None "dependent",
                         Is.EqualTo(Some WorkUnitPhase.Blocked))
             let initialQueue = WorkQueueGitLedger.load b |> ok |> snd
-            Assert.That(initialQueue.Works.[workId].State, Is.EqualTo(WorkState.Available))
-            WorkCompositionQueueTransaction.holdBlocked b "Fixture"
-                (Guid.NewGuid()) initial |> ok |> ignore
+            Assert.That(initialQueue.Works.[workId].State, Is.EqualTo(WorkState.Blocked))
+            // WQ04 producer blocked the stage IN its creation CAS; there is
+            // no intervening Available head and no optional second CAS hold.
             let heldQueue = WorkQueueGitLedger.load a |> ok |> snd
             Assert.That(heldQueue.Works.[workId].State, Is.EqualTo(WorkState.Blocked))
             Assert.That(heldQueue.Migration, Is.EqualTo(MigrationEpoch.Frozen))
@@ -241,8 +251,8 @@ type WorkCompositionQueueTransactionTests() =
     [<Test>]
     member _.TwoIndependentClonesRacingAcceptanceProduceOneWinnerWithExactUuidReplay() =
         withClones (fun a b workId ->
-            WorkCompositionQueueTransaction.holdBlocked a "Fixture"
-                (Guid.NewGuid()) (request a workId Guid.Empty) |> ok |> ignore
+            Assert.That((WorkQueueGitLedger.load a |> ok |> snd).Works.[workId].State,
+                        Is.EqualTo(WorkState.Blocked))
             let approved = approvedChild a b
             let input = request a workId approved
             let firstId, secondId = Guid.NewGuid(), Guid.NewGuid()
@@ -277,13 +287,17 @@ type WorkCompositionQueueTransactionTests() =
             let forgery = { source with OriginOid = String.replicate 40 "a" }
             let forgedId = Guid.NewGuid()
             failWithoutCommit b forgedId (fun () ->
-                WorkCompositionQueueTransaction.holdBlocked b "Fixture" forgedId forgery)
-            WorkCompositionQueueTransaction.holdBlocked b "Fixture"
-                (Guid.NewGuid()) source |> ok |> ignore
+                WorkCompositionQueueTransaction.acceptAndRelease b "Fixture" forgedId forgery)
             let failedApproval = request a workId (Guid.NewGuid())
             let denialId = Guid.NewGuid()
             failWithoutCommit a denialId (fun () ->
                 WorkCompositionQueueTransaction.acceptAndRelease a "Fixture" denialId failedApproval)
+            let graph = WorkCompositionGitLedger.load a |> ok |> snd
+            WorkCompositionGitLedger.execute a "Fixture" (Guid.NewGuid()) graph.Version
+                (WorkCompositionMutation.Revise("foundation",
+                    graph.Units.["foundation"].SpecVersion,
+                    spec "Unrelated foundation revision" None))
+            |> ok |> ignore
             let staleId = Guid.NewGuid()
             failWithoutCommit a staleId (fun () ->
                 WorkCompositionQueueTransaction.acceptAndRelease a "Fixture" staleId source)
@@ -291,3 +305,134 @@ type WorkCompositionQueueTransactionTests() =
             let queue = WorkQueueGitLedger.loadAt a head |> ok
             Assert.That(queue.Works.[workId].State, Is.EqualTo(WorkState.Blocked))
             Assert.That(queue.Migration, Is.EqualTo(MigrationEpoch.Frozen)))
+
+
+    [<TestCase("linked-task")>]
+    [<TestCase("spec")>]
+    [<TestCase("parent")>]
+    [<TestCase("hard-edge")>]
+    [<TestCase("ancestor-spec")>]
+    member _.RelevantMutationAtomicallyRevokesOldStageAndReplaysExactOriginalUuid(kind: string) =
+        withClones (fun a b workId ->
+            let accepted = approvedChild a b
+            let releaseId = Guid.NewGuid()
+            WorkCompositionQueueTransaction.acceptAndRelease b "Fixture" releaseId
+                (request b workId accepted) |> ok |> ignore
+            Assert.That((WorkQueueGitLedger.load a |> ok |> snd).Works.[workId].State,
+                        Is.EqualTo(WorkState.Available))
+            let graph = WorkCompositionGitLedger.load a |> ok |> snd
+            let dependent = graph.Units.["dependent"]
+            let mutation =
+                match kind with
+                | "linked-task" ->
+                    WorkCompositionMutation.Revise("dependent", dependent.SpecVersion,
+                        { dependent.Spec with LinkedTaskId = Some "replacement-task" })
+                | "spec" ->
+                    WorkCompositionMutation.Revise("dependent", dependent.SpecVersion,
+                        { dependent.Spec with Goal = "Revised success criteria" })
+                | "parent" ->
+                    WorkCompositionMutation.Move("dependent", Some "foundation")
+                | "hard-edge" ->
+                    WorkCompositionMutation.Unrequire("dependent", "prerequisite")
+                | "ancestor-spec" ->
+                    let parent = graph.Units.["delivery"]
+                    WorkCompositionMutation.Revise("delivery", parent.SpecVersion,
+                        { parent.Spec with Scope = "Altered ancestor specification" })
+                | _ -> failwith "Unknown mutation fixture"
+            let mutationId = Guid.NewGuid()
+            let before = LedgerStore.fetch a |> ok
+            let change = WorkCompositionGitLedger.execute b "Fixture" mutationId
+                            graph.Version mutation |> ok
+            Assert.That(change.AlreadyApplied, Is.False)
+            let after = LedgerStore.fetch a |> ok
+            Assert.That(after.Header.NextSequence, Is.EqualTo(before.Header.NextSequence + 1L))
+            let original = LedgerStore.getOperationAt a after mutationId |> ok |> Option.get
+            Assert.That(original.Paths,
+                        Is.EquivalentTo([| WorkCompositionGitLedger.RecordPath;
+                                          WorkQueueGitLedger.RecordPath |]))
+            let graphAfter, _ = WorkCompositionGitLedger.loadAt a after |> ok
+            let queueAfter = WorkQueueGitLedger.loadAt a after |> ok
+            Assert.That(queueAfter.Works.[workId].State, Is.EqualTo(WorkState.Blocked))
+            Assert.That(queueAfter.Works.[workId].AvailableSequence, Is.Zero)
+            Assert.That(Contracts.orderAvailable queueAfter |> ok
+                        |> List.exists (fun work -> work.Id = workId), Is.False)
+            // Two-clone original UUID replay never reopens the old stage.
+            let replay = WorkCompositionGitLedger.execute a "Fixture" mutationId
+                            graph.Version mutation |> ok
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That((WorkQueueGitLedger.load b |> ok |> snd).Works.[workId].State,
+                        Is.EqualTo(WorkState.Blocked))
+            let oldLink = WorkCompositionGitLedger.readStageLinkAt b after workId |> ok |> Option.get
+            Assert.That(oldLink.SpecVersion, Is.EqualTo(2))
+            Assert.That(WorkCompositionGitLedger.stageLinkStillCurrent oldLink
+                            queueAfter.Works.[workId] graphAfter, Is.False))
+
+    [<Test>]
+    member _.UnrelatedGraphEditDoesNotRevokeVerifiedOriginalBinding() =
+        withClones (fun a b workId ->
+            let accepted = approvedChild a b
+            WorkCompositionQueueTransaction.acceptAndRelease a "Fixture" (Guid.NewGuid())
+                (request a workId accepted) |> ok |> ignore
+            let graph = WorkCompositionGitLedger.load b |> ok |> snd
+            let unaffectedId = Guid.NewGuid()
+            WorkCompositionGitLedger.execute b "Fixture" unaffectedId graph.Version
+                (WorkCompositionMutation.Create("unrelated-feature", WorkUnitKind.Feature,
+                    Some "foundation", spec "Unrelated feature" None))
+            |> ok |> ignore
+            let final = LedgerStore.fetch a |> ok
+            let op = LedgerStore.getOperationAt a final unaffectedId |> ok |> Option.get
+            Assert.That(op.Paths.Length, Is.EqualTo(1))
+            Assert.That(op.Paths.[0], Is.EqualTo(WorkCompositionGitLedger.RecordPath))
+            Assert.That((WorkQueueGitLedger.load a |> ok |> snd).Works.[workId].State,
+                        Is.EqualTo(WorkState.Available)))
+
+
+    [<Test>]
+    member _.DependencyBlockedStageGainsNonWakingGraphHoldInGraphCas() =
+        withClones (fun a b workId ->
+            let accepted = approvedChild a b
+            WorkCompositionQueueTransaction.acceptAndRelease a "Fixture" (Guid.NewGuid())
+                (request a workId accepted) |> ok |> ignore
+            let first = WorkQueueGitLedger.load b |> ok |> snd
+            let synthetic =
+                { first.Works.[workId] with
+                    Id = "fixture-unlinked-prerequisite"
+                    SubjectId = "fixture-offline-source"
+                    StageGeneration = 1
+                    State = WorkState.Available
+                    Gate = GateState.Clear
+                    Dependencies = Set.empty
+                    AvailableAt = 0L
+                    AvailableSequence = 0L }
+            WorkQueueGitLedger.executeInertFixture b "Fixture" (Guid.NewGuid())
+                first.Version (WorkMutation.PublishStage synthetic) |> ok |> ignore
+            let second = WorkQueueGitLedger.load a |> ok |> snd
+            WorkQueueGitLedger.executeInertFixture a "Fixture" (Guid.NewGuid())
+                second.Version
+                (WorkMutation.SetHardPrerequisite(workId, synthetic.Id)) |> ok |> ignore
+            let heldByQueue = WorkQueueGitLedger.load b |> ok |> snd
+            Assert.That(heldByQueue.Works.[workId].State, Is.EqualTo(WorkState.Blocked))
+            Assert.That(heldByQueue.Works.[workId].Gate, Is.EqualTo(GateState.Clear))
+            let graph = WorkCompositionGitLedger.load a |> ok |> snd
+            let dependent = graph.Units.["dependent"]
+            let invalidationId = Guid.NewGuid()
+            WorkCompositionGitLedger.execute b "Fixture" invalidationId graph.Version
+                (WorkCompositionMutation.Revise("dependent", dependent.SpecVersion,
+                    { dependent.Spec with LinkedTaskId = Some "replacement-task" }))
+            |> ok |> ignore
+            let pinned = LedgerStore.fetch a |> ok
+            let committed = LedgerStore.getOperationAt a pinned invalidationId |> ok |> Option.get
+            Assert.That(committed.Paths, Does.Contain(WorkQueueGitLedger.RecordPath))
+            let fenced = WorkQueueGitLedger.loadAt a pinned |> ok
+            Assert.That(fenced.Works.[workId].State, Is.EqualTo(WorkState.Blocked))
+            Assert.That(fenced.Works.[workId].Gate,
+                        Is.EqualTo(GateState.CompositionHold("dependent", dependent.SpecVersion)))
+            // Removing WQ02's final dependency would normally wake a Blocked
+            // stage. This immutable graph hold must still prevent resurrection.
+            WorkQueueGitLedger.executeInertFixture b "Fixture" (Guid.NewGuid())
+                fenced.Version
+                (WorkMutation.RemoveHardPrerequisite(workId, synthetic.Id)) |> ok |> ignore
+            let after = WorkQueueGitLedger.load a |> ok |> snd
+            Assert.That(after.Works.[workId].State, Is.EqualTo(WorkState.Blocked))
+            Assert.That(after.Works.[workId].Gate,
+                        Is.EqualTo(GateState.CompositionHold("dependent", dependent.SpecVersion))))

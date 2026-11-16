@@ -726,6 +726,11 @@ module WorkQueueGitLedger =
                             | _ -> false)
                     | _ -> false))
             && (match work.Gate with
+                | GateState.CompositionHold (unitId, specVersion) ->
+                    nonBlank unitId && specVersion > 0
+                    && work.Kind = WorkKind.Planning
+                    && work.State = WorkState.Blocked
+                    && work.SourceLineage.IsNone && work.Push.IsNone
                 | GateState.SourceRecoveryBlocked reason ->
                     nonBlank reason && work.SourceLineage.IsSome && work.State <> WorkState.Available
                 | _ -> true)
@@ -964,7 +969,8 @@ module WorkQueueGitLedger =
     /// visible to the caller for ordinary agent reconciliation.
     let internal publishCanonicalEvent (binding: LedgerBinding) (actor: string) (operationId: Guid)
                                        (expectedVersion: int) (now: int64) (origin: CanonicalWorkOrigin)
-                                       (event: QueueProducerEvent) =
+                                       (event: QueueProducerEvent)
+                                       (compositionGate: LedgerSnapshot -> WorkStage -> Result<GateState option * LedgerFileChange list, LedgerFailure>) =
         let request = JsonObject()
         request.Add("schemaVersion", JsonValue.Create(1))
         request.Add("expectedProjectVersion", JsonValue.Create(expectedVersion))
@@ -1033,14 +1039,38 @@ module WorkQueueGitLedger =
                 | _ -> Error(InvalidBinding "WQ04 practical producer currently accepts task/review/integration work only.")
             if not (validInitialStage stage) then
                 return! Error(InvalidBinding "WQ04 malformed canonical stage.")
+            // Decide the canonical composition hold inside this very same
+            // original WQ04 Git CAS. No separately visible Available window.
+            let! graphHold, compositionChanges = compositionGate snapshot stage
+            if graphHold |> Option.exists (function GateState.CompositionHold _ -> false | _ -> true) then
+                return! Error(InvalidBinding "WQ04 composition planner supplied an unsupported gate.")
             let staged = witnessNewStage state now stage
             let! next = Contracts.publishStage expectedVersion (operationId.ToString("D")) staged state
                         |> Result.mapError failure
-            let! stateContent = validatedContent binding next
+            // The ordinary publish validator permits Blocked only for WQ02
+            // dependencies. A pinned graph prerequisite is a separate,
+            // verified source of blocking, so apply it before committing bytes.
+            let committed =
+                match graphHold with
+                | Some (GateState.CompositionHold _ as hold) ->
+                    { next with
+                        Works = next.Works.Add(stage.Id,
+                            { next.Works.[stage.Id] with
+                                State = WorkState.Blocked
+                                Gate = hold
+                                AvailableAt = 0L
+                                AvailableSequence = 0L })
+                        NextAvailability = state.NextAvailability }
+                | None -> next
+                | Some _ ->
+                    // Only the original, immutable composition hold is
+                    // accepted: never synthesize other WQ02 gate authority.
+                    next
+            let! stateContent = validatedContent binding committed
             return
                 [ { Path = RecordPath; ExpectedBlobOid = oid; Content = stateContent }
                   { Path = originPath origin.WorkId; ExpectedBlobOid = None
-                    Content = CanonicalCodec.encode origin } ]
+                    Content = CanonicalCodec.encode origin } ] @ compositionChanges
         })
 
     // Schema-1 WQ-02 projects have no canonical source/event/index or pinned

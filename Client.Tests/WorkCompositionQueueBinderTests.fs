@@ -249,7 +249,10 @@ type WorkCompositionQueueBinderTests() =
             Assert.That(origin.RoleVersion, Is.Zero)
             Assert.That(origin.SourceRef, Is.Empty)
             Assert.That(origin.SourceCommit, Is.Empty)
-            Assert.That(stage.State, Is.EqualTo(WorkState.Available))
+            // Original WQ04 now makes the graph hold permanent in the
+            // publication CAS; this does not manufacture role/source authority.
+            Assert.That(stage.State, Is.EqualTo(WorkState.Blocked))
+            Assert.That(stage.Gate, Is.EqualTo(GateState.CompositionHold("dependent", 2)))
 
             let original: CompositionQueueBindRequest =
                 { request with
@@ -267,7 +270,7 @@ type WorkCompositionQueueBinderTests() =
                 | _ -> false), Is.True)
             Assert.That(blockers |> List.exists (function
                 | ContradictoryReadiness id when id = stage.Id -> true
-                | _ -> false), Is.True)
+                | _ -> false), Is.False)
             Assert.That(hasAtomic blockers, Is.True)
 
             let attemptId = Guid.NewGuid()

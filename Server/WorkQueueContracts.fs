@@ -30,6 +30,9 @@ type DomainState =
 [<RequireQualifiedAccess>]
 type GateState =
     | Clear
+    // Original WQ04 planning stage held by a verified composition unit/spec.
+    // Independent of WQ02 prerequisite edges: generic queue wake cannot clear.
+    | CompositionHold of unitId: string * specVersion: int
     | DependencyGatePending of graphVersion: int
     | IntegrationGateHold of graphVersion: int * pushOperationId: string
     | ExternalEffectObservedPendingGate of graphVersion: int * pushOperationId: string * remoteCommit: string

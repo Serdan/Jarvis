@@ -8,6 +8,7 @@ open Client.LedgerStore
 open Client.WorkQueueGitLedger
 open Client.WorkQueueCanonicalSourceEvidence
 open Client.WorkQueueRoleAuthority
+open Client.WorkCompositionGitLedger
 
 // No positive authority is representable in this module. The accepted
 // canonical-event reader proves an original *orchestration* Git event, not a
@@ -300,6 +301,7 @@ module WorkQueueCanonicalCasBinder =
         return! WorkQueueGitLedger.publishCanonicalEvent
                     binding actor operationId request.ExpectedProjectVersion
                     (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()) origin projection
+                    (WorkCompositionGitLedger.planOriginalStage binding)
     }
 
     let publishPractical (binding: LedgerBinding) actor operationId

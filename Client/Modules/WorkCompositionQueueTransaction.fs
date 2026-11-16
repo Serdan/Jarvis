@@ -83,11 +83,20 @@ module WorkCompositionQueueTransaction =
            || stage.QueueId <> "planning"
            || stage.StageGeneration <> request.StageGeneration
            || stage.ClaimGeneration <> 0
-           || stage.Gate <> GateState.Clear
+           || (match stage.State, stage.Gate with
+               | WorkState.Blocked, GateState.CompositionHold (unitId, version)
+                    when unitId = dependent.Id && version = dependent.SpecVersion -> false
+               | WorkState.Available, GateState.Clear -> false
+               | _ -> true)
            || stage.Domain <> DomainState.Undecided
            || stage.Push.IsSome || stage.SourceLineage.IsSome
            || stage.IntegrationAuthorized || not stage.WaivedDependencies.IsEmpty then
             return! Error(reject "original WQ04 stage or side-effect fence changed")
+        // The source stage must have been atomically born with this exact
+        // feature, linked task, spec and prerequisite closure. A later graph
+        // rewrite cannot silently rebind a previously released generation.
+        do! WorkCompositionGitLedger.verifyStageLinkAt
+                binding snapshot graph dependent.Id stage
         return graph, graphOid, queue, queueOid, prerequisite, dependent, stage
     }
 
@@ -172,6 +181,7 @@ module WorkCompositionQueueTransaction =
                 return! Error(reject "hold requires a real unmet composition prerequisite")
             let blocked =
                 { stage with State = WorkState.Blocked
+                             Gate = GateState.CompositionHold(dependent.Id, dependent.SpecVersion)
                              AvailableAt = 0L
                              AvailableSequence = 0L }
             let! content = queueUpdate binding queue operationId stage blocked
@@ -214,6 +224,7 @@ module WorkCompositionQueueTransaction =
             let now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
             let available =
                 { stage with State = WorkState.Available
+                             Gate = GateState.Clear
                              AvailableAt = now
                              AvailableSequence = queue.NextAvailability + 1L }
             let! queueContent = queueUpdate binding queue operationId stage available
@@ -250,16 +261,24 @@ module WorkCompositionQueueTransaction =
                 return! Error(reject "invalid corrected graph candidate")
             if stage.State <> WorkState.Available && stage.State <> WorkState.Blocked then
                 return! Error(reject "claimed/external-effect stage cannot be revoked without settlement")
+            let! link = WorkCompositionGitLedger.readStageLinkAt binding snapshot stage.Id
             let nowBlocked =
-                nextGraph.Units.TryFind dependent.Id
-                |> Option.exists (fun current ->
-                    current.CancellationReason.IsSome
-                    || current.HardPrerequisites
-                       |> Set.exists (fun id -> WorkComposition.currentAcceptance nextGraph id |> Option.isNone))
+                match link with
+                | None -> true
+                | Some original ->
+                    not (WorkCompositionGitLedger.stageLinkStillCurrent original stage nextGraph)
+                    || (nextGraph.Units.TryFind original.UnitId
+                        |> Option.map (WorkCompositionGitLedger.graphBlocked nextGraph)
+                        |> Option.defaultValue true)
             // Never auto-awaken on a graph revision: fresh independent
             // review/integration evidence must reauthorize release.
+            let! original =
+                match link with
+                | Some existing -> Ok existing
+                | None -> Error(reject "missing immutable composition stage link")
             let blocked = if nowBlocked then
                               { stage with State = WorkState.Blocked
+                                           Gate = GateState.CompositionHold(original.UnitId, original.SpecVersion)
                                            AvailableAt = 0L
                                            AvailableSequence = 0L }
                           else stage

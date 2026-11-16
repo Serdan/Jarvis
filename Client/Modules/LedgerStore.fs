@@ -1240,6 +1240,46 @@ module LedgerStore =
                 |> Array.toList)
 
 
+    // Read-only full-tree evidence for default-off Agent => Work retirement.
+    // Domain listAt readers omit ops, alerts, indexes and future record
+    // families; discarding them here would silently lose migration evidence.
+    // This only inspects the caller's pinned Git commit, never another head.
+    let listPinnedLedgerBlobsAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) =
+        run binding.RepositoryPath [ "ls-tree"; "-r"; snapshot.Commit ]
+        |> Result.bind (fun output ->
+            if output.Length > 12_000_000 then
+                Error(LedgerIntegrityError "Retirement evidence tree exceeds bounded inspection size.")
+            else
+                let lines = output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                if lines.Length > 50_000 then
+                    Error(LedgerIntegrityError "Retirement evidence tree has too many records.")
+                else
+                    (Ok Map.empty, lines)
+                    ||> Array.fold (fun state line ->
+                        state |> Result.bind (fun entries ->
+                            match line.Split('\t') with
+                            | [| header; path |] ->
+                                let parts = header.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                                let safePath =
+                                    not (String.IsNullOrWhiteSpace path)
+                                    && Regex.IsMatch(path, "^[A-Za-z0-9_./-]+$")
+                                    && not (path.StartsWith("/", StringComparison.Ordinal))
+                                    && (path.Split('/') |> Array.forall (fun part ->
+                                        part <> "" && part <> "." && part <> ".."))
+                                let validOid =
+                                    parts.Length = 3
+                                    && (parts.[2].Length = 40 || parts.[2].Length = 64)
+                                    && (parts.[2] |> Seq.forall (fun c ->
+                                        (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+                                if parts.Length <> 3 || parts.[0] <> "100644"
+                                   || parts.[1] <> "blob" || not validOid || not safePath then
+                                    Error(LedgerIntegrityError "Unexpected Git tree entry in retirement evidence.")
+                                elif entries.ContainsKey path then
+                                    Error(LedgerIntegrityError "Duplicate Git path in retirement evidence.")
+                                else Ok(entries.Add(path, parts.[2]))
+                            | _ -> Error(LedgerIntegrityError "Malformed Git tree entry in retirement evidence.")))
+                    |> Result.map Map.toList)
+
     // Git blob content is immutable, but historical OIDs accumulate forever.
     // Keep a bounded FIFO of recent verified blobs, never a process-global
     // unbounded copy of every notification or task version ever visited.

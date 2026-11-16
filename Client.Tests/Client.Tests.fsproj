@@ -42,6 +42,7 @@
         <Compile Include="WorkCompositionLedgerTests.fs"/>
         <Compile Include="WorkCompositionQueueBinderTests.fs"/>
         <Compile Include="WorkQueueToolFacadeTests.fs"/>
+        <Compile Include="WorkQueuePersistentAgentRetirementTests.fs"/>
         <Compile Include="TaskFirstUiProjectionTests.fs"/>
         <Compile Include="TaskFirstUiSnapshotAdapterTests.fs"/>
         <!-- Deferred WQ06 transport fixtures currently lack the canonical WQ04 producer

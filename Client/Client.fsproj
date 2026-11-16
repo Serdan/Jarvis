@@ -79,6 +79,7 @@
         <Compile Include="Modules\WorkCompositionGitLedger.fs"/>
         <Compile Include="Modules\WorkQueueRoleAuthority.fs"/>
         <Compile Include="Modules\WorkQueueToolFacade.fs"/>
+        <Compile Include="Modules\WorkQueuePersistentAgentRetirement.fs"/>
         <Compile Include="Modules\WorkQueueDashboardReadBinding.fs"/>
         <Compile Include="Modules\WorkQueueConversationTransport.fs"/>
         <Compile Include="Modules\WorkQueueOperatorConversations.fs"/>

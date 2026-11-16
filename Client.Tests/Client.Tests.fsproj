@@ -70,6 +70,7 @@
         <Compile Include="WorkQueueAcceptedAdaptersCapOneSmokeTests.fs"/>
         <Compile Include="WorkQueueWorkReplacementVerticalSliceTests.fs"/>
         <Compile Include="WorkQueueCrossProjectHostPreviewTests.fs"/>
+        <Compile Include="WorkQueueDurableLaunchIntentTests.fs"/>
         <Compile Include="WorkQueueVerifiedDispatchAdapterTests.fs"/>
         <Compile Include="WorkingTurnGuidanceTests.fs"/>
         <Compile Include="OrchestrationApiTests.fs"/>

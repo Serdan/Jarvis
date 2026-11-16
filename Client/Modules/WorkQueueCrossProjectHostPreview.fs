@@ -86,6 +86,28 @@ type CrossProjectHostReport =
 module WorkQueueCrossProjectHostPreview =
     let private nonBlank (value: string) = not (String.IsNullOrWhiteSpace value)
 
+    // WQ04's immutable CreateTask operation can originate planning Work without
+    // a source branch. This is only a read-only projection; source-writing Work
+    // still requires approved immutable source lineage, and any binder must
+    // independently recheck the original Git operation and origin blob.
+    let private projectedSourceEligible (work: WorkStage) (origin: CanonicalWorkOrigin) =
+        if work.Kind = WorkKind.Planning then
+            work.QueueId = "planning"
+            && origin.SourceOperationKind = "CreateTask"
+            && String.IsNullOrWhiteSpace origin.SourceRef
+            && String.IsNullOrWhiteSpace origin.SourceCommit
+            && origin.SourceOperationSequence > 0L
+            && origin.SourceHighWater >= origin.SourceOperationSequence
+            && nonBlank origin.SourceOriginHead
+            && nonBlank origin.SourceEntityPath
+            && nonBlank origin.SourceEntityBlobOid
+            && nonBlank origin.SourceEntitySha256
+            && origin.AccountCreditStatus = "NotReserved"
+            && String.IsNullOrWhiteSpace origin.RoleId
+            && origin.RoleVersion = 0
+        else
+            nonBlank origin.SourceRef && nonBlank origin.SourceCommit
+
     let private issue code record action : PlannerIssue =
         { Code = code; Record = record; NextAction = action }
 
@@ -247,7 +269,9 @@ module WorkQueueCrossProjectHostPreview =
                                                  && nonBlank value.SourceHead
                                                  && nonBlank value.SourceOperationId
                                                  && nonBlank value.SourceRequestHash
-                                                 && (nonBlank value.SourceRef || nonBlank value.SourceCommit) ->
+                                                 && (pinned.Project.Works.TryFind chosen.WorkId
+                                                     |> Option.exists (fun stage ->
+                                                         projectedSourceEligible stage value)) ->
                                             { Head = value.SourceHead
                                               OperationId = value.SourceOperationId
                                               RequestHash = value.SourceRequestHash

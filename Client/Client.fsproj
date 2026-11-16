@@ -96,6 +96,7 @@
         <Compile Include="Modules\WorkQueueSchedulerHostPreview.fs"/>
         <Compile Include="Modules\WorkQueueCrossProjectPlanner.fs"/>
         <Compile Include="Modules\WorkQueueCrossProjectHostPreview.fs"/>
+        <Compile Include="Modules\WorkQueueDurableLaunchIntent.fs"/>
         <Compile Include="Modules\WorkQueueReactiveWake.fs"/>
         <Compile Include="Modules\WorkQueueVerifiedDispatchAdapter.fs"/>
         <Compile Include="Modules\\WorkQueueOperatorConversationCli.fs"/>

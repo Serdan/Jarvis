@@ -1,0 +1,17 @@
+# P1 — Recovery can report success despite an unverified or non-inert final state
+
+Frozen source: `a268ffe6473dc820d75c732c022da8242ee0e12e` (review `4b2fa60d1d134b43b54f9de8f0ea9e05`).
+
+## Finding A — the positive completion result does not require verified three-ledger recovery
+
+In `Client/Modules/WorkQueueMultiLedgerPreparedRecovery.fs:245-278`, `Failure` is populated only from the individual CAS/re-read steps, while the final `inspect plan` result is attached without enforcing `Recovery.AccountOriginalReceiptVerified` or `Recovery.AllProjectsInertPrepared`. The original WQ02 `LedgerStore.transact` operation UUID replay is deliberately idempotent and can return `AlreadyApplied` without re-running the first-write validation. Consequently, after an original project Prepared receipt is removed or invalidated by an intervening Git head update, replay of the *same* UUID can return both project operations as `AlreadyApplied`, `Failure=None`, and simultaneously a `NotPrepared`/`RecoveryBlocked` observation. The same ambiguity applies to a post-B account-head change before final inspection. These are the missing/changed-receipt recovery negatives required by the task; a clean invocation result is not proof of completed current three-ledger Prepared state.
+
+Require the final observed account + both project receipts/statuses to reconcile before returning a completed success; otherwise expose an explicit recoverable partial/failure state preserving each committed Git head and original UUID (never roll back or fabricate atomicity). Add a two-clone test changing/removing a Prepared receipt after its original UUID was committed and replaying that same UUID.
+
+## Finding B — `PreparedInert` does not establish that the entire project is inert
+
+The new coordinator classifies `ProjectPreparedInspection.ProjectOnly` as `PreparedInert` at `Client/Modules/WorkQueueMultiLedgerPreparedRecovery.fs:187-207`. However the delegated `WorkQueueProjectMigrationPrepare.inspect` (`Client/Modules/WorkQueueProjectMigrationPrepare.fs:445-486`) verifies only the converted link stages are blocked/gated. It does **not** require `queue.Launches.IsEmpty`, all `queue.Works` non-runnable, `Contracts.orderAvailable queue` empty, or that an unrelated post-Prepared available stage is absent. `WorkQueueGitLedger.loadAt` performs structural/hash verification but imposes no Preparing-phase no-runnable invariant (`Client/Modules/WorkQueueGitLedger.fs:638-795,874-897`). An otherwise canonical subsequent queue mutation can preserve every converted link while adding an unrelated available Work; the monitor will still say `PreparedInert` and `AllProjectsInertPrepared=true` if the account head is unchanged. This contradicts the recovery field's meaning and the documented no-runnable guarantee, even though the production migration route is correctly disabled.
+
+Require whole-queue and launch invariants (plus source/history receipt checks where relevant) in the new read-only recovery classification. Add a negative test for a post-Prepared extra runnable stage/launch that must produce `RecoveryBlocked`, not `PreparedInert`. Keep the existing default-off public port and no Scheduler/Manager activation.
+
+This is a source-level correctness finding, not a claim that production cutover is enabled or that either scenario occurred in deployed ledgers.

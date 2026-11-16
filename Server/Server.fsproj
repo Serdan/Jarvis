@@ -20,6 +20,7 @@
         <Compile Include="WorkQueueSchedulerInert.fs"/>
         <Compile Include="WorkQueueDependencyDiagnostics.fs"/>
         <Compile Include="WorkQueueProducers.fs"/>
+        <Compile Include="WorkQueueSchedulerPrototype.fs"/>
         <Compile Include="JarvisOptions.fs"/>
         <Compile Include="Auth.fs"/>
         <Compile Include="HttpRateLimitProtection.fs"/>

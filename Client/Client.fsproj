@@ -26,6 +26,7 @@
         <Compile Include="AssemblyInfo.fs"/>
         <Compile Include="Types.fs"/>
         <Compile Include="..\Server\WorkQueueContracts.fs" Link="WorkQueueContracts.fs"/>
+        <Compile Include="..\Server\WorkComposition.fs" Link="WorkComposition.fs"/>
         <Compile Include="..\Server\WorkQueueDependencyDiagnostics.fs" Link="WorkQueueDependencyDiagnostics.fs"/>
         <Compile Include="Modules\TaskFirstUiProjection.fs"/>
         <Compile Include="..\Server\WorkQueueProducers.fs" Link="WorkQueueProducers.fs"/>
@@ -73,6 +74,7 @@
         <Compile Include="Modules\SourceEffectJournal.fs"/>
         <Compile Include="Modules\SourceEffectRouteBridge.fs"/>
         <Compile Include="Modules\WorkQueueGitLedger.fs"/>
+        <Compile Include="Modules\WorkCompositionGitLedger.fs"/>
         <Compile Include="Modules\WorkQueueRoleAuthority.fs"/>
         <Compile Include="Modules\WorkQueueConversationTransport.fs"/>
         <Compile Include="Modules\WorkQueueOperatorConversations.fs"/>

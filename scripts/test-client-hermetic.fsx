@@ -90,6 +90,10 @@ let validateScratchParent (path: string) =
 
 let scratchLocation = scratchParent |> Option.map validateScratchParent
 let mutable scratchLease: FileStream option = None
+let mutable scratchJob: Microsoft.Win32.SafeHandles.SafeFileHandle option = None
+// On Windows, once a test process may have launched, deletion is forbidden
+// until every member of its kill-on-close job has been proved terminated.
+let mutable canCleanupProcessScratch = true
 let captureTail (reader: StreamReader) =
     task {
         // Never retain the unbounded output of a failing or chatty test process.
@@ -380,18 +384,97 @@ try
 
     // --no-restore consumes the already restored project assets. NuGet packages
     // may be read from the existing cache, but test code cannot write there.
+    // Launch a minimal FSI gate, not VSTest itself. The gate cannot spawn
+    // VSTest until the parent has attached it to its kill-on-close job; all
+    // testhost descendants are therefore born INSIDE the job, including the
+    // otherwise dangerous Start -> Assign race.
+    let releaseGate =
+        if OperatingSystem.IsWindows() then
+            let originalCommand = start.FileName
+            let originalArgs = start.ArgumentList |> Seq.toArray
+            let gate = Path.Combine(tempDirectory, ".process-start-gate")
+            start.ArgumentList.Clear()
+            start.ArgumentList.Add("fsi")
+            start.ArgumentList.Add(Path.Combine(sourceRoot, "scripts", "launch-client-tests-gated.fsx"))
+            start.ArgumentList.Add("--")
+            start.ArgumentList.Add("--gate-file")
+            start.ArgumentList.Add(gate)
+            start.ArgumentList.Add("--")
+            start.ArgumentList.Add(originalCommand)
+            for arg in originalArgs do start.ArgumentList.Add(arg)
+            Some gate
+        else None
     use child = new Process(StartInfo = start)
+    if OperatingSystem.IsWindows() then
+        // Create and configure the job before spawning any process. Publishing
+        // this owner-only marker BEFORE Process.Start makes an abrupt parent
+        // crash in the Start -> Assign window fail-closed for stale recovery.
+        scratchJob <- Some (WindowsDisposableGuard.createKillOnCloseJob())
+        let started = WindowsDisposableGuard.runStartedMarker tempDirectory
+        File.WriteAllText(started, "Windows VSTest process may be live; no teardown receipt yet.")
+        WindowsDisposableGuard.assertOwnerOnly started false false
+        canCleanupProcessScratch <- false
     if not (child.Start()) then
         failwith "Could not launch the isolated dotnet test process."
+    match scratchJob with
+    | Some job ->
+        try
+            WindowsDisposableGuard.assignToJob job child
+            // Only after verified membership may the launcher create VSTest.
+            let gate = releaseGate.Value
+            File.WriteAllText(gate, "Parent verified launcher membership in the Windows kill-on-close job.")
+            WindowsDisposableGuard.assertOwnerOnly gate false false
+        with error ->
+            // Before the positive release, the gate cannot start VSTest.
+            // The unverified-run marker nevertheless forbids recovery.
+            try child.Kill(true) with killError ->
+                eprintfn "Hermetic Client.Tests: failed unassigned-child termination: %s" killError.Message
+            raise error
+    | None -> ()
     // Read both streams concurrently so full-diagnostic NUnit output cannot
     // block a child on a filled stdout/stderr pipe.
     let stdoutTask = captureTail child.StandardOutput
     let stderrTask = captureTail child.StandardError
     let finished = child.WaitForExit(timeout * 1000)
     if not finished then
-        eprintfn "Hermetic Client.Tests: exceeded %d seconds (FAIL, not PASS); killing test process tree." timeout
-        try child.Kill(true) with _ -> ()
-        child.WaitForExit(10000) |> ignore
+        eprintfn "Hermetic Client.Tests: exceeded %d seconds (FAIL, not PASS); terminating test job." timeout
+
+    // A direct process exit does NOT establish that its testhost descendants
+    // exited. Query the kernel job, then terminate remaining members and
+    // verify an empty job before allowing any filesystem deletion or lease
+    // release. Failure to query/terminate leaves scratch for manual recovery.
+    let mutable forcedStop = false
+    let mutable treeEmpty = false
+    match scratchJob with
+    | Some job ->
+        treeEmpty <-
+            try WindowsDisposableGuard.waitForJobEmpty job 10000
+            with error ->
+                eprintfn "Hermetic Client.Tests: job liveness query failed: %s" error.Message
+                false
+        if not treeEmpty then
+            forcedStop <- true
+            try
+                WindowsDisposableGuard.terminateJob job
+                treeEmpty <- WindowsDisposableGuard.waitForJobEmpty job 10000
+            with error ->
+                eprintfn "Hermetic Client.Tests: job termination unverified: %s" error.Message
+                treeEmpty <- false
+        if treeEmpty then
+            // Only the owning process that saw an empty kernel job can produce
+            // this receipt. Recovery refuses all started roots lacking it.
+            let drainedMarker = WindowsDisposableGuard.runDrainedMarker tempDirectory
+            File.WriteAllText(drainedMarker, "Windows job active process count verified zero.")
+            WindowsDisposableGuard.assertOwnerOnly drainedMarker false false
+            canCleanupProcessScratch <- true
+        else
+            eprintfn "Hermetic Client.Tests: Windows descendants not proven drained; preserving root and recovery guard."
+    | None ->
+        if not finished then
+            try child.Kill(true) with error ->
+                eprintfn "Hermetic Client.Tests: Linux child kill failed: %s" error.Message
+            if not (child.WaitForExit(10000)) then
+                eprintfn "Hermetic Client.Tests: direct child exit was not verified."
 
     let drained =
         Task.WaitAll([| stdoutTask :> Task; stderrTask :> Task |], 10000)
@@ -427,7 +510,9 @@ try
         // .NET can return exit 0 after only a build when test discovery fails.
         // An empty or unreported run must never be presented as a test PASS.
         let exitCode =
-            if child.ExitCode <> 0 then child.ExitCode
+            if forcedStop || (OperatingSystem.IsWindows() && not treeEmpty) then 125
+            elif not drained then 126
+            elif child.ExitCode <> 0 then child.ExitCode
             elif discoveryOnly || testCount > 0 then 0
             else 2
         if exitCode = 2 then
@@ -437,25 +522,32 @@ try
     else
         Environment.ExitCode <- 124
 finally
-    // A failed setup, test failure, cancellation or timeout must not retain
-    // activity, bindings, test output or private temporary credentials.
-    // The exclusive lease persists until independent root-absence proof.
+    // Never traverse/deallocate a possibly live Windows descendant's scratch.
+    // The job handle is retained until AFTER checked cleanup, so a crash
+    // closes it and forcibly terminates all assigned descendants.
     try
-        cleanDisposableTree tempDirectory
-        match scratchLease with
-        | Some lease -> WindowsDisposableGuard.finishScratchLease tempDirectory lease
-        | None -> ()
-        scratchLease <- None
-        printfn "Hermetic Client.Tests: scratch cleanup verified = true"
-    with cleanupFailure ->
-        // If the root survived, leave its sidecar provenance on disk so a
-        // future explicit recovery may claim it after this process exits.
+        if canCleanupProcessScratch then
+            try
+                cleanDisposableTree tempDirectory
+                match scratchLease with
+                | Some lease -> WindowsDisposableGuard.finishScratchLease tempDirectory lease
+                | None -> ()
+                scratchLease <- None
+                printfn "Hermetic Client.Tests: scratch cleanup verified = true"
+            with cleanupFailure ->
+                // Missing cleanup proof retains the sidecar for explicit,
+                // liveness-gated recovery. No second attempt through links.
+                eprintfn "Hermetic Client.Tests: scratch cleanup verified = false (%s)" cleanupFailure.Message
+                reraise()
+        else
+            eprintfn "Hermetic Client.Tests: scratch cleanup verified = false (unverified child/job liveness; root retained)"
+            Environment.ExitCode <- 125
+        if injectSetupFailure then
+            eprintfn "Hermetic Client.Tests: scratch cleanup verified = %b"
+                (WindowsDisposableGuard.provenAbsent tempDirectory)
+    finally
+        scratchJob |> Option.iter (fun job -> job.Dispose())
         scratchLease |> Option.iter (fun lease -> lease.Dispose())
-        eprintfn "Hermetic Client.Tests: scratch cleanup verified = false (%s)" cleanupFailure.Message
-        reraise()
-    if injectSetupFailure then
-        eprintfn "Hermetic Client.Tests: scratch cleanup verified = %b"
-            (WindowsDisposableGuard.provenAbsent tempDirectory)
 
 // F# Interactive resets ExitCode when the script returns normally. The child
 // outcome must be the host process outcome, and cleanup must run first.

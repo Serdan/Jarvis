@@ -33,9 +33,10 @@ let parent = WindowsDisposableGuard.attestScratchParent scratchParent
 let root = Path.GetFullPath(Path.Combine(parent, scratchId))
 if not (String.Equals(Path.GetDirectoryName root, parent, StringComparison.OrdinalIgnoreCase)) then
     failwith "Recovered root must be an immediate child of the attested parent."
-// This exclusive parent-side lease is held for the entire recovery. Opening it
-// fails when a live harness has the same scratch ID; missing pre-lease
-// provenance also fails closed rather than guessing process liveness.
+// The exclusive lease prevents concurrent recovery and active-parent races.
+// A RELEASED parent lease alone is not proof of a stopped testhost. Claiming
+// additionally rejects a started root without a protected post-job-empty
+// .run-drained receipt; no explicit recovery may guess descendant liveness.
 use recoveryLease = WindowsDisposableGuard.claimStaleScratchLease root
 
 let rec removeTree (path: string) =

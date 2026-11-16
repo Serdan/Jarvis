@@ -19,10 +19,17 @@ modify Wayfold, the operator profile, production service, or WQ-01.
 
 ## Isolation contract
 
-On Windows use only the separately registered, self-hosted
-`Jarvis-Windows-QA` project on Kruso, or an equivalently independently
-attested disposable Windows account/VM. The selected checkout must be clean
-and pinned to the exact source SHA under review. Verify Windows, `dotnet
+On Windows use only a **proven disposable Windows OS user profile or VM**.
+The separately registered, self-hosted `Jarvis-Windows-QA` project on Kruso
+isolates source checkout but **does not, by itself, isolate the SDK user's
+profile**. Do not execute even `dotnet restore`, `dotnet build`, or an FSI
+preflight from the actual operator's Windows logon. Before the *first* SDK
+process starts, independently attest the disposable account/profile (or
+equivalent full virtualization of HKCU, known folders, NuGet user configuration
+and credentials, and .NET CLI first-run state). If that cannot be proved,
+stop with the Windows validation gate Blocked; redirecting `--packages`,
+`TEMP` or `DOTNET_CLI_HOME` alone is not sufficient. The selected checkout
+must be clean and pinned to the exact source SHA under review. Verify Windows, `dotnet
 --version` (11.x), Release artifacts, and an explicitly provisioned
 disposable scratch parent **outside** the token-derived real user profile
 and physical AppData known folders. Reject absent, unverified, linked or
@@ -32,6 +39,17 @@ only TEMP/USERPROFILE makes the environment safe.
 The FSI parent allocates a random private root with an atomic protected
 owner-only Windows ACL. It holds an exclusive **owner-only sidecar lease in
 the attested parent** from before root creation through verified teardown.
+Before Process.Start it writes a protected `.run-started` marker and creates
+a Windows Job Object configured KILL_ON_JOB_CLOSE. The initial process is a
+minimal `launch-client-tests-gated.fsx` FSI launcher which **cannot start
+VSTest until its own job membership has been independently verified** and the
+parent writes an owner-only release gate. VSTest and its testhosts are
+therefore born inside the job; no descendant can escape through the
+Start-to-Assign race. A crash before release is still deliberately
+**unrecoverable by the automatic helper**, because the missing drain receipt
+leaves an uncertainty that no parent-only lease can resolve. A completed run writes `.run-drained`
+only after querying the job and proving zero active members. Forced termination
+is a failure outcome even if the whole job is subsequently drained.
 NUnit independently checks native token-profile exclusion, owner-only ACLs,
 the layout, and non-reparse containment before Client storage is used.
 Client-owned config, activity, ledger, identity and file-edit lock paths use
@@ -40,23 +58,30 @@ override. The child gets disposable HOME, APPDATA/LOCALAPPDATA, XDG, temp,
 DOTNET_CLI_HOME and isolated Git identity/config. Inherited `GIT_*`
 overrides are removed. The parent/operator environment is not changed.
 
-Windows invokes prebuilt .NET 11 Release `Client.Tests.dll` through
-`dotnet vstest`, not the zero-test `dotnet test` path. The harness accepts
+Windows's job-attached FSI gate invokes prebuilt .NET 11 Release
+`Client.Tests.dll` through `dotnet vstest`, not the zero-test `dotnet test`
+path. The release gate is created **only after** the kernel verifies
+the launcher's job assignment. The harness accepts
 `--filter`, `--list-tests`, `--no-build` and `--no-restore` only.
 Results require an actual positive executed-test count. The runner bounds
-output, logs per-test progress, sets a per-test hang detector, kills the
-child process tree on timeout, and requires drained stdout/stderr. Scratch
-removal retries only transient Windows I/O locks. **Directory.Exists=false
+output, logs per-test progress, sets a per-test hang detector, and bounds
+timeout teardown with a kernel job/process-tree query. An unverified kill,
+live descendant or job-query failure **prohibits scratch deletion**; the
+protected `.run-started` marker remains without a `.run-drained` receipt.
+Passing requires verified process-tree emptiness and drained stdout/stderr.
+Scratch removal retries only transient Windows I/O locks. **Directory.Exists=false
 is never treated as absence proof**: access denial and uncertain paths fail
 closed, and cleanup success is printed only after independent native-path
 absence proof and lease removal.
 
 ## Local/self-hosted Windows diagnostic sequence
 
-Use commands only from the already attested disposable QA checkout, with a
-scratch parent whose isolation was independently verified. Example commands
-(the parent is an example of an independently verified Kruso path, not a
-universal safe location):
+Run the following **only inside the preflight-verified disposable Windows
+OS account/profile or VM**, from its clean exact-SHA QA checkout, with the
+disposable scratch parent separately attested. **Do not run this bootstrap
+from the operator's normal Kruso logon**, even if the checkout and package
+directory are separate. The parent below is illustrative, not a universal
+safe location:
 
 ```powershell
 dotnet --version
@@ -88,8 +113,14 @@ must be tested on Windows; never weaken the gate to make them pass.
 
 Use `scripts/recover-hermetic-client-scratch.fsx` **only** after observing
 the failed run's exact `jarvis-client-tests-<32-hex>` ID and verifying the
-corresponding harness/testhost process tree is no longer live. Specify
-`--scratch-parent` and that exact `--scratch-id`; never sweep or guess IDs.
+corresponding harness/testhost process tree is no longer live. Recovery
+cannot prove that fact from a released parent-side lease alone: for any run
+that reached Process.Start it additionally requires the protected
+post-job-empty `.run-drained` receipt. If only `.run-started` exists (parent
+crash, job/child liveness uncertain), **the helper refuses deletion even after
+the operator observes the child exit**; retain the root for separately
+authorized forensic/manual recovery. Specify `--scratch-parent` and the exact
+`--scratch-id`; never sweep or guess IDs.
 
 ```powershell
 dotnet fsi scripts/recover-hermetic-client-scratch.fsx -- --scratch-parent "C:\Windows\Temp" --scratch-id "jarvis-client-tests-0123456789abcdef0123456789abcdef"
@@ -98,10 +129,12 @@ dotnet fsi scripts/recover-hermetic-client-scratch.fsx -- --scratch-parent "C:\W
 The helper independently re-attests the parent/profile, refuses unrecognized
 IDs or missing pre-lease provenance, and must acquire the **exclusive lease**
 before deleting any root content. A currently running harness holds the
-lease, so the helper fails without touching its files. A crashed process
-releases the OS handle; recovery then checks owner-only protected ACL,
-path ancestry/reparse safety and independently verified post-deletion
-absence. Inaccessible roots and unleased legacy roots fail closed for
+lease, so the helper fails without touching its files. A crashed parent
+releases that OS handle **even while orphaned child processes may still be
+alive**; the helper therefore refuses a started root lacking its authoritative
+drain receipt. When the receipt exists, recovery verifies protected marker
+and root ACLs, path ancestry/reparse safety and independently attested
+post-deletion absence. Inaccessible roots and unleased legacy roots fail closed for
 operator investigation. Retain the exact command, exit, lease and scratch
 cleanup evidence; never interpret failure as successful cleanup.
 

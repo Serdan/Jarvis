@@ -404,6 +404,82 @@ module HermeticHarnessTests =
                     "The failed recovery claim must leave the live scratch intact.")
 
     [<Test>]
+    let windows_recovery_refuses_orphan_after_parent_lease_dies () =
+        if not (OperatingSystem.IsWindows()) then
+            Assert.Ignore("Windows orphan recovery requires native process and ACL semantics.")
+        // The fake orphan performs no Client reads/writes or external network
+        // traffic. A freed FSI lease alone must never authorize scratch deletion.
+        let parent = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_HERMETIC_ROOT")
+        let scratch = Path.Combine(parent, "jarvis-client-tests-" + Guid.NewGuid().ToString("N"))
+        use lease = WindowsDisposableGuard.createScratchLease scratch
+        WindowsDisposableGuard.acquirePrivateRoot scratch false |> ignore
+        let started = WindowsDisposableGuard.runStartedMarker scratch
+        try
+            File.WriteAllText(started, "Unverified subprocess tree.")
+            WindowsDisposableGuard.assertOwnerOnly started false false
+            use orphan = new Process()
+            orphan.StartInfo <- ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "ping.exe"))
+            orphan.StartInfo.UseShellExecute <- false
+            orphan.StartInfo.CreateNoWindow <- true
+            orphan.StartInfo.WorkingDirectory <- scratch
+            orphan.StartInfo.ArgumentList.Add("-n")
+            orphan.StartInfo.ArgumentList.Add("30")
+            orphan.StartInfo.ArgumentList.Add("127.0.0.1")
+            let mutable launched = false
+            try
+                launched <- orphan.Start()
+                Assert.That(launched, Is.True)
+                Assert.That(orphan.HasExited, Is.False, "The synthetic orphan must be live.")
+                lease.Dispose() // Simulates abrupt FSI parent death.
+                Assert.Throws<UnauthorizedAccessException>(
+                    TestDelegate(fun () ->
+                        use claim = WindowsDisposableGuard.claimStaleScratchLease scratch
+                        ())) |> ignore
+                Assert.That(WindowsDisposableGuard.provenAbsent scratch, Is.False)
+                Assert.That(orphan.HasExited, Is.False, "Recovery must not kill the orphan or remove live files.")
+            finally
+                if launched then
+                    if not orphan.HasExited then orphan.Kill(true)
+                    Assert.That(orphan.WaitForExit(10000), Is.True,
+                                "Negative fixture's orphan must be drained before teardown.")
+        finally
+            // This fixture owns the fake process and positively waited for it.
+            // Do not use the recovery helper: the unverified-run marker must
+            // continue to reject that public path even after test completion.
+            WindowsDisposableGuard.assertNoLinkedAncestors scratch
+            WindowsDisposableGuard.assertOwnerOnly scratch true true
+            if not (WindowsDisposableGuard.provenAbsent started) then File.Delete started
+            Directory.Delete scratch
+            WindowsDisposableGuard.finishScratchLease scratch lease
+
+    [<Test>]
+    let windows_kill_on_close_job_terminates_attached_subprocess () =
+        if not (OperatingSystem.IsWindows()) then
+            Assert.Ignore("Windows kernel job termination requires Windows.")
+        use job = WindowsDisposableGuard.createKillOnCloseJob()
+        use child = new Process()
+        child.StartInfo <- ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "ping.exe"))
+        child.StartInfo.UseShellExecute <- false
+        child.StartInfo.CreateNoWindow <- true
+        child.StartInfo.ArgumentList.Add("-n")
+        child.StartInfo.ArgumentList.Add("30")
+        child.StartInfo.ArgumentList.Add("127.0.0.1")
+        let mutable launched = false
+        try
+            launched <- child.Start()
+            Assert.That(launched, Is.True)
+            WindowsDisposableGuard.assignToJob job child
+            Assert.That(WindowsDisposableGuard.waitForJobEmpty job 100, Is.False,
+                        "A live job member cannot count as an empty process tree.")
+            job.Dispose() // Simulates FSI parent crash.
+            Assert.That(child.WaitForExit(10000), Is.True,
+                        "Kill-on-close must drain the attached subprocess.")
+        finally
+            if launched && not child.HasExited then
+                child.Kill(true)
+                child.WaitForExit(10000) |> ignore
+
+    [<Test>]
     let windows_recovery_refuses_legacy_unleased_root () =
         if not (OperatingSystem.IsWindows()) then
             Assert.Ignore("Native Windows stale-root provenance requires Windows.")

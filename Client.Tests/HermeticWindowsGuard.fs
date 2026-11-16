@@ -2,11 +2,63 @@ namespace Jarvis.Testing
 
 open System
 open System.IO
+open System.Diagnostics
+open System.Threading
 open System.Text
 open System.Runtime.InteropServices
 open System.Security.AccessControl
 open System.Security.Principal
 open Microsoft.Win32.SafeHandles
+
+
+[<StructLayout(LayoutKind.Sequential)>]
+type private JobBasicLimits =
+    struct
+        val mutable PerProcessUserTimeLimit: int64
+        val mutable PerJobUserTimeLimit: int64
+        val mutable LimitFlags: uint32
+        val mutable MinimumWorkingSetSize: nativeint
+        val mutable MaximumWorkingSetSize: nativeint
+        val mutable ActiveProcessLimit: uint32
+        val mutable Affinity: nativeint
+        val mutable PriorityClass: uint32
+        val mutable SchedulingClass: uint32
+    end
+
+[<StructLayout(LayoutKind.Sequential)>]
+type private JobIoCounters =
+    struct
+        val mutable ReadOperationCount: uint64
+        val mutable WriteOperationCount: uint64
+        val mutable OtherOperationCount: uint64
+        val mutable ReadTransferCount: uint64
+        val mutable WriteTransferCount: uint64
+        val mutable OtherTransferCount: uint64
+    end
+
+[<StructLayout(LayoutKind.Sequential)>]
+type private JobExtendedLimits =
+    struct
+        val mutable BasicLimitInformation: JobBasicLimits
+        val mutable IoInfo: JobIoCounters
+        val mutable ProcessMemoryLimit: nativeint
+        val mutable JobMemoryLimit: nativeint
+        val mutable PeakProcessMemoryUsed: nativeint
+        val mutable PeakJobMemoryUsed: nativeint
+    end
+
+[<StructLayout(LayoutKind.Sequential)>]
+type private JobAccounting =
+    struct
+        val mutable TotalUserTime: int64
+        val mutable TotalKernelTime: int64
+        val mutable ThisPeriodTotalUserTime: int64
+        val mutable ThisPeriodTotalKernelTime: int64
+        val mutable TotalPageFaultCount: uint32
+        val mutable TotalProcesses: uint32
+        val mutable ActiveProcesses: uint32
+        val mutable TotalTerminatedProcesses: uint32
+    end
 
 // Test-only Windows security boundary shared by the FSI parent and NUnit testhost.
 // The runner must attest the real token profile and private scratch ACL BEFORE
@@ -29,9 +81,72 @@ module private WindowsNative =
     [<DllImport("kernel32.dll", EntryPoint = "GetFinalPathNameByHandleW", CharSet = CharSet.Unicode, SetLastError = true)>]
     extern uint32 GetFinalPathNameByHandle(SafeFileHandle handle, StringBuilder buffer, uint32 capacity, uint32 flags)
 
+    [<DllImport("kernel32.dll", EntryPoint = "CreateJobObjectW", CharSet = CharSet.Unicode, SetLastError = true)>]
+    extern SafeFileHandle CreateJobObject(nativeint securityAttributes, string name)
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool SetInformationJobObject(SafeFileHandle job, int informationClass, JobExtendedLimits& limits, int size)
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool AssignProcessToJobObject(SafeFileHandle job, nativeint processHandle)
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool IsProcessInJob(nativeint processHandle, SafeFileHandle job, bool& inJob)
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool QueryInformationJobObject(SafeFileHandle job, int informationClass, JobAccounting& accounting, int size, uint32& returned)
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool TerminateJobObject(SafeFileHandle job, uint32 exitCode)
+
 [<RequireQualifiedAccess>]
 module WindowsDisposableGuard =
     let private deny message = raise (UnauthorizedAccessException message)
+
+    /// The VSTest root and all its descendants belong to one Windows job.
+    /// KILL_ON_JOB_CLOSE terminates them if FSI is killed. A pre-assignment
+    /// crash is covered by the durable unsafe-run recovery marker.
+    let createKillOnCloseJob () =
+        if not (OperatingSystem.IsWindows()) then
+            deny "Windows process-tree jobs require Windows."
+        let job = WindowsNative.CreateJobObject(IntPtr.Zero, null)
+        if isNull job || job.IsInvalid then
+            deny "Cannot create a Windows test process job."
+        try
+            let mutable basic = Unchecked.defaultof<JobBasicLimits>
+            basic.LimitFlags <- 0x2000u // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            let mutable limits = Unchecked.defaultof<JobExtendedLimits>
+            limits.BasicLimitInformation <- basic
+            if not (WindowsNative.SetInformationJobObject(
+                        job, 9, &limits, Marshal.SizeOf<JobExtendedLimits>())) then
+                deny "Cannot configure kill-on-close for the Windows test job."
+            job
+        with _ ->
+            job.Dispose()
+            reraise()
+
+    let assignToJob (job: SafeFileHandle) (targetProcess: Process) =
+        if not (WindowsNative.AssignProcessToJobObject(job, targetProcess.Handle)) then
+            deny "Cannot place VSTest in its Windows kill-on-close job."
+        let mutable inJob = false
+        if not (WindowsNative.IsProcessInJob(targetProcess.Handle, job, &inJob)) || not inJob then
+            deny "Cannot verify VSTest process job membership."
+
+    let private activeJobProcesses (job: SafeFileHandle) =
+        let mutable accounting = Unchecked.defaultof<JobAccounting>
+        let mutable returned = 0u
+        if not (WindowsNative.QueryInformationJobObject(
+                    job, 1, &accounting, Marshal.SizeOf<JobAccounting>(), &returned)) then
+            deny "Cannot attest Windows VSTest process-tree liveness."
+        accounting.ActiveProcesses
+
+    let waitForJobEmpty (job: SafeFileHandle) (timeoutMs: int) =
+        let clock = Stopwatch.StartNew()
+        let mutable empty = activeJobProcesses job = 0u
+        while not empty && clock.ElapsedMilliseconds < int64 timeoutMs do
+            Thread.Sleep 100
+            empty <- activeJobProcesses job = 0u
+        empty
+
+    let terminateJob (job: SafeFileHandle) =
+        if not (WindowsNative.TerminateJobObject(job, 124u)) then
+            deny "Windows could not terminate the isolated VSTest process tree."
+
 
     let private sameOrUnder (root: string) (path: string) =
         let root = Path.TrimEndingDirectorySeparator(root)
@@ -200,6 +315,28 @@ module WindowsDisposableGuard =
 
     let scratchLeasePath (root: string) = root + ".lease"
 
+    // The first marker is created before Process.Start. Only a verified empty
+    // job can authorize the second marker. A crash before job assignment
+    // remains unrecoverable by the automatic helper, not falsely "stale".
+    let runStartedMarker (root: string) = Path.Combine(root, ".run-started")
+    let runDrainedMarker (root: string) = Path.Combine(root, ".run-drained")
+
+    let attestRecoveryLiveness (root: string) =
+        let started = runStartedMarker root
+        let drained = runDrainedMarker root
+        let hasStarted = not (provenAbsent started)
+        let hasDrained = not (provenAbsent drained)
+        if hasDrained && not hasStarted then
+            deny "Windows scratch has an inconsistent process-tree receipt."
+        if hasStarted then
+            assertNoLinkedAncestors root
+            assertOwnerOnly root true true
+            assertOwnerOnly started false false
+            if not hasDrained then
+                deny "Refusing recovery: a crashed parent may have left a live VSTest/testhost descendant."
+            assertOwnerOnly drained false false
+
+
     /// A protected exclusive lease lives beside (not inside) the scratch root.
     /// The harness holds it from before root creation through final cleanup.
     /// A crash releases the kernel handle; recovery cannot claim a live run.
@@ -231,6 +368,8 @@ module WindowsDisposableGuard =
             deny "Cannot establish stale scratch ownership without a lease record."
         assertNoLinkedAncestors (Path.GetDirectoryName lease)
         assertOwnerOnly lease false true
+        // An available parent lease cannot attest the death of descendants.
+        attestRecoveryLiveness root
         new FileStream(lease, FileMode.Open, FileAccess.ReadWrite, FileShare.None)
 
     /// Never release the lease until root absence is independently proven.

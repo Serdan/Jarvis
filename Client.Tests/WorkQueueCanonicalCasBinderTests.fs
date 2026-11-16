@@ -11,6 +11,7 @@ open Client.ReviewWorkflow
 open Client.WorkQueueGitLedger
 open Client.WorkQueueCanonicalSourceEvidence
 open Client.WorkQueueCanonicalCasBinder
+open Client.WorkQueueReceiptProducer
 open Client.WorkQueueRoleAuthority
 
 [<TestFixture>]
@@ -387,4 +388,151 @@ type WorkQueueCanonicalCasBinderTests() =
             Assert.That(integration.Dependencies, Does.Contain(reviewStage.Id))
             Assert.That(integration.SubjectId, Is.EqualTo(task))
             Assert.That(nextQueue.Works.Count, Is.EqualTo(2))
+        )
+
+    [<Test>]
+    member _.ExplicitReceiptEntryPointResolvesOriginalTaskAndReplaysWithoutNewHeadAssertions() =
+        withClones (fun a b _ ->
+            let task = "receipt-entrypoint-task"
+            let created = ReviewWorkflow.createTask a (Guid.NewGuid()) task "Original task receipt" |> ok
+            let sourceId = Guid.Parse created.Operation.OperationId
+            let preview = WorkQueueReceiptProducer.preview b sourceId |> ok
+            Assert.That(preview.Status, Is.EqualTo("ReadyToProduce"))
+            Assert.That(preview.SourceOperationKind, Is.EqualTo("CreateTask"))
+            Assert.That(preview.SubjectId, Is.EqualTo(task))
+            Assert.That(preview.StageQueue, Is.EqualTo("planning"))
+            Assert.That(preview.AccountCredit, Is.EqualTo("NotReserved"))
+            let producerId = Guid.NewGuid()
+            let produced = WorkQueueReceiptProducer.produce b "Lead" producerId sourceId |> ok
+            Assert.That(produced.AlreadyApplied, Is.False)
+            let after = WorkQueueReceiptProducer.preview a sourceId |> ok
+            Assert.That(after.Status, Is.EqualTo("AlreadyProduced"))
+            Assert.That(after.StageId, Is.EqualTo(preview.StageId))
+            // Reconstructing the request against a newer Git head would be a
+            // false UUID collision. The original durable producer receipt wins.
+            let replay = WorkQueueReceiptProducer.produce a "Lead" producerId sourceId |> ok
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That(replay.Operation.OperationId, Is.EqualTo(producerId.ToString("D")))
+            match WorkQueueReceiptProducer.produce a "Other" producerId sourceId with
+            | Error OperationIdReused -> ()
+            | other -> Assert.Fail(sprintf "Cross-actor UUID replay was not rejected: %A" other)
+            match WorkQueueReceiptProducer.produce a "Lead" (Guid.NewGuid()) sourceId with
+            | Error _ -> ()
+            | Ok _ -> Assert.Fail("A different operation ID published a duplicate task stage.")
+            let snapshot, project = WorkQueueGitLedger.load a |> ok
+            Assert.That(project.Works.Count, Is.EqualTo(1))
+            let stage = project.Works.[preview.StageId]
+            Assert.That(stage.Kind, Is.EqualTo(WorkKind.Planning))
+            Assert.That(stage.State, Is.EqualTo(WorkState.Available))
+            let origin, _ = WorkQueueGitLedger.readOriginAt a snapshot preview.StageId |> ok |> Option.get
+            Assert.That(origin.SourceOperationId, Is.EqualTo(sourceId.ToString("D")))
+            Assert.That(project.Launches.IsEmpty, Is.True, "Production launch is not activated.")
+            // Explicit disposable WQ02 fixture only, not real account admission.
+            let launch : Launch =
+                { Id = "receipt-fixture-planner"; ProjectId = a.ProjectId.ToString("D")
+                  RoleId = "Planner"; RoleVersion = 1
+                  AccountTokenId = Guid.NewGuid().ToString("D")
+                  State = LaunchState.ReservedUnregistered; Lease = None; Version = 0
+                  Credit = None; PrimaryWorkId = None; EverClaimed = false
+                  AncillaryMessages = Set.empty; DispatchCount = 0 }
+            let apply mutation =
+                let _, current = WorkQueueGitLedger.load a |> ok
+                WorkQueueGitLedger.executeInertFixtureAt a "Lead" (Guid.NewGuid())
+                    current.Version 101L mutation |> ok |> ignore
+            apply (AdmitProject launch)
+            apply (DispatchOnce(launch.Id, DispatchState.Submitted))
+            apply (InitializeAgent(launch.Id, "receipt-planning-fixture-session"))
+            apply (ClaimNext launch.Id)
+            let _, claimed = WorkQueueGitLedger.load a |> ok
+            Assert.That(claimed.Works.[preview.StageId].State, Is.EqualTo(WorkState.Claimed launch.Id))
+            apply (CompleteOrdinary(launch.Id, preview.StageId))
+            let _, doneState = WorkQueueGitLedger.load a |> ok
+            Assert.That(doneState.Works.[preview.StageId].State, Is.EqualTo(WorkState.Completed))
+        )
+
+    [<Test>]
+    member _.ExplicitReceiptReviewAndIntegrationRequireOriginalDependentStage() =
+        withClones (fun a b _ ->
+            let task = "receipt-review-task"
+            ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Owner" |> ok |> ignore
+            ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Reviewer" |> ok |> ignore
+            let sourceSha = git a.RepositoryPath [ "rev-parse"; "HEAD" ]
+            let sourceRef = "refs/heads/main"
+            ReviewWorkflow.createTask a (Guid.NewGuid()) task task |> ok |> ignore
+            let reviewId = Guid.NewGuid()
+            let submittedReview =
+                ReviewWorkflow.submitBranchReview a (Guid.NewGuid()) task "Owner" reviewId
+                    sourceRef sourceSha "Review exact SHA" "task-bound" sourceRef |> ok
+            let sourceId = Guid.Parse submittedReview.Operation.OperationId
+            let reviewPreview = WorkQueueReceiptProducer.preview b sourceId |> ok
+            Assert.That(reviewPreview.Status, Is.EqualTo("ReadyToProduce"))
+            Assert.That(reviewPreview.StageQueue, Is.EqualTo("review"))
+            WorkQueueReceiptProducer.produce b "Lead" (Guid.NewGuid()) sourceId |> ok |> ignore
+            ReviewWorkflow.claimBranchReview a (Guid.NewGuid()) task reviewId "Reviewer" 1
+                |> ok |> ignore
+            let existing = WorkQueueReceiptProducer.preview b sourceId |> ok
+            Assert.That(existing.Status, Is.EqualTo("AlreadyProduced"))
+            ReviewWorkflow.decideBranchReview a (Guid.NewGuid()) task reviewId "Reviewer" 2 Accept
+                |> ok |> ignore
+            let integrationId = Guid.NewGuid()
+            let submitted =
+                ReviewWorkflow.submitIntegration a (Guid.NewGuid()) task "Owner" integrationId
+                    sourceRef sourceSha (reviewId.ToString("N")) sourceRef |> ok
+            let integrationSource = Guid.Parse submitted.Operation.OperationId
+            let integrationPreview = WorkQueueReceiptProducer.preview b integrationSource |> ok
+            Assert.That(integrationPreview.Status, Is.EqualTo("ReadyToProduce"))
+            Assert.That(integrationPreview.StageQueue, Is.EqualTo("integration"))
+            Assert.That(integrationPreview.PriorReviewStageId, Is.EqualTo(reviewPreview.StageId))
+            WorkQueueReceiptProducer.produce b "Lead" (Guid.NewGuid()) integrationSource |> ok |> ignore
+            let _, queue = WorkQueueGitLedger.load b |> ok
+            let stage = queue.Works.[integrationPreview.StageId]
+            Assert.That(stage.Kind, Is.EqualTo(WorkKind.Integration))
+            Assert.That(stage.State, Is.EqualTo(WorkState.Blocked))
+            Assert.That(stage.Dependencies, Does.Contain(reviewPreview.StageId))
+        )
+
+    [<Test>]
+    member _.LateClaimedReviewIsVisibleAndCannotSilentlyBackfillAsUnclaimed() =
+        withClones (fun a b _ ->
+            let task = "receipt-late-review"
+            ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Owner" |> ok |> ignore
+            ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Reviewer" |> ok |> ignore
+            let sourceSha = git a.RepositoryPath [ "rev-parse"; "HEAD" ]
+            ReviewWorkflow.createTask a (Guid.NewGuid()) task task |> ok |> ignore
+            let reviewId = Guid.NewGuid()
+            let original =
+                ReviewWorkflow.submitBranchReview a (Guid.NewGuid()) task "Owner" reviewId
+                    "refs/heads/main" sourceSha "Late review" "task-bound" "refs/heads/main" |> ok
+            let originalId = Guid.Parse original.Operation.OperationId
+            ReviewWorkflow.claimBranchReview a (Guid.NewGuid()) task reviewId "Reviewer" 1
+                |> ok |> ignore
+            let preview = WorkQueueReceiptProducer.preview b originalId |> ok
+            Assert.That(preview.SourceStatus, Is.EqualTo("Claimed"))
+            Assert.That(preview.Status, Is.EqualTo("NeedsAttention"))
+            Assert.That(preview.Blockers, Is.Not.Empty)
+            Assert.That(preview.Recovery, Does.Contain("backup SHA"))
+            match WorkQueueReceiptProducer.produce b "Lead" (Guid.NewGuid()) originalId with
+            | Error _ -> ()
+            | Ok _ -> Assert.Fail("Claimed review was backfilled as an unclaimed runnable review.")
+            let _, queue = WorkQueueGitLedger.load b |> ok
+            Assert.That(queue.Works.Count, Is.EqualTo(0))
+        )
+
+    [<Test>]
+    member _.TwoClonesCannotDuplicateTheSameOriginalTaskStage() =
+        withClones (fun a b _ ->
+            let task = "receipt-race-task"
+            let created = ReviewWorkflow.createTask a (Guid.NewGuid()) task task |> ok
+            let originalId = Guid.Parse created.Operation.OperationId
+            let left = Task.Run(fun () -> WorkQueueReceiptProducer.produce a "Lead" (Guid.NewGuid()) originalId)
+            let right = Task.Run(fun () -> WorkQueueReceiptProducer.produce b "Lead" (Guid.NewGuid()) originalId)
+            Task.WaitAll [| left :> Task; right :> Task |]
+            let successful =
+                [ left.Result; right.Result ]
+                |> List.filter (function Ok _ -> true | Error _ -> false)
+            Assert.That(successful.Length, Is.EqualTo(1))
+            let _, queue = WorkQueueGitLedger.load b |> ok
+            let stages = queue.Works |> Map.toList |> List.map snd
+                         |> List.filter (fun stage -> stage.SubjectId = task)
+            Assert.That(stages.Length, Is.EqualTo(1))
         )

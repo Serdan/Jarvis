@@ -85,6 +85,7 @@
         <Compile Include="Modules\\WorkQueueCanonicalSourceEvidence.fs"/>
         <Compile Include="Modules\\WorkQueueCanonicalCasBinder.fs"/>
         <Compile Include="Modules\\OrchestrationApi.fs"/>
+        <Compile Include="Modules\\WorkQueueReceiptProducer.fs"/>
         <Compile Include="Modules\\WorkQueueOperatorConversationCli.fs"/>
         <Compile Include="Modules\SourceEffectHostBinding.fs"/>
         <Compile Include="Modules\ProjectCreation.fs"/>

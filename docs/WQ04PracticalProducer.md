@@ -80,3 +80,53 @@ analysis paths remain unchanged for their earlier tests; the positive
 path is `publishPractical`. Review publication currently requires the
 canonical review to be unclaimed; source corrections/replaced reviews and
 late event backfills need an explicit follow-up path.
+
+## Explicit local CLI (default-off; no Scheduler or automatic producer)
+
+The client now exposes an operator/agent-invoked command that derives the
+task/review/integration selector, expected project version, and pinned source
+head from **the actual original operation receipt**, rather than asking the
+caller to invent source identifiers or high-water counters. Supply the
+original `CreateTask`, `SubmitBranchReview`, or `SubmitIntegration`
+operation UUID returned by Jarvis:
+
+```sh
+JarvisClient queue-producer /approved/project/root preview ORIGINAL_OP_UUID
+JarvisClient queue-producer /approved/project/root produce ACTOR NEW_PRODUCER_OP_UUID ORIGINAL_OP_UUID
+JarvisClient queue-producer /approved/project/root inspect ORIGINAL_OR_PRODUCER_OP_UUID
+JarvisClient queue-producer /approved/project/root origin WORK_ID
+JarvisClient queue-producer /approved/project/root demand ROLE_ID
+```
+
+`preview` is read-only. It includes the verified Git head, canonical
+operation kind/sequence/hash, source entity path/status, deterministic work ID,
+prerequisite review stage, account-credit state and blockers. Values
+`ReadyToProduce`, `AlreadyProduced` and `NeedsAttention` describe
+**project-only publication**, never live dispatch eligibility.
+
+`produce` is the only command in this interface that writes. It requires
+a distinct, caller-stable **new** UUID and actor label; this creates one
+project work stage and its immutable origin under normal Git CAS. Exact-UUID
+replay inspects the already-applied original producer operation first, even if
+the ledger advanced since its request was made. The source operation must
+still match. A genuinely stale/new operation surfaces `Conflict`;
+ambiguous Git transport returns `Unknown`, with the operation UUID to
+inspect. Never silently treat `NotFoundAtVerifiedHead` as evidence that a
+delayed push cannot arrive.
+
+The commands require an **existing locally approved trusted Git ledger
+binding**. They are not part of ordinary client startup, task/review event
+handlers, the host Scheduler, or automatic agent dispatch.
+
+A late `SubmitBranchReview` event whose review has already been claimed or
+decided is shown with its current status and a `NeedsAttention` blocker.
+It is not naively backfilled as another runnable unclaimed reviewer job.
+Inspect the original receipt and the project work/origin records; if
+reconciliation requires direct editing, save the known-good SHA, inspect
+the before/after diff and record a reason. Missing integration prerequisite
+review stages are similarly called out with their exact deterministic ID.
+
+The `demand` command gives a read-only view of pinned role matching and
+blocking-first queue ranking; it does not reserve account credit or dispatch.
+Use ordinary, local .NET 11 Release tests and disposable two-clone ledgers
+before integrating changes to this path.

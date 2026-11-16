@@ -136,6 +136,25 @@ type WorkQueueCanonicalMigrationPrepareTests() =
 
     let contains predicate assessment = assessment.Missing |> List.exists predicate
 
+    let withRedirectedMetadata repo relative action =
+        let original = Path.Combine(repo, relative)
+        let escaped = Path.Combine(Path.GetTempPath(), "wq10-outside-" + Guid.NewGuid().ToString("N"))
+        Directory.Move(original, escaped)
+        Directory.CreateSymbolicLink(original, escaped) |> ignore
+        try
+            let originalOutsideFiles =
+                Directory.GetFiles(escaped, "*", SearchOption.AllDirectories) |> Set.ofArray
+            action ()
+            let observedOutsideFiles =
+                Directory.GetFiles(escaped, "*", SearchOption.AllDirectories) |> Set.ofArray
+            Assert.That(
+                (observedOutsideFiles = originalOutsideFiles),
+                Is.True,
+                "A Git operation escaped the disposable fixture through nested metadata.")
+        finally
+            Directory.Delete original
+            Directory.Move(escaped, original)
+
     [<Test>]
     member _.DefaultOffTwoProjectsRemainsReadOnlyWithNoCanonicalReceipt() =
         withClones (fun fixture ->
@@ -257,3 +276,34 @@ type WorkQueueCanonicalMigrationPrepareTests() =
                 assertNoCanonicalWrite fixture original
             finally
                 File.Delete(alternate))
+
+    [<Test>]
+    member _.NestedCloneObjectsSymlinkCannotRedirectFetchWritesOutsideFixture() =
+        withClones (fun fixture ->
+            let input = request fixture CanonicalPrepareMode.AttemptOnDisposable
+            // Advance the true remote, so an unguarded Git fetch would write
+            // new objects into the symlinked clone metadata directory.
+            AccountCapacityLedger.setCapacity fixture.AccountB (Guid.NewGuid()) "legacy writer" 1L 4
+            |> success |> ignore
+            let authoritativeAfter = snapshotRemoteHeads fixture
+            withRedirectedMetadata fixture.AccountA.RepositoryPath (Path.Combine(".git", "objects")) (fun () ->
+                let result = WorkQueueCanonicalMigrationPrepare.attemptCanonicalPrepare input |> blocked
+                Assert.That(result.AccountHead.IsNone, Is.True)
+                Assert.That(contains (function CanonicalPrepareGap.UnapprovedDisposableAuthority _ -> true | _ -> false) result, Is.True)
+                assertNoCanonicalWrite fixture authoritativeAfter))
+
+    [<Test>]
+    member _.NestedCloneAndBareAuthorityMetadataLinksAreRejectedBeforeAnyGitFetch() =
+        withClones (fun fixture ->
+            let input = request fixture CanonicalPrepareMode.AttemptOnDisposable
+            let originalHeads = snapshotRemoteHeads fixture
+            for repository, relative in
+                [ fixture.ProjectA.RepositoryPath, Path.Combine(".git", "refs")
+                  fixture.ProjectB.RepositoryPath, Path.Combine(".git", "objects", "info")
+                  fixture.AccountRemote, "refs"
+                  fixture.ProjectARemote, "objects" ] do
+                withRedirectedMetadata repository relative (fun () ->
+                    let result = WorkQueueCanonicalMigrationPrepare.attemptCanonicalPrepare input |> blocked
+                    Assert.That(result.AccountHead.IsNone, Is.True)
+                    Assert.That(contains (function CanonicalPrepareGap.UnapprovedDisposableAuthority _ -> true | _ -> false) result, Is.True)
+                    assertNoCanonicalWrite fixture originalHeads))

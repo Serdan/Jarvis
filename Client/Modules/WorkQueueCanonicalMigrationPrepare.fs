@@ -1,6 +1,7 @@
 module Client.WorkQueueCanonicalMigrationPrepare
 
 open System
+open System.Diagnostics
 open System.IO
 open System.Text.RegularExpressions
 open Jarvis.WorkQueues
@@ -105,17 +106,27 @@ module WorkQueueCanonicalMigrationPrepare =
             && Directory.Exists absolute && noSymlinkAncestors absolute
         | None -> false
 
-    // A clone's .git metadata is a write target for a trusted fetch. A Git
-    // worktree pointer or object alternate can redirect even a read-only
-    // assessment outside the approved scratch directory; reject them before
-    // calling the existing CAS readers.
+    // A symlink anywhere under .git (objects, refs, logs, packs, or nested
+    // descendants) may redirect fetch writes. Check the entire supplied
+    // metadata tree, then use a newly created private clone for actual reads.
+    let private noGitMetadataRedirects (root: string) =
+        let rec check directory =
+            try
+                noSymlinkAncestors directory
+                && (Directory.EnumerateFileSystemEntries directory
+                    |> Seq.forall (fun path ->
+                        let attrs = File.GetAttributes path
+                        not (attrs.HasFlag FileAttributes.ReparsePoint)
+                        && (not (attrs.HasFlag FileAttributes.Directory) || check path)))
+            with _ -> false
+        Directory.Exists root && check root
+
     let private safeClone root (raw: string) =
         if not (under root raw) then false
         else
             let metadata = Path.Combine(raw, ".git")
             let alternates = Path.Combine(metadata, "objects", "info", "alternates")
-            Directory.Exists metadata
-            && noSymlinkAncestors metadata
+            noGitMetadataRedirects metadata
             && not (File.Exists alternates)
             && not (File.Exists(Path.Combine(metadata, "commondir")))
 
@@ -127,7 +138,8 @@ module WorkQueueCanonicalMigrationPrepare =
             let refs = Path.Combine(raw, "refs")
             let config = Path.Combine(raw, "config")
             let alternates = Path.Combine(objects, "info", "alternates")
-            File.Exists head && noSymlinkAncestors head
+            noGitMetadataRedirects raw
+            && File.Exists head && noSymlinkAncestors head
             && Directory.Exists objects && noSymlinkAncestors objects
             && Directory.Exists refs && noSymlinkAncestors refs
             && File.Exists config && noSymlinkAncestors config
@@ -176,7 +188,95 @@ module WorkQueueCanonicalMigrationPrepare =
                     if authorities.Length <> 3
                        || (authorities |> List.map (fun s -> s.ToUpperInvariant()) |> List.distinct |> List.length) <> 3 then
                         Error "One distinct account and exactly two distinct project Git authorities are required."
-                    else Ok ()
+                    else Ok root
+
+    // Existing WQ07/WQ02 fetch readers mutate local Git object/ref caches.
+    // Caller-supplied clones cannot guarantee confinement: a nested symlink
+    // may be swapped in after preflight. Build fresh private metadata instead.
+    let private isolatedClone (root: string) template label remote (remoteName: string) =
+        if not (Regex.IsMatch(remoteName, "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) then
+            invalidOp "Disposable Git remote name is invalid."
+        let destination = Path.Combine(root, label)
+        use gitProcess = new Process()
+        gitProcess.StartInfo.FileName <- "git"
+        gitProcess.StartInfo.WorkingDirectory <- root
+        gitProcess.StartInfo.UseShellExecute <- false
+        gitProcess.StartInfo.CreateNoWindow <- true
+        gitProcess.StartInfo.RedirectStandardOutput <- true
+        gitProcess.StartInfo.RedirectStandardError <- true
+        for arg in
+            [ "clone"; "--quiet"; "--no-checkout"; "--no-local"
+              "--template=" + template; "--origin"; remoteName
+              "--"; remote; destination ] do
+            gitProcess.StartInfo.ArgumentList.Add arg
+        // A fresh metadata directory is not safe if Git inherits redirection
+        // or tracing paths via the operator's environment.
+        let gitOverrides =
+            gitProcess.StartInfo.Environment.Keys
+            |> Seq.filter (fun key -> key.StartsWith("GIT_", StringComparison.OrdinalIgnoreCase))
+            |> Seq.toList
+        for key in gitOverrides do
+            gitProcess.StartInfo.Environment.Remove key |> ignore
+        gitProcess.StartInfo.Environment["GIT_CONFIG_NOSYSTEM"] <- "1"
+        gitProcess.StartInfo.Environment["GIT_CONFIG_GLOBAL"] <- Path.Combine(root, "empty-global-config")
+        gitProcess.StartInfo.Environment["GIT_TEMPLATE_DIR"] <- template
+        gitProcess.StartInfo.Environment["GIT_TERMINAL_PROMPT"] <- "0"
+        if not (gitProcess.Start()) then
+            invalidOp "Could not start disposable Git clone."
+        let stderr = gitProcess.StandardError.ReadToEndAsync()
+        let stdout = gitProcess.StandardOutput.ReadToEndAsync()
+        if not (gitProcess.WaitForExit(30000)) then
+            gitProcess.Kill(true)
+            invalidOp "Disposable Git clone exceeded the bounded deadline."
+        let errors = stderr.GetAwaiter().GetResult()
+        stdout.GetAwaiter().GetResult() |> ignore
+        if gitProcess.ExitCode <> 0 then
+            invalidOp ("Disposable Git clone failed: " + errors)
+        if not (safeClone root destination) then
+            invalidOp "New private Git metadata failed the no-redirect check."
+        destination
+
+    let private withPrivateReadBindings (root: string) (request: CanonicalPrepareRequest) action =
+        // Root must be non-world-writable; otherwise another user could race
+        // setup before the fresh child directory is made private.
+        if not (OperatingSystem.IsWindows()) then
+            let rootMode = File.GetUnixFileMode root
+            let writableByOthers = UnixFileMode.GroupWrite ||| UnixFileMode.OtherWrite
+            if (rootMode &&& writableByOthers) <> UnixFileMode.None then
+                invalidOp "Disposable root is not private enough for isolated Git reads."
+        let scopePath = Path.Combine(root, "wq10-private-" + Guid.NewGuid().ToString("N"))
+        let scope =
+            if OperatingSystem.IsWindows() then Directory.CreateDirectory scopePath
+            else
+                Directory.CreateDirectory(
+                    scopePath,
+                    UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+        try
+            if not (noSymlinkAncestors scope.FullName) then
+                invalidOp "Disposable isolated scratch redirected."
+            if not (OperatingSystem.IsWindows()) then
+                let mode = File.GetUnixFileMode scope.FullName
+                let otherAccess =
+                    UnixFileMode.GroupRead ||| UnixFileMode.GroupWrite ||| UnixFileMode.GroupExecute
+                    ||| UnixFileMode.OtherRead ||| UnixFileMode.OtherWrite ||| UnixFileMode.OtherExecute
+                if (mode &&& otherAccess) <> UnixFileMode.None then
+                    invalidOp "Isolated Git scratch must not be accessible to other users."
+            let template = Path.Combine(scope.FullName, "empty-template")
+            Directory.CreateDirectory template |> ignore
+            let isolatedAccount =
+                { request.Account with
+                    RepositoryPath = isolatedClone scope.FullName template "account"
+                                                    request.Account.ApprovedFetchUrl request.Account.RemoteName }
+            let isolatedProjects =
+                request.Projects
+                |> List.mapi (fun i project ->
+                    let repository =
+                        isolatedClone scope.FullName template ("project-" + string i)
+                                      project.Binding.ApprovedFetchUrl project.Binding.RemoteName
+                    project, { project.Binding with RepositoryPath = repository })
+            action isolatedAccount isolatedProjects
+        finally
+            Directory.Delete(scope.FullName, true)
 
     let private permanentMissing =
         [ CanonicalPrepareGap.AuthenticatedOfflineReviewMissing
@@ -218,46 +318,47 @@ module WorkQueueCanonicalMigrationPrepare =
             try
                 match approvedRoot request with
                 | Error reason -> gaps.Add(CanonicalPrepareGap.UnapprovedDisposableAuthority reason)
-                | Ok () ->
-                    match AccountCapacityLedger.fetch request.Account with
-                    | Error error -> gaps.Add(CanonicalPrepareGap.AccountUnreadable(string error))
-                    | Ok account ->
-                        accountHead <- Some account.Head
-                        if account.Head <> request.ExpectedAccountHead then
-                            gaps.Add(CanonicalPrepareGap.AccountHeadChanged(request.ExpectedAccountHead, account.Head))
-                        if account.State.MigrationPhase <> "Frozen" then
-                            gaps.Add(CanonicalPrepareGap.AccountNotFrozen(account.State.MigrationPhase))
-                        let occupied = AccountCapacityLedger.occupied account.State
-                        if occupied <> 0 then
-                            gaps.Add(CanonicalPrepareGap.AccountCapacityOccupied occupied)
-                    for p in request.Projects do
-                        match LedgerStore.fetch p.Binding with
-                        | Error error ->
-                            gaps.Add(CanonicalPrepareGap.ProjectUnreadable(p.Name, string error))
-                        | Ok snapshot ->
-                            projectHeads.Add(p.Name, snapshot.Commit)
-                            if snapshot.Commit <> p.ExpectedHead then
-                                gaps.Add(CanonicalPrepareGap.ProjectHeadChanged(p.Name, p.ExpectedHead, snapshot.Commit))
-                            let highWater = snapshot.Header.NextSequence - 1L
-                            if highWater <> p.ExpectedHighWater then
-                                gaps.Add(CanonicalPrepareGap.ProjectHighWaterChanged(p.Name, p.ExpectedHighWater, highWater))
-                            match WorkQueueGitLedger.loadAt p.Binding snapshot with
+                | Ok root ->
+                    withPrivateReadBindings root request (fun accountBinding projectBindings ->
+                        match AccountCapacityLedger.fetch accountBinding with
+                        | Error error -> gaps.Add(CanonicalPrepareGap.AccountUnreadable(string error))
+                        | Ok account ->
+                            accountHead <- Some account.Head
+                            if account.Head <> request.ExpectedAccountHead then
+                                gaps.Add(CanonicalPrepareGap.AccountHeadChanged(request.ExpectedAccountHead, account.Head))
+                            if account.State.MigrationPhase <> "Frozen" then
+                                gaps.Add(CanonicalPrepareGap.AccountNotFrozen(account.State.MigrationPhase))
+                            let occupied = AccountCapacityLedger.occupied account.State
+                            if occupied <> 0 then
+                                gaps.Add(CanonicalPrepareGap.AccountCapacityOccupied occupied)
+                        for p, binding in projectBindings do
+                            match LedgerStore.fetch binding with
                             | Error error ->
                                 gaps.Add(CanonicalPrepareGap.ProjectUnreadable(p.Name, string error))
-                            | Ok project ->
-                                if project.Version <> p.ExpectedVersion then
-                                    gaps.Add(CanonicalPrepareGap.ProjectVersionChanged(p.Name, p.ExpectedVersion, project.Version))
-                                if project.Migration <> MigrationEpoch.Frozen then
-                                    gaps.Add(CanonicalPrepareGap.ProjectNotFrozen(p.Name, project.Migration))
-                                if project.Launches.Count <> 0 then
-                                    gaps.Add(CanonicalPrepareGap.ProjectLaunchesOutstanding(p.Name, project.Launches.Count))
-                                let coverage =
-                                    [ if not project.QueueCovered then "queue"
-                                      if not project.GraphCovered then "dependency-graph"
-                                      if not project.MessageCovered then "messages"
-                                      if not project.SourceCovered then "source" ]
-                                if not coverage.IsEmpty then
-                                    gaps.Add(CanonicalPrepareGap.ProjectCoverageIncomplete(p.Name, coverage))
+                            | Ok snapshot ->
+                                projectHeads.Add(p.Name, snapshot.Commit)
+                                if snapshot.Commit <> p.ExpectedHead then
+                                    gaps.Add(CanonicalPrepareGap.ProjectHeadChanged(p.Name, p.ExpectedHead, snapshot.Commit))
+                                let highWater = snapshot.Header.NextSequence - 1L
+                                if highWater <> p.ExpectedHighWater then
+                                    gaps.Add(CanonicalPrepareGap.ProjectHighWaterChanged(p.Name, p.ExpectedHighWater, highWater))
+                                match WorkQueueGitLedger.loadAt binding snapshot with
+                                | Error error ->
+                                    gaps.Add(CanonicalPrepareGap.ProjectUnreadable(p.Name, string error))
+                                | Ok project ->
+                                    if project.Version <> p.ExpectedVersion then
+                                        gaps.Add(CanonicalPrepareGap.ProjectVersionChanged(p.Name, p.ExpectedVersion, project.Version))
+                                    if project.Migration <> MigrationEpoch.Frozen then
+                                        gaps.Add(CanonicalPrepareGap.ProjectNotFrozen(p.Name, project.Migration))
+                                    if project.Launches.Count <> 0 then
+                                        gaps.Add(CanonicalPrepareGap.ProjectLaunchesOutstanding(p.Name, project.Launches.Count))
+                                    let coverage =
+                                        [ if not project.QueueCovered then "queue"
+                                          if not project.GraphCovered then "dependency-graph"
+                                          if not project.MessageCovered then "messages"
+                                          if not project.SourceCovered then "source" ]
+                                    if not coverage.IsEmpty then
+                                        gaps.Add(CanonicalPrepareGap.ProjectCoverageIncomplete(p.Name, coverage)))
             with ex ->
                 gaps.Add(CanonicalPrepareGap.UnapprovedDisposableAuthority(
                     "Disposable inspection failed closed: " + ex.GetType().Name))

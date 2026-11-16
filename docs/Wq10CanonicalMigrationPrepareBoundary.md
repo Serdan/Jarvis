@@ -21,6 +21,9 @@ and project SHA heads, project versions and original high-water, a SHA-256 of
 the offline report, and an approved disposable directory with the exact
 .wq10-disposable-fixture marker. All repository paths and local fetch/push
 authorities must be under that root with no traversal or symlink ancestors.
+Every supplied clone and bare authority has its Git metadata recursively
+checked for nested symlinks/junctions, not merely the top-level .git/objects
+or refs directories. Linked descendants and object alternates fail before fetch.
 
 InspectOnly is default-off. AttemptOnDisposable still always returns a typed
 blocked assessment. An operator-supplied report hash, permission boolean or
@@ -28,13 +31,22 @@ migration phase string is never independently authenticated authorization.
 
 The module uses AccountCapacityLedger.fetch, LedgerStore.fetch, and
 WorkQueueGitLedger.loadAt to re-read trusted identities and canonical
-project state. It reports separate typed gaps for pinned heads, versions,
+project state. Fetches and trusted-cache update-ref operations run exclusively
+in fresh, unpredictable, private temporary clone metadata within the approved
+root, made from bare authorities without Git hardlinks or installed templates.
+Caller-supplied clone metadata is never a fetch target, avoiding the
+check-then-fetch symlink race against the original clone. On Unix the scratch
+must be private to the current user (mode 0700); a group/other-writable
+disposable root is refused. Clone metadata is discarded after each assessment.
+The assessment reports separate typed gaps for pinned heads, versions,
 high-water, migration phase, held global tokens, outstanding launches,
 queue/graph/message/source coverage and remote validation failures.
 
 No canonical transaction is attempted. The module does not call reserve,
-release, setCapacity, execute, LedgerStore.transact, git push, or update-ref.
-Existing fetch operations can update clone-local fetch/trust refs only.
+release, setCapacity, execute, LedgerStore.transact or git push.
+The existing fetch readers can internally invoke update-ref, but only against
+the fresh private ephemeral clones; they never update the supplied clones
+or any canonical account/project authority.
 Account/project authoritative before/after diffs are empty for this adapter,
 including repeated original UUID, competing head changes and read failures.
 A competing writer can move its authority; the adapter observes conflict,
@@ -82,9 +94,14 @@ Run with .NET 11 Release, not GitHub Actions:
 The native fixture uses a bare account and two bare project repositories,
 each with two clones, and asserts no extra authoritative ref movement for
 default-off, explicit attempted, repeated-UUID, stale-head, old-writer,
-incomplete-high-water, missing-marker, traversal and symlink cases.
+incomplete-high-water, missing-marker, traversal and symlink cases,
+including nested clone objects/refs and bare authority metadata links
+to outside directories. The negative tests compare external-directory
+contents before/after the attempt and verify remote refs never move.
 
-These directory checks are defense in depth for an approved disposable
-fixture, not a production trust system. OS-isolated scratch, Git config,
-object alternates and authority binding require independent inspection
-before any future real mutation. No live migration is authorized.
+These private scratch and recursive metadata checks are defense in depth for
+an approved disposable fixture, not a production trust system or a substitute
+for a host-level sandbox against malicious code running as the same OS user.
+A future canonical writer still requires authenticated authority binding,
+fencing and reviewed transaction receipts plus process-level isolation.
+No live migration is authorized.

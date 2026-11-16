@@ -181,6 +181,60 @@ let ``cancelled child remains in the progress denominator until explicitly reope
     Assert.That(reopened.Units.["cancelled"].SpecVersion, Is.EqualTo(2))
 
 [<Test>]
+let ``re-cancelling a reopened child never resurrects historical parent acceptance`` () =
+    for reason in [ "No longer in scope"; "Different scope decision" ] do
+        let original =
+            initial ()
+            |> fun g -> system g "system" "project"
+            |> fun g -> feature g "child" "system" None
+            |> fun g -> change g (WorkCompositionMutation.Cancel("child", "No longer in scope"))
+            |> fun g -> accepted g "system"
+            |> fun g -> accepted g "project"
+        let systemProof = (currentAcceptance original "system").Value
+        let projectProof = (currentAcceptance original "project").Value
+        Assert.That(systemProof.ChildAcceptances.["child"], Is.EqualTo(-1))
+
+        let reopened = change original (WorkCompositionMutation.Reopen "child")
+        Assert.That(currentAcceptance reopened "system" |> Option.isNone, Is.True)
+        Assert.That(currentAcceptance reopened "project" |> Option.isNone, Is.True)
+        let recancelled = change reopened (WorkCompositionMutation.Cancel("child", reason))
+        Assert.That(recancelled.Units.["child"].SpecVersion, Is.EqualTo(2))
+        for id in [ "system"; "project" ] do
+            Assert.That(currentAcceptance recancelled id |> Option.isNone, Is.True,
+                        sprintf "Historical %s acceptance resurrected after re-cancellation: %s" id reason)
+        Assert.That(recancelled.Units.["system"].Acceptances.[string systemProof.GraphVersion],
+                    Is.EqualTo(systemProof))
+        Assert.That(recancelled.Units.["project"].Acceptances.[string projectProof.GraphVersion],
+                    Is.EqualTo(projectProof))
+
+        // An explicit new proof is required at each ancestor after changing the child.
+        let reaccepted = recancelled |> fun g -> accepted g "system"
+                                     |> fun g -> accepted g "project"
+        Assert.That((currentAcceptance reaccepted "system").Value.ChildAcceptances.["child"],
+                    Is.EqualTo(-2))
+        Assert.That(currentAcceptance reaccepted "project" |> Option.isSome, Is.True)
+        Assert.That(reaccepted.Units.["system"].Acceptances.Count, Is.EqualTo(2))
+
+[<Test>]
+let ``revising a still-cancelled child invalidates historical parent acceptance`` () =
+    let original =
+        initial ()
+        |> fun g -> feature g "child" "project" None
+        |> fun g -> change g (WorkCompositionMutation.Cancel("child", "Excluded"))
+        |> fun g -> accepted g "project"
+    let originalProof = (currentAcceptance original "project").Value
+    let revisedSpec = { original.Units.["child"].Spec with Scope = "Updated excluded scope" }
+    let revised = change original (WorkCompositionMutation.Revise("child", 1, revisedSpec))
+    Assert.That(revised.Units.["child"].CancellationReason, Is.EqualTo(Some "Excluded"))
+    Assert.That(revised.Units.["child"].SpecVersion, Is.EqualTo(2))
+    Assert.That(currentAcceptance revised "project" |> Option.isNone, Is.True)
+    Assert.That(revised.Units.["project"].Acceptances.[string originalProof.GraphVersion],
+                Is.EqualTo(originalProof))
+    let reaccepted = accepted revised "project"
+    Assert.That((currentAcceptance reaccepted "project").Value.ChildAcceptances.["child"],
+                Is.EqualTo(-2))
+
+[<Test>]
 let ``stale concurrent edits and invalid references fail closed`` () =
     let graph = initial ()
     let committed = system graph "a" "project"

@@ -1186,6 +1186,20 @@ module ReviewWorkflow =
         return submissions |> List.sortBy (fun s -> s.CreatedSequence, s.SubmissionId)
     }
 
+    // Snapshot-scoped evidence lookup for composition acceptance. The caller
+    // must check review identity and semantic acceptance independently.
+    let getIntegrationSubmissionAt binding snapshot taskId submissionId =
+        if not (validTaskId taskId) || submissionId = Guid.Empty then
+            Error(InvalidBinding "Invalid integration evidence identity.")
+        else result {
+            let! submission, _ = required<IntegrationSubmission> binding snapshot
+                                    (integrationPath taskId submissionId)
+            if submission.TaskId <> taskId
+               || submission.SubmissionId <> submissionId.ToString("N") then
+                return! Error(LedgerIntegrityError "Canonical integration receipt identity mismatch.")
+            return submission
+        }
+
     let getIntegrationSubmissions binding taskId =
         if not (validTaskId taskId) then Error(InvalidBinding "Invalid task ID.")
         else result {

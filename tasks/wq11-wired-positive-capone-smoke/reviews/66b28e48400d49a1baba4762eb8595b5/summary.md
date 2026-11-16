@@ -1,0 +1,1 @@
+Real original CreateTask -> WQ04 receipt producer -> second-clone canonical work/origin -> WQ08 real read-only Scheduler preview using WQ07 disposable cap=1, with full-capacity and exact UUID replay. No production dispatch. .NET 11 Release focused 1/1, targeted regressions 24/24; runbook records commands and remaining provider gap.

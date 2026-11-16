@@ -93,6 +93,18 @@ type AgentUiAccess =
 type WorkUiAccess =
     { Load: unit -> Result<WorkDashboardView.ProjectSource list, string> }
 
+// Read-only terminal test seam. Captures the actual Work renderer and key
+// dispatcher without starting an interactive Console.ReadKey loop or requiring
+// a live Git ledger. No production mode or source is changed by inspection.
+type WorkUiDiagnostics =
+    { Mode: string
+      Filter: string
+      Selected: string option
+      Refreshing: bool
+      ProjectCount: int
+      Error: string option
+      Lines: string list }
+
 type OperatorChallengeUiAccess =
     { Load: unit -> Result<OperatorChallengeSnapshot, string>
       Reply: OperatorChallengeReply -> Result<unit, OperatorChallengeReplyFailure> }
@@ -1815,6 +1827,60 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                         agentError <- Some error
                     renderUnsafe()))) |> ignore
 
+    // One dispatcher is shared by production keyboard input and the
+    // hermetic terminal fixture. Non-Work keys continue through the
+    // existing legacy key handler unchanged.
+    let handleWorkKeyUnsafe (keyInfo: ConsoleKeyInfo) =
+        match mode with
+        | WorkFilterMode ->
+            match keyInfo.Key with
+            | ConsoleKey.Enter -> mode <- WorkMode
+            | ConsoleKey.Escape ->
+                workFilter <- workOriginalFilter
+                mode <- WorkMode
+            | ConsoleKey.Backspace when workFilter.Length > 0 ->
+                workFilter <- workFilter.Substring(0, workFilter.Length - 1)
+            | _ when not (Char.IsControl keyInfo.KeyChar) ->
+                workFilter <- workFilter + string keyInfo.KeyChar
+            | _ -> ()
+            normalizeWorkSelectionUnsafe()
+            true
+        | WorkMode ->
+            match keyInfo.KeyChar, keyInfo.Key with
+            | _, ConsoleKey.UpArrow -> moveWorkSelectionUnsafe -1; true
+            | _, ConsoleKey.DownArrow -> moveWorkSelectionUnsafe 1; true
+            | _, ConsoleKey.PageUp -> moveWorkSelectionUnsafe -(workViewportRows()); true
+            | _, ConsoleKey.PageDown -> moveWorkSelectionUnsafe (workViewportRows()); true
+            | _, ConsoleKey.End ->
+                workSelected <- workRowsUnsafe() |> List.tryLast |> Option.map _.Key
+                true
+            | _, ConsoleKey.LeftArrow ->
+                workDetailScroll <- max 0 (workDetailScroll - 1)
+                true
+            | _, ConsoleKey.RightArrow ->
+                workDetailScroll <- workDetailScroll + 1
+                true
+            | _, ConsoleKey.Enter ->
+                if workSelected.IsSome then showWorkDetails <- not showWorkDetails
+                true
+            | '/', _ | _, ConsoleKey.F ->
+                workOriginalFilter <- workFilter
+                mode <- WorkFilterMode
+                true
+            | _, ConsoleKey.R -> startWorkRefreshUnsafe(); true
+            | _, ConsoleKey.Escape -> mode <- ActivityMode; true
+            | _, ConsoleKey.A ->
+                mode <- AgentsMode
+                normalizeAgentSelectionUnsafe()
+                startAgentRefreshUnsafe()
+                true
+            | _ -> false
+        | ActivityMode | AgentsMode | JobsMode when keyInfo.Key = ConsoleKey.W ->
+            mode <- WorkMode
+            startWorkRefreshUnsafe()
+            true
+        | _ -> false
+
     let handleMouseUnsafe mouse =
         match mouse with
         | Scroll(direction, _, _) ->
@@ -2050,6 +2116,44 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             startWorkRefreshUnsafe()
             renderUnsafe())
 
+    /// Drive the production Work key dispatcher without Console.ReadKey.
+    /// Returns false for non-Work keys so legacy handling remains separate.
+    member _.DispatchWorkKeyForFixture(keyInfo: ConsoleKeyInfo) =
+        lock syncRoot (fun () ->
+            let handled = handleWorkKeyUnsafe keyInfo
+            if handled then renderUnsafe()
+            handled)
+
+    /// Capture actual Work-mode rendering into a bounded, in-memory frame.
+    /// This does not present a frame to the real console or touch the ledger.
+    member _.InspectWorkForFixture(width: int, height: int) : WorkUiDiagnostics =
+        lock syncRoot (fun () ->
+            let previousDraw = draw
+            let previousPageRows = workPageRows
+            let previousHits = mouseHits |> Seq.toList
+            draw <- Frame(max 1 width, max 1 height)
+            mouseHits.Clear()
+            try
+                if mode = WorkMode || mode = WorkFilterMode then
+                    renderWorkUnsafe draw.Width
+                let lines =
+                    [ for y in 0 .. draw.Height - 1 ->
+                        [ for x in 0 .. draw.Width - 1 -> draw.GetCell(y, x).Text ]
+                        |> String.concat ""
+                        |> fun line -> line.TrimEnd() ]
+                { Mode = string mode
+                  Filter = workFilter
+                  Selected = workSelected
+                  Refreshing = workRefreshing
+                  ProjectCount = workProjects.Length
+                  Error = workError
+                  Lines = lines }
+            finally
+                draw <- previousDraw
+                workPageRows <- previousPageRows
+                mouseHits.Clear()
+                for hit in previousHits do mouseHits.Add hit)
+
     member _.SetKey value =
         lock syncRoot (fun () ->
             key <- value
@@ -2225,7 +2329,17 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                 handleMouseUnsafe mouse
                                 renderUnsafe())
                         | Key keyInfo ->
-                            if mode = ChallengeReplyMode then
+                            // The same Work keyboard path is exercised by
+                            // terminal fixtures; everything else remains on
+                            // the legacy dispatcher below.
+                            let workHandled =
+                                lock syncRoot (fun () ->
+                                    if handleWorkKeyUnsafe keyInfo then
+                                        renderUnsafe()
+                                        true
+                                    else false)
+                            if workHandled then ()
+                            elif mode = ChallengeReplyMode then
                                 lock syncRoot (fun () ->
                                     if not challengeSubmitting then
                                         match keyInfo.Key with
@@ -2278,20 +2392,6 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     let items = jobListUnsafe()
                                     jobSelectedId <- items |> List.tryHead |> Option.map _.JobId
                                     jobListScroll <- 0
-                                    renderUnsafe())
-                            elif mode = WorkFilterMode then
-                                lock syncRoot (fun () ->
-                                    match keyInfo.Key with
-                                    | ConsoleKey.Enter -> mode <- WorkMode
-                                    | ConsoleKey.Escape ->
-                                        workFilter <- workOriginalFilter
-                                        mode <- WorkMode
-                                    | ConsoleKey.Backspace when workFilter.Length > 0 ->
-                                        workFilter <- workFilter.Substring(0, workFilter.Length - 1)
-                                    | _ when not (Char.IsControl keyInfo.KeyChar) ->
-                                        workFilter <- workFilter + string keyInfo.KeyChar
-                                    | _ -> ()
-                                    normalizeWorkSelectionUnsafe()
                                     renderUnsafe())
                             elif mode = AgentFilterMode then
                                 lock syncRoot (fun () ->
@@ -2411,14 +2511,6 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     lock syncRoot (fun () ->
                                         beginFilterUnsafe "#"
                                         renderUnsafe())
-                                | _, ConsoleKey.LeftArrow when mode = WorkMode ->
-                                    lock syncRoot (fun () ->
-                                        workDetailScroll <- max 0 (workDetailScroll - 1)
-                                        renderUnsafe())
-                                | _, ConsoleKey.RightArrow when mode = WorkMode ->
-                                    lock syncRoot (fun () ->
-                                        workDetailScroll <- workDetailScroll + 1
-                                        renderUnsafe())
                                 | _, ConsoleKey.LeftArrow when mode = ChallengesMode ->
                                     lock syncRoot (fun () ->
                                         challengeDetailScroll <- max 0 (challengeDetailScroll - 1)
@@ -2434,7 +2526,6 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                         | PermissionMode ->
                                             selectedPrompt <- max 0 (selectedPrompt - 1)
                                         | SettingsMode -> settingsSelected <- max 0 (settingsSelected - 1)
-                                        | WorkMode -> moveWorkSelectionUnsafe -1
                                         | AgentsMode -> moveAgentSelectionUnsafe -1
                                         | JobsMode -> moveJobSelectionUnsafe -1
                                         | ChallengesMode -> selectChallengeUnsafe (challengeSelected - 1)
@@ -2451,7 +2542,6 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                             selectedPrompt <- min (prompts.Count - 1) (selectedPrompt + 1)
                                             selectedPrompt <- max 0 selectedPrompt
                                         | SettingsMode -> settingsSelected <- min (settingKeys.Length - 1) (settingsSelected + 1)
-                                        | WorkMode -> moveWorkSelectionUnsafe 1
                                         | AgentsMode -> moveAgentSelectionUnsafe 1
                                         | JobsMode -> moveJobSelectionUnsafe 1
                                         | ChallengesMode -> selectChallengeUnsafe (challengeSelected + 1)
@@ -2464,7 +2554,6 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     lock syncRoot (fun () ->
                                         match mode with
                                         | ActivityMode -> moveActivitySelectionUnsafe -(activityViewportRows())
-                                        | WorkMode -> moveWorkSelectionUnsafe -(workViewportRows())
                                         | AgentsMode -> moveAgentSelectionUnsafe -(agentViewportRows())
                                         | JobsMode -> moveJobSelectionUnsafe -(jobViewportRows())
                                         | ChallengesMode -> selectChallengeUnsafe (challengeSelected - challengePageRows)
@@ -2477,7 +2566,6 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     lock syncRoot (fun () ->
                                         match mode with
                                         | ActivityMode -> moveActivitySelectionUnsafe (activityViewportRows())
-                                        | WorkMode -> moveWorkSelectionUnsafe (workViewportRows())
                                         | AgentsMode -> moveAgentSelectionUnsafe (agentViewportRows())
                                         | JobsMode -> moveJobSelectionUnsafe (jobViewportRows())
                                         | ChallengesMode -> selectChallengeUnsafe (challengeSelected + challengePageRows)
@@ -2491,9 +2579,6 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                         let filtered = filteredActivityUnsafe()
                                         if mode = ActivityMode && filtered.Length > 0 then
                                             selectActivityIndexUnsafe (filtered.Length - 1)
-                                        elif mode = WorkMode then
-                                            workSelected <- WorkDashboardView.visibleRows workFilter workProjects
-                                                            |> List.tryLast |> Option.map _.Key
                                         elif mode = AgentsMode then
                                             selectAgentIndexUnsafe ((agentListUnsafe()).Length - 1)
                                         renderUnsafe())
@@ -2501,8 +2586,6 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     lock syncRoot (fun () ->
                                         if mode = ActivityMode && (filteredActivityUnsafe()).Length > 0 then
                                             showActivityDetails <- not showActivityDetails
-                                        elif mode = WorkMode && workSelected.IsSome then
-                                            showWorkDetails <- not showWorkDetails
                                         elif mode = AgentsMode && agentSelected.IsSome then showAgentDetails <- not showAgentDetails
                                         elif mode = JobsMode then openJobDetailsUnsafe()
                                         elif mode = ChallengesMode then beginChallengeReplyUnsafe()
@@ -2544,23 +2627,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     lock syncRoot (fun () ->
                                         mode <- settingsReturnMode
                                         renderUnsafe())
-                                | _, ConsoleKey.W when mode = ActivityMode || mode = AgentsMode || mode = JobsMode ->
-                                    lock syncRoot (fun () ->
-                                        mode <- WorkMode
-                                        startWorkRefreshUnsafe()
-                                        renderUnsafe())
-                                | ('/', _) | (_, ConsoleKey.F) when mode = WorkMode ->
-                                    lock syncRoot (fun () ->
-                                        workOriginalFilter <- workFilter
-                                        mode <- WorkFilterMode
-                                        renderUnsafe())
-                                | _, ConsoleKey.R when mode = WorkMode ->
-                                    lock syncRoot (fun () ->
-                                        startWorkRefreshUnsafe()
-                                        renderUnsafe())
-                                | _, ConsoleKey.Escape when mode = WorkMode ->
-                                    lock syncRoot (fun () -> mode <- ActivityMode; renderUnsafe())
-                                | _, ConsoleKey.A when mode = ActivityMode || mode = JobsMode || mode = WorkMode ->
+                                | _, ConsoleKey.A when mode = ActivityMode || mode = JobsMode ->
                                     lock syncRoot (fun () ->
                                         mode <- AgentsMode
                                         normalizeAgentSelectionUnsafe()

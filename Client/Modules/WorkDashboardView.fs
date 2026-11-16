@@ -119,9 +119,19 @@ let private workStatus (snapshot: Snapshot) (row: WorkRow) =
         | "Blocked" -> "Blocked"
         | "Unknown" -> "UNKNOWN"
         | "Active" ->
-            if row.Liveness.Contains("UNKNOWN", StringComparison.OrdinalIgnoreCase) then
-                "Claimed; session UNKNOWN"
-            else "Active (observed)"
+            // Category=Active records the Work claim, not proof that its
+            // associated execution is live. Require an explicitly recognized
+            // positive observation and both bound identities; all other
+            // strings (including stale/stopped/unbound) fail closed.
+            let identified =
+                (row.ClaimLaunchId |> Option.exists (not << String.IsNullOrWhiteSpace))
+                && (row.SessionUuid |> Option.exists (not << String.IsNullOrWhiteSpace))
+            let observedLive =
+                match row.Liveness with
+                | "Running" | "Live (verified)" -> true
+                | _ -> false
+            if identified && observedLive then "Active (observed)"
+            else "Claimed; session UNKNOWN"
         | "Terminal" -> "Terminal"
         | _ -> "UNKNOWN / NotReady"
 
@@ -224,8 +234,10 @@ let moveSelection current delta rows =
 
 let displayLine width selected (row: DisplayRow) =
     let marker = if Some row.Key = selected then ">" else " "
+    // Readiness is the safety-critical field: keep it ahead of unbounded
+    // project IDs, Work IDs, titles and queue labels during truncation.
     fit width (sprintf "%s %s | %s | %s | %s | %s"
-                   marker row.Project row.WorkId row.Subject row.QueueAndKind row.Status)
+                   marker row.Status row.Project row.WorkId row.Subject row.QueueAndKind)
 
 let detailLines width (row: DisplayRow) =
     row.Details |> List.map (fit width)

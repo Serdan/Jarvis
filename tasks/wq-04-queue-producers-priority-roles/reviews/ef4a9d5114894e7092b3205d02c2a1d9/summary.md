@@ -1,1 +1,5 @@
-Audit historical-role evidence rejection, preserved unconditional RecoveryBlocked boundary, two-clone forged/disabled/stale role tests and source authority. .NET11 Release build passed, focused binder 5/5, combined binder/source/role 22/22. No live runtime.
+# Reviewer 2 — Accepted (inert scope only)
+
+Frozen WQ04 historical-role binder commit `8ec10490a080d41a33be73cde86c08031f38308b`, base `d3b7ab73f4616050e7f7cd54381267f63a519895`. Independent diff, call-site, role-provenance and two-clone negative audit found no blocker in the deliberately **non-executable** binder. Real .NET 11.0.100 Release verification: binder 5/5, combined canonical-source + role-history + binder 22/22. The binder always returns RecoveryBlocked and its CAS seam produces no receipt. Full evidence and restrictions: `findings/reviewer2-independent-wq04-role-audit.md`.
+
+**Not** approval of a positive WQ04 producer, stage, claim, account-credit/Scheduler route, source handoff, migration or deployment. Canonical source-effect/high-water, same-CAS role/account-credit and terminal authority remain explicit blocking prerequisites.

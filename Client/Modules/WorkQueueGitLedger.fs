@@ -201,6 +201,9 @@ type WorkMutation =
     | StopStalled of launchId: string * leaseGeneration: int * stalledAfter: int64
     | ClaimNext of launchId: string
     | ClaimVerifiedWork of launchId: string * workId: string * expectedStageGeneration: int * resultingClaimGeneration: int
+    // FrozenReview domain finalization requires a trusted, same-CAS original
+    // WQ05 Accepted-review witness; this variant cannot run without it.
+    | FinalizeVerifiedReview of launchId: string * workId: string * expectedClaimGeneration: int * immutableReceipt: string
     | CompleteOrdinary of launchId: string * workId: string
     | CompleteMessage of launchId: string * workId: string * messageId: string * handlerGeneration: int * replyId: string
     | ClaimAncillary of launchId: string * messageId: string
@@ -1229,6 +1232,17 @@ module WorkQueueGitLedger =
                                      && not owner.EverClaimed ->
                                 Contracts.claimNext expectedVersion op launch state
                             | _ -> Error(Rejection.InvalidState "stale selected Work/stage/claim or credit")
+                        | FinalizeVerifiedReview (launch, work, claimGeneration, receipt) ->
+                            match state.Works.TryFind work, state.Launches.TryFind launch with
+                            | Some stage, Some owner
+                                when verifiedLifecycle.IsSome
+                                     && stage.Kind = WorkKind.FrozenReview
+                                     && stage.State = WorkState.Claimed launch
+                                     && stage.ClaimGeneration = claimGeneration
+                                     && owner.PrimaryWorkId = Some work
+                                     && not (String.IsNullOrWhiteSpace receipt) ->
+                                Contracts.decideReview expectedVersion op work receipt state
+                            | _ -> Error(Rejection.MissingProof)
                         | CompleteOrdinary (launch, work) ->
                             match state.Works.TryFind work with
                             | Some stage when stage.Kind = WorkKind.Implementation
@@ -1485,7 +1499,8 @@ module WorkQueueGitLedger =
             now mutation (verifyAtCas: LedgerSnapshot -> Project -> Project -> Result<unit, LedgerFailure>) =
         let supported =
             match mutation with
-            | ClaimVerifiedWork _ | CheckpointReadOnly _ | CompleteVerifiedReadOnly _ -> true
+            | ClaimVerifiedWork _ | CheckpointReadOnly _ | CompleteVerifiedReadOnly _
+            | FinalizeVerifiedReview _ -> true
             | _ -> false
         if not supported || isNull (box verifyAtCas) then
             Error(InvalidBinding

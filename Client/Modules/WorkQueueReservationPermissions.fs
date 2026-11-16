@@ -10,6 +10,7 @@ open FsToolkit.ErrorHandling
 open Jarvis.WorkQueues
 open Client.LedgerStore
 open Client.WorkQueueGitLedger
+open Client.WorkQueueIntegrationSourceAuthority
 
 // A narrow, opt-in Work launch authorization contract. This is NOT a second
 // principal, generic RBAC system or a filesystem sandbox. No public MCP/Agent
@@ -148,7 +149,9 @@ module WorkQueueReservationPermissions =
             common.Add ReservationOperationFamily.Implementation
         | WorkKind.FrozenReview ->
             common.Add ReservationOperationFamily.Review
-        | WorkKind.Integration when stage.IntegrationAuthorized && stage.SourceLineage.IsSome ->
+        // IntegrationAuthorized is a post-push flag, not a pre-claim permit.
+        // The WQ04/WQ05 same-CAS source witness is checked before this call.
+        | WorkKind.Integration when stage.SourceLineage.IsSome ->
             common.Add ReservationOperationFamily.Integration
         | _ -> common
 
@@ -237,8 +240,11 @@ module WorkQueueReservationPermissions =
            || request.ExpiresAtUnixMs - now > 86400000L
            || request.ReadProjectIds.Count > 16
            || (request.ReadProjectIds |> Seq.exists String.IsNullOrWhiteSpace)
+           // A canonical WQ04 hashed Work ID plus launch UUID and generation
+           // yields a ~130-character WQ03 basename. The exact computed name
+           // and physical registered checkout are still checked in pinSource.
            || (request.SourceWorktree |> Option.exists (fun name ->
-               not (Regex.IsMatch(name, "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")))) then
+               not (Regex.IsMatch(name, "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")))) then
             Error(InvalidBinding "Invalid operator reservation scope revision; obtain a fresh explicit approval.")
         else
             let requestJson = JsonObject()
@@ -285,7 +291,13 @@ module WorkQueueReservationPermissions =
                 let existingVersion = existing |> Option.map (fun (record, _) -> record.Revision) |> Option.defaultValue 0
                 if existingVersion <> request.ExpectedRevision then
                     return! Error(StaleEntityVersion "Reservation scope revision changed; refresh explicit approval.")
-                let allowed = supportedFamilies stage
+                let! authorizedStage =
+                    if stage.Kind = WorkKind.Integration
+                       && not request.Revoked
+                       && request.Families.Contains ReservationOperationFamily.Integration then
+                        WorkQueueIntegrationSourceAuthority.verifiedStageAt binding snapshot stage
+                    else Ok stage
+                let allowed = supportedFamilies authorizedStage
                 if not request.Revoked
                    && (request.Families.IsEmpty || not (Set.isSubset request.Families allowed)
                        || not (request.Families.Contains ReservationOperationFamily.ContextRead)
@@ -302,11 +314,8 @@ module WorkQueueReservationPermissions =
                             && request.Families.Contains ReservationOperationFamily.Integration))
                 let! source =
                     if needsSource then
-                        if stage.Kind = WorkKind.Integration && not stage.IntegrationAuthorized then
-                            Error(InvalidBinding "Integration source authority is not canonically approved.")
-                        else
-                            pinSource binding sourceBinding launch stage request.SourceWorktree
-                            |> Result.map Some
+                        pinSource binding sourceBinding launch authorizedStage request.SourceWorktree
+                        |> Result.map Some
                     else
                         if request.SourceWorktree.IsSome then
                             Error(InvalidBinding "Non-source or revoked grant cannot select a checkout.")
@@ -431,11 +440,15 @@ module WorkQueueReservationPermissions =
                 || (stage.Kind = WorkKind.Integration
                     && request.Family = ReservationOperationFamily.Integration)
             if sourceOperation then
+                let! authorizedStage =
+                    if stage.Kind = WorkKind.Integration then
+                        WorkQueueIntegrationSourceAuthority.verifiedStageAt binding snapshot stage
+                    else Ok stage
                 // Recheck the original Work generation and physical WQ03 source
                 // checkout at the operation boundary; comparing strings alone
                 // would allow a different but valid reservation's worktree.
                 let! pinned =
-                    pinSource binding sourceBinding launch stage grant.SourceWorktree
+                    pinSource binding sourceBinding launch authorizedStage grant.SourceWorktree
                     |> Result.mapError (fun _ ->
                         InvalidBinding "Source checkout is not WQ03-pinned to this reservation.")
                 if grant.SourceRef <> pinned.SourceRef

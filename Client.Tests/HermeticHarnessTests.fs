@@ -434,7 +434,9 @@ module HermeticHarnessTests =
             // must not need, and caused an UnauthorizedAccessException.
             security.PurgeAccessRules(SecurityIdentifier(WellKnownSidType.WorldSid, null))
             FileSystemAclExtensions.SetAccessControl(info, security)
-            WindowsDisposableGuard.assertOwnerOnly isolated true true
+            // Child inherits the protected root's owner-only grant; only the
+            // top-level scratch root itself must be ACL inheritance-protected.
+            WindowsDisposableGuard.assertOwnerOnly isolated true false
             Directory.Delete(isolated)
 
     [<Test>]

@@ -1,0 +1,1 @@
+Fix structural ledger validator to accept cancellation proofs -SpecVersion at versions after reopening; add canonical two-clone persistence test preserving historical proof and invalidating current parent acceptance on corrective child. Release Client composition 4/4 and Server composition 17/17 passed; git diff --check clean.

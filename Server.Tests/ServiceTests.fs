@@ -2648,3 +2648,107 @@ let wq06_manual_conversation_mcp_is_default_off_and_enforces_git_write_scope () 
                         "RepairOperatorConversation" ] do
         Assert.That(typeof<JarvisMcpTools>.GetMethod(methodName), Is.Not.Null,
                     "The public WQ06 MCP method must be explicitly registered: " + methodName)
+
+
+[<Test>]
+let wq06_authenticated_mcp_post_forwards_only_oauth_derived_actor_and_original_uuid () =
+    task {
+        let user = "auth0|wq06-verified-operator"
+        let users = UserService()
+        let connection = "wq06-operator-connection"
+        users.TransportConnected(user, connection)
+        let registration =
+            users.Register(user,
+                { DeviceId = "wq06-operator-device"
+                  DeviceName = "WQ06 disposable operator"
+                  ProtocolVersion = AgentProtocol.version
+                  ClientVersion = "test"
+                  SupportedCommands = [ "OperatorConversationWrite" ] }, connection)
+
+        let tracker = ClientResponseTracker()
+        let mutable forwardedJson = ""
+        let reply correlation =
+            tracker.Complete(correlation, user, connection, registration.Generation,
+                { Result = Some """{"status":"fixture-response"}"""
+                  Error = None; Instructions = []; AgentStateChanges = []
+                  InboxActivation = None; PendingJob = None })
+            |> ignore
+            Task.CompletedTask
+        let recipient =
+            { new IClientService with
+                member _.ReceiveMessage(_) = Task.CompletedTask
+                member _.ReceiveCommand(correlation, commandJson, _) =
+                    forwardedJson <- commandJson
+                    reply correlation
+                member _.ReceiveSourceCommand(correlation, commandJson, _, _) =
+                    forwardedJson <- commandJson
+                    reply correlation
+                member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+                member _.RecordAgentActivity(_, _, _) = Task.CompletedTask
+                member _.InvalidateAllAgentStates() = Task.CompletedTask }
+        let clients =
+            { new Microsoft.AspNetCore.SignalR.IHubClients<IClientService> with
+                member _.All = recipient
+                member _.AllExcept(_) = recipient
+                member _.Client(_) = recipient
+                member _.Clients(_) = recipient
+                member _.Group(_) = recipient
+                member _.GroupExcept(_, _) = recipient
+                member _.Groups(_) = recipient
+                member _.User(_) = recipient
+                member _.Users(_) = recipient }
+        let hub =
+            { new Microsoft.AspNetCore.SignalR.IHubContext<HubService, IClientService> with
+                member _.Clients = clients
+                member _.Groups = Unchecked.defaultof<_> }
+
+        let services =
+            Microsoft.Extensions.DependencyInjection.ServiceCollection()
+            :> Microsoft.Extensions.DependencyInjection.IServiceCollection
+        Microsoft.Extensions.DependencyInjection.ServiceCollectionServiceExtensions.AddSingleton<
+            Microsoft.Extensions.Options.IOptions<JarvisOptions>>(
+                services,
+                Microsoft.Extensions.Options.Options.Create(
+                    { Auth0Domain = "auth.example"; Audience = "https://example.test"
+                      OpenAIAppsChallenge = ""; EnableOperatorConversations = true }))
+        |> ignore
+        use provider =
+            Microsoft.Extensions.DependencyInjection.ServiceCollectionContainerBuilderExtensions.BuildServiceProvider(services)
+        let context = Microsoft.AspNetCore.Http.DefaultHttpContext()
+        context.RequestServices <- provider
+        context.User <-
+            System.Security.Claims.ClaimsPrincipal(
+                System.Security.Claims.ClaimsIdentity(
+                    [ System.Security.Claims.Claim("sub", user)
+                      System.Security.Claims.Claim("scope", Auth.WorkspaceRead + " " + Auth.GitWrite) ],
+                    "test"))
+        let accessor = Microsoft.AspNetCore.Http.HttpContextAccessor()
+        accessor.HttpContext <- context
+        let service =
+            ClientService(hub, users, tracker, accessor,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
+
+        let originalOperationId = Guid.NewGuid().ToString("D")
+        let stableMessageId = Guid.NewGuid().ToString("D")
+        let! result =
+            JarvisMcpTools.PostOperatorConversationMessage(
+                "Jarvis", "Worker 8", "Role", "Lead", 0, stableMessageId,
+                "Explicit decision needed.", originalOperationId,
+                "wq06-operator-device", service, accessor)
+        Assert.That(result.IsError, Is.Not.EqualTo(Nullable true))
+        Assert.That(forwardedJson, Is.Not.Empty,
+                    "An authenticated enabled request must reach the bound client.")
+        match JsonSerializer.Deserialize<AgentCommand>(forwardedJson) with
+        | OperatorConversationWriteCommand sent ->
+            Assert.That(sent.ProjectName, Is.EqualTo("Jarvis"))
+            Assert.That(sent.SubjectKind, Is.EqualTo("Role"))
+            Assert.That(sent.SubjectId, Is.EqualTo("Lead"))
+            Assert.That(sent.Action, Is.EqualTo("Post"))
+            Assert.That(sent.ActorId, Is.EqualTo("operator:" + Auth.profileId user),
+                        "Audit identity must come from the OAuth subject, not an agent label.")
+            Assert.That(sent.OperationId, Is.EqualTo(originalOperationId),
+                        "An original UUID must survive the authenticated MCP boundary.")
+            Assert.That(sent.MessageId, Is.EqualTo(stableMessageId))
+            Assert.That(sent.ExpectedVersion, Is.Zero)
+        | command -> Assert.Fail(sprintf "Unexpected forwarded WQ06 wire command: %A" command)
+    }

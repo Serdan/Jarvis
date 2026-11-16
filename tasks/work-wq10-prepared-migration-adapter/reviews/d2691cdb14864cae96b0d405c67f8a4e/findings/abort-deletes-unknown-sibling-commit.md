@@ -1,0 +1,11 @@
+# [P2] Abort deletes an independently changed prepared ref without matching the recorded prepared commit
+
+**Frozen commit:** `377782ae44c14db8a9467abf105bf69a88e4215f`
+
+**Location:** `tools/Wq10MigrationPreview/prepare.py`, `abort` lines 438–450.
+
+The abort path reads each `staging_ref` tip and validates only the JSON `operationId`, `inputSha256` and the commit's parent (`originalHead`). It does **not** require the observed tip to equal the precise `entry['preparedHead']` recorded in the receipt, or otherwise verify its complete reviewed payload/hash. It then deletes the observed tip by `update-ref delete ... <current>`. A competing author can publish a *different sibling* commit (same parent and operation/input IDs but additional or modified evidence) under the staging ref; `abort` silently deletes that unknown commit and reports success. Git's deletion CAS protects against a concurrent change *after the read*, not against treating an unrecognized preexisting commit as ours. This contradicts the reversible/no-silent-data-loss and original-evidence requirements.
+
+**Independently reproduced** in a disposable `PreparedAdapterTests` fixture at the frozen commit: prepared successfully, authored a sibling commit with the same original parent and a sidecar containing the original IDs plus `extraEvidence`, advanced only the staging ref by exact-CAS, then ran `abort --apply-disposable`. It returned `status=ABORTED`, and the changed ref was gone (`mismatched_staging_ref_preserved=False`). No production or nonfixture refs were touched.
+
+**Fix:** Require exact observed staging SHA to match the receipt's `preparedHead` before deletion; if missing or different, return an actionable unknown/conflict and retain the ref and original evidence. For a crash between publishing a staged ref and persisting its receipt, reconstruct and independently verify the exact deterministic commit/payload from reviewed inputs before authorizing any deletion. Add a regression for an otherwise valid same-operation sibling commit and verify abort preserves it, while repeated abort of an unchanged owned ref remains idempotent.

@@ -18,6 +18,17 @@ type CompositionCommand =
       ExpectedGraphVersion: int
       Mutation: WorkCompositionMutation }
 
+type CompositionViewItem =
+    { Unit: CompositeWorkUnit
+      Overview: WorkUnitOverview }
+
+type CompositionViewPage =
+    { SnapshotCommit: string
+      GraphVersion: int
+      TotalUnits: int
+      Items: CompositionViewItem list
+      NextCursor: string option }
+
 module WorkCompositionGitLedger =
     [<Literal>]
     let RecordPath = "records/work-composition/graph.json"
@@ -101,6 +112,64 @@ module WorkCompositionGitLedger =
                         |> Result.map (fun queue ->
                             WorkComposition.allOverviews graph (Some queue)))))
 
+    // Specs, acceptance proofs and stage projections share one verified Git
+    // snapshot. A continuation is pinned to that head, never a moving offset.
+    let loadOverviewPage binding (unitId: string) pageSize (cursor: string) =
+        if pageSize < 0 || pageSize > 100 then
+            Error(InvalidBinding "Composition page size must be between 0 and 100 (0 uses 50).")
+        else
+            LedgerStore.fetch binding
+            |> Result.bind (fun snapshot ->
+                loadAt binding snapshot
+                |> Result.bind (fun (graph, _) ->
+                    let parseCursor () =
+                        if String.IsNullOrWhiteSpace cursor then Ok 0
+                        elif validText unitId then
+                            Error(InvalidBinding "Single-unit queries do not accept a cursor.")
+                        else
+                            match cursor.Split(':', 2) with
+                            | [| head; offset |] when head = snapshot.Commit ->
+                                match Int32.TryParse offset with
+                                | true, value when value > 0 -> Ok value
+                                | _ -> Error(InvalidBinding "Malformed composition continuation cursor.")
+                            | [| _; _ |] ->
+                                Error(StaleEntityVersion "Composition snapshot changed during pagination.")
+                            | _ -> Error(InvalidBinding "Malformed composition continuation cursor.")
+                    parseCursor ()
+                    |> Result.bind (fun start ->
+                        LedgerStore.readAt binding snapshot WorkQueueGitLedger.RecordPath
+                        |> Result.bind (fun (raw, _) ->
+                            match raw with
+                            | None -> Ok None
+                            | Some _ ->
+                                WorkQueueGitLedger.loadAt binding snapshot |> Result.map Some)
+                        |> Result.bind (fun queue ->
+                            let units =
+                                graph.Units
+                                |> Map.toList
+                                |> List.filter (fun (id, _) -> not (validText unitId) || id = unitId)
+                            if validText unitId && units.IsEmpty then
+                                Error(InvalidBinding ("Unknown composition unit: " + unitId))
+                            elif start >= units.Length && start <> 0 then
+                                Error(InvalidBinding "Composition continuation offset is outside the graph.")
+                            else
+                                let size = if pageSize = 0 then 50 else pageSize
+                                let items =
+                                    units
+                                    |> List.skip start
+                                    |> List.truncate size
+                                    |> List.choose (fun (id, unit) ->
+                                        WorkComposition.overview graph queue id
+                                        |> Option.map (fun overview -> { Unit = unit; Overview = overview }))
+                                let next = start + items.Length
+                                Ok { SnapshotCommit = snapshot.Commit
+                                     GraphVersion = graph.Version
+                                     TotalUnits = units.Length
+                                     Items = items
+                                     NextCursor =
+                                         if next < units.Length then
+                                             Some(snapshot.Commit + ":" + string next)
+                                         else None }))))
     let private rejected error =
         match error with
         | WorkCompositionError.StaleGraph (expected, actual) ->

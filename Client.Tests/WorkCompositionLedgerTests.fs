@@ -342,3 +342,73 @@ let historicalCancellationProofLedgerRoundTrip () =
         Assert.That(WorkComposition.currentAcceptance withCorrection "project" |> Option.isNone, Is.True)
         Assert.That(withCorrection.Units.["project"].Acceptances.[string originalProof.GraphVersion],
                     Is.EqualTo(originalProof)))
+
+
+[<Test>]
+let ``operator mutation input maps explicit units and forbids caller acceptance`` () =
+    let json = """{"action":"Create","unitId":"scheduling","kind":"System","parentId":"project","title":"Scheduling","goal":"Dispatch ready work","scope":"Queues","acceptanceCriteria":["Two prerequisites gate launch"],"constraints":["Git is authoritative"],"linkedTaskId":"canonical-scheduling"}"""
+    match Client.WorkCompositionOperatorInputs.WorkCompositionOperatorInputs.parseMutation json with
+    | Ok(WorkCompositionMutation.Create(id, WorkUnitKind.System, Some parent, input)) ->
+        Assert.That(id, Is.EqualTo("scheduling"))
+        Assert.That(parent, Is.EqualTo("project"))
+        Assert.That(input.LinkedTaskId, Is.EqualTo(Some "canonical-scheduling"))
+        Assert.That(input.AcceptanceCriteria.Contains("Two prerequisites gate launch"), Is.True)
+    | other -> Assert.Fail(sprintf "Expected explicit System mutation: %A" other)
+
+    let revise = """{"action":"revise","unitId":"scheduling","expectedSpecVersion":3,"title":"Scheduling","goal":"Dispatch","scope":"Queues","acceptanceCriteria":["Ready"],"constraints":[]}"""
+    match Client.WorkCompositionOperatorInputs.WorkCompositionOperatorInputs.parseMutation revise with
+    | Ok(WorkCompositionMutation.Revise("scheduling", 3, _)) -> ()
+    | other -> Assert.Fail(sprintf "Expected version-pinned revision: %A" other)
+
+    let forged = """{"action":"accept","unitId":"scheduling","reason":"trusted"}"""
+    match Client.WorkCompositionOperatorInputs.WorkCompositionOperatorInputs.parseMutation forged with
+    | Error message when message.Contains("separately verified") -> ()
+    | other -> Assert.Fail(sprintf "Unexpected arbitrary acceptance: %A" other)
+
+    match Client.WorkCompositionOperatorInputs.WorkCompositionOperatorInputs.parseMutation "{}" with
+    | Error message when message.Contains("unitId") -> ()
+    | other -> Assert.Fail(sprintf "Unbounded operator input: %A" other)
+
+[<Test>]
+let ``composition operator overview pages pin specs and stages to one verified Git head`` () =
+    withTwoClones (fun first second ->
+        let create version id kind parent =
+            WorkCompositionGitLedger.execute first "Fixture" (Guid.NewGuid()) version
+                (WorkCompositionMutation.Create(id, kind, parent, spec id None))
+            |> succeed |> ignore
+        create 0 "project" WorkUnitKind.Project None
+        create 1 "system" WorkUnitKind.System (Some "project")
+        create 2 "feature" WorkUnitKind.Feature (Some "system")
+
+        let initial = WorkCompositionGitLedger.loadOverviewPage second "" 1 "" |> succeed
+        Assert.That(initial.TotalUnits, Is.EqualTo(3))
+        Assert.That(initial.Items.Length, Is.EqualTo(1))
+        Assert.That(initial.Items.Head.Unit.Id, Is.EqualTo("feature"))
+        Assert.That(initial.Items.Head.Overview.Id, Is.EqualTo("feature"))
+        Assert.That(initial.NextCursor.IsSome, Is.True)
+
+        let next = WorkCompositionGitLedger.loadOverviewPage second "" 1 initial.NextCursor.Value |> succeed
+        Assert.That(next.SnapshotCommit, Is.EqualTo(initial.SnapshotCommit))
+        Assert.That(next.Items.Head.Unit.Id, Is.EqualTo("project"))
+        Assert.That(next.NextCursor.IsSome, Is.True)
+
+        let unit = WorkCompositionGitLedger.loadOverviewPage second "system" 10 "" |> succeed
+        Assert.That(unit.Items.Length, Is.EqualTo(1))
+        Assert.That(unit.Items.Head.Unit.Spec.Goal, Is.EqualTo("Deliver system"))
+        Assert.That(unit.Items.Head.Overview.ChildrenAwaitingAcceptance, Does.Contain("feature"))
+
+        WorkCompositionGitLedger.execute first "Fixture" (Guid.NewGuid()) 3
+            (WorkCompositionMutation.Cancel("feature", "Superseded by system-level work"))
+        |> succeed |> ignore
+
+        match WorkCompositionGitLedger.loadOverviewPage second "" 1 initial.NextCursor.Value with
+        | Error(StaleEntityVersion _) -> ()
+        | other -> Assert.Fail(sprintf "Expected fail-closed stale cursor: %A" other)
+
+        let after = WorkCompositionGitLedger.loadOverviewPage second "feature" 10 "" |> succeed
+        Assert.That(after.Items.Head.Unit.CancellationReason, Is.EqualTo(Some "Superseded by system-level work"))
+        Assert.That(after.Items.Head.Overview.Phase, Is.EqualTo(WorkUnitPhase.Cancelled))
+
+        match WorkCompositionGitLedger.loadOverviewPage second "missing" 10 "" with
+        | Error(InvalidBinding _) -> ()
+        | other -> Assert.Fail(sprintf "Expected missing-unit error: %A" other))

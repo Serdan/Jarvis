@@ -1,0 +1,19 @@
+WQ03 LOCAL, DISPOSABLE, OFFLINE FIXTURE - No hosted/production remote was contacted.
+Git: git version 2.47.3
+Fixture: /tmp/wq03-ledger-CeMh8r (removed by EXIT trap)
+warning: You appear to have cloned an empty repository.
+/tmp/wq03-ledger-CeMh8r/A.bundle is okay
+A=05c63045dce93f41cc451b72cf6bd059710a71fa
+Bundle bytes=293 sha256=9313ef52e311fc19bb4a42820d2574a88b5ade97fc232021b815d0630bed6af7
+warning: You appear to have cloned an empty repository.
+L0=113bf1f8538578191ff016bcd6b2cd8de8d9cef8
+PASS two-clone ledger snapshot extraction a: 05c63045dce93f41cc451b72cf6bd059710a71fa exact
+PASS two-clone ledger snapshot extraction b: 05c63045dce93f41cc451b72cf6bd059710a71fa exact
+warning: You appear to have cloned an empty repository.
+PASS source ref deletion+GC made A unavailable to fresh source clone
+PASS ledger-reachable bundle survived local ledger GC and restored exact A
+PASS two-clone stale CAS rejected: first=2b8940e8268d3e990dc445c555bdca9344b1ecd1 second_candidate=680285d2a25ade92a94cfaced673c01038df9de7 second_exit=1 remote=2b8940e8268d3e990dc445c555bdca9344b1ecd1
+PASS late old writer could push B=a46ef512d0d65d95eb75f8062c84286567042634, independent ledger bundle still A=05c63045dce93f41cc451b72cf6bd059710a71fa
+warning: You appear to have cloned an empty repository.
+PASS deleting unprotected ledger ref loses snapshot to new clones, despite prior CAS and content-addressed bundle
+All tests LOCAL ONLY; no long-term host retention, credentials or process fencing attested.

@@ -33,6 +33,10 @@ let parent = WindowsDisposableGuard.attestScratchParent scratchParent
 let root = Path.GetFullPath(Path.Combine(parent, scratchId))
 if not (String.Equals(Path.GetDirectoryName root, parent, StringComparison.OrdinalIgnoreCase)) then
     failwith "Recovered root must be an immediate child of the attested parent."
+// This exclusive parent-side lease is held for the entire recovery. Opening it
+// fails when a live harness has the same scratch ID; missing pre-lease
+// provenance also fails closed rather than guessing process liveness.
+use recoveryLease = WindowsDisposableGuard.claimStaleScratchLease root
 
 let rec removeTree (path: string) =
     let attributes = File.GetAttributes path
@@ -53,7 +57,7 @@ let rec removeTree (path: string) =
 let elapsed = Stopwatch.StartNew()
 let mutable retries = 0
 let rec safelyRemove () =
-    if Directory.Exists root then
+    if not (WindowsDisposableGuard.provenAbsent root) then
         WindowsDisposableGuard.assertNoLinkedAncestors root
         WindowsDisposableGuard.assertOwnerOnly root true true
         try
@@ -65,12 +69,7 @@ let rec safelyRemove () =
             safelyRemove ()
 
 safelyRemove ()
-// Directory.Exists returns false on access denial as well as absence.
-// Only a native missing-path result is proof that the scratch is gone.
-try
-    File.GetAttributes(root) |> ignore
+if not (WindowsDisposableGuard.provenAbsent root) then
     failwith "Recovery did not remove the explicit scratch root."
-with
-| :? FileNotFoundException
-| :? DirectoryNotFoundException -> ()
+WindowsDisposableGuard.finishScratchLease root recoveryLease
 printfn "Hermetic Client.Tests: explicitly attested stale scratch %s; cleanup retries %d; scratch cleanup verified = true" scratchId retries

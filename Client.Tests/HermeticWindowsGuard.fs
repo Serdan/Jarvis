@@ -188,6 +188,64 @@ module WindowsDisposableGuard =
             (rule.FileSystemRights &&& FileSystemRights.FullControl) = FileSystemRights.FullControl)) then
             deny "Windows scratch owner does not have full control."
 
+    /// Directory.Exists and File.Exists collapse access-denied into false.
+    /// Only native missing-path errors prove a scratch/lease is absent.
+    let provenAbsent (path: string) =
+        try
+            File.GetAttributes(path) |> ignore
+            false
+        with
+        | :? FileNotFoundException
+        | :? DirectoryNotFoundException -> true
+
+    let scratchLeasePath (root: string) = root + ".lease"
+
+    /// A protected exclusive lease lives beside (not inside) the scratch root.
+    /// The harness holds it from before root creation through final cleanup.
+    /// A crash releases the kernel handle; recovery cannot claim a live run.
+    let createScratchLease (root: string) =
+        if not (OperatingSystem.IsWindows()) then
+            deny "Windows scratch leases require Windows."
+        if not (provenAbsent root) then
+            deny "Refusing a scratch lease for an occupied root."
+        assertNoLinkedAncestors (Path.GetDirectoryName root)
+        let user = currentUser()
+        let security = FileSecurity()
+        security.SetOwner user
+        security.SetAccessRuleProtection(true, false)
+        security.AddAccessRule(FileSystemAccessRule(user, FileSystemRights.FullControl,
+                                                   AccessControlType.Allow))
+        FileSystemAclExtensions.Create(
+            FileInfo(scratchLeasePath root), FileMode.CreateNew,
+            FileSystemRights.FullControl, FileShare.None, 4096,
+            FileOptions.None, security)
+
+    /// Exact-ID owner/ACL checks alone cannot prove a run has stopped.
+    /// Pre-lease roots fail closed; the caller holds the exclusive handle
+    /// throughout removal so another recovery cannot run concurrently.
+    let claimStaleScratchLease (root: string) =
+        if not (OperatingSystem.IsWindows()) then
+            deny "Windows scratch recovery requires Windows."
+        let lease = scratchLeasePath root
+        if provenAbsent lease then
+            deny "Cannot establish stale scratch ownership without a lease record."
+        assertNoLinkedAncestors (Path.GetDirectoryName lease)
+        assertOwnerOnly lease false true
+        new FileStream(lease, FileMode.Open, FileAccess.ReadWrite, FileShare.None)
+
+    /// Never release the lease until root absence is independently proven.
+    /// If cleanup fails, leave the lease record for guarded stale recovery.
+    let finishScratchLease (root: string) (handle: FileStream) =
+        if not (provenAbsent root) then
+            deny "Cannot release the scratch lease while the root remains."
+        handle.Dispose()
+        let lease = scratchLeasePath root
+        if not (provenAbsent lease) then
+            assertNoLinkedAncestors (Path.GetDirectoryName lease)
+            assertOwnerOnly lease false true
+            File.Delete lease
+        if not (provenAbsent lease) then
+            failwith "Windows scratch lease removal was not verified."
     /// Atomic security descriptor at creation time: no moment with inherited
     /// world-readable access before a post-creation ACL rewrite.
     let createPrivateRoot (path: string) (injectAfterCreate: bool) =
@@ -220,13 +278,15 @@ module WindowsDisposableGuard =
                 deny "Refusing a linked disposable Client.Tests scratch root."
             created
         with original ->
-            if Directory.Exists path then
+            if not (provenAbsent path) then
                 try
                     assertNoLinkedAncestors path
                     assertOwnerOnly path true true
                     Directory.Delete(path)
+                    if not (provenAbsent path) then
+                        failwith "Failed root acquisition cleanup did not remove private root."
                     printfn "Hermetic Client.Tests: failed root acquisition %s" path
-                    printfn "Hermetic Client.Tests: scratch cleanup verified = %b" (not (Directory.Exists path))
+                    printfn "Hermetic Client.Tests: scratch cleanup verified = true"
                 with cleanupError ->
                     raise (AggregateException(
                         "Hermetic root allocation failed and safe scratch cleanup could not be verified.",

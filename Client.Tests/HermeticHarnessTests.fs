@@ -383,6 +383,82 @@ module HermeticHarnessTests =
         Assert.That(File.Exists(candidate), Is.False)
 
     [<Test>]
+    let windows_explicit_recovery_cannot_claim_active_harness_lease () =
+        if not (OperatingSystem.IsWindows()) then
+            Assert.Ignore("Exclusive scratch lease arbitration requires Windows.")
+        // This testhost runs inside the parent's live scratch. The parent
+        // holds its exclusive sidecar lease from before startup through
+        // teardown; recovery of that exact active ID must never succeed.
+        let scratch = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_HERMETIC_ROOT")
+        Assert.That(WindowsDisposableGuard.provenAbsent (WindowsDisposableGuard.scratchLeasePath scratch),
+                    Is.False, "The parent must hold a lease before starting VSTest.")
+        let mutable acquired = false
+        try
+            use other = WindowsDisposableGuard.claimStaleScratchLease scratch
+            acquired <- true
+        with
+        | :? IOException
+        | :? UnauthorizedAccessException -> ()
+        Assert.That(acquired, Is.False, "Active harness scratch must not be recoverable.")
+        Assert.That(WindowsDisposableGuard.provenAbsent scratch, Is.False,
+                    "The failed recovery claim must leave the live scratch intact.")
+
+    [<Test>]
+    let windows_recovery_refuses_legacy_unleased_root () =
+        if not (OperatingSystem.IsWindows()) then
+            Assert.Ignore("Native Windows stale-root provenance requires Windows.")
+        let scratch = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_HERMETIC_ROOT")
+        let unleased = Path.Combine(scratch, "jarvis-client-tests-" + Guid.NewGuid().ToString("N"))
+        Assert.That(WindowsDisposableGuard.provenAbsent unleased, Is.True)
+        Assert.Throws<UnauthorizedAccessException>(
+            TestDelegate(fun () ->
+                use handle = WindowsDisposableGuard.claimStaleScratchLease unleased
+                ())) |> ignore
+        Assert.That(WindowsDisposableGuard.provenAbsent unleased, Is.True)
+
+    [<Test>]
+    let windows_access_denied_scratch_does_not_count_as_removed () =
+        if not (OperatingSystem.IsWindows()) then
+            Assert.Ignore("Native Windows access-denied absence proof requires Windows.")
+        // Mutate only a temporary child underneath the known owner-only test
+        // root, retaining WRITE_DAC so this regression can restore its ACL.
+        let scratch = Environment.GetEnvironmentVariable("JARVIS_CLIENT_TEST_HERMETIC_ROOT")
+        let isolated = Path.Combine(scratch, "acl-denied-" + Guid.NewGuid().ToString("N"))
+        WindowsDisposableGuard.createPrivateRoot isolated false |> ignore
+        let info = DirectoryInfo(isolated)
+        let identity = WindowsIdentity.GetCurrent().User
+        try
+            let restricted = FileSystemAclExtensions.GetAccessControl(info)
+            restricted.SetAccessRuleProtection(true, false)
+            restricted.PurgeAccessRules(identity)
+            restricted.AddAccessRule(
+                FileSystemAccessRule(identity,
+                                     FileSystemRights.ChangePermissions ||| FileSystemRights.ReadPermissions,
+                                     AccessControlType.Allow))
+            FileSystemAclExtensions.SetAccessControl(info, restricted)
+            // Directory.Exists can return false for denied paths. Whether
+            // Windows permits a metadata lookup or rejects it, it must not
+            // produce positive proof of absence for this existing root.
+            let mutable confirmedAbsent = false
+            try confirmedAbsent <- WindowsDisposableGuard.provenAbsent isolated
+            with
+            | :? UnauthorizedAccessException
+            | :? IOException -> ()
+            Assert.That(confirmedAbsent, Is.False,
+                        "An inaccessible but existing scratch must never verify cleanup.")
+        finally
+            // Restore via a DACL-only edit; do not try to set the owner SID.
+            let restored = FileSystemAclExtensions.GetAccessControl(info)
+            restored.SetAccessRuleProtection(true, false)
+            restored.PurgeAccessRules(identity)
+            restored.AddAccessRule(
+                FileSystemAccessRule(identity, FileSystemRights.FullControl,
+                                     InheritanceFlags.ContainerInherit ||| InheritanceFlags.ObjectInherit,
+                                     PropagationFlags.None, AccessControlType.Allow))
+            FileSystemAclExtensions.SetAccessControl(info, restored)
+            WindowsDisposableGuard.assertOwnerOnly isolated true true
+            Directory.Delete(isolated)
+    [<Test>]
     let forged_disposable_root_inside_synthetic_profile_is_rejected_before_any_writes () =
         // No operator profile is opened: every synthetic path belongs to this
         // invocation's already isolated test sandbox.

@@ -89,6 +89,7 @@ let validateScratchParent (path: string) =
     else full
 
 let scratchLocation = scratchParent |> Option.map validateScratchParent
+let mutable scratchLease: FileStream option = None
 let captureTail (reader: StreamReader) =
     task {
         // Never retain the unbounded output of a failing or chatty test process.
@@ -129,11 +130,13 @@ let sourceRoot = Path.GetFullPath(Path.Combine(__SOURCE_DIRECTORY__, ".."))
 let tempDirectory =
     match scratchLocation with
     | Some parent ->
-        // Directory.CreateTempSubdirectory has no parent overload in .NET 11.
-        // Allocate a unique child only under the pre-attested scratch parent.
+        // Allocate a random child under the pre-attested disposable parent.
+        // Its exclusive, owner-only sidecar lease is held BEFORE root creation.
         let path = Path.Combine(parent, $"jarvis-client-tests-{Guid.NewGuid():N}")
-        if File.Exists path || Directory.Exists path then
+        if not (WindowsDisposableGuard.provenAbsent path) then
             failwith "Refusing an already occupied disposable Client.Tests scratch name."
+        if OperatingSystem.IsWindows() then
+            scratchLease <- Some (WindowsDisposableGuard.createScratchLease path)
         try
             let created =
                 if OperatingSystem.IsWindows() then
@@ -145,21 +148,27 @@ let tempDirectory =
                 failwith "Refusing a linked disposable Client.Tests scratch root."
             created.FullName
         with original ->
-            // Acquisition happens before the main try/finally. At this point
-            // nothing has been placed inside the root: delete non-recursively,
-            // and only if independent ownership/link checks permit it.
-            if Directory.Exists path then
-                try
+            // Allocation precedes the main try/finally. This root has no
+            // children yet; remove it non-recursively only after security
+            // attestation, and preserve any failed cleanup for investigation.
+            try
+                if not (WindowsDisposableGuard.provenAbsent path) then
                     if OperatingSystem.IsWindows() then
                         WindowsDisposableGuard.assertNoLinkedAncestors path
                         WindowsDisposableGuard.assertOwnerOnly path true true
                     Directory.Delete(path)
-                    printfn "Hermetic Client.Tests: failed root acquisition %s" path
-                    printfn "Hermetic Client.Tests: scratch cleanup verified = %b" (not (Directory.Exists path))
-                with cleanupError ->
-                    raise (AggregateException(
-                        "Hermetic root allocation failed and safe scratch cleanup could not be verified.",
-                        original, cleanupError))
+                if not (WindowsDisposableGuard.provenAbsent path) then
+                    failwith "Failed acquisition left an unverified scratch root."
+                match scratchLease with
+                | Some lease -> WindowsDisposableGuard.finishScratchLease path lease
+                | None -> ()
+                scratchLease <- None
+                printfn "Hermetic Client.Tests: failed root acquisition %s; scratch cleanup verified = true" path
+            with cleanupError ->
+                scratchLease |> Option.iter (fun lease -> lease.Dispose())
+                raise (AggregateException(
+                    "Hermetic root allocation failed and safe scratch cleanup could not be verified.",
+                    original, cleanupError))
             reraise()
     | None -> Directory.CreateTempSubdirectory("jarvis-client-tests-").FullName
 // Direct/external NUnit fixtures attest that the root and every layout
@@ -198,7 +207,7 @@ let cleanDisposableTree (path: string) =
     let elapsed = Stopwatch.StartNew()
     let mutable retries = 0
     let rec remove () =
-        if Directory.Exists(path) then
+        if not (WindowsDisposableGuard.provenAbsent path) then
             if OperatingSystem.IsWindows() then
                 WindowsDisposableGuard.assertNoLinkedAncestors path
                 WindowsDisposableGuard.assertOwnerOnly path true true
@@ -213,7 +222,7 @@ let cleanDisposableTree (path: string) =
     remove ()
     if retries > 0 then
         printfn "Hermetic Client.Tests: delayed Windows lock release required %d cleanup retries." retries
-    if Directory.Exists(path) then
+    if not (WindowsDisposableGuard.provenAbsent path) then
         failwith "Hermetic Client.Tests: scratch cleanup did not remove the private root."
 
 
@@ -430,14 +439,23 @@ try
 finally
     // A failed setup, test failure, cancellation or timeout must not retain
     // activity, bindings, test output or private temporary credentials.
+    // The exclusive lease persists until independent root-absence proof.
     try
         cleanDisposableTree tempDirectory
+        match scratchLease with
+        | Some lease -> WindowsDisposableGuard.finishScratchLease tempDirectory lease
+        | None -> ()
+        scratchLease <- None
         printfn "Hermetic Client.Tests: scratch cleanup verified = true"
     with cleanupFailure ->
+        // If the root survived, leave its sidecar provenance on disk so a
+        // future explicit recovery may claim it after this process exits.
+        scratchLease |> Option.iter (fun lease -> lease.Dispose())
         eprintfn "Hermetic Client.Tests: scratch cleanup verified = false (%s)" cleanupFailure.Message
         reraise()
     if injectSetupFailure then
-        eprintfn "Hermetic Client.Tests: scratch cleanup verified = %b" (not (Directory.Exists tempDirectory))
+        eprintfn "Hermetic Client.Tests: scratch cleanup verified = %b"
+            (WindowsDisposableGuard.provenAbsent tempDirectory)
 
 // F# Interactive resets ExitCode when the script returns normally. The child
 // outcome must be the host process outcome, and cleanup must run first.

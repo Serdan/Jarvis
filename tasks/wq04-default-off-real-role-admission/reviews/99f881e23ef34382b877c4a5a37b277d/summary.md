@@ -1,0 +1,1 @@
+Default-off explicit canonical CreateTask admission: WQ07 held token, WQ04 role/source re-verification and WQ02 actual selected work in one project CAS, exact replay at issuing commit, authenticated C01 repair. .NET11 Release: 3/3 focused two-clone tests; 45/45 adjacent regression tests. No live Scheduler, browser or real account touched.

@@ -129,7 +129,7 @@ type HermeticClientTestEnvironment() =
         HermeticClientTestEnvironment.AssertOutsideProtectedFolders root actualFolders
         // Independently repeat the parent process's token/physical-identity
         // check; environmental mappings cannot authorize testhost writes.
-        WindowsDisposableGuard.attestScratchParent parent |> ignore
+        WindowsDisposableGuard.attestScratchParentTokenOnly parent |> ignore
         HermeticClientTestEnvironment.AssertPrivatePath parent root
 
     /// Lexical containment is insufficient: reject any symlink/junction/reparse
@@ -547,7 +547,7 @@ module HermeticHarnessTests =
         try
             Assert.Throws<UnauthorizedAccessException>(
                 TestDelegate(fun () ->
-                    WindowsDisposableGuard.attestScratchParent alias |> ignore))
+                    WindowsDisposableGuard.attestScratchParentTokenOnly alias |> ignore))
             |> ignore
             Assert.That(Directory.Exists(notCreated), Is.False,
                         "Junction preflight must not allocate or write behind an alias.")

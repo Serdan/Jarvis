@@ -118,24 +118,33 @@ module WindowsDisposableGuard =
             deny "Windows directory has no stable local volume identity."
         Path.TrimEndingDirectorySeparator full
 
-    /// Must run in the parent process before any scratch directory creation.
-    let attestScratchParent (path: string) =
+    /// Token-derived OS profile exclusion remains reliable even when the
+    /// testhost intentionally remaps USERPROFILE/APPDATA to disposable folders.
+    /// Perform this second independent attestation at NUnit startup.
+    let attestScratchParentTokenOnly (path: string) =
         if not (OperatingSystem.IsWindows()) then
             deny "Native Windows profile attestation requires Windows."
         if String.IsNullOrWhiteSpace path || not (Path.IsPathFullyQualified path) then
             deny "Windows scratch parent must be an absolute directory."
         let full = Path.TrimEndingDirectorySeparator(Path.GetFullPath path)
         let candidate = physicalDirectory full
-        let token = physicalDirectory (tokenProfileDirectory())
-        let roaming = physicalDirectory (knownFolder "3EB685DB-65F9-4CF6-A03A-E3EF65729F3D")
-        let local = physicalDirectory (knownFolder "F1B32785-6FBA-4FCF-9D55-7B8E7F157091")
-        assertOutsideProtectedFolders candidate [token; roaming; local]
-        // Retain an independent lexical guard for any alias unexpectedly
-        // normalized differently by native APIs.
-        assertOutsideProtectedFolders full
-            [ tokenProfileDirectory()
-              knownFolder "3EB685DB-65F9-4CF6-A03A-E3EF65729F3D"
-              knownFolder "F1B32785-6FBA-4FCF-9D55-7B8E7F157091" ]
+        let realProfile = tokenProfileDirectory()
+        let token = physicalDirectory realProfile
+        assertOutsideProtectedFolders candidate [token]
+        assertOutsideProtectedFolders full [realProfile]
+        full
+
+    /// Parent FSI process only: BEFORE changing environment or allocating any
+    /// scratch, additionally attest real roaming/local known folders. Repeating
+    /// those queries in testhost could read synthetic, nonexistent mappings.
+    let attestScratchParent (path: string) =
+        let full = attestScratchParentTokenOnly path
+        let candidate = physicalDirectory full
+        let roamingPath = knownFolder "3EB685DB-65F9-4CF6-A03A-E3EF65729F3D"
+        let localPath = knownFolder "F1B32785-6FBA-4FCF-9D55-7B8E7F157091"
+        assertOutsideProtectedFolders candidate
+            [ physicalDirectory roamingPath; physicalDirectory localPath ]
+        assertOutsideProtectedFolders full [roamingPath; localPath]
         full
 
     let private currentUser () =

@@ -137,8 +137,12 @@ let page_rejects_missing_files_and_symlink_escapes () =
             match readFilePage (page "escape.txt" None 100) context with
             | Error(Client.PermissionDenied _) -> ()
             | other -> Assert.Fail($"Expected symlink rejection, got {other}")
-        with :? UnauthorizedAccessException ->
+        with
+        | :? UnauthorizedAccessException ->
             Assert.Ignore("Symbolic links unavailable in this environment.")
+        | :? IOException as ex when OperatingSystem.IsWindows() && (ex.HResult &&& 0xFFFF) = 1314 ->
+            // Win32 ERROR_PRIVILEGE_NOT_HELD can surface as IOException.
+            Assert.Ignore("Windows test token lacks symbolic-link creation privilege.")
     finally Directory.Delete(baseDir, true)
 
 type private CountingContext(path: string, operations: FileOperations) =
@@ -463,6 +467,9 @@ let search_rejects_matching_symlink_directories_without_exposing_results () =
         with
         | :? UnauthorizedAccessException -> Assert.Ignore("Symlink creation not permitted.")
         | :? PlatformNotSupportedException -> Assert.Ignore("Symlink creation not supported.")
+        | :? IOException as ex when OperatingSystem.IsWindows() && (ex.HResult &&& 0xFFFF) = 1314 ->
+            // Win32 ERROR_PRIVILEGE_NOT_HELD can surface as IOException.
+            Assert.Ignore("Windows test token lacks symbolic-link creation privilege.")
         let cmd =
             { ProjectName = "Project1"; FolderPath = None
               Query = "linked-dir"; MaxResults = Some 1 }

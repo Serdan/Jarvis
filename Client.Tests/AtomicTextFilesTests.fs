@@ -228,6 +228,11 @@ let destination_replaced_by_symlink_before_publish_is_rejected () =
         | Error(Client.PermissionDenied _) -> ()
         | Error(Client.ExceptionError (:? UnauthorizedAccessException)) ->
             Assert.Ignore("Symbolic links unavailable in this test environment.")
+        // Win32 ERROR_PRIVILEGE_NOT_HELD (1314) surfaces as IOException rather
+        // than UnauthorizedAccessException for CreateSymbolicLink on Windows.
+        | Error(Client.ExceptionError (:? IOException as ex))
+            when OperatingSystem.IsWindows() && (ex.HResult &&& 0xFFFF) = 1314 ->
+            Assert.Ignore("Windows test token lacks symbolic-link creation privilege.")
         | other -> Assert.Fail($"Expected rejected symlink substitution, got {other}")
         Assert.That(File.ReadAllText(outside), Is.EqualTo("do not change"))
         Assert.That(File.ReadAllText(backup), Is.EqualTo("original"))

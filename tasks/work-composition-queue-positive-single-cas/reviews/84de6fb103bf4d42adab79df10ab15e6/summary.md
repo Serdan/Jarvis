@@ -1,0 +1,1 @@
+Source 9afd761: graph-blocked WQ04 now born with non-waking WQ02 CompositionHold and immutable stage-unit/spec binding in same Git CAS; graph mutations revoke stale eligibility atomically. Local .NET11 Release 30/30 Client.Tests two-clone tests. Role/source/account admission and Scheduler remain NO-GO.

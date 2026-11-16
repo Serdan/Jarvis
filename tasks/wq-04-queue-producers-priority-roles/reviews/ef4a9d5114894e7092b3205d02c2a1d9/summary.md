@@ -1,0 +1,1 @@
+Audit historical-role evidence rejection, preserved unconditional RecoveryBlocked boundary, two-clone forged/disabled/stale role tests and source authority. .NET11 Release build passed, focused binder 5/5, combined binder/source/role 22/22. No live runtime.

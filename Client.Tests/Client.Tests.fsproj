@@ -82,6 +82,7 @@
         <Compile Include="WorkQueueDurableLaunchIntentTests.fs"/>
         <Compile Include="WorkQueueVerifiedDispatchAdapterTests.fs"/>
         <Compile Include="WorkQueueNativeCredentialDispatchAdapterTests.fs"/>
+        <Compile Include="WorkQueueNativePrivateHostBridgeTests.fs"/>
         <Compile Include="WorkQueueNativeLifecycleCasTests.fs"/>
         <Compile Include="WorkingTurnGuidanceTests.fs"/>
         <Compile Include="OrchestrationApiTests.fs"/>

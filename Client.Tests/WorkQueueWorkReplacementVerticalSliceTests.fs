@@ -213,13 +213,12 @@ type WorkQueueWorkReplacementVerticalSliceTests() =
                         Is.EqualTo(Some bStage.Id))
             Assert.That(demandB.Chosen |> Option.map (fun chosen -> chosen.BlocksUnfinishedStage),
                         Is.EqualTo(Some true))
-            // WQ08 requires an immutable source ref/commit, which a task-created
-            // planning stage does not provide. Do not invent lineage to force
-            // a cross-project simulated winner.
-            Assert.That(before.ProjectSetComplete, Is.False)
+            // Verified WQ04 CreateTask origin is sufficient for planning-only
+            // projection, without inventing a source-writing branch or IDs.
+            Assert.That(before.ProjectSetComplete, Is.True)
             Assert.That(before.Issues |> List.exists (fun issue -> issue.Code = "SourceLineageUnknown"),
-                        Is.True, sprintf "Missing WQ04 lineage was not surfaced: %A" before.Issues)
-            Assert.That(before.SimulatedWinner, Is.EqualTo(None))
+                        Is.False, sprintf "Genuine planning origin was rejected: %A" before.Issues)
+            Assert.That(before.SimulatedWinner |> Option.map _.WorkId, Is.EqualTo(Some bStage.Id))
             Assert.That((WorkQueueToolFacade.readWithBinding a1 "List" "Available" "" |> succeed).Work
                         |> List.exists (fun work -> work.WorkId = aStage.Id), Is.True)
 

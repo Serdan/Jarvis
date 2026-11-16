@@ -49,6 +49,7 @@ type DurablePlanningLaunchIntent =
       PrepareOperationId: string
       OriginalBrowserOperationId: string
       AdmissionOperationId: string
+      AdmissionActor: string
       AbortOperationId: string
       ReleaseOperationId: string
       DispatchOperationId: string
@@ -114,12 +115,13 @@ module WorkQueueDurableLaunchIntent =
             let parsed =
                 try
                     let intent = CanonicalCodec.decode<DurablePlanningLaunchIntent> content
-                    if intent.SchemaVersion <> 1
+                    if intent.SchemaVersion <> 2
                        || intent.ProjectId <> projectId binding
                        || intent.ProjectLedgerId <> binding.LedgerId.ToString("D")
                        || intent.ProjectEpoch <> binding.Epoch
                        || intent.WorkId <> workId
                        || intent.WorkGeneration <> generation
+                       || intent.AdmissionActor <> "WQ12.Prepared:" + intent.PrepareOperationId
                        || codec intent <> content
                        || not (allDistinct intent) then
                         Error(invalid "Stored intent identity, canonical bytes or UUIDs conflict.")
@@ -325,7 +327,7 @@ module WorkQueueDurableLaunchIntent =
                             (head: LedgerSnapshot) (account: AccountSnapshot)
                             (selected: CrossProjectProjectedDemand)
                             (origin: CanonicalWorkOrigin) originOid (prepareId: Guid) =
-        { SchemaVersion = 1
+        { SchemaVersion = 2
           AccountId = accountId context.Account
           AccountLedgerId = context.Account.LedgerId.ToString("D")
           AccountEpoch = context.Account.Epoch
@@ -355,6 +357,9 @@ module WorkQueueDurableLaunchIntent =
           PrepareOperationId = prepareId.ToString("D")
           OriginalBrowserOperationId = Guid.NewGuid().ToString("D")
           AdmissionOperationId = Guid.NewGuid().ToString("D")
+          // The canonical original, not the invoking client's label, owns
+          // both the WQ07 request hash and WQ04 immutable admission actor.
+          AdmissionActor = "WQ12.Prepared:" + prepareId.ToString("D")
           AbortOperationId = Guid.NewGuid().ToString("D")
           ReleaseOperationId = Guid.NewGuid().ToString("D")
           DispatchOperationId = Guid.NewGuid().ToString("D")
@@ -473,32 +478,66 @@ module WorkQueueDurableLaunchIntent =
                         match WorkQueueGitLedger.load selected.Binding with
                         | Error error -> Error("Project Git head is unknown: " + explain error)
                         | Ok (_, state) when state.Launches.ContainsKey original.LaunchId ->
-                            // Existing WQ07/WQ04 admissions replay only their
-                            // exact immutable UUIDs, even after capacity fills.
+                            // WQ04 verifies the original issuing CAS before any
+                            // project launch replay, including immutable credit.
                             Ok ()
-                        | Ok _ ->
-                            // Preparation is not global permission: before the
-                            // FIRST account reservation, independently redo
-                            // blocking-first FIFO and project-set/cap evidence.
-                            match freshSelection context with
-                            | Ok (binding, _, account, chosen, source, oid) when
-                                binding.ProjectId = selected.Binding.ProjectId
-                                && account.Head = original.AccountHead
-                                && chosen.WorkId = original.WorkId
-                                && chosen.WorkGeneration = original.WorkGeneration
-                                && chosen.RoleId = original.RoleId
-                                && chosen.RoleVersion = original.RoleVersion
-                                && chosen.CatalogBlobOid = original.CatalogBlobOid
-                                && source.SourceOperationId = original.SourceOperationId
-                                && source.SourceRequestHash = original.SourceRequestHash
-                                && oid = original.OriginBlobOid -> Ok ()
-                            | Ok _ -> Error "Current global winner or pinned account/source differs from the original."
-                            | Error error -> Error("Current global authority is unresolved: " + explain error)
+                        | Ok (_, state) ->
+                            // At cap=1, global selection cannot select anything
+                            // after WQ07 held the same original token but WQ04
+                            // lost its CAS acknowledgment. Reconcile exact IDs.
+                            match AccountCapacityLedger.fetch context.Account with
+                            | Error error -> Error("Account Git head is unknown: " + explain error)
+                            | Ok account ->
+                                let token =
+                                    account.State.Tokens
+                                    |> Array.tryFind (fun item ->
+                                        item.LaunchId = original.LaunchId
+                                        || item.AdmissionOperationId = original.AdmissionOperationId)
+                                match token with
+                                | Some held when
+                                    held.Status = "Held"
+                                    && held.LaunchId = original.LaunchId
+                                    && held.AdmissionOperationId = original.AdmissionOperationId
+                                    && held.ProjectId = original.ProjectId
+                                    && held.ProjectLedgerId = original.ProjectLedgerId
+                                    && held.ProjectLedgerEpoch = original.ProjectEpoch
+                                    && held.ProjectAuthoritySha256 = original.ProjectAuthoritySha256
+                                    && held.RoleId = original.RoleId
+                                    && held.RoleConfigVersion = int64 original.RoleVersion ->
+                                    // A held token is not blanket permission:
+                                    // WQ04 independently checks role/source/CAS.
+                                    match state.Works.TryFind original.WorkId with
+                                    | Some stage when stage.Kind = WorkKind.Planning
+                                                      && stage.QueueId = "planning"
+                                                      && stage.State = WorkState.Available
+                                                      && stage.StageGeneration = original.WorkGeneration
+                                                      && stage.Gate = GateState.Clear
+                                                      && stage.Dependencies.IsEmpty
+                                                      && stage.WaivedDependencies.IsEmpty -> Ok ()
+                                    | _ -> Error "Held original Work generation is no longer eligible for admission."
+                                | Some _ -> Error "Original account token is foreign, released or inconsistent; retain it."
+                                | None ->
+                                    // Before the FIRST reservation redo
+                                    // blocking-first FIFO and global capacity.
+                                    match freshSelection context with
+                                    | Ok (binding, _, freshAccount, chosen, source, oid) when
+                                        binding.ProjectId = selected.Binding.ProjectId
+                                        && freshAccount.Head = original.AccountHead
+                                        && chosen.WorkId = original.WorkId
+                                        && chosen.WorkGeneration = original.WorkGeneration
+                                        && chosen.RoleId = original.RoleId
+                                        && chosen.RoleVersion = original.RoleVersion
+                                        && chosen.CatalogBlobOid = original.CatalogBlobOid
+                                        && source.SourceOperationId = original.SourceOperationId
+                                        && source.SourceRequestHash = original.SourceRequestHash
+                                        && oid = original.OriginBlobOid -> Ok ()
+                                    | Ok _ -> Error "Current global winner or pinned account/source differs from the original."
+                                    | Error error -> Error("Current global authority is unresolved: " + explain error)
                     match currentSelection with
                     | Error why -> retained why
                     | Ok () ->
                         let request: AccountAdmissionRequest =
-                            { Actor = actor
+                            { Actor = original.AdmissionActor
                               LaunchId = Guid.Parse original.LaunchId
                               AdmissionOperationId = Guid.Parse original.AdmissionOperationId
                               AbortOperationId = Guid.Parse original.AbortOperationId

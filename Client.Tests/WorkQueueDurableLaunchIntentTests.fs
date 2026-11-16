@@ -134,6 +134,8 @@ type WorkQueueDurableLaunchIntentTests() =
             Assert.That(original.SourceOperationKind, Is.EqualTo("CreateTask"))
             Assert.That(original.SourceRef, Is.Empty)
             Assert.That(original.SourceCommit, Is.Empty)
+            Assert.That(original.AdmissionActor,
+                        Is.EqualTo("WQ12.Prepared:" + original.PrepareOperationId))
             let uuidNames =
                 [ original.PrepareOperationId; original.LaunchId; original.OriginalBrowserOperationId
                   original.AdmissionOperationId; original.AbortOperationId
@@ -158,7 +160,7 @@ type WorkQueueDurableLaunchIntentTests() =
             | TokenRetained _ -> ()
             | other -> Assert.Fail(sprintf "Incomplete global membership admitted a launch: %A" other)
 
-            match WorkQueueDurableLaunchIntent.admitPreparedExplicit true first original "WQ12" with
+            match WorkQueueDurableLaunchIntent.admitPreparedExplicit true first original "Client A" with
             | ProjectAdmitted _ -> ()
             | other -> Assert.Fail(sprintf "Original durable launch was not admitted: %A" other)
             let state = WorkQueueRoleAuthority.load a2 |> success
@@ -170,7 +172,7 @@ type WorkQueueDurableLaunchIntentTests() =
             Assert.That(cap.State.Tokens.[0].AdmissionOperationId,
                         Is.EqualTo(original.AdmissionOperationId))
 
-            match WorkQueueDurableLaunchIntent.admitPreparedExplicit true second original "WQ12" with
+            match WorkQueueDurableLaunchIntent.admitPreparedExplicit true second original "Client B" with
             | ProjectAdmitted _ -> ()
             | other -> Assert.Fail(sprintf "Exact original UUID replay was not idempotent: %A" other)
             Assert.That((AccountCapacityLedger.fetch account1 |> success).State.Tokens.Length, Is.EqualTo(1))
@@ -179,6 +181,74 @@ type WorkQueueDurableLaunchIntentTests() =
             | DurableIntentOutcome.NeedsAttention _ -> ()
             | other -> Assert.Fail(sprintf "Held account cap issued a second original: %A" other)
             Assert.That((AccountCapacityLedger.fetch account2 |> success).State.Tokens.Length, Is.EqualTo(1)))
+
+    [<Test>]
+    member _.AccountHeldWithoutProjectAdmissionResumesSameOriginalFromSecondClient() =
+        withBindings (fun (a1,a2) (b1,b2) (account1,account2) ->
+            let stage, _ = producedTask a1 a2 "partial-wq07-original"
+            let first = context account1 a1 b1
+            let second = context account2 b2 a2
+            let original =
+                WorkQueueDurableLaunchIntent.prepareExplicit true first "Preparing client A"
+                |> prepared
+            // Model lost WQ04 project-CAS acknowledgment after WQ07's
+            // original reservation was published. No project admission exists.
+            let held =
+                AccountCapacityLedger.reserve account1
+                    (Guid.Parse original.AdmissionOperationId)
+                    original.AdmissionActor
+                    (Guid.Parse original.LaunchId)
+                    (AccountAdmissionAdapter.projectAuthority a1)
+                    original.RoleId (int64 original.RoleVersion)
+                |> success
+            Assert.That(held.AlreadyApplied, Is.False)
+            Assert.That((WorkQueueRoleAuthority.load a1 |> success).Project.Launches.Count,
+                        Is.Zero)
+            let occupied = AccountCapacityLedger.fetch account2 |> success
+            Assert.That(AccountCapacityLedger.occupied occupied.State, Is.EqualTo(1))
+            Assert.That(occupied.State.Tokens.Length, Is.EqualTo(1))
+
+            // Client B has a different caller identity and checkout. The
+            // wrapper must re-use the original held token rather than trying
+            // fresh global selection, which cannot pass while cap=1 is held.
+            match WorkQueueDurableLaunchIntent.admitPreparedExplicit true second original "Client B" with
+            | ProjectAdmitted _ -> ()
+            | other -> Assert.Fail(sprintf "WQ07-only partial original did not recover: %A" other)
+            let view = WorkQueueRoleAuthority.load a1 |> success
+            Assert.That(view.Project.Launches.Count, Is.EqualTo(1))
+            Assert.That(view.Project.Launches.[original.LaunchId].Credit, Is.EqualTo(Some stage.Id))
+            let after = AccountCapacityLedger.fetch account1 |> success
+            Assert.That(after.State.Tokens.Length, Is.EqualTo(1))
+            Assert.That(AccountCapacityLedger.occupied after.State, Is.EqualTo(1))
+            match WorkQueueDurableLaunchIntent.admitPreparedExplicit true first original "Client A again" with
+            | ProjectAdmitted _ -> ()
+            | other -> Assert.Fail(sprintf "Recovered original could not replay: %A" other))
+
+    [<Test>]
+    member _.HeldTokenWithDifferentOriginalActorCannotReuseAdmissionOperation() =
+        withBindings (fun (a1,a2) (b1,b2) (account1,account2) ->
+            let _, _ = producedTask a1 a2 "mismatched-wq07-actor"
+            let first = context account1 a1 b1
+            let second = context account2 b2 a2
+            let original =
+                WorkQueueDurableLaunchIntent.prepareExplicit true first "Preparing client A"
+                |> prepared
+            // A conflicting original WQ07 receipt must never be reinterpreted
+            // as the canonical prepared request, even if its token fields match.
+            AccountCapacityLedger.reserve account1
+                (Guid.Parse original.AdmissionOperationId) "DifferentOriginalActor"
+                (Guid.Parse original.LaunchId)
+                (AccountAdmissionAdapter.projectAuthority a1)
+                original.RoleId (int64 original.RoleVersion)
+            |> success |> ignore
+            match WorkQueueDurableLaunchIntent.admitPreparedExplicit true second original "Client B" with
+            | GlobalReservationRejected AccountOperationIdReused -> ()
+            | other -> Assert.Fail(sprintf "Conflicting original actor bypassed WQ07: %A" other)
+            Assert.That((WorkQueueRoleAuthority.load a1 |> success).Project.Launches.Count,
+                        Is.Zero)
+            let after = AccountCapacityLedger.fetch account2 |> success
+            Assert.That(after.State.Tokens.Length, Is.EqualTo(1))
+            Assert.That(AccountCapacityLedger.occupied after.State, Is.EqualTo(1)))
 
     [<Test>]
     member _.ConcurrentProjectGitClientsShareOneCanonicalOriginalIdentity() =

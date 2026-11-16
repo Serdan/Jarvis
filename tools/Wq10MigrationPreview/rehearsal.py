@@ -11,10 +11,11 @@ import pathlib
 import subprocess
 import sys
 
+from provenance import verify_candidate
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 DLL = ROOT / "tools/Wq10MigrationPreview/bin/Release/net11.0/Wq10MigrationPreview.dll"
-EXPECTED_PREVIEW_ISSUES = {"AccountNotActivated"}
 
 
 def load(path):
@@ -80,12 +81,16 @@ def review_case(case, base, app=DLL):
             if not ok:
                 issues.append(fail(code, f"{prefix}: {context}", action))
 
-        check(preview.get("mode") == "ReadOnlyDryRun" and preview.get("canDispatch") is False,
+        inert = preview.get("mode") == "ReadOnlyDryRun" and preview.get("canDispatch") is False
+        check(inert,
               "SCHEDULER_NOT_INERT", "mode/canDispatch does not match WQ08 read-only contract",
               "Capture a genuine default-off WQ08 host preview; never authorize dispatch here")
         check(preview.get("projectHead") == project["head"] == project["currentRefTip"],
               "PROJECT_HEAD_CONFLICT", f"pinned {project['head']}; observed {project['currentRefTip']}; scheduler {preview.get('projectHead')}",
               "Pin and independently fetch the same exact project Git head again")
+        check(preview.get("accountMigration") == account["migrationPhase"],
+              "ACCOUNT_PHASE_CONFLICT", "WQ08 account migration phase differs from pinned WQ10 account",
+              "Reconcile the same exact account Git authority and migration phase")
         check(preview.get("accountHead") == account["head"] == account["currentRefTip"],
               "ACCOUNT_HEAD_CONFLICT", f"pinned {account['head']}; observed {account['currentRefTip']}; scheduler {preview.get('accountHead')}",
               "Reconcile account token owners and competing writer before a fresh preview")
@@ -97,26 +102,54 @@ def review_case(case, base, app=DLL):
               "CAPACITY_EVIDENCE_CONFLICT",
               f"inspector cap={capacity} held={occupied}; scheduler cap={preview.get('maxConcurrentAgents')} held={preview.get('occupiedAgents')} free={preview.get('availableSlots')}",
               "Fetch both account observations at exact heads; do not infer capacity")
+        check(type(preview.get("projectVersion")) is int and preview["projectVersion"] > 0 and
+              type(preview.get("roleCatalogRevision")) is int and preview["roleCatalogRevision"] > 0,
+              "VERSIONED_PREVIEW_UNVERIFIED", "project or role catalog version unavailable",
+              "Read the versioned project and role catalog at the pinned project head")
         check(isinstance(preview.get("roleId"), str) and bool(preview.get("roleId")) and
               isinstance(preview.get("selectedRoleVersion"), int) and
               preview["selectedRoleVersion"] > 0,
               "ROLE_PREVIEW_UNVERIFIED", "enabled versioned role not selected",
               "Inspect WQ04 enabled role definition at pinned project Git head")
         candidate = preview.get("wouldLaunch")
-        if case.get("requireCandidate", True):
-            check(isinstance(candidate, dict) and
-                  all(candidate.get(key) for key in ("workId", "sourceOperationId",
-                                                     "sourceRequestHash", "originBlobOid")),
-                  "SOURCE_PROVENANCE_UNVERIFIED", "positive candidate lacks original identity or source receipt",
-                  "Read the immutable WQ04 work origin; do not invent a source UUID or hash")
+        if case.get("requireCandidate") is False:
+            issues.append(fail("CANDIDATE_BYPASS_REJECTED", prefix,
+                               "Manifest flags cannot waive immutable source provenance"))
+        source_snapshot = next(s for s in supplied if s["name"] == project_name)
+        source_findings = verify_candidate(project, source_snapshot, preview)
+        for reason in source_findings:
+            issues.append(fail("SOURCE_PROVENANCE_UNVERIFIED", f"{prefix}: {reason}",
+                               "Inspect WQ04 immutable work origin and matching pinned task/queue lineage"))
         preview_issues = preview.get("issues")
         if not isinstance(preview_issues, list):
             issues.append(fail("SCHEDULER_ISSUES_MISSING", prefix,
                                "Capture the full WQ08 issue inventory, even when empty"))
             preview_issues = []
+        dispatch_count = sum(isinstance(item, dict) and item.get("code") == "DispatchDisabled"
+                             for item in preview_issues)
+        check(dispatch_count == 1, "SCHEDULER_DISPATCH_DIAGNOSTIC_MISSING",
+              "actual WQ08 host must report exactly one DispatchDisabled diagnostic",
+              "Capture the complete genuine WQ08 preview, not an edited issue inventory")
+        not_activated_count = sum(isinstance(item, dict) and item.get("code") == "AccountNotActivated"
+                                  for item in preview_issues)
+        expected_not_activated = account["migrationPhase"] != "Activated"
+        check(not_activated_count == int(expected_not_activated),
+              "SCHEDULER_ACCOUNT_DIAGNOSTIC_CONFLICT",
+              "AccountNotActivated inventory disagrees with actual WQ08 migration contract",
+              "Capture the full WQ08 account migration issue list at the pinned head")
+        expected_diagnostics = []
+        adverse_diagnostics = []
         for item in preview_issues:
             code = item.get("code") if isinstance(item, dict) else None
-            if not code or code not in EXPECTED_PREVIEW_ISSUES:
+            accepted = ((code == "DispatchDisabled" and inert and
+                         item.get("record") == project["head"]) or
+                        (code == "AccountNotActivated" and inert and
+                         account["migrationPhase"] != "Activated" and
+                         item.get("record") == account["head"]))
+            if accepted:
+                expected_diagnostics.append(code)
+            else:
+                adverse_diagnostics.append(code or "malformed")
                 issues.append(fail("SCHEDULER_PREVIEW_ISSUE", f"{prefix}: {code or 'malformed'}",
                                    item.get("nextAction", "Inspect original WQ08 issue") if isinstance(item, dict)
                                    else "Inspect exact Scheduler issue"))
@@ -135,7 +168,11 @@ def review_case(case, base, app=DLL):
                           "sourceOperationId": candidate.get("sourceOperationId") if isinstance(candidate, dict) else None,
                           "sourceRequestHash": candidate.get("sourceRequestHash") if isinstance(candidate, dict) else None,
                           "originBlobOid": candidate.get("originBlobOid") if isinstance(candidate, dict) else None,
+                          "sourceProvenanceVerified": not source_findings,
+                          "sourceProvenanceFindings": source_findings,
                           "canDispatch": preview.get("canDispatch"),
+                          "expectedDiagnostics": expected_diagnostics,
+                          "adverseIssues": adverse_diagnostics,
                           "issues": [i.get("code", "malformed") if isinstance(i, dict) else "malformed"
                                      for i in preview_issues]}
         })
@@ -199,8 +236,8 @@ def markdown(out):
             lines.append(f"| {key} | Operator-supplied: {str(value).lower()} | {'EVIDENCED' if value else 'NO_GO'} |")
         for p in case["projectMatrix"]:
             issues = ", ".join(p["scheduler"]["issues"]) or "none"
-            lines.append(f"| {p['project']} immutable provenance | source UUID: {p['scheduler']['sourceOperationId'] or '(missing)'}; request SHA: {p['scheduler']['sourceRequestHash'] or '(missing)'}; origin blob: {p['scheduler']['originBlobOid'] or '(missing)'} | REVIEW |")
-            lines.append(f"| {p['project']} migration / Scheduler | pinned `{p['pinnedHead']}`; observed `{p['observedHead']}`; {p['queueMigration']}; WQ08 {p['scheduler']['mode']}, role {p['scheduler']['roleId']} v{p['scheduler']['selectedRoleVersion']}, candidate {p['scheduler']['wouldLaunch'] or '(none)'}, issues: {issues}; dispatch={p['scheduler']['canDispatch']} | {'INSPECT' if issues else 'EVIDENCED'} |")
+            lines.append(f"| {p['project']} immutable provenance | source UUID: {p['scheduler']['sourceOperationId'] or '(missing)'}; request SHA: {p['scheduler']['sourceRequestHash'] or '(missing)'}; origin blob: {p['scheduler']['originBlobOid'] or '(missing)'} | {'EVIDENCED (PINNED LOCAL)' if p['scheduler']['sourceProvenanceVerified'] else 'NO_GO'} |")
+            lines.append(f"| {p['project']} migration / Scheduler | pinned `{p['pinnedHead']}`; observed `{p['observedHead']}`; {p['queueMigration']}; WQ08 {p['scheduler']['mode']}, role {p['scheduler']['roleId']} v{p['scheduler']['selectedRoleVersion']}, candidate {p['scheduler']['wouldLaunch'] or '(none)'}, issues: {issues}; dispatch={p['scheduler']['canDispatch']} | {'INSPECT' if p['scheduler']['adverseIssues'] else 'EVIDENCED'} |")
             lines.append(f"| {p['project']} legacy state | tasks: {', '.join(p['legacyTasks']) or '(none)'}; messages: {', '.join(p['pendingMessageIds']) or '(none)'}; working: {', '.join(p['workingAgents']) or '(none)'}; launches: {', '.join(p['launchIds']) or '(none)'} | INVENTORIED |")
         lines += ["", "### Pending / uncertain originals"]
         if case["originalUncertainIds"]:

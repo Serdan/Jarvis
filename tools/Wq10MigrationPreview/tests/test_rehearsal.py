@@ -4,6 +4,7 @@ Imports ONLY fixture helpers from accepted test_preview.py. Both project ledgers
 and the account ledger have bare remotes and two local clones each. WQ08 JSON is
 clearly fixture evidence; it cannot be mistaken for a live authenticated host run.
 """
+import hashlib
 import json
 import pathlib
 import subprocess
@@ -39,6 +40,25 @@ class RehearsalTests(unittest.TestCase):
             ("Alpha", "T-alpha", "cccccccc-cccc-cccc-cccc-cccccccccccc"),
             ("Beta", "T-beta", "dddddddd-dddd-dddd-dddd-dddddddddddd")
         ):
+            work_id = f"W-{name}"
+            origin_path = "records/work-queue/origins/" + hashlib.sha256(work_id.encode()).hexdigest() + ".json"
+            if not hasattr(self, "origin_paths"):
+                self.origin_paths = {}
+            self.origin_paths[name] = origin_path
+            origin = {
+                "SchemaVersion": 1, "ProjectId": project_id, "WorkId": work_id,
+                "SourceHead": "4" * 40, "SourceHighWater": 9,
+                "SourceOperationId": ("66666666-6666-6666-6666-666666666666" if name == "Alpha"
+                                      else "77777777-7777-7777-7777-777777777777"),
+                "SourceOperationSequence": 8, "SourceOperationKind": "PublishWork",
+                "SourceOperationActor": "Worker 1", "SourceRequestHash": "2" * 64,
+                "SourceOriginHead": "5" * 40,
+                "SourceEntityPath": f"tasks/{task_id}/task.json",
+                "SourceEntityBlobOid": "6" * 40, "SourceEntitySha256": "7" * 64,
+                "SourceSelector": "Task", "SourceRef": f"refs/heads/feature/{task_id}",
+                "SourceCommit": "1" * 40, "RoleId": "Planner", "RoleVersion": 1,
+                "AccountCreditStatus": "Available", "Ambiguity": "None"
+            }
             self.projects[name] = LedgerFixture(self.root, name.lower(), "jarvis-orchestration", {
                 "ledger.json": {
                     "schemaVersion": 3, "projectId": project_id,
@@ -67,6 +87,7 @@ class RehearsalTests(unittest.TestCase):
                         "queueCovered": True, "graphCovered": True,
                         "messageCovered": True, "sourceCovered": True,
                         "works": {f"W-{name}": {
+                            "queueId": name,
                             "subjectId": task_id, "stageGeneration": 1,
                             "kind": {"case": "Implementation", "fields": []},
                             "state": {"case": "Available", "fields": []},
@@ -89,13 +110,7 @@ class RehearsalTests(unittest.TestCase):
                         "launches": {}
                     }
                 },
-                f"records/work-queue/origins/{task_id}.json": {
-                    "sourceHighWater": 9,
-                    "sourceOperationId": "66666666-6666-6666-6666-666666666666" if name == "Alpha" else "77777777-7777-7777-7777-777777777777",
-                    "sourceRequestHash": "2" * 64,
-                    "sourceRef": f"refs/heads/feature/{task_id}",
-                    "sourceCommit": "1" * 40
-                }
+                origin_path: origin
             })
 
     def manifest(self, prefix, *, held=False, unknown=False):
@@ -128,6 +143,8 @@ class RehearsalTests(unittest.TestCase):
         for name, project in sorted(self.projects.items()):
             issues = [{"code": "AccountNotActivated", "record": self.account.head,
                        "nextAction": "Requires separate operator activation"}]
+            issues.append({"code": "DispatchDisabled", "record": project.head,
+                           "nextAction": "Production canDispatch remains OFF. Operator must separately approve cutover."})
             if held:
                 issues.append({"code": "CapacityFull", "record": self.account.head,
                                "nextAction": "Verify original terminal token release"})
@@ -146,10 +163,12 @@ class RehearsalTests(unittest.TestCase):
                 "wouldLaunch": {
                     "workId": f"W-{name}", "workGeneration": 1,
                     "queueId": name, "roleId": "Planner", "roleVersion": 1,
-                    "sourceHead": project.head, "sourceRef": f"refs/heads/feature/T-{name.lower()}",
+                    "sourceHead": "4" * 40, "sourceRef": f"refs/heads/feature/T-{name.lower()}",
                     "sourceCommit": "1" * 40,
                     "sourceOperationId": "66666666-6666-6666-6666-666666666666" if name == "Alpha" else "77777777-7777-7777-7777-777777777777",
-                    "sourceRequestHash": "2" * 64, "originBlobOid": "3" * 40
+                    "sourceRequestHash": "2" * 64,
+                    "originBlobOid": git(project.remote, "rev-parse",
+                                         f"{project.head}:{self.origin_paths[name]}")
                 },
                 "existingLaunches": [], "issues": issues
             }
@@ -157,7 +176,7 @@ class RehearsalTests(unittest.TestCase):
             preview_path.write_text(json.dumps(preview), encoding="utf-8")
             previews[name] = preview_path.name
         return {"name": prefix, "manifest": path.name,
-                "schedulerPreviews": previews, "requireCandidate": True}
+                "schedulerPreviews": previews}
 
     def run_rehearsal(self, cases, *, markdown=False):
         path = self.root / "rehearsal.json"
@@ -299,6 +318,129 @@ class RehearsalTests(unittest.TestCase):
         self.assertEqual(report["rehearsalVerdict"], "PREPARED_FOR_REVIEW")
         self.assertTrue(all(p["scheduler"]["mode"] == "ReadOnlyDryRun"
                             for p in report["projectMatrix"]))
+
+
+    def test_source_backed_host_preview_contract_includes_mandatory_diagnostic(self):
+        # The real WQ08 previewWith contract unconditionally emits this code.
+        # These are source-backed host-shaped fixtures, NOT live/attested output.
+        source = (ROOT / "Client/Modules/WorkQueueSchedulerHostPreview.fs").read_text(encoding="utf-8")
+        self.assertIn('add "DispatchDisabled" (projectHead', source)
+        self.assertIn('Mode = "ReadOnlyDryRun"', source)
+        self.assertIn("CanDispatch = false", source)
+        prepared = self.manifest("host-contract")
+        for path in prepared["schedulerPreviews"].values():
+            preview = json.loads((self.root / path).read_text())
+            self.assertEqual(preview["mode"], "ReadOnlyDryRun")
+            self.assertIs(preview["canDispatch"], False)
+            self.assertEqual([i["code"] for i in preview["issues"]].count("DispatchDisabled"), 1)
+        result = self.run_rehearsal([prepared])["cases"][0]
+        self.assertEqual(result["rehearsalVerdict"], "PREPARED_FOR_REVIEW")
+        self.assertEqual(result["productionCutover"], "NOT_AUTHORIZED")
+        for row in result["projectMatrix"]:
+            self.assertIn("DispatchDisabled", row["scheduler"]["expectedDiagnostics"])
+            self.assertEqual(row["scheduler"]["adverseIssues"], [])
+
+    def test_missing_duplicate_or_cross_project_dispatch_disabled_is_never_green(self):
+        for variation in ("missing", "duplicate", "cross-project-record"):
+            with self.subTest(variation=variation):
+                prepared = self.manifest("dispatch-" + variation)
+                path = self.root / prepared["schedulerPreviews"]["Alpha"]
+                preview = json.loads(path.read_text())
+                issue = next(i for i in preview["issues"] if i["code"] == "DispatchDisabled")
+                if variation == "missing":
+                    preview["issues"].remove(issue)
+                elif variation == "duplicate":
+                    preview["issues"].append(dict(issue))
+                else:
+                    issue["record"] = "9" * 40
+                path.write_text(json.dumps(preview))
+                result = self.run_rehearsal([prepared])["cases"][0]
+                self.assertEqual(result["rehearsalVerdict"], "NO_GO")
+                self.assertEqual(result["productionCutover"], "NOT_AUTHORIZED")
+                codes = {f["code"] for f in result["blockers"]}
+                self.assertTrue({"SCHEDULER_DISPATCH_DIAGNOSTIC_MISSING",
+                                 "SCHEDULER_PREVIEW_ISSUE"} & codes)
+
+    def test_adverse_wq08_issues_remain_blocking_despite_inert_dispatch(self):
+        prepared = self.manifest("mixed-issues")
+        path = self.root / prepared["schedulerPreviews"]["Beta"]
+        preview = json.loads(path.read_text())
+        for code in ("AccountUnknown", "ProjectHeadConflict", "CapacityFull",
+                     "BrowserJournalUnknown"):
+            preview["issues"].append({"code": code, "record": "unresolved",
+                                      "nextAction": "Inspect original witness"})
+        path.write_text(json.dumps(preview))
+        result = self.run_rehearsal([prepared])["cases"][0]
+        self.assertEqual(result["rehearsalVerdict"], "NO_GO")
+        self.assertEqual(result["productionCutover"], "NOT_AUTHORIZED")
+        beta = next(r for r in result["projectMatrix"] if r["project"] == "Beta")
+        self.assertEqual(set(beta["scheduler"]["adverseIssues"]),
+                         {"AccountUnknown", "ProjectHeadConflict", "CapacityFull",
+                          "BrowserJournalUnknown"})
+
+    def test_reviewer_exact_two_project_require_candidate_false_bypass(self):
+        prepared = self.manifest("reviewer-bypass")
+        prepared["requireCandidate"] = False  # untrusted caller-controlled input
+        for name, path in prepared["schedulerPreviews"].items():
+            preview_path = self.root / path
+            data = json.loads(preview_path.read_text())
+            data["wouldLaunch"] = None
+            preview_path.write_text(json.dumps(data), encoding="utf-8")
+        result = self.run_rehearsal([prepared])["cases"][0]
+        self.assertEqual(result["rehearsalVerdict"], "NO_GO")
+        self.assertEqual(result["productionCutover"], "NOT_AUTHORIZED")
+        codes = [f["code"] for f in result["blockers"]]
+        self.assertIn("CANDIDATE_BYPASS_REJECTED", codes)
+        self.assertEqual(codes.count("SOURCE_PROVENANCE_UNVERIFIED"), 2)
+        for row in result["projectMatrix"]:
+            self.assertIsNone(row["scheduler"]["wouldLaunch"])
+            self.assertEqual(len(row["legacyTasks"]), 1)
+            self.assertEqual(len(row["pendingMessageIds"]), 2)
+
+    def test_no_candidate_cannot_be_prepared_even_without_bypass_flag(self):
+        prepared = self.manifest("no-candidate")
+        for path in prepared["schedulerPreviews"].values():
+            preview_path = self.root / path
+            data = json.loads(preview_path.read_text())
+            data["wouldLaunch"] = None
+            preview_path.write_text(json.dumps(data))
+        result = self.run_rehearsal([prepared])["cases"][0]
+        self.assertEqual(result["rehearsalVerdict"], "NO_GO")
+        self.assertEqual([f["code"] for f in result["blockers"]].count(
+            "SOURCE_PROVENANCE_UNVERIFIED"), 2)
+
+    def test_candidate_identity_and_source_lineage_must_match_git_inventory(self):
+        alterations = (
+            ("workId", "W-unrelated"), ("workGeneration", 2), ("queueId", "wrong-queue"),
+            ("sourceOperationId", "ffffffff-ffff-ffff-ffff-ffffffffffff"),
+            ("sourceRequestHash", "a" * 64), ("sourceHead", "9" * 40),
+            ("sourceRef", "refs/heads/other"), ("sourceCommit", "8" * 40),
+            ("originBlobOid", "a" * 40), ("roleVersion", 2),
+        )
+        for key, wrong in alterations:
+            with self.subTest(field=key):
+                prepared = self.manifest("alter-" + key)
+                preview_path = self.root / prepared["schedulerPreviews"]["Alpha"]
+                preview = json.loads(preview_path.read_text())
+                preview["wouldLaunch"][key] = wrong
+                preview_path.write_text(json.dumps(preview))
+                result = self.run_rehearsal([prepared])["cases"][0]
+                self.assertEqual(result["rehearsalVerdict"], "NO_GO")
+                self.assertIn("SOURCE_PROVENANCE_UNVERIFIED",
+                              {f["code"] for f in result["blockers"]})
+
+    def test_origin_blob_matches_but_original_identity_disagrees(self):
+        beta = self.projects["Beta"]
+        origin_path = beta.first / self.origin_paths["Beta"]
+        origin = json.loads(origin_path.read_text())
+        origin["SourceOperationId"] = "abababab-abab-abab-abab-abababababab"
+        beta.commit({self.origin_paths["Beta"]: origin}, "alter source origin at later pinned head")
+        prepared = self.manifest("wrong-original")
+        result = self.run_rehearsal([prepared])["cases"][0]
+        self.assertEqual(result["rehearsalVerdict"], "NO_GO")
+        # The expected blob OID is correct, but the actual source identity isn't.
+        self.assertIn("candidate sourceOperationId differs",
+                      str(result["blockers"]))
 
 
 if __name__ == "__main__":

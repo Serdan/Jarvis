@@ -350,13 +350,27 @@ module WorkQueueRoleAuthority =
                             Error(integrity "current role catalog differs from complete issued high-water")
                         else Ok ())))
 
-    let private originalAdmissionRequest (operation: LedgerOperation) (launch: Launch) =
+    let private originalAdmissionRequest (operation: LedgerOperation) (launch: Launch)
+                                         (credential: WorkCredentialVerifier option) =
         requestMatches operation (fun body ->
             if body.GetProperty("schemaVersion").GetInt32() <> 1 then false
             else
                 let mutation = body.GetProperty("mutation")
-                let admitted = mutation.GetProperty("fields").EnumerateArray() |> Seq.head
-                mutation.GetProperty("case").GetString() = "AdmitProject"
+                let fields = mutation.GetProperty("fields").EnumerateArray() |> Seq.toArray
+                let correctCase =
+                    match credential with
+                    | None -> mutation.GetProperty("case").GetString() = "AdmitProject"
+                              && fields.Length = 1
+                    | Some verifier ->
+                        mutation.GetProperty("case").GetString() = "AdmitCredentialProject"
+                        && fields.Length = 2
+                        && fields.[1].GetString() = verifier.SecretSha256
+                        && verifier.SchemaVersion = 1
+                        && verifier.ProjectId = launch.ProjectId
+                        && verifier.LaunchId = launch.Id
+                        && verifier.AccountTokenId = launch.AccountTokenId
+                let admitted = fields.[0]
+                correctCase
                 && admitted.GetProperty("Id").GetString() = launch.Id
                 && admitted.GetProperty("ProjectId").GetString() = launch.ProjectId
                 && admitted.GetProperty("AccountTokenId").GetString() = launch.AccountTokenId
@@ -379,6 +393,29 @@ module WorkQueueRoleAuthority =
 
     // Legacy WQ02 admissions, even if made after a role catalog was created,
     // never become WQ04-authorized by backfilling a matching numeric version.
+    // Admission's verifier, role witness and launch must all be traceable
+    // to the same original Git commit. Legacy admissions have no verifier.
+    let private authenticatedAdmissionOrigin binding snapshot (launch: Launch)
+                                             (decision: ProjectAdmissionRecord) = result {
+        let! current = WorkQueueGitLedger.readCredentialAt binding snapshot launch.Id
+        let admissionPath = WorkQueueGitLedger.admissionPath launch.Id
+        let rolePath = roleAdmissionPath launch.Id
+        let paths =
+            match current with
+            | Some _ ->
+                [ WorkQueueGitLedger.RecordPath; admissionPath
+                  WorkQueueGitLedger.credentialPath launch.Id; rolePath ]
+            | None -> [ WorkQueueGitLedger.RecordPath; admissionPath; rolePath ]
+        let! receipt, issued =
+            operationOrigin binding snapshot decision.AdmissionOperationId "WQ02.Mutate" paths
+        let! original = WorkQueueGitLedger.readCredentialAt binding issued launch.Id
+        if current <> original then
+            return! Error(integrity "Work credential verifier differs from immutable original admission")
+        if not (originalAdmissionRequest receipt launch (current |> Option.map fst)) then
+            return! Error(integrity "original admission semantic request mismatches pinned launch")
+        return issued
+    }
+
     let private verifyAdmittedLaunch (binding: LedgerBinding) (snapshot: LedgerSnapshot)
                                       (catalog: RoleCatalog) (launch: Launch) =
         match historical catalog launch.RoleId launch.RoleVersion with
@@ -395,16 +432,10 @@ module WorkQueueRoleAuthority =
                     && decision.AccountTokenId = launch.AccountTokenId
                     && decision.Kind = "AdmissionWon"
                     && decision.AbortOperationId = "" ->
-                    let path = WorkQueueGitLedger.admissionPath launch.Id
-                    let rolePath = roleAdmissionPath launch.Id
-                    operationOrigin binding snapshot decision.AdmissionOperationId
-                        "WQ02.Mutate" [WorkQueueGitLedger.RecordPath; path; rolePath]
-                    |> Result.bind (fun (receipt, issued) ->
-                        if not (originalAdmissionRequest receipt launch) then
-                            Error(integrity "original admission semantic request mismatches pinned launch")
-                        else
-                            WorkQueueGitLedger.readAdmissionAt binding issued launch.Id
-                            |> Result.bind (function
+                    authenticatedAdmissionOrigin binding snapshot launch decision
+                    |> Result.bind (fun issued ->
+                        WorkQueueGitLedger.readAdmissionAt binding issued launch.Id
+                        |> Result.bind (function
                                 | Some (originalDecision, originalOid)
                                     when originalOid = decisionOid && originalDecision = decision ->
                                     readRoleAdmission binding snapshot launch.Id

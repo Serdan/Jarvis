@@ -270,3 +270,45 @@ type WorkQueuePracticalAdmissionTests() =
             | other -> Assert.Fail(sprintf "WQ04 future admission after C01 repair failed: %A" other)
             Assert.That((WorkQueueRoleAuthority.load b |> ok).Project.Launches.Count,
                         Is.EqualTo(2)))
+
+    [<Test>]
+    member _.CredentialIsAtomicWithPinnedAccountRoleAndSourceAndCannotDowngrade() =
+        withGitPair (fun a b accountA accountB ->
+            let selected = producedTask a b "wq04-credential-admission"
+            let first = request "Lead"
+            let launchId = first.LaunchId.ToString("D")
+            let issued = IssuedWorkCredential.Issue launchId
+            let wrong = IssuedWorkCredential.Issue launchId
+            match WorkQueuePracticalAdmission.admitExplicitWithCredential true accountA a first selected issued with
+            | ProjectAdmitted _ -> ()
+            | other -> Assert.Fail(sprintf "Credentialed WQ04 admission failed: %A" other)
+            let head, state = WorkQueueGitLedger.load b |> ok
+            let record, _ = WorkQueueGitLedger.readCredentialAt b head launchId |> ok |> Option.get
+            Assert.That(record.SecretSha256, Is.EqualTo(issued.VerifierSha256))
+            Assert.That(record.AccountTokenId, Is.EqualTo(first.AdmissionOperationId.ToString("D")))
+            Assert.That(state.Launches.[launchId].Credit, Is.EqualTo(Some selected.WorkId))
+            let receipt = LedgerStore.getOperationAt b head first.AdmissionOperationId |> ok |> Option.get
+            let expectedPaths : string array =
+                [| WorkQueueGitLedger.RecordPath
+                   WorkQueueGitLedger.admissionPath launchId
+                   WorkQueueGitLedger.credentialPath launchId
+                   WorkQueueRoleAuthority.roleAdmissionPath launchId |]
+            Assert.That(receipt.Paths = expectedPaths, Is.True)
+            let credentialBody, _ = LedgerStore.readAt b head (WorkQueueGitLedger.credentialPath launchId) |> ok
+            Assert.That(credentialBody.Value, Does.Not.Contain(issued.RevealForPrivateDelivery()))
+            match WorkQueuePracticalAdmission.admitExplicitWithCredential true accountB b first selected issued with
+            | ProjectAdmitted _ -> ()
+            | other -> Assert.Fail(sprintf "Exact credential admission replay failed: %A" other)
+            match WorkQueuePracticalAdmission.admitExplicit true accountA a first selected with
+            | TokenRetained _ -> ()
+            | other -> Assert.Fail(sprintf "Legacy admission should not replay credentialed launch: %A" other)
+            match WorkQueuePracticalAdmission.admitExplicitWithCredential true accountA a first selected wrong with
+            | TokenRetained _ -> ()
+            | other -> Assert.Fail(sprintf "Reissued credential should not replay original launch: %A" other)
+            currentProjectMutation a (Guid.NewGuid()) (DispatchOnce(launchId, DispatchState.Submitted))
+            |> ignore
+            let _, dispatched = WorkQueueGitLedger.load b |> ok
+            match WorkQueueGitLedger.executeInertFixtureAt b "legacy" (Guid.NewGuid())
+                    dispatched.Version 110L (InitializeAgent(launchId, "stolen-legacy-session")) with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Legacy registration bypassed Work credential: %A" other))

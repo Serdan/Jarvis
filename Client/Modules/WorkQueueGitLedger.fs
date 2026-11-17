@@ -802,7 +802,15 @@ module WorkQueueGitLedger =
             && (match work.Gate with
                 | GateState.CompositionHold (unitId, specVersion) ->
                     nonBlank unitId && specVersion > 0
-                    && work.Kind = WorkKind.Planning
+                    && (match work.Kind, work.QueueId with
+                        | WorkKind.Planning, "planning" -> true
+                        // Original WQ04 review and integration stages use the
+                        // same immutable graph gate, not just planning stages.
+                        // Other queue kinds cannot inherit this hold.
+                        | WorkKind.FrozenReview, "review"
+                        | WorkKind.Integration, "integration" ->
+                            work.Id.StartsWith("wq04-", StringComparison.Ordinal)
+                        | _ -> false)
                     && work.State = WorkState.Blocked
                     && work.SourceLineage.IsNone && work.Push.IsNone
                 | GateState.SourceRecoveryBlocked reason ->

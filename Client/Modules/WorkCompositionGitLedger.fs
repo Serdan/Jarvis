@@ -389,7 +389,18 @@ module WorkCompositionGitLedger =
                         view.Units
                         |> Map.exists (fun _ unit -> unit.Spec.LinkedTaskId = Some subject)
                     let revocation (stage: WorkStage) = result {
-                        if stage.Kind <> WorkKind.Planning || stage.QueueId <> "planning" then
+                        // All original WQ04 stage kinds share the immutable
+                        // composition binding, not just Planning.
+                        let originalQueue =
+                            match stage.Kind, stage.QueueId with
+                            | WorkKind.Planning, "planning" -> true
+                            // Other review/integration sources cannot acquire
+                            // original WQ04 graph authority by task name.
+                            | WorkKind.FrozenReview, "review"
+                            | WorkKind.Integration, "integration" ->
+                                stage.Id.StartsWith("wq04-", StringComparison.Ordinal)
+                            | _ -> false
+                        if not originalQueue then
                             return false, None
                         else
                             let oldLink = linkedIn graph stage.SubjectId

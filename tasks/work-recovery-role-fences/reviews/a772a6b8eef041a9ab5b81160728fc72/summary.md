@@ -1,1 +1,14 @@
-G0 pure recovery model and typed queue; focused hermetic NUnit recovery cases, full .NET 11 Release Server.Tests 316/316, commit a7a835a85ff79667e54fed0ccc17e75dd4de2a21. Inspect account/project gap seals, STOP, scoped release and proof binding, journals, duplicate operations, deterministic output. No live cutover.
+# Reviewer 2 — Changes requested (G0 pure Recovery)
+
+**Exact frozen source:** `a7a835a85ff79667e54fed0ccc17e75dd4de2a21`; base `7712bc547c264873036975e30194da03a05cc0ba`, target `refs/heads/main`. Four-file diff adds `Server/WorkRecovery.fs` and focused tests, without changing existing live Scheduler, restore or host code. This is a **pure/default-off G0** review; G1 restore/Scheduler integration and production rollout are separate gates.
+
+**Independent evidence:** Reviewed complete 528-line Recovery module and complete 385-line tests in the exact clean registered worktree `work-recovery-role-fences-w12-20261117`. Local .NET 11 Release focused Recovery NUnit **15/15 passed**; independent full `dotnet test Server.Tests/Server.Tests.fsproj -c Release --no-restore` **316/316 passed**, zero skipped. No live restore, host restart, Scheduler launch, Codex, GitHub Actions or source changes.
+
+**Blocking correctness findings:**
+
+1. [P1 Stale-generation accepted review/integration replay](findings/stale-review-generation-replay.md). The typed accepted `FrozenReviewProof` and `IntegrationProof` have no original stage/Work-generation or role/graph lineage. Genuine receipts from a prior generation can authorize the current generation whenever the Git SHA remains unchanged. Require generation-bound original proof/authorization and tests covering same-SHA, different-generation cases.
+2. [P1 Release authorization does not bind proof payload](findings/release-proof-payload-binding.md). `ReleaseAuthorization.EvidenceReceipts` is a set of receipt ID strings only; changing verified source SHA/repository/ref or integration target/commit while retaining receipt IDs leaves an existing authorization valid. Require immutable content-addressed proof provenance (or another authoritative versioned receipt-content mapping), bound in the final release CAS, plus negative regression tests changing material proof fields with unchanged IDs.
+
+The current model correctly fails closed for many exercised unknown/STOP/gap cases, but tests do not exercise these stale-approval and receipt-content substitution cases. The pure model must not convert legitimate *historical* positive evidence into current authorization. After correction, submit a new exact frozen review and independently rerun .NET11 Release. Do not treat this verdict as permission for G1 wiring, production restore, or G6 cutover.
+
+**Submitted scope before review:** G0 pure recovery model and typed queue; focused hermetic NUnit recovery cases, full .NET 11 Release Server.Tests 316/316, commit a7a835a85ff79667e54fed0ccc17e75dd4de2a21. Inspect account/project gap seals, STOP, scoped release and proof binding, journals, duplicate operations, deterministic output. No live cutover.

@@ -943,6 +943,52 @@ type LegacyWriterProtocolFenceTests() =
             Assert.That((OriginalGitWriterAdmissionJournal.inspect pathB |> success).HighWater,
                         Is.EqualTo(0L)))
 
+    [<TestCase(false)>]
+    [<TestCase(true)>]
+    member _.StoppedHostCannotPublishAfterSameIdRollbackOrWholeBindingRootLoss(deleteRoot: bool) =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "stopped-writer.db")
+            let backup = Path.Combine(f.Root, "pre-stop-writer.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            AccountCapacityLedger.setCapacity f.AccountOne (Guid.NewGuid()) "Operator" 1L 4
+            |> success |> ignore
+            // This backup has the same journal_identity UUID and closed=0.
+            File.Copy(path, backup)
+            let before = AccountCapacityLedger.fetch f.AccountTwo |> success
+            let accountHead =
+                git f.Root [ "--git-dir=" + f.AccountRemote; "rev-parse"; AccountCapacityLedger.AccountRef ]
+            let projectHead =
+                git f.Root [ "--git-dir=" + f.ProjectRemote; "rev-parse"; "refs/heads/jarvis-orchestration" ]
+            OriginalGitWriterAdmissionJournal.stop path |> success |> ignore
+            if deleteRoot then
+                Directory.Delete(Path.Combine(f.Root, "original-writer-host-binding"), true)
+                Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, null)
+            else
+                File.Copy(backup, path, true)
+                // A stale same-UUID journal must also not produce a trustworthy STOP witness.
+                Assert.That(OriginalGitWriterAdmissionJournal.inspect path |> Result.isError, Is.True)
+            let mode = if deleteRoot then "whole host-binding root loss" else "same-UUID pre-STOP rollback"
+            Assert.That(
+                AccountCapacityLedger.setCapacity f.AccountTwo (Guid.NewGuid()) "Operator"
+                    before.State.StateVersion 5 |> Result.isError, Is.True,
+                mode + ": account original Git writer must remain stopped")
+            let operation =
+                { OperationId = Guid.NewGuid(); Actor = "Operator"
+                  Kind = "RollbackOrRootLossProject"; RequestJson = "{}" }
+            Assert.That(
+                LedgerStore.transact f.ProjectTwo operation (fun _ ->
+                    Ok [ { Path = "records/stop-rollback-denied.json"
+                           ExpectedBlobOid = None; Content = "{}" } ])
+                |> Result.isError, Is.True,
+                mode + ": project original Git writer must remain stopped")
+            Assert.That(
+                git f.Root [ "--git-dir=" + f.AccountRemote; "rev-parse"; AccountCapacityLedger.AccountRef ],
+                Is.EqualTo(accountHead), mode + ": no remote account ref change")
+            Assert.That(
+                git f.Root [ "--git-dir=" + f.ProjectRemote; "rev-parse"; "refs/heads/jarvis-orchestration" ],
+                Is.EqualTo(projectHead), mode + ": no remote project ref change"))
+
     [<Test>]
     member _.JournalConfiguredBeforeActualProjectAndAccountInitializationFencesBothAfterStop() =
         withFixture (fun f ->

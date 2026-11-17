@@ -226,6 +226,64 @@ module OriginalGitWriterAdmissionJournal =
     let private bindingText path identity =
         String.concat "\n" ["OriginalWriterHostBinding/v1"; path; identity]
 
+    // This host-owned authority is deliberately OUTSIDE the binding directory.
+    // Removal of the whole binding directory cannot turn an activated host
+    // back into a never-activated, default-off original Git publisher.
+    let private hostStateFile (root: string) =
+        Path.Combine(Path.GetDirectoryName root, "original-git-writer-host-state")
+
+    let private hostStateText path identity stopped epoch highWater =
+        String.concat "\n"
+            [ "OriginalWriterHostState/v1"; path; identity
+              (if stopped then "Stopped" else "Open")
+              string epoch; string highWater ]
+
+    let private readHostState stateFile =
+        if not (File.Exists stateFile) then Ok None
+        elif not (protectedFile stateFile) then
+            Error "OriginalWriterJournalUnknown/HostStateMissingOrInsecure"
+        else
+            try
+                let fields = File.ReadAllText(stateFile).Split('\n')
+                if fields.Length <> 6 || fields.[0] <> "OriginalWriterHostState/v1"
+                   || not (Path.IsPathFullyQualified fields.[1])
+                   || (fields.[3] <> "Open" && fields.[3] <> "Stopped") then
+                    Error "OriginalWriterJournalUnknown/HostStateMalformed"
+                else
+                    let epochOk, epoch = Int64.TryParse fields.[4]
+                    let highWaterOk, highWater = Int64.TryParse fields.[5]
+                    if not epochOk || not highWaterOk || epoch < 1L || highWater < 0L then
+                        Error "OriginalWriterJournalUnknown/HostStateWatermarkInvalid"
+                    else
+                        Ok(Some(fields.[1], fields.[2], fields.[3] = "Stopped", epoch, highWater))
+            with _ -> Error "OriginalWriterJournalUnknown/HostStateUnreadable"
+
+    let private requireBoundState root path identity =
+        match readHostState (hostStateFile root) with
+        | Ok(Some(pinned, journalIdentity, stopped, epoch, highWater))
+            when pinned = path && journalIdentity = identity ->
+            Ok(stopped, epoch, highWater)
+        | Ok _ -> Error "OriginalWriterJournalUnknown/HostStateMissingOrChanged"
+        | Error reason -> Error reason
+
+    let private updateHostStateAtomically stateFile content =
+        // The old record remains intact until a same-filesystem durable rename.
+        // Crash after this STOP rename but before closing SQLite must deny
+        // admission and require Recovery, never re-open the old Git writer.
+        let temporary = stateFile + "." + Guid.NewGuid().ToString("N") + ".tmp"
+        try
+            createProtected temporary content
+            File.Move(temporary, stateFile, true)
+            syncParent stateFile
+        finally
+            if File.Exists temporary then File.Delete temporary
+
+    let private readJournalIdentity (db: SqliteConnection) (tx: SqliteTransaction) =
+        use cmd = command db tx "SELECT journal_id FROM journal_identity WHERE id=1" []
+        let value = cmd.ExecuteScalar()
+        if isNull value then invalidOp "OriginalWriterJournalUnknown/JournalIdentityUnavailable"
+        string value
+
     let private readHostBinding path seal =
         if not (protectedFile path && protectedFile seal) then
             Error "OriginalWriterJournalUnknown/HostBindingMissingOrInsecure"
@@ -269,22 +327,35 @@ module OriginalGitWriterAdmissionJournal =
             let root = boundRoot()
             let binding = Path.Combine(root, "journal.binding")
             let seal = Path.Combine(root, "journal.binding.sha256")
+            let state = hostStateFile root
             match hostRootState root with
             | Error reason -> Error reason
             | Ok rootExists when rootExists && (File.Exists binding || File.Exists seal) ->
                 match readHostBinding binding seal with
                 | Error reason -> Error reason
-                | Ok pinned when String.IsNullOrWhiteSpace requested ->
-                    Error "OriginalWriterJournalUnknown/ActivatedHostBindingMissing"
-                | Ok pinned when requested <> pinned ->
-                    Error "OriginalWriterJournalUnknown/ActivatedHostBindingChanged"
-                | Ok pinned -> Ok(Some pinned)
+                | Ok pinned ->
+                    match journalId pinned with
+                    | None -> Error "OriginalWriterJournalUnknown/JournalIdentityUnavailable"
+                    | Some identity ->
+                        match requireBoundState root pinned identity with
+                        | Error reason -> Error reason
+                        | Ok(_, epoch, _) when epoch <> 1L ->
+                            Error "OriginalWriterJournalUnknown/HostStateEpochMismatch"
+                        | Ok _ when String.IsNullOrWhiteSpace requested ->
+                            Error "OriginalWriterJournalUnknown/ActivatedHostBindingMissing"
+                        | Ok _ when requested <> pinned ->
+                            Error "OriginalWriterJournalUnknown/ActivatedHostBindingChanged"
+                        | Ok _ -> Ok(Some pinned)
             | Ok true ->
-                // The host-specific root is only created on enrollment. Even
-                // deletion of BOTH binding files must not revert to default-off.
+                // Root exists but its original binding was removed or incomplete.
                 Error "OriginalWriterJournalUnknown/ActivatedHostBindingDeleted"
+            | Ok false when File.Exists state || Directory.Exists state ->
+                // Host authority lives outside the removed binding directory.
+                // Neither root loss nor environment loss grants direct-push fallback.
+                Error "OriginalWriterJournalUnknown/ActivatedHostBindingRootDeleted"
             | Ok false when String.IsNullOrWhiteSpace requested ->
-                // Truly never activated: retain existing default-off behavior.
+                // Genuine preactivation only; absence of all local authority after
+                // host storage loss is unprovable and requires operator Recovery.
                 Ok None
             | Ok false when not (safeJournalPath requested) ->
                 Error "OriginalWriterJournalUnknown/UntrustedOrMissingJournal"
@@ -292,21 +363,28 @@ module OriginalGitWriterAdmissionJournal =
                 match journalId requested with
                 | None -> Error "OriginalWriterJournalUnknown/JournalIdentityUnavailable"
                 | Some identity ->
-                    // A fixed host-owned anchor, not a dynamically selected
-                    // environment-variable path after activation.
-                    Directory.CreateDirectory root |> ignore
-                    if not (OperatingSystem.IsWindows()) then
-                        File.SetUnixFileMode(root,
-                            UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
-                    if not (noRedirects root) then
-                        Error "OriginalWriterJournalUnknown/UntrustedHostBindingRoot"
+                    // First persist independent host authority; interrupted
+                    // enrollment then fails closed instead of returning default-off.
+                    let parent = Path.GetDirectoryName root
+                    Directory.CreateDirectory parent |> ignore
+                    if not (noRedirects parent) then
+                        Error "OriginalWriterJournalUnknown/UntrustedHostAuthorityParent"
                     else
-                        let contents = bindingText requested identity
-                        createProtected binding contents
-                        syncParent binding
-                        createProtected seal (digest contents)
-                        syncParent seal
-                        Ok(Some requested)
+                        createProtected state (hostStateText requested identity false 1L 0L)
+                        syncParent state
+                        Directory.CreateDirectory root |> ignore
+                        if not (OperatingSystem.IsWindows()) then
+                            File.SetUnixFileMode(root,
+                                UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+                        if not (noRedirects root) then
+                            Error "OriginalWriterJournalUnknown/UntrustedHostBindingRoot"
+                        else
+                            let contents = bindingText requested identity
+                            createProtected binding contents
+                            syncParent binding
+                            createProtected seal (digest contents)
+                            syncParent seal
+                            Ok(Some requested)
         with _ -> Error "OriginalWriterJournalUnknown/HostBindingUnavailable"
 
     let private validateIntent (operationId: Guid) (kind: string) (authority: string) (gitRef: string) (payload: string) =
@@ -332,6 +410,13 @@ module OriginalGitWriterAdmissionJournal =
                     let key = digest (String.concat "\n" [operationId.ToString("D"); kind; authority; gitRef])
                     inTransaction path (fun db tx ->
                         let epoch, closed = readControl db tx
+                        // SQLite's write transaction serializes this check with
+                        // STOP's durable external watermark before any admission.
+                        match requireBoundState (boundRoot()) path (readJournalIdentity db tx) with
+                        | Ok(false, authorityEpoch, 0L) when authorityEpoch = epoch -> ()
+                        | Ok(true, _, _) -> invalidOp "OriginalWriterAdmissionClosed"
+                        | Ok _ -> invalidOp "OriginalWriterJournalUnknown/HostStateEpochMismatch"
+                        | Error reason -> invalidOp reason
                         if closed then Error "OriginalWriterAdmissionClosed"
                         else
                             use read =
@@ -365,7 +450,10 @@ module OriginalGitWriterAdmissionJournal =
                                 let sequence = Convert.ToInt64(seqCommand.ExecuteScalar())
                                 Ok(Some {DatabasePath=path; EffectKey=key; Sequence=sequence;
                                          Epoch=epoch; Replay=false}))
-                with _ -> Error "OriginalWriterJournalUnknown/AdmissionNotDurable"
+                with
+                | :? InvalidOperationException as ex when ex.Message.StartsWith("OriginalWriter") ->
+                    Error ex.Message
+                | _ -> Error "OriginalWriterJournalUnknown/AdmissionNotDurable"
 
     let internal markAttempt permit =
         if permit.Replay then Error "OriginalWriterJournalUnknown/ReplayMayNotRepublish"
@@ -405,6 +493,23 @@ module OriginalGitWriterAdmissionJournal =
                 let epoch, closed = readControl db tx
                 use maxCmd = command db tx "SELECT COALESCE(MAX(sequence),0) FROM effects" []
                 let highWater = Convert.ToInt64(maxCmd.ExecuteScalar())
+                // A witness from restored SQLite cannot override independently
+                // durable host STOP authority or its settled-effect high-water.
+                match readHostState (hostStateFile (boundRoot())) with
+                | Error reason -> invalidOp reason
+                | Ok(Some(pinned, identity, stopped, authorityEpoch, authorityHighWater))
+                    when pinned = path ->
+                    if identity <> readJournalIdentity db tx
+                       || authorityEpoch <> epoch || stopped <> closed
+                       || highWater < authorityHighWater then
+                        invalidOp "OriginalWriterJournalUnknown/StopWatermarkRollback"
+                | Ok None ->
+                    match hostRootState (boundRoot()) with
+                    | Ok true ->
+                        invalidOp "OriginalWriterJournalUnknown/HostStateMissingOrChanged"
+                    | Error reason -> invalidOp reason
+                    | Ok false -> () // Unactivated disposable journal.
+                | _ -> () // Another isolated unactivated journal on this host.
                 use cmd =
                     command db tx
                         """SELECT sequence,effect_key,kind,authority_sha256,git_ref,status
@@ -431,7 +536,20 @@ module OriginalGitWriterAdmissionJournal =
     let internal stop path =
         try
             inTransaction path (fun db tx ->
-                let epoch, _ = readControl db tx
+                let epoch, alreadyClosed = readControl db tx
+                let identity = readJournalIdentity db tx
+                use highWaterCmd = command db tx "SELECT COALESCE(MAX(sequence),0) FROM effects" []
+                let highWater = Convert.ToInt64(highWaterCmd.ExecuteScalar())
+                match requireBoundState (boundRoot()) path identity with
+                | Ok(false, authorityEpoch, 0L) when not alreadyClosed && authorityEpoch = epoch ->
+                    // STOP is durable BEFORE updating the journal control row.
+                    // An interrupted transaction therefore fails closed.
+                    updateHostStateAtomically (hostStateFile (boundRoot()))
+                        (hostStateText path identity true epoch highWater)
+                | Ok(true, authorityEpoch, authorityHighWater)
+                    when alreadyClosed && authorityEpoch = epoch && highWater >= authorityHighWater ->
+                    () // Idempotent already-stopped journal and same monotonic authority.
+                | _ -> invalidOp "OriginalWriterJournalUnknown/StopAuthorityMismatch"
                 use cmd = command db tx "UPDATE control SET closed=1 WHERE id=1 AND epoch=$epoch"
                                     ["$epoch",box epoch]
                 if cmd.ExecuteNonQuery() <> 1 then

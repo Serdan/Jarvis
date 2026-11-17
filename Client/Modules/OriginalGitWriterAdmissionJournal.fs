@@ -31,6 +31,7 @@ type OriginalWriterJournalWitness =
     { Epoch: int64
       AdmissionClosed: bool
       HighWater: int64
+      SettledHighWater: int64
       PendingOrUnknown: OriginalWriterEffect list
       AllRecordedEffectsSettled: bool
       // Explicitly cannot be inferred from journal rows themselves.
@@ -278,9 +279,15 @@ module OriginalGitWriterAdmissionJournal =
                     pending <- {Sequence=reader.GetInt64 0; EffectKey=reader.GetString 1;
                                 Kind=reader.GetString 2; AuthoritySha256=reader.GetString 3;
                                 GitRef=reader.GetString 4; Status=reader.GetString 5} :: pending
+                let unresolved = List.rev pending
+                let settledHighWater =
+                    match unresolved with
+                    | [] -> highWater
+                    | first :: _ -> max 0L (first.Sequence - 1L)
                 Ok {Epoch=epoch; AdmissionClosed=closed; HighWater=highWater;
-                    PendingOrUnknown=List.rev pending;
-                    AllRecordedEffectsSettled=List.isEmpty pending;
+                    SettledHighWater=settledHighWater;
+                    PendingOrUnknown=unresolved;
+                    AllRecordedEffectsSettled=List.isEmpty unresolved;
                     RouteCoverageProven=false})
         with _ -> Error "OriginalWriterJournalUnknown/UnverifiableJournal"
 
@@ -294,3 +301,52 @@ module OriginalGitWriterAdmissionJournal =
                     invalidOp "Cannot close original-writer admission epoch.")
             inspect path
         with _ -> Error "OriginalWriterJournalUnknown/StopNotDurable"
+
+
+    // An irreversible remote publisher must acquire this admission BEFORE
+    // invoking Git, and its caller must verify the durable remote effect before
+    // reporting success. Failed/uncertain confirmation remains UNKNOWN across
+    // process restarts, including when STOP races an already-admitted push.
+    // A settled duplicate is never a permit to publish again.
+    let internal withPublication operationId kind authority gitRef payload
+                                 (publish: unit -> Result<'a, 'error>)
+                                 (verified: 'a -> bool)
+                                 (failure: string -> 'error) : Result<'a, 'error> =
+        match admit operationId kind authority gitRef payload with
+        | Error reason -> Error(failure reason)
+        | Ok None -> publish() // Default-off preserves existing Git behavior.
+        | Ok(Some permit) when permit.Replay ->
+            Error(failure "OriginalWriterJournalUnknown/SettledReplayMustUseCanonicalReceipt")
+        | Ok(Some permit) ->
+            match markAttempt permit with
+            | Error reason -> Error(failure reason)
+            | Ok () ->
+                try
+                    match publish() with
+                    | Ok result when verified result ->
+                        match settle permit true true with
+                        | Ok () -> Ok result
+                        | Error reason -> Error(failure reason)
+                    | Ok _ ->
+                        match settle permit false true with
+                        | Ok () -> Error(failure "OriginalWriterJournalUnknown/PublicationUnverified")
+                        | Error reason -> Error(failure reason)
+                    | Error originalError ->
+                        match settle permit false true with
+                        | Ok () -> Error originalError
+                        | Error reason -> Error(failure reason)
+                with _ ->
+                    settle permit false true |> ignore
+                    reraise()
+
+    // Identity is the logical remote authority, not an interchangeable local
+    // clone path or a caller-asserted actor name. Scope and ref are both bound.
+    let internal authoritySha256 (parts: string list) =
+        digest (String.concat "\\n" parts)
+
+    // Immutable source refs and initialization have no caller UUID. Their
+    // canonical ref and content deterministically identify one publication.
+    let internal deterministicOperationId kind gitRef payload =
+        SHA256.HashData(Encoding.UTF8.GetBytes(String.concat "\n" [ kind; gitRef; payload ]))
+        |> Array.take 16
+        |> Guid

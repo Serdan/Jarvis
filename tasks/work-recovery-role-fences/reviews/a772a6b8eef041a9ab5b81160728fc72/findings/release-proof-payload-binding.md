@@ -1,0 +1,10 @@
+# P1 — Recovery release does not bind the contents of verified proof
+
+**Frozen source:** `a7a835a85ff79667e54fed0ccc17e75dd4de2a21`
+**Paths:** `Server/WorkRecovery.fs:220-237,291-332,350-407,409-444`; test `Server.Tests/WorkRecoveryTests.fs:237-252`.
+
+`ReleaseAuthorization.EvidenceReceipts` is compared exactly to a set of **receipt ID strings**, but those strings do not include the pinned Git source/review/integration artifact identity, target ref, original job generation/result, or a hash of the verified proof. `sourceReceipt` is `"source:" + source.ReceiptId`; review and integration are analogous. The comments promise an exact proof-change fence, yet a proof can change in material ways without changing its emitted receipt set.
+
+**Counterexample:** Authorize a `WorkSnapshot` with `Goal=SourceProduced`, verified source at `SourceSha=A`, `RepositoryId=R1`, `SourceRef=refs/heads/x`, `ReceiptId=source-verified`, Work generation 2, and all required gap/STOP seals. Then change `SourceSha` to another well-formed SHA `B` (or repository/ref to `R2`/`refs/heads/y`), keep the same source receipt ID and `ReachabilityVerified=true`, and do not alter WorkVersion/Generation. `sourceReceipt` remains the same string; all prerequisites stay empty; the *old* `ReleaseAuthorization` still returns `ReleaseAuthorized=true`. The same issue applies to a changed `IntegrationProof.IntegratedSha` or target ref using the same receipt ID, with the rest of the input kept consistent.
+
+The future adapter must authenticate immutable receipts; nevertheless the G0 pure versioned boundary explicitly promises to invalidate stale authorization after proof changes. Bind the authorization to a deterministic digest of the exact typed proof (including immutable origin and content, target ref, SHA, source and generation), or use a versioned immutable canonical proof identity whose mapping cannot change, and verify it in the same release CAS. Add negative tests changing each material source/integration field **without changing the receipt ID**; current `scoped_release_is_bound...` tests only change version/generation or the receipt ID itself.

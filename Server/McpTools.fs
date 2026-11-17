@@ -102,6 +102,17 @@ module private WorkQueueCommands =
               WorkId = workId; ExpectedProjectVersion = expectedProjectVersion
               ClaimGeneration = claimGeneration; EvidenceSha256 = evidenceSha256 }
 
+    let priority (http: IHttpContextAccessor) project operationId workId
+                 expectedProjectVersion priority reason =
+        WorkPriorityCommand
+            { ProjectName = project
+              ActorId = OperatorConversationCommands.actor http
+              OperationId = operationId
+              WorkId = workId
+              ExpectedProjectVersion = expectedProjectVersion
+              Priority = priority
+              Reason = reason }
+
 module private TaskCommands =
     // Compatibility wire value for administrative calls lacking a caller field.
     // This is NOT the audit actor. The local TaskApi resolves provenance from
@@ -393,7 +404,9 @@ module McpToolHelpers =
           for name in [ "ListWork"; "GetWork" ] ->
               fromWire "WorkQueueRead" name
           for name in [ "ConnectWork"; "ClaimNextWork"; "CheckpointWork"; "CompleteWork" ] ->
-              fromWire "WorkQueueWrite" name ]
+              fromWire "WorkQueueWrite" name
+          for name in [ "SetWorkPriority" ] ->
+              fromWire "WorkPriority" name ]
 
     let mcpListCommandsResult : ListCommandsResult =
         { ProtocolVersion = AgentProtocol.version
@@ -407,7 +420,8 @@ module McpToolHelpers =
                  && capability.Name <> "OperatorConversationRead"
                  && capability.Name <> "OperatorConversationWrite"
                  && capability.Name <> "WorkQueueRead"
-                 && capability.Name <> "WorkQueueWrite"))
+                 && capability.Name <> "WorkQueueWrite"
+                 && capability.Name <> "WorkPriority"))
             @ ledgerAliasCapabilities
             @ [ serverLocalCapability
                     "GetProfile"
@@ -671,6 +685,7 @@ module McpToolHelpers =
         | RemoveWorktreeCommand _
         | OperatorConversationWriteCommand _
         | WorkQueueWriteCommand _
+        | WorkPriorityCommand _
         | TaskWriteCommand _
         | CrossProjectNotificationCommand _
         | ChallengeWriteCommand _
@@ -802,6 +817,10 @@ module McpToolHelpers =
         | WorkQueueWriteCommand cmd ->
             let id, generated = resolveOperationId cmd.OperationId
             WorkQueueWriteCommand { cmd with OperationId = id },
+            (if generated then Some id else None)
+        | WorkPriorityCommand cmd ->
+            let id, generated = resolveOperationId cmd.OperationId
+            WorkPriorityCommand { cmd with OperationId = id },
             (if generated then Some id else None)
         | TaskWriteCommand cmd ->
             let id, generated = resolveOperationId cmd.OperationId
@@ -2934,6 +2953,20 @@ type JarvisMcpTools =
     ) =
         McpToolHelpers.send client http
             (WorkQueueCommands.read projectName "Get" "All" workId)
+
+    [<McpServerTool(Title = "Set canonical Work priority", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("Lead/operator sets a Work priority, signed integer higher-first within each hard blocker/ordinary Ready bucket. Expected project version, UUID and audit reason are required. Git CAS only; does not launch or unblock work.")>]
+    static member SetWorkPriority(
+        projectName: string, agentId: string, workId: string,
+        expectedProjectVersion: int, priority: int, reason: string,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        McpToolHelpers.send client http
+            (WorkQueueCommands.priority http projectName operationId workId
+                expectedProjectVersion priority reason)
 
     [<McpServerTool(Title = "Connect an ephemeral Work execution (default off)", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");

@@ -21,6 +21,7 @@ type WorkRow =
       SubjectId: string
       SubjectTitle: string option
       QueueId: string
+      Priority: int
       Kind: string
       State: string
       Category: string
@@ -142,6 +143,7 @@ let private details project snapshot (row: WorkRow) status =
       "Project: " + project + " | canonical project ID: " + snapshot.ProjectId
       "Subject: " + (row.SubjectTitle |> Option.defaultValue row.SubjectId) + " [" + row.SubjectId + "]"
       "Queue: " + row.QueueId + " | kind: " + row.Kind
+      sprintf "Lead priority: %d (higher first within blocker/ordinary Ready bucket)" row.Priority
       sprintf "Category: %s | readiness: %s | state: %s" row.Category status row.State
       sprintf "Work stage v%d / claim v%d / graph v%d" row.StageGeneration row.ClaimGeneration row.GraphVersion
       sprintf "Snapshot: Git %s / project v%d / graph v%d" snapshot.VerifiedGitHead snapshot.ProjectVersion snapshot.GraphVersion

@@ -22,6 +22,7 @@ let private row id category =
       SubjectId = "task-" + id
       SubjectTitle = Some("Title " + id)
       QueueId = "implementation"
+      Priority = 0
       Kind = "Implementation"
       State = category
       Category = category
@@ -289,3 +290,11 @@ let terminalFailedRefreshSuppressesLastGoodGitDataAndShowsUnknown () =
     Assert.That(broken.Error, Is.EqualTo(Some "Git ledger unbound"))
     Assert.That(broken.Lines |> List.exists (fun line -> line.Contains("UNKNOWN")), Is.True)
     Assert.That(broken.Lines |> List.exists (fun line -> line.Contains("ready")), Is.False)
+
+
+[<Test>]
+let leadPriorityDisplayedInWorkDetailsWithoutGrantingClaimAuthority () =
+    let prioritized = { row "priority" "Available" with Priority = 21 }
+    let displayed = allRows [source "One" "proj-one" "Verified" [prioritized]] |> List.head
+    Assert.That(displayed.Details |> String.concat "\n", Does.Contain("Lead priority: 21"))
+    Assert.That(displayed.Status, Does.StartWith("NotReady"))

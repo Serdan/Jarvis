@@ -124,6 +124,7 @@ let private fixture action =
               WorkId = work.Id; WorkGeneration = work.StageGeneration
               QueueId = work.QueueId; AvailableAt = work.AvailableAt
               AvailableSequence = work.AvailableSequence
+              Priority = Contracts.priorityOf view.Project work.Id
               BlocksOtherWork = false
               RoleId = req.RoleId; RoleVersion = req.RoleVersion
               CatalogBlobOid = view.Proof.CatalogBlobOid

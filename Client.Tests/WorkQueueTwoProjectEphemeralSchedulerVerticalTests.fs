@@ -249,6 +249,7 @@ let private candidate (project: LedgerBinding) (original: DurablePlanningLaunchI
       WorkId = original.WorkId; WorkGeneration = original.WorkGeneration
       QueueId = stage.QueueId; AvailableAt = stage.AvailableAt
       AvailableSequence = stage.AvailableSequence
+      Priority = Contracts.priorityOf view.Project stage.Id
       BlocksOtherWork = view.Project.Works |> Map.exists (fun _ w ->
           w.Dependencies.Contains original.WorkId
           && w.State <> WorkState.Completed)

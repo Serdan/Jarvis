@@ -152,6 +152,7 @@ let private candidate binding (req: AccountAdmissionRequest) (originalId: Guid) 
           WorkId = work.Id; WorkGeneration = work.StageGeneration
           QueueId = work.QueueId; AvailableAt = work.AvailableAt
           AvailableSequence = work.AvailableSequence
+          Priority = Contracts.priorityOf view.Project work.Id
           BlocksOtherWork =
               view.Project.Works |> Map.exists (fun _ other ->
                   other.Dependencies.Contains work.Id

@@ -235,6 +235,7 @@ type WorkMutation =
     | CompleteMessage of launchId: string * workId: string * messageId: string * handlerGeneration: int * replyId: string
     | ClaimAncillary of launchId: string * messageId: string
     | CompleteAncillary of launchId: string * messageId: string * handlerGeneration: int * replyId: string
+    | AssignPriority of workId: string * priority: int * reason: string
     | SetHardPrerequisite of workId: string * prerequisite: string
     | RemoveHardPrerequisite of workId: string * prerequisite: string
     | CancelUnclaimed of workId: string * reason: string
@@ -772,6 +773,13 @@ module WorkQueueGitLedger =
         && state.Receipts |> Map.forall (fun operationId payload ->
             match payload with
             | ProjectOperationPayload.SourceHandoff checkpoint -> validRecordedHandoff operationId checkpoint
+            | ProjectOperationPayload.AssignPriority decision ->
+                state.Works.ContainsKey decision.WorkId
+                && decision.ProjectVersion > 0
+                && decision.ProjectVersion <= state.Version
+                && not (String.IsNullOrWhiteSpace decision.Reason)
+                && decision.Reason.Length <= 1024
+                && decision.Reason = decision.Reason.Trim()
             | _ -> true)
         && state.GraphVersion >= 0
         && state.NextAvailability >= 0L
@@ -1179,6 +1187,7 @@ module WorkQueueGitLedger =
         | StopStalled _
         | CancelUnclaimed _
         | MarkSourceRecoveryBlocked _
+        | AssignPriority _
         | ProduceEvent _ -> false // ProduceEvent has its own unconditional hold.
         | _ -> true
 
@@ -1314,6 +1323,8 @@ module WorkQueueGitLedger =
                             Contracts.claimAncillaryMessage expectedVersion op launch message state
                         | CompleteAncillary (launch, message, generation, reply) ->
                             Contracts.completeAncillaryMessage expectedVersion op launch message generation reply now state
+                        | AssignPriority (work, priority, reason) ->
+                            Contracts.assignPriority expectedVersion op work priority reason state
                         | SetHardPrerequisite (work, prerequisite) ->
                             Contracts.setHardPrerequisite expectedVersion op work prerequisite now state
                         | RemoveHardPrerequisite (work, prerequisite) ->
@@ -1448,6 +1459,12 @@ module WorkQueueGitLedger =
         | Ok _, Some shouldDrop when shouldDrop operationId ->
             Error(OutcomeUnknown $"Injected lost WQ-02 post-publication acknowledgement {operationId:D}.")
         | _ -> result
+
+    // OAuth-authenticated operator endpoint only. The original WQ02 project
+    // Git CAS is both the priority state and the durable audit receipt.
+    let setPriority binding actor operationId expectedVersion workId priority reason =
+        execute binding actor operationId expectedVersion
+            (AssignPriority(workId, priority, reason))
 
     // Default-off WQ04/WQ07 admission boundary. The only transition this seam
     // can publish is a project launch with both immutable original WQ02 and

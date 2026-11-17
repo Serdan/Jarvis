@@ -207,6 +207,11 @@ let private requiresConfirmation command =
              else [ VersionControlWrite; NetworkAccess ]) [] (Some "git")
             [ cmd.SubjectKind; cmd.SubjectId; cmd.OperationId ]
             ("Explicit operator conversation " + cmd.Action + " (manual Git CAS)") false
+    | WorkPriorityCommand cmd ->
+        confirmation "SetWorkPriority" (Some cmd.ProjectName)
+            [ VersionControlWrite; NetworkAccess ] [] (Some "git")
+            [ cmd.WorkId; cmd.OperationId; string cmd.Priority ]
+            ("Lead/operator priority mutation at verified Work Git version") false
     | WorkQueueWriteCommand cmd ->
         confirmation ("WorkQueue" + cmd.Action) (Some cmd.ProjectName)
             [ VersionControlWrite; NetworkAccess ] [] (Some "git")

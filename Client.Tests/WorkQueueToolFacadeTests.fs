@@ -291,3 +291,29 @@ type WorkQueueToolFacadeTests() =
                       "L1" "W1" 0 1 sha with
             | Error(InvalidBinding _) -> ()
             | other -> Assert.Fail(sprintf "Invalid operation UUID must fail: %A" other))
+
+    [<Test>]
+    member _.OperatorPriorityReadbackIsVersionedAndDoesNotGrantClaim() =
+        withClones (fun a b ->
+            WorkQueueGitLedger.initialize a "Fixture" (Guid.NewGuid())
+                (Map.ofList [ "Lead", Set.singleton "planning" ]) |> success |> ignore
+            let projectId = a.ProjectId.ToString("D")
+            WorkQueueGitLedger.executeInertFixtureAt a "Fixture" (Guid.NewGuid()) 0 1000L
+                (PublishStage (stage projectId "P" [])) |> success |> ignore
+            let before = WorkQueueToolFacade.readWithBinding b "Get" "All" "P" |> success
+            Assert.That(before.Work.Head.Priority, Is.EqualTo(0))
+            let operation = Guid.NewGuid()
+            let changed = WorkQueueToolFacade.setPriorityWithBinding a actor
+                            (operation.ToString("D")) "P" before.ProjectVersion
+                            19 "Lead reprioritized" |> success
+            Assert.That(changed.Applied, Is.True)
+            Assert.That(changed.Priority, Is.EqualTo(19))
+            let fromOtherClone = WorkQueueToolFacade.readWithBinding b "Get" "All" "P" |> success
+            Assert.That(fromOtherClone.Work.Head.Priority, Is.EqualTo(19))
+            Assert.That(fromOtherClone.Work.Head.ClaimEnabled, Is.False)
+            Assert.That(fromOtherClone.Work.Head.Category, Is.EqualTo("Available"))
+            match WorkQueueToolFacade.setPriorityWithBinding b actor
+                    (Guid.NewGuid().ToString("D")) "P" before.ProjectVersion
+                    100 "Stale" with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Expected stale version: %A" other))

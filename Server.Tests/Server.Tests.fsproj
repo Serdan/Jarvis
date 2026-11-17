@@ -15,9 +15,11 @@
         <Compile Include="RoutingRetentionTests.fs"/>
         <Compile Include="McpCapacityTests.fs"/>
         <Compile Include="WorkQueueContractTests.fs"/>
+        <Compile Include="WorkRecoveryTests.fs"/>
         <Compile Include="WorkSnapshotCodecTests.fs"/>
         <Compile Include="WorkLegacyImportPreflightTests.fs"/>
         <Compile Include="WorkLegacyImportFenceTests.fs"/>
+
         <Compile Include="WorkCompositionTests.fs"/>
         <Compile Include="WorkSqliteAuthorityTests.fs"/>
         <Compile Include="WorkSchedulerSqliteTests.fs"/>

@@ -17,7 +17,9 @@
     <ItemGroup>
         <Content Include="Structure.md"/>
         <Compile Include="WorkQueueContracts.fs"/>
+        <Compile Include="WorkRecovery.fs"/>
         <Compile Include="WorkSnapshotCodec.fs"/>
+
         <Compile Include="WorkComposition.fs"/>
         <Compile Include="WorkSqliteAuthority.fs"/>
         <Compile Include="WorkProposal.fs"/>

@@ -47,6 +47,9 @@ type SqliteSchedulerError =
     | NoCapacity
     | NoEligibleWork
     | BlockedByExternalEffect
+    // A committed operation is audit evidence, not renewed authorization
+    // after a Recovery, STOP, or source-generation fence.
+    | HistoricalReceiptNotAdmission
     | Projection of WorkBlockingError
     | Storage of WorkSqliteFailure
 
@@ -403,7 +406,9 @@ module internal WorkSchedulerSqlite =
     /// E0 admission: rank globally by D, preserve existing specialist credits,
     /// then atomically reserve the account token and create the project launch.
     /// The immutable caller operationId is also the SQLite replay receipt.
-    let private reserveFresh (store: WorkSqliteAuthority) (snapshot: SqliteSchedulerSnapshot)
+    // Internal commit path; tests exercise a caller that passed its receipt
+    // preflight before a concurrent commit and Recovery fence.
+    let internal reserveFresh (store: WorkSqliteAuthority) (snapshot: SqliteSchedulerSnapshot)
                 (operationId: Guid) launchId : Result<SqliteSchedulerOutcome, SqliteSchedulerError> =
         if operationId = Guid.Empty || String.IsNullOrWhiteSpace launchId then
             fail "original operation/launch identity is missing"
@@ -486,6 +491,11 @@ module internal WorkSchedulerSqlite =
                           Capacities = [ accountMutation snapshot.Account 1 ] }
                     match store.Commit command with
                     | Error error -> Error(SqliteSchedulerError.Storage error)
+                    // Receipt preflight and Commit are distinct transactions.
+                    // SQLite can return an immutable replay receipt before
+                    // checking newer Recovery/STOP guards. Never admit it.
+                    | Ok receipt when receipt.Replayed ->
+                        Error SqliteSchedulerError.HistoricalReceiptNotAdmission
                     | Ok receipt ->
                         Ok { Receipt = receipt
                              ProjectId = p.Id; RoleId = role.Id; LaunchId = launchId
@@ -494,7 +504,7 @@ module internal WorkSchedulerSqlite =
 
     /// A registered launch gets at most one primary claim. This does NOT
     /// release account capacity or execute external effects.
-    let private claimFresh (store: WorkSqliteAuthority) (p: SqliteSchedulerProject)
+    let internal claimFresh (store: WorkSqliteAuthority) (p: SqliteSchedulerProject)
               (operationId: Guid) launchId : Result<SqliteSchedulerOutcome, SqliteSchedulerError> =
         if operationId = Guid.Empty then fail "claim operation ID missing"
         else
@@ -566,6 +576,8 @@ module internal WorkSchedulerSqlite =
                                   Capacities = [] }
                             match store.Commit command with
                             | Error error -> Error(SqliteSchedulerError.Storage error)
+                            | Ok receipt when receipt.Replayed ->
+                                Error SqliteSchedulerError.HistoricalReceiptNotAdmission
                             | Ok receipt ->
                                 Ok { Receipt = receipt
                                      ProjectId = p.Id
@@ -575,9 +587,10 @@ module internal WorkSchedulerSqlite =
                                      WorkGeneration = item.Stage.StageGeneration }
                 | _ -> fail "requires registered, unstopped, never-claimed launch"
 
-    // A retry after store reopen must resolve the original committed outcome
-    // before current eligibility, account capacity, or EverClaimed can reject it.
-    // An unrelated receipt (including a changed launch identity) fails closed.
+    // Read-only reconciliation of a committed outcome. Never treat an old
+    // receipt as fresh admission: its immutable idempotency proof says nothing
+    // about Recovery coverage, STOP, or current role/stage/source generations.
+    // Unrelated receipts and changed launch identities fail closed.
     let private replayOutcome (store: WorkSqliteAuthority) (operationId: Guid)
                               (launchId: string) (projectIds: string list)
                               (operationField: string) (workField: string)
@@ -633,7 +646,10 @@ module internal WorkSchedulerSqlite =
                     "reservationOperationId" "reservationWorkId" "reservationWorkGeneration"
                     false (Some snapshot.Account.AccountId) with
             | Error failure -> Error failure
-            | Ok(Some original) -> Ok original
+            // Historical same-UUID receipts remain available through
+            // ReadReceipt and launch provenance, but never reauthorize a
+            // launch after newer Recovery/STOP fences.
+            | Ok(Some _) -> Error SqliteSchedulerError.HistoricalReceiptNotAdmission
             | Ok None -> reserveFresh store snapshot operationId launchId
 
     let claim (store: WorkSqliteAuthority) (p: SqliteSchedulerProject)
@@ -644,5 +660,5 @@ module internal WorkSchedulerSqlite =
             match replayOutcome store operationId launchId [ p.Id ]
                     "claimOperationId" "primaryWorkId" "claimWorkGeneration" true None with
             | Error failure -> Error failure
-            | Ok(Some original) -> Ok original
+            | Ok(Some _) -> Error SqliteSchedulerError.HistoricalReceiptNotAdmission
             | Ok None -> claimFresh store p operationId launchId

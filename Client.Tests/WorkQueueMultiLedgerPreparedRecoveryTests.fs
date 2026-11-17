@@ -340,6 +340,33 @@ type WorkQueueMultiLedgerPreparedRecoveryTests() =
               Content = "{}" }
         |> ok |> ignore
 
+    // Replace with a VALID canonical WQ10 receipt through an unrelated second-
+    // clone Git CAS. Neither the original UUID nor its signed result is edited.
+    let rewriteValidPreparedReceipt project rewriteGraphVersion =
+        let snapshot = LedgerStore.fetch project.Second |> ok
+        let raw, oid =
+            LedgerStore.readAt project.Second snapshot WorkQueueProjectMigrationPrepare.ReceiptPath |> ok
+        let originalReceipt = CanonicalCodec.decode<ProjectPreparedReceipt> raw.Value
+        let changed =
+            if rewriteGraphVersion then
+                { originalReceipt with GraphVersion = originalReceipt.GraphVersion + 1 }
+            else
+                { originalReceipt with OriginalOperationRequestHashes = Map.empty }
+        let canonical = CanonicalCodec.encode changed
+        Assert.That(canonical, Is.Not.EqualTo(raw.Value))
+        LedgerStore.putRecord project.Second
+            { OperationId = Guid.NewGuid()
+              Actor = "independent valid-receipt fixture writer"
+              Path = WorkQueueProjectMigrationPrepare.ReceiptPath
+              ExpectedBlobOid = oid
+              Content = canonical }
+        |> ok |> ignore
+
+    let preparedOperationBlob project (id: Guid) =
+        let key = id.ToString("N")
+        let snapshot = LedgerStore.fetch project.Second |> ok
+        historicalBlob project.Second snapshot ("ops/" + key.Substring(0, 2) + "/" + key + ".json")
+
     let addUnrelatedAvailableStage project =
         let snapshot = LedgerStore.fetch project.Second |> ok
         let queue = WorkQueueGitLedger.loadAt project.Second snapshot |> ok
@@ -583,6 +610,39 @@ type WorkQueueMultiLedgerPreparedRecoveryTests() =
                         Is.AnyOf("RecoveryBlocked", "Unreadable"))
             Assert.That(replay.Recovery.Projects[1].ObservedHead,
                         Is.EqualTo(Some((LedgerStore.fetch f.B.Second |> ok).Commit)))
+            verifyHistorical f f.A
+            verifyHistorical f f.B)
+
+    [<TestCase(false)>]
+    [<TestCase(true)>]
+    member _.OriginalUuidReplayRejectsCanonicalReceiptRewrite(rewriteGraphVersion: bool) =
+        withFixture (fun f ->
+            let first = WorkQueueMultiLedgerPreparedRecovery.attemptOnDisposableFixture f.Plan |> succeeded
+            Assert.That(first.Failure.IsNone, Is.True)
+            let originalOperation = preparedOperationBlob f.B f.Plan.Projects[1].OriginalOperationId
+            rewriteValidPreparedReceipt f.B rewriteGraphVersion
+            // The independent mutation remains fully canonical and passes the
+            // narrower WQ02 conversion reader; only original CAS proof rejects it.
+            match WorkQueueProjectMigrationPrepare.inspect f.B.Second f.AccountB |> ok with
+            | ProjectPreparedInspection.ProjectOnly _ -> ()
+            | other -> Assert.Fail(sprintf "Valid independent receipt rewrite was not canonical: %A" other)
+            let afterMutation = remoteHeads f
+            let replay =
+                WorkQueueMultiLedgerPreparedRecovery.attemptOnDisposableFixture (otherClones f) |> succeeded
+            Assert.That(replay.AccountWrite.Value.AlreadyApplied, Is.True)
+            Assert.That(replay.ProjectWrites.Count, Is.EqualTo(2))
+            Assert.That(replay.ProjectWrites |> Map.forall (fun _ op -> op.AlreadyApplied), Is.True)
+            Assert.That(replay.Failure.IsSome, Is.True)
+            Assert.That(replay.Recovery.AllProjectsInertPrepared, Is.False)
+            Assert.That(replay.Recovery.Projects[0].Status, Is.EqualTo("PreparedInert"))
+            Assert.That(replay.Recovery.Projects[1].Status, Is.EqualTo("RecoveryBlocked"))
+            Assert.That(replay.Recovery.Projects[1].Issue.Value,
+                        Does.Contain("original immutable CAS result hash"))
+            Assert.That(replay.Recovery.Projects[1].ObservedHead,
+                        Is.EqualTo(Some((LedgerStore.fetch f.B.Second |> ok).Commit)))
+            Assert.That(remoteHeads f = afterMutation, Is.True)
+            Assert.That(preparedOperationBlob f.B f.Plan.Projects[1].OriginalOperationId,
+                        Is.EqualTo(originalOperation), "Immutable original operation result was rewritten")
             verifyHistorical f f.A
             verifyHistorical f f.B)
 

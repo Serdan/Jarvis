@@ -130,6 +130,85 @@ module WorkQueueMultiLedgerPreparedRecovery =
         && receipt.ReviewedReportSha256 = (target plan).ReviewedOfflineReportSha256
         && not receipt.RuntimeAuthorized
 
+    // Later Git CAS writers can replace a syntactically valid Prepared record.
+    // Only the original WQ02 operation's immutable result proves its contents.
+    let private verifyOriginalReceipt (plan: MultiLedgerPreparePlan)
+                                      (p: MultiLedgerProjectPlan)
+                                      (observedHead: string option)
+                                      (receipt: ProjectPreparedReceipt) =
+        let binding = p.Target.Binding
+        match observedHead with
+        | None -> Error "Project head unavailable for original Prepared operation proof."
+        | Some head ->
+            match LedgerStore.fetch binding with
+            | Error error -> Error(sprintf "Cannot fetch original Prepared operation: %A" error)
+            | Ok snapshot when snapshot.Commit <> head ->
+                Error "Project head changed during original Prepared operation proof."
+            | Ok snapshot ->
+                match LedgerStore.getOperationAt binding snapshot p.OriginalOperationId,
+                      LedgerStore.readAt binding snapshot WorkQueueProjectMigrationPrepare.ReceiptPath with
+                | Ok (Some operation), Ok (Some currentReceipt, Some _) ->
+                    try
+                        use envelope = JsonDocument.Parse(operation.CanonicalRequestJson)
+                        let outer = envelope.RootElement
+                        use request = JsonDocument.Parse(outer.GetProperty("request").GetString())
+                        let fields = request.RootElement
+                        let text (key: string) (expected: string) = fields.GetProperty(key).GetString() = expected
+                        let number (key: string) (expected: int) = fields.GetProperty(key).GetInt32() = expected
+                        let a = account plan
+                        let requestMatches =
+                            outer.GetProperty("schemaVersion").GetInt32() = 2
+                            && outer.GetProperty("projectId").GetString() = original binding.ProjectId
+                            && outer.GetProperty("operationId").GetString() = original p.OriginalOperationId
+                            && outer.GetProperty("actor").GetString() = (target plan).Actor
+                            && outer.GetProperty("kind").GetString() = "WQ10.PrepareProjectEpoch.FixtureOnly"
+                            && number "schemaVersion" 1
+                            && text "action" "PrepareProjectEpoch"
+                            && text "projectId" (original binding.ProjectId)
+                            && text "projectLedgerId" (original binding.LedgerId)
+                            && number "projectEpoch" binding.Epoch
+                            && text "expectedProjectHead" p.Target.ExpectedHead
+                            && text "accountId" (original a.AccountId)
+                            && text "accountLedgerId" (original a.LedgerId)
+                            && number "accountEpoch" a.Epoch
+                            && text "expectedAccountHead" receipt.AccountPreparingHead
+                            && fields.GetProperty("expectedAccountVersion").GetInt64() =
+                               plan.AccountCommand.ExpectedAccountStateVersion + 1L
+                            && text "originalJournalId" (original p.OriginalJournalId)
+                            && text "reviewedReportSha256" (target plan).ReviewedOfflineReportSha256
+                            && receipt.AccountStateVersion =
+                               plan.AccountCommand.ExpectedAccountStateVersion + 1L
+                        if operation.Type <> "WQ10.PrepareProjectEpoch.FixtureOnly"
+                           || operation.Actor <> (target plan).Actor
+                           || operation.OperationId <> original p.OriginalOperationId
+                           || not requestMatches
+                           || not (operation.Paths |> Array.contains WorkQueueProjectMigrationPrepare.ReceiptPath)
+                           || currentReceipt <> CanonicalCodec.encode receipt then
+                            Error "Original Prepared operation type, actor, request or current receipt binding differs."
+                        else
+                            use result = JsonDocument.Parse(operation.OriginalResultJson)
+                            let originalResult = result.RootElement
+                            let changes =
+                                originalResult.GetProperty("changes").EnumerateArray()
+                                |> Seq.filter (fun change ->
+                                    change.GetProperty("path").GetString() =
+                                        WorkQueueProjectMigrationPrepare.ReceiptPath)
+                                |> Seq.toArray
+                            if originalResult.GetProperty("schemaVersion").GetInt32() = 2
+                               && originalResult.GetProperty("operationId").GetString() =
+                                  original p.OriginalOperationId
+                               && originalResult.GetProperty("kind").GetString() =
+                                  "WQ10.PrepareProjectEpoch.FixtureOnly"
+                               && changes.Length = 1
+                               && changes[0].GetProperty("contentSha256").GetString() =
+                                  CanonicalCodec.digest currentReceipt then
+                                Ok ()
+                            else
+                                Error "Current Prepared receipt differs from the original immutable CAS result hash."
+                    with _ ->
+                        Error "Original Prepared operation request/result evidence is malformed."
+                | _ -> Error "Original Prepared operation or current canonical receipt cannot be verified."
+
     // Prepared conversion validates its own linked stages, not unrelated
     // WQ02 work added in a later Git CAS. A recovery claim covers the whole
     // current queue, including launches and every possible runnable stage.
@@ -217,12 +296,17 @@ module WorkQueueMultiLedgerPreparedRecovery =
                     match WorkQueueProjectMigrationPrepare.inspect p.Target.Binding (account plan) with
                     | Ok ProjectPreparedInspection.NotPrepared -> "NotPrepared", None, None
                     | Ok (ProjectPreparedInspection.ProjectOnly r) when matchesReceipt plan p r ->
-                        match inspectWholeQueueInert p.Target.Binding with
-                        | Ok head when Some head = observed -> "PreparedInert", Some r, None
-                        | Ok _ -> "RecoveryBlocked", Some r, Some "Project head moved during recovery inspection; reread the canonical authorities."
+                        match verifyOriginalReceipt plan p observed r with
                         | Error reason -> "RecoveryBlocked", Some r, Some reason
+                        | Ok () ->
+                            match inspectWholeQueueInert p.Target.Binding with
+                            | Ok head when Some head = observed -> "PreparedInert", Some r, None
+                            | Ok _ -> "RecoveryBlocked", Some r, Some "Project head moved during recovery inspection; reread the canonical authorities."
+                            | Error reason -> "RecoveryBlocked", Some r, Some reason
                     | Ok (ProjectPreparedInspection.AccountHeadDiverged(r, head)) when matchesReceipt plan p r ->
-                        "AccountHeadDiverged", Some r, Some("Account head moved to " + head)
+                        match verifyOriginalReceipt plan p observed r with
+                        | Error reason -> "RecoveryBlocked", Some r, Some reason
+                        | Ok () -> "AccountHeadDiverged", Some r, Some("Account head moved to " + head)
                     | Ok (ProjectPreparedInspection.RecoveryBlocked reason) ->
                         "RecoveryBlocked", None, Some reason
                     | Ok _ -> "RecoveryBlocked", None, Some "Project receipt does not bind the original signed account/project source."

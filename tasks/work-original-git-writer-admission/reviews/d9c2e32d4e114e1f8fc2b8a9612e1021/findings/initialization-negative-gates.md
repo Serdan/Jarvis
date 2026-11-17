@@ -1,0 +1,9 @@
+# P2 — Journal-enabled initialization and binding-loss negatives are untested
+
+Frozen head `ab6ecdb0d952f348ecaea504c59a4ed0c875aba9`.
+
+The new fixture `withFixture` initializes the account and project original ledgers before individual tests set `JARVIS_ORIGINAL_GIT_WRITER_ADMISSION_JOURNAL`. Accordingly, the new `ConfiguredOriginalWriterJournalCoversProjectAccountAndSourceAndStop` case covers later CAS and source/ref publication, but **does not exercise the new guarded** `AccountCapacityLedger.initialize` and `LedgerStore.initialize` paths (AccountCapacityLedger.fs around 597-632; LedgerStore.fs around 1118-1148). The two dedicated journal-state tests use `admit`/`markAttempt`/`settle` directly, not a genuine lost-acknowledgement Git initialization. The contract explicitly calls for initialized original writers, restart, delayed/UNKNOWN effects, incompatible source refs, and fail-closed Recovery tests.
+
+Add a fresh two-repository fixture with journal provisioned/configured **before** initialization; assert positive publication and settled journal effects for each, STOP before init prevents both with no remote new ref, and lost confirmation persists UNKNOWN across reopening/restart. Also cover the missing or substituted binding after a stopped journal from the P1 finding, and a duplicate UUID with changed payload. Existing test pass is not proof of these negative gates.
+
+**Independent execution:** .NET 11 Release `dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-restore --filter FullyQualifiedName~LegacyWriterProtocolFenceTests` passed 16/16, and `git diff --check` passed. This finding is about gaps in the acceptance evidence, not a claim those existing tests failed.

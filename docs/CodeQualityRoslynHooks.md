@@ -17,8 +17,9 @@ export JARVIS_APPROVED_CODE_QUALITY_ROOTS="/absolute/path/to/Wayfold"
 Multiple approved checkouts can be separated by the OS path separator (colon on Linux,
 semicolon on Windows). Add worktree roots individually. In particular, approval of the
 main checkout does **not** approve its sibling worktrees. Restart JarvisClient after changing
-the environment. Without approval, hook-enabled file writes/commits are rejected before
-modifying files/the index. No approval means no Roslyn process launch.
+the environment. Without approval, writes matching an enabled after-write hook and
+hook-enabled commits are rejected before modifying files/the index. Unrelated file
+writes remain available. No approval means no Roslyn process launch.
 
 The client requires the official `roslyn-language-server` global dotnet tool installed,
 and the corresponding .NET runtime. It supports a managed DLL launcher through the current
@@ -102,6 +103,23 @@ worktree removal and JarvisClient shutdown. Missing/unapproved hooks do not laun
 This implementation covers C# Roslyn formatting; it does **not** auto-fix arbitrary
 diagnostics or implement a complete LSP code-action selection service. It does not
 modify Wayfold merely by being present in Jarvis. No deployment is part of this change.
+
+## Validation evidence (2026-11-17)
+
+On .NET 11 Release, `dotnet fsi scripts/roslyn-smoke.fsx` passed against two
+disposable local C# roots: first session cold 1,540 ms / 9 edits, same session
+warm 115 ms / 0 edits, second independent root 272 ms / 5 edits; no
+diagnostics were published during the requests. A repeat with a warm daemon
+measured 107 ms / 7 ms / 79 ms respectively; both opted-in after-write hooks
+passed and enforced distinct checkout-specific `insert_final_newline` settings.
+
+The focused Release NUnit tests passed **23/23**. An unfiltered client-suite run
+timed out after 180 seconds without a test verdict; its logs included
+activity-persistence permission errors. Do not treat that run as passing.
+
+These checks establish basic two-root formatting and hook behavior, **not**
+distinct project/analyzer compilation state, Wayfold small/large parity against
+`dotnet format`, or daemon RSS.
 
 ## Suggested validation
 

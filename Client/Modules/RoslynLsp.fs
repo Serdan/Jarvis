@@ -74,7 +74,8 @@ let applyTextEdits (content: string) (edits: JsonElement) : Result<string * int,
                 |> Seq.sortBy (fun edit -> edit.Start, edit.End)
                 |> Seq.toArray
             for i in 1 .. parsed.Length - 1 do
-                if parsed[i].Start < parsed[i - 1].End then
+                if parsed[i].Start < parsed[i - 1].End
+                   || (parsed[i].Start = parsed[i - 1].Start && parsed[i].End = parsed[i - 1].End) then
                     invalidArg "edits" "Overlapping LSP formatting edits."
             let mutable updated = content
             for edit in Array.rev parsed do
@@ -321,8 +322,16 @@ let private sessions = ConcurrentDictionary<string, Lazy<Task<Session>>>(StringC
 
 let private remove root =
     let mutable old = Unchecked.defaultof<Lazy<Task<Session>>>
-    if sessions.TryRemove(root, &old) && old.IsValueCreated && old.Value.IsCompletedSuccessfully then
-        (old.Value.Result :> IDisposable).Dispose()
+    if sessions.TryRemove(root, &old) && old.IsValueCreated then
+        let initialized = old.Value
+        if initialized.IsCompletedSuccessfully then
+            (initialized.Result :> IDisposable).Dispose()
+        elif not initialized.IsCompleted then
+            // Shutdown or worktree removal must also dispose a session whose
+            // asynchronous initialization is still in flight.
+            initialized.ContinueWith(fun (finished: Task<Session>) ->
+                if finished.IsCompletedSuccessfully then
+                    (finished.Result :> IDisposable).Dispose()) |> ignore
 
 let private getLazy root =
     sessions.GetOrAdd(root, fun path ->

@@ -255,11 +255,23 @@ let private oneFile (root: string) (hook: Hook) (path: string) =
                             Ok(false, formatted.EditCount, formatted.Diagnostics, "Already formatted.")
     with ex -> Error ex.Message
 
+let private matchesPath (hook: Hook) (path: string) =
+    hook.Extensions
+    |> List.exists (fun extension -> path.EndsWith(extension, StringComparison.OrdinalIgnoreCase))
+
+let hasMatchingHook (configured: Hook list) trigger paths =
+    configured
+    |> List.exists (fun hook ->
+        hook.Trigger = trigger && (paths |> List.exists (matchesPath hook)))
+
 let run (root: string) (trigger: HookTrigger) (paths: string list) : Client.Result<HookSummary option> =
     match load root with
     | Error message -> Error(Client.ValidationError message)
     | Ok configured ->
-        let matching = configured |> List.filter (fun hook -> hook.Trigger = trigger)
+        let matching =
+            configured
+            |> List.filter (fun hook ->
+                hook.Trigger = trigger && (paths |> List.exists (matchesPath hook)))
         match requireApproval root with
         | Error _ when matching.IsEmpty -> Ok None
         | Error problem -> Error problem
@@ -269,8 +281,7 @@ let run (root: string) (trigger: HookTrigger) (paths: string list) : Client.Resu
             let failures = ResizeArray<string>()
             for hook in matching do
                 for path in paths |> List.distinct do
-                    if hook.Extensions |> List.exists (fun extension ->
-                        path.EndsWith(extension, StringComparison.OrdinalIgnoreCase)) then
+                    if matchesPath hook path then
                         let report =
                             match oneFile root hook path with
                             | Ok(modified, edits, diagnostics, message) ->

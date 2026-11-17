@@ -126,6 +126,24 @@ let ``overlapping Roslyn edits fail closed`` () =
     | other -> Assert.Fail(sprintf "Expected conflict, got %A" other)
 
 [<Test>]
+let ``two Roslyn insertions at the same offset fail closed`` () =
+    let json =
+        """[{"range":{"start":{"line":0,"character":1},"end":{"line":0,"character":1}},"newText":"X"},{"range":{"start":{"line":0,"character":1},"end":{"line":0,"character":1}},"newText":"Y"}]"""
+    match edits "abc" json with
+    | Error message -> message.Contains("Overlapping") |> shouldEqual true
+    | other -> Assert.Fail(sprintf "Expected ambiguous insert rejection, got %A" other)
+
+[<Test>]
+let ``C-sharp hooks do not require approval for unrelated paths`` () =
+    withTempRoot (fun root ->
+        config root """{"codeQuality":{"hooks":[{"enabled":true,"name":"format","adapter":"roslyn-format","trigger":"after-write","extensions":[".cs"]}]}}"""
+        match load root with
+        | Ok hooks ->
+            hasMatchingHook hooks AfterWrite [ "notes.md" ] |> shouldEqual false
+            run root AfterWrite [ "notes.md" ] |> shouldEqual (Ok None)
+        | Error message -> Assert.Fail message)
+
+[<Test>]
 let ``out-of-range Roslyn edits fail without partial output`` () =
     let json =
         """[{"range":{"start":{"line":4,"character":0},"end":{"line":4,"character":1}},"newText":"X"}]"""

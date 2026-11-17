@@ -1208,7 +1208,7 @@ let private withAfterWriteHooks source path skip (operation: IO<'rt, 'a>) =
         let! (FolderPath root) = hookRoot source
         let! configured = fun _ ->
             CodeQualityHooks.load root |> Result.mapError Client.ValidationError
-        let active = configured |> List.exists (fun hook -> hook.Trigger = CodeQualityHooks.AfterWrite)
+        let active = CodeQualityHooks.hasMatchingHook configured CodeQualityHooks.AfterWrite [ path ]
         // Refuse an unapproved project before publishing an edit, rather than
         // reporting a hook failure after the source was already changed.
         do!

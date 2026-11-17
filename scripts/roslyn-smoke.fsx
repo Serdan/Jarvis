@@ -1,4 +1,5 @@
-#r "../Client/bin/Debug/net11.0/JarvisClient.dll"
+#r "../Common/bin/Release/net11.0/Common.dll"
+#r "../Client/bin/Release/net11.0/JarvisClient.dll"
 
 open System
 open System.Diagnostics
@@ -36,6 +37,28 @@ try
     let third = RoslynLsp.formatDocument secondRoot secondPath otherInput
     let otherTime = int watch.ElapsedMilliseconds
     print "other-worktree" third otherTime |> ignore
+    let config =
+        """{"codeQuality":{"hooks":[{"enabled":true,"name":"format-csharp","trigger":"after-write","adapter":"roslyn-format","extensions":[".cs"],"autoFix":true}]}}"""
+    for checkout in [ root; secondRoot ] do
+        File.WriteAllText(Path.Combine(checkout, ".jarvis.json"), config)
+    File.WriteAllText(Path.Combine(root, ".editorconfig"), "[*.cs]\ninsert_final_newline = true\n")
+    File.WriteAllText(Path.Combine(secondRoot, ".editorconfig"), "[*.cs]\ninsert_final_newline = false\n")
+    let previousApproval = Environment.GetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS")
+    try
+        Environment.SetEnvironmentVariable(
+            "JARVIS_APPROVED_CODE_QUALITY_ROOTS",
+            String.Join(string Path.PathSeparator, [ root; secondRoot ]))
+        for checkout, relative in [ root, "Sample.cs"; secondRoot, "Other.cs" ] do
+            match CodeQualityHooks.run checkout CodeQualityHooks.AfterWrite [ relative ] with
+            | Ok(Some report) when report.ModifiedFiles = [ relative ] -> ()
+            | other -> failwithf "Hook failed for %s: %A" relative other
+        if not (File.ReadAllText(path).EndsWith("\n")) then
+            failwith "First checkout ignored insert_final_newline = true."
+        if File.ReadAllText(secondPath).EndsWith("\n") then
+            failwith "Second checkout unexpectedly added a final newline."
+        printfn "HOOK PASS: checkout-specific final newline rules"
+    finally
+        Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", previousApproval)
     RoslynLsp.disposeCheckout secondRoot
     Directory.Delete(secondRoot, true)
     printfn "SMOKE PASS"

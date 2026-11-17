@@ -1,0 +1,1 @@
+Two authorized files only; RED-first regression cases cover mode/editor node replacement, restored drafts, mode/user turn/route fail-closed boundaries, dual launch contexts, persistent Send and post-Send uncertainty. Node launcher 53/53 twice, adjacent bridge/private host 68/68, node --check on both files, git diff --check. No deployment or browser session activation.

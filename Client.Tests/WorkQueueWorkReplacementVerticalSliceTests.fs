@@ -143,18 +143,38 @@ type WorkQueueWorkReplacementVerticalSliceTests() =
             // link. Keep the separate graph unbound: a later graph mutation
             // cannot retroactively manufacture that immutable provenance.
             // Dependency and parent existence are read on the other client.
+            // WQ04 already owns the one true root. Extend that pinned graph,
+            // never fabricate a second project root or reset its version.
+            let beforeHead, beforeGraph = WorkCompositionGitLedger.load b1 |> succeed
+            Assert.That(beforeGraph.Version, Is.GreaterThan(0),
+                        "Original WQ04 provenance must exist before WQ11 mutations")
+            let originalRoot =
+                beforeGraph.Units
+                |> Map.toSeq
+                |> Seq.choose (fun (id, unit) ->
+                    if unit.Kind = WorkUnitKind.Project then Some id else None)
+                |> Seq.exactlyOne
             let changes =
-                [ WorkCompositionMutation.Create("project", WorkUnitKind.Project, None, spec "Project" None)
-                  WorkCompositionMutation.Create("foundation", WorkUnitKind.System, Some "project", spec "Foundation" None)
-                  WorkCompositionMutation.Create("delivery", WorkUnitKind.System, Some "project", spec "Delivery" None)
+                [ WorkCompositionMutation.Create("foundation", WorkUnitKind.System, Some originalRoot, spec "Foundation" None)
+                  WorkCompositionMutation.Create("delivery", WorkUnitKind.System, Some originalRoot, spec "Delivery" None)
                   WorkCompositionMutation.Create("prerequisite", WorkUnitKind.Feature, Some "foundation", spec "Prerequisite" None)
                   WorkCompositionMutation.Create("dependent", WorkUnitKind.Feature, Some "delivery", spec "Dependent" None)
                   WorkCompositionMutation.Require("dependent", "prerequisite") ]
-            changes |> List.iteri (fun version mutation ->
-                WorkCompositionGitLedger.execute b1 "Fixture" (Guid.NewGuid()) version mutation
+            match WorkCompositionGitLedger.execute b1 "Fixture" (Guid.NewGuid()) 0
+                      (List.head changes) with
+            | Error (StaleEntityVersion reason) ->
+                Assert.That(reason, Does.Contain("Composition graph expected version 0"))
+            | other -> Assert.Fail(sprintf "Stale composition graph CAS did not fail: %A" other)
+            let rejectedHead, rejectedGraph = WorkCompositionGitLedger.load b2 |> succeed
+            Assert.That(rejectedHead.Commit, Is.EqualTo(beforeHead.Commit),
+                        "Rejected CAS cannot write a Git head or receipt")
+            Assert.That(rejectedGraph.Version, Is.EqualTo beforeGraph.Version)
+            changes |> List.iteri (fun offset mutation ->
+                WorkCompositionGitLedger.execute b1 "Fixture" (Guid.NewGuid())
+                    (beforeGraph.Version + offset) mutation
                 |> succeed |> ignore)
             let headB, graph = WorkCompositionGitLedger.load b2 |> succeed
-            Assert.That(graph.Version, Is.EqualTo(6))
+            Assert.That(graph.Version, Is.EqualTo(beforeGraph.Version + List.length changes))
             Assert.That(graph.Units.["dependent"].HardPrerequisites = Set.singleton "prerequisite", Is.True)
             Assert.That(graph.Units.["dependent"].ParentId, Is.EqualTo(Some "delivery"))
             let views = WorkCompositionGitLedger.loadOverviews b2 |> succeed
@@ -164,14 +184,15 @@ type WorkQueueWorkReplacementVerticalSliceTests() =
             Assert.That(graph.Units.["dependent"].Spec.LinkedTaskId, Is.EqualTo(None))
 
             // Queue availability is not graph acceptance or Scheduler authority.
-            // Explicitly prove the forbidden retroactive link fails without a
-            // graph/queue commit on either approved clone.
+            // WQ04 has already pinned the dependent task to its original
+            // feature. A second owner cannot retroactively take that identity.
+            // The rejection must preserve both graph and queue heads.
             let retroactiveLink =
                 WorkCompositionMutation.Revise("dependent", graph.Units.["dependent"].SpecVersion,
                     { graph.Units.["dependent"].Spec with LinkedTaskId = Some "dependent-task" })
             match WorkCompositionGitLedger.execute b1 "Fixture" (Guid.NewGuid()) graph.Version retroactiveLink with
             | Error (InvalidBinding reason) ->
-                Assert.That(reason, Does.Contain("immutable original composition binding"))
+                Assert.That(reason, Does.Contain("Canonical task has multiple composition owners: dependent-task"))
             | other -> Assert.Fail(sprintf "Retroactive WQ04 stage link was not denied: %A" other)
             Assert.That((LedgerStore.fetch b2 |> succeed).Commit, Is.EqualTo(headB.Commit))
 

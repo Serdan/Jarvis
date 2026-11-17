@@ -141,6 +141,17 @@ let private withAuthorities run =
                   Instructions = "Disposable Work-only execution"
                   QueueSubscriptions = set ["planning"] }
             |> success |> ignore
+            // WQ04's genuine producer seeds missing review/integration roles.
+            // Install these known fixture roles BEFORE pinning independent
+            // approval, rather than accepting a changed catalog at host read.
+            for roleId, queue in ["Reviewer", "review"; "Integrator", "integration"] do
+                let revision = (WorkQueueRoleAuthority.load first |> success).Catalog.Revision
+                WorkQueueRoleAuthority.configure first "WQ11 native fixture"
+                    (Guid.NewGuid()) revision 0
+                    { RoleId = roleId; Version = 1; Enabled = true
+                      Instructions = "Authenticated disposable original WQ04 role"
+                      QueueSubscriptions = set [queue] }
+                |> success |> ignore
             // Seed representative legacy Agent and independently accepted review
             // records in the ORIGINAL disposable Git ledger, not an in-memory
             // replacement. All subsequent flows must preserve their blob OIDs.
@@ -173,7 +184,10 @@ let private withAuthorities run =
         let journalRoot = Path.Combine(root, "originals")
         Directory.CreateDirectory journalRoot |> ignore
         OriginalBrowserJournal.provisionTrustedHostRoot journalRoot |> success |> ignore
-        let subscription = Map.ofList ["Lead", set ["planning"]]
+        let subscription =
+            Map.ofList ["Lead", set ["planning"]
+                        "Reviewer", set ["review"]
+                        "Integrator", set ["integration"]]
         let approval =
             { AccountId = accountId
               ProjectIds = set [priorityId; otherId]
@@ -353,6 +367,34 @@ let private dispatch f original executionId =
 [<TestFixture>]
 type WorkQueueTwoProjectEphemeralSchedulerVerticalTests() =
     [<Test>]
+    member _.ChangedRoleCatalogStillBlocksBeforeAnySchedulerCallback() =
+        withAuthorities (fun f ->
+            let writer, reader = f.Priority
+            let _ = newPlanning writer reader "stale-role-approval"
+            Assert.That(f.Observer.ReadAll() |> Result.isOk, Is.True,
+                        "The originally pinned role catalog must be valid")
+            let accountBefore = (AccountCapacityLedger.fetch (snd f.Account) |> success).Head
+            let oldCatalog = WorkQueueRoleAuthority.load writer |> success
+            WorkQueueRoleAuthority.configure writer "WQ11 changed-role negative fixture"
+                (Guid.NewGuid()) oldCatalog.Catalog.Revision 1
+                { RoleId = "Lead"; Version = 2; Enabled = true
+                  Instructions = "Changed after independent approval"
+                  QueueSubscriptions = set ["planning"] }
+            |> success |> ignore
+            let mutable effects = 0
+            let callback _ =
+                effects <- effects + 1
+                WorkExecutorResult.Rejected "Must never be invoked"
+            let actual = host f reader None callback false true
+            match actual.RunOnce [WorkWakeTrigger.WorkCreated] with
+            | SchedulerHostOutcome.NeedsAttention ("CanonicalHeadsUnavailable", reason) ->
+                Assert.That(reason, Does.Contain("RoleCatalogApprovalChanged"))
+            | other -> Assert.Fail(sprintf "Changed approval must fail closed: %A" other)
+            Assert.That(effects, Is.Zero)
+            Assert.That((AccountCapacityLedger.fetch (snd f.Account) |> success).Head,
+                        Is.EqualTo accountBefore))
+
+    [<Test>]
     member _.OriginalGitHeadsAndProductionGatesAreNoGoWithoutAnyProviderCall() =
         withAuthorities (fun f ->
             let priorityWriter, priorityReader = f.Priority
@@ -503,11 +545,13 @@ type WorkQueueTwoProjectEphemeralSchedulerVerticalTests() =
             let b = newPlanning priorityWriter priorityReader "priority"
             // A later versioned review and Integration hard edge make B the
             // priority. These inert gates are NOT forged WQ05 Accepted receipts.
+            // These original-less synthetic stages use queues with no approved
+            // subscriber: they cannot become runnable WQ08 launch candidates.
             let stageReview: WorkStage =
                 { Id = "review-" + Guid.NewGuid().ToString("N")
                   ProjectId = priorityWriter.ProjectId.ToString("D")
                   SubjectId = "pending-review"; Kind = WorkKind.FrozenReview
-                  QueueId = "review"; StageGeneration = 2; State = WorkState.Blocked
+                  QueueId = "inert-review"; StageGeneration = 2; State = WorkState.Blocked
                   Domain = DomainState.Undecided; Gate = GateState.Clear
                   ClaimGeneration = 0; Dependencies = Set.singleton b.Id
                   WaivedDependencies = Map.empty
@@ -516,7 +560,7 @@ type WorkQueueTwoProjectEphemeralSchedulerVerticalTests() =
             let stageIntegration: WorkStage =
                 { stageReview with
                     Id = "integration-" + Guid.NewGuid().ToString("N")
-                    Kind = WorkKind.Integration; QueueId = "integration"
+                    Kind = WorkKind.Integration; QueueId = "inert-integration"
                     SubjectId = "pending-integration"
                     StageGeneration = 1; Dependencies = Set.singleton stageReview.Id
                     AvailableAt = stageReview.AvailableAt + 1L

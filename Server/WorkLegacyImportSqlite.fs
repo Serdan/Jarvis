@@ -88,7 +88,7 @@ module internal WorkLegacyImportSqlite =
         let encode<'T> (value: 'T) =
             encodeType typeof<'T> (box value) |> fun node -> node.ToJsonString()
 
-    let private verifiedFixturePath (databasePath: string) =
+    let isDisposableFixturePath (databasePath: string) =
         try
             if String.IsNullOrWhiteSpace databasePath
                || not (Path.IsPathFullyQualified databasePath) then
@@ -158,7 +158,8 @@ module internal WorkLegacyImportSqlite =
     let private buildTransaction importOperationId
                                  (inspection: WorkLegacyImportInspection)
                                  (index: WorkLegacyImportEvidenceIndex)
-                                 (fence: WorkLegacyImportOfflineFence) =
+                                 (fence: WorkLegacyImportOfflineFence)
+                                 (auditRecords: WorkSqliteRecordMutation list) =
         let accountId = inspection.Account.AccountId.ToString("D")
         let plain (json: string) =
             let container = JsonObject()
@@ -255,7 +256,7 @@ module internal WorkLegacyImportSqlite =
                           (plain (SnapshotJson.encode operation)) ]
         { OperationId = importOperationId
           Guards = []
-          Records = accountSnapshot :: frozenMarker :: (accountOperations @ projectRecords)
+          Records = accountSnapshot :: frozenMarker :: (accountOperations @ projectRecords @ auditRecords)
           Capacities = [ { AccountId = accountId; ExpectedVersion = None
                            Maximum = Some inspection.Account.MaxConcurrent
                            ReservedDelta = index.ReservedCapacity } ] }
@@ -263,11 +264,12 @@ module internal WorkLegacyImportSqlite =
     // Hermetic-only conversion. A snapshot with the right strings but no
     // externally enforced old-writer fence is NOT production migration proof.
     // No production route calls this and the disposable marker is mandatory.
-    let commitOfflineFixture (databasePath: string) (importOperationId: Guid)
+    let commitOfflineFixtureWithAudit (databasePath: string) (importOperationId: Guid)
                              (inspection: WorkLegacyImportInspection)
                              (fence: WorkLegacyImportOfflineFence)
+                             (auditRecords: WorkSqliteRecordMutation list)
                              : Result<WorkLegacyImportOfflineReceipt, WorkLegacyImportSqliteGap> =
-        if not (verifiedFixturePath databasePath) then
+        if not (isDisposableFixturePath databasePath) then
             Error(WorkLegacyImportSqliteGap.UnsafeDestination databasePath)
         else
             match WorkLegacyImportPreflight.inspect inspection with
@@ -280,7 +282,7 @@ module internal WorkLegacyImportSqlite =
                     authority.Initialize()
                     |> Result.mapError WorkLegacyImportSqliteGap.StorageFailure
                     |> Result.bind (fun _ ->
-                        buildTransaction importOperationId inspection index fence
+                        buildTransaction importOperationId inspection index fence auditRecords
                         |> authority.Commit
                         |> Result.mapError WorkLegacyImportSqliteGap.StorageFailure)
                     |> Result.map (fun receipt ->
@@ -290,3 +292,11 @@ module internal WorkLegacyImportSqlite =
                           ProjectHeads = index.Projects |> List.map (fun (p, _, h, _, _) -> p, h)
                           SqliteSequence = receipt.Sequence
                           Replayed = receipt.Replayed })
+
+
+    // The accepted C1 API remains intentionally offline and has no cutover authority.
+    let commitOfflineFixture (databasePath: string) (importOperationId: Guid)
+                             (inspection: WorkLegacyImportInspection)
+                             (fence: WorkLegacyImportOfflineFence)
+                             : Result<WorkLegacyImportOfflineReceipt, WorkLegacyImportSqliteGap> =
+        commitOfflineFixtureWithAudit databasePath importOperationId inspection fence []

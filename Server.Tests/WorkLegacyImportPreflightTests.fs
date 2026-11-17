@@ -23,7 +23,8 @@ let private operation =
       Sequence = 1L
       RequestSha256 = digest
       ResultSha256 = digest
-      Kind = "verified-ledger-operation" }
+      Kind = "verified-ledger-operation"
+      TerminalResult = None }
 
 let private head =
     { PinnedCommit = shaA
@@ -126,13 +127,20 @@ let private reviewAndIntegration (input: WorkLegacyImportInspection) =
                          (DomainState.FinalizedPendingTerminal "accepted-review")
         let integration = stage p.ProjectId "T" "task-I1"
                               WorkKind.Integration "integration" WorkState.Completed
-                              (DomainState.Integrated "integrated-receipt")
+                              (DomainState.Integrated shaC)
         { p with
             Queue =
                 { p.Queue with
                     Works = p.Queue.Works
                             |> Map.add review.Id review
-                            |> Map.add integration.Id { integration with IntegrationAuthorized = true } }
+                            |> Map.add integration.Id
+                                { integration with
+                                    IntegrationAuthorized = true
+                                    Push =
+                                        Some { OperationId = "verified-integration-push"
+                                               AcceptedSourceSha = shaB
+                                               TargetRef = "refs/heads/main"
+                                               Outcome = PushOutcome.Observed shaC } } }
             Origins = p.Origins @ [ origin review "Reviewer" shaB; origin integration "Integrator" shaB ]
             Reviews =
                 [ { WorkId = "R"
@@ -149,6 +157,40 @@ let private reviewAndIntegration (input: WorkLegacyImportInspection) =
                     TargetRef = "refs/heads/main"
                     IntegratedCommit = shaC
                     SourceAncestryVerified = true } ] }) input
+
+let private rejectedReviewOnly (input: WorkLegacyImportInspection) =
+    input |> reviewAndIntegration |> modifyOne (fun p ->
+        { p with
+            Queue = { p.Queue with Works = p.Queue.Works.Remove "T" }
+            Origins = p.Origins |> List.filter (fun o -> o.WorkId <> "T")
+            Reviews = p.Reviews |> List.map (fun review -> { review with Accepted = false })
+            Integrations = [] })
+
+let private withGraphAcceptance evidence (input: WorkLegacyImportInspection) =
+    modifyOne (fun p ->
+        let spec =
+            { Title = "Verified import acceptance"
+              Goal = "Inspect frozen approval evidence"
+              Scope = "Offline only"
+              AcceptanceCriteria = Set.singleton "receipt-bound"
+              Constraints = Set.empty
+              LinkedTaskId = None }
+        let proof =
+            { SpecVersion = 1
+              GraphVersion = 1
+              EvidenceRef = evidence
+              ChildAcceptances = Map.empty
+              PrerequisiteAcceptances = Map.empty }
+        let root =
+            { Id = "migration-project"
+              Kind = WorkUnitKind.Project
+              ParentId = None
+              Spec = spec
+              SpecVersion = 1
+              HardPrerequisites = Set.empty
+              Acceptances = Map.ofList [ "1", proof ]
+              CancellationReason = None }
+        { p with Graph = { Version = 1; Units = Map.ofList [ root.Id, root ] } }) input
 
 [<Test>]
 let c0_two_project_account_fixture_is_read_only_and_stably_indexed () =
@@ -236,6 +278,70 @@ let c0_unaccepted_review_never_authorizes_integration () =
                       { p with Reviews = p.Reviews |> List.map (fun r -> { r with Accepted = false }) })
     invalid |> WorkLegacyImportPreflight.inspect
     |> expectsGap (function WorkLegacyImportGap.MissingReviewDecision _ -> true | _ -> false)
+
+[<Test>]
+let c0_rejected_finalized_review_imports_as_rejection_without_integration () =
+    match twoProjects () |> rejectedReviewOnly |> WorkLegacyImportPreflight.inspect with
+    | Error gaps -> Assert.Fail(sprintf "Legitimate negative decision rejected: %A" gaps)
+    | Ok index ->
+        Assert.That(index.FrozenReviews, Is.EqualTo(box [ projectOne, "R", shaB, false ]))
+        Assert.That(index.Integrations, Is.Empty)
+
+[<Test>]
+let c0_negative_review_receipt_or_frozen_source_mismatch_remains_invalid () =
+    let wrongReceipt =
+        twoProjects () |> rejectedReviewOnly |> modifyOne (fun p ->
+            { p with Reviews = p.Reviews |> List.map (fun r -> { r with ReceiptId = "wrong" }) })
+    wrongReceipt |> WorkLegacyImportPreflight.inspect
+    |> expectsGap (function WorkLegacyImportGap.InvalidReviewDecision _ -> true | _ -> false)
+    let wrongSource =
+        twoProjects () |> rejectedReviewOnly |> modifyOne (fun p ->
+            { p with Reviews = p.Reviews |> List.map (fun r -> { r with FrozenCommit = shaC }) })
+    wrongSource |> WorkLegacyImportPreflight.inspect
+    |> expectsGap (function WorkLegacyImportGap.InvalidReviewDecision _ -> true | _ -> false)
+
+[<Test>]
+let c0_unfinalized_review_receipt_cannot_satisfy_graph_acceptance () =
+    let invalid =
+        twoProjects () |> reviewAndIntegration |> withGraphAcceptance "accepted-review"
+        |> modifyOne (fun p ->
+            let review =
+                { p.Queue.Works.["R"] with
+                    Domain = DomainState.Undecided
+                    State = WorkState.Blocked }
+            { p with Queue = { p.Queue with Works = p.Queue.Works.Add("R", review) } })
+    match invalid |> WorkLegacyImportPreflight.inspect with
+    | Ok index -> Assert.Fail(sprintf "Unfinalized review accepted: %A" index)
+    | Error gaps ->
+        Assert.That(gaps |> List.exists (function WorkLegacyImportGap.InvalidReviewDecision _ -> true | _ -> false), Is.True)
+        Assert.That(gaps |> List.exists (function WorkLegacyImportGap.MissingAcceptanceEvidence _ -> true | _ -> false), Is.True)
+
+[<Test>]
+let c0_unfinalized_integration_receipt_cannot_satisfy_graph_acceptance () =
+    let invalid =
+        twoProjects () |> reviewAndIntegration |> withGraphAcceptance "integrated-receipt"
+        |> modifyOne (fun p ->
+            let integration = { p.Queue.Works.["T"] with
+                                    Domain = DomainState.Undecided
+                                    State = WorkState.Blocked
+                                    IntegrationAuthorized = false }
+            { p with Queue = { p.Queue with Works = p.Queue.Works.Add("T", integration) } })
+    match invalid |> WorkLegacyImportPreflight.inspect with
+    | Ok index -> Assert.Fail(sprintf "Unfinalized integration accepted: %A" index)
+    | Error gaps ->
+        Assert.That(gaps |> List.exists (function WorkLegacyImportGap.InvalidIntegration _ -> true | _ -> false), Is.True)
+        Assert.That(gaps |> List.exists (function WorkLegacyImportGap.MissingAcceptanceEvidence _ -> true | _ -> false), Is.True)
+
+[<Test>]
+let c0_integrated_stage_requires_exact_observed_push_source_and_target () =
+    let invalid =
+        twoProjects () |> reviewAndIntegration |> modifyOne (fun p ->
+            let integration = p.Queue.Works.["T"]
+            let badPush =
+                { integration.Push.Value with TargetRef = "refs/heads/other" }
+            { p with Queue = { p.Queue with Works = p.Queue.Works.Add("T", { integration with Push = Some badPush }) } })
+    invalid |> WorkLegacyImportPreflight.inspect
+    |> expectsGap (function WorkLegacyImportGap.InvalidIntegration _ -> true | _ -> false)
 
 [<Test>]
 let c0_unmatched_claim_generation_is_rejected () =
@@ -352,40 +458,88 @@ let c0_original_account_release_needs_independently_verified_project_terminal ()
     fixture |> WorkLegacyImportPreflight.inspect
     |> expectsGap (function WorkLegacyImportGap.AccountCapacityConflict _ -> true | _ -> false)
 
-[<Test>]
-let c0_project_terminal_provenance_preserves_capacity_release_without_active_claim () =
+let private withVerifiedTerminalRelease (input: WorkLegacyImportInspection) =
+    let result =
+        { LaunchId = "one-running-launch"
+          AccountTokenId = "one-account-token"
+          ReceiptId = "terminal-receipt" }
+    let terminalOperation =
+        { operation with
+            Kind = "project-launch-terminal"
+            TerminalResult = Some result }
     let fixture =
-        twoProjects ()
+        input
         |> withStoppedClaim
         |> modifyOne (fun p ->
             let work = { p.Queue.Works.["I1"] with State = WorkState.Completed }
-            let launch = { p.Queue.Launches.["one-running-launch"] with
-                               State = LaunchState.TerminalPendingRelease "terminal-receipt" }
+            let launch = { p.Queue.Launches.[result.LaunchId] with
+                               State = LaunchState.TerminalPendingRelease result.ReceiptId }
             { p with
                 Queue =
                     { p.Queue with
                         Works = p.Queue.Works.Add("I1", work)
-                        Launches = p.Queue.Launches.Add("one-running-launch", launch) }
+                        Launches = p.Queue.Launches.Add(result.LaunchId, launch) }
+                Operations = [ terminalOperation ]
                 Terminals =
                     [ { LaunchId = launch.Id
                         AccountTokenId = launch.AccountTokenId
-                        ReceiptId = "terminal-receipt"
-                        OperationId = operation.OperationId
+                        ReceiptId = result.ReceiptId
+                        OperationId = terminalOperation.OperationId
+                        OperationResultSha256 = terminalOperation.ResultSha256
                         TerminalHead = shaA
                         TerminalBlobOid = shaB
                         AncestryVerified = true
                         LaunchGeneration = 4L } ] })
-    let fixture =
-        { fixture with
-            Account =
-                { fixture.Account with
-                    Tokens = fixture.Account.Tokens |> List.map (fun token ->
-                        { token with Released = true; TerminalReceipt = Some "terminal-receipt" }) } }
-    match fixture |> WorkLegacyImportPreflight.inspect with
+    { fixture with
+        Account =
+            { fixture.Account with
+                Tokens = fixture.Account.Tokens |> List.map (fun token ->
+                    { token with Released = true; TerminalReceipt = Some result.ReceiptId }) } }
+
+[<Test>]
+let c0_project_terminal_provenance_preserves_capacity_release_without_active_claim () =
+    match twoProjects () |> withVerifiedTerminalRelease |> WorkLegacyImportPreflight.inspect with
     | Error gaps -> Assert.Fail(sprintf "Verified terminal incorrectly rejected: %A" gaps)
     | Ok index ->
         Assert.That(index.ReservedCapacity, Is.Zero)
         Assert.That(index.StoppedLaunches, Has.Length.EqualTo 1)
+
+[<Test>]
+let c0_terminal_release_rejects_mismatched_launch_receipt () =
+    let invalid =
+        twoProjects () |> withVerifiedTerminalRelease |> modifyOne (fun p ->
+            let launch = { p.Queue.Launches.["one-running-launch"] with
+                               State = LaunchState.TerminalPendingRelease "different-receipt" }
+            { p with Queue = { p.Queue with Launches = p.Queue.Launches.Add(launch.Id, launch) } })
+    invalid |> WorkLegacyImportPreflight.inspect
+    |> expectsGap (function WorkLegacyImportGap.AccountCapacityConflict _ -> true | _ -> false)
+
+[<Test>]
+let c0_terminal_release_rejects_unrelated_operation_kind_and_result () =
+    let fixture = twoProjects () |> withVerifiedTerminalRelease
+    let unrelated =
+        fixture |> modifyOne (fun p ->
+            let operations =
+                p.Operations |> List.map (fun op -> { op with Kind = "verified-ledger-operation" })
+            { p with Operations = operations })
+    unrelated |> WorkLegacyImportPreflight.inspect
+    |> expectsGap (function WorkLegacyImportGap.AccountCapacityConflict _ -> true | _ -> false)
+    let wrongResult =
+        fixture |> modifyOne (fun p ->
+            let operations =
+                p.Operations |> List.map (fun op ->
+                    let result = { op.TerminalResult.Value with ReceiptId = "not-terminal-receipt" }
+                    { op with TerminalResult = Some result })
+            { p with Operations = operations })
+    wrongResult |> WorkLegacyImportPreflight.inspect
+    |> expectsGap (function WorkLegacyImportGap.AccountCapacityConflict _ -> true | _ -> false)
+    let wrongDigest =
+        fixture |> modifyOne (fun p ->
+            let operations =
+                p.Operations |> List.map (fun op -> { op with ResultSha256 = String.replicate 64 "f" })
+            { p with Operations = operations })
+    wrongDigest |> WorkLegacyImportPreflight.inspect
+    |> expectsGap (function WorkLegacyImportGap.AccountCapacityConflict _ -> true | _ -> false)
 
 [<Test>]
 let c0_tampered_terminal_blob_or_generation_blocks_release () =
@@ -398,6 +552,7 @@ let c0_tampered_terminal_blob_or_generation_blocks_release () =
                   AccountTokenId = "one-account-token"
                   ReceiptId = "terminal-receipt"
                   OperationId = operation.OperationId
+                  OperationResultSha256 = digest
                   TerminalHead = shaA
                   TerminalBlobOid = "not-a-git-object"
                   AncestryVerified = true
@@ -440,6 +595,27 @@ let private imported input fence path operationId =
     match WorkLegacyImportSqlite.commitOfflineFixture path operationId input fence with
     | Ok result -> result
     | Error gap -> failwithf "Offline import unexpectedly failed: %A" gap
+
+[<Test>]
+let c1_offline_negative_review_persists_as_rejected_without_integration_effect () =
+    withDisposableSqlite (fun path ->
+        let input = twoProjects () |> rejectedReviewOnly |> withOfflineFrozenProjects
+        let receipt = imported input (offlineFence input) path offlineImportOperation
+        Assert.That(receipt.Replayed, Is.False)
+        let db = WorkSqliteAuthority(path)
+        let reviewKey = { ProjectId = projectOne.ToString("D")
+                          Kind = WorkSqliteRecordKind.Review
+                          EntityId = "R" }
+        match db.ReadRecord reviewKey with
+        | Ok(Some record) ->
+            Assert.That(record.Value.BodyJson, Does.Contain("\"Accepted\":false"))
+            Assert.That(record.Value.ExternalEffect, Is.EqualTo WorkSqliteEffect.NoneRecorded)
+        | result -> Assert.Fail(sprintf "Rejected review not imported: %A" result)
+        let integrationKey = { reviewKey with Kind = WorkSqliteRecordKind.Integration
+                                              EntityId = "T" }
+        match db.ReadRecord integrationKey with
+        | Ok None -> ()
+        | result -> Assert.Fail(sprintf "Negative review invented integration: %A" result))
 
 [<Test>]
 let c1_offline_sqlite_atomic_two_project_import_restart_and_idempotent_replay () =

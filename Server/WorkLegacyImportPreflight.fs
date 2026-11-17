@@ -16,12 +16,20 @@ type WorkLegacyImportHead =
       SourceHighWater: int64
       ObservedHighWater: int64 }
 
+// Independently decoded from the verified result of a project terminal CAS.
+// A matching operation ID alone is not proof that a launch became terminal.
+type WorkLegacyImportTerminalResult =
+    { LaunchId: string
+      AccountTokenId: string
+      ReceiptId: string }
+
 type WorkLegacyImportOperation =
     { OperationId: Guid
       Sequence: int64
       RequestSha256: string
       ResultSha256: string
-      Kind: string }
+      Kind: string
+      TerminalResult: WorkLegacyImportTerminalResult option }
 
 type WorkLegacyImportOrigin =
     { WorkId: string
@@ -62,6 +70,7 @@ type WorkLegacyImportTerminal =
       AccountTokenId: string
       ReceiptId: string
       OperationId: Guid
+      OperationResultSha256: string
       TerminalHead: string
       TerminalBlobOid: string
       AncestryVerified: bool
@@ -246,11 +255,63 @@ module WorkLegacyImportPreflight =
                    || not integration.SourceAncestryVerified then
                     gaps.Add(WorkLegacyImportGap.InvalidIntegration(label + ": " + integration.WorkId))
 
+            let matchingFrozenSource workId commit =
+                match origins.TryGetValue workId with
+                | true, source -> source.SourceCommit = commit
+                | _ -> false
+            let verifiedReview (decision: WorkLegacyImportReview) =
+                match project.Queue.Works.TryFind decision.WorkId with
+                | Some stage ->
+                    stage.Kind = WorkKind.FrozenReview
+                    && stage.SubjectId = decision.SubjectId
+                    && stage.Domain = DomainState.FinalizedPendingTerminal decision.ReceiptId
+                    && stage.State <> WorkState.Available
+                    && stage.State <> WorkState.Cancelled
+                    && text decision.ReceiptId
+                    && valid oid decision.FrozenCommit
+                    && decision.DecisionSequence > 0L
+                    && matchingFrozenSource decision.WorkId decision.FrozenCommit
+                | _ -> false
+            let verifiedIntegration (integration: WorkLegacyImportIntegration) =
+                match project.Queue.Works.TryFind integration.WorkId,
+                      reviews.TryGetValue integration.ReviewWorkId with
+                | Some stage, (true, decision) ->
+                    let matchedDomain =
+                        match stage.Domain with
+                        // The normal finalized path stores a receipt; the gate-exception
+                        // resolution path stores the exact observed remote commit.
+                        | DomainState.FinalizedPendingTerminal receipt ->
+                            receipt = integration.ReceiptId
+                            && stage.State <> WorkState.Available
+                            && stage.State <> WorkState.Cancelled
+                        | DomainState.Integrated commit ->
+                            commit = integration.IntegratedCommit
+                            && stage.State = WorkState.Completed
+                        | _ -> false
+                    let matchedEffect =
+                        match stage.Push with
+                        | Some push ->
+                            push.AcceptedSourceSha = integration.SourceCommit
+                            && push.TargetRef = integration.TargetRef
+                            && push.Outcome = PushOutcome.Observed integration.IntegratedCommit
+                        | None -> false
+                    stage.Kind = WorkKind.Integration
+                    && stage.IntegrationAuthorized
+                    && matchedDomain && matchedEffect
+                    && integration.SourceAncestryVerified
+                    && matchingFrozenSource integration.WorkId integration.SourceCommit
+                    && decision.Accepted && verifiedReview decision
+                    && decision.SubjectId = stage.SubjectId
+                    && decision.FrozenCommit = integration.SourceCommit
+                | _ -> false
+
             let acceptedEvidence =
                 (project.Reviews
-                 |> List.filter (fun review -> review.Accepted)
+                 |> List.filter (fun review -> review.Accepted && verifiedReview review)
                  |> List.map (fun review -> review.ReceiptId))
-                @ (project.Integrations |> List.map (fun integration -> integration.ReceiptId))
+                @ (project.Integrations
+                   |> List.filter verifiedIntegration
+                   |> List.map (fun integration -> integration.ReceiptId))
                 @ (project.Validations
                    |> List.filter (fun proof -> proof.EvidenceVerified && valid oid proof.SourceCommit)
                    |> List.map (fun proof -> proof.EvidenceRef))
@@ -300,29 +361,18 @@ module WorkLegacyImportPreflight =
                 | Some push when push.Outcome = PushOutcome.Unknown ->
                     gaps.Add(WorkLegacyImportGap.UnresolvedExternalEffect prefix)
                 | _ -> ()
-                let matchingFrozenSource workId commit =
-                    match origins.TryGetValue workId with
-                    | true, source -> source.SourceCommit = commit
-                    | _ -> false
                 match stage.Kind, stage.Domain with
                 | WorkKind.FrozenReview, DomainState.FinalizedPendingTerminal receipt ->
                     match reviews.TryGetValue workId with
                     | true, decision when decision.ReceiptId = receipt
-                                          && decision.SubjectId = stage.SubjectId
-                                          && decision.Accepted
-                                          && matchingFrozenSource workId decision.FrozenCommit -> ()
+                                          && verifiedReview decision -> ()
                     | _ -> gaps.Add(WorkLegacyImportGap.MissingReviewDecision prefix)
                 | WorkKind.FrozenReview, _ when stage.State = WorkState.Completed ->
                     gaps.Add(WorkLegacyImportGap.MissingReviewDecision prefix)
-                | WorkKind.Integration, DomainState.Integrated receipt ->
+                | WorkKind.Integration, DomainState.Integrated _
+                | WorkKind.Integration, DomainState.FinalizedPendingTerminal _ ->
                     match integrations.TryGetValue workId with
-                    | true, integration when integration.ReceiptId = receipt
-                                            && matchingFrozenSource workId integration.SourceCommit
-                                            && project.Reviews |> List.exists (fun review ->
-                                                review.WorkId = integration.ReviewWorkId
-                                                && review.Accepted
-                                                && review.SubjectId = stage.SubjectId
-                                                && review.FrozenCommit = integration.SourceCommit) -> ()
+                    | true, integration when verifiedIntegration integration -> ()
                     | _ -> gaps.Add(WorkLegacyImportGap.MissingIntegration prefix)
                 | WorkKind.Integration, _ when stage.State = WorkState.Completed ->
                     gaps.Add(WorkLegacyImportGap.MissingIntegration prefix)
@@ -330,7 +380,7 @@ module WorkLegacyImportPreflight =
                 if stage.IntegrationAuthorized && stage.Kind = WorkKind.Integration then
                     match origins.TryGetValue workId with
                     | true, origin when project.Reviews |> List.exists (fun review ->
-                        review.Accepted && review.SubjectId = stage.SubjectId
+                        review.Accepted && verifiedReview review && review.SubjectId = stage.SubjectId
                         && review.FrozenCommit = origin.SourceCommit) -> ()
                     | _ -> gaps.Add(WorkLegacyImportGap.MissingReviewDecision(prefix + ": integration authorization"))
 
@@ -338,15 +388,28 @@ module WorkLegacyImportPreflight =
                 if not (project.Queue.Works.ContainsKey origin.WorkId) then
                     gaps.Add(WorkLegacyImportGap.MissingOrigin(label + ": orphan " + origin.WorkId))
             for review in project.Reviews do
-                match project.Queue.Works.TryFind review.WorkId with
-                | Some stage when stage.Kind = WorkKind.FrozenReview
-                                  && stage.SubjectId = review.SubjectId -> ()
-                | _ -> gaps.Add(WorkLegacyImportGap.InvalidReviewDecision(label + ": orphan " + review.WorkId))
+                if not (verifiedReview review) then
+                    gaps.Add(WorkLegacyImportGap.InvalidReviewDecision(label + ": unmatched stage " + review.WorkId))
             for integration in project.Integrations do
-                match project.Queue.Works.TryFind integration.WorkId with
-                | Some stage when stage.Kind = WorkKind.Integration -> ()
-                | _ -> gaps.Add(WorkLegacyImportGap.InvalidIntegration(label + ": orphan " + integration.WorkId))
+                if not (verifiedIntegration integration) then
+                    gaps.Add(WorkLegacyImportGap.InvalidIntegration(label + ": unmatched stage/effect " + integration.WorkId))
 
+            // A terminal record is only proof after its exact operation, decoded
+            // terminal result, outcome digest, and project launch all agree.
+            // "project-launch-terminal" is the normalized *verified* CAS kind,
+            // never an inference from membership in the operation ID list.
+            let verifiedTerminalOperation (terminal: WorkLegacyImportTerminal) =
+                project.Operations |> List.exists (fun operation ->
+                    operation.OperationId = terminal.OperationId
+                    && operation.Kind = "project-launch-terminal"
+                    && valid hash terminal.OperationResultSha256
+                    && operation.ResultSha256 = terminal.OperationResultSha256
+                    && (match operation.TerminalResult with
+                        | Some result ->
+                            result.LaunchId = terminal.LaunchId
+                            && result.AccountTokenId = terminal.AccountTokenId
+                            && result.ReceiptId = terminal.ReceiptId
+                        | None -> false))
             let knownTerminals = HashSet<string>(StringComparer.Ordinal)
             for terminal in project.Terminals do
                 if not (knownTerminals.Add terminal.LaunchId)
@@ -355,14 +418,29 @@ module WorkLegacyImportPreflight =
                    || not (valid oid terminal.TerminalBlobOid)
                    || not terminal.AncestryVerified
                    || terminal.LaunchGeneration < 0L
-                   || not (project.Operations |> List.exists (fun op -> op.OperationId = terminal.OperationId)) then
+                   || not (verifiedTerminalOperation terminal) then
                     gaps.Add(WorkLegacyImportGap.AccountCapacityConflict(label + ": unverified terminal " + terminal.LaunchId))
                 match project.Queue.Launches.TryFind terminal.LaunchId with
                 | Some launch when launch.AccountTokenId = terminal.AccountTokenId
+                                   && (match launch.State with
+                                       | LaunchState.TerminalPendingRelease receipt -> receipt = terminal.ReceiptId
+                                       | _ -> false)
                                    && (launch.Lease |> Option.forall (fun lease ->
                                        int64 lease.Generation = terminal.LaunchGeneration)) -> ()
                 | _ ->
                     gaps.Add(WorkLegacyImportGap.AccountCapacityConflict(label + ": orphan terminal " + terminal.LaunchId))
+            for operation in project.Operations do
+                match operation.TerminalResult with
+                | Some result when operation.Kind = "project-launch-terminal"
+                                   && project.Terminals |> List.exists (fun terminal ->
+                                       terminal.OperationId = operation.OperationId
+                                       && terminal.LaunchId = result.LaunchId
+                                       && terminal.AccountTokenId = result.AccountTokenId
+                                       && terminal.ReceiptId = result.ReceiptId
+                                       && verifiedTerminalOperation terminal) -> ()
+                | Some _ ->
+                    gaps.Add(WorkLegacyImportGap.AccountCapacityConflict(label + ": orphan terminal operation " + identifier operation.OperationId))
+                | None -> ()
 
             for KeyValue(launchId, launch) in project.Queue.Launches do
                 if launchId <> launch.Id || launch.ProjectId <> label
@@ -399,8 +477,9 @@ module WorkLegacyImportPreflight =
                 match project.Queue.Launches.TryFind label with
                 | Some launch when launch.AccountTokenId = token.AccountTokenId
                                    && (not token.Released
-                                       || (match launch.State with
-                                           | LaunchState.TerminalPendingRelease _ -> true
+                                       || (match launch.State, token.TerminalReceipt with
+                                           | LaunchState.TerminalPendingRelease projectReceipt, Some accountReceipt ->
+                                               text projectReceipt && projectReceipt = accountReceipt
                                            | _ -> false)) -> ()
                 | _ -> gaps.Add(WorkLegacyImportGap.AccountCapacityConflict("unmatched token " + label))
                 if token.Released && (project.Queue.Works |> Map.exists (fun _ stage ->
@@ -413,7 +492,16 @@ module WorkLegacyImportPreflight =
                         && terminal.AccountTokenId = token.AccountTokenId
                         && terminal.ReceiptId = receipt
                         && terminal.AncestryVerified
-                        && project.Operations |> List.exists (fun op -> op.OperationId = terminal.OperationId)) -> ()
+                        && project.Operations |> List.exists (fun op ->
+                            op.OperationId = terminal.OperationId
+                            && op.Kind = "project-launch-terminal"
+                            && valid hash terminal.OperationResultSha256
+                            && op.ResultSha256 = terminal.OperationResultSha256
+                            && (match op.TerminalResult with
+                                | Some result -> result.LaunchId = terminal.LaunchId
+                                                 && result.AccountTokenId = terminal.AccountTokenId
+                                                 && result.ReceiptId = terminal.ReceiptId
+                                | None -> false))) -> ()
                     | _ ->
                         gaps.Add(WorkLegacyImportGap.AccountCapacityConflict("unverified project terminal release " + label))
             | None -> gaps.Add(WorkLegacyImportGap.AccountCapacityConflict("unknown project token " + label))

@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"work-verified-git-sqlite-import","title":"[P1][Stateful Work/C] Verified legacy Git-ledger importer and writer fence","version":5,"lifecycle":"InProgress","specVersion":4,"attemptId":"d19ba52d876c4d44a529f6b967510fad"}
+{"schemaVersion":2,"taskId":"work-verified-git-sqlite-import","title":"[P1][Stateful Work/C] Controlled single-operator Git-to-SQLite handover","version":6,"lifecycle":"InProgress","specVersion":5,"attemptId":"d19ba52d876c4d44a529f6b967510fad"}

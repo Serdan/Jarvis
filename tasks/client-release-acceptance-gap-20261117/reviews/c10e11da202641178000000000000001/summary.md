@@ -1,0 +1,1 @@
+One-doc-only evidence on clean isolated head: all 98 Client.Tests fixture files covered by six hermetic Release partitions (1,231/1,231 passing), dashboard exact-head focused 258/258, 240s unfiltered baseline+AGENTS comparative timeouts 124 with progressing tests, exact SHA/source scope, HOLD release/integration gate. Review provenance and no full-suite PASS claims.

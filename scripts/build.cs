@@ -139,16 +139,29 @@ int Build(string configuration)
 
 int PublishClient(string rid, string server, string configuration, string output)
 {
-    return DotNet(
+    var commit = configuration == "Release" ? GitHead() : "";
+    if (configuration == "Release")
+    {
+        var preflight = DotNet("scripts/release-provenance.cs", "preflight", commit);
+        if (preflight != 0)
+            return preflight;
+    }
+
+    var code = DotNet(
         "publish",
         "Client/Client.fsproj",
         "-c", configuration,
-        "-r", rid,
+        $"-p:RuntimeIdentifier={rid}",
+        "-p:RestoreLockedMode=true",
         "-o", output,
         "-p:PublishSingleFile=true",
         "-p:SelfContained=true",
         $"-p:JarvisServerUrl={server}"
     );
+    if (code != 0 || configuration != "Release")
+        return code;
+
+    return DotNet("scripts/release-provenance.cs", "stamp", "client", rid, configuration, output, server, commit);
 }
 
 int PublishClients(IReadOnlyCollection<string> rids, string server, string configuration, string outputRoot)
@@ -166,16 +179,29 @@ int PublishClients(IReadOnlyCollection<string> rids, string server, string confi
 
 int PublishServer(string rid, string configuration, string output)
 {
-    return DotNet(
+    var commit = configuration == "Release" ? GitHead() : "";
+    if (configuration == "Release")
+    {
+        var preflight = DotNet("scripts/release-provenance.cs", "preflight", commit);
+        if (preflight != 0)
+            return preflight;
+    }
+
+    var code = DotNet(
         "publish",
         "Server/Server.fsproj",
         "-c", configuration,
-        "-r", rid,
+        $"-p:RuntimeIdentifier={rid}",
+        "-p:RestoreLockedMode=true",
         "-o", output,
         "-p:PublishSingleFile=true",
         "-p:SelfContained=true",
         "-p:IncludeNativeLibrariesForSelfExtract=true"
     );
+    if (code != 0 || configuration != "Release")
+        return code;
+
+    return DotNet("scripts/release-provenance.cs", "stamp", "server", rid, configuration, output, "-", commit);
 }
 
 int PublishJarvis2Linux(string configuration)
@@ -201,6 +227,24 @@ int Clean()
     }
 
     return DotNet("clean", "Jarvis.slnx");
+}
+
+string GitHead()
+{
+    using var process = new Process();
+    process.StartInfo.FileName = "git";
+    process.StartInfo.WorkingDirectory = root;
+    process.StartInfo.UseShellExecute = false;
+    process.StartInfo.RedirectStandardOutput = true;
+    process.StartInfo.ArgumentList.Add("rev-parse");
+    process.StartInfo.ArgumentList.Add("--verify");
+    process.StartInfo.ArgumentList.Add("HEAD");
+    process.Start();
+    var commit = process.StandardOutput.ReadToEnd().Trim();
+    process.WaitForExit();
+    if (process.ExitCode != 0 || commit.Length is not (40 or 64))
+        throw new InvalidOperationException("Cannot establish exact Git source commit for release.");
+    return commit;
 }
 
 int DotNet(params string[] arguments)

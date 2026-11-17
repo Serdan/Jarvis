@@ -1,27 +1,43 @@
 #!/usr/bin/env dotnet
+// Explicit operator action: build the Linux server and collect its verified download.
 using System.Diagnostics;
-using System.Security.Cryptography;
 
-var root = Directory.GetCurrentDirectory();
-var process = Process.Start(new ProcessStartInfo("dotnet")
-{
-    ArgumentList = { "scripts/build.cs", "publish-server", "--rid", "linux-x64" },
-    UseShellExecute = false
-}) ?? throw new Exception("Could not start server publish.");
-process.WaitForExit();
-if (process.ExitCode != 0) return process.ExitCode;
-var dir = Path.Combine(root, "artifacts", "downloads");
-Directory.CreateDirectory(dir);
-var file = "JarvisServer-linux-x64";
-var source = Path.Combine(root, "artifacts", "server", "linux-x64", "JarvisServer");
-File.Copy(source, Path.Combine(dir, file), true);
-using var stream = File.OpenRead(Path.Combine(dir, file));
-var hash = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
-var manifest = Path.Combine(dir, "SHA256SUMS");
-var lines = File.Exists(manifest)
-    ? File.ReadAllLines(manifest).Where(line => !line.EndsWith("  " + file, StringComparison.Ordinal)).ToList()
-    : new List<string>();
-lines.Add(hash + "  " + file);
-File.WriteAllLines(manifest, lines.Order(StringComparer.Ordinal));
-Console.WriteLine($"Published {file}: {hash}");
+var root = FindRepositoryRoot();
+var preflight = DotNet("scripts/release-provenance.cs", "preflight");
+if (preflight != 0) return preflight;
+
+var build = DotNet("scripts/build.cs", "publish-server", "--rid", "linux-x64");
+if (build != 0) return build;
+
+var collect = DotNet("scripts/release-provenance.cs", "collect",
+    Path.Combine("artifacts", "server", "linux-x64", "JarvisServer"), "JarvisServer-linux-x64");
+if (collect != 0) return collect;
+
+var verify = DotNet("scripts/release-provenance.cs", "verify");
+if (verify != 0) return verify;
+Console.WriteLine("Linux server download has verified checksums and release provenance.");
 return 0;
+
+int DotNet(params string[] arguments)
+{
+    using var process = new Process();
+    process.StartInfo.FileName = "dotnet";
+    process.StartInfo.WorkingDirectory = root;
+    process.StartInfo.UseShellExecute = false;
+    foreach (var argument in arguments) process.StartInfo.ArgumentList.Add(argument);
+    Console.WriteLine("dotnet " + string.Join(' ', arguments));
+    process.Start();
+    process.WaitForExit();
+    return process.ExitCode;
+}
+
+string FindRepositoryRoot()
+{
+    var current = new DirectoryInfo(Directory.GetCurrentDirectory());
+    while (current is not null)
+    {
+        if (File.Exists(Path.Combine(current.FullName, "Jarvis.slnx"))) return current.FullName;
+        current = current.Parent;
+    }
+    throw new InvalidOperationException("Could not find Jarvis.slnx.");
+}

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-validation:
+    name: Release validation (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Python for isolated release checks
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install .NET 11
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 11.0.x
+      - name: Restore pinned package graph
+        run: dotnet restore Jarvis.slnx --locked-mode
+      - name: Build solution (Release)
+        run: dotnet build Jarvis.slnx --configuration Release --no-restore
+      - name: Client Release tests
+        run: dotnet test Client.Tests/Client.Tests.fsproj --configuration Release --no-build --no-restore
+      - name: Server Release tests
+        run: dotnet test Server.Tests/Server.Tests.fsproj --configuration Release --no-build --no-restore
+      - name: Release provenance negative controls
+        run: python scripts/tests/test-release-provenance.py

@@ -137,7 +137,9 @@ async function execute(args) {
   // ProseMirror can clear visible text before React disables Send. Wait for
   // three empty/inactive observations rather than inserting into stale state.
   // Never click Send to clear an unrelated restored draft.
-  const settleDeadline = Math.min(deadline, Date.now() + 1800);
+  // Hidden Chromium tabs can clamp 75ms timers to roughly 1000ms.
+  // Leave time for three consecutive observed inactive Send states.
+  const settleDeadline = Math.min(deadline, Date.now() + 8000);
   let settledSamples = 0;
   while (true) {
     if (location.href !== startUrl) return notSubmitted("UnexpectedStartUrl");
@@ -187,13 +189,28 @@ async function execute(args) {
     return { status: "outcomeUnknown", reason: "SendClickUncertain" };
   }
 
+  // ChatGPT renders Markdown backtick-delimited inline code as <code>,
+  // so innerText omits the delimiters. Require both identical visible
+  // text and exact code-element contents before accepting that rendering.
+  const matchesRenderedUserMessage = bubble => {
+    const normalize = value => (value || "").replace(/\r\n/g, "\n").replace(/\u00a0/g, " ").trim();
+    const visibleText = normalize(bubble.innerText);
+    if (visibleText === normalizedPrompt) return true;
+    const inlineCodePattern = /`([^`\n]+)`/g;
+    const expectedCode = Array.from(normalizedPrompt.matchAll(inlineCodePattern), match => match[1]);
+    if (!expectedCode.length || visibleText !== normalizedPrompt.replace(inlineCodePattern, "$1")) return false;
+    const actualCode = Array.from(bubble.querySelectorAll?.("code:not(pre code)") || [],
+      node => normalize(node.textContent));
+    return actualCode.length === expectedCode.length &&
+      actualCode.every((code, index) => code === expectedCode[index]);
+  };
   const evidence = await until(() => {
     const legacyTurn = document.querySelectorAll('[data-message-author-role="user"]').length > initialTurns;
     // Match the actual newly rendered user bubble, not a sidebar title or
     // arbitrary page text. Never include prompt content in diagnostics.
     const matchingBubble = Array.from(document.querySelectorAll('[data-user-message-bubble]'))
       .slice(initialBubbles)
-      .some(bubble => (bubble.innerText || "").replace(/\r\n/g, "\n").replace(/\u00a0/g, " ").trim() === normalizedPrompt);
+      .some(matchesRenderedUserMessage);
     const newUserTurn = legacyTurn || matchingBubble;
     const routeChanged = location.href !== initialUrl && location.origin === new URL(startUrl).origin;
     const composerCleared = readEditor().trim().length === 0;

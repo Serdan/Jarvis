@@ -117,7 +117,14 @@ function harness(options = {}) {
         return options.noModeToggle ? [] : [chatMode, workMode];
       }
       if (selector === '[data-user-message-bubble]') {
-        return renderedBubble === null ? [] : [{ innerText: renderedBubble }];
+        if (renderedBubble === null) return [];
+        const inlineCode = /`([^`\n]+)`/g;
+        const codeParts = Array.from(renderedBubble.matchAll(inlineCode), match => match[1]);
+        return [{
+          innerText: options.renderInlineCode ? renderedBubble.replace(inlineCode, "$1") : renderedBubble,
+          querySelectorAll: query => query === "code:not(pre code)" && options.renderInlineCode
+            ? codeParts.map(textContent => ({ textContent })) : []
+        }];
       }
       if (selector.includes('data-message-author-role="user"') &&
           options.injectTurnAfterClear && draftWasCleared && !injectedTurn) {
@@ -129,7 +136,10 @@ function harness(options = {}) {
     }
   };
   const window = { getSelection: () => options.selectionUnavailable ? null : selection };
-  const ctx = vm.createContext({ document, window, location: site, setTimeout, Date, URL });
+  const timer = options.backgroundTimerClampMs
+    ? (callback, ms) => setTimeout(callback, Math.max(ms, options.backgroundTimerClampMs))
+    : setTimeout;
+  const ctx = vm.createContext({ document, window, location: site, setTimeout: timer, Date, URL });
   const run = async (prompt = "Start fresh\nRead Jarvis assignment", extra = {}) =>
     await vm.runInContext(source + "\nexecute(" + JSON.stringify({
       prompt, timeoutMs: options.timeoutMs || 350, ...extra
@@ -471,4 +481,45 @@ test("existing conversation with draft is not touched", async () => {
   assert.equal(result.reason, "UnexpectedStartUrl");
   assert.equal(h.content, "Personal text");
   assert.equal(h.clicks, 0);
+});
+
+
+test("acknowledges an exact user message rendered with inline-code Markdown", async () => {
+  const prompt = "You're `Lead` in Favn. Read `agent_inbox` and `yield_agent`.";
+  const h = harness({ noLegacyTurnMarkers: true, renderUserBubble: true,
+    renderInlineCode: true, bubbleDelayMs: 30, timeoutMs: 600 });
+  const result = await h.run(prompt);
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.deepEqual(Array.from(result.evidence), ["newUserTurn", "matchingUserBubble", "conversationRoute"]);
+  assert.equal(h.lastSubmittedText, prompt);
+  assert.equal(h.clicks, 1);
+});
+
+test("a visually matching message without expected inline-code elements is not acknowledged", async () => {
+  const h = harness({ noLegacyTurnMarkers: true, renderUserBubble: true,
+    renderInlineCode: true, bubbleTextOverride: "You're Lead in Favn", timeoutMs: 300 });
+  const result = await h.run("You're `Lead` in Favn");
+  assert.equal(result.status, "outcomeUnknown");
+  assert.equal(result.reason, "SubmissionUnconfirmed");
+  assert.equal(h.clicks, 1);
+});
+
+test("a different rendered inline-code user message is not acknowledged", async () => {
+  const h = harness({ noLegacyTurnMarkers: true, renderUserBubble: true,
+    renderInlineCode: true, bubbleTextOverride: "You're `Worker` in Favn", timeoutMs: 300 });
+  const result = await h.run("You're `Lead` in Favn");
+  assert.equal(result.status, "outcomeUnknown");
+  assert.equal(result.reason, "SubmissionUnconfirmed");
+  assert.equal(h.clicks, 1);
+});
+
+test("background 1000ms timer clamp still permits safe restored-draft acknowledgement", async () => {
+  const prompt = "Resume `Lead` and read `agent_inbox`.";
+  const h = harness({ existingDraft: "Unrelated stale draft", noLegacyTurnMarkers: true,
+    renderUserBubble: true, renderInlineCode: true, backgroundTimerClampMs: 1000,
+    bubbleDelayMs: 40, timeoutMs: 9500 });
+  const result = await h.run(prompt);
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.equal(h.lastSubmittedText, prompt);
+  assert.equal(h.clicks, 1);
 });

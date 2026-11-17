@@ -188,6 +188,69 @@ let interrupted_prepared_row_restarts_as_non_replayable_recovery_hold () =
         Assert.That(restarted.Prepare(Guid.NewGuid(), digestB) |> Result.isError, Is.True))
 
 [<Test>]
+let unresolved_prepared_uuid_blocks_fresh_admission_without_restart () =
+    withDisposableStore (fun path ->
+        let store = OriginalGitPublisherStore(path)
+        let firstId = Guid.NewGuid()
+        match store.Prepare(firstId, digestA) with
+        | Ok(OriginalGitFixturePrepare.Fresh _) -> ()
+        | other -> Assert.Fail(sprintf "First CAS was not prepared: %A" other)
+        // A prepared row is not a known completed effect. The persisted phase
+        // is still Active, but a second UUID must never enter remote CAS.
+        Assert.That(store.ReadState().Phase, Is.EqualTo(OriginalGitFixturePhase.Active))
+        match store.Prepare(Guid.NewGuid(), digestB) with
+        | Error OriginalGitPublisherFailure.UnresolvedOriginalEffect -> ()
+        | other -> Assert.Fail(sprintf "Second UUID escaped unresolved journal: %A" other)
+        match store.Prepare(firstId, digestA) with
+        | Ok(OriginalGitFixturePrepare.Replay row) ->
+            Assert.That(row.Status, Is.EqualTo(OriginalGitFixtureCasStatus.Prepared))
+        | other -> Assert.Fail(sprintf "Original UUID replay changed: %A" other))
+
+[<Test>]
+let failed_unknown_write_poison_live_gateway_and_hold_after_restart () =
+    withDisposableStore (fun path ->
+        let mutable failNextUnknownWrite = true
+        let store =
+            OriginalGitPublisherStore(
+                path,
+                beforeMarkUnknownWrite = (fun () ->
+                    if failNextUnknownWrite then
+                        failNextUnknownWrite <- false
+                        invalidOp "Injected transient unknown journal failure"))
+        let host = InMemoryFixtureRemote(identity, inventory)
+        host.SetFaultAfterWrite true
+        let gateway = OriginalGitPublisherFixtureExecutor(store, host)
+        let first = originalCas ()
+        match gateway.PublishCas first with
+        | Error(OriginalGitPublisherFailure.OutcomeUnknown id) when id = first.OperationId -> ()
+        | other -> Assert.Fail(sprintf "Ambiguous first CAS outcome was promoted: %A" other)
+        Assert.That(host.Head projectTarget1, Is.EqualTo(Some oidB))
+        Assert.That((store.ReadOperation first.OperationId |> Option.get).Status,
+                    Is.EqualTo(OriginalGitFixtureCasStatus.Prepared))
+        // The injected failure was transient; absence of a durable Unknown
+        // transition must nevertheless poison this still-running publisher.
+        Assert.That(failNextUnknownWrite, Is.False)
+        Assert.That(store.ReadState().Phase,
+                    Is.EqualTo(OriginalGitFixturePhase.RecoveryHold(Some first.OperationId)))
+        host.SetFaultAfterWrite false
+        let second =
+            { originalCas() with ExpectedRemoteHead = Some oidB; ProposedRemoteHead = Some oidA }
+        match gateway.PublishCas second with
+        | Error OriginalGitPublisherFailure.UnresolvedOriginalEffect -> ()
+        | other -> Assert.Fail(sprintf "Fresh CAS escaped live poison: %A" other)
+        Assert.That(host.CasCalls, Is.EqualTo(1))
+        let restartedStore = OriginalGitPublisherStore(path)
+        let restarted = OriginalGitPublisherFixtureExecutor(restartedStore, host)
+        Assert.That(restartedStore.ReadState().Phase,
+                    Is.EqualTo(OriginalGitFixturePhase.RecoveryHold(Some first.OperationId)))
+        Assert.That((restartedStore.ReadOperation first.OperationId |> Option.get).Status,
+                    Is.EqualTo(OriginalGitFixtureCasStatus.Unknown))
+        match restarted.PublishCas second with
+        | Error OriginalGitPublisherFailure.UnresolvedOriginalEffect -> ()
+        | other -> Assert.Fail(sprintf "Fresh CAS escaped restart recovery: %A" other)
+        Assert.That(host.CasCalls, Is.EqualTo(1)))
+
+[<Test>]
 let lost_response_after_remote_advance_remains_unknown_after_restart () =
     withDisposableStore (fun path ->
         let host = InMemoryFixtureRemote(identity, inventory)

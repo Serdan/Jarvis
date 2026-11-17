@@ -69,11 +69,14 @@ module private OriginalGitFixtureSql =
         use cmd = command c sql
         cmd.ExecuteNonQuery() |> ignore
 
-type OriginalGitPublisherStore(databasePath: string) =
+type OriginalGitPublisherStore(databasePath: string, ?beforeMarkUnknownWrite: unit -> unit) =
     let path = Path.GetFullPath databasePath
     let folder = Path.GetDirectoryName path
     let marker = Path.Combine(folder, OriginalGitPublisherStore.DisposableMarker)
     let lane = OriginalGitFixtureSql.locks.GetOrAdd(path, fun _ -> obj())
+    // A failed uncertainty journal write must not reopen publication during
+    // this process lifetime, even while the durable database is unavailable.
+    let mutable liveUnknownOperation: Guid option = None
 
     let readState (c: SqliteConnection) =
         use cmd = OriginalGitFixtureSql.command c
@@ -95,7 +98,10 @@ type OriginalGitPublisherStore(databasePath: string) =
                     parseGuid 1 |> Option.defaultWith (fun () -> invalidOp "Fence ID missing"), epoch)
             | "recovery" -> OriginalGitFixturePhase.RecoveryHold(parseGuid 3)
             | unknown -> invalidOp ("Unknown publisher fixture phase: " + unknown)
-        { Phase = phase; FenceEpoch = epoch }
+        let persisted = { Phase = phase; FenceEpoch = epoch }
+        match liveUnknownOperation with
+        | Some operationId -> OriginalGitPublisherState.uncertain operationId persisted
+        | None -> persisted
 
     let readCas (c: SqliteConnection) (operationId: Guid) =
         use cmd = OriginalGitFixtureSql.command c
@@ -117,6 +123,11 @@ type OriginalGitPublisherStore(databasePath: string) =
                   Sequence = reader.GetInt64 0
                   Status = status
                   ReceiptSha256 = OriginalGitFixtureSql.optionalText reader 3 }
+
+    let hasUnresolvedEffects (c: SqliteConnection) =
+        use cmd = OriginalGitFixtureSql.command c
+                    "SELECT EXISTS(SELECT 1 FROM publisher_ops WHERE status IN ('prepared','unknown'))"
+        Convert.ToInt32(cmd.ExecuteScalar()) <> 0
 
     do
         if String.IsNullOrWhiteSpace databasePath
@@ -178,6 +189,8 @@ type OriginalGitPublisherStore(databasePath: string) =
             | None ->
                 match OriginalGitPublisherState.allowMutation (readState c) with
                 | Error error -> Error error
+                | Ok () when hasUnresolvedEffects c ->
+                    Error OriginalGitPublisherFailure.UnresolvedOriginalEffect
                 | Ok () ->
                     use cmd = OriginalGitFixtureSql.command c
                                 "INSERT INTO publisher_ops(op_id,envelope_sha,status) VALUES(@id,@sha,'prepared'); SELECT last_insert_rowid();"
@@ -205,6 +218,10 @@ type OriginalGitPublisherStore(databasePath: string) =
 
     member _.MarkUnknown(operationId: Guid) =
         lock lane (fun () ->
+            // Poison live admission BEFORE any fallible journal IO. Even if
+            // writing Unknown/recovery fails, no later UUID can publish.
+            liveUnknownOperation <- Some operationId
+            beforeMarkUnknownWrite |> Option.iter (fun inject -> inject())
             use c = OriginalGitFixtureSql.openConnection path
             use tx = c.BeginTransaction()
             use operation = OriginalGitFixtureSql.command c "UPDATE publisher_ops SET status='unknown' WHERE op_id=@id AND status='prepared'"
@@ -254,9 +271,7 @@ type OriginalGitPublisherStore(databasePath: string) =
                             OriginalGitFixtureSql.parameter cmd "@operator" (box (operatorDecisionId.ToString("N")))
                             OriginalGitFixtureSql.parameter cmd "@sha" (box targetSetSha256)
                             cmd.ExecuteNonQuery() |> ignore
-                        use pending = OriginalGitFixtureSql.command c
-                                        "SELECT count(*) FROM publisher_ops WHERE status IN ('prepared','unknown')"
-                        if Convert.ToInt32(pending.ExecuteScalar()) > 0 then
+                        if hasUnresolvedEffects c then
                             Error OriginalGitPublisherFailure.UnresolvedOriginalEffect
                         else Ok next)
 
@@ -304,9 +319,7 @@ type OriginalGitPublisherStore(databasePath: string) =
                                              previous.OriginalSourceEffectHighWater = effectHighWater -> Ok previous
                         | _ -> Error OriginalGitPublisherFailure.ReusedOperationId
                     | _ ->
-                        use pending = OriginalGitFixtureSql.command c
-                                        "SELECT count(*) FROM publisher_ops WHERE status IN ('prepared','unknown')"
-                        if Convert.ToInt32(pending.ExecuteScalar()) > 0 then
+                        if hasUnresolvedEffects c then
                             Error OriginalGitPublisherFailure.UnresolvedOriginalEffect
                         else
                             use cmd = OriginalGitFixtureSql.command c

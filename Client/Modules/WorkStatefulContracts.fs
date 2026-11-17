@@ -95,6 +95,9 @@ type IntegrationStage =
 
 type WorkStage =
     { Id: string
+      // Canonical project instance; node/stage IDs are only project-local.
+      // Never join or authorize by an unqualified ID.
+      ProjectId: string
       NodeId: string
       QueueId: string
       Kind: StageKind
@@ -162,13 +165,19 @@ type WorkCommand =
     | Claim of stageId: string
     | SubmitFrozenReview of stageId: string * commit: string
     | RecordIntegration of stageId: string * commit: string
-    | ReleaseRecoveryFence of projectId: string * evidenceRef: string
+    | ReleaseRecoveryFence of evidenceRef: string
 
 type CommandRequest =
     { ApiVersion: int
+      // Scope all project-local subject IDs to this canonical project.
+      // The server must verify the ID against authenticated authority.
+      ProjectId: string
       OperationId: Guid
       ExpectedSnapshotRevision: int64
       ExpectedSubjectVersion: int
+      // H1 stage commands require an exact generation to fence stale effects;
+      // None is reserved for project/node commands.
+      ExpectedStageGeneration: int option
       Command: WorkCommand }
 
 [<RequireQualifiedAccess>]

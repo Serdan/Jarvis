@@ -128,21 +128,24 @@ let private integration = function
     | IntegrationStage.Unknown why -> unknown ("Integration: " + why)
     | _ -> unknown "Invalid integration SHA"
 
-let private pathFor (nodes: Map<string, WorkNode>) (node: WorkNode) =
-    let rec visit (visited: Set<string>) (current: WorkNode) =
-        if Set.contains current.Id visited then Error "Cycle in Project/System/Feature ancestry"
+let private rowKey projectId localId = projectId + "/" + localId
+
+let private pathFor (nodes: Map<string * string, WorkNode>) (node: WorkNode) =
+    let rec visit (visited: Set<string * string>) (current: WorkNode) =
+        let currentKey = current.ProjectId, current.Id
+        if Set.contains currentKey visited then Error "Cycle in Project/System/Feature ancestry"
         else
             let currentLabel = kind current.Kind + ": " + current.Title
             match current.ParentId with
             | None when current.Kind = NodeKind.Project -> Ok [ currentLabel ]
             | None -> Error "Non-project Work unit has no parent"
             | Some parentId ->
-                match Map.tryFind parentId nodes with
+                match Map.tryFind (current.ProjectId, parentId) nodes with
                 | None -> Error ("Missing parent " + parentId)
                 | Some parent when parent.ProjectId <> current.ProjectId ->
                     Error "Parent belongs to another project"
                 | Some parent ->
-                    visit (Set.add current.Id visited) parent
+                    visit (Set.add currentKey visited) parent
                     |> Result.map (fun result -> result @ [ currentLabel ])
     visit Set.empty node |> Result.map (String.concat " / ")
 
@@ -208,7 +211,7 @@ let private contains (term: string) (value: string) =
     value.Contains(term, StringComparison.OrdinalIgnoreCase)
 
 let private projectStage revision origin scope roles capacity recovery nodes claimedTwice (stage: WorkStage) =
-    let node = Map.tryFind stage.NodeId nodes
+    let node = Map.tryFind (stage.ProjectId, stage.NodeId) nodes
     let path =
         node
         |> Option.map (fun n -> pathFor nodes n |> Result.defaultWith unknown)
@@ -281,7 +284,7 @@ let private projectStage revision origin scope roles capacity recovery nodes cla
             "Eligible in snapshot (read-only; no H0 claim endpoint)"
         | StageState.Available ->
             "NotReady: " + String.concat "; " gate
-    { Key = stage.Id
+    { Key = rowKey stage.ProjectId stage.Id
       Path = path
       Queue = stage.QueueId
       Kind = stageKind stage.Kind
@@ -293,6 +296,7 @@ let private projectStage revision origin scope roles capacity recovery nodes cla
       Integration = integration stage.Integration
       Details =
         [ sprintf "Work stage %s generation %d / availability sequence %d" stage.Id stage.Generation stage.AvailableSequence
+          "Project: " + stage.ProjectId
           "Node: " + stage.NodeId
           evidenceText revision "Unmet hard prerequisites" stage.UnmetHardDependencies
               (fun deps -> if deps.IsEmpty then "No unmet hard prerequisites (at this revision)" else String.concat ", " deps)
@@ -333,17 +337,19 @@ let renderAt (now: DateTimeOffset) (query: Query) (snapshot: Snapshot) =
                 let selectedNodes = snapshot.Nodes |> List.filter included
                 let duplicates =
                     selectedNodes
-                    |> List.groupBy _.Id
+                    |> List.groupBy (fun node -> node.ProjectId, node.Id)
                     |> List.filter (fun (_, members) -> members.Length > 1)
-                if not duplicates.IsEmpty then unavailable "Duplicate canonical Work node identities in snapshot"
+                if selectedNodes |> List.exists (fun node -> not (nonblank node.ProjectId && nonblank node.Id)) then
+                    unavailable "Missing canonical project/node identity in snapshot"
+                elif not duplicates.IsEmpty then unavailable "Duplicate canonical Work node identities in snapshot"
                 else
-                    let nodes = selectedNodes |> List.map (fun node -> node.Id, node) |> Map.ofList
+                    let nodes = selectedNodes |> List.map (fun node -> (node.ProjectId, node.Id), node) |> Map.ofList
                     let nodeRows =
                         selectedNodes
                         |> List.sortBy (fun node -> node.ProjectId, node.Id)
                         |> List.map (fun node ->
                             let path = pathFor nodes node
-                            { Key = node.Id
+                            { Key = rowKey node.ProjectId node.Id
                               Path = path |> Result.defaultWith unknown
                               State = lifecycle node
                               Proposal = proposal node.Proposal
@@ -364,7 +370,7 @@ let renderAt (now: DateTimeOffset) (query: Query) (snapshot: Snapshot) =
                             | Error reason -> Error ("Role filter cannot be verified: " + reason)
                     let projectStages =
                         snapshot.Stages
-                        |> List.filter (fun stage -> Map.containsKey stage.NodeId nodes)
+                        |> List.filter (fun stage -> Map.containsKey (stage.ProjectId, stage.NodeId) nodes)
                     let allStages =
                         projectStages
                         |> List.filter (fun stage -> query.QueueId |> Option.forall ((=) stage.QueueId))
@@ -372,14 +378,16 @@ let renderAt (now: DateTimeOffset) (query: Query) (snapshot: Snapshot) =
                         match snapshot.Origin, query.ProjectId with
                         | SnapshotOrigin.ExplicitFixture _, None ->
                             snapshot.Stages
-                            |> List.filter (fun stage -> not (Map.containsKey stage.NodeId nodes))
-                            |> List.map _.Id
+                            |> List.filter (fun stage -> not (Map.containsKey (stage.ProjectId, stage.NodeId) nodes))
+                            |> List.map (fun stage -> rowKey stage.ProjectId stage.Id)
                         | _ -> []
+                    let malformedStageIds =
+                        projectStages |> List.exists (fun stage -> not (nonblank stage.ProjectId && nonblank stage.Id && nonblank stage.NodeId))
                     let duplicateStageIds =
                         projectStages
-                        |> List.groupBy _.Id
-                        |> List.choose (fun (id, members) ->
-                            if members.Length > 1 then Some id else None)
+                        |> List.groupBy (fun stage -> stage.ProjectId, stage.Id)
+                        |> List.choose (fun ((projectId, id), members) ->
+                            if members.Length > 1 then Some(rowKey projectId id) else None)
                     let claims =
                         projectStages
                         |> List.choose (fun stage ->
@@ -392,7 +400,7 @@ let renderAt (now: DateTimeOffset) (query: Query) (snapshot: Snapshot) =
                     let stages =
                         match roleFilter with
                         | Error _ -> []
-                        | Ok _ when not duplicateStageIds.IsEmpty -> []
+                        | Ok _ when malformedStageIds || not duplicateStageIds.IsEmpty -> []
                         | Ok queues ->
                             allStages
                             |> List.filter (fun stage ->
@@ -403,7 +411,7 @@ let renderAt (now: DateTimeOffset) (query: Query) (snapshot: Snapshot) =
                                 let blocker = evidence snapshot.Revision stage.IsBlocking = Ok true
                                 let priority = evidence snapshot.Revision stage.LeadPriority |> Result.defaultValue Int32.MinValue
                                 (if ready then 0 else 1), (if blocker then 0 else 1),
-                                -int64 priority, stage.AvailableSequence, stage.Id)
+                                -int64 priority, stage.AvailableSequence, stage.ProjectId, stage.Id)
                             |> List.map (projectStage snapshot.Revision snapshot.Origin snapshot.Scope
                                             snapshot.RoleQueues snapshot.Capacity snapshot.Recovery nodes claims)
                             |> List.filter (fun row ->
@@ -414,6 +422,8 @@ let renderAt (now: DateTimeOffset) (query: Query) (snapshot: Snapshot) =
                         [ match roleFilter with Error reason -> yield unknown reason | Ok _ -> ()
                           if not unresolvedFixtureLinks.IsEmpty then
                               yield unknown ("Unresolved Work stage node links in fixture: " + String.concat ", " unresolvedFixtureLinks)
+                          if malformedStageIds then
+                              yield unknown "Missing canonical project/stage identity in snapshot"
                           if not duplicateStageIds.IsEmpty then
                               yield unknown ("Duplicate Work stage identities: " + String.concat ", " duplicateStageIds)
                           if not claims.IsEmpty then

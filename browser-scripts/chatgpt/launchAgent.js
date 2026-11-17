@@ -91,154 +91,210 @@ async function execute(args) {
     }
     return null;
   };
+  // Mode hydration may replace these button nodes after the first observation.
+  // Resolve the semantic mode again after every await; only the original
+  // Work-to-Chat selection may click a mode control.
+  let modeWaitFailure = null;
   const modes = await until(() => {
+    modeWaitFailure = emptyHomeFailure();
+    if (modeWaitFailure) return true;
     const chat = modeButton("Chat");
     const work = modeButton("Work");
     return chat && work ? { chat, work } : null;
   });
+  if (modeWaitFailure) return modeWaitFailure;
   if (!modes) return incompatible("modeSelection", "ModeToggleUnavailable");
   const beforeModeFailure = emptyHomeFailure();
   if (beforeModeFailure) return beforeModeFailure;
   if (Date.now() >= deadline) {
     return { ...notSubmitted("LaunchDeadlineExceeded"), stage: "modeSelection" };
   }
-  if (modes.chat.getAttribute("aria-pressed") !== "true") {
-    modes.chat.click();
+  const selectedChat = modeButton("Chat");
+  const selectedWork = modeButton("Work");
+  if (!selectedChat || !selectedWork) return incompatible("modeSelection", "ModeToggleUnavailable");
+  if (selectedChat.getAttribute("aria-pressed") !== "true") {
+    selectedChat.click();
   }
   const chatReady = await until(() => {
+    modeWaitFailure = emptyHomeFailure();
+    if (modeWaitFailure) return true;
     const chat = modeButton("Chat");
     const work = modeButton("Work");
     return chat?.getAttribute("aria-pressed") === "true" &&
       work?.getAttribute("aria-pressed") === "false";
   });
+  if (modeWaitFailure) return modeWaitFailure;
   if (!chatReady) return incompatible("modeSelection", "ChatModeUnavailable");
 
   const composerSelector = '[data-composer-input-layout] [contenteditable="true"][role="textbox"]';
   const sendSelector = 'button[type="submit"][aria-label="Send"]:not(:disabled)';
   const initialUrl = location.href;
   const initialTurns = document.querySelectorAll('[data-message-author-role="user"]').length;
-  // Current ChatGPT renders user messages under data-user-message-bubble,
-  // without the older data-message-author-role marker.
+  // Modern ChatGPT user messages use the bubble marker instead of the old role.
   const initialBubbles = document.querySelectorAll('[data-user-message-bubble]').length;
-  // This script is for new Jarvis-owned home tabs only. An existing user turn
-  // means this is not an empty new-chat surface, even if the URL still matches.
   if (initialUrl !== startUrl || initialTurns || initialBubbles) {
     return notSubmitted("ExistingConversation");
   }
   const normalizedPrompt = prompt.replace(/\r\n/g, "\n").replace(/\u00a0/g, " ").trim();
-  const composer = await until(() => {
-    const editors = document.querySelectorAll(composerSelector);
-    return editors.length === 1 ? editors[0] : null;
-  });
-  if (!composer) return incompatible("composer", "ComposerUnavailable");
-  if (location.href !== startUrl) return notSubmitted("UnexpectedStartUrl");
-  const readEditor = () => composer.innerText.replace(/\r\n/g, "\n").replace(/\u00a0/g, " ");
-  // The zero-turn Chat editor is a *specific* surface, not just any input
-  // that happens to match the selectors after a React hydration transition.
-  // Guard it again after every asynchronous wait and immediately before Send.
-  const surfaceFailure = stage => {
-    if (location.href !== startUrl) return notSubmitted("UnexpectedStartUrl");
-    if (document.querySelectorAll('[data-message-author-role="user"]').length !== initialTurns ||
-        document.querySelectorAll('[data-user-message-bubble]').length !== initialBubbles) {
-      return notSubmitted("ExistingConversation");
-    }
+  const insertedPrompt = prompt.replace(/\r\n/g, "\n");
+  let activeComposer = null;
+  let activeModes = null;
+  let settledSamples = 0;
+  let inserted = false;
+  let sawComposer = false;
+  let lastTransient = null;
+  let unexpectedSendEnabled = false;
+  let rebinds = 0;
+  let clears = 0;
+  const readEditor = () => activeComposer.innerText.replace(/\r\n/g, "\n").replace(/\u00a0/g, " ");
+
+  // The only recoverable state is a still-home, zero-user-turn page with
+  // Chat actively selected. Actual Work selection, new turns and navigation
+  // are not hydration: fail closed rather than click back or edit the page.
+  const surface = stage => {
+    const homeFailure = emptyHomeFailure();
+    if (homeFailure) return { failure: homeFailure };
     const chat = modeButton("Chat");
     const work = modeButton("Work");
-    if (chat !== modes.chat || work !== modes.work ||
-        chat?.getAttribute("aria-pressed") !== "true" ||
-        work?.getAttribute("aria-pressed") !== "false") {
-      return incompatible(stage, "ModeChanged");
+    if (!chat || !work) return { transient: "ModeChanged" };
+    if (chat.getAttribute("aria-pressed") !== "true" ||
+        work.getAttribute("aria-pressed") !== "false") {
+      return { failure: incompatible(stage, "ModeChanged") };
     }
     const editors = document.querySelectorAll(composerSelector);
-    if (editors.length !== 1 || editors[0] !== composer) {
-      return incompatible(stage, "ComposerChanged");
-    }
-    return null;
+    if (editors.length !== 1) return { transient: "ComposerChanged" };
+    return { chat, work, composer: editors[0] };
   };
-  const beforeClearFailure = surfaceFailure("composer");
-  if (beforeClearFailure) return beforeClearFailure;
-  if (Date.now() >= deadline) {
-    return { ...notSubmitted("LaunchDeadlineExceeded"), stage: "composer" };
-  }
-  if ((composer.textContent || "").length > 0) {
-    // Only actual editor text, not a rendered empty-paragraph newline,
-    // counts as a restored draft.
-    // Any restored draft on the newly Jarvis-created home tab is disposable.
-    // Replace it through ProseMirror editing, not direct DOM text mutation.
-    composer.focus();
-    const selection = window.getSelection();
-    if (!selection) return incompatible("composer", "DraftSelectionUnavailable");
-    const range = document.createRange();
-    range.selectNodeContents(composer);
-    selection.removeAllRanges();
-    selection.addRange(range);
-    const removed = document.execCommand("delete", false, null);
-    selection.removeAllRanges();
-    if (!removed || (composer.textContent || "").length > 0) return incompatible("composer", "DraftClearFailed");
-  }
-  // ProseMirror can clear visible text before React disables Send. On a fresh
-  // tab, hydration may leave Send enabled for several seconds. Use the single
-  // launch deadline, not a second arbitrary 1800ms deadline, and only advance
-  // after three consecutive observations of the same empty/inactive editor.
-  // No enabled Send state can by itself authorize insertion or a click.
-  let settledSamples = 0;
-  while (true) {
-    const changed = surfaceFailure("draftStabilization");
-    if (changed) return changed;
-    if ((composer.textContent || "").length !== 0 || readEditor().trim().length !== 0) {
-      return incompatible("draftStabilization", "DraftReappeared");
-    }
-    settledSamples = document.querySelector(sendSelector) ? 0 : settledSamples + 1;
-    if (settledSamples >= 3) {
-      if (Date.now() >= deadline) {
-        return { ...notSubmitted("LaunchDeadlineExceeded"), stage: "draftStabilization" };
-      }
-      break;
-    }
-    if (Date.now() >= deadline) {
-      return {
-        ...notSubmitted("UnexpectedSendState"), stage: "draftStabilization",
-        diagnostics: { documentReadyState: document.readyState || "unknown", ...selectorCounts() }
-      };
-    }
-    await delay(Math.min(75, Math.max(1, deadline - Date.now())));
-  }
 
-  composer.focus();
-  // ProseMirror must observe the editing operation. Setting textContent bypasses its state.
-  const inserted = document.execCommand("insertText", false, prompt);
-  if (!inserted || readEditor() !== prompt.replace(/\r\n/g, "\n")) {
-    return incompatible("composer", "TextInsertionFailed");
-  }
-  const afterInsertFailure = surfaceFailure("composer");
-  if (afterInsertFailure) return afterInsertFailure;
-  let pendingSurfaceFailure = null;
-  const send = await until(() => {
-    pendingSurfaceFailure = surfaceFailure("submitControl");
-    if (pendingSurfaceFailure) return true; // Stop waiting, but never send.
-    return document.querySelector(sendSelector);
-  });
-  if (pendingSurfaceFailure) return pendingSurfaceFailure;
-  if (!send) return incompatible("submitControl", "SendUnavailable");
-  if (readEditor() !== prompt.replace(/\r\n/g, "\n")) {
-    return incompatible("composer", "ComposerChanged");
-  }
-  const beforeSendFailure = surfaceFailure("submitControl");
-  if (beforeSendFailure) return beforeSendFailure;
-  if (document.querySelector(sendSelector) !== send) {
-    return incompatible("submitControl", "SendChanged");
-  }
-  // A late readiness observation must not turn an expired pre-Send budget
-  // into an unaccounted attempt with no time left for acknowledgement.
-  if (Date.now() >= deadline) {
-    return { ...notSubmitted("LaunchDeadlineExceeded"), stage: "submitControl" };
-  }
-  // Once this click is attempted the effect is non-idempotent. Never try again.
-  try {
-    sendAttempted = true;
-    send.click();
-  } catch {
-    return { status: "outcomeUnknown", reason: "SendClickUncertain" };
+  // A bounded pre-Send state machine. Re-snapshot on React node replacement,
+  // restart the three empty/inactive observations, and use ProseMirror to clear
+  // any auto-restored unsent text. Insertion can be retried BEFORE Send only;
+  // submission itself is a single, irrevocable attempt.
+  while (true) {
+    if (Date.now() >= deadline) {
+      if (lastTransient) return incompatible(sawComposer ? "draftStabilization" : "composer",
+        !sawComposer && lastTransient === "ComposerChanged" ? "ComposerUnavailable" : lastTransient);
+      if (!sawComposer) return incompatible("composer", "ComposerUnavailable");
+      if (inserted) return incompatible("submitControl", "SendUnavailable");
+      if (unexpectedSendEnabled) {
+        return {
+          ...notSubmitted("UnexpectedSendState"), stage: "draftStabilization",
+          diagnostics: { documentReadyState: document.readyState || "unknown", ...selectorCounts() }
+        };
+      }
+      return { ...notSubmitted("LaunchDeadlineExceeded"), stage: "draftStabilization" };
+    }
+
+    let justInserted = false;
+    const stage = inserted ? "submitControl" : sawComposer ? "draftStabilization" : "composer";
+    const current = surface(stage);
+    if (current.failure) return current.failure;
+    if (current.transient) {
+      // Temporary disappearance is only tolerated inside the overall deadline.
+      if (activeComposer && ++rebinds > 10) return incompatible(stage, "SurfaceUnstable");
+      activeComposer = null;
+      activeModes = null;
+      settledSamples = 0;
+      inserted = false;
+      lastTransient = current.transient;
+      unexpectedSendEnabled = false;
+    } else {
+      lastTransient = null;
+      sawComposer = true;
+      if (current.composer !== activeComposer ||
+          current.chat !== activeModes?.chat || current.work !== activeModes?.work) {
+        if (activeComposer && ++rebinds > 10) return incompatible(stage, "SurfaceUnstable");
+        activeComposer = current.composer;
+        activeModes = { chat: current.chat, work: current.work };
+        // A previously inserted prompt on an old editor is not proof that
+        // the live replacement has matching ProseMirror state.
+        settledSamples = 0;
+        inserted = false;
+        unexpectedSendEnabled = false;
+      }
+
+      if (inserted) {
+        if (readEditor() !== insertedPrompt) {
+          // Draft restoration can race our insertion in another home tab.
+          // It has no value, but must never be submitted as our prompt.
+          inserted = false;
+          settledSamples = 0;
+        } else {
+          const send = document.querySelector(sendSelector);
+          if (send) {
+            // No awaited operation separates this complete re-proof from
+            // the one Send. Guard against selector replacement even here.
+            const verified = surface("submitControl");
+            if (verified.failure) return verified.failure;
+            if (!verified.transient &&
+                verified.chat === activeModes.chat &&
+                verified.work === activeModes.work &&
+                verified.composer === activeComposer &&
+                readEditor() === insertedPrompt &&
+                document.querySelector(sendSelector) === send) {
+              if (Date.now() >= deadline) {
+                return { ...notSubmitted("LaunchDeadlineExceeded"), stage: "submitControl" };
+              }
+              try {
+                sendAttempted = true;
+                send.click();
+              } catch {
+                return { status: "outcomeUnknown", reason: "SendClickUncertain" };
+              }
+              break;
+            }
+            // Unsafe-to-click changes are recoverable only by re-stabilizing
+            // the new zero-turn surface, never by clicking the stale button.
+            activeComposer = null;
+            activeModes = null;
+            settledSamples = 0;
+            inserted = false;
+          }
+        }
+      }
+
+      if (!inserted && activeComposer) {
+        if ((activeComposer.textContent || "").length !== 0 || readEditor().trim().length !== 0) {
+          if (++clears > 10) return incompatible("draftStabilization", "SurfaceUnstable");
+          activeComposer.focus();
+          const selection = window.getSelection();
+          if (!selection) return incompatible("composer", "DraftSelectionUnavailable");
+          const range = document.createRange();
+          range.selectNodeContents(activeComposer);
+          selection.removeAllRanges();
+          selection.addRange(range);
+          const removed = document.execCommand("delete", false, null);
+          selection.removeAllRanges();
+          if (!removed || (activeComposer.textContent || "").length !== 0) {
+            return incompatible("composer", "DraftClearFailed");
+          }
+          settledSamples = 0;
+          unexpectedSendEnabled = false;
+        } else {
+          // A disabled Send must hold for three consecutive samples of the
+          // same buttons and editor. A stale enabled Send never permits input.
+          unexpectedSendEnabled = Boolean(document.querySelector(sendSelector));
+          settledSamples = unexpectedSendEnabled ? 0 : settledSamples + 1;
+          if (settledSamples >= 3) {
+            if (Date.now() >= deadline) {
+              return { ...notSubmitted("LaunchDeadlineExceeded"), stage: "draftStabilization" };
+            }
+            activeComposer.focus();
+            const didInsert = document.execCommand("insertText", false, prompt);
+            if (!didInsert || readEditor() !== insertedPrompt) {
+              return incompatible("composer", "TextInsertionFailed");
+            }
+            inserted = true;
+            justInserted = true;
+            unexpectedSendEnabled = false;
+          }
+        }
+      }
+    }
+    // Let React's synchronous/microtask ProseMirror update complete before
+    // re-proving the surface. Do not impose another 75ms before Send.
+    if (justInserted) await Promise.resolve();
+    else await delay(Math.min(75, Math.max(1, deadline - Date.now())));
   }
 
   const evidence = await until(() => {

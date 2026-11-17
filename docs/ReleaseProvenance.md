@@ -2,14 +2,14 @@
 
 ## Continuous validation
 
-`.github/workflows/ci.yml` runs on pull requests and pushes to `main`. The Linux and Windows jobs use .NET 11, locked dependency restore, Release solution build, and both Client and Server Release tests. The local provenance black-box test uses temporary Git repositories and never deploys or contacts production.
+`.github/workflows/ci.yml` runs on pull requests and pushes to `main`. Linux and Windows jobs use .NET 11, locked dependency restore, Release solution build, Server Release tests, and provenance negative controls. **Client Release tests are supported in Linux only**, through the existing isolated `scripts/test-client-hermetic.fsx` runner. Windows runs only the compile and Server tests: the Client test harness deliberately rejects Windows until known-folder isolation is proved. This omission is explicit, not evidence of Windows Client test success. See `scripts/test-client-hermetic.md` for the limitation. The local provenance black-box tests use temporary Git repositories and never deploy or contact production.
 
 Reproduce the checks at the repository root:
 
 ```sh
 dotnet restore Jarvis.slnx --locked-mode
 dotnet build Jarvis.slnx --configuration Release --no-restore
-dotnet test Client.Tests/Client.Tests.fsproj --configuration Release --no-build --no-restore
+dotnet fsi scripts/test-client-hermetic.fsx -- --no-build --timeout-seconds 900  # Linux only; individual-test hang detection remains 75s
 dotnet test Server.Tests/Server.Tests.fsproj --configuration Release --no-build --no-restore
 python scripts/tests/test-release-provenance.py
 ```

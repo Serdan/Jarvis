@@ -37,8 +37,9 @@ jobs:
         run: dotnet restore Jarvis.slnx --locked-mode
       - name: Build solution (Release)
         run: dotnet build Jarvis.slnx --configuration Release --no-restore
-      - name: Client Release tests
-        run: dotnet test Client.Tests/Client.Tests.fsproj --configuration Release --no-build --no-restore
+      - name: Hermetic Client Release tests (Linux only)
+        if: runner.os == 'Linux'
+        run: dotnet fsi scripts/test-client-hermetic.fsx -- --no-build --timeout-seconds 900
       - name: Server Release tests
         run: dotnet test Server.Tests/Server.Tests.fsproj --configuration Release --no-build --no-restore
       - name: Release provenance negative controls

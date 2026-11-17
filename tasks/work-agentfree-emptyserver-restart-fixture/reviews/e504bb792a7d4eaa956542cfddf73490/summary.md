@@ -1,0 +1,1 @@
+Exact frozen source 5554d34b; prior independent Reviewer3 Accepted at seq5502 in _reviews namespace, but task-bound integration requires a review under work-agentfree-emptyserver-restart-fixture. Reverify that exact source unchanged and local .NET11 Release fixture 2/2. Test-only, no production service restart or Work GO.

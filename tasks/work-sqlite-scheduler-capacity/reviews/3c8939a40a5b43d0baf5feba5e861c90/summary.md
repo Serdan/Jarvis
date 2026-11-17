@@ -1,1 +1,7 @@
-Scheduler replay fence in f9976ff931520994bc7dc216f07f301f0c49b29c; historical receipt only returns typed non-admission. Two-project post-Recovery tests, no extra capacity or sequence. .NET 11 Release focused 21/21 and full 441/441 PASS.
+# Independent P1 Scheduler replay-fence review
+
+**Verdict: ChangesRequested** for frozen `f9976ff931520994bc7dc216f07f301f0c49b29c` (base `2a51920bcedf3fed185a2956b7dc812474107881`).
+
+The change rejects sequential same-operation replays and preserves read-only historical receipts, but **does not close the commit-time race**: both fresh success arms convert `store.Commit` returning `Replayed=true` into an actionable `Ok`, while SQLite checks the immutable receipt before checking any newly installed Recovery/STOP guards. Two callers with the same UUID and original snapshot can therefore interleave an original commit and Recovery fence between the retry's preflight lookup and its commit. This violates the P1 no-positive-post-fence-admission requirement.
+
+**Blocking finding:** `findings/commit-time-replay-admission-race.md` gives exact code locations, interleaving, and remediation/test requirements. Both `reserveFresh` and `claimFresh` must fail closed on a replayed commit receipt (or prove same-transaction authority before positive admission); add a race-path regression and resubmit a newly frozen independent review. No live Scheduler or G1a merge authorized. Owner reports focused 21/21 and full 441/441 Release PASS, which do not exercise this interleaving; no reviewer build was run.

@@ -75,7 +75,6 @@
         <Compile Include="Modules\SourceEffectJournal.fs"/>
         <Compile Include="Modules\SourceEffectRouteBridge.fs"/>
         <Compile Include="Modules\WorkQueueGitLedger.fs"/>
-        <Compile Include="Modules\WorkQueueReservationPermissions.fs"/>
         <Compile Include="Modules\WorkCompositionGitLedger.fs"/>
         <Compile Include="Modules\WorkQueueRoleAuthority.fs"/>
         <Compile Include="Modules\WorkQueueToolFacade.fs"/>
@@ -95,6 +94,8 @@
         <Compile Include="Modules\WorkCompositionQueueBinder.fs"/>
         <Compile Include="Modules\WorkCompositionQueueTransaction.fs"/>
         <Compile Include="Modules\\WorkQueueReviewIntegrationAdapter.fs"/>
+        <Compile Include="Modules\WorkQueueIntegrationSourceAuthority.fs"/>
+        <Compile Include="Modules\WorkQueueReservationPermissions.fs"/>
         <Compile Include="Modules\\ChallengeWorkflow.fs"/>
         <Compile Include="Modules\\WorkQueueCanonicalSourceEvidence.fs"/>
         <Compile Include="Modules\\WorkQueueCanonicalCasBinder.fs"/>

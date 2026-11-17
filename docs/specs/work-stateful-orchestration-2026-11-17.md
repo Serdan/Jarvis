@@ -37,12 +37,12 @@ A Project or System can be fully described and dormant until dependencies make i
 
 Proposed tasks/work units pass through:
 
-    Draft -> AwaitingLeadApproval -> Open -> active work / verified outcomes -> Closed
-              |                  |
-              +---- return ------+ (return to Draft for revision)
+    Draft -> Proposed -> Open -> active work / verified outcomes -> Closed
+                 |
+                 +----------> Draft (Lead returns for revision)
 
 - Draft: editable and durable; the operator/agent can iterate on the spec; no automatic Lead review demand and no execution demand.
-- AwaitingLeadApproval: explicit submission produces a Lead-compatible review/planning work item. Lead assesses scope, acceptance criteria, dependencies and, primarily, priority; Lead may approve or return to Draft.
+- Proposed: explicit submission produces a Lead-compatible review/planning work item. Lead assesses scope, acceptance criteria, dependencies and, primarily, priority; Lead may approve or return to Draft.
 - Open: approved and eligible to produce execution stages when readiness prerequisites are met. Open does not mean immediately runnable.
 - Active/Completed/Closed/Cancelled: existing domain and stage lifecycle semantics continue, with distinct reviewed, integrated and parent-accepted evidence.
 
@@ -231,7 +231,7 @@ The following should be decided through implementation evidence or Lead engineer
 
 ## 14. Acceptance examples for revised architecture
 
-A. Draft -> AwaitingLeadApproval creates only Lead review demand; rejected/returned Draft creates no implementation demand. Approved Open work becomes eligible only when prerequisites hold.
+A. Draft -> Proposed creates only Lead review demand; rejected/returned Draft creates no implementation demand. Approved Open work becomes eligible only when prerequisites hold.
 B. Blocking review of priority 3 sorts ahead of ordinary implementation priority 9. Within a tier, higher Lead priority wins; equal priority FIFO; yielded work receives a new availability sequence.
 C. System B blocks A; the unfinished required actionable descendants of B inherit blocking importance. Unrelated required children of a nonblocking System do not all become blockers.
 D. A role subscribed to implementation and review chooses the best feasible candidate across both; admission matching avoids stranding a review-only execution.

@@ -186,3 +186,23 @@ Run the code-quality NUnit tests, Git selection tests, the full Jarvis client su
 and an opt-in smoke on a disposable checkout before approving a production project.
 For Wayfold, measure one small file, one large file, cold/warm initialization, two
 separate worktrees, output stability, daemon RSS and selected-only commit behavior.
+
+
+## Follow-up: delayed opt-in retry and Wayfold read-only parity (2026-11-17)
+
+The project-scoped P2 review at frozen source `5564d6c58e16b48ab9bbe1ccad6c35b5e704c0de` was **Accepted only for that fast-negative correction**, not the P1 full task. The reviewer identified an additional same-assignment retry edge: a negative approval/configuration gate previously returned `true` from the asynchronous dispatcher delegate, permanently caching the key even though Roslyn had not prewarmed. `InboxPrewarmDispatcher.TryScheduleIfCandidate` now treats an ineligible candidate as an incomplete attempt, permits a later inbox read with the same assignment key to retry after hooks/approval become available, and continues to defer all discovery off the synchronous response path. A dedicated regression covers unavailable-to-available transition and deduplication after success. The exact source-ref checkout is now independently checked through `CodeQualityHooks.tryPrewarm`: an eligible sibling in the same Git project cannot mark an unapproved selected checkout as successfully prewarmed. A second regression covers selected-checkout denial and subsequent exact checkout approval without launching Roslyn on the ineligible root.
+
+Release .NET 11 focused regression results with the installed official Roslyn Language Server DLL: **61 passed, 0 skipped, 0 failed** for `DispatchProbeTests|CodeQualityHooksTests|GitCommandTests|WorktreeTests` (exit 0, 4 s). An earlier focused run without the explicit official DLL had 34 passed / 1 skipped. An unfiltered Client.Tests run again showed activity-persistence `InvalidDataException` and `UnauthorizedAccessException` diagnostics and did not return a verdict before cancellation; no unfiltered pass is claimed.
+
+For reproducible, *non-mutating* source comparisons, run `dotnet fsi scripts/roslyn-wayfold-readonly.fsx -- /absolute/Wayfold-checkout` after building the Jarvis Client in Release. The script reads a small and large Wayfold file and performs a whitespace-only source edit **in memory**, measures raw official Roslyn LSP requests against the source checkout, and compares the fully configured Jarvis after-write hook on **disposable copies** with `dotnet format whitespace --folder` on separate disposable copies using the original `.editorconfig`. The test temporarily approves only its disposable hook root within its own process. It never writes into the supplied Wayfold checkout.
+
+On `/home/serdan/Projects/.Wayfold-worktrees/dotnet-format-timings` (clean Git status before and after), the read-only sample results were:
+
+| Source | Original size | Raw Roslyn first / warm edit | Raw LSP diagnostics | Raw LSP vs dotnet format | Full Jarvis hook vs dotnet format |
+|---|---:|---:|---:|---|---|
+| `InformationOverlayUiState.cs` | 2,232 bytes | 1,114 / 48 ms | 0 | Byte-identical | **Byte-identical** |
+| `ImportedPreviewSessionController.cs` | 123,012 bytes | 207 / 136 ms | 0 | **Differs only by final newline** | **Byte-identical** |
+
+The larger raw LSP output did not end in a newline while `dotnet format whitespace` did. The hook's existing explicit `insert_final_newline = true` postprocessing correctly inserted that newline. The tested hook outputs had the same SHA-256 content as their respective `dotnet format` baselines. Latencies are individual host-contended measurements, not statistically stable benchmarks. The script prints matching Roslyn-related process RSS snapshots, but other active Roslyn clients/daemons existed and the observed PIDs cannot all be attributed to this run; no isolated daemon/launcher RSS or project/analyzer compilation-isolation claim is made. The disposable hook-root invocation also does not prove the actual Wayfold solution's analyzer load path.
+
+**Still open:** an unfiltered client-suite verdict and triage; actual TaskRead -> AgentInbox -> source-ref resolution -> async prewarm end-to-end integration timing and idempotence; two genuinely distinct project/analyzer contexts sharing an official daemon; and isolated process-memory/project-load diagnostics. No deployment or source merge is authorized by these checks.

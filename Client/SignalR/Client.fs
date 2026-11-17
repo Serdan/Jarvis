@@ -37,6 +37,12 @@ type InboxPrewarmDispatcher() =
                 if not completed then
                     lock gate (fun () -> scheduled.Remove key |> ignore))) |> ignore
         accepted
+    member this.TryScheduleIfCandidate(key: string, hasCandidate: unit -> bool, discoverAndPrewarm: unit -> bool) =
+        // A negative fast gate is not a successful prewarm. Approval or hooks
+        // may become available during the same Working assignment.
+        this.TrySchedule(key, fun () ->
+            if hasCandidate () then discoverAndPrewarm ()
+            else false)
 
 let private inboxPrewarmDispatchers = ConditionalWeakTable<Runtime, InboxPrewarmDispatcher>()
 let invalidateAgentStates (rt: Runtime) (projectName: string) (agentIds: string array) =
@@ -115,8 +121,7 @@ let private prewarmFromInbox (rt: Runtime) projectName (inbox: Client.ReviewWork
                                 else StringComparison.Ordinal
                             if String.Equals(Path.GetFullPath validated,
                                              Path.GetFullPath checkoutPath, comparison) then
-                                CodeQualityHooks.prewarm validated
-                                true
+                                CodeQualityHooks.tryPrewarm validated
                             else false
     | _ -> false
 
@@ -829,22 +834,20 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
                     String.concat "|" [ cmd.ProjectName; inbox.Agent.AgentId; focus.Attempt.AttemptId
                                         string focus.Attempt.AssignmentGeneration; focus.Attempt.SourceRef ]
                 let dispatcher = inboxPrewarmDispatchers.GetValue(rt, fun _ -> InboxPrewarmDispatcher())
-                dispatcher.TrySchedule(key, fun () ->
+                dispatcher.TryScheduleIfCandidate(key, (fun () ->
                     // Resolve only the main project's configured path here.
                     // A registered selector would itself run Git discovery
                     // before the negative approval gate.
-                    let candidate =
-                        match ProjectPaths.ProjectTarget.parse cmd.ProjectName with
+                    match ProjectPaths.ProjectTarget.parse cmd.ProjectName with
+                    | Error _ -> false
+                    | Ok target ->
+                        let mainProject = ProjectPaths.ProjectTarget.projectName target
+                        match ProjectPaths.resolveProjectContext mainProject rt with
                         | Error _ -> false
-                        | Ok target ->
-                            let mainProject = ProjectPaths.ProjectTarget.projectName target
-                            match ProjectPaths.resolveProjectContext mainProject rt with
-                            | Error _ -> false
-                            | Ok context ->
-                                let (Client.FolderPath mainRoot) = ProjectPaths.ResolvedProject.mainRoot context
-                                CodeQualityHooks.hasApprovedPrewarmCandidate mainRoot
-                    if candidate then prewarmFromInbox rt cmd.ProjectName inbox
-                    else true) |> ignore
+                        | Ok context ->
+                            let (Client.FolderPath mainRoot) = ProjectPaths.ResolvedProject.mainRoot context
+                            CodeQualityHooks.hasApprovedPrewarmCandidate mainRoot),
+                    (fun () -> prewarmFromInbox rt cmd.ProjectName inbox)) |> ignore
             | _ -> ()
         | _ -> ()
         response |> serialize'

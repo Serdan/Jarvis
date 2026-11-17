@@ -347,12 +347,23 @@ let runAfterWrite root path : Client.Result<HookSummary option> =
               PersistedAfterHash = observedHash root path
               BlockingFailures = [ message ] })
 
-let prewarm root =
+let hasApprovedPrewarmCheckout root =
     match load root with
     | Ok hooks when (hooks |> List.exists (fun hook -> hook.Adapter = "roslyn-format"))
                     && (requireApproval root |> Result.isOk) ->
+        true
+    | _ -> false
+
+// A successful project-level candidate gate does not imply that the precise
+// source-ref checkout is eligible. Return false so the same assignment can
+// retry once the selected checkout itself is approved and configured.
+let tryPrewarm root =
+    if hasApprovedPrewarmCheckout root then
         RoslynLsp.prewarm root
-    | _ -> ()
+        true
+    else false
+
+let prewarm root = tryPrewarm root |> ignore
 
 
 // Resolve a checkout's common Git directory using only its local metadata.

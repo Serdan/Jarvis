@@ -239,3 +239,30 @@ let ``approved hooks from another project cannot prewarm this project's inbox`` 
             hasApprovedPrewarmCandidate aMain |> shouldEqual true
         finally
             Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", previous))
+
+
+[<Test; NonParallelizable>]
+let ``one approved hooked sibling cannot permanently cache an unapproved selected checkout`` () =
+    withTempRoot (fun root ->
+        let main = Path.Combine(root, "main")
+        let approved = linkedWorktree main "approved"
+        let selected = linkedWorktree main "selected"
+        let enabled = """{"codeQuality":{"hooks":[{"enabled":true,"name":"format","adapter":"roslyn-format","trigger":"after-write"}]}}"""
+        config approved enabled
+        config selected enabled
+        let previous = Environment.GetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS")
+        try
+            Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", approved)
+            hasApprovedPrewarmCandidate main |> shouldEqual true
+            hasApprovedPrewarmCheckout approved |> shouldEqual true
+            hasApprovedPrewarmCheckout selected |> shouldEqual false
+            tryPrewarm selected |> shouldEqual false
+            // The same source-ref checkout can become eligible later without
+            // changing the assignment key or borrowing another root's approval.
+            Environment.SetEnvironmentVariable(
+                "JARVIS_APPROVED_CODE_QUALITY_ROOTS",
+                approved + string Path.PathSeparator + selected)
+            hasApprovedPrewarmCheckout selected |> shouldEqual true
+            hasApprovedPrewarmCandidate main |> shouldEqual true
+        finally
+            Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", previous))

@@ -637,3 +637,33 @@ module DispatchProbeTests =
         Assert.That(dispatcher.TrySchedule("unknown-source", fun () -> true), Is.False,
             "A successfully scheduled assignment must stay deduplicated.")
     }
+
+    [<Test>]
+    let ``inbox prewarm retries a previously unapproved candidate during the same assignment`` () = task {
+        let dispatcher = InboxPrewarmDispatcher()
+        let enabled = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let checkedCandidate = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let prewarmed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let candidate () =
+            // Capture the state before signaling: the first attempt must
+            // observe the disabled hook even if approval changes immediately.
+            let available = enabled.Task.IsCompleted
+            checkedCandidate.TrySetResult(()) |> ignore
+            available
+        let prewarm () =
+            prewarmed.TrySetResult(()) |> ignore
+            true
+        let key = "same-assignment/late-opt-in"
+        Assert.That(dispatcher.TryScheduleIfCandidate(key, candidate, prewarm), Is.True)
+        do! checkedCandidate.Task.WaitAsync(TimeSpan.FromSeconds 5.)
+        Assert.That(prewarmed.Task.IsCompleted, Is.False,
+            "The ineligible candidate must not reach Roslyn discovery.")
+        enabled.TrySetResult(()) |> ignore
+        let retried =
+            SpinWait.SpinUntil(
+                (fun () -> dispatcher.TryScheduleIfCandidate(key, candidate, prewarm)),
+                TimeSpan.FromSeconds 5.)
+        Assert.That(retried, Is.True, "Later approval must not be suppressed by the negative fast gate.")
+        do! prewarmed.Task.WaitAsync(TimeSpan.FromSeconds 5.)
+        Assert.That(dispatcher.TryScheduleIfCandidate(key, candidate, prewarm), Is.False)
+    }

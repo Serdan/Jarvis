@@ -2798,6 +2798,13 @@ let wq06_authenticated_mcp_post_forwards_only_oauth_derived_actor_and_original_u
                     { Auth0Domain = "auth.example"; Audience = "https://example.test"
                       OpenAIAppsChallenge = ""; EnableOperatorConversations = true }))
         |> ignore
+        Microsoft.Extensions.DependencyInjection.ServiceCollectionServiceExtensions.AddSingleton<AccountInstructionStore>(
+            services,
+            AccountInstructionStore(System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+                "jarvis-wq06-" + Guid.NewGuid().ToString("N"))))
+        |> ignore
+        Microsoft.Extensions.DependencyInjection.ServiceCollectionServiceExtensions.AddSingleton<UserService>(services, users)
+        |> ignore
         use provider =
             Microsoft.Extensions.DependencyInjection.ServiceCollectionContainerBuilderExtensions.BuildServiceProvider(services)
         let context = Microsoft.AspNetCore.Http.DefaultHttpContext()

@@ -14,6 +14,7 @@ open Client.RoleInstructions
 open Client.ChallengeWorkflow
 open Client.LegacyDirectWriterFence
 open Client.LegacyWriterProtocolFence
+open Client.OriginalGitWriterAdmissionJournal
 
 type private OldWriterFixture =
     { Root: string
@@ -505,6 +506,49 @@ type LegacyWriterProtocolFenceTests() =
             Assert.That(old.IsNone, Is.True, "CAS losing original Agent write must not publish"))
 
 
+    // RED: STOP racing a planner that already admitted the original writer
+    // must not turn a pending remote effect into a quiescence assertion.
+    [<Test>]
+    member _.AccountFreezeBetweenOriginalPlannerAndPushMustNotProduceFalseQuiescence() =
+        withFixture (fun f ->
+            activateHost f (scope f f.AccountTwo f.ProjectTwo)
+            let originalHead =
+                git f.Root [ "--git-dir=" + f.ProjectRemote
+                             "rev-parse"; "refs/heads/jarvis-orchestration" ]
+            let mutable stopped = false
+            let id = Guid.NewGuid()
+            let original =
+                { OperationId = id; Actor = "OldClient"
+                  Kind = "OriginalWriterStopRace"; RequestJson = "{}" }
+            let outcome =
+                LedgerStore.withGitTransportFaults
+                    (fun phase arguments ->
+                        if not stopped && phase = "publication-push"
+                           && (arguments |> List.tryHead) = Some "push" then
+                            stopped <- true
+                            fixtureAccountPhase f "Frozen" |> ignore
+                        None)
+                    (fun () ->
+                        LegacyDirectWriterFence.transact f.ProjectOne original (fun _ ->
+                            Ok [ { Path = "records/wq10-fixture/stop-race-escaped.json"
+                                   ExpectedBlobOid = None; Content = "{}" } ]))
+            Assert.That(stopped, Is.True, "Fixture must freeze after legacy planning")
+            let latest = LedgerStore.fetch f.ProjectTwo |> success
+            let escaped, _ =
+                LedgerStore.readAt f.ProjectTwo latest
+                    "records/wq10-fixture/stop-race-escaped.json" |> success
+            if escaped.IsSome then
+                // A pre-STOP admission may finish after STOP, but cannot be
+                // mistaken for quiescence without durable operation coverage.
+                let witness = LegacyDirectWriterFence.inspectHighWater f.ProjectTwo |> success
+                Assert.That(witness.OriginalPendingJournal, Does.Not.StartWith("Unknown:"),
+                            "A pre-STOP operation published without a complete durable journal")
+            else
+                Assert.That(latest.Commit, Is.EqualTo(originalHead))
+                match outcome with
+                | Error _ -> ()
+                | Ok _ -> Assert.Fail("Operation returned success without publishing or settlement"))
+
     [<Test>]
     member _.FrozenDirectReviewCannotPublishOrphanSourceRefBeforeLedgerCAS() =
         withFixture (fun f ->
@@ -524,6 +568,108 @@ type LegacyWriterProtocolFenceTests() =
                              "for-each-ref"; "--format=%(refname)"; "refs/heads/jarvis-review" ]
             Assert.That(after, Is.EqualTo(before), "Frozen review must not publish orphan Git refs")
             Assert.That(after.Contains(managed, StringComparison.Ordinal), Is.False))
+
+    // RED: an independent immutable source ref is a remote effect even when
+    // its later ledger transaction is rejected by a newly frozen account.
+    [<Test>]
+    member _.SourceReviewRefPushRacingAccountStopNeedsDurableEffectCoverage() =
+        withFixture (fun f ->
+            activateHost f (scope f f.AccountTwo f.ProjectTwo)
+            let request = Guid.NewGuid()
+            let sourceHead = git f.ProjectOne.RepositoryPath [ "rev-parse"; "HEAD" ]
+            let managed = $"refs/heads/jarvis-review/_reviews/{request:N}/r1"
+            let mutable stopped = false
+            let outcome =
+                LedgerStore.withGitTransportFaults
+                    (fun _ args ->
+                        if not stopped && (args |> List.tryHead) = Some "push"
+                           && (args |> List.exists (fun a -> a.Contains(managed, StringComparison.Ordinal))) then
+                            stopped <- true
+                            fixtureAccountPhase f "Frozen" |> ignore
+                        None)
+                    (fun () ->
+                        ReviewWorkflow.submitBranchReview f.ProjectOne (Guid.NewGuid())
+                            "_reviews" "Historical" request "" sourceHead
+                            "Racing source review" "" "")
+            Assert.That(stopped, Is.True, "Fixture must stop at the source ref push")
+            let sourceRefs =
+                git f.Root [ "--git-dir=" + f.ProjectRemote
+                             "for-each-ref"; "--format=%(refname)"; managed ]
+            if sourceRefs.Contains(managed, StringComparison.Ordinal) then
+                let witness = LegacyDirectWriterFence.inspectHighWater f.ProjectTwo |> success
+                Assert.That(witness.OriginalSourceEffectJournal, Does.Not.StartWith("Unknown:"),
+                            "A remote source ref was published without a durable source-effect journal")
+            else
+                match outcome with
+                | Error _ -> ()
+                | Ok _ -> Assert.Fail("Source ref command acknowledged without a published ref"))
+
+    [<Test>]
+    member _.OriginalWriterJournalStopPreservesInflightAndFencesNewAdmissions() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "original-writer-admission.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            let prior =
+                Environment.GetEnvironmentVariable(
+                    OriginalGitWriterAdmissionJournal.JournalEnvironment)
+            Environment.SetEnvironmentVariable(
+                OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            try
+                let authority = String.replicate 64 "a"
+                let first = Guid.NewGuid()
+                let permit =
+                    OriginalGitWriterAdmissionJournal.admit first "ProjectCAS"
+                        authority "refs/heads/jarvis-orchestration" "immutable-request"
+                    |> success |> Option.get
+                OriginalGitWriterAdmissionJournal.markAttempt permit |> success
+                let stopping = OriginalGitWriterAdmissionJournal.stop path |> success
+                Assert.That(stopping.AdmissionClosed, Is.True)
+                Assert.That(stopping.PendingOrUnknown.Length, Is.EqualTo(1))
+                Assert.That(stopping.PendingOrUnknown.Head.Status, Is.EqualTo("Attempted"))
+                Assert.That(stopping.RouteCoverageProven, Is.False,
+                            "A journal alone is not exhaustive writer-route proof")
+                match OriginalGitWriterAdmissionJournal.admit (Guid.NewGuid()) "ProjectCAS"
+                          authority "refs/heads/jarvis-orchestration" "after-stop" with
+                | Error "OriginalWriterAdmissionClosed" -> ()
+                | other -> Assert.Fail(sprintf "STOP admitted a new writer: %A" other)
+                OriginalGitWriterAdmissionJournal.settle permit true true |> success
+                let settled = OriginalGitWriterAdmissionJournal.inspect path |> success
+                Assert.That(settled.PendingOrUnknown, Is.Empty)
+                Assert.That(settled.AllRecordedEffectsSettled, Is.True)
+                Assert.That(settled.RouteCoverageProven, Is.False)
+            finally
+                Environment.SetEnvironmentVariable(
+                    OriginalGitWriterAdmissionJournal.JournalEnvironment, prior))
+
+    [<Test>]
+    member _.OriginalWriterJournalUnknownRemoteEffectSurvivesReinspection() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "original-writer-unknown.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            let prior =
+                Environment.GetEnvironmentVariable(
+                    OriginalGitWriterAdmissionJournal.JournalEnvironment)
+            Environment.SetEnvironmentVariable(
+                OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            try
+                let authority = String.replicate 64 "b"
+                let operation = Guid.NewGuid()
+                let permit =
+                    OriginalGitWriterAdmissionJournal.admit operation "ReviewRef"
+                        authority "refs/heads/jarvis-review/example" "source-publish"
+                    |> success |> Option.get
+                OriginalGitWriterAdmissionJournal.markAttempt permit |> success
+                OriginalGitWriterAdmissionJournal.settle permit false true |> success
+                let reopened = OriginalGitWriterAdmissionJournal.inspect path |> success
+                Assert.That(reopened.PendingOrUnknown.Length, Is.EqualTo(1))
+                Assert.That(reopened.PendingOrUnknown.Head.Status, Is.EqualTo("Unknown"))
+                match OriginalGitWriterAdmissionJournal.admit operation "ReviewRef"
+                          authority "refs/heads/jarvis-review/example" "source-publish" with
+                | Error reason -> Assert.That(reason, Does.Contain("RequiresReconciliation"))
+                | Ok _ -> Assert.Fail("UNKNOWN remote effect was re-admitted")
+            finally
+                Environment.SetEnvironmentVariable(
+                    OriginalGitWriterAdmissionJournal.JournalEnvironment, prior))
 
     [<Test>]
     member _.FourConcreteDirectReplayFastPathsRespectFrozenPreparingAndInvalidHostProof() =

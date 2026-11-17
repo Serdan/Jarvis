@@ -1,0 +1,11 @@
+# Blocking: complete Client Release CI gate is not yet demonstrated
+
+**Severity:** P1 acceptance/evidence blocker (not a demonstrated source defect). **Frozen review head:** `a636f5c87fb5e9f708ec8f3e5d968cf74713f3bc`.
+
+The canonical task explicitly requires a clean PR/branch build that passes *both* Client and Server Release suites. The new `.github/workflows/ci.yml` invokes the Linux-only hermetic Client suite with `--timeout-seconds 900`, but the author's submitted summary reports a direct Client run exceeding 300 seconds and says the hermetic runner is still under diagnosis. No complete, nonzero-count hermetic Client suite PASS or GitHub Linux/Windows matrix result is furnished. Increasing the process deadline is not a substitute for proving that the tests terminate and pass deterministically; the existing 75-second individual-test hang detector helps but does not itself establish completion.
+
+**Independent checks at frozen source:** locked restore PASS; full Release build PASS; Server.Tests Release **488 passed, 0 failed**; Python isolated provenance black-box tests PASS; Linux hermetic Client `FullyQualifiedName~HermeticHarnessTests` **3 passed, 0 failed**, disposable environment removed. These are valuable but the three selected Client cases are not the full Client suite. The source worktree remained clean afterward.
+
+**Required for acceptance:** provide an exact-checkout full Linux hermetic Client Release run with executed-test count, exit code, duration, and any named failure/hang; diagnose and fix deterministic failures rather than quietly extending the timeout. Record a real hosted CI run, or state clearly if hosted Windows/Linux checks remain unverified and obtain the appropriate release/merge gate before claiming complete task acceptance. An independently checked complete positive result should be bound to the exact frozen commit under review; a correction requires a new frozen review.
+
+**Operational boundary:** GitHub Actions only *reports* checks. The docs correctly say branch protection/rulesets must require both OS jobs; actual repository ruleset enforcement was not verified in this review. No release, merge, upload, or deployment authorization follows from these local checks.

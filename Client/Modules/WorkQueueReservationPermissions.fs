@@ -2,6 +2,7 @@ module Client.WorkQueueReservationPermissions
 
 open System
 open System.IO
+open System.Diagnostics
 open System.Security.Cryptography
 open System.Text
 open System.Text.Json.Nodes
@@ -26,6 +27,20 @@ type ReservationOperationFamily =
 
 // The immutable revisions live in Git alongside one replaceable, versioned
 // current pointer. The credential preimage is deliberately absent.
+// Immutable physical Git administration/object-store evidence lives alongside
+// its grant revision. Separate storage retains canonical v2 grant compatibility.
+type SourceCheckoutGitIdentity =
+    { GitAdministrationDirectory: string
+      CommonGitDirectory: string
+      GitObjectStoreDirectory: string }
+
+type SourceCheckoutGitIdentityWitness =
+    { SchemaVersion: int
+      LaunchId: string
+      Revision: int
+      GrantSha256: string
+      Identity: SourceCheckoutGitIdentity }
+
 type ReservationScopeGrant =
     { SchemaVersion: int
       Revision: int
@@ -119,6 +134,86 @@ module WorkQueueReservationPermissions =
     let revisionPath launchId revision =
         sprintf "records/work-queue/reservation-scopes/history/%s/%08d.json" (hash launchId) revision
 
+    let internal sourceIdentityPath launchId revision =
+        sprintf "records/work-queue/reservation-scopes/source-identity/%s/%08d.json"
+            (hash launchId) revision
+
+    // Source grants are minted from an actual clean, registered WQ03 worktree.
+    // Capture the original *physical* Git admin and object-store directories,
+    // rather than a remote-derived repository ID or the user-visible pathname.
+    // This read does not repeat the claim-time clean-status check and therefore
+    // also works for a deliberately dirty Implementation continuation.
+    let internal physicalSourceGitIdentity (checkoutPath: string) = result {
+        let invalid reason =
+            Error(InvalidBinding("WQ11 Git administration proof unavailable: " + reason))
+        if String.IsNullOrWhiteSpace checkoutPath
+           || not (Path.IsPathFullyQualified checkoutPath) then
+            return! invalid "checkout is not a fully qualified host-selected path"
+        let root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(checkoutPath))
+        if not (Directory.Exists root) then
+            return! invalid "original checkout directory no longer exists"
+        let git (args: string list) = result {
+            try
+                use runner = new Process()
+                runner.StartInfo.FileName <- "git"
+                runner.StartInfo.WorkingDirectory <- root
+                runner.StartInfo.UseShellExecute <- false
+                runner.StartInfo.RedirectStandardOutput <- true
+                runner.StartInfo.RedirectStandardError <- true
+                runner.StartInfo.Environment.["GIT_TERMINAL_PROMPT"] <- "0"
+                // Never let inherited Git environment redirects impersonate
+                // the physical checkout resolved at this host path.
+                for key in [ "GIT_DIR"; "GIT_COMMON_DIR"; "GIT_WORK_TREE";
+                             "GIT_OBJECT_DIRECTORY"; "GIT_ALTERNATE_OBJECT_DIRECTORIES";
+                             "GIT_INDEX_FILE" ] do
+                    runner.StartInfo.Environment.Remove(key) |> ignore
+                args |> List.iter (fun arg -> runner.StartInfo.ArgumentList.Add(arg))
+                if not (runner.Start()) then
+                    return! invalid "cannot launch local Git identity probe"
+                let output = runner.StandardOutput.ReadToEndAsync()
+                let errors = runner.StandardError.ReadToEndAsync()
+                if not (runner.WaitForExit(20000)) then
+                    runner.Kill(true)
+                    runner.WaitForExit()
+                    return! invalid "local Git identity probe timed out"
+                errors.GetAwaiter().GetResult() |> ignore
+                if runner.ExitCode <> 0 then
+                    return! invalid "local Git identity probe failed"
+                let value = output.GetAwaiter().GetResult().Trim()
+                if String.IsNullOrWhiteSpace value then
+                    return! invalid "Git returned an empty identity component"
+                return value
+            with _ ->
+                return! invalid "local Git identity probe failed"
+        }
+        let! admin = git [ "rev-parse"; "--absolute-git-dir" ]
+        let! common = git [ "rev-parse"; "--git-common-dir" ]
+        let! objects = git [ "rev-parse"; "--git-path"; "objects" ]
+        let absolute (value: string) =
+            Path.TrimEndingDirectorySeparator(Path.GetFullPath(
+                if Path.IsPathRooted value then value else Path.Combine(root, value)))
+        let identity =
+            { GitAdministrationDirectory = absolute admin
+              CommonGitDirectory = absolute common
+              GitObjectStoreDirectory = absolute objects }
+        let comparison =
+            if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase
+            else StringComparison.Ordinal
+        let same x y = String.Equals(x, y, comparison)
+        let rec hasLink (directory: DirectoryInfo) =
+            if isNull directory then false
+            elif not directory.Exists || not (isNull directory.LinkTarget) then true
+            else hasLink directory.Parent
+        let physical =
+            [ identity.GitAdministrationDirectory; identity.CommonGitDirectory;
+              identity.GitObjectStoreDirectory ]
+        if same identity.GitAdministrationDirectory identity.CommonGitDirectory
+           || (physical |> List.exists (fun path ->
+               not (Directory.Exists path) || hasLink (DirectoryInfo path))) then
+            return! invalid "not an isolated physical linked checkout or Git administration path is unavailable"
+        return identity
+    }
+
     let proposalPath (operationId: Guid) =
         "records/work-queue/prerequisite-proposals/" + hash (operationId.ToString("D")) + ".json"
 
@@ -135,6 +230,10 @@ module WorkQueueReservationPermissions =
                 with _ ->
                     Error(LedgerIntegrityError ("Malformed Work reservation record: " + path))
             | _ -> Error(LedgerIntegrityError ("Partial Work reservation record: " + path)))
+
+    let internal readSourceIdentityAt binding snapshot launchId revision =
+        readCanonical<SourceCheckoutGitIdentityWitness> binding snapshot
+            (sourceIdentityPath launchId revision)
 
     let readScopeAt binding snapshot launchId =
         readCanonical<ReservationScopeGrant> binding snapshot (scopePath launchId)
@@ -172,7 +271,8 @@ module WorkQueueReservationPermissions =
           LineageGeneration: int
           ClaimGeneration: int
           WorktreeName: string
-          CheckoutPath: string }
+          CheckoutPath: string
+          GitIdentity: SourceCheckoutGitIdentity }
 
     let private generationForSource (launch: Launch) (stage: WorkStage) =
         match stage.State with
@@ -213,6 +313,7 @@ module WorkQueueReservationPermissions =
                 "Source grant does not match original Work/launch/claim-generation checkout or continuation.")
         do! WorkQueueGitLedger.verifySourceClaimCheckout checkout launch.Id
                 { stage with ClaimGeneration = claimGeneration }
+        let! identity = physicalSourceGitIdentity root
         return
             { SourceRef = lineage.ReachableRef
               SourceSha = lineage.ContinuationSha |> Option.defaultValue lineage.PinnedBaseCommit
@@ -221,7 +322,8 @@ module WorkQueueReservationPermissions =
               LineageGeneration = lineage.Generation
               ClaimGeneration = claimGeneration
               WorktreeName = expectedName
-              CheckoutPath = root }
+              CheckoutPath = root
+              GitIdentity = identity }
     }
 
     // An operator-approved revision is independently auditable in the canonical
@@ -341,6 +443,20 @@ module WorkQueueReservationPermissions =
                       Revoked = request.Revoked; OperatorActor = trustedActor
                       OperatorApprovalId = request.OperatorApprovalId
                       RevisionOperationId = operationId.ToString("D") }
+                // Exact grant bytes are immutable; the companion original
+                // filesystem identity is created in the *same* Git CAS.
+                // Existing v2 grants remain decodable, but WQ11 dirty-source
+                // inspection rejects historical revisions without this witness.
+                let sourceWitness =
+                    source |> Option.map (fun pinned ->
+                        { SchemaVersion = 1; LaunchId = launch.Id; Revision = revision
+                          GrantSha256 = CanonicalCodec.digest(CanonicalCodec.encode record)
+                          Identity = pinned.GitIdentity })
+                let! priorWitness =
+                    readSourceIdentityAt binding snapshot launch.Id revision
+                if priorWitness.IsSome then
+                    return! Error(LedgerIntegrityError
+                        "Immutable source Git administration identity already exists.")
                 let! older =
                     match existing with
                     | Some (prior, oid) when prior.SchemaVersion = 2
@@ -353,11 +469,19 @@ module WorkQueueReservationPermissions =
                 let! priorHistory = readCanonical<ReservationScopeGrant> binding snapshot (revisionPath launch.Id revision)
                 if priorHistory.IsSome then
                     return! Error(LedgerIntegrityError "Reservation scope revision history already exists.")
+                let identityChange =
+                    match sourceWitness with
+                    | Some witness ->
+                        [ { Path = sourceIdentityPath launch.Id revision
+                            ExpectedBlobOid = None
+                            Content = CanonicalCodec.encode witness } ]
+                    | None -> []
                 return
                     [ { Path = scopePath launch.Id; ExpectedBlobOid = older
                         Content = CanonicalCodec.encode record }
                       { Path = revisionPath launch.Id revision; ExpectedBlobOid = None
                         Content = CanonicalCodec.encode record } ]
+                    @ identityChange
             })
 
     let internal reviseAt binding trustedActor operationId now request =

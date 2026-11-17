@@ -105,6 +105,10 @@ module WorkQueueClaimBoundDirtySourcePolicy =
             command.StartInfo.RedirectStandardOutput <- true
             command.StartInfo.RedirectStandardError <- true
             command.StartInfo.Environment.["GIT_TERMINAL_PROMPT"] <- "0"
+            for key in [ "GIT_DIR"; "GIT_COMMON_DIR"; "GIT_WORK_TREE";
+                         "GIT_OBJECT_DIRECTORY"; "GIT_ALTERNATE_OBJECT_DIRECTORIES";
+                         "GIT_INDEX_FILE" ] do
+                command.StartInfo.Environment.Remove(key) |> ignore
             for arg in args do command.StartInfo.ArgumentList.Add arg
             if not (command.Start()) then return! missing "Cannot start physical Git verifier."
             let output = command.StandardOutput.ReadToEndAsync()
@@ -125,8 +129,8 @@ module WorkQueueClaimBoundDirtySourcePolicy =
     // WQ03's clean-status check. A dirty worktree is expected after editing,
     // but a moved HEAD, foreign tree or changed remote source is never valid.
     let private verifyPhysical (ledger: LedgerBinding) (source: LedgerBinding)
-        (grant: ReservationScopeGrant) (lineage: SourceLineage)
-        (work: WorkStage) (launch: Launch) = result {
+        (grant: ReservationScopeGrant) (expectedGitIdentity: SourceCheckoutGitIdentity)
+        (lineage: SourceLineage) (work: WorkStage) (launch: Launch) = result {
         let! grantPath =
             match grant.SourceCheckoutPath, grant.SourceWorktree, grant.SourceSha,
                   grant.SourceRepositoryId, grant.SourceClaimGeneration with
@@ -162,13 +166,20 @@ module WorkQueueClaimBoundDirtySourcePolicy =
         if headName <> "HEAD" then return! denied "Source checkout is no longer detached."
         if not (samePath top root) || actualHead <> grant.SourceSha.Value then
             return! denied "Physical source HEAD is not its original claim SHA."
-        let! gitDir = git root ["rev-parse"; "--absolute-git-dir"]
-        let! common = git root ["rev-parse"; "--git-common-dir"]
-        let commonPath =
-            if Path.IsPathRooted(common) then fullPath common
-            else fullPath(Path.Combine(root, common))
-        if samePath gitDir commonPath then
-            return! denied "Source checkout is not an isolated linked worktree."
+        // A same-path checkout from a second clone of the same approved
+        // remote has the same HEAD, basename and remote-derived repository ID.
+        // It must not inherit the *removed* checkout's awaited edit receipts.
+        let! currentGitIdentity =
+            WorkQueueReservationPermissions.physicalSourceGitIdentity root
+            |> Result.mapError (fun _ ->
+                "SourceHostProofUnavailable: physical Git administration/object-store identity cannot be verified.")
+        if not (samePath expectedGitIdentity.GitAdministrationDirectory
+                         currentGitIdentity.GitAdministrationDirectory)
+           || not (samePath expectedGitIdentity.CommonGitDirectory
+                            currentGitIdentity.CommonGitDirectory)
+           || not (samePath expectedGitIdentity.GitObjectStoreDirectory
+                            currentGitIdentity.GitObjectStoreDirectory) then
+            return! denied "Original Git administration/object-store identity differs from the immutable claim-bound grant."
         let! trees = git root ["worktree"; "list"; "--porcelain"]
         let registered =
             trees.Split([| "\n\n" |], StringSplitOptions.RemoveEmptyEntries)
@@ -231,6 +242,19 @@ module WorkQueueClaimBoundDirtySourcePolicy =
         match originalGrant with
         | Some raw, Some _ when raw = CanonicalCodec.encode grant -> ()
         | _ -> return! denied "Current grant has no matching original immutable revision."
+        let! originalGitIdentity =
+            WorkQueueReservationPermissions.readSourceIdentityAt ledger snapshot
+                grant.LaunchId grant.Revision
+            |> Result.mapError (fun _ ->
+                "SourceHostProofUnavailable: original physical Git identity revision cannot be read.")
+            |> Result.bind (function
+                | Some (witness, _) when witness.SchemaVersion = 1
+                                          && witness.LaunchId = grant.LaunchId
+                                          && witness.Revision = grant.Revision
+                                          && witness.GrantSha256 =
+                                              CanonicalCodec.digest(CanonicalCodec.encode grant) ->
+                    Ok witness.Identity
+                | _ -> missing "No immutable original Git administration/object-store identity matching the grant.")
         let! credential =
             WorkQueueGitLedger.readCredentialAt ledger snapshot request.LaunchId
             |> Result.mapError (fun _ -> "SourceHostProofUnavailable: original credential unreadable.")
@@ -321,7 +345,7 @@ module WorkQueueClaimBoundDirtySourcePolicy =
            || request.SourceClaimGeneration <> grant.SourceClaimGeneration
            || request.SourceWorktree <> grant.SourceWorktree then
             return! denied "Original claim, scoped grant, generation or source ancestry differs."
-        do! verifyPhysical ledger source grant lineage work launch
+        do! verifyPhysical ledger source grant originalGitIdentity lineage work launch
         return grant, work, launch, lineage
     }
 

@@ -296,6 +296,37 @@ let foreign_valid_same_name_wrong_path_wrong_credential_and_symlink_are_rejected
             | other -> Assert.Fail(sprintf "Traversal guard not proven: %A" other))
 
 [<Test>]
+let same_path_replacement_from_second_clone_cannot_reuse_original_host_edit () =
+    withFixture (fun f ->
+        awaitedEdit f
+        inspect f f.Source f.Bearer f.GrantRequest f.Effect (Some f.HostJournal)
+        |> verified |> ignore
+        let originalGitAdmin = git f.Source.RepositoryPath ["rev-parse"; "--absolute-git-dir"]
+        let originalObjects = git f.Source.RepositoryPath ["rev-parse"; "--git-path"; "objects"]
+        let originalSha = git f.Source.RepositoryPath ["rev-parse"; "HEAD"]
+        // The claimed dirty checkout disappears; the exact same pathname and
+        // generation-qualified basename now point to clone B's linked tree.
+        // The trusted host journal is intentionally left unchanged.
+        git f.A.RepositoryPath ["worktree"; "remove"; "--force";
+                                f.Source.RepositoryPath] |> ignore
+        git f.B.RepositoryPath ["worktree"; "add"; "--detach";
+                                f.Source.RepositoryPath; originalSha] |> ignore
+        Assert.That(git f.Source.RepositoryPath ["rev-parse"; "HEAD"],
+                    Is.EqualTo originalSha)
+        Assert.That(git f.Source.RepositoryPath ["rev-parse"; "--absolute-git-dir"],
+                    Is.Not.EqualTo originalGitAdmin)
+        Assert.That(git f.Source.RepositoryPath ["rev-parse"; "--git-path"; "objects"],
+                    Is.Not.EqualTo originalObjects)
+        // An unmodified grant, valid same-remote source ref, exact credential,
+        // physical pathname and historical terminal UUID are NOT sufficient.
+        match inspect f f.Source f.Bearer f.GrantRequest f.Effect
+                      (Some f.HostJournal) with
+        | ClaimedDirtySourceDecision.Rejected reason
+            when reason.Contains("Git administration", StringComparison.OrdinalIgnoreCase)
+                 || reason.Contains("object-store", StringComparison.OrdinalIgnoreCase) -> ()
+        | other -> Assert.Fail(sprintf "Same-path clone substitution survived identity binding: %A" other))
+
+[<Test>]
 let modified_head_revoked_grant_stale_claim_and_disabled_route_remain_fail_closed () =
     withFixture (fun f ->
         awaitedEdit f

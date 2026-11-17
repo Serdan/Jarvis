@@ -493,7 +493,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
         |> Set.ofArray
 
     let serverLocalNames =
-        set [ "GetProfile"; "Feedback"; "ListFeedback"; "GetFeedback"; "UpdateFeedback"; "GetFeedbackSummary"; "GetConnectionDiagnostics"; "ListDevices";  "SelectDevice"; "UpdateServer"; "GetServerUpdateStatus"; "RequestGrant" ]
+        set [ "GetProfile"; "GetAccountInstructions"; "UpdateAccountInstructions"; "Feedback"; "ListFeedback"; "GetFeedback"; "UpdateFeedback"; "GetFeedbackSummary"; "GetConnectionDiagnostics"; "ListDevices"; "SelectDevice"; "UpdateServer"; "GetServerUpdateStatus"; "RequestGrant" ]
 
     // Retired task commands must not be exposed by either the wire protocol or MCP.
     // The orphan Git branch is the sole supported orchestration API.
@@ -1121,6 +1121,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
             match definition with
             | Some definition -> expectedScope definition
             | None when methodInfo.Name = "UpdateServer" -> Auth.ProcessExecute
+            | None when methodInfo.Name = "UpdateAccountInstructions" -> Auth.WorkspaceWrite
             | None -> Auth.WorkspaceRead
 
         let readOnly =
@@ -1128,8 +1129,8 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
             | Some definition -> not definition.MutatesState
             | None ->
                 match methodInfo.Name with
-                | "Feedback" | "UpdateFeedback" | "SelectDevice" | "UpdateServer" | "RequestGrant" -> false
-                | "ListFeedback" | "GetFeedback" | "GetFeedbackSummary" | "GetConnectionDiagnostics" | "ListDevices" | "GetServerUpdateStatus" -> true
+                | "Feedback" | "UpdateFeedback" | "SelectDevice" | "UpdateServer" | "UpdateAccountInstructions" | "RequestGrant" -> false
+                | "GetAccountInstructions" | "ListFeedback" | "GetFeedback" | "GetFeedbackSummary" | "GetConnectionDiagnostics" | "ListDevices" | "GetServerUpdateStatus" -> true
                 | name -> failwith $"Unexpected server-local MCP tool: {name}"
 
         attribute.ReadOnly |> shouldEqual readOnly

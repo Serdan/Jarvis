@@ -42,6 +42,7 @@
         <Compile Include="WorkQueueSchedulerPrototype.fs"/>
         <Compile Include="JarvisOptions.fs"/>
         <Compile Include="Auth.fs"/>
+        <Compile Include="Services\AccountInstructionStore.fs"/>
         <Compile Include="ManualGrantStore.fs"/>
         <Compile Include="HttpRateLimitProtection.fs"/>
         <Compile Include="Services\ClientResponseTracker.fs"/>

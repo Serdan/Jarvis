@@ -332,6 +332,58 @@ module McpToolHelpers =
             result.Content <- contents
             result
 
+    /// Prepend server-held account guidance before all local repository and
+    /// role instructions. A single agent/client generation sees each revision
+    /// once, while explicit hierarchy reads always return the complete body.
+    let attachAccountGlobal (store: AccountInstructionStore) (users: UserService)
+                            command (context: HttpContext) (response: AgentCommandResponse)
+                            (result: CallToolResult) =
+        if response.PendingJob.IsSome then result
+        else
+            match Auth.tryUserId context.User, AgentCommandInfo.projectName command with
+            | Some subject, Some project when project <> "@global" ->
+                let agent = RequestDeviceRouting.agentId() |> Option.defaultValue ""
+                // Distinct ChatGPT conversations on the same connected device
+                // must each receive guidance on their own initial agent turn.
+                let cacheIdentity =
+                    match RequestDeviceRouting.session() with
+                    | Some session -> agent.Length.ToString() + ":" + agent + session
+                    | None -> agent
+                let device, generation =
+                    match users.GetSelectedSession(subject, RequestDeviceRouting.session(),
+                                                   RequestDeviceRouting.deviceOverride()) with
+                    | ValueSome selected -> selected.DeviceId, selected.Generation
+                    | ValueNone -> "unselected", 0L
+                let explicitRead =
+                    match command with
+                    | GetAgentInstructionsCommand _ -> true
+                    | _ -> false
+                match store.NextDelivery(subject, cacheIdentity, project, device, generation, explicitRead) with
+                | None -> result
+                | Some document ->
+                    let node = JsonObject()
+                    node["scope"] <- JsonValue.Create("account-global")
+                    node["status"] <- JsonValue.Create(document.Status)
+                    node["revision"] <- JsonValue.Create(document.Revision)
+                    node["precedence"] <- JsonValue.Create("before workspace/project/directory AGENTS.md, roles and individual instructions")
+                    match document.Sha256 with
+                    | Some hash -> node["sha256"] <- JsonValue.Create(hash)
+                    | None -> ()
+                    match document.Content with
+                    | Some body -> node["content"] <- JsonValue.Create(body)
+                    | None -> ()
+                    match document.Problem with
+                    | Some error -> node["error"] <- JsonValue.Create("INCOMPLETE ACCOUNT INSTRUCTIONS: " + error)
+                    | None -> ()
+                    let wrapper = JsonObject()
+                    wrapper["accountGlobalInstructions"] <- node
+                    let blocks = ResizeArray<ContentBlock>()
+                    blocks.Add(textContent (wrapper.ToJsonString()))
+                    for block in result.Content do blocks.Add(block)
+                    result.Content <- blocks
+                    result
+            | _ -> result
+
     let private jsonResult value =
         JsonSerializer.Serialize(value)
         |> fun serialized -> textResult serialized false
@@ -428,6 +480,16 @@ module McpToolHelpers =
                     "Returns the profile represented by the authenticated OAuth credentials."
                     [ ReadOnly ]
                     false
+                serverLocalCapability
+                    "GetAccountInstructions"
+                    "Read authenticated server-wide AGENTS.md with exact revision and state."
+                    [ ReadOnly ]
+                    false
+                serverLocalCapability
+                    "UpdateAccountInstructions"
+                    "Conditionally replace authenticated server-wide AGENTS.md."
+                    []
+                    true
                 serverLocalCapability
                     "Feedback"
                     "Persists explicit structured agent feedback on the Jarvis server."
@@ -1102,6 +1164,8 @@ module McpToolHelpers =
                     // Other devices use the existing bounded cache TTL if no
                     // direct update notification was delivered.
 
+                    let store = context.RequestServices.GetRequiredService<AccountInstructionStore>()
+                    let users = context.RequestServices.GetRequiredService<UserService>()
                     return
                         (match command with
                          | ReadImageCommand _ -> imageResult response
@@ -1109,6 +1173,7 @@ module McpToolHelpers =
                          | _ -> toCallToolResult response)
                         |> attachStateEffects evidence
                         |> attachInstructions evidence.Instructions
+                        |> attachAccountGlobal store users command context response
                         |> attachOperationId tracking
                         |> attachGeneratedOperationId generatedId
                         |> attachGeneratedTaskId (if response.Result.IsSome && response.Error.IsNone && response.PendingJob.IsNone then generatedTaskId else None)
@@ -1236,6 +1301,38 @@ module McpToolHelpers =
                     return structuredResult structured serialized false
                 | None ->
                     return authenticationErrorResult context None
+        }
+
+    let private accountContext requiredScope (http: IHttpContextAccessor) =
+        match Option.ofObj http.HttpContext with
+        | None -> Error(errorResult (PermissionDenied "Authenticated HTTP context is required."))
+        | Some context ->
+            match Auth.tryUserId context.User with
+            | None -> Error(authenticationErrorResult context (Some requiredScope))
+            | Some _ when not (Auth.hasScope requiredScope context.User) ->
+                Error(authorizationErrorResult context requiredScope)
+            | Some subject -> Ok subject
+
+    let getAccountInstructions (store: AccountInstructionStore) (http: IHttpContextAccessor) =
+        task {
+            match accountContext Auth.WorkspaceRead http with
+            | Error denied -> return denied
+            | Ok subject -> return jsonResult (store.Read subject)
+        }
+
+    let updateAccountInstructions (store: AccountInstructionStore) (http: IHttpContextAccessor)
+                                  (expectedRevision: string) (content: string) =
+        task {
+            match accountContext Auth.WorkspaceWrite http with
+            | Error denied -> return denied
+            | Ok subject ->
+                match store.Update(subject, expectedRevision, content) with
+                | Ok updated -> return jsonResult updated
+                | Error(RevisionConflict current) ->
+                    return errorResult (Conflict $"Account AGENTS.md revision conflict. Current revision: {current}. Read again before editing.")
+                | Error(InvalidInput message) -> return errorResult (ValidationFailed message)
+                | Error(StorageUnavailable message) ->
+                    return errorResult (ExecutionFailed message)
         }
 
     let private optionalString (value: string) =
@@ -1646,6 +1743,15 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "Get profile", UseStructuredContent = true, OutputSchemaType = typeof<ProfileResult>, ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":[]}]"""); McpMeta("openai/profile", true); Description("Return the profile represented by the authenticated OAuth credentials.")>]
     static member GetProfile(http: IHttpContextAccessor) =
         McpToolHelpers.getProfile http
+
+    [<McpServerTool(Title = "Read account instructions", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read this authenticated account's server-wide AGENTS.md, including exact revision and missing, empty or unavailable state. Requires no selected client.")>]
+    static member GetAccountInstructions(store: AccountInstructionStore, http: IHttpContextAccessor) =
+        McpToolHelpers.getAccountInstructions store http
+
+    [<McpServerTool(Title = "Update account instructions", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Atomically replace this authenticated account's server-wide AGENTS.md using the exact expectedRevision returned by GetAccountInstructions. A stale revision returns Conflict.")>]
+    static member UpdateAccountInstructions(expectedRevision: string, content: string,
+                                            store: AccountInstructionStore, http: IHttpContextAccessor) =
+        McpToolHelpers.updateAccountInstructions store http expectedRevision content
 
     [<McpServerTool(Title = "Submit feedback", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Submit structured feedback about Jarvis tool failures, limitations, ergonomics, missing capabilities, documentation, or positive behavior. Does not require local client approval.")>]
     static member Feedback(

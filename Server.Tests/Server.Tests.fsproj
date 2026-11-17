@@ -8,6 +8,7 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <Compile Include="AccountInstructionStoreTests.fs"/>
         <Compile Include="ExportStoreTests.fs"/>
         <Compile Include="FeedbackStoreTests.fs"/>
         <Compile Include="OptionalFeedbackStoreTests.fs"/>

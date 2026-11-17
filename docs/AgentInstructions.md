@@ -10,17 +10,50 @@ Jarvis is an MCP bridge, not the host model's harness. It can guarantee that the
 
 Use the canonical, case-sensitive filename `AGENTS.md`. Do not scan arbitrary alternative filenames.
 
+The server additionally holds an **account-global `AGENTS.md`** for each authenticated
+OAuth subject, independently of clients, project checkouts and task ownership.
 For a project `P` under the client's selected workspace `W`, ordered applicable sources are:
 
-1. `W/AGENTS.md` — workspace-wide instructions, if present.
-2. `W/P/AGENTS.md` — project-wide instructions, if present.
-3. `W/P/path/AGENTS.md` — additional instructions in each successive directory from project root to the operation target, if present.
+1. Account-global server document, if configured and available.
+2. `W/AGENTS.md` — workspace-wide instructions, if present.
+3. `W/P/AGENTS.md` — project-wide instructions, if present.
+4. `W/P/path/AGENTS.md` — additional instructions in each successive directory from project root to the operation target, if present.
 
 Read and present these in ancestor-to-descendant order. A more specific file can refine an earlier file but cannot override the host's higher-priority instructions, Jarvis permissions, or security rules. No file is inherited from outside the selected workspace.
 
 An instruction file applies to work **in its directory and descendants**, not sibling directories. For a file target, use its parent directory. For a directory target, include that directory. For multiple targets, use the union of their applicable files, deduplicated by normalized path, ordered from shallowest to deepest and then ordinal path order at the same depth. Do not recursively scan a project for unrelated instruction files.
 
 A missing `AGENTS.md` is normal and contributes no document. Empty files are allowed. Automatic delivery contributes no instruction content for an empty file; explicit hierarchy retrieval includes it. The existing path confinement and symlink/reparse-point prohibitions apply to both directories and instruction files, including the workspace-level file.
+
+### Server-held account instructions
+
+`get_account_instructions` (OAuth `workspace:read`) returns the authenticated
+account's exact global document and revision; `update_account_instructions`
+(OAuth `workspace:write`) replaces it only when the exact `expectedRevision`
+matches. Neither operation accepts an account ID, client device, project, or
+filesystem path as authority. The server derives a private SHA-256 account
+directory from the authenticated `sub` claim. Configurable server setting
+`AccountInstructionRoot` defaults to the server user's local app-data
+`Jarvis/account-instructions` directory.
+
+State is explicit: `missing` has revision `missing`; a present file has
+`sha256:<lowercase-hex>` even when the body is empty; an unreadable, invalid
+UTF-8, linked, or oversized file is `unavailable`, **not** an empty policy.
+Content is strict UTF-8, at most 64 KiB. Updates are serialized in-process
+and atomically rename a flushed private temporary file, then refresh the
+server's in-memory snapshot. The server preloads existing account files on
+startup; a storage-root failure blocks startup, rather than silently disabling
+configured instructions.
+
+For project-scoped agent calls, the server prepends a distinct
+`accountGlobalInstructions` object **before** the existing relative path-keyed
+`AGENTS.md` object and role layers. Successful deliveries are deduplicated by
+agent, project, conversation, device generation, and revision; a new revision
+or reconnect resends the body. Explicit initial hierarchy reads always include
+current state. If a stable agent identity is absent or account instructions
+are unavailable, delivery is conservative rather than silently omitting a
+configured policy. This is server-owned instruction storage, not a new
+task/assignment/review ledger. No deployment is authorized by these APIs.
 
 The incremental delivery cache records one current observation per logical
 instruction path. A complete delivery and an omission warning replace one another;

@@ -44,6 +44,7 @@ let unauthenticated_mcp_requests_get_http_oauth_challenge_but_resource_metadata_
     start.Environment["JarvisAuth0Domain"] <- "dev-kn4j3jz3qv2cvw05.eu.auth0.com"
     start.Environment["JarvisAudience"] <- "https://jarvis2.kehlet.dev"
     start.Environment["JarvisDatabasePath"] <- Path.Combine(tempDirectory, "feedback.db")
+    start.Environment["JarvisAccountInstructionRoot"] <- Path.Combine(tempDirectory, "account-instructions")
 
     use server = Process.Start(start)
     try
@@ -133,6 +134,7 @@ let server_authentication_and_routing_start_with_missing_corrupt_or_unavailable_
             start.Environment["ASPNETCORE_ENVIRONMENT"] <- "Development"
             start.Environment["JarvisAuth0Domain"] <- "dev-kn4j3jz3qv2cvw05.eu.auth0.com"
             start.Environment["JarvisAudience"] <- "https://jarvis2.kehlet.dev"
+            start.Environment["JarvisAccountInstructionRoot"] <- Path.Combine(temporary, "account-instructions")
             match path with
             | Some configured -> start.Environment["JarvisDatabasePath"] <- configured
             | None -> start.Environment.Remove("JarvisDatabasePath") |> ignore

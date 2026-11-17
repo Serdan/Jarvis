@@ -1,6 +1,7 @@
 #nowarn "20"
 
 open System
+open System.IO
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Authentication.JwtBearer
 open Microsoft.AspNetCore.Authorization
@@ -36,6 +37,13 @@ let private getConfiguredOptions (configuration: IConfiguration) =
 let private getDatabasePath (configuration: IConfiguration) =
     let path = configuration["DatabasePath"]
     if String.IsNullOrWhiteSpace(path) then "" else path
+
+let private getAccountInstructionRoot (configuration: IConfiguration) =
+    let configured = configuration["AccountInstructionRoot"]
+    if String.IsNullOrWhiteSpace configured then
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                     "Jarvis", "account-instructions")
+    else configured
 
 let configureServices (services: IServiceCollection) (configuration: IConfiguration) =
     let configured = getConfiguredOptions configuration
@@ -120,6 +128,8 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
         .AddSingleton<ClientResponseTracker>()
         .AddSingleton<ExportStore>(fun _ -> new ExportStore())
         .AddSingleton<ManualGrantStore>()
+        .AddSingleton<AccountInstructionStore>(fun _ ->
+            AccountInstructionStore(getAccountInstructionRoot configuration))
         // SQLite is optional diagnostics. Its initialization, lock acquisition
         // and filesystem I/O must never gate authentication or MCP readiness.
         .AddSingleton<OptionalFeedbackStore>(fun _ -> new OptionalFeedbackStore(databasePath))
@@ -203,6 +213,9 @@ builder.Services.Configure<JarvisOptions>(builder.Configuration) |> ignore
 configureServices builder.Services builder.Configuration
 
 let app = builder.Build()
+
+// Preload account-wide guidance before accepting authenticated MCP requests.
+app.Services.GetRequiredService<AccountInstructionStore>() |> ignore
 
 
 if app.Environment.IsDevelopment() then

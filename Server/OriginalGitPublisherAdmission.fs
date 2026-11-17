@@ -95,6 +95,8 @@ module OriginalGitPublisherAdmission =
     let private sha256 = Regex("^[0-9a-f]{64}$", RegexOptions.Compiled)
     let private oid = Regex("^[0-9a-f]{40}([0-9a-f]{24})?$", RegexOptions.Compiled)
     let private safeRef = Regex("^refs/(heads|tags)/[A-Za-z0-9][A-Za-z0-9._/-]*$", RegexOptions.Compiled)
+    let private projectLedgerRef = "refs/heads/jarvis-orchestration"
+    let private accountLedgerRef = "refs/heads/jarvis-account-admission"
 
     let private valid (pattern: Regex) (value: string) =
         not (String.IsNullOrWhiteSpace value) && pattern.IsMatch value
@@ -108,6 +110,7 @@ module OriginalGitPublisherAdmission =
         && not (value.EndsWith(".", StringComparison.Ordinal))
         && (value.Split('/') |> Array.forall (fun part ->
             part <> "." && part <> ".."
+            && not (part.StartsWith(".", StringComparison.Ordinal))
             && not (part.EndsWith(".lock", StringComparison.OrdinalIgnoreCase))))
 
     // Shape validation is necessary but NEVER a positive remote admission
@@ -126,12 +129,14 @@ module OriginalGitPublisherAdmission =
         else
             match target.Purpose, target.ProjectId with
             | OriginalGitRefPurpose.AccountLedger, None
-                when target.GitRef = "refs/heads/jarvis-account-admission" -> Ok ()
+                when target.GitRef = accountLedgerRef -> Ok ()
             | OriginalGitRefPurpose.ProjectLedger, Some id
                 when id <> Guid.Empty
-                     && target.GitRef = "refs/heads/jarvis-orchestration" -> Ok ()
+                     && target.GitRef = projectLedgerRef -> Ok ()
             | OriginalGitRefPurpose.SourceEffect, Some id
-                when id <> Guid.Empty -> Ok ()
+                when id <> Guid.Empty
+                     && target.GitRef <> projectLedgerRef
+                     && target.GitRef <> accountLedgerRef -> Ok ()
             | _ -> Error(OriginalGitPublisherFailure.InvalidEnvelope "ScopeOrRefMismatch")
 
     let validateCas (operation: OriginalGitPublisherCas) =
@@ -184,10 +189,7 @@ module OriginalGitPublisherAdmission =
                     request.Targets
                     |> List.map (fun target ->
                         target.CanonicalRepositoryId,
-                        target.GitRef,
-                        target.ProjectId,
-                        target.LedgerId,
-                        target.LedgerEpoch)
+                        target.GitRef)
                     |> List.distinct
                 if distinct.Length <> request.Targets.Length then
                     Error(OriginalGitPublisherFailure.InvalidEnvelope "DuplicateFenceTarget")
@@ -200,3 +202,49 @@ module OriginalGitPublisherAdmission =
                               target.Purpose = OriginalGitRefPurpose.ProjectLedger)) then
                     Error(OriginalGitPublisherFailure.InvalidEnvelope "ProjectAuthorityMissing")
                 else Ok ()
+
+    // This comparison is only an input-consistency check. The *enforcing*
+    // publisher must obtain this inventory independently from its authenticated
+    // remote/ref authority (never the CAS caller), including credential/bypass
+    // coverage, before it can issue a positive admission or fence receipt.
+    // A syntactically valid source ref is not thereby an authorized ref.
+    let validateTargetAgainstTrustedInventory
+        (trustedInventory: OriginalGitPublisherTarget list)
+        (target: OriginalGitPublisherTarget) =
+        match validateTarget target with
+        | Error error -> Error error
+        | Ok () ->
+            if isNull (box trustedInventory) || trustedInventory.IsEmpty then
+                Error OriginalGitPublisherFailure.UntrustedAuthority
+            else
+                let matches =
+                    trustedInventory
+                    |> List.filter (fun approved ->
+                        approved.CanonicalRepositoryId = target.CanonicalRepositoryId
+                        && approved.GitRef = target.GitRef)
+                match matches with
+                | [ approved ] when approved = target -> Ok ()
+                | [ _ ] ->
+                    Error(OriginalGitPublisherFailure.InvalidEnvelope "RefClassificationOrIdentityMismatch")
+                | [] -> Error OriginalGitPublisherFailure.UntrustedAuthority
+                | _ ->
+                    Error(OriginalGitPublisherFailure.InvalidEnvelope "ConflictingTrustedRefInventory")
+
+    let validateCasAgainstTrustedInventory trustedInventory operation =
+        match validateCas operation with
+        | Error error -> Error error
+        | Ok () ->
+            validateTargetAgainstTrustedInventory trustedInventory operation.Target
+
+    let validateFenceRequestAgainstTrustedInventory trustedInventory request =
+        match validateFenceRequest request with
+        | Error error -> Error error
+        | Ok () ->
+            request.Targets
+            |> List.tryPick (fun target ->
+                match validateTargetAgainstTrustedInventory trustedInventory target with
+                | Error error -> Some error
+                | Ok () -> None)
+            |> function
+                | Some error -> Error error
+                | None -> Ok ()

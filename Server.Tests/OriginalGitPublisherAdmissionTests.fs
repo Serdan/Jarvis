@@ -44,6 +44,10 @@ let private invalid = function
     | Error(OriginalGitPublisherFailure.InvalidEnvelope _) -> true
     | _ -> false
 
+let private rejected = function
+    | Error _ -> true
+    | _ -> false
+
 [<Test>]
 let ``valid project and account envelopes remain only syntactic evidence`` () =
     Assert.That(OriginalGitPublisherAdmission.validateTarget projectTarget = Ok (), Is.True)
@@ -78,6 +82,48 @@ let ``source effects require a stable original effect ID and safe ref`` () =
         { source with GitRef = "refs/heads/jarvis-review/../escape" }), Is.True)
     Assert.That(invalid (OriginalGitPublisherAdmission.validateTarget
         { source with GitRef = "refs/heads/forged.lock" }), Is.True)
+    Assert.That(invalid (OriginalGitPublisherAdmission.validateTarget
+        { source with GitRef = "refs/heads/jarvis-review/.shadow" }), Is.True)
+
+[<Test>]
+let ``trusted remote-ref inventory binds source effects to exact class and identity`` () =
+    let source = { projectTarget with
+                    Purpose = OriginalGitRefPurpose.SourceEffect
+                    GitRef = "refs/heads/jarvis-review/task/1234" }
+    let trustedInventory = [accountTarget; projectTarget; source]
+    let sourceCas = { cas with Target = source; SourceEffectOperationId = Some operation }
+    Assert.That(OriginalGitPublisherAdmission.validateCasAgainstTrustedInventory
+        trustedInventory sourceCas = Ok (), Is.True)
+
+    // Neither original-ledger CAS ref can be reclassified by a caller.
+    for reserved in [ "refs/heads/jarvis-orchestration"
+                      "refs/heads/jarvis-account-admission" ] do
+        Assert.That(invalid (OriginalGitPublisherAdmission.validateTarget
+            { source with GitRef = reserved }), Is.True)
+        Assert.That(invalid (OriginalGitPublisherAdmission.validateCas
+            { sourceCas with Target = { source with GitRef = reserved } }), Is.True)
+
+    // A valid Git source ref is only a shape, not evidence of authorization.
+    let alternate = { source with GitRef = "refs/heads/unregistered-source-effect" }
+    Assert.That(OriginalGitPublisherAdmission.validateTarget alternate = Ok (), Is.True)
+    Assert.That(rejected (OriginalGitPublisherAdmission.validateCasAgainstTrustedInventory
+        trustedInventory { sourceCas with Target = alternate }), Is.True)
+    Assert.That(rejected (OriginalGitPublisherAdmission.validateTargetAgainstTrustedInventory
+        [] source), Is.True)
+
+    // Exact approved ref binding includes project, ledger, epoch, remote and purpose.
+    for spoofed in [
+        { source with ProjectId = Some(Guid.NewGuid()) }
+        { source with LedgerId = Guid.NewGuid() }
+        { source with LedgerEpoch = 2 }
+        { source with ApprovedRemoteFingerprintSha256 = shaA }
+    ] do
+        Assert.That(invalid (OriginalGitPublisherAdmission.validateTargetAgainstTrustedInventory
+            trustedInventory spoofed), Is.True)
+    Assert.That(rejected (OriginalGitPublisherAdmission.validateTargetAgainstTrustedInventory
+        trustedInventory { source with CanonicalRepositoryId = shaB }), Is.True)
+    Assert.That(invalid (OriginalGitPublisherAdmission.validateTargetAgainstTrustedInventory
+        (trustedInventory @ [{ source with LedgerEpoch = 2 }]) source), Is.True)
 
 [<Test>]
 let ``barrier envelope requires distinct canonical account and project authorities`` () =
@@ -93,6 +139,20 @@ let ``barrier envelope requires distinct canonical account and project authoriti
         { fixture with Targets = [accountTarget; projectTarget; projectTarget] }), Is.True)
     Assert.That(invalid (OriginalGitPublisherAdmission.validateFenceRequest
         { fixture with Targets = [accountTarget; {projectTarget with AccountId = Guid.NewGuid()}] }), Is.True)
+    // The physical remote/ref key must reject conflicting claims, even when
+    // epoch, ledger ID, project ID, or approved remote fingerprint changes.
+    for conflicting in [
+        { projectTarget with LedgerEpoch = 2 }
+        { projectTarget with LedgerId = Guid.NewGuid() }
+        { projectTarget with ProjectId = Some(Guid.NewGuid()) }
+        { projectTarget with ApprovedRemoteFingerprintSha256 = shaA }
+    ] do
+        Assert.That(invalid (OriginalGitPublisherAdmission.validateFenceRequest
+            { fixture with Targets = [accountTarget; projectTarget; conflicting] }), Is.True)
+    Assert.That(OriginalGitPublisherAdmission.validateFenceRequestAgainstTrustedInventory
+        [accountTarget; projectTarget] fixture = Ok (), Is.True)
+    Assert.That(invalid (OriginalGitPublisherAdmission.validateFenceRequestAgainstTrustedInventory
+        [accountTarget; {projectTarget with LedgerEpoch = 2}] fixture), Is.True)
 
 // A necessary real-Git negative test. This is NOT a positive gateway test:
 // installing a hook is not serialized with an in-flight push, and a caller

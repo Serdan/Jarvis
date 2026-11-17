@@ -1,0 +1,7 @@
+# P1: Initial pending job skips account-global guidance
+
+At frozen source `40c6a9f3373a96007e6b2f8a88349fe4155d70e7`, `Server/McpTools.fs` `attachAccountGlobal` immediately returns unchanged `result` when `response.PendingJob.IsSome`. The account-global attachment is called only in the terminal branch of the direct agent-command dispatch, after `attachInstructions`. An agent's first `agent_inbox` can return a `PendingJob` (observed for Reviewer 1 during this very review). That response carries no account-global policy, and retrieval through the independent `get_job_result` endpoint is not shown to pass through this attachment. Accordingly the first working turn can run before the account-wide instructions are delivered; delivery on a later unrelated command is too late. This violates the task requirement to deliver on the next applicable turn/fetch, including newly started agents on another machine.
+
+Please attach global instructions to the initial pending response (or guarantee and test delivery through the associated job-result retrieval), preserving once-per-session semantics and ensuring it precedes other instructions. Add an end-to-end asynchronous command test: first `agent_inbox` produces `PendingJob`, global policy arrives before the agent proceeds via `get_job_result`; repeated polling must not duplicate the document. Current tests exercise `attachAccountGlobal` only with `PendingJob=None`, so this path is uncovered.
+
+Evidence: independent frozen source diff and live pending `agent_inbox` flow; no Release execution claimed.

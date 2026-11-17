@@ -3,11 +3,24 @@ module Client.Tests.ChallengeWorkflowTests
 open System
 open System.Diagnostics
 open System.IO
+open System.Text.Json
 open System.Threading.Tasks
 open Client.LedgerStore
 open Client.ReviewWorkflow
 open Client.ChallengeWorkflow
 open NUnit.Framework
+
+[<CLIMutable>]
+type LegacyAttemptChallengeWait =
+    { TaskId: string
+      AttemptId: string
+      OwnerAgentId: string
+      Reason: string
+      ChallengeIds: string list
+      Status: string
+      Version: int
+      BlockedAtUtc: string
+      RequeuedAtUtc: string }
 
 [<TestFixture>]
 type ChallengeTests() =
@@ -106,6 +119,14 @@ type ChallengeTests() =
             ("refs/heads/" + branch) head "Frozen independent review" "" ""
         |> ok |> ignore
         id.ToString("N")
+
+    let readWaitJson binding task attemptId =
+        let snapshot = LedgerStore.fetch binding |> ok
+        let content, _ =
+            LedgerStore.readAt binding snapshot
+                ($"tasks/{task}/attempts/{attemptId}/challenge-wait.json") |> ok
+        content |> Option.defaultWith (fun () -> failwith "Missing canonical challenge wait.")
+
 
     // Publish canonical schema-2 records through the real CAS ledger, but omit
     // the operator index exactly as the pre-index implementation did. The
@@ -696,6 +717,86 @@ type ChallengeTests() =
 
 
     [<Test>]
+    member _.ReviewWaitSchemaThreePreventsOldClientFromTreatingItAsManualWait() =
+        withFixture (fun a b ->
+            let task = "review-schema-upgrade"
+            let tv, pv, av, attemptId = assignment a task
+            let reviewId = requestReview b task
+            ChallengeWorkflow.blockOnDependencies a (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "Wait for independent verdict" [] [ reviewId ] |> ok |> ignore
+
+            // The old schema-2 decoder ignores unknown JSON members. Its
+            // deserialized view has zero challenges and would pass the old
+            // manual requeue gate if the record had remained schema 2.
+            let raw = readWaitJson b task attemptId
+            use document = JsonDocument.Parse raw
+            let root = document.RootElement
+            Assert.That(root.GetProperty("schemaVersion").GetInt32(), Is.EqualTo(3))
+            Assert.That(root.GetProperty("reviewIds").GetArrayLength(), Is.EqualTo(1))
+            let legacy = JsonSerializer.Deserialize<LegacyAttemptChallengeWait>(
+                            raw, JsonSerializerOptions(PropertyNameCaseInsensitive = true))
+            Assert.That(legacy.ChallengeIds, Is.Empty)
+            Assert.That(legacy.Status, Is.EqualTo("Waiting"))
+            Assert.That(root.GetProperty("schemaVersion").GetInt32() = 2, Is.False,
+                        "A pre-upgrade client requires schema 2 and must reject this wait.")
+
+            // Both current clients enforce the pending review even though the
+            // known challenge list is empty. The reviewer queue is unchanged.
+            failStale (ChallengeWorkflow.requeueAttempt b (Guid.NewGuid()) "Agent 3" task
+                           attemptId tv (pv + 1) (av + 1) 1 "Premature manual requeue")
+            let stillBlocked = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(stillBlocked.Agent.State, Is.EqualTo("NeedsWork"))
+            Assert.That(stillBlocked.AwaitedReviews.Head.Status, Is.EqualTo("Unclaimed"))
+            ReviewWorkflow.claimBranchReview a (Guid.NewGuid()) task (Guid.Parse reviewId) "Lead" 1
+            |> ok |> ignore
+            ReviewWorkflow.decideBranchReview b (Guid.NewGuid()) task (Guid.Parse reviewId)
+                "Lead" 2 Accept |> ok |> ignore
+            let ready = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
+            Assert.That(ready.RunnableQueue.Head.Attempt.AssignmentGeneration, Is.EqualTo(2))
+            use after = JsonDocument.Parse(readWaitJson a task attemptId)
+            Assert.That(after.RootElement.GetProperty("schemaVersion").GetInt32(), Is.EqualTo(3),
+                        "Review-linked waits must retain the compatibility barrier after requeue.")
+        )
+
+    [<Test>]
+    member _.ChallengeOnlyWaitPreservesLegacySchemaTwoAndManualRequeue() =
+        withFixture (fun a b ->
+            let task = "challenge-only-schema-two"
+            let tv, pv, av, attemptId = assignment a task
+            ChallengeWorkflow.blockAttempt b (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "Manual challenge wait" [] |> ok |> ignore
+            let raw = readWaitJson a task attemptId
+            use document = JsonDocument.Parse raw
+            Assert.That(document.RootElement.GetProperty("schemaVersion").GetInt32(), Is.EqualTo(2))
+            let legacy = JsonSerializer.Deserialize<LegacyAttemptChallengeWait>(
+                            raw, JsonSerializerOptions(PropertyNameCaseInsensitive = true))
+            Assert.That(legacy.ChallengeIds, Is.Empty)
+            Assert.That(legacy.Status, Is.EqualTo("Waiting"))
+            // An actual pre-upgrade schema-2 record has no reviewIds member.
+            // Preserve its readability and manual requeue across migration.
+            let legacyRaw = raw.Replace(",\"reviewIds\":[]", "", StringComparison.Ordinal)
+            Assert.That(legacyRaw, Is.Not.EqualTo(raw))
+            let path = $"tasks/{task}/attempts/{attemptId}/challenge-wait.json"
+            let snapshot = LedgerStore.fetch b |> ok
+            let _, oid = LedgerStore.readAt b snapshot path |> ok
+            let mutation : LedgerIntent =
+                { OperationId = Guid.NewGuid(); Actor = "Agent 3"
+                  Kind = "LegacyChallengeWaitFixture"; RequestJson = "{}" }
+            LedgerStore.transact b mutation (fun _ ->
+                Ok [ { Path = path; ExpectedBlobOid = oid; Content = legacyRaw } ])
+            |> ok |> ignore
+            Assert.That(readWaitJson a task attemptId, Is.EqualTo(legacyRaw))
+            let inbox = ReviewWorkflow.getAgentInbox b "Agent 3" |> ok
+            Assert.That(inbox.BlockedChallengeWaits.Head.ReviewIds, Is.Empty)
+            ChallengeWorkflow.requeueAttempt a (Guid.NewGuid()) "Agent 3" task attemptId
+                tv (pv + 1) (av + 1) 1 "Manual wait complete" |> ok |> ignore
+            let ready = ReviewWorkflow.getAgentInbox b "Agent 3" |> ok
+            Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
+            Assert.That(ready.RunnableQueue.Head.Attempt.AssignmentGeneration, Is.EqualTo(2))
+        )
+
+    [<Test>]
     member _.ReviewChangesRequestedWakesOwnerWhileIndependentQueueAndFeedbackSurvive() =
         withFixture (fun a b ->
             let task = "review-wait-changes"
@@ -822,6 +923,16 @@ type ChallengeTests() =
             Assert.That(ready.Agent.CurrentAssignment.AttemptId, Is.EqualTo(attemptId))
             Assert.That(ready.BlockedChallengeWaits, Is.Empty)
             Assert.That(ready.AwaitedReviews.Head.Status, Is.EqualTo("Accepted"))
+            let snapshot = LedgerStore.fetch b |> ok
+            let issuePath = $"tasks/{task}/attempts/{attemptId}/assignments/2.json"
+            let issueRaw, _ = LedgerStore.readAt b snapshot issuePath |> ok
+            use issue = JsonDocument.Parse(issueRaw.Value)
+            Assert.That(issue.RootElement.GetProperty("reason").GetString(), Is.EqualTo("ReviewUnblock"))
+            let eventPath = $"tasks/{task}/lifecycle/{ready.RunnableQueue.Head.Attempt.IssuedSequence}.json"
+            let eventRaw, _ = LedgerStore.readAt b snapshot eventPath |> ok
+            use evt = JsonDocument.Parse(eventRaw.Value)
+            Assert.That(evt.RootElement.GetProperty("action").GetString(),
+                        Is.EqualTo("RequeueReviewBlockedAttempt"))
             Assert.That(notices b, Is.Empty)
         )
 

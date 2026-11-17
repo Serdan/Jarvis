@@ -471,7 +471,15 @@ module ReviewWorkflow =
         let content = json value
         if not (content.StartsWith("{", StringComparison.Ordinal)) then
             invalidArg "value" "A ledger entity must be a JSON object."
-        let version = if List.contains typeof<'t>.Name [ "BranchReview"; "ReviewAgent"; "ReviewAttempt" ] then 3 else 2
+        // Schema-2 readers ignore unknown reviewIds and could prematurely
+        // requeue a review-only wait as a zero-challenge manual wait.
+        // Challenge-only records remain schema 2 for old-client compatibility.
+        let version =
+            if typeof<'t> = typeof<AttemptChallengeWait> then
+                let wait = unbox<AttemptChallengeWait>(box value)
+                if not (isNull (box wait.ReviewIds)) && not (List.isEmpty wait.ReviewIds) then 3 else 2
+            elif List.contains typeof<'t>.Name [ "BranchReview"; "ReviewAgent"; "ReviewAttempt" ] then 3
+            else 2
         $"{{\"schemaVersion\":{version}," + content.Substring(1)
 
     let private validEntity<'t> (content: string) =
@@ -485,10 +493,18 @@ module ReviewWorkflow =
                 let names = System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase)
                 let unique = properties |> Array.forall (fun property -> names.Add property.Name)
                 let mutable schema = Unchecked.defaultof<JsonElement>
+                let schemaNumber =
+                    if root.TryGetProperty("schemaVersion", &schema)
+                       && schema.ValueKind = JsonValueKind.Number then Some(schema.GetInt32())
+                    else None
                 let schemaValid =
-                    root.TryGetProperty("schemaVersion", &schema)
-                    && schema.ValueKind = JsonValueKind.Number
-                    && schema.GetInt32() = (if List.contains typeof<'t>.Name [ "BranchReview"; "ReviewAgent"; "ReviewAttempt" ] then 3 else 2)
+                    match schemaNumber with
+                    | Some number when typeof<'t> = typeof<AttemptChallengeWait> ->
+                        number = 2 || number = 3
+                    | Some number when List.contains typeof<'t>.Name [ "BranchReview"; "ReviewAgent"; "ReviewAttempt" ] ->
+                        number = 3
+                    | Some number -> number = 2
+                    | None -> false
                 let required =
                     typeof<'t>.GetProperties()
                     |> Array.filter (fun property ->
@@ -504,7 +520,7 @@ module ReviewWorkflow =
                         || (typeof<'t> = typeof<AgentNotification>
                             && property = "fromProjectName")
                         || (typeof<'t> = typeof<AttemptChallengeWait>
-                            && property = "reviewIds")
+                            && property = "reviewIds" && schemaNumber = Some 2)
                         || (typeof<'t> = typeof<TaskLifecycleEvent>
                             && List.contains property
                                 [ "requestingAgentId"; "targetAgentId"
@@ -538,7 +554,17 @@ module ReviewWorkflow =
                         && (let mutable kind = Unchecked.defaultof<JsonElement>
                             root.TryGetProperty("kind", &kind) && kind.ValueKind = JsonValueKind.String)
                     | "IntegrationSubmission" -> status "status" [ "Pending"; "Integrated" ]
-                    | "AttemptChallengeWait" -> status "status" [ "Waiting"; "Eligible"; "Requeued" ]
+                    | "AttemptChallengeWait" ->
+                        status "status" [ "Waiting"; "Eligible"; "Requeued" ]
+                        && (let mutable ids = Unchecked.defaultof<JsonElement>
+                            let present = root.TryGetProperty("reviewIds", &ids)
+                            match schemaNumber with
+                            | Some 2 ->
+                                not present || ids.ValueKind = JsonValueKind.Null
+                                || (ids.ValueKind = JsonValueKind.Array && ids.GetArrayLength() = 0)
+                            | Some 3 ->
+                                present && ids.ValueKind = JsonValueKind.Array && ids.GetArrayLength() > 0
+                            | _ -> false)
                     | "ReviewFeedbackNotice" -> status "status" [ "Accepted"; "ChangesRequested" ]
                     | "AgentCheckpoint" -> status "kind" [ "Yield"; "Completion"; "Recovery"; "Progress"; "Submission"; "Revision" ]
                     | "TaskLifecycleEvent" ->
@@ -896,7 +922,12 @@ module ReviewWorkflow =
                                 let sequence = snapshot.Header.NextSequence
                                 let timestamp = DateTimeOffset.UtcNow.ToString("O")
                                 let generation = attempt.AssignmentGeneration + 1
-                                let reason = "Satisfied challenge dependencies requeued after owner release"
+                                let reviewLinked = not (List.isEmpty (waitReviewIds wait))
+                                let reason =
+                                    if reviewLinked then "Completed review dependencies requeued after owner release"
+                                    else "Satisfied challenge dependencies requeued after owner release"
+                                let issueReason = if reviewLinked then "ReviewUnblock" else "ChallengeUnblock"
+                                let auditAction = if reviewLinked then "RequeueReviewBlockedAttempt" else "RequeueChallengeBlockedAttempt"
                                 let readyAttempt =
                                     { attempt with Version = attempt.Version + 1
                                                    Phase = "Queued"
@@ -913,7 +944,7 @@ module ReviewWorkflow =
                                 let audit : TaskLifecycleEvent =
                                     { TaskId = wait.TaskId; AttemptId = wait.AttemptId
                                       OperationId = operationId.ToString("D")
-                                      Sequence = sequence; Action = "RequeueChallengeBlockedAttempt"
+                                      Sequence = sequence; Action = auditAction
                                       ActorId = actor; Reason = reason
                                       PreviousLifecycle = task.Lifecycle; NewLifecycle = task.Lifecycle
                                       PreviousPhase = "Blocked"; NewPhase = "Queued"
@@ -931,7 +962,7 @@ module ReviewWorkflow =
                                                     Status = "Requeued"; RequeuedAtUtc = timestamp }
                                     change (attemptPath wait.TaskId wait.AttemptId) (Some attemptOid) readyAttempt
                                     change (issuePath wait.TaskId wait.AttemptId generation) None
-                                        (issue wait.TaskId readyAttempt generation actor "ChallengeUnblock" reason sequence)
+                                        (issue wait.TaskId readyAttempt generation actor issueReason reason sequence)
                                     change (lifecycleEventPath wait.TaskId sequence) None audit
                                 ]
                                 claimed <- true

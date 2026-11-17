@@ -145,7 +145,11 @@ module ChallengeWorkflow =
         let body = json value
         if not (body.StartsWith("{", StringComparison.Ordinal)) then invalidArg "value" "Expected record."
         let schema =
-            if List.contains typeof<'t>.Name [ "ReviewAgent"; "ReviewAttempt"; "BranchReview" ] then 3 else 2
+            if typeof<'t> = typeof<AttemptChallengeWait> then
+                let wait = unbox<AttemptChallengeWait>(box value)
+                if not (isNull (box wait.ReviewIds)) && not (List.isEmpty wait.ReviewIds) then 3 else 2
+            elif List.contains typeof<'t>.Name [ "ReviewAgent"; "ReviewAttempt"; "BranchReview" ] then 3
+            else 2
         $"{{\"schemaVersion\":{schema}," + body.Substring(1)
 
     let private path (challengeId: Guid) =
@@ -1499,10 +1503,17 @@ module ChallengeWorkflow =
         | Some body, Some blob ->
             try
                 use doc = JsonDocument.Parse(body)
-                let expectedSchema =
-                    if typeof<'t> = typeof<ReviewTask> || typeof<'t> = typeof<AttemptChallengeWait> then 2
-                    else 3
-                if doc.RootElement.GetProperty("schemaVersion").GetInt32() <> expectedSchema then
+                let schema = doc.RootElement.GetProperty("schemaVersion").GetInt32()
+                let validSchema =
+                    if typeof<'t> = typeof<AttemptChallengeWait> then
+                        let mutable ids = Unchecked.defaultof<JsonElement>
+                        let present = doc.RootElement.TryGetProperty("reviewIds", &ids)
+                        (schema = 2 && (not present || ids.ValueKind = JsonValueKind.Null
+                                           || (ids.ValueKind = JsonValueKind.Array && ids.GetArrayLength() = 0)))
+                        || (schema = 3 && present && ids.ValueKind = JsonValueKind.Array && ids.GetArrayLength() > 0)
+                    elif typeof<'t> = typeof<ReviewTask> then schema = 2
+                    else schema = 3
+                if not validSchema then
                     return! Error(LedgerIntegrityError ("Unexpected ledger schema for " + file))
                 let decoded = JsonSerializer.Deserialize<'t>(body, options)
                 if isNull (box decoded) then

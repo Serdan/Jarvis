@@ -94,6 +94,20 @@ type WorkSqliteReceipt =
       Sequence: int64
       Replayed: bool }
 
+// Original-source repository identity cannot be reconstructed from SourceSha
+// or the separate Git backup location. A v2 writer must supply verified
+// original-source evidence for each source-bearing record.
+type WorkSqliteSourceProvenance =
+    { RepositoryId: string
+      SourceRef: string
+      SourceCommit: string
+      VerificationReceiptId: Guid
+      EvidenceSha256: string }
+
+type WorkSqliteProvenancedMutation =
+    { Mutation: WorkSqliteRecordMutation
+      Source: WorkSqliteSourceProvenance option }
+
 [<RequireQualifiedAccess>]
 type WorkSqliteFailure =
     | InvalidCommand of string
@@ -110,6 +124,9 @@ type WorkSqliteFailure =
 module private WorkSqliteInternals =
     [<Literal>]
     let SchemaVersion = 1
+
+    [<Literal>]
+    let TrustedSchemaVersion = 2
 
     // "JWRK". Distinct from the legacy FeedbackStore's database.
     [<Literal>]
@@ -187,6 +204,58 @@ module private WorkSqliteInternals =
                     |> Option.defaultValue (Ok ())
             with :? JsonException ->
                 Error(WorkSqliteFailure.InvalidCommand "Work record body is not valid JSON.")
+
+    // This is the physical v2 baseline only; it does not substitute for the
+    // complete closed per-kind DTO parser or trusted producer boundary.
+    let validateNoDuplicateBodyProperties (bodyJson: string) =
+        let rec duplicate (element: JsonElement) =
+            match element.ValueKind with
+            | JsonValueKind.Object ->
+                let seen = System.Collections.Generic.HashSet<string>(StringComparer.Ordinal)
+                element.EnumerateObject()
+                |> Seq.exists (fun property ->
+                    not (seen.Add property.Name) || duplicate property.Value)
+            | JsonValueKind.Array ->
+                element.EnumerateArray() |> Seq.exists duplicate
+            | _ -> false
+        try
+            use doc = JsonDocument.Parse bodyJson
+            if duplicate doc.RootElement then
+                Error(WorkSqliteFailure.InvalidCommand "Duplicate JSON properties are forbidden in v2 Work-domain bodies.")
+            else Ok ()
+        with :? JsonException ->
+            Error(WorkSqliteFailure.InvalidCommand "Invalid v2 Work-domain JSON body.")
+
+    let validateProvenance (item: WorkSqliteProvenancedMutation) =
+        let source = item.Source
+        let value = item.Mutation.Value
+        match value.SourceSha, source with
+        | None, None -> Ok ()
+        | Some _, None ->
+            Error(WorkSqliteFailure.InvalidCommand "Original repository/ref evidence is required for source-bearing v2 records.")
+        | None, Some _ ->
+            Error(WorkSqliteFailure.InvalidCommand "Unbound original-source evidence cannot accompany an absent SourceSha.")
+        | Some sha, Some proof ->
+            let refText = proof.SourceRef
+            let safeRef =
+                not (String.IsNullOrWhiteSpace refText) && refText.Length <= 512 &&
+                refText.StartsWith("refs/", StringComparison.Ordinal) &&
+                not (refText.Contains("..", StringComparison.Ordinal)) &&
+                not (refText.Contains("@{", StringComparison.Ordinal)) &&
+                not (refText.EndsWith(".lock", StringComparison.Ordinal)) &&
+                not (refText |> Seq.exists (fun c ->
+                    Char.IsControl c || Char.IsWhiteSpace c ||
+                    "~^:?*[\\".Contains(c)))
+            let digest = proof.EvidenceSha256
+            if String.IsNullOrWhiteSpace proof.RepositoryId || proof.RepositoryId.Length > 256 ||
+               proof.RepositoryId <> proof.RepositoryId.Trim() ||
+               proof.RepositoryId |> Seq.exists Char.IsControl ||
+               not safeRef || proof.SourceCommit <> sha ||
+               proof.VerificationReceiptId = Guid.Empty ||
+               isNull digest || digest.Length <> 64 ||
+               (digest |> Seq.exists (fun c -> not (Char.IsAsciiHexDigitLower c))) then
+                Error(WorkSqliteFailure.InvalidCommand "Invalid authenticated original repository/ref/commit/evidence binding.")
+            else Ok ()
 
     let validate (command: WorkSqliteTransactionCommand) =
         let duplicateRecords =
@@ -292,6 +361,21 @@ module private WorkSqliteInternals =
         SHA256.HashData(Encoding.UTF8.GetBytes(builder.ToString()))
         |> Convert.ToHexString
 
+    let fingerprintProvenanced (command: WorkSqliteTransactionCommand)
+                                (records: WorkSqliteProvenancedMutation list) =
+        let builder = StringBuilder("WorkSqliteAuthenticatedTransaction/v1|")
+        builder.Append(fingerprint command) |> ignore
+        for record in records do
+            builder.Append('|').Append(keyText record.Mutation.Key) |> ignore
+            match record.Source with
+            | None -> builder.Append("|no-source") |> ignore
+            | Some source ->
+                for value in [ source.RepositoryId; source.SourceRef; source.SourceCommit
+                               source.VerificationReceiptId.ToString("D"); source.EvidenceSha256 ] do
+                    builder.Append('|').Append(value.Length).Append(':').Append(value) |> ignore
+        SHA256.HashData(Encoding.UTF8.GetBytes(builder.ToString()))
+        |> Convert.ToHexString
+
     let sql (connection: SqliteConnection) (transaction: SqliteTransaction option)
             (statement: string) (parameters: (string * obj) list) =
         let cmd = connection.CreateCommand()
@@ -318,9 +402,10 @@ module private WorkSqliteInternals =
     let requireSchema connection =
         let schema = version connection
         let app = applicationId connection
-        if schema = SchemaVersion && app = ApplicationId then Ok ()
+        if (schema = SchemaVersion || schema = TrustedSchemaVersion) && app = ApplicationId then Ok ()
         elif schema = 0 && app = 0 then Error WorkSqliteFailure.ForeignDatabase
-        elif schema <> SchemaVersion then Error(WorkSqliteFailure.UnsupportedSchemaVersion schema)
+        elif schema <> SchemaVersion && schema <> TrustedSchemaVersion then
+            Error(WorkSqliteFailure.UnsupportedSchemaVersion schema)
         else Error WorkSqliteFailure.ForeignDatabase
 
     let openConnection (path: string) (mode: SqliteOpenMode) =
@@ -395,7 +480,8 @@ module private WorkSqliteInternals =
                    Reserved = reader.GetInt32 2 }
         else None
 
-    let applyRecord connection transaction (item: WorkSqliteRecordMutation) =
+    let applyRecord connection transaction (item: WorkSqliteRecordMutation)
+                    (source: WorkSqliteSourceProvenance option) =
         let key = item.Key
         let identity = keyText key
         let current = currentRecordVersion connection (Some transaction) key
@@ -415,16 +501,46 @@ module private WorkSqliteInternals =
                   "$review", optionalString value.ReviewSha
                   "$integration", optionalString value.IntegrationSha
                   "$effect", box (effectText value.ExternalEffect) ]
+            let sourceParameters =
+                match source with
+                | None -> []
+                | Some proof ->
+                    [ "$repo", box proof.RepositoryId; "$ref", box proof.SourceRef
+                      "$evidenceReceipt", box (proof.VerificationReceiptId.ToString("D"))
+                      "$evidenceSha", box proof.EvidenceSha256 ]
+            let parameters = parameters @ sourceParameters
             let statement, parameters =
-                match current with
-                | None ->
+                match current, source with
+                | None, Some _ ->
+                    """INSERT INTO work_records
+                        (project_id, record_kind, entity_id, version, body_json,
+                         graph_version, stage_generation, claim_generation, stop_generation,
+                         role_version, source_sha, review_sha, integration_sha, external_effect,
+                         source_repository_id, source_ref, source_verification_receipt_id,
+                         source_evidence_sha256)
+                       VALUES ($p,$k,$id,1,$json,$graph,$stage,$claim,$stop,$role,$source,
+                               $review,$integration,$effect,$repo,$ref,$evidenceReceipt,$evidenceSha);""",
+                    parameters
+                | Some expected, Some _ ->
+                    """UPDATE work_records SET version=version+1, body_json=$json,
+                         graph_version=$graph, stage_generation=$stage,
+                         claim_generation=$claim, stop_generation=$stop,
+                         role_version=$role, source_sha=$source, review_sha=$review,
+                         integration_sha=$integration, external_effect=$effect,
+                         source_repository_id=$repo, source_ref=$ref,
+                         source_verification_receipt_id=$evidenceReceipt,
+                         source_evidence_sha256=$evidenceSha
+                       WHERE project_id=$p AND record_kind=$k AND entity_id=$id
+                         AND version=$expected;""",
+                    ("$expected", box expected) :: parameters
+                | None, None ->
                     """INSERT INTO work_records
                         (project_id, record_kind, entity_id, version, body_json,
                          graph_version, stage_generation, claim_generation, stop_generation,
                          role_version, source_sha, review_sha, integration_sha, external_effect)
                        VALUES ($p,$k,$id,1,$json,$graph,$stage,$claim,$stop,$role,$source,$review,$integration,$effect);""",
                     parameters
-                | Some expected ->
+                | Some expected, None ->
                     """UPDATE work_records SET version=version+1, body_json=$json,
                          graph_version=$graph, stage_generation=$stage,
                          claim_generation=$claim, stop_generation=$stop,
@@ -519,8 +635,10 @@ type WorkSqliteAuthority(databasePath: string) =
                 use connection = WorkSqliteInternals.openConnection path SqliteOpenMode.ReadWriteCreate
                 let schema = WorkSqliteInternals.version connection
                 let app = WorkSqliteInternals.applicationId connection
-                if schema = WorkSqliteInternals.SchemaVersion && app = WorkSqliteInternals.ApplicationId then
-                    Ok WorkSqliteInternals.SchemaVersion
+                if (schema = WorkSqliteInternals.SchemaVersion
+                    || schema = WorkSqliteInternals.TrustedSchemaVersion)
+                   && app = WorkSqliteInternals.ApplicationId then
+                    Ok schema
                 elif schema <> 0 then
                     Error(WorkSqliteFailure.UnsupportedSchemaVersion schema)
                 elif app <> 0 then
@@ -586,18 +704,86 @@ PRAGMA user_version = 1;
                         transaction.Commit()
                         Ok WorkSqliteInternals.SchemaVersion)
 
-    member _.Commit(command: WorkSqliteTransactionCommand) : Result<WorkSqliteReceipt, WorkSqliteFailure> =
-        match WorkSqliteInternals.validate command with
+    // Explicit opt-in migration. Never infer original RepositoryId/SourceRef
+    // from an existing SHA; pre-v2 rows remain untrusted until reimported by
+    // independently verified original source authorities.
+    member _.InitializeProvenanceV2() : Result<int, WorkSqliteFailure> =
+        guarded (fun () ->
+            use connection = WorkSqliteInternals.openConnection path SqliteOpenMode.ReadWrite
+            let schema = WorkSqliteInternals.version connection
+            let app = WorkSqliteInternals.applicationId connection
+            if app <> WorkSqliteInternals.ApplicationId then
+                Error WorkSqliteFailure.ForeignDatabase
+            elif schema <> WorkSqliteInternals.SchemaVersion &&
+                 schema <> WorkSqliteInternals.TrustedSchemaVersion then
+                Error(WorkSqliteFailure.UnsupportedSchemaVersion schema)
+            else
+                let metaVersion =
+                    WorkSqliteInternals.scalar connection None
+                        "SELECT schema_version FROM work_meta WHERE id=1;" []
+                    |> Convert.ToInt32
+                let columnCount =
+                    WorkSqliteInternals.scalar connection None
+                        "SELECT COUNT(*) FROM pragma_table_info('work_records');" []
+                    |> Convert.ToInt32
+                if metaVersion <> schema ||
+                   columnCount <> (if schema = WorkSqliteInternals.SchemaVersion then 14 else 18) then
+                    Error WorkSqliteFailure.ForeignDatabase
+                elif schema = WorkSqliteInternals.TrustedSchemaVersion then
+                    Ok schema
+                else
+                    use tx = connection.BeginTransaction()
+                    let upgrade = """
+ALTER TABLE work_records ADD COLUMN source_repository_id TEXT;
+ALTER TABLE work_records ADD COLUMN source_ref TEXT;
+ALTER TABLE work_records ADD COLUMN source_verification_receipt_id TEXT;
+ALTER TABLE work_records ADD COLUMN source_evidence_sha256 TEXT;
+UPDATE work_meta SET schema_version=2 WHERE id=1 AND schema_version=1;
+PRAGMA user_version=2;
+"""
+                    WorkSqliteInternals.execute connection (Some tx) upgrade [] |> ignore
+                    tx.Commit()
+                    Ok WorkSqliteInternals.TrustedSchemaVersion)
+
+    member private _.CommitCore(command: WorkSqliteTransactionCommand,
+                                provenance: WorkSqliteProvenancedMutation list option)
+                                : Result<WorkSqliteReceipt, WorkSqliteFailure> =
+        let validation =
+            WorkSqliteInternals.validate command
+            |> Result.bind (fun () ->
+                match provenance with
+                | None -> Ok ()
+                | Some records ->
+                    if records.Length <> command.Records.Length ||
+                       (List.map (fun r -> r.Mutation) records) <> command.Records then
+                        Error(WorkSqliteFailure.InvalidCommand "Typed v2 mutations must exactly match their transaction.")
+                    else
+                        records
+                        |> List.map (fun record ->
+                            WorkSqliteInternals.validateProvenance record
+                            |> Result.bind (fun () ->
+                                WorkSqliteInternals.validateNoDuplicateBodyProperties record.Mutation.Value.BodyJson))
+                        |> List.tryFind Result.isError |> Option.defaultValue (Ok ()))
+        match validation with
         | Error failure -> Error failure
         | Ok () ->
             guarded (fun () ->
                 use connection = WorkSqliteInternals.openConnection path SqliteOpenMode.ReadWrite
                 match WorkSqliteInternals.requireSchema connection with
                 | Error failure -> Error failure
+                | Ok () when WorkSqliteInternals.version connection = WorkSqliteInternals.SchemaVersion
+                             && provenance.IsSome ->
+                    Error(WorkSqliteFailure.UnsupportedSchemaVersion WorkSqliteInternals.SchemaVersion)
+                | Ok () when WorkSqliteInternals.version connection = WorkSqliteInternals.TrustedSchemaVersion
+                             && provenance.IsNone ->
+                    Error(WorkSqliteFailure.InvalidCommand "Legacy untyped Commit cannot write a trusted v2 database.")
                 | Ok () ->
                     use transaction = connection.BeginTransaction()
                     let operationId = command.OperationId.ToString("D")
-                    let hash = WorkSqliteInternals.fingerprint command
+                    let hash =
+                        match provenance with
+                        | Some records -> WorkSqliteInternals.fingerprintProvenanced command records
+                        | None -> WorkSqliteInternals.fingerprint command
                     use receipt = WorkSqliteInternals.sql connection (Some transaction)
                                     "SELECT command_hash, sequence FROM work_receipts WHERE operation_id=$id;"
                                     [ "$id", box operationId ]
@@ -611,10 +797,15 @@ PRAGMA user_version = 1;
                         Ok { OperationId = command.OperationId; Sequence = sequence; Replayed = true }
                     | Some _ -> Error(WorkSqliteFailure.OperationIdReused command.OperationId)
                     | None ->
-                        let rec applyRecordChanges = function
+                        let rec applyRecordChanges (pending: WorkSqliteRecordMutation list) =
+                            match pending with
                             | [] -> Ok ()
                             | mutation :: rest ->
-                                match WorkSqliteInternals.applyRecord connection transaction mutation with
+                                let source =
+                                    provenance
+                                    |> Option.bind (List.tryFind (fun (x: WorkSqliteProvenancedMutation) -> x.Mutation.Key = mutation.Key))
+                                    |> Option.bind (fun x -> x.Source)
+                                match WorkSqliteInternals.applyRecord connection transaction mutation source with
                                 | Ok () -> applyRecordChanges rest
                                 | Error error -> Error error
                         let rec applyCapacityChanges = function
@@ -654,6 +845,25 @@ PRAGMA user_version = 1;
                                 transaction.Commit()
                                 Ok { OperationId = command.OperationId; Sequence = sequence; Replayed = false })
 
+    // Historical default-off v1 callers remain untouched. On a v2 database,
+    // writes require the separately verified typed ingress, never raw BodyJson.
+    member this.Commit(command: WorkSqliteTransactionCommand) =
+        this.CommitCore(command, None)
+
+    // Internal physical adapter for a closed authenticated domain producer.
+    // This does not itself attest a caller-supplied verifier; no live host is
+    // allowed to bind it until the exact original-producer contract is reviewed.
+    member internal this.CommitProvenanced(operationId: Guid,
+                                          guards: WorkSqliteRecordGuard list,
+                                          records: WorkSqliteProvenancedMutation list,
+                                          capacities: WorkSqliteCapacityMutation list) =
+        let command =
+            { OperationId = operationId
+              Guards = guards
+              Records = records |> List.map (fun r -> r.Mutation)
+              Capacities = capacities }
+        this.CommitCore(command, Some records)
+
     // Expose the immutable applied receipt, never a reconstructed command.
     // Scheduler replay binds this receipt to original launch provenance.
     member _.ReadReceipt(operationId: Guid) : Result<WorkSqliteReceipt option, WorkSqliteFailure> =
@@ -679,6 +889,55 @@ PRAGMA user_version = 1;
             match WorkSqliteInternals.requireSchema connection with
             | Error failure -> Error failure
             | Ok () -> Ok(WorkSqliteInternals.readRecord connection key))
+
+    // Exact physical source binding for the F1/G1b typed readers. A v1 row,
+    // missing original source or a partially populated v2 row never becomes a
+    // verified origin through a cache, checkout name, or content hash.
+    member _.ReadSourceProvenance(key: WorkSqliteRecordKey)
+            : Result<WorkSqliteSourceProvenance option, WorkSqliteFailure> =
+        guarded (fun () ->
+            use connection = WorkSqliteInternals.openConnection path SqliteOpenMode.ReadWrite
+            match WorkSqliteInternals.requireSchema connection with
+            | Error failure -> Error failure
+            | Ok () when WorkSqliteInternals.version connection <> WorkSqliteInternals.TrustedSchemaVersion ->
+                Error(WorkSqliteFailure.UnsupportedSchemaVersion WorkSqliteInternals.SchemaVersion)
+            | Ok () ->
+                use cmd = WorkSqliteInternals.sql connection None
+                            """SELECT source_sha, source_repository_id, source_ref,
+                                      source_verification_receipt_id, source_evidence_sha256
+                               FROM work_records
+                               WHERE project_id=$p AND record_kind=$k AND entity_id=$id;"""
+                            [ "$p", box key.ProjectId
+                              "$k", box (WorkSqliteInternals.kindText key.Kind)
+                              "$id", box key.EntityId ]
+                use reader = cmd.ExecuteReader()
+                if not (reader.Read()) then
+                    Error(WorkSqliteFailure.MissingEntity (WorkSqliteInternals.keyText key))
+                else
+                    let parts = [ for i in 0 .. 4 -> WorkSqliteInternals.readOptionalString reader i ]
+                    match parts with
+                    | [ None; None; None; None; None ] -> Ok None
+                    | [ Some sha; Some repo; Some sourceRef; Some receipt; Some evidence ] ->
+                        match Guid.TryParse receipt with
+                        | true, receiptId ->
+                            let proof =
+                                { RepositoryId = repo; SourceRef = sourceRef
+                                  SourceCommit = sha; VerificationReceiptId = receiptId
+                                  EvidenceSha256 = evidence }
+                            let dummy =
+                                { Mutation =
+                                    { Key = key; ExpectedVersion = None
+                                      Value =
+                                        { BodyJson = "{}"; GraphVersion = 0L; StageGeneration = 0L
+                                          ClaimGeneration = 0L; StopGeneration = 0L; RoleVersion = 0L
+                                          SourceSha = Some sha; ReviewSha = None; IntegrationSha = None
+                                          ExternalEffect = WorkSqliteEffect.NoneRecorded } }
+                                  Source = Some proof }
+                            WorkSqliteInternals.validateProvenance dummy
+                            |> Result.map (fun () -> Some proof)
+                        | _ -> Error(WorkSqliteFailure.InvalidCommand "Invalid persisted original-source receipt.")
+                    | _ ->
+                        Error(WorkSqliteFailure.InvalidCommand "Incomplete trusted source-provenance columns."))
 
     member _.ReadCapacity(accountId: string) : Result<WorkSqliteCapacity option, WorkSqliteFailure> =
         guarded (fun () ->

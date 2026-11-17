@@ -18,6 +18,7 @@
         <Content Include="Structure.md"/>
         <Compile Include="WorkQueueContracts.fs"/>
         <Compile Include="WorkComposition.fs"/>
+        <Compile Include="WorkSqliteAuthority.fs"/>
         <Compile Include="WorkLegacyImportPreflight.fs"/>
         <Compile Include="WorkQueueSchedulerInert.fs"/>
         <Compile Include="WorkQueueDependencyDiagnostics.fs"/>

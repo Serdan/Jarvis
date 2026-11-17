@@ -654,6 +654,25 @@ PRAGMA user_version = 1;
                                 transaction.Commit()
                                 Ok { OperationId = command.OperationId; Sequence = sequence; Replayed = false })
 
+    // Expose the immutable applied receipt, never a reconstructed command.
+    // Scheduler replay binds this receipt to original launch provenance.
+    member _.ReadReceipt(operationId: Guid) : Result<WorkSqliteReceipt option, WorkSqliteFailure> =
+        if operationId = Guid.Empty then
+            Error(WorkSqliteFailure.InvalidCommand "operation ID is empty")
+        else
+            guarded (fun () ->
+                use connection = WorkSqliteInternals.openConnection path SqliteOpenMode.ReadWrite
+                match WorkSqliteInternals.requireSchema connection with
+                | Error failure -> Error failure
+                | Ok () ->
+                    use query = WorkSqliteInternals.sql connection None
+                                    "SELECT sequence FROM work_receipts WHERE operation_id=$id;"
+                                    [ "$id", box (operationId.ToString("D")) ]
+                    use reader = query.ExecuteReader()
+                    if reader.Read() then
+                        Ok(Some { OperationId = operationId; Sequence = reader.GetInt64 0; Replayed = true })
+                    else Ok None)
+
     member _.ReadRecord(key: WorkSqliteRecordKey) : Result<WorkSqliteRecord option, WorkSqliteFailure> =
         guarded (fun () ->
             use connection = WorkSqliteInternals.openConnection path SqliteOpenMode.ReadWrite

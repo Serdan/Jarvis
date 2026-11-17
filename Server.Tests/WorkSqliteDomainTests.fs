@@ -152,3 +152,126 @@ let v2_rejects_root_and_nested_duplicate_body_properties () =
             | Error(WorkSqliteFailure.InvalidCommand _) -> ()
             | other -> Assert.Fail(sprintf "Duplicate JSON property passed v2 guard: %A" other)
         Assert.That(store.CurrentSequence() |> ok, Is.EqualTo 0L))
+[<Test>]
+let v2_source_debinding_clears_all_columns_on_update_and_survives_restart_replay () =
+    withAuthority (fun store path ->
+        store.Initialize() |> ok |> ignore
+        store.InitializeProvenanceV2() |> ok |> ignore
+        let initial = singleRecord "alpha" WorkSqliteRecordKind.Stage "stage" """{"state":"Ready"}"""
+        let first = { Mutation = initial; Source = Some(provenance sha) }
+        store.CommitProvenanced(Guid.NewGuid(), [], [ first ], []) |> ok |> ignore
+        let revised =
+            { Mutation =
+                { initial with
+                    ExpectedVersion = Some 1L
+                    Value =
+                        { initial.Value with
+                            BodyJson = """{"state":"Removed"}"""
+                            SourceSha = None } }
+              Source = None }
+        let updateId = Guid.NewGuid()
+        let updated = store.CommitProvenanced(updateId, [], [ revised ], []) |> ok
+        Assert.That(updated.Sequence, Is.EqualTo 2L)
+        let restarted = WorkSqliteAuthority(path)
+        Assert.That(restarted.Initialize() |> ok, Is.EqualTo 2)
+        let persisted = restarted.ReadRecord initial.Key |> ok |> Option.get
+        Assert.That(persisted.Version, Is.EqualTo 2L)
+        Assert.That(persisted.Value.SourceSha, Is.EqualTo None)
+        Assert.That(restarted.ReadSourceProvenance initial.Key |> ok, Is.EqualTo None)
+        use connection = new SqliteConnection(sprintf "Data Source=%s" path)
+        connection.Open()
+        use query = connection.CreateCommand()
+        query.CommandText <-
+            """SELECT source_sha, source_repository_id, source_ref,
+                      source_verification_receipt_id, source_evidence_sha256
+               FROM work_records WHERE project_id='alpha' AND record_kind='stage' AND entity_id='stage';"""
+        use reader = query.ExecuteReader()
+        Assert.That(reader.Read(), Is.True)
+        for column in 0 .. 4 do
+            Assert.That(reader.IsDBNull column, Is.True, sprintf "Stale provenance column %d" column)
+        reader.Close()
+        let replay = restarted.CommitProvenanced(updateId, [], [ revised ], []) |> ok
+        Assert.That(replay.Replayed, Is.True)
+        Assert.That(replay.Sequence, Is.EqualTo 2L)
+        Assert.That(restarted.CurrentSequence() |> ok, Is.EqualTo 2L)
+        match restarted.CommitProvenanced(updateId, [], [ first ], []) with
+        | Error(WorkSqliteFailure.OperationIdReused _) -> ()
+        | other -> Assert.Fail(sprintf "Changed replay must be rejected: %A" other))
+
+[<Test>]
+let v1_same_count_wrong_named_column_rejected_without_upgrade_or_receipt_change () =
+    withAuthority (fun store path ->
+        store.Initialize() |> ok |> ignore
+        let initial = singleRecord "alpha" WorkSqliteRecordKind.Stage "stage" "{}"
+        let receiptId = Guid.NewGuid()
+        store.Commit { OperationId = receiptId; Guards = []; Records = [ initial ]; Capacities = [] }
+        |> ok |> ignore
+        use connection = new SqliteConnection(sprintf "Data Source=%s" path)
+        connection.Open()
+        use change = connection.CreateCommand()
+        change.CommandText <- "ALTER TABLE work_records RENAME COLUMN source_sha TO unrelated_sha;"
+        change.ExecuteNonQuery() |> ignore
+        match (WorkSqliteAuthority(path)).InitializeProvenanceV2() with
+        | Error WorkSqliteFailure.ForeignDatabase -> ()
+        | other -> Assert.Fail(sprintf "Same-count invalid v1 layout was upgraded: %A" other)
+        match (WorkSqliteAuthority(path)).Initialize() with
+        | Error WorkSqliteFailure.ForeignDatabase -> ()
+        | other -> Assert.Fail(sprintf "Same-count invalid v1 layout was initialized: %A" other)
+        use verify = connection.CreateCommand()
+        verify.CommandText <-
+            "SELECT (SELECT schema_version FROM work_meta WHERE id=1), (SELECT last_sequence FROM work_meta WHERE id=1);"
+        use reader = verify.ExecuteReader()
+        Assert.That(reader.Read(), Is.True)
+        Assert.That(reader.GetInt64 0, Is.EqualTo 1L)
+        Assert.That(reader.GetInt64 1, Is.EqualTo 1L)
+        reader.Close()
+        use version = connection.CreateCommand()
+        version.CommandText <- "PRAGMA user_version;"
+        Assert.That(Convert.ToInt32(version.ExecuteScalar()), Is.EqualTo 1)
+        Assert.That(store.ReadReceipt receiptId |> ok |> Option.isSome, Is.True))
+
+[<Test>]
+let v2_same_count_fabricated_provenance_layout_rejected_after_restart () =
+    withAuthority (fun store path ->
+        store.Initialize() |> ok |> ignore
+        use connection = new SqliteConnection(sprintf "Data Source=%s" path)
+        connection.Open()
+        use fabricate = connection.CreateCommand()
+        fabricate.CommandText <-
+            """ALTER TABLE work_records ADD COLUMN fake_repository TEXT;
+               ALTER TABLE work_records ADD COLUMN fake_ref TEXT;
+               ALTER TABLE work_records ADD COLUMN fake_receipt TEXT;
+               ALTER TABLE work_records ADD COLUMN fake_evidence TEXT;
+               UPDATE work_meta SET schema_version=2 WHERE id=1;
+               PRAGMA user_version=2;"""
+        fabricate.ExecuteNonQuery() |> ignore
+        let restarted = WorkSqliteAuthority(path)
+        match restarted.Initialize() with
+        | Error WorkSqliteFailure.ForeignDatabase -> ()
+        | other -> Assert.Fail(sprintf "Fabricated v2 layout initialized: %A" other)
+        match restarted.InitializeProvenanceV2() with
+        | Error WorkSqliteFailure.ForeignDatabase -> ()
+        | other -> Assert.Fail(sprintf "Fabricated v2 layout upgraded: %A" other)
+        use version = connection.CreateCommand()
+        version.CommandText <- "PRAGMA user_version;"
+        Assert.That(Convert.ToInt32(version.ExecuteScalar()), Is.EqualTo 2)
+        use sequence = connection.CreateCommand()
+        sequence.CommandText <- "SELECT last_sequence FROM work_meta WHERE id=1;"
+        Assert.That(Convert.ToInt64(sequence.ExecuteScalar()), Is.EqualTo 0L))
+
+[<Test>]
+let v2_missing_required_index_is_foreign_even_with_correct_columns () =
+    withAuthority (fun store path ->
+        store.Initialize() |> ok |> ignore
+        store.InitializeProvenanceV2() |> ok |> ignore
+        use connection = new SqliteConnection(sprintf "Data Source=%s" path)
+        connection.Open()
+        use dropIndex = connection.CreateCommand()
+        dropIndex.CommandText <- "DROP INDEX work_records_stage_claim;"
+        dropIndex.ExecuteNonQuery() |> ignore
+        match (WorkSqliteAuthority(path)).InitializeProvenanceV2() with
+        | Error WorkSqliteFailure.ForeignDatabase -> ()
+        | other -> Assert.Fail(sprintf "Malformed v2 index identity was accepted: %A" other)
+        match (WorkSqliteAuthority(path)).Initialize() with
+        | Error WorkSqliteFailure.ForeignDatabase -> ()
+        | other -> Assert.Fail(sprintf "Malformed v2 index initialized: %A" other))

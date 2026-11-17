@@ -428,6 +428,110 @@ module private WorkSqliteInternals =
     let readOptionalString (reader: SqliteDataReader) index =
         if reader.IsDBNull index then None else Some(reader.GetString index)
 
+    // Compare physical names, affinity declarations, NOT NULL and primary-key
+    // ordinals, not just the number of columns. Foreign/corrupt same-count
+    // schemas must never be mistaken for an initialized Work authority.
+    let physicalSchemaMatches (connection: SqliteConnection) schema =
+        let column name typeName required primaryKey = name, typeName, required, primaryKey
+        let expected =
+            [ "work_meta",
+                [ column "id" "INTEGER" false 1
+                  column "schema_version" "INTEGER" true 0
+                  column "last_sequence" "INTEGER" true 0 ]
+              "work_records",
+                [ column "project_id" "TEXT" true 1
+                  column "record_kind" "TEXT" true 2
+                  column "entity_id" "TEXT" true 3
+                  column "version" "INTEGER" true 0
+                  column "body_json" "TEXT" true 0
+                  column "graph_version" "INTEGER" true 0
+                  column "stage_generation" "INTEGER" true 0
+                  column "claim_generation" "INTEGER" true 0
+                  column "stop_generation" "INTEGER" true 0
+                  column "role_version" "INTEGER" true 0
+                  column "source_sha" "TEXT" false 0
+                  column "review_sha" "TEXT" false 0
+                  column "integration_sha" "TEXT" false 0
+                  column "external_effect" "TEXT" true 0 ]
+              "work_capacity",
+                [ column "account_id" "TEXT" false 1
+                  column "version" "INTEGER" true 0
+                  column "maximum" "INTEGER" true 0
+                  column "reserved" "INTEGER" true 0 ]
+              "work_receipts",
+                [ column "operation_id" "TEXT" false 1
+                  column "command_hash" "TEXT" true 0
+                  column "sequence" "INTEGER" true 0 ]
+              "work_audit",
+                [ column "sequence" "INTEGER" false 1
+                  column "operation_id" "TEXT" true 0
+                  column "command_hash" "TEXT" true 0
+                  column "committed_at_utc" "TEXT" true 0 ] ]
+            |> List.map (fun (table, columns) ->
+                if table = "work_records" && schema = TrustedSchemaVersion then
+                    table, columns @
+                        [ column "source_repository_id" "TEXT" false 0
+                          column "source_ref" "TEXT" false 0
+                          column "source_verification_receipt_id" "TEXT" false 0
+                          column "source_evidence_sha256" "TEXT" false 0 ]
+                else table, columns)
+        let actualColumns table =
+            use cmd = sql connection None
+                          """SELECT name, type, "notnull", pk
+                             FROM pragma_table_info($table) ORDER BY cid;"""
+                          [ "$table", box table ]
+            use reader = cmd.ExecuteReader()
+            [ while reader.Read() do
+                yield reader.GetString 0, reader.GetString 1,
+                      reader.GetInt32 2 <> 0, reader.GetInt32 3 ]
+        let columnsMatch =
+            expected |> List.forall (fun (table, columns) -> actualColumns table = columns)
+        if not columnsMatch then false
+        else
+            let compact (value: string) =
+                value |> Seq.filter (Char.IsWhiteSpace >> not) |> Seq.toArray
+                |> fun chars -> String(chars).ToLowerInvariant()
+            let storedDdl kind name =
+                scalar connection None
+                    "SELECT sql FROM sqlite_master WHERE type=$kind AND name=$name;"
+                    [ "$kind", box kind; "$name", box name ]
+                |> function :? string as ddl -> Some(compact ddl) | _ -> None
+            let requires table fragments =
+                match storedDdl "table" table with
+                | Some ddl ->
+                    fragments |> List.forall (fun fragment ->
+                        ddl.Contains(compact fragment, StringComparison.Ordinal))
+                | None -> false
+            let checkConstraints =
+                [ "work_meta", [ "CHECK(id=1)"; "CHECK(last_sequence>=0)" ]
+                  "work_records",
+                    [ "CHECK(version>=1)"; "CHECK(json_valid(body_json))"
+                      "CHECK(graph_version>=0)"; "CHECK(stage_generation>=0)"
+                      "CHECK(claim_generation>=0)"; "CHECK(stop_generation>=0)"
+                      "CHECK(role_version>=0)"
+                      "CHECK(external_effect IN ('none','prepared','unknown','definitive-no-effect','observed'))" ]
+                  "work_capacity",
+                    [ "CHECK(version>=1)"; "CHECK(maximum>=0)"
+                      "CHECK(reserved>=0 AND reserved<=maximum)" ]
+                  "work_receipts", [ "UNIQUE"; "CHECK(sequence>=1)" ]
+                  "work_audit",
+                    [ "UNIQUE REFERENCES work_receipts(operation_id)" ] ]
+                |> List.forall (fun (table, fragments) -> requires table fragments)
+            let indexesMatch =
+                [ "work_records_project_kind",
+                    "CREATE INDEX work_records_project_kind ON work_records(project_id,record_kind)"
+                  "work_records_stage_claim",
+                    "CREATE INDEX work_records_stage_claim ON work_records(record_kind,project_id,claim_generation)" ]
+                |> List.forall (fun (name, statement) ->
+                    storedDdl "index" name = Some(compact statement))
+            let metaRows =
+                scalar connection None "SELECT COUNT(*) FROM work_meta;" []
+                |> Convert.ToInt32
+            let metaSchema =
+                scalar connection None "SELECT schema_version FROM work_meta WHERE id=1;" []
+                |> function null -> -1 | value -> Convert.ToInt32 value
+            checkConstraints && indexesMatch && metaRows = 1 && metaSchema = schema
+
     let currentRecordVersion connection transaction key =
         scalar connection transaction
             "SELECT version FROM work_records WHERE project_id=$p AND record_kind=$k AND entity_id=$id;"
@@ -481,7 +585,7 @@ module private WorkSqliteInternals =
         else None
 
     let applyRecord connection transaction (item: WorkSqliteRecordMutation)
-                    (source: WorkSqliteSourceProvenance option) =
+                    (source: WorkSqliteSourceProvenance option) (trustedSchema: bool) =
         let key = item.Key
         let identity = keyText key
         let current = currentRecordVersion connection (Some transaction) key
@@ -540,6 +644,18 @@ module private WorkSqliteInternals =
                          role_version, source_sha, review_sha, integration_sha, external_effect)
                        VALUES ($p,$k,$id,1,$json,$graph,$stage,$claim,$stop,$role,$source,$review,$integration,$effect);""",
                     parameters
+                | Some expected, None when trustedSchema ->
+                    """UPDATE work_records SET version=version+1, body_json=$json,
+                         graph_version=$graph, stage_generation=$stage,
+                         claim_generation=$claim, stop_generation=$stop,
+                         role_version=$role, source_sha=$source, review_sha=$review,
+                         integration_sha=$integration, external_effect=$effect,
+                         source_repository_id=NULL, source_ref=NULL,
+                         source_verification_receipt_id=NULL,
+                         source_evidence_sha256=NULL
+                       WHERE project_id=$p AND record_kind=$k AND entity_id=$id
+                         AND version=$expected;""",
+                    ("$expected", box expected) :: parameters
                 | Some expected, None ->
                     """UPDATE work_records SET version=version+1, body_json=$json,
                          graph_version=$graph, stage_generation=$stage,
@@ -638,7 +754,9 @@ type WorkSqliteAuthority(databasePath: string) =
                 if (schema = WorkSqliteInternals.SchemaVersion
                     || schema = WorkSqliteInternals.TrustedSchemaVersion)
                    && app = WorkSqliteInternals.ApplicationId then
-                    Ok schema
+                    if WorkSqliteInternals.physicalSchemaMatches connection schema then
+                        Ok schema
+                    else Error WorkSqliteFailure.ForeignDatabase
                 elif schema <> 0 then
                     Error(WorkSqliteFailure.UnsupportedSchemaVersion schema)
                 elif app <> 0 then
@@ -718,16 +836,7 @@ PRAGMA user_version = 1;
                  schema <> WorkSqliteInternals.TrustedSchemaVersion then
                 Error(WorkSqliteFailure.UnsupportedSchemaVersion schema)
             else
-                let metaVersion =
-                    WorkSqliteInternals.scalar connection None
-                        "SELECT schema_version FROM work_meta WHERE id=1;" []
-                    |> Convert.ToInt32
-                let columnCount =
-                    WorkSqliteInternals.scalar connection None
-                        "SELECT COUNT(*) FROM pragma_table_info('work_records');" []
-                    |> Convert.ToInt32
-                if metaVersion <> schema ||
-                   columnCount <> (if schema = WorkSqliteInternals.SchemaVersion then 14 else 18) then
+                if not (WorkSqliteInternals.physicalSchemaMatches connection schema) then
                     Error WorkSqliteFailure.ForeignDatabase
                 elif schema = WorkSqliteInternals.TrustedSchemaVersion then
                     Ok schema
@@ -805,7 +914,7 @@ PRAGMA user_version=2;
                                     provenance
                                     |> Option.bind (List.tryFind (fun (x: WorkSqliteProvenancedMutation) -> x.Mutation.Key = mutation.Key))
                                     |> Option.bind (fun x -> x.Source)
-                                match WorkSqliteInternals.applyRecord connection transaction mutation source with
+                                match WorkSqliteInternals.applyRecord connection transaction mutation source provenance.IsSome with
                                 | Ok () -> applyRecordChanges rest
                                 | Error error -> Error error
                         let rec applyCapacityChanges = function

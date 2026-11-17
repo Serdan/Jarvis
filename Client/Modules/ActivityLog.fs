@@ -345,8 +345,22 @@ type Store(settings: Settings) =
                 try
                     ensureDirectory settings.DirectoryPath
                     secureFile seenPath
+                    // Two clients may each know a different subset of agent
+                    // timestamps. Merge under a cross-process lock so neither
+                    // can replace newer or disjoint evidence with a stale view.
+                    use _guard = SharedFileLock.acquire (seenPath + ".lock") (TimeSpan.FromSeconds 30.)
                     let snapshot = Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase)
-                    for key, value in values do snapshot[key] <- value
+                    if File.Exists seenPath then
+                        if FileInfo(seenPath).Length > int64 maxSeenBytes then
+                            invalidOp "Existing agent-seen snapshot exceeds its size limit."
+                        let old = JsonSerializer.Deserialize<Dictionary<string, DateTimeOffset>>(File.ReadAllText seenPath)
+                        if isNull old then invalidOp "Existing agent-seen snapshot was null."
+                        for KeyValue(key, value) in old do
+                            snapshot[key] <- value
+                    for key, value in values do
+                        match snapshot.TryGetValue key with
+                        | true, previous when previous > value -> ()
+                        | _ -> snapshot[key] <- value
                     do
                         use stream = createPrivateFile temporary
                         use writer = new StreamWriter(stream, UTF8Encoding(false))

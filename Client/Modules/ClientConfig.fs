@@ -166,6 +166,7 @@ module ClientConfig =
             let path = snapshot.Path
             let mutable temporary = ""
             try
+                use _guard = SharedFileLock.acquire (path + ".lock") (TimeSpan.FromSeconds 30.)
                 let original = readRaw path
                 if revision original <> snapshot.Revision then
                     Error "Config was changed by another process. Reload before saving."

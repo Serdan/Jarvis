@@ -360,7 +360,17 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                     let! response = trackingTask.WaitAsync(requestAborted)
                                     replyMs <- Stopwatch.GetElapsedTime(awaitReplyAt).TotalMilliseconds
                                     report "completed"
-                                    return response
+                                    // A pending job exists only in the client
+                                    // process that started it. Bind the handle
+                                    // to the exact dispatch route before any
+                                    // default or conversation selection changes.
+                                    return
+                                        match response.PendingJob with
+                                        | Some handle ->
+                                            let routed = { handle with DeviceId = Some session.DeviceId }
+                                            { response with PendingJob = Some routed
+                                                            Result = Some(JsonSerializer.Serialize routed) }
+                                        | None -> response
                                 with :? TaskCanceledException when not requestAborted.IsCancellationRequested ->
                                     replyMs <- Stopwatch.GetElapsedTime(awaitReplyAt).TotalMilliseconds
                                     let outcome =

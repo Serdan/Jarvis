@@ -253,6 +253,39 @@ type UserService(clock: unit -> DateTimeOffset, retention: UserRetentionPolicy) 
             | ValueNone -> fallback ()
         | _ -> fallback ()
 
+    // Upgrade compatibility: a pre-v2 opaque device route was the stable
+    // machine UUID. Once it disconnects, migrate only its implicit selections
+    // to a live per-process route of that same machine. Never redirect an
+    // explicit device override or an actively connected legacy client.
+    let migrateDisconnectedLegacySelections (userId: string) (legacyDeviceId: string) =
+        match Guid.TryParse legacyDeviceId with
+        | false, _ -> ()
+        | true, legacyMachine ->
+            let oldKey = struct (userId, legacyDeviceId)
+            match tryGet oldKey sessions with
+            | ValueSome old when old.State = Disconnected ->
+                let replacement =
+                    sessions.Values
+                    |> Seq.filter (fun s ->
+                        s.UserId = userId && s.State = Registered && s.ConnectionId.IsSome
+                        && (match DeviceRouteIdentity.tryParse s.DeviceId with
+                            | Some route -> route.MachineId = legacyMachine.ToString("D")
+                            | None -> false))
+                    |> Seq.sortBy (fun s -> s.RegisteredAt, s.DeviceId)
+                    |> Seq.tryHead
+                match replacement with
+                | Some session ->
+                    match tryGet userId defaults with
+                    | ValueSome id when id = legacyDeviceId ->
+                        defaults[userId] <- session.DeviceId
+                    | _ -> ()
+                    for KeyValue(key, selected) in conversationSelections do
+                        let struct (owner, _) = key
+                        if owner = userId && selected.DeviceId = legacyDeviceId then
+                            conversationSelections[key] <- { selected with DeviceId = session.DeviceId }
+                | None -> ()
+            | _ -> ()
+
     member _.TransportConnected(userId: string, connectionId: string) =
         if String.IsNullOrWhiteSpace userId || String.IsNullOrWhiteSpace connectionId then
             invalidArg "connectionId" "Authenticated transport user and connection ID are required."
@@ -297,6 +330,27 @@ type UserService(clock: unit -> DateTimeOffset, retention: UserRetentionPolicy) 
             match tryGet connectionId connections with
             | ValueSome transport when transport.UserId = userId -> ()
             | _ -> invalidOp "Device registration requires its authenticated transport."
+            // The transport ID identifies one running process. A copied
+            // roaming machine ID with a different local-installation marker
+            // must not silently impersonate an existing machine.
+            let route = DeviceRouteIdentity.tryParse registration.DeviceId
+            if registration.DeviceId.StartsWith(DeviceRouteIdentity.Prefix, StringComparison.Ordinal)
+               && route.IsNone then
+                invalidArg "registration" "Malformed Jarvis version 2 client route identity."
+            match route with
+            | None -> () // Older clients continue to register opaque IDs.
+            | Some current ->
+                let collision =
+                    sessions.Values
+                    |> Seq.exists (fun session ->
+                        session.UserId = userId
+                        && (match DeviceRouteIdentity.tryParse session.DeviceId with
+                            | Some previous ->
+                                previous.MachineId = current.MachineId
+                                && previous.InstallationId <> current.InstallationId
+                            | None -> false))
+                if collision then
+                    invalidOp "Machine identity collision: this device-id is already used by another installation. Resolve the duplicated machine ID on the affected client; the active route was not replaced."
             let key = struct (userId, registration.DeviceId)
             let previous = tryGet key sessions
 
@@ -353,6 +407,9 @@ type UserService(clock: unit -> DateTimeOffset, retention: UserRetentionPolicy) 
 
             sessions[key] <- session
             if not (defaults.ContainsKey userId) then defaults[userId] <- registration.DeviceId
+            match route with
+            | Some identity -> migrateDisconnectedLegacySelections userId identity.MachineId
+            | None -> ()
 
             let connectedAt =
                 match tryGet connectionId connections with
@@ -392,6 +449,7 @@ type UserService(clock: unit -> DateTimeOffset, retention: UserRetentionPolicy) 
                                 LastSeenAt = now
                                 DisconnectedAt = Some now
                                 LastFailure = Some(defaultArg reason "Transport disconnected") }
+                        migrateDisconnectedLegacySelections connection.UserId deviceId
                     | _ -> ()
                 | None -> ()
                 trimDisconnected connection.UserId

@@ -184,12 +184,19 @@ let private runClient args =
     // Opt-in local browser bridge. The extension must authenticate and register a tab.
     let browserPort = effective.BrowserPort
     let browser =
-        browserPort |> Option.map (fun port ->
+        browserPort |> Option.bind (fun port ->
             let bridge = BrowserBridge.Service(port, BrowserBridge.getOrCreateSecret())
-            bridge.Start()
-            rt.Browser <- Some bridge
-            tui.Log $"Browser bridge listening on 127.0.0.1:{port}; registered windows and explicit tab registrations required."
-            bridge)
+            try
+                bridge.Start()
+                rt.Browser <- Some bridge
+                tui.Log $"Browser bridge listening on 127.0.0.1:{port}; registered windows and explicit tab registrations required."
+                Some bridge
+            with ex ->
+                // Shared machine settings may specify one port for several
+                // processes. Only the bridge is unavailable, not the client.
+                (bridge :> IDisposable).Dispose()
+                tui.Log $"Browser bridge port {port} unavailable in this process ({ex.GetType().Name}): {ex.Message}"
+                None)
 
     // One persistent execution scheduler for CLI and browser actions.
     // The browser bridge is optional; CLI scheduling works without an extension.
@@ -475,7 +482,9 @@ let private runClient args =
         use tracking = Client.TerminalMouse.Tracking.enable()
         use cts = new CancellationTokenSource()
         let inputLoop = tui.RunInputLoop(cts.Token)
-        let deviceId = DeviceIdentity.getOrCreate ()
+        let identity = DeviceIdentity.createInstance ()
+        let deviceId = identity.RouteId
+        tui.Log $"Machine {identity.MachineId}; client instance {identity.InstanceId}"
         let mutable connectionFailureCount = 0
 
         Console.CancelKeyPress.AddHandler(ConsoleCancelEventHandler(fun _ args ->

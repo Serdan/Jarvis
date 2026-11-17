@@ -490,3 +490,22 @@ let recent_selection_includes_newly_finished_long_running_activity () =
         Assert.That(entries |> List.map _.ActivityId, Is.EqualTo(box [ "long-running"; "new" ]))
         Assert.That(entries.Head.Result, Is.EqualTo("finished now"))
     finally Directory.Delete(path, true)
+
+[<Test>]
+let concurrently_started_clients_merge_agent_seen_snapshots_without_losing_evidence () =
+    let path = tempDirectory()
+    try
+        use first = new Store(settings path (1024L * 1024L))
+        use second = new Store(settings path (1024L * 1024L))
+        let stamp = DateTimeOffset(2026, 11, 17, 12, 0, 0, TimeSpan.Zero)
+        [| 1 .. 48 |]
+        |> Array.Parallel.iter (fun i ->
+            let owner = if i % 2 = 0 then first else second
+            owner.SaveAgentSeen [ "Jarvis::Agent " + string i, stamp.AddSeconds(float i) ])
+        let actual = first.LoadAgentSeen() |> Map.ofList
+        Assert.That(actual.Count, Is.EqualTo(48))
+        first.SaveAgentSeen [ "Jarvis::Agent 1", stamp.AddMinutes(-10.) ]
+        let retained = second.LoadAgentSeen() |> Map.ofList
+        Assert.That(retained["Jarvis::Agent 1"], Is.EqualTo(stamp.AddSeconds(1.)))
+    finally
+        Directory.Delete(path, true)

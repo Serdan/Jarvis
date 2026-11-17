@@ -29,25 +29,40 @@ let private utf8 = UTF8Encoding(false, true)
 let secretFile () =
     Path.Combine(Path.GetDirectoryName(Client.ClientConfig.configPath()), "browser-bridge.key")
 
-let getOrCreateSecret () =
-    let path = secretFile()
-    Directory.CreateDirectory(Path.GetDirectoryName(path)) |> ignore
-    if File.Exists(path) then
-        if File.GetAttributes(path).HasFlag(FileAttributes.ReparsePoint) then
-            invalidOp "Browser bridge pairing key must not be a symlink."
-        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
-            let mode = File.GetUnixFileMode(path)
-            if (mode &&& (UnixFileMode.GroupRead ||| UnixFileMode.OtherRead ||| UnixFileMode.GroupWrite ||| UnixFileMode.OtherWrite)) <> enum 0 then
-                invalidOp "Browser bridge key permissions are too broad."
-        File.ReadAllText(path).Trim()
-    else
-        let key = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant()
-        use file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None)
-        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
-            File.SetUnixFileMode(path, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
-        use writer = new StreamWriter(file, utf8)
-        writer.Write(key)
-        key
+let getOrCreateSecretAt path =
+    let directory = Path.GetDirectoryName(Path.GetFullPath(path))
+    Directory.CreateDirectory(directory) |> ignore
+    use _guard = SharedFileLock.acquire (path + ".lock") (TimeSpan.FromSeconds 30.)
+    if not (File.Exists(path)) then
+        // Publish a fully written, mode-600 key with an atomic no-overwrite
+        // rename. Concurrent client starts all read the same winning key.
+        let temporary = Path.Combine(directory, "." + Path.GetFileName(path) + "." + Guid.NewGuid().ToString("N") + ".tmp")
+        let writeTemporary () =
+            use file = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None)
+            if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                File.SetUnixFileMode(temporary, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+            use writer = new StreamWriter(file, utf8)
+            writer.Write(Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant())
+            writer.Flush()
+            file.Flush(true)
+        try
+            writeTemporary()
+            try File.Move(temporary, path)
+            with :? IOException when File.Exists(path) -> ()
+        finally
+            if File.Exists(temporary) then File.Delete(temporary)
+    if File.GetAttributes(path).HasFlag(FileAttributes.ReparsePoint) then
+        invalidOp "Browser bridge pairing key must not be a symlink."
+    if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+        let mode = File.GetUnixFileMode(path)
+        if (mode &&& (UnixFileMode.GroupRead ||| UnixFileMode.OtherRead ||| UnixFileMode.GroupWrite ||| UnixFileMode.OtherWrite)) <> enum 0 then
+            invalidOp "Browser bridge key permissions are too broad."
+    let key = File.ReadAllText(path, utf8).Trim()
+    if key.Length <> 64 || not (key |> Seq.forall Uri.IsHexDigit) then
+        invalidOp "Browser bridge pairing key is malformed; explicit repair is required."
+    key
+
+let getOrCreateSecret () = getOrCreateSecretAt (secretFile())
 
 let private asString (node: JsonNode) (key: string) =
     try

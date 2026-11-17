@@ -24,6 +24,7 @@ open System.Text.Json.Nodes
 open System.Threading.Tasks
 open System.Threading
 open Common
+open Common.SignalR
 open Microsoft.AspNetCore.Http
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Logging
@@ -1525,8 +1526,12 @@ module McpToolHelpers =
     let private deviceStatuses (users: UserService) userId =
         users.ListDevices(userId)
         |> Array.map (fun session ->
+            let route = DeviceRouteIdentity.tryParse session.DeviceId
             {| deviceId = session.DeviceId
                deviceName = session.DeviceName
+               machineId = route |> Option.map _.MachineId |> Option.defaultValue ""
+               installationId = route |> Option.map _.InstallationId |> Option.defaultValue ""
+               instanceId = route |> Option.map _.InstanceId |> Option.defaultValue ""
                state = match session.State with | Registered -> "Registered" | Disconnected -> "Disconnected"
                connectionId = session.ConnectionId |> Option.defaultValue ""
                generation = session.Generation

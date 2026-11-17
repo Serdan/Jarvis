@@ -305,6 +305,14 @@ module OAuth =
         finally
             if File.Exists temporary then File.Delete temporary
 
+    /// Refresh token rotation is account-shared across client processes.
+    /// Serialize refresh/read/save with an OS handle lock, not a sentinel file.
+    let private withRefreshTokenLock (path: string) (action: unit -> Task<'a>) : Task<'a> =
+        task {
+            use! _guard = SharedFileLock.acquireAsync (path + ".lock") (TimeSpan.FromMinutes 6.)
+            return! action()
+        }
+
     let login (log: string -> unit) =
         task {
             let config = configuration ()
@@ -315,9 +323,10 @@ module OAuth =
                     try saveRefreshTokenAt path config token
                     with _ -> log "Could not persist OAuth refresh credentials; a later restart may require sign-in."
                 | None -> ()
-            let! initial =
+
+            let restoreOrSignIn savedToken =
                 task {
-                    match loadRefreshTokenAt path config with
+                    match savedToken with
                     | Some token ->
                         try
                             let! result = refresh config token
@@ -328,7 +337,16 @@ module OAuth =
                             return! interactiveLogin config log
                     | None -> return! interactiveLogin config log
                 }
-            remember initial
+
+            // A second process can only refresh after the first has persisted
+            // its rotated token. Holding the lock through interactive sign-in
+            // also prevents simultaneous callbacks to the same OAuth port.
+            let! initial =
+                withRefreshTokenLock path (fun () -> task {
+                    let! tokens = restoreOrSignIn (loadRefreshTokenAt path config)
+                    remember tokens
+                    return tokens
+                })
             let gate = new SemaphoreSlim(1, 1)
             let mutable current = initial
 
@@ -338,25 +356,19 @@ module OAuth =
                         return current.AccessToken
                     else
                         do! gate.WaitAsync()
-
                         try
                             if current.ExpiresAt <= DateTimeOffset.UtcNow.AddMinutes(1.0) then
-                                match current.RefreshToken with
-                                | Some refreshToken ->
-                                    try
-                                        let! refreshed = refresh config refreshToken
-                                        current <- refreshed
-                                        remember refreshed
-                                    with ex ->
-                                        log $"OAuth refresh failed; signing in again: {ex.Message}"
-                                        let! authenticated = interactiveLogin config log
-                                        current <- authenticated
-                                        remember authenticated
-                                | None ->
-                                    let! authenticated = interactiveLogin config log
-                                    current <- authenticated
-                                    remember authenticated
-
+                                let! refreshed =
+                                    withRefreshTokenLock path (fun () -> task {
+                                        // Other processes may already have rotated the
+                                        // refresh token since this session started.
+                                        let latest = loadRefreshTokenAt path config
+                                                     |> Option.orElse current.RefreshToken
+                                        let! tokens = restoreOrSignIn latest
+                                        remember tokens
+                                        return tokens
+                                    })
+                                current <- refreshed
                             return current.AccessToken
                         finally
                             gate.Release() |> ignore

@@ -133,10 +133,17 @@ module WorkQueueCrossProjectPlanner =
 
     let private duplicateUuidSpellings (values: string list) =
         values
-        |> List.groupBy uuidIdentity
+        // Unissued WQ08 read-only demand has no original launch/browser UUID.
+        // It is independently rejected as CandidateIdentityInvalid, but two
+        // absent IDs are not one duplicated *issued* identity. Keep canonical
+        // UUID alias collisions strict, never invent a placeholder credential.
+        |> List.choose (fun value ->
+            uuidIdentity value |> Option.map (fun uuid -> uuid, value))
+        |> List.groupBy fst
         |> List.choose (fun (_, group) ->
             if List.length group > 1 then
-                group |> List.sortWith compareOrdinal |> String.concat ", " |> Some
+                group |> List.map snd |> List.sortWith compareOrdinal
+                |> String.concat ", " |> Some
             else None)
         |> List.sortWith compareOrdinal
 

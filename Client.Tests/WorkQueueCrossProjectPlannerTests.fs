@@ -325,6 +325,20 @@ type WorkQueueCrossProjectPlannerTests() =
             && e.Record.Contains(browserA) && e.Record.Contains(alias.OriginalBrowserOperationId)), Is.True)
 
     [<Test>]
+    member _.TwoUnissuedReadOnlyCandidatesAreInvalidNotDuplicateBrowserOperations() =
+        let beforeA = { a with LaunchId = ""; OriginalBrowserOperationId = "" }
+        let beforeB = { b with LaunchId = ""; OriginalBrowserOperationId = "" }
+        let result = report (account [||]) [pA; pB] roles [beforeA; beforeB] []
+        Assert.That(result.Decision, Is.EqualTo PlannerDecision.NeedsAttention)
+        Assert.That(result.CanDispatch, Is.False)
+        Assert.That(result.Issues
+                    |> List.filter (fun e -> e.Code = "CandidateIdentityInvalid")
+                    |> List.length, Is.EqualTo 2)
+        Assert.That(result.Issues |> List.exists (fun e ->
+            e.Code = "DuplicateBrowserIntent" || e.Code = "DuplicateLaunchIntent"), Is.False,
+                    "Two missing originals do not alias one already-issued UUID")
+
+    [<Test>]
     member _.ReleasedAccountTokenAliasStillMatchesHistoricalLaunch() =
         let terminal = existing pA launchA (Some browserA)
                            PlannerLaunchPhase.TerminalPendingRelease

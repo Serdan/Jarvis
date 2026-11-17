@@ -156,13 +156,27 @@ function harness(options = {}) {
     }
   };
   const window = { getSelection: () => options.selectionUnavailable ? null : selection };
-  const ctx = vm.createContext({ document, window, location: site, setTimeout, Date, URL });
+  // Test-only virtual time makes the pre-Send deadline boundary deterministic.
+  // Wall-clock scheduling at 100 ms can otherwise race the third inactive sample.
+  const virtualClock = options.virtualClock ? { now: 0, delays: [] } : null;
+  const clockDate = virtualClock
+    ? class extends Date { static now() { return virtualClock.now; } }
+    : Date;
+  const schedule = virtualClock
+    ? (callback, ms) => {
+      virtualClock.delays.push(ms);
+      virtualClock.now += ms;
+      queueMicrotask(callback);
+    }
+    : setTimeout;
+  const ctx = vm.createContext({ document, window, location: site, setTimeout: schedule, Date: clockDate, URL });
   const run = async (prompt = "Start fresh\nRead Jarvis assignment", extra = {}) =>
     await vm.runInContext(source + "\nexecute(" + JSON.stringify({
       prompt, timeoutMs: options.timeoutMs || 350, ...extra
     }) + ")", ctx);
   return { run, site, get clicks() { return clicks; }, get chatClicks() { return chatClicks; },
     get mode() { return mode; }, get content() { return content; },
+    get virtualClockState() { return virtualClock && { now: virtualClock.now, delays: [...virtualClock.delays] }; },
     get staleSendObserved() { return staleSendObserved; }, get lastSubmittedText() { return lastSubmittedText; } };
 }
 
@@ -560,12 +574,13 @@ test("throwing Send click yields uncertain outcome with exactly one attempt", as
   assert.equal(h.lastSubmittedText, null);
 });
 
-test("deadline before three inactive samples cannot edit even an empty editor", async () => {
-  const h = harness({ timeoutMs: 100 });
+test("deadline exactly at the third inactive sample cannot edit or send", async () => {
+  const h = harness({ timeoutMs: 100, virtualClock: true });
   const result = await h.run("Must not send");
   assert.equal(result.status, "notSubmitted");
   assert.equal(result.reason, "LaunchDeadlineExceeded");
   assert.equal(result.stage, "draftStabilization");
+  assert.deepEqual(h.virtualClockState, { now: 100, delays: [75, 25] });
   assert.equal(h.content, "");
   assert.equal(h.clicks, 0);
 });

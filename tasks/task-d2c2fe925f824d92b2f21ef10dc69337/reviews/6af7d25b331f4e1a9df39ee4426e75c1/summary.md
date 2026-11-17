@@ -1,0 +1,1 @@
+Fix Reviewer 1 ChangesRequested decision6657 at 40c6a9f. Remove pending guard in attachAccountGlobal; append policy before pending-job text in first agent inbox, with regression. Release Server.Tests 499/499. No deployment.

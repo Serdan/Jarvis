@@ -1,0 +1,1 @@
+Inspect exact frozen source: WQ02 and WQ04 at one trusted Git head, explicit host opt-in, local trust revalidation and fail-closed unknown project rows, no claims, Scheduler or Agent replacement. .NET 11 Release local focused 27/27, adjacent 42/42, git diff --check clean. Feature branch push was remotely rejected; review may require separate source publication.

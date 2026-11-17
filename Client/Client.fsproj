@@ -64,6 +64,8 @@
         <Compile Include="Modules\TerminalLayout.fs"/>
         <Compile Include="Modules\TerminalFrame.fs"/>
         <Compile Include="Modules\WorkDashboardView.fs"/>
+        <Compile Include="Modules\WorkStatefulContracts.fs"/>
+        <Compile Include="Modules\WorkStatefulProjection.fs"/>
         <Compile Include="Modules\ConsoleTui.fs"/>
         <Compile Include="Modules\ProjectBrowser.fs"/>
         <Compile Include="Modules\ProcessEnvironment.fs"/>

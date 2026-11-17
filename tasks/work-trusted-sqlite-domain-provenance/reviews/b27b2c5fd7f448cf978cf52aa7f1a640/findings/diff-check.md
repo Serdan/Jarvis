@@ -1,0 +1,5 @@
+# F3 — Frozen source delta fails the required diff check (minor)
+
+At frozen `69987d0a8b9364b1cfdb4e222f51e90d24dd69ae` relative to required base `51b67bf1d5ba7e16512b915f8004456440b3489c`, independent `git diff --check BASE HEAD` returned **exit 2**, with trailing whitespace at `docs/testing/work-sqlite-domain-provenance-w20-20261117.md:3-5` (the two spaces used for Markdown line breaks). The submitted review summary says `diff --check clean`, which is not correct for the committed frozen delta.
+
+Remove trailing spaces or reformat the metadata block without Markdown hard-break whitespace; rerun the **base-to-HEAD** diff check (not just `git diff --check` on a clean worktree). This is not a security blocker by itself, but the task explicitly requires a passing frozen diff check and accurate review evidence.

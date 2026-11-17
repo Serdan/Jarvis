@@ -1,8 +1,8 @@
 # Original Git publisher admission — Worker 16 source audit and implementation gate
 
-**Date:** 2026-11-17  
-**Task:** work-original-git-publisher-admission-protocol, generation 1  
-**Source baseline:** origin/main 2cf1aa3625661aa24aba5c2118764afafe31e6ca  
+**Date:** 2026-11-17
+**Task:** work-original-git-publisher-admission-protocol, generation 1
+**Source baseline:** origin/main 2cf1aa3625661aa24aba5c2118764afafe31e6ca
 **Status:** P0 source audit and proposed remote protocol. **HARD NO-GO** for live exclusive fence, all-client witness, C3 import, or SQLite promotion until authenticated remote publication controls and independent proof exist. This document changes no production configuration.
 
 ## 1. Boundary and verified observations

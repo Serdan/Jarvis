@@ -1,0 +1,9 @@
+# F2 — Schema v2 detection trusts column count rather than the named physical schema (blocking)
+
+**Frozen source:** `69987d0a8b9364b1cfdb4e222f51e90d24dd69ae`; `Server/WorkSqliteAuthority.fs:710-746`, especially `columnCount` at 725-733 and the v2 early return.
+
+The claimed explicit fail-closed migration checks `application_id`, `user_version`, `work_meta.schema_version`, and only the *number* of `work_records` columns (14 for v1, 18 for v2). It does not check their actual names, types, nullability/constraints or expected v2 source column set. For example, a v1 database with the expected JWRK identity can be altered to add four unrelated columns, set meta and user versions to 2, and `InitializeProvenanceV2()` returns `Ok 2` despite missing all four required provenance columns. `Initialize()` also returns 2 based only on app/version. Later `ReadSourceProvenance` tries to select nonexistent columns and fails with a storage exception; a malformed v2 layout has already been reported as initialized.
+
+**Required correction:** Before returning `Ok 2`, inspect and validate the expected `pragma_table_info` names/types/nullability and relevant B schema identities, not solely the count. For v1 -> v2, verify the expected named source table columns before beginning the migration. Add negative tests for same-count wrong-name v1/v2 layouts, re-open/restart of corrupt/foreign v2, and unchanged sequence/metadata on rejected upgrades. Report mismatched layouts as unsupported/foreign consistently, never a healthy v2.
+
+This is a **physical schema validation** finding, independent of the separately blocked authenticated producer/F1/G1b work.

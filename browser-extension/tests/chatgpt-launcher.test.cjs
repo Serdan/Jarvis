@@ -21,7 +21,15 @@ function harness(options = {}) {
   let staleSendObserved = 0;
   let draftWasCleared = false;
   let injectedTurn = false;
+  let afterClearEffectsScheduled = false;
+  let afterInsertEffectsScheduled = false;
+  let insertions = 0;
   const launchStartedAt = Date.now();
+  const postInsert = (ms, callback) => {
+    if (ms === undefined) return;
+    if (ms === 0) queueMicrotask(callback);
+    else setTimeout(callback, ms);
+  };
   if (options.addUserTurnBeforeModeMs) {
     setTimeout(() => { userTurns++; }, options.addUserTurnBeforeModeMs);
   }
@@ -35,6 +43,12 @@ function harness(options = {}) {
         chatClicks++;
         if (!options.modeSwitchFails) {
           setTimeout(() => { mode = "Chat"; }, options.modeDelayMs || 0);
+        }
+        if (options.replaceModesDuringModeSwitchMs) {
+          setTimeout(() => {
+            chatMode = makeMode("Chat");
+            workMode = makeMode("Work");
+          }, options.replaceModesDuringModeSwitchMs);
         }
       }
     }
@@ -74,7 +88,7 @@ function harness(options = {}) {
     createRange() {
       return {
         composerSelected: false,
-        selectNodeContents(node) { this.composerSelected = node === editor; }
+        selectNodeContents(node) { this.composerSelected = node === activeEditor; }
       };
     },
     execCommand(command, _, value) {
@@ -86,27 +100,43 @@ function harness(options = {}) {
         if (!content) {
           draftWasCleared = true;
           staleSendChecks = options.staleSendChecks || 0;
-          if (options.routeAfterClear) site.href = "https://chatgpt.com/c/unexpected";
-          if (options.draftReappearsAfterClearMs) {
-            setTimeout(() => { content = "Unrelated draft restored after clear"; }, options.draftReappearsAfterClearMs);
-          }
-          if (options.replaceComposerAfterClearMs) {
-            setTimeout(() => { activeEditor = Object.create(editor); }, options.replaceComposerAfterClearMs);
-          }
-          if (options.replaceModesAfterClearMs) {
-            setTimeout(() => {
-              chatMode = makeMode("Chat");
-              workMode = makeMode("Work");
-            }, options.replaceModesAfterClearMs);
-          }
-          if (options.switchToWorkAfterClearMs) {
-            setTimeout(() => { mode = "Work"; }, options.switchToWorkAfterClearMs);
+          if (!afterClearEffectsScheduled) {
+            afterClearEffectsScheduled = true;
+            if (options.routeAfterClear) site.href = "https://chatgpt.com/c/unexpected";
+            if (options.draftReappearsAfterClearMs) {
+              setTimeout(() => { content = options.restoredDraftText || "Unrelated draft restored after clear"; }, options.draftReappearsAfterClearMs);
+            }
+            if (options.replaceComposerAfterClearMs) {
+              setTimeout(() => { activeEditor = Object.create(editor); }, options.replaceComposerAfterClearMs);
+            }
+            if (options.replaceModesAfterClearMs) {
+              setTimeout(() => {
+                chatMode = makeMode("Chat");
+                workMode = makeMode("Work");
+              }, options.replaceModesAfterClearMs);
+            }
+            if (options.switchToWorkAfterClearMs) {
+              setTimeout(() => { mode = "Work"; }, options.switchToWorkAfterClearMs);
+            }
           }
         }
         return true;
       }
       if (command !== "insertText") return false;
+      insertions++;
       content = options.insertWrong ? "wrong" : value;
+      if (!afterInsertEffectsScheduled) {
+        afterInsertEffectsScheduled = true;
+        postInsert(options.replaceComposerAfterInsertMs, () => { activeEditor = Object.create(editor); });
+        postInsert(options.replaceModesAfterInsertMs, () => {
+          chatMode = makeMode("Chat");
+          workMode = makeMode("Work");
+        });
+        postInsert(options.restoreDraftAfterInsertMs, () => { content = "Competing tab restored an unsent draft"; });
+        postInsert(options.switchToWorkAfterInsertMs, () => { mode = "Work"; });
+        postInsert(options.addTurnAfterInsertMs, () => { userTurns++; });
+        postInsert(options.routeAfterInsertMs, () => { site.href = "https://chatgpt.com/c/new-route"; });
+      }
       return true;
     },
     querySelector(selector) {
@@ -174,7 +204,7 @@ function harness(options = {}) {
     await vm.runInContext(source + "\nexecute(" + JSON.stringify({
       prompt, timeoutMs: options.timeoutMs || 350, ...extra
     }) + ")", ctx);
-  return { run, site, get clicks() { return clicks; }, get chatClicks() { return chatClicks; },
+  return { run, site, get clicks() { return clicks; }, get insertions() { return insertions; }, get chatClicks() { return chatClicks; },
     get mode() { return mode; }, get content() { return content; },
     get virtualClockState() { return virtualClock && { now: virtualClock.now, delays: [...virtualClock.delays] }; },
     get staleSendObserved() { return staleSendObserved; }, get lastSubmittedText() { return lastSubmittedText; } };
@@ -523,29 +553,31 @@ test("fresh empty Chat editor waits longer than the former 1800ms stabilization 
   assert.equal(h.clicks, 1);
 });
 
-test("a restored draft reappearing during hydration is never overwritten", async () => {
-  const h = harness({ existingDraft: "Unsaved text", draftReappearsAfterClearMs: 50, staleSendChecks: 5 });
+test("a restored unsent draft during hydration is replaced only on the still-zero-turn home", async () => {
+  const h = harness({ existingDraft: "Unsaved text", draftReappearsAfterClearMs: 50, staleSendChecks: 5, timeoutMs: 1500 });
   const result = await h.run("Task prompt");
-  assert.equal(result.status, "uiIncompatible");
-  assert.equal(result.reason, "DraftReappeared");
-  assert.equal(h.content, "Unrelated draft restored after clear");
-  assert.equal(h.clicks, 0);
+  assert.equal(result.status, "submitted");
+  assert.equal(h.lastSubmittedText, "Task prompt");
+  assert.equal(h.clicks, 1);
+  assert.equal(h.insertions, 1);
 });
 
-test("a replaced composer during stabilization is not trusted", async () => {
-  const h = harness({ existingDraft: "Old", replaceComposerAfterClearMs: 50, staleSendChecks: 5 });
+test("a replaced composer during stabilization is resnapshotted before editing", async () => {
+  const h = harness({ existingDraft: "Old", replaceComposerAfterClearMs: 50, staleSendChecks: 5, timeoutMs: 1400 });
   const result = await h.run("Task prompt");
-  assert.equal(result.status, "uiIncompatible");
-  assert.equal(result.reason, "ComposerChanged");
-  assert.equal(h.clicks, 0);
+  assert.equal(result.status, "submitted");
+  assert.equal(h.lastSubmittedText, "Task prompt");
+  assert.equal(h.clicks, 1);
+  assert.equal(h.insertions, 1);
 });
 
-test("replaced mode controls during stabilization are not trusted", async () => {
-  const h = harness({ existingDraft: "Old", replaceModesAfterClearMs: 50, staleSendChecks: 5 });
+test("same-selected Chat mode controls may re-render during stabilization", async () => {
+  const h = harness({ existingDraft: "Old", replaceModesAfterClearMs: 50, staleSendChecks: 5, timeoutMs: 1400 });
   const result = await h.run("Task prompt");
-  assert.equal(result.status, "uiIncompatible");
-  assert.equal(result.reason, "ModeChanged");
-  assert.equal(h.clicks, 0);
+  assert.equal(result.status, "submitted");
+  assert.equal(h.lastSubmittedText, "Task prompt");
+  assert.equal(h.clicks, 1);
+  assert.equal(h.chatClicks, 0);
 });
 
 test("mode switching away from Chat during stabilization prevents sending", async () => {
@@ -598,5 +630,92 @@ test("a conversation appearing while mode controls hydrate cannot have its mode 
   assert.equal(result.safeToDisposeCreatedTab, false);
   assert.equal(h.chatClicks, 0);
   assert.equal(h.mode, "Work");
+  assert.equal(h.clicks, 0);
+});
+
+test("Work to Chat selection survives replacement of the clicked mode buttons", async () => {
+  const h = harness({ initialMode: "Work", modeDelayMs: 90, replaceModesDuringModeSwitchMs: 25, timeoutMs: 750 });
+  const result = await h.run("Mode hydration prompt");
+  assert.equal(result.status, "submitted");
+  assert.equal(h.mode, "Chat");
+  assert.equal(h.chatClicks, 1);
+  assert.equal(h.lastSubmittedText, "Mode hydration prompt");
+  assert.equal(h.clicks, 1);
+});
+
+for (const reRenderMs of [90, 160]) {
+  test(`same Chat controls re-render after inactive sample at ${reRenderMs}ms without premature Send`, async () => {
+    const h = harness({ existingDraft: "Old", replaceModesAfterClearMs: reRenderMs, timeoutMs: 1000 });
+    const result = await h.run("Safe re-snapshot");
+    assert.equal(result.status, "submitted");
+    assert.equal(h.lastSubmittedText, "Safe re-snapshot");
+    assert.equal(h.clicks, 1);
+    assert.equal(h.insertions, 1);
+  });
+}
+
+test("composer replacement after insertion restarts pre-Send stabilization without duplicate click", async () => {
+  const h = harness({ replaceComposerAfterInsertMs: 0, timeoutMs: 1150 });
+  const result = await h.run("New task");
+  assert.equal(result.status, "submitted");
+  assert.equal(h.lastSubmittedText, "New task");
+  assert.equal(h.insertions, 2);
+  assert.equal(h.clicks, 1);
+});
+
+test("mode button replacement after insertion re-proves Chat and sends exactly once", async () => {
+  const h = harness({ replaceModesAfterInsertMs: 0, timeoutMs: 1150 });
+  const result = await h.run("New task");
+  assert.equal(result.status, "submitted");
+  assert.equal(h.lastSubmittedText, "New task");
+  assert.equal(h.insertions, 2);
+  assert.equal(h.clicks, 1);
+});
+
+test("another tab restoring a different draft after insertion cannot cause the wrong prompt to send", async () => {
+  const h = harness({ restoreDraftAfterInsertMs: 0, timeoutMs: 1150 });
+  const result = await h.run("Worker 22 unique prompt");
+  assert.equal(result.status, "submitted");
+  assert.equal(h.lastSubmittedText, "Worker 22 unique prompt");
+  assert.equal(h.insertions, 2);
+  assert.equal(h.clicks, 1);
+});
+
+test("two parallel new tabs sharing a persisted unsent draft each send only their own prompt", async () => {
+  const a = harness({ existingDraft: "Persisted stale shared text", draftReappearsAfterClearMs: 45, timeoutMs: 1350 });
+  const b = harness({ existingDraft: "Persisted stale shared text", replaceModesAfterClearMs: 95, timeoutMs: 1350 });
+  const [ra, rb] = await Promise.all([a.run("Agent A task"), b.run("Agent B task")]);
+  assert.equal(ra.status, "submitted");
+  assert.equal(rb.status, "submitted");
+  assert.equal(a.lastSubmittedText, "Agent A task");
+  assert.equal(b.lastSubmittedText, "Agent B task");
+  assert.equal(a.clicks, 1);
+  assert.equal(b.clicks, 1);
+});
+
+test("actual switch to Work after prompt insertion fails closed without Send", async () => {
+  const h = harness({ switchToWorkAfterInsertMs: 0, timeoutMs: 650 });
+  const result = await h.run("Must not send");
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.reason, "ModeChanged");
+  assert.equal(h.mode, "Work");
+  assert.equal(h.clicks, 0);
+});
+
+test("new user turn after insertion always prevents a Send", async () => {
+  const h = harness({ addTurnAfterInsertMs: 0, timeoutMs: 650 });
+  const result = await h.run("Must not send");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "ExistingConversation");
+  assert.equal(result.safeToDisposeCreatedTab, false);
+  assert.equal(h.clicks, 0);
+});
+
+test("route change after insertion always prevents a Send", async () => {
+  const h = harness({ routeAfterInsertMs: 0, timeoutMs: 650 });
+  const result = await h.run("Must not send");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "UnexpectedStartUrl");
+  assert.equal(result.safeToDisposeCreatedTab, false);
   assert.equal(h.clicks, 0);
 });

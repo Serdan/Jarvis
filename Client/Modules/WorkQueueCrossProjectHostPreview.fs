@@ -103,8 +103,8 @@ module WorkQueueCrossProjectHostPreview =
             && nonBlank origin.SourceEntityBlobOid
             && nonBlank origin.SourceEntitySha256
             && origin.AccountCreditStatus = "NotReserved"
-            && String.IsNullOrWhiteSpace origin.RoleId
-            && origin.RoleVersion = 0
+            && not (String.IsNullOrWhiteSpace origin.RoleId)
+            && origin.RoleVersion >= 1
         else
             nonBlank origin.SourceRef && nonBlank origin.SourceCommit
 

@@ -216,13 +216,12 @@ module WorkCompositionGitLedger =
             | _ -> Error(InvalidBinding
                 "Composition stage lacks its original immutable WQ04 unit/spec binding; recovery required."))
 
-    // Called from the WQ04 producer's WINNING original project Git CAS.
-    // The stage and immutable unit/spec binding are born together. The ordinary
-    // source, role and account gates remain unchanged and default-off.
+    // Called from the ordinary WQ04 producer's WINNING original project Git
+    // CAS. Every task/review/integration stage needs its immutable graph link
+    // before it may become Available. A later stitch is not source authority.
     let internal planOriginalStage binding snapshot (stage: WorkStage) = result {
-        if stage.Kind <> WorkKind.Planning then
-            return None, []
-        else
+        match stage.Kind with
+        | WorkKind.Planning | WorkKind.FrozenReview | WorkKind.Integration ->
             let! graph, _ = loadAt binding snapshot
             let linked =
                 graph.Units
@@ -230,7 +229,10 @@ module WorkCompositionGitLedger =
                 |> List.map snd
                 |> List.filter (fun unit -> unit.Spec.LinkedTaskId = Some stage.SubjectId)
             match linked with
-            | [] -> return None, []
+            | [] ->
+                return! Error(InvalidBinding
+                    ("WQ04 original stage has no Work composition feature for task " +
+                     stage.SubjectId + "; add an original linked feature before producing."))
             | [unit] when unit.Kind = WorkUnitKind.Feature ->
                 let! previous = readStageLinkAt binding snapshot stage.Id
                 if previous.IsSome then
@@ -258,7 +260,10 @@ module WorkCompositionGitLedger =
                            Content = CanonicalCodec.encode link } ]
             | _ ->
                 return! Error(InvalidBinding
-                    "WQ04 planning stage has an ambiguous or non-feature composition owner.")
+                    "WQ04 original stage has an ambiguous or non-feature composition owner.")
+        | _ ->
+            return! Error(InvalidBinding
+                "WQ04 original composition only accepts task/review/integration stages.")
     }
     let load binding =
         LedgerStore.fetch binding

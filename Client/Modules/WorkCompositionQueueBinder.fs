@@ -139,7 +139,10 @@ module WorkCompositionQueueBinder =
                 else []
             let roleSource =
                 if not (nonBlank origin.RoleId) || origin.RoleVersion < 1
-                   || not (nonBlank origin.SourceRef) || not (nonBlank origin.SourceCommit) then
+                   || (origin.SourceOperationKind <> "CreateTask"
+                       && (not (nonBlank origin.SourceRef) || not (nonBlank origin.SourceCommit)))
+                   || (origin.SourceOperationKind = "CreateTask"
+                       && (origin.SourceRef <> "" || origin.SourceCommit <> "")) then
                     [ UnprovenRoleOrSource "Original stage does not carry approved role and source lineage." ]
                 else []
             let original =

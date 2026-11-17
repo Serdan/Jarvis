@@ -99,7 +99,7 @@ let private context account first second : DurableIntentContext =
 let private producedTask source receiver taskId =
     let op = Guid.NewGuid()
     ReviewWorkflow.createTask source op taskId ("WQ12 " + taskId) |> success |> ignore
-    WorkQueueReceiptProducer.produce receiver "Lead" (Guid.NewGuid()) op |> success |> ignore
+    WQ04ProducerFixture.produce receiver "Lead" (Guid.NewGuid()) op |> success |> ignore
     let snapshot, project = WorkQueueGitLedger.load receiver |> success
     let stage = project.Works |> Map.toList |> List.map snd
                 |> List.find (fun work -> work.SubjectId = taskId)
@@ -287,14 +287,17 @@ type WorkQueueDurableLaunchIntentTests() =
                   LinkedTaskId = linked }
             let mutations =
                 [ WorkCompositionMutation.Create("root", WorkUnitKind.Project, None, spec "Root" None)
+                  WorkCompositionMutation.Create("prerequisite", WorkUnitKind.Feature, Some "root",
+                                                 spec "Unaccepted prerequisite" None)
                   WorkCompositionMutation.Create("blocked", WorkUnitKind.Feature, Some "root",
-                                                 spec "Blocked" (Some taskId)) ]
+                                                 spec "Blocked" (Some taskId))
+                  WorkCompositionMutation.Require("blocked", "prerequisite") ]
             mutations |> List.iteri (fun version mutation ->
                 WorkCompositionGitLedger.execute a1 "WQ12" (Guid.NewGuid()) version mutation
                 |> success |> ignore)
-            // The legacy task-derived stage has no original WQ04 binding.
-            // Compose first; WQ12 preparation must still refuse unaccepted
-            // composition rather than retroactively rebinding that stage.
+            // Original WQ04 CAS now pins graph, role and source. Its feature
+            // has a genuinely unaccepted hard prerequisite, so it must remain
+            // composition-held even though its task receipt is authentic.
             let stage, _ = producedTask a1 a2 taskId
             let valid = context account1 a1 b1
             match WorkQueueDurableLaunchIntent.prepareExplicit true valid "WQ12" with

@@ -1066,6 +1066,7 @@ module WorkQueueGitLedger =
     let internal publishCanonicalEvent (binding: LedgerBinding) (actor: string) (operationId: Guid)
                                        (expectedVersion: int) (now: int64) (origin: CanonicalWorkOrigin)
                                        (event: QueueProducerEvent)
+                                       (roleGuard: LedgerSnapshot -> WorkStage -> Result<unit, LedgerFailure>)
                                        (compositionGate: LedgerSnapshot -> WorkStage -> Result<GateState option * LedgerFileChange list, LedgerFailure>) =
         let request = JsonObject()
         request.Add("schemaVersion", JsonValue.Create(1))
@@ -1085,7 +1086,7 @@ module WorkQueueGitLedger =
                || String.IsNullOrWhiteSpace origin.SourceEntityPath
                || String.IsNullOrWhiteSpace origin.SourceSelector
                || origin.AccountCreditStatus <> "NotReserved"
-               || origin.RoleId <> "" || origin.RoleVersion <> 0 then
+               || String.IsNullOrWhiteSpace origin.RoleId || origin.RoleVersion < 1 then
                 return! Error(InvalidBinding "WQ04 producer identity or project-only scope is invalid.")
             if origin.SourceHead <> snapshot.Commit
                || origin.SourceHighWater <> snapshot.Header.NextSequence - 1L then
@@ -1135,6 +1136,10 @@ module WorkQueueGitLedger =
                 | _ -> Error(InvalidBinding "WQ04 practical producer currently accepts task/review/integration work only.")
             if not (validInitialStage stage) then
                 return! Error(InvalidBinding "WQ04 malformed canonical stage.")
+            // Original source/task receipt, versioned role demand and the
+            // composition graph are evaluated at the winning project CAS.
+            // WQ07 account credit is independent; this is not launch authority.
+            do! roleGuard snapshot stage
             // Decide the canonical composition hold inside this very same
             // original WQ04 Git CAS. No separately visible Available window.
             let! graphHold, compositionChanges = compositionGate snapshot stage

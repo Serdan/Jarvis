@@ -100,7 +100,7 @@ let private withAuthorities action =
 let private produce source receiver name =
     let sourceOperation, producerOperation = Guid.NewGuid(), Guid.NewGuid()
     ReviewWorkflow.createTask source sourceOperation name ("WQ11 " + name) |> ok |> ignore
-    WorkQueueReceiptProducer.produce receiver "Lead" producerOperation sourceOperation
+    WQ04ProducerFixture.produce receiver "Lead" producerOperation sourceOperation
     |> ok |> ignore
     let head, project = WorkQueueGitLedger.load receiver |> ok
     let stage =

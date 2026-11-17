@@ -195,10 +195,12 @@ module WorkQueueDurableLaunchIntent =
            || stage.Gate <> GateState.Clear then
             return! Error(invalid "Hard stage dependency, waiver or gate needs explicit reconciliation.")
         let! composition, _ = WorkCompositionGitLedger.loadAt binding snapshot
-        if composition.Units |> Map.exists (fun _ unit ->
-            unit.Spec.LinkedTaskId = Some stage.SubjectId) then
+        let! originalLink = WorkCompositionGitLedger.readStageLinkAt binding snapshot stage.Id
+        match originalLink with
+        | Some link when WorkCompositionGitLedger.stageLinkStillCurrent link stage composition -> ()
+        | _ ->
             return! Error(invalid
-                "Task-linked composition requires the separately accepted atomic composition verifier.")
+                "Original WQ04 stage lacks a current immutable composition CAS link.")
         let! originFound = WorkQueueGitLedger.readOriginAt binding snapshot stage.Id
         let! origin, originOid =
             match originFound with
@@ -209,7 +211,8 @@ module WorkQueueDurableLaunchIntent =
            || origin.WorkId <> stage.Id
            || origin.SourceOperationKind <> "CreateTask"
            || origin.AccountCreditStatus <> "NotReserved"
-           || nonBlank origin.RoleId || origin.RoleVersion <> 0
+           || not (nonBlank origin.RoleId) || origin.RoleVersion < 1
+           || origin.RoleId <> selected.RoleId || origin.RoleVersion <> selected.RoleVersion
            || nonBlank origin.SourceRef || nonBlank origin.SourceCommit
            || origin.SourceOperationId <> selected.SourceOperationId
            || origin.SourceRequestHash <> selected.SourceRequestHash

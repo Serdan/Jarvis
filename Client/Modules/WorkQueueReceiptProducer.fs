@@ -12,6 +12,7 @@ open Client.WorkQueueGitLedger
 open Client.WorkQueueCanonicalSourceEvidence
 open Client.WorkQueueCanonicalCasBinder
 open Client.WorkQueueRoleAuthority
+open Client.WorkCompositionGitLedger
 open Client.OrchestrationApi
 
 /// Explicit local operator/agent tooling only: not called by the Scheduler,
@@ -80,7 +81,7 @@ module WorkQueueReceiptProducer =
           Origin = origin
           HardPrerequisites = prerequisites }
 
-    let private prepare (binding: LedgerBinding) (originalOperationId: Guid) = result {
+    let private prepare (binding: LedgerBinding) (originalOperationId: Guid) (selectedRole: string option) = result {
         if originalOperationId = Guid.Empty then
             return! Error(invalid "Nonempty original source-operation UUID required.")
         let! snapshot = LedgerStore.fetch binding
@@ -157,6 +158,36 @@ module WorkQueueReceiptProducer =
             | other ->
                 Error(invalid ("Original operation " + other +
                                 " is not CreateTask, SubmitBranchReview or SubmitIntegration."))
+        // The original role demand is explicit or unambiguous from the
+        // authenticated, versioned role catalog. Legacy WQ02 subscriptions
+        // are not authority, nor may a missing role silently become runnable.
+        let stageQueue =
+            match event.Origin with
+            | QueueProducerOrigin.TaskRequested _ -> "planning"
+            | QueueProducerOrigin.FrozenReviewRequested _ -> "review"
+            | QueueProducerOrigin.AcceptedIntegration _ -> "integration"
+            | _ -> ""
+        let! roles = WorkQueueRoleAuthority.loadAt binding snapshot
+        let eligible =
+            roles.Catalog.Current
+            |> Map.toList
+            |> List.choose (fun (id, version) ->
+                roles.Catalog.Versions.TryFind id
+                |> Option.bind (fun history -> history.TryFind version)
+                |> Option.filter (fun role ->
+                    role.Enabled && role.QueueSubscriptions.Contains stageQueue)
+                |> Option.map (fun _ -> id, version))
+        let! roleId, roleVersion =
+            match selectedRole with
+            | Some id ->
+                match eligible |> List.tryFind (fun (role, _) -> role = id) with
+                | Some role -> Ok role
+                | None -> Error(invalid ("Role " + id + " has no current enabled original " + stageQueue + " demand."))
+            | None ->
+                match eligible with
+                | [role] -> Ok role
+                | [] -> Error(invalid ("No original enabled versioned role subscribes to " + stageQueue + ". Configure WQ04 role first."))
+                | _ -> Error(invalid ("Multiple original roles subscribe to " + stageQueue + "; explicitly select the role for this producer receipt."))
         let request =
             { SourceAnchor =
                 { SnapshotHead = snapshot.Commit
@@ -165,7 +196,7 @@ module WorkQueueReceiptProducer =
                   OriginalRequestHash = operation.RequestHash }
               SourceEvent = selector
               ExpectedProjectVersion = project.Version
-              RoleScope = NoRoleTransition }
+              RoleScope = NewRoleDemand(roleId, roleVersion) }
         return
             { Request = request; Snapshot = snapshot; Project = project
               SourceOperation = operation; SourceEntityPath = path
@@ -175,11 +206,13 @@ module WorkQueueReceiptProducer =
 
     /// Inspect the original receipt and the work that would be written. No
     /// permissions, token credits, agents or queue stages are changed.
-    let preview (binding: LedgerBinding) (originalOperationId: Guid) = result {
-        let! prepared = prepare binding originalOperationId
+    let private previewSelected (binding: LedgerBinding) (originalOperationId: Guid)
+                                (selectedRole: string option) = result {
+        let! prepared = prepare binding originalOperationId selectedRole
         let stageId = WorkQueueProducers.workId prepared.Event
         let! originalStage = WorkQueueGitLedger.readOriginAt binding prepared.Snapshot stageId
         let alreadyPublished = prepared.Project.Works.ContainsKey stageId
+        let! compositionLink = WorkCompositionGitLedger.readStageLinkAt binding prepared.Snapshot stageId
         let sameOrigin =
             match originalStage with
             | Some (origin, _) ->
@@ -188,6 +221,10 @@ module WorkQueueReceiptProducer =
                 && origin.SourceOperationKind = prepared.SourceOperation.Type
                 && origin.SourceOperationSequence = prepared.SourceOperation.Sequence
                 && origin.SourceRequestHash = prepared.SourceOperation.RequestHash
+            | None -> false
+        let originalAuthority =
+            match originalStage with
+            | Some(origin, _) -> not (String.IsNullOrWhiteSpace origin.RoleId) && origin.RoleVersion > 0 && compositionLink.IsSome
             | None -> false
         let validation =
             if alreadyPublished && sameOrigin then
@@ -202,6 +239,10 @@ module WorkQueueReceiptProducer =
                 | Error error -> ["Original receipt/source needs attention: " + sprintf "%A" error]
         let projection =
             match WorkQueueProducers.projectEvent prepared.Project prepared.Event with
+            | Ok (ProducedProjection.Work stage) when not alreadyPublished ->
+                match WorkCompositionGitLedger.planOriginalStage binding prepared.Snapshot stage with
+                | Ok _ -> []
+                | Error error -> ["Original composition needs attention: " + sprintf "%A" error]
             | Ok (ProducedProjection.Work _) -> []
             | Ok _ -> ["Original event does not produce a project work stage."]
             | Error rejected -> ["Work projection needs attention: " + sprintf "%A" rejected]
@@ -217,7 +258,9 @@ module WorkQueueReceiptProducer =
                 | _ -> []
         let collision =
             if not alreadyPublished && originalStage.IsNone then []
-            elif alreadyPublished && sameOrigin then []
+            elif alreadyPublished && sameOrigin && originalAuthority then []
+            elif alreadyPublished && sameOrigin then
+                ["Existing original WQ04 stage has no pinned role/composition authority; reconcile legacy receipt with operator."]
             else ["Stage/origin mismatch: inspect the pinned Git ledger and repair with a backup SHA and diff."]
         let status =
             if collision <> [] || dependency <> [] then "NeedsAttention"
@@ -247,11 +290,18 @@ module WorkQueueReceiptProducer =
               SourceHighWater = prepared.Snapshot.Header.NextSequence - 1L
               Blockers = collision @ validation @ projection @ dependency
               AccountCredit = "NotReserved"
-              Recovery = "Read the original operation and stage/origin Git records. For a changed or claimed review, reconcile/backfill the original stage using a backup SHA, diff and reason. For Unknown inspect the exact producer UUID before retrying. This preview never authorizes Scheduler launch." }
+              Recovery = "Configure a current enabled versioned role and linked Work feature before the original producer CAS. TaskCreated uses its authenticated task receipt as lineage, not an invented branch. For legacy/incomplete stages preserve a backup SHA and reconcile with the operator; Unknown requires inspecting the exact UUID. WQ07 remains independent; this preview cannot launch Scheduler." }
     }
 
+    let preview binding originalOperationId =
+        previewSelected binding originalOperationId None
+
+    let previewForRole binding originalOperationId roleId =
+        previewSelected binding originalOperationId (Some roleId)
+
     let private appliedProducer (binding: LedgerBinding) (actor: string)
-                                (operationId: Guid) (originalOperationId: Guid) = result {
+                                (operationId: Guid) (originalOperationId: Guid)
+                                (selectedRole: string option) = result {
         let! snapshot = LedgerStore.fetch binding
         let! existing = LedgerStore.getOperationAt binding snapshot operationId
         match existing with
@@ -276,10 +326,18 @@ module WorkQueueReceiptProducer =
                     "Applied WQ04 producer receipt is missing its immutable origin path; reconcile Git ledger.")
             let! priorOrigin = WorkQueueGitLedger.readOriginAt binding snapshot workId
             let! project = WorkQueueGitLedger.loadAt binding snapshot
+            let! link = WorkCompositionGitLedger.readStageLinkAt binding snapshot workId
             match priorOrigin with
+            | Some (origin, _) when String.IsNullOrWhiteSpace origin.RoleId
+                                    || origin.RoleVersion < 1 || link.IsNone ->
+                return! Error(LedgerIntegrityError
+                    "Original WQ04 receipt is missing role or graph authority; operator reconciliation of the historical record is required.")
+            | Some (origin, _) when selectedRole.IsSome && selectedRole <> Some origin.RoleId ->
+                return! Error OperationIdReused
             | Some (origin, _) when origin.WorkId = workId
                                     && origin.SourceOperationId = sourceId
                                     && origin.SourceRequestHash = requestHash
+                                    && (operation.Paths |> Array.contains (WorkCompositionGitLedger.stageLinkPath workId))
                                     && project.Works.ContainsKey workId -> ()
             | _ ->
                 return! Error(LedgerIntegrityError
@@ -291,26 +349,33 @@ module WorkQueueReceiptProducer =
     /// The caller explicitly opts in with a new UUID and known actor. A
     /// previous durable receipt is recognized before refreshing the source,
     /// so an uncertain successful push is not misclassified as UUID reuse.
-    let produce (binding: LedgerBinding) (actor: string)
-                (operationId: Guid) (originalOperationId: Guid) = result {
+    let private produceSelected (binding: LedgerBinding) (actor: string)
+                                (operationId: Guid) (originalOperationId: Guid)
+                                (selectedRole: string option) = result {
         if String.IsNullOrWhiteSpace actor || operationId = Guid.Empty
            || originalOperationId = Guid.Empty || operationId = originalOperationId then
             return! Error(invalid "Actor and distinct nonempty original/new operation UUIDs required.")
-        let! applied = appliedProducer binding actor operationId originalOperationId
+        let! applied = appliedProducer binding actor operationId originalOperationId selectedRole
         match applied with
         | Some original -> return original
         | None ->
-            let! prepared = prepare binding originalOperationId
+            let! prepared = prepare binding originalOperationId selectedRole
             return! WorkQueueCanonicalCasBinder.publishPractical
                         binding actor operationId prepared.Request
     }
+
+    let produce binding actor operationId originalOperationId =
+        produceSelected binding actor operationId originalOperationId None
+
+    let produceForRole binding actor operationId originalOperationId roleId =
+        produceSelected binding actor operationId originalOperationId (Some roleId)
 
     let private pretty value =
         JsonSerializer.Serialize(value, JsonSerializerOptions(WriteIndented = true))
 
     let private help () =
-        eprintfn "Usage: JarvisClient queue-producer ROOT preview ORIGINAL_OP_UUID"
-        eprintfn "       JarvisClient queue-producer ROOT produce ACTOR NEW_OP_UUID ORIGINAL_OP_UUID"
+        eprintfn "Usage: JarvisClient queue-producer ROOT preview ORIGINAL_OP_UUID [ROLE_ID]"
+        eprintfn "       JarvisClient queue-producer ROOT produce ACTOR NEW_OP_UUID ORIGINAL_OP_UUID [ROLE_ID]"
         eprintfn "       JarvisClient queue-producer ROOT inspect OP_UUID"
         eprintfn "       JarvisClient queue-producer ROOT origin WORK_ID"
         eprintfn "       JarvisClient queue-producer ROOT demand ROLE_ID"
@@ -342,19 +407,19 @@ module WorkQueueReceiptProducer =
 
     let private runAt (binding: LedgerBinding) command =
         match command with
-        | [ "preview"; source ] ->
+        | "preview" :: source :: remaining when List.length remaining <= 1 ->
             match parseUuid source with
             | Some id ->
-                match preview binding id with
+                match previewSelected binding id (List.tryHead remaining) with
                 | Ok details ->
                     printfn "%s" (pretty details)
                     if details.Status = "NeedsAttention" then 3 else 0
                 | Error error -> printFailure source error
             | None -> help ()
-        | [ "produce"; actor; newId; source ] ->
+        | "produce" :: actor :: newId :: source :: remaining when List.length remaining <= 1 ->
             match parseUuid newId, parseUuid source with
             | Some operationId, Some sourceId ->
-                match produce binding actor operationId sourceId with
+                match produceSelected binding actor operationId sourceId (List.tryHead remaining) with
                 | Ok receipt ->
                     printfn "%s" (pretty
                         {| status = "Applied"; producerOperationId = receipt.Operation.OperationId

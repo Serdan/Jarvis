@@ -219,7 +219,7 @@ let private context (f: EphemeralSchedulerFixture) =
 let private newPlanning source reader taskId =
     let creation = Guid.NewGuid()
     ReviewWorkflow.createTask source creation taskId ("WQ11 " + taskId) |> success |> ignore
-    WorkQueueReceiptProducer.produce reader "Lead" (Guid.NewGuid()) creation
+    WQ04ProducerFixture.produce reader "Lead" (Guid.NewGuid()) creation
     |> success |> ignore
     let _, state = WorkQueueGitLedger.load reader |> success
     state.Works |> Map.toList |> List.map snd

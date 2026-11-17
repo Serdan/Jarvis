@@ -100,11 +100,10 @@ module WorkCompositionQueueTransaction =
         return graph, graphOid, queue, queueOid, prerequisite, dependent, stage
     }
 
-    // The original WQ04 TaskCreated producer has NO role transition and no
-    // source checkout. That is a legitimate project-only *planning* stage,
-    // NOT proof of selected role, source-capable execution, or WQ07 credit.
-    // Verify the complete immutable source operation rather than filling these
-    // blank fields or accepting a caller-authored origin.
+    // The original WQ04 TaskCreated producer pins a versioned role demand
+    // but has no source checkout. The authenticated task receipt is its source
+    // lineage; it does NOT prove WQ07 credit or live launch permission.
+    // Verify the original immutable operation, never invent branch provenance.
     let private originalPlanningOrigin (binding: LedgerBinding) snapshot request
                                        (stage: WorkStage) = result {
         let! maybeOrigin = WorkQueueGitLedger.readOriginAt binding snapshot stage.Id
@@ -115,7 +114,7 @@ module WorkCompositionQueueTransaction =
            || origin.WorkId <> stage.Id
            || origin.SourceOperationKind <> "CreateTask"
            || origin.SourceEntityPath <> ("tasks/" + stage.SubjectId + "/task.json")
-           || origin.RoleId <> "" || origin.RoleVersion <> 0
+           || String.IsNullOrWhiteSpace origin.RoleId || origin.RoleVersion < 1
            || origin.SourceRef <> "" || origin.SourceCommit <> ""
            || origin.AccountCreditStatus <> "NotReserved" then
             return! Error(reject "original WQ04 project-only lineage or pinned origin OID mismatch")

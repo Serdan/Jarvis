@@ -13,6 +13,7 @@ open Client.WorkQueueCanonicalSourceEvidence
 open Client.WorkQueueCanonicalCasBinder
 open Client.WorkQueueReceiptProducer
 open Client.WorkQueueRoleAuthority
+open Client.WorkCompositionGitLedger
 
 [<TestFixture>]
 type WorkQueueCanonicalCasBinderTests() =
@@ -107,6 +108,38 @@ type WorkQueueCanonicalCasBinderTests() =
         finally
             try Directory.Delete(root, true) with _ -> ()
 
+    // Real original WQ04 producer fixtures: authenticated Git role history and
+    // task-linked composition predate publication; no fake graph-only writer.
+    let seedOriginalRoles binding =
+        WorkQueueRoleAuthority.initializeCatalog binding "Lead" (Guid.NewGuid()) |> ok |> ignore
+        [ "Planner", "planning"; "Reviewer", "review"; "Integrator", "integration" ]
+        |> List.iteri (fun revision (name, queue) ->
+            let role: RoleConfiguration =
+                { RoleId = name; Version = 1; Enabled = true
+                  Instructions = "Original WQ04 fixture: " + name
+                  QueueSubscriptions = Set.singleton queue }
+            WorkQueueRoleAuthority.configure binding "Lead" (Guid.NewGuid()) revision 0 role
+            |> ok |> ignore)
+
+    let linkOriginalTask binding task =
+        let apply mutation =
+            let version = WorkCompositionGitLedger.load binding |> ok |> snd
+            WorkCompositionGitLedger.execute binding "Lead" (Guid.NewGuid()) version.Version mutation
+            |> ok |> ignore
+        let graph = WorkCompositionGitLedger.load binding |> ok |> snd
+        if graph.Version = 0 then
+            let spec kind linked =
+                { Title = kind; Goal = "Original source/role/graph fixture"
+                  Scope = "Hermetic project CAS"; AcceptanceCriteria = Set.singleton "Exact receipt"
+                  Constraints = Set.empty; LinkedTaskId = linked }
+            apply (WorkCompositionMutation.Create("root", WorkUnitKind.Project, None, spec "Root" None))
+            apply (WorkCompositionMutation.Create("module", WorkUnitKind.System, Some "root", spec "Module" None))
+        let spec =
+            { Title = task; Goal = "Original source/role/graph fixture"
+              Scope = "Hermetic project CAS"; AcceptanceCriteria = Set.singleton "Exact receipt"
+              Constraints = Set.empty; LinkedTaskId = Some task }
+        apply (WorkCompositionMutation.Create("unit-" + task, WorkUnitKind.Feature, Some "module", spec))
+
     let requestFor binding (write: LedgerWrite) selector =
         let snapshot = LedgerStore.fetch binding |> ok
         let project = WorkQueueGitLedger.loadAt binding snapshot |> ok
@@ -117,7 +150,12 @@ type WorkQueueCanonicalCasBinderTests() =
               OriginalRequestHash = write.Operation.RequestHash }
           SourceEvent = selector
           ExpectedProjectVersion = project.Version
-          RoleScope = NoRoleTransition }
+          RoleScope =
+              match selector with
+              | TaskCreated _ -> NewRoleDemand("Planner", 1)
+              | ReviewSubmitted _ -> NewRoleDemand("Reviewer", 1)
+              | IntegrationState _ -> NewRoleDemand("Integrator", 1)
+              | _ -> NoRoleTransition }
 
     [<Test>]
     member _.ValidOriginalCanonicalEventStillCannotProduceOrClaim() =
@@ -261,6 +299,8 @@ type WorkQueueCanonicalCasBinderTests() =
     member _.PracticalTaskProducerPublishesImmutableOriginAndRunsThroughFixtureClaim() =
         withClones (fun a b _ ->
             let task = "practical-task"
+            seedOriginalRoles a
+            linkOriginalTask a task
             let created = ReviewWorkflow.createTask a (Guid.NewGuid()) task "Practical" |> ok
             let request = requestFor b created (TaskCreated task)
             let publishedId = Guid.NewGuid()
@@ -288,7 +328,7 @@ type WorkQueueCanonicalCasBinderTests() =
             | Error error -> Assert.Fail(sprintf "Original producer UUID replay failed: %A" error)
             for altered in
                 [ { request with SourceEvent = TaskCreated "forged-task" }
-                  { request with RoleScope = NewRoleDemand("Planner", 1) } ] do
+                  { request with RoleScope = NewRoleDemand("Reviewer", 1) } ] do
                 match WorkQueueCanonicalCasBinder.publishPractical b "Lead" publishedId altered with
                 | Error OperationIdReused -> ()
                 | other -> Assert.Fail(sprintf "Changed input reused producer UUID: %A" other)
@@ -304,12 +344,6 @@ type WorkQueueCanonicalCasBinderTests() =
             Assert.That(snapshotAfter.Header.NextSequence, Is.EqualTo(snapshot.Header.NextSequence))
             // Versioned, Git-pinned practical role ranking is a read-only
             // feasibility result. It is not a launch/admission permission.
-            WorkQueueRoleAuthority.initializeCatalog a "Lead" (Guid.NewGuid()) |> ok |> ignore
-            let role : RoleConfiguration =
-                { RoleId = "Planner"; Version = 1; Enabled = true
-                  Instructions = "Plan queued tasks"
-                  QueueSubscriptions = set [ "planning" ] }
-            WorkQueueRoleAuthority.configure a "Lead" (Guid.NewGuid()) 0 0 role |> ok |> ignore
             let demand = WorkQueueRoleAuthority.selectPracticalDemand b "Planner" |> ok
             Assert.That(demand.Chosen.IsSome, Is.True)
             let chosen = demand.Chosen.Value
@@ -343,6 +377,8 @@ type WorkQueueCanonicalCasBinderTests() =
     member _.PracticalReviewAndIntegrationPreserveImmutableHardDependency() =
         withClones (fun a b _ ->
             let task = "practical-review"
+            seedOriginalRoles a
+            linkOriginalTask a task
             ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Owner" |> ok |> ignore
             ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Reviewer" |> ok |> ignore
             let sourceSha = git a.RepositoryPath [ "rev-parse"; "HEAD" ]
@@ -394,6 +430,8 @@ type WorkQueueCanonicalCasBinderTests() =
     member _.ExplicitReceiptEntryPointResolvesOriginalTaskAndReplaysWithoutNewHeadAssertions() =
         withClones (fun a b _ ->
             let task = "receipt-entrypoint-task"
+            seedOriginalRoles a
+            linkOriginalTask a task
             let created = ReviewWorkflow.createTask a (Guid.NewGuid()) task "Original task receipt" |> ok
             let sourceId = Guid.Parse created.Operation.OperationId
             let preview = WorkQueueReceiptProducer.preview b sourceId |> ok
@@ -454,6 +492,8 @@ type WorkQueueCanonicalCasBinderTests() =
     member _.ExplicitReceiptReviewAndIntegrationRequireOriginalDependentStage() =
         withClones (fun a b _ ->
             let task = "receipt-review-task"
+            seedOriginalRoles a
+            linkOriginalTask a task
             ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Owner" |> ok |> ignore
             ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Reviewer" |> ok |> ignore
             let sourceSha = git a.RepositoryPath [ "rev-parse"; "HEAD" ]
@@ -495,6 +535,8 @@ type WorkQueueCanonicalCasBinderTests() =
     member _.LateClaimedReviewIsVisibleAndCannotSilentlyBackfillAsUnclaimed() =
         withClones (fun a b _ ->
             let task = "receipt-late-review"
+            seedOriginalRoles a
+            linkOriginalTask a task
             ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Owner" |> ok |> ignore
             ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Reviewer" |> ok |> ignore
             let sourceSha = git a.RepositoryPath [ "rev-parse"; "HEAD" ]
@@ -522,6 +564,8 @@ type WorkQueueCanonicalCasBinderTests() =
     member _.TwoClonesCannotDuplicateTheSameOriginalTaskStage() =
         withClones (fun a b _ ->
             let task = "receipt-race-task"
+            seedOriginalRoles a
+            linkOriginalTask a task
             let created = ReviewWorkflow.createTask a (Guid.NewGuid()) task task |> ok
             let originalId = Guid.Parse created.Operation.OperationId
             let left = Task.Run(fun () -> WorkQueueReceiptProducer.produce a "Lead" (Guid.NewGuid()) originalId)
@@ -535,4 +579,52 @@ type WorkQueueCanonicalCasBinderTests() =
             let stages = queue.Works |> Map.toList |> List.map snd
                          |> List.filter (fun stage -> stage.SubjectId = task)
             Assert.That(stages.Length, Is.EqualTo(1))
+        )
+
+    [<Test>]
+    member _.OriginalProducerRejectsMissingRoleMissingGraphAndStaleRoleWithoutAnyPartialCAS() =
+        withClones (fun a b _ ->
+            let task = "original-gates-regression"
+            seedOriginalRoles a
+            let created = ReviewWorkflow.createTask a (Guid.NewGuid()) task task |> ok
+            let original = requestFor b created (TaskCreated task)
+            let before = LedgerStore.fetch b |> ok
+            let deny expected result =
+                match result with
+                | Error(InvalidBinding reason) when expected = "invalid" -> ()
+                | Error(StaleEntityVersion reason) when expected = "stale" -> ()
+                | other -> Assert.Fail(sprintf "Original CAS should deny %s: %A" expected other)
+            deny "invalid" (WorkQueueCanonicalCasBinder.publishPractical
+                                b "Lead" (Guid.NewGuid())
+                                { original with RoleScope = NoRoleTransition })
+            deny "invalid" (WorkQueueCanonicalCasBinder.publishPractical
+                                b "Lead" (Guid.NewGuid()) original)
+            let after = LedgerStore.fetch b |> ok
+            Assert.That(after.Commit, Is.EqualTo(before.Commit),
+                        "Neither unbound role nor graph may produce Available or an orphan origin")
+            linkOriginalTask a task
+            let oldRole = (WorkQueueRoleAuthority.load a |> ok).Catalog
+            let updated =
+                { oldRole.Versions.["Planner"].[1] with
+                    Version = 2; Instructions = "Revised original planner demand" }
+            WorkQueueRoleAuthority.configure a "Lead" (Guid.NewGuid())
+                oldRole.Revision 1 updated |> ok |> ignore
+            let staleRole = requestFor b created (TaskCreated task)
+            let freshBefore = LedgerStore.fetch b |> ok
+            deny "stale" (WorkQueueCanonicalCasBinder.publishPractical
+                              b "Lead" (Guid.NewGuid()) staleRole)
+            Assert.That((LedgerStore.fetch b |> ok).Commit, Is.EqualTo(freshBefore.Commit))
+            let accepted = { staleRole with RoleScope = NewRoleDemand("Planner", 2) }
+            WorkQueueCanonicalCasBinder.publishPractical b "Lead" (Guid.NewGuid()) accepted
+            |> ok |> ignore
+            let head, queue = WorkQueueGitLedger.load a |> ok
+            let stage = queue.Works |> Map.toSeq |> Seq.map snd
+                        |> Seq.find (fun item -> item.SubjectId = task)
+            Assert.That(stage.State, Is.EqualTo(WorkState.Available))
+            let origin, _ = WorkQueueGitLedger.readOriginAt a head stage.Id |> ok |> Option.get
+            Assert.That(origin.RoleId, Is.EqualTo("Planner"))
+            Assert.That(origin.RoleVersion, Is.EqualTo(2))
+            Assert.That(origin.SourceOperationId, Is.EqualTo(created.Operation.OperationId))
+            Assert.That((WorkCompositionGitLedger.readStageLinkAt a head stage.Id |> ok).IsSome,
+                        Is.True, "Original stage, source, role and composition must commit atomically")
         )

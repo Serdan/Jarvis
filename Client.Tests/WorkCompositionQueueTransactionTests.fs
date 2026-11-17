@@ -9,6 +9,7 @@ open Client.LedgerStore
 open Client.ReviewWorkflow
 open Client.WorkQueueGitLedger
 open Client.WorkQueueReceiptProducer
+open Client.WorkQueueRoleAuthority
 open Client.WorkCompositionGitLedger
 open Client.WorkCompositionAcceptanceAdapter
 open Client.WorkCompositionQueueTransaction
@@ -78,6 +79,14 @@ type WorkCompositionQueueTransactionTests() =
             |> ok |> ignore
             ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Owner" |> ok |> ignore
             ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Reviewer" |> ok |> ignore
+            WorkQueueRoleAuthority.initializeCatalog a "Fixture" (Guid.NewGuid())
+            |> ok |> ignore
+            let planner: RoleConfiguration =
+                { RoleId = "Owner"; Version = 1; Enabled = true
+                  Instructions = "Authenticated original planning fixture"
+                  QueueSubscriptions = Set.singleton "planning" }
+            WorkQueueRoleAuthority.configure a "Fixture" (Guid.NewGuid()) 0 0 planner
+            |> ok |> ignore
             ReviewWorkflow.createTask a (Guid.NewGuid()) "child-validation" "Original prerequisite validation"
             |> ok |> ignore
             let dependentTaskOp = Guid.NewGuid()
@@ -106,8 +115,8 @@ type WorkCompositionQueueTransactionTests() =
             let snapshot = LedgerStore.fetch a |> ok
             let origin, _ =
                 WorkQueueGitLedger.readOriginAt a snapshot stage.Id |> ok |> Option.get
-            Assert.That(origin.RoleId, Is.Empty)
-            Assert.That(origin.RoleVersion, Is.Zero)
+            Assert.That(origin.RoleId, Is.EqualTo("Owner"))
+            Assert.That(origin.RoleVersion, Is.EqualTo(1))
             Assert.That(origin.SourceRef, Is.Empty)
             Assert.That(origin.SourceCommit, Is.Empty)
             Assert.That(origin.SourceOperationId, Is.EqualTo(dependentTaskOp.ToString("D")))

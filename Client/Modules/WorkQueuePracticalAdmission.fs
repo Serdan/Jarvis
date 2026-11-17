@@ -66,7 +66,7 @@ module WorkQueuePracticalAdmission =
            || origin.ProjectId <> binding.ProjectId.ToString("D")
            || origin.WorkId <> stage.Id
            || origin.AccountCreditStatus <> "NotReserved"
-           || origin.RoleId <> "" || origin.RoleVersion <> 0
+           || String.IsNullOrWhiteSpace origin.RoleId || origin.RoleVersion < 1
            || origin.SourceOperationKind <> "CreateTask"
            || String.IsNullOrWhiteSpace origin.SourceRequestHash
            || String.IsNullOrWhiteSpace origin.SourceSelector
@@ -124,6 +124,15 @@ module WorkQueuePracticalAdmission =
                            && chosen.RoleVersion = request.RoleVersion -> ()
         | _ -> return! Error(invalid "Pinned role selected different work or role revision.")
         do! sourceAt binding snapshot state demand true
+        // The original published role demand must match the WQ07 token and
+        // prospective project admission role; no cross-role stage laundering.
+        let! originalRole = WorkQueueGitLedger.readOriginAt binding snapshot demand.WorkId
+        match originalRole with
+        | Some (origin, _) when origin.RoleId = request.RoleId
+                                && origin.RoleVersion = request.RoleVersion -> ()
+        | _ ->
+            return! Error(invalid
+                "Original WQ04 stage is pinned to another role/version; account admission denied.")
         let! role =
             match view.Catalog.Versions.TryFind request.RoleId with
             | Some history ->

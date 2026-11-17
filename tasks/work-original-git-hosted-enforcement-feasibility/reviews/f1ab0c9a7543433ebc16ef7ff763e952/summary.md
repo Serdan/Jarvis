@@ -1,0 +1,1 @@
+Read-only verified repo branch/ruleset evidence, sole-App hosting versus bare-Git receive-pack feasibility, unknown credential/ref bypasses, atomic barrier requirements and operator decision checklist. No source or host configuration changed.

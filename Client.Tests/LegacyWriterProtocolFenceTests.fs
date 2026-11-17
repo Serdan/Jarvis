@@ -181,7 +181,8 @@ type LegacyWriterProtocolFenceTests() =
         WorkQueueWriteCommand {
             ProjectName = "Fixture"; Action = "CheckpointWork"
             ActorId = "WorkCredentialSubject"; OperationId = Guid.NewGuid().ToString("D")
-            LaunchId = Guid.NewGuid().ToString("D"); WorkId = Guid.NewGuid().ToString("D")
+            LaunchId = Guid.NewGuid().ToString("D"); Credential = ""
+            WorkId = Guid.NewGuid().ToString("D")
             ExpectedProjectVersion = 0; ClaimGeneration = 0
             EvidenceSha256 = "" }
 

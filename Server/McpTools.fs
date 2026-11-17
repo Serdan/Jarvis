@@ -93,13 +93,13 @@ module private WorkQueueCommands =
         WorkQueueReadCommand
             { ProjectName = project; Action = action; Category = category; WorkId = workId }
 
-    let write (http: IHttpContextAccessor) project action operationId launchId workId
+    let write (http: IHttpContextAccessor) project action operationId credential launchId workId
               expectedProjectVersion claimGeneration evidenceSha256 =
         WorkQueueWriteCommand
             { ProjectName = project; Action = action
               ActorId = OperatorConversationCommands.actor http
-              OperationId = operationId; LaunchId = launchId; WorkId = workId
-              ExpectedProjectVersion = expectedProjectVersion
+              OperationId = operationId; LaunchId = launchId; Credential = credential
+              WorkId = workId; ExpectedProjectVersion = expectedProjectVersion
               ClaimGeneration = claimGeneration; EvidenceSha256 = evidenceSha256 }
 
 module private TaskCommands =
@@ -2909,9 +2909,9 @@ type JarvisMcpTools =
             (OperatorConversationWriteCommand
                 { cmd with ExpectedBlobOid = expectedBlobOid; Reason = reason; Text = replacementJson })
 
-    // Work-first authenticated tools. These never use the caller's legacy agentId
-    // as durable Work ownership. Reads are active; writes are typed and return
-    // RejectedMissingBinding until the verified WQ03/WQ04 CAS seam is installed.
+    // Work-first tools use an explicit model-supplied UUIDv4 bearer, checked
+    // against the original Git verifier. Legacy agentId is not Work identity.
+    // Writes (including first-connect) remain default-off after authentication.
     [<McpServerTool(Title = "List canonical Work", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]""");
       Description("Read pinned canonical Work, available/blocked/active classification, exact dependency generations and coverage. Queue availability is not a capacity or launch permit.")>]
@@ -2935,17 +2935,32 @@ type JarvisMcpTools =
         McpToolHelpers.send client http
             (WorkQueueCommands.read projectName "Get" "All" workId)
 
-    [<McpServerTool(Title = "Claim next canonical Work (default off)", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+    [<McpServerTool(Title = "Connect an ephemeral Work execution (default off)", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
-      Description("Typed fail-closed Work-first claim boundary. Requires verified ephemeral launch and same-CAS role/source/account binding not yet installed. Returns exact missing binding, no legacy Agent assignment.")>]
-    static member ClaimNextWork(
+      Description("Explicit UUIDv4 execution credential first-connect. Requires the original Git verifier; live registration remains default-off until WQ03 original dispatch/continuity is bound.")>]
+    static member ConnectWork(
         projectName: string, agentId: string, launchId: string, expectedProjectVersion: int,
+        [<Optional; DefaultParameterValue("")>] credential: string,
         [<Optional; DefaultParameterValue("")>] operationId: string,
         [<Optional; DefaultParameterValue("")>] deviceId: string,
         client: ClientService, http: IHttpContextAccessor
     ) =
         McpToolHelpers.send client http
-            (WorkQueueCommands.write http projectName "ClaimNext" operationId
+            (WorkQueueCommands.write http projectName "FirstConnect" operationId credential
+                launchId "" expectedProjectVersion 0 "")
+
+    [<McpServerTool(Title = "Claim next canonical Work (default off)", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("Typed fail-closed Work-first claim boundary. Requires verified ephemeral launch and same-CAS role/source/account binding not yet installed. Returns exact missing binding, no legacy Agent assignment.")>]
+    static member ClaimNextWork(
+        projectName: string, agentId: string, launchId: string, expectedProjectVersion: int,
+        [<Optional; DefaultParameterValue("")>] credential: string,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        McpToolHelpers.send client http
+            (WorkQueueCommands.write http projectName "ClaimNext" operationId credential
                 launchId "" expectedProjectVersion 0 "")
 
     [<McpServerTool(Title = "Checkpoint canonical Work (default off)", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
@@ -2954,12 +2969,13 @@ type JarvisMcpTools =
     static member CheckpointWork(
         projectName: string, agentId: string, launchId: string, workId: string,
         expectedProjectVersion: int, claimGeneration: int, evidenceSha256: string,
+        [<Optional; DefaultParameterValue("")>] credential: string,
         [<Optional; DefaultParameterValue("")>] operationId: string,
         [<Optional; DefaultParameterValue("")>] deviceId: string,
         client: ClientService, http: IHttpContextAccessor
     ) =
         McpToolHelpers.send client http
-            (WorkQueueCommands.write http projectName "Checkpoint" operationId
+            (WorkQueueCommands.write http projectName "Checkpoint" operationId credential
                 launchId workId expectedProjectVersion claimGeneration evidenceSha256)
 
     [<McpServerTool(Title = "Complete canonical Work (default off)", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
@@ -2968,10 +2984,11 @@ type JarvisMcpTools =
     static member CompleteWork(
         projectName: string, agentId: string, launchId: string, workId: string,
         expectedProjectVersion: int, claimGeneration: int, evidenceSha256: string,
+        [<Optional; DefaultParameterValue("")>] credential: string,
         [<Optional; DefaultParameterValue("")>] operationId: string,
         [<Optional; DefaultParameterValue("")>] deviceId: string,
         client: ClientService, http: IHttpContextAccessor
     ) =
         McpToolHelpers.send client http
-            (WorkQueueCommands.write http projectName "Complete" operationId
+            (WorkQueueCommands.write http projectName "Complete" operationId credential
                 launchId workId expectedProjectVersion claimGeneration evidenceSha256)

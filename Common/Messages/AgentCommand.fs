@@ -216,6 +216,8 @@ type WorkQueueWriteCommand =
       ActorId: string
       OperationId: string
       LaunchId: string
+      // Explicit model-supplied bearer; transient on the relay, never Git/audit.
+      Credential: string
       WorkId: string
       ExpectedProjectVersion: int
       ClaimGeneration: int

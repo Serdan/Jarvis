@@ -3101,7 +3101,7 @@ module WorkQueueApi =
     let write (cmd: WorkQueueWriteCommand) rt =
         LedgerBindingConfig.load cmd.ProjectName rt
         |> Result.bind (fun binding ->
-            Client.WorkQueueToolFacade.WorkQueueToolFacade.transitionWithBinding binding
-                cmd.Action cmd.ActorId cmd.OperationId cmd.LaunchId cmd.WorkId
+            Client.WorkQueueToolFacade.WorkQueueToolFacade.transitionWithExplicitCredential binding
+                cmd.Action cmd.ActorId cmd.OperationId cmd.LaunchId cmd.Credential cmd.WorkId
                 cmd.ExpectedProjectVersion cmd.ClaimGeneration cmd.EvidenceSha256
             |> mapError |> Result.map box)

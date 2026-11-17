@@ -20,6 +20,11 @@ type WorkQueueCredentialTests() =
         | Error (InvalidBinding _) -> ()
         | other -> Assert.Fail(sprintf "Expected credential denial, received: %A" other)
 
+    let sha256 (value: string) =
+        System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes value)
+        |> Convert.ToHexString
+        |> fun hex -> hex.ToLowerInvariant()
+
     let git directory args =
         use p = new Process()
         p.StartInfo.FileName <- "git"
@@ -203,3 +208,81 @@ type WorkQueueCredentialTests() =
                          (CredentialWorkAction.HeartbeatLease 2))
             reject (auth b (Guid.NewGuid()) stopped.Version 2002L id bearer CredentialWorkAction.ClaimPrimary)
             reject (auth a (Guid.NewGuid()) stopped.Version 2003L id bearer CredentialWorkAction.FirstConnect))
+
+    [<Test>]
+    member _.UuidV4IssueIsRandomCanonicalAndDistinctFromLaunch() =
+        let launchId = Guid.NewGuid().ToString("D")
+        let issued = [ for _ in 1 .. 128 -> IssuedWorkCredential.Issue launchId ]
+        let text = issued |> List.map (fun c -> c.RevealForExplicitToolArgument())
+        Assert.That(text |> List.distinct |> List.length, Is.EqualTo(128))
+        for credential, bearer in List.zip issued text do
+            Assert.That(bearer, Is.Not.EqualTo(launchId))
+            Assert.That(bearer.Length, Is.EqualTo(36))
+            Assert.That(WorkCredentialFormat.isCanonicalUuidV4 bearer, Is.True)
+            Assert.That(bearer.[14] = '4', Is.True)
+            Assert.That("89ab".Contains(bearer.[19]), Is.True)
+            Assert.That(credential.VerifierSha256.Length, Is.EqualTo(64))
+            Assert.That(credential.VerifierSha256,
+                        Is.EqualTo(sha256 bearer))
+            Assert.That(credential.ToString(), Does.Not.Contain(bearer))
+        for malformed in
+            [ ""; launchId.ToUpperInvariant(); "{" + launchId + "}"
+              "not-a-credential"; "00000000-0000-0000-0000-000000000000"
+              "00000000-0000-1000-8000-000000000000"
+              "00000000-0000-7000-8000-000000000000"
+              "00000000-0000-4000-7000-000000000000" ] do
+            Assert.That(WorkCredentialFormat.isCanonicalUuidV4 malformed, Is.False, malformed)
+
+    [<Test>]
+    member _.ExplicitWorkToolArgumentVerifiesGitWhileLiveMutationsRemainOff() =
+        withClones (fun a b ->
+            let launchId = Guid.NewGuid().ToString("D")
+            let issued = setup a b launchId "plan-explicit"
+            let bearer = issued.RevealForExplicitToolArgument()
+            let _, state = WorkQueueGitLedger.load a |> ok
+            let actor = "operator:" + String.replicate 64 "a"
+            let workTool binding action credential (op: Guid) version =
+                Client.WorkQueueToolFacade.WorkQueueToolFacade.transitionWithExplicitCredential
+                    binding action actor (op.ToString("D")) launchId credential
+                    "" version 0 ""
+            let preHead = (LedgerStore.fetch a |> ok).Commit
+            let first = workTool b "FirstConnect" bearer (Guid.NewGuid()) state.Version |> ok
+            Assert.That(first.Applied, Is.False)
+            Assert.That(first.Status, Is.EqualTo("RejectedMissingBinding"))
+            Assert.That(first.MissingBinding, Does.Contain("default-off"))
+            Assert.That((LedgerStore.fetch b |> ok).Commit, Is.EqualTo(preHead))
+            reject (workTool a "FirstConnect" launchId (Guid.NewGuid()) state.Version)
+            reject (workTool b "FirstConnect" "" (Guid.NewGuid()) state.Version)
+            reject (workTool a "FirstConnect" (bearer.ToUpperInvariant())
+                        (Guid.NewGuid()) state.Version)
+            let wrongBearer =
+                (IssuedWorkCredential.Issue launchId).RevealForExplicitToolArgument()
+            reject (workTool a "FirstConnect" wrongBearer (Guid.NewGuid()) state.Version)
+            Assert.That((LedgerStore.fetch b |> ok).Commit, Is.EqualTo(preHead))
+            let firstOp = Guid.NewGuid()
+            auth a firstOp state.Version 110L launchId bearer CredentialWorkAction.FirstConnect |> ok |> ignore
+            let _, connected = WorkQueueGitLedger.load b |> ok
+            let claim = workTool b "ClaimNext" bearer (Guid.NewGuid()) connected.Version |> ok
+            Assert.That(claim.Applied, Is.False)
+            Assert.That(claim.Status, Is.EqualTo("RejectedMissingBinding"))
+            reject (workTool a "ClaimNext" launchId (Guid.NewGuid()) connected.Version)
+            Assert.That((WorkQueueGitLedger.load a |> ok |> snd).Version, Is.EqualTo(connected.Version)))
+
+    [<Test>]
+    member _.PreviouslyIssuedWq02Base64BearerStillVerifiesOriginalStoredHash() =
+        withClones (fun a b ->
+            let launchId = Guid.NewGuid().ToString("D")
+            let originalBearer = String.replicate 43 "A"
+            let sha = sha256 originalBearer
+            let projectId = a.ProjectId.ToString("D")
+            mutate a 100L (PublishStage(plan projectId "plan-legacy"))
+            mutate b 101L (AdmitCredentialProject(reserved projectId launchId, sha))
+            mutate a 102L (DispatchOnce(launchId, DispatchState.Submitted))
+            let _, state = WorkQueueGitLedger.load b |> ok
+            Assert.That(WorkCredentialFormat.isSupportedBearer originalBearer, Is.True)
+            Assert.That(WorkCredentialFormat.isCanonicalUuidV4 originalBearer, Is.False)
+            auth a (Guid.NewGuid()) state.Version 103L launchId originalBearer
+                CredentialWorkAction.FirstConnect |> ok |> ignore
+            let _, after = WorkQueueGitLedger.load b |> ok
+            Assert.That(after.Launches.[launchId].State,
+                        Is.EqualTo(LaunchState.Registered(launchId, "work-credential-v1:" + launchId))))

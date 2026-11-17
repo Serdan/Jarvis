@@ -1,0 +1,9 @@
+# Blocking: caller/project activity identity is documented but not proven at the boundary
+
+**Scope:** `Server/McpTools.fs` BrowserRunInNewTab description; `Client.Tests/BrowserSchedulesTests.fs:692-713`; `Server/Services/ClientService.fs:327-333`; Favn-launch provenance in `docs/audits/cross-project-browser-launch-actor-2026-11-17.md`.
+
+The only MCP implementation change is a description requiring `projectName` to be the initiating agent's actual project. The command continues to accept a caller-selected project and independent `agentId`. The server's activity hint uses `AgentCommandInfo.projectName command` with supplied actor, normalizing `::worktree`. If a Favn Manager launcher instead names Jarvis to borrow the Jarvis-owned script, it is still recorded as Jarvis/Manager activity. The P0 collision therefore remains possible on that call path. The new test only constructs two `BrowserRunInNewTabCommand` values and confirms their existing `projectName` properties; it never reaches the server activity recorder or checks the resulting project key.
+
+The task allows **verified Favn-local script provenance** as an alternative to a code-level actor/source separation. The audit cites a Favn GitHub blob and a Favn Manager notification but explicitly states no independently verified exact launch records or frozen Favn source acceptance. Do not treat that as proved operational identity correction.
+
+**Required before P0 closure:** independently bind a verified Favn-owned script blob, actual caller `agentId=Manager`, `projectName=Favn` (or `Favn::registered-worktree`), and relevant dispatch/attribution evidence; add a bounded synthetic server/client attribution regression for normalized Favn Manager vs Jarvis Manager keys. If this cannot be independently verified, maintain the safe UNKNOWN and require a separately authorized actor-project/script-source boundary design. No real-browser replay or speculative suppression of Jarvis activity.

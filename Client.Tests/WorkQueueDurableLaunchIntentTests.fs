@@ -279,7 +279,7 @@ type WorkQueueDurableLaunchIntentTests() =
 
     [<Test>]
     member _.BlockedCompositionAndInvalidProjectMembershipNeverPrepareAnOriginal() =
-        withBindings (fun (a1,a2) (b1,b2) (account1,_) ->
+        withBindings (fun (a1,a2) (b1,b2) (account1,account2) ->
             let taskId = "composed-blocked"
             let spec title linked =
                 { Title = title; Goal = title; Scope = "WQ12"
@@ -295,20 +295,57 @@ type WorkQueueDurableLaunchIntentTests() =
             mutations |> List.iteri (fun version mutation ->
                 WorkCompositionGitLedger.execute a1 "WQ12" (Guid.NewGuid()) version mutation
                 |> success |> ignore)
-            // Original WQ04 CAS now pins graph, role and source. Its feature
-            // has a genuinely unaccepted hard prerequisite, so it must remain
-            // composition-held even though its task receipt is authentic.
+            // The unaccepted hard prerequisite excludes this authentic
+            // source-origin stage at WQ04 role selection, BEFORE WQ12 can
+            // inspect a selected stage's composition CAS link.
             let stage, _ = producedTask a1 a2 taskId
+            let roleDemand = WorkQueueRoleAuthority.selectPracticalDemand a1 "Lead" |> success
+            Assert.That(roleDemand.Chosen.IsNone, Is.True,
+                        "Composition-held WQ04 Work must not reach cross-project selection")
             let valid = context account1 a1 b1
-            match WorkQueueDurableLaunchIntent.prepareExplicit true valid "WQ12" with
-            | DurableIntentOutcome.NeedsAttention text ->
-                Assert.That(text, Does.Contain("composition"))
-            | other -> Assert.Fail(sprintf "Composed task crossed unverified graph gate: %A" other)
+            let secondClient = context account2 b2 a2
+            let beforeSequence = (LedgerStore.fetch a1 |> success).Header.NextSequence
+            let expectNoWinner (label: string) = function
+                | DurableIntentOutcome.NeedsAttention text ->
+                    Assert.That(text, Does.Contain("No verified source-origin planning Work wins global blocking-first FIFO."),
+                                label)
+                | other -> Assert.Fail(sprintf "%s: composition-held Work minted an original: %A" label other)
+            // Two independently fetched project/account clones must both
+            // fail closed, including repeated calls after the concurrent read.
+            let concurrent =
+                [| Task.Run(fun () -> WorkQueueDurableLaunchIntent.prepareExplicit true valid "WQ12 client A")
+                   Task.Run(fun () -> WorkQueueDurableLaunchIntent.prepareExplicit true secondClient "WQ12 client B") |]
+            concurrent |> Array.map (fun job -> job :> Task) |> Task.WaitAll
+            concurrent |> Array.iteri (fun index job ->
+                expectNoWinner (sprintf "Concurrent WQ12 client %d" index) job.Result)
+            expectNoWinner "WQ12 client A replay"
+                (WorkQueueDurableLaunchIntent.prepareExplicit true valid "WQ12 client A replay")
+            expectNoWinner "WQ12 client B replay"
+                (WorkQueueDurableLaunchIntent.prepareExplicit true secondClient "WQ12 client B replay")
             let missing = { valid with CompleteProjectSet = false }
             match WorkQueueDurableLaunchIntent.prepareExplicit true missing "WQ12" with
-            | DurableIntentOutcome.NeedsAttention _ -> ()
+            | DurableIntentOutcome.NeedsAttention text ->
+                Assert.That(text, Does.Contain("membership"))
             | other -> Assert.Fail(sprintf "Incomplete membership minted a launch: %A" other)
+            let wrongProject = context account1 a1 a2
+            match WorkQueueDurableLaunchIntent.prepareExplicit true wrongProject "WQ12" with
+            | DurableIntentOutcome.NeedsAttention text ->
+                Assert.That(text, Does.Contain("membership"))
+            | other -> Assert.Fail(sprintf "Duplicate project membership minted a launch: %A" other)
+            let forgedBinding = { b1 with ProjectId = Guid.NewGuid() }
+            let forgedProject = context account1 a1 forgedBinding
+            match WorkQueueDurableLaunchIntent.prepareExplicit true forgedProject "WQ12" with
+            | DurableIntentOutcome.NeedsAttention _ -> ()
+            | other -> Assert.Fail(sprintf "Untrusted project identity minted a launch: %A" other)
             Assert.That((AccountCapacityLedger.fetch account1 |> success).State.Tokens, Is.Empty)
+            Assert.That((AccountCapacityLedger.fetch account2 |> success).State.Tokens, Is.Empty)
+            Assert.That((WorkQueueRoleAuthority.load a1 |> success).Project.Launches.Count, Is.Zero)
+            let after = LedgerStore.fetch a1 |> success
+            Assert.That(after.Header.NextSequence, Is.EqualTo(beforeSequence),
+                        "Denied preparation must not append an original operation")
+            let path = WorkQueueDurableLaunchIntent.intentPath (a1.ProjectId.ToString("D")) stage.Id stage.StageGeneration
+            let stored, _ = LedgerStore.readAt a1 after path |> success
+            Assert.That(stored.IsNone, Is.True, "No WQ12 durable original may be persisted")
             match WorkQueueDurableLaunchIntent.readPrepared valid a1 stage.Id stage.StageGeneration with
             | DurableIntentOutcome.NeedsAttention _ -> ()
             | other -> Assert.Fail(sprintf "Rejected demand persisted an original: %A" other))

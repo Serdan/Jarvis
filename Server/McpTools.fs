@@ -392,7 +392,7 @@ module McpToolHelpers =
               fromWire "OperatorConversationWrite" name
           for name in [ "ListWork"; "GetWork" ] ->
               fromWire "WorkQueueRead" name
-          for name in [ "ClaimNextWork"; "CheckpointWork"; "CompleteWork" ] ->
+          for name in [ "ConnectWork"; "ClaimNextWork"; "CheckpointWork"; "CompleteWork" ] ->
               fromWire "WorkQueueWrite" name ]
 
     let mcpListCommandsResult : ListCommandsResult =
@@ -2951,7 +2951,7 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "Claim next canonical Work (default off)", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
-      Description("Typed fail-closed Work-first claim boundary. Requires verified ephemeral launch and same-CAS role/source/account binding not yet installed. Returns exact missing binding, no legacy Agent assignment.")>]
+      Description("Typed fail-closed Work-first claim boundary. Pass the model-supplied UUIDv4 execution credential explicitly; same-CAS role/source/account binding is not yet installed. Returns exact missing binding, no legacy Agent assignment.")>]
     static member ClaimNextWork(
         projectName: string, agentId: string, launchId: string, expectedProjectVersion: int,
         [<Optional; DefaultParameterValue("")>] credential: string,
@@ -2965,7 +2965,7 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "Checkpoint canonical Work (default off)", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
-      Description("Typed fail-closed checkpoint with exact Work/claim generation and SHA-256 evidence. No mutation until verified session/source journal bound.")>]
+      Description("Typed fail-closed checkpoint with an explicit model-supplied UUIDv4 execution credential, exact Work/claim generation and SHA-256 evidence. No mutation until verified session/source journal bound.")>]
     static member CheckpointWork(
         projectName: string, agentId: string, launchId: string, workId: string,
         expectedProjectVersion: int, claimGeneration: int, evidenceSha256: string,
@@ -2980,7 +2980,7 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "Complete canonical Work (default off)", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
-      Description("Typed fail-closed terminal Work boundary tied to ephemeral session evidence; never equates execution terminal with Accepted or Integrated.")>]
+      Description("Typed fail-closed terminal Work boundary with an explicit model-supplied UUIDv4 execution credential and ephemeral session evidence; never equates execution terminal with Accepted or Integrated.")>]
     static member CompleteWork(
         projectName: string, agentId: string, launchId: string, workId: string,
         expectedProjectVersion: int, claimGeneration: int, evidenceSha256: string,

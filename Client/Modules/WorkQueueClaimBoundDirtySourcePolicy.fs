@@ -322,8 +322,10 @@ module WorkQueueClaimBoundDirtySourcePolicy =
                      && marker = "work-credential-v1:" + launch.Id
                      && not lease.StopRequested -> Ok lease
             | _ -> denied "Launch is stopped, unregistered or has no live lease."
-        if not (nonblank bearer && bearer.Length = 43
-                && Regex.IsMatch(bearer, "^[A-Za-z0-9_-]{43}$"))
+        // WQ02 issues CSPRNG UUIDv4 bearers while preserving original
+        // Base64URL credentials by their immutable SHA-256 verifier. Reuse
+        // its canonical format gate so accepted launches stay compatible.
+        if not (WorkCredentialFormat.isSupportedBearer bearer)
            || not (hex64 credential.SecretSha256) then
             return! denied "Credential is invalid."
         let presented = SHA256.HashData(Encoding.UTF8.GetBytes bearer)

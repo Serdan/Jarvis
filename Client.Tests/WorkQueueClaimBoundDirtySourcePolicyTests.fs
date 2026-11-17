@@ -213,6 +213,8 @@ let private blocked = function
 [<Test>]
 let clean_claim_then_host_awaited_edit_dirty_checkout_two_clone_evidence_and_checkpoint () =
     withFixture (fun f ->
+        // The normal WQ02 issuer now supplies a 36-character CSPRNG UUIDv4.
+        Assert.That(WorkCredentialFormat.isCanonicalUuidV4 f.Bearer, Is.True)
         awaitedEdit f
         // Original claim authority stays clean-only; never relax this invariant.
         WorkQueueReservationPermissions.checkSourceAt f.B f.Source 140L f.Bearer

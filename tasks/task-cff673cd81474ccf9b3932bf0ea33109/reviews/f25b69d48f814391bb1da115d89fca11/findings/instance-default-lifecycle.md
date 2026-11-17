@@ -1,0 +1,11 @@
+# P1 — Ephemeral process route strands implicit default after a normal client restart
+
+**Frozen commit:** `6d1f003aec6f097dae2d35b347f51263a46dd9db` (not a live-main observation).
+
+**Source:** `Client/Modules/DeviceIdentity.fs` `createInstanceAt` (new instance GUID and `RouteId`); `Client/Program.fs:480-485` creates this once per process; `Server/Services/UserService.fs:408-412` assigns a default only if none exists and migrates only a *legacy machine-UUID* route, while `:432-455` retains a disconnected versioned route. `UserService.fs:228-253,487-500` returns the retained default/selection without an active-session alternative. `UserService.fs:45-48` retains disconnected sessions for seven days. Existing `Server.Tests/RoutingRetentionTests.fs:45-71` explicitly covers this retention behavior for old stable IDs, not ephemeral instance IDs.
+
+**Reproduction / consequence:** Start the first v2 client; it becomes the user's default. Exit it, leaving the server running, then start a replacement process on the same machine/installation. Its new instance GUID yields a new `jarvis2:` route; the old default remains a disconnected session. Implicit command calls continue selecting the old disconnected route (and failing) for up to seven days, despite the replacement client being connected and discoverable. The new tests cover two simultaneous registration routes and reconnect on an *existing* route, not exit/new-instance replacement.
+
+**Required correction:** Decide and implement an explicit safe policy for *implicit* default/conversation affinity across instance replacement. E.g. when the old selected route has disconnected, promote only a uniquely determined eligible replacement of the same machine/installation, never a random one; if multiple candidates exist, fail closed with an actionable reselect error. Preserve explicit exact-instance overrides and their failure-on-disconnect behavior. Add a regression that starts A, disconnects A, registers B with the same machine/installation but a new instance ID, and exercises implicit command selection before any TTL expiry, including ambiguous two-candidate negative control.
+
+**Evidence limit:** Source-derived behavior, not a deployed two-process integration observation; passing Release tests do not cover this transition.

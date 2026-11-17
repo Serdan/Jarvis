@@ -39,11 +39,24 @@ type WorkBlockingError =
 
 [<RequireQualifiedAccess>]
 module WorkBlocking =
+    // Cancellation of a containing System or Project suppresses its whole
+    // subtree even before the queue has revoked its previously Available stages.
+    // Validate still diagnoses containment cycles; the guard also fails closed.
+    let private activeAncestry (graph: WorkCompositionGraph) id =
+        let rec walk visited current =
+            if Set.contains current visited then false
+            else
+                match graph.Units.TryFind current with
+                | Some unit when unit.CancellationReason.IsNone ->
+                    match unit.ParentId with
+                    | None -> true
+                    | Some parentId -> walk (Set.add current visited) parentId
+                | _ -> false
+        walk Set.empty id
+
     let private unfinished (graph: WorkCompositionGraph) id =
-        match graph.Units.TryFind id with
-        | Some unit when unit.CancellationReason.IsNone ->
-            WorkComposition.currentAcceptance graph id |> Option.isNone
-        | _ -> false
+        activeAncestry graph id
+        && (WorkComposition.currentAcceptance graph id |> Option.isNone)
 
     let private requiredChildren (graph: WorkCompositionGraph) (optionalUnits: Set<string>) parentId =
         graph.Units

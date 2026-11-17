@@ -30,6 +30,9 @@ type VerifiedLeadProposalDecision =
       ExpectedVersion: int
       Spec: WorkProposalSpecPin
       Action: LeadProposalAction
+      // Values are bound to the verified Lead receipt; command callers cannot override them.
+      AuthorizedPriority: int option
+      AuthorizedReason: string option
       CanonicallyVerified: bool }
 
 // Separate explicit authority for routine internal original producers such as
@@ -39,6 +42,7 @@ type VerifiedInternalWorkProducer =
       WorkId: string
       OriginalEventId: string
       Spec: WorkProposalSpecPin
+      AuthorizedPriority: int
       MayPublishOpen: bool
       CanonicallyVerified: bool }
 
@@ -56,6 +60,7 @@ type WorkProposalRecord =
       Version: int
       State: WorkProposalState
       CurrentSpec: WorkProposalSpecPin
+      LastReturnedSpec: WorkProposalSpecPin option
       ApprovedSpec: WorkProposalSpecPin option
       LeadPriority: int option
       ApprovalReceipt: string option
@@ -98,6 +103,7 @@ type WorkProposalError =
     | UnverifiedAuthority
     | DecisionMismatch
     | InvalidReason
+    | RevisionRequired
 
 [<RequireQualifiedAccess>]
 module WorkProposal =
@@ -135,6 +141,7 @@ module WorkProposal =
                   Version = 1
                   State = WorkProposalState.Draft
                   CurrentSpec = pin
+                  LastReturnedSpec = None
                   ApprovedSpec = None
                   LeadPriority = None
                   ApprovalReceipt = None
@@ -149,6 +156,7 @@ module WorkProposal =
         elif not authorization.CanonicallyVerified || not authorization.MayPublishOpen then
             Error WorkProposalError.UnverifiedAuthority
         elif authorization.WorkId <> workId || authorization.Spec <> pin
+             || authorization.AuthorizedPriority <> priority
              || not (nonBlank authorization.ReceiptId)
              || not (nonBlank authorization.OriginalEventId) then
             Error WorkProposalError.DecisionMismatch
@@ -158,6 +166,7 @@ module WorkProposal =
                   Version = 1
                   State = WorkProposalState.Open
                   CurrentSpec = pin
+                  LastReturnedSpec = None
                   ApprovedSpec = Some pin
                   LeadPriority = Some priority
                   ApprovalReceipt = None
@@ -165,12 +174,14 @@ module WorkProposal =
                   History = [ WorkProposalEvent.InternalOpen(1, authorization.ReceiptId, authorization.OriginalEventId) ] }
             Ok { Record = record; Publication = publication record }
 
-    let private verifyDecision action (decision: VerifiedLeadProposalDecision) (record: WorkProposalRecord) =
+    let private verifyDecision action priority reason (decision: VerifiedLeadProposalDecision) (record: WorkProposalRecord) =
         if not decision.CanonicallyVerified then Error WorkProposalError.UnverifiedAuthority
         elif decision.WorkId <> record.WorkId
              || decision.ExpectedVersion <> record.Version
              || decision.Spec <> record.CurrentSpec
              || decision.Action <> action
+             || decision.AuthorizedPriority <> priority
+             || decision.AuthorizedReason <> reason
              || not (nonBlank decision.ReceiptId) then
             Error WorkProposalError.DecisionMismatch
         else Ok ()
@@ -194,19 +205,24 @@ module WorkProposal =
                         { record with CurrentSpec = pin }
                     |> updated
             | WorkProposalCommand.Submit, WorkProposalState.Draft ->
-                event nextVersion (WorkProposalEvent.Submitted(nextVersion, record.CurrentSpec))
-                    { record with State = WorkProposalState.Proposed }
-                |> updated
+                if record.LastReturnedSpec = Some record.CurrentSpec then
+                    Error WorkProposalError.RevisionRequired
+                else
+                    event nextVersion (WorkProposalEvent.Submitted(nextVersion, record.CurrentSpec))
+                        { record with State = WorkProposalState.Proposed }
+                    |> updated
             | WorkProposalCommand.Return(decision, reason), WorkProposalState.Proposed ->
-                verifyDecision LeadProposalAction.ReturnForRevision decision record
+                verifyDecision LeadProposalAction.ReturnForRevision None (Some reason) decision record
                 |> Result.bind (fun () ->
                     if not (checkReason reason) then Error WorkProposalError.InvalidReason
                     else
                         event nextVersion (WorkProposalEvent.Returned(nextVersion, decision.ReceiptId, reason))
-                            { record with State = WorkProposalState.Draft }
+                            { record with
+                                State = WorkProposalState.Draft
+                                LastReturnedSpec = Some record.CurrentSpec }
                         |> updated)
             | WorkProposalCommand.Approve(decision, priority), WorkProposalState.Proposed ->
-                verifyDecision LeadProposalAction.Approve decision record
+                verifyDecision LeadProposalAction.Approve (Some priority) None decision record
                 |> Result.map (fun () ->
                     let approved =
                         event nextVersion (WorkProposalEvent.Approved(nextVersion, decision.ReceiptId, priority))
@@ -217,7 +233,7 @@ module WorkProposal =
                                 ApprovalReceipt = Some decision.ReceiptId }
                     { Record = approved; Publication = publication approved })
             | WorkProposalCommand.SetPriority(decision, priority, reason), WorkProposalState.Open ->
-                verifyDecision LeadProposalAction.ChangePriority decision record
+                verifyDecision LeadProposalAction.ChangePriority (Some priority) (Some reason) decision record
                 |> Result.bind (fun () ->
                     if not (checkReason reason) then Error WorkProposalError.InvalidReason
                     else

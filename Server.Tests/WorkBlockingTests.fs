@@ -112,6 +112,32 @@ let optionalAndCancelledDescendantsDoNotInheritBlockerRank () =
     Assert.That(result.Eligible.[1].IsBlocking, Is.False)
 
 [<Test>]
+let cancelledAncestorSuppressesAvailableDescendantsUntilExplicitReopen () =
+    let graph =
+        root () |> system "a" |> system "b" |> system "ordinary"
+        |> subsystem "b-child" "b"
+        |> child "b-grandchild" "b-child"
+        |> require "a" "b"
+    let available =
+        [ stage "b-child" 1L; stage "b-grandchild" 2L; stage "ordinary" 3L ]
+    let before = rank graph (queue graph available) Set.empty
+    Assert.That(ids before = [ "stage-b-child"; "stage-b-grandchild"; "stage-ordinary" ], Is.True)
+    let cancelled = cancel "b" graph
+    // Cancel marks only B. Its descendants still look Available in a stale
+    // queue until reconciliation, but must NEVER appear eligible or blocking.
+    Assert.That(cancelled.Units.["b-child"].CancellationReason.IsNone, Is.True)
+    Assert.That(cancelled.Units.["b-grandchild"].CancellationReason.IsNone, Is.True)
+    let afterCancel = rank cancelled (queue cancelled available) Set.empty
+    Assert.That(ids afterCancel = [ "stage-ordinary" ], Is.True)
+    Assert.That(afterCancel.BlockingUnits, Is.Empty)
+    let reopened =
+        WorkComposition.apply cancelled.Version (WorkCompositionMutation.Reopen "b") cancelled |> ok
+    let afterReconcile = rank reopened (queue reopened available) Set.empty
+    let expectedAfterReconcile = [ "stage-b-child"; "stage-b-grandchild"; "stage-ordinary" ]
+    Assert.That(ids afterReconcile = expectedAfterReconcile, Is.True)
+    Assert.That(afterReconcile.BlockingUnits.Contains "b-grandchild", Is.True)
+
+[<Test>]
 let transitiveHardPrerequisitesBlockButUnmetCandidatesCannotDispatch () =
     let graph =
         root () |> system "a" |> system "b" |> system "c"

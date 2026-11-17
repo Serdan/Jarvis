@@ -23,6 +23,8 @@ let private verified action (record: WorkProposalRecord) =
       ExpectedVersion = record.Version
       Spec = record.CurrentSpec
       Action = action
+      AuthorizedPriority = None
+      AuthorizedReason = None
       CanonicallyVerified = true }
 
 let private submitted () =
@@ -43,7 +45,7 @@ let draftHasNoDemandAndSubmitEmitsOnlyLead () =
 [<Test>]
 let approvalPublishesPinnedSpecAndReadinessGatesDemand () =
     let pending = submitted ()
-    let proof = verified LeadProposalAction.Approve pending
+    let proof = { verified LeadProposalAction.Approve pending with AuthorizedPriority = Some -5 }
     let approved =
         WorkProposal.apply pending.Version (WorkProposalCommand.Approve(proof, -5)) pending |> ok
     Assert.That(approved.Record.State, Is.EqualTo(WorkProposalState.Open))
@@ -58,31 +60,44 @@ let approvalPublishesPinnedSpecAndReadinessGatesDemand () =
 [<Test>]
 let unverifiedAndMismatchedLeadDecisionsCannotApprove () =
     let pending = submitted ()
-    let proof = verified LeadProposalAction.Approve pending
+    let proof = { verified LeadProposalAction.Approve pending with AuthorizedPriority = Some 1 }
     WorkProposal.apply pending.Version
-        (WorkProposalCommand.Approve({ proof with CanonicallyVerified = false }, 5)) pending
+        (WorkProposalCommand.Approve({ proof with CanonicallyVerified = false }, 1)) pending
     |> expectError WorkProposalError.UnverifiedAuthority
     WorkProposal.apply pending.Version
-        (WorkProposalCommand.Approve({ proof with Spec = pin 8 }, 5)) pending
+        (WorkProposalCommand.Approve({ proof with Spec = pin 8 }, 1)) pending
     |> expectError WorkProposalError.DecisionMismatch
     WorkProposal.apply pending.Version
-        (WorkProposalCommand.Approve({ proof with Action = LeadProposalAction.ReturnForRevision }, 5)) pending
+        (WorkProposalCommand.Approve({ proof with Action = LeadProposalAction.ReturnForRevision }, 1)) pending
     |> expectError WorkProposalError.DecisionMismatch
     WorkProposal.apply (pending.Version - 1)
-        (WorkProposalCommand.Approve(proof, 5)) pending
+        (WorkProposalCommand.Approve(proof, 1)) pending
     |> expectError (WorkProposalError.VersionConflict(pending.Version - 1, pending.Version))
+    // The same otherwise-valid canonical receipt cannot authorize two ranks.
+    WorkProposal.apply pending.Version (WorkProposalCommand.Approve(proof, 999)) pending
+    |> expectError WorkProposalError.DecisionMismatch
+    WorkProposal.apply pending.Version (WorkProposalCommand.Approve(proof, 1)) pending |> ok
+    |> fun update -> Assert.That(update.Record.LeadPriority, Is.EqualTo(Some 1))
 
 [<Test>]
 let returnedProposalRequiresRevisionSubmissionAndFreshApproval () =
     let pending = submitted ()
-    let oldProof = verified LeadProposalAction.Approve pending
+    let returnProof = { verified LeadProposalAction.ReturnForRevision pending with AuthorizedReason = Some "scope too wide" }
+    WorkProposal.apply pending.Version
+        (WorkProposalCommand.Return(returnProof, "unauthorized replacement")) pending
+    |> expectError WorkProposalError.DecisionMismatch
+    let oldProof = { verified LeadProposalAction.Approve pending with AuthorizedPriority = Some 5 }
     let returned =
         WorkProposal.apply pending.Version
-            (WorkProposalCommand.Return(verified LeadProposalAction.ReturnForRevision pending, "scope too wide")) pending
+            (WorkProposalCommand.Return(
+                { verified LeadProposalAction.ReturnForRevision pending with AuthorizedReason = Some "scope too wide" },
+                "scope too wide")) pending
         |> ok
     Assert.That(returned.Publication.IsNone, Is.True)
     Assert.That(returned.Record.State, Is.EqualTo(WorkProposalState.Draft))
     Assert.That(WorkProposal.demand true returned.Record, Is.EqualTo(WorkProposalDemand.NoDemand))
+    WorkProposal.apply returned.Record.Version WorkProposalCommand.Submit returned.Record
+    |> expectError WorkProposalError.RevisionRequired
     let revised =
         WorkProposal.apply returned.Record.Version
             (WorkProposalCommand.ReviseDraft(pin 2)) returned.Record |> ok
@@ -93,7 +108,8 @@ let returnedProposalRequiresRevisionSubmissionAndFreshApproval () =
     |> expectError WorkProposalError.DecisionMismatch
     let approved =
         WorkProposal.apply resubmitted.Record.Version
-            (WorkProposalCommand.Approve(verified LeadProposalAction.Approve resubmitted.Record, 5))
+            (WorkProposalCommand.Approve(
+                { verified LeadProposalAction.Approve resubmitted.Record with AuthorizedPriority = Some 5 }, 5))
             resubmitted.Record |> ok
     Assert.That(approved.Publication.Value.ApprovedSpec, Is.EqualTo(pin 2))
     Assert.That(approved.Record.History.Length, Is.EqualTo(5))
@@ -103,14 +119,24 @@ let openSpecImmutableAndPriorityChangesAreVersioned () =
     let pending = submitted ()
     let published =
         WorkProposal.apply pending.Version
-            (WorkProposalCommand.Approve(verified LeadProposalAction.Approve pending, 1)) pending |> ok
+            (WorkProposalCommand.Approve(
+                { verified LeadProposalAction.Approve pending with AuthorizedPriority = Some 1 }, 1)) pending |> ok
     WorkProposal.apply published.Record.Version
         (WorkProposalCommand.ReviseDraft(pin 2)) published.Record
     |> expectError (WorkProposalError.InvalidTransition(WorkProposalState.Open, "revise"))
+    let priorityProof =
+        { verified LeadProposalAction.ChangePriority published.Record with
+            AuthorizedPriority = Some 20
+            AuthorizedReason = Some "critical path" }
+    WorkProposal.apply published.Record.Version
+        (WorkProposalCommand.SetPriority(priorityProof, 999, "critical path")) published.Record
+    |> expectError WorkProposalError.DecisionMismatch
+    WorkProposal.apply published.Record.Version
+        (WorkProposalCommand.SetPriority(priorityProof, 20, "unapproved reason")) published.Record
+    |> expectError WorkProposalError.DecisionMismatch
     let changed =
         WorkProposal.apply published.Record.Version
-            (WorkProposalCommand.SetPriority(
-                verified LeadProposalAction.ChangePriority published.Record, 20, "critical path"))
+            (WorkProposalCommand.SetPriority(priorityProof, 20, "critical path"))
             published.Record |> ok
     Assert.That(changed.Publication.IsNone, Is.True)
     Assert.That(changed.Record.ApprovedSpec, Is.EqualTo(published.Record.ApprovedSpec))
@@ -126,6 +152,7 @@ let internalOriginalProducerRequiresExplicitVerifiedBypass () =
           WorkId = "feature-1"
           OriginalEventId = "review-successor-1"
           Spec = pin 1
+          AuthorizedPriority = 3
           MayPublishOpen = true
           CanonicallyVerified = true }
     WorkProposal.createAuthorizedOpen "feature-1" (pin 1) 3
@@ -135,6 +162,8 @@ let internalOriginalProducerRequiresExplicitVerifiedBypass () =
         { internalAuth with MayPublishOpen = false }
     |> expectError WorkProposalError.UnverifiedAuthority
     WorkProposal.createAuthorizedOpen "other" (pin 1) 3 internalAuth
+    |> expectError WorkProposalError.DecisionMismatch
+    WorkProposal.createAuthorizedOpen "feature-1" (pin 1) 999 internalAuth
     |> expectError WorkProposalError.DecisionMismatch
     let authorized = WorkProposal.createAuthorizedOpen "feature-1" (pin 1) 3 internalAuth |> ok
     Assert.That(authorized.Record.State, Is.EqualTo(WorkProposalState.Open))
@@ -147,14 +176,16 @@ let illegalTransitionsAndUnpinnedRevisionsFailClosed () =
     WorkProposal.apply original.Version
         (WorkProposalCommand.Approve(
             { ReceiptId = "fake"; WorkId = "feature-1"; ExpectedVersion = 1
-              Spec = pin 1; Action = LeadProposalAction.Approve; CanonicallyVerified = true }, 0))
+              Spec = pin 1; Action = LeadProposalAction.Approve
+              AuthorizedPriority = Some 0; AuthorizedReason = None; CanonicallyVerified = true }, 0))
         original
     |> expectError (WorkProposalError.InvalidTransition(WorkProposalState.Draft, "approve"))
     WorkProposal.apply original.Version (WorkProposalCommand.ReviseDraft(pin 3)) original
     |> expectError WorkProposalError.InvalidSpecPin
     let pending = submitted ()
     WorkProposal.apply pending.Version
-        (WorkProposalCommand.Return(verified LeadProposalAction.ReturnForRevision pending, " ")) pending
+        (WorkProposalCommand.Return(
+            { verified LeadProposalAction.ReturnForRevision pending with AuthorizedReason = Some " " }, " ")) pending
     |> expectError WorkProposalError.InvalidReason
     WorkProposal.apply pending.Version WorkProposalCommand.Submit pending
     |> expectError (WorkProposalError.InvalidTransition(WorkProposalState.Proposed, "submit"))

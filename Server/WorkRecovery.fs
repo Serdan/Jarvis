@@ -1,6 +1,9 @@
 namespace Jarvis.WorkRecovery
 
 open System
+open System.IO
+open System.Security.Cryptography
+open System.Text
 
 // G0 only: pure, default-off recovery reasoning. This module does not read or
 // mutate SQLite, Git, the Scheduler, live launches, or authorization grants.
@@ -26,13 +29,22 @@ type ReviewVerdict =
     | ChangesRequested
     | Rejected
 
+// The trusted adapter must inspect these fields on the ORIGINAL, immutable
+// proof/authorization, not fill them from the current Work. A source SHA alone
+// cannot carry a review or approval across a Work/graph/role revision.
+type OriginalStageLineage =
+    { WorkVersion: int
+      Generation: int
+      ProjectGraphVersion: int
+      RoleAuthoritySha: string }
+
 type SourceProof =
     { ProjectId: string
       WorkId: string
       RepositoryId: string
       SourceRef: string
       SourceSha: string
-      Generation: int
+      OriginalLineage: OriginalStageLineage
       ReceiptId: string
       ReachabilityVerified: bool }
 
@@ -40,15 +52,39 @@ type FrozenReviewProof =
     { ProjectId: string
       WorkId: string
       ReviewId: string
+      OriginalLineage: OriginalStageLineage
+      SourceRepositoryId: string
+      SourceRef: string
+      SourceReceiptId: string
       FrozenSourceSha: string
       Verdict: ReviewVerdict
       ReceiptId: string
+      CanonicallyVerified: bool }
+
+// This proves the original authorization TO INTEGRATE, separately from the
+// later Recovery release. A verified old approval is not a new-stage grant.
+type IntegrationAuthorizationProof =
+    { ReceiptId: string
+      OriginalLineage: OriginalStageLineage
+      SourceRepositoryId: string
+      SourceRef: string
+      SourceReceiptId: string
+      SourceSha: string
+      AcceptedReviewId: string
+      AcceptedReviewReceiptId: string
+      TargetRef: string
       CanonicallyVerified: bool }
 
 type IntegrationProof =
     { ProjectId: string
       WorkId: string
       SubmissionId: string
+      OriginalLineage: OriginalStageLineage
+      SourceRepositoryId: string
+      SourceRef: string
+      AcceptedReviewId: string
+      AcceptedReviewReceiptId: string
+      Authorization: IntegrationAuthorizationProof
       AcceptedSourceSha: string
       TargetRef: string
       IntegratedSha: string
@@ -113,14 +149,17 @@ type ReleaseAuthorization =
       ProjectGraphVersion: int
       WorkVersion: int
       Generation: int
-      // Exact evidence binding rejects a stale approval after any proof,
-      // journal, STOP or gap-seal changes.
-      EvidenceReceipts: Set<string> }
+      RoleAuthoritySha: string
+      // Receipt IDs are informational. The digest binds their ORIGINAL proof
+      // payloads, lineage, all effect outcomes and STOP/gap-seal contents.
+      EvidenceReceipts: Set<string>
+      EvidenceDigest: string }
 
 type RecoveryWorkSnapshot =
     { WorkId: string
       WorkVersion: int
       Generation: int
+      RoleAuthoritySha: string
       Goal: ArtifactGoal
       CapturedInFlightLaunch: bool
       Source: SourceProof option
@@ -162,6 +201,7 @@ type Requirement =
     | DuplicateProjectIdentity
     | DuplicateWorkIdentity
     | InvalidWorkVersion
+    | InvalidRoleAuthority
     | MissingSourceProof
     | UnverifiedSourceProof
     | UnexpectedSourceArtifact
@@ -187,6 +227,7 @@ type RecoveryWorkDecision =
     { WorkId: string
       Requirements: Requirement list
       EvidenceReceipts: Set<string>
+      EvidenceDigest: string
       ReleaseAuthorized: bool
       NormalDispatchAllowed: bool }
 
@@ -288,53 +329,83 @@ module WorkRecovery =
             Set.singleton ("gap:" + seal.ReceiptId)
         | _ -> Set.empty
 
-    let private sourceReceipt projectId (work: RecoveryWorkSnapshot) =
+    let private lineageMatches (project: RecoveryProjectSnapshot) (work: RecoveryWorkSnapshot) lineage =
+        validSha work.RoleAuthoritySha
+        && lineage =
+            { WorkVersion = work.WorkVersion
+              Generation = work.Generation
+              ProjectGraphVersion = project.GraphVersion
+              RoleAuthoritySha = work.RoleAuthoritySha }
+
+    let private sourceReceipt (project: RecoveryProjectSnapshot) (work: RecoveryWorkSnapshot) =
         match work.Source with
         | Some source
-            when source.ProjectId = projectId
+            when source.ProjectId = project.ProjectId
                  && source.WorkId = work.WorkId
-                 && source.Generation = work.Generation
+                 && lineageMatches project work source.OriginalLineage
                  && validId source.RepositoryId
+                 && not (isNull source.SourceRef)
                  && source.SourceRef.StartsWith("refs/heads/", StringComparison.Ordinal)
                  && validSha source.SourceSha
                  && source.ReachabilityVerified
                  && validId source.ReceiptId -> Some ("source:" + source.ReceiptId)
         | _ -> None
 
-    let private reviewReceipt projectId (work: RecoveryWorkSnapshot) =
+    let private reviewReceipt (project: RecoveryProjectSnapshot) (work: RecoveryWorkSnapshot) =
         match work.Source, work.Review with
         | Some source, Some review
-            when (sourceReceipt projectId work |> Option.isSome)
-                 && review.ProjectId = projectId
+            when (sourceReceipt project work |> Option.isSome)
+                 && review.ProjectId = project.ProjectId
                  && review.WorkId = work.WorkId
+                 && lineageMatches project work review.OriginalLineage
                  && review.CanonicallyVerified
                  && review.Verdict = ReviewVerdict.Accepted
                  && validId review.ReviewId
                  && validId review.ReceiptId
+                 && review.SourceRepositoryId = source.RepositoryId
+                 && review.SourceRef = source.SourceRef
+                 && review.SourceReceiptId = source.ReceiptId
                  && review.FrozenSourceSha = source.SourceSha ->
             Some ("review:" + review.ReceiptId)
         | _ -> None
 
-    let private integrationReceipt projectId (work: RecoveryWorkSnapshot) =
-        match work.Source, work.Integration with
-        | Some source, Some integration
-            when (reviewReceipt projectId work |> Option.isSome)
-                 && integration.ProjectId = projectId
+    let private integrationReceipt (project: RecoveryProjectSnapshot) (work: RecoveryWorkSnapshot) =
+        match work.Source, work.Review, work.Integration with
+        | Some source, Some review, Some integration
+            when (reviewReceipt project work |> Option.isSome)
+                 && integration.ProjectId = project.ProjectId
                  && integration.WorkId = work.WorkId
+                 && lineageMatches project work integration.OriginalLineage
                  && integration.CanonicallyVerified
                  && integration.ContainsSourceVerified
+                 && not (isNull (box integration.Authorization))
+                 && integration.Authorization.CanonicallyVerified
+                 && lineageMatches project work integration.Authorization.OriginalLineage
+                 && validId integration.Authorization.ReceiptId
+                 && integration.Authorization.SourceRepositoryId = source.RepositoryId
+                 && integration.Authorization.SourceRef = source.SourceRef
+                 && integration.Authorization.SourceReceiptId = source.ReceiptId
+                 && integration.Authorization.SourceSha = source.SourceSha
+                 && integration.Authorization.AcceptedReviewId = review.ReviewId
+                 && integration.Authorization.AcceptedReviewReceiptId = review.ReceiptId
+                 && integration.Authorization.TargetRef = integration.TargetRef
                  && validId integration.SubmissionId
                  && validId integration.ReceiptId
+                 && not (isNull integration.TargetRef)
                  && integration.TargetRef.StartsWith("refs/heads/", StringComparison.Ordinal)
                  && validSha integration.IntegratedSha
+                 && integration.SourceRepositoryId = source.RepositoryId
+                 && integration.SourceRef = source.SourceRef
+                 && integration.AcceptedReviewId = review.ReviewId
+                 && integration.AcceptedReviewReceiptId = review.ReceiptId
                  && integration.AcceptedSourceSha = source.SourceSha ->
             Some ("integration:" + integration.ReceiptId)
         | _ -> None
 
-    let private artifactRequirements projectId (work: RecoveryWorkSnapshot) =
-        let sourceOk = sourceReceipt projectId work |> Option.isSome
-        let reviewOk = reviewReceipt projectId work |> Option.isSome
-        let integrationOk = integrationReceipt projectId work |> Option.isSome
+    let private artifactRequirements (project: RecoveryProjectSnapshot) (work: RecoveryWorkSnapshot) =
+        let sourceOk = sourceReceipt project work |> Option.isSome
+        let reviewOk = reviewReceipt project work |> Option.isSome
+        let integrationOk = integrationReceipt project work |> Option.isSome
         let sourceRequired = work.Goal <> ArtifactGoal.Unchanged
         let reviewRequired = work.Goal = ArtifactGoal.AcceptedReview || work.Goal = ArtifactGoal.Integrated
         let integrationRequired = work.Goal = ArtifactGoal.Integrated
@@ -347,7 +418,7 @@ module WorkRecovery =
           if integrationRequired && work.Integration.IsNone then Requirement.VerifiedIntegrationRequired
           if integrationRequired && work.Integration.IsSome && not integrationOk then Requirement.InvalidIntegration ]
 
-    let private effectAssessment projectId (work: RecoveryWorkSnapshot) =
+    let private effectAssessment (project: RecoveryProjectSnapshot) (work: RecoveryWorkSnapshot) =
         let badDuplicates =
             work.Effects
             |> List.groupBy (fun effect -> effect.OperationId)
@@ -389,9 +460,9 @@ module WorkRecovery =
                         else
                             let matchesSource =
                                 match effect.Kind, effect.SourceSha, work.Source, work.Integration with
-                                | EffectKind.SourcePush, Some sha, Some source, _ -> sha = source.SourceSha && (sourceReceipt projectId work |> Option.isSome)
+                                | EffectKind.SourcePush, Some sha, Some source, _ -> sha = source.SourceSha && (sourceReceipt project work |> Option.isSome)
                                 | EffectKind.IntegrationPush, Some sha, _, Some integration ->
-                                    sha = integration.IntegratedSha && (integrationReceipt projectId work |> Option.isSome)
+                                    sha = integration.IntegratedSha && (integrationReceipt project work |> Option.isSome)
                                 | EffectKind.Launch, None, _, _
                                 | EffectKind.Claim, None, _, _ -> true
                                 | _ -> false
@@ -406,15 +477,178 @@ module WorkRecovery =
 
         ordered requirements, receipts
 
+    // Deterministic, length-prefixed binary transcript of the exact typed
+    // recovery evidence. Never use caller-defined receipt IDs as the identity
+    // of a proof: the same ID may accompany changed Git/ref/role/job payloads.
+    // Sort effect rows to preserve set semantics without losing duplicates.
+    // Exclude only Release itself to avoid a circular authorization digest.
+    let private evidenceFingerprint
+        (input: RecoveryInput)
+        (project: RecoveryProjectSnapshot)
+        (work: RecoveryWorkSnapshot)
+        (receipts: Set<string>) =
+        use stream = new MemoryStream()
+        use writer = new BinaryWriter(stream, Encoding.UTF8, true)
+        let writeString (value: string) =
+            writer.Write(not (isNull value))
+            if not (isNull value) then writer.Write(value)
+        let writeInt (value: int) = writer.Write(value)
+        let writeLong (value: int64) = writer.Write(value)
+        let writeBool (value: bool) = writer.Write(value)
+        let writeOption writeValue value =
+            match value with
+            | None -> writeBool false
+            | Some entry -> writeBool true; writeValue entry
+        let writeList writeValue (entries: 'a list) =
+            writeInt entries.Length
+            List.iter writeValue entries
+        let writeLineage (lineage: OriginalStageLineage) =
+            writeInt lineage.WorkVersion
+            writeInt lineage.Generation
+            writeInt lineage.ProjectGraphVersion
+            writeString lineage.RoleAuthoritySha
+        let writeStop status =
+            match status with
+            | StopFence.Active -> writeInt 0
+            | StopFence.Unknown -> writeInt 1
+            | StopFence.Cleared (receipt, version, verified) ->
+                writeInt 2
+                writeString receipt
+                writeInt version
+                writeBool verified
+        let writeGap (seal: SequenceGapSeal) =
+            writeString seal.ProjectId
+            writeLong seal.RestoredProjectSequence
+            writeLong seal.KnownPreviousProjectSequence
+            writeLong seal.CoveredThroughSequence
+            writeString seal.ReceiptId
+            writeBool seal.CanonicallyVerified
+            writeBool seal.WorkGraphCovered
+            writeBool seal.ExternalEffectsCovered
+        let writeAccountGap (seal: AccountGapSeal) =
+            writeLong seal.SnapshotDatabaseSequence
+            writeLong seal.KnownPreviousDatabaseSequence
+            writeLong seal.CoveredThroughDatabaseSequence
+            writeString seal.ReceiptId
+            writeBool seal.CanonicallyVerified
+            writeBool seal.ProjectSetCovered
+            writeBool seal.ExternalEffectsCovered
+        let writeSource (source: SourceProof) =
+            writeString source.ProjectId
+            writeString source.WorkId
+            writeString source.RepositoryId
+            writeString source.SourceRef
+            writeString source.SourceSha
+            writeLineage source.OriginalLineage
+            writeString source.ReceiptId
+            writeBool source.ReachabilityVerified
+        let writeReview (review: FrozenReviewProof) =
+            writeString review.ProjectId
+            writeString review.WorkId
+            writeString review.ReviewId
+            writeLineage review.OriginalLineage
+            writeString review.SourceRepositoryId
+            writeString review.SourceRef
+            writeString review.SourceReceiptId
+            writeString review.FrozenSourceSha
+            writeInt (match review.Verdict with
+                      | ReviewVerdict.Accepted -> 0
+                      | ReviewVerdict.ChangesRequested -> 1
+                      | ReviewVerdict.Rejected -> 2)
+            writeString review.ReceiptId
+            writeBool review.CanonicallyVerified
+        let writeIntegrationAuthorization (authorization: IntegrationAuthorizationProof) =
+            writeString authorization.ReceiptId
+            writeLineage authorization.OriginalLineage
+            writeString authorization.SourceRepositoryId
+            writeString authorization.SourceRef
+            writeString authorization.SourceReceiptId
+            writeString authorization.SourceSha
+            writeString authorization.AcceptedReviewId
+            writeString authorization.AcceptedReviewReceiptId
+            writeString authorization.TargetRef
+            writeBool authorization.CanonicallyVerified
+        let writeIntegration (integration: IntegrationProof) =
+            writeString integration.ProjectId
+            writeString integration.WorkId
+            writeString integration.SubmissionId
+            writeLineage integration.OriginalLineage
+            writeString integration.SourceRepositoryId
+            writeString integration.SourceRef
+            writeString integration.AcceptedReviewId
+            writeString integration.AcceptedReviewReceiptId
+            writeIntegrationAuthorization integration.Authorization
+            writeString integration.AcceptedSourceSha
+            writeString integration.TargetRef
+            writeString integration.IntegratedSha
+            writeString integration.ReceiptId
+            writeBool integration.ContainsSourceVerified
+            writeBool integration.CanonicallyVerified
+        let writeEffect (effect: ExternalEffect) =
+            writeString effect.OperationId
+            writeString effect.WorkId
+            writeInt effect.Generation
+            writeInt (match effect.Kind with
+                      | EffectKind.Launch -> 0
+                      | EffectKind.Claim -> 1
+                      | EffectKind.SourcePush -> 2
+                      | EffectKind.IntegrationPush -> 3)
+            writeOption writeString effect.SourceSha
+            match effect.Outcome with
+            | EffectOutcome.Unknown -> writeInt 0
+            | EffectOutcome.DefinitiveNoEffect (receipt, verified, reconciled) ->
+                writeInt 1
+                writeString receipt
+                writeBool verified
+                writeBool reconciled
+            | EffectOutcome.Observed (receipt, verified, reconciled, terminal) ->
+                writeInt 2
+                writeString receipt
+                writeBool verified
+                writeBool reconciled
+                writeBool terminal
+
+        // Version this encoding before adding or reordering any fields.
+        writeInt 1
+        writeInt input.SchemaVersion
+        writeLong input.SnapshotDatabaseSequence
+        writeOption writeLong input.KnownPreviousDatabaseSequence
+        writeBool input.CompleteProjectSetVerified
+        writeOption writeAccountGap input.AccountGapSeal
+        writeStop input.GlobalStop
+        writeString project.ProjectId
+        writeInt project.GraphVersion
+        writeLong project.RestoredSequence
+        writeOption writeLong project.KnownPreviousSequence
+        writeStop project.Stop
+        writeOption writeGap project.GapSeal
+        writeString work.WorkId
+        writeInt work.WorkVersion
+        writeInt work.Generation
+        writeString work.RoleAuthoritySha
+        writeInt (match work.Goal with
+                  | ArtifactGoal.Unchanged -> 0
+                  | ArtifactGoal.SourceProduced -> 1
+                  | ArtifactGoal.AcceptedReview -> 2
+                  | ArtifactGoal.Integrated -> 3)
+        writeBool work.CapturedInFlightLaunch
+        writeOption writeSource work.Source
+        writeOption writeReview work.Review
+        writeOption writeIntegration work.Integration
+        writeList writeEffect (work.Effects |> List.sort)
+        writeList writeString (receipts |> Set.toList)
+        writer.Flush()
+        SHA256.HashData(stream.ToArray()) |> Convert.ToHexString |> fun h -> h.ToLowerInvariant()
+
     let private assessWork
         (input: RecoveryInput)
         (globalRequirements: Requirement list)
         (project: RecoveryProjectSnapshot)
         (projectRequirements: Requirement list)
         (work: RecoveryWorkSnapshot) =
-        let effectRequirements, effectReceipts = effectAssessment project.ProjectId work
+        let effectRequirements, effectReceipts = effectAssessment project work
         let evidence =
-            [ sourceReceipt project.ProjectId work; reviewReceipt project.ProjectId work; integrationReceipt project.ProjectId work ]
+            [ sourceReceipt project work; reviewReceipt project work; integrationReceipt project work ]
             |> List.choose id
             |> Set.ofList
             |> Set.union effectReceipts
@@ -422,9 +656,11 @@ module WorkRecovery =
             |> Set.union (accountGapProof input |> Option.toList |> Set.ofList)
             |> Set.union (stopReceipts "account" input.GlobalStop)
             |> Set.union (stopReceipts ("project:" + project.ProjectId) project.Stop)
+        let evidenceDigest = evidenceFingerprint input project work evidence
         let prerequisites =
-            globalRequirements @ projectRequirements @ artifactRequirements project.ProjectId work @ effectRequirements
-            @ [ if work.WorkVersion <= 0 || work.Generation <= 0 then Requirement.InvalidWorkVersion ]
+            globalRequirements @ projectRequirements @ artifactRequirements project work @ effectRequirements
+            @ [ if work.WorkVersion <= 0 || work.Generation <= 0 then Requirement.InvalidWorkVersion
+                if not (validSha work.RoleAuthoritySha) then Requirement.InvalidRoleAuthority ]
             |> ordered
         let authorized =
             match project.KnownPreviousSequence, work.Release with
@@ -440,7 +676,9 @@ module WorkRecovery =
                      && release.ProjectGraphVersion = project.GraphVersion
                      && release.WorkVersion = work.WorkVersion
                      && release.Generation = work.Generation
-                     && release.EvidenceReceipts = evidence -> true
+                     && release.RoleAuthoritySha = work.RoleAuthoritySha
+                     && release.EvidenceReceipts = evidence
+                     && release.EvidenceDigest = evidenceDigest -> true
             | _ -> false
         let requirements =
             if prerequisites.IsEmpty && not authorized then
@@ -449,6 +687,7 @@ module WorkRecovery =
         { WorkId = work.WorkId
           Requirements = requirements
           EvidenceReceipts = evidence
+          EvidenceDigest = evidenceDigest
           ReleaseAuthorized = authorized
           NormalDispatchAllowed = authorized && work.Goal = ArtifactGoal.Unchanged }
 

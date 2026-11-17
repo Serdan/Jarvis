@@ -7,13 +7,19 @@ open Jarvis.WorkRecovery
 let private sha c = String.replicate 40 (string c)
 let private clear = StopFence.Cleared ("operator-cleared", 3, true)
 
+let private lineage =
+    { WorkVersion = 4
+      Generation = 2
+      ProjectGraphVersion = 3
+      RoleAuthoritySha = sha 'c' }
+
 let private source =
     { ProjectId = "alpha"
       WorkId = "W"
       RepositoryId = "repo:jarvis"
       SourceRef = "refs/heads/feature/recovery"
       SourceSha = sha 'a'
-      Generation = 2
+      OriginalLineage = lineage
       ReceiptId = "source-verified"
       ReachabilityVerified = true }
 
@@ -21,15 +27,37 @@ let private review =
     { ProjectId = "alpha"
       WorkId = "W"
       ReviewId = "frozen-r1"
+      OriginalLineage = lineage
+      SourceRepositoryId = source.RepositoryId
+      SourceRef = source.SourceRef
+      SourceReceiptId = source.ReceiptId
       FrozenSourceSha = source.SourceSha
       Verdict = ReviewVerdict.Accepted
       ReceiptId = "review-accepted"
+      CanonicallyVerified = true }
+
+let private integrationApproval =
+    { ReceiptId = "original-integration-approval"
+      OriginalLineage = lineage
+      SourceRepositoryId = source.RepositoryId
+      SourceRef = source.SourceRef
+      SourceReceiptId = source.ReceiptId
+      SourceSha = source.SourceSha
+      AcceptedReviewId = review.ReviewId
+      AcceptedReviewReceiptId = review.ReceiptId
+      TargetRef = "refs/heads/main"
       CanonicallyVerified = true }
 
 let private integration =
     { ProjectId = "alpha"
       WorkId = "W"
       SubmissionId = "submission-1"
+      OriginalLineage = lineage
+      SourceRepositoryId = source.RepositoryId
+      SourceRef = source.SourceRef
+      AcceptedReviewId = review.ReviewId
+      AcceptedReviewReceiptId = review.ReceiptId
+      Authorization = integrationApproval
       AcceptedSourceSha = source.SourceSha
       TargetRef = "refs/heads/main"
       IntegratedSha = sha 'b'
@@ -41,6 +69,7 @@ let private work id goal =
     { WorkId = id
       WorkVersion = 4
       Generation = 2
+      RoleAuthoritySha = lineage.RoleAuthoritySha
       Goal = goal
       CapturedInFlightLaunch = false
       Source = None
@@ -112,7 +141,9 @@ let private authorize input projectId workId =
           ProjectGraphVersion = originalProject.GraphVersion
           WorkVersion = originalWork.WorkVersion
           Generation = originalWork.Generation
-          EvidenceReceipts = pre.EvidenceReceipts }
+          RoleAuthoritySha = originalWork.RoleAuthoritySha
+          EvidenceReceipts = pre.EvidenceReceipts
+          EvidenceDigest = pre.EvidenceDigest }
     { input with
         Projects =
             input.Projects
@@ -383,3 +414,183 @@ let project_recovery_queue_identity_is_disjoint_from_adversarial_work_id () =
                 Is.EqualTo(2))
     Assert.That(result.RecoveryQueue |> List.exists (fun item -> item.WorkId.IsNone), Is.True)
     Assert.That(result.RecoveryQueue |> List.exists (fun item -> item.WorkId = Some "(project)"), Is.True)
+
+[<Test>]
+let historical_accepted_review_and_integration_cannot_cross_work_generation_or_role_graph_lineage () =
+    let current = { lineage with Generation = 3 }
+    let next =
+        { completed "W" with
+            Generation = 3
+            Source = Some { source with OriginalLineage = current } }
+    let stale = snapshot [ project "alpha" [ next ] ]
+    let denied = decision (authorize stale "alpha" "W") "alpha" "W"
+    has Requirement.InvalidFrozenReview denied.Requirements
+    has Requirement.InvalidIntegration denied.Requirements
+    Assert.That(denied.ReleaseAuthorized, Is.False)
+    let fresh =
+        { next with
+            Review = Some { review with OriginalLineage = current }
+            Integration =
+                Some { integration with
+                           OriginalLineage = current
+                           Authorization = { integrationApproval with OriginalLineage = current } } }
+    let approved = authorize (snapshot [ project "alpha" [ fresh ] ]) "alpha" "W"
+    Assert.That((decision approved "alpha" "W").ReleaseAuthorized, Is.True)
+
+    // Even with exactly the same source SHA, independent role/graph/version
+    // revisions require their own originally bound review and integration.
+    let changedRole = sha 'd'
+    let roleStage = { lineage with RoleAuthoritySha = changedRole }
+    let roleChanged =
+        { completed "W" with
+            RoleAuthoritySha = changedRole
+            Source = Some { source with OriginalLineage = roleStage } }
+    let deniedRole = decision (snapshot [ project "alpha" [ roleChanged ] ]) "alpha" "W"
+    has Requirement.InvalidFrozenReview deniedRole.Requirements
+    has Requirement.InvalidIntegration deniedRole.Requirements
+
+    let graphStage = { lineage with ProjectGraphVersion = 4 }
+    let graphChanged =
+        { project "alpha" [ { completed "W" with Source = Some { source with OriginalLineage = graphStage } } ] with
+            GraphVersion = 4 }
+    let deniedGraph = decision (snapshot [ graphChanged ]) "alpha" "W"
+    has Requirement.InvalidFrozenReview deniedGraph.Requirements
+    has Requirement.InvalidIntegration deniedGraph.Requirements
+
+    let versionStage = { lineage with WorkVersion = 5 }
+    let versionChanged =
+        { completed "W" with
+            WorkVersion = 5
+            Source = Some { source with OriginalLineage = versionStage } }
+    let deniedVersion = decision (snapshot [ project "alpha" [ versionChanged ] ]) "alpha" "W"
+    has Requirement.InvalidFrozenReview deniedVersion.Requirements
+    has Requirement.InvalidIntegration deniedVersion.Requirements
+
+[<Test>]
+let integration_requires_original_verified_authorization_and_exact_accepted_review_receipt () =
+    for stale in
+        [ { integration with AcceptedReviewId = "earlier-review" }
+          { integration with AcceptedReviewReceiptId = "earlier-review-receipt" }
+          { integration with Authorization = { integrationApproval with ReceiptId = "" } }
+          { integration with Authorization = { integrationApproval with CanonicallyVerified = false } }
+          { integration with Authorization = { integrationApproval with OriginalLineage = { lineage with Generation = 1 } } }
+          { integration with Authorization = { integrationApproval with AcceptedReviewReceiptId = "old-review" } }
+          { integration with Authorization = { integrationApproval with SourceSha = sha 'd' } }
+          { integration with SourceRepositoryId = "other-repo" }
+          { integration with SourceRef = "refs/heads/other" } ] do
+        let candidate = { completed "W" with Integration = Some stale }
+        has Requirement.InvalidIntegration (decision (snapshot [ project "alpha" [ candidate ] ]) "alpha" "W").Requirements
+
+[<Test>]
+let same_receipt_ids_cannot_preserve_release_after_source_or_integration_payload_changes () =
+    let produced = { work "W" ArtifactGoal.SourceProduced with Source = Some source }
+    let approvedSource = authorize (snapshot [ project "alpha" [ produced ] ]) "alpha" "W"
+    Assert.That((decision approvedSource "alpha" "W").ReleaseAuthorized, Is.True)
+    for modified in
+        [ { source with SourceSha = sha 'f' }
+          { source with RepositoryId = "repo:another" }
+          { source with SourceRef = "refs/heads/other" } ] do
+        let currentProject = approvedSource.Projects.Head
+        let currentWork = currentProject.Works.Head
+        let changed =
+            { approvedSource with
+                Projects = [ { currentProject with Works = [ { currentWork with Source = Some modified } ] } ] }
+        let pending = decision changed "alpha" "W"
+        Assert.That(pending.EvidenceReceipts, Is.EqualTo(box ((decision approvedSource "alpha" "W").EvidenceReceipts)))
+        Assert.That(pending.Requirements, Is.EqualTo(box [ Requirement.RecoveryAuthorizationRequired ]))
+        Assert.That(pending.ReleaseAuthorized, Is.False)
+        let renewed = authorize changed "alpha" "W"
+        Assert.That((decision renewed "alpha" "W").ReleaseAuthorized, Is.True)
+
+    let approvedIntegration = authorize (snapshot [ project "alpha" [ completed "W" ] ]) "alpha" "W"
+    let original = approvedIntegration.Projects.Head.Works.Head
+    for modified in
+        [ { integration with IntegratedSha = sha 'e' }
+          { integration with TargetRef = "refs/heads/release"
+                             Authorization = { integrationApproval with TargetRef = "refs/heads/release" } }
+          { integration with SubmissionId = "submission-2" } ] do
+        let altered =
+            { approvedIntegration with
+                Projects =
+                    [ { approvedIntegration.Projects.Head with
+                          Works = [ { original with Integration = Some modified } ] } ] }
+        let pending = decision altered "alpha" "W"
+        Assert.That(pending.EvidenceReceipts, Is.EqualTo(box ((decision approvedIntegration "alpha" "W").EvidenceReceipts)))
+        Assert.That(pending.Requirements, Is.EqualTo(box [ Requirement.RecoveryAuthorizationRequired ]))
+        Assert.That(pending.ReleaseAuthorized, Is.False)
+
+    // Review identity also participates even when the accepted-review and
+    // integration receipt IDs, source SHA and Work generation stay unchanged.
+    let newReview = { review with ReviewId = "new-review" }
+    let pairedIntegration =
+        { integration with
+            AcceptedReviewId = newReview.ReviewId
+            Authorization = { integrationApproval with AcceptedReviewId = newReview.ReviewId } }
+    let reviewChanged =
+        { approvedIntegration with
+            Projects =
+                [ { approvedIntegration.Projects.Head with
+                      Works =
+                          [ { original with
+                                Review = Some newReview
+                                Integration = Some pairedIntegration } ] } ] }
+    let pendingReview = decision reviewChanged "alpha" "W"
+    Assert.That(pendingReview.Requirements, Is.EqualTo(box [ Requirement.RecoveryAuthorizationRequired ]))
+    Assert.That(pendingReview.ReleaseAuthorized, Is.False)
+
+[<Test>]
+let unchanged_seal_receipt_and_external_effect_receipt_cannot_hide_changed_payload () =
+    let approved = authorize (snapshot [ project "alpha" [ work "W" ArtifactGoal.Unchanged ] ]) "alpha" "W"
+    let currentProject = approved.Projects.Head
+    let broadenedSeal =
+        { currentProject with
+            GapSeal = Some { sealedGap with CoveredThroughSequence = 9L } }
+    let candidate = { approved with Projects = [ broadenedSeal ] }
+    Assert.That((decision candidate "alpha" "W").Requirements,
+                Is.EqualTo(box [ Requirement.RecoveryAuthorizationRequired ]))
+    Assert.That((decision candidate "alpha" "W").EvidenceReceipts,
+                Is.EqualTo(box ((decision approved "alpha" "W").EvidenceReceipts)))
+    let accountChanged =
+        { approved with AccountGapSeal = Some { accountSeal with CoveredThroughDatabaseSequence = 13L } }
+    Assert.That((decision accountChanged "alpha" "W").Requirements,
+                Is.EqualTo(box [ Requirement.RecoveryAuthorizationRequired ]))
+
+    let push =
+        { OperationId = "source-push"
+          WorkId = "W"
+          Generation = 2
+          Kind = EffectKind.SourcePush
+          SourceSha = Some source.SourceSha
+          Outcome = EffectOutcome.Observed ("observed", true, true, true) }
+    let produced = { work "W" ArtifactGoal.SourceProduced with Source = Some source; Effects = [ push ] }
+    let approvedPush = authorize (snapshot [ project "alpha" [ produced ] ]) "alpha" "W"
+    Assert.That((decision approvedPush "alpha" "W").ReleaseAuthorized, Is.True)
+    let updatedPush = { push with Outcome = EffectOutcome.Observed ("observed", true, true, false) }
+    let modifiedWork = { approvedPush.Projects.Head.Works.Head with Effects = [ updatedPush ] }
+    let changed =
+        { approvedPush with
+            Projects = [ { approvedPush.Projects.Head with Works = [ modifiedWork ] } ] }
+    Assert.That((decision changed "alpha" "W").EvidenceReceipts,
+                Is.EqualTo(box ((decision approvedPush "alpha" "W").EvidenceReceipts)))
+    Assert.That((decision changed "alpha" "W").Requirements,
+                Is.EqualTo(box [ Requirement.RecoveryAuthorizationRequired ]))
+
+[<Test>]
+let evidence_fingerprint_is_order_invariant_but_tracks_all_effect_rows () =
+    let effect id =
+        { OperationId = id
+          WorkId = "W"
+          Generation = 2
+          Kind = EffectKind.Launch
+          SourceSha = None
+          Outcome = EffectOutcome.DefinitiveNoEffect ("terminal-" + id, true, true) }
+    let item = { work "W" ArtifactGoal.Unchanged with Effects = [ effect "b"; effect "a" ] }
+    let approved = authorize (snapshot [ project "alpha" [ item ] ]) "alpha" "W"
+    let shuffled =
+        { approved with
+            Projects = [ { approved.Projects.Head with
+                              Works = [ { approved.Projects.Head.Works.Head with Effects = [ effect "a"; effect "b" ] } ] } ] }
+    let before = decision approved "alpha" "W"
+    let after = decision shuffled "alpha" "W"
+    Assert.That(after.EvidenceDigest, Is.EqualTo(before.EvidenceDigest))
+    Assert.That(after.ReleaseAuthorized, Is.True)

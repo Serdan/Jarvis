@@ -355,19 +355,56 @@ let prewarm root =
     | _ -> ()
 
 
-// Fast negative gate before any Git worktree discovery: a checked-out
-// repository cannot launch Roslyn unless its exact root was operator-approved
-// and has an enabled built-in hook. This reads config only; it never executes
-// untrusted project code or treats main-checkout approval as sibling approval.
-let hasApprovedPrewarmCandidate () =
+// Resolve a checkout's common Git directory using only its local metadata.
+// This is a fast *negative* gate, not an authorization to prewarm: the later
+// registered-branch selector and exact-checkout approval are still mandatory.
+let private commonGitDirectory (root: string) =
+    try
+        let dotGit = Path.Combine(Path.GetFullPath root, ".git")
+        let canonical path = Path.TrimEndingDirectorySeparator(Path.GetFullPath path)
+        if Directory.Exists dotGit && DirectoryInfo(dotGit).LinkTarget = null then
+            Some(canonical dotGit)
+        elif File.Exists dotGit && FileInfo(dotGit).LinkTarget = null
+             && FileInfo(dotGit).Length <= 4096L then
+            let directive = File.ReadLines(dotGit) |> Seq.tryHead |> Option.defaultValue ""
+            if not (directive.StartsWith("gitdir:", StringComparison.OrdinalIgnoreCase)) then None
+            else
+                let relativeGitDir = directive.Substring("gitdir:".Length).Trim()
+                if String.IsNullOrWhiteSpace relativeGitDir then None
+                else
+                    let gitDir = Path.GetFullPath(Path.Combine(Path.GetDirectoryName dotGit, relativeGitDir))
+                    let commonFile = Path.Combine(gitDir, "commondir")
+                    if not (File.Exists commonFile) || FileInfo(commonFile).LinkTarget <> null
+                       || FileInfo(commonFile).Length > 4096L then None
+                    else
+                        let relativeCommon = File.ReadAllText(commonFile).Trim()
+                        if String.IsNullOrWhiteSpace relativeCommon then None
+                        else Some(canonical (Path.Combine(gitDir, relativeCommon)))
+        else None
+    with _ -> None
+
+// Fast *project-scoped* negative gate before Git worktree enumeration. A
+// hooked checkout approved for project A must never cause Git subprocesses
+// when project B's AgentInbox is read. An approved main checkout is not
+// sufficient: inbox source selection requires a distinct registered worktree.
+let hasApprovedPrewarmCandidate (mainRoot: string) =
     let raw = Environment.GetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS")
-    if String.IsNullOrWhiteSpace raw then false
-    else
+    match commonGitDirectory mainRoot with
+    | None -> false
+    | Some _ when String.IsNullOrWhiteSpace raw -> false
+    | Some common ->
+        let comparison =
+            if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase
+            else StringComparison.Ordinal
+        let canonicalMain = Path.TrimEndingDirectorySeparator(Path.GetFullPath mainRoot)
         raw.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
         |> Array.exists (fun item ->
             try
                 let approved = Path.TrimEndingDirectorySeparator(Path.GetFullPath(item.Trim()))
-                match load approved with
-                | Ok hooks -> hooks |> List.exists (fun hook -> hook.Adapter = "roslyn-format")
-                | Error _ -> false
+                if String.Equals(canonicalMain, approved, comparison) then false
+                elif not (String.Equals(defaultArg (commonGitDirectory approved) "", common, comparison)) then false
+                else
+                    match load approved with
+                    | Ok hooks -> hooks |> List.exists (fun hook -> hook.Adapter = "roslyn-format")
+                    | Error _ -> false
             with _ -> false)

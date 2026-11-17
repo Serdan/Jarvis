@@ -112,9 +112,13 @@ initialization. Background discovery resolves the focused attempt's exact
 source branch to one non-main Git-registered worktree and validates its selector.
 Unknown or ambiguous source refs never select main, and may retry on a later
 inbox read. In-flight discovery and successful prewarm are deduplicated by
-project, agent, attempt, generation and source ref. If no operator-approved
-checkout has an enabled Roslyn hook, the background prewarm short-circuits
-before any Git subprocess. Initialization otherwise occurs on the first matching
+project, agent, attempt, generation and source ref. Before Git enumeration,
+a filesystem-only gate matches an enabled, operator-approved checkout's Git
+common directory to the *selected project's* main Git directory. Approval of
+another project's hooked worktree or of the main checkout alone does not
+authorize discovery, let alone a Roslyn process. The later exact registered
+source-ref selector and checkout-specific approval remain mandatory; missing
+metadata fails closed. Initialization otherwise occurs on the first matching
 hook. Sessions are cleaned up on Git worktree removal and JarvisClient shutdown.
 Missing/unapproved hooks do not launch a server.
 
@@ -164,6 +168,17 @@ passed **58/58, zero skips**, with JARVIS_ROSLYN_LSP_DLL set to the installed
 official Roslyn 5.13.0-1.26514.10 DLL (exit 0; 4 seconds). Without that
 explicit DLL path, the combined filter passed 56 and skipped two live tests.
 The full client suite and Wayfold-specific acceptance measurements remain open.
+
+
+
+The follow-up mixed-project negative-gate correction is isolated to the reviewed
+feature branch. Its .NET 11 Release focused `CodeQualityHooksTests|SignalRDispatchTests`
+filter passed **18, skipped 1, failed 0**; the skipped live Roslyn recovery
+case requires `JARVIS_ROSLYN_LSP_DLL`. The test models two independent Git
+common-directory identities and confirms that a hooked, approved project A
+cannot make project B eligible for background discovery. This is **not** a
+production TaskRead-to-inbox integration benchmark, nor does it resolve the
+unfiltered-suite or Wayfold-specific acceptance gates.
 
 ## Suggested validation
 

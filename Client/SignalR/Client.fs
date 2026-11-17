@@ -830,8 +830,20 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
                                         string focus.Attempt.AssignmentGeneration; focus.Attempt.SourceRef ]
                 let dispatcher = inboxPrewarmDispatchers.GetValue(rt, fun _ -> InboxPrewarmDispatcher())
                 dispatcher.TrySchedule(key, fun () ->
-                    if CodeQualityHooks.hasApprovedPrewarmCandidate () then
-                        prewarmFromInbox rt cmd.ProjectName inbox
+                    // Resolve only the main project's configured path here.
+                    // A registered selector would itself run Git discovery
+                    // before the negative approval gate.
+                    let candidate =
+                        match ProjectPaths.ProjectTarget.parse cmd.ProjectName with
+                        | Error _ -> false
+                        | Ok target ->
+                            let mainProject = ProjectPaths.ProjectTarget.projectName target
+                            match ProjectPaths.resolveProjectContext mainProject rt with
+                            | Error _ -> false
+                            | Ok context ->
+                                let (Client.FolderPath mainRoot) = ProjectPaths.ResolvedProject.mainRoot context
+                                CodeQualityHooks.hasApprovedPrewarmCandidate mainRoot
+                    if candidate then prewarmFromInbox rt cmd.ProjectName inbox
                     else true) |> ignore
             | _ -> ()
         | _ -> ()

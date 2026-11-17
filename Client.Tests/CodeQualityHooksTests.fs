@@ -183,18 +183,59 @@ let ``Roslyn session recovers after unavailable server and explicit checkout dis
             Environment.SetEnvironmentVariable("JARVIS_ROSLYN_LSP_DLL", installed))
 
 
+// Model the filesystem Git metadata layout without invoking Git or creating
+// a repository: this fast-negative gate must never enumerate worktrees.
+let private linkedWorktree mainRoot name =
+    let gitAdmin = Path.Combine(mainRoot, ".git", "worktrees", name)
+    let checkout = Path.Combine(Path.GetDirectoryName mainRoot, name)
+    Directory.CreateDirectory(gitAdmin) |> ignore
+    Directory.CreateDirectory(checkout) |> ignore
+    File.WriteAllText(Path.Combine(gitAdmin, "commondir"), "../..\n")
+    File.WriteAllText(Path.Combine(checkout, ".git"), "gitdir: " + gitAdmin + "\n")
+    checkout
+
 [<Test; NonParallelizable>]
 let ``inbox prewarm avoids Git discovery for unapproved and no-hook roots`` () =
     withTempRoot (fun root ->
+        let main = Path.Combine(root, "main")
+        let checkout = linkedWorktree main "worker"
         let previous = Environment.GetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS")
         try
-            Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", root)
-            hasApprovedPrewarmCandidate () |> shouldEqual false
-            config root """{"codeQuality":{"hooks":[{"enabled":false,"name":"format","adapter":"roslyn-format","trigger":"after-write"}]}}"""
-            hasApprovedPrewarmCandidate () |> shouldEqual false
-            config root """{"codeQuality":{"hooks":[{"enabled":true,"name":"format","adapter":"roslyn-format","trigger":"after-write"}]}}"""
-            hasApprovedPrewarmCandidate () |> shouldEqual true
-            Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", root + "-unapproved")
-            hasApprovedPrewarmCandidate () |> shouldEqual false
+            Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", checkout)
+            hasApprovedPrewarmCandidate main |> shouldEqual false
+            config checkout """{"codeQuality":{"hooks":[{"enabled":false,"name":"format","adapter":"roslyn-format","trigger":"after-write"}]}}"""
+            hasApprovedPrewarmCandidate main |> shouldEqual false
+            config checkout """{"codeQuality":{"hooks":[{"enabled":true,"name":"format","adapter":"roslyn-format","trigger":"after-write"}]}}"""
+            hasApprovedPrewarmCandidate main |> shouldEqual true
+            Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", main)
+            hasApprovedPrewarmCandidate main |> shouldEqual false
+            Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", checkout + "-unapproved")
+            hasApprovedPrewarmCandidate main |> shouldEqual false
+        finally
+            Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", previous))
+
+[<Test; NonParallelizable>]
+let ``approved hooks from another project cannot prewarm this project's inbox`` () =
+    withTempRoot (fun root ->
+        let aMain = Path.Combine(root, "main-a")
+        let bMain = Path.Combine(root, "main-b")
+        let aCheckout = linkedWorktree aMain "a-worktree"
+        let bCheckout = linkedWorktree bMain "b-worktree"
+        let enabled = """{"codeQuality":{"hooks":[{"enabled":true,"name":"format","adapter":"roslyn-format","trigger":"after-write"}]}}"""
+        config aCheckout enabled
+        let previous = Environment.GetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS")
+        try
+            Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", aCheckout)
+            hasApprovedPrewarmCandidate aMain |> shouldEqual true
+            hasApprovedPrewarmCandidate bMain |> shouldEqual false
+            // Even an unapproved enabled hook in B must not use A's approval.
+            config bCheckout enabled
+            hasApprovedPrewarmCandidate bMain |> shouldEqual false
+            // An explicitly approved and hooked B checkout becomes eligible.
+            Environment.SetEnvironmentVariable(
+                "JARVIS_APPROVED_CODE_QUALITY_ROOTS",
+                aCheckout + string Path.PathSeparator + bCheckout)
+            hasApprovedPrewarmCandidate bMain |> shouldEqual true
+            hasApprovedPrewarmCandidate aMain |> shouldEqual true
         finally
             Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", previous))

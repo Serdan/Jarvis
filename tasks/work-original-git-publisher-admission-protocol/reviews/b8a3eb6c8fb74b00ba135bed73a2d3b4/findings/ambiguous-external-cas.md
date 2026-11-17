@@ -1,0 +1,9 @@
+# P1b: ambiguous remote errors incorrectly become durable stale rejections
+
+**Severity: blocking for P1b hermetic gateway correctness.** Frozen source `656c1c347dfb86053b2f6fd76a2e04ae71e0c951`; new code only, no production cutover decision.
+
+At `Server.Tests/OriginalGitPublisherGatewayTests.fs:308-315`, the bare-Git fixture's `ExactRemoteCas` maps **every nonzero** `git update-ref` exit to `StaleRemoteHead`, without proving the returned failure is an old-OID conflict or that the remote ref was not changed. At `Server/OriginalGitPublisherExecutor.fs:161-165`, any `Error StaleRemoteHead` from the external mutation is immediately persisted as `RejectedStale` (`Server/OriginalGitPublisherStore.fs:197-203`), without a remote readback. This is a false terminal outcome for an ambiguous mutation-boundary error, not an independently established stale CAS.
+
+A deterministic negative test can make the injected remote advance its head and then return `Error StaleRemoteHead` (the fixture contract does not require a no-effect proof). The current executor records `RejectedStale` rather than `Unknown` / `RecoveryHold`, and a subsequent fixture barrier can continue as though the effect had been resolved. This breaches the accepted P1a §4/§5 external-effect uncertainty rule and the P1b task's non-replayable unknown-effect journal requirement. The existing test only covers a thrown post-write exception, which *does* become `Unknown`; it misses the typed-error case.
+
+**Required correction:** classify a definite `StaleRemoteHead` only after independently proving the CAS did not publish, or make every unverifiable post-attempt error `Unknown` with durable `RecoveryHold`. Do not assume arbitrary Git nonzero exit proves a stale-head conflict. Add the typed-error-after-effect regression and verify a barrier cannot be positively released while that outcome is unresolved. No live-remote experiment is authorized.

@@ -145,6 +145,10 @@ staged content stayed excluded. It also covered advisory versus blocking
 pre-commit failures and recovery after a broken Roslyn entrypoint and session
 disposal. These checks do not establish full acceptance.
 
+An unfiltered Release client-suite rerun timed out after 240 seconds without
+a verdict, with activity-persistence UnauthorizedAccessException and
+InvalidDataException diagnostics. Do not claim an unfiltered-suite pass.
+
 ## Suggested validation
 
 Run the code-quality NUnit tests, Git selection tests, the full Jarvis client suite,

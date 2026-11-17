@@ -7,6 +7,7 @@ open System.Text.RegularExpressions
 open System.Security.Cryptography
 open FsToolkit.ErrorHandling
 open Client.LedgerStore
+open Client.LegacyDirectWriterFence
 open Client.RoleInstructions
 
 [<CLIMutable>]
@@ -888,7 +889,7 @@ module ReviewWorkflow =
            || not (validTaskHtml html) then
             Error(InvalidBinding "Invalid task ID, title or canonical HTML specification.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor "CreateTask"
                     {| taskId = taskId; title = title; specSha256 = specDigest html |})
                 (fun snapshot ->
@@ -919,7 +920,7 @@ module ReviewWorkflow =
            || not (validText 512 title) || not (validTaskHtml html) then
             Error(InvalidBinding "Invalid task spec revision.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor
                     (if String.IsNullOrWhiteSpace expectedSpecBlobOid then "ReviseTaskSpec" else "ReviseTaskSpecPinned")
                     {| taskId = taskId; expectedTaskVersion = expectedTaskVersion
@@ -964,7 +965,7 @@ module ReviewWorkflow =
                && original.BlobOid <> expectedSourceBlobOid) then
             Error(InvalidBinding "Import requires safe pinned HTML, task/spec versions and source identity.")
         else
-                LedgerStore.transact binding
+                LegacyDirectWriterFence.transact binding
                     (intent operationId actor "ImportTaskSpec"
                         {| taskId = taskId; expectedTaskVersion = expectedTaskVersion
                            expectedSpecBlobOid = expectedSpecBlobOid; expectedSourceBlobOid = original.BlobOid
@@ -1031,7 +1032,7 @@ module ReviewWorkflow =
            || String.IsNullOrWhiteSpace expectedCurrentSpecOid then
             Error(InvalidBinding "Spec adoption requires pinned canonical blob, exact versions and instructions.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor "AdoptTaskSpec"
                     {| taskId = taskId; ownerId = ownerId
                        expectedTaskVersion = expectedTaskVersion
@@ -1235,7 +1236,7 @@ module ReviewWorkflow =
                             {| taskId = taskId; submissionId = submissionId
                                sourceRef = sourceRef; submittedCommit = submittedCommit
                                reviewId = reviewId; targetRef = targetRef |}
-            match LedgerStore.findApplied binding action with
+            match LegacyDirectWriterFence.findAppliedForLegacyWrite binding action with
             | Error failure -> Error failure
             | Ok(Some applied) -> Ok applied
             | Ok None -> result {
@@ -1270,9 +1271,10 @@ module ReviewWorkflow =
                 // fast-forward of this snapshot. Such work needs a new review.
                 do! LedgerStore.verifySourceAncestry binding targetHead pinned
                 let managedRef = $"refs/heads/jarvis-integration/{submissionId:N}"
+                do! LegacyDirectWriterFence.preflightSourcePublication binding
                 do! LedgerStore.publishIntegrationRef binding managedRef pinned
                 do! LedgerStore.fetchIntegrationRef binding managedRef pinned
-                return! LedgerStore.transact binding action (fun current -> result {
+                return! LegacyDirectWriterFence.transact binding action (fun current -> result {
                     let! _ = required<ReviewTask> binding current (taskPath taskId)
                     let! _ = required<ReviewAgent> binding current (agentPath actorId)
                     let! latestReview, _ = required<BranchReview> binding current path
@@ -1308,7 +1310,7 @@ module ReviewWorkflow =
             let action = intent operationId actorId "CompleteIntegration"
                            {| taskId = taskId; submissionId = submissionId
                               integratedCommit = integratedCommit |}
-            match LedgerStore.findApplied binding action with
+            match LegacyDirectWriterFence.findAppliedForLegacyWrite binding action with
             | Error failure -> Error failure
             | Ok(Some applied) -> Ok applied
             | Ok None -> result {
@@ -1334,7 +1336,7 @@ module ReviewWorkflow =
                             currentRecord.TargetHeadAtSubmission currentRecord.SubmittedCommit
                 do! LedgerStore.verifyIntegrationOnRemote binding currentRecord.TargetRef
                         currentRecord.SubmittedCommit integratedCommit
-                return! LedgerStore.transact binding action (fun current -> result {
+                return! LegacyDirectWriterFence.transact binding action (fun current -> result {
                     let! _ = required<ReviewAgent> binding current (agentPath actorId)
                     let! existing, oid = required<IntegrationSubmission> binding current path
                     if existing.Status <> "Pending" then
@@ -1394,7 +1396,7 @@ module ReviewWorkflow =
             Error(InvalidBinding "Invalid sender block or autoreply.")
         else
             let source = Option.get source
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actorId "SetNotificationSenderBlock"
                     {| recipientId = recipientId; senderProject = source; senderId = senderId
                        blocked = blocked; autoReply = autoReply |})
@@ -1426,7 +1428,7 @@ module ReviewWorkflow =
              || (not muted && autoReply <> "") then
             Error(InvalidBinding "Invalid notification mute or autoreply.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actorId "SetNotificationMute"
                     {| recipientId = recipientId; muted = muted; autoReply = autoReply |})
                 (fun snapshot -> result {
@@ -1470,7 +1472,7 @@ module ReviewWorkflow =
         else
             let fromProjectName = Option.get source
             // Operation ID is also the stable notification ID: retries cannot duplicate messages.
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId fromAgentId "NotifyAgent"
                     {| toAgentId = toAgentId; fromProjectName = fromProjectName; taskId = taskId; message = message |})
                 (fun snapshot -> result {
@@ -1555,7 +1557,7 @@ module ReviewWorkflow =
         if not (validAgent targetAgentId) || not (validText 1536 message) then
             Error(InvalidBinding "Invalid alert target or message (maximum 1536 UTF-8 bytes).")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actorId "QueueResponseAlert"
                     {| targetAgentId = targetAgentId; message = message |})
                 (fun snapshot -> result {
@@ -1577,7 +1579,7 @@ module ReviewWorkflow =
         if not (validAgent targetAgentId) || alertId = Guid.Empty then
             Error(InvalidBinding "Invalid alert target or alert ID.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actorId "ClearResponseAlert"
                     {| targetAgentId = targetAgentId; alertId = alertId.ToString("N") |})
                 (fun snapshot -> result {
@@ -1602,7 +1604,7 @@ module ReviewWorkflow =
                 // response is lost afterward, the one-shot alert is lost too.
                 // On a failed CAS, do not deliver stale or replaced messages.
                 let! _ =
-                    LedgerStore.transact binding
+                    LegacyDirectWriterFence.transact binding
                         (intent (Guid.NewGuid()) agentId "DeliverResponseAlerts"
                             {| agentId = agentId; version = queued.Version |})
                         (fun latest -> result {
@@ -1618,7 +1620,7 @@ module ReviewWorkflow =
         if not (validAgent agentId) || notificationId = Guid.Empty then
             Error(InvalidBinding "Invalid notification acknowledgement.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId agentId "AcknowledgeNotification"
                     {| notificationId = notificationId; agentId = agentId |})
                 (fun snapshot -> result {
@@ -1654,7 +1656,7 @@ module ReviewWorkflow =
     let registerAgentAs binding actor operationId agentId =
         if not (validAgent agentId) then Error(InvalidBinding "Invalid agent ID.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor "RegisterAgent" {| agentId = agentId |})
                 (fun snapshot ->
                     result {
@@ -1680,7 +1682,7 @@ module ReviewWorkflow =
         if not (validAgent agentId) || expectedAgentVersion < 1 || not (validText 2048 activity) then
             Error(InvalidBinding "Starting taskless work requires a registered agent, exact version and activity.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId agentId "StartTasklessWork"
                     {| agentId = agentId; expectedAgentVersion = expectedAgentVersion; activity = activity |})
                 (fun snapshot -> result {
@@ -1701,7 +1703,7 @@ module ReviewWorkflow =
         if not (validAgent agentId) || expectedAgentVersion < 1 || not (validText 2048 summary) then
             Error(InvalidBinding "Yielding taskless work requires an exact agent version and summary.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId agentId "YieldTasklessWork"
                     {| agentId = agentId; expectedAgentVersion = expectedAgentVersion; summary = summary |})
                 (fun snapshot -> result {
@@ -1724,7 +1726,7 @@ module ReviewWorkflow =
            || String.IsNullOrWhiteSpace actor then
             Error(InvalidBinding "Recovery requires an authenticated actor, an exact agent version and a reason.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor "RecoverTasklessWork"
                     {| agentId = agentId; expectedAgentVersion = expectedAgentVersion
                        reason = reason |})
@@ -1747,7 +1749,7 @@ module ReviewWorkflow =
             Error(InvalidBinding "Invalid task assignment.")
         else
             let attemptIdText = attemptId.ToString("N")
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor "AssignTask"
                     {| taskId = taskId; attemptId = attemptId; ownerId = ownerId |})
                 (fun snapshot ->
@@ -1795,7 +1797,7 @@ module ReviewWorkflow =
            || expectedAttemptVersion < 1 || generation < 1 then
             Error(InvalidBinding "Invalid assignment acknowledgment.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId ownerId "AcknowledgeAssignment"
                     {| taskId = taskId; ownerId = ownerId
                        expectedVersion = expectedAttemptVersion; generation = generation |})
@@ -1863,7 +1865,7 @@ module ReviewWorkflow =
         if not (validTaskId taskId) || not (validAgent ownerId) || expectedVersion < 1 || generation < 1 then
             Error(InvalidBinding "Invalid BeginAttempt request.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId ownerId "BeginAttempt"
                     {| taskId = taskId; ownerId = ownerId; expectedVersion = expectedVersion; generation = generation |})
                 (fun snapshot ->
@@ -1918,7 +1920,7 @@ module ReviewWorkflow =
            || not (validText 8192 summary) || not (validText 8192 nextAction) then
             Error(InvalidBinding "Yield requires current versions and a substantive checkpoint/next action.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId ownerId "YieldAgent"
                     {| taskId = taskId; ownerId = ownerId
                        expectedAttemptVersion = expectedAttemptVersion
@@ -1995,7 +1997,7 @@ module ReviewWorkflow =
            || expectedAttemptVersion < 0 || expectedAgentVersion < 0 || generation < 0 then
             Error(InvalidBinding "Invalid ResumeAgent version or generation.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId ownerId "ResumeAgent"
                     {| taskId = taskId; ownerId = ownerId
                        expectedAttemptVersion = expectedAttemptVersion
@@ -2102,7 +2104,7 @@ module ReviewWorkflow =
            || not (validText 8192 summary) then
             Error(InvalidBinding "Completion requires a summary and exact assignment versions.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId ownerId "CompleteAgentWork"
                     {| taskId = taskId; ownerId = ownerId
                        expectedAttemptVersion = expectedAttemptVersion
@@ -2181,7 +2183,7 @@ module ReviewWorkflow =
                                    generation summary nextAction sourceCommit evidence with
         | Some error -> Error error
         | None ->
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId ownerId "CheckpointAttempt"
                     {| taskId = taskId; ownerId = ownerId; expectedAttemptVersion = expectedAttemptVersion
                        expectedAgentVersion = expectedAgentVersion; generation = generation
@@ -2244,7 +2246,7 @@ module ReviewWorkflow =
         if not (validAgent agentId) || expectedAgentVersion < 1 || not (validText 2048 reason) then
             Error(InvalidBinding "Parking requires an agent version and reason.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor "ParkAgent"
                     {| agentId = agentId; expectedAgentVersion = expectedAgentVersion
                        reason = reason |})
@@ -2274,7 +2276,7 @@ module ReviewWorkflow =
              || expectedAgentVersion < 1 || not (validText 2048 reason) then
             Error(InvalidBinding "Administrative state must be NeedsWork or Parked with an exact agent version and reason.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor "SetAgentState"
                     {| agentId = agentId; targetState = targetState
                        expectedAgentVersion = expectedAgentVersion; reason = reason |})
@@ -2320,7 +2322,7 @@ module ReviewWorkflow =
            || sourceRef.StartsWith("refs/heads/jarvis-review/", StringComparison.Ordinal) then
             Error(InvalidBinding "Invalid source repository/ref binding.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId ownerId "BindAttemptSource"
                     {| taskId = taskId; ownerId = ownerId; expectedVersion = expectedVersion
                        generation = generation; sourceRef = sourceRef; baseOid = baseOid
@@ -2367,7 +2369,7 @@ module ReviewWorkflow =
            || sourceRef.StartsWith("refs/heads/jarvis-review/", StringComparison.Ordinal) then
             Error(InvalidBinding "Invalid replacement source ref.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId ownerId "RebindAttemptSource"
                     {| taskId = taskId; ownerId = ownerId; expectedVersion = expectedVersion
                        generation = generation; sourceRef = sourceRef |})
@@ -2400,7 +2402,7 @@ module ReviewWorkflow =
         if not (validTaskId taskId) || not (validAgent ownerId) || not (validBranch targetRef) then
             Error(InvalidBinding "Invalid source baseline binding.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId ownerId "BindReviewBase"
                     {| taskId = taskId; ownerId = ownerId; expectedVersion = expectedVersion
                        generation = generation; baseOid = baseOid; targetRef = targetRef |})
@@ -2443,7 +2445,7 @@ module ReviewWorkflow =
            || not (validText 2048 reason) then
             Error(InvalidBinding "Reissue requires versions, generation and a reason.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor "ReissueQueuedAttempt"
                     {| taskId = taskId; ownerId = ownerId
                        expectedAttemptVersion = expectedAttemptVersion
@@ -2488,7 +2490,7 @@ module ReviewWorkflow =
            || (not (String.IsNullOrEmpty newSpecHtml) && not (validTaskHtml newSpecHtml)) then
             Error(InvalidBinding "Explicit reissue requires current versions, instructions and safe optional HTML.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor "ReissueAssignment"
                     {| taskId = taskId; ownerId = ownerId
                        expectedAttemptVersion = expectedAttemptVersion
@@ -2557,7 +2559,7 @@ module ReviewWorkflow =
            || not (validText 2048 reason) then
             Error(InvalidBinding "Recovery requires exact versions and an explicit reason.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor "RecoverAgentAssignment"
                     {| taskId = taskId; ownerId = ownerId
                        expectedAttemptVersion = expectedAttemptVersion
@@ -2656,7 +2658,7 @@ module ReviewWorkflow =
            || not (validText 2048 reason) then
             Error(InvalidBinding "Administrative Working-to-Ready correction requires exact identities, versions, generation and reason.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor "CorrectAgentWorkingState"
                     {| requestingAgentId = requestingAgentId; targetAgentId = targetAgentId
                        taskId = taskId; attemptId = attemptId
@@ -2742,7 +2744,7 @@ module ReviewWorkflow =
            || not (List.contains action [ "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask" ]) then
             Error(InvalidBinding "Invalid administrative task/attempt transition.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor action
                     {| taskId = taskId; expectedTaskVersion = expectedTaskVersion
                        expectedAttemptVersion = expectedAttemptVersion
@@ -2834,7 +2836,7 @@ module ReviewWorkflow =
         if not (validTaskId taskId) || expectedTaskVersion < 1 || not (validText 2048 reason) then
             Error(InvalidBinding "Open-task cancellation requires exact task version and reason.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor "CancelTask"
                     {| taskId = taskId; expectedTaskVersion = expectedTaskVersion; reason = reason |})
                 (fun snapshot -> result {
@@ -2862,7 +2864,7 @@ module ReviewWorkflow =
             Error(InvalidBinding "Owner transfer requires a registered new owner, new attempt and exact versions.")
         else
             let newId = newAttemptId.ToString("N")
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor "TransferOwner"
                     {| taskId = taskId; newAttemptId = newAttemptId; newOwner = newOwner
                        expectedTaskVersion = expectedTaskVersion
@@ -2932,7 +2934,7 @@ module ReviewWorkflow =
            || not (validText 2048 reason) then
             Error(InvalidBinding "Reopen requires terminal task version and explanation.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor "ReopenTask"
                     {| taskId = taskId; expectedTaskVersion = expectedTaskVersion; reason = reason |})
                 (fun snapshot -> result {
@@ -3054,7 +3056,7 @@ module ReviewWorkflow =
         else
             let id = requestId.ToString("N")
             let expected = if String.IsNullOrWhiteSpace expectedBlobOid then None else Some expectedBlobOid
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actorId "PutReviewDocument"
                     {| taskId = taskId; requestId = id; documentPath = documentPath
                        expectedBlobOid = expectedBlobOid; contentSha256 = specDigest content |})
@@ -3381,7 +3383,7 @@ module ReviewWorkflow =
                             {| taskId = taskId; reviewId = id; ownerId = requesterId
                                sourceRef = sourceRef; sourceHead = sourceHead; summary = summary
                                kind = purpose; targetRef = targetRef |}
-            match LedgerStore.findApplied binding action with
+            match LegacyDirectWriterFence.findAppliedForLegacyWrite binding action with
             | Error failure -> Error failure
             | Ok(Some applied) -> Ok applied
             | Ok None -> result {
@@ -3396,8 +3398,9 @@ module ReviewWorkflow =
                 let! existing = read<BranchReview> binding snapshot (branchReviewPath taskId id)
                 if existing.IsSome then
                     return! Error(StaleEntityVersion "Review ID already exists.")
+                do! LegacyDirectWriterFence.preflightSourcePublication binding
                 do! LedgerStore.publishReviewRef binding refName sourceHead
-                let writeResult = LedgerStore.transact binding action (fun current -> result {
+                let writeResult = LegacyDirectWriterFence.transact binding action (fun current -> result {
                     let! existing = read<BranchReview> binding current (branchReviewPath taskId id)
                     if existing.IsSome then
                         return! Error(StaleEntityVersion "Review ID already exists.")
@@ -3431,7 +3434,7 @@ module ReviewWorkflow =
                             {| taskId = taskId; reviewId = id; requesterId = requesterId
                                expectedVersion = expectedVersion
                                sourceRef = sourceRef; sourceHead = sourceHead; summary = summary |}
-            match LedgerStore.findApplied binding action with
+            match LegacyDirectWriterFence.findAppliedForLegacyWrite binding action with
             | Error failure -> Error failure
             | Ok(Some applied) -> Ok applied
             | Ok None -> result {
@@ -3446,9 +3449,10 @@ module ReviewWorkflow =
                     if String.IsNullOrWhiteSpace existing.TargetRef then Ok sourceHead
                     else LedgerStore.reviewMergeBase binding existing.TargetRef sourceHead
                 do! LedgerStore.verifySourceObject binding sourceHead
+                do! LegacyDirectWriterFence.preflightSourcePublication binding
                 do! LedgerStore.publishReviewRef binding refName sourceHead
                 let writeResult =
-                    LedgerStore.transact binding action (fun current -> result {
+                    LegacyDirectWriterFence.transact binding action (fun current -> result {
                         let! review, reviewOid =
                             required<BranchReview> binding current (branchReviewPath taskId id)
                         if review.Version <> expectedVersion || review.Status <> "Unclaimed" then
@@ -3472,7 +3476,7 @@ module ReviewWorkflow =
            || expectedVersion < 1 then Error(InvalidBinding "Invalid review claim.")
         else
             let id = reviewId.ToString("N")
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId reviewerId "ClaimBranchReview"
                     {| taskId = taskId; reviewId = id; reviewerId = reviewerId
                        expectedVersion = expectedVersion |})
@@ -3491,7 +3495,7 @@ module ReviewWorkflow =
         else
             let status = match verdict with Accept -> "Accepted" | RequestChanges -> "ChangesRequested"
             let id = reviewId.ToString("N")
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId reviewerId "DecideBranchReview"
                     {| taskId = taskId; reviewId = id; reviewerId = reviewerId
                        expectedVersion = expectedVersion; status = status |})
@@ -3510,7 +3514,7 @@ module ReviewWorkflow =
         if not (validTaskId taskId) || not (validAgent ownerId) || decisionSequence < 1L then
             Error(InvalidBinding "Invalid review acknowledgement.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId ownerId "AcknowledgeBranchReview"
                     {| taskId = taskId; ownerId = ownerId; decisionSequence = decisionSequence |})
                 (fun snapshot -> result {
@@ -3533,7 +3537,7 @@ module ReviewWorkflow =
             Error(InvalidBinding "Invalid review claim release.")
         else
             let id = reviewId.ToString("N")
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actorId "ReleaseBranchReview"
                     {| taskId = taskId; reviewId = id; actorId = actorId
                        expectedVersion = expectedVersion |})
@@ -3551,7 +3555,7 @@ module ReviewWorkflow =
            || expectedVersion < 1 then Error(InvalidBinding "Invalid review withdrawal.")
         else
             let id = reviewId.ToString("N")
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actorId "WithdrawBranchReview"
                     {| taskId = taskId; reviewId = id; actorId = actorId
                        expectedVersion = expectedVersion |})
@@ -3587,7 +3591,7 @@ module ReviewWorkflow =
         if not (validTaskId taskId) || expectedTaskVersion < 1 then
             Error(InvalidBinding "Invalid task closure.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor "CloseTask"
                     {| taskId = taskId; expectedTaskVersion = expectedTaskVersion |})
                 (fun snapshot -> result {

@@ -169,16 +169,30 @@ type WorkBackupGitCheckoutSink(checkoutPath: string, remote: string, branch: str
                 | Ok validatedSequence when validatedSequence = sequence -> ()
                 | _ -> invalidOp "Git backup input failed strict format and sequence verification"
                 // Bind to the operator-configured dedicated checkout. Refuse a
-                // dirty checkout to avoid capturing unrelated or private data.
+                // dirty checkout except for byte-identical files prepared by
+                // an interrupted publication of this exact sequence.
                 let! headBranch = git [ "symbolic-ref"; "--quiet"; "--short"; "HEAD" ] cancellationToken
                 if headBranch <> branch then invalidOp "Git backup checkout branch changed"
-                let! status = git [ "status"; "--porcelain" ] cancellationToken
-                if status <> "" then invalidOp "Git backup checkout has unrelated changes"
+                let name = "s-" + sequence.ToString("D20", Globalization.CultureInfo.InvariantCulture)
+                let relative = $"snapshots/{name}"
+                let allowedFiles =
+                    set [ $"{relative}/manifest.json"; $"{relative}/authority.json" ]
+                let! status = git [ "status"; "--porcelain"; "--untracked-files=all" ] cancellationToken
+                if status <> "" then
+                    let permitted (line: string) =
+                        // Interrupted materialization can leave these exact
+                        // untracked or staged additions. Other dirty paths,
+                        // renames, edits and deletions remain forbidden.
+                        (line.StartsWith("?? ", StringComparison.Ordinal)
+                         || line.StartsWith("A  ", StringComparison.Ordinal))
+                        && allowedFiles.Contains(line.Substring(3).TrimEnd('\r'))
+                    if not (status.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                            |> Array.forall permitted) then
+                        invalidOp "Git backup checkout has unrelated changes"
                 let root = Path.Combine(checkoutPath, "snapshots")
                 Directory.CreateDirectory root |> ignore
                 if File.GetAttributes(root).HasFlag(FileAttributes.ReparsePoint) then
                     invalidOp "Symlinked Git backup snapshot directory forbidden"
-                let name = "s-" + sequence.ToString("D20", Globalization.CultureInfo.InvariantCulture)
                 let destination = Path.Combine(root, name)
                 let staging = Path.Combine(root, ".staging-" + Guid.NewGuid().ToString("N"))
                 try
@@ -204,15 +218,16 @@ type WorkBackupGitCheckoutSink(checkoutPath: string, remote: string, branch: str
                                 invalidOp "Unexpected Git backup artifact path"
                             File.WriteAllBytes(Path.Combine(staging, path), bytes)
                         Directory.Move(staging, destination)
-                    let relative = $"snapshots/{name}"
                     let! _ = git [ "add"; "--"; relative ] cancellationToken
                     // A prior commit may have succeeded when push failed.
-                    // A clean retry only pushes the existing exact head.
-                    let! staged = git [ "diff"; "--cached"; "--name-only" ] cancellationToken
+                    // A clean retry only pushes the exact existing head.
+                    // Never commit unrelated files staged by another process.
+                    let! staged = git [ "diff"; "--cached"; "--name-only"; "--"; relative ] cancellationToken
                     if staged <> "" then
                         let! _ = git [ "-c"; "user.name=Jarvis Work Backup";
                                       "-c"; "user.email=work-backup@localhost";
-                                      "commit"; "-m"; $"work-backup: sequence {sequence}" ] cancellationToken
+                                      "commit"; "--only"; "-m"; $"work-backup: sequence {sequence}";
+                                      "--"; relative ] cancellationToken
                         ()
                     let! _ = git [ "push"; remote; $"HEAD:refs/heads/{branch}" ] cancellationToken
                     return ()

@@ -314,6 +314,84 @@ let dedicated_git_checkout_publishes_only_backup_artifacts_and_replays_idempoten
     )
 
 
+// A crash after the files were materialized (or partially staged) but before
+// commit must be retryable without ever adopting an unrelated dirty checkout.
+[<Test>]
+let git_sink_recovers_exact_precommit_files_but_refuses_unrelated_dirty_changes () =
+    fixture (fun authority original target ->
+        seed authority |> ignore
+        let parent = Path.GetDirectoryName(target)
+        let bare = Path.Combine(parent, "retry-bare.git")
+        let checkout = Path.Combine(parent, "retry-checkout")
+        Directory.CreateDirectory checkout |> ignore
+        runLocalGit parent [ "init"; "--bare"; bare ] |> ignore
+        runLocalGit checkout [ "init"; "-b"; "backups" ] |> ignore
+        runLocalGit checkout [ "-c"; "user.name=Test"; "-c"; "user.email=test@localhost";
+                               "commit"; "--allow-empty"; "-m"; "initial" ] |> ignore
+        runLocalGit checkout [ "remote"; "add"; "origin"; bare ] |> ignore
+
+        let sink = WorkBackupGitCheckoutSink(checkout, "origin", "backups")
+        let outbox = WorkBackupOutbox(original, target + ".spool", sink)
+        outbox.Capture() |> ok |> ignore
+        let bundle = WorkSqliteBackup.exportSnapshot original |> ok
+        let path = "snapshots/s-00000000000000000002"
+        let destination = Path.Combine(checkout, "snapshots", "s-00000000000000000002")
+        Directory.CreateDirectory destination |> ignore
+        for KeyValue(name, bytes) in bundle.Files do
+            File.WriteAllBytes(Path.Combine(destination, name), bytes)
+        // Simulate a crash with one file already added and the other untracked.
+        runLocalGit checkout [ "add"; "--"; path + "/authority.json" ] |> ignore
+
+        let unrelated = Path.Combine(checkout, "private-unrelated.txt")
+        File.WriteAllText(unrelated, "must not be included in Git backup")
+        fail (outbox.PublishPendingAsync(CancellationToken.None).GetAwaiter().GetResult())
+        Assert.That(outbox.PendingSequences() |> ok, Is.EqualTo(box [ 2L ]))
+        File.Delete unrelated
+
+        let published = outbox.PublishPendingAsync(CancellationToken.None).GetAwaiter().GetResult() |> ok
+        Assert.That(published, Is.EqualTo(box [ 2L ]))
+        let changed = runLocalGit checkout [ "show"; "--format="; "--name-only"; "HEAD" ]
+        Assert.That(changed, Does.Contain(path + "/authority.json"))
+        Assert.That(changed, Does.Contain(path + "/manifest.json"))
+        Assert.That(changed, Does.Not.Contain("private-unrelated.txt"))
+        Assert.That(runLocalGit checkout [ "status"; "--porcelain" ], Is.Empty)
+        let localHead = runLocalGit checkout [ "rev-parse"; "HEAD" ]
+        let remoteHead = runLocalGit parent [ "--git-dir"; bare; "rev-parse"; "refs/heads/backups" ]
+        Assert.That(remoteHead, Is.EqualTo localHead)
+    )
+
+[<Test>]
+let git_sink_retries_push_failure_without_recommitting_local_snapshot () =
+    fixture (fun authority original target ->
+        seed authority |> ignore
+        let parent = Path.GetDirectoryName(target)
+        let bare = Path.Combine(parent, "late-remote.git")
+        let unreachable = Path.Combine(parent, "missing-remote.git")
+        let checkout = Path.Combine(parent, "push-retry-checkout")
+        Directory.CreateDirectory checkout |> ignore
+        runLocalGit parent [ "init"; "--bare"; bare ] |> ignore
+        runLocalGit checkout [ "init"; "-b"; "backups" ] |> ignore
+        runLocalGit checkout [ "-c"; "user.name=Test"; "-c"; "user.email=test@localhost";
+                               "commit"; "--allow-empty"; "-m"; "initial" ] |> ignore
+        runLocalGit checkout [ "remote"; "add"; "origin"; unreachable ] |> ignore
+
+        let sink = WorkBackupGitCheckoutSink(checkout, "origin", "backups")
+        let outbox = WorkBackupOutbox(original, target + ".spool", sink)
+        outbox.Capture() |> ok |> ignore
+        fail (outbox.PublishPendingAsync(CancellationToken.None).GetAwaiter().GetResult())
+        Assert.That(outbox.PendingSequences() |> ok, Is.EqualTo(box [ 2L ]))
+        let committed = runLocalGit checkout [ "rev-parse"; "HEAD" ]
+        Assert.That(runLocalGit checkout [ "status"; "--porcelain" ], Is.Empty)
+
+        runLocalGit checkout [ "remote"; "set-url"; "origin"; bare ] |> ignore
+        let published = outbox.PublishPendingAsync(CancellationToken.None).GetAwaiter().GetResult() |> ok
+        Assert.That(published, Is.EqualTo(box [ 2L ]))
+        Assert.That(outbox.PendingSequences() |> ok, Is.Empty)
+        Assert.That(runLocalGit checkout [ "rev-parse"; "HEAD" ], Is.EqualTo committed)
+        let remoteHead = runLocalGit parent [ "--git-dir"; bare; "rev-parse"; "refs/heads/backups" ]
+        Assert.That(remoteHead, Is.EqualTo committed)
+    )
+
 [<Test>]
 let deleting_highest_sequence_rows_does_not_rewind_restore_audit_high_water () =
     fixture (fun authority original target ->

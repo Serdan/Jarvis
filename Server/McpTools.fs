@@ -2474,7 +2474,7 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "Run project script in a new browser tab", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute","workspace:read"]}]""");
-      Description("Create a new tab in a registered browser window, run a project .js file, and optionally close it. Never retries uncertain page effects.")>]
+      Description("Create a new tab in a registered browser window, run a project .js file, and optionally close it. projectName MUST be the initiating agent's actual project: it controls both script lookup and activity attribution. To launch another project's agent, use that project's verified local script copy and its actual agentId; never select a foreign project merely to reuse a script. Never retries uncertain page effects.")>]
     static member BrowserRunInNewTab(windowRegistration: string, url: string, projectName: string, agentId: string,
                                       [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, scriptPath: string,
                                       [<Optional; DefaultParameterValue("")>] argsJson: string,

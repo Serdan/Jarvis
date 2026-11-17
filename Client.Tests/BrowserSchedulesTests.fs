@@ -689,3 +689,70 @@ let missingCrossDeviceActivityProofBlocksBothClientsAndRestartedIdleSchedules ()
     finally
         Directory.Delete(dir, true)
 }
+
+[<Test>]
+let crossProjectBrowserLaunchUsesExplicitProjectForCallerActivity () =
+    // Browser JavaScript and prompt text do not authenticate an agent.
+    // A copied project-local script must be launched with its actual project.
+    let launch project =
+        BrowserRunInNewTabCommand
+            { WindowRegistration = "agents"; Url = "https://chatgpt.com/"
+              ProjectName = project; ScriptPath = "browser-scripts/chatgpt/launchAgent.js"
+              ArgsJson = Some """{"prompt":"You are Manager in the other project"}"""
+              Active = Some false; CloseTabAfterExecution = Some true
+              TimeoutMs = Some 27000 }
+    let favn = launch "Favn::favn-manager-browser-bridge"
+    let jarvis = launch "Jarvis"
+    Assert.That(AgentCommandInfo.projectName favn,
+                Is.EqualTo(Some "Favn::favn-manager-browser-bridge"))
+    Assert.That(AgentCommandInfo.projectName jarvis, Is.EqualTo(Some "Jarvis"))
+    Assert.That(AgentCommandInfo.isAgentActivity favn, Is.True)
+    Assert.That(AgentCommandInfo.isAgentActivity jarvis, Is.True)
+    // A script/prompt reused from Jarvis must not substitute for Favn caller identity.
+    Assert.That(AgentCommandInfo.projectName favn, Is.Not.EqualTo(AgentCommandInfo.projectName jarvis))
+
+[<Test>]
+let sameNamedManagersAcrossProjectsHaveIndependentIdleDeadlines () = task {
+    let dir,path = temp()
+    let mutable clock = DateTimeOffset.UtcNow
+    let createdAt = clock
+    // Both managers must have trustworthy last activity; an unknown watermark
+    // intentionally fails closed and must not be mistaken for an idle agent.
+    let mutable jarvisSeen: DateTimeOffset option = Some createdAt
+    let mutable favnSeen: DateTimeOffset option = Some createdAt
+    let executed = System.Collections.Concurrent.ConcurrentQueue<string>()
+    let observed project agent =
+        if agent <> "Manager" then None
+        elif project = "Favn" then favnSeen
+        elif project = "Jarvis" then jarvisSeen
+        else None
+    let executor (action: BrowserSchedules.ScheduledAction) = task {
+        executed.Enqueue(action.ProjectName)
+        return Ok "completed"
+    }
+    try
+        use store = new BrowserSchedules.Service(path, executor, now=(fun () -> clock), pollMs=25,
+                                                 agentLastSeen=observed,
+                                                 verifyIdleActivity=(fun p a -> Task.FromResult(Ok(observed p a))))
+        let schedule project id =
+            { commandSchedule id "AfterAgentIdle" with
+                ProjectName = project; RunAfterSeconds = None
+                IdleAgentId = Some "Manager"; IdleSeconds = Some 600 }
+        Assert.That(store.ScheduleExecution(schedule "Jarvis" "jarvis-manager").IsOk, Is.True)
+        Assert.That(store.ScheduleExecution(schedule "Favn" "favn-manager").IsOk, Is.True)
+        store.Start()
+        clock <- createdAt.AddSeconds(550.)
+        favnSeen <- Some clock
+        clock <- createdAt.AddSeconds(601.)
+        do! awaitStatus (fun () -> status store "jarvis-manager" = "waitingActivity" &&
+                                   getDue store "favn-manager" >= createdAt.AddSeconds(1150.))
+        Assert.That(executed.ToArray() = [| "Jarvis" |], Is.True,
+                    "Favn activity must not reset Jarvis Manager or launch Favn prematurely")
+        Assert.That(status store "favn-manager", Is.EqualTo("pending"))
+        clock <- createdAt.AddSeconds(1151.)
+        do! awaitStatus (fun () -> status store "favn-manager" = "waitingActivity")
+        Assert.That(executed.ToArray() = [| "Jarvis"; "Favn" |], Is.True,
+                    "Distinct project/agent keys must dispatch independently")
+    finally
+        Directory.Delete(dir, true)
+}

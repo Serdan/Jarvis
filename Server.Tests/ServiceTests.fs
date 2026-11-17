@@ -2400,16 +2400,20 @@ let attributed_tool_dispatch_survives_missing_sqlite_and_notifies_only_user_devi
             users.Register(user,
                 { DeviceId = device; DeviceName = device
                   ProtocolVersion = AgentProtocol.version; ClientVersion = "test"
-                  SupportedCommands = [ "RunCommand"; "ListJobs" ] }, connection)
+                  SupportedCommands = [ "RunCommand"; "ListJobs"; "BrowserRunInNewTab" ] }, connection)
         registrations[connection] <- receipt.Generation
     register "alice" "desktop" "desktop-connection"
     register "alice" "laptop" "laptop-connection"
     register "bob" "foreign" "foreign-connection"
     let tracker = ClientResponseTracker()
     let mutable deliveredCommands = 0
+    let mutable uncertainBrowserReply = false
     let received = System.Collections.Concurrent.ConcurrentQueue<string * string * string * DateTimeOffset>()
     let expected = { Result = Some "ok"; Error = None; Instructions = []
                      AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+    let uncertain = { expected with Result = None;
+                                   Error = Some(UncertainOutcome { Message = "Synthetic uncertain browser reply"
+                                                                   OperationId = None }) }
     let recipient connection =
         { new Common.SignalR.IClientService with
             member _.ReceiveMessage(_) = Task.CompletedTask
@@ -2418,7 +2422,8 @@ let attributed_tool_dispatch_survives_missing_sqlite_and_notifies_only_user_devi
             member _.ReceiveManualGrantApproval(_, _, _) = Task.CompletedTask
             member _.ReceiveCommand(correlationId, _, _) =
                 System.Threading.Interlocked.Increment(&deliveredCommands) |> ignore
-                tracker.Complete(correlationId, "alice", connection, registrations[connection], expected)
+                tracker.Complete(correlationId, "alice", connection, registrations[connection],
+                                 if uncertainBrowserReply then uncertain else expected)
                 |> ignore
                 Task.CompletedTask
             member _.InvalidateAgentStates(_, _) = Task.CompletedTask
@@ -2465,10 +2470,65 @@ let attributed_tool_dispatch_survives_missing_sqlite_and_notifies_only_user_devi
         Assert.That(project, Is.EqualTo("Jarvis"))
         Assert.That(agent, Is.EqualTo("Manager"))
         Assert.That(timestamp, Is.GreaterThan(DateTimeOffset.UtcNow.AddMinutes(-1.)))
+    // The actual browser dispatch path (not just command metadata) must
+    // attribute same-named actors to their selected source project. A Favn
+    // registered worktree normalizes to Favn, never Jarvis, even when the
+    // script prompt mentions Jarvis. These are synthetic SignalR commands:
+    // no browser tab or external prompt is executed.
+    let browser project prompt =
+        BrowserRunInNewTabCommand
+            { WindowRegistration = "agents"; Url = "https://chatgpt.com/"
+              ProjectName = project
+              ScriptPath = "browser-scripts/chatgpt/launchAgent.js"
+              ArgsJson = Some prompt; Active = Some false
+              CloseTabAfterExecution = Some true; TimeoutMs = Some 27000 }
+    let sendBrowser project prompt =
+        // Separate instances avoid coupling the test to optional best-effort
+        // hint batch scheduling on a single ClientService instance.
+        let scoped = ClientService(hub, users, tracker, accessor,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
+        scoped.SendCommandToUser("alice", browser project prompt,
+                                 deviceId = "desktop", agentId = "Manager")
+    let! foreign = sendBrowser "Favn::favn-manager-browser-bridge" """{"prompt":"You are Jarvis Manager"}"""
+    Assert.That(foreign.Result, Is.EqualTo(Some "ok"))
+    let foreignDeadline = System.Diagnostics.Stopwatch.StartNew()
+    while received.Count < 4 && foreignDeadline.Elapsed < TimeSpan.FromSeconds(2.) do
+        do! Task.Delay(10)
+    Assert.That(received.Count, Is.EqualTo(4))
+    let! sameProject = sendBrowser "Jarvis" """{"prompt":"You are Favn Manager"}"""
+    Assert.That(sameProject.Result, Is.EqualTo(Some "ok"))
+    let sameDeadline = System.Diagnostics.Stopwatch.StartNew()
+    while received.Count < 6 && sameDeadline.Elapsed < TimeSpan.FromSeconds(2.) do
+        do! Task.Delay(10)
+    let browserHints = received.ToArray()
+    Assert.That(browserHints.Length, Is.EqualTo(6))
+    Assert.That(browserHints |> Array.filter (fun (_, p, a, _) -> p = "Favn" && a = "Manager")
+                             |> Array.length, Is.EqualTo(2))
+    Assert.That(browserHints |> Array.filter (fun (_, p, a, _) -> p = "Jarvis" && a = "Manager")
+                             |> Array.length, Is.EqualTo(4))
+    Assert.That(browserHints |> Array.forall (fun (connection, _, _, _) ->
+                    connection <> "foreign-connection"), Is.True)
+    // An ambiguous Favn browser reply is not a successful browser execution
+    // receipt. It must not be retried automatically or produce Jarvis hints.
+    let beforeUncertain = deliveredCommands
+    uncertainBrowserReply <- true
+    let! ambiguous = sendBrowser "Favn::favn-manager-browser-bridge" """{"prompt":"Jarvis Manager"}"""
+    uncertainBrowserReply <- false
+    Assert.That(AgentStateEvidence.isUnknown ambiguous, Is.True)
+    Assert.That(deliveredCommands, Is.EqualTo(beforeUncertain + 1))
+    let uncertainDeadline = System.Diagnostics.Stopwatch.StartNew()
+    while received.Count < 8 && uncertainDeadline.Elapsed < TimeSpan.FromSeconds(2.) do
+        do! Task.Delay(10)
+    let allHints = received.ToArray()
+    Assert.That(allHints.Length, Is.EqualTo(8))
+    Assert.That(allHints |> Array.filter (fun (_, p, a, _) -> p = "Favn" && a = "Manager")
+                         |> Array.length, Is.EqualTo(4))
+    Assert.That(allHints |> Array.filter (fun (_, p, a, _) -> p = "Jarvis" && a = "Manager")
+                         |> Array.length, Is.EqualTo(4))
     let poll = ListJobsCommand { ProjectName = Some "Jarvis"; IncludeCompleted = true }
     let! result2 = service.SendCommandToUser("alice", poll, deviceId = "desktop", agentId = "Manager")
     Assert.That(result2.Result, Is.EqualTo(Some "ok"))
-    Assert.That(received.Count, Is.EqualTo(2), "Job polling must not reset Manager idle clock")
+    Assert.That(received.Count, Is.EqualTo(8), "Job polling must not reset Manager idle clock")
     // Missing or corrupt SQLite is irrelevant to tool dispatch; simulated
     // server service replacement retains in-memory session routing here.
     let beforeRestart = deliveredCommands

@@ -604,3 +604,228 @@ let already_claimed_launch_replays_from_fresh_reopened_sqlite_state () =
         | Error(SqliteSchedulerError.Incomplete _) -> ()
         | result -> Assert.Fail(sprintf "Fresh claim succeeded on previously claimed launch: %A" result)
     )
+
+
+// E1a tests use disposable two-project SQLite state and exact C1-style origin
+// records. They deliberately do not construct a production old-writer fence.
+let private importJournalEvidence (store: WorkSqliteAuthority)
+                                  (projects: (SqliteSchedulerProject * string) list) =
+    let accountHead = String.replicate 40 "c"
+    let projectHead = String.replicate 40 "d"
+    let sourceHead = String.replicate 40 "e"
+    let fenceBody = JsonObject()
+    setString fenceBody "Mode" "offline-only"
+    fenceBody["FenceVersion"] <- JsonValue.Create(1L)
+    setString fenceBody "FenceOperationId" (Guid.NewGuid().ToString("D"))
+    setString fenceBody "AccountHead" accountHead
+    let heads = JsonArray()
+    for p, _ in projects do
+        let head = JsonObject()
+        setString head "ProjectId" p.Id
+        setString head "Head" projectHead
+        heads.Add(head)
+    fenceBody["ProjectHeads"] <- heads
+    let fence =
+        record "shared" WorkSqliteRecordKind.Project "legacy-import-fence"
+               fenceBody 0 0 0 0 0
+    let fenceValue =
+        { fence.Value with
+            SourceSha = Some accountHead
+            ExternalEffect = WorkSqliteEffect.Prepared }
+    let fence = { fence with Value = fenceValue }
+    let sourceRows =
+        [ for p, sha in projects do
+            let legacyBody = JsonObject()
+            setString legacyBody "kind" "verified-offline-import"
+            let legacy = record p.Id WorkSqliteRecordKind.Project
+                                "legacy-queue" legacyBody p.Graph.Version 0 0 0 0
+            yield { legacy with Value = { legacy.Value with SourceSha = Some projectHead } }
+            for KeyValue(workId, work) in p.Queue.Works do
+                let origin = JsonObject()
+                setString origin "WorkId" workId
+                setString origin "RepositoryId" ("repo-" + p.Id)
+                setString origin "SourceRef" ("refs/heads/feature-" + p.Id)
+                setString origin "SourceCommit" sha
+                setString origin "SourceHead" sourceHead
+                setString origin "RoleId" "worker"
+                setInt origin "RoleVersion" 1
+                setInt origin "StageGeneration" work.StageGeneration
+                setInt origin "GraphVersion" p.Graph.Version
+                setBool origin "SourceAncestryVerified" true
+                let row = record p.Id WorkSqliteRecordKind.Work
+                                 ("origin/" + workId) origin p.Graph.Version
+                                 work.StageGeneration 0 0 1
+                yield { row with Value = { row.Value with SourceSha = Some sha } } ]
+    store.Commit
+        { OperationId = Guid.NewGuid()
+          Guards = []
+          Records = (fence :: sourceRows)
+                    |> List.map (fun row ->
+                        { Key = row.Key; ExpectedVersion = None; Value = row.Value })
+          Capacities = [] } |> ok |> ignore
+
+let private dispatchProject id sha =
+    let p =
+        makeProject id (root id)
+            [ stage id ("work-" + id) "implementation" 1L WorkState.Available Set.empty ]
+            [ "worker", Set.singleton "implementation" ] [] []
+    let records =
+        p.StageRecords
+        |> Map.map (fun _ row ->
+            let value = { row.Value with SourceSha = Some sha }
+            { row with Value = value })
+    { p with StageRecords = records }
+
+[<Test>]
+let e1a_two_project_prepared_unknown_crash_replay_keeps_account_credit_and_refuses_transport () =
+    withStore (fun store path ->
+        let a = dispatchProject "alpha" (String.replicate 40 "a")
+        let b = dispatchProject "beta" (String.replicate 40 "b")
+        let snapshot = seed store 1 0 [ a; b ]
+        importJournalEvidence store [ a, String.replicate 40 "a"; b, String.replicate 40 "b" ]
+        let reservationId = Guid.NewGuid()
+        let reserved = WorkSchedulerSqlite.reserve store snapshot reservationId "launch-alpha" |> ok
+        Assert.That(reserved.ProjectId, Is.EqualTo "alpha")
+        Assert.That((store.ReadCapacity "shared" |> ok |> Option.get).Reserved, Is.EqualTo 1)
+        let prepareId = Guid.NewGuid()
+        let first =
+            WorkSchedulerSqliteDispatch.prepare store "shared" "alpha" "launch-alpha" prepareId |> ok
+        Assert.That(first.Effect, Is.EqualTo WorkSqliteEffect.Prepared)
+        Assert.That(first.Receipt.Value.Replayed, Is.False)
+        Assert.That(first.SourceRef, Is.EqualTo "refs/heads/feature-alpha")
+        Assert.That(first.SourceSha, Is.EqualTo(String.replicate 40 "a"))
+        Assert.That(first.ReservationOperationId, Is.EqualTo reservationId)
+        Assert.That(first.RoleId, Is.EqualTo "worker")
+        Assert.That(first.StageGeneration, Is.EqualTo 1L)
+        match WorkSchedulerSqliteDispatch.refuseExternalDispatch first with
+        | Error SqliteSchedulerDispatchError.UnverifiedWriterFence -> ()
+        | other -> Assert.Fail(sprintf "E1a must never authorize provider dispatch: %A" other)
+        let reopened = WorkSqliteAuthority(path)
+        let replay =
+            WorkSchedulerSqliteDispatch.prepare reopened "shared" "alpha" "launch-alpha" prepareId |> ok
+        Assert.That(replay.Receipt.Value.Replayed, Is.True)
+        Assert.That(replay.Receipt.Value.Sequence, Is.EqualTo first.Receipt.Value.Sequence)
+        Assert.That(replay.Effect, Is.EqualTo WorkSqliteEffect.Prepared)
+        let uncertaintyId = Guid.NewGuid()
+        let unknown =
+            WorkSchedulerSqliteDispatch.markUnknown reopened "shared" "alpha"
+                "launch-alpha" uncertaintyId |> ok
+        Assert.That(unknown.Effect, Is.EqualTo WorkSqliteEffect.Unknown)
+        Assert.That(unknown.Receipt.Value.Replayed, Is.False)
+        let unknownReplay =
+            WorkSchedulerSqliteDispatch.markUnknown store "shared" "alpha"
+                "launch-alpha" uncertaintyId |> ok
+        Assert.That(unknownReplay.Receipt.Value.Replayed, Is.True)
+        Assert.That(unknownReplay.Receipt.Value.Sequence, Is.EqualTo unknown.Receipt.Value.Sequence)
+        let persisted =
+            WorkSchedulerSqliteDispatch.readIntent store "shared" "alpha" "launch-alpha" |> ok
+        Assert.That(persisted.Effect, Is.EqualTo WorkSqliteEffect.Unknown)
+        Assert.That((store.ReadCapacity "shared" |> ok |> Option.get).Reserved, Is.EqualTo 1)
+        Assert.That(store.CurrentSequence() |> ok, Is.EqualTo 5L)
+        match WorkSchedulerSqliteDispatch.markUnknown store "shared" "alpha"
+                "launch-alpha" (Guid.NewGuid()) with
+        | Error(SqliteSchedulerDispatchError.MissingOrInvalidEvidence _) -> ()
+        | other -> Assert.Fail(sprintf "Unknown dispatch was reissued: %A" other)
+        match WorkSchedulerSqliteDispatch.prepare reopened "shared" "beta"
+                "launch-alpha" prepareId with
+        | Error(SqliteSchedulerDispatchError.MissingOrInvalidEvidence _) -> ()
+        | other -> Assert.Fail(sprintf "Cross-project receipt was laundered: %A" other)
+        Assert.That(store.ReadRecord(key WorkSqliteRecordKind.ExternalEffect "beta" "launch-alpha")
+                    |> ok |> Option.isNone, Is.True)
+    )
+
+[<Test>]
+let e1a_stale_original_source_and_stop_are_refused_without_new_effect_record () =
+    for breach in [ "source"; "stop" ] do
+        withStore (fun store _ ->
+            let a = dispatchProject "alpha" (String.replicate 40 "a")
+            let snapshot = seed store 1 0 [ a ]
+            importJournalEvidence store [ a, String.replicate 40 "a" ]
+            WorkSchedulerSqlite.reserve store snapshot (Guid.NewGuid()) "launch" |> ok |> ignore
+            let bad =
+                if breach = "source" then
+                    let row = store.ReadRecord(key WorkSqliteRecordKind.Work "alpha" "origin/work-alpha")
+                              |> ok |> Option.get
+                    { row with Value = { row.Value with SourceSha = Some(String.replicate 40 "b") } }
+                else
+                    let row = store.ReadRecord(key WorkSqliteRecordKind.Project "alpha" "authority")
+                              |> ok |> Option.get
+                    { row with Value = { row.Value with StopGeneration = row.Value.StopGeneration + 1L } }
+            store.Commit
+                { OperationId = Guid.NewGuid()
+                  Guards = []
+                  Records = [ { Key = bad.Key; ExpectedVersion = Some bad.Version; Value = bad.Value } ]
+                  Capacities = [] } |> ok |> ignore
+            match WorkSchedulerSqliteDispatch.prepare store "shared" "alpha" "launch" (Guid.NewGuid()) with
+            | Error(SqliteSchedulerDispatchError.MissingOrInvalidEvidence _) -> ()
+            | other -> Assert.Fail(sprintf "Stale %s was not fenced: %A" breach other)
+            Assert.That(store.ReadRecord(key WorkSqliteRecordKind.ExternalEffect "alpha" "launch")
+                        |> ok |> Option.isNone, Is.True)
+            Assert.That((store.ReadCapacity "shared" |> ok |> Option.get).Reserved, Is.EqualTo 1)
+        )
+
+[<Test>]
+let e1a_competing_prepares_serialize_without_duplicate_journal_or_credit () =
+    withStore (fun store path ->
+        let a = dispatchProject "alpha" (String.replicate 40 "a")
+        let snapshot = seed store 1 0 [ a ]
+        importJournalEvidence store [ a, String.replicate 40 "a" ]
+        WorkSchedulerSqlite.reserve store snapshot (Guid.NewGuid()) "launch" |> ok |> ignore
+        use gate = new ManualResetEventSlim(false)
+        let contender () =
+            Task.Run(fun () ->
+                let client = WorkSqliteAuthority(path)
+                gate.Wait()
+                WorkSchedulerSqliteDispatch.prepare client "shared" "alpha" "launch" (Guid.NewGuid()))
+        let one, two = contender(), contender()
+        gate.Set()
+        let results = Task.WhenAll([| one; two |]).GetAwaiter().GetResult()
+        Assert.That(results |> Array.filter Result.isOk |> Array.length, Is.EqualTo 1)
+        Assert.That(results |> Array.filter Result.isError |> Array.length, Is.EqualTo 1)
+        let stored = WorkSchedulerSqliteDispatch.readIntent store "shared" "alpha" "launch" |> ok
+        Assert.That(stored.Effect, Is.EqualTo WorkSqliteEffect.Prepared)
+        Assert.That((store.ReadCapacity "shared" |> ok |> Option.get).Reserved, Is.EqualTo 1)
+        Assert.That(store.CurrentSequence() |> ok, Is.EqualTo 4L)
+    )
+
+
+[<Test>]
+let e1a_account_binding_rejects_cross_account_reservation_replay_and_preparation () =
+    withStore (fun store _ ->
+        let p = dispatchProject "alpha" (String.replicate 40 "a")
+        let snapshot = seed store 1 0 [ p ]
+        importJournalEvidence store [ p, String.replicate 40 "a" ]
+        let reserveId = Guid.NewGuid()
+        WorkSchedulerSqlite.reserve store snapshot reserveId "launch" |> ok |> ignore
+
+        // A different account has its own slot and a cloned offline marker.
+        // Neither proves it owns alpha's original reservation credit.
+        let oldFence =
+            store.ReadRecord (key WorkSqliteRecordKind.Project "shared" "legacy-import-fence")
+            |> ok |> Option.get
+        let copiedFence =
+            { Key = key WorkSqliteRecordKind.Project "other" "legacy-import-fence"
+              ExpectedVersion = None
+              Value = oldFence.Value }
+        store.Commit
+            { OperationId = Guid.NewGuid()
+              Guards = []
+              Records = [ copiedFence ]
+              Capacities =
+                [ { AccountId = "other"; ExpectedVersion = None
+                    Maximum = Some 1; ReservedDelta = 1 } ] }
+        |> ok |> ignore
+        let wrongSnapshot =
+            { snapshot with Account = { snapshot.Account with AccountId = "other" } }
+        match WorkSchedulerSqlite.reserve store wrongSnapshot reserveId "launch" with
+        | Error(SqliteSchedulerError.Storage(WorkSqliteFailure.OperationIdReused _)) -> ()
+        | other -> Assert.Fail(sprintf "Cross-account reservation receipt was replayed: %A" other)
+        match WorkSchedulerSqliteDispatch.prepare store "other" "alpha" "launch"
+                (Guid.NewGuid()) with
+        | Error(SqliteSchedulerDispatchError.MissingOrInvalidEvidence _) -> ()
+        | other -> Assert.Fail(sprintf "Foreign account prepared another account's launch: %A" other)
+        Assert.That(store.ReadRecord(key WorkSqliteRecordKind.ExternalEffect "alpha" "launch")
+                    |> ok |> Option.isNone, Is.True)
+        Assert.That((store.ReadCapacity "shared" |> ok |> Option.get).Reserved, Is.EqualTo 1)
+        Assert.That((store.ReadCapacity "other" |> ok |> Option.get).Reserved, Is.EqualTo 1)
+    )

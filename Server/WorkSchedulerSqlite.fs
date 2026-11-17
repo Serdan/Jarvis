@@ -384,7 +384,7 @@ module internal WorkSchedulerSqlite =
             | Some e -> Error e
             | None -> Ok(results |> List.choose (function Ok x -> Some x | _ -> None))
 
-    let private newLaunchBody (launch: Launch) (operationId: Guid) (workGeneration: int) =
+    let private newLaunchBody (launch: Launch) (operationId: Guid) (workGeneration: int) (accountId: string) =
         let body = JsonObject()
         body["state"] <- JsonValue.Create("ReservedUnregistered")
         body["roleId"] <- JsonValue.Create(launch.RoleId)
@@ -395,6 +395,7 @@ module internal WorkSchedulerSqlite =
         // Bind the original reservation result, not a later re-ranked credit
         // or claim, to the immutable SQLite operation receipt.
         body["reservationOperationId"] <- JsonValue.Create(operationId.ToString("D"))
+        body["reservationAccountId"] <- JsonValue.Create(accountId)
         body["reservationWorkId"] <- JsonValue.Create(launch.Credit.Value)
         body["reservationWorkGeneration"] <- JsonValue.Create(workGeneration)
         body.ToJsonString()
@@ -462,7 +463,7 @@ module internal WorkSchedulerSqlite =
                         { Key = key WorkSqliteRecordKind.Launch p.Id launchId
                           ExpectedVersion = None
                           Value =
-                            { BodyJson = newLaunchBody launch operationId item.Stage.StageGeneration
+                            { BodyJson = newLaunchBody launch operationId item.Stage.StageGeneration snapshot.Account.AccountId
                               GraphVersion = int64 p.Graph.Version
                               StageGeneration = int64 item.Stage.StageGeneration
                               ClaimGeneration = 0L
@@ -580,7 +581,7 @@ module internal WorkSchedulerSqlite =
     let private replayOutcome (store: WorkSqliteAuthority) (operationId: Guid)
                               (launchId: string) (projectIds: string list)
                               (operationField: string) (workField: string)
-                              (generationField: string) (requirePrimary: bool) =
+                              (generationField: string) (requirePrimary: bool) (accountId: string option) =
         match store.ReadReceipt operationId with
         | Error failure -> Error(SqliteSchedulerError.Storage failure)
         | Ok None -> Ok None
@@ -599,7 +600,9 @@ module internal WorkSchedulerSqlite =
             match locate (projectIds |> List.distinct) None with
             | Error failure -> Error failure
             | Ok(Some(projectId, row)) when
-                stringProperty operationField row = Some(operationId.ToString("D")) ->
+                stringProperty operationField row = Some(operationId.ToString("D"))
+                && (accountId |> Option.forall (fun expected ->
+                    stringProperty "reservationAccountId" row = Some expected)) ->
                 match stringProperty "roleId" row,
                       stringProperty workField row,
                       intProperty generationField row with
@@ -627,7 +630,8 @@ module internal WorkSchedulerSqlite =
         else
             match replayOutcome store operationId launchId
                     (snapshot.Projects |> List.map (fun p -> p.Id))
-                    "reservationOperationId" "reservationWorkId" "reservationWorkGeneration" false with
+                    "reservationOperationId" "reservationWorkId" "reservationWorkGeneration"
+                    false (Some snapshot.Account.AccountId) with
             | Error failure -> Error failure
             | Ok(Some original) -> Ok original
             | Ok None -> reserveFresh store snapshot operationId launchId
@@ -638,7 +642,7 @@ module internal WorkSchedulerSqlite =
             fail "claim operation/launch identity is missing"
         else
             match replayOutcome store operationId launchId [ p.Id ]
-                    "claimOperationId" "primaryWorkId" "claimWorkGeneration" true with
+                    "claimOperationId" "primaryWorkId" "claimWorkGeneration" true None with
             | Error failure -> Error failure
             | Ok(Some original) -> Ok original
             | Ok None -> claimFresh store p operationId launchId

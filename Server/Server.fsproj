@@ -27,6 +27,7 @@
         <Compile Include="WorkQueueDependencyDiagnostics.fs"/>
         <Compile Include="WorkBlocking.fs"/>
         <Compile Include="WorkSchedulerSqlite.fs"/>
+        <Compile Include="WorkSchedulerSqliteDispatch.fs"/>
         <Compile Include="WorkQueueProducers.fs"/>
         <Compile Include="WorkQueueSchedulerPrototype.fs"/>
         <Compile Include="JarvisOptions.fs"/>

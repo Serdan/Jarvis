@@ -240,7 +240,8 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
         | _ -> TimeSpan.FromMinutes(10L)
 
     member this.SendCommandToUser(userId: string, command: AgentCommand, ?conversationId: string, ?deviceId: string,
-                                  ?agentId: string, ?sourceOperationId: string) =
+                                  ?agentId: string, ?sourceOperationId: string,
+                                  ?manualGrantAuthorized: bool, ?manualGrantApprovalRequest: string) =
         task {
             let requestAcceptedAt = Stopwatch.GetTimestamp()
             let requestAborted =
@@ -335,12 +336,20 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                 // Preserve the original source operation UUID across
                                 // client hops; correlation IDs are not authority.
                                 let dispatch =
-                                    match sourceOperationId with
-                                    | Some original ->
+                                    match sourceOperationId, manualGrantApprovalRequest, defaultArg manualGrantAuthorized false with
+                                    | Some original, None, false ->
                                         client.ReceiveSourceCommand(
                                             correlationId, commandJson, defaultArg agentId "", original)
-                                    | None ->
+                                    | None, Some request, false ->
+                                        client.ReceiveManualGrantApproval(
+                                            correlationId, request, defaultArg agentId "")
+                                    | None, None, true ->
+                                        client.ReceiveManualGrantedCommand(
+                                            correlationId, commandJson, defaultArg agentId "")
+                                    | None, None, false ->
                                         client.ReceiveCommand(correlationId, commandJson, defaultArg agentId "")
+                                    | _ ->
+                                        raise (InvalidOperationException("Conflicting Jarvis source/manual grant dispatch routes."))
                                 do! dispatch.WaitAsync(requestAborted)
                                 sendMs <- Stopwatch.GetElapsedTime(dispatchAt).TotalMilliseconds
                                 users.RecordDispatchSuccess(userId, connectionId)

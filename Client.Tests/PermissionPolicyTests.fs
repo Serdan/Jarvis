@@ -530,3 +530,28 @@ let ``start job exact grant ignores presentation reason`` () =
 
     grant original request None |> ignore
     evaluate sameJobDifferentReason |> shouldEqual (Ok())
+
+[<Test>]
+let ``manual grant approval always presents explicit scope and server lifetime`` () =
+    let request: ManualGrantApprovalRequest =
+        { Purpose = "Initialize scoped project"
+          ProjectName = "NewProject"
+          ResourceKind = "prospective"
+          Capabilities = [ "Implementation"; "SchedulingAdmin" ] }
+    match manualGrantConfirmation request with
+    | None -> Assert.Fail("Valid operator-only approval was not presented.")
+    | Some confirmation ->
+        Assert.That(confirmation.Summary, Does.Contain("until server restart"))
+        Assert.That(confirmation.Summary, Does.Contain("NewProject"))
+        Assert.That(confirmation.Summary, Does.Contain("Implementation"))
+        Assert.That(confirmation.CommandName, Does.Contain("operator only"))
+
+[<Test>]
+let ``manual grant approval rejects malformed scope and capability`` () =
+    let valid: ManualGrantApprovalRequest =
+        { Purpose = "Initialize scoped project"
+          ProjectName = "Project1"
+          ResourceKind = "existing"
+          Capabilities = [ "Implementation" ] }
+    Assert.That(manualGrantConfirmation { valid with Capabilities = [ "Owner" ] }, Is.EqualTo(None))
+    Assert.That(manualGrantConfirmation { valid with ResourceKind = "wildcard" }, Is.EqualTo(None))

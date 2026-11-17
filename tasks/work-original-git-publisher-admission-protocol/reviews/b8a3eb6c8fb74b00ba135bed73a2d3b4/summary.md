@@ -1,0 +1,1 @@
+Frozen source 656c1c347; Server.Tests Release 486/486; Client original ledger focused Release 30/30; publisher focused Release 10/10; Git show --check clean. Bare remotes prove only receive-pack stale-clone denial, NOT hosted all-client exclusion. Full Client suite running; no P1c/live approval.

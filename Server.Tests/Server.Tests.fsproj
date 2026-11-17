@@ -16,8 +16,10 @@
         <Compile Include="McpCapacityTests.fs"/>
         <Compile Include="WorkQueueContractTests.fs"/>
         <Compile Include="WorkCompositionTests.fs"/>
+        <Compile Include="WorkProposalTests.fs"/>
         <Compile Include="WorkQueueSchedulerInertTests.fs"/>
         <Compile Include="WorkQueueDependencyDiagnosticsTests.fs"/>
+        <Compile Include="WorkBlockingTests.fs"/>
         <Compile Include="WorkQueueProducerTests.fs"/>
         <Compile Include="WorkQueueSchedulerPrototypeTests.fs"/>
         <Compile Include="McpAuthenticationTests.fs"/>

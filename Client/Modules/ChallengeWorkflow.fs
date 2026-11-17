@@ -6,6 +6,7 @@ open System.Text.Json
 open System.Security.Cryptography
 open FsToolkit.ErrorHandling
 open Client.LedgerStore
+open Client.LegacyDirectWriterFence
 open Client.ReviewWorkflow
 
 [<CLIMutable>]
@@ -623,7 +624,7 @@ module ChallengeWorkflow =
 
     let private changed binding operationId actor kind payload
                         (plan: LedgerSnapshot -> Result<LedgerFileChange list, LedgerFailure>) =
-        LedgerStore.transact binding (intent operationId actor kind payload) plan
+        LegacyDirectWriterFence.transact binding (intent operationId actor kind payload) plan
 
     /// The authenticated local operator UI initializes a legacy ledger once
     /// before it can display indexed actions. CAS retries recompute from the

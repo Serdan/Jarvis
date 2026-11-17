@@ -8,6 +8,7 @@ open System.Text.Json
 open System.Text.RegularExpressions
 open FsToolkit.ErrorHandling
 open Client.LedgerStore
+open Client.LegacyDirectWriterFence
 
 // Role definitions and agent-specific instructions belong to the canonical
 // project ledger, not to an assignment or a particular source checkout.
@@ -227,7 +228,7 @@ module RoleInstructions =
             Error(InvalidBinding "Invalid role ID, version, purpose or instructions.")
         else
             let kind = if expectedVersion = 0 then "CreateRole" else "UpdateRole"
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor kind
                     {| roleId = roleId; expectedVersion = expectedVersion
                        purpose = purpose; instructionsSha256 = hash instructions |})
@@ -255,7 +256,7 @@ module RoleInstructions =
            || String.IsNullOrWhiteSpace actor then
             Error(InvalidBinding "Invalid role attachment arguments.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor "AttachRole"
                     {| agentId = agentId; roleId = roleId; expectedVersion = expectedVersion |})
                 (fun snapshot -> result {
@@ -278,7 +279,7 @@ module RoleInstructions =
            || String.IsNullOrWhiteSpace actor then
             Error(InvalidBinding "Invalid role detachment arguments.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor "DetachRole"
                     {| agentId = agentId; roleId = roleId; expectedVersion = expectedVersion |})
                 (fun snapshot -> result {
@@ -298,7 +299,7 @@ module RoleInstructions =
            || not (validBody true instructions) || String.IsNullOrWhiteSpace actor then
             Error(InvalidBinding "Invalid agent instruction update.")
         else
-            LedgerStore.transact binding
+            LegacyDirectWriterFence.transact binding
                 (intent operationId actor "SetAgentInstructions"
                     {| agentId = agentId; expectedVersion = expectedVersion
                        instructionsSha256 = hash instructions |})

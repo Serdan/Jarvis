@@ -105,14 +105,14 @@ module LegacyWriterProtocolFence =
         && (text |> Seq.forall (fun c ->
             (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
 
-    let private sameProjectAuthority (a: LedgerBinding) (b: LedgerBinding) =
+    let internal sameProjectAuthority (a: LedgerBinding) (b: LedgerBinding) =
         a.ProjectId = b.ProjectId && a.LedgerId = b.LedgerId
         && a.Epoch = b.Epoch && a.Epoch > 0
         && a.RemoteName = b.RemoteName
         && a.ApprovedFetchUrl = b.ApprovedFetchUrl
         && a.ApprovedPushUrl = b.ApprovedPushUrl
 
-    let private scopeValid (scope: LegacyFenceScope) =
+    let internal scopeValid (scope: LegacyFenceScope) =
         scope.ProtocolVersion = ProtocolVersion
         && not (String.IsNullOrWhiteSpace scope.ProjectName)
         && not (isNull (box scope.Project))
@@ -196,7 +196,7 @@ module LegacyWriterProtocolFence =
             loop path
         with _ -> false
 
-    let private readHostScope () : Result<LegacyFenceScope option, string> =
+    let internal readHostScope () : Result<LegacyFenceScope option, string> =
         let file = Environment.GetEnvironmentVariable HostBindingEnvironment
         if String.IsNullOrWhiteSpace file then Ok None // DEFAULT OFF
         else

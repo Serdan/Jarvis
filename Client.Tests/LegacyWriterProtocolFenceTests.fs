@@ -10,6 +10,9 @@ open Client.LedgerStore
 open Client.AccountCapacityLedger
 open Client.WorkQueueGitLedger
 open Client.ReviewWorkflow
+open Client.RoleInstructions
+open Client.ChallengeWorkflow
+open Client.LegacyDirectWriterFence
 open Client.LegacyWriterProtocolFence
 
 type private OldWriterFixture =
@@ -105,6 +108,44 @@ type LegacyWriterProtocolFenceTests() =
           ExpectedAccountHead = cap.Head
           ExpectedProjectHead = source.Commit
           ProtocolVersion = LegacyWriterProtocolFence.ProtocolVersion }
+
+    let activateHost f (gate: LegacyFenceScope) =
+        let config = Path.Combine(f.Root, "direct-host-fence.json")
+        let document =
+            {| schemaVersion = 1; protocolVersion = gate.ProtocolVersion
+               projectName = gate.ProjectName
+               projectRepositoryPath = gate.Project.RepositoryPath
+               projectRemoteName = gate.Project.RemoteName
+               projectApprovedFetchUrl = gate.Project.ApprovedFetchUrl
+               projectApprovedPushUrl = gate.Project.ApprovedPushUrl
+               projectId = string gate.Project.ProjectId
+               projectLedgerId = string gate.Project.LedgerId
+               projectEpoch = gate.Project.Epoch
+               accountRepositoryPath = gate.Account.RepositoryPath
+               accountRemoteName = gate.Account.RemoteName
+               accountApprovedFetchUrl = gate.Account.ApprovedFetchUrl
+               accountApprovedPushUrl = gate.Account.ApprovedPushUrl
+               accountId = string gate.Account.AccountId
+               accountLedgerId = string gate.Account.LedgerId
+               accountEpoch = gate.Account.Epoch
+               expectedAccountHead = gate.ExpectedAccountHead
+               expectedProjectHead = gate.ExpectedProjectHead |}
+        File.WriteAllText(config, JsonSerializer.Serialize document)
+        if not (OperatingSystem.IsWindows()) then
+            File.SetUnixFileMode(config, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+        Environment.SetEnvironmentVariable(LegacyWriterProtocolFence.HostBindingEnvironment, config)
+
+    let expectDirectFenced (actual: Result<unit, LedgerFailure>) =
+        match actual with
+        | Error(InvalidBinding reason) ->
+            Assert.That(reason, Does.StartWith("OldWriterFenced"), reason)
+        | other -> Assert.Fail(sprintf "Expected direct original writer denial, got %A" other)
+
+    let expectDirectUnknown expected (actual: Result<unit, LedgerFailure>) =
+        match actual with
+        | Error(InvalidBinding reason) ->
+            Assert.That(reason, Does.Contain(expected), reason)
+        | other -> Assert.Fail(sprintf "Expected original epoch unknown/deny, got %A" other)
 
     // Fixture-only Git state mutation, never exposed as migration authority:
     // no production Freeze operation or independent signer exists yet.
@@ -345,3 +386,140 @@ type LegacyWriterProtocolFenceTests() =
             | Error reason -> Assert.That(reason, Does.Contain("AccountEpochHeadChanged"))
             | Ok() -> Assert.Fail("Stale host account head was accepted")
             Assert.That(newAccount.Head, Is.Not.EqualTo(gate.ExpectedAccountHead)))
+
+    [<Test>]
+    member _.DirectLegacyWritersRemainCompatibleWhenOffOrAccountLegacyActive() =
+        withFixture (fun f ->
+            ReviewWorkflow.registerAgent f.ProjectOne (Guid.NewGuid()) "DirectBeforeOptIn"
+            |> success |> ignore
+            let gate = scope f f.AccountTwo f.ProjectTwo
+            activateHost f gate
+            ReviewWorkflow.registerAgent f.ProjectTwo (Guid.NewGuid()) "DirectBeforeFreeze"
+            |> success |> ignore
+            Assert.That((ReviewWorkflow.getAgentWorkingTurn f.ProjectOne "DirectBeforeFreeze"
+                         |> success).AgentId, Is.EqualTo("DirectBeforeFreeze")))
+
+    [<Test>]
+    member _.FrozenDirectAgentRoleAndChallengeWritersAreDeniedOnBothOriginalClones() =
+        withFixture (fun f ->
+            fixtureAccountPhase f "Frozen" |> ignore
+            let gate = scope f f.AccountTwo f.ProjectTwo
+            activateHost f gate
+            let before =
+                git f.Root [ "--git-dir=" + f.ProjectRemote
+                             "rev-parse"; "refs/heads/jarvis-orchestration" ]
+            for binding in [ f.ProjectOne; f.ProjectTwo ] do
+                ReviewWorkflow.registerAgent binding (Guid.NewGuid()) "PostFreeze"
+                |> Result.map ignore |> expectDirectFenced
+                RoleInstructions.createRole binding "AuthenticatedUser" (Guid.NewGuid())
+                    "GuardRole" "Purpose" "Role instruction body"
+                |> Result.map ignore |> expectDirectFenced
+                ChallengeWorkflow.ensureOperatorIndex binding
+                |> Result.map ignore |> expectDirectFenced
+                Assert.That((ReviewWorkflow.getAgentWorkingTurn binding "Historical" |> success).AgentId,
+                            Is.EqualTo("Historical"))
+            let after =
+                git f.Root [ "--git-dir=" + f.ProjectRemote
+                             "rev-parse"; "refs/heads/jarvis-orchestration" ]
+            Assert.That(after, Is.EqualTo(before), "Frozen direct writers must not move the original ref")
+            let observation = LegacyDirectWriterFence.inspectHighWater f.ProjectTwo |> success
+            Assert.That(observation.AccountHead, Is.EqualTo(gate.ExpectedAccountHead))
+            Assert.That(observation.ProjectHead, Is.EqualTo(gate.ExpectedProjectHead))
+            Assert.That(observation.ProjectOperationHighWater, Is.GreaterThanOrEqualTo(0L))
+            Assert.That(observation.OriginalPendingJournal, Does.StartWith("Unknown:"))
+            Assert.That(observation.OriginalSourceEffectJournal, Does.StartWith("Unknown:"))
+            Assert.That(observation.MinimumClientProtocol, Does.StartWith("Unknown:")))
+
+    [<Test>]
+    member _.FrozenDirectReplayAndStaleAccountProjectHeadsFailClosed() =
+        withFixture (fun f ->
+            let originalId = Guid.NewGuid()
+            ReviewWorkflow.registerAgent f.ProjectOne originalId "AlreadyAppliedBeforeFreeze"
+            |> success |> ignore
+            fixtureAccountPhase f "Frozen" |> ignore
+            let frozen = scope f f.AccountTwo f.ProjectTwo
+            activateHost f frozen
+            let before =
+                git f.Root [ "--git-dir=" + f.ProjectRemote
+                             "rev-parse"; "refs/heads/jarvis-orchestration" ]
+            ReviewWorkflow.registerAgent f.ProjectTwo originalId "AlreadyAppliedBeforeFreeze"
+            |> Result.map ignore |> expectDirectFenced
+            let mismatch = { f.ProjectTwo with LedgerId = Guid.NewGuid() }
+            let projectSnapshot = LedgerStore.fetch f.ProjectTwo |> success
+            match LegacyDirectWriterFence.decideAt frozen mismatch projectSnapshot with
+            | LegacyWriterDecision.Unknown "DirectProjectAuthorityMismatch" -> ()
+            | other -> Assert.Fail(sprintf "Wrong bound ledger was trusted: %A" other)
+            fixtureAccountPhase f "Preparing" |> ignore
+            ReviewWorkflow.registerAgent f.ProjectTwo (Guid.NewGuid()) "OldAccountHead"
+            |> Result.map ignore |> expectDirectUnknown "AccountEpochHeadChanged"
+            let preparing = scope f f.AccountTwo f.ProjectTwo
+            activateHost f preparing
+            // This is a Work-native fixture record, not an old Agent write.
+            let intent =
+                { OperationId = Guid.NewGuid(); Actor = "WorkNativeFixture"
+                  Kind = "WorkNativeDrift"; RequestJson = "{}" }
+            LedgerStore.transact f.ProjectOne intent (fun _ ->
+                Ok [ { Path = "records/wq10-fixture/direct-head-drift.json"
+                       ExpectedBlobOid = None; Content = "{}" } ])
+            |> success |> ignore
+            ReviewWorkflow.registerAgent f.ProjectTwo (Guid.NewGuid()) "OldProjectHead"
+            |> Result.map ignore |> expectDirectUnknown "ProjectEpochHeadChanged"
+            let after =
+                git f.Root [ "--git-dir=" + f.ProjectRemote
+                             "rev-parse"; "refs/heads/jarvis-orchestration" ]
+            Assert.That(after, Is.Not.EqualTo(before))
+            Assert.That((ReviewWorkflow.getAgentWorkingTurn f.ProjectTwo "Historical"
+                         |> success).AgentId, Is.EqualTo("Historical")))
+
+    [<Test>]
+    member _.CompetingProjectGitCASRevalidatesAccountPhaseBeforeLegacyRetry() =
+        withFixture (fun f ->
+            let active = scope f f.AccountTwo f.ProjectTwo
+            activateHost f active
+            let mutable planned = 0
+            let legacyIntent =
+                { OperationId = Guid.NewGuid(); Actor = "OldClient"
+                  Kind = "DirectLegacyMutation"; RequestJson = "{}" }
+            let result =
+                LegacyDirectWriterFence.transact f.ProjectOne legacyIntent (fun _ ->
+                    planned <- planned + 1
+                    if planned = 1 then
+                        // A second client advances the original project CAS and
+                        // the original account becomes Frozen during this plan.
+                        fixtureAccountPhase f "Frozen" |> ignore
+                        let other =
+                            { OperationId = Guid.NewGuid(); Actor = "WorkNativeFixture"
+                              Kind = "CompetingProjectWrite"; RequestJson = "{}" }
+                        LedgerStore.transact f.ProjectTwo other (fun _ ->
+                            Ok [ { Path = "records/wq10-fixture/competing-cas.json"
+                                   ExpectedBlobOid = None; Content = "{}" } ])
+                        |> success |> ignore
+                    Ok [ { Path = "records/wq10-fixture/old-client-escaped.json"
+                           ExpectedBlobOid = None; Content = "{}" } ])
+            result |> Result.map ignore |> expectDirectUnknown "AccountEpochHeadChanged"
+            Assert.That(planned, Is.EqualTo(1), "Stale planner must not run again after account freeze")
+            let latest = LedgerStore.fetch f.ProjectTwo |> success
+            let old, _ = LedgerStore.readAt f.ProjectTwo latest
+                             "records/wq10-fixture/old-client-escaped.json" |> success
+            Assert.That(old.IsNone, Is.True, "CAS losing original Agent write must not publish"))
+
+
+    [<Test>]
+    member _.FrozenDirectReviewCannotPublishOrphanSourceRefBeforeLedgerCAS() =
+        withFixture (fun f ->
+            fixtureAccountPhase f "Frozen" |> ignore
+            activateHost f (scope f f.AccountTwo f.ProjectTwo)
+            let request = Guid.NewGuid()
+            let sourceCommit = git f.ProjectOne.RepositoryPath [ "rev-parse"; "HEAD" ]
+            let managed = $"refs/heads/jarvis-review/_reviews/{request:N}/r1"
+            let before =
+                git f.Root [ "--git-dir=" + f.ProjectRemote
+                             "for-each-ref"; "--format=%(refname)"; "refs/heads/jarvis-review" ]
+            ReviewWorkflow.submitBranchReview f.ProjectOne (Guid.NewGuid()) "_reviews"
+                "Historical" request "" sourceCommit "Frozen source request" "" ""
+            |> Result.map ignore |> expectDirectFenced
+            let after =
+                git f.Root [ "--git-dir=" + f.ProjectRemote
+                             "for-each-ref"; "--format=%(refname)"; "refs/heads/jarvis-review" ]
+            Assert.That(after, Is.EqualTo(before), "Frozen review must not publish orphan Git refs")
+            Assert.That(after.Contains(managed, StringComparison.Ordinal), Is.False))

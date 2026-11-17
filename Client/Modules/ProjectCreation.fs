@@ -100,6 +100,8 @@ let create (cmd: CreateProjectCommand) rt =
                               remoteConfigured = not (String.IsNullOrWhiteSpace cmd.RemoteUrl)
                               jarvisConfigCreated = cmd.CreateJarvisConfig
                               agentInstructionsCreated = cmd.CreateAgentInstructions
+                              canonicalProjectId =
+                                  ledger |> Option.map (fun identity -> identity.projectId) |> Option.defaultValue ""
                               ledger = ledger |}
                 with ex ->
                     Error(ValidationError $"Project folder may have been created at {path}, but setup failed: {ex.Message}. Inspect it manually.")

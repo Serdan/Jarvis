@@ -64,6 +64,43 @@ let private confirmation commandName projectName permissions paths executable ar
     |> ConfirmationRequired
     |> Error
 
+// Manual grants always use a human prompt, even under FullTrust. This is
+// display material only: the server decides and retains all grant authority.
+let manualGrantConfirmation (intent: ManualGrantApprovalRequest) =
+    let allowed = set [ "ContextRead"; "Implementation"; "Prerequisite"; "Review"; "Integration"; "SchedulingAdmin" ]
+    if isNull (box intent) || String.IsNullOrWhiteSpace intent.Purpose
+       || String.IsNullOrWhiteSpace intent.ProjectName
+       || (intent.ResourceKind <> "existing" && intent.ResourceKind <> "prospective")
+       || isNull (box intent.Capabilities) || intent.Capabilities.IsEmpty
+       || (intent.Capabilities |> List.exists (allowed.Contains >> not)) then None
+    else
+        let caps = Set.ofList intent.Capabilities
+        let permissions =
+            [ if caps.Contains "ContextRead" then ReadOnly
+              if caps.Contains "Implementation" then
+                  WorkspaceWrite
+                  ProcessExecution
+                  VersionControlWrite
+              if caps.Contains "Prerequisite" || caps.Contains "Review" || caps.Contains "Integration"
+                 || caps.Contains "SchedulingAdmin" then
+                  VersionControlWrite
+                  NetworkAccess ]
+            |> List.distinct
+        let detail =
+            sprintf "Operator decision: authorize later calls without per-operation prompts, for %s project '%s', until server restart. Purpose: %s. Capabilities: %s. This does not grant Work reservation or persistent project ownership."
+                intent.ResourceKind intent.ProjectName intent.Purpose
+                (String.concat ", " intent.Capabilities)
+        Some
+            { CommandName = "RequestGrant (operator only)"
+              ProjectName = Some intent.ProjectName
+              Permissions = permissions
+              Summary = detail
+              Paths = [ intent.ProjectName ]
+              Executable = None
+              Args = intent.Capabilities
+              EstimatedImpact = detail
+              SupportsDryRun = false }
+
 let grant command request expiresAt =
     let grant =
         { GrantId = Guid.NewGuid().ToString("N")

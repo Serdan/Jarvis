@@ -20,6 +20,7 @@
         <Compile Include="WorkQueueDependencyDiagnosticsTests.fs"/>
         <Compile Include="WorkQueueProducerTests.fs"/>
         <Compile Include="WorkQueueSchedulerPrototypeTests.fs"/>
+        <Compile Include="ManualGrantTests.fs"/>
         <Compile Include="McpAuthenticationTests.fs"/>
         <Compile Include="Program.fs"/>
     </ItemGroup>

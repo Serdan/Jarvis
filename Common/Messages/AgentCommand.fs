@@ -699,6 +699,14 @@ type GetJobResultCommand =
 
 type CancelJobCommand = { ProjectName: string; JobId: string }
 
+// Display-only approval payload. Never contains a bearer or provides an agent tool
+// that can approve its own authority.
+type ManualGrantApprovalRequest =
+    { Purpose: string
+      ProjectName: string
+      ResourceKind: string
+      Capabilities: string list }
+
 type MessageCommand =
     { ProjectName: string option
       Message: string }
@@ -908,6 +916,25 @@ module AgentStateEvidence =
         | _ -> false
 
 module AgentCommandInfo =
+    // Compact Work permission families shared by scheduled reservations and
+    // server-approved manual grant dispatch. All other commands stay on the
+    // ordinary authenticated-account/host permission path.
+    let manualGrantFamily = function
+        | CreateProjectCommand _ -> Some "SchedulingAdmin"
+        | WriteFileCommand _ | PatchFileCommand _ | ImportFileCommand _
+        | CreateSkillCommand _ | GitCommitCommand _ | CreateWorktreeCommand _
+        | RunCommandCommand _ | RunProjectTaskCommand _ -> Some "Implementation"
+        | TaskWriteCommand cmd when
+            List.contains cmd.Action [ "CreateTask"; "ReviseTaskSpec"; "ReviseTaskSpecPinned"; "ImportTaskSpec"; "ExportTaskSpec" ] ->
+            Some "Prerequisite"
+        | TaskWriteCommand cmd when
+            List.contains cmd.Action [ "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions" ] ->
+            Some "SchedulingAdmin"
+        | ReviewWriteCommand _ -> Some "Review"
+        | TaskWriteCommand cmd when cmd.Action = "SubmitIntegration" || cmd.Action = "CompleteIntegration" ->
+            Some "Integration"
+        | _ -> None
+
     /// A forwarded notification has already validated and possibly activated
     /// its source agent. These are confirmed facts even when the destination
     /// write later has an uncertain outcome.
@@ -1415,7 +1442,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.67"
+    let version = "3.68"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

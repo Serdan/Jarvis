@@ -397,7 +397,7 @@ let private runClient args =
                 tui.Log $"MCP command {correlationId}: unhandledType={error.GetType().Name} recoveryReplyType={deliveryError.GetType().Name}"
         }
 
-    let receiveQueuedWithSource correlationId commandJson agentId (originalId: string option) : Task =
+    let receiveQueuedWithSource correlationId commandJson agentId (originalId: string option) (manualGranted: bool) (manualApproval: bool) : Task =
         if dispatch.TrySubmit(
             correlationId,
             (fun () ->
@@ -405,11 +405,16 @@ let private runClient args =
                         if commandMs >= 200.0 || replyMs >= 1000.0 || not delivered then
                             tui.Log
                                 $"MCP stage {id}: commandMs={commandMs:F0} replyMs={replyMs:F0} replyAck={delivered}"
-                match originalId with
-                | Some original ->
-                    Client.receiveSourceCommandAndReplyWithTiming connection rt correlationId commandJson agentId original report
-                | None ->
-                    Client.receiveCommandAndReplyWithTiming connection rt correlationId commandJson agentId report),
+                if manualApproval then
+                    Client.receiveManualGrantApprovalAndReplyWithTiming connection rt correlationId commandJson agentId report
+                elif manualGranted then
+                    Client.receiveManualGrantedCommandAndReplyWithTiming connection rt correlationId commandJson agentId report
+                else
+                    match originalId with
+                    | Some original ->
+                        Client.receiveSourceCommandAndReplyWithTiming connection rt correlationId commandJson agentId original report
+                    | None ->
+                        Client.receiveCommandAndReplyWithTiming connection rt correlationId commandJson agentId report),
             (fun error -> replyUnhandled correlationId commandJson error)) then
             Task.CompletedTask
         else
@@ -428,14 +433,20 @@ let private runClient args =
             } :> Task
 
     let receiveQueued correlationId commandJson agentId : Task =
-        receiveQueuedWithSource correlationId commandJson agentId None
+        receiveQueuedWithSource correlationId commandJson agentId None false false
     let receiveSourceQueued correlationId commandJson agentId originalId : Task =
-        receiveQueuedWithSource correlationId commandJson agentId (Some originalId)
+        receiveQueuedWithSource correlationId commandJson agentId (Some originalId) false false
+    let receiveManualGrantedQueued correlationId commandJson agentId : Task =
+        receiveQueuedWithSource correlationId commandJson agentId None true false
+    let receiveManualApprovalQueued correlationId requestJson agentId : Task =
+        receiveQueuedWithSource correlationId requestJson agentId None false true
 
     ignoreAll {
         connection.On<string>("ReceiveMessage", Func<string, Task>(Client.receiveMessage rt))
         connection.On<string, string, string>("ReceiveCommand", Func<string, string, string, Task>(receiveQueued))
         connection.On<string, string, string, string>("ReceiveSourceCommand", Func<string, string, string, string, Task>(receiveSourceQueued))
+        connection.On<string, string, string>("ReceiveManualGrantedCommand", Func<string, string, string, Task>(receiveManualGrantedQueued))
+        connection.On<string, string, string>("ReceiveManualGrantApproval", Func<string, string, string, Task>(receiveManualApprovalQueued))
         connection.On<string, string array>("InvalidateAgentStates", Func<string, string array, Task>(fun project agentIds ->
             Client.invalidateAgentStates rt project agentIds
             Task.CompletedTask))

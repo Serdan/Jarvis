@@ -430,6 +430,7 @@ module McpToolHelpers =
                 serverLocalCapability "UpdateServer" "Schedules a verified systemd-managed server update with rollback." [ ProcessExecution; NetworkAccess; Destructive ] true
                 serverLocalCapability "GetServerUpdateStatus" "Reads the server update status file." [ ReadOnly ] false
                 serverLocalCapability "ListDevices" "Lists registered Jarvis devices and the selected default." [ ReadOnly ] false
+                serverLocalCapability "RequestGrant" "Requests operator-only permission for a scoped ephemeral manual grant." [ ReadOnly ] true
                 serverLocalCapability "SelectDevice" "Selects the default Jarvis command destination." [] true
                 serverLocalCapability
                     "GetConnectionDiagnostics"
@@ -844,7 +845,7 @@ module McpToolHelpers =
             result.Content.Add(textContent $"Jarvis taskId: {taskId} (generated; use this ID for subsequent task operations).")
             result
 
-    let sendWithSourceOperationId (sourceOriginalId: string option) (client: ClientService) (http: IHttpContextAccessor) command =
+    let sendWithSourceOperationId (sourceOriginalId: string option) (manualCredential: string) (client: ClientService) (http: IHttpContextAccessor) command =
         task {
             match Option.ofObj http.HttpContext with
             | None ->
@@ -871,8 +872,64 @@ module McpToolHelpers =
                 let missingScope =
                     scopes |> List.tryFind (fun scope -> not (Auth.hasScope scope context.User))
 
+                let manualDevice =
+                    if String.IsNullOrWhiteSpace manualCredential then None
+                    else
+                        match Auth.tryUserId context.User with
+                        | None -> None
+                        | Some owner ->
+                            let users = context.RequestServices.GetRequiredService<UserService>()
+                            match users.GetSelectedSession(owner, RequestDeviceRouting.session(),
+                                                           RequestDeviceRouting.deviceOverride()) with
+                            | ValueSome selected -> Some selected.DeviceId
+                            | ValueNone -> None
+                let! manualCheck =
+                    task {
+                        if String.IsNullOrWhiteSpace manualCredential then return Ok false
+                        elif sourceOriginalId.IsSome then
+                            return Error "Manual grant cannot combine with source effect authorization."
+                        elif manualDevice.IsNone then
+                            return Error "Manual grant requires one selected authenticated client device."
+                        else
+                            match Auth.tryUserId context.User with
+                            | Some owner when missingScope.IsNone && Auth.hasScope Auth.WorkspaceRead context.User ->
+                                let store = context.RequestServices.GetRequiredService<ManualGrantStore>()
+                                let! observedProjectId =
+                                    task {
+                                        match store.ExpectedCanonicalProjectId(owner, manualCredential) with
+                                        | None -> return None
+                                        | Some _ ->
+                                            match ManualGrantPolicy.target command with
+                                            | None -> return None
+                                            | Some project ->
+                                                // A fresh trusted Git ledger health read on the
+                                                // SAME selected client provides immutable project
+                                                // identity. Missing/unknown proof denies mutation.
+                                                let! health =
+                                                    client.SendCommandToUser(owner,
+                                                        LedgerReadCommand
+                                                            { ProjectName = project; Action = "Health"
+                                                              OperationId = ""; Cursor = ""; PageSize = 0 },
+                                                        ?conversationId = RequestDeviceRouting.session(),
+                                                        ?deviceId = manualDevice,
+                                                        ?agentId = RequestDeviceRouting.agentId())
+                                                match health.Result, health.Error, health.PendingJob with
+                                                | Some body, None, None ->
+                                                    try
+                                                        use document = JsonDocument.Parse(body)
+                                                        let mutable id = Unchecked.defaultof<JsonElement>
+                                                        if document.RootElement.TryGetProperty("projectId", &id)
+                                                           && id.ValueKind = JsonValueKind.String then
+                                                            return Some(id.GetString())
+                                                        else return None
+                                                    with _ -> return None
+                                                | _ -> return None
+                                    }
+                                return store.Authorize(owner, manualCredential, command, observedProjectId)
+                            | _ -> return Error "Account OAuth authentication and scoped privileges are required."
+                    }
                 match Auth.tryUserId context.User with
-                | Some userId when missingScope.IsNone &&
+                | Some userId when Result.isOk manualCheck && missingScope.IsNone &&
                                    (AgentCommandInfo.projectName command = None ||
                                     AgentCommandInfo.projectName command = Some "@global" ||
                                     Auth.hasScope Auth.WorkspaceRead context.User) ->
@@ -997,9 +1054,30 @@ module McpToolHelpers =
                         | _ ->
                             client.SendCommandToUser(userId, command,
                                                      ?conversationId = RequestDeviceRouting.session(),
-                                                     ?deviceId = RequestDeviceRouting.deviceOverride(),
+                                                     ?deviceId = (if String.IsNullOrWhiteSpace manualCredential
+                                                                  then RequestDeviceRouting.deviceOverride()
+                                                                  else manualDevice),
                                                      ?agentId = RequestDeviceRouting.agentId(),
-                                                     ?sourceOperationId = sourceOriginalId)
+                                                     ?sourceOperationId = sourceOriginalId,
+                                                     manualGrantAuthorized = not (String.IsNullOrWhiteSpace manualCredential))
+                    if manualCheck = Ok true then
+                        let created =
+                            match response.Result, response.Error, response.PendingJob with
+                            | Some body, None, None ->
+                                try
+                                    use document = JsonDocument.Parse(body)
+                                    let mutable projectName = Unchecked.defaultof<JsonElement>
+                                    let mutable canonicalId = Unchecked.defaultof<JsonElement>
+                                    if document.RootElement.TryGetProperty("name", &projectName)
+                                       && projectName.ValueKind = JsonValueKind.String
+                                       && document.RootElement.TryGetProperty("canonicalProjectId", &canonicalId)
+                                       && canonicalId.ValueKind = JsonValueKind.String then
+                                        Some(projectName.GetString(), canonicalId.GetString())
+                                    else None
+                                with _ -> None
+                            | _ -> None
+                        context.RequestServices.GetRequiredService<ManualGrantStore>()
+                            .FinishCreation(userId, manualCredential, created) |> ignore
                     stopwatch.Stop()
                     finishOperation tracking response stopwatch.ElapsedMilliseconds
 
@@ -1022,16 +1100,76 @@ module McpToolHelpers =
                         |> attachGeneratedOperationId generatedId
                         |> attachGeneratedTaskId (if response.Result.IsSome && response.Error.IsNone && response.PendingJob.IsNone then generatedTaskId else None)
                 | Some _ ->
-                    match missingScope with
-                    | Some scope -> return authorizationErrorResult context scope
-                    | None -> return authorizationErrorResult context Auth.WorkspaceRead
+                    match missingScope, manualCheck with
+                    | Some scope, _ -> return authorizationErrorResult context scope
+                    | _, Error reason -> return errorResult (PermissionDenied reason)
+                    | _ -> return authorizationErrorResult context Auth.WorkspaceRead
                 | None ->
                     return authenticationErrorResult context (Some(String.concat " " scopes))
         }
 
     // Existing MCP routes intentionally transport NO source identity.
     let send (client: ClientService) (http: IHttpContextAccessor) command =
-        sendWithSourceOperationId None client http command
+        sendWithSourceOperationId None "" client http command
+
+    // The credential is an explicit MCP argument, never inferred from session
+    // IDs, client actor labels or request headers. All authorization runs on
+    // server before ordinary local dispatch.
+    let sendWithManualGrant (credential: string) (client: ClientService) (http: IHttpContextAccessor) command =
+        sendWithSourceOperationId None credential client http command
+
+    let requestGrant (store: ManualGrantStore) (client: ClientService) (http: IHttpContextAccessor)
+                     (purpose: string) (resourceKind: string) (projectName: string) (capabilities: string array) =
+        task {
+            match Option.ofObj http.HttpContext with
+            | None -> return errorResult (PermissionDenied "Authenticated MCP HTTP context is required.")
+            | Some context ->
+                match Auth.tryUserId context.User with
+                | None -> return authenticationErrorResult context (Some Auth.WorkspaceRead)
+                | Some _ when not (Auth.hasScope Auth.WorkspaceRead context.User) ->
+                    return authorizationErrorResult context Auth.WorkspaceRead
+                | Some owner ->
+                    let requested = if isNull capabilities then [] else Array.toList capabilities
+                    match store.Request(owner, resourceKind, projectName, purpose, requested) with
+                    | Error reason -> return errorResult (ValidationFailed reason)
+                    | Ok ticket ->
+                        // This separate SignalR route always displays an
+                        // operator-only permission prompt, regardless of the
+                        // local client's FullTrust setting.
+                        let intent: ManualGrantApprovalRequest =
+                            { Purpose = ticket.Scope.Purpose
+                              ResourceKind = ticket.Scope.ResourceKind
+                              ProjectName = ticket.Scope.ProjectName
+                              Capabilities = ticket.Scope.Capabilities |> Set.toList }
+                        let! reply =
+                            client.SendCommandToUser(
+                                owner,
+                                MessageCommand
+                                    { ProjectName = Some ticket.Scope.ProjectName
+                                      Message = "Operator-only manual grant decision" },
+                                ?conversationId = RequestDeviceRouting.session(),
+                                ?deviceId = RequestDeviceRouting.deviceOverride(),
+                                ?agentId = RequestDeviceRouting.agentId(),
+                                manualGrantApprovalRequest = JsonSerializer.Serialize intent)
+                        let approved =
+                            reply.Result = Some "true" && reply.Error.IsNone && reply.PendingJob.IsNone
+                        let denied =
+                            match reply.Error with
+                            | Some (PermissionDenied _) -> true
+                            | _ -> false
+                        if approved then store.Decide(owner, ticket.Credential, true) |> ignore
+                        elif denied then store.Decide(owner, ticket.Credential, false) |> ignore
+                        // Failed or ambiguous UI delivery stays pending.
+                        // Never infer operator approval from transport success.
+                        let status = if approved then "approved" elif denied then "denied" else "pending"
+                        return jsonResult
+                            {| credential = ticket.Credential
+                               status = status
+                               projectName = ticket.Scope.ProjectName
+                               resourceKind = ticket.Scope.ResourceKind
+                               purpose = ticket.Scope.Purpose
+                               capabilities = (ticket.Scope.Capabilities |> Set.toList) |}
+        }
 
     // Supplied by the ORIGINAL source caller, never server-minted or obtained
     // from its SignalR correlation ID. Empty continues the existing legacy
@@ -1551,6 +1689,13 @@ type JarvisMcpTools =
     static member ListProjects([<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http ListProjectsCommand
 
+    [<McpServerTool(Title = "Request manual grant", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Request an operator-approved ephemeral manual grant for one existing or prospective named project. Supply purpose and Work capability families: ContextRead, Implementation, Prerequisite, Review, Integration, SchedulingAdmin. Operator approval is required regardless of client trust; request itself never authorizes mutations. The returned CSPRNG UUIDv4 is an explicit manualGrantCredential argument for subsequent supported tools. No Work reservation or durable authority is created.")>]
+    static member RequestGrant(purpose: string, resourceKind: string, projectName: string,
+                              agentId: string, capabilities: string array,
+                              [<Optional; DefaultParameterValue("")>] deviceId: string,
+                              store: ManualGrantStore, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.requestGrant store client http purpose resourceKind projectName capabilities
+
     [<McpServerTool(Title = "Create project", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create a new top-level workspace folder. Optionally initialize local Git, create .jarvis.json and AGENTS.md, configure origin, and initialize the remote-backed Jarvis ledger with explicit remote visibility acknowledgment. Never overwrites an existing folder.")>]
     static member CreateProject(name: string,
                                 [<Optional; DefaultParameterValue(false)>] initializeGit: bool,
@@ -1560,8 +1705,8 @@ type JarvisMcpTools =
                                 [<Optional; DefaultParameterValue("")>] remoteUrl: string,
                                 [<Optional; DefaultParameterValue(false)>] acknowledgeRemoteVisibility: bool,
                                 [<Optional; DefaultParameterValue("")>] deviceId: string,
-                                client: ClientService, http: IHttpContextAccessor) =
-        McpToolHelpers.send client http
+                                [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.sendWithManualGrant manualGrantCredential client http
             (CreateProjectCommand
                 { Name = name; InitializeGit = initializeGit || initializeLedger
                   CreateJarvisConfig = createJarvisConfig
@@ -1578,8 +1723,8 @@ type JarvisMcpTools =
         McpToolHelpers.send client http (GetWorktreeCommand { ProjectName = projectName; WorktreePath = worktreePath })
 
     [<McpServerTool(Title = "Create worktree", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create an isolated Git working tree and branch for development. The worktree is registered with Jarvis and requires local approval.")>]
-    static member CreateWorktree(projectName: string, agentId: string, name: string, branch: string, baseRef: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        McpToolHelpers.send client http (CreateWorktreeCommand { ProjectName = projectName; Name = name; Branch = branch; BaseRef = baseRef })
+    static member CreateWorktree(projectName: string, agentId: string, name: string, branch: string, baseRef: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.sendWithManualGrant manualGrantCredential client http (CreateWorktreeCommand { ProjectName = projectName; Name = name; Branch = branch; BaseRef = baseRef })
 
     [<McpServerTool(Title = "Inspect worktree removal", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Inspect cleanliness, lock state and integration before removing a worktree.")>]
     static member InspectWorktreeRemoval(projectName: string, agentId: string, worktreePath: string, [<Optional; DefaultParameterValue("")>] targetRef: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
@@ -1721,15 +1866,15 @@ type JarvisMcpTools =
                 { ProjectName = projectName; ObserverAgentId = agentId; TargetAgentId = targetAgentId })
 
     [<McpServerTool(Title = "create task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Atomically create a task and canonical HTML spec on the bound Git ledger. Omit taskId to generate a unique, stable ID derived from operationId; provide taskId explicitly for named tasks and imports. Reusing operationId on retry preserves the generated ID.")>]
-    static member CreateTask(projectName: string, agentId: string, title: string, html: string, [<Optional; DefaultParameterValue("")>] taskId: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member CreateTask(projectName: string, agentId: string, title: string, html: string, [<Optional; DefaultParameterValue("")>] taskId: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "CreateTask" operationId taskId TaskCommands.legacyAdministrativePlaceholder
-        McpToolHelpers.send client http (TaskWriteCommand { cmd with Title = title; Html = html })
+        McpToolHelpers.sendWithManualGrant manualGrantCredential client http (TaskWriteCommand { cmd with Title = title; Html = html })
 
     [<McpServerTool(Title = "revise task spec", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Revise a canonical HTML task spec with an exact task version. Supply expectedSpecBlobOid for assigned tasks or to assert the exact current spec; leave it empty for unassigned Open tasks. Assignment adoption remains explicit.")>]
-    static member ReviseTaskSpec(projectName: string, agentId: string, taskId: string, expectedTaskVersion: int, title: string, html: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] expectedSpecBlobOid: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ReviseTaskSpec(projectName: string, agentId: string, taskId: string, expectedTaskVersion: int, title: string, html: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] expectedSpecBlobOid: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
         let pinned = not (String.IsNullOrWhiteSpace expectedSpecBlobOid)
         let cmd = TaskCommands.write projectName (if pinned then "ReviseTaskSpecPinned" else "ReviseTaskSpec") operationId taskId TaskCommands.legacyAdministrativePlaceholder
-        McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedTaskVersion; BaseOid = expectedSpecBlobOid; Title = title; Html = html })
+        McpToolHelpers.sendWithManualGrant manualGrantCredential client http (TaskWriteCommand { cmd with ExpectedVersion = expectedTaskVersion; BaseOid = expectedSpecBlobOid; Title = title; Html = html })
 
     [<McpServerTool(Title = "register agent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Register an agent in the canonical ledger with no assignment, Stopped execution and explicit Parked disposition.")>]
     static member RegisterAgent(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
@@ -1745,14 +1890,14 @@ type JarvisMcpTools =
         McpToolHelpers.send client http (TaskCommands.read projectName "ListRoles" "" "")
 
     [<McpServerTool(Title = "create role", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create an independent versioned shared agent role with purpose and instructions. Does not assign tasks or grant permissions.")>]
-    static member CreateRole(projectName: string, agentId: string, roleId: string, purpose: string, instructions: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member CreateRole(projectName: string, agentId: string, roleId: string, purpose: string, instructions: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "CreateRole" operationId roleId TaskCommands.legacyAdministrativePlaceholder
-        McpToolHelpers.send client http (TaskWriteCommand { cmd with Title = purpose; Html = instructions })
+        McpToolHelpers.sendWithManualGrant manualGrantCredential client http (TaskWriteCommand { cmd with Title = purpose; Html = instructions })
 
     [<McpServerTool(Title = "update role", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Revise shared role purpose and instructions with an exact version. Edits apply on the next instruction read without changing historical assignments.")>]
-    static member UpdateRole(projectName: string, agentId: string, roleId: string, expectedVersion: int, purpose: string, instructions: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member UpdateRole(projectName: string, agentId: string, roleId: string, expectedVersion: int, purpose: string, instructions: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "UpdateRole" operationId roleId TaskCommands.legacyAdministrativePlaceholder
-        McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedVersion; Title = purpose; Html = instructions })
+        McpToolHelpers.sendWithManualGrant manualGrantCredential client http (TaskWriteCommand { cmd with ExpectedVersion = expectedVersion; Title = purpose; Html = instructions })
 
     [<McpServerTool(Title = "get agent instruction config", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a registered agent's versioned role memberships and persistent individual instructions.")>]
     static member GetAgentInstructionConfig(projectName: string, agentId: string, targetAgentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
@@ -1763,33 +1908,33 @@ type JarvisMcpTools =
         McpToolHelpers.send client http (TaskCommands.read projectName "ResolveAgentInstructions" targetAgentId "")
 
     [<McpServerTool(Title = "attach role", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Attach an existing shared role to a registered agent using the current agent-instruction version (zero when absent). No permission or activity effect.")>]
-    static member AttachRole(projectName: string, agentId: string, targetAgentId: string, roleId: string, expectedVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member AttachRole(projectName: string, agentId: string, targetAgentId: string, roleId: string, expectedVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "AttachRole" operationId roleId TaskCommands.legacyAdministrativePlaceholder
-        McpToolHelpers.send client http (TaskWriteCommand { cmd with OwnerId = targetAgentId; ExpectedVersion = expectedVersion })
+        McpToolHelpers.sendWithManualGrant manualGrantCredential client http (TaskWriteCommand { cmd with OwnerId = targetAgentId; ExpectedVersion = expectedVersion })
 
     [<McpServerTool(Title = "detach role", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Detach role membership with optimistic versioning; the shared role remains in the ledger for other agents.")>]
-    static member DetachRole(projectName: string, agentId: string, targetAgentId: string, roleId: string, expectedVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member DetachRole(projectName: string, agentId: string, targetAgentId: string, roleId: string, expectedVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "DetachRole" operationId roleId TaskCommands.legacyAdministrativePlaceholder
-        McpToolHelpers.send client http (TaskWriteCommand { cmd with OwnerId = targetAgentId; ExpectedVersion = expectedVersion })
+        McpToolHelpers.sendWithManualGrant manualGrantCredential client http (TaskWriteCommand { cmd with OwnerId = targetAgentId; ExpectedVersion = expectedVersion })
 
     [<McpServerTool(Title = "set agent instructions", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Replace an agent's persistent individual instruction body using the exact current config version. Empty body clears the override while retaining memberships.")>]
-    static member SetAgentInstructions(projectName: string, agentId: string, targetAgentId: string, expectedVersion: int, instructions: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member SetAgentInstructions(projectName: string, agentId: string, targetAgentId: string, expectedVersion: int, instructions: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "SetAgentInstructions" operationId "" TaskCommands.legacyAdministrativePlaceholder
-        McpToolHelpers.send client http (TaskWriteCommand { cmd with OwnerId = targetAgentId; ExpectedVersion = expectedVersion; Html = instructions })
+        McpToolHelpers.sendWithManualGrant manualGrantCredential client http (TaskWriteCommand { cmd with OwnerId = targetAgentId; ExpectedVersion = expectedVersion; Html = instructions })
 
     [<McpServerTool(Title = "integration submissions", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read every recorded exact-commit integration submission and the latest submitted boundary for a task, including pending and integrated evidence. Does not merge or infer that a review verdict implies integration.")>]
     static member GetIntegrationSubmissions(projectName: string, agentId: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (TaskReadCommand { ProjectName = projectName; AgentId = ""; Action = "GetIntegrationSubmissions"; TaskId = taskId; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
     [<McpServerTool(Title = "submit integration boundary", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Submit an Accepted immutable review snapshot for integration. reviewId is required; pass empty sourceRef and submittedCommit to use its exact pinned SHA. Jarvis fetches the reviewed remote snapshot and publishes a create-only managed integration ref. A nonempty submittedCommit must exactly match the Accepted review; sourceRef is descriptive. The reviewed commit must fast-forward from the current remote target. Does not merge, push target, deploy, or change the review verdict. submissionId is a caller-stable UUID; use the same operationId for uncertain retries.")>]
-    static member SubmitIntegration(projectName: string, taskId: string, agentId: string, submissionId: string, sourceRef: string, submittedCommit: string, targetRef: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] reviewId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member SubmitIntegration(projectName: string, taskId: string, agentId: string, submissionId: string, sourceRef: string, submittedCommit: string, targetRef: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] reviewId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "SubmitIntegration" operationId taskId agentId
-        McpToolHelpers.send client http (TaskWriteCommand { cmd with AttemptId = submissionId; SourceRef = sourceRef; BaseOid = submittedCommit; TargetRef = targetRef; Reason = reviewId })
+        McpToolHelpers.sendWithManualGrant manualGrantCredential client http (TaskWriteCommand { cmd with AttemptId = submissionId; SourceRef = sourceRef; BaseOid = submittedCommit; TargetRef = targetRef; Reason = reviewId })
 
     [<McpServerTool(Title = "complete integration boundary", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Record an exact integration commit only after verifying the remote target branch contains it and that it contains the submitted commit; does not merge, push source branches or mutate task/review lifecycle.")>]
-    static member CompleteIntegration(projectName: string, taskId: string, agentId: string, submissionId: string, integratedCommit: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member CompleteIntegration(projectName: string, taskId: string, agentId: string, submissionId: string, integratedCommit: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "CompleteIntegration" operationId taskId agentId
-        McpToolHelpers.send client http (TaskWriteCommand { cmd with AttemptId = submissionId; BaseOid = integratedCommit })
+        McpToolHelpers.sendWithManualGrant manualGrantCredential client http (TaskWriteCommand { cmd with AttemptId = submissionId; BaseOid = integratedCommit })
 
     [<McpServerTool(Title = "get notification preferences", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read this registered agent's durable recipient-owned notification mute and sender blocks without changing them. The empty source project denotes this same project.")>]
     static member GetNotificationPreferences(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
@@ -2075,9 +2220,9 @@ type JarvisMcpTools =
                       RequestId = requestId; ReviewerId = ""; DocumentPath = documentPath })
 
     [<McpServerTool(Title = "write review document", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create or update one review summary.md or findings/<slug>.md on the Git ledger (up to 512 KiB). Supply the current blob ID when replacing a document; review status is unchanged.")>]
-        static member PutReviewDocument(projectName: string, taskId: string, requestId: string, agentId: string, documentPath: string, content: string, expectedBlobOid: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        static member PutReviewDocument(projectName: string, taskId: string, requestId: string, agentId: string, documentPath: string, content: string, expectedBlobOid: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
             let cmd = ReviewCommands.write projectName "PutDocument" operationId taskId requestId agentId 0
-            McpToolHelpers.send client http
+            McpToolHelpers.sendWithManualGrant manualGrantCredential client http
                 (ReviewWriteCommand
                     { cmd with DocumentPath = documentPath; Content = content
                                ExpectedBlobOid = expectedBlobOid })
@@ -2095,26 +2240,26 @@ type JarvisMcpTools =
                                    [<Optional; DefaultParameterValue("")>] summary: string,
                                    [<Optional; DefaultParameterValue("")>] deviceId: string,
                                    [<Optional; DefaultParameterValue(0)>] expectedRequestVersion: int,
-                                   client: ClientService, http: IHttpContextAccessor) =
+                                   [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
             if expectedRequestVersion < 0 then
                 raise (ArgumentOutOfRangeException("expectedRequestVersion", "Expected request version must be zero or positive."))
             if expectedRequestVersion > 0 && (not (String.IsNullOrWhiteSpace targetRef) || not (String.IsNullOrWhiteSpace purpose)) then
                 raise (ArgumentException("Replacement preserves the original targetRef and purpose; omit both on update."))
             let namespaceId = if String.IsNullOrWhiteSpace taskId then "_reviews" else taskId
             let cmd = ReviewCommands.write projectName (if expectedRequestVersion > 0 then "Update" else "Submit") operationId namespaceId requestId agentId expectedRequestVersion
-            McpToolHelpers.send client http (ReviewWriteCommand
+            McpToolHelpers.sendWithManualGrant manualGrantCredential client http (ReviewWriteCommand
                 { cmd with Kind = purpose; SourceRef = sourceRef; HeadOid = headOid
                            TargetRef = targetRef; Summary = summary })
 
     [<McpServerTool(Title = "claim review", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Claim an unclaimed review and freeze its submitted Git branch for independent inspection.")>]
-        static member ClaimReview(projectName: string, taskId: string, requestId: string, agentId: string, expectedRequestVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        static member ClaimReview(projectName: string, taskId: string, requestId: string, agentId: string, expectedRequestVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
             let cmd = ReviewCommands.write projectName "Claim" operationId taskId requestId agentId expectedRequestVersion
-            McpToolHelpers.send client http (ReviewWriteCommand cmd)
+            McpToolHelpers.sendWithManualGrant manualGrantCredential client http (ReviewWriteCommand cmd)
 
     [<McpServerTool(Title = "decide review", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Accept a claimed review or request changes. Write detailed findings in separate Markdown documents using put_review_document.")>]
-        static member DecideReview(projectName: string, taskId: string, requestId: string, agentId: string, expectedRequestVersion: int, verdict: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        static member DecideReview(projectName: string, taskId: string, requestId: string, agentId: string, expectedRequestVersion: int, verdict: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
             let cmd = ReviewCommands.write projectName "Decide" operationId taskId requestId agentId expectedRequestVersion
-            McpToolHelpers.send client http (ReviewWriteCommand { cmd with Verdict = verdict })
+            McpToolHelpers.sendWithManualGrant manualGrantCredential client http (ReviewWriteCommand { cmd with Verdict = verdict })
 
     [<McpServerTool(Title = "release review claim", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Make a claimed review available to another reviewer, retaining its frozen source snapshot and leaving the task unchanged.")>]
         static member ReleaseReview(projectName: string, taskId: string, requestId: string, agentId: string, expectedRequestVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
@@ -2417,11 +2562,12 @@ type JarvisMcpTools =
         overwrite: bool,
         createParents: bool,
         maxBytes: Nullable<int64>,
-        [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService,
-        http: IHttpContextAccessor
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        [<Optional; DefaultParameterValue("")>] manualGrantCredential: string,
+        client: ClientService, http: IHttpContextAccessor
     ) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
-        McpToolHelpers.send client http (ImportFileCommand {
+        McpToolHelpers.sendWithManualGrant manualGrantCredential client http (ImportFileCommand {
             ProjectName = projectName
             FilePath = filePath
             DownloadUrl = file.download_url
@@ -2437,14 +2583,14 @@ type JarvisMcpTools =
         McpToolHelpers.send client http UpdateClientCommand
 
     [<McpServerTool(Title = "Write file", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Create, update or append to a file in the selected project workspace using configured local permissions. Requires client approval.")>]
-    static member WriteFile(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, content: string, [<Description("File write mode. Allowed values: Write, Append.")>] fileWriteMode: string, [<Description("Optional precondition: SHA-256 hash to require matching existing content, none to require a new file, or empty string for no precondition.")>] expectedHash: string, createParents: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue(""); Description("EXPERIMENTAL nonproduction source file route: original caller-retained UUID. Omitting preserves the legacy RPC; never generate a new UUID on retry.")>] sourceOperationId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member WriteFile(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, content: string, [<Description("File write mode. Allowed values: Write, Append.")>] fileWriteMode: string, [<Description("Optional precondition: SHA-256 hash to require matching existing content, none to require a new file, or empty string for no precondition.")>] expectedHash: string, createParents: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue(""); Description("EXPERIMENTAL nonproduction source file route: original caller-retained UUID. Omitting preserves the legacy RPC; never generate a new UUID on retry.")>] sourceOperationId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         match McpToolHelpers.parseFileWriteMode fileWriteMode,
               McpToolHelpers.parseSourceOriginalId sourceOperationId with
         | Error message, _ | _, Error message ->
             Task.FromResult(McpToolHelpers.validationErrorResult message)
         | Ok mode, Ok sourceId ->
-            McpToolHelpers.sendWithSourceOperationId sourceId client http (WriteFileCommand {
+            McpToolHelpers.sendWithSourceOperationId sourceId manualGrantCredential client http (WriteFileCommand {
                 ProjectName = projectName
                 FilePath = filePath
                 Content = content
@@ -2453,12 +2599,12 @@ type JarvisMcpTools =
                 CreateParents = McpToolHelpers.optionOfNullableBool createParents })
 
     [<McpServerTool(Title = "Patch file", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Edit a project file using an atomic unified diff, with optional expected-hash checking and dry-run validation. Requires client approval.")>]
-    static member PatchFile(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, patch: string, expectedHash: string, dryRun: Nullable<bool>, fuzzyContextLines: Nullable<int>, returnContent: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue(""); Description("EXPERIMENTAL nonproduction source patch: original caller-retained UUID; never generate a new UUID on retry.")>] sourceOperationId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member PatchFile(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, patch: string, expectedHash: string, dryRun: Nullable<bool>, fuzzyContextLines: Nullable<int>, returnContent: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue(""); Description("EXPERIMENTAL nonproduction source patch: original caller-retained UUID; never generate a new UUID on retry.")>] sourceOperationId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         match McpToolHelpers.parseSourceOriginalId sourceOperationId with
         | Error message -> Task.FromResult(McpToolHelpers.validationErrorResult message)
         | Ok sourceId ->
-            McpToolHelpers.sendWithSourceOperationId sourceId client http (PatchFileCommand {
+            McpToolHelpers.sendWithSourceOperationId sourceId manualGrantCredential client http (PatchFileCommand {
                 ProjectName = projectName
                 FilePath = filePath
                 ExpectedHash = McpToolHelpers.optionOfString expectedHash
@@ -2469,9 +2615,9 @@ type JarvisMcpTools =
                 ReturnContent = McpToolHelpers.optionOfNullableBool returnContent })
 
     [<McpServerTool(Title = "Run command", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Execute a bounded development command within the local Jarvis OS-permission sandbox for the selected project workspace. Commands run with the explicitly configured local account permissions and require client approval. Supply a short reason for the command.")>]
-    static member RunCommand(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, executable: string, args: string array, [<Optional; DefaultParameterValue("")>] reason: string, workingDirectory: string, timeoutSeconds: Nullable<int>, maxOutputBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member RunCommand(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, executable: string, args: string array, [<Optional; DefaultParameterValue("")>] reason: string, workingDirectory: string, timeoutSeconds: Nullable<int>, maxOutputBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
-        McpToolHelpers.send client http (RunCommandCommand {
+        McpToolHelpers.sendWithManualGrant manualGrantCredential client http (RunCommandCommand {
             ProjectName = projectName
             Executable = executable
             Args = args |> Array.toList
@@ -2499,15 +2645,13 @@ type JarvisMcpTools =
         skillName: string,
         content: string,
         [<Optional; DefaultParameterValue(false)>] overwrite: bool,
-        [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService,
-        http: IHttpContextAccessor
-    ) =
-        McpToolHelpers.send client http (CreateSkillCommand { ProjectName = projectName; SkillName = skillName; Content = content; Overwrite = overwrite })
+        [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.sendWithManualGrant manualGrantCredential client http (CreateSkillCommand { ProjectName = projectName; SkillName = skillName; Content = content; Overwrite = overwrite })
 
     [<McpServerTool(Title = "Run project task", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Run a predefined build, test or other development task from the project's .jarvis.json inside the local Jarvis OS-permission sandbox. Requires client approval.")>]
-    static member RunProjectTask(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, taskName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member RunProjectTask(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, taskName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
-        McpToolHelpers.send client http (RunProjectTaskCommand { ProjectName = projectName; TaskName = taskName })
+        McpToolHelpers.sendWithManualGrant manualGrantCredential client http (RunProjectTaskCommand { ProjectName = projectName; TaskName = taskName })
 
     [<McpServerTool(Title = "Get git status", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get git status for a project.")>]
     static member GetGitStatus(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
@@ -2523,9 +2667,9 @@ type JarvisMcpTools =
             MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes })
 
     [<McpServerTool(Title = "Create git commit", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Commit selected project files to the local Git branch. Does not push to a remote; requires local approval.")>]
-    static member GitCommit(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, message: string, body: string, paths: string array, allowEmpty: bool, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GitCommit(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, message: string, body: string, paths: string array, allowEmpty: bool, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
-        McpToolHelpers.send client http (GitCommitCommand {
+        McpToolHelpers.sendWithManualGrant manualGrantCredential client http (GitCommitCommand {
             ProjectName = projectName
             Message = message
             Body = McpToolHelpers.optionOfString body

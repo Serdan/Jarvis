@@ -211,6 +211,18 @@ module internal WorkSchedulerSqlite =
         && (match launch.PrimaryWorkId with
             | Some work -> stringProperty "primaryWorkId" record = Some work
             | None -> stringProperty "primaryWorkId" record = None)
+        // A credit may be reassigned at admission; a primary may be chosen at
+        // claim. Either binding must carry that stage's actual provenance.
+        && (match (if launch.EverClaimed then launch.PrimaryWorkId else launch.Credit) with
+            | None -> true
+            | Some workId ->
+                match p.Queue.Works.TryFind workId, p.StageRecords.TryFind workId with
+                | Some stage, Some stageRow ->
+                    record.Value.StageGeneration = int64 stage.StageGeneration
+                    && record.Value.SourceSha = stageRow.Value.SourceSha
+                    && (not launch.EverClaimed
+                        || record.Value.ClaimGeneration = int64 stage.ClaimGeneration)
+                | _ -> false)
         && settled record
 
     let private verifyProject (p: SqliteSchedulerProject) =
@@ -293,7 +305,11 @@ module internal WorkSchedulerSqlite =
             match roles.TryFind launch.RoleId with
             | Some role when role.Version = launch.RoleVersion ->
                 eligible
-                |> List.filter (fun item -> runnableRole p role item.Stage)
+                // Never count an unresolved one-shot effect as usable credit
+                // when both admission and actual claim refuse that stage.
+                |> List.filter (fun item ->
+                    runnableRole p role item.Stage
+                    && (p.StageRecords.TryFind item.Stage.Id |> Option.exists settled))
                 |> List.map (fun item -> item.Stage.Id)
             | _ -> []
         let byId = existing |> List.map (fun l -> l.Id, l) |> Map.ofList
@@ -326,8 +342,12 @@ module internal WorkSchedulerSqlite =
             item.AvailableSequence, p.Id, item.Stage.Id)
         |> List.map (fun item -> p, item)
 
-    let private withCredit (record: WorkSqliteRecord) credit =
-        { record.Value with BodyJson = changeString "credit" credit record.Value.BodyJson }
+    let private withCredit (p: SqliteSchedulerProject) (record: WorkSqliteRecord) (credit: string) =
+        let stage = p.StageRecords.[credit]
+        { record.Value with
+            BodyJson = changeString "credit" (Some credit) record.Value.BodyJson
+            StageGeneration = stage.Value.StageGeneration
+            SourceSha = stage.Value.SourceSha }
 
     let private accountMutation account delta =
         { AccountId = account.AccountId
@@ -364,7 +384,7 @@ module internal WorkSchedulerSqlite =
             | Some e -> Error e
             | None -> Ok(results |> List.choose (function Ok x -> Some x | _ -> None))
 
-    let private newLaunchBody (launch: Launch) =
+    let private newLaunchBody (launch: Launch) (operationId: Guid) (workGeneration: int) =
         let body = JsonObject()
         body["state"] <- JsonValue.Create("ReservedUnregistered")
         body["roleId"] <- JsonValue.Create(launch.RoleId)
@@ -372,12 +392,17 @@ module internal WorkSchedulerSqlite =
         body["primaryWorkId"] <- null
         body["everClaimed"] <- JsonValue.Create(false)
         body["stopRequested"] <- JsonValue.Create(false)
+        // Bind the original reservation result, not a later re-ranked credit
+        // or claim, to the immutable SQLite operation receipt.
+        body["reservationOperationId"] <- JsonValue.Create(operationId.ToString("D"))
+        body["reservationWorkId"] <- JsonValue.Create(launch.Credit.Value)
+        body["reservationWorkGeneration"] <- JsonValue.Create(workGeneration)
         body.ToJsonString()
 
     /// E0 admission: rank globally by D, preserve existing specialist credits,
     /// then atomically reserve the account token and create the project launch.
     /// The immutable caller operationId is also the SQLite replay receipt.
-    let reserve (store: WorkSqliteAuthority) (snapshot: SqliteSchedulerSnapshot)
+    let private reserveFresh (store: WorkSqliteAuthority) (snapshot: SqliteSchedulerSnapshot)
                 (operationId: Guid) launchId : Result<SqliteSchedulerOutcome, SqliteSchedulerError> =
         if operationId = Guid.Empty || String.IsNullOrWhiteSpace launchId then
             fail "original operation/launch identity is missing"
@@ -437,7 +462,7 @@ module internal WorkSchedulerSqlite =
                         { Key = key WorkSqliteRecordKind.Launch p.Id launchId
                           ExpectedVersion = None
                           Value =
-                            { BodyJson = newLaunchBody launch
+                            { BodyJson = newLaunchBody launch operationId item.Stage.StageGeneration
                               GraphVersion = int64 p.Graph.Version
                               StageGeneration = int64 item.Stage.StageGeneration
                               ClaimGeneration = 0L
@@ -452,7 +477,7 @@ module internal WorkSchedulerSqlite =
                             let next = credits.[other.Id]
                             if other.Credit <> Some next then
                                 let current = p.LaunchRecords.[other.Id]
-                                yield update current (withCredit current (Some next)) ]
+                                yield update current (withCredit p current next) ]
                     let command =
                         { OperationId = operationId
                           Guards = verified |> List.collect (fst >> projectGuards)
@@ -468,7 +493,7 @@ module internal WorkSchedulerSqlite =
 
     /// A registered launch gets at most one primary claim. This does NOT
     /// release account capacity or execute external effects.
-    let claim (store: WorkSqliteAuthority) (p: SqliteSchedulerProject)
+    let private claimFresh (store: WorkSqliteAuthority) (p: SqliteSchedulerProject)
               (operationId: Guid) launchId : Result<SqliteSchedulerOutcome, SqliteSchedulerError> =
         if operationId = Guid.Empty then fail "claim operation ID missing"
         else
@@ -519,13 +544,17 @@ module internal WorkSchedulerSqlite =
                                         |> changeString "credit" None
                                         |> changeString "primaryWorkId" (Some item.Stage.Id)
                                         |> changeBool "everClaimed" true
-                                    ClaimGeneration = stage.Value.ClaimGeneration + 1L }
+                                        |> changeString "claimOperationId" (Some(operationId.ToString("D")))
+                                        |> changeInt "claimWorkGeneration" item.Stage.StageGeneration
+                                    ClaimGeneration = stage.Value.ClaimGeneration + 1L
+                                    StageGeneration = stage.Value.StageGeneration
+                                    SourceSha = stage.Value.SourceSha }
                             let recredits =
                                 [ for other in others do
                                     let next = credits.[other.Id]
                                     if other.Credit <> Some next then
                                         let current = p.LaunchRecords.[other.Id]
-                                        yield update current (withCredit current (Some next)) ]
+                                        yield update current (withCredit p current next) ]
                             let command =
                                 { OperationId = operationId
                                   Guards = projectGuards p
@@ -544,3 +573,72 @@ module internal WorkSchedulerSqlite =
                                      WorkId = item.Stage.Id
                                      WorkGeneration = item.Stage.StageGeneration }
                 | _ -> fail "requires registered, unstopped, never-claimed launch"
+
+    // A retry after store reopen must resolve the original committed outcome
+    // before current eligibility, account capacity, or EverClaimed can reject it.
+    // An unrelated receipt (including a changed launch identity) fails closed.
+    let private replayOutcome (store: WorkSqliteAuthority) (operationId: Guid)
+                              (launchId: string) (projectIds: string list)
+                              (operationField: string) (workField: string)
+                              (generationField: string) (requirePrimary: bool) =
+        match store.ReadReceipt operationId with
+        | Error failure -> Error(SqliteSchedulerError.Storage failure)
+        | Ok None -> Ok None
+        | Ok(Some receipt) ->
+            let rec locate remaining found =
+                match remaining with
+                | [] -> Ok found
+                | projectId :: rest ->
+                    match store.ReadRecord (key WorkSqliteRecordKind.Launch projectId launchId) with
+                    | Error failure -> Error(SqliteSchedulerError.Storage failure)
+                    | Ok None -> locate rest found
+                    | Ok(Some row) ->
+                        match found with
+                        | Some _ -> fail "duplicate launch identity across replay projects"
+                        | None -> locate rest (Some(projectId, row))
+            match locate (projectIds |> List.distinct) None with
+            | Error failure -> Error failure
+            | Ok(Some(projectId, row)) when
+                stringProperty operationField row = Some(operationId.ToString("D")) ->
+                match stringProperty "roleId" row,
+                      stringProperty workField row,
+                      intProperty generationField row with
+                | Some roleId, Some workId, Some generation when
+                    generation > 0
+                    && (not requirePrimary
+                        || (boolProperty "everClaimed" row = Some true
+                            && stringProperty "primaryWorkId" row = Some workId)) ->
+                    Ok(Some
+                        { Receipt = receipt
+                          ProjectId = projectId
+                          RoleId = roleId
+                          LaunchId = launchId
+                          WorkId = workId
+                          WorkGeneration = generation })
+                | _ -> fail "applied receipt has missing or inconsistent launch result provenance"
+            | _ -> Error(SqliteSchedulerError.Storage(WorkSqliteFailure.OperationIdReused operationId))
+
+    let reserve (store: WorkSqliteAuthority) (snapshot: SqliteSchedulerSnapshot)
+                (operationId: Guid) launchId : Result<SqliteSchedulerOutcome, SqliteSchedulerError> =
+        if operationId = Guid.Empty || String.IsNullOrWhiteSpace launchId then
+            fail "original operation/launch identity is missing"
+        elif not snapshot.CompleteProjectSet then
+            fail "account project set is incomplete"
+        else
+            match replayOutcome store operationId launchId
+                    (snapshot.Projects |> List.map (fun p -> p.Id))
+                    "reservationOperationId" "reservationWorkId" "reservationWorkGeneration" false with
+            | Error failure -> Error failure
+            | Ok(Some original) -> Ok original
+            | Ok None -> reserveFresh store snapshot operationId launchId
+
+    let claim (store: WorkSqliteAuthority) (p: SqliteSchedulerProject)
+              (operationId: Guid) launchId : Result<SqliteSchedulerOutcome, SqliteSchedulerError> =
+        if operationId = Guid.Empty || String.IsNullOrWhiteSpace launchId then
+            fail "claim operation/launch identity is missing"
+        else
+            match replayOutcome store operationId launchId [ p.Id ]
+                    "claimOperationId" "primaryWorkId" "claimWorkGeneration" true with
+            | Error failure -> Error failure
+            | Ok(Some original) -> Ok original
+            | Ok None -> claimFresh store p operationId launchId

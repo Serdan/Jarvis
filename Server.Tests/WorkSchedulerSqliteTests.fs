@@ -453,3 +453,154 @@ let role_message_requires_future_durable_handler_cas_and_is_not_ghost_claimed ()
         Assert.That((store.ReadCapacity "shared" |> ok |> Option.get).Reserved, Is.EqualTo 0)
         Assert.That(store.ReadRecord (key WorkSqliteRecordKind.Launch id "ghost") |> ok |> Option.isNone, Is.True)
     )
+
+
+let private reloadProject (store: WorkSqliteAuthority) (p: SqliteSchedulerProject) queue =
+    let read key = store.ReadRecord key |> ok |> Option.get
+    { p with
+        Queue = queue
+        Stored = read p.Stored.Key
+        StageRecords = p.StageRecords |> Map.map (fun _ item -> read item.Key)
+        RoleRecords = p.RoleRecords |> List.map (fun role -> { role with Stored = read role.Stored.Key })
+        LaunchRecords =
+            queue.Launches
+            |> Map.map (fun launchId _ -> read (key WorkSqliteRecordKind.Launch p.Id launchId)) }
+
+[<Test>]
+let review_only_unsettled_credit_cannot_justify_another_global_reservation () =
+    for effect in [ WorkSqliteEffect.Unknown; WorkSqliteEffect.Prepared ] do
+        withStore (fun store _ ->
+            let id = "p"
+            let review = stage id "review" "review" 1L WorkState.Available Set.empty
+            let implement = stage id "implement" "implementation" 2L WorkState.Available Set.empty
+            let existing =
+                launch id "specialist-reserved" "reviewer" LaunchState.ReservedUnregistered (Some "review")
+            let original =
+                makeProject id (root id) [ review; implement ]
+                    [ "reviewer", Set.singleton "review"
+                      "generalist", Set.singleton "implementation" ]
+                    [ existing ] [ "implement", 10 ]
+            let old = original.StageRecords.["review"]
+            let project =
+                { original with
+                    StageRecords =
+                        original.StageRecords.Add(
+                            "review", { old with Value = { old.Value with ExternalEffect = effect } }) }
+            let snapshot = seed store 2 1 [ project ]
+            match WorkSchedulerSqlite.reserve store snapshot (Guid.NewGuid()) "new-generalist" with
+            | Error SqliteSchedulerError.NoEligibleWork -> ()
+            | result -> Assert.Fail(sprintf "Unsettled %A was counted as specialist credit: %A" effect result)
+            Assert.That((store.ReadCapacity "shared" |> ok |> Option.get).Reserved, Is.EqualTo 1)
+            Assert.That(store.ReadRecord(key WorkSqliteRecordKind.Launch id "new-generalist") |> ok |> Option.isNone, Is.True)
+        )
+
+[<Test>]
+let claim_reranking_persists_actual_work_source_and_generation () =
+    withStore (fun store _ ->
+        let id = "p"
+        let shaA = String.replicate 40 "a"
+        let shaB = String.replicate 40 "b"
+        let a = stage id "a" "implementation" 1L WorkState.Available Set.empty
+        let b = { stage id "b" "implementation" 2L WorkState.Available Set.empty with StageGeneration = 2 }
+        let registered =
+            launch id "launch" "engineer" (LaunchState.Registered("uuid", "session")) (Some "a")
+        let original = makeProject id (root id) [ a; b ]
+                            [ "engineer", Set.singleton "implementation" ]
+                            [ registered ] [ "a", 1; "b", 20 ]
+        let withSource workId sha =
+            let row = original.StageRecords.[workId]
+            { row with Value = { row.Value with SourceSha = Some sha } }
+        let launchRow = original.LaunchRecords.[registered.Id]
+        let p =
+            { original with
+                StageRecords =
+                    original.StageRecords.Add("a", withSource "a" shaA)
+                        .Add("b", withSource "b" shaB)
+                LaunchRecords =
+                    original.LaunchRecords.Add(
+                        registered.Id,
+                        { launchRow with Value = { launchRow.Value with SourceSha = Some shaA } }) }
+        seed store 1 1 [ p ] |> ignore
+        let claimed = WorkSchedulerSqlite.claim store p (Guid.NewGuid()) registered.Id |> ok
+        Assert.That(claimed.WorkId, Is.EqualTo "b")
+        Assert.That(claimed.WorkGeneration, Is.EqualTo 2)
+        let persisted = store.ReadRecord p.LaunchRecords.[registered.Id].Key |> ok |> Option.get
+        Assert.That(persisted.Value.SourceSha, Is.EqualTo(Some shaB))
+        Assert.That(persisted.Value.StageGeneration, Is.EqualTo 2L)
+        Assert.That(persisted.Value.ClaimGeneration, Is.EqualTo 1L)
+        let body = JsonNode.Parse(persisted.Value.BodyJson).AsObject()
+        let primary = body["primaryWorkId"]
+        Assert.That(primary.ToString(), Is.EqualTo "b")
+    )
+
+[<Test>]
+let cap_one_reservation_replays_from_fresh_reopened_sqlite_state () =
+    withStore (fun store path ->
+        let id = "p"
+        let p = makeProject id (root id)
+                    [ stage id "work" "implementation" 1L WorkState.Available Set.empty ]
+                    [ "engineer", Set.singleton "implementation" ] [] []
+        let initial = seed store 1 0 [ p ]
+        let operation = Guid.NewGuid()
+        let first = WorkSchedulerSqlite.reserve store initial operation "reserved" |> ok
+        let reserved = launch id "reserved" first.RoleId LaunchState.ReservedUnregistered (Some first.WorkId)
+        let queue =
+            { p.Queue with
+                Version = p.Queue.Version + 1
+                Launches = p.Queue.Launches.Add(reserved.Id, reserved) }
+        let fresh =
+            { initial with
+                Account = store.ReadCapacity "shared" |> ok |> Option.get
+                Projects = [ reloadProject store p queue ] }
+        let reopened = WorkSqliteAuthority(path)
+        let again = WorkSchedulerSqlite.reserve reopened fresh operation "reserved" |> ok
+        Assert.That(again.Receipt.Replayed, Is.True)
+        Assert.That(again.Receipt.Sequence, Is.EqualTo first.Receipt.Sequence)
+        Assert.That(again.WorkId, Is.EqualTo first.WorkId)
+        Assert.That(again.WorkGeneration, Is.EqualTo first.WorkGeneration)
+        Assert.That((store.ReadCapacity "shared" |> ok |> Option.get).Reserved, Is.EqualTo 1)
+        Assert.That(store.CurrentSequence() |> ok, Is.EqualTo 2L)
+        match WorkSchedulerSqlite.reserve reopened fresh operation "different-launch" with
+        | Error(SqliteSchedulerError.Storage(WorkSqliteFailure.OperationIdReused _)) -> ()
+        | result -> Assert.Fail(sprintf "Reused receipt with changed launch identity: %A" result)
+        match WorkSchedulerSqlite.reserve reopened fresh (Guid.NewGuid()) "new" with
+        | Error SqliteSchedulerError.NoCapacity -> ()
+        | result -> Assert.Fail(sprintf "Fresh operation unexpectedly bypassed cap-one: %A" result)
+    )
+
+[<Test>]
+let already_claimed_launch_replays_from_fresh_reopened_sqlite_state () =
+    withStore (fun store path ->
+        let id = "p"
+        let originalStage = stage id "work" "implementation" 1L WorkState.Available Set.empty
+        let registered =
+            launch id "launch" "engineer" (LaunchState.Registered("uuid", "session")) (Some "work")
+        let p = makeProject id (root id) [ originalStage ]
+                    [ "engineer", Set.singleton "implementation" ] [ registered ] []
+        seed store 1 1 [ p ] |> ignore
+        let operation = Guid.NewGuid()
+        let first = WorkSchedulerSqlite.claim store p operation registered.Id |> ok
+        let claimedStage =
+            { originalStage with State = WorkState.Claimed registered.Id; ClaimGeneration = 1 }
+        let claimedLaunch =
+            { registered with Credit = None; PrimaryWorkId = Some originalStage.Id; EverClaimed = true }
+        let queue =
+            { p.Queue with
+                Version = p.Queue.Version + 1
+                Works = p.Queue.Works.Add(originalStage.Id, claimedStage)
+                Launches = p.Queue.Launches.Add(registered.Id, claimedLaunch) }
+        let fresh = reloadProject store p queue
+        let reopened = WorkSqliteAuthority(path)
+        let again = WorkSchedulerSqlite.claim reopened fresh operation registered.Id |> ok
+        Assert.That(again.Receipt.Replayed, Is.True)
+        Assert.That(again.Receipt.Sequence, Is.EqualTo first.Receipt.Sequence)
+        Assert.That(again.WorkId, Is.EqualTo first.WorkId)
+        Assert.That(again.WorkGeneration, Is.EqualTo first.WorkGeneration)
+        Assert.That(store.CurrentSequence() |> ok, Is.EqualTo 2L)
+        match WorkSchedulerSqlite.claim reopened fresh operation "different-launch" with
+        | Error(SqliteSchedulerError.Storage(WorkSqliteFailure.OperationIdReused _)) -> ()
+        | result -> Assert.Fail(sprintf "Reused claim operation with changed identity: %A" result)
+        match WorkSchedulerSqlite.claim reopened fresh (Guid.NewGuid()) registered.Id with
+        | Error(SqliteSchedulerError.Incomplete _) -> ()
+        | result -> Assert.Fail(sprintf "Fresh claim succeeded on previously claimed launch: %A" result)
+    )

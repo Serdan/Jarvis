@@ -4,6 +4,7 @@ open System
 open System.Collections.Generic
 open System.Security.Cryptography
 open System.Text
+open System.Text.Json
 open Common
 
 // Manual, operator-supervised authority is deliberately NOT a Work reservation.
@@ -13,6 +14,7 @@ type ManualGrantTicket = { Credential: string; Scope: ManualGrantScope }
 type ManualGrantStatus = Pending | Approved | Denied | Creating | Created | CreationBlocked
 type private ManualGrantEntry =
     { Owner: string
+      DeviceId: string
       Scope: ManualGrantScope
       mutable Status: ManualGrantStatus
       mutable CanonicalProjectId: string option }
@@ -58,6 +60,28 @@ module ManualGrantPolicy =
                 && value.[14] = '4' && "89ab".Contains(value.[19])
             | _ -> false)
 
+    let canonicalProjectId (value: string) =
+        not (String.IsNullOrWhiteSpace value)
+        && (match Guid.TryParseExact(value, "D") with
+            | true, parsed -> parsed <> Guid.Empty && parsed.ToString("D") = value
+            | _ -> false)
+
+    // Accept only a completed ledger Health response from the selected client.
+    // A pending/failed response, malformed ID or missing Git binding is no proof.
+    let verifiedHealthProjectId (response: AgentCommandResponse) =
+        match response.Result, response.Error, response.PendingJob with
+        | Some body, None, None ->
+            try
+                use document = JsonDocument.Parse(body)
+                let mutable id = Unchecked.defaultof<JsonElement>
+                if document.RootElement.TryGetProperty("projectId", &id)
+                   && id.ValueKind = JsonValueKind.String then
+                    let value = id.GetString()
+                    if canonicalProjectId value then Some value else None
+                else None
+            with _ -> None
+        | _ -> None
+
 type ManualGrantStore() =
     let syncRoot = obj()
     // SHA-256 of 122-bit CSPRNG UUIDv4: never retain bearer preimages.
@@ -71,15 +95,23 @@ type ManualGrantStore() =
             | true, entry when String.Equals(entry.Owner, owner, StringComparison.Ordinal) -> Some entry
             | _ -> None
 
-    member _.Request(owner, kind, projectName, purpose, capabilities: string list) =
+    member _.Request(owner, deviceId, kind, projectName, purpose,
+                     capabilities: string list, observedCanonicalProjectId: string option) =
         lock syncRoot (fun () ->
             match ManualGrantPolicy.validate owner kind projectName purpose capabilities with
             | Error message -> Error message
+            | Ok _ when String.IsNullOrWhiteSpace deviceId || deviceId.Length > 256 ->
+                Error "Manual grant requires the exact registered client device."
+            | Ok _ when kind = "existing"
+                        && not (observedCanonicalProjectId |> Option.exists ManualGrantPolicy.canonicalProjectId) ->
+                Error "Existing project must have a verified canonical Git project identity on the selected device."
             | Ok scope when entries.Count >= 4096 ->
                 Error "Ephemeral manual-grant verifier capacity is exhausted until server restart."
             | Ok scope ->
                 let credential = Guid.NewGuid().ToString("D")
-                let entry = { Owner = owner; Scope = scope; Status = Pending; CanonicalProjectId = None }
+                let entry =
+                    { Owner = owner; DeviceId = deviceId; Scope = scope; Status = Pending
+                      CanonicalProjectId = if kind = "existing" then observedCanonicalProjectId else None }
                 entries.Add(digest credential, entry)
                 Ok { Credential = credential; Scope = scope })
 
@@ -97,16 +129,24 @@ type ManualGrantStore() =
     // Only approved, in-scope operation *families* reach the host.
     // Prospective creation is an atomic one-use transition: all subsequent
     // operations are forbidden until the returned canonical project name binds.
+    member _.BoundDeviceId(owner, credential) =
+        lock syncRoot (fun () -> find owner credential |> Option.map _.DeviceId)
+
     member _.ExpectedCanonicalProjectId(owner, credential) =
         lock syncRoot (fun () ->
             match find owner credential with
-            | Some entry when entry.Status = Created -> entry.CanonicalProjectId
+            | Some entry when entry.Status = Created
+                               || (entry.Scope.ResourceKind = "existing" && entry.Status = Approved) ->
+                entry.CanonicalProjectId
             | _ -> None)
 
-    member _.Authorize(owner, credential, command: AgentCommand, observedCanonicalProjectId: string option) =
+    member _.Authorize(owner, credential, deviceId, command: AgentCommand,
+                       observedCanonicalProjectId: string option) =
         lock syncRoot (fun () ->
             match find owner credential with
             | None -> Error "Unknown manual grant credential or account."
+            | Some entry when not (String.Equals(entry.DeviceId, deviceId, StringComparison.Ordinal)) ->
+                Error "Manual grant is bound to the original operator-approved client device."
             | Some entry when entry.Status = Pending -> Error "Manual grant is awaiting operator approval."
             | Some entry when entry.Status = Denied -> Error "Manual grant was denied."
             | Some entry when entry.Status = Creating -> Error "Project creation is awaiting a verified result."
@@ -130,7 +170,11 @@ type ManualGrantStore() =
                         Error "Canonical project identity was not independently verified for this operation."
                     | "existing", Approved, CreateProjectCommand _ ->
                         Error "Existing-project grants cannot create projects."
-                    | "existing", Approved, _ -> Ok false
+                    | "existing", Approved, _ when entry.CanonicalProjectId.IsSome
+                                                   && observedCanonicalProjectId = entry.CanonicalProjectId ->
+                        Ok false
+                    | "existing", Approved, _ ->
+                        Error "Existing project identity was not independently verified for this operation."
                     | _ -> Error "Prospective project must be created and canonically bound first."
                 | None, _ -> Error "This operation is not delegable through a manual grant."
                 | Some _, None -> Error "Operation has no project scope."
@@ -145,10 +189,7 @@ type ManualGrantStore() =
                 let verifiedId =
                     match createdProject with
                     | Some(name, projectId) when name = entry.Scope.ProjectName ->
-                        match Guid.TryParseExact(projectId, "D") with
-                        | true, guid when guid <> Guid.Empty
-                                          && guid.ToString("D") = projectId -> Some projectId
-                        | _ -> None
+                        if ManualGrantPolicy.canonicalProjectId projectId then Some projectId else None
                     | _ -> None
                 entry.CanonicalProjectId <- verifiedId
                 entry.Status <- if verifiedId.IsSome then Created else CreationBlocked

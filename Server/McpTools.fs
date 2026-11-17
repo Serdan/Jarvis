@@ -894,38 +894,32 @@ module McpToolHelpers =
                             match Auth.tryUserId context.User with
                             | Some owner when missingScope.IsNone && Auth.hasScope Auth.WorkspaceRead context.User ->
                                 let store = context.RequestServices.GetRequiredService<ManualGrantStore>()
-                                let! observedProjectId =
-                                    task {
-                                        match store.ExpectedCanonicalProjectId(owner, manualCredential) with
-                                        | None -> return None
-                                        | Some _ ->
-                                            match ManualGrantPolicy.target command with
-                                            | None -> return None
-                                            | Some project ->
-                                                // A fresh trusted Git ledger health read on the
-                                                // SAME selected client provides immutable project
-                                                // identity. Missing/unknown proof denies mutation.
+                                match store.BoundDeviceId(owner, manualCredential), manualDevice with
+                                | Some approvedDevice, Some selectedDevice
+                                    when String.Equals(approvedDevice, selectedDevice, StringComparison.Ordinal) ->
+                                    let! observedProjectId =
+                                        task {
+                                            match store.ExpectedCanonicalProjectId(owner, manualCredential),
+                                                  ManualGrantPolicy.target command with
+                                            | Some _, Some project ->
+                                                // Recheck the Git ledger identity on the SAME approved
+                                                // device before every mutation. Names alone are not authority.
                                                 let! health =
                                                     client.SendCommandToUser(owner,
                                                         LedgerReadCommand
                                                             { ProjectName = project; Action = "Health"
                                                               OperationId = ""; Cursor = ""; PageSize = 0 },
                                                         ?conversationId = RequestDeviceRouting.session(),
-                                                        ?deviceId = manualDevice,
+                                                        deviceId = approvedDevice,
                                                         ?agentId = RequestDeviceRouting.agentId())
-                                                match health.Result, health.Error, health.PendingJob with
-                                                | Some body, None, None ->
-                                                    try
-                                                        use document = JsonDocument.Parse(body)
-                                                        let mutable id = Unchecked.defaultof<JsonElement>
-                                                        if document.RootElement.TryGetProperty("projectId", &id)
-                                                           && id.ValueKind = JsonValueKind.String then
-                                                            return Some(id.GetString())
-                                                        else return None
-                                                    with _ -> return None
-                                                | _ -> return None
-                                    }
-                                return store.Authorize(owner, manualCredential, command, observedProjectId)
+                                                return ManualGrantPolicy.verifiedHealthProjectId health
+                                            | _ -> return None
+                                        }
+                                    return store.Authorize(owner, manualCredential, selectedDevice, command, observedProjectId)
+                                | Some _, _ ->
+                                    return Error "Manual grant cannot be reused on another client device."
+                                | None, _ ->
+                                    return Error "Unknown manual grant credential or account."
                             | _ -> return Error "Account OAuth authentication and scoped privileges are required."
                     }
                 match Auth.tryUserId context.User with
@@ -1129,46 +1123,74 @@ module McpToolHelpers =
                 | Some _ when not (Auth.hasScope Auth.WorkspaceRead context.User) ->
                     return authorizationErrorResult context Auth.WorkspaceRead
                 | Some owner ->
-                    let requested = if isNull capabilities then [] else Array.toList capabilities
-                    match store.Request(owner, resourceKind, projectName, purpose, requested) with
-                    | Error reason -> return errorResult (ValidationFailed reason)
-                    | Ok ticket ->
-                        // This separate SignalR route always displays an
-                        // operator-only permission prompt, regardless of the
-                        // local client's FullTrust setting.
-                        let intent: ManualGrantApprovalRequest =
-                            { Purpose = ticket.Scope.Purpose
-                              ResourceKind = ticket.Scope.ResourceKind
-                              ProjectName = ticket.Scope.ProjectName
-                              Capabilities = ticket.Scope.Capabilities |> Set.toList }
-                        let! reply =
-                            client.SendCommandToUser(
-                                owner,
-                                MessageCommand
-                                    { ProjectName = Some ticket.Scope.ProjectName
-                                      Message = "Operator-only manual grant decision" },
-                                ?conversationId = RequestDeviceRouting.session(),
-                                ?deviceId = RequestDeviceRouting.deviceOverride(),
-                                ?agentId = RequestDeviceRouting.agentId(),
-                                manualGrantApprovalRequest = JsonSerializer.Serialize intent)
-                        let approved =
-                            reply.Result = Some "true" && reply.Error.IsNone && reply.PendingJob.IsNone
-                        let denied =
-                            match reply.Error with
-                            | Some (PermissionDenied _) -> true
-                            | _ -> false
-                        if approved then store.Decide(owner, ticket.Credential, true) |> ignore
-                        elif denied then store.Decide(owner, ticket.Credential, false) |> ignore
-                        // Failed or ambiguous UI delivery stays pending.
-                        // Never infer operator approval from transport success.
-                        let status = if approved then "approved" elif denied then "denied" else "pending"
-                        return jsonResult
-                            {| credential = ticket.Credential
-                               status = status
-                               projectName = ticket.Scope.ProjectName
-                               resourceKind = ticket.Scope.ResourceKind
-                               purpose = ticket.Scope.Purpose
-                               capabilities = (ticket.Scope.Capabilities |> Set.toList) |}
+                    let users = context.RequestServices.GetRequiredService<UserService>()
+                    match users.GetSelectedSession(owner, RequestDeviceRouting.session(),
+                                                   RequestDeviceRouting.deviceOverride()) with
+                    | ValueNone ->
+                        return errorResult (PermissionDenied "Manual grant requires a selected authenticated client device.")
+                    | ValueSome selected when selected.State <> Registered || selected.ConnectionId.IsNone ->
+                        return errorResult (PermissionDenied "Manual grant requires a connected authenticated client device.")
+                    | ValueSome selected ->
+                        // Resolve and pin the device BEFORE prompting. Neither
+                        // later conversation selection nor per-call deviceId overrides
+                        // may transplant authority to a different physical project.
+                        let approvedDevice = selected.DeviceId
+                        let! observedProjectId =
+                            task {
+                                if resourceKind <> "existing" then return None
+                                else
+                                    let! health =
+                                        client.SendCommandToUser(owner,
+                                            LedgerReadCommand
+                                                { ProjectName = projectName; Action = "Health"
+                                                  OperationId = ""; Cursor = ""; PageSize = 0 },
+                                            ?conversationId = RequestDeviceRouting.session(),
+                                            deviceId = approvedDevice,
+                                            ?agentId = RequestDeviceRouting.agentId())
+                                    return ManualGrantPolicy.verifiedHealthProjectId health
+                            }
+                        let requested = if isNull capabilities then [] else Array.toList capabilities
+                        match store.Request(owner, approvedDevice, resourceKind, projectName, purpose,
+                                            requested, observedProjectId) with
+                        | Error reason -> return errorResult (ValidationFailed reason)
+                        | Ok ticket ->
+                            // This separate SignalR route always displays an
+                            // operator-only permission prompt, regardless of the
+                            // local client's FullTrust setting.
+                            let intent: ManualGrantApprovalRequest =
+                                { Purpose = ticket.Scope.Purpose
+                                  ResourceKind = ticket.Scope.ResourceKind
+                                  ProjectName = ticket.Scope.ProjectName
+                                  Capabilities = ticket.Scope.Capabilities |> Set.toList }
+                            let! reply =
+                                client.SendCommandToUser(
+                                    owner,
+                                    MessageCommand
+                                        { ProjectName = Some ticket.Scope.ProjectName
+                                          Message = "Operator-only manual grant decision" },
+                                    ?conversationId = RequestDeviceRouting.session(),
+                                    deviceId = approvedDevice,
+                                    ?agentId = RequestDeviceRouting.agentId(),
+                                    manualGrantApprovalRequest = JsonSerializer.Serialize intent)
+                            let approved =
+                                reply.Result = Some "true" && reply.Error.IsNone && reply.PendingJob.IsNone
+                            let denied =
+                                match reply.Error with
+                                | Some (PermissionDenied _) -> true
+                                | _ -> false
+                            if approved then store.Decide(owner, ticket.Credential, true) |> ignore
+                            elif denied then store.Decide(owner, ticket.Credential, false) |> ignore
+                            // Failed or ambiguous UI delivery stays pending.
+                            // Never infer operator approval from transport success.
+                            let status = if approved then "approved" elif denied then "denied" else "pending"
+                            return jsonResult
+                                {| credential = ticket.Credential
+                                   status = status
+                                   deviceId = approvedDevice
+                                   projectName = ticket.Scope.ProjectName
+                                   resourceKind = ticket.Scope.ResourceKind
+                                   purpose = ticket.Scope.Purpose
+                                   capabilities = (ticket.Scope.Capabilities |> Set.toList) |}
         }
 
     // Supplied by the ORIGINAL source caller, never server-minted or obtained
@@ -1689,7 +1711,7 @@ type JarvisMcpTools =
     static member ListProjects([<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http ListProjectsCommand
 
-    [<McpServerTool(Title = "Request manual grant", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Request an operator-approved ephemeral manual grant for one existing or prospective named project. Supply purpose and Work capability families: ContextRead, Implementation, Prerequisite, Review, Integration, SchedulingAdmin. Operator approval is required regardless of client trust; request itself never authorizes mutations. The returned CSPRNG UUIDv4 is an explicit manualGrantCredential argument for subsequent supported tools. No Work reservation or durable authority is created.")>]
+    [<McpServerTool(Title = "Request manual grant", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Request an operator-approved ephemeral manual grant for one existing or prospective named project. Supply purpose and Work capability families: ContextRead, Implementation, Prerequisite, Review, Integration, SchedulingAdmin. Operator approval is required regardless of client trust; request itself never authorizes mutations. The returned CSPRNG UUIDv4 is an explicit manualGrantCredential argument for subsequent supported tools. The returned deviceId is the approved client and must remain selected on subsequent calls. Existing projects are bound to their verified canonical Git identity. No Work reservation or durable authority is created.")>]
     static member RequestGrant(purpose: string, resourceKind: string, projectName: string,
                               agentId: string, capabilities: string array,
                               [<Optional; DefaultParameterValue("")>] deviceId: string,

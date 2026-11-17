@@ -1,8 +1,8 @@
 # C3 prerequisite proposal — authoritative original-Git writer admission and quiescence
 
-**Status:** Proposed engineering dependency for independent review; **not approved, deployed, enabled, or a migration GO**.  
-**Parent:** `work-verified-git-sqlite-import` (C3).  
-**Base:** integrated C2 source `9c290e299faf7ee40061f262f682c36b30d0771a`, accepted C2 `528b72659a6865aa1b8bb47875a2c4bbb4fdd4a9`, review `d4a29f0b7c9a4b5db14746b2f8ae1974`.  
+**Status:** Proposed engineering dependency for independent review; **not approved, deployed, enabled, or a migration GO**.
+**Parent:** `work-verified-git-sqlite-import` (C3).
+**Base:** integrated C2 source `9c290e299faf7ee40061f262f682c36b30d0771a`, accepted C2 `528b72659a6865aa1b8bb47875a2c4bbb4fdd4a9`, review `d4a29f0b7c9a4b5db14746b2f8ae1974`.
 **Scope of this document:** explain the missing source-authenticated protocol; propose a separately reviewed dependency rather than constructing a fictitious positive fence receipt.
 
 ## 1. Reproducible blocking fact

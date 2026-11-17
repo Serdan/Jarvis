@@ -428,6 +428,94 @@ module private WorkSqliteInternals =
     let readOptionalString (reader: SqliteDataReader) index =
         if reader.IsDBNull index then None else Some(reader.GetString index)
 
+
+    // The create/upgrade scripts are the only canonical source for physical
+    // schema identity. Compare every sqlite_master object against schemas
+    // executed by the same SQLite engine, so comments, literals, dropped
+    // constraints/indexes and unrelated objects cannot spoof the authority.
+    let initialSchemaSql = """
+CREATE TABLE work_meta (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    schema_version INTEGER NOT NULL,
+    last_sequence INTEGER NOT NULL CHECK(last_sequence>=0)
+);
+INSERT INTO work_meta(id,schema_version,last_sequence) VALUES(1,1,0);
+CREATE TABLE work_records (
+    project_id TEXT NOT NULL,
+    record_kind TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(version>=1),
+    body_json TEXT NOT NULL CHECK(json_valid(body_json)),
+    graph_version INTEGER NOT NULL CHECK(graph_version>=0),
+    stage_generation INTEGER NOT NULL CHECK(stage_generation>=0),
+    claim_generation INTEGER NOT NULL CHECK(claim_generation>=0),
+    stop_generation INTEGER NOT NULL CHECK(stop_generation>=0),
+    role_version INTEGER NOT NULL CHECK(role_version>=0),
+    source_sha TEXT,
+    review_sha TEXT,
+    integration_sha TEXT,
+    external_effect TEXT NOT NULL CHECK(external_effect IN
+        ('none','prepared','unknown','definitive-no-effect','observed')),
+    PRIMARY KEY(project_id,record_kind,entity_id)
+);
+CREATE INDEX work_records_project_kind ON work_records(project_id,record_kind);
+CREATE INDEX work_records_stage_claim ON work_records(record_kind,project_id,claim_generation);
+CREATE TABLE work_capacity (
+    account_id TEXT PRIMARY KEY,
+    version INTEGER NOT NULL CHECK(version>=1),
+    maximum INTEGER NOT NULL CHECK(maximum>=0),
+    reserved INTEGER NOT NULL CHECK(reserved>=0 AND reserved<=maximum)
+);
+CREATE TABLE work_receipts (
+    operation_id TEXT PRIMARY KEY,
+    command_hash TEXT NOT NULL,
+    sequence INTEGER NOT NULL UNIQUE CHECK(sequence>=1)
+);
+CREATE TABLE work_audit (
+    sequence INTEGER PRIMARY KEY,
+    operation_id TEXT NOT NULL UNIQUE REFERENCES work_receipts(operation_id),
+    command_hash TEXT NOT NULL,
+    committed_at_utc TEXT NOT NULL
+);
+PRAGMA application_id = 1247236683;
+PRAGMA user_version = 1;
+"""
+
+    let provenanceV2UpgradeSql = """
+ALTER TABLE work_records ADD COLUMN source_repository_id TEXT;
+ALTER TABLE work_records ADD COLUMN source_ref TEXT;
+ALTER TABLE work_records ADD COLUMN source_verification_receipt_id TEXT;
+ALTER TABLE work_records ADD COLUMN source_evidence_sha256 TEXT;
+UPDATE work_meta SET schema_version=2 WHERE id=1 AND schema_version=1;
+PRAGMA user_version=2;
+"""
+
+    let private compactSchemaSql (value: string) =
+        value |> Seq.filter (Char.IsWhiteSpace >> not) |> Seq.toArray
+        |> fun chars -> String(chars).ToLowerInvariant()
+
+    let private schemaCatalog (connection: SqliteConnection) =
+        use command = sql connection None
+                        """SELECT type, name, tbl_name, sql
+                           FROM sqlite_master ORDER BY type, name, tbl_name;""" []
+        use reader = command.ExecuteReader()
+        [ while reader.Read() do
+            let definition =
+                if reader.IsDBNull 3 then None
+                else Some(compactSchemaSql (reader.GetString 3))
+            yield reader.GetString 0, reader.GetString 1,
+                  reader.GetString 2, definition ]
+
+    // Lazy creation avoids per-initialization DDL replay and keeps version 2
+    // ALTER TABLE formatting identical to SQLite's real migration behavior.
+    let private expectedCatalogs = lazy (
+        use canonical = openConnection ":memory:" SqliteOpenMode.ReadWriteCreate
+        execute canonical None initialSchemaSql [] |> ignore
+        let v1 = schemaCatalog canonical
+        execute canonical None provenanceV2UpgradeSql [] |> ignore
+        let v2 = schemaCatalog canonical
+        Map.ofList [ SchemaVersion, v1; TrustedSchemaVersion, v2 ])
+
     // Compare physical names, affinity declarations, NOT NULL and primary-key
     // ordinals, not just the number of columns. Foreign/corrupt same-count
     // schemas must never be mistaken for an initialized Work authority.
@@ -488,49 +576,17 @@ module private WorkSqliteInternals =
             expected |> List.forall (fun (table, columns) -> actualColumns table = columns)
         if not columnsMatch then false
         else
-            let compact (value: string) =
-                value |> Seq.filter (Char.IsWhiteSpace >> not) |> Seq.toArray
-                |> fun chars -> String(chars).ToLowerInvariant()
-            let storedDdl kind name =
-                scalar connection None
-                    "SELECT sql FROM sqlite_master WHERE type=$kind AND name=$name;"
-                    [ "$kind", box kind; "$name", box name ]
-                |> function :? string as ddl -> Some(compact ddl) | _ -> None
-            let requires table fragments =
-                match storedDdl "table" table with
-                | Some ddl ->
-                    fragments |> List.forall (fun fragment ->
-                        ddl.Contains(compact fragment, StringComparison.Ordinal))
+            let catalogMatches =
+                match Map.tryFind schema expectedCatalogs.Value with
+                | Some canonical -> schemaCatalog connection = canonical
                 | None -> false
-            let checkConstraints =
-                [ "work_meta", [ "CHECK(id=1)"; "CHECK(last_sequence>=0)" ]
-                  "work_records",
-                    [ "CHECK(version>=1)"; "CHECK(json_valid(body_json))"
-                      "CHECK(graph_version>=0)"; "CHECK(stage_generation>=0)"
-                      "CHECK(claim_generation>=0)"; "CHECK(stop_generation>=0)"
-                      "CHECK(role_version>=0)"
-                      "CHECK(external_effect IN ('none','prepared','unknown','definitive-no-effect','observed'))" ]
-                  "work_capacity",
-                    [ "CHECK(version>=1)"; "CHECK(maximum>=0)"
-                      "CHECK(reserved>=0 AND reserved<=maximum)" ]
-                  "work_receipts", [ "UNIQUE"; "CHECK(sequence>=1)" ]
-                  "work_audit",
-                    [ "UNIQUE REFERENCES work_receipts(operation_id)" ] ]
-                |> List.forall (fun (table, fragments) -> requires table fragments)
-            let indexesMatch =
-                [ "work_records_project_kind",
-                    "CREATE INDEX work_records_project_kind ON work_records(project_id,record_kind)"
-                  "work_records_stage_claim",
-                    "CREATE INDEX work_records_stage_claim ON work_records(record_kind,project_id,claim_generation)" ]
-                |> List.forall (fun (name, statement) ->
-                    storedDdl "index" name = Some(compact statement))
             let metaRows =
                 scalar connection None "SELECT COUNT(*) FROM work_meta;" []
                 |> Convert.ToInt32
             let metaSchema =
                 scalar connection None "SELECT schema_version FROM work_meta WHERE id=1;" []
                 |> function null -> -1 | value -> Convert.ToInt32 value
-            checkConstraints && indexesMatch && metaRows = 1 && metaSchema = schema
+            catalogMatches && metaRows = 1 && metaSchema = schema
 
     let currentRecordVersion connection transaction key =
         scalar connection transaction
@@ -770,54 +826,7 @@ type WorkSqliteAuthority(databasePath: string) =
                     else
                         WorkSqliteInternals.execute connection None "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;" [] |> ignore
                         use transaction = connection.BeginTransaction()
-                        let create =
-                            """
-CREATE TABLE work_meta (
-    id INTEGER PRIMARY KEY CHECK(id=1),
-    schema_version INTEGER NOT NULL,
-    last_sequence INTEGER NOT NULL CHECK(last_sequence>=0)
-);
-INSERT INTO work_meta(id,schema_version,last_sequence) VALUES(1,1,0);
-CREATE TABLE work_records (
-    project_id TEXT NOT NULL,
-    record_kind TEXT NOT NULL,
-    entity_id TEXT NOT NULL,
-    version INTEGER NOT NULL CHECK(version>=1),
-    body_json TEXT NOT NULL CHECK(json_valid(body_json)),
-    graph_version INTEGER NOT NULL CHECK(graph_version>=0),
-    stage_generation INTEGER NOT NULL CHECK(stage_generation>=0),
-    claim_generation INTEGER NOT NULL CHECK(claim_generation>=0),
-    stop_generation INTEGER NOT NULL CHECK(stop_generation>=0),
-    role_version INTEGER NOT NULL CHECK(role_version>=0),
-    source_sha TEXT,
-    review_sha TEXT,
-    integration_sha TEXT,
-    external_effect TEXT NOT NULL CHECK(external_effect IN
-        ('none','prepared','unknown','definitive-no-effect','observed')),
-    PRIMARY KEY(project_id,record_kind,entity_id)
-);
-CREATE INDEX work_records_project_kind ON work_records(project_id,record_kind);
-CREATE INDEX work_records_stage_claim ON work_records(record_kind,project_id,claim_generation);
-CREATE TABLE work_capacity (
-    account_id TEXT PRIMARY KEY,
-    version INTEGER NOT NULL CHECK(version>=1),
-    maximum INTEGER NOT NULL CHECK(maximum>=0),
-    reserved INTEGER NOT NULL CHECK(reserved>=0 AND reserved<=maximum)
-);
-CREATE TABLE work_receipts (
-    operation_id TEXT PRIMARY KEY,
-    command_hash TEXT NOT NULL,
-    sequence INTEGER NOT NULL UNIQUE CHECK(sequence>=1)
-);
-CREATE TABLE work_audit (
-    sequence INTEGER PRIMARY KEY,
-    operation_id TEXT NOT NULL UNIQUE REFERENCES work_receipts(operation_id),
-    command_hash TEXT NOT NULL,
-    committed_at_utc TEXT NOT NULL
-);
-PRAGMA application_id = 1247236683;
-PRAGMA user_version = 1;
-"""
+                        let create = WorkSqliteInternals.initialSchemaSql
                         WorkSqliteInternals.execute connection (Some transaction) create [] |> ignore
                         transaction.Commit()
                         Ok WorkSqliteInternals.SchemaVersion)
@@ -842,14 +851,7 @@ PRAGMA user_version = 1;
                     Ok schema
                 else
                     use tx = connection.BeginTransaction()
-                    let upgrade = """
-ALTER TABLE work_records ADD COLUMN source_repository_id TEXT;
-ALTER TABLE work_records ADD COLUMN source_ref TEXT;
-ALTER TABLE work_records ADD COLUMN source_verification_receipt_id TEXT;
-ALTER TABLE work_records ADD COLUMN source_evidence_sha256 TEXT;
-UPDATE work_meta SET schema_version=2 WHERE id=1 AND schema_version=1;
-PRAGMA user_version=2;
-"""
+                    let upgrade = WorkSqliteInternals.provenanceV2UpgradeSql
                     WorkSqliteInternals.execute connection (Some tx) upgrade [] |> ignore
                     tx.Commit()
                     Ok WorkSqliteInternals.TrustedSchemaVersion)

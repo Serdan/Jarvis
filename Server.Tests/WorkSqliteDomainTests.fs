@@ -275,3 +275,84 @@ let v2_missing_required_index_is_foreign_even_with_correct_columns () =
         match (WorkSqliteAuthority(path)).Initialize() with
         | Error WorkSqliteFailure.ForeignDatabase -> ()
         | other -> Assert.Fail(sprintf "Malformed v2 index initialized: %A" other))
+
+
+// A CHECK string in sqlite_master.sql comments is not an enforced constraint.
+let private weakenJsonCheckInMaster path =
+    use connection = new SqliteConnection(sprintf "Data Source=%s" path)
+    connection.Open()
+    let scalar statement =
+        use command = connection.CreateCommand()
+        command.CommandText <- statement
+        command.ExecuteScalar()
+    let originalDdl = scalar "SELECT sql FROM sqlite_master WHERE type='table' AND name='work_records';" :?> string
+    Assert.That(originalDdl, Does.Contain("CHECK(json_valid(body_json))"))
+    let cookie = scalar "PRAGMA schema_version;" |> Convert.ToInt32
+    let execute statement =
+        use command = connection.CreateCommand()
+        command.CommandText <- statement
+        command.ExecuteNonQuery() |> ignore
+    execute "PRAGMA writable_schema=ON;"
+    try
+        use change = connection.CreateCommand()
+        change.CommandText <-
+            """UPDATE sqlite_master
+               SET sql=REPLACE(sql, 'CHECK(json_valid(body_json))',
+                                   '/* CHECK(json_valid(body_json)) */')
+               WHERE type='table' AND name='work_records';"""
+        Assert.That(change.ExecuteNonQuery(), Is.EqualTo 1)
+    finally
+        execute "PRAGMA writable_schema=OFF;"
+    execute (sprintf "PRAGMA schema_version=%d;" (cookie + 1))
+
+[<TestCase(1)>]
+[<TestCase(2)>]
+let commented_out_required_sqlite_check_is_foreign_in_both_schema_versions (schema: int) =
+    withAuthority (fun store path ->
+        Assert.That(store.Initialize() |> ok, Is.EqualTo 1)
+        if schema = 2 then
+            Assert.That(store.InitializeProvenanceV2() |> ok, Is.EqualTo 2)
+        let initial = singleRecord "alpha" WorkSqliteRecordKind.Stage "stage" "{}"
+        let operationId = Guid.NewGuid()
+        if schema = 2 then
+            store.CommitProvenanced(operationId, [],
+                [ { Mutation = initial; Source = Some(provenance sha) } ], [])
+            |> ok |> ignore
+        else
+            store.Commit { OperationId = operationId; Guards = []
+                           Records = [ initial ]; Capacities = [] }
+            |> ok |> ignore
+        weakenJsonCheckInMaster path
+
+        // Check the weakening is real, but roll back the invalid update.
+        use direct = new SqliteConnection(sprintf "Data Source=%s" path)
+        direct.Open()
+        use transaction = direct.BeginTransaction()
+        use violate = direct.CreateCommand()
+        violate.Transaction <- transaction
+        violate.CommandText <-
+            """UPDATE work_records SET body_json='not json'
+               WHERE project_id='alpha' AND record_kind='stage' AND entity_id='stage';"""
+        Assert.That(violate.ExecuteNonQuery(), Is.EqualTo 1,
+                    "Commented-out CHECK must actually permit invalid JSON")
+        transaction.Rollback()
+
+        let restarted = WorkSqliteAuthority(path)
+        match restarted.Initialize() with
+        | Error WorkSqliteFailure.ForeignDatabase -> ()
+        | other -> Assert.Fail(sprintf "Comment-weakened v%d SQLite initialized: %A" schema other)
+        match restarted.InitializeProvenanceV2() with
+        | Error WorkSqliteFailure.ForeignDatabase -> ()
+        | other -> Assert.Fail(sprintf "Comment-weakened v%d SQLite upgraded: %A" schema other)
+
+        let query statement =
+            use command = direct.CreateCommand()
+            command.CommandText <- statement
+            command.ExecuteScalar()
+        Assert.That(query "PRAGMA user_version;" |> Convert.ToInt32, Is.EqualTo schema)
+        Assert.That(query "SELECT schema_version FROM work_meta WHERE id=1;" |> Convert.ToInt32,
+                    Is.EqualTo schema)
+        Assert.That(query "SELECT last_sequence FROM work_meta WHERE id=1;" |> Convert.ToInt64,
+                    Is.EqualTo 1L)
+        Assert.That(query "SELECT COUNT(*) FROM work_receipts;" |> Convert.ToInt32,
+                    Is.EqualTo 1))

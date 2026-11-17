@@ -8,7 +8,7 @@
 ## Source decisions
 
 1. **An explicit v1 -> v2 SQLite migration, never a silent reinterpretation.** Original repository ID and original full Git ref cannot be inferred from B `source_sha` or the Git *backup* repository. V2 adds `source_repository_id`, `source_ref`, `source_verification_receipt_id`, `source_evidence_sha256` to each `work_records` row. Existing `source_sha` remains the exact commit and legacy rows remain unchanged. A legacy row with `source_sha` but no original source columns is **untrusted**, including after upgrade. The new `ReadSourceProvenance` refuses such rows and partial evidence; it cannot manufacture a witness.
-2. **No implicit upgrade and no new authority.** `Initialize()` still makes v1 by default. Explicit `InitializeProvenanceV2()` checks JWRK application identity, user/meta schema consistency, exact physical named column/type/NOT NULL/primary-key layouts, CHECK/UNIQUE/foreign-reference fragments, and declared indexes before returning healthy v1/v2 or upgrading. A same-count foreign schema fails closed. The v1-to-v2 upgrade is additive and transactional. Existing B receipt/sequence/audit transaction ordering remains unchanged. The old `Commit` is valid only for v1. An internal v2 physical adapter couples recorded original source evidence with the operation fingerprint and original row CAS guards. Changing repo/ref/evidence with a replayed operation ID cannot replay as the original; a v2 source-bearing to source-less UPDATE atomically clears all five related fields.
+2. **No implicit upgrade and no new authority.** `Initialize()` still makes v1 by default. Explicit `InitializeProvenanceV2()` checks JWRK application identity, user/meta schema consistency, exact physical named column/type/NOT NULL/primary-key layouts, complete canonical SQLite table/index catalogs (including enforced CHECK/UNIQUE/references), and schema metadata before returning healthy v1/v2 or upgrading. A same-count foreign schema fails closed. The v1-to-v2 upgrade is additive and transactional. Existing B receipt/sequence/audit transaction ordering remains unchanged. The old `Commit` is valid only for v1. An internal v2 physical adapter couples recorded original source evidence with the operation fingerprint and original row CAS guards. Changing repo/ref/evidence with a replayed operation ID cannot replay as the original; a v2 source-bearing to source-less UPDATE atomically clears all five related fields.
 3. **A physical provenance tuple is not an authentication proof.** `WorkSqliteSourceProvenance` records a claimed source and a referenced original-verification receipt; the B store does **not** itself independently fetch/verify canonical Git, immutable source, role approval, authenticated producer identity or scheduled credential scope. Tests which construct this tuple are explicitly **physical schema** tests, not authority tests. There is no live host registration for this adapter. F1/G1b must not treat the tuple alone or `ReadSourceProvenance` success as complete trusted provenance. An independently verified original-producer boundary must be installed and tested first.
 
 ## Blocked domain and producer obligations (not implemented in this lane)
@@ -23,4 +23,40 @@ Precise dependency for Lead/Manager backlog admission: **proposed** `work-truste
 
 ## Evidence
 
-Isolated `.NET 11 Release` compilation succeeded after project-local restore. `Server.Tests/WorkSqliteDomainTests.fs` covers explicit migration, eight physical record tags on two projects with shared capacity and replay, bad/missing repo/ref/commit/evidence inputs, raw-v2 denial, duplicate JSON property rejection (including nested objects/arrays), and partial schema upgrade failure. In direct response to independent review `b27b2c5fd7f448cf978cf52aa7f1a640` (ChangesRequested at sequence 6330), four additional tests cover source-bearing to source-less v2 update clearing, exact restart/receipt replay, same-count wrong-name v1 upgrade rejection, fabricated same-count v2 layout rejection after restart, and missing v2 index rejection. **Post-correction Release results:** focused `FullyQualifiedName~WorkSqliteDomainTests` 9 passed/0 failed/0 skipped; full `Server.Tests` Release 497 passed/0 failed/0 skipped. These are physical B tests, not authenticated eight-kind ingress proof. All checks use disposable local SQLite fixtures; nothing was migrated on a live host. No F1 export, recovery fencing, Scheduler, external effect, host route, deployment or cutover was executed.
+Isolated `.NET 11 Release` compilation succeeded after project-local restore. `Server.Tests/WorkSqliteDomainTests.fs` covers explicit migration, eight physical record tags on two projects with shared capacity and replay, bad/missing repo/ref/commit/evidence inputs, raw-v2 denial, duplicate JSON property rejection (including nested objects/arrays), and partial schema upgrade failure. In direct response to independent review `b27b2c5fd7f448cf978cf52aa7f1a640` (ChangesRequested at sequence 6330), four additional tests cover source-bearing to source-less v2 update clearing, exact restart/receipt replay, same-count wrong-name v1 upgrade rejection, fabricated same-count v2 layout rejection after restart, and missing v2 index rejection. **First-correction Release results (reviewed at 60df897d):** focused `FullyQualifiedName~WorkSqliteDomainTests` 9 passed/0 failed/0 skipped; full `Server.Tests` Release 497 passed/0 failed/0 skipped. These are physical B tests, not authenticated eight-kind ingress proof. All checks use disposable local SQLite fixtures; nothing was migrated on a live host. No F1 export, recovery fencing, Scheduler, external effect, host route, deployment or cutover was executed.
+
+
+### Second independent ChangesRequested correction: commented-out constraint bypass
+
+Reviewer 4's frozen review 5b6bb2b1c6d64e45b51a77a5f1017a5f of exact
+60df897dba87b42440420b69cbdcd0c7f1706360 (decision sequence 6377)
+established that sqlite_master.sql kept CHECK(json_valid(body_json)) as
+literal text even when the SQLite CHECK itself was replaced by a block comment.
+The old fragment-presence validator therefore accepted physically non-enforcing
+v1 and v2 layouts. This review has been acknowledged; it was **not** an approval.
+
+**Red-first:** two new NUnit cases build disposable v1/v2 authorities,
+commit one record and receipt, replace exactly the CHECK with a SQL comment in
+sqlite_master, and reload the altered schema. An invalid JSON UPDATE
+**succeeds** in a new connection (rolled back), proving the constraint is
+actually absent; before the source fix Initialize() returned Ok 1 and
+Ok 2, respectively. Both cases failed as expected.
+
+**Corrected implementation:** the original v1 CREATE/metadata and explicit v2
+ALTER/metadata SQL are shared single-source constants. A lazy, SQLite-executed
+in-memory reference builds complete canonical v1 and v2 sqlite_master
+catalogs. physicalSchemaMatches checks exact normalized catalog objects and
+full DDL (tables, indices, autoindices, constraints and references), together
+with existing named column/type/NOT NULL/PK and work_meta checks. Full-catalog
+equality rejects comments, extra schema objects and noncanonical constraints;
+a displayed substring can no longer impersonate enforcement. No unrelated
+producer, F1, G1b or host file was changed.
+
+**Independent-review candidate (not yet approved):** .NET 11 Release focused
+WorkSqliteDomainTests **11 passed / 0 failed / 0 skipped**; full
+Server.Tests **499 passed / 0 failed / 0 skipped**; git diff --check
+exit 0. Both new cases verify ForeignDatabase from Initialize() and
+InitializeProvenanceV2() without modifying SQLite user/meta schema version,
+last sequence or receipts. This is still a **physical v2 partial B slice only**:
+no authenticated eight-kind typed ingress, production writer authorization,
+F1 backup/inverse, G1b restore/recovery, deployment or cutover approval.

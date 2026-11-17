@@ -1,9 +1,11 @@
 module ServerWorkLegacyImportPreflightTests
 
 open System
+open System.IO
 open NUnit.Framework
 open Jarvis.WorkQueues
 open Jarvis.WorkQueues.Contracts
+open Server
 
 let private shaA = String.replicate 40 "a"
 let private shaB = String.replicate 40 "b"
@@ -409,3 +411,147 @@ let c0_tampered_terminal_blob_or_generation_blocks_release () =
                         { token with Released = true; TerminalReceipt = Some "terminal-receipt" }) } }
     fixture |> WorkLegacyImportPreflight.inspect
     |> expectsGap (function WorkLegacyImportGap.AccountCapacityConflict _ -> true | _ -> false)
+
+let private withOfflineFrozenProjects (input: WorkLegacyImportInspection) =
+    { input with
+        Projects =
+            input.Projects |> List.map (fun p ->
+                { p with Queue = { p.Queue with Migration = MigrationEpoch.Frozen } }) }
+
+let private offlineFence (input: WorkLegacyImportInspection) =
+    { AccountHead = input.Account.Head.PinnedCommit
+      ProjectHeads = input.Projects |> List.map (fun p -> p.ProjectId, p.Head.PinnedCommit)
+      FenceVersion = 2L
+      FenceOperationId = Guid.Parse "88888888-8888-4888-8888-888888888888" }
+
+let private withDisposableSqlite (act: string -> unit) =
+    let root = Path.Combine(Path.GetTempPath(), "jarvis-work-import-c1-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(root) |> ignore
+    File.WriteAllText(Path.Combine(root, WorkLegacyImportSqlite.DisposableMarker),
+                      WorkLegacyImportSqlite.DisposableMarkerContent)
+    let path = Path.Combine(root, "work.sqlite")
+    try act path
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
+let private offlineImportOperation = Guid.Parse "99999999-9999-4999-8999-999999999999"
+
+let private imported input fence path operationId =
+    match WorkLegacyImportSqlite.commitOfflineFixture path operationId input fence with
+    | Ok result -> result
+    | Error gap -> failwithf "Offline import unexpectedly failed: %A" gap
+
+[<Test>]
+let c1_offline_sqlite_atomic_two_project_import_restart_and_idempotent_replay () =
+    withDisposableSqlite (fun path ->
+        let input = twoProjects () |> withOfflineFrozenProjects
+        let fence = offlineFence input
+        let receipt = imported input fence path offlineImportOperation
+        Assert.That(receipt.Replayed, Is.False)
+        Assert.That(receipt.SqliteSequence, Is.EqualTo 1L)
+        let db = WorkSqliteAuthority(path)
+        match db.ReadCapacity(input.Account.AccountId.ToString("D")) with
+        | Ok(Some capacity) ->
+            Assert.That(capacity.Maximum, Is.EqualTo 2)
+            Assert.That(capacity.Reserved, Is.Zero)
+        | result -> Assert.Fail(sprintf "Missing global account capacity: %A" result)
+        for project in input.Projects do
+            let key =
+                { ProjectId = project.ProjectId.ToString("D")
+                  Kind = WorkSqliteRecordKind.Project
+                  EntityId = "legacy-queue" }
+            match db.ReadRecord key with
+            | Ok(Some record) ->
+                Assert.That(record.Version, Is.EqualTo 1L)
+                Assert.That(record.Value.BodyJson, Does.Contain("Migration"))
+                Assert.That(record.Value.SourceSha, Is.EqualTo(Some shaA))
+            | result -> Assert.Fail(sprintf "Missing project snapshot: %A" result)
+        let restarted = WorkSqliteAuthority(path)
+        Assert.That(restarted.CurrentSequence() |> Result.defaultValue -1L, Is.EqualTo 1L)
+        let replay = imported input fence path offlineImportOperation
+        Assert.That(replay.Replayed, Is.True)
+        Assert.That(replay.SqliteSequence, Is.EqualTo 1L)
+        Assert.That(restarted.CurrentSequence() |> Result.defaultValue -1L, Is.EqualTo 1L)
+        let changedOperation = Guid.Parse "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        match WorkLegacyImportSqlite.commitOfflineFixture path changedOperation input fence with
+        | Error(WorkLegacyImportSqliteGap.StorageFailure(WorkSqliteFailure.EntityAlreadyExists _)) -> ()
+        | result -> Assert.Fail(sprintf "Non-idempotent second import was not rejected: %A" result)
+        Assert.That(restarted.CurrentSequence() |> Result.defaultValue -1L, Is.EqualTo 1L))
+
+[<Test>]
+let c1_offline_preflight_and_fence_gate_refuse_unverified_inputs_before_db_creation () =
+    withDisposableSqlite (fun path ->
+        let input = twoProjects () |> withOfflineFrozenProjects
+        let fence = offlineFence input
+        let stale = { fence with ProjectHeads = [] }
+        match WorkLegacyImportSqlite.commitOfflineFixture path offlineImportOperation input stale with
+        | Error(WorkLegacyImportSqliteGap.UnverifiedWriterFence _) -> ()
+        | result -> Assert.Fail(sprintf "Unmatched fence accepted: %A" result)
+        Assert.That(File.Exists path, Is.False)
+        let invalid = modifyOne (fun p -> { p with Origins = [] }) input
+        match WorkLegacyImportSqlite.commitOfflineFixture path offlineImportOperation invalid fence with
+        | Error(WorkLegacyImportSqliteGap.PreflightRejected _) -> ()
+        | result -> Assert.Fail(sprintf "Source provenance missing but import succeeded: %A" result)
+        Assert.That(File.Exists path, Is.False))
+
+[<Test>]
+let c1_sqlite_transaction_rollback_on_late_second_project_conflict () =
+    withDisposableSqlite (fun path ->
+        let input = twoProjects () |> withOfflineFrozenProjects
+        let fence = offlineFence input
+        let db = WorkSqliteAuthority(path)
+        Assert.That(db.Initialize() |> Result.defaultValue -1, Is.EqualTo 1)
+        let occupiedKey =
+            { ProjectId = projectTwo.ToString("D")
+              Kind = WorkSqliteRecordKind.Stage
+              EntityId = "I2" }
+        let seedValue =
+            { BodyJson = "{}"
+              GraphVersion = 0L
+              StageGeneration = 1L
+              ClaimGeneration = 0L
+              StopGeneration = 0L
+              RoleVersion = 0L
+              SourceSha = None
+              ReviewSha = None
+              IntegrationSha = None
+              ExternalEffect = WorkSqliteEffect.NoneRecorded }
+        let seeded = db.Commit { OperationId = Guid.Parse "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                                 Guards = []
+                                 Records = [ { Key = occupiedKey; ExpectedVersion = None; Value = seedValue } ]
+                                 Capacities = [] }
+        Assert.That(seeded |> Result.isOk, Is.True)
+        match WorkLegacyImportSqlite.commitOfflineFixture path offlineImportOperation input fence with
+        | Error(WorkLegacyImportSqliteGap.StorageFailure(WorkSqliteFailure.EntityAlreadyExists _)) -> ()
+        | result -> Assert.Fail(sprintf "Late write conflict incorrectly imported: %A" result)
+        let firstProjectKey =
+            { ProjectId = projectOne.ToString("D")
+              Kind = WorkSqliteRecordKind.Project
+              EntityId = "legacy-queue" }
+        match db.ReadRecord firstProjectKey with
+        | Ok None -> ()
+        | result -> Assert.Fail(sprintf "Rolled back first project not absent: %A" result)
+        match db.ReadCapacity(accountId.ToString("D")) with
+        | Ok None -> ()
+        | result -> Assert.Fail(sprintf "Rolled back account capacity not absent: %A" result)
+        Assert.That(db.CurrentSequence() |> Result.defaultValue -1L, Is.EqualTo 1L))
+
+[<Test>]
+let c1_offline_fixture_import_does_not_open_unmarked_or_arbitrary_destinations () =
+    let path = Path.Combine(Path.GetTempPath(), "jarvis-not-marked-" + Guid.NewGuid().ToString("N"), "work.sqlite")
+    let input = twoProjects () |> withOfflineFrozenProjects
+    match WorkLegacyImportSqlite.commitOfflineFixture path offlineImportOperation input (offlineFence input) with
+    | Error(WorkLegacyImportSqliteGap.UnsafeDestination _) -> ()
+    | result -> Assert.Fail(sprintf "Unmarked DB destination was not rejected: %A" result)
+    Assert.That(File.Exists path, Is.False)
+
+[<Test>]
+let c1_symlink_database_is_rejected_even_if_dangling () =
+    if OperatingSystem.IsLinux() then
+        withDisposableSqlite (fun path ->
+            let target = Path.Combine(Path.GetTempPath(), "not-a-fixture-" + Guid.NewGuid().ToString("N"), "outside.sqlite")
+            File.CreateSymbolicLink(path, target) |> ignore
+            let input = twoProjects () |> withOfflineFrozenProjects
+            match WorkLegacyImportSqlite.commitOfflineFixture path offlineImportOperation input (offlineFence input) with
+            | Error(WorkLegacyImportSqliteGap.UnsafeDestination _) -> ()
+            | result -> Assert.Fail(sprintf "Dangling symlink DB path was not rejected: %A" result))

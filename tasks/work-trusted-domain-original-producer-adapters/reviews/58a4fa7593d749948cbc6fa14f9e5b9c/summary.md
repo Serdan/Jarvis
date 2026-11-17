@@ -1,0 +1,1 @@
+Frozen one-doc commit 09b739e32b928e8a2014e93032c65edacea55526; diff --check passed. Review exact eight-kind matrix, authenticated original versus caller assertion, credential/Unknown boundaries, explicit hard NO-GO.

@@ -1,5 +1,14 @@
 # Work queues and ephemeral agent executions
 
+> **Superseded target contract (2026-11-17):** This document records the
+> previously accepted Git-backed, FIFO-first work-queue architecture and
+> remains useful as historical design and current default-off implementation
+> reference. The new target contract is
+> [stateful Work orchestration](work-stateful-orchestration-2026-11-17.md)
+> and its [implementation alignment plan](work-stateful-implementation-alignment-2026-11-17.md).
+> The old per-project/account remote Git-CAS hot path, lack of explicit Lead
+> work-item priority, and empty-server durability premise **do not govern
+> future implementation**. No live cutover is authorized by this note.
 **Status:** Proposed architecture specification; design reference, not implemented or deployed. This branch is a Lead correction draft, not the frozen original under independent review.
 **Revision basis:** `e737c2da901ae4073f7ecc066781f428020ffdd1` (frozen review `d4fbb56e2d4c451eab1ef23c281dc647`).
 **Date:** 2026-11-15

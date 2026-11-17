@@ -6,33 +6,48 @@ Reviewers form an interchangeable pool. Submit a frozen review through `submit_r
 
 Agents own their notification preferences. Respect a `Blocked` notification outcome and its optional autoreply (for example, `Use the review queue.`); do not evade the block by changing operation IDs or recipients. Notification blocking does not suppress canonical task, review, or challenge state.
 
-## Server architecture: stateless by contract
+## Server architecture: minimal durable Work authority
 
-Keep the Jarvis server a simple authenticated relay suitable for the cheapest
-droplet that can run it. Minimize its CPU, RAM, disk, and service footprint.
-Spreading authoritative persistent state across machines creates unnecessary
-backup, migration, recovery, and operational work.
+The **target** architecture is documented in
+`docs/specs/work-stateful-orchestration-2026-11-17.md` and its
+`work-stateful-implementation-alignment-2026-11-17.md` migration plan.
+The operator has explicitly relaxed the old statelessness requirement because
+autonomous Work scheduling makes per-mutation remote-Git transactions too
+expensive and complex. Keep the server small, but allow the appropriate
+durable local state.
 
-- Clients and the approved Git-backed ledgers own durable project, workflow,
-  scheduling, execution, and recovery state. Never make server-local storage
-  authoritative for claims, launches, source effects, or other project actions.
-- Jarvis-level agent instruction files are the one intentionally durable
-  server-filesystem exception. Live connection registries, request correlation,
-  bounded transient exports, and other replaceable in-memory state are fine.
-- The existing server-side SQLite FeedbackStore may have been previously
-  authorized for disposable telemetry. Do not assume it was unauthorized or
-  remove it merely for architectural purity. Small, bounded, best-effort
-  diagnostics may remain only if losing the database is harmless to operational
-  correctness and requires no backup, restore, or migration. Do not introduce
-  new durable server-owned databases or files without explicit operator approval.
-- IMPORTANT: `attributed_agent_activity` in that SQLite database currently
-  influences `AfterAgentIdle` scheduling. An absent, reset, or recreated
-  database must never count as proof of inactivity or authorize a launch.
-  Fail closed until trustworthy client/ledger-owned activity evidence is
-  available; do not call this path disposable until that is demonstrated.
+- After an independently reviewed and explicitly authorized cutover, **one
+  authoritative server-side SQLite database** may own Work, task graph,
+  queues, priorities, claims, reservations, account-global capacity,
+  authorization receipts, and coordination audit events. Local SQLite
+  transactions, not GitHub round-trips, must be the normal mutation path.
+  Multiple clients contact the same authenticated service.
+- Source repositories and exact frozen implementation/review/integration
+  artifacts remain in Git. Export consistent, deterministic human-readable
+  JSON snapshots of coordination state to a separate Git backup history
+  asynchronously; unavailability of GitHub must not block ordinary claims.
+  Backups must be verified by tested JSON-to-empty-SQLite restore.
+- Ordinary server restart must preserve local durable state. Loss of the
+  host's persistent storage requires restore and **Recovery** reconciliation.
+  After a stale restore, the Scheduler must deterministically fence uncertain
+  launches, claims and external effects before specialized Recovery work
+  investigates newer Git artifacts. Never equate missing data with proof
+  that an action did not happen.
+- Preserve versioned state transitions, idempotency, source/ref provenance,
+  STOP, generation, exact review/integration outcomes, one-shot external-effect
+  journals, permission boundaries, and fail-closed unknown outcomes.
+- Server-memory-only operator-approved **manual grants** remain intentionally
+  ephemeral and do not enter SQLite or backups. Never export plaintext
+  scheduled bearer credentials. The existing SQLite FeedbackStore remains a
+  separate legacy/telemetry concern; do not replace or remove it on
+  architectural-purity grounds.
+- Important current transitional fact: `attributed_agent_activity` in the
+  existing FeedbackStore can influence `AfterAgentIdle`. Loss or reset of
+  that data is not proof of inactivity and must not authorize a launch.
 
-Acceptance test: replace or restart the server with an empty data directory
-(apart from Jarvis-level instruction files and normal deployment configuration).
-Project correctness, idempotency, scheduling safety, and recovery must survive;
-only nonessential diagnostics may disappear. Test missing state, reconnection,
-multiple clients, and stale/unknown outcomes before depending on a server cache.
+**No silent activation:** until the new backend, importer, backups, recovery
+and safety gates are reviewed and the operator explicitly approves cutover,
+the existing Git-backed project/account ledgers remain authoritative for
+existing live and default-off Work behavior. Do not introduce simultaneous
+old/new live writers, deploy/restart, or launch the unattended Scheduler merely
+because these target instructions have changed.

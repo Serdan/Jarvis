@@ -390,8 +390,7 @@ module WorkQueueReservationPermissions =
         let! (stage: WorkStage) =
             project.Works.TryFind grant.WorkId
             |> requireSome (InvalidBinding "Scoped Work is absent from the canonical project.")
-        if isNull bearer || bearer.Length <> 43
-           || not (Regex.IsMatch(bearer, "^[A-Za-z0-9_-]{43}$"))
+        if not (WorkCredentialFormat.isSupportedBearer bearer)
            || not (hex64 credential.SecretSha256) then
             return! denied request "Launch credential invalid"
         let presented = SHA256.HashData(Encoding.UTF8.GetBytes bearer)

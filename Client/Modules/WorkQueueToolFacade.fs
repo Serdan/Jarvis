@@ -274,3 +274,66 @@ module WorkQueueToolFacade =
                          ProjectVersion = project.Version; LaunchId = launchId; WorkId = workId
                          MissingBinding =
                            if action = "ClaimNext" then MissingClaimBinding else MissingTerminalBinding })
+
+    // Model-visible Work bearer is an explicit ordinary tool argument. The
+    // public launchId is only an index into the original Git verifier, never
+    // authentication. A valid bearer still cannot enable default-off live
+    // claim/registration: WQ03/WQ04 session/source CAS remains a separate gate.
+    let transitionWithExplicitCredential (binding: LedgerBinding) (action: string)
+            (actor: string) (operationId: string) (launchId: string)
+            (credential: string) (workId: string) expectedProjectVersion
+            claimGeneration evidenceSha =
+        let operation =
+            match Guid.TryParse operationId with
+            | true, id when id <> Guid.Empty -> Some id
+            | _ -> None
+        let credentialAction =
+            match action with
+            | "FirstConnect" -> Some CredentialWorkAction.FirstConnect
+            | "ClaimNext" -> Some CredentialWorkAction.ClaimPrimary
+            | "Checkpoint" ->
+                Some(CredentialWorkAction.Checkpoint(workId, claimGeneration, evidenceSha))
+            | "Complete" ->
+                Some(CredentialWorkAction.CompleteReadOnly(workId, claimGeneration, evidenceSha))
+            | _ -> None
+        let evidenceValid =
+            Regex.IsMatch((if isNull evidenceSha then "" else evidenceSha), "^[a-f0-9]{64}$")
+        if not (authenticatedActor actor) then
+            Error(InvalidBinding "Work transition requires an OAuth-authenticated operator actor.")
+        elif operation.IsNone || String.IsNullOrWhiteSpace launchId
+             || expectedProjectVersion < 0 || claimGeneration < 0 then
+            Error(InvalidBinding "Stable operation UUID, launch ID and nonnegative CAS versions are required.")
+        elif credentialAction.IsNone then
+            Error(InvalidBinding "Unsupported explicit-credential Work action.")
+        elif action = "Checkpoint" || action = "Complete" then
+            if String.IsNullOrWhiteSpace workId || not evidenceValid then
+                Error(InvalidBinding "Checkpoint/complete requires canonical Work ID and evidence SHA-256.")
+            else
+                WorkQueueGitLedger.load binding
+                |> Result.bind (fun (head, project) ->
+                    if project.Version <> expectedProjectVersion then
+                        Error(StaleEntityVersion "Work CAS project version changed.")
+                    else
+                        WorkQueueGitLedger.verifyBearerAt binding head project launchId
+                            credential operation.Value credentialAction.Value
+                        |> Result.map (fun () ->
+                            { Status = "RejectedMissingBinding"; Applied = false
+                              OperationId = operationId; VerifiedGitHead = head.Commit
+                              ProjectVersion = project.Version; LaunchId = launchId; WorkId = workId
+                              MissingBinding = MissingTerminalBinding }))
+        else
+            WorkQueueGitLedger.load binding
+            |> Result.bind (fun (head, project) ->
+                if project.Version <> expectedProjectVersion then
+                    Error(StaleEntityVersion "Work CAS project version changed.")
+                else
+                    WorkQueueGitLedger.verifyBearerAt binding head project launchId
+                        credential operation.Value credentialAction.Value
+                    |> Result.map (fun () ->
+                        { Status = "RejectedMissingBinding"; Applied = false
+                          OperationId = operationId; VerifiedGitHead = head.Commit
+                          ProjectVersion = project.Version; LaunchId = launchId; WorkId = workId
+                          MissingBinding =
+                              if action = "FirstConnect" then
+                                  "WQ03 original provider dispatch and execution continuity is not bound to the live Work relay; registration remains default-off."
+                              else MissingClaimBinding }))

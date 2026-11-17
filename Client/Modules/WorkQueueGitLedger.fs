@@ -172,18 +172,45 @@ type WorkCredentialVerifier =
       AccountTokenId: string
       SecretSha256: string }
 
+// Existing WQ02 verifier records use this same SHA-256 shape. Only new
+// issuance changes to UUIDv4; already-delivered Base64URL credentials remain
+// valid against their original verifier (never as an identity fallback).
+module WorkCredentialFormat =
+    let isCanonicalUuidV4 (value: string) =
+        match Guid.TryParseExact(value, "D") with
+        | true, parsed ->
+            parsed <> Guid.Empty
+            && String.Equals(value, parsed.ToString("D"), StringComparison.Ordinal)
+            && value.[14] = '4'
+            && (value.[19] = '8' || value.[19] = '9'
+                || value.[19] = 'a' || value.[19] = 'b')
+        | _ -> false
+
+    let isSupportedBearer (value: string) =
+        isCanonicalUuidV4 value
+        || (not (isNull value) && value.Length = 43
+            && Regex.IsMatch(value, "^[A-Za-z0-9_-]{43}$"))
+
 [<Sealed>]
 type IssuedWorkCredential private (launchId: string, secret: string) =
     member _.LaunchId = launchId
     member _.VerifierSha256 = CanonicalCodec.digest secret
-    // Only the approved launch bridge should call this transient delivery seam.
+    // The trusted launcher supplies this value explicitly to the model at
+    // bootstrap; the model includes it in every Work execution tool call.
+    member _.RevealForExplicitToolArgument() = secret
+    // Original disposable fake-provider compatibility (not implicit injection).
     member _.RevealForPrivateDelivery() = secret
     override _.ToString() = "IssuedWorkCredential(<redacted>)"
     static member Issue(launchId: string) =
         match Guid.TryParse launchId with
         | true, id when id <> Guid.Empty ->
-            let secret = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
-                             .TrimEnd('=').Replace('+', '-').Replace('/', '_')
+            // .NET 11 Guid.NewGuid uses the platform CSPRNG for UUIDv4.
+            // Never reuse the distinct public launch ID as a bearer.
+            let rec fresh () =
+                let candidate = Guid.NewGuid().ToString("D")
+                if String.Equals(candidate, launchId, StringComparison.OrdinalIgnoreCase)
+                then fresh () else candidate
+            let secret = fresh ()
             IssuedWorkCredential(launchId, secret)
         | _ -> invalidArg (nameof launchId) "Expected nonempty launch UUID."
 
@@ -1566,13 +1593,11 @@ module WorkQueueGitLedger =
         | CredentialWorkAction.FinishMessage (workId, messageId, generation, replyId) ->
             CompleteMessage(launchId, workId, messageId, generation, replyId)
 
-    let private verifyBearerAt (binding: LedgerBinding) snapshot (state: Project)
+    let internal verifyBearerAt (binding: LedgerBinding) snapshot (state: Project)
                                launchId (bearer: string) (operationId: Guid)
                                (action: CredentialWorkAction) =
         let denied = InvalidBinding "Work execution credential or launch lifecycle rejected."
-        let validEncoding =
-            not (isNull bearer) && bearer.Length = 43
-            && Regex.IsMatch(bearer, "^[a-zA-Z0-9_-]{43}$")
+        let validEncoding = WorkCredentialFormat.isSupportedBearer bearer
         // Hash the candidate independently of the public launch label;
         // compare fixed-size digests in constant time.
         if not validEncoding then Error denied

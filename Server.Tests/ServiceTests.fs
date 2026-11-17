@@ -525,8 +525,8 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "ListOperatorConversation"; "RawOperatorConversation"; "InspectOperatorConversationOperation"
               "PostOperatorConversationMessage"; "ClaimOperatorConversationMessage"
               "HandleOperatorConversationMessage"; "ReleaseOperatorConversationMessage"; "RepairOperatorConversation"
-              // WorkQueueRead/Write expose five authenticated facade methods, not raw wire tools.
-              "ListWork"; "GetWork"; "ClaimNextWork"; "CheckpointWork"; "CompleteWork"
+              // WorkQueueRead/Write expose six authenticated facade methods, not raw wire tools.
+              "ListWork"; "GetWork"; "ConnectWork"; "ClaimNextWork"; "CheckpointWork"; "CompleteWork"
               ]
     // Retired wire cases are deleted; public CreateTask/AssignTask are canonical ledger tools.
     unionNames |> shouldEqual catalogNames
@@ -611,9 +611,9 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
             methodInfo.GetParameters()
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
     // Preserve role/instruction aliases, Challenges, taskless execution and
-    // recipient notifications and composition APIs, plus five public Work aliases
+    // recipient notifications and composition APIs, plus six public Work aliases
     // over two hidden WorkQueue wire commands, all with device routing.
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 88 + (5 - 2))
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 88 + (6 - 2))
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -1101,7 +1101,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
                   name, original["OperatorConversationWrite"]
               for name in [ "ListWork"; "GetWork" ] ->
                   name, original["WorkQueueRead"]
-              for name in [ "ClaimNextWork"; "CheckpointWork"; "CompleteWork" ] ->
+              for name in [ "ConnectWork"; "ClaimNextWork"; "CheckpointWork"; "CompleteWork" ] ->
                   name, original["WorkQueueWrite"] ]
         aliases |> List.fold (fun map (key, value) -> Map.add key value map) original
 
@@ -1155,6 +1155,64 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
             scopes[1].GetString() |> shouldEqual Auth.WorkspaceRead
         elif methodInfo.Name = "BrowserCaptureDom" then
             scopes.GetArrayLength() |> shouldEqual 1
+
+
+[<Test>]
+let ``Work write MCP facades publish explicit UUIDv4 credential and git-write metadata`` () =
+    let publicWorkWrites = [ "ConnectWork"; "ClaimNextWork"; "CheckpointWork"; "CompleteWork" ]
+    let catalog = McpToolHelpers.mcpListCommandsResult.Commands
+
+    for name in publicWorkWrites do
+        let entries = catalog |> List.filter (fun item -> item.Name = name)
+        Assert.That(entries.Length, Is.EqualTo(1), $"Public command catalog entry for {name}")
+        let capability = entries.Head
+        Assert.That(capability.Permissions, Does.Contain(VersionControlWrite), name)
+        Assert.That(capability.MutatesState, Is.True, name)
+
+        let methodInfo = typeof<JarvisMcpTools>.GetMethod(name)
+        Assert.That(methodInfo, Is.Not.Null, name)
+        let tool =
+            methodInfo.GetCustomAttributes(typeof<McpServerToolAttribute>, false)
+            |> Array.choose (function
+                | :? McpServerToolAttribute as item -> Some item
+                | _ -> None)
+            |> Array.exactlyOne
+        Assert.That(tool.ReadOnly, Is.False, name)
+        Assert.That(tool.Destructive, Is.False, name)
+        Assert.That(tool.Idempotent, Is.True, name)
+        Assert.That(tool.OpenWorld, Is.False, name)
+
+        let description =
+            methodInfo.GetCustomAttributes(typeof<System.ComponentModel.DescriptionAttribute>, false)
+            |> Array.choose (function
+                | :? System.ComponentModel.DescriptionAttribute as item -> Some item.Description
+                | _ -> None)
+            |> Array.exactlyOne
+        Assert.That(description, Does.Contain("UUIDv4"), name)
+
+        let parameters = methodInfo.GetParameters()
+        let parameterNames = parameters |> Array.map _.Name
+        Assert.That(parameterNames, Does.Contain("launchId"), name)
+        Assert.That(parameterNames, Does.Not.Contain("ownerAgentId"), name)
+        for field in [ "credential"; "operationId"; "deviceId" ] do
+            let parameter = parameters |> Array.find (fun item -> item.Name = field)
+            Assert.That(parameter.ParameterType, Is.EqualTo(typeof<string>), $"{name}.{field}")
+            // Empty defaults preserve old callers; the Work verifier rejects an absent bearer.
+            Assert.That(parameter.IsOptional, Is.True, $"{name}.{field}")
+            Assert.That(parameter.DefaultValue, Is.EqualTo(""), $"{name}.{field}")
+
+        let scheme =
+            methodInfo.GetCustomAttributes(typeof<McpMetaAttribute>, false)
+            |> Array.choose (function
+                | :? McpMetaAttribute as item when item.Name = "securitySchemes" -> Some item.JsonValue
+                | _ -> None)
+            |> Array.exactlyOne
+        use metadata = JsonDocument.Parse(scheme)
+        let auth = metadata.RootElement[0]
+        Assert.That(auth.GetProperty("type").GetString(), Is.EqualTo("oauth2"), name)
+        let scopes = auth.GetProperty("scopes")
+        Assert.That(scopes.GetArrayLength(), Is.EqualTo(1), name)
+        Assert.That(scopes[0].GetString(), Is.EqualTo(Auth.GitWrite), name)
 
 
 [<Test>]

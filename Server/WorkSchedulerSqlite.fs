@@ -47,6 +47,9 @@ type SqliteSchedulerError =
     | NoCapacity
     | NoEligibleWork
     | BlockedByExternalEffect
+    // A committed operation is audit evidence, not renewed authorization
+    // after a Recovery, STOP, or source-generation fence.
+    | HistoricalReceiptNotAdmission
     | Projection of WorkBlockingError
     | Storage of WorkSqliteFailure
 
@@ -575,9 +578,10 @@ module internal WorkSchedulerSqlite =
                                      WorkGeneration = item.Stage.StageGeneration }
                 | _ -> fail "requires registered, unstopped, never-claimed launch"
 
-    // A retry after store reopen must resolve the original committed outcome
-    // before current eligibility, account capacity, or EverClaimed can reject it.
-    // An unrelated receipt (including a changed launch identity) fails closed.
+    // Read-only reconciliation of a committed outcome. Never treat an old
+    // receipt as fresh admission: its immutable idempotency proof says nothing
+    // about Recovery coverage, STOP, or current role/stage/source generations.
+    // Unrelated receipts and changed launch identities fail closed.
     let private replayOutcome (store: WorkSqliteAuthority) (operationId: Guid)
                               (launchId: string) (projectIds: string list)
                               (operationField: string) (workField: string)
@@ -633,7 +637,10 @@ module internal WorkSchedulerSqlite =
                     "reservationOperationId" "reservationWorkId" "reservationWorkGeneration"
                     false (Some snapshot.Account.AccountId) with
             | Error failure -> Error failure
-            | Ok(Some original) -> Ok original
+            // Historical same-UUID receipts remain available through
+            // ReadReceipt and launch provenance, but never reauthorize a
+            // launch after newer Recovery/STOP fences.
+            | Ok(Some _) -> Error SqliteSchedulerError.HistoricalReceiptNotAdmission
             | Ok None -> reserveFresh store snapshot operationId launchId
 
     let claim (store: WorkSqliteAuthority) (p: SqliteSchedulerProject)
@@ -644,5 +651,5 @@ module internal WorkSchedulerSqlite =
             match replayOutcome store operationId launchId [ p.Id ]
                     "claimOperationId" "primaryWorkId" "claimWorkGeneration" true None with
             | Error failure -> Error failure
-            | Ok(Some original) -> Ok original
+            | Ok(Some _) -> Error SqliteSchedulerError.HistoricalReceiptNotAdmission
             | Ok None -> claimFresh store p operationId launchId

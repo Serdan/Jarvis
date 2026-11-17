@@ -1,0 +1,1 @@
+Audit found existing legacy transaction publication not remotely barred for all devices; optional host-local fence cannot authenticate disconnected client/pending-intent/source-effect high-water. This proposal specifies source-enforced admission, journals and negative multi-client proof before a positive gateway can exist. No code or cutover GO.

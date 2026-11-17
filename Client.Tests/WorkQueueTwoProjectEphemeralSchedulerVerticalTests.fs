@@ -3,6 +3,8 @@ module Client.Tests.WorkQueueTwoProjectEphemeralSchedulerVerticalTests
 open System
 open System.Diagnostics
 open System.IO
+open System.Threading
+open System.Threading.Tasks
 open NUnit.Framework
 open Jarvis.WorkQueues
 open Client.LedgerStore
@@ -48,10 +50,34 @@ type private EphemeralSchedulerFixture =
     { Priority: LedgerBinding * LedgerBinding
       Other: LedgerBinding * LedgerBinding
       Account: AccountBinding * AccountBinding
+      Historical: (LedgerBinding * LedgerBinding * (string * string) list) list
       JournalRoot: string
       Scratch: NativeDisposableAuthority
       Observer: Observer
       Root: string }
+
+let private assertHistoricalUnchanged (f: EphemeralSchedulerFixture) =
+    for first, second, originals in f.Historical do
+        let writer = LedgerStore.fetch first |> success
+        let reader = LedgerStore.fetch second |> success
+        Assert.That(reader.Commit, Is.EqualTo writer.Commit,
+                    "Both independent readers must converge on the original history")
+        for path, expectedOid in originals do
+            for binding, snapshot in [first, writer; second, reader] do
+                let bytes, oid = LedgerStore.readAt binding snapshot path |> success
+                Assert.That(oid, Is.EqualTo(Some expectedOid),
+                            sprintf "Historical Git blob changed or disappeared: %s" path)
+                Assert.That(bytes.IsSome, Is.True)
+        let expectedAgent =
+            originals |> List.find (fun (path, _) -> path.StartsWith("agents/")) |> fst
+        let expectedReview =
+            originals |> List.find (fun (path, _) -> path.EndsWith("/review.json")) |> fst
+        Assert.That(git first.RepositoryPath
+                        ["ls-tree"; "-r"; "--name-only"; writer.Commit; "agents"],
+                    Is.EqualTo expectedAgent, "No persistent Agent may be added or deleted")
+        Assert.That(git first.RepositoryPath
+                        ["ls-tree"; "-r"; "--name-only"; writer.Commit; "tasks/historical-work/reviews"],
+                    Is.EqualTo expectedReview, "No historical review may be added or deleted")
 
 let private withAuthorities run =
     // Exact naming is required by the nominal native disposable issuer.
@@ -100,12 +126,13 @@ let private withAuthorities run =
         let otherFirst, otherSecond = other
         let accountFirst, accountSecond = account
         let scratch = WorkQueueNativeLifecycleCas.authorizeFreshScratch priorityFirst accountFirst |> success
+        let historical = ResizeArray<LedgerBinding * LedgerBinding * (string * string) list>()
         for first, second in [priority; other] do
             LedgerStore.initialize first true |> success |> ignore
             LedgerStore.fetch second |> success |> ignore
             WorkQueueGitLedger.initialize first "WQ11 native fixture" (Guid.NewGuid())
                 (Map.ofList ["Lead", set ["planning"]]) |> success |> ignore
-            // No registerAgent. Nothing writes agents/* even for fixture setup.
+            // No registerAgent. The only agents/* rows are historical data seeded below.
             WorkQueueRoleAuthority.initializeCatalog first "WQ11 native fixture" (Guid.NewGuid())
             |> success |> ignore
             WorkQueueRoleAuthority.configure first "WQ11 native fixture"
@@ -114,6 +141,33 @@ let private withAuthorities run =
                   Instructions = "Disposable Work-only execution"
                   QueueSubscriptions = set ["planning"] }
             |> success |> ignore
+            // Seed representative legacy Agent and independently accepted review
+            // records in the ORIGINAL disposable Git ledger, not an in-memory
+            // replacement. All subsequent flows must preserve their blob OIDs.
+            let agentPath = "agents/historical-agent.json"
+            let reviewId = Guid.NewGuid().ToString("N")
+            let reviewPath = sprintf "tasks/historical-work/reviews/%s/review.json" reviewId
+            let agentBytes =
+                """{"schemaVersion":1,"agentId":"historical-agent","version":7,"execution":"Stopped","unassignedDisposition":"Parked","currentAssignment":null,"stateSequence":42}"""
+            let reviewBytes =
+                sprintf """{"schemaVersion":1,"reviewId":"%s","taskId":"historical-work","status":"Accepted","version":3,"reviewerId":"historical-reviewer","reviewRef":"refs/heads/archived/frozen-review"}""" reviewId
+            let seed: LedgerIntent =
+                { OperationId = Guid.NewGuid(); Actor = "WQ11 historical-only fixture"
+                  Kind = "SeedOriginalHistoricalRecords"
+                  RequestJson = """{"schemaVersion":1,"purpose":"historical-preservation"}""" }
+            let changes: LedgerFileChange list =
+                [ { Path = agentPath; ExpectedBlobOid = None; Content = agentBytes }
+                  { Path = reviewPath; ExpectedBlobOid = None; Content = reviewBytes } ]
+            LedgerStore.transact first seed (fun _ -> Ok changes) |> success |> ignore
+            let seeded = LedgerStore.fetch first |> success
+            let originals =
+                [agentPath; reviewPath]
+                |> List.map (fun path ->
+                    let bytes, oid = LedgerStore.readAt first seeded path |> success
+                    Assert.That(bytes.IsSome, Is.True)
+                    path, (oid |> Option.get))
+            LedgerStore.fetch second |> success |> ignore
+            historical.Add (first, second, originals)
         AccountCapacityLedger.initialize accountFirst 1 |> success |> ignore
         AccountCapacityLedger.fetch accountSecond |> success |> ignore
         let journalRoot = Path.Combine(root, "originals")
@@ -140,9 +194,11 @@ let private withAuthorities run =
               Membership = Some approval }
         let f =
             { Priority = priority; Other = other; Account = account
+              Historical = historical |> Seq.toList
               JournalRoot = journalRoot; Scratch = scratch
               Observer = Observer(scope, enabled = true); Root = root }
         run f
+        assertHistoricalUnchanged f
         for path in checkouts do
             Assert.That(git path ["status"; "--porcelain"], Is.Empty,
                         "No source checkout can be modified by Git ledger CAS")
@@ -340,6 +396,103 @@ type WorkQueueTwoProjectEphemeralSchedulerVerticalTests() =
                         "Only the explicit WQ12 durable intent may write before admission"))
 
     [<Test>]
+    member _.ConcurrentOriginalWq07CapOneFromTwoClonesHasSingleCasWinner() =
+        withAuthorities (fun f ->
+            let priorityWriter, priorityReader = f.Priority
+            let otherWriter, otherReader = f.Other
+            let accountWriter, accountReader = f.Account
+            let _ = newPlanning priorityWriter priorityReader "race-priority"
+            let _ = newPlanning otherWriter otherReader "race-other"
+            let request () : AccountAdmissionRequest =
+                { Actor = "WQ11 disposable competing admission"
+                  LaunchId = Guid.NewGuid()
+                  AdmissionOperationId = Guid.NewGuid()
+                  AbortOperationId = Guid.NewGuid()
+                  ReleaseOperationId = Guid.NewGuid()
+                  RoleId = "Lead"; RoleVersion = 1 }
+            let firstRequest, secondRequest = request (), request ()
+            let beforeWriter = AccountCapacityLedger.fetch accountWriter |> success
+            let beforeReader = AccountCapacityLedger.fetch accountReader |> success
+            Assert.That(beforeReader.Head, Is.EqualTo beforeWriter.Head)
+            Assert.That(beforeWriter.State.Tokens, Is.Empty)
+            // Both original WQ07 contenders MUST reach the lease-protected push
+            // with the same verified pre-admission head. Their separate clones
+            // then compete; a serial post-commit NoCapacity check is insufficient.
+            use simultaneousLease = new Barrier(2)
+            let compete account project (admission: AccountAdmissionRequest) =
+                Task.Run(fun () ->
+                    let mutable firstLease = true
+                    let mutable observedParent = None
+                    let hooks: AccountGitTestInterposition =
+                        { BeforeLeasePush = fun operation parent ->
+                            if operation = admission.AdmissionOperationId && firstLease then
+                                firstLease <- false
+                                observedParent <- Some parent
+                                Assert.That(
+                                    simultaneousLease.SignalAndWait(TimeSpan.FromSeconds 30.0),
+                                    Is.True, "Two original WQ07 writers never reached the same CAS barrier")
+                          GitCommand = fun _ -> AccountGitTestFault.PassThrough }
+                    let result =
+                        AccountCapacityLedger.withTestInterposition hooks (fun () ->
+                            AccountAdmissionAdapter.admitInertFixture account project admission)
+                    result, observedParent)
+            let one = compete accountWriter priorityWriter firstRequest
+            let two = compete accountReader otherReader secondRequest
+            Assert.That(Task.WaitAll([| one :> Task; two :> Task |], TimeSpan.FromSeconds 90.0),
+                        Is.True, "Competing original WQ07 admissions did not terminate")
+            let oneOutcome, oneParent = one.Result
+            let twoOutcome, twoParent = two.Result
+            Assert.That(oneParent, Is.EqualTo(Some beforeWriter.Head))
+            Assert.That(twoParent, Is.EqualTo(Some beforeWriter.Head))
+            let outcomes = [oneOutcome; twoOutcome]
+            Assert.That(
+                outcomes |> List.filter (function ProjectAdmitted _ -> true | _ -> false) |> List.length,
+                Is.EqualTo 1, sprintf "Exact one WQ07 winner required: %A" outcomes)
+            match outcomes |> List.filter (function ProjectAdmitted _ -> false | _ -> true) with
+            | [GlobalReservationRejected(AccountCapacityFull(1, 1))] -> ()
+            | other -> Assert.Fail(sprintf "Expected original typed capacity-one loser: %A" other)
+            let winnerRequest, winnerProject, loserRequest, loserProject =
+                match oneOutcome with
+                | ProjectAdmitted _ -> firstRequest, priorityReader, secondRequest, otherReader
+                | _ -> secondRequest, otherReader, firstRequest, priorityReader
+            let settledWriter = AccountCapacityLedger.fetch accountWriter |> success
+            let settledReader = AccountCapacityLedger.fetch accountReader |> success
+            Assert.That(settledReader.Head, Is.EqualTo settledWriter.Head)
+            Assert.That(settledWriter.State.StateVersion,
+                        Is.EqualTo(beforeWriter.State.StateVersion + 1L))
+            Assert.That(settledWriter.State.NextSequence,
+                        Is.EqualTo(beforeWriter.State.NextSequence + 1L))
+            Assert.That(settledWriter.State.Tokens, Has.Length.EqualTo 1)
+            Assert.That(settledWriter.State.Tokens.[0].LaunchId,
+                        Is.EqualTo(winnerRequest.LaunchId.ToString("D")))
+            Assert.That(settledWriter.State.MigrationPhase, Is.EqualTo "LegacyActive")
+            let _, winnerReceipt =
+                AccountCapacityLedger.readOperation accountReader winnerRequest.AdmissionOperationId
+                |> success
+            let _, loserReceipt =
+                AccountCapacityLedger.readOperation accountWriter loserRequest.AdmissionOperationId
+                |> success
+            Assert.That(winnerReceipt.IsSome, Is.True)
+            Assert.That(loserReceipt.IsNone, Is.True,
+                        "Losing lease may not publish a WQ07 operation receipt")
+            Assert.That((WorkQueueGitLedger.load winnerProject |> success |> snd).Launches.Count,
+                        Is.EqualTo 1)
+            Assert.That((WorkQueueGitLedger.load loserProject |> success |> snd).Launches.Count,
+                        Is.Zero)
+            for project, admission in [priorityReader, firstRequest; otherReader, secondRequest] do
+                let verified = LedgerStore.fetch project |> success
+                let path = WorkQueueGitLedger.credentialPath (admission.LaunchId.ToString("D"))
+                let bytes, oid = LedgerStore.readAt project verified path |> success
+                Assert.That(bytes.IsNone && oid.IsNone, Is.True,
+                            "No losing or winning inert admission may issue a WQ02 four-path credential")
+            for writer, reader in [f.Priority; f.Other] do
+                let firstHead = (LedgerStore.fetch writer |> success).Commit
+                let otherHead = (LedgerStore.fetch reader |> success).Commit
+                Assert.That(otherHead, Is.EqualTo firstHead,
+                            "Independent original project readers must converge")
+            assertHistoricalUnchanged f)
+
+    [<Test>]
     member _.ManualTickTwoProjectsRealCasCapOneNativeTerminalAndNextStop() =
         withAuthorities (fun f ->
             let priorityWriter, priorityReader = f.Priority
@@ -395,6 +548,7 @@ type WorkQueueTwoProjectEphemeralSchedulerVerticalTests() =
                 Assert.That(selected.LaunchId, Is.EqualTo originalB.LaunchId)
             | other -> Assert.Fail(sprintf "Fake-only manually wired tick did not execute B: %A" other)
             Assert.That(sendsB, Is.EqualTo 1)
+            assertHistoricalUnchanged f
             Assert.That(held f, Is.EqualTo 1)
             match hostA.RunOnce [WorkWakeTrigger.WorkCreated] with
             | SchedulerHostOutcome.Reconciled WorkWakeResult.NoCapacity -> ()
@@ -441,10 +595,35 @@ type WorkQueueTwoProjectEphemeralSchedulerVerticalTests() =
             let claim = WorkQueueNativeLifecycleCas.transitionDisposable true bBound actor
                             claimOp beforeClaim.Version (NativeWorkAction.Claim 1) |> success
             Assert.That(claim.Status, Is.EqualTo "Applied")
+            let staleOperation = Guid.NewGuid()
+            let beforeStaleProject = LedgerStore.fetch priorityReader |> success
+            let beforeStaleAccount = AccountCapacityLedger.fetch accountReader |> success
+            let _, beforeStaleState = WorkQueueGitLedger.load priorityReader |> success
+            let credentialPath = WorkQueueGitLedger.credentialPath originalB.LaunchId
+            let _, credentialBefore =
+                LedgerStore.readAt priorityReader beforeStaleProject credentialPath |> success
+            Assert.That(credentialBefore.IsSome, Is.True)
             match WorkQueueNativeLifecycleCas.transitionDisposable true bOther actor
-                      (Guid.NewGuid()) beforeClaim.Version (NativeWorkAction.Claim 1) with
-            | Error _ -> ()
-            | Ok _ -> Assert.Fail "Stale second client won the original claim"
+                      staleOperation beforeClaim.Version (NativeWorkAction.Claim 1) with
+            | Error(StaleEntityVersion "Stale WQ-02 project version.") -> ()
+            | other -> Assert.Fail(sprintf
+                "Stale clone must fail on the exact original WQ02 version CAS, not preflight: %A" other)
+            let afterStaleProject = LedgerStore.fetch priorityReader |> success
+            let afterStaleAccount = AccountCapacityLedger.fetch accountReader |> success
+            let _, afterStaleState = WorkQueueGitLedger.load priorityReader |> success
+            let _, credentialAfter =
+                LedgerStore.readAt priorityReader afterStaleProject credentialPath |> success
+            let rejectedReceipt =
+                LedgerStore.getOperationAt priorityReader afterStaleProject staleOperation |> success
+            Assert.That(afterStaleProject.Commit, Is.EqualTo beforeStaleProject.Commit)
+            Assert.That(afterStaleAccount.Head, Is.EqualTo beforeStaleAccount.Head)
+            Assert.That(afterStaleState.Version, Is.EqualTo beforeStaleState.Version)
+            Assert.That(afterStaleState.Receipts.Count, Is.EqualTo beforeStaleState.Receipts.Count)
+            Assert.That(afterStaleState.Launches.Count, Is.EqualTo beforeStaleState.Launches.Count)
+            Assert.That(credentialAfter, Is.EqualTo credentialBefore)
+            Assert.That(rejectedReceipt.IsNone, Is.True,
+                        "Rejected contender must not publish an original receipt")
+            assertHistoricalUnchanged f
             let replay = WorkQueueNativeLifecycleCas.transitionDisposable true bOther actor
                             claimOp beforeClaim.Version (NativeWorkAction.Claim 1) |> success
             Assert.That(replay.Status, Is.EqualTo "IdempotentReplay")
@@ -455,6 +634,7 @@ type WorkQueueTwoProjectEphemeralSchedulerVerticalTests() =
             WorkQueueNativeLifecycleCas.transitionDisposable true bOther actor
                 checkpointOp afterClaim.Version (NativeWorkAction.Checkpoint(1,sha))
             |> success |> ignore
+            assertHistoricalUnchanged f
             let terminalOp = Guid.NewGuid()
             let afterCheckpoint = WorkQueueGitLedger.load priorityWriter |> success |> snd
             let withoutTerminal: INativeWorkSessionJournal =
@@ -490,6 +670,7 @@ type WorkQueueTwoProjectEphemeralSchedulerVerticalTests() =
                                     accountReader priorityReader "WQ11 fake-only"
                                     (Guid.Parse originalB.ReleaseOperationId) locator |> success
             Assert.That(replayRelease.AlreadyApplied, Is.True)
+            assertHistoricalUnchanged f
             Assert.That(held f, Is.Zero)
             let nowAvailable = WorkQueueGitLedger.load priorityReader |> success |> snd
             Assert.That(nowAvailable.Works.[b.Id].State, Is.EqualTo WorkState.Completed)
@@ -526,11 +707,7 @@ type WorkQueueTwoProjectEphemeralSchedulerVerticalTests() =
             Assert.That(held f, Is.EqualTo 1, "Stopped unresolved execution retains capacity")
             Assert.That((AccountCapacityLedger.fetch accountReader |> success).State.MigrationPhase,
                         Is.EqualTo "LegacyActive")
-            for project in [priorityWriter; otherWriter] do
-                let head = (LedgerStore.fetch project |> success).Commit
-                Assert.That((git project.RepositoryPath
-                            ["ls-tree"; "-r"; "--name-only"; head; "agents"]),
-                            Is.Empty, "Work-only fixture wrote persistent Agent entities")
+            assertHistoricalUnchanged f
             Assert.That((f.Observer.ReadAll() |> success).OccupiedCapacity, Is.EqualTo 1))
 
     [<Test>]
@@ -558,6 +735,7 @@ type WorkQueueTwoProjectEphemeralSchedulerVerticalTests() =
                             true f.JournalRoot ticket provider).Phase,
                         Is.EqualTo NativeDispatchPhase.NoResend)
             Assert.That(count, Is.EqualTo 1)
+            assertHistoricalUnchanged f
             Assert.That(held f, Is.EqualTo 1)
             match WorkQueueDurableLaunchIntent.prepareExplicit true (context f) "competing client" with
             | DurableIntentOutcome.NeedsAttention _ -> ()

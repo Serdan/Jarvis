@@ -16,12 +16,25 @@ live Scheduler registration, source execution route, migration, or cutover appro
 - The WQ03 one-shot fake-provider journal, canonical original-send host claim,
   credential first connect, sealed disposable WQ02 claim/checkpoint/terminal and
   original WQ07 terminal release are observed from the second clones.
-- A stale second-client claim, a second credential for the admitted original, an
-  invalid terminal witness and unknown-send retries fail closed. Verified terminal
-  release (not merely Work Completed) frees the global slot for the other project.
-  STOP revokes subsequent credential actions without releasing unresolved credit.
-  No `agents/*` file is introduced, no model Manager needs to poll, and no
-  long-lived service is started.
+- A deliberately synchronized two-clone WQ07 test forces both competing
+  project admissions to reach the exact same original account-head lease before
+  either Git push. Exactly one original admission wins capacity one; the other
+  returns typed `GlobalReservationRejected(AccountCapacityFull(1,1))`, with
+  no losing WQ07 receipt, project launch or four-path credential.
+- The stale second-client WQ02 Claim must return exactly
+  `StaleEntityVersion "Stale WQ-02 project version."`; a generic preflight
+  error no longer passes. The original account/project heads, receipts,
+  credential blob and launch state remain identical across that rejected call.
+  Second credential issuance, invalid terminal witness and unknown-send retries
+  remain separately fail-closed.
+- Each original project ledger is seeded with a historical Agent record and an
+  accepted review record before any Work flow. Their exact Git blob OIDs and
+  both-clone head convergence are checked across admission, claim, checkpoint,
+  terminal release, STOP and unknown-send. No *new* `agents/*` row or
+  historical-review rewrite/deletion is allowed. No model Manager needs to poll,
+  and no long-lived service is started. Verified terminal release (not merely
+  Work Completed) frees the global slot for the other project; STOP never frees
+  unresolved credit.
 
 ## Previously disconnected original interfaces
 
@@ -60,10 +73,13 @@ There is deliberately no invented cross-repository atomic commit.
 ## Run locally
 
 ```bash
-dotnet test Client.Tests/Client.Tests.fsproj -c Release --filter FullyQualifiedName~WorkQueueTwoProjectEphemeralSchedulerVerticalTests
+dotnet restore Client.Tests/Client.Tests.fsproj --ignore-failed-sources
+dotnet build Client.Tests/Client.Tests.fsproj -c Release --no-restore
+dotnet vstest Client.Tests/bin/Release/net11.0/Client.Tests.dll --TestCaseFilter:FullyQualifiedName~WorkQueueTwoProjectEphemeralSchedulerVerticalTests
 ```
 
-Run adjacent WQ07/WQ08/WQ11 fixture tests and the full Server Release suite before
+Verify the NUnit test count in the VSTest summary: a bare dotnet test invocation can
+exit successfully without executing cases for this project. Run adjacent WQ07/WQ08/WQ11 fixture tests and the full Server Release suite before
 a Lead-owned integration. Only an exact independently reviewed, frozen commit
 may be integrated nonforce. Never run hosted Actions, a live Scheduler, or Codex
 for this fixture.

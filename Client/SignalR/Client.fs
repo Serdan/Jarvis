@@ -902,7 +902,7 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
 let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
                                     (resolved: ProjectPaths.ResolvedProject option)
                                     (preparedTask: ProjectTaskDefinition option) (agentId: string) (command: AgentCommand)
-                                    (sourceOriginalId: string option) =
+                                    (sourceOriginalId: string option) (manualGrantAuthorized: bool) =
     task {
         let activityId =
             match command with
@@ -955,7 +955,16 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
                         }
 
                     let! authorization =
-                        PermissionPolicy.authorizeWithTrust permission.TrustLevel promptWithActivityState authorizationCommand
+                        if manualGrantAuthorized then
+                            // The server has checked the ephemeral verifier, account,
+                            // resource identity and operation family for this RPC.
+                            // Nondelegable commands can never use this bypass.
+                            match AgentCommandInfo.manualGrantFamily authorizationCommand with
+                            | Some _ -> Task.FromResult(Ok ())
+                            | None -> Task.FromResult(Error(Client.ValidationError
+                                                "Manual grant transport cannot authorize this command."))
+                        else
+                            PermissionPolicy.authorizeWithTrust permission.TrustLevel promptWithActivityState authorizationCommand
 
                     match authorization with
                     | Error error -> return Error error
@@ -1028,19 +1037,19 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
 
 let receiveCommand (rt: Runtime) (command: AgentCommand) =
     task {
-        let! result = receiveCommandForTarget rt None None None "" command None
+        let! result = receiveCommandForTarget rt None None None "" command None false
         return result |> Result.map (fun outcome -> outcome.Payload)
     }
 
 let private receiveCommandWithTypedInstructions (rt: Runtime)
                                                 (target: ProjectPaths.ProjectTarget option) (agentId: string) command
-                                                (sourceOriginalId: string option) =
+                                                (sourceOriginalId: string option) (manualGrantAuthorized: bool) =
     task {
         match command with
         | GetJobResultCommand _ | ListJobsCommand _ | CancelJobCommand _ ->
             // Cheap controls must bypass source instruction preparation and
             // remain responsive even while source/ledger commands are blocked.
-            let! response = receiveCommandForTarget rt target None None agentId command sourceOriginalId
+            let! response = receiveCommandForTarget rt target None None agentId command sourceOriginalId manualGrantAuthorized
             return response, [], AgentInstructions.RootBootstrapRequired
         | _ ->
             match AgentInstructions.prepareOperationWithTarget rt target command with
@@ -1048,7 +1057,7 @@ let private receiveCommandWithTypedInstructions (rt: Runtime)
                 return Error error, [], AgentInstructions.RootBootstrapRequired
             | Ok prepared ->
                 let! response =
-                    receiveCommandForTarget rt target prepared.Source prepared.ProjectTask agentId command sourceOriginalId
+                    receiveCommandForTarget rt target prepared.Source prepared.ProjectTask agentId command sourceOriginalId manualGrantAuthorized
                 let provenance =
                     if prepared.Source.IsSome then AgentInstructions.HierarchyLoaded
                     else AgentInstructions.RootBootstrapRequired
@@ -1064,7 +1073,7 @@ let receiveCommandWithInstructions (rt: Runtime) command =
         | Error error -> return Error error, []
         | Ok scope ->
             let! response, instructions, _ =
-                receiveCommandWithTypedInstructions rt (projectTarget scope) "" command None
+                receiveCommandWithTypedInstructions rt (projectTarget scope) "" command None false
             return response |> Result.map (fun outcome -> outcome.Payload), instructions
     }
 
@@ -1072,7 +1081,7 @@ let receiveCommandWithInstructions (rt: Runtime) command =
 // not inferred from provider conversation metadata.
 let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agentId: string)
                                        (includeResponseAlerts: bool)
-                                       (sourceOriginalId: string option) =
+                                       (sourceOriginalId: string option) (manualGrantAuthorized: bool) =
     task {
         let mutable parsedCommand = None
         let mutable responseScope: ProjectPaths.ProjectTarget option = None
@@ -1165,7 +1174,7 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                                 // Polling does not activate or record local
                                 // agent activity, but access checks still need
                                 // the initiating actor label from the transport.
-                                receiveCommandWithTypedInstructions rt target agentId command sourceOriginalId
+                                receiveCommandWithTypedInstructions rt target agentId command sourceOriginalId manualGrantAuthorized
                             // A write may alter another agent's state, or none
                             // at all. Invalidate precisely the affected local
                             // cache entries before preparing turn guidance.
@@ -1228,7 +1237,7 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
 // Preserve direct dispatch semantics for callers that receive an immediate
 // response. Promoted tool jobs execute the undecorated core in the background.
 let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string) =
-    processIncomingCommandCore rt commandJson agentId true None
+    processIncomingCommandCore rt commandJson agentId true None false
 
 // Background completion is not an agent-visible response. This is the only
 // response-alert consumption point for SignalR-delivered tool calls, including
@@ -1358,19 +1367,30 @@ let executeOrPromoteWith (rt: Runtime) (commandJson: string) (agentId: string)
     }
 
 let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: string)
-                             (sourceOriginalId: string option) =
-    executeOrPromoteWith rt commandJson agentId (promotionThreshold ())
-        (fun serialized actor -> task {
-            let! _, _, outcome = processIncomingCommandCore rt serialized actor false sourceOriginalId
-            return outcome
-        })
+                             (sourceOriginalId: string option) (manualGrantAuthorized: bool) =
+    let run serialized actor = task {
+        let! _, _, outcome =
+            processIncomingCommandCore rt serialized actor false sourceOriginalId manualGrantAuthorized
+        return outcome
+    }
+    // A prospective project cannot be bound to its actual canonical name
+    // from a background PendingJob. Complete creation before returning.
+    let directCreation =
+        manualGrantAuthorized &&
+        (try
+            match JsonSerializer.Deserialize<AgentCommand>(commandJson) with
+            | CreateProjectCommand _ -> true
+            | _ -> false
+         with _ -> false)
+    if directCreation then run commandJson agentId
+    else executeOrPromoteWith rt commandJson agentId (promotionThreshold ()) run
 
 let private receiveCommandAndReplyCore (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (agentId: string)
-    (sourceOriginalId: string option)
+    (sourceOriginalId: string option) (manualGrantAuthorized: bool)
     (report: string -> float -> float -> bool -> unit) : Task =
     task {
         let commandStarted = Stopwatch.GetTimestamp()
-        let! agentResponse = executeOrPromote rt commandJson agentId sourceOriginalId
+        let! agentResponse = executeOrPromote rt commandJson agentId sourceOriginalId manualGrantAuthorized
         let commandMilliseconds = Stopwatch.GetElapsedTime(commandStarted).TotalMilliseconds
         let replyStarted = Stopwatch.GetTimestamp()
         let! sendResult =
@@ -1414,7 +1434,7 @@ let private receiveCommandAndReplyCore (connection: HubConnection) (rt: Runtime)
 let receiveCommandAndReplyWithTiming (connection: HubConnection) (rt: Runtime)
     (correlationId: string) (commandJson: string) (agentId: string)
     (report: string -> float -> float -> bool -> unit) : Task =
-    receiveCommandAndReplyCore connection rt correlationId commandJson agentId None report
+    receiveCommandAndReplyCore connection rt correlationId commandJson agentId None false report
 
 let receiveCommandAndReply (connection: HubConnection) (rt: Runtime)
     (correlationId: string) (commandJson: string) (agentId: string) : Task =
@@ -1429,4 +1449,64 @@ let receiveSourceCommandAndReplyWithTiming (connection: HubConnection) (rt: Runt
     (originalOperationId: string)
     (report: string -> float -> float -> bool -> unit) : Task =
     receiveCommandAndReplyCore connection rt correlationId commandJson agentId
-        (Some originalOperationId) report
+        (Some originalOperationId) false report
+
+// A separate SignalR ingress exists only for the server-validated manual
+// grant. It never sends the credential to the client or bypasses other fences.
+let receiveManualGrantedCommandAndReplyWithTiming (connection: HubConnection) (rt: Runtime)
+    (correlationId: string) (commandJson: string) (agentId: string)
+    (report: string -> float -> float -> bool -> unit) : Task =
+    receiveCommandAndReplyCore connection rt correlationId commandJson agentId None true report
+
+// The requesting model has no approval endpoint. Only the operator's local
+// permission UI can answer this server-originated SignalR request. FullTrust
+// cannot skip this prompt, and the one-use approval result is not cached.
+let processManualGrantApproval (rt: Runtime) (requestJson: string) =
+    task {
+        let response approved error : AgentCommandResponse =
+            { Result = if approved then Some "true" else None
+              Error = error
+              Instructions = []
+              AgentStateChanges = []
+              InboxActivation = None
+              PendingJob = None }
+        try
+            let intent = JsonSerializer.Deserialize<ManualGrantApprovalRequest>(requestJson)
+            match PermissionPolicy.manualGrantConfirmation intent with
+            | None ->
+                return response false (Some(ValidationFailed "Malformed manual grant approval request."))
+            | Some confirmation ->
+                let displayCommand =
+                    MessageCommand
+                        { ProjectName = Some intent.ProjectName
+                          Message = "Operator-only RequestGrant approval" }
+                let! decision = (rt :> PermissionIO).PromptPermission displayCommand confirmation
+                match decision with
+                | AllowOnce | AllowExactForSession ->
+                    return response true None
+                | Client.Deny | AllowExecutableForSession ->
+                    return response false (Some(PermissionDenied "Operator denied the manual grant request."))
+        with _ ->
+            return response false (Some(ValidationFailed "Invalid manual grant approval request."))
+    }
+
+let receiveManualGrantApprovalAndReplyWithTiming (connection: HubConnection) (rt: Runtime)
+    (correlationId: string) (requestJson: string) (_agentId: string)
+    (report: string -> float -> float -> bool -> unit) : Task =
+    task {
+        let started = Stopwatch.GetTimestamp()
+        let! answer = processManualGrantApproval rt requestJson
+        let commandMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds
+        let replyStarted = Stopwatch.GetTimestamp()
+        let! sent =
+            ResponseDelivery.sendWithReconnectRetry
+                (TimeSpan.FromMinutes 2.0)
+                (TimeSpan.FromMilliseconds 250.0)
+                (fun () -> connection.State)
+                (fun () -> connection.invokeAsync("SendClientResponse", correlationId, answer))
+        try report correlationId commandMs (Stopwatch.GetElapsedTime(replyStarted).TotalMilliseconds) sent.IsOk
+        with _ -> ()
+        match sent with
+        | Ok () -> ()
+        | Error ex -> rt.Tui.Log $"Could not deliver manual grant operator decision: {ex.GetType().Name}"
+    }

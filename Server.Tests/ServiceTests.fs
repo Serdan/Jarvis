@@ -493,7 +493,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
         |> Set.ofArray
 
     let serverLocalNames =
-        set [ "GetProfile"; "Feedback"; "ListFeedback"; "GetFeedback"; "UpdateFeedback"; "GetFeedbackSummary"; "GetConnectionDiagnostics"; "ListDevices"; "SelectDevice"; "UpdateServer"; "GetServerUpdateStatus" ]
+        set [ "GetProfile"; "Feedback"; "ListFeedback"; "GetFeedback"; "UpdateFeedback"; "GetFeedbackSummary"; "GetConnectionDiagnostics"; "ListDevices";  "SelectDevice"; "UpdateServer"; "GetServerUpdateStatus"; "RequestGrant" ]
 
     // Retired task commands must not be exposed by either the wire protocol or MCP.
     // The orphan Git branch is the sole supported orchestration API.
@@ -613,7 +613,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
     // Preserve role/instruction aliases, Challenges, taskless execution and
     // recipient notifications and composition APIs, plus six public Work aliases
     // over two hidden WorkQueue wire commands, all with device routing.
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 88 + (6 - 2))
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 88 + (6 - 2) + 1)
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -672,6 +672,7 @@ let ``WriteFile rejects invalid file write mode with actionable validation error
             "Create",
             "",
             Nullable(),
+            "",
             "",
             "",
             Unchecked.defaultof<ClientService>,
@@ -1127,7 +1128,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
             | Some definition -> not definition.MutatesState
             | None ->
                 match methodInfo.Name with
-                | "Feedback" | "UpdateFeedback" | "SelectDevice" | "UpdateServer" -> false
+                | "Feedback" | "UpdateFeedback" | "SelectDevice" | "UpdateServer" | "RequestGrant" -> false
                 | "ListFeedback" | "GetFeedback" | "GetFeedbackSummary" | "GetConnectionDiagnostics" | "ListDevices" | "GetServerUpdateStatus" -> true
                 | name -> failwith $"Unexpected server-local MCP tool: {name}"
 
@@ -1676,6 +1677,8 @@ let client_request_abort_cancels_outstanding_device_correlation_without_faulting
             { new Common.SignalR.IClientService with
                 member _.ReceiveMessage(_) = Task.CompletedTask
                 member _.ReceiveSourceCommand(_, _, _, _) = Task.CompletedTask
+                member _.ReceiveManualGrantedCommand(_, _, _) = Task.CompletedTask
+                member _.ReceiveManualGrantApproval(_, _, _) = Task.CompletedTask
                 member _.ReceiveCommand(correlationId, _, _) =
                     if System.Threading.Interlocked.Increment(&dispatchCount) = 1 then
                         dispatched.TrySetResult(correlationId) |> ignore
@@ -1772,6 +1775,8 @@ let post_commit_uncertain_client_reply_remains_unknown_across_server_dispatch_an
             { new Common.SignalR.IClientService with
                 member _.ReceiveMessage(_) = Task.CompletedTask
                 member _.ReceiveSourceCommand(_, _, _, _) = Task.CompletedTask
+                member _.ReceiveManualGrantedCommand(_, _, _) = Task.CompletedTask
+                member _.ReceiveManualGrantApproval(_, _, _) = Task.CompletedTask
                 member _.ReceiveCommand(correlationId, commandJson, _) =
                     task {
                         let received = JsonSerializer.Deserialize<AgentCommand>(commandJson)
@@ -2008,6 +2013,8 @@ let private routedNotificationFixtureWithReceipt (sourceReceipt: AgentInboxActiv
                 member _.InvalidateAgentStates(_, _) = Task.CompletedTask
                 member _.RecordAgentActivity(_, _, _) = Task.CompletedTask
                 member _.InvalidateAllAgentStates() = Task.CompletedTask
+                member _.ReceiveManualGrantedCommand(_, _, _) = Task.CompletedTask
+                member _.ReceiveManualGrantApproval(_, _, _) = Task.CompletedTask
                 member _.ReceiveCommand(correlationId, commandJson, senderActor) =
                     let device = connectionId.Replace("-connection", "", StringComparison.Ordinal)
                     let command = JsonSerializer.Deserialize<AgentCommand>(commandJson)
@@ -2283,6 +2290,8 @@ let browser_dom_mcp_tools_route_only_when_all_required_oauth_scopes_are_present 
         { new Common.SignalR.IClientService with
             member _.ReceiveMessage(_) = Task.CompletedTask
             member _.ReceiveSourceCommand(_, _, _, _) = Task.CompletedTask
+            member _.ReceiveManualGrantedCommand(_, _, _) = Task.CompletedTask
+            member _.ReceiveManualGrantApproval(_, _, _) = Task.CompletedTask
             member _.ReceiveCommand(correlationId, commandJson, _) =
                 let command = JsonSerializer.Deserialize<AgentCommand>(commandJson)
                 lock dispatched (fun () -> dispatched.Add(command))
@@ -2405,6 +2414,8 @@ let attributed_tool_dispatch_survives_missing_sqlite_and_notifies_only_user_devi
         { new Common.SignalR.IClientService with
             member _.ReceiveMessage(_) = Task.CompletedTask
             member _.ReceiveSourceCommand(_, _, _, _) = Task.CompletedTask
+            member _.ReceiveManualGrantedCommand(_, _, _) = Task.CompletedTask
+            member _.ReceiveManualGrantApproval(_, _, _) = Task.CompletedTask
             member _.ReceiveCommand(correlationId, _, _) =
                 System.Threading.Interlocked.Increment(&deliveredCommands) |> ignore
                 tracker.Complete(correlationId, "alice", connection, registrations[connection], expected)
@@ -2495,6 +2506,8 @@ let stalled_cross_device_activity_hints_drop_without_unbounded_tasks_or_blocking
     let recipient connection =
         { new IClientService with
             member _.ReceiveMessage(_) = Task.CompletedTask
+            member _.ReceiveManualGrantedCommand(_, _, _) = Task.CompletedTask
+            member _.ReceiveManualGrantApproval(_, _, _) = Task.CompletedTask
             member _.ReceiveCommand(correlationId, _, _) =
                 System.Threading.Interlocked.Increment(&commands) |> ignore
                 tracker.Complete(correlationId, "alice", connection,
@@ -2577,7 +2590,7 @@ let ``source file UUID ingress refuses a fabricated or empty caller identity`` (
     let result =
         JarvisMcpTools.WriteFile(
             "Project1", "Test Agent", "", "effect.txt", "content",
-            "Write", "", Nullable(), "", "not-a-uuid",
+            "Write", "", Nullable(), "", "not-a-uuid", "",
             Unchecked.defaultof<ClientService>,
             Unchecked.defaultof<Microsoft.AspNetCore.Http.IHttpContextAccessor>)
         |> Async.AwaitTask
@@ -2614,6 +2627,8 @@ let source_uuid_signalr_dispatch_preserves_caller_identity_and_legacy_receiver (
         let recipient =
             { new Common.SignalR.IClientService with
                 member _.ReceiveMessage(_) = Task.CompletedTask
+                member _.ReceiveManualGrantedCommand(_, _, _) = Task.CompletedTask
+                member _.ReceiveManualGrantApproval(_, _, _) = Task.CompletedTask
                 member _.ReceiveCommand(correlation, _, _) =
                     System.Threading.Interlocked.Increment(&legacyDispatches) |> ignore
                     reply correlation
@@ -2745,6 +2760,8 @@ let wq06_authenticated_mcp_post_forwards_only_oauth_derived_actor_and_original_u
         let recipient =
             { new IClientService with
                 member _.ReceiveMessage(_) = Task.CompletedTask
+                member _.ReceiveManualGrantedCommand(_, _, _) = Task.CompletedTask
+                member _.ReceiveManualGrantApproval(_, _, _) = Task.CompletedTask
                 member _.ReceiveCommand(correlation, commandJson, _) =
                     forwardedJson <- commandJson
                     reply correlation

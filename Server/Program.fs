@@ -119,6 +119,7 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
         .AddSingleton<UserService>()
         .AddSingleton<ClientResponseTracker>()
         .AddSingleton<ExportStore>(fun _ -> new ExportStore())
+        .AddSingleton<ManualGrantStore>()
         // SQLite is optional diagnostics. Its initialization, lock acquisition
         // and filesystem I/O must never gate authentication or MCP readiness.
         .AddSingleton<OptionalFeedbackStore>(fun _ -> new OptionalFeedbackStore(databasePath))

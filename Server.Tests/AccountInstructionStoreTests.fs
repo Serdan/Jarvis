@@ -222,6 +222,31 @@ let ``explicit hierarchy presentation puts account guidance before repository gu
 
 
 [<Test>]
+let ``pending first inbox delivers global policy before job polling`` () =
+    temporaryFolder (fun root ->
+        let store = AccountInstructionStore(root)
+        commit store "alice" "missing" "# Mandatory global policy" |> ignore
+        let http, _ = context "alice" "workspace:read"
+        let command = TaskReadCommand
+                          { ProjectName = "Jarvis"; Action = "AgentInbox"; AgentId = "Worker 9"
+                            TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
+                            Cursor = ""; PageSize = 0; BeforeOid = null
+                            AfterOid = null; RelativePath = null }
+        let pending: AgentCommandResponse =
+            { Result = None; Error = None; Instructions = []
+              AgentStateChanges = []; InboxActivation = None
+              PendingJob = Some Unchecked.defaultof<_> }
+        let output () =
+            let result = CallToolResult()
+            result.Content <- ResizeArray<ContentBlock>([
+                TextContentBlock(Text = "pending job") :> ContentBlock ])
+            result
+        let users = UserService()
+        let first = McpToolHelpers.attachAccountGlobal store users command http pending (output ())
+        Assert.That((first.Content.[0] :?> TextContentBlock).Text, Does.Contain("# Mandatory global policy"))
+        Assert.That((first.Content.[1] :?> TextContentBlock).Text, Is.EqualTo("pending job")))
+
+[<Test>]
 let ``account IDs resembling paths cannot escape the private store root`` () =
     temporaryFolder (fun root ->
         let suspicious = "../../other\\../../account"

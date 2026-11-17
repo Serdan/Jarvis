@@ -338,8 +338,6 @@ module McpToolHelpers =
     let attachAccountGlobal (store: AccountInstructionStore) (users: UserService)
                             command (context: HttpContext) (response: AgentCommandResponse)
                             (result: CallToolResult) =
-        if response.PendingJob.IsSome then result
-        else
             match Auth.tryUserId context.User, AgentCommandInfo.projectName command with
             | Some subject, Some project when project <> "@global" ->
                 let agent = RequestDeviceRouting.agentId() |> Option.defaultValue ""

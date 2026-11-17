@@ -87,6 +87,7 @@
         <Compile Include="Modules\AccountAdmissionAdapter.fs"/>
         <Compile Include="Modules\WorkQueueCanonicalMigrationPrepare.fs"/>
         <Compile Include="Modules\WorkQueueProjectMigrationPrepare.fs"/>
+        <Compile Include="Modules\WorkQueueMultiLedgerPreparedRecovery.fs"/>
         <Compile Include="Modules\RoleInstructions.fs"/>
         <Compile Include="Modules\\ReviewWorkflow.fs"/>
         <Compile Include="Modules\WorkCompositionAcceptanceAdapter.fs"/>

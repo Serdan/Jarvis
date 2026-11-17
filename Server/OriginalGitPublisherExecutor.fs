@@ -69,14 +69,14 @@ module private OriginalGitPublisherFixtureHash =
         |> List.toArray
         |> digest
 
-    let witness (operationId: Guid) (epoch: int64) targetHash (highWater: int64 * int64) (heads: (OriginalGitPublisherTarget * string option) list) =
+    let witness (operationId: Guid) (operatorDecisionId: Guid) (epoch: int64) targetHash (highWater: int64 * int64) (heads: (OriginalGitPublisherTarget * string option) list) =
         let sorted =
             heads
             |> List.map (fun (target, head) -> target.CanonicalRepositoryId + ":" +
                                                  target.GitRef + "=" + (head |> Option.defaultValue "<deleted>"))
             |> List.sort
         digest (Array.ofList (
-            [operationId.ToString("N"); string epoch; targetHash
+            [operationId.ToString("N"); operatorDecisionId.ToString("N"); string epoch; targetHash
              string (fst highWater); string (snd highWater)] @ sorted))
 
 type internal OriginalGitPublisherFixtureExecutor(
@@ -159,9 +159,10 @@ type internal OriginalGitPublisherFixtureExecutor(
                                     Error OriginalGitPublisherFailure.StaleRemoteHead
                                 | Ok _ ->
                                     match remote.ExactRemoteCas operation with
-                                    | Error OriginalGitPublisherFailure.StaleRemoteHead ->
-                                        store.MarkRejectedStale operation.OperationId
-                                        Error OriginalGitPublisherFailure.StaleRemoteHead
+                                    // An error returned *after* initiating remote CAS
+                                    // cannot prove that no ref changed, even when typed
+                                    // StaleRemoteHead. Only pre-effect ReadHead mismatch
+                                    // is safe to journal as a definite stale rejection.
                                     | Error _ -> uncertain operation.OperationId
                                     | Ok () ->
                                         match remote.ReadHead operation.Target with
@@ -192,7 +193,7 @@ type internal OriginalGitPublisherFixtureExecutor(
                     Error OriginalGitPublisherFailure.UnknownCredentialChannel
                 | Ok () ->
                     let targetSha = OriginalGitPublisherFixtureHash.targets trusted
-                    match store.BeginFence(request.FenceOperationId, targetSha) with
+                    match store.BeginFence(request.FenceOperationId, request.OperatorDecisionId, targetSha) with
                     | Error error -> Error error
                     | Ok { Phase = OriginalGitFixturePhase.Fenced _ } ->
                         match store.ReadBarrier() with
@@ -220,7 +221,7 @@ type internal OriginalGitPublisherFixtureExecutor(
                                         let nextEpoch = store.ReadState().FenceEpoch + 1L
                                         let witness =
                                             OriginalGitPublisherFixtureHash.witness
-                                                request.FenceOperationId nextEpoch targetSha highWater heads
+                                                request.FenceOperationId request.OperatorDecisionId nextEpoch targetSha highWater heads
                                         match store.FinishFence(request.FenceOperationId, targetSha,
                                                                witness, fst highWater, snd highWater) with
                                         | Error error -> Error error
@@ -259,7 +260,7 @@ type internal OriginalGitPublisherFixtureExecutor(
                                           record.OriginalSourceEffectHighWater) ->
                             let actual =
                                 OriginalGitPublisherFixtureHash.witness
-                                    record.OperationId record.FenceEpoch record.TargetSetSha256 highWater heads
+                                    record.OperationId record.OperatorDecisionId record.FenceEpoch record.TargetSetSha256 highWater heads
                             if actual = record.WitnessSha256 then Ok receipt
                             else Error OriginalGitPublisherFailure.UntrustedAuthority
                     | _ -> Error OriginalGitPublisherFailure.UntrustedAuthority

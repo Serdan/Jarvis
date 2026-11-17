@@ -29,6 +29,7 @@ type OriginalGitFixturePrepare =
 
 type OriginalGitFixtureBarrierRecord =
     { OperationId: Guid
+      OperatorDecisionId: Guid
       TargetSetSha256: string
       FenceEpoch: int64
       WitnessSha256: string
@@ -127,7 +128,7 @@ type OriginalGitPublisherStore(databasePath: string) =
             use c = OriginalGitFixtureSql.openConnection path
             OriginalGitFixtureSql.execute c "PRAGMA synchronous=FULL;"
             OriginalGitFixtureSql.execute c
-                "CREATE TABLE IF NOT EXISTS publisher_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1), phase TEXT NOT NULL, fence_id TEXT, epoch INTEGER NOT NULL, target_sha TEXT, witness_sha TEXT, pending_highwater INTEGER, effect_highwater INTEGER, hold_op TEXT);"
+                "CREATE TABLE IF NOT EXISTS publisher_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1), phase TEXT NOT NULL, fence_id TEXT, operator_id TEXT, epoch INTEGER NOT NULL, target_sha TEXT, witness_sha TEXT, pending_highwater INTEGER, effect_highwater INTEGER, hold_op TEXT);"
             OriginalGitFixtureSql.execute c
                 "CREATE TABLE IF NOT EXISTS publisher_ops (seq INTEGER PRIMARY KEY AUTOINCREMENT, op_id TEXT NOT NULL UNIQUE, envelope_sha TEXT NOT NULL, status TEXT NOT NULL, receipt_sha TEXT);"
             OriginalGitFixtureSql.execute c
@@ -217,49 +218,63 @@ type OriginalGitPublisherStore(databasePath: string) =
             hold.ExecuteNonQuery() |> ignore
             tx.Commit())
 
-    member _.BeginFence(operationId: Guid, targetSetSha256: string) =
+    member _.BeginFence(operationId: Guid, operatorDecisionId: Guid, targetSetSha256: string) =
         lock lane (fun () ->
             use c = OriginalGitFixtureSql.openConnection path
-            match OriginalGitPublisherState.beginFence operationId (readState c) with
-            | Error error -> Error error
-            | Ok next ->
-                use existing = OriginalGitFixtureSql.command c
-                                "SELECT fence_id, target_sha FROM publisher_state WHERE singleton=1"
-                use reader = existing.ExecuteReader()
-                reader.Read() |> ignore
-                let previousId = OriginalGitFixtureSql.optionalText reader 0
-                let previousTarget = OriginalGitFixtureSql.optionalText reader 1
-                reader.Close()
-                match previousId, previousTarget with
-                | Some id, Some sha when id <> operationId.ToString("N") || sha <> targetSetSha256 ->
-                    Error OriginalGitPublisherFailure.ReusedOperationId
-                | _ ->
-                    if next.Phase = OriginalGitFixturePhase.FencePending operationId then
-                        use cmd = OriginalGitFixtureSql.command c
-                                    "UPDATE publisher_state SET phase='pending', fence_id=@id, target_sha=@sha WHERE singleton=1 AND phase='active'"
-                        OriginalGitFixtureSql.parameter cmd "@id" (box (operationId.ToString("N")))
-                        OriginalGitFixtureSql.parameter cmd "@sha" (box targetSetSha256)
-                        cmd.ExecuteNonQuery() |> ignore
-                    use pending = OriginalGitFixtureSql.command c
-                                    "SELECT count(*) FROM publisher_ops WHERE status IN ('prepared','unknown')"
-                    if Convert.ToInt32(pending.ExecuteScalar()) > 0 then
-                        Error OriginalGitPublisherFailure.UnresolvedOriginalEffect
-                    else Ok next)
+            if operatorDecisionId = Guid.Empty then
+                Error(OriginalGitPublisherFailure.InvalidEnvelope "OperatorDecisionMissing")
+            else
+                match OriginalGitPublisherState.beginFence operationId (readState c) with
+                | Error error -> Error error
+                | Ok next ->
+                    use existing = OriginalGitFixtureSql.command c
+                                    "SELECT fence_id, operator_id, target_sha FROM publisher_state WHERE singleton=1"
+                    use reader = existing.ExecuteReader()
+                    reader.Read() |> ignore
+                    let previousId = OriginalGitFixtureSql.optionalText reader 0
+                    let previousOperator = OriginalGitFixtureSql.optionalText reader 1
+                    let previousTarget = OriginalGitFixtureSql.optionalText reader 2
+                    reader.Close()
+                    let sameEnvelope =
+                        match previousId, previousOperator, previousTarget with
+                        | Some id, Some decision, Some sha ->
+                            id = operationId.ToString("N")
+                            && decision = operatorDecisionId.ToString("N")
+                            && sha = targetSetSha256
+                        | None, None, None ->
+                            next.Phase = OriginalGitFixturePhase.FencePending operationId
+                        | _ -> false
+                    if not sameEnvelope then
+                        Error OriginalGitPublisherFailure.ReusedOperationId
+                    else
+                        if next.Phase = OriginalGitFixturePhase.FencePending operationId then
+                            use cmd = OriginalGitFixtureSql.command c
+                                        "UPDATE publisher_state SET phase='pending', fence_id=@id, operator_id=@operator, target_sha=@sha WHERE singleton=1 AND phase='active'"
+                            OriginalGitFixtureSql.parameter cmd "@id" (box (operationId.ToString("N")))
+                            OriginalGitFixtureSql.parameter cmd "@operator" (box (operatorDecisionId.ToString("N")))
+                            OriginalGitFixtureSql.parameter cmd "@sha" (box targetSetSha256)
+                            cmd.ExecuteNonQuery() |> ignore
+                        use pending = OriginalGitFixtureSql.command c
+                                        "SELECT count(*) FROM publisher_ops WHERE status IN ('prepared','unknown')"
+                        if Convert.ToInt32(pending.ExecuteScalar()) > 0 then
+                            Error OriginalGitPublisherFailure.UnresolvedOriginalEffect
+                        else Ok next)
 
     member _.ReadBarrier() =
         lock lane (fun () ->
             use c = OriginalGitFixtureSql.openConnection path
             use cmd = OriginalGitFixtureSql.command c
-                        "SELECT fence_id,target_sha,epoch,witness_sha,pending_highwater,effect_highwater FROM publisher_state WHERE singleton=1 AND phase='fenced'"
+                        "SELECT fence_id,operator_id,target_sha,epoch,witness_sha,pending_highwater,effect_highwater FROM publisher_state WHERE singleton=1 AND phase='fenced'"
             use reader = cmd.ExecuteReader()
             if not (reader.Read()) then None
             else
                 Some { OperationId = Guid.Parse(reader.GetString 0)
-                       TargetSetSha256 = reader.GetString 1
-                       FenceEpoch = reader.GetInt64 2
-                       WitnessSha256 = reader.GetString 3
-                       OriginalPendingHighWater = reader.GetInt64 4
-                       OriginalSourceEffectHighWater = reader.GetInt64 5 })
+                       OperatorDecisionId = Guid.Parse(reader.GetString 1)
+                       TargetSetSha256 = reader.GetString 2
+                       FenceEpoch = reader.GetInt64 3
+                       WitnessSha256 = reader.GetString 4
+                       OriginalPendingHighWater = reader.GetInt64 5
+                       OriginalSourceEffectHighWater = reader.GetInt64 6 })
 
     member this.FinishFence(operationId: Guid, targetSetSha256: string, witnessSha256: string,
                          pendingHighWater: int64, effectHighWater: int64) =
@@ -272,9 +287,13 @@ type OriginalGitPublisherStore(databasePath: string) =
                 Error(OriginalGitPublisherFailure.InvalidEnvelope "NegativeOriginalJournalHighWater")
             | Ok next ->
                 use existing = OriginalGitFixtureSql.command c
-                                "SELECT target_sha FROM publisher_state WHERE singleton=1"
-                let persistedTarget = existing.ExecuteScalar()
-                if isNull persistedTarget || string persistedTarget <> targetSetSha256 then
+                                "SELECT operator_id, target_sha FROM publisher_state WHERE singleton=1"
+                use reader = existing.ExecuteReader()
+                reader.Read() |> ignore
+                let storedDecision = OriginalGitFixtureSql.optionalText reader 0
+                let persistedTarget = OriginalGitFixtureSql.optionalText reader 1
+                reader.Close()
+                if storedDecision.IsNone || persistedTarget <> Some targetSetSha256 then
                     Error OriginalGitPublisherFailure.UntrustedAuthority
                 else
                     match state.Phase with
@@ -300,6 +319,7 @@ type OriginalGitPublisherStore(databasePath: string) =
                             if cmd.ExecuteNonQuery() <> 1 then Error OriginalGitPublisherFailure.Fenced
                             else
                                 Ok { OperationId = operationId
+                                     OperatorDecisionId = Guid.Parse(storedDecision.Value)
                                      TargetSetSha256 = targetSetSha256
                                      FenceEpoch = next.FenceEpoch
                                      WitnessSha256 = witnessSha256

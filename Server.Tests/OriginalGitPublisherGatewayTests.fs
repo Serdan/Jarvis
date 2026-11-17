@@ -40,6 +40,7 @@ let uncertain_external_effect_never_admits_after_recovery () =
 
 open System.Collections.Generic
 open System.IO
+open System.Threading
 
 let private oidA = String.replicate 40 "a"
 let private oidB = String.replicate 40 "b"
@@ -98,10 +99,23 @@ type private InMemoryFixtureRemote(authorized: OriginalGitPublisherIdentity,
     let mutable completeHistory = true
     let mutable denialInstalled = false
     let mutable faultAfterWrite = false
+    let mutable typedStaleAfterWrite = false
+    let mutable gateBeforeWrite: (ManualResetEventSlim * ManualResetEventSlim) option = None
+    let mutable gateAfterWrite: (ManualResetEventSlim * ManualResetEventSlim) option = None
     let mutable casCalls = 0
+    let waitAtGate (gate: (ManualResetEventSlim * ManualResetEventSlim) option) =
+        match gate with
+        | None -> ()
+        | Some (entered, release) ->
+            entered.Set()
+            if not (release.Wait(15000)) then
+                failwith "Fixture CAS synchronization timed out"
     do for target in approved do heads.[key target] <- Some oidA
     member _.CasCalls = casCalls
     member _.SetFaultAfterWrite value = faultAfterWrite <- value
+    member _.SetTypedStaleAfterWrite value = typedStaleAfterWrite <- value
+    member _.GateBeforeWrite(entered, release) = gateBeforeWrite <- Some(entered, release)
+    member _.GateAfterWrite(entered, release) = gateAfterWrite <- Some(entered, release)
     member _.SetCoverage value = canVerify <- value
     member _.SetOriginalHistory value = completeHistory <- value
     member _.MoveHead target newHead = heads.[key target] <- newHead
@@ -118,9 +132,12 @@ type private InMemoryFixtureRemote(authorized: OriginalGitPublisherIdentity,
             if heads.[key operation.Target] <> operation.ExpectedRemoteHead then
                 Error OriginalGitPublisherFailure.StaleRemoteHead
             else
+                waitAtGate gateBeforeWrite
                 heads.[key operation.Target] <- operation.ProposedRemoteHead
+                waitAtGate gateAfterWrite
                 if faultAfterWrite then failwith "Simulated lost remote response after ref advanced"
-                Ok ()
+                if typedStaleAfterWrite then Error OriginalGitPublisherFailure.StaleRemoteHead
+                else Ok ()
         member _.InstallFixtureRemoteDenial targets =
             if not canVerify || List.length targets <> approved.Length then
                 Error OriginalGitPublisherFailure.UnknownCredentialChannel
@@ -193,6 +210,24 @@ let lost_response_after_remote_advance_remains_unknown_after_restart () =
         Assert.That(resumed.AcquireExclusiveFixtureBarrier(originalBarrier()) |> Result.isError, Is.True))
 
 [<Test>]
+let typed_stale_error_after_remote_advance_must_be_unknown_and_hold_fence () =
+    withDisposableStore (fun path ->
+        let host = InMemoryFixtureRemote(identity, inventory)
+        host.SetTypedStaleAfterWrite true
+        let store = OriginalGitPublisherStore(path)
+        let gateway = OriginalGitPublisherFixtureExecutor(store, host)
+        let operation = originalCas ()
+        match gateway.PublishCas operation with
+        | Error(OriginalGitPublisherFailure.OutcomeUnknown id) when id = operation.OperationId -> ()
+        | other -> Assert.Fail(sprintf "Ambiguous typed CAS error incorrectly finalized: %A" other)
+        Assert.That(host.Head projectTarget1, Is.EqualTo(Some oidB))
+        let stored = store.ReadOperation(operation.OperationId) |> Option.get
+        Assert.That(stored.Status, Is.EqualTo(OriginalGitFixtureCasStatus.Unknown))
+        Assert.That(store.ReadState().Phase,
+                    Is.EqualTo(OriginalGitFixturePhase.RecoveryHold(Some operation.OperationId)))
+        Assert.That(gateway.AcquireExclusiveFixtureBarrier(originalBarrier()) |> Result.isError, Is.True))
+
+[<Test>]
 let fixture_barrier_is_durable_and_reinspection_rejects_forged_receipts () =
     withDisposableStore (fun path ->
         let host = InMemoryFixtureRemote(identity, inventory)
@@ -210,6 +245,38 @@ let fixture_barrier_is_durable_and_reinspection_rejects_forged_receipts () =
         Assert.That(reopened.PublishCas(originalCas()) = Error OriginalGitPublisherFailure.Fenced, Is.True)
         host.MoveHead projectTarget2 (Some oidB)
         Assert.That(reopened.ReinspectFixtureBarrier receipt |> Result.isError, Is.True))
+
+[<Test>]
+let fence_replay_with_changed_operator_decision_is_rejected_after_restart () =
+    withDisposableStore (fun path ->
+        let host = InMemoryFixtureRemote(identity, inventory)
+        let request = originalBarrier ()
+        let gateway = OriginalGitPublisherFixtureExecutor(OriginalGitPublisherStore(path), host)
+        let first = gateway.AcquireExclusiveFixtureBarrier request |> unwrap
+        let restarted = OriginalGitPublisherFixtureExecutor(OriginalGitPublisherStore(path), host)
+        Assert.That(restarted.AcquireExclusiveFixtureBarrier request = Ok first, Is.True)
+        let changed = { request with OperatorDecisionId = Guid.NewGuid() }
+        match restarted.AcquireExclusiveFixtureBarrier changed with
+        | Error OriginalGitPublisherFailure.ReusedOperationId -> ()
+        | other -> Assert.Fail(sprintf "Changed operator decision replay accepted: %A" other)
+        Assert.That(restarted.ReinspectFixtureBarrier first = Ok first, Is.True))
+
+[<Test>]
+let pending_fence_replay_with_changed_operator_remains_refused_after_restart () =
+    withDisposableStore (fun path ->
+        let host = InMemoryFixtureRemote(identity, inventory)
+        host.SetOriginalHistory false
+        let request = originalBarrier ()
+        let store = OriginalGitPublisherStore(path)
+        let gateway = OriginalGitPublisherFixtureExecutor(store, host)
+        Assert.That(gateway.AcquireExclusiveFixtureBarrier request |> Result.isError, Is.True)
+        Assert.That(store.ReadState().Phase,
+                    Is.EqualTo(OriginalGitFixturePhase.FencePending request.FenceOperationId))
+        let restarted = OriginalGitPublisherFixtureExecutor(OriginalGitPublisherStore(path), host)
+        let changed = { request with OperatorDecisionId = Guid.NewGuid() }
+        match restarted.AcquireExclusiveFixtureBarrier changed with
+        | Error OriginalGitPublisherFailure.ReusedOperationId -> ()
+        | other -> Assert.Fail(sprintf "Changed pending fence operator was accepted: %A" other))
 
 [<Test>]
 let partial_inventory_or_missing_original_history_never_releases_barrier () =
@@ -234,6 +301,96 @@ let partial_inventory_or_missing_original_history_never_releases_barrier () =
         let request = { originalBarrier() with Targets = [accountTarget; projectTarget1] }
         Assert.That(gateway.AcquireExclusiveFixtureBarrier request |> Result.isError, Is.True))
 
+
+[<Test>]
+let source_effect_ref_missing_from_fence_or_misclassified_fails_closed () =
+    withDisposableStore (fun path ->
+        let sourceEffect =
+            { projectTarget1 with
+                Purpose = OriginalGitRefPurpose.SourceEffect
+                LedgerId = Guid.NewGuid()
+                GitRef = "refs/heads/jarvis-original-source-effects" }
+        let trusted = sourceEffect :: inventory
+        let host = InMemoryFixtureRemote(identity, trusted)
+        let gateway = OriginalGitPublisherFixtureExecutor(OriginalGitPublisherStore(path), host)
+        match gateway.AcquireExclusiveFixtureBarrier(originalBarrier()) with
+        | Error OriginalGitPublisherFailure.UnknownCredentialChannel -> ()
+        | other -> Assert.Fail(sprintf "Incomplete source-effect fence accepted: %A" other)
+        let misclassified =
+            { sourceEffect with Purpose = OriginalGitRefPurpose.ProjectLedger }
+        match OriginalGitPublisherAdmission.validateTargetAgainstTrustedInventory trusted misclassified with
+        | Error(OriginalGitPublisherFailure.InvalidEnvelope "ScopeOrRefMismatch") -> ()
+        | other -> Assert.Fail(sprintf "Source ref classification was not rejected: %A" other)
+        let invalidSourceCas = { originalCas() with Target = sourceEffect }
+        match gateway.PublishCas invalidSourceCas with
+        | Error(OriginalGitPublisherFailure.InvalidEnvelope "SourceEffectJournalIdentityMissing") -> ()
+        | other -> Assert.Fail(sprintf "Missing source-effect journal identity was accepted: %A" other))
+
+[<Test>]
+let in_flight_pre_write_cas_is_accounted_before_barrier_positive () =
+    withDisposableStore (fun path ->
+        let host = InMemoryFixtureRemote(identity, inventory)
+        use entered = new ManualResetEventSlim(false)
+        use release = new ManualResetEventSlim(false)
+        use barrierStarted = new ManualResetEventSlim(false)
+        host.GateBeforeWrite(entered, release)
+        let store = OriginalGitPublisherStore(path)
+        let gateway = OriginalGitPublisherFixtureExecutor(store, host)
+        let operation = originalCas ()
+        let casJob = System.Threading.Tasks.Task.Run(fun () -> gateway.PublishCas operation)
+        try
+            Assert.That(entered.Wait(10000), Is.True)
+            let barrierJob =
+                System.Threading.Tasks.Task.Run(fun () ->
+                    barrierStarted.Set()
+                    gateway.AcquireExclusiveFixtureBarrier(originalBarrier()))
+            Assert.That(barrierStarted.Wait(10000), Is.True)
+            Assert.That(barrierJob.Wait(50), Is.False,
+                        "Barrier must not complete while remote CAS is in flight")
+            release.Set()
+            Assert.That(casJob.Wait(15000), Is.True)
+            Assert.That(barrierJob.Wait(15000), Is.True)
+            Assert.That(casJob.Result |> Result.isOk, Is.True)
+            let stored = store.ReadOperation(operation.OperationId) |> Option.get
+            Assert.That(stored.Status, Is.EqualTo(OriginalGitFixtureCasStatus.Applied))
+            Assert.That(barrierJob.Result |> Result.isOk, Is.True)
+            Assert.That(host.Head projectTarget1, Is.EqualTo(Some oidB))
+        finally release.Set())
+
+[<Test>]
+let in_flight_post_write_typed_error_blocks_barrier_positive () =
+    withDisposableStore (fun path ->
+        let host = InMemoryFixtureRemote(identity, inventory)
+        use entered = new ManualResetEventSlim(false)
+        use release = new ManualResetEventSlim(false)
+        use barrierStarted = new ManualResetEventSlim(false)
+        host.GateAfterWrite(entered, release)
+        host.SetTypedStaleAfterWrite true
+        let store = OriginalGitPublisherStore(path)
+        let gateway = OriginalGitPublisherFixtureExecutor(store, host)
+        let operation = originalCas ()
+        let casJob = System.Threading.Tasks.Task.Run(fun () -> gateway.PublishCas operation)
+        try
+            Assert.That(entered.Wait(10000), Is.True)
+            let barrierJob =
+                System.Threading.Tasks.Task.Run(fun () ->
+                    barrierStarted.Set()
+                    gateway.AcquireExclusiveFixtureBarrier(originalBarrier()))
+            Assert.That(barrierStarted.Wait(10000), Is.True)
+            Assert.That(barrierJob.Wait(50), Is.False,
+                        "Barrier must wait for ambiguous external CAS outcome")
+            release.Set()
+            Assert.That(casJob.Wait(15000), Is.True)
+            Assert.That(barrierJob.Wait(15000), Is.True)
+            match casJob.Result with
+            | Error(OriginalGitPublisherFailure.OutcomeUnknown id) when id = operation.OperationId -> ()
+            | other -> Assert.Fail(sprintf "In-flight ambiguous CAS was finalized: %A" other)
+            Assert.That(barrierJob.Result |> Result.isError, Is.True)
+            let stored = store.ReadOperation(operation.OperationId) |> Option.get
+            Assert.That(stored.Status, Is.EqualTo(OriginalGitFixtureCasStatus.Unknown))
+            Assert.That(store.ReadState().Phase,
+                        Is.EqualTo(OriginalGitFixturePhase.RecoveryHold(Some operation.OperationId)))
+        finally release.Set())
 
 open System.Diagnostics
 open System.Threading.Tasks
@@ -312,7 +469,9 @@ type private BareGitFixtureRemote(
             let code, _, _ =
                 runGit root ["--git-dir=" + path; "update-ref"; operation.Target.GitRef; proposed; old]
             if code = 0 then Ok ()
-            else Error OriginalGitPublisherFailure.StaleRemoteHead
+            // Arbitrary nonzero Git exit is not a no-publication proof:
+            // even a terminated process can leave the external effect uncertain.
+            else Error(OriginalGitPublisherFailure.OutcomeUnknown operation.OperationId)
         member _.InstallFixtureRemoteDenial targets =
             for target in targets do
                 let path = pathFor target

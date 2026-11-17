@@ -67,8 +67,12 @@ module WorkSnapshotCodec =
         not (isNull value) && (value.Length = 40 || value.Length = 64)
         && (value |> Seq.forall (fun c -> c >= '0' && c <= '9' || c >= 'a' && c <= 'f'))
 
-    // A closed vocabulary means bearer plaintext, free-form payloads and
-    // ephemeral operator grants have no serializable representation in F0.
+    // The closed key vocabulary rejects arbitrary payloads and manual grant
+    // record kinds, but it cannot distinguish an identifier from a secret
+    // supplied as that identifier. F1 MUST use a trusted typed projection
+    // from the authoritative SQLite transaction: scheduled bearer plaintext
+    // and ephemeral manual grants must never enter these generic strings.
+    // F0 alone is NOT a credential secrecy boundary.
     let private allowedFields kind =
         match kind with
         | "AccountCapacity" -> Some(set [ "maxConcurrent"; "stopRequested"; "status" ])
@@ -80,6 +84,58 @@ module WorkSnapshotCodec =
         | "Receipt" -> Some(set [ "workId"; "operationId"; "status"; "reviewSha"; "integrationSha" ])
         | "AuditEvent" -> Some(set [ "workId"; "eventKind"; "operationId"; "status" ])
         | _ -> None
+
+    // F0 freezes a deliberately small set of logical states. The eventual B
+    // schema mapper must prove equivalence or introduce a new format version.
+    let private requiredFields kind =
+        match kind with
+        | "AccountCapacity" -> set [ "maxConcurrent"; "stopRequested"; "status" ]
+        | "WorkUnit" -> set [ "unitKind"; "status" ]
+        | "WorkStage" -> set [ "workId"; "queueId"; "status"; "priority"; "generation" ]
+        | "Reservation" -> set [ "workId"; "roleId"; "stageId"; "status"; "generation" ]
+        | "ScheduledVerifier" -> set [ "verifierSha256"; "reservationId" ]
+        | "EffectJournal" -> set [ "workId"; "effectKind"; "operationId"; "status" ]
+        | "Receipt" -> set [ "workId"; "operationId"; "status" ]
+        | "AuditEvent" -> set [ "eventKind"; "status" ]
+        | _ -> Set.empty
+
+    let private knownStatuses kind =
+        match kind with
+        | "AccountCapacity" -> set [ "Active"; "Paused"; "Stopped" ]
+        | "WorkUnit" -> set [ "Draft"; "Proposed"; "Open"; "InProgress"; "Blocked";
+                               "Completed"; "Accepted"; "Closed"; "Cancelled" ]
+        | "WorkStage" -> set [ "Available"; "Blocked"; "Claimed"; "GateException";
+                                "Completed"; "Cancelled" ]
+        | "Reservation" -> set [ "ReservedUnregistered"; "SubmittedUnregistered";
+                                  "Registered"; "DemandInvalidatedPendingTerminal";
+                                  "TerminalPendingRelease"; "Released" ]
+        | "EffectJournal" -> set [ "Pending"; "Prepared"; "Submitted"; "Unknown";
+                                    "OutcomeUnknown"; "DefinitiveNoEffect"; "Observed";
+                                    "Applied"; "Failed"; "Cancelled"; "Completed" ]
+        | "Receipt" -> set [ "Pending"; "Accepted"; "ChangesRequested"; "Applied";
+                              "Rejected"; "Integrated"; "Unknown"; "Failed"; "Completed" ]
+        | "AuditEvent" -> set [ "Pending"; "Complete"; "Completed"; "Applied";
+                                 "Rejected"; "Unknown" ]
+        | _ -> Set.empty
+
+    // Git check-ref-format semantics, without shelling out or accepting
+    // checksummed provenance that cannot represent a real full ref.
+    let private validGitRef (value: string) =
+        not (String.IsNullOrEmpty value)
+        && value.Length <= 512
+        && value.StartsWith("refs/", StringComparison.Ordinal)
+        && not (value.EndsWith("/", StringComparison.Ordinal))
+        && not (value.EndsWith(".", StringComparison.Ordinal))
+        && not (value.Contains("..", StringComparison.Ordinal))
+        && not (value.Contains("@{", StringComparison.Ordinal))
+        && (value |> Seq.forall (fun c ->
+            not (Char.IsControl c || Char.IsWhiteSpace c)
+            && not (":?*[^~\\".Contains(c))))
+        && (value.Split('/') |> Array.forall (fun segment ->
+            segment.Length > 0
+            && not (segment.StartsWith(".", StringComparison.Ordinal))
+            && not (segment.EndsWith(".lock", StringComparison.Ordinal))))
+        && value.Split('/').Length >= 3
 
     let private numberField (_key: string) (value: string) =
         let mutable result = 0L
@@ -95,8 +151,8 @@ module WorkSnapshotCodec =
             | _, ("priority" | "generation" | "availableSequence" | "maxConcurrent") -> numberField key value
             | _, ("stopRequested" | "required") -> value = "true" || value = "false"
             | _, ("specSha" | "reviewSha" | "integrationSha") -> commitHash value
-            | _, "status" -> value.Length > 0 && value.Length <= 64
-                               && (value |> Seq.forall Char.IsAsciiLetter)
+            | _, "status" -> knownStatuses kind |> Set.contains value
+            | _, "targetRef" -> validGitRef value
             | _, "unitKind" -> Set.contains value (set ["Project"; "System"; "Feature"])
             | _, "effectKind" -> value.Length > 0 && value.Length <= 64
                                  && (value |> Seq.forall Char.IsAsciiLetter)
@@ -114,18 +170,20 @@ module WorkSnapshotCodec =
         ensure (not record.Fields.IsEmpty) "Empty logical record"
         ensure (record.Fields |> Map.forall (fun key value ->
             allowed.Contains key && validField record.Kind key value)) "Unsupported or invalid logical field"
+        ensure (requiredFields record.Kind |> Set.forall record.Fields.ContainsKey)
+            "Missing required logical fields"
         if record.Kind = "ScheduledVerifier" then
-            ensure (record.Fields.ContainsKey "verifierSha256"
-                    && record.Fields.ContainsKey "reservationId"
-                    && record.Fields.Count = 2) "Incomplete scheduled credential verifier"
+            ensure (record.Fields.Count = 2) "Incomplete scheduled credential verifier"
+        if record.Kind = "WorkStage" then
+            match record.Fields.["status"] with
+            | "Claimed" -> ensure (record.Fields.ContainsKey "claimId") "Missing claimed stage identity"
+            | "Available" -> ensure (record.Fields.ContainsKey "availableSequence")
+                                 "Missing available stage ordering"
+            | _ -> ()
         record.Source
         |> Option.iter (fun source ->
             ensure (legalId source.RepositoryId) "Invalid source repository"
-            ensure (not (isNull source.Ref) && source.Ref.StartsWith("refs/", StringComparison.Ordinal)
-                    && source.Ref.Length <= 512
-                    && not (source.Ref |> Seq.exists Char.IsWhiteSpace)
-                    && not (source.Ref.Contains("..", StringComparison.Ordinal)))
-                "Invalid source ref"
+            ensure (validGitRef source.Ref) "Invalid source ref"
             ensure (commitHash source.Commit) "Invalid source commit")
 
     let private validate (snapshot: WorkSnapshot) =
@@ -142,8 +200,22 @@ module WorkSnapshotCodec =
         ensure (snapshot.AccountRecords |> List.forall (fun r -> r.Kind <> "ScheduledVerifier"))
             "Scheduled verifier must belong to a project"
         all |> List.iter (validateRecord snapshot.CommittedSequence)
-        let maxSeq = if List.isEmpty all then 0L else all |> List.maxBy (fun x -> x.Sequence) |> fun x -> x.Sequence
-        ensure (maxSeq = snapshot.CommittedSequence) "Committed sequence does not match exported records"
+        // Scheduled verifier identity is derived from a durable reservation
+        // in the same project. A free-form token in reservationId without a
+        // corresponding authority record is not restorable.
+        snapshot.Projects |> List.iter (fun project ->
+            let reservations =
+                project.Records
+                |> List.filter (fun record -> record.Kind = "Reservation")
+                |> List.map _.Id
+                |> Set.ofList
+            project.Records |> List.iter (fun record ->
+                if record.Kind = "ScheduledVerifier" then
+                    ensure (reservations.Contains record.Fields.["reservationId"])
+                        "Unbound scheduled credential verifier"))
+        // A committed mutation may delete the highest-sequence record (or
+        // every record). The authoritative transaction sequence is independent
+        // of retained row maxima; validate only that no row is from the future.
 
     let private sortedRecords records =
         records |> List.sortWith (fun a b ->

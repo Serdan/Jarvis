@@ -39,10 +39,14 @@ let private fixture () =
                   [ "eventKind", "StagePublished"; "status", "Complete"; "workId", "beta-job" ] None ] }
           { ProjectId = "alpha"
             Records =
-              [ record "verifier-alpha" "ScheduledVerifier" 1L 7L
+              [ record "reservation-alpha" "Reservation" 1L 6L
+                  [ "workId", "unit-alpha"; "stageId", "stage-alpha";
+                    "roleId", "Worker"; "status", "Registered"; "generation", "1" ] None
+                record "verifier-alpha" "ScheduledVerifier" 1L 7L
                   [ "verifierSha256", String.replicate 64 "f"; "reservationId", "reservation-alpha" ] None
                 record "stage-alpha" "WorkStage" 2L 5L
-                  [ "workId", "unit-alpha"; "status", "Available"; "queueId", "implementation"; "priority", "2" ] (Some source)
+                  [ "workId", "unit-alpha"; "status", "Available"; "queueId", "implementation";
+                    "priority", "2"; "generation", "1"; "availableSequence", "5" ] (Some source)
                 record "unit-alpha" "WorkUnit" 1L 4L
                   [ "unitKind", "Feature"; "status", "Open"; "specSha", String.replicate 40 "b" ] None ] } ] }
 
@@ -95,7 +99,7 @@ let snapshot_codec_rejects_duplicate_identifiers_invalid_sequences_and_unsafe_pa
     let duplicateRecord = { beta with Records = [ sameId ] }
     let duplicate = { snapshot with Projects = duplicateRecord :: snapshot.Projects.Tail }
     invalid (WorkSnapshotCodec.exportSnapshot duplicate)
-    let dishonest = { snapshot with CommittedSequence = 9L }
+    let dishonest = { snapshot with CommittedSequence = 7L }
     invalid (WorkSnapshotCodec.exportSnapshot dishonest)
     let doubleProject = { snapshot with Projects = snapshot.Projects @ [ beta ] }
     invalid (WorkSnapshotCodec.exportSnapshot doubleProject)
@@ -123,6 +127,11 @@ let snapshot_codec_rejects_plain_scheduled_bearers_manual_grants_and_unknown_fie
     let plaintext = { verifier with Fields = verifier.Fields.Add("verifierSha256", token) }
     let badAlpha = { alpha with Records = plaintext :: alpha.Records.Tail }
     invalid (WorkSnapshotCodec.exportSnapshot { snapshot with Projects = [ beta; badAlpha ] })
+    // An allowed identifier key cannot silently refer to a non-existent
+    // reservation; this does not replace the F1 typed producer secrecy proof.
+    let misplaced = { verifier with Fields = verifier.Fields.Add("reservationId", token) }
+    let badBinding = { alpha with Records = misplaced :: alpha.Records.Tail }
+    invalid (WorkSnapshotCodec.exportSnapshot { snapshot with Projects = [ beta; badBinding ] })
     let valid = WorkSnapshotCodec.exportSnapshot snapshot |> good
     let joined = valid.Files.Values |> Seq.map (fun bytes -> Encoding.UTF8.GetString(bytes)) |> String.concat "\n"
     Assert.That(joined, Does.Not.Contain(token))
@@ -155,13 +164,115 @@ let snapshot_codec_safely_handles_empty_initial_database () =
     let restored = WorkSnapshotCodec.importSnapshot exported |> good
     Assert.That(restored, Is.EqualTo(box empty))
 
+[<Test>]
+let snapshot_codec_retains_authoritative_sequence_after_deletion_and_full_compaction () =
+    let snapshot = { fixture () with CommittedSequence = 19L }
+    let restored = snapshot |> WorkSnapshotCodec.exportSnapshot |> good
+                            |> WorkSnapshotCodec.importSnapshot |> good
+    Assert.That(restored.CommittedSequence, Is.EqualTo(19L))
+    let highest = restored.Projects |> List.collect _.Records |> List.maxBy _.Sequence
+    Assert.That(highest.Sequence, Is.LessThan(19L))
+
+    let compacted = { CommittedSequence = 22L; AccountRecords = []; Projects = [] }
+    let restoredEmpty = compacted |> WorkSnapshotCodec.exportSnapshot |> good
+                                  |> WorkSnapshotCodec.importSnapshot |> good
+    Assert.That(restoredEmpty, Is.EqualTo(box compacted))
+
 let private tamperAndRehash path (transform: byte[] -> byte[]) (bundle: WorkSnapshotBundle) =
     let oldBytes = bundle.Files.[path]
     let newBytes = transform oldBytes
+    if oldBytes.AsSpan().SequenceEqual(newBytes) then
+        failwithf "Test tampering was a no-op: %s" path
     let hash (bytes: byte[]) =
         SHA256.HashData(bytes) |> Convert.ToHexString |> fun x -> x.ToLowerInvariant()
     let manifest = replaceBytes (hash oldBytes) (hash newBytes) bundle.Files.["manifest.json"]
     { Files = bundle.Files.Add(path, newBytes).Add("manifest.json", manifest) }
+
+[<Test>]
+let snapshot_codec_requires_complete_logical_fences_and_known_statuses () =
+    let baseSnapshot = fixture ()
+    let beta = baseSnapshot.Projects.Head
+    let effect =
+        record "effect-beta" "EffectJournal" 1L 8L
+            [ "workId", "beta-job"; "effectKind", "GitPush"; "status", "Unknown";
+              "operationId", "operation-beta"; "targetRef", "refs/heads/main" ] None
+    let receipt =
+        record "receipt-beta" "Receipt" 1L 8L
+            [ "workId", "beta-job"; "operationId", "receipt-operation"; "status", "Applied" ] None
+    let complete = { baseSnapshot with
+                       Projects = { beta with Records = effect :: receipt :: beta.Records }
+                                  :: baseSnapshot.Projects.Tail }
+    let exported = WorkSnapshotCodec.exportSnapshot complete |> good
+    let imported = WorkSnapshotCodec.importSnapshot exported |> good
+    Assert.That(imported.Projects |> List.sumBy (fun p -> p.Records.Length), Is.EqualTo(7))
+
+    let alpha = baseSnapshot.Projects.Tail.Head
+    let stage = alpha.Records |> List.find (fun r -> r.Kind = "WorkStage")
+    let reservation = alpha.Records |> List.find (fun r -> r.Kind = "Reservation")
+    let invalidAlpha newRecord =
+        let records = alpha.Records |> List.map (fun r -> if r.Id = newRecord.Id then newRecord else r)
+        invalid (WorkSnapshotCodec.exportSnapshot
+                    { baseSnapshot with Projects = [ beta; { alpha with Records = records } ] })
+    invalidAlpha { stage with Fields = stage.Fields.Remove("queueId") }
+    invalidAlpha { stage with Fields = stage.Fields.Add("status", "Teleporting") }
+    invalidAlpha { stage with Fields = stage.Fields.Add("status", "Claimed") }
+    invalidAlpha { reservation with Fields = reservation.Fields.Remove("roleId") }
+    let invalidBeta newRecord =
+        let changed = { beta with Records = newRecord :: beta.Records }
+        invalid (WorkSnapshotCodec.exportSnapshot { baseSnapshot with Projects = [ changed; alpha ] })
+    invalidBeta { effect with Fields = effect.Fields.Remove("operationId") }
+    invalidBeta { effect with Fields = effect.Fields.Add("status", "Maybe") }
+    invalidBeta { receipt with Fields = receipt.Fields.Remove("workId") }
+
+    // Rehash the canonical file to bypass checksum protection: the importer
+    // must reject logical incompleteness rather than only tampered checksums.
+    let expectRehashedFailure path original replacement (expected: string) =
+        let modified =
+            tamperAndRehash path (replaceBytes original replacement) exported
+        match WorkSnapshotCodec.importSnapshot modified with
+        | Error message -> Assert.That(message, Is.EqualTo(expected), sprintf "File: %s" path)
+        | Ok _ -> Assert.Fail(sprintf "Rehashed incomplete %s unexpectedly restored" path)
+
+    expectRehashedFailure "projects/alpha.json"
+        "\"queueId\": \"implementation\"," "" "Missing required logical fields"
+    expectRehashedFailure "projects/alpha.json"
+        "\"roleId\": \"Worker\"," "" "Missing required logical fields"
+    expectRehashedFailure "projects/beta.json"
+        "\"operationId\": \"operation-beta\"," "" "Missing required logical fields"
+    expectRehashedFailure "projects/beta.json"
+        "\"operationId\": \"receipt-operation\"," "" "Missing required logical fields"
+    expectRehashedFailure "projects/alpha.json"
+        "\"status\": \"Available\"" "\"status\": \"Teleporting\""
+        "Unsupported or invalid logical field"
+    expectRehashedFailure "projects/beta.json"
+        "\"status\": \"Unknown\"" "\"status\": \"Maybe\""
+        "Unsupported or invalid logical field"
+    expectRehashedFailure "projects/alpha.json"
+        "\"reservationId\": \"reservation-alpha\""
+        "\"reservationId\": \"d9f1234e-2e50-4f44-8b8e-d1d798292263\""
+        "Unbound scheduled credential verifier"
+
+[<Test>]
+let snapshot_codec_rejects_invalid_git_refs_in_export_and_rehashed_import () =
+    let baseline = fixture ()
+    let beta = baseline.Projects.Head
+    let alpha = baseline.Projects.Tail.Head
+    let stage = alpha.Records |> List.find (fun r -> r.Kind = "WorkStage")
+    let withRef value =
+        let source = { stage.Source.Value with Ref = value }
+        let updated = { stage with Source = Some source }
+        let records = alpha.Records |> List.map (fun r -> if r.Id = stage.Id then updated else r)
+        { baseline with Projects = [ beta; { alpha with Records = records } ] }
+    for invalidRef in [ "refs/heads/a:b"; "refs/heads/a\\b"; "refs/heads/a..b";
+                        "refs/heads/.hidden"; "refs/heads/a.lock"; "refs/heads/a//b";
+                        "refs/heads/a?b"; "refs/heads/a" + string (char 1) ] do
+        invalid (WorkSnapshotCodec.exportSnapshot (withRef invalidRef))
+
+    let valid = WorkSnapshotCodec.exportSnapshot baseline |> good
+    let rehashed =
+        tamperAndRehash "projects/alpha.json"
+            (replaceBytes "refs/heads/feature/example" "refs/heads/a:b") valid
+    invalid (WorkSnapshotCodec.importSnapshot rehashed)
 
 [<Test>]
 let snapshot_codec_rejects_hashed_but_invalid_source_content () =
@@ -197,7 +308,9 @@ let snapshot_codec_two_project_export_restore_initial_performance () =
                   [ "workId", sprintf "%s-work-%04d" project index
                     "status", "Available"
                     "queueId", "implementation"
-                    "priority", "1" ] None ]
+                    "priority", "1"
+                    "generation", "1"
+                    "availableSequence", string (index + 1) ] None ]
     let large =
         { CommittedSequence = 2000L
           AccountRecords = []

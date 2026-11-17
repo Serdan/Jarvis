@@ -356,3 +356,95 @@ let commented_out_required_sqlite_check_is_foreign_in_both_schema_versions (sche
                     Is.EqualTo 1L)
         Assert.That(query "SELECT COUNT(*) FROM work_receipts;" |> Convert.ToInt32,
                     Is.EqualTo 1))
+
+// Mutate the catalog without changing names, columns, indexes or schema metadata.
+// SQLite CHECK string literals retain their case-sensitive BINARY semantics.
+let private alterEffectCheckLiteralInMaster path =
+    use connection = new SqliteConnection(sprintf "Data Source=%s" path)
+    connection.Open()
+    let scalar statement =
+        use command = connection.CreateCommand()
+        command.CommandText <- statement
+        command.ExecuteScalar()
+    let originalDdl =
+        scalar "SELECT sql FROM sqlite_master WHERE type='table' AND name='work_records';" :?> string
+    let alteredDdl = originalDdl.Replace("'unknown'", "'UNKNOWN'", StringComparison.Ordinal)
+    Assert.That(alteredDdl, Is.Not.EqualTo originalDdl)
+    let cookie = scalar "PRAGMA schema_version;" |> Convert.ToInt32
+    let execute statement =
+        use command = connection.CreateCommand()
+        command.CommandText <- statement
+        command.ExecuteNonQuery() |> ignore
+    execute "PRAGMA writable_schema=ON;"
+    try
+        use update = connection.CreateCommand()
+        update.CommandText <-
+            "UPDATE sqlite_master SET sql=$ddl WHERE type='table' AND name='work_records';"
+        update.Parameters.AddWithValue("$ddl", alteredDdl) |> ignore
+        Assert.That(update.ExecuteNonQuery(), Is.EqualTo 1)
+    finally
+        execute "PRAGMA writable_schema=OFF;"
+    execute (sprintf "PRAGMA schema_version=%d;" (cookie + 1))
+
+[<TestCase(1)>]
+[<TestCase(2)>]
+let case_changed_check_literal_is_foreign_in_both_schema_versions (schema: int) =
+    withAuthority (fun store path ->
+        Assert.That(store.Initialize() |> ok, Is.EqualTo 1)
+        if schema = 2 then
+            Assert.That(store.InitializeProvenanceV2() |> ok, Is.EqualTo 2)
+        let initial = singleRecord "alpha" WorkSqliteRecordKind.Stage "stage" "{}"
+        let operationId = Guid.NewGuid()
+        if schema = 2 then
+            store.CommitProvenanced(operationId, [],
+                [ { Mutation = initial; Source = Some(provenance sha) } ], [])
+            |> ok |> ignore
+        else
+            store.Commit { OperationId = operationId; Guards = []
+                           Records = [ initial ]; Capacities = [] }
+            |> ok |> ignore
+        alterEffectCheckLiteralInMaster path
+
+        // The foreign CHECK really has different acceptance, despite identical
+        // column and index metadata. Both probes are rolled back.
+        use direct = new SqliteConnection(sprintf "Data Source=%s" path)
+        direct.Open()
+        use transaction = direct.BeginTransaction()
+        let writeEffect effect =
+            use command = direct.CreateCommand()
+            command.Transaction <- transaction
+            command.CommandText <-
+                "UPDATE work_records SET external_effect=$effect WHERE project_id='alpha' AND record_kind='stage' AND entity_id='stage';"
+            command.Parameters.AddWithValue("$effect", effect) |> ignore
+            command.ExecuteNonQuery()
+        Assert.That(writeEffect "UNKNOWN", Is.EqualTo 1,
+                    "Mutated SQLite CHECK must accept upper-case UNKNOWN")
+        let lowerCaseRejected =
+            try
+                writeEffect "unknown" |> ignore
+                false
+            with :? SqliteException -> true
+        Assert.That(lowerCaseRejected, Is.True,
+                    "Mutated SQLite CHECK must reject canonical lower-case unknown")
+        transaction.Rollback()
+
+        let restarted = WorkSqliteAuthority(path)
+        match restarted.Initialize() with
+        | Error WorkSqliteFailure.ForeignDatabase -> ()
+        | other -> Assert.Fail(sprintf "Case-altered v%d SQLite initialized: %A" schema other)
+        match restarted.InitializeProvenanceV2() with
+        | Error WorkSqliteFailure.ForeignDatabase -> ()
+        | other -> Assert.Fail(sprintf "Case-altered v%d SQLite upgraded: %A" schema other)
+        let scalar statement =
+            use command = direct.CreateCommand()
+            command.CommandText <- statement
+            command.ExecuteScalar()
+        Assert.That(scalar "PRAGMA user_version;" |> Convert.ToInt32, Is.EqualTo schema)
+        Assert.That(scalar "SELECT schema_version FROM work_meta WHERE id=1;" |> Convert.ToInt32,
+                    Is.EqualTo schema)
+        Assert.That(scalar "SELECT last_sequence FROM work_meta WHERE id=1;" |> Convert.ToInt64,
+                    Is.EqualTo 1L)
+        Assert.That(scalar "SELECT COUNT(*) FROM work_receipts;" |> Convert.ToInt32,
+                    Is.EqualTo 1)
+        Assert.That(scalar "SELECT operation_id FROM work_receipts;" :?> string,
+                    Is.EqualTo(operationId.ToString("D"))))

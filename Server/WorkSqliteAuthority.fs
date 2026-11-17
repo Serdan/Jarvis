@@ -490,9 +490,9 @@ UPDATE work_meta SET schema_version=2 WHERE id=1 AND schema_version=1;
 PRAGMA user_version=2;
 """
 
-    let private compactSchemaSql (value: string) =
-        value |> Seq.filter (Char.IsWhiteSpace >> not) |> Seq.toArray
-        |> fun chars -> String(chars).ToLowerInvariant()
+    // sqlite_master.sql must match the canonical SQLite-generated DDL exactly.
+    // Folding case or whitespace changes literals and quoted identifiers,
+    // letting an altered CHECK expression impersonate the trusted schema.
 
     let private schemaCatalog (connection: SqliteConnection) =
         use command = sql connection None
@@ -502,7 +502,7 @@ PRAGMA user_version=2;
         [ while reader.Read() do
             let definition =
                 if reader.IsDBNull 3 then None
-                else Some(compactSchemaSql (reader.GetString 3))
+                else Some(reader.GetString 3)
             yield reader.GetString 0, reader.GetString 1,
                   reader.GetString 2, definition ]
 

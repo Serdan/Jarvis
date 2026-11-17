@@ -6,10 +6,11 @@ open NUnit.Framework
 open Server
 open Jarvis.WorkSnapshots
 
-// G1b RED-FIRST contract: only disposable, private SQLite files.
+// G1b diagnostic RED probes: only disposable, private SQLite files.
 // No host, Scheduler dispatch, credential, manual grant or restore cutover.
-// These tests intentionally exercise the missing persistent pre-serve fence;
-// the existing F1 RequiresRecovery receipt alone cannot enforce the assertions.
+// Raw B Commit is an internal transaction substrate, not the authenticated
+// pre-serve gate. These probes MUST NOT become host-facing acceptance tests.
+// The F1 RequiresRecovery receipt alone is not a persisted recovery lock.
 
 let private ok = function
     | Ok value -> value
@@ -86,16 +87,32 @@ let private admissionCommand (store: WorkSqliteAuthority) project =
             Maximum = None
             ReservedDelta = 1 } ] }
 
-let private assertRecoveryDenied (store: WorkSqliteAuthority) command =
-    let priorSequence = store.CurrentSequence() |> ok
+type private RawBProbe =
+    | RawBAdmitted of WorkSqliteReceipt
+    | RawBRejectedWithoutRecoveryProof of WorkSqliteFailure
+
+let private rawBProbe (store: WorkSqliteAuthority) command =
     match store.Commit command with
-    | Error _ -> ()
-    | Ok accepted ->
+    | Ok receipt -> RawBAdmitted receipt
+    | Error failure -> RawBRejectedWithoutRecoveryProof failure
+
+// Deliberately no success branch: WorkSqliteFailure has no RecoveryRequired
+// case, and no trusted persisted boot-mode witness or host-facing adapter is
+// available to this test-only lane. B errors are never evidence of that gate.
+// Replace these probes (do not make them green) with host-authorized gate
+// tests once the reviewed G1b implementation exists.
+let private assertRawBDiagnosticRed (store: WorkSqliteAuthority) command =
+    let priorSequence = store.CurrentSequence() |> ok
+    match rawBProbe store command with
+    | RawBAdmitted accepted ->
         Assert.Fail(
-            sprintf "RED G1b: pre-serve Recovery lock absent; ordinary admission was accepted at sequence %d, replay=%b"
+            sprintf "DIAGNOSTIC RED G1b (raw B only): internal transaction accepted at sequence %d, replay=%b; this is not a host admission test"
                 accepted.Sequence accepted.Replayed)
-    Assert.That(store.CurrentSequence() |> ok, Is.EqualTo priorSequence,
-                "A rejected pre-serve admission must not consume an audit/receipt sequence")
+    | RawBRejectedWithoutRecoveryProof failure ->
+        Assert.That(store.CurrentSequence() |> ok, Is.EqualTo priorSequence,
+                    "Rejected raw B command must not consume an audit/receipt sequence")
+        Assert.Fail(
+            sprintf "DIAGNOSTIC RED G1b (raw B only): unrelated internal rejection %A is NOT a durable RecoveryRequired witness or authenticated host denial" failure)
 
 let private withStaleRestore f =
     let folder = Path.Combine(Path.GetTempPath(), "jarvis-g1b-red-" + Guid.NewGuid().ToString("N"))
@@ -132,7 +149,7 @@ let private withStaleRestore f =
         Directory.Delete(folder, true)
 
 [<Test>]
-let sealed_stale_restore_must_lock_fresh_admission_before_recovery_seeding () =
+let diagnostic_raw_b_stale_restore_admission_is_not_host_gate () =
     withStaleRestore (fun source restored _ n ->
         Assert.That(source.CurrentSequence() |> ok, Is.EqualTo(n + 1L))
         Assert.That((restored.ReadRecord (key "alpha" WorkSqliteRecordKind.ExternalEffect "effect-after-n") |> ok).IsNone,
@@ -141,21 +158,21 @@ let sealed_stale_restore_must_lock_fresh_admission_before_recovery_seeding () =
         Assert.That(prepared.Value.ExternalEffect, Is.EqualTo WorkSqliteEffect.Prepared)
         let unknown = getRow restored "alpha" WorkSqliteRecordKind.ExternalEffect "effect-at-n"
         Assert.That(unknown.Value.ExternalEffect, Is.EqualTo WorkSqliteEffect.Unknown)
-        assertRecoveryDenied restored (admissionCommand restored "alpha"))
+        assertRawBDiagnosticRed restored (admissionCommand restored "alpha"))
 
 [<Test>]
-let stale_restore_must_fence_other_project_on_same_account_capacity () =
+let diagnostic_raw_b_two_project_shared_capacity_is_not_host_gate () =
     withStaleRestore (fun _ restored _ _ ->
         // Uncertainty in alpha must not leave beta runnable through the same
         // global account capacity before a verified, complete reconciliation.
         let before = restored.ReadCapacity "shared-account" |> ok |> Option.get
-        assertRecoveryDenied restored (admissionCommand restored "beta")
+        assertRawBDiagnosticRed restored (admissionCommand restored "beta")
         let after = restored.ReadCapacity "shared-account" |> ok |> Option.get
         Assert.That(after.Version, Is.EqualTo before.Version)
         Assert.That(after.Reserved, Is.EqualTo before.Reserved))
 
 [<Test>]
-let historical_receipt_and_same_uuid_replay_do_not_authorize_new_dispatch () =
+let diagnostic_raw_b_historical_replay_is_not_new_dispatch_permission () =
     withStaleRestore (fun _ restored original _ ->
         let old = restored.ReadReceipt original.OperationId |> ok |> Option.get
         Assert.That(old.Replayed, Is.True,
@@ -164,10 +181,10 @@ let historical_receipt_and_same_uuid_replay_do_not_authorize_new_dispatch () =
         Assert.That(replay.Replayed, Is.True,
                     "Historical receipt is retained for forensics, not consumed as a fresh admission")
         Assert.That(replay.Sequence, Is.EqualTo old.Sequence)
-        assertRecoveryDenied restored (admissionCommand restored "beta"))
+        assertRawBDiagnosticRed restored (admissionCommand restored "beta"))
 
 [<Test>]
-let even_empty_backup_requires_a_durable_pre_serve_recovery_gate () =
+let diagnostic_raw_b_empty_restore_write_is_not_host_gate () =
     let folder = Path.Combine(Path.GetTempPath(), "jarvis-g1b-empty-red-" + Guid.NewGuid().ToString("N"))
     Directory.CreateDirectory folder |> ignore
     try
@@ -188,9 +205,28 @@ let even_empty_backup_requires_a_durable_pre_serve_recovery_gate () =
                                Maximum = Some 1; ReservedDelta = 0 } ] }
         // A zero-row snapshot does not prove that no newer source, launch,
         // same-name project on another device, or external action exists.
-        assertRecoveryDenied restored create
+        assertRawBDiagnosticRed restored create
     finally
         Directory.Delete(folder, true)
+
+[<Test>]
+let negative_control_stale_cas_rejection_cannot_masquerade_as_recovery () =
+    withStaleRestore (fun _ restored _ _ ->
+        let valid = admissionCommand restored "beta"
+        // The old Error _ assertion would falsely accept this ordinary CAS
+        // rejection as evidence of a missing pre-serve Recovery authority.
+        let stale =
+            { valid with
+                Guards =
+                    valid.Guards
+                    |> List.map (fun guard -> { guard with ExpectedVersion = guard.ExpectedVersion + 7L }) }
+        let before = restored.CurrentSequence() |> ok
+        match rawBProbe restored stale with
+        | RawBRejectedWithoutRecoveryProof (WorkSqliteFailure.StaleVersion (_, expected, actual)) ->
+            Assert.That(expected, Is.GreaterThan actual)
+        | other -> Assert.Fail(sprintf "Expected unrelated typed stale-CAS failure, got %A" other)
+        Assert.That(restored.CurrentSequence() |> ok, Is.EqualTo before,
+                    "Unrelated rejection has no durable Recovery authority semantics"))
 
 [<Test>]
 let ordinary_intact_sqlite_restart_is_not_a_stale_restore () =

@@ -338,3 +338,46 @@ let ``pre-commit Roslyn formatting fixes only selected source in committed tree`
     finally
         Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", previous)
         Directory.Delete(root, true)
+
+
+[<Test; NonParallelizable>]
+let ``pre-commit advisory failure commits unchanged selection while blocking refuses it`` () =
+    let previous = Environment.GetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS")
+    try
+        for policy in [ "advisory"; "blocking" ] do
+            let root, project = createTempProject ()
+            try
+                let context = TestContext root
+                initRepo context
+                File.WriteAllText(Path.Combine(project, "README.md"), "base\n")
+                expectGitSuccess context [ "add"; "README.md" ]
+                expectGitSuccess context [ "commit"; "-m"; "Base" ]
+                File.WriteAllText(Path.Combine(project, ".jarvis.json"),
+                    sprintf """{"codeQuality":{"hooks":[{"enabled":true,"name":"quality","trigger":"pre-commit","adapter":"roslyn-format","failure":"%s"}]}}""" policy)
+                let source = Path.Combine(project, "Broken.cs")
+                let content = "class Broken\u0000 { }"
+                File.WriteAllText(source, content)
+                Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", project)
+                let cmd =
+                    { ProjectName = "Project1"; Paths = [ "Broken.cs" ]
+                      Message = "Selected binary"; Body = None; AllowEmpty = false }
+                match policy, gitCommit cmd context with
+                | "advisory", Ok result ->
+                    match result.Hooks with
+                    | Some hooks ->
+                        hooks.Reports.Head.Status |> shouldEqual "advisory-failure"
+                        hooks.BlockingFailures |> shouldEqual []
+                    | None -> Assert.Fail("Missing advisory hook diagnostics")
+                    gitOutput context [ "show"; "--format="; "--name-only"; "HEAD" ]
+                    |> shouldEqual "Broken.cs"
+                | "blocking", Error(Client.ValidationError reason) ->
+                    reason.Contains("blocked operation") |> shouldEqual true
+                    gitOutput context [ "log"; "-1"; "--format=%s" ] |> shouldEqual "Base"
+                    gitOutput context [ "diff"; "--cached"; "--name-only" ]
+                    |> shouldEqual "Broken.cs"
+                | _, unexpected ->
+                    Assert.Fail(sprintf "Unexpected %s hook policy result: %A" policy unexpected)
+                File.ReadAllText(source) |> shouldEqual content
+            finally Directory.Delete(root, true)
+    finally
+        Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", previous)

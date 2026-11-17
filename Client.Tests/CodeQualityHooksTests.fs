@@ -150,3 +150,34 @@ let ``out-of-range Roslyn edits fail without partial output`` () =
     match edits "one\ntwo" json with
     | Error message -> message.Contains("outside") |> shouldEqual true
     | other -> Assert.Fail(sprintf "Expected range rejection, got %A" other)
+
+
+[<Test; NonParallelizable>]
+let ``Roslyn session recovers after unavailable server and explicit checkout disposal`` () =
+    let installed = Environment.GetEnvironmentVariable("JARVIS_ROSLYN_LSP_DLL")
+    if String.IsNullOrWhiteSpace installed then
+        Assert.Ignore("Set JARVIS_ROSLYN_LSP_DLL to run the live Roslyn recovery test.")
+    withTempRoot (fun root ->
+        let file = Path.Combine(root, "Recover.cs")
+        let content = "class Recover{int A=1;}"
+        File.WriteAllText(file, content)
+        let invalid = Path.Combine(root, "roslyn-language-server.dll")
+        File.WriteAllText(invalid, "intentionally invalid managed tool")
+        try
+            Environment.SetEnvironmentVariable("JARVIS_ROSLYN_LSP_DLL", invalid)
+            match formatDocument root file content with
+            | Error _ -> ()
+            | Ok _ -> Assert.Fail("Invalid Roslyn entrypoint should fail closed.")
+            Environment.SetEnvironmentVariable("JARVIS_ROSLYN_LSP_DLL", installed)
+            prewarm root
+            prewarm root
+            match formatDocument root file content with
+            | Ok result -> result.Content.Contains("class Recover") |> shouldEqual true
+            | Error error -> Assert.Fail(sprintf "Failed to restart Roslyn: %s" error)
+            disposeCheckout root
+            match formatDocument root file content with
+            | Ok result -> result.Content.Contains("class Recover") |> shouldEqual true
+            | Error error -> Assert.Fail(sprintf "Failed to restore disposed Roslyn session: %s" error)
+        finally
+            disposeCheckout root
+            Environment.SetEnvironmentVariable("JARVIS_ROSLYN_LSP_DLL", installed))

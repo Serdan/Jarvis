@@ -138,10 +138,12 @@ These checks establish basic two-root formatting and hook behavior, **not**
 distinct project/analyzer compilation state, Wayfold small/large parity against
 `dotnet format`, or daemon RSS.
 
-The post-review focused Release suite passed **40/40** with an explicitly
+The post-review focused Release suite passed **42/42** with an explicitly
 selected installed `JARVIS_ROSLYN_LSP_DLL`. The live test verified that a
 selected-file pre-commit formatting fix landed in the commit while unrelated
-staged content stayed excluded. These checks do not establish full acceptance.
+staged content stayed excluded. It also covered advisory versus blocking
+pre-commit failures and recovery after a broken Roslyn entrypoint and session
+disposal. These checks do not establish full acceptance.
 
 ## Suggested validation
 

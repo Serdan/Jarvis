@@ -30,12 +30,14 @@ type ProposalState =
     | AwaitingLead
     | Returned of reason: string
     | Approved of decisionId: string
+    | Unknown of reason: string
 
 [<RequireQualifiedAccess>]
 type AcceptanceState =
     | AwaitingIndependentAcceptance
     | Accepted of evidenceRef: string
     | NotRequired
+    | Unknown of reason: string
 
 type WorkNode =
     { Id: string

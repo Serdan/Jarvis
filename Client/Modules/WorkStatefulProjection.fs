@@ -90,6 +90,7 @@ let private proposal = function
     | ProposalState.Returned reason -> "Returned to Draft: " + reason
     | ProposalState.Approved decision when nonblank decision -> "Approved: " + decision
     | ProposalState.Approved _ -> unknown "Approval decision reference missing"
+    | ProposalState.Unknown reason -> unknown ("Proposal: " + reason)
 
 let private lifecycle (node: WorkNode) =
     match node.State, node.Proposal with
@@ -110,6 +111,7 @@ let private accepted = function
     | AcceptanceState.AwaitingIndependentAcceptance -> "Awaiting independent acceptance"
     | AcceptanceState.Accepted reference when nonblank reference -> "Accepted: " + reference
     | AcceptanceState.Accepted _ -> unknown "Acceptance evidence reference missing"
+    | AcceptanceState.Unknown reason -> unknown ("Acceptance: " + reason)
 
 let private review = function
     | ReviewStage.NotRequired -> "Not required"

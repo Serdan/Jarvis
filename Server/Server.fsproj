@@ -24,6 +24,8 @@
         <Compile Include="WorkSqliteAuthority.fs"/>
         <Compile Include="WorkSqliteBackup.fs"/>
         <Compile Include="WorkBackupReplication.fs"/>
+        <Compile Include="WorkStatefulApiContracts.fs"/>
+        <Compile Include="WorkStatefulApiRead.fs"/>
         <Compile Include="WorkProposal.fs"/>
         <Compile Include="WorkLegacyImportPreflight.fs"/>
         <Compile Include="WorkLegacyImportSqlite.fs"/>

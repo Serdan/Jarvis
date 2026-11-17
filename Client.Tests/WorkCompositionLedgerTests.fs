@@ -417,9 +417,9 @@ let ``composition operator overview pages pin specs and stages to one verified G
         | other -> Assert.Fail(sprintf "Expected missing-unit error: %A" other))
 
 [<Test>]
-let ``composition operator byte pages survive shared WQ stage amplification through transport guard`` () =
+let ``composition operator pages preserve unique task ownership and transport guard`` () =
     withTwoClones (fun first second ->
-        let sharedTask = "shared-validation-task"
+        let linkedTask index = sprintf "validation-task-%03d" index
         let projectId = first.ProjectId.ToString("D")
         let step (graph: WorkCompositionGraph) mutation =
             match WorkComposition.apply graph.Version mutation graph with
@@ -430,16 +430,18 @@ let ``composition operator byte pages survive shared WQ stage amplification thro
             |> List.fold (fun graph index ->
                 let id = sprintf "f%03d" index
                 let tinySpec =
-                    { spec id (Some sharedTask) with Goal = "g"; Scope = "s"
-                                                     AcceptanceCriteria = Set.singleton "c" }
+                    { spec id (Some (linkedTask index)) with
+                        Goal = "g"
+                        Scope = "s"
+                        AcceptanceCriteria = Set.singleton "c" }
                 step graph (WorkCompositionMutation.Create(
                     id, WorkUnitKind.Feature, Some "project", tinySpec)))
                 (step WorkComposition.empty (WorkCompositionMutation.Create(
                     "project", WorkUnitKind.Project, None, spec "Project" None)))
 
-        // Each stage is stored only once in a legal WQ record, but appears
-        // once per feature in the derived overview. No fabricated oversized
-        // graph/spec/acceptance history is required for amplification.
+        // Every feature owns a distinct canonical task. The original stage
+        // link uniqueness and 64 KiB record cap prohibit the former artificial
+        // amplification by linking all features to one task.
         WorkQueueGitLedger.initialize first "Fixture" (Guid.NewGuid()) Map.empty
         |> succeed |> ignore
         let _, initialQueue = WorkQueueGitLedger.load first |> succeed
@@ -450,7 +452,7 @@ let ``composition operator byte pages survive shared WQ stage amplification thro
                 id,
                 { Id = id
                   ProjectId = projectId
-                  SubjectId = sharedTask
+                  SubjectId = linkedTask index
                   Kind = WorkKind.FrozenReview
                   QueueId = "review"
                   StageGeneration = 1
@@ -516,12 +518,23 @@ let ``composition operator byte pages survive shared WQ stage amplification thro
                   ChangedAgentIds = [] }
             Client.SignalR.Client.toAgentResponse ListCommandsCommand [] [] None (Ok dispatched)
 
-        match (throughTransport unbounded).Error with
+        Assert.That((throughTransport unbounded).Error.IsNone, Is.True,
+                    "Unique canonical task ownership must produce a valid bounded overview")
+        // Independently assert the real transport guard rejects oversized
+        // responses. The synthetic payload is never written to the Git ledger.
+        let firstItem = allItems.Head
+        let oversizedUnit =
+            { firstItem.Unit with
+                Spec =
+                    { firstItem.Unit.Spec with
+                        Goal = String.replicate (AgentProtocol.maxResponseBytes + 1) "x" } }
+        let oversizedPage = { unbounded with Items = [ { firstItem with Unit = oversizedUnit } ] }
+        match (throughTransport oversizedPage).Error with
         | Some (OutputTruncated _) -> ()
-        | other -> Assert.Fail(sprintf "Amplified unpaged result bypassed the real transport guard: %A" other)
+        | other -> Assert.Fail(sprintf "Oversized response bypassed the real transport guard: %A" other)
 
         let rec readAll cursor seen pages =
-            let page = WorkCompositionGitLedger.loadOverviewPage second "" 100 cursor |> succeed
+            let page = WorkCompositionGitLedger.loadOverviewPage second "" 10 cursor |> succeed
             Assert.That(page.SnapshotCommit, Is.EqualTo(pinned.Commit))
             Assert.That(page.Items.Length, Is.GreaterThan(0))
             Assert.That((throughTransport page).Error.IsNone, Is.True,
@@ -533,9 +546,9 @@ let ``composition operator byte pages survive shared WQ stage amplification thro
                 Assert.That(next.StartsWith(pinned.Commit + ":"), Is.True)
                 readAll next (seen @ ids) (pages + 1)
         let ids, pageCount = readAll "" [] 0
-        Assert.That(pageCount, Is.GreaterThan(1), "The count-only page must split by bytes")
+        Assert.That(pageCount, Is.GreaterThan(1), "The count-limited page must advance by cursor")
         Assert.That(ids.Length, Is.EqualTo(graph.Units.Count))
         Assert.That(Set.ofList ids = (graph.Units |> Map.toSeq |> Seq.map fst |> Set.ofSeq), Is.True)
         let single = WorkCompositionGitLedger.loadOverviewPage second "f000" 100 "" |> succeed
-        Assert.That(single.Items.Head.Overview.ReviewStages.Length, Is.EqualTo(80))
+        Assert.That(single.Items.Head.Overview.ReviewStages.Length, Is.EqualTo(1))
         Assert.That((throughTransport single).Error.IsNone, Is.True))

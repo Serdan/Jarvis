@@ -139,14 +139,16 @@ type WorkQueueWorkReplacementVerticalSliceTests() =
             WorkQueueGitLedger.executeInertFixture b1 "Fixture" (Guid.NewGuid()) queue.Version
                 (PublishStage dependent) |> succeed |> ignore
 
-            // Separate authoritative composition graph: dependency and parent
-            // existence are independently read on the other approved client.
+            // This WQ11 stage was born without an original WQ04 composition
+            // link. Keep the separate graph unbound: a later graph mutation
+            // cannot retroactively manufacture that immutable provenance.
+            // Dependency and parent existence are read on the other client.
             let changes =
                 [ WorkCompositionMutation.Create("project", WorkUnitKind.Project, None, spec "Project" None)
                   WorkCompositionMutation.Create("foundation", WorkUnitKind.System, Some "project", spec "Foundation" None)
                   WorkCompositionMutation.Create("delivery", WorkUnitKind.System, Some "project", spec "Delivery" None)
                   WorkCompositionMutation.Create("prerequisite", WorkUnitKind.Feature, Some "foundation", spec "Prerequisite" None)
-                  WorkCompositionMutation.Create("dependent", WorkUnitKind.Feature, Some "delivery", spec "Dependent" (Some "dependent-task"))
+                  WorkCompositionMutation.Create("dependent", WorkUnitKind.Feature, Some "delivery", spec "Dependent" None)
                   WorkCompositionMutation.Require("dependent", "prerequisite") ]
             changes |> List.iteri (fun version mutation ->
                 WorkCompositionGitLedger.execute b1 "Fixture" (Guid.NewGuid()) version mutation
@@ -159,6 +161,20 @@ type WorkQueueWorkReplacementVerticalSliceTests() =
             let workUnit = views |> List.find (fun view -> view.Id = "dependent")
             Assert.That(workUnit.Phase, Is.EqualTo(WorkUnitPhase.Blocked))
             Assert.That(workUnit.UnmetPrerequisites, Does.Contain("prerequisite"))
+            Assert.That(graph.Units.["dependent"].Spec.LinkedTaskId, Is.EqualTo(None))
+
+            // Queue availability is not graph acceptance or Scheduler authority.
+            // Explicitly prove the forbidden retroactive link fails without a
+            // graph/queue commit on either approved clone.
+            let retroactiveLink =
+                WorkCompositionMutation.Revise("dependent", graph.Units.["dependent"].SpecVersion,
+                    { graph.Units.["dependent"].Spec with LinkedTaskId = Some "dependent-task" })
+            match WorkCompositionGitLedger.execute b1 "Fixture" (Guid.NewGuid()) graph.Version retroactiveLink with
+            | Error (InvalidBinding reason) ->
+                Assert.That(reason, Does.Contain("immutable original composition binding"))
+            | other -> Assert.Fail(sprintf "Retroactive WQ04 stage link was not denied: %A" other)
+            Assert.That((LedgerStore.fetch b2 |> succeed).Commit, Is.EqualTo(headB.Commit))
+
 
             let workView = WorkQueueToolFacade.readWithBinding b2 "Get" "All" bStage.Id |> succeed
             Assert.That(workView.VerifiedGitHead, Is.EqualTo(headB.Commit))

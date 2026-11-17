@@ -280,7 +280,7 @@ type WorkQueueDurableLaunchIntentTests() =
     [<Test>]
     member _.BlockedCompositionAndInvalidProjectMembershipNeverPrepareAnOriginal() =
         withBindings (fun (a1,a2) (b1,b2) (account1,_) ->
-            let stage, _ = producedTask a1 a2 "composed-blocked"
+            let taskId = "composed-blocked"
             let spec title linked =
                 { Title = title; Goal = title; Scope = "WQ12"
                   AcceptanceCriteria = set ["Verified prereq"]; Constraints = Set.empty
@@ -288,10 +288,14 @@ type WorkQueueDurableLaunchIntentTests() =
             let mutations =
                 [ WorkCompositionMutation.Create("root", WorkUnitKind.Project, None, spec "Root" None)
                   WorkCompositionMutation.Create("blocked", WorkUnitKind.Feature, Some "root",
-                                                 spec "Blocked" (Some stage.SubjectId)) ]
+                                                 spec "Blocked" (Some taskId)) ]
             mutations |> List.iteri (fun version mutation ->
                 WorkCompositionGitLedger.execute a1 "WQ12" (Guid.NewGuid()) version mutation
                 |> success |> ignore)
+            // The legacy task-derived stage has no original WQ04 binding.
+            // Compose first; WQ12 preparation must still refuse unaccepted
+            // composition rather than retroactively rebinding that stage.
+            let stage, _ = producedTask a1 a2 taskId
             let valid = context account1 a1 b1
             match WorkQueueDurableLaunchIntent.prepareExplicit true valid "WQ12" with
             | DurableIntentOutcome.NeedsAttention text ->

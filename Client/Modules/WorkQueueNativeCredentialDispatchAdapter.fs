@@ -8,6 +8,7 @@ open Client.WorkQueueDurableLaunchIntent
 open Client.OriginalBrowserJournal
 open Client.AccountCapacityLedger
 open Client.AccountAdmissionAdapter
+open Client.WorkQueueNativePrivateHostBridge
 open Jarvis.WorkQueues
 
 // No production provider bridge exists. Only a disposable, explicit caller may
@@ -93,7 +94,9 @@ module WorkQueueNativeCredentialDispatchAdapter =
     // bootstrap/first-connect transport is actually implemented and observed.
     // Do not reserve, write or mint a secret when the host cannot deliver it.
     let prepareProduction (_: DurableIntentContext) (_: DurablePlanningLaunchIntent) =
-        NativeCredentialAdmission.HostBridgeUnavailable
+        match WorkQueueNativePrivateHostBridge.inspectProduction true with
+        | PrivateHostGate.HostBridgeUnavailable _ -> NativeCredentialAdmission.HostBridgeUnavailable
+        | PrivateHostGate.Disabled -> NativeCredentialAdmission.Disabled
 
     // Explicit offline admission uses the existing original WQ12 identity,
     // original WQ04 source and WQ07 credit witness in the SAME project CAS.
@@ -252,7 +255,9 @@ module WorkQueueNativeCredentialDispatchAdapter =
     // The real host/browser path is deliberately NO-GO. Caller-supplied
     // callbacks below are only cooperative disposable-provider fixtures.
     let dispatchProduction (_: NativeCredentialTicket) =
-        NativeDispatchPhase.HostBridgeUnavailable
+        match WorkQueueNativePrivateHostBridge.inspectProduction true with
+        | PrivateHostGate.HostBridgeUnavailable _ -> NativeDispatchPhase.HostBridgeUnavailable
+        | PrivateHostGate.Disabled -> NativeDispatchPhase.Disabled
 
     let submitDisposable enabled journalRoot (ticket: NativeCredentialTicket)
                          (provider: OriginalBrowserIntent -> NativePrivateBootstrap -> NativeProviderReply) =

@@ -19,6 +19,7 @@
         <Compile Include="WorkLegacyImportPreflightTests.fs"/>
         <Compile Include="WorkCompositionTests.fs"/>
         <Compile Include="WorkSqliteAuthorityTests.fs"/>
+        <Compile Include="WorkStatefulApiReadTests.fs"/>
         <Compile Include="WorkSchedulerSqliteTests.fs"/>
         <Compile Include="WorkProposalTests.fs"/>
         <Compile Include="WorkQueueSchedulerInertTests.fs"/>

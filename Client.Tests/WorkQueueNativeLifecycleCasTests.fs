@@ -89,7 +89,7 @@ let private fixture action =
         AccountCapacityLedger.initialize aa 1 |> ok |> ignore
         let sourceId = Guid.NewGuid()
         ReviewWorkflow.createTask pa sourceId "native-plan" "Native Work CAS fixture" |> ok |> ignore
-        WorkQueueReceiptProducer.produce pb "Lead" (Guid.NewGuid()) sourceId |> ok |> ignore
+        WQ04ProducerFixture.produce pb "Lead" (Guid.NewGuid()) sourceId |> ok |> ignore
         let _, state = WorkQueueGitLedger.load pa |> ok
         let work = state.Works |> Map.toList |> List.map snd |> List.exactlyOne
         let req: AccountAdmissionRequest =

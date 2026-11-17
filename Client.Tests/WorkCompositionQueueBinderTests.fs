@@ -11,6 +11,7 @@ open Client.WorkCompositionGitLedger
 open Client.WorkCompositionQueueBinder
 open Client.ReviewWorkflow
 open Client.WorkQueueReceiptProducer
+open Client.WorkQueueRoleAuthority
 open Jarvis.WorkQueues
 
 [<TestFixture>]
@@ -72,6 +73,14 @@ type WorkCompositionQueueBinderTests() =
             LedgerStore.initialize first true |> ok |> ignore
             WorkQueueGitLedger.initialize first "Fixture" (Guid.NewGuid())
                 (Map.ofList [ "Reviewer", Set.singleton "review" ])
+            |> ok |> ignore
+            WorkQueueRoleAuthority.initializeCatalog first "Fixture" (Guid.NewGuid())
+            |> ok |> ignore
+            let planner: RoleConfiguration =
+                { RoleId = "Planner"; Version = 1; Enabled = true
+                  Instructions = "Original WQ04 task producer"
+                  QueueSubscriptions = Set.singleton "planning" }
+            WorkQueueRoleAuthority.configure first "Fixture" (Guid.NewGuid()) 0 0 planner
             |> ok |> ignore
 
             // Canonical WQ02 sees the stage Available. The separately
@@ -218,7 +227,7 @@ type WorkCompositionQueueBinderTests() =
 
 
     [<Test>]
-    member _.OriginalWq04ProducerCannotSatisfySameHeadRoleAndSourceLineageContract() =
+    member _.OriginalWq04ProducerHasRoleTaskAndCompositionProofButCannotAuthorizeLaunch() =
         withClones (fun first second _ request ->
             // Exercise the real WQ04 canonical producer and its immutable
             // original CreateTask receipt rather than an invented stage origin.
@@ -241,16 +250,16 @@ type WorkCompositionQueueBinderTests() =
                 WorkQueueGitLedger.readOriginAt first head stage.Id
                 |> ok |> Option.get
 
-            // WQ04.PracticalProducer deliberately uses NoRoleTransition and
-            // does not carry original source/role lineage for TaskRequested.
+            // Original task receipt, pinned versioned role and graph link
+            // were authored together before any runnable WQ04 publication.
             Assert.That(origin.SourceOperationId, Is.EqualTo(taskOperation.ToString("D")))
             Assert.That(origin.SourceOperationKind, Is.EqualTo("CreateTask"))
-            Assert.That(origin.RoleId, Is.Empty)
-            Assert.That(origin.RoleVersion, Is.Zero)
+            Assert.That(origin.RoleId, Is.EqualTo("Planner"))
+            Assert.That(origin.RoleVersion, Is.EqualTo(1))
             Assert.That(origin.SourceRef, Is.Empty)
             Assert.That(origin.SourceCommit, Is.Empty)
-            // Original WQ04 now makes the graph hold permanent in the
-            // publication CAS; this does not manufacture role/source authority.
+            // Composition holds still apply; original source/task lineage is
+            // not an invented source branch or WQ07 token authorization.
             Assert.That(stage.State, Is.EqualTo(WorkState.Blocked))
             Assert.That(stage.Gate, Is.EqualTo(GateState.CompositionHold("dependent", 2)))
 
@@ -264,7 +273,7 @@ type WorkCompositionQueueBinderTests() =
             let blockers = WorkCompositionQueueBinder.inspect second original |> issues
             Assert.That(blockers |> List.exists (function
                 | UnprovenRoleOrSource _ -> true
-                | _ -> false), Is.True)
+                | _ -> false), Is.False)
             Assert.That(blockers |> List.exists (function
                 | UnacceptedDependency "prerequisite" -> true
                 | _ -> false), Is.True)

@@ -37,6 +37,7 @@
         <Compile Include="WorktreeTests.fs"/>
         <Compile Include="LedgerStoreTests.fs"/>
         <Compile Include="WorkQueueGitLedgerTests.fs"/>
+        <Compile Include="WQ04ProducerFixture.fs"/>
         <Compile Include="WorkQueueCredentialTests.fs"/>
         <Compile Include="WorkQueueReservationPermissionsTests.fs"/>
         <Compile Include="WorkQueueClaimBoundDirtySourcePolicyTests.fs"/>

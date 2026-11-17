@@ -84,7 +84,7 @@ let private producedTask source producer id =
     let sourceOp = Guid.NewGuid()
     let producerOp = Guid.NewGuid()
     ReviewWorkflow.createTask source sourceOp id ("WQ04 source " + id) |> ok |> ignore
-    WorkQueueReceiptProducer.produce producer "Lead" producerOp sourceOp |> ok |> ignore
+    WQ04ProducerFixture.produce producer "Lead" producerOp sourceOp |> ok |> ignore
     let snapshot, state = WorkQueueGitLedger.load producer |> ok
     let work =
         state.Works |> Map.toList |> List.map snd

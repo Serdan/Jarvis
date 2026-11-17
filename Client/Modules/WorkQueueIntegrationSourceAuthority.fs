@@ -54,8 +54,8 @@ module WorkQueueIntegrationSourceAuthority =
                                     && origin.WorkId = stage.Id
                                     && origin.SourceOperationKind = "SubmitIntegration"
                                     && origin.AccountCreditStatus = "NotReserved"
-                                    && origin.RoleId = ""
-                                    && origin.RoleVersion = 0
+                                    && not (String.IsNullOrWhiteSpace origin.RoleId)
+                                    && origin.RoleVersion >= 1
                                     && origin.SourceHighWater < snapshot.Header.NextSequence ->
                 Ok origin
             | _ -> unavailable "Original WQ04 SubmitIntegration stage/origin CAS receipt is absent."
@@ -266,7 +266,8 @@ module WorkQueueIntegrationSourceAuthority =
                                                 && origin.ProjectId = projectId
                                                 && origin.WorkId = stage.Id
                                                 && origin.SourceOperationKind = "SubmitBranchReview"
-                                                && origin.RoleId = ""
+                                                && not (String.IsNullOrWhiteSpace origin.RoleId)
+                                                && origin.RoleVersion >= 1
                                                 && origin.AccountCreditStatus = "NotReserved" -> Ok origin
                         | _ -> unavailable "No original WQ04 immutable FrozenReview source receipt.")
                 let! review = ReviewWorkflow.getBranchReviewAt binding snapshot stage.SubjectId reviewId

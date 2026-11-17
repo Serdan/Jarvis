@@ -100,7 +100,7 @@ type WorkQueueNativePrivateHostBridgeTests() =
         let operation = Guid.NewGuid()
         ReviewWorkflow.createTask first operation taskId "Disposable planning source"
         |> ok |> ignore
-        WorkQueueReceiptProducer.produce firstOther "Lead" (Guid.NewGuid()) operation
+        WQ04ProducerFixture.produce firstOther "Lead" (Guid.NewGuid()) operation
         |> ok |> ignore
         match WorkQueueDurableLaunchIntent.prepareExplicit true
                   (context account first second) "private fake" with

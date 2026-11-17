@@ -98,7 +98,7 @@ let private withAuthorities action =
 let private produce source receiver taskId =
     let sourceOp, publishOp = Guid.NewGuid(), Guid.NewGuid()
     let created = ReviewWorkflow.createTask source sourceOp taskId ("WQ11 " + taskId) |> ok
-    let published = WorkQueueReceiptProducer.produce receiver "Lead" publishOp sourceOp |> ok
+    let published = WQ04ProducerFixture.produce receiver "Lead" publishOp sourceOp |> ok
     Assert.That(published.AlreadyApplied, Is.False)
     let snapshot, project = WorkQueueGitLedger.load receiver |> ok
     let work =

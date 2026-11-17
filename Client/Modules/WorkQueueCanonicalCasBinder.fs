@@ -10,10 +10,10 @@ open Client.WorkQueueCanonicalSourceEvidence
 open Client.WorkQueueRoleAuthority
 open Client.WorkCompositionGitLedger
 
-// No positive authority is representable in this module. The accepted
-// canonical-event reader proves an original *orchestration* Git event, not a
-// complete source-effect/high-water join. The frozen role catalog has not yet
-// been integrated into the project writer's single CAS planner.
+// Audit-only inspectAt/attemptUnderCas never grant runtime launch/claim
+// authority. The separate opt-in practical producer below commits one
+// original task/review/integration stage, versioned role demand and graph
+// binding in the same project CAS. WQ07 credit and live dispatch remain closed.
 type RoleScope =
     | NoRoleTransition
     | NewRoleDemand of roleId: string * expectedRoleVersion: int
@@ -159,8 +159,11 @@ module WorkQueueCanonicalCasBinder =
     // An alternative request under that UUID is still an explicit collision.
     let private findPracticalReplay (binding: LedgerBinding) (actor: string)
                                     (operationId: Guid) (request: CanonicalBindRequest) = result {
-        if request.RoleScope <> NoRoleTransition then
-            return! Error OperationIdReused
+        let! requiredRole, requiredVersion =
+            match request.RoleScope with
+            | NewRoleDemand (id, version) when not (String.IsNullOrWhiteSpace id) && version > 0 ->
+                Ok(id, version)
+            | _ -> Error(InvalidBinding "WQ04 original producer requires an explicit pinned role demand.")
         let! snapshot = LedgerStore.fetch binding
         let! existing = LedgerStore.getOperationAt binding snapshot operationId
         match existing with
@@ -192,19 +195,24 @@ module WorkQueueCanonicalCasBinder =
                 return! Error OperationIdReused
             let! origin = WorkQueueGitLedger.readOriginAt binding snapshot workId
             let! state = WorkQueueGitLedger.loadAt binding snapshot
+            let! link = WorkCompositionGitLedger.readStageLinkAt binding snapshot workId
             match origin with
+            | Some(stored, _) when String.IsNullOrWhiteSpace stored.RoleId
+                                   || stored.RoleVersion < 1 || link.IsNone ->
+                return! Error(LedgerIntegrityError
+                    "Legacy WQ04 producer receipt has incomplete original role/composition authority; operator reconciliation required, not a later synthetic binding.")
             | Some(stored, _) when stored.SourceOperationId = originalId
                                    && stored.SourceSelector = selector
                                    && stored.SourceHead = sourceHead
                                    && stored.SourceHighWater = sourceHighWater
+                                   && stored.RoleId = requiredRole
+                                   && stored.RoleVersion = requiredVersion
                                    && state.Works.ContainsKey workId ->
                 return Some { Operation = operation
                               CurrentHead = snapshot.Commit
                               AlreadyApplied = true }
             | _ ->
-                return! Error(LedgerIntegrityError
-                    ("WQ04 original producer receipt exists but stage/provenance needs recovery: "
-                      + WorkQueueGitLedger.originPath workId))
+                return! Error OperationIdReused
     }
 
     // A practical, opt-in producer path. It is deliberately not registered
@@ -214,11 +222,17 @@ module WorkQueueCanonicalCasBinder =
     // immutable provenance record. Missing links are reported, not invented.
     let private publishFreshPractical (binding: LedgerBinding) actor operationId
                          (request: CanonicalBindRequest) = result {
-        match request.RoleScope with
-        | NoRoleTransition -> ()
-        | _ ->
+        let! roleId, roleVersion =
+            match request.RoleScope with
+            | NewRoleDemand (id, version) when not (String.IsNullOrWhiteSpace id)
+                                               && id <> "Manager" && version > 0 ->
+                Ok(id, version)
+            | _ ->
+                Error(InvalidBinding
+                    "WQ04 requires a versioned original role demand; no role or pinned launch authority is not a producer permit.")
+        if roleId = "Manager" then
             return! Error(InvalidBinding
-                "WQ04 role launch/credit admission remains separate; project stage publication reserves no role or account credit.")
+                "WQ04 Manager cannot be an execution role.")
         let! proof =
             WorkQueueCanonicalSourceEvidence.read binding request.SourceAnchor request.SourceEvent
         let! snapshot = LedgerStore.fetch binding
@@ -276,6 +290,27 @@ module WorkQueueCanonicalCasBinder =
             | _ ->
                 Error(InvalidBinding
                     "WQ04 practical producer currently supports CreateTask, unclaimed SubmitBranchReview, and accepted SubmitIntegration events.")
+        // The *winning* Git transaction must resolve this current enabled
+        // revision and its subscribed stage queue from the ORIGINAL role
+        // catalog, not WQ02's legacy Project.Subscriptions.
+        let verifyRoleDemand snapshot (stage: WorkStage) = result {
+            let! view = WorkQueueRoleAuthority.loadAt binding snapshot
+            if view.Project.Version <> request.ExpectedProjectVersion then
+                return! Error(StaleEntityVersion "WQ04 project version changed during role binding.")
+            let! role =
+                match view.Catalog.Current.TryFind roleId with
+                | Some current when current = roleVersion ->
+                    match view.Catalog.Versions.TryFind roleId with
+                    | Some history ->
+                        match history.TryFind roleVersion with
+                        | Some found -> Ok found
+                        | None -> Error(LedgerIntegrityError "WQ04 current role has no original versioned definition.")
+                    | None -> Error(LedgerIntegrityError "WQ04 role has no original issuance history.")
+                | _ -> Error(StaleEntityVersion "WQ04 role revision changed or is missing; refresh original producer demand.")
+            if not role.Enabled || not (role.QueueSubscriptions.Contains stage.QueueId) then
+                return! Error(InvalidBinding
+                    ("WQ04 role is disabled or is not subscribed to original stage queue " + stage.QueueId))
+        }
         let origin : CanonicalWorkOrigin =
             { SchemaVersion = 1
               ProjectId = projectId
@@ -294,13 +329,14 @@ module WorkQueueCanonicalCasBinder =
               SourceSelector = sprintf "%A" request.SourceEvent
               SourceRef = sourceRef
               SourceCommit = sourceCommit
-              RoleId = ""
-              RoleVersion = 0
+              RoleId = roleId
+              RoleVersion = roleVersion
               AccountCreditStatus = "NotReserved"
-              Ambiguity = "Producer records project work only. Account credit, source-effect terminal and live scheduler evidence remain separate; an agent must reconcile before activation." }
+              Ambiguity = "Task planning lineage is the authenticated original task receipt, not an invented source branch. WQ07 account credit, STOP and live Scheduler authority remain separate." }
         return! WorkQueueGitLedger.publishCanonicalEvent
                     binding actor operationId request.ExpectedProjectVersion
                     (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()) origin projection
+                    verifyRoleDemand
                     (WorkCompositionGitLedger.planOriginalStage binding)
     }
 

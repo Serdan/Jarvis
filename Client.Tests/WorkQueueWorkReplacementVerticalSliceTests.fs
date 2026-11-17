@@ -100,7 +100,7 @@ let private produce source receiver taskId =
     let creationOperation = Guid.NewGuid()
     ReviewWorkflow.createTask source creationOperation taskId ("WQ11 " + taskId)
     |> succeed |> ignore
-    WorkQueueReceiptProducer.produce receiver "Lead" (Guid.NewGuid()) creationOperation
+    WQ04ProducerFixture.produce receiver "Lead" (Guid.NewGuid()) creationOperation
     |> succeed |> ignore
     let snapshot, state = WorkQueueGitLedger.load receiver |> succeed
     let stage =

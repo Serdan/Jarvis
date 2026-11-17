@@ -113,15 +113,17 @@ type WorkQueueIntegrationSourceAuthorityTests() =
                     sourceRef reviewedSha "Review exact source" "task-bound" targetRef |> ok
             let originalReview = (ReviewWorkflow.getBranchReview a task reviewId |> ok).Review
             let reviewSourceOperation = Guid.Parse submittedReview.Operation.OperationId
+            WQ04ProducerFixture.prepare b reviewSourceOperation
             let reviewPreview = WorkQueueReceiptProducer.preview b reviewSourceOperation |> ok
             Assert.That(reviewPreview.Status, Is.EqualTo("ReadyToProduce"))
-            WorkQueueReceiptProducer.produce b "fixture" (Guid.NewGuid())
+            WQ04ProducerFixture.produce b "fixture" (Guid.NewGuid())
                 reviewSourceOperation |> ok |> ignore
 
             // The canonical WQ02 review prerequisite is actually Completed,
             // rather than a caller-supplied boolean permitting the integration.
             let reviewerLaunch = Guid.NewGuid().ToString("D")
-            mutate a 100L (AdmitProject(baseLaunch a reviewerLaunch "Reviewer"))
+            WQ04ProducerFixture.admitPinnedReviewFixture a "fixture" (Guid.NewGuid())
+                (baseLaunch a reviewerLaunch "Reviewer") reviewPreview.StageId
             mutate b 101L (DispatchOnce(reviewerLaunch, DispatchState.Submitted))
             mutate a 102L (InitializeAgent(reviewerLaunch,"fixture-only-noncredentialed-review"))
             mutate b 103L (ClaimNext reviewerLaunch)
@@ -152,9 +154,10 @@ type WorkQueueIntegrationSourceAuthorityTests() =
             let submitted = ReviewWorkflow.submitIntegration a (Guid.NewGuid()) task "Owner" integrationId
                                 sourceRef reviewedSha (reviewId.ToString("N")) targetRef |> ok
             let integrationOp = Guid.Parse submitted.Operation.OperationId
+            WQ04ProducerFixture.prepare b integrationOp
             let preview = WorkQueueReceiptProducer.preview b integrationOp |> ok
             Assert.That(preview.Status, Is.EqualTo("ReadyToProduce"))
-            WorkQueueReceiptProducer.produce b "fixture" (Guid.NewGuid()) integrationOp |> ok |> ignore
+            WQ04ProducerFixture.produce b "fixture" (Guid.NewGuid()) integrationOp |> ok |> ignore
             let _, before = WorkQueueGitLedger.load a |> ok
             let stage = before.Works.[preview.StageId]
             Assert.That(stage.Kind, Is.EqualTo(WorkKind.Integration))

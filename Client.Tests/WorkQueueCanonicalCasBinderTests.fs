@@ -13,6 +13,7 @@ open Client.WorkQueueCanonicalSourceEvidence
 open Client.WorkQueueCanonicalCasBinder
 open Client.WorkQueueReceiptProducer
 open Client.WorkQueueRoleAuthority
+open Client.WorkCompositionGitLedger
 
 [<TestFixture>]
 type WorkQueueCanonicalCasBinderTests() =
@@ -107,6 +108,38 @@ type WorkQueueCanonicalCasBinderTests() =
         finally
             try Directory.Delete(root, true) with _ -> ()
 
+    // Real original WQ04 producer fixtures: authenticated Git role history and
+    // task-linked composition predate publication; no fake graph-only writer.
+    let seedOriginalRoles binding =
+        WorkQueueRoleAuthority.initializeCatalog binding "Lead" (Guid.NewGuid()) |> ok |> ignore
+        [ "Planner", "planning"; "Reviewer", "review"; "Integrator", "integration" ]
+        |> List.iteri (fun revision (name, queue) ->
+            let role: RoleConfiguration =
+                { RoleId = name; Version = 1; Enabled = true
+                  Instructions = "Original WQ04 fixture: " + name
+                  QueueSubscriptions = Set.singleton queue }
+            WorkQueueRoleAuthority.configure binding "Lead" (Guid.NewGuid()) revision 0 role
+            |> ok |> ignore)
+
+    let linkOriginalTask binding task =
+        let apply mutation =
+            let version = WorkCompositionGitLedger.load binding |> ok |> snd
+            WorkCompositionGitLedger.execute binding "Lead" (Guid.NewGuid()) version.Version mutation
+            |> ok |> ignore
+        let graph = WorkCompositionGitLedger.load binding |> ok |> snd
+        if graph.Version = 0 then
+            let spec kind linked =
+                { Title = kind; Goal = "Original source/role/graph fixture"
+                  Scope = "Hermetic project CAS"; AcceptanceCriteria = Set.singleton "Exact receipt"
+                  Constraints = Set.empty; LinkedTaskId = linked }
+            apply (WorkCompositionMutation.Create("root", WorkUnitKind.Project, None, spec "Root" None))
+            apply (WorkCompositionMutation.Create("module", WorkUnitKind.System, Some "root", spec "Module" None))
+        let spec =
+            { Title = task; Goal = "Original source/role/graph fixture"
+              Scope = "Hermetic project CAS"; AcceptanceCriteria = Set.singleton "Exact receipt"
+              Constraints = Set.empty; LinkedTaskId = Some task }
+        apply (WorkCompositionMutation.Create("unit-" + task, WorkUnitKind.Feature, Some "module", spec))
+
     let requestFor binding (write: LedgerWrite) selector =
         let snapshot = LedgerStore.fetch binding |> ok
         let project = WorkQueueGitLedger.loadAt binding snapshot |> ok
@@ -117,7 +150,57 @@ type WorkQueueCanonicalCasBinderTests() =
               OriginalRequestHash = write.Operation.RequestHash }
           SourceEvent = selector
           ExpectedProjectVersion = project.Version
-          RoleScope = NoRoleTransition }
+          RoleScope =
+              match selector with
+              | TaskCreated _ -> NewRoleDemand("Planner", 1)
+              | ReviewSubmitted _ -> NewRoleDemand("Reviewer", 1)
+              | IntegrationState _ -> NewRoleDemand("Integrator", 1)
+              | _ -> NoRoleTransition }
+
+    // These stages are born via the ordinary WQ04 receipt producer, not
+    // synthesized by a graph-only test writer.
+    let originalReviewStage a b task =
+        seedOriginalRoles a
+        linkOriginalTask a task
+        ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Owner" |> ok |> ignore
+        ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Reviewer" |> ok |> ignore
+        let sourceSha = git a.RepositoryPath [ "rev-parse"; "HEAD" ]
+        let sourceRef = "refs/heads/main"
+        ReviewWorkflow.createTask a (Guid.NewGuid()) task task |> ok |> ignore
+        let reviewId = Guid.NewGuid()
+        let submitted =
+            ReviewWorkflow.submitBranchReview a (Guid.NewGuid()) task "Owner" reviewId
+                sourceRef sourceSha "Exact immutable graph review" "task-bound" sourceRef |> ok
+        WorkQueueReceiptProducer.produce b "Lead" (Guid.NewGuid())
+            (Guid.Parse submitted.Operation.OperationId) |> ok |> ignore
+        let snapshot, queue = WorkQueueGitLedger.load a |> ok
+        let stage =
+            queue.Works |> Map.toSeq |> Seq.map snd
+            |> Seq.find (fun work -> work.Kind = WorkKind.FrozenReview && work.SubjectId = task)
+        Assert.That(stage.State, Is.EqualTo(WorkState.Available))
+        let link = WorkCompositionGitLedger.readStageLinkAt a snapshot stage.Id |> ok |> Option.get
+        let graph, _ = WorkCompositionGitLedger.loadAt a snapshot |> ok
+        Assert.That(WorkCompositionGitLedger.stageLinkStillCurrent link stage graph, Is.True)
+        reviewId, sourceSha, sourceRef, stage
+
+    let originalIntegrationStage a b task reviewId sourceSha sourceRef (reviewStage: WorkStage) =
+        ReviewWorkflow.claimBranchReview a (Guid.NewGuid()) task reviewId "Reviewer" 1
+        |> ok |> ignore
+        ReviewWorkflow.decideBranchReview a (Guid.NewGuid()) task reviewId "Reviewer" 2 Accept
+        |> ok |> ignore
+        let submitted =
+            ReviewWorkflow.submitIntegration a (Guid.NewGuid()) task "Owner" (Guid.NewGuid())
+                sourceRef sourceSha (reviewId.ToString("N")) sourceRef |> ok
+        WorkQueueReceiptProducer.produce b "Lead" (Guid.NewGuid())
+            (Guid.Parse submitted.Operation.OperationId) |> ok |> ignore
+        let snapshot, queue = WorkQueueGitLedger.load a |> ok
+        let stage = queue.Works |> Map.toSeq |> Seq.map snd
+                    |> Seq.find (fun work -> work.Kind = WorkKind.Integration && work.SubjectId = task)
+        Assert.That(stage.Dependencies, Does.Contain(reviewStage.Id))
+        Assert.That(stage.State, Is.EqualTo(WorkState.Blocked))
+        Assert.That((WorkCompositionGitLedger.readStageLinkAt a snapshot stage.Id |> ok).IsSome,
+                    Is.True)
+        stage
 
     [<Test>]
     member _.ValidOriginalCanonicalEventStillCannotProduceOrClaim() =
@@ -261,6 +344,8 @@ type WorkQueueCanonicalCasBinderTests() =
     member _.PracticalTaskProducerPublishesImmutableOriginAndRunsThroughFixtureClaim() =
         withClones (fun a b _ ->
             let task = "practical-task"
+            seedOriginalRoles a
+            linkOriginalTask a task
             let created = ReviewWorkflow.createTask a (Guid.NewGuid()) task "Practical" |> ok
             let request = requestFor b created (TaskCreated task)
             let publishedId = Guid.NewGuid()
@@ -288,7 +373,7 @@ type WorkQueueCanonicalCasBinderTests() =
             | Error error -> Assert.Fail(sprintf "Original producer UUID replay failed: %A" error)
             for altered in
                 [ { request with SourceEvent = TaskCreated "forged-task" }
-                  { request with RoleScope = NewRoleDemand("Planner", 1) } ] do
+                  { request with RoleScope = NewRoleDemand("Reviewer", 1) } ] do
                 match WorkQueueCanonicalCasBinder.publishPractical b "Lead" publishedId altered with
                 | Error OperationIdReused -> ()
                 | other -> Assert.Fail(sprintf "Changed input reused producer UUID: %A" other)
@@ -304,12 +389,6 @@ type WorkQueueCanonicalCasBinderTests() =
             Assert.That(snapshotAfter.Header.NextSequence, Is.EqualTo(snapshot.Header.NextSequence))
             // Versioned, Git-pinned practical role ranking is a read-only
             // feasibility result. It is not a launch/admission permission.
-            WorkQueueRoleAuthority.initializeCatalog a "Lead" (Guid.NewGuid()) |> ok |> ignore
-            let role : RoleConfiguration =
-                { RoleId = "Planner"; Version = 1; Enabled = true
-                  Instructions = "Plan queued tasks"
-                  QueueSubscriptions = set [ "planning" ] }
-            WorkQueueRoleAuthority.configure a "Lead" (Guid.NewGuid()) 0 0 role |> ok |> ignore
             let demand = WorkQueueRoleAuthority.selectPracticalDemand b "Planner" |> ok
             Assert.That(demand.Chosen.IsSome, Is.True)
             let chosen = demand.Chosen.Value
@@ -343,6 +422,8 @@ type WorkQueueCanonicalCasBinderTests() =
     member _.PracticalReviewAndIntegrationPreserveImmutableHardDependency() =
         withClones (fun a b _ ->
             let task = "practical-review"
+            seedOriginalRoles a
+            linkOriginalTask a task
             ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Owner" |> ok |> ignore
             ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Reviewer" |> ok |> ignore
             let sourceSha = git a.RepositoryPath [ "rev-parse"; "HEAD" ]
@@ -394,6 +475,8 @@ type WorkQueueCanonicalCasBinderTests() =
     member _.ExplicitReceiptEntryPointResolvesOriginalTaskAndReplaysWithoutNewHeadAssertions() =
         withClones (fun a b _ ->
             let task = "receipt-entrypoint-task"
+            seedOriginalRoles a
+            linkOriginalTask a task
             let created = ReviewWorkflow.createTask a (Guid.NewGuid()) task "Original task receipt" |> ok
             let sourceId = Guid.Parse created.Operation.OperationId
             let preview = WorkQueueReceiptProducer.preview b sourceId |> ok
@@ -454,6 +537,8 @@ type WorkQueueCanonicalCasBinderTests() =
     member _.ExplicitReceiptReviewAndIntegrationRequireOriginalDependentStage() =
         withClones (fun a b _ ->
             let task = "receipt-review-task"
+            seedOriginalRoles a
+            linkOriginalTask a task
             ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Owner" |> ok |> ignore
             ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Reviewer" |> ok |> ignore
             let sourceSha = git a.RepositoryPath [ "rev-parse"; "HEAD" ]
@@ -495,6 +580,8 @@ type WorkQueueCanonicalCasBinderTests() =
     member _.LateClaimedReviewIsVisibleAndCannotSilentlyBackfillAsUnclaimed() =
         withClones (fun a b _ ->
             let task = "receipt-late-review"
+            seedOriginalRoles a
+            linkOriginalTask a task
             ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Owner" |> ok |> ignore
             ReviewWorkflow.registerAgent a (Guid.NewGuid()) "Reviewer" |> ok |> ignore
             let sourceSha = git a.RepositoryPath [ "rev-parse"; "HEAD" ]
@@ -522,6 +609,8 @@ type WorkQueueCanonicalCasBinderTests() =
     member _.TwoClonesCannotDuplicateTheSameOriginalTaskStage() =
         withClones (fun a b _ ->
             let task = "receipt-race-task"
+            seedOriginalRoles a
+            linkOriginalTask a task
             let created = ReviewWorkflow.createTask a (Guid.NewGuid()) task task |> ok
             let originalId = Guid.Parse created.Operation.OperationId
             let left = Task.Run(fun () -> WorkQueueReceiptProducer.produce a "Lead" (Guid.NewGuid()) originalId)
@@ -536,3 +625,274 @@ type WorkQueueCanonicalCasBinderTests() =
                          |> List.filter (fun stage -> stage.SubjectId = task)
             Assert.That(stages.Length, Is.EqualTo(1))
         )
+
+    [<Test>]
+    member _.OriginalProducerRejectsMissingRoleMissingGraphAndStaleRoleWithoutAnyPartialCAS() =
+        withClones (fun a b _ ->
+            let task = "original-gates-regression"
+            seedOriginalRoles a
+            let created = ReviewWorkflow.createTask a (Guid.NewGuid()) task task |> ok
+            let original = requestFor b created (TaskCreated task)
+            let before = LedgerStore.fetch b |> ok
+            let deny expected result =
+                match result with
+                | Error(InvalidBinding reason) when expected = "invalid" -> ()
+                | Error(StaleEntityVersion reason) when expected = "stale" -> ()
+                | other -> Assert.Fail(sprintf "Original CAS should deny %s: %A" expected other)
+            deny "invalid" (WorkQueueCanonicalCasBinder.publishPractical
+                                b "Lead" (Guid.NewGuid())
+                                { original with RoleScope = NoRoleTransition })
+            deny "invalid" (WorkQueueCanonicalCasBinder.publishPractical
+                                b "Lead" (Guid.NewGuid()) original)
+            let after = LedgerStore.fetch b |> ok
+            Assert.That(after.Commit, Is.EqualTo(before.Commit),
+                        "Neither unbound role nor graph may produce Available or an orphan origin")
+            linkOriginalTask a task
+            let oldRole = (WorkQueueRoleAuthority.load a |> ok).Catalog
+            let updated =
+                { oldRole.Versions.["Planner"].[1] with
+                    Version = 2; Instructions = "Revised original planner demand" }
+            WorkQueueRoleAuthority.configure a "Lead" (Guid.NewGuid())
+                oldRole.Revision 1 updated |> ok |> ignore
+            let staleRole = requestFor b created (TaskCreated task)
+            let freshBefore = LedgerStore.fetch b |> ok
+            deny "stale" (WorkQueueCanonicalCasBinder.publishPractical
+                              b "Lead" (Guid.NewGuid()) staleRole)
+            Assert.That((LedgerStore.fetch b |> ok).Commit, Is.EqualTo(freshBefore.Commit))
+            let accepted = { staleRole with RoleScope = NewRoleDemand("Planner", 2) }
+            WorkQueueCanonicalCasBinder.publishPractical b "Lead" (Guid.NewGuid()) accepted
+            |> ok |> ignore
+            let head, queue = WorkQueueGitLedger.load a |> ok
+            let stage = queue.Works |> Map.toSeq |> Seq.map snd
+                        |> Seq.find (fun item -> item.SubjectId = task)
+            Assert.That(stage.State, Is.EqualTo(WorkState.Available))
+            let origin, _ = WorkQueueGitLedger.readOriginAt a head stage.Id |> ok |> Option.get
+            Assert.That(origin.RoleId, Is.EqualTo("Planner"))
+            Assert.That(origin.RoleVersion, Is.EqualTo(2))
+            Assert.That(origin.SourceOperationId, Is.EqualTo(created.Operation.OperationId))
+            Assert.That((WorkCompositionGitLedger.readStageLinkAt a head stage.Id |> ok).IsSome,
+                        Is.True, "Original stage, source, role and composition must commit atomically")
+        )
+
+    [<TestCase("spec")>]
+    [<TestCase("context")>]
+    [<TestCase("cancel")>]
+    [<TestCase("linked-task")>]
+    member _.OriginalReviewGraphChangeRevokesAvailableStageInSameCasAcrossTwoClones(kind: string) =
+        withClones (fun a b _ ->
+            let task = "original-review-invalidation"
+            let _, _, _, review = originalReviewStage a b task
+            let initialGraph = WorkCompositionGitLedger.load a |> ok |> snd
+            let unrelated =
+                { Title = "Unrelated"; Goal = "Unrelated"; Scope = "Other feature"
+                  AcceptanceCriteria = Set.singleton "Independent fixture criterion"; Constraints = Set.empty; LinkedTaskId = None }
+            let unrelatedId = Guid.NewGuid()
+            WorkCompositionGitLedger.execute a "Lead" unrelatedId initialGraph.Version
+                (WorkCompositionMutation.Create("unrelated-review-fixture", WorkUnitKind.Feature,
+                                                Some "module", unrelated))
+            |> ok |> ignore
+            let unrelatedHead = LedgerStore.fetch b |> ok
+            let unrelatedReceipt = LedgerStore.getOperationAt b unrelatedHead unrelatedId |> ok |> Option.get
+            Assert.That(unrelatedReceipt.Paths, Is.EquivalentTo([| WorkCompositionGitLedger.RecordPath |]))
+            Assert.That((WorkQueueGitLedger.load a |> ok |> snd).Works.[review.Id].State,
+                        Is.EqualTo(WorkState.Available))
+            let graph = WorkCompositionGitLedger.load b |> ok |> snd
+            let unit = graph.Units.["unit-" + task]
+            let mutation =
+                match kind with
+                | "spec" ->
+                    WorkCompositionMutation.Revise(unit.Id, unit.SpecVersion,
+                        { unit.Spec with Scope = "Changed review requirements" })
+                | "context" ->
+                    let ancestor = graph.Units.["module"]
+                    WorkCompositionMutation.Revise(ancestor.Id, ancestor.SpecVersion,
+                        { ancestor.Spec with Goal = "Changed immutable ancestor context" })
+                | "cancel" ->
+                    WorkCompositionMutation.Cancel("module", "Cancelled ancestor")
+                | "linked-task" ->
+                    WorkCompositionMutation.Revise(unit.Id, unit.SpecVersion,
+                        { unit.Spec with LinkedTaskId = Some "different-task" })
+                | _ -> failwith "Unknown review graph change"
+            let operationId = Guid.NewGuid()
+            let before = LedgerStore.fetch b |> ok
+            let written = WorkCompositionGitLedger.execute b "Lead" operationId graph.Version mutation |> ok
+            Assert.That(written.AlreadyApplied, Is.False)
+            let after = LedgerStore.fetch a |> ok
+            Assert.That(after.Header.NextSequence, Is.EqualTo(before.Header.NextSequence + 1L))
+            let receipt = LedgerStore.getOperationAt a after operationId |> ok |> Option.get
+            Assert.That(receipt.Paths, Is.EquivalentTo([| WorkCompositionGitLedger.RecordPath;
+                                                         WorkQueueGitLedger.RecordPath |]))
+            let queue = WorkQueueGitLedger.loadAt a after |> ok
+            let changedGraph, _ = WorkCompositionGitLedger.loadAt a after |> ok
+            let stage = queue.Works.[review.Id]
+            Assert.That(stage.State, Is.EqualTo(WorkState.Blocked))
+            Assert.That(stage.Gate, Is.EqualTo(GateState.CompositionHold(unit.Id, unit.SpecVersion)))
+            Assert.That(stage.AvailableSequence, Is.Zero)
+            let link = WorkCompositionGitLedger.readStageLinkAt a after review.Id |> ok |> Option.get
+            let originalContextStillCurrent =
+                WorkCompositionGitLedger.stageLinkStillCurrent link stage changedGraph
+            if kind = "cancel" then
+                // Ancestor cancellation blocks the stage without rewriting
+                // its original immutable spec/parent/prerequisite identity.
+                Assert.That(originalContextStillCurrent, Is.True)
+                Assert.That(WorkCompositionGitLedger.graphBlocked changedGraph changedGraph.Units.[unit.Id], Is.True)
+            else
+                Assert.That(originalContextStillCurrent, Is.False)
+            let replay = WorkCompositionGitLedger.execute a "Lead" operationId graph.Version mutation |> ok
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That((WorkQueueGitLedger.load b |> ok |> snd).Works.[review.Id].State,
+                        Is.EqualTo(WorkState.Blocked)))
+
+    [<Test>]
+    member _.OriginalIntegrationAvailableStageRevokedInSameCasAndDependencyWakeCannotResurrect() =
+        withClones (fun a b _ ->
+            let task = "original-integration-invalidation"
+            let reviewId, sha, sourceRef, review = originalReviewStage a b task
+            let integration = originalIntegrationStage a b task reviewId sha sourceRef review
+            // Only the WQ02 dependency-readiness transition is an inert fixture:
+            // both review and integration were published by the actual WQ04
+            // original producer, each with its own immutable same-CAS link.
+            let originalQueue = WorkQueueGitLedger.load a |> ok |> snd
+            WorkQueueGitLedger.executeInertFixtureAt a "Lead" (Guid.NewGuid())
+                originalQueue.Version 300L
+                (RemoveHardPrerequisite(integration.Id, review.Id))
+            |> ok |> ignore
+            let ready = WorkQueueGitLedger.load b |> ok |> snd
+            Assert.That(ready.Works.[integration.Id].State, Is.EqualTo(WorkState.Available))
+            let graph = WorkCompositionGitLedger.load b |> ok |> snd
+            let unit = graph.Units.["unit-" + task]
+            let mutation =
+                WorkCompositionMutation.Revise(unit.Id, unit.SpecVersion,
+                    { unit.Spec with Goal = "Changed integration source graph" })
+            let operationId = Guid.NewGuid()
+            let before = LedgerStore.fetch b |> ok
+            WorkCompositionGitLedger.execute b "Lead" operationId graph.Version mutation
+            |> ok |> ignore
+            let after = LedgerStore.fetch a |> ok
+            Assert.That(after.Header.NextSequence, Is.EqualTo(before.Header.NextSequence + 1L))
+            let receipt = LedgerStore.getOperationAt a after operationId |> ok |> Option.get
+            Assert.That(receipt.Paths, Is.EquivalentTo([| WorkCompositionGitLedger.RecordPath;
+                                                         WorkQueueGitLedger.RecordPath |]))
+            let queue = WorkQueueGitLedger.loadAt a after |> ok
+            for id in [ review.Id; integration.Id ] do
+                Assert.That(queue.Works.[id].State, Is.EqualTo(WorkState.Blocked))
+                Assert.That(queue.Works.[id].Gate,
+                            Is.EqualTo(GateState.CompositionHold(unit.Id, unit.SpecVersion)))
+                Assert.That(Contracts.orderAvailable queue |> ok
+                            |> List.exists (fun work -> work.Id = id), Is.False)
+            Assert.That((WorkCompositionGitLedger.readStageLinkAt a after integration.Id |> ok).IsSome,
+                        Is.True)
+            let replay = WorkCompositionGitLedger.execute a "Lead" operationId graph.Version mutation |> ok
+            Assert.That(replay.AlreadyApplied, Is.True)
+            // A WQ02 dependency re-addition/removal normally wakes a Blocked
+            // stage, but cannot erase the immutable graph hold.
+            let apply mutation =
+                let current = WorkQueueGitLedger.load b |> ok |> snd
+                WorkQueueGitLedger.executeInertFixtureAt b "Lead" (Guid.NewGuid())
+                    current.Version 310L mutation |> ok |> ignore
+            apply (SetHardPrerequisite(integration.Id, review.Id))
+            apply (RemoveHardPrerequisite(integration.Id, review.Id))
+            let woke = WorkQueueGitLedger.load a |> ok |> snd
+            Assert.That(woke.Works.[integration.Id].State, Is.EqualTo(WorkState.Blocked))
+            Assert.That(woke.Works.[integration.Id].Gate,
+                        Is.EqualTo(GateState.CompositionHold(unit.Id, unit.SpecVersion))))
+
+    [<Test>]
+    member _.ClaimedOriginalReviewDeniesRelevantGraphChangeButNotUnrelatedFeature() =
+        withClones (fun a b _ ->
+            let task = "original-review-claimed"
+            let _, _, _, review = originalReviewStage a b task
+            let launchId = Guid.NewGuid().ToString("D")
+            let launch : Launch =
+                { Id = launchId; ProjectId = a.ProjectId.ToString("D")
+                  RoleId = "Reviewer"; RoleVersion = 1
+                  AccountTokenId = Guid.NewGuid().ToString("D")
+                  State = LaunchState.ReservedUnregistered; Lease = None; Version = 0
+                  Credit = None; PrimaryWorkId = None; EverClaimed = false
+                  AncillaryMessages = Set.empty; DispatchCount = 0 }
+            WQ04ProducerFixture.admitPinnedReviewFixture a "Lead" (Guid.NewGuid())
+                launch review.Id
+            let apply mutation =
+                let current = WorkQueueGitLedger.load a |> ok |> snd
+                WorkQueueGitLedger.executeInertFixtureAt a "Lead" (Guid.NewGuid())
+                    current.Version 100L mutation |> ok |> ignore
+            apply (DispatchOnce(launchId, DispatchState.Submitted))
+            apply (InitializeAgent(launchId, "review-claim-fixture"))
+            apply (ClaimNext launchId)
+            let claimed = WorkQueueGitLedger.load b |> ok |> snd
+            Assert.That(claimed.Works.[review.Id].State, Is.EqualTo(WorkState.Claimed launchId))
+            let graph = WorkCompositionGitLedger.load a |> ok |> snd
+            let unit = graph.Units.["unit-" + task]
+            let mutation =
+                WorkCompositionMutation.Revise(unit.Id, unit.SpecVersion,
+                    { unit.Spec with Scope = "Unsafe claimed review rewrite" })
+            let before = LedgerStore.fetch b |> ok
+            let deniedId = Guid.NewGuid()
+            match WorkCompositionGitLedger.execute b "Lead" deniedId graph.Version mutation with
+            | Error(InvalidBinding reason) when reason.Contains("claimed/live") -> ()
+            | other -> Assert.Fail(sprintf "Claimed stage graph rewrite should be denied: %A" other)
+            let after = LedgerStore.fetch a |> ok
+            Assert.That(after.Commit, Is.EqualTo(before.Commit))
+            Assert.That((LedgerStore.getOperationAt a after deniedId |> ok).IsNone, Is.True)
+            // No global freeze: an unrelated graph edit remains possible even
+            // while a separate original review is legitimately claimed.
+            let unrelated =
+                { Title = "Other"; Goal = "Independent feature"; Scope = "Other"
+                  AcceptanceCriteria = Set.singleton "Independent fixture criterion"; Constraints = Set.empty; LinkedTaskId = None }
+            let unrelatedId = Guid.NewGuid()
+            WorkCompositionGitLedger.execute a "Lead" unrelatedId graph.Version
+                (WorkCompositionMutation.Create("unrelated-while-review-claimed",
+                                                WorkUnitKind.Feature, Some "module", unrelated))
+            |> ok |> ignore
+            let final = LedgerStore.fetch b |> ok
+            let op = LedgerStore.getOperationAt b final unrelatedId |> ok |> Option.get
+            Assert.That(op.Paths, Is.EquivalentTo([| WorkCompositionGitLedger.RecordPath |]))
+            Assert.That((WorkQueueGitLedger.load b |> ok |> snd).Works.[review.Id].State,
+                        Is.EqualTo(WorkState.Claimed launchId)))
+
+    [<Test>]
+    member _.ClaimedOriginalIntegrationDeniesGraphChangeWithNoPartialCas() =
+        withClones (fun a b _ ->
+            let task = "original-integration-claimed"
+            let reviewId, sha, sourceRef, review = originalReviewStage a b task
+            let integration = originalIntegrationStage a b task reviewId sha sourceRef review
+            // Pure WQ02 frozen admission/claim fixture, not live WQ07/host.
+            // Remove the review dependency only to reach Available without
+            // a persistent launch, keeping the WQ04 birth/link unchanged.
+            let frozen = WorkQueueGitLedger.load a |> ok |> snd
+            WorkQueueGitLedger.executeInertFixtureAt a "Lead" (Guid.NewGuid())
+                frozen.Version 100L
+                (RemoveHardPrerequisite(integration.Id, review.Id)) |> ok |> ignore
+            let launchId = Guid.NewGuid().ToString("D")
+            let launch : Launch =
+                { Id = launchId; ProjectId = a.ProjectId.ToString("D")
+                  RoleId = "Integrator"; RoleVersion = 1
+                  AccountTokenId = Guid.NewGuid().ToString("D")
+                  State = LaunchState.ReservedUnregistered; Lease = None; Version = 0
+                  Credit = None; PrimaryWorkId = None; EverClaimed = false
+                  AncillaryMessages = Set.empty; DispatchCount = 0 }
+            let apply mutation =
+                let queue = WorkQueueGitLedger.load a |> ok |> snd
+                WorkQueueGitLedger.executeInertFixtureAt a "Lead" (Guid.NewGuid())
+                    queue.Version 110L mutation |> ok |> ignore
+            apply (AdmitProject launch)
+            apply (DispatchOnce(launchId, DispatchState.Submitted))
+            apply (InitializeAgent(launchId, "integration-claim-fixture"))
+            apply (ClaimNext launchId)
+            let claimed = WorkQueueGitLedger.load b |> ok |> snd
+            Assert.That(claimed.Works.[integration.Id].State, Is.EqualTo(WorkState.Claimed launchId))
+            let graph = WorkCompositionGitLedger.load a |> ok |> snd
+            let unit = graph.Units.["unit-" + task]
+            let revised =
+                WorkCompositionMutation.Revise(unit.Id, unit.SpecVersion,
+                    { unit.Spec with AcceptanceCriteria = unit.Spec.AcceptanceCriteria.Add "New integration gate" })
+            let deniedId = Guid.NewGuid()
+            let before = LedgerStore.fetch b |> ok
+            match WorkCompositionGitLedger.execute b "Lead" deniedId graph.Version revised with
+            | Error(InvalidBinding reason) when reason.Contains("claimed/live") -> ()
+            | other -> Assert.Fail(sprintf "Claimed Integration graph rewrite should be denied: %A" other)
+            let after = LedgerStore.fetch a |> ok
+            Assert.That(after.Commit, Is.EqualTo(before.Commit))
+            Assert.That((LedgerStore.getOperationAt a after deniedId |> ok).IsNone, Is.True)
+            Assert.That((WorkQueueGitLedger.load a |> ok |> snd).Works.[integration.Id].State,
+                        Is.EqualTo(WorkState.Claimed launchId)))

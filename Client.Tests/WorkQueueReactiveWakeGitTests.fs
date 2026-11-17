@@ -153,7 +153,7 @@ type WorkQueueReactiveWakeGitTests() =
                 let original = Guid.NewGuid()
                 ReviewWorkflow.createTask (project one) original taskId ("Fixture " + taskId)
                 |> succeed |> ignore
-                WorkQueueReceiptProducer.produce (project two) "Lead" (Guid.NewGuid()) original
+                WQ04ProducerFixture.produce (project two) "Lead" (Guid.NewGuid()) original
                 |> succeed |> ignore
                 let snapshot, state = WorkQueueGitLedger.load (project one) |> succeed
                 let stage =

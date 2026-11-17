@@ -102,7 +102,7 @@ type WorkQueueNativeCredentialDispatchAdapterTests() =
         let taskId = "native-" + Guid.NewGuid().ToString("N")
         let sourceOp = Guid.NewGuid()
         ReviewWorkflow.createTask a1 sourceOp taskId "Native disposable planning" |> ok |> ignore
-        WorkQueueReceiptProducer.produce a2 "Lead" (Guid.NewGuid()) sourceOp |> ok |> ignore
+        WQ04ProducerFixture.produce a2 "Lead" (Guid.NewGuid()) sourceOp |> ok |> ignore
         let ctx = context account a1 b1
         match WorkQueueDurableLaunchIntent.prepareExplicit true ctx "native fixture" with
         | DurableIntentOutcome.Prepared (prepared,_,_) -> prepared

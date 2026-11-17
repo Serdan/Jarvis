@@ -337,10 +337,11 @@ type WorkQueueReleaseAcceptanceTests() =
             let created = ReviewWorkflow.createTask a sourceOp taskId "Connected smoke task" |> ok
             Assert.That(created.Operation.Type, Is.EqualTo("CreateTask"))
             Assert.That(created.Operation.OperationId, Is.EqualTo(sourceOp.ToString("D")))
+            WQ04ProducerFixture.prepare b sourceOp
             let planned = WorkQueueReceiptProducer.preview b sourceOp |> ok
             Assert.That(planned.Status, Is.EqualTo("ReadyToProduce"))
             Assert.That(planned.SourceOperationKind, Is.EqualTo("CreateTask"))
-            let published = WorkQueueReceiptProducer.produce b "Lead" producerOp sourceOp |> ok
+            let published = WQ04ProducerFixture.produce b "Lead" producerOp sourceOp |> ok
             Assert.That(published.AlreadyApplied, Is.False)
 
             // A second checkout independently fetches canonical work and origin;
@@ -403,7 +404,7 @@ type WorkQueueReleaseAcceptanceTests() =
                 ReviewWorkflow.createTask b sourceOp taskId "Connected smoke task" |> ok
             Assert.That(sourceReplay.AlreadyApplied, Is.True)
             let producerReplay =
-                WorkQueueReceiptProducer.produce a "Lead" producerOp sourceOp |> ok
+                WQ04ProducerFixture.produce a "Lead" producerOp sourceOp |> ok
             Assert.That(producerReplay.AlreadyApplied, Is.True)
             match ReviewWorkflow.createTask b sourceOp taskId "Changed payload" with
             | Error OperationIdReused -> ()
@@ -440,9 +441,10 @@ type WorkQueueReleaseAcceptanceTests() =
             let produce source producer taskId =
                 let sourceOp, producerOp = Guid.NewGuid(), Guid.NewGuid()
                 let created = ReviewWorkflow.createTask source sourceOp taskId "Fake provider test" |> ok
+                WQ04ProducerFixture.prepare producer sourceOp
                 let planned = WorkQueueReceiptProducer.preview producer sourceOp |> ok
                 Assert.That(planned.Status, Is.EqualTo("ReadyToProduce"))
-                let published = WorkQueueReceiptProducer.produce producer "Lead" producerOp sourceOp |> ok
+                let published = WQ04ProducerFixture.produce producer "Lead" producerOp sourceOp |> ok
                 Assert.That(published.AlreadyApplied, Is.False)
                 created, planned.StageId, sourceOp, producerOp
 
@@ -484,6 +486,11 @@ type WorkQueueReleaseAcceptanceTests() =
 
             let created, workId, sourceOp, producerOp =
                 produce a b "wq11-fake-provider-first-connect"
+            // Seed both original source/role/composition-bound tasks before
+            // the intentionally legacy inert WQ02 launch; it cannot create
+            // new trusted role evidence while its witness is incomplete.
+            let created2, work2, source2, _ =
+                produce b a "wq11-fake-provider-unknown-original"
             let visible = WorkQueueSchedulerHostPreview.preview accountB a "Lead"
             Assert.That(visible.CanDispatch, Is.False)
             Assert.That(visible.AvailableSlots, Is.EqualTo(Some 1))
@@ -627,8 +634,6 @@ type WorkQueueReleaseAcceptanceTests() =
 
             // Cap is usable again, yet an unknown original never authorizes
             // a repeat send or a release without a verified terminal.
-            let created2, work2, source2, _ =
-                produce b a "wq11-fake-provider-unknown-original"
             let selected2 = WorkQueueSchedulerHostPreview.preview accountA b "Lead"
             let _, secondWorkState = WorkQueueGitLedger.load a |> ok
             Assert.That(secondWorkState.Works.[work2].State, Is.EqualTo(WorkState.Available))

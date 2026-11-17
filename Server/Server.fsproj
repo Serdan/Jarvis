@@ -20,6 +20,8 @@
         <Compile Include="WorkSnapshotCodec.fs"/>
         <Compile Include="WorkComposition.fs"/>
         <Compile Include="WorkSqliteAuthority.fs"/>
+        <Compile Include="WorkSqliteBackup.fs"/>
+        <Compile Include="WorkBackupReplication.fs"/>
         <Compile Include="WorkProposal.fs"/>
         <Compile Include="WorkLegacyImportPreflight.fs"/>
         <Compile Include="WorkLegacyImportSqlite.fs"/>

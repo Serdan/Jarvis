@@ -1,0 +1,9 @@
+# P0 closure remains blocked: provenance and authority boundary
+
+**Classification:** Blocking for incident closure / operational cutover, **not** a blocker to accepting the bounded offline test-and-doc correction.
+
+- The frozen Jarvis source still uses caller-selected `projectName` for both launcher script resolution and the `RecordAgentActivity` project watermark, and a separate supplied `agentId`. The revised tests prove routing/normalization for correct `Favn::favn-manager-browser-bridge` / Manager and Jarvis / Manager inputs. They do **not** prohibit an erroneous Favn caller from requesting Jarvis / Manager to read a Jarvis-owned script; that misuse could still reset the wrong Manager's activity clock.
+- The Favn Manager notification identifying blob `4183036f638ed346d01a930705895418ec12c000` and local Favn worktree is useful operator-reported evidence but not independently verified launch-by-launch provenance. No historical browser invocation, exact prompt-submission state, dispatch receipt, or causal link to Jarvis sequence 6985 was independently examined. Keep historical cause **UNKNOWN**.
+- Before declaring this P0 incident closed or activating unattended scheduling/deployment, bind the exact verified Favn script source and actual project/actor call evidence, plus independent attribution/activation outcome; alternatively commission a separate reviewed server-enforced caller-project/script-source authority mechanism. No ambiguous browser launch may be replayed for evidence. Keep existing active ledgers and scheduler switches unchanged absent authorization.
+
+The current regression slice may be integrated only under the Integrator's distinct source/target/review gates, and any operational claims must remain scoped to what was actually tested.

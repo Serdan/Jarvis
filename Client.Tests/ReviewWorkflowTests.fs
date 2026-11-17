@@ -2782,6 +2782,45 @@ type ReviewWorkflowTests() =
                 if File.Exists reviewerConfigPath then File.Delete reviewerConfigPath)
 
     [<Test>]
+    member _.GlobalRosterCannotPublishConflictingApprovedRemotesForSameLedger() =
+        withFixture (fun one two first second _ _ _ _ ->
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let firstConfig = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            let secondConfig = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot two
+            let mirror = Path.Combine(Path.GetDirectoryName one, "mirror.git")
+            git one [ "clone"; "--bare"; first.ApprovedFetchUrl; mirror ] |> ignore
+            git two [ "remote"; "add"; "mirror"; mirror ] |> ignore
+            let head = (LedgerStore.fetch first |> success).Commit
+            try
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" context first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl head true
+                |> success |> ignore
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "reviewer" context second.ProjectId second.LedgerId second.Epoch
+                    "mirror" mirror mirror head true
+                |> success |> ignore
+                let claims = Client.AgentDashboard.discoverClaims context |> success
+                Assert.That(claims.Length, Is.EqualTo(1))
+                Assert.That(claims[0].Aliases, Is.EquivalentTo([| "owner"; "reviewer" |]))
+                let request : Common.SignalR.AgentRosterRefreshRequest =
+                    { RequestId = Guid.NewGuid().ToString("N")
+                      Identity = claims[0].Identity
+                      ProjectName = claims[0].ProjectName
+                      PreviousHead = "" }
+                let response = Client.AgentDashboard.readForRoster request context
+                Assert.That(response.Error, Does.Contain("conflicting approved ledger remotes"))
+                Assert.That(isNull (box response.Data), Is.True,
+                            "The global roster must not publish a Fresh ledger from either alias.")
+                let local = Client.AgentDashboard.load context |> success
+                Assert.That(local.Agents, Is.Empty)
+                Assert.That(local.Projects.Length, Is.EqualTo(1))
+                Assert.That(local.Projects.Head.Status, Is.EqualTo(Client.AgentView.Unavailable))
+            finally
+                for path in [firstConfig; secondConfig] do
+                    if File.Exists path then File.Delete path)
+
+    [<Test>]
     member _.RoleOnlyReviewerExplicitlyWorksOnIndependentReviewAndYieldsWithoutTask() =
         withFixture (fun one _ first second baseOid sourceRef _ initTask ->
             Client.RoleInstructions.RoleInstructions.createRole first "AuthenticatedUser" (Guid.NewGuid())
@@ -2884,7 +2923,7 @@ type ReviewWorkflowTests() =
                 Assert.That(parked.InstructionLayers.RoleIds, Is.EqualTo(box [ "Auditor" ]))
                 let after = Client.AgentDashboard.load context |> success
                 Assert.That((Client.AgentView.visibleRows "" after |> List.exists
-                    (fun row -> row.Agent = "Reviewer")), Is.False)
+                    (fun row -> row.Agent = "Reviewer")), Is.True)
                 let parkedRow = after.Agents |> List.find (fun row -> row.Agent = "Reviewer")
                 Assert.That(parkedRow.RoleIds, Is.EqualTo(box [ "Auditor" ]))
             finally

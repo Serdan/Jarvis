@@ -367,7 +367,7 @@ let private inspectProject project rt =
             |> Result.map Some
             |> Result.mapError classifyFailure
 
-let private refreshGroup identity (members: (string * LedgerBinding * string) array) rt =
+let internal refreshGroup identity (members: (string * LedgerBinding * string) array) rt =
     let project, firstBinding, _ = members[0]
     let aliases = members |> Array.map (fun (name, _, _) -> name) |> Array.toList
     let matchingTransport (binding: LedgerBinding) =
@@ -456,6 +456,28 @@ let discoverClaims rt : Result<AgentRosterClaim array, string> =
             |> Seq.toArray
         Ok members
 
+/// A roster claim is a group of local aliases, not a trust grant for its
+/// first project name. Re-inspect every alias before any Git fetch so a
+/// conflicting or disappearing binding cannot be advertised as Fresh.
+let private inspectRosterMembers (claim: AgentRosterClaim) rt =
+    if isNull claim.Aliases || claim.Aliases.Length = 0 then
+        Error "Ledger advertisement has no configured aliases."
+    else
+        let inspected =
+            claim.Aliases
+            |> Array.map (fun alias ->
+                match inspectProject alias rt with
+                | Error reason -> Error (alias + ": " + failureMessage reason)
+                | Ok None -> Error (alias + ": local ledger binding disappeared.")
+                | Ok (Some (binding, head)) ->
+                    if bindingIdentity binding <> claim.Identity then
+                        Error (alias + ": canonical ledger identity changed during roster refresh.")
+                    else Ok (alias, binding, head))
+        match inspected |> Array.tryPick (function Error reason -> Some reason | Ok _ -> None) with
+        | Some reason -> Error reason
+        | None ->
+            Ok (inspected |> Array.choose (function Ok member' -> Some member' | Error _ -> None))
+
 /// One verified Git fetch per requested ledger. The prior server-observed head
 /// is checked for ancestry by the owning client, so a lagging provider cannot
 /// replace a newer snapshot with an older commit.
@@ -471,12 +493,11 @@ let readForRoster (request: AgentRosterRefreshRequest) rt : AgentRosterRefreshRe
                 c.Identity = request.Identity && c.ProjectName = request.ProjectName) with
             | None -> failed "Ledger advertisement no longer matches a trusted local binding."
             | Some claim ->
-                match inspectProject claim.ProjectName rt with
-                | Error error -> failed (failureMessage error)
-                | Ok None -> failed "Local ledger binding disappeared."
-                | Ok (Some (binding, head)) ->
-                    let read = refreshGroup request.Identity
-                                   [| claim.ProjectName, binding, head |] rt
+                match inspectRosterMembers claim rt with
+                | Error error -> failed error
+                | Ok members ->
+                    let _, binding, _ = members[0]
+                    let read = refreshGroup request.Identity members rt
                     match read.Result with
                     | Error error -> failed (failureMessage error)
                     | Ok data ->

@@ -562,9 +562,13 @@ let globalRosterHydrationPreservesIndependentSameNamedLedgersAndActivity () =
            Data = ledger id "Jarvis" agents }
           : Common.SignalR.AgentRosterLedgerView)
     let observed = DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero)
+    let parked =
+        { agent "Worker 7" with State = "Parked"
+                                RoleIds = [| "worker"; "reviewer" |]
+                                PendingNotifications = 2 }
     let view : Common.SignalR.AgentRosterView =
         { Ledgers = [| entry firstId "Fresh" [| agent "Worker 7" |]
-                       entry secondId "Stale" [| agent "Worker 7" |] |]
+                       entry secondId "Stale" [| parked |] |]
           Activity = [| { Identity = firstId; AgentId = "Worker 7"
                           LastSeenAtUtc = observed; DeviceName = "Laptop" } |]
           ServerNowUtc = observed }
@@ -573,10 +577,42 @@ let globalRosterHydrationPreservesIndependentSameNamedLedgersAndActivity () =
     Assert.That(result.Agents.Length, Is.EqualTo(2))
     Assert.That(result.Agents |> List.map _.Key |> List.distinct |> List.length, Is.EqualTo(2))
     Assert.That(result.Projects |> List.map _.Identity |> List.distinct |> List.length, Is.EqualTo(2))
-    Assert.That(result.Agents |> List.map _.PendingNotifications |> List.sum, Is.EqualTo(2))
+    Assert.That(result.Agents |> List.map _.PendingNotifications |> List.sum, Is.EqualTo(3))
     let known = result.Agents |> List.find (fun row -> row.Key.StartsWith(firstId))
     let unknown = result.Agents |> List.find (fun row -> row.Key.StartsWith(secondId))
     Assert.That(known.LastSeenAt, Is.EqualTo(Some observed))
     Assert.That(known.LastSeenDevice, Is.EqualTo(Some "Laptop"))
     Assert.That(unknown.LastSeenAt, Is.EqualTo(None))
     Assert.That(result.Projects |> List.exists (fun p -> p.Status = AgentView.Stale), Is.True)
+    Assert.That(AgentView.visibleRows "" result |> List.length, Is.EqualTo(2),
+                "The global Agents screen includes Parked agents by default.")
+    let parkedRows = AgentView.visibleRows "Parked" result
+    Assert.That(parkedRows.Length, Is.EqualTo(1))
+    Assert.That(parkedRows.Head.Key, Is.EqualTo(secondId + "::Worker 7"))
+    Assert.That(parkedRows.Head.RoleIds, Is.EquivalentTo([ "worker"; "reviewer" ]))
+    Assert.That(parkedRows.Head.PendingNotifications, Is.EqualTo(2))
+    Assert.That(AgentView.visibleRows "@Worker 7 machine:laptop" result |> List.length, Is.EqualTo(2))
+    Assert.That(AgentView.visibleRows "Parked machine:laptop" result |> List.length, Is.EqualTo(1))
+    Assert.That(AgentView.visibleRows "Parked machine:desktop" result, Is.Empty)
+
+[<Test>]
+let globalRosterRejectsConflictingApprovedRemotesForSameLedgerAliases () =
+    let first : LedgerBinding =
+        { RepositoryPath = "/test/one"; RemoteName = "origin"
+          ApprovedFetchUrl = "file:///one.git"; ApprovedPushUrl = "file:///one.git"
+          ProjectId = Guid.NewGuid(); LedgerId = Guid.NewGuid(); Epoch = 1 }
+    let second =
+        { first with RepositoryPath = "/test/two"
+                     ApprovedFetchUrl = "file:///different.git" }
+    let identity = first.ProjectId.ToString("N") + ":" + first.LedgerId.ToString("N") + ":1"
+    let read = AgentDashboard.refreshGroup identity
+                      [| ("owner", first, "head-1"); ("mirror", second, "head-1") |]
+                      (GitCommandTests.TestContext("/tmp"))
+    match read.Result with
+    | Error (AgentDashboard.OtherDashboardFailure message) ->
+        Assert.That(message, Does.Contain("conflicting approved ledger remotes"))
+    | other -> Assert.Fail(sprintf "Conflicting aliases must fail closed: %A" other)
+    let projected = AgentDashboard.snapshotFromResults [read]
+    Assert.That(projected.Agents, Is.Empty)
+    Assert.That(projected.Projects.Head.Status, Is.EqualTo(AgentView.Unavailable))
+    Assert.That(projected.Projects.Head.Counts.IsNone, Is.True)

@@ -333,8 +333,7 @@ let visibleRows (filter: string) (snapshot: Snapshot) =
     let terms = ActivityFilter.parseTerms (String.concat " " general)
     rows snapshot
     |> List.filter (fun row ->
-        row.State <> "Parked"
-        && matchesTerms terms row
+        matchesTerms terms row
         && (machines |> Array.forall (fun (machine: string) ->
             row.Machines |> List.exists (fun name ->
                 name.Contains(machine, StringComparison.OrdinalIgnoreCase)))))

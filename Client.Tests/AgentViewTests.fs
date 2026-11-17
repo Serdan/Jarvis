@@ -72,7 +72,7 @@ let canonicalAgentSearchUsesProjectStatusTaskAndSourceRef () =
     lookup "320" |> shouldEqual ["Agent 3"]
     lookup "audio-commit-alloc" |> shouldEqual ["Agent 3"]
     lookup "Ready" |> shouldEqual ["Agent 3"]
-    lookup "Parked" |> shouldEqual []
+    lookup "Parked" |> shouldEqual ["Agent 8"]
 
 [<Test>]
 let canonicalStateTransitionsAndReasonChangeMarkAgentAsChanged () =
@@ -148,14 +148,14 @@ let numericAgentSortingIsStableAcrossStateAndNotificationChanges () =
 
 
 [<Test>]
-let parkedAgentsAreHiddenFromTheTuiButRemainInTheLedgerSnapshot () =
+let parkedAgentsRemainVisibleInTheTuiAndAreSearchable () =
     let parked = record "Wayfold" "Orchestrator" "Parked" None
     let active = record "Wayfold" "Lead" "Working" None
     let data = snapshot [ parked; active ]
     rows data |> List.map _.Agent |> shouldEqual ["Lead"; "Orchestrator"]
-    visibleRows "" data |> List.map _.Agent |> shouldEqual ["Lead"]
-    visibleRows "orchestrator" data |> shouldEqual []
-    visibleRows "Parked" data |> shouldEqual []
+    visibleRows "" data |> List.map _.Agent |> shouldEqual ["Lead"; "Orchestrator"]
+    visibleRows "orchestrator" data |> List.map _.Agent |> shouldEqual ["Orchestrator"]
+    visibleRows "Parked" data |> List.map _.Agent |> shouldEqual ["Orchestrator"]
     let resumed = { parked with State = "Ready" }
     visibleRows "" (snapshot [ resumed; active ]) |> List.map _.Agent
     |> shouldEqual ["Lead"; "Orchestrator"]

@@ -21,6 +21,8 @@
         <Compile Include="WorkComposition.fs"/>
         <Compile Include="WorkSqliteAuthority.fs"/>
         <Compile Include="WorkProposal.fs"/>
+        <Compile Include="WorkLegacyImportPreflight.fs"/>
+        <Compile Include="WorkLegacyImportSqlite.fs"/>
         <Compile Include="WorkQueueSchedulerInert.fs"/>
         <Compile Include="WorkQueueDependencyDiagnostics.fs"/>
         <Compile Include="WorkBlocking.fs"/>

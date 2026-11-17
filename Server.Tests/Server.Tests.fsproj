@@ -27,6 +27,7 @@
         <Compile Include="WorkStatefulApiReadTests.fs"/>
         <Compile Include="WorkSchedulerSqliteTests.fs"/>
         <Compile Include="WorkSqliteBackupTests.fs"/>
+        <Compile Include="WorkLegacyImportProjectionTests.fs"/>
         <Compile Include="WorkProposalTests.fs"/>
         <Compile Include="WorkQueueSchedulerInertTests.fs"/>
         <Compile Include="WorkQueueDependencyDiagnosticsTests.fs"/>

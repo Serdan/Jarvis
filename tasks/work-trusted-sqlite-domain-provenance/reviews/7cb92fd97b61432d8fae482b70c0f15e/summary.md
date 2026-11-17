@@ -1,0 +1,1 @@
+Exact a064165c. Red-first v1/v2 commented-out CHECK tests failed on 60df897, now 11/11 focused and 499/499 full .NET11 Release green; git diff --check 0. Files: SQLite authority, focused tests, evidence note only. Verify no schema/receipt mutations on rejected corrupt layouts.

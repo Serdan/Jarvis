@@ -5,6 +5,29 @@ open System.Globalization
 open System.IO
 open System.Text
 
+/// Narrow terminal output seam: production uses System.Console, while tests can
+/// resize between writes and detect cursor coordinates outside the viewport.
+type IFrameOutput =
+    abstract IsOutputRedirected: bool
+    abstract Size: int * int
+    abstract ForegroundColor: ConsoleColor with get, set
+    abstract BackgroundColor: ConsoleColor with get, set
+    abstract SetCursorPosition: int * int -> unit
+    abstract Write: string -> unit
+
+type private SystemFrameOutput() =
+    interface IFrameOutput with
+        member _.IsOutputRedirected = Console.IsOutputRedirected
+        member _.Size = Console.WindowWidth, Console.WindowHeight
+        member _.ForegroundColor
+            with get() = Console.ForegroundColor
+            and set value = Console.ForegroundColor <- value
+        member _.BackgroundColor
+            with get() = Console.BackgroundColor
+            and set value = Console.BackgroundColor <- value
+        member _.SetCursorPosition(left, top) = Console.SetCursorPosition(left, top)
+        member _.Write(value) = Console.Write(value)
+
 [<Struct; StructuralEquality; StructuralComparison>]
 type Cell = { Text: string; Color: ConsoleColor; Background: ConsoleColor; BackgroundRgb: (byte * byte * byte) option }
 
@@ -96,9 +119,24 @@ type Frame(width: int, height: int) =
     /// Draws only changed rows, retaining unchanged cells and their colors.
     /// Width reserves one physical terminal column to avoid bottom-right wrapping.
     /// Paint that final column with ECH, which does not advance the cursor.
-    member this.Present(previous: Frame option) =
-        if Console.IsOutputRedirected then false
-        elif Console.WindowWidth - 1 <> width || Console.WindowHeight <> height then false
+    member this.PresentOn(previous: Frame option, terminal: IFrameOutput, ?onFailure: exn -> unit) =
+        let sizeMatches () =
+            try
+                let columns, rows = terminal.Size
+                TerminalLayout.matchesFrame width height columns rows
+            with
+            | :? ArgumentOutOfRangeException
+            | :? IOException
+            | :? InvalidOperationException
+            | :? IndexOutOfRangeException -> false
+        let reportFailure error =
+            match onFailure with
+            | None -> ()
+            | Some report ->
+                try report error
+                with _ -> ()
+        if terminal.IsOutputRedirected then false
+        elif not (sizeMatches()) then false
         else
             let full =
                 previous |> Option.forall (fun old -> old.Width <> width || old.Height <> height)
@@ -109,10 +147,12 @@ type Frame(width: int, height: int) =
                 // Clear using the terminal's default background (OSC 11), not
                 // Console.Clear's palette black. This also covers untouched cells
                 // and the rightmost column reserved against terminal wrapping.
-                if full then Console.Write("\u001b[49m\u001b[2J")
-                initialColor <- Console.ForegroundColor
-                initialBackground <- Console.BackgroundColor
+                if full then terminal.Write("\u001b[49m\u001b[2J")
+                initialColor <- terminal.ForegroundColor
+                initialBackground <- terminal.BackgroundColor
                 for row in 0 .. height - 1 do
+                    if not (sizeMatches()) then
+                        raise (InvalidOperationException("Terminal resized during presentation."))
                     let mutable col = 0
                     while col < width do
                         let current = cells[row, col]
@@ -133,57 +173,70 @@ type Frame(width: int, height: int) =
                                 if part <> "" then text.Append(part) |> ignore
                                 col <- col + 1
                             if text.Length > 0 then
-                                if Console.WindowWidth - 1 <> width || Console.WindowHeight <> height then
+                                if not (sizeMatches()) then
                                     raise (InvalidOperationException("Terminal resized during presentation."))
-                                Console.SetCursorPosition(runStart, row)
-                                if Console.ForegroundColor <> runColor then Console.ForegroundColor <- runColor
-                                // Console.ForegroundColor may reset terminal attributes,
+                                terminal.SetCursorPosition(runStart, row)
+                                if terminal.ForegroundColor <> runColor then terminal.ForegroundColor <- runColor
+                                // terminal.ForegroundColor may reset terminal attributes,
                                 // including a true-color background. Reapply RGB for every
                                 // changed run rather than trusting a stale cached setting.
                                 match runRgb with
                                 | Some(r, g, b) ->
-                                    Console.Write($"\u001b[48;2;{r};{g};{b}m")
+                                    terminal.Write($"\u001b[48;2;{r};{g};{b}m")
                                     activeRgb <- runRgb
                                 | None ->
                                     if activeRgb.IsSome then
-                                        Console.Write("\u001b[49m")
+                                        terminal.Write("\u001b[49m")
                                         activeRgb <- None
-                                    if Console.BackgroundColor <> runBackground then
-                                        Console.BackgroundColor <- runBackground
-                                Console.Write(text.ToString())
+                                    if terminal.BackgroundColor <> runBackground then
+                                        terminal.BackgroundColor <- runBackground
+                                terminal.Write(text.ToString())
                 // The frame reserves the terminal's rightmost column to prevent
                 // a write into the bottom-right corner from scrolling. Still paint
                 // its background, using ECH (erase character) at that position.
                 // ECH fills with the current rendition but does not move the cursor.
                 for row in 0 .. height - 1 do
+                    if not (sizeMatches()) then
+                        raise (InvalidOperationException("Terminal resized during presentation."))
                     let edge = cells[row, width - 1]
+                    // A full redraw may follow growth from a narrower old frame.
+                    // Never index old cells using coordinates from new geometry.
                     let oldEdge =
-                        previous |> Option.map (fun frame -> frame.GetCell(row, width - 1))
+                        if full then None
+                        else previous |> Option.map (fun frame -> frame.GetCell(row, width - 1))
                     if full
                        || (oldEdge |> Option.exists (fun old -> old.BackgroundRgb <> edge.BackgroundRgb || old.Background <> edge.Background)) then
-                        Console.SetCursorPosition(width, row)
+                        terminal.SetCursorPosition(width, row)
                         match edge.BackgroundRgb with
                         | Some(r, g, b) ->
-                            Console.Write($"\u001b[48;2;{r};{g};{b}m")
+                            terminal.Write($"\u001b[48;2;{r};{g};{b}m")
                             activeRgb <- edge.BackgroundRgb
                         | None ->
                             if activeRgb.IsSome then
-                                Console.Write("\u001b[49m")
+                                terminal.Write("\u001b[49m")
                                 activeRgb <- None
-                            Console.BackgroundColor <- edge.Background
-                        Console.Write("\u001b[1X")
-                if activeRgb.IsSome then Console.Write("\u001b[49m")
-                Console.ForegroundColor <- initialColor
-                Console.BackgroundColor <- initialBackground
-                Console.SetCursorPosition(0, 0)
-                true
-            with
-            | :? ArgumentOutOfRangeException
-            | :? IOException
-            | :? InvalidOperationException ->
+                            terminal.BackgroundColor <- edge.Background
+                        terminal.Write("\u001b[1X")
+                if activeRgb.IsSome then terminal.Write("\u001b[49m")
+                terminal.ForegroundColor <- initialColor
+                terminal.BackgroundColor <- initialBackground
+                if not (sizeMatches()) then
+                    raise (InvalidOperationException("Terminal resized during presentation."))
+                terminal.SetCursorPosition(0, 0)
+                sizeMatches()
+            with ex when (ex :? ArgumentOutOfRangeException
+                          || ex :? IOException
+                          || ex :? InvalidOperationException
+                          || ex :? IndexOutOfRangeException) ->
+                // An interrupted write invalidates the whole frame. Surface the
+                // original stack trace to the caller's durable diagnostic log.
+                reportFailure ex
                 try
-                    if activeRgb.IsSome then Console.Write("\u001b[49m")
-                    Console.ForegroundColor <- initialColor
-                    Console.BackgroundColor <- initialBackground
+                    if activeRgb.IsSome then terminal.Write("\u001b[49m")
+                    terminal.ForegroundColor <- initialColor
+                    terminal.BackgroundColor <- initialBackground
                 with _ -> ()
                 false
+
+    member this.Present(previous: Frame option, ?onFailure: exn -> unit) =
+        this.PresentOn(previous, SystemFrameOutput(), ?onFailure = onFailure)

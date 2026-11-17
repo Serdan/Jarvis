@@ -8,6 +8,18 @@ let contains x y rect =
     && x >= rect.X && x < rect.X + rect.Width
     && y >= rect.Y && y < rect.Y + rect.Height
 
+/// Keep the physical terminal's final column free to prevent wrapping and
+/// scrolling when the bottom-right cell is painted. A collapsed terminal has
+/// no drawable frame; it must not be substituted with a made-up 1x1 viewport.
+let tryFrameSize physicalColumns physicalRows =
+    if physicalColumns < 2 || physicalRows < 1 then None
+    else Some(physicalColumns - 1, physicalRows)
+
+/// A frame is presented only if its full physical viewport still matches.
+/// A resize during presentation must invalidate the previous frame and retry.
+let matchesFrame width height physicalColumns physicalRows =
+    tryFrameSize physicalColumns physicalRows = Some(width, height)
+
 /// Agents always use the full available width for list rows. Selected
 /// details are rendered beneath the list, independent of terminal width.
 let agentListWidth terminalWidth = max 1 terminalWidth

@@ -213,7 +213,48 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let mutable draw = Frame(80, 24)
     let mutable previousFrame: Frame option = None
     let mutable frameSize = (0, 0)
-    let mutable lastRenderError: string option = None
+    // Diagnostic text belongs in the activity log, never above the TUI header.
+    // Coalesce repeated physical-console failures during a resize burst.
+    let mutable lastRenderDiagnostic: (string * DateTimeOffset) option = None
+    let recordRenderFailure (ex: exn) =
+        let signature = ex.GetType().FullName + ": " + ex.Message
+        let now = DateTimeOffset.UtcNow
+        let duplicate =
+            match lastRenderDiagnostic with
+            | Some(previous, recordedAt) ->
+                signature = previous && now - recordedAt < TimeSpan.FromSeconds(20.)
+            | None -> false
+        if not duplicate then
+            lastRenderDiagnostic <- Some(signature, now)
+            activityLog |> Option.iter (fun store ->
+                let record: ActivityLog.Snapshot =
+                    { Version = 1
+                      ActivityId = Guid.NewGuid().ToString("N")
+                      Origin = "Observer"
+                      StartedAt = now
+                      ProjectName = null
+                      CommandName = "TerminalRender"
+                      Message = "Terminal rendering interrupted; a full redraw was scheduled."
+                      Reason = null
+                      Detail = null
+                      Status = "Failed"
+                      DurationMs = Nullable()
+                      Result = signature
+                      Error = ex.ToString() }
+                store.Append record)
+    let resetPresentationUnsafe () =
+        mouseHits.Clear()
+        previousFrame <- None
+        frameSize <- 0, 0
+    let tryCurrentFrameSize () =
+        try
+            if Console.IsOutputRedirected then Some(80, 24)
+            else TerminalLayout.tryFrameSize Console.WindowWidth Console.WindowHeight
+        with
+        | :? ArgumentOutOfRangeException
+        | :? IO.IOException
+        | :? InvalidOperationException
+        | :? IndexOutOfRangeException -> None
     let mutable activityPageRows = 1
     let mutable workPageRows = 1
     let mutable agentPageRows = 1
@@ -1543,16 +1584,10 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                         (workDetailScroll + 1) lastDetail detail.Length)))
         draw.WriteLine(safe "Work is canonical; launch/session identifiers are evidence, not Work owners.")
 
-    let renderUnsafe () =
-        let width, height =
-            try
-                if Console.IsOutputRedirected then (80, 24)
-                else (max 1 (Console.WindowWidth - 1), max 1 Console.WindowHeight)
-            with _ -> (80, 24)
+    let renderForGeometryUnsafe width height =
         draw <- Frame(width, height)
         mouseHits.Clear()
         try
-            lastRenderError |> Option.iter (fun error -> draw.WriteLine ("Render warning: " + error))
             let compactHeader = draw.Height < 22
             if compactHeader then
                 draw.WriteLine $"Jarvis · {connectionLabel connectionState} · {serverHost}"
@@ -1645,20 +1680,21 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 renderActivityDetailsUnsafe width
 
                 renderPermissionPreviewUnsafe width
-            if draw.Present(previousFrame) then
+            if draw.Present(previousFrame, onFailure = recordRenderFailure) then
                 previousFrame <- Some draw
                 frameSize <- width, height
-                lastRenderError <- None
             else
-                // No hit region is considered valid until the frame is presented.
-                mouseHits.Clear()
-                previousFrame <- None
-                frameSize <- 0, 0
+                // Every failed/partial presentation forces a full clean repaint.
+                // Mouse hits from an unpresented layout are never actionable.
+                resetPresentationUnsafe()
         with ex ->
-            mouseHits.Clear()
-            previousFrame <- None
-            frameSize <- 0, 0
-            lastRenderError <- Some ex.Message
+            resetPresentationUnsafe()
+            recordRenderFailure ex
+
+    let renderUnsafe () =
+        match tryCurrentFrameSize() with
+        | Some(width, height) -> renderForGeometryUnsafe width height
+        | None -> resetPresentationUnsafe()
 
     let startChallengeRefreshUnsafe () =
         if not challengeRefreshing then
@@ -2290,7 +2326,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             while not shouldQuit && not cancellationToken.IsCancellationRequested do
                 try
                     if not Console.IsOutputRedirected then
-                        let size = (max 1 (Console.WindowWidth - 1), max 1 Console.WindowHeight)
+                        let size = tryCurrentFrameSize() |> Option.defaultValue (0, 0)
                         if size <> frameSize then
                             lock syncRoot renderUnsafe
                     if (mode = JobsMode || mode = JobDetailsMode || mode = JobCancelMode || mode = JobFilterMode)

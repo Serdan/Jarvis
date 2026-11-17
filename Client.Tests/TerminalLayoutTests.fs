@@ -31,3 +31,17 @@ let availableRowsAccountForPanelsAndTinyTerminals () =
     Assert.That(availableRows 35 10 13, Is.EqualTo(12))
     Assert.That(availableRows 8 12 5, Is.EqualTo(1))
     Assert.That(availableRows 30 7 -4, Is.EqualTo(23))
+
+[<Test>]
+let collapsedPhysicalTerminalsHaveNoDrawableFrame () =
+    for columns, rows in [ 0, 0; 0, 20; 1, 1; 1, 20; 2, 0; 80, 0 ] do
+        Assert.That(tryFrameSize columns rows, Is.EqualTo(None),
+                    $"A terminal of {columns}x{rows} must not manufacture geometry.")
+
+[<Test>]
+let frameGeometryReservesPhysicalLastColumn () =
+    for columns, rows in [ 2, 1; 3, 2; 81, 24; 160, 48 ] do
+        Assert.That(tryFrameSize columns rows, Is.EqualTo(Some(columns - 1, rows)))
+        Assert.That(matchesFrame (columns - 1) rows columns rows, Is.True)
+        Assert.That(matchesFrame columns rows columns rows, Is.False)
+        Assert.That(matchesFrame (columns - 1) rows (columns + 1) rows, Is.False)

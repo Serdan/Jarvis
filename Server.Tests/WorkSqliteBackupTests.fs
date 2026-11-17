@@ -445,3 +445,218 @@ let outbox_refuses_missing_spool_parent_instead_of_claiming_a_durable_capture ()
         Assert.That(Directory.Exists spool, Is.False)
         Assert.That(authority.CurrentSequence() |> ok, Is.EqualTo 2L)
     )
+
+
+// -----------------------------------------------------------------------------
+// F1a contract ONLY: these intentionally RED tests stay on an isolated branch.
+// They are not proof that arbitrary WorkSqliteAuthority.BodyJson is authenticated.
+// Once the B typed-ingress/provenance schema is independently accepted, replace
+// the raw staging fixtures below with its authenticated constructors before a
+// GREEN verdict. Do not merge intentionally RED tests into main.
+// -----------------------------------------------------------------------------
+
+[<Test; Category("F1aRed")>]
+let f1a_red_full_e0_g1_domain_and_account_state_require_lossless_two_project_restore () =
+    fixture (fun authority original target ->
+        // Current B admits these E0/G1-shaped bodies. This is an honest source
+        // gap fixture, NOT a substitute for future authenticated B production.
+        seed authority |> ignore
+        let rows =
+            [ mutation "project-alpha" WorkSqliteRecordKind.Project "authority" None
+                (makeValue """{"coverage":"Verified","queueVersion":7,"stageIds":["stage-a"],"roleIds":["role-a"],"launchIds":["launch-a"]}""")
+              mutation "project-beta" WorkSqliteRecordKind.Project "authority" None
+                (makeValue """{"coverage":"RecoveryRequired","queueVersion":8,"stageIds":[],"roleIds":[],"launchIds":[]}""")
+              mutation "project-alpha" WorkSqliteRecordKind.Work "work-a" None
+                (makeValue """{"state":"Open","priority":5,"dependencies":["work-b"],"proposalState":"Open"}""")
+              mutation "project-alpha" WorkSqliteRecordKind.Stage "stage-a" (Some 2L)
+                (makeValue """{"state":"Available","queueId":"queue-a","gate":"Clear","dependencies":[],"waivedDependencies":[],"availableSequence":3,"proposalState":"Open"}""")
+              mutation "project-alpha" WorkSqliteRecordKind.Launch "launch-a" None
+                (makeValue """{"state":"Claimed","roleId":"role-a","everClaimed":true,"stopRequested":false,"primaryWorkId":"stage-a"}""")
+              mutation "project-alpha" WorkSqliteRecordKind.Role "role-a" None
+                (makeValue """{"state":"Active","instructionsDigest":"role-digest","queues":["queue-a"]}""")
+              mutation "project-alpha" WorkSqliteRecordKind.Review "review-a" None
+                (makeValue """{"state":"Accepted","requestId":"review-a","decisionVersion":2}""")
+              mutation "project-alpha" WorkSqliteRecordKind.Integration "integration-a" None
+                (makeValue """{"state":"Integrated","targetRef":"refs/heads/main","submissionId":"submission-a"}""")
+              mutation "project-beta" WorkSqliteRecordKind.ExternalEffect "effect-b" (Some 1L)
+                ({ makeValue """{"status":"Unknown","originalOperationId":"00000000-0000-0000-0000-000000000001"}""" with
+                    ExternalEffect = WorkSqliteEffect.Unknown }) ]
+        authority.Commit(transact rows [ updateCapacity "global" (Some 2L) None 0 ])
+        |> ok |> ignore
+        // RED now: safeBody rejects real nested B/E/G records. Future GREEN must
+        // use trusted typed B ingress and retain every row/receipt/audit/capacity.
+        let bundle = WorkSqliteBackup.exportSnapshot original |> ok
+        let text = Encoding.UTF8.GetString(bundle.Files.["authority.json"])
+        Assert.That(text, Does.Contain("project-alpha"))
+        Assert.That(text, Does.Contain("project-beta"))
+        Assert.That(text, Does.Contain("role-digest"))
+        Assert.That(text, Does.Contain("originalOperationId"))
+        Assert.That(text, Does.Contain("queueVersion"))
+        Assert.That(WorkSqliteBackup.restoreEmpty bundle target |> restored, Is.EqualTo 3L)
+        let copied = WorkSqliteAuthority target
+        Assert.That(copied.CurrentSequence() |> ok, Is.EqualTo 3L)
+        Assert.That((copied.ReadCapacity "global" |> ok |> Option.get).Version, Is.EqualTo 3L)
+        Assert.That(WorkSqliteBackup.exportSnapshot target |> ok |> _.Files,
+                    Is.EqualTo(box bundle.Files))
+    )
+
+[<Test; Category("F1aRed")>]
+let f1a_red_original_repository_ref_and_commit_must_survive_typed_export_and_inverse () =
+    fixture (fun authority original target ->
+        let repositoryId = "repo-canonical-verified-123"
+        let sourceRef = "refs/heads/feature/authenticated-source"
+        let sourceSha = String.replicate 40 "a"
+        let body = sprintf """{"state":"Available","source":{"repositoryId":"%s","ref":"%s","commit":"%s"}}"""
+                           repositoryId sourceRef sourceSha
+        // Intentionally staging through B's *untrusted* current JSON ingress.
+        // The eventual positive test MUST reseed with Worker20's verified
+        // producer/source constructor; a caller-controlled source is not proof.
+        let tx = transact
+                    [ mutation "project-alpha" WorkSqliteRecordKind.Stage "stage-a" None
+                        (makeValue body) ] []
+        authority.Commit tx |> ok |> ignore
+        let bundle = WorkSqliteBackup.exportSnapshot original |> ok
+        let text = Encoding.UTF8.GetString(bundle.Files.["authority.json"])
+        Assert.That(text, Does.Contain(repositoryId))
+        Assert.That(text, Does.Contain(sourceRef))
+        Assert.That(text, Does.Contain(sourceSha))
+        WorkSqliteBackup.restoreEmpty bundle target |> restored |> ignore
+        Assert.That(WorkSqliteBackup.exportSnapshot target |> ok |> _.Files,
+                    Is.EqualTo(box bundle.Files))
+    )
+
+[<Test; Category("F1aRed")>]
+let f1a_red_existing_b_admissible_200_character_id_cannot_disappear_from_snapshot () =
+    fixture (fun authority original target ->
+        // B boundedId currently accepts up to 256 non-control characters;
+        // F1 safeId currently rejects >128. The reviewed B contract may instead
+        // narrow admission prospectively, but existing valid rows cannot vanish.
+        let id = "stage-" + String.replicate 194 "x"
+        authority.Commit(
+            transact [ mutation "project-alpha" WorkSqliteRecordKind.Stage id None
+                        (makeValue """{"state":"Available"}""") ] [])
+        |> ok |> ignore
+        let bundle = WorkSqliteBackup.exportSnapshot original |> ok
+        let text = Encoding.UTF8.GetString(bundle.Files.["authority.json"])
+        Assert.That(text, Does.Contain(id))
+        WorkSqliteBackup.restoreEmpty bundle target |> restored |> ignore
+        let copied = WorkSqliteAuthority target
+        Assert.That(copied.ReadRecord
+                        { ProjectId = "project-alpha"; Kind = WorkSqliteRecordKind.Stage; EntityId = id }
+                    |> ok |> Option.isSome, Is.True)
+    )
+
+[<Test; Category("F1aRed")>]
+let f1a_red_prepared_external_effect_keeps_original_operation_identity_and_fence () =
+    fixture (fun authority original target ->
+        let originalOperationId = "00000000-0000-0000-0000-000000000007"
+        let value =
+            { makeValue ($"""{{"status":"Prepared","originalOperationId":"{originalOperationId}"}}""") with
+                ExternalEffect = WorkSqliteEffect.Prepared }
+        authority.Commit(
+            transact [ mutation "project-beta" WorkSqliteRecordKind.ExternalEffect
+                        "effect-prepared" None value ] [])
+        |> ok |> ignore
+        let bundle = WorkSqliteBackup.exportSnapshot original |> ok
+        let text = Encoding.UTF8.GetString(bundle.Files.["authority.json"])
+        Assert.That(text, Does.Contain(originalOperationId))
+        Assert.That(text, Does.Contain("prepared"))
+        WorkSqliteBackup.restoreEmpty bundle target |> restored |> ignore
+        let copied = WorkSqliteAuthority target
+        let effect =
+            copied.ReadRecord
+                { ProjectId = "project-beta"; Kind = WorkSqliteRecordKind.ExternalEffect; EntityId = "effect-prepared" }
+            |> ok |> Option.get
+        Assert.That(effect.Value.ExternalEffect, Is.EqualTo WorkSqliteEffect.Prepared)
+        Assert.That(effect.Value.BodyJson, Does.Contain(originalOperationId))
+    )
+
+[<Test; Category("F1aRed")>]
+let f1a_red_rehashed_valid_json_from_untrusted_backup_root_cannot_authorize_restore () =
+    fixture (fun authority original target ->
+        seed authority |> ignore
+        let bundle = WorkSqliteBackup.exportSnapshot original |> ok
+        // Change to another *valid* state and recompute a canonical manifest.
+        // An integrity hash does not establish Git commit/repository authenticity.
+        let originalBytes = bundle.Files.["authority.json"]
+        let originalText = Encoding.UTF8.GetString(originalBytes)
+        let tamperedText = originalText.Replace("Claimed", "Open", StringComparison.Ordinal)
+        Assert.That(tamperedText, Is.Not.EqualTo(originalText))
+        let modifiedBytes = Encoding.UTF8.GetBytes(tamperedText)
+        let digest (bytes: byte[]) =
+            SHA256.HashData(bytes) |> Convert.ToHexString |> fun s -> s.ToLowerInvariant()
+        let modifiedManifest =
+            Encoding.UTF8.GetString(bundle.Files.["manifest.json"])
+                .Replace(digest originalBytes, digest modifiedBytes, StringComparison.Ordinal)
+            |> Encoding.UTF8.GetBytes
+        let forged =
+            { Files = bundle.Files.Add("authority.json", modifiedBytes)
+                                   .Add("manifest.json", modifiedManifest) }
+        // RED now: restoreEmpty accepts a self-consistent bundle without any
+        // authenticated trusted backup root. No production restore is invoked.
+        fail (WorkSqliteBackup.restoreEmpty forged target)
+        Assert.That(File.Exists(target), Is.False)
+    )
+
+[<Test; Category("F1aRed")>]
+let f1a_red_stale_restore_must_persist_a_boot_fence_before_any_new_commit () =
+    fixture (fun authority original target ->
+        seed authority |> ignore
+        let bundle = WorkSqliteBackup.exportSnapshot original |> ok
+        WorkSqliteBackup.restoreEmpty bundle target |> restored |> ignore
+        let restoredAuthority = WorkSqliteAuthority target
+        let next =
+            transact [ mutation "project-alpha" WorkSqliteRecordKind.Stage "stage-a"
+                        (Some 2L) (makeValue """{"state":"Available"}""") ] []
+        // RED now: a RequiresRecovery receipt is process-local evidence,
+        // not a persistent admission fence. G1b owns the implementation.
+        match restoredAuthority.Commit next with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Stale restored SQLite remains writable before persisted Recovery fence")
+    )
+
+
+[<Test; Category("F1aRed")>]
+let f1a_red_scheduled_verifier_needs_retained_reservation_role_permission_and_source_binding () =
+    fixture (fun authority original target ->
+        let verifierHash = String.replicate 64 "d"
+        let sourceSha = String.replicate 40 "a"
+        let body =
+            sprintf """{"state":"Claimed","credentialVerifierSha256":"%s","reservationId":"reservation-a","roleId":"role-a","allowedOperations":["agent.tool"],"source":{"repositoryId":"repo-authenticated-a","ref":"refs/heads/main","commit":"%s"}}"""
+                    verifierHash sourceSha
+        authority.Commit(
+            transact [ mutation "project-alpha" WorkSqliteRecordKind.Launch
+                        "launch-a" None (makeValue body) ]
+                     [ updateCapacity "global" None (Some 1) 1 ])
+        |> ok |> ignore
+        // RED: present F1 flat-body allowlist cannot retain any of these
+        // bindings. Final GREEN must use the B-authenticated verifier ADT,
+        // not assert that caller-supplied arbitrary JSON is a safe credential.
+        let bundle = WorkSqliteBackup.exportSnapshot original |> ok
+        let text = Encoding.UTF8.GetString(bundle.Files.["authority.json"])
+        Assert.That(text, Does.Contain(verifierHash))
+        Assert.That(text, Does.Contain("reservation-a"))
+        Assert.That(text, Does.Contain("role-a"))
+        Assert.That(text, Does.Contain("allowedOperations"))
+        Assert.That(text, Does.Contain("repo-authenticated-a"))
+        WorkSqliteBackup.restoreEmpty bundle target |> restored |> ignore
+        Assert.That(WorkSqliteBackup.exportSnapshot target |> ok |> _.Files,
+                    Is.EqualTo(box bundle.Files))
+    )
+
+[<Test>]
+let f1a_unknown_future_format_refuses_restore_instead_of_guessing_migration () =
+    fixture (fun authority original target ->
+        seed authority |> ignore
+        let bundle = WorkSqliteBackup.exportSnapshot original |> ok
+        let manifestText = Encoding.UTF8.GetString(bundle.Files.["manifest.json"])
+        let formatMarker = """ "formatVersion": 2"""
+        Assert.That(manifestText, Does.Contain(formatMarker))
+        let changed =
+            manifestText.Replace(formatMarker, """ "formatVersion": 999""",
+                                 StringComparison.Ordinal)
+            |> Encoding.UTF8.GetBytes
+        let unknownFormat = { Files = bundle.Files.Add("manifest.json", changed) }
+        fail (WorkSqliteBackup.restoreEmpty unknownFormat target)
+        Assert.That(File.Exists target, Is.False)
+    )

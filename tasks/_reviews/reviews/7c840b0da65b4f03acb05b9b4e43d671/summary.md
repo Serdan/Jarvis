@@ -1,0 +1,1 @@
+Review pinned docs branch 1d83581dd426a8cb3fd21094ff0e7e7e9439805d: new operator contract, WQ01-WQ11 migration plan, AGENTS.md update and old Work spec supersession. No source activation or cutover.

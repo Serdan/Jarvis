@@ -1,0 +1,1 @@
+One-file 133-line design at b6999a39 (base 3773830); verified only docs/design/work-original-git-client-publisher-p1c-plan-2026-11-17.md changed, source blobs match exact pinned commit, git diff --check clean. No source code changes, no remote fence, no C3 authorization.

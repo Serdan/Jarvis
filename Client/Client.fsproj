@@ -97,6 +97,7 @@
         <Compile Include="Modules\\WorkQueueReviewIntegrationAdapter.fs"/>
         <Compile Include="Modules\WorkQueueIntegrationSourceAuthority.fs"/>
         <Compile Include="Modules\WorkQueueReservationPermissions.fs"/>
+        <Compile Include="Modules\WorkQueueClaimBoundDirtySourcePolicy.fs"/>
         <Compile Include="Modules\\ChallengeWorkflow.fs"/>
         <Compile Include="Modules\\WorkQueueCanonicalSourceEvidence.fs"/>
         <Compile Include="Modules\\WorkQueueCanonicalCasBinder.fs"/>

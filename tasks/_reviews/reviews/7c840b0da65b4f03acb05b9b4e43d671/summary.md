@@ -1,1 +1,30 @@
-Review pinned docs branch 1d83581dd426a8cb3fd21094ff0e7e7e9439805d: new operator contract, WQ01-WQ11 migration plan, AGENTS.md update and old Work spec supersession. No source activation or cutover.
+# Independent G0 stateful Work architecture review
+
+**Reviewer:** Reviewer 1  
+**Request:** 7c840b0da65b4f03acb05b9b4e43d671 (`_reviews`)  
+**Frozen commit:** `1d83581dd426a8cb3fd21094ff0e7e7e9439805d`  
+**Frozen parent / pinned operator contract:** `bd2f5e18a0850fcdc1077ee5d9f7d163110f83a5`  
+**Diff base:** `9940fad1789f81006a8cd05db24d4798c6abe931`  
+**Scope:** Architecture/documentation G0 only; no implementation, deployment, Scheduler activation, or migration approval.  
+**Recommendation:** **Accepted** for G0 documentation, with subsequent G1–G6 engineering gates outstanding.
+
+## Independent verification
+
+1. **Exact frozen changeset.** Read source from the pinned SHA and reviewed four changed documentation files: `AGENTS.md`, legacy `docs/specs/work-queues-and-ephemeral-executions.md`, new `docs/specs/work-stateful-orchestration-2026-11-17.md`, and new `docs/specs/work-stateful-implementation-alignment-2026-11-17.md`. The frozen SHA is the direct child of the pinned operator contract. `git diff bd2f5e18..1d83581d -- docs/specs/work-stateful-orchestration-2026-11-17.md` was empty: the operator contract is unchanged. No executable source files changed. The named review worktree was clean and on `docs/work-architecture-stateful-20261117`. `git diff --check 9940fad1..1d83581d` returned exit 0 without output.
+
+2. **Contract coherence.** New target explicitly replaces remote per-mutation project/account Git-CAS with one authoritative SQLite transaction domain while preserving Git source/review/integration provenance and unknown-outcome safeguards. Asynchronous deterministic JSON-to-Git backup, strict JSON-to-empty-SQLite restore, and fenced Recovery after stale backups are identified as separate gates. It retains Project/System/Feature composition and independent parent acceptance; Draft → AwaitingLeadApproval → Open; blocking > Lead priority > FIFO; propagation only through unfinished required actionable descendants of genuinely blocking Systems; multi-queue role subscription and specialist-preserving feasible matching; one primary claim per launch; CSPRNG UUIDv4 with durable scheduled verifier versus device/project-bound transient manual grants.
+
+3. **WQ01–WQ11 alignment and source grounding.** The impact matrix distinguishes retained semantics from changed storage/host/producers across all WQ01–WQ11, composable graph, credentials, manual grants, priority, original producer, Agent retirement and current release gate. Verified named modules exist at the exact frozen SHA in Server/ and Client/ (including WorkQueueContracts, WorkQueueGitLedger, WorkQueueProducers, WorkQueueReceiptProducer, WorkCompositionGitLedger, AccountCapacityLedger, WorkQueueSchedulerHostLoop, and UI/migration adapters). Canonical `work-stateful-orchestration-alignment` task and parent `work-queues-ephemeral-executions` now link the exact design/matrix and explicitly distinguish G0 from activation. In-flight Worker 1/4/10/13 work is historical/transitional, not silently rebased or declared to implement SQLite.
+
+4. **Old-runtime default-off boundary.** `Client/Modules/WorkQueueSchedulerHostLoop.fs:43-49` explicitly has no background loop until `Start` and `defaultArg enabled false`. No `WorkQueueSchedulerHostLoop` reference in `Client/Program.fs`; cross-project preview advertises `RealCrossProjectReadOnlyDefaultOff`; `WorkQueuePracticalAdmission.fs` says there is no live host and explicit enablement is required. The changed `AGENTS.md` says Git remains live authority until independently reviewed backend/importer/backups/recovery and explicit operator cutover, with no dual live writers. The legacy spec gets an upfront superseding note without retroactively rewriting accepted reviews.
+
+5. **Actual local Release evidence.** On exact frozen `work-architecture-spec-20261117` checkout using `.NET 11.0.100`: `dotnet test Client.Tests/Client.Tests.fsproj -c Release --filter 'FullyQualifiedName~WorkQueueSchedulerHostLoopTests|FullyQualifiedName~WorkQueueReleaseAcceptanceTests' --logger 'console;verbosity=normal'` ran **20 discovered, 20 passed, 0 failed** (NUnit 4.6 adapter, total 11.02 s). The host default-off test, reentrancy, one-shot unknown-outcome, fake provider and cap-one source cases passed. Existing F# warnings are unrelated to this docs-only change. An earlier `--no-restore` invocation reported no discovered tests despite exit 0 and was correctly **not** counted as a pass.
+
+## Non-blocking follow-through / hold points
+
+- Backups must have measured RPO/retention, access controls/redaction appropriate to human-readable coordination history, corruption detection, bounded lag and alerting. Scheduled verifier restoration and backup privacy are not yet proven.
+- SQLite claim/capacity atomicity, source-effect outbox, restart safety, old-writer fencing across multiple client versions, migration/rollback, JSON restore, Recovery provenance, and independent security/UI tests remain G1–G6; none are demonstrated by the G0 document change or the 20 legacy tests.
+- Generated-stage priority inheritance, partial System blocker/acceptance edge cases, historical credential verifier portability, and schema/backup operational choices are explicitly unresolved in the contract. Resolve before their implementation gates; do not silently select defaults.
+- The canonical epic retains historical paragraphs referring to old FIFO/Git authority; its newer 2026-11-17 superseding sections and new docs are clear. When issuing new implementation tasks, replace or unmistakably label stale historical assumptions in each affected live task spec.
+
+**G0 decision:** No blocking finding in the frozen documentation. Accept docs-only architecture/migration alignment; do not treat this as G1–G6 approval, live system readiness, or authority to deploy, cut over, migrate, restart services, run hosted Actions or use Codex.

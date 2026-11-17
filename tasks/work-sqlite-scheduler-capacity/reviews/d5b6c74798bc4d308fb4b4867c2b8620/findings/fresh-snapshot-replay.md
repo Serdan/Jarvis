@@ -1,0 +1,13 @@
+# P1 — Durable operation replay fails after refreshing a successful reservation/claim
+
+**Frozen source:** `a8e8639b16596c2cbcbe93ee21e94f88496ff8af`
+
+**Location:** `Server/WorkSchedulerSqlite.fs:385-390, 475-484, 537-545`; replay receipt gate in `Server/WorkSqliteAuthority.fs:589-613`.
+
+**Problem:** The SQLite authority can return a stable replay receipt for the original command, but `reserve` and `claim` only reach `store.Commit` after they re-evaluate the *current* snapshot. After an initial successful `reserve(opId, launchId)`, a normal refreshed snapshot contains that launch and may have full account capacity: retrying the *same* operation returns `Incomplete("launch identity is already reserved...")` or `NoCapacity` before the durable receipt can be consulted. After an initial successful `claim(opId, launchId)`, the refreshed projection has `EverClaimed = true` and `PrimaryWorkId`, so the identical retry returns `Incomplete("requires registered, unstopped, never-claimed launch")`. This is an expected restart/recovery path, not a competing new operation.
+
+**Why this blocks acceptance:** E0 explicitly requires crash/replay and durable idempotency. The tests `reservation_replays_identically_without_second_capacity_lease` and `registered_launch_claims_exactly_once_and_original_operation_replays` reuse the *stale pre-commit* snapshot; both miss this case. Operators must be able to distinguish 'original already applied' from a new conflicting attempt without dispatching another launch or claiming another stage.
+
+**Required correction:** Provide a durable read/resolve path for the original operation ID and its bound launch/project/work result (or a safe explicit applied/uncertain result), before the fresh-operation eligibility checks; retain original command identity/fingerprint verification and never synthesize a successful *new* decision from the refreshed queue. Add negative tests that reconstruct fresh project/account/launch/stage state after a committed reservation and claim, then retry the exact same operation IDs after store reopen, including cap-one and already-claimed states. A changed operation payload with the same ID must still fail closed.
+
+**Validation:** Independently ran `dotnet test Server.Tests/Server.Tests.fsproj -c Release --no-restore --filter FullyQualifiedName~WorkSchedulerSqliteTests` at frozen worktree; 11 passed, 0 failed. This result does not cover the fresh-snapshot replay path.

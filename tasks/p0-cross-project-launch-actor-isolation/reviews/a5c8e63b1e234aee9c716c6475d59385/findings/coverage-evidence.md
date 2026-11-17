@@ -1,0 +1,9 @@
+# Blocking: P0 acceptance coverage and historic evidence boundary
+
+**Scope:** canonical P0 specification; `Client.Tests/BrowserSchedulesTests.fs:692-755`; `docs/audits/cross-project-browser-launch-actor-2026-11-17.md`.
+
+The two new tests pass independently in Release mode (2/2); they cover (a) command metadata projectName for an artificial Favn worktree vs Jarvis and (b) independent synthetic `AfterAgentIdle` deadlines for two Manager names in one scheduler. They do **not** test the end-to-end `BrowserRunInNewTab`/server activity-hint attribution or normalized key, nor the task-requested Ready->Working and yield->Ready transitions, same-project baseline, and failure/uncertain browser outcome behavior in a cross-project scenario. Existing generic fail-closed idle tests are valuable, but not proof that a wrongly attributed launch cannot mutate the other project's activity watermark.
+
+The audit explicitly lacks the actual historical call/receipt that might connect ledger sequence 6985 to the browser launch after Jarvis Manager's successful yield at sequence 6983. Its source analysis is appropriately conditional. No historic cause is established, and the Favn local-launch notification is not independently replayed or bound to exact invocation records. This uncertainty is not itself a code defect, but prevents claiming causal closure.
+
+**Required:** supply exact offline test coverage or references anchored at this commit for Ready/Working, same-project, cross-project normalized activity attribution, and failure/uncertain outcomes without new browser effects. Keep the historic event UNKNOWN unless new immutable receipts establish it; accept the docs/testing slice only as a bounded partial if P0 closure evidence remains absent. Do not invent successful sends, repeat uncertain launches or turn on live schedules.

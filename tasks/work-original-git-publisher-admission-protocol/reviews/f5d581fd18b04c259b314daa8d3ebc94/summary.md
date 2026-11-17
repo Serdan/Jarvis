@@ -1,0 +1,1 @@
+One design doc on integrated P0 a5cb190, exact frozen SHA 0a596a4; git show --check clean, branch published nonforce. Review host credential/ref coverage, CAS/barrier linearization, SQLite reuse and negative matrix. Live remote admission/C3 remain HARD NO-GO.

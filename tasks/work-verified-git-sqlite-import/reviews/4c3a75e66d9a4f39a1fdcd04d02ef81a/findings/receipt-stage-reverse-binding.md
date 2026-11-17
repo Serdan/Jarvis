@@ -1,0 +1,12 @@
+# P1 — Unfinalized stages can be imported as accepted review/integration evidence
+
+**Frozen source:** `76944ed50389b73b93ee307063049e8e80f6a368`
+**Paths:** `Server/WorkLegacyImportPreflight.fs:231-257,268-335,337-348,445-453`; `Server/WorkLegacyImportSqlite.fs:227-236`
+
+`inspect` validates a review or integration receipt against its stage **only when the stage already reports the corresponding finalized domain**, and separately accepts any non-orphan matching-kind receipt. It never requires the inverse: an `Accepted=true` review receipt or an integration record must correspond to a finalized/authorized stage with the same receipt and frozen source. Yet `acceptedEvidence` includes all accepted review receipt IDs and **all** integration receipt IDs, regardless of those stages' domains/states; the returned evidence index labels the review accepted, and the C1 materializer writes integration evidence as `WorkSqliteEffect.Observed`.
+
+**Concrete counterexample:** Start from the valid `reviewAndIntegration (twoProjects ())` fixture. Keep the `Reviews`, `Integrations`, and `Origins` lists unchanged but set the review stage `R` to `State=Available; Domain=Undecided`, and integration stage `T` to `State=Available; Domain=Undecided; IntegrationAuthorized=false`. With no reverse receipt checks, `WorkLegacyImportPreflight.inspect` returns `Ok` and its `FrozenReviews` still says accepted and `Integrations` still lists the completed commit. The same stray receipts can satisfy graph acceptance `EvidenceRef` even though the corresponding stages have never finalized.
+
+This is a G2 fail-closed issue: contradictory or incomplete legacy ledger material is treated as authoritative approved evidence. Require bidirectional binding of the decision and integration receipt, stage state/domain, subject, frozen SHA, exact target/integration evidence and authorization. If historical receipt/state lag is legitimate, return an explicit **unresolved** import gap rather than promoting the receipt to completed evidence. Add negative fixtures for these reverse mismatches, including graph acceptance references.
+
+This finding is about the C0/C1 submitted proof; it does not request live cutover or production writer-fence work.

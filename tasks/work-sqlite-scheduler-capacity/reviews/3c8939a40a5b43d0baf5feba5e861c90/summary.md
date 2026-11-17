@@ -1,0 +1,1 @@
+Scheduler replay fence in f9976ff931520994bc7dc216f07f301f0c49b29c; historical receipt only returns typed non-admission. Two-project post-Recovery tests, no extra capacity or sequence. .NET 11 Release focused 21/21 and full 441/441 PASS.

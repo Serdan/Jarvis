@@ -16,6 +16,7 @@
         <Compile Include="McpCapacityTests.fs"/>
         <Compile Include="WorkQueueContractTests.fs"/>
         <Compile Include="WorkRecoveryTests.fs"/>
+        <Compile Include="WorkRecoverySqliteTests.fs"/>
         <Compile Include="WorkSnapshotCodecTests.fs"/>
         <Compile Include="WorkLegacyImportPreflightTests.fs"/>
         <Compile Include="WorkLegacyImportFenceTests.fs"/>

@@ -33,6 +33,7 @@
         <Compile Include="WorkBlocking.fs"/>
         <Compile Include="WorkSchedulerSqlite.fs"/>
         <Compile Include="WorkSchedulerSqliteDispatch.fs"/>
+        <Compile Include="WorkRecoverySqlite.fs"/>
         <Compile Include="WorkQueueProducers.fs"/>
         <Compile Include="WorkQueueSchedulerPrototype.fs"/>
         <Compile Include="JarvisOptions.fs"/>

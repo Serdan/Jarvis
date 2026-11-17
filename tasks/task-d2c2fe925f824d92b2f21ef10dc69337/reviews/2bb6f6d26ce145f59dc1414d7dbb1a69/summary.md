@@ -1,0 +1,1 @@
+Server-owned account-global instruction snapshot with authenticated scoped read/update, startup preload, strict UTF-8 and 64 KiB bound, atomic CAS updates, explicit unavailable versus missing/empty states, hierarchy precedence and revision-aware delivery. Release Server.Tests 498/498 pass at frozen 40c6a9f3. No deployment.

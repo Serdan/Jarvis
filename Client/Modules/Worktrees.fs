@@ -68,6 +68,22 @@ let parsePorcelain (mainPath: string) (output: string) : Result<WorktreeInfo lis
         | _, Error e -> Error e) (Ok [])
     |> Result.map List.rev
 
+// A source ref is an identity, not a worktree pathname. Never guess from
+// a branch suffix or fall back to the main checkout on an ambiguous match.
+let findRegisteredBranchCheckout (sourceRef: string) (entries: WorktreeInfo list) =
+    let prefix = "refs/heads/"
+    if String.IsNullOrWhiteSpace sourceRef
+       || not (sourceRef.StartsWith(prefix, StringComparison.Ordinal)) then None
+    else
+        let branch = sourceRef.Substring(prefix.Length)
+        entries
+        |> List.filter (fun item ->
+            not item.IsMain && not item.IsDetached && not item.IsPrunable
+            && item.Branch = Some branch)
+        |> function
+           | [ item ] -> Some item.Path
+           | _ -> None
+
 let listWorktrees (cmd: ListWorktreesCommand) =
     effect {
         let! result = git cmd.ProjectName [ "worktree"; "list"; "--porcelain" ]

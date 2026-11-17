@@ -531,7 +531,12 @@ type CodeQualityHookReport =
 type CodeQualityHookSummary =
     { Trigger: string
       Reports: CodeQualityHookReport list
-      ModifiedFiles: string list }
+      ModifiedFiles: string list
+      // After-write hooks run after the original edit is durable. A hook
+      // failure must not disguise that persisted write as an absent change.
+      WritePersisted: bool option
+      PersistedAfterHash: string option
+      BlockingFailures: string list }
 
 type PatchFileResult =
     { Applied: bool

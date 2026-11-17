@@ -66,6 +66,41 @@ let private classifyProject command =
         | Some raw -> ProjectPaths.ProjectTarget.parse raw |> Result.map Checkout
 
 
+// Inbox activation is the supported Ready -> Working path. Resolve the
+// prewarm checkout from a unique registered branch, never the project main.
+let private prewarmFromInbox (rt: Runtime) projectName (inbox: Client.ReviewWorkflow.AgentInbox) =
+    match inbox.Focused with
+    | Some focus when inbox.Agent.Execution = "Working"
+                      && not (String.IsNullOrWhiteSpace focus.Attempt.SourceRef) ->
+        match ProjectPaths.resolveProjectContext projectName rt with
+        | Error _ -> ()
+        | Ok context ->
+            let (Client.FolderPath mainRoot) = ProjectPaths.ResolvedProject.mainRoot context
+            match ProjectPaths.WorktreeGit.list "git" mainRoot (TimeSpan.FromSeconds 10.) with
+            | Error _ -> ()
+            | Ok listing ->
+                match Worktrees.parsePorcelain mainRoot listing with
+                | Error _ -> ()
+                | Ok worktrees ->
+                    match Worktrees.findRegisteredBranchCheckout focus.Attempt.SourceRef worktrees with
+                    | None -> () // Unknown, detached or ambiguous source: defer.
+                    | Some checkoutPath ->
+                        let name = Path.GetFileName(Path.TrimEndingDirectorySeparator checkoutPath)
+                        let project = ProjectPaths.ResolvedProject.target context
+                                      |> ProjectPaths.ProjectTarget.projectName
+                        match ProjectPaths.resolveProjectContext (project + "::" + name) rt with
+                        | Error _ -> ()
+                        | Ok registered ->
+                            let (Client.FolderPath validated) =
+                                ProjectPaths.ResolvedProject.sourceRoot registered
+                            let comparison =
+                                if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase
+                                else StringComparison.Ordinal
+                            if String.Equals(Path.GetFullPath validated,
+                                             Path.GetFullPath checkoutPath, comparison) then
+                                CodeQualityHooks.prewarm validated
+    | _ -> ()
+
 let private loadAgentState (rt: Runtime) (project: string) (agentId: string) =
     match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt with
     | Error _ -> None
@@ -763,7 +798,14 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
         rt |> OrchestrationApi.OperatorConversationApi.read cmd |> serialize'
     | OperatorConversationWriteCommand cmd ->
         rt |> OrchestrationApi.OperatorConversationApi.write cmd |> serialize'
-    | TaskReadCommand cmd -> rt |> OrchestrationApi.TaskApi.read cmd |> serialize'
+    | TaskReadCommand cmd ->
+        let response = rt |> OrchestrationApi.TaskApi.read cmd
+        match response with
+        | Ok (:? Client.ReviewWorkflow.AgentInbox as inbox) when cmd.Action = "AgentInbox" ->
+            // Initialization remains asynchronous and repeated calls are idempotent.
+            try prewarmFromInbox rt cmd.ProjectName inbox with _ -> ()
+        | _ -> ()
+        response |> serialize'
     | ObserveAgentCommand cmd ->
         rt |> OrchestrationApi.AgentObservationApi.observe cmd
             (fun project agent -> rt.Tui.GetAgentLastSeen(project, agent)) |> serialize'

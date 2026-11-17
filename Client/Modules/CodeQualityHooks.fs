@@ -264,7 +264,7 @@ let hasMatchingHook (configured: Hook list) trigger paths =
     |> List.exists (fun hook ->
         hook.Trigger = trigger && (paths |> List.exists (matchesPath hook)))
 
-let run (root: string) (trigger: HookTrigger) (paths: string list) : Client.Result<HookSummary option> =
+let private evaluate (root: string) (trigger: HookTrigger) (paths: string list) : Client.Result<HookSummary option> =
     match load root with
     | Error message -> Error(Client.ValidationError message)
     | Ok configured ->
@@ -296,18 +296,56 @@ let run (root: string) (trigger: HookTrigger) (paths: string list) : Client.Resu
                                   Message = message; Modified = false
                                   FormattingEdits = 0; Diagnostics = [] }
                         reports.Add report
-            if failures.Count > 0 then
-                Error(Client.ValidationError("Code-quality hook blocked operation: " + String.Join("; ", failures)))
-            else
-                Ok(Some
-                    { Trigger = if trigger = AfterWrite then "after-write" else "pre-commit"
-                      Reports = List.ofSeq reports
-                      ModifiedFiles =
-                        reports
-                        |> Seq.filter (fun report -> report.Modified)
-                        |> Seq.map (fun report -> report.Path)
-                        |> Seq.distinct
-                        |> Seq.toList })
+            Ok(Some
+                { Trigger = if trigger = AfterWrite then "after-write" else "pre-commit"
+                  Reports = List.ofSeq reports
+                  ModifiedFiles =
+                    reports
+                    |> Seq.filter (fun report -> report.Modified)
+                    |> Seq.map (fun report -> report.Path)
+                    |> Seq.distinct
+                    |> Seq.toList
+                  WritePersisted = None
+                  PersistedAfterHash = None
+                  BlockingFailures = List.ofSeq failures })
+
+let run root trigger paths =
+    evaluate root trigger paths
+    |> Result.bind (function
+        | Some report when not report.BlockingFailures.IsEmpty ->
+            Error(Client.ValidationError(
+                "Code-quality hook blocked operation: " + String.Join("; ", report.BlockingFailures)))
+        | report -> Ok report)
+
+let private observedHash root path =
+    try
+        match validateFile root path with
+        | Error _ -> None
+        | Ok absolute ->
+            use stream = File.OpenRead absolute
+            let digest = System.Security.Cryptography.SHA256.HashData(stream)
+            Some("sha256:" + Convert.ToHexString(digest).ToLowerInvariant())
+    with _ -> None
+
+// The original write has already persisted when this is called. Return a
+// structured partial-success result, even when the formatter failed.
+let runAfterWrite root path : Client.Result<HookSummary option> =
+    match evaluate root AfterWrite [ path ] with
+    | Ok None -> Ok None
+    | Ok(Some report) ->
+        Ok(Some { report with WritePersisted = Some true
+                              PersistedAfterHash = observedHash root path })
+    | Error problem ->
+        let message = sprintf "%A" problem
+        Ok(Some
+            { Trigger = "after-write"
+              Reports = [ { Hook = "code-quality"; Path = path; Status = "blocking-failure"
+                            Message = message; Modified = false
+                            FormattingEdits = 0; Diagnostics = [] } ]
+              ModifiedFiles = []
+              WritePersisted = Some true
+              PersistedAfterHash = observedHash root path
+              BlockingFailures = [ message ] })
 
 let prewarm root =
     match load root with

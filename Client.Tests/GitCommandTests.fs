@@ -245,3 +245,96 @@ let ``unapproved pre-commit hooks fail before staging any changes`` () =
         gitOutput context [ "diff"; "--cached"; "--name-only" ] |> shouldEqual ""
     finally
         Directory.Delete(root, true)
+
+
+[<Test; NonParallelizable>]
+let ``nonmatching pre-commit paths do not require Roslyn approval`` () =
+    let root, project = createTempProject ()
+    let previous = Environment.GetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS")
+    try
+        Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", null)
+        let context = TestContext root
+        initRepo context
+        File.WriteAllText(Path.Combine(project, ".jarvis.json"),
+            """{"codeQuality":{"hooks":[{"enabled":true,"name":"csharp","trigger":"pre-commit","adapter":"roslyn-format","extensions":[".cs"]}]}}""")
+        File.WriteAllText(Path.Combine(project, "README.md"), "notes\n")
+        let cmd =
+            { ProjectName = "Project1"; Paths = [ "README.md" ]
+              Message = "Commit documentation only"; Body = None; AllowEmpty = false }
+        match gitCommit cmd context with
+        | Ok _ -> ()
+        | Error error -> Assert.Fail(sprintf "Nonmatching commit was blocked: %A" error)
+        gitOutput context [ "show"; "HEAD:README.md" ] |> shouldEqual "notes"
+        gitOutput context [ "show"; "--format="; "--name-only"; "HEAD" ] |> shouldEqual "README.md"
+    finally
+        Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", previous)
+        Directory.Delete(root, true)
+
+
+[<Test; NonParallelizable>]
+let ``after-write formatter failure reports the original persisted write`` () =
+    let root, project = createTempProject ()
+    let previous = Environment.GetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS")
+    try
+        let context = TestContext root
+        File.WriteAllText(Path.Combine(project, ".jarvis.json"),
+            """{"codeQuality":{"hooks":[{"enabled":true,"name":"format","trigger":"after-write","adapter":"roslyn-format","failure":"blocking"}]}}""")
+        Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", project)
+        let content = "source\u0000cannot-format"
+        let cmd =
+            { ProjectName = "Project1"; FilePath = "Broken.cs"; Content = content
+              FileWriteMode = Write; ExpectedHash = None; CreateParents = None }
+        match Client.ProjectBrowser.writeFile cmd context with
+        | Ok(Some outcome) ->
+            outcome.WritePersisted |> shouldEqual (Some true)
+            outcome.PersistedAfterHash.IsSome |> shouldEqual true
+            outcome.BlockingFailures.IsEmpty |> shouldEqual false
+            outcome.Reports.Head.Status |> shouldEqual "blocking-failure"
+        | other -> Assert.Fail(sprintf "Expected persisted write plus failure report, got %A" other)
+        File.ReadAllText(Path.Combine(project, "Broken.cs")) |> shouldEqual content
+    finally
+        Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", previous)
+        Directory.Delete(root, true)
+
+[<Test; NonParallelizable>]
+let ``pre-commit Roslyn formatting fixes only selected source in committed tree`` () =
+    // This is an opt-in external-tool integration test. Hermetic test runners
+    // may intentionally isolate HOME from the global Roslyn installation.
+    // CI must supply the exact operator-installed managed Roslyn DLL path.
+    if String.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("JARVIS_ROSLYN_LSP_DLL")) then
+        Assert.Ignore("Set JARVIS_ROSLYN_LSP_DLL to run the live Roslyn pre-commit integration test.")
+    let root, project = createTempProject ()
+    let previous = Environment.GetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS")
+    try
+        let context = TestContext root
+        initRepo context
+        File.WriteAllText(Path.Combine(project, "README.md"), "base\n")
+        expectGitSuccess context [ "add"; "README.md" ]
+        expectGitSuccess context [ "commit"; "-m"; "Base" ]
+        File.WriteAllText(Path.Combine(project, ".jarvis.json"),
+            """{"codeQuality":{"hooks":[{"enabled":true,"name":"format","trigger":"pre-commit","adapter":"roslyn-format","failure":"blocking","extensions":[".cs"]}]}}""")
+        let original = "namespace Demo{class C{void M(){int x=1;}}}\n"
+        let selected = Path.Combine(project, "Selected.cs")
+        File.WriteAllText(selected, original)
+        File.WriteAllText(Path.Combine(project, "unrelated.txt"), "staged but excluded\n")
+        expectGitSuccess context [ "add"; "unrelated.txt" ]
+        Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", project)
+        let commit = { ProjectName = "Project1"; Paths = [ "Selected.cs" ]
+                       Message = "Format selected"; Body = None; AllowEmpty = false }
+        match gitCommit commit context with
+        | Ok result ->
+            match result.Hooks with
+            | Some report ->
+                report.BlockingFailures |> shouldEqual []
+                report.ModifiedFiles |> shouldContain "Selected.cs"
+            | None -> Assert.Fail("Expected an active pre-commit formatter")
+        | Error error -> Assert.Fail(sprintf "Selected hooked commit failed: %A" error)
+        let committed = gitOutput context [ "show"; "HEAD:Selected.cs" ]
+        committed |> shouldNotEqual (original.Trim())
+        File.ReadAllText(selected).Trim() |> shouldEqual committed
+        gitOutput context [ "show"; "--format="; "--name-only"; "HEAD" ] |> shouldEqual "Selected.cs"
+        gitOutput context [ "diff"; "--cached"; "--name-only" ] |> shouldEqual "unrelated.txt"
+        File.ReadAllText(Path.Combine(project, "unrelated.txt")) |> shouldEqual "staged but excluded\n"
+    finally
+        Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", previous)
+        Directory.Delete(root, true)

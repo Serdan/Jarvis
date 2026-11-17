@@ -265,9 +265,15 @@ module private Core =
                 let! (FolderPath root) = resolveSourceWorkingDirectory source None
                 let! configured = fun _ ->
                     CodeQualityHooks.load root |> Result.mapError Client.ValidationError
+                // Nonmatching single-file commits must not require analyzer
+                // approval. Directory selections may contain hooked files and
+                // are conservatively guarded before staging.
                 let preCommitEnabled =
                     not safePaths.IsEmpty
-                    && (configured |> List.exists (fun hook -> hook.Trigger = CodeQualityHooks.PreCommit))
+                    && (CodeQualityHooks.hasMatchingHook configured CodeQualityHooks.PreCommit safePaths
+                        || ((configured |> List.exists (fun hook -> hook.Trigger = CodeQualityHooks.PreCommit))
+                            && (safePaths |> List.exists (fun path ->
+                                Directory.Exists(Path.Combine(root, path))))))
                 do!
                     if preCommitEnabled then fun _ -> CodeQualityHooks.requireApproval root
                     else fun _ -> Ok()

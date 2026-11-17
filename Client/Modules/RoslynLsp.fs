@@ -125,6 +125,16 @@ let private readFrame (stream: Stream) =
     document.RootElement.Clone()
 
 let private roslynExecutable () =
+    // Explicit operator-owned tool selection supports hermetic runners whose
+    // HOME is isolated from the globally installed dotnet tool store. The
+    // repository hook config cannot set or control this executable.
+    let overrideDll = Environment.GetEnvironmentVariable("JARVIS_ROSLYN_LSP_DLL")
+    let approvedOverride =
+        not (String.IsNullOrWhiteSpace overrideDll)
+        && Path.IsPathFullyQualified overrideDll
+        && String.Equals(Path.GetFileName overrideDll, "roslyn-language-server.dll",
+                         StringComparison.OrdinalIgnoreCase)
+        && File.Exists overrideDll
     // The dotnet global-tool shim can point at the system's old .NET runtime
     // even when a newer SDK is selected through mise. Run the managed DLL
     // through the user's dotnet command when a global installation exists.
@@ -135,7 +145,7 @@ let private roslynExecutable () =
             Directory.EnumerateFiles(store, "roslyn-language-server.dll", SearchOption.AllDirectories)
             |> Seq.tryHead
         else None
-    match dll with
+    match if approvedOverride then Some overrideDll else dll with
     | Some path -> "dotnet", [ path ]
     | None -> "roslyn-language-server", []
 

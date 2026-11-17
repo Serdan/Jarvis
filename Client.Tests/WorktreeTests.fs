@@ -222,3 +222,20 @@ let ``active job in a selected worktree blocks safe removal`` () =
                 | Error e -> Assert.Fail($"Inspection failed: {e}")
             finally
                 Client.JobManager.cancelJob { ProjectName = "Project1::running-job"; JobId = id } context |> shouldEqual (Ok()))
+
+
+[<Test>]
+let ``prewarm branch resolution requires one registered nonmain worktree`` () =
+    let sample =
+        "worktree /tmp/quality-main\nHEAD abc\nbranch refs/heads/main\n\n" +
+        "worktree /tmp/quality-branch\nHEAD def\nbranch refs/heads/feature/quality\n\n"
+    match parsePorcelain "/tmp/quality-main" sample with
+    | Ok entries ->
+        findRegisteredBranchCheckout "refs/heads/feature/quality" entries
+        |> shouldEqual (Some "/tmp/quality-branch")
+        findRegisteredBranchCheckout "refs/heads/main" entries |> shouldEqual None
+        findRegisteredBranchCheckout "" entries |> shouldEqual None
+        findRegisteredBranchCheckout "feature/quality" entries |> shouldEqual None
+        findRegisteredBranchCheckout "refs/heads/feature/quality" (entries @ List.tail entries)
+        |> shouldEqual None
+    | Error error -> Assert.Fail(error)

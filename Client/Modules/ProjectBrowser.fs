@@ -1217,7 +1217,7 @@ let private withAfterWriteHooks source path skip (operation: IO<'rt, 'a>) =
         let! result = operation
         if skip then return result, None
         else
-            let! hooks = fun _ -> CodeQualityHooks.run root CodeQualityHooks.AfterWrite [ path ]
+            let! hooks = fun _ -> CodeQualityHooks.runAfterWrite root path
             return result, hooks
     }
 

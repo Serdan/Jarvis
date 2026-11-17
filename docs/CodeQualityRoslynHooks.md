@@ -26,6 +26,12 @@ and the corresponding .NET runtime. It supports a managed DLL launcher through t
 `dotnet` command when the global shim resolves an obsolete system runtime. No repository
 configuration may name an executable, argument list, script, package, URL, or shell.
 
+For isolated integration-test runners whose HOME does not contain the global
+dotnet tool store, the operator can set `JARVIS_ROSLYN_LSP_DLL` to the full path
+of an installed `roslyn-language-server.dll`. This selects only the Roslyn
+managed entrypoint; project files cannot configure or override its location.
+The live selected-file pre-commit NUnit test runs only when this variable is set.
+
 ## Example project configuration
 
 Add the `codeQuality` property to the existing `.jarvis.json` without removing
@@ -60,8 +66,12 @@ Add the `codeQuality` property to the existing `.jarvis.json` without removing
 
 Each hook is independently enabled. Only the `roslyn-format` adapter is implemented.
 The failure policy is `blocking` or `advisory` (default blocking). An advisory
-failure is returned in the structured `Hooks.Reports` result; a blocking failure stops the
-operation with the hook and path in the error. The output also lists modified files and
+failure is returned in the structured `Hooks.Reports` result; a blocking pre-commit
+failure stops the commit with the hook and path in the error. An **after-write**
+formatting failure cannot erase a successful original write: it returns a
+structured `Hooks` result with `WritePersisted = true`, an observed
+`PersistedAfterHash` when available, and `BlockingFailures`. Callers must
+inspect that outcome rather than blindly retrying the write. The output lists modified files and
 formatting edit counts; Roslyn diagnostic messages are best-effort asynchronous snapshots,
 not a full compiler/analyzer diagnostic result.
 
@@ -95,10 +105,17 @@ atomic edit lock contract.
 
 ## Lifecycle and constraints
 
-When a worktree-scoped resume supplies a validated checkout, Jarvis prewarms the
-configured/approved Roslyn session without blocking the resume response. Otherwise
-initialization occurs on the first matching hook. Sessions are cleaned up on Git
+On the supported `agent_inbox` Ready-to-Working transition, Jarvis resolves the
+focused attempt's exact source branch to one non-main Git-registered worktree,
+validates its selector, and prewarms the configured/approved Roslyn session
+asynchronously. Unknown or ambiguous source refs never select the main checkout.
+An inbox read after source binding can also prewarm it; initialization
+otherwise occurs on the first matching hook. Sessions are cleaned up on Git
 worktree removal and JarvisClient shutdown. Missing/unapproved hooks do not launch a server.
+
+A configured pre-commit C# hook does not require approval for a nonmatching
+single-file commit (such as `README.md`); directory selections remain
+conservatively gated until their actual contents are enumerated.
 
 This implementation covers C# Roslyn formatting; it does **not** auto-fix arbitrary
 diagnostics or implement a complete LSP code-action selection service. It does not
@@ -120,6 +137,11 @@ activity-persistence permission errors. Do not treat that run as passing.
 These checks establish basic two-root formatting and hook behavior, **not**
 distinct project/analyzer compilation state, Wayfold small/large parity against
 `dotnet format`, or daemon RSS.
+
+The post-review focused Release suite passed **40/40** with an explicitly
+selected installed `JARVIS_ROSLYN_LSP_DLL`. The live test verified that a
+selected-file pre-commit formatting fix landed in the commit while unrelated
+staged content stayed excluded. These checks do not establish full acceptance.
 
 ## Suggested validation
 

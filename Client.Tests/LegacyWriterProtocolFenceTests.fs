@@ -523,3 +523,106 @@ type LegacyWriterProtocolFenceTests() =
                              "for-each-ref"; "--format=%(refname)"; "refs/heads/jarvis-review" ]
             Assert.That(after, Is.EqualTo(before), "Frozen review must not publish orphan Git refs")
             Assert.That(after.Contains(managed, StringComparison.Ordinal), Is.False))
+
+    [<Test>]
+    member _.FourConcreteDirectReplayFastPathsRespectFrozenPreparingAndInvalidHostProof() =
+        withFixture (fun f ->
+            let sourceHead = git f.ProjectOne.RepositoryPath [ "rev-parse"; "HEAD" ]
+            let targetRef = "refs/heads/main"
+            let reviewId = Guid.NewGuid()
+            let reviewSubmitId = Guid.NewGuid()
+            let reviewReplaceId = Guid.NewGuid()
+            let reviewSubmit binding =
+                ReviewWorkflow.submitBranchReview binding reviewSubmitId "_reviews" "Historical"
+                    reviewId "" sourceHead "Original legacy review" "" ""
+            let reviewReplace binding =
+                ReviewWorkflow.replaceBranchReview binding reviewReplaceId "_reviews"
+                    "Historical" reviewId 1 "" sourceHead "Replaced legacy review"
+            Assert.That((reviewSubmit f.ProjectOne |> success).AlreadyApplied, Is.False)
+            Assert.That((reviewReplace f.ProjectTwo |> success).AlreadyApplied, Is.False)
+
+            let taskId = "wq10-direct-replay"
+            ReviewWorkflow.registerAgent f.ProjectOne (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.registerAgent f.ProjectOne (Guid.NewGuid()) "Reviewer"
+            |> success |> ignore
+            ReviewWorkflow.createTask f.ProjectOne (Guid.NewGuid()) taskId "Direct replay"
+            |> success |> ignore
+            let acceptedReviewId = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReview f.ProjectOne (Guid.NewGuid()) taskId
+                "Owner" acceptedReviewId "" sourceHead "Accepted integration proof" "" targetRef
+            |> success |> ignore
+            ReviewWorkflow.claimBranchReview f.ProjectTwo (Guid.NewGuid()) taskId
+                acceptedReviewId "Reviewer" 1
+            |> success |> ignore
+            ReviewWorkflow.decideBranchReview f.ProjectOne (Guid.NewGuid()) taskId
+                acceptedReviewId "Reviewer" 2 Accept
+            |> success |> ignore
+
+            let submissionId = Guid.NewGuid()
+            let integrationSubmitId = Guid.NewGuid()
+            let integrationCompleteId = Guid.NewGuid()
+            let integrationSubmit binding =
+                ReviewWorkflow.submitIntegration binding integrationSubmitId taskId "Owner"
+                    submissionId "" "" (acceptedReviewId.ToString("N")) targetRef
+            let integrationComplete binding =
+                ReviewWorkflow.completeIntegration binding integrationCompleteId taskId "Reviewer"
+                    submissionId sourceHead
+            Assert.That((integrationSubmit f.ProjectTwo |> success).AlreadyApplied, Is.False)
+            Assert.That((integrationComplete f.ProjectOne |> success).AlreadyApplied, Is.False)
+
+            let replay binding =
+                [ "submit review", reviewSubmit binding
+                  "replace review", reviewReplace binding
+                  "submit integration", integrationSubmit binding
+                  "complete integration", integrationComplete binding ]
+            // A disabled fence and an enabled original LegacyActive epoch must
+            // retain the exact prior idempotent receipts from both real clones.
+            for binding in [ f.ProjectOne; f.ProjectTwo ] do
+                for name, outcome in replay binding do
+                    Assert.That((success outcome).AlreadyApplied, Is.True, name)
+            activateHost f (scope f f.AccountTwo f.ProjectTwo)
+            for binding in [ f.ProjectOne; f.ProjectTwo ] do
+                for name, outcome in replay binding do
+                    Assert.That((success outcome).AlreadyApplied, Is.True, name)
+
+            fixtureAccountPhase f "Frozen" |> ignore
+            let frozen = scope f f.AccountTwo f.ProjectTwo
+            activateHost f frozen
+            let projectHead () =
+                git f.Root [ "--git-dir=" + f.ProjectRemote
+                             "rev-parse"; "refs/heads/jarvis-orchestration" ]
+            let managedRefs () =
+                git f.Root [ "--git-dir=" + f.ProjectRemote
+                             "for-each-ref"; "--format=%(refname) %(objectname)"
+                             "refs/heads/jarvis-review"; "refs/heads/jarvis-integration" ]
+            let originalHead, originalRefs = projectHead (), managedRefs ()
+            for binding in [ f.ProjectOne; f.ProjectTwo ] do
+                for _, outcome in replay binding do
+                    outcome |> Result.map ignore |> expectDirectFenced
+
+            fixtureAccountPhase f "Preparing" |> ignore
+            // The host's old account head must not authorize a replay.
+            for binding in [ f.ProjectOne; f.ProjectTwo ] do
+                for _, outcome in replay binding do
+                    outcome |> Result.map ignore
+                    |> expectDirectUnknown "AccountEpochHeadChanged"
+            activateHost f (scope f f.AccountTwo f.ProjectTwo)
+            for binding in [ f.ProjectOne; f.ProjectTwo ] do
+                for _, outcome in replay binding do
+                    outcome |> Result.map ignore |> expectDirectFenced
+
+            let forged = { f.ProjectTwo with LedgerId = Guid.NewGuid() }
+            for _, outcome in replay forged do
+                outcome |> Result.map ignore
+                |> expectDirectUnknown "DirectProjectAuthorityMismatch"
+            Environment.SetEnvironmentVariable(LegacyWriterProtocolFence.HostBindingEnvironment,
+                                               Path.Combine(f.Root, "missing-host-binding.json"))
+            for binding in [ f.ProjectOne; f.ProjectTwo ] do
+                for _, outcome in replay binding do
+                    outcome |> Result.map ignore |> expectDirectUnknown "OldWriterFenceUnknown"
+
+            Assert.That(projectHead (), Is.EqualTo originalHead,
+                        "Old UUID replays may not move the original project ledger ref")
+            Assert.That(managedRefs (), Is.EqualTo originalRefs,
+                        "Old UUID replays may not publish source refs"))

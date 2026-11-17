@@ -1236,7 +1236,7 @@ module ReviewWorkflow =
                             {| taskId = taskId; submissionId = submissionId
                                sourceRef = sourceRef; submittedCommit = submittedCommit
                                reviewId = reviewId; targetRef = targetRef |}
-            match LedgerStore.findApplied binding action with
+            match LegacyDirectWriterFence.findAppliedForLegacyWrite binding action with
             | Error failure -> Error failure
             | Ok(Some applied) -> Ok applied
             | Ok None -> result {
@@ -1310,7 +1310,7 @@ module ReviewWorkflow =
             let action = intent operationId actorId "CompleteIntegration"
                            {| taskId = taskId; submissionId = submissionId
                               integratedCommit = integratedCommit |}
-            match LedgerStore.findApplied binding action with
+            match LegacyDirectWriterFence.findAppliedForLegacyWrite binding action with
             | Error failure -> Error failure
             | Ok(Some applied) -> Ok applied
             | Ok None -> result {
@@ -3383,7 +3383,7 @@ module ReviewWorkflow =
                             {| taskId = taskId; reviewId = id; ownerId = requesterId
                                sourceRef = sourceRef; sourceHead = sourceHead; summary = summary
                                kind = purpose; targetRef = targetRef |}
-            match LedgerStore.findApplied binding action with
+            match LegacyDirectWriterFence.findAppliedForLegacyWrite binding action with
             | Error failure -> Error failure
             | Ok(Some applied) -> Ok applied
             | Ok None -> result {
@@ -3434,7 +3434,7 @@ module ReviewWorkflow =
                             {| taskId = taskId; reviewId = id; requesterId = requesterId
                                expectedVersion = expectedVersion
                                sourceRef = sourceRef; sourceHead = sourceHead; summary = summary |}
-            match LedgerStore.findApplied binding action with
+            match LegacyDirectWriterFence.findAppliedForLegacyWrite binding action with
             | Error failure -> Error failure
             | Ok(Some applied) -> Ok applied
             | Ok None -> result {

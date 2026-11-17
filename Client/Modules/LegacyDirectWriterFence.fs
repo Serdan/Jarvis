@@ -89,9 +89,21 @@ module LegacyDirectWriterFence =
         match LegacyWriterProtocolFence.readHostScope () with
         | Error reason -> Error(invalid reason)
         | Ok None -> Ok ()
+        | Ok(Some scope) when not (LegacyWriterProtocolFence.scopeValid scope) ->
+            Error(invalid "FenceProtocolOrAuthorityInvalid")
+        | Ok(Some scope) when not (LegacyWriterProtocolFence.sameProjectAuthority scope.Project binding) ->
+            Error(invalid "DirectProjectAuthorityMismatch")
         | Ok(Some scope) ->
             LedgerStore.fetch binding
             |> Result.bind (authorize scope binding)
+
+    // LedgerStore.findApplied returns a prior success without reaching the
+    // transaction planner. Direct workflows must check the enabled host fence
+    // before inspecting an old UUID, including when no ref is published.
+    // Default-off and LegacyActive keep their original idempotency semantics.
+    let findAppliedForLegacyWrite (binding: LedgerBinding) (intent: LedgerIntent) =
+        preflightSourcePublication binding
+        |> Result.bind (fun () -> LedgerStore.findApplied binding intent)
 
     let transact (binding: LedgerBinding) (intent: LedgerIntent)
                  (plan: LedgerSnapshot -> Result<LedgerFileChange list, LedgerFailure>) =

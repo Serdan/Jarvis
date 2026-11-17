@@ -406,7 +406,9 @@ module internal WorkSchedulerSqlite =
     /// E0 admission: rank globally by D, preserve existing specialist credits,
     /// then atomically reserve the account token and create the project launch.
     /// The immutable caller operationId is also the SQLite replay receipt.
-    let private reserveFresh (store: WorkSqliteAuthority) (snapshot: SqliteSchedulerSnapshot)
+    // Internal commit path; tests exercise a caller that passed its receipt
+    // preflight before a concurrent commit and Recovery fence.
+    let internal reserveFresh (store: WorkSqliteAuthority) (snapshot: SqliteSchedulerSnapshot)
                 (operationId: Guid) launchId : Result<SqliteSchedulerOutcome, SqliteSchedulerError> =
         if operationId = Guid.Empty || String.IsNullOrWhiteSpace launchId then
             fail "original operation/launch identity is missing"
@@ -489,6 +491,11 @@ module internal WorkSchedulerSqlite =
                           Capacities = [ accountMutation snapshot.Account 1 ] }
                     match store.Commit command with
                     | Error error -> Error(SqliteSchedulerError.Storage error)
+                    // Receipt preflight and Commit are distinct transactions.
+                    // SQLite can return an immutable replay receipt before
+                    // checking newer Recovery/STOP guards. Never admit it.
+                    | Ok receipt when receipt.Replayed ->
+                        Error SqliteSchedulerError.HistoricalReceiptNotAdmission
                     | Ok receipt ->
                         Ok { Receipt = receipt
                              ProjectId = p.Id; RoleId = role.Id; LaunchId = launchId
@@ -497,7 +504,7 @@ module internal WorkSchedulerSqlite =
 
     /// A registered launch gets at most one primary claim. This does NOT
     /// release account capacity or execute external effects.
-    let private claimFresh (store: WorkSqliteAuthority) (p: SqliteSchedulerProject)
+    let internal claimFresh (store: WorkSqliteAuthority) (p: SqliteSchedulerProject)
               (operationId: Guid) launchId : Result<SqliteSchedulerOutcome, SqliteSchedulerError> =
         if operationId = Guid.Empty then fail "claim operation ID missing"
         else
@@ -569,6 +576,8 @@ module internal WorkSchedulerSqlite =
                                   Capacities = [] }
                             match store.Commit command with
                             | Error error -> Error(SqliteSchedulerError.Storage error)
+                            | Ok receipt when receipt.Replayed ->
+                                Error SqliteSchedulerError.HistoricalReceiptNotAdmission
                             | Ok receipt ->
                                 Ok { Receipt = receipt
                                      ProjectId = p.Id

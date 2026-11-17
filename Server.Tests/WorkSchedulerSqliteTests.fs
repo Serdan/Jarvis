@@ -918,3 +918,70 @@ let post_recovery_same_uuid_two_project_claim_never_renews_admission () =
         Assert.That(store.ReadRecord(key WorkSqliteRecordKind.Launch "beta" registered.Id)
                     |> ok |> Option.isNone, Is.True)
     )
+
+[<Test>]
+let commit_time_reservation_replay_after_recovery_is_not_new_admission () =
+    withStore (fun store path ->
+        let a = dispatchProject "alpha" (String.replicate 40 "a")
+        let b = dispatchProject "beta" (String.replicate 40 "b")
+        let snapshot = seed store 2 0 [ a; b ]
+        let operationId = Guid.NewGuid()
+        let first = WorkSchedulerSqlite.reserve store snapshot operationId "launch-alpha" |> ok
+        Assert.That(first.Receipt.Replayed, Is.False)
+        installDurableRecoveryCoverage store "alpha"
+        let fencedSequence = store.CurrentSequence() |> ok
+
+        // Deterministic interleaving: contender B's ReadReceipt returned None
+        // before contender A committed; A then committed and Recovery fenced
+        // alpha. Resume B at its fresh commit path with its original snapshot.
+        // SQLite resolves the exact operation hash as a replay BEFORE its
+        // current authority guards. A replay must not authorize a launch.
+        let contender = WorkSqliteAuthority(path)
+        match WorkSchedulerSqlite.reserveFresh contender snapshot operationId "launch-alpha" with
+        | Error SqliteSchedulerError.HistoricalReceiptNotAdmission -> ()
+        | other -> Assert.Fail(sprintf "Commit-time replay renewed reservation: %A" other)
+
+        let historical = contender.ReadReceipt operationId |> ok |> Option.get
+        Assert.That(historical.Replayed, Is.True)
+        Assert.That(historical.Sequence, Is.EqualTo first.Receipt.Sequence)
+        Assert.That(store.CurrentSequence() |> ok, Is.EqualTo fencedSequence)
+        Assert.That((store.ReadCapacity "shared" |> ok |> Option.get).Reserved, Is.EqualTo 1)
+        Assert.That(store.ReadRecord(key WorkSqliteRecordKind.Launch "beta" "launch-alpha")
+                    |> ok |> Option.isNone, Is.True)
+        Assert.That(store.ReadRecord(key WorkSqliteRecordKind.ExternalEffect "alpha" "launch-alpha")
+                    |> ok |> Option.isNone, Is.True)
+    )
+
+[<Test>]
+let commit_time_claim_replay_after_recovery_is_not_new_admission () =
+    withStore (fun store path ->
+        let a = dispatchProject "alpha" (String.replicate 40 "a")
+        let b = dispatchProject "beta" (String.replicate 40 "b")
+        let registered = launch "alpha" "launch-alpha" "worker"
+                            (LaunchState.Registered("uuid", "session")) (Some "work-alpha")
+        let a = makeProject "alpha" a.Graph [ a.Queue.Works.["work-alpha"] ]
+                    [ "worker", Set.singleton "implementation" ] [ registered ] []
+        seed store 2 1 [ a; b ] |> ignore
+        let operationId = Guid.NewGuid()
+        let first = WorkSchedulerSqlite.claim store a operationId registered.Id |> ok
+        Assert.That(first.Receipt.Replayed, Is.False)
+        installDurableRecoveryCoverage store "alpha"
+        let fencedSequence = store.CurrentSequence() |> ok
+
+        // Same preflight/commit race for a registered launch's primary claim.
+        let contender = WorkSqliteAuthority(path)
+        match WorkSchedulerSqlite.claimFresh contender a operationId registered.Id with
+        | Error SqliteSchedulerError.HistoricalReceiptNotAdmission -> ()
+        | other -> Assert.Fail(sprintf "Commit-time replay renewed primary claim: %A" other)
+
+        let historical = contender.ReadReceipt operationId |> ok |> Option.get
+        Assert.That(historical.Replayed, Is.True)
+        Assert.That(historical.Sequence, Is.EqualTo first.Receipt.Sequence)
+        Assert.That(store.CurrentSequence() |> ok, Is.EqualTo fencedSequence)
+        Assert.That((store.ReadCapacity "shared" |> ok |> Option.get).Reserved, Is.EqualTo 1)
+        let claimed = store.ReadRecord(key WorkSqliteRecordKind.Stage "alpha" "work-alpha")
+                      |> ok |> Option.get
+        Assert.That(claimed.Value.ClaimGeneration, Is.EqualTo 1L)
+        Assert.That(store.ReadRecord(key WorkSqliteRecordKind.ExternalEffect "alpha" registered.Id)
+                    |> ok |> Option.isNone, Is.True)
+    )

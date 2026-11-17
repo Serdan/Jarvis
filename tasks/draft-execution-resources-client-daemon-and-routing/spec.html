@@ -1,0 +1,45 @@
+
+<h1>DRAFT - DO NOT ASSIGN</h1>
+<p><strong>Status:</strong> Exploratory specification only. NOT approved for implementation, assignment, agent launch, or automatic scheduling. The current legacy task API may record this as <code>Open</code> because it does not support a true Draft state; this title/body marker is the operator's explicit HOLD. Do not infer approval from its ledger lifecycle. Only the operator can authorize promotion after review against current architecture and milestones.</p>
+
+<h2>Objective</h2>
+<p>Let the operator configure how Jarvis uses available projects, AI accounts, client instances, browser bridges, and machines. Jarvis should route new AI sessions to a viable spawner/account and dispatch queued development jobs to suitable hosts (initially <code>home</code> and <code>kruso</code>) without requiring persistent named agents, an open TUI, or manual machine selection for every operation. Keep the smallest implementation that meets observed needs, extending existing Work scheduling, client routing, browser bridge, and job execution mechanisms.</p>
+
+<h2>Candidate requirements to refine</h2>
+<ol>
+<li><strong>Operator project priorities.</strong> Configure project-level priority/pause policy separately from Lead's within-project Work priority; define precedence clearly so a Lead cannot accidentally override operator allocation. Avoid unproven fairness algorithms. No implicit preemption of running work when priorities change.</li>
+<li><strong>Shared execution capacity.</strong> Set an account-wide maximum for simultaneously active AI sessions across all participating clients/machines, with optional per-account/per-host limits. Admission must be consistent across clients and must not release capacity merely because a launch or termination outcome is uncertain. Reuse the existing/target authoritative Work capacity and claim machinery.</li>
+<li><strong>Multiple accounts and spawners.</strong> Configure multiple authorized execution-account/profile references and one or more spawner methods (initially existing browser-based launches), including simple preferred-order fallback when an account is unavailable or quota-exhausted. Route only new sessions; do not silently move running sessions. Credentials must remain protected and scope-specific. Observe provider requirements and account terms.</li>
+<li><strong>Quota/availability probes.</strong> Allow the operator to register a trusted local script/command per account or spawner that reports a small structured status such as available, exhausted, or unknown, plus optional reset time. Use bounded execution, explicit expiry, and transparent diagnostics. Treat a probe as advisory; live launch errors and unknown outcomes must also affect readiness and reconciliation. Do not create a provider-specific quota subsystem by default.</li>
+<li><strong>Client daemon mode.</strong> Run the existing Jarvis client without an interactive TUI as a long-lived process under OS supervision, maintaining authentication, heartbeats/reconnect, capability advertisement, and authorized session/job handling. Closing the TUI must not terminate daemon-hosted work. Reuse the client implementation; do not invent a separate machine-agent product or service manager. A daemon may still need an active graphical session/bridge for browser work.</li>
+<li><strong>Dynamic browser readiness.</strong> Discover browser-spawning capability from a connected, responsive browser bridge rather than a redundant static enabled flag. On bridge loss, stop new launch admission through it; reconcile uncertain in-flight launches rather than treating them as definitely failed.</li>
+<li><strong>Machine capabilities and queued jobs.</strong> Treat participating machine/client instances as eligible job hosts. Support a small operator policy identifying allowed workloads and concurrency per host, with initially simple routing by explicit host or required capability (e.g. Windows/.NET 11, test, benchmark). A session on <code>home</code> may queue an external job on <code>kruso</code>; that job is not another AI-session slot. Reuse existing Jarvis remote job/queue capabilities and stable machine/instance identity rather than building a new execution layer.</li>
+<li><strong>Heavy-work isolation.</strong> Provide practical queueing and exclusive benchmark access where required to preserve reproducible measurements. A mere max-concurrent-jobs=1 does not prove the machine is otherwise quiet; define what the host can actually guarantee and report external interference/unknowns honestly. Avoid speculative generic resource pools or continuous CPU/RAM/GPU allocation accounting.</li>
+<li><strong>Visibility and recovery.</strong> Operator-facing state should explain why sessions/jobs are waiting (quota, bridge unavailable, global limit, host down, exclusive resource held, etc.). Reconnect/restart must not duplicate uncertain launches or jobs; preserve existing one-shot journaling, idempotent operation IDs, fencing, and audited results.</li>
+</ol>
+
+<h2>Minimal scenarios to validate later</h2>
+<ul>
+<li>Two project queues have different operator priority; eligible work is admitted according to the agreed precedence, subject to the shared session cap.</li>
+<li>A preferred browser-account quota probe reports exhausted: the next authorized launch uses the second configured account, without duplicating a possibly-submitted first launch.</li>
+<li>A bridge disconnects/reconnects on <code>home</code>: new-launch readiness changes automatically; unrelated jobs/sessions are not falsely completed.</li>
+<li>Run the client as a daemon and close the TUI: permitted jobs and connectivity continue, with safe reconnection.</li>
+<li>A Worker session hosted on <code>home</code> submits a .NET test/build to <code>kruso</code> and receives durable completion evidence; a queued benchmark runs only under a justified isolation condition.</li>
+<li>Concurrent client instances/machines do not collide in identity, routing, capacity accounting, or uncertain-effect recovery.</li>
+</ul>
+
+<h2>Review questions before promotion</h2>
+<ul>
+<li>Which of these requirements are essential for the minimum trustworthy Work cutover versus follow-on improvements? Do not expand G0/G5 by implication.</li>
+<li>What existing Jarvis Work Scheduler, account-global capacity, client-instance identity, BrowserBridge, job queue, and remote-execution components should be reused or extended?</li>
+<li>Do we actually need generic resource allocation, host capability discovery, fair sharing, or advanced reservations now? Default answer: no, absent a concrete scenario.</li>
+<li>How should operator project priority interact with existing <code>(isBlocking, leadAssignedPriority, -availableSequence)</code> ordering? Preserve the current guarantee intentionally, not accidentally.</li>
+<li>What is the correct deployment/host identity and security boundary for daemon-side quota scripts and spawner credentials?</li>
+<li>What is the smallest verifiable exclusivity contract for performance benchmarks, including unmanaged host activity?</li>
+</ul>
+
+<h2>Existing architecture and related work</h2>
+<p>Ground any promoted task in <code>docs/specs/work-stateful-orchestration-2026-11-17.md</code> and <code>docs/specs/work-stateful-implementation-alignment-2026-11-17.md</code>. Related existing mechanisms/tasks include Work's global-capacity/Scheduler foundations, existing BrowserBridge and browser launcher, existing remote jobs, and <code>task-cff673cd81474ccf9b3932bf0ea33109</code> (concurrent client instances and machine identities). Avoid duplicate parallel infrastructure and independently challenge this entire draft for both overengineering and underengineering before breaking it into executable tasks.</p>
+
+<h2>Non-goals and admission boundary</h2>
+<p>Not an authorization to implement a generic distributed Resource Allocator, Kubernetes-like resource pools, generic machine agent, dynamic hardware accounting, new scheduling fairness framework, or automatic deployment. No agent assignments, task subdivision, or unrelated Lead/Manager changes are authorized by creating this draft. Review and split into small justified slices when the operator explicitly promotes the work.</p>

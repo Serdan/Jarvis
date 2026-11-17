@@ -1,0 +1,1 @@
+One-doc design at 60cacc98152da3f66cc13f63224d32854d400c53 on clean a5cb1906 baseline; full-domain export/restore explicitly NO-GO until reviewed source repository/ref, typed body/verifier and persistent recovery boot fences exist.

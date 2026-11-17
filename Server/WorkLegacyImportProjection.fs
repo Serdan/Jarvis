@@ -1,8 +1,10 @@
 namespace Jarvis.WorkQueues
 
 open System
+open System.Collections
 open System.Text.Json.Nodes
 open System.Text.RegularExpressions
+open Microsoft.FSharp.Reflection
 open Server
 
 // C1 -> E0 is NOT a field-name conversion. These proofs must be supplied by a
@@ -66,6 +68,64 @@ type WorkLegacyProjectionOutcome =
 
 [<RequireQualifiedAccess>]
 module internal WorkLegacyImportProjection =
+    // C1's original SnapshotJson is private to its importer. Independently
+    // re-encode the complete typed inspection (same F# record/DU/map/set
+    // format) instead of trusting SQLite's SourceSha or same-name key sets.
+    // This helper never promotes captured evidence: Verify must authenticate
+    // the original Git/role/approval source independently.
+    module private OriginalC1 =
+        let private encodeText (s: string) = JsonValue.Create(s) :> JsonNode
+        let rec private encodeType (shape: Type) (value: obj) : JsonNode =
+            if shape = typeof<string> then encodeText (unbox value)
+            elif shape = typeof<Guid> then encodeText ((unbox<Guid> value).ToString("D"))
+            elif shape = typeof<int> then JsonValue.Create(unbox<int> value) :> JsonNode
+            elif shape = typeof<int64> then JsonValue.Create(unbox<int64> value) :> JsonNode
+            elif shape = typeof<bool> then JsonValue.Create(unbox<bool> value) :> JsonNode
+            elif shape.IsGenericType && shape.GetGenericTypeDefinition() = typedefof<Map<_,_>> then
+                let args = shape.GetGenericArguments()
+                if args.[0] <> typeof<string> then invalidOp "Unsupported legacy map key."
+                let o = JsonObject()
+                for item in (value :?> IEnumerable) do
+                    let itemType = item.GetType()
+                    let key = itemType.GetProperty("Key").GetValue(item) :?> string
+                    let body = itemType.GetProperty("Value").GetValue(item)
+                    o.Add(key, encodeType args.[1] body)
+                o :> JsonNode
+            elif shape.IsGenericType && shape.GetGenericTypeDefinition() = typedefof<Set<_>> then
+                let child = shape.GetGenericArguments().[0]
+                let a = JsonArray()
+                for item in value :?> IEnumerable do a.Add(encodeType child item)
+                a :> JsonNode
+            elif shape.IsArray then
+                let a = JsonArray()
+                for item in value :?> IEnumerable do a.Add(encodeType (shape.GetElementType()) item)
+                a :> JsonNode
+            elif FSharpType.IsRecord shape then
+                let o = JsonObject()
+                let fields = FSharpType.GetRecordFields shape
+                let values = FSharpValue.GetRecordFields value
+                for f, item in Array.zip fields values |> Array.sortBy (fun (f, _) -> f.Name) do
+                    o.Add(f.Name, encodeType f.PropertyType item)
+                o :> JsonNode
+            elif FSharpType.IsUnion shape then
+                let case, fields = FSharpValue.GetUnionFields(value, shape)
+                let o = JsonObject()
+                o.Add("case", encodeText case.Name)
+                let a = JsonArray()
+                for f, item in Array.zip (case.GetFields()) fields do
+                    a.Add(encodeType f.PropertyType item)
+                o.Add("fields", a)
+                o :> JsonNode
+            else invalidOp ("Unsupported legacy field type " + shape.FullName)
+
+        let encode<'T> (value: 'T) =
+            encodeType typeof<'T> (box value) |> fun node -> node.ToJsonString()
+
+        let plain<'T> (value: 'T) =
+            let container = JsonObject()
+            container.Add("LegacyValue", encodeType typeof<'T> (box value))
+            container.ToJsonString()
+
     type private ResultBuilder() =
         member _.Bind(value, next) = Result.bind next value
         member _.Return(value) = Ok value
@@ -77,6 +137,7 @@ module internal WorkLegacyImportProjection =
         if condition then Ok () else incomplete detail
 
     let private sha = Regex("^[0-9a-f]{64}$", RegexOptions.Compiled)
+    let private gitOid = Regex("^[0-9a-f]{40}([0-9a-f]{24})?$", RegexOptions.Compiled)
     let private digest (value: string) =
         not (isNull value) && sha.IsMatch value
 
@@ -148,6 +209,35 @@ module internal WorkLegacyImportProjection =
           RoleVersion = Some row.Value.RoleVersion
           SourceSha = row.Value.SourceSha }
 
+    let private originalValue json graph stage claim stop role source review integration effect =
+        { BodyJson = json
+          GraphVersion = int64 graph
+          StageGeneration = int64 stage
+          ClaimGeneration = int64 claim
+          StopGeneration = int64 stop
+          RoleVersion = int64 role
+          SourceSha = source
+          ReviewSha = review
+          IntegrationSha = integration
+          ExternalEffect = effect }
+
+    // Read the *whole* original C1 row. SourceSha and CAS row version are not
+    // authenticated hashes of BodyJson; a modified body must fail before the
+    // normalized authority is written.
+    let private originalRow (store: WorkSqliteAuthority) kind project entity expected =
+        result {
+            let! row = read store kind project entity
+            let! () = ensure (row.Version = 1L && row.Value = expected)
+                        ("original imported row is not equal to verified source: " + project + "/" + entity)
+            return row
+        }
+
+    let private originalOrProjected (row: WorkSqliteRecord)
+                                    (original: WorkSqliteRecordValue)
+                                    (normalized: WorkSqliteRecordValue) =
+        (row.Version = 1L && row.Value = original)
+        || (row.Version = 2L && row.Value = normalized)
+
     let private rawSet (name: string) (o: JsonObject) = strings name o
     let private stageState = function
         | WorkState.Available -> "Available"
@@ -199,9 +289,18 @@ module internal WorkLegacyImportProjection =
             let! () = ensure (importReceipt |> Option.exists (fun r -> r.Sequence = c2.Import.SqliteSequence)) "the exact original C1 SQLite import receipt is absent"
             let! marker = read store WorkSqliteRecordKind.Project accountId "legacy-import-fence"
             let! markerBody = body marker
-            let! () = ensure (str "Mode" markerBody = Some "offline-only"
+            let! () = ensure (marker.Version = 1L
+                 && markerBody.Count = 6
+                 && marker.Value.GraphVersion = 0L
+                 && marker.Value.StageGeneration = 0L
+                 && marker.Value.ClaimGeneration = 0L
+                 && marker.Value.StopGeneration = 0L
+                 && marker.Value.RoleVersion = 0L
                  && marker.Value.ExternalEffect = WorkSqliteEffect.Prepared
                  && marker.Value.SourceSha = Some proof.AccountHead
+                 && marker.Value.ReviewSha.IsNone
+                 && marker.Value.IntegrationSha.IsNone
+                 && str "Mode" markerBody = Some "offline-only"
                  && str "AccountHead" markerBody = Some proof.AccountHead
                  && int32 "SchemaVersion" markerBody = Some 1
                  && importedHeads markerBody =
@@ -210,38 +309,108 @@ module internal WorkLegacyImportProjection =
                          |> List.sort)) "C1 offline fence is absent or changed"
             let! audit = read store WorkSqliteRecordKind.Project accountId "legacy-import-c2-authority-audit"
             let! auditBody = body audit
-            let! () = ensure (str "Mode" auditBody = Some "c2-disposable-offline-only"
-                 && str "DecisionId" auditBody = Some(proof.ApprovalId.ToString("D"))
-                 && str "DeviceId" auditBody = Some(proof.DeviceId.ToString("D"))
-                 && str "AccountId" auditBody = Some accountId
-                 && str "ImportOperationId" auditBody = Some(proof.ImportOperationId.ToString("D"))
-                 && audit.Value.SourceSha = Some proof.AccountHead
-                 && audit.Value.ExternalEffect = WorkSqliteEffect.Prepared) "independently fenced C2 audit is absent or mismatched"
             let all = c2.OriginalWriterFence
             let expectedIds =
                 Set.ofList(account.AccountId :: (inspection.Projects |> List.map (fun p -> p.ProjectId)))
+            let sourceMatches (r: WorkLegacyGitFenceReceipt) =
+                let b = r.Binding
+                if b.Scope = WorkLegacyGitScope.Account then
+                    b.EntityId = account.AccountId
+                    && b.LedgerId = account.LedgerId
+                    && b.LedgerEpoch = account.LedgerEpoch
+                    && b.PinnedHead = account.Head.PinnedCommit
+                    && b.SourceHighWater = account.Head.SourceHighWater
+                else
+                    inspection.Projects |> List.exists (fun p ->
+                        b.Scope = WorkLegacyGitScope.Project
+                        && b.EntityId = p.ProjectId
+                        && b.LedgerId = p.LedgerId
+                        && b.LedgerEpoch = p.LedgerEpoch
+                        && b.PinnedHead = p.Head.PinnedCommit
+                        && b.SourceHighWater = p.Head.SourceHighWater)
+            let validReceipt (r: WorkLegacyGitFenceReceipt) =
+                let b = r.Binding
+                sourceMatches r
+                && b.DeviceId = proof.DeviceId
+                && not (String.IsNullOrWhiteSpace b.TrustedRemoteId)
+                && r.DecisionId = proof.ApprovalId
+                && r.DecisionVersion > 0L
+                && r.FenceOperationId <> Guid.Empty
+                && r.ExclusiveReceiptId <> Guid.Empty
+                && r.OriginalHead = b.PinnedHead
+                && r.FencedHead <> b.PinnedHead
+                && not (isNull r.FencedHead) && gitOid.IsMatch r.FencedHead
+                && r.OriginalHighWater = b.SourceHighWater
+                && r.OriginalHighWater < Int64.MaxValue
+                && r.FenceHighWater = r.OriginalHighWater + 1L
+                && r.WriterGeneration > 0L
+                && r.NoNewOriginalMutations
+                && r.DurableUntilExplicitCutover
+                && r.OriginalPendingIntentHighWater >= 0L
+                && r.OriginalSourceEffectHighWater >= 0L
+                && r.MinimumClientProtocolVersion > 0
+                && r.AllOriginalClientsQuiesced
+                && digest r.AllClientQuiescenceProofSha256
+                && digest r.AuditSha256
             let! () = ensure (all.Length = expectedIds.Count
                  && (all |> List.map (fun r -> r.Binding.EntityId) |> Set.ofList) = expectedIds
-                 && (all |> List.forall (fun r ->
-                     r.Binding.DeviceId = proof.DeviceId
-                     && r.DecisionId = proof.ApprovalId
-                     && r.NoNewOriginalMutations && r.DurableUntilExplicitCutover
-                     && r.AllOriginalClientsQuiesced
-                     && r.OriginalPendingIntentHighWater >= 0L
-                     && r.OriginalSourceEffectHighWater >= 0L
-                     && r.FenceHighWater = r.OriginalHighWater + 1L))) "original writer/client/high-water quiescence cannot be proved"
+                 && (all |> List.forall validReceipt)
+                 && (all |> List.map (fun r -> r.DecisionVersion) |> Set.ofList).Count = 1
+                 && (all |> List.map (fun r -> r.FenceOperationId) |> Set.ofList).Count = 1
+                 && (all |> List.map (fun r -> r.ExclusiveReceiptId) |> Set.ofList).Count = 1) "original writer/client/high-water quiescence cannot be proved"
+            let referenceReceipt = all.Head
+            let! () = ensure (audit.Version = 1L
+                 && auditBody.Count = 9
+                 && audit.Value.GraphVersion = 0L
+                 && audit.Value.StageGeneration = 0L
+                 && audit.Value.ClaimGeneration = 0L
+                 && audit.Value.StopGeneration = 0L
+                 && audit.Value.RoleVersion = 0L
+                 && audit.Value.ReviewSha.IsNone && audit.Value.IntegrationSha.IsNone
+                 && int32 "SchemaVersion" auditBody = Some 1
+                 && str "Mode" auditBody = Some "c2-disposable-offline-only"
+                 && str "DecisionId" auditBody = Some(proof.ApprovalId.ToString("D"))
+                 && int64Prop "DecisionVersion" auditBody = Some referenceReceipt.DecisionVersion
+                 && str "DeviceId" auditBody = Some(proof.DeviceId.ToString("D"))
+                 && str "AccountId" auditBody = Some accountId
+                 && str "ImportOperationId" auditBody = Some(proof.ImportOperationId.ToString("D"))
+                 && str "FenceOperationId" auditBody = Some(referenceReceipt.FenceOperationId.ToString("D"))
+                 && str "FenceOperationId" markerBody = Some(referenceReceipt.FenceOperationId.ToString("D"))
+                 && int64Prop "FenceVersion" markerBody = Some referenceReceipt.DecisionVersion
+                 && audit.Value.SourceSha = Some proof.AccountHead
+                 && audit.Value.ExternalEffect = WorkSqliteEffect.Prepared) "independently fenced C2 audit is absent or mismatched"
             let! () =
                 try
-                    let entries = auditBody["OriginalGitFences"].AsArray() |> Seq.map (fun n -> n.AsObject()) |> Seq.toList
-                    ensure (entries.Length = all.Length &&
-                        all |> List.forall (fun r ->
-                            entries |> List.exists (fun e ->
-                                str "EntityId" e = Some(r.Binding.EntityId.ToString("D"))
-                                && str "LedgerId" e = Some(r.Binding.LedgerId.ToString("D"))
-                                && str "FencedHead" e = Some r.FencedHead
-                                && str "AuditSha256" e = Some r.AuditSha256
-                                && int64Prop "WriterGeneration" e = Some r.WriterGeneration
-                                && boolean "AllOriginalClientsQuiesced" e = Some true))) "C2 receipt set differs from its transaction-bound SQLite audit"
+                    let entries =
+                        auditBody["OriginalGitFences"].AsArray()
+                        |> Seq.map (fun n -> n.AsObject())
+                        |> Seq.toList
+                    let entryMatches (r: WorkLegacyGitFenceReceipt) (e: JsonObject) =
+                        let b = r.Binding
+                        e.Count = 19
+                        && str "Scope" e = Some(sprintf "%A" b.Scope)
+                        && str "EntityId" e = Some(b.EntityId.ToString("D"))
+                        && str "LedgerId" e = Some(b.LedgerId.ToString("D"))
+                        && int32 "LedgerEpoch" e = Some b.LedgerEpoch
+                        && str "DeviceId" e = Some(b.DeviceId.ToString("D"))
+                        && str "TrustedRemoteId" e = Some b.TrustedRemoteId
+                        && str "OriginalHead" e = Some r.OriginalHead
+                        && str "FencedHead" e = Some r.FencedHead
+                        && int64Prop "FenceHighWater" e = Some r.FenceHighWater
+                        && int64Prop "WriterGeneration" e = Some r.WriterGeneration
+                        && str "ExclusiveReceiptId" e = Some(r.ExclusiveReceiptId.ToString("D"))
+                        && str "AuditSha256" e = Some r.AuditSha256
+                        && boolean "NoNewOriginalMutations" e = Some r.NoNewOriginalMutations
+                        && boolean "DurableUntilExplicitCutover" e = Some r.DurableUntilExplicitCutover
+                        && int64Prop "OriginalPendingIntentHighWater" e = Some r.OriginalPendingIntentHighWater
+                        && int64Prop "OriginalSourceEffectHighWater" e = Some r.OriginalSourceEffectHighWater
+                        && int32 "MinimumClientProtocolVersion" e = Some r.MinimumClientProtocolVersion
+                        && boolean "AllOriginalClientsQuiesced" e = Some r.AllOriginalClientsQuiesced
+                        && str "AllClientQuiescenceProofSha256" e = Some r.AllClientQuiescenceProofSha256
+                    ensure (entries.Length = all.Length
+                        && (entries |> List.choose (str "EntityId") |> Set.ofList).Count = all.Length
+                        && (all |> List.forall (fun r -> entries |> List.exists (entryMatches r))))
+                        "C2 receipt set differs from its transaction-bound SQLite audit"
                 with _ -> incomplete "malformed C2 original-writer receipt inventory"
             return [ marker; audit ]
         }
@@ -267,21 +436,19 @@ module internal WorkLegacyImportProjection =
                  && (proof.Roles |> List.map (fun r -> r.RoleId) |> Set.ofList) =
                     (roles |> Map.toSeq |> Seq.map fst |> Set.ofSeq)
                  && proof.Roles.Length = roles.Count) ("legacy launch, graph, proposal or role coverage is incomplete for " + id)
-            let! legacyQueue = read store WorkSqliteRecordKind.Project id "legacy-queue"
-            let! queueJson = body legacyQueue
-            let! legacyGraph = read store WorkSqliteRecordKind.Project id "legacy-composition"
-            let! graphJson = body legacyGraph
-            let! () = ensure (legacyQueue.Value.SourceSha = Some proof.SourceHead
-                 && legacyQueue.Value.GraphVersion = int64 project.Graph.Version
-                 && legacyGraph.Value.SourceSha = Some proof.SourceHead
-                 && legacyGraph.Value.GraphVersion = int64 project.Graph.Version
-                 && int32 "Version" queueJson = Some project.Queue.Version
-                 && int32 "GraphVersion" queueJson = Some project.Queue.GraphVersion
-                 && (nested "Migration" queueJson |> Option.bind (str "case")) = Some "Frozen"
-                 && keys "Works" queueJson = Some(stages |> Map.toSeq |> Seq.map fst |> Set.ofSeq)
-                 && keys "Subscriptions" queueJson = Some(roles |> Map.toSeq |> Seq.map fst |> Set.ofSeq)
-                 && keys "Launches" queueJson = Some Set.empty
-                 && int32 "Version" graphJson = Some project.Graph.Version) "imported queue/graph/source version or exact stage and role inventory changed"
+            let sourceHead = Some proof.SourceHead
+            let! legacyQueue =
+                originalRow store WorkSqliteRecordKind.Project id "legacy-queue"
+                    (originalValue (OriginalC1.encode project.Queue) project.Graph.Version
+                        0 0 0 0 sourceHead None None WorkSqliteEffect.NoneRecorded)
+            let! legacyGraph =
+                originalRow store WorkSqliteRecordKind.Project id "legacy-composition"
+                    (originalValue (OriginalC1.encode project.Graph) project.Graph.Version
+                        0 0 0 0 sourceHead None None WorkSqliteEffect.NoneRecorded)
+            let! () = ensure (
+                (project.Origins |> List.map (fun origin -> origin.WorkId) |> Set.ofList) =
+                    (stages |> Map.toSeq |> Seq.map fst |> Set.ofSeq)
+                && project.Origins.Length = stages.Count) "imported source inventory does not cover exactly the stage set"
             let decisions = proof.Decisions |> List.map (fun d -> d.WorkId, d) |> Map.ofList
             let roleProofs = proof.Roles |> List.map (fun r -> r.RoleId, r) |> Map.ofList
             let! projectedStages =
@@ -305,40 +472,31 @@ module internal WorkLegacyImportProjection =
                              && (roleProofs.TryFind source.RoleId |> Option.exists (fun role ->
                                  role.Version = source.RoleVersion))
                              && (stage.Push |> Option.exists (fun push -> push.Outcome = PushOutcome.Unknown) |> not)) ("original approval, source or external effect is not proved for " + workId)
+                        let effect =
+                            match stage.Push with
+                            | Some push ->
+                                match push.Outcome with
+                                | PushOutcome.Unknown -> WorkSqliteEffect.Unknown
+                                | PushOutcome.Observed _ -> WorkSqliteEffect.Observed
+                                | PushOutcome.DefinitiveNoEffect -> WorkSqliteEffect.DefinitiveNoEffect
+                            | None -> WorkSqliteEffect.NoneRecorded
+                        let reviewSha =
+                            project.Reviews |> List.tryFind (fun r -> r.WorkId = workId)
+                            |> Option.map (fun r -> r.FrozenCommit)
+                        let integrationSha =
+                            project.Integrations |> List.tryFind (fun r -> r.WorkId = workId)
+                            |> Option.map (fun r -> r.IntegratedCommit)
+                        let original =
+                            originalValue (OriginalC1.encode stage) project.Graph.Version
+                                stage.StageGeneration stage.ClaimGeneration 0 0
+                                (Some source.SourceCommit) reviewSha integrationSha effect
                         let! raw = read store WorkSqliteRecordKind.Stage id workId
-                        let! rawJson = body raw
-                        let! originRow = read store WorkSqliteRecordKind.Work id ("origin/" + workId)
-                        let! originJson = body originRow
-                        let! () = ensure (raw.Version = 1L || raw.Version = 2L) ("stage has been modified by an unknown writer: " + workId)
-                        let! () = ensure (raw.Value.GraphVersion = int64 project.Graph.Version
-                             && raw.Value.StageGeneration = int64 stage.StageGeneration
-                             && raw.Value.ClaimGeneration = int64 stage.ClaimGeneration
-                             && raw.Value.ExternalEffect <> WorkSqliteEffect.Unknown
-                             && raw.Value.ExternalEffect <> WorkSqliteEffect.Prepared
-                             && (nested "State" rawJson |> Option.bind (str "case")) = Some(stageState stage.State)
-                             && str "QueueId" rawJson = Some stage.QueueId
-                             && str "Id" rawJson = Some workId
-                             && str "ProjectId" rawJson = Some id
-                             && int32 "StageGeneration" rawJson = Some stage.StageGeneration
-                             && int32 "ClaimGeneration" rawJson = Some stage.ClaimGeneration
-                             && (nested "Gate" rawJson |> Option.bind (str "case")) = Some(gateState stage.Gate)
-                             && strings "Dependencies" rawJson = Some stage.Dependencies
-                             && keys "WaivedDependencies" rawJson =
-                                 Some(stage.WaivedDependencies |> Map.toSeq |> Seq.map fst |> Set.ofSeq)
-                             && int64Prop "AvailableSequence" rawJson = Some stage.AvailableSequence
-                             && int64Prop "AvailableAt" rawJson = Some stage.AvailableAt
-                             && originRow.Value.SourceSha = Some source.SourceCommit
-                             && raw.Value.ReviewSha =
-                                 (project.Reviews |> List.tryFind (fun review -> review.WorkId = workId)
-                                  |> Option.map (fun review -> review.FrozenCommit))
-                             && raw.Value.IntegrationSha =
-                                 (project.Integrations |> List.tryFind (fun integration -> integration.WorkId = workId)
-                                  |> Option.map (fun integration -> integration.IntegratedCommit))
-                             && str "SourceCommit" originJson = Some source.SourceCommit
-                             && str "SourceRef" originJson = Some source.SourceRef
-                             && str "RepositoryId" originJson = Some source.RepositoryId
-                             && str "SourceHead" originJson = Some source.SourceHead
-                             && raw.Value.SourceSha = Some source.SourceCommit) ("raw C1 stage/source mismatch: " + workId)
+                        let! originRow =
+                            originalRow store WorkSqliteRecordKind.Work id ("origin/" + workId)
+                                (originalValue (OriginalC1.encode source) source.GraphVersion
+                                    source.StageGeneration 0 0 source.RoleVersion
+                                    (Some source.SourceCommit) None None WorkSqliteEffect.NoneRecorded)
+                        let rawJson = JsonNode.Parse(original.BodyJson).AsObject()
                         rawJson["state"] <- JsonValue.Create(stageState stage.State)
                         rawJson["queueId"] <- JsonValue.Create(stage.QueueId)
                         rawJson["gate"] <- JsonValue.Create(gateState stage.Gate)
@@ -348,8 +506,12 @@ module internal WorkLegacyImportProjection =
                         rawJson["dependencies"] <- array stage.Dependencies
                         rawJson["waivedDependencies"] <- array (stage.WaivedDependencies |> Map.toSeq |> Seq.map fst)
                         let value =
-                            { raw.Value with BodyJson = rawJson.ToJsonString()
-                                             StopGeneration = proof.StopGeneration }
+                            { original with
+                                BodyJson = rawJson.ToJsonString()
+                                StopGeneration = proof.StopGeneration }
+                        let! () = ensure (effect <> WorkSqliteEffect.Unknown
+                             && effect <> WorkSqliteEffect.Prepared
+                             && originalOrProjected raw original value) ("full original C1 stage, authorization, waiver or source differs: " + workId)
                         let normalized = { raw with Version = 2L; Value = value }
                         return (workId, normalized, originRow)
                     })
@@ -362,17 +524,20 @@ module internal WorkLegacyImportProjection =
                              && proofRole.EvidenceReceiptId <> Guid.Empty
                              && proofRole.SourceHead = proof.SourceHead) ("missing independently verified role instructions " + roleId)
                         let! raw = read store WorkSqliteRecordKind.Role id roleId
-                        let! rawJson = body raw
-                        let! () = ensure ((raw.Version = 1L || raw.Version = 2L)
-                             && rawSet "LegacyValue" rawJson = Some queues) ("raw C1 role subscription differs from verified role " + roleId)
+                        let original =
+                            originalValue (OriginalC1.plain queues) 0 0 0 0 0
+                                None None None WorkSqliteEffect.NoneRecorded
+                        let rawJson = JsonNode.Parse(original.BodyJson).AsObject()
                         rawJson["state"] <- JsonValue.Create("Active")
                         rawJson["instructionsDigest"] <- JsonValue.Create(proofRole.InstructionsDigest)
                         rawJson["queues"] <- array queues
                         rawJson["evidenceReceiptId"] <- JsonValue.Create(proofRole.EvidenceReceiptId.ToString("D"))
                         let value =
-                            { raw.Value with BodyJson = rawJson.ToJsonString()
-                                             StopGeneration = proof.StopGeneration
-                                             RoleVersion = int64 proofRole.Version }
+                            { original with
+                                BodyJson = rawJson.ToJsonString()
+                                StopGeneration = proof.StopGeneration
+                                RoleVersion = int64 proofRole.Version }
+                        let! () = ensure (originalOrProjected raw original value) ("full original C1 subscription/role record changed: " + roleId)
                         let normalized = { raw with Version = 2L; Value = value }
                         return
                             { Id = roleId
@@ -381,6 +546,34 @@ module internal WorkLegacyImportProjection =
                               InstructionsDigest = proofRole.InstructionsDigest
                               Stored = normalized }
                     })
+            // Preserve every original C1 review, integration and operation
+            // receipt in the same immutable-source CAS as the stage/role graph.
+            let extras =
+                [ for review in project.Reviews do
+                    yield WorkSqliteRecordKind.Review, review.WorkId,
+                        originalValue (OriginalC1.encode review) project.Graph.Version
+                            0 0 0 0 (Some review.FrozenCommit) (Some review.FrozenCommit)
+                            None WorkSqliteEffect.NoneRecorded
+                  for integration in project.Integrations do
+                    yield WorkSqliteRecordKind.Integration, integration.WorkId,
+                        originalValue (OriginalC1.encode integration) project.Graph.Version
+                            0 0 0 0 (Some integration.SourceCommit) None
+                            (Some integration.IntegratedCommit) WorkSqliteEffect.Observed
+                  for terminal in project.Terminals do
+                    yield WorkSqliteRecordKind.Work, "terminal/" + terminal.LaunchId,
+                        originalValue (OriginalC1.plain terminal) 0 0 0 0 0
+                            None None None WorkSqliteEffect.NoneRecorded
+                  for validation in project.Validations do
+                    yield WorkSqliteRecordKind.Work, "validation/" + validation.EvidenceRef,
+                        originalValue (OriginalC1.plain validation) 0 0 0 0 0
+                            None None None WorkSqliteEffect.NoneRecorded
+                  for operation in project.Operations do
+                    yield WorkSqliteRecordKind.Work, "receipt/" + operation.OperationId.ToString("D"),
+                        originalValue (OriginalC1.plain operation) 0 0 0 0 0
+                            None None None WorkSqliteEffect.NoneRecorded ]
+            let! immutableExtras =
+                extras |> traverse (fun (kind, entity, expected) ->
+                    originalRow store kind id entity expected)
             let pBody = JsonObject()
             pBody["coverage"] <- JsonValue.Create("Verified")
             pBody["queueVersion"] <- JsonValue.Create(project.Queue.Version)
@@ -414,6 +607,7 @@ module internal WorkLegacyImportProjection =
                   LaunchRecords = Map.empty }
             let immutableEvidence =
                 [ yield legacyQueue; yield legacyGraph
+                  yield! immutableExtras
                   for (_, _, origin) in projectedStages do yield origin ]
             let newRecords =
                 [ yield { Key = authority.Key; ExpectedVersion = None; Value = authority.Value }
@@ -455,9 +649,17 @@ module internal WorkLegacyImportProjection =
                              && (proof.Projects |> List.map (fun p -> p.ProjectId) |> Set.ofList) =
                                 (inspection.Projects |> List.map (fun p -> p.ProjectId) |> Set.ofList)
                              && index.ReservedCapacity = 0) "unverified global capacity, incomplete project set or existing launch"
+                        let accountKey = proof.AccountId.ToString("D")
                         let! accountSnapshot =
-                            read store WorkSqliteRecordKind.Project (proof.AccountId.ToString("D")) "legacy-account"
-                        let! () = ensure (accountSnapshot.Value.SourceSha = Some proof.AccountHead) "imported original account snapshot changed"
+                            originalRow store WorkSqliteRecordKind.Project accountKey "legacy-account"
+                                (originalValue (OriginalC1.encode inspection.Account) 0 0 0 0 0
+                                    (Some proof.AccountHead) None None WorkSqliteEffect.NoneRecorded)
+                        let! accountReceipts =
+                            inspection.Account.Operations |> traverse (fun original ->
+                                originalRow store WorkSqliteRecordKind.Work accountKey
+                                    ("receipt/" + original.OperationId.ToString("D"))
+                                    (originalValue (OriginalC1.plain original) 0 0 0 0 0
+                                        None None None WorkSqliteEffect.NoneRecorded))
                         let! projects =
                             inspection.Projects
                             |> traverse (fun p ->
@@ -472,7 +674,7 @@ module internal WorkLegacyImportProjection =
                         let command =
                             { OperationId = operationId
                               Guards =
-                                (accountSnapshot :: immutableFence)
+                                (accountSnapshot :: (accountReceipts @ immutableFence))
                                 @ (projects |> List.collect (fun (_, immutable, _) -> immutable))
                                 |> List.map guard
                               Records = projects |> List.collect (fun (_, _, mutations) -> mutations)

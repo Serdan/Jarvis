@@ -263,6 +263,30 @@ let private projectCommit path raw c2 proof operationId =
     let verifier = CaptureVerifier(Some proof) :> IWorkLegacyProjectionVerifier
     WorkLegacyImportProjection.commitOfflineFixture verifier path raw c2 operationId
 
+let private tamperImportedJson path kind projectId entityId change =
+    let store = WorkSqliteAuthority(path)
+    let key = { ProjectId = projectId; Kind = kind; EntityId = entityId }
+    let original = store.ReadRecord(key) |> ok |> Option.get
+    let json = System.Text.Json.Nodes.JsonNode.Parse(original.Value.BodyJson).AsObject()
+    change json
+    store.Commit
+        { OperationId = Guid.NewGuid()
+          Guards = []
+          Records =
+            [ { Key = key
+                ExpectedVersion = Some original.Version
+                Value = { original.Value with BodyJson = json.ToJsonString() } } ]
+          Capacities = [] }
+    |> ok |> ignore
+
+let private assertIncompleteWithoutProjection path raw c2 proof detail =
+    let store = WorkSqliteAuthority(path)
+    let before = store.CurrentSequence() |> ok
+    match projectCommit path raw c2 proof (Guid.NewGuid()) with
+    | Error(WorkLegacyProjectionGap.Incomplete _) -> ()
+    | other -> Assert.Fail(sprintf "Unsealed %s promoted to authority: %A" detail other)
+    Assert.That(store.CurrentSequence() |> ok, Is.EqualTo before)
+
 [<Test>]
 let c1_c2_e0_e1a_disposable_two_project_cap_one_positive_chain () =
     withImport (fun path raw c2 proof ->
@@ -416,6 +440,97 @@ let c1_projection_rejects_uncertain_effect_and_mutated_stage_or_role_provenance 
                 Assert.That(store.ReadRecord(authorityKey) |> ok |> Option.isNone, Is.True))
 
 [<Test>]
+let c1_projection_binds_full_original_payloads_not_only_keys_and_union_cases () =
+    let account = accountId.ToString("D")
+    let p = projectTwo.ToString("D")
+    let corruptions : (string * WorkSqliteRecordKind * string * string * (System.Text.Json.Nodes.JsonObject -> unit)) list =
+        [ "account payload", WorkSqliteRecordKind.Project, account, "legacy-account",
+            (fun json -> json["MaxConcurrent"] <- System.Text.Json.Nodes.JsonValue.Create(9))
+          "queue stage body", WorkSqliteRecordKind.Project, p, "legacy-queue",
+            (fun json ->
+                let works = json["Works"].AsObject()
+                let stage = works["I2"].AsObject()
+                stage["QueueId"] <- System.Text.Json.Nodes.JsonValue.Create("other"))
+          "graph payload", WorkSqliteRecordKind.Project, p, "legacy-composition",
+            (fun json -> json["rogueUnverifiedGraphField"] <- System.Text.Json.Nodes.JsonValue.Create("untrusted"))
+          "stage gate same case", WorkSqliteRecordKind.Stage, p, "I2",
+            (fun json ->
+                let fields = System.Text.Json.Nodes.JsonArray()
+                fields.Add(System.Text.Json.Nodes.JsonValue.Create("forged"))
+                json["Gate"].AsObject()["fields"] <- fields)
+          "role duplicate subscription", WorkSqliteRecordKind.Role, p, "Worker",
+            (fun json ->
+                json["LegacyValue"].AsArray().Add(System.Text.Json.Nodes.JsonValue.Create("implementation")))
+          "origin context digest", WorkSqliteRecordKind.Work, p, "origin/I2",
+            (fun json -> json["ContextDigest"] <- System.Text.Json.Nodes.JsonValue.Create(String.replicate 64 "f"))
+          "retained operation receipt", WorkSqliteRecordKind.Work, p, "receipt/" + approvalReceipt.ToString("D"),
+            (fun json ->
+                json["LegacyValue"].AsObject()["RequestSha256"] <-
+                    System.Text.Json.Nodes.JsonValue.Create(String.replicate 64 "f")) ]
+    for detail,kind,entity,recordId,change in corruptions do
+        withImport (fun path raw c2 proof ->
+            tamperImportedJson path kind entity recordId change
+            assertIncompleteWithoutProjection path raw c2 proof detail)
+
+[<Test>]
+let c1_projection_rejects_same_key_changed_waiver_receipt_from_original_stage () =
+    // Unlike empty waivers, this preserves the dependency *key* and changes
+    // only its authoritative receipt value in the transactionally imported C1.
+    disposable (fun path ->
+        let source = input ()
+        let withWaiver (p: WorkLegacyImportProject) =
+            if p.ProjectId <> projectTwo then p
+            else
+                let modified =
+                    p.Queue.Works |> Map.map (fun _ stage ->
+                        { stage with
+                            Dependencies = Set.singleton "predecessor"
+                            WaivedDependencies = Map.ofList [ "predecessor", "signed-waiver-receipt" ] })
+                let queue = { p.Queue with Works = modified }
+                { p with Queue = queue }
+        let raw = { source with Projects = source.Projects |> List.map withWaiver }
+        let p = plan ()
+        let gateway = SourceGateway(p)
+        let c2 =
+            WorkLegacyImportFence.commitFencedOfflineFixture
+                (gateway :> IWorkLegacyOriginalGitFenceGateway) path raw p |> ok
+        let proof = evidence raw c2
+        tamperImportedJson path WorkSqliteRecordKind.Stage (projectTwo.ToString("D")) "I2"
+            (fun json ->
+                json["WaivedDependencies"].AsObject()["predecessor"] <-
+                    System.Text.Json.Nodes.JsonValue.Create("unsigned-replacement"))
+        assertIncompleteWithoutProjection path raw c2 proof "same-key waiver receipt")
+
+[<Test>]
+let c1_projection_requires_complete_c2_receipt_and_retained_audit_equality () =
+    let modifications : (string * (WorkLegacyGitFenceReceipt -> WorkLegacyGitFenceReceipt)) list =
+        [ "pending high-water", (fun r -> { r with OriginalPendingIntentHighWater = 0L })
+          "source effect high-water", (fun r -> { r with OriginalSourceEffectHighWater = 0L })
+          "quiescence digest", (fun r -> { r with AllClientQuiescenceProofSha256 = String.replicate 64 "f" })
+          "protocol version", (fun r -> { r with MinimumClientProtocolVersion = 2 })
+          "binding scope", (fun r ->
+              { r with Binding = { r.Binding with Scope = WorkLegacyGitScope.Account } })
+          "original head", (fun r -> { r with OriginalHead = shaB })
+          "exclusive receipt", (fun r -> { r with ExclusiveReceiptId = Guid.NewGuid() })
+          "fence operation", (fun r -> { r with FenceOperationId = Guid.NewGuid() }) ]
+    for detail,change in modifications do
+        withImport (fun path raw c2 proof ->
+            let altered =
+                { c2 with
+                    OriginalWriterFence =
+                        c2.OriginalWriterFence |> List.map (fun r ->
+                            if r.Binding.EntityId = projectTwo then change r else r) }
+            assertIncompleteWithoutProjection path raw altered proof ("C2 " + detail))
+    withImport (fun path raw c2 proof ->
+        tamperImportedJson path WorkSqliteRecordKind.Project (accountId.ToString("D"))
+            "legacy-import-c2-authority-audit"
+            (fun json ->
+                let fences = json["OriginalGitFences"].AsArray()
+                fences.[0].AsObject()["OriginalSourceEffectHighWater"] <-
+                    System.Text.Json.Nodes.JsonValue.Create(999L))
+        assertIncompleteWithoutProjection path raw c2 proof "retained C2 source-effect audit")
+
+[<Test>]
 let c1_projection_rejects_c2_fence_lost_client_quiescence_before_any_sqlite_authority () =
     withImport (fun path raw c2 proof ->
         let altered =
@@ -443,6 +558,7 @@ let c1_projection_identical_uuid_with_changed_verified_role_authority_is_not_a_r
                         { r with InstructionsDigest = String.replicate 64 "f" }) }) proof
         match projectCommit path raw c2 changed operation with
         | Error(WorkLegacyProjectionGap.Storage(WorkSqliteFailure.OperationIdReused _)) -> ()
+        | Error(WorkLegacyProjectionGap.Incomplete _) -> ()
         | other -> Assert.Fail(sprintf "Mismatched original UUID rebound to new authority: %A" other)
         Assert.That((WorkSqliteAuthority(path)).CurrentSequence() |> ok, Is.EqualTo 2L))
 

@@ -190,6 +190,56 @@ let unknown_effect_and_original_launch_identity_survive_fencing () =
                     Does.Contain(Requirement.InFlightLaunchReconciliation)))
 
 [<Test>]
+let prepared_effect_is_fenced_for_entire_account_without_erasing_original_evidence () =
+    withStore (fun store ->
+        // An in-flight original effect is evidence requiring reconciliation,
+        // not a reason to leave an otherwise Available sibling project live.
+        let source = setup store [ "alpha", WorkSqliteEffect.Prepared; "beta", WorkSqliteEffect.NoneRecorded ]
+        let originalStage = source.Projects.Head.Stages.["W-alpha"]
+        let capturedLaunch =
+            { ProjectId = "alpha"; WorkId = "W-alpha"; Generation = 2; OperationId = "original-prepared-launch" }
+        let uncertainEffect =
+            { OperationId = capturedLaunch.OperationId
+              WorkId = "W-alpha"; Generation = 2; Kind = EffectKind.Launch
+              SourceSha = None; Outcome = EffectOutcome.Unknown }
+        let uncertainWork =
+            { work "alpha" with
+                CapturedInFlightLaunch = true
+                CapturedLaunches = [ capturedLaunch ]
+                Effects = [ uncertainEffect ] }
+        let original =
+            { input [ "alpha"; "beta" ] with
+                Projects =
+                    [ { recoveryProject "alpha" with Works = [ uncertainWork ] }
+                      recoveryProject "beta" ] }
+        let operation = Guid.NewGuid()
+        let first = WorkRecoverySqlite.seed store source original operation |> ok
+        Assert.That(first.Receipt.Replayed, Is.False)
+        Assert.That(first.Plan.NormalDispatchAllowed, Is.False)
+        let alphaDecision = first.Plan.Projects |> List.find (fun p -> p.ProjectId = "alpha")
+        Assert.That(alphaDecision.Works.Head.Requirements,
+                    Does.Contain(Requirement.UnknownExternalEffect "original-prepared-launch"))
+        Assert.That(alphaDecision.Works.Head.Requirements,
+                    Does.Contain(Requirement.InFlightLaunchReconciliation))
+        for project in [ "alpha"; "beta" ] do assertFenced store project |> ignore
+        let preserved = record store "alpha" WorkSqliteRecordKind.Stage "W-alpha"
+        Assert.That(preserved.Value.ExternalEffect, Is.EqualTo WorkSqliteEffect.Prepared)
+        let fence = WorkRecoverySqlite.readFence store "alpha" |> ok |> Option.get
+        let fenceJson = JsonNode.Parse(fence.Value.BodyJson).AsObject()
+        let originalStages = fenceJson["originalStages"].AsObject()
+        let originalRow = originalStages["W-alpha"].AsObject()
+        Assert.That(originalRow["bodyJson"].GetValue<string>(), Is.EqualTo originalStage.Value.BodyJson)
+        Assert.That(originalRow["externalEffect"].GetValue<string>(), Is.EqualTo "Prepared")
+        Assert.That(fence.Value.BodyJson, Does.Contain "original-prepared-launch")
+        Assert.That((store.ReadCapacity "shared" |> ok |> Option.get).Version, Is.EqualTo 2L)
+        let replay = WorkRecoverySqlite.seed store source original operation |> ok
+        Assert.That(replay.Receipt.Replayed, Is.True)
+        Assert.That(replay.Receipt.Sequence, Is.EqualTo first.Receipt.Sequence)
+        Assert.That(store.CurrentSequence() |> ok, Is.EqualTo 2L)
+        Assert.That((record store "alpha" WorkSqliteRecordKind.Stage "W-alpha").Value.ExternalEffect,
+                    Is.EqualTo WorkSqliteEffect.Prepared))
+
+[<Test>]
 let one_stale_stage_rejects_whole_batch_without_partial_project_fences () =
     withStore (fun store ->
         let source = setup store [ "alpha", WorkSqliteEffect.NoneRecorded; "beta", WorkSqliteEffect.NoneRecorded ]
@@ -394,6 +444,48 @@ let private e0Fixture (store: WorkSqliteAuthority) =
       Projects = [ sourceProject ]
       CompleteProjectSet = true }
 
+// The Prepared alpha stage is not dispatchable, but beta remains an ordinary
+// eligible stage until Recovery fences the *complete* account project set.
+let private e0PreparedAndAvailablePair (store: WorkSqliteAuthority) =
+    let initial = e0Fixture store
+    let alpha = initial.Projects.Head
+    let betaStage =
+        { alpha.Queue.Works.["W-alpha"] with
+            Id = "W-beta"; ProjectId = "beta"; SubjectId = "task-W-beta" }
+    let clone (row: WorkSqliteRecord) kind id =
+        { row with
+            Key = key "beta" kind id
+            Value = { row.Value with BodyJson = row.Value.BodyJson.Replace("W-alpha", "W-beta") } }
+    let betaRole = alpha.RoleRecords.Head
+    let betaStageRow = clone alpha.StageRecords.["W-alpha"] WorkSqliteRecordKind.Stage "W-beta"
+    let beta =
+        { alpha with
+            Id = "beta"
+            Queue = { alpha.Queue with Works = Map.ofList [ betaStage.Id, betaStage ] }
+            Stored = clone alpha.Stored WorkSqliteRecordKind.Project "authority"
+            StageRecords = Map.ofList [ "W-beta", betaStageRow ]
+            RoleRecords = [ { betaRole with Stored = clone betaRole.Stored WorkSqliteRecordKind.Role "worker" } ] }
+    let insert (row: WorkSqliteRecord) =
+        { Key = row.Key; ExpectedVersion = None; Value = row.Value }
+    store.Commit
+        { OperationId = Guid.NewGuid()
+          Guards = []
+          Records = [ insert beta.Stored; insert betaStageRow; insert beta.RoleRecords.Head.Stored ]
+          Capacities = [] } |> ok |> ignore
+    let originalAlpha = alpha.StageRecords.["W-alpha"]
+    store.Commit
+        { OperationId = Guid.NewGuid()
+          Guards = []
+          Records =
+            [ { Key = originalAlpha.Key
+                ExpectedVersion = Some originalAlpha.Version
+                Value = { originalAlpha.Value with ExternalEffect = WorkSqliteEffect.Prepared } } ]
+          Capacities = [] } |> ok |> ignore
+    let preparedAlpha =
+        { alpha with
+            StageRecords = Map.ofList [ "W-alpha", record store "alpha" WorkSqliteRecordKind.Stage "W-alpha" ] }
+    { initial with Projects = [ preparedAlpha; beta ] }
+
 [<Test>]
 let actual_e0_scheduler_reserve_fails_both_stale_and_fresh_after_recovery_seed () =
     withStore (fun store ->
@@ -432,3 +524,54 @@ let actual_e0_scheduler_reserve_fails_both_stale_and_fresh_after_recovery_seed (
         | Error(SqliteSchedulerError.Incomplete _) -> ()
         | other -> Assert.Fail(sprintf "Fresh Scheduler bypassed Recovery coverage: %A" other)
         Assert.That((store.ReadCapacity "shared" |> ok |> Option.get).Reserved, Is.EqualTo 0))
+
+[<Test>]
+let actual_e0_two_project_prepared_effect_fences_otherwise_eligible_sibling () =
+    // Before Recovery, beta is genuinely eligible: alpha's Prepared effect
+    // cannot be treated as a reason that beta would already be rejected.
+    withStore (fun store ->
+        let verified = e0PreparedAndAvailablePair store
+        match WorkSchedulerSqlite.reserve store verified (Guid.NewGuid()) "pre-fence-beta" with
+        | Ok outcome -> Assert.That(outcome.ProjectId, Is.EqualTo "beta")
+        | other -> Assert.Fail(sprintf "Settled sibling was not eligible before Recovery: %A" other))
+    withStore (fun store ->
+        let verified = e0PreparedAndAvailablePair store
+        let original =
+            { input [ "alpha"; "beta" ] with
+                Projects =
+                    verified.Projects
+                    |> List.map (fun p ->
+                        { recoveryProject p.Id with
+                            GraphVersion = p.Graph.Version
+                            Works = [ { work p.Id with Generation = 1 } ] }) }
+        let source = WorkRecoverySqlite.fromScheduler verified
+        let seedId = Guid.NewGuid()
+        WorkRecoverySqlite.seed store source original seedId |> ok |> ignore
+        let alphaStage = record store "alpha" WorkSqliteRecordKind.Stage "W-alpha"
+        Assert.That(alphaStage.Value.ExternalEffect, Is.EqualTo WorkSqliteEffect.Prepared)
+        for project in [ "alpha"; "beta" ] do
+            let projectRow = record store project WorkSqliteRecordKind.Project "authority"
+            Assert.That(strProp projectRow "coverage", Is.EqualTo "Recovery")
+            let stage = record store project WorkSqliteRecordKind.Stage ("W-" + project)
+            Assert.That(strProp stage "state", Is.EqualTo "Blocked")
+            Assert.That(strProp stage "gate", Is.EqualTo "SourceRecoveryBlocked")
+        match WorkSchedulerSqlite.reserve store verified (Guid.NewGuid()) "stale-beta" with
+        | Error(SqliteSchedulerError.Storage(WorkSqliteFailure.StaleVersion _)) -> ()
+        | other -> Assert.Fail(sprintf "Stale E0 escaped project-wide fence: %A" other)
+        let freshProjects =
+            verified.Projects
+            |> List.map (fun p ->
+                { p with
+                    Stored = record store p.Id WorkSqliteRecordKind.Project "authority"
+                    StageRecords =
+                        p.StageRecords
+                        |> Map.map (fun id _ -> record store p.Id WorkSqliteRecordKind.Stage id) })
+        let fresh =
+            { verified with
+                Account = store.ReadCapacity "shared" |> ok |> Option.get
+                Projects = freshProjects }
+        match WorkSchedulerSqlite.reserve store fresh (Guid.NewGuid()) "fresh-beta" with
+        | Error(SqliteSchedulerError.Incomplete _) -> ()
+        | other -> Assert.Fail(sprintf "Fresh E0 escaped project-wide Recovery coverage: %A" other)
+        Assert.That((store.ReadCapacity "shared" |> ok |> Option.get).Reserved, Is.EqualTo 0)
+        Assert.That((WorkRecoverySqlite.seed store source original seedId |> ok).Receipt.Replayed, Is.True))

@@ -119,6 +119,9 @@ module internal WorkRecoverySqlite =
                        || ids.Length <> (ids |> Set.ofList |> Set.count)
                        || Set.ofList ids <> Set.ofList rows then
                         Some("project/stage authority mismatch: " + p.ProjectId)
+                    // Prepared is legitimate in-flight evidence, not corrupt
+                    // authority. The CAS must durably fence it and siblings
+                    // without converting the original effect to terminal.
                     elif state.Works |> List.exists (fun w ->
                         let row = p.Stages.[w.WorkId]
                         row.Key <> { ProjectId = p.ProjectId; Kind = WorkSqliteRecordKind.Stage; EntityId = w.WorkId }
@@ -126,7 +129,6 @@ module internal WorkRecoverySqlite =
                         || row.Value.GraphVersion <> int64 state.GraphVersion
                         || row.Value.StageGeneration <> int64 w.Generation
                         || row.Value.StopGeneration <> p.Project.Value.StopGeneration
-                        || row.Value.ExternalEffect = WorkSqliteEffect.Prepared
                         || (field "state" row |> Option.isNone)
                         || (field "gate" row |> Option.isNone)) then
                         Some("stage, STOP, generation or effect mismatch: " + p.ProjectId)

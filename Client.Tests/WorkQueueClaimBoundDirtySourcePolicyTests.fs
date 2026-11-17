@@ -327,6 +327,87 @@ let same_path_replacement_from_second_clone_cannot_reuse_original_host_edit () =
         | other -> Assert.Fail(sprintf "Same-path clone substitution survived identity binding: %A" other))
 
 [<Test>]
+let same_clone_same_path_checkout_reincarnation_cannot_reuse_original_host_edit () =
+    withFixture (fun f ->
+        awaitedEdit f
+        inspect f f.Source f.Bearer f.GrantRequest f.Effect (Some f.HostJournal)
+        |> verified |> ignore
+        let path = f.Source.RepositoryPath
+        let originalSha = git path ["rev-parse"; "HEAD"]
+        let admin = git path ["rev-parse"; "--absolute-git-dir"]
+        let common = git path ["rev-parse"; "--git-common-dir"]
+        let objects = git path ["rev-parse"; "--git-path"; "objects"]
+        let marker = Path.Combine(admin, "jarvis-wq11-checkout-instance.v1")
+        Assert.That(File.Exists marker, Is.True, "Clean WQ03 claim must have host instance proof.")
+        // Remove the *same clone's* original linked checkout after its edit.
+        // Git can recreate exactly the original admin/common/objects paths.
+        // Keep the successful original journal, grant and credential untouched.
+        git f.A.RepositoryPath ["worktree"; "remove"; "--force"; path] |> ignore
+        git f.A.RepositoryPath ["worktree"; "add"; "--detach"; path; originalSha] |> ignore
+        Assert.That(git path ["rev-parse"; "HEAD"], Is.EqualTo originalSha)
+        Assert.That(git path ["rev-parse"; "--absolute-git-dir"], Is.EqualTo admin)
+        Assert.That(git path ["rev-parse"; "--git-common-dir"], Is.EqualTo common)
+        Assert.That(git path ["rev-parse"; "--git-path"; "objects"], Is.EqualTo objects)
+        Assert.That(File.Exists marker, Is.False,
+                    "Git removal must destroy the original host-owned checkout instance marker.")
+        // Even a new operator scope revision cannot silently mint a replacement
+        // witness for the *old* claim generation and authorize its old journal.
+        let replacementScope: ReservationScopeRevision =
+            { LaunchId = f.LaunchId; ExpectedRevision = 1; ExpectedWorkId = f.WorkId
+              ReadProjectIds = set [f.A.ProjectId.ToString("D")]
+              Families = set [ReservationOperationFamily.ContextRead;
+                              ReservationOperationFamily.Implementation]
+              SourceWorktree = Some f.TreeName; ExpiresAtUnixMs = 5000L
+              Revoked = false; OperatorApprovalId = "reincarnation-rebind-denial" }
+        match WorkQueueReservationPermissions.reviseWithSourceAt f.A (Some f.Source)
+                  ("operator:" + String.replicate 64 "a") (Guid.NewGuid()) 200L
+                  replacementScope with
+        | Error (InvalidBinding reason)
+            when reason.Contains("checkout instance proof", StringComparison.OrdinalIgnoreCase) -> ()
+        | other ->
+            Assert.Fail(sprintf "Same-claim regrant did not fail on lost checkout instance: %A" other)
+        let verifiedSnapshot, _ = WorkQueueGitLedger.load f.A |> ok
+        let currentScope =
+            WorkQueueReservationPermissions.readScopeAt f.A verifiedSnapshot f.LaunchId |> ok
+        Assert.That((currentScope |> Option.get |> fst).Revision, Is.EqualTo 1)
+        match inspect f f.Source f.Bearer f.GrantRequest f.Effect
+                      (Some f.HostJournal) with
+        | ClaimedDirtySourceDecision.HostProofUnavailable reason
+            when reason.Contains("checkout instance", StringComparison.OrdinalIgnoreCase) -> ()
+        | ClaimedDirtySourceDecision.Rejected reason
+            when reason.Contains("checkout instance", StringComparison.OrdinalIgnoreCase) -> ()
+        | other ->
+            Assert.Fail(sprintf
+                "Reincarnated same-clone checkout wrongly inherited original FileEdit receipt: %A" other))
+
+[<Test>]
+let unchanged_checkout_renewal_preserves_immutable_claim_instance_and_edit_evidence () =
+    withFixture (fun f ->
+        let beforeSnapshot, _ = WorkQueueGitLedger.load f.A |> ok
+        let before =
+            WorkQueueReservationPermissions.readSourceClaimInstanceAt
+                f.A beforeSnapshot f.LaunchId 1 |> ok |> Option.get |> fst
+        let renewal: ReservationScopeRevision =
+            { LaunchId = f.LaunchId; ExpectedRevision = 1; ExpectedWorkId = f.WorkId
+              ReadProjectIds = set [f.A.ProjectId.ToString("D")]
+              Families = set [ReservationOperationFamily.ContextRead;
+                              ReservationOperationFamily.Implementation]
+              SourceWorktree = Some f.TreeName; ExpiresAtUnixMs = 5000L
+              Revoked = false; OperatorApprovalId = "same-instance-renewal" }
+        WorkQueueReservationPermissions.reviseWithSourceAt f.A (Some f.Source)
+            ("operator:" + String.replicate 64 "a") (Guid.NewGuid()) 140L renewal
+        |> ok |> ignore
+        let afterSnapshot, _ = WorkQueueGitLedger.load f.B |> ok
+        let after =
+            WorkQueueReservationPermissions.readSourceClaimInstanceAt
+                f.B afterSnapshot f.LaunchId 1 |> ok |> Option.get |> fst
+        Assert.That(after, Is.EqualTo before)
+        awaitedEdit f
+        inspect f f.Source f.Bearer
+            { f.GrantRequest with ExpectedRevision = 2 } f.Effect (Some f.HostJournal)
+        |> verified |> ignore)
+
+[<Test>]
 let modified_head_revoked_grant_stale_claim_and_disabled_route_remain_fail_closed () =
     withFixture (fun f ->
         awaitedEdit f

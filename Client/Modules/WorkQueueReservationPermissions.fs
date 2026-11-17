@@ -39,7 +39,20 @@ type SourceCheckoutGitIdentityWitness =
       LaunchId: string
       Revision: int
       GrantSha256: string
-      Identity: SourceCheckoutGitIdentity }
+      Identity: SourceCheckoutGitIdentity
+      CheckoutInstanceSha256: string }
+
+// One immutable anchor per original Work/launch claim generation. A later
+// scope revision cannot bless a replacement checkout under the same claim.
+type SourceCheckoutClaimInstanceWitness =
+    { SchemaVersion: int
+      ProjectId: string
+      WorkId: string
+      LaunchId: string
+      ClaimGeneration: int
+      CheckoutPath: string
+      Identity: SourceCheckoutGitIdentity
+      CheckoutInstanceSha256: string }
 
 type ReservationScopeGrant =
     { SchemaVersion: int
@@ -138,6 +151,10 @@ module WorkQueueReservationPermissions =
         sprintf "records/work-queue/reservation-scopes/source-identity/%s/%08d.json"
             (hash launchId) revision
 
+    let internal sourceClaimInstancePath launchId generation =
+        sprintf "records/work-queue/reservation-scopes/claim-instance/%s/%08d.json"
+            (hash launchId) generation
+
     // Source grants are minted from an actual clean, registered WQ03 worktree.
     // Capture the original *physical* Git admin and object-store directories,
     // rather than a remote-derived repository ID or the user-visible pathname.
@@ -214,6 +231,56 @@ module WorkQueueReservationPermissions =
         return identity
     }
 
+    // The linked worktree's Git administration directory is deleted by Git
+    // when the checkout is removed. Git may reuse its *name and full path*
+    // when recreating a linked tree from the same clone. A one-time CSPRNG
+    // marker in that host-owned directory distinguishes these lifetimes.
+    // It is never placed inside the source worktree or written by FileEdit.
+    // The original grant CAS stores only its digest; inspections only read.
+    let private checkoutInstanceMarker = "jarvis-wq11-checkout-instance.v1"
+
+    let internal sourceCheckoutInstanceDigest create
+            (identity: SourceCheckoutGitIdentity) = result {
+        let invalid reason =
+            Error(InvalidBinding("WQ11 checkout instance proof unavailable: " + reason))
+        let admin = identity.GitAdministrationDirectory
+        if String.IsNullOrWhiteSpace admin
+           || not (Path.IsPathFullyQualified admin)
+           || not (Directory.Exists admin) then
+            return! invalid "original linked Git administration directory missing"
+        let marker = Path.Combine(admin, checkoutInstanceMarker)
+        try
+            if not (File.Exists marker) then
+                if not create then
+                    return! invalid "original host-owned checkout instance marker missing"
+                // CreateNew never adopts/replaces an existing marker. A
+                // failed/racing creation denies this grant instead of silently
+                // changing its original physical checkout evidence.
+                let bytes = Encoding.ASCII.GetBytes(
+                    Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant())
+                use output = new FileStream(marker, FileMode.CreateNew, FileAccess.Write,
+                                            FileShare.None, 4096, FileOptions.WriteThrough)
+                output.Write(bytes, 0, bytes.Length)
+                output.Flush(true)
+                if not (OperatingSystem.IsWindows()) then
+                    File.SetUnixFileMode(marker,
+                        UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+
+            let file = FileInfo(marker)
+            if not file.Exists || not (isNull file.LinkTarget) || file.Length <> 64L then
+                return! invalid "host-owned checkout instance marker missing, linked or malformed"
+            if not (OperatingSystem.IsWindows())
+               && File.GetUnixFileMode(marker) <>
+                    (UnixFileMode.UserRead ||| UnixFileMode.UserWrite) then
+                return! invalid "host-owned checkout instance marker is not private"
+            let nonce = File.ReadAllText(marker, Encoding.ASCII)
+            if not (Regex.IsMatch(nonce, "^[a-f0-9]{64}$")) then
+                return! invalid "host-owned checkout instance marker invalid"
+            return hash nonce
+        with _ ->
+            return! invalid "host-owned checkout instance marker unreadable or cannot be provisioned"
+    }
+
     let proposalPath (operationId: Guid) =
         "records/work-queue/prerequisite-proposals/" + hash (operationId.ToString("D")) + ".json"
 
@@ -234,6 +301,10 @@ module WorkQueueReservationPermissions =
     let internal readSourceIdentityAt binding snapshot launchId revision =
         readCanonical<SourceCheckoutGitIdentityWitness> binding snapshot
             (sourceIdentityPath launchId revision)
+
+    let internal readSourceClaimInstanceAt binding snapshot launchId generation =
+        readCanonical<SourceCheckoutClaimInstanceWitness> binding snapshot
+            (sourceClaimInstancePath launchId generation)
 
     let readScopeAt binding snapshot launchId =
         readCanonical<ReservationScopeGrant> binding snapshot (scopePath launchId)
@@ -447,11 +518,42 @@ module WorkQueueReservationPermissions =
                 // filesystem identity is created in the *same* Git CAS.
                 // Existing v2 grants remain decodable, but WQ11 dirty-source
                 // inspection rejects historical revisions without this witness.
-                let sourceWitness =
-                    source |> Option.map (fun pinned ->
-                        { SchemaVersion = 1; LaunchId = launch.Id; Revision = revision
-                          GrantSha256 = CanonicalCodec.digest(CanonicalCodec.encode record)
-                          Identity = pinned.GitIdentity })
+                let! sourceWitness, claimInstanceChange =
+                    match source with
+                    | Some pinned ->
+                      result {
+                        let! original =
+                            readSourceClaimInstanceAt binding snapshot launch.Id pinned.ClaimGeneration
+                        // Never retrofit an original claim witness to a
+                        // preexisting scope: that checkout could be a replacement.
+                        if original.IsNone && existingVersion <> 0 then
+                            return! Error(InvalidBinding
+                                "Original checkout claim instance is unanchored; cannot rebind an existing reservation.")
+                        let! instanceSha =
+                            sourceCheckoutInstanceDigest original.IsNone pinned.GitIdentity
+                        let claimWitness =
+                            { SchemaVersion = 1; ProjectId = projectId binding
+                              WorkId = stage.Id; LaunchId = launch.Id
+                              ClaimGeneration = pinned.ClaimGeneration
+                              CheckoutPath = pinned.CheckoutPath
+                              Identity = pinned.GitIdentity
+                              CheckoutInstanceSha256 = instanceSha }
+                        let! claimChange =
+                            match original with
+                            | None ->
+                                Ok [ { Path = sourceClaimInstancePath launch.Id pinned.ClaimGeneration
+                                       ExpectedBlobOid = None
+                                       Content = CanonicalCodec.encode claimWitness } ]
+                            | Some (prior, _) when prior = claimWitness -> Ok []
+                            | _ -> Error(LedgerIntegrityError
+                                "Original checkout claim instance differs; re-claim with a new generation.")
+                        return
+                            Some { SchemaVersion = 2; LaunchId = launch.Id; Revision = revision
+                                   GrantSha256 = CanonicalCodec.digest(CanonicalCodec.encode record)
+                                   Identity = pinned.GitIdentity
+                                   CheckoutInstanceSha256 = instanceSha }, claimChange
+                      }
+                    | None -> Ok(None, [])
                 let! priorWitness =
                     readSourceIdentityAt binding snapshot launch.Id revision
                 if priorWitness.IsSome then
@@ -481,7 +583,7 @@ module WorkQueueReservationPermissions =
                         Content = CanonicalCodec.encode record }
                       { Path = revisionPath launch.Id revision; ExpectedBlobOid = None
                         Content = CanonicalCodec.encode record } ]
-                    @ identityChange
+                    @ identityChange @ claimInstanceChange
             })
 
     let internal reviseAt binding trustedActor operationId now request =

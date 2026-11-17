@@ -129,7 +129,7 @@ module WorkQueueClaimBoundDirtySourcePolicy =
     // WQ03's clean-status check. A dirty worktree is expected after editing,
     // but a moved HEAD, foreign tree or changed remote source is never valid.
     let private verifyPhysical (ledger: LedgerBinding) (source: LedgerBinding)
-        (grant: ReservationScopeGrant) (expectedGitIdentity: SourceCheckoutGitIdentity)
+        (grant: ReservationScopeGrant) (witness: SourceCheckoutGitIdentityWitness)
         (lineage: SourceLineage) (work: WorkStage) (launch: Launch) = result {
         let! grantPath =
             match grant.SourceCheckoutPath, grant.SourceWorktree, grant.SourceSha,
@@ -173,6 +173,7 @@ module WorkQueueClaimBoundDirtySourcePolicy =
             WorkQueueReservationPermissions.physicalSourceGitIdentity root
             |> Result.mapError (fun _ ->
                 "SourceHostProofUnavailable: physical Git administration/object-store identity cannot be verified.")
+        let expectedGitIdentity = witness.Identity
         if not (samePath expectedGitIdentity.GitAdministrationDirectory
                          currentGitIdentity.GitAdministrationDirectory)
            || not (samePath expectedGitIdentity.CommonGitDirectory
@@ -180,6 +181,17 @@ module WorkQueueClaimBoundDirtySourcePolicy =
            || not (samePath expectedGitIdentity.GitObjectStoreDirectory
                             currentGitIdentity.GitObjectStoreDirectory) then
             return! denied "Original Git administration/object-store identity differs from the immutable claim-bound grant."
+        // Recreating a linked checkout from its original clone can reuse all
+        // three Git paths and HEAD. Its removed host marker cannot survive
+        // worktree removal; never credit the old FileEdit journal to the new
+        // physical checkout, even though its Git paths are equal.
+        let! currentInstanceSha =
+            WorkQueueReservationPermissions.sourceCheckoutInstanceDigest false currentGitIdentity
+            |> Result.mapError (fun _ ->
+                "SourceHostProofUnavailable: original host-owned checkout instance marker missing or invalid.")
+        if not (hex64 witness.CheckoutInstanceSha256)
+           || currentInstanceSha <> witness.CheckoutInstanceSha256 then
+            return! denied "Host-owned checkout instance differs from original claim-bound grant."
         let! trees = git root ["worktree"; "list"; "--porcelain"]
         let registered =
             trees.Split([| "\n\n" |], StringSplitOptions.RemoveEmptyEntries)
@@ -248,13 +260,35 @@ module WorkQueueClaimBoundDirtySourcePolicy =
             |> Result.mapError (fun _ ->
                 "SourceHostProofUnavailable: original physical Git identity revision cannot be read.")
             |> Result.bind (function
-                | Some (witness, _) when witness.SchemaVersion = 1
+                | Some (witness, _) when witness.SchemaVersion = 2
                                           && witness.LaunchId = grant.LaunchId
                                           && witness.Revision = grant.Revision
                                           && witness.GrantSha256 =
                                               CanonicalCodec.digest(CanonicalCodec.encode grant) ->
-                    Ok witness.Identity
+                    Ok witness
                 | _ -> missing "No immutable original Git administration/object-store identity matching the grant.")
+        // The original clean claim has one immutable checkout instance.
+        // A later grant revision cannot establish a different instance
+        // under the same claim generation and reuse an older edit receipt.
+        let! _claimInstance =
+            match grant.SourceClaimGeneration with
+            | Some generation when generation > 0 ->
+                WorkQueueReservationPermissions.readSourceClaimInstanceAt ledger snapshot
+                    grant.LaunchId generation
+                |> Result.mapError (fun _ ->
+                    "SourceHostProofUnavailable: original checkout claim instance anchor unreadable.")
+                |> Result.bind (function
+                    | Some (claim, _) when claim.SchemaVersion = 1
+                                            && claim.ProjectId = ledger.ProjectId.ToString("D")
+                                            && claim.WorkId = grant.WorkId
+                                            && claim.LaunchId = grant.LaunchId
+                                            && claim.ClaimGeneration = generation
+                                            && Some claim.CheckoutPath = grant.SourceCheckoutPath
+                                            && claim.Identity = originalGitIdentity.Identity
+                                            && claim.CheckoutInstanceSha256 =
+                                                originalGitIdentity.CheckoutInstanceSha256 -> Ok claim
+                    | _ -> missing "No immutable original checkout claim instance matching this grant.")
+            | _ -> denied "Original source claim generation missing."
         let! credential =
             WorkQueueGitLedger.readCredentialAt ledger snapshot request.LaunchId
             |> Result.mapError (fun _ -> "SourceHostProofUnavailable: original credential unreadable.")

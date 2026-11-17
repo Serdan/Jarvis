@@ -1,0 +1,27 @@
+# G1b Recovery boot-fence RED baseline — independent findings
+
+**Verdict: ChangesRequested (test-contract quality only).** Frozen source `dd2995580e0b2361a3e811a520810dabc5eaa96c`, base `51b67bf1d5ba7e16512b915f8004456440b3489c`, review `0f2d740b9a87464c857fc6d2b4b80f62`. No production G1b, F1/B, Scheduler, host, live recovery, activation or RED merge is authorized.
+
+## Independently verified evidence
+
+- The frozen worktree is clean and `git diff --name-status 51b67..dd299` changes exactly: new `Server.Tests/WorkRecoveryRestoreBootFenceRedFirstTests.fs`, its single `Server.Tests.fsproj` compile include, and new `docs/testing/work-recovery-g1b-red-first-bootfence-2026-11-17.md`; no production source changes.
+- Original local focused .NET 11 Release TRX `Server.Tests/TestResults/work-recovery-g1b-red-20261117.trx` independently hashes SHA-256 `522d77d52d28f692ef26e554a20e5202e3b1f68b1c88af71fe8cbd1ad696732f`. Parsed counters: 5 total/executed, 1 passed (intact SQLite restart), 4 failed, 0 skipped/aborted/errors. All four failures bear the intended `RED G1b: pre-serve Recovery lock absent; ordinary admission was accepted` assertion, not compilation/fixture errors. This is valid observation of current unguarded raw B transactions, not proof about a production admission path.
+- `git diff --check` flags only four double-space Markdown hard line breaks in the evidence document; cosmetic, not part of this verdict.
+
+## Blocking — B1: unrelated failures are accepted as correct recovery denial
+
+In `WorkRecoveryRestoreBootFenceRedFirstTests.fs`, `assertRecoveryDenied` does `match store.Commit command with | Error _ -> () | Ok _ -> Assert.Fail(...)`, then checks sequence unchanged. `WorkSqliteFailure` currently includes unrelated `InvalidCommand`, `StaleVersion`, `StaleEvidence`, `CapacityExceeded`, `StorageUnavailable`, etc. Any such non-Recovery rejection, with unchanged sequence, makes the supposed pre-serve Recovery test **GREEN without a Recovery fence**. The evidence doc itself says an unrelated low-level failure is not proof of a Recovery protocol, contrary to the implementation.
+
+**Required correction:** make passing depend on *positive, independently observable, durable Recovery-specific authority evidence* and its causal denial; distinguish unrelated validation, capacity, transient storage and stale-CAS errors. Since no RecoveryRequired error/lock API currently exists, keep the relevant assertions intentionally RED pending the proper API rather than accepting `Error _`. Add an adversarial negative control or equally clear check demonstrating that an unrelated rejected transaction cannot masquerade as Recovery fencing. Preserve original TRX as historical evidence and provide new, source-frozen corrected evidence.
+
+## Blocking — B2: raw B proxy cannot alone specify pre-serve admission safety
+
+`Server/WorkSqliteAuthority.fs` explicitly states this is the internal substrate, that domain reducers must authenticate/authorize commands *before* invoking it, and that no production Scheduler entry point exists there (lines 10–12). All four RED tests call `WorkSqliteAuthority.Commit` directly, never an authenticated host/Scheduler/permission/claim gate. The design permits a durable pre-serve lock enforced above B. In that valid architecture, raw internal `Commit` may keep accepting the same commands indefinitely, so this baseline would remain red despite correct external fencing. The evidence doc calls this a B-level proxy and notes replacement is necessary, which is honest, but the actual test names and `assertRecoveryDenied` present the proxy as an executable enforcement contract.
+
+**Required correction:** make the documented test contract explicit about the true allowed enforcement boundary and avoid treating direct B `Commit` outcomes as acceptance of or regression against the host-facing G1b gate. For future GREEN, bind a test to a real Recovery-enforced boundary and persisted lock evidence; if that API is not yet available in the permitted tests-only lane, keep these as clearly named diagnostic RED probes, not eventual acceptance gates, and specify the exact superseding interface/test requirement. No production code changes are authorized in this correction.
+
+## Scope gap requiring explicit disposition
+
+Task spec's latest staged G1b lane also calls out trusted complete-account witness, actual claim and launch identities, cross-device same-name project mismatch, and progressive scoped release. The fixture stores two distinct project IDs, Stage/Launch/Unknown-effect rows and an N/N+1 effect, plus same-UUID receipt history, but does **not** exercise two same-name cross-device identities, authenticated complete-account witness, an actual claim, or recovery release. The evidence document correctly lists these as future B/F1/G1b gates. Keep them explicitly HOLD; either add feasible test-only checks with the correct identity model or obtain a canonical narrowed staged scope, rather than silently counting the five tests as coverage of those requirements.
+
+**Disposition:** current 4-RED/1-PASS receipt and bounded source changes are genuine and valuable. They do not yet constitute a non-vacuous, architecture-correct RED-first acceptance contract. Do not merge intentionally failing tests, authorize native/production Recovery, declare F1/B/G1b GO, or change live Work authority. Submit a new exact frozen test-only revision for independent review.

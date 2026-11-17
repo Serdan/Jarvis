@@ -72,11 +72,18 @@ let private work id goal =
       RoleAuthoritySha = lineage.RoleAuthoritySha
       Goal = goal
       CapturedInFlightLaunch = false
+      CapturedLaunches = []
       Source = None
       Review = None
       Integration = None
       Effects = []
       Release = None }
+
+let private capturedLaunch id =
+    { ProjectId = "alpha"
+      WorkId = "W"
+      Generation = 2
+      OperationId = id }
 
 let private completed id =
     { work id ArtifactGoal.Integrated with
@@ -202,7 +209,10 @@ let changed_or_rejected_frozen_review_is_not_accepted_for_integration () =
 
 [<Test>]
 let lost_inflight_launch_cannot_be_dispatched_again_without_terminal_proof () =
-    let original = { work "W" ArtifactGoal.Unchanged with CapturedInFlightLaunch = true }
+    let original =
+        { work "W" ArtifactGoal.Unchanged with
+            CapturedInFlightLaunch = true
+            CapturedLaunches = [ capturedLaunch "L" ] }
     let input = snapshot [ project "alpha" [ original ] ] |> fun state -> authorize state "alpha" "W"
     let result = decision input "alpha" "W"
     has Requirement.InFlightLaunchReconciliation result.Requirements
@@ -222,6 +232,102 @@ let lost_inflight_launch_cannot_be_dispatched_again_without_terminal_proof () =
     has Requirement.RecoveryAuthorizationRequired (decision repaired "alpha" "W").Requirements
     let released = authorize repaired "alpha" "W"
     Assert.That((decision released "alpha" "W").NormalDispatchAllowed, Is.True)
+
+[<Test>]
+let unrelated_terminal_launch_of_same_work_and_generation_cannot_clear_original_launch_fence () =
+    let terminal operation =
+        { OperationId = operation
+          WorkId = "W"
+          Generation = 2
+          Kind = EffectKind.Launch
+          SourceSha = None
+          Outcome = EffectOutcome.Observed ("terminal-" + operation, true, true, true) }
+    let captured =
+        { work "W" ArtifactGoal.Unchanged with
+            CapturedInFlightLaunch = true
+            CapturedLaunches = [ capturedLaunch "L-active" ]
+            Effects = [ terminal "L-other" ] }
+    // The unrelated launch has genuinely verified terminal evidence. The
+    // captured original is still unknown; even a newly minted recovery
+    // authorization using this evidence cannot bypass the reconciliation.
+    let input = snapshot [ project "alpha" [ captured ] ] |> fun s -> authorize s "alpha" "W"
+    let blocked = decision input "alpha" "W"
+    has Requirement.InFlightLaunchReconciliation blocked.Requirements
+    Assert.That(blocked.ReleaseAuthorized, Is.False)
+    Assert.That(blocked.NormalDispatchAllowed, Is.False)
+    let matching = { captured with Effects = [ terminal "L-other"; terminal "L-active" ] }
+    let repaired = snapshot [ project "alpha" [ matching ] ]
+    Assert.That((decision repaired "alpha" "W").Requirements,
+                Is.EqualTo(box [ Requirement.RecoveryAuthorizationRequired ]))
+    let released = authorize repaired "alpha" "W"
+    Assert.That((decision released "alpha" "W").NormalDispatchAllowed, Is.True)
+
+[<Test>]
+let captured_launches_require_all_exact_terminal_evidence_and_unknown_identity_stays_fenced () =
+    let settled operation =
+        { OperationId = operation
+          WorkId = "W"
+          Generation = 2
+          Kind = EffectKind.Launch
+          SourceSha = None
+          Outcome = EffectOutcome.DefinitiveNoEffect ("no-effect-" + operation, true, true) }
+    let identities = [ capturedLaunch "L-active"; capturedLaunch "L-next" ]
+    let original =
+        { work "W" ArtifactGoal.Unchanged with
+            CapturedInFlightLaunch = true
+            CapturedLaunches = identities
+            Effects = [ settled "L-active" ] }
+    let pending = snapshot [ project "alpha" [ original ] ]
+    has Requirement.InFlightLaunchReconciliation (decision pending "alpha" "W").Requirements
+    let both = { original with Effects = [ settled "L-active"; settled "L-next" ] }
+    let approved = authorize (snapshot [ project "alpha" [ both ] ]) "alpha" "W"
+    Assert.That((decision approved "alpha" "W").NormalDispatchAllowed, Is.True)
+
+    // Missing original identity cannot be reconstructed from any other
+    // journal, and inconsistent/malformed captured metadata remains blocked.
+    for invalid in
+        [ { original with CapturedLaunches = [] }
+          { original with CapturedLaunches = [ capturedLaunch "L-other" ] }
+          { original with CapturedInFlightLaunch = false }
+          { both with CapturedLaunches = identities @ [ capturedLaunch "L-active" ] }
+          { both with CapturedLaunches = [ { capturedLaunch "L-active" with WorkId = "other" } ] }
+          { both with CapturedLaunches = [ { capturedLaunch "L-active" with Generation = 3 } ] }
+          { both with CapturedLaunches = [ { capturedLaunch "L-active" with ProjectId = "other" } ] } ] do
+        let candidate = snapshot [ project "alpha" [ invalid ] ] |> fun s -> authorize s "alpha" "W"
+        has Requirement.InFlightLaunchReconciliation (decision candidate "alpha" "W").Requirements
+        Assert.That((decision candidate "alpha" "W").NormalDispatchAllowed, Is.False)
+
+[<Test>]
+let captured_launch_identity_changes_invalidate_existing_authorization_even_with_same_effect_receipts () =
+    let settled operation =
+        { OperationId = operation
+          WorkId = "W"
+          Generation = 2
+          Kind = EffectKind.Launch
+          SourceSha = None
+          Outcome = EffectOutcome.DefinitiveNoEffect ("terminal-" + operation, true, true) }
+    let original =
+        { work "W" ArtifactGoal.Unchanged with
+            CapturedInFlightLaunch = true
+            CapturedLaunches = [ capturedLaunch "L-original" ]
+            Effects = [ settled "L-original"; settled "L-other" ] }
+    let approved = authorize (snapshot [ project "alpha" [ original ] ]) "alpha" "W"
+    let swapped =
+        { original with CapturedLaunches = [ capturedLaunch "L-other" ]; Release = approved.Projects.Head.Works.Head.Release }
+    let changed = snapshot [ project "alpha" [ swapped ] ]
+    let before = decision approved "alpha" "W"
+    let after = decision changed "alpha" "W"
+    Assert.That(after.EvidenceReceipts, Is.EqualTo(box before.EvidenceReceipts))
+    Assert.That(after.EvidenceDigest, Is.Not.EqualTo(before.EvidenceDigest))
+    Assert.That(after.Requirements, Is.EqualTo(box [ Requirement.RecoveryAuthorizationRequired ]))
+    Assert.That(after.ReleaseAuthorized, Is.False)
+    let reordered = { original with CapturedLaunches = [ capturedLaunch "L-other"; capturedLaunch "L-original" ] }
+    let two = authorize (snapshot [ project "alpha" [ reordered ] ]) "alpha" "W"
+    let reorderedAgain =
+        { two with Projects = [ { two.Projects.Head with
+                                   Works = [ { two.Projects.Head.Works.Head with
+                                                 CapturedLaunches = List.rev reordered.CapturedLaunches } ] } ] }
+    Assert.That((decision reorderedAgain "alpha" "W").ReleaseAuthorized, Is.True)
 
 [<Test>]
 let unknown_source_push_and_unreconciled_original_job_keep_effect_fenced () =

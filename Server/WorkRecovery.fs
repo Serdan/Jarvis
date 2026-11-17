@@ -117,6 +117,16 @@ type ExternalEffect =
       SourceSha: string option
       Outcome: EffectOutcome }
 
+// These identities must come from the ORIGINAL captured launch records, not
+// from whichever journal entries happen to be visible after restoration.
+// Operation IDs are account-global one-shot identities; the project, Work and
+// generation bind each captured launch to its original execution scope.
+type CapturedLaunchIdentity =
+    { ProjectId: string
+      WorkId: string
+      Generation: int
+      OperationId: string }
+
 type SequenceGapSeal =
     { ProjectId: string
       RestoredProjectSequence: int64
@@ -161,7 +171,10 @@ type RecoveryWorkSnapshot =
       Generation: int
       RoleAuthoritySha: string
       Goal: ArtifactGoal
+      // True with no identities means the original launch identity was lost:
+      // the Recovery role must investigate; no other launch may clear it.
       CapturedInFlightLaunch: bool
+      CapturedLaunches: CapturedLaunchIdentity list
       Source: SourceProof option
       Review: FrozenReviewProof option
       Integration: IntegrationProof option
@@ -431,9 +444,34 @@ module WorkRecovery =
         let mutable requirements = []
         let mutable receipts = Set.empty
 
-        if work.CapturedInFlightLaunch
-           && not (effects |> List.exists (fun effect ->
-               effect.Kind = EffectKind.Launch && effect.WorkId = work.WorkId && effect.Generation = work.Generation)) then
+        let capturedDuplicate =
+            work.CapturedLaunches
+            |> List.countBy id
+            |> List.exists (fun (_, count) -> count > 1)
+
+        let capturedLaunchSettled (captured: CapturedLaunchIdentity) =
+            validId captured.OperationId
+            && captured.ProjectId = project.ProjectId
+            && captured.WorkId = work.WorkId
+            && captured.Generation = work.Generation
+            && (effects |> List.exists (fun effect ->
+                effect.OperationId = captured.OperationId
+                && effect.WorkId = captured.WorkId
+                && effect.Generation = captured.Generation
+                && effect.Kind = EffectKind.Launch
+                && effect.SourceSha.IsNone
+                && (match effect.Outcome with
+                    | EffectOutcome.DefinitiveNoEffect (receipt, true, true) -> validId receipt
+                    | EffectOutcome.Observed (receipt, true, true, true) -> validId receipt
+                    | _ -> false)))
+
+        // A captured but unidentified launch is unknown, even if an unrelated
+        // launch from the same Work/generation has a verified terminal result.
+        // An inconsistent "not captured" flag and nonempty identity set also
+        // fails closed instead of silently ignoring original launch evidence.
+        if work.CapturedInFlightLaunch <> (not work.CapturedLaunches.IsEmpty)
+           || capturedDuplicate
+           || not (work.CapturedLaunches |> List.forall capturedLaunchSettled) then
             requirements <- Requirement.InFlightLaunchReconciliation :: requirements
 
         for id in badDuplicates do
@@ -608,8 +646,14 @@ module WorkRecovery =
                 writeBool reconciled
                 writeBool terminal
 
+        let writeCapturedLaunch (captured: CapturedLaunchIdentity) =
+            writeString captured.ProjectId
+            writeString captured.WorkId
+            writeInt captured.Generation
+            writeString captured.OperationId
+
         // Version this encoding before adding or reordering any fields.
-        writeInt 1
+        writeInt 2
         writeInt input.SchemaVersion
         writeLong input.SnapshotDatabaseSequence
         writeOption writeLong input.KnownPreviousDatabaseSequence
@@ -632,6 +676,7 @@ module WorkRecovery =
                   | ArtifactGoal.AcceptedReview -> 2
                   | ArtifactGoal.Integrated -> 3)
         writeBool work.CapturedInFlightLaunch
+        writeList writeCapturedLaunch (work.CapturedLaunches |> List.sort)
         writeOption writeSource work.Source
         writeOption writeReview work.Review
         writeOption writeIntegration work.Integration

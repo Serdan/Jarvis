@@ -349,10 +349,33 @@ module WorkQueueNativeLifecycleCas =
                 Ok lease
             | _ -> Error(reject "Ephemeral session UUID/key, stop flag or fresh lease generation cannot be verified.")
         let _ = lease
+        let! storedCredential =
+            WorkQueueGitLedger.readCredentialAt project snapshot launchId
+        let originalFirstConnect =
+            before.Receipts.TryFind(binding.FirstConnectOperationId.ToString("D"))
+        // The Work-native WQ02 credential route intentionally has no Agent
+        // UUID/session secret. Its first connect uses launch identity and an
+        // immutable verifier stored in the same four-path admission Git CAS.
+        // Never mistake that for the older legacy Agent initialize receipt.
+        let credentialFirstConnect =
+            match storedCredential with
+            | Some (verifier, _) when
+                verifier.SchemaVersion = 1 &&
+                verifier.ProjectId = project.ProjectId.ToString("D") &&
+                verifier.LaunchId = launchId &&
+                verifier.AccountTokenId = admission.AdmissionOperationId.ToString("D") &&
+                session.AgentUuid = launchId &&
+                session.SessionKey = "work-credential-v1:" + launchId ->
+                originalFirstConnect =
+                    Some(ProjectOperationPayload.OtherMutation ("initialize-work|" + launchId))
+            | _ -> false
+        let legacyFirstConnect =
+            storedCredential.IsNone &&
+            originalFirstConnect =
+                Some(ProjectOperationPayload.OtherMutation ("initialize|" + launchId + "|" + session.SessionKey))
         do! required (before.Receipts.TryFind(binding.DispatchOperationId.ToString("D")) =
                           Some(ProjectOperationPayload.OtherMutation ("dispatch|" + launchId + "|Submitted")) &&
-                      before.Receipts.TryFind(binding.FirstConnectOperationId.ToString("D")) =
-                          Some(ProjectOperationPayload.OtherMutation ("initialize|" + launchId + "|" + session.SessionKey)))
+                      (credentialFirstConnect || legacyFirstConnect))
              "WQ02 original dispatch/first-connect operation receipts are missing."
 
         match action with

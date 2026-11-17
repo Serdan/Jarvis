@@ -303,6 +303,14 @@ let private runClient args =
             JobManager.cancelJob { ProjectName = ""; JobId = jobId } rt
             |> formatJobResult) }
     tui.SetAgentAccess { Load = (fun () -> AgentDashboard.load rt) }
+    // Explicit local opt-in. No claims, Scheduler or Agent-based Work source.
+    let workTuiEnabled =
+        String.Equals(Environment.GetEnvironmentVariable("JARVIS_WORK_TUI_READONLY"),
+                      "1", StringComparison.Ordinal)
+    WorkQueueDashboardHost.installIfEnabled workTuiEnabled tui
+        (fun () -> WorkQueueDashboardHost.createAccess rt)
+    if workTuiEnabled then
+        tui.Log "Read-only Git-verified Work view enabled; account capacity and dispatch remain UNKNOWN."
     tui.Log $"Trust: {TrustLevel.toDisplayName trustLevel}"
     tui.Log $"Allowed sensitive environment variables: {allowedEnvironmentVariables.Length}"
     let importSizeDescription =

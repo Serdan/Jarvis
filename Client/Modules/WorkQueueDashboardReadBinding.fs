@@ -111,7 +111,7 @@ let private hasPinnedRoleProof (view: WorkToolSnapshot) =
         | true, value -> value >= 0
         | false, _ -> false
 
-let private toSnapshot (binding: LedgerBinding) (view: WorkToolSnapshot) : Result<Snapshot, string> =
+let internal toSnapshot (binding: LedgerBinding) (view: WorkToolSnapshot) : Result<Snapshot, string> =
     if view.ProjectId <> binding.ProjectId.ToString("D") then
         Error "UNKNOWN: Work snapshot project identity differs from approved Git binding."
     elif not (validHead view.VerifiedGitHead) then

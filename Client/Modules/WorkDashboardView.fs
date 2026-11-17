@@ -3,20 +3,10 @@ module Client.WorkDashboardView
 open System
 open System.Globalization
 
-// STAGED, NOT PRODUCTION-BOUND. The WorkQueueToolFacade module is not on
-// integrated main at this source baseline. The host binding to install after
-// that facade is accepted is:
-//   1. Enumerate actual trusted LedgerBinding projects in the client host.
-//   2. For each binding, call WorkQueueToolFacade.readWithBinding
-//      binding "List" "All" "" (a pinned Git-backed read).
-//   3. Copy every WorkToolSnapshot field and WorkToolRow/WorkDependencyReason
-//      field to the DTOs below, setting SubjectTitle=None unless a title was
-//      independently verified at that *same* canonical Git head.
-//   4. Preserve one ProjectSource per bound project, using Error reason on
-//      incomplete/unbound reads; no stale cache or legacy Agent substitutions.
-//   5. Inject that per-project Load function through ConsoleTui.SetWorkAccess.
-// There is no command to claim/complete Work or start Scheduler in this view.
-// Until that explicit host adapter is installed, the tab displays NotReady.
+// Read-only Work projection. WorkQueueDashboardHost installs its Git-verified
+// provider only under an explicit local opt-in. No legacy Agent substitutions,
+// claim/complete action, or Scheduler dispatch are provided. Account membership,
+// capacity and original source effects remain UNKNOWN in this view.
 type Dependency =
     { WorkId: string
       StageGeneration: int option

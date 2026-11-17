@@ -10,8 +10,15 @@ open Client.WorkStatefulContracts
 type IAuthenticatedWorkSnapshotReader =
     abstract ReadProjectSnapshot: WorkReadRequest -> Result<WorkReadSnapshot, string>
 
+[<RequireQualifiedAccess>]
+type ReadSourceProvenance =
+    // SQLite provenance is reported, not Git/review/integration attestation.
+    | ReportedUnverified of string
+    | Unknown of string
+
 type ReadProjection =
     { Snapshot: Snapshot
+      StageSources: Map<string * string, ReadSourceProvenance>
       Diagnostics: string list }
 
 [<RequireQualifiedAccess>]
@@ -20,6 +27,11 @@ type ReadTransportFailure =
     | InvalidResponse of string
 
 let private nonblank value = not (String.IsNullOrWhiteSpace value)
+
+let private validSourceCommit (sha: string) =
+    not (String.IsNullOrWhiteSpace sha)
+    && (sha.Length = 40 || sha.Length = 64)
+    && (sha |> Seq.forall (fun c -> (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
 
 let private nodeKind = function
     | Some "Project" -> Some NodeKind.Project
@@ -89,10 +101,12 @@ let private stage graphVersion stopGeneration (row: WorkReadStage) =
             | Some "Pending" -> Some StageState.Pending
             | Some "Available" -> Some StageState.Available
             | Some "Blocked" -> Some(StageState.Blocked ["Blocked reasons not yet attested"])
-            | Some "Claimed" when row.ClaimLaunchId |> Option.exists nonblank ->
+            | Some "Claimed" when (row.ClaimLaunchId |> Option.exists nonblank)
+                                  && row.ClaimGeneration > 0L
+                                  && row.ClaimGeneration <= int64 Int32.MaxValue ->
                 Some(StageState.Claimed
                     { LaunchId = row.ClaimLaunchId.Value
-                      Generation = int row.StageGeneration
+                      Generation = int row.ClaimGeneration
                       Execution = Evidence.Unknown "No verified live execution observation" })
             | Some "Completed" | Some "Finished" -> Some StageState.Finished
             | Some "Cancelled" -> Some StageState.Cancelled
@@ -159,6 +173,21 @@ let fetch (reader: IAuthenticatedWorkSnapshotReader)
             | Ok () ->
                 let nodes = response.Nodes |> List.choose (node response.GraphVersion)
                 let stages = response.Stages |> List.choose (stage response.GraphVersion response.StopGeneration)
+                let sourceRows =
+                    response.Stages
+                    |> List.map (fun row -> (row.ProjectId, row.Id), row)
+                    |> Map.ofList
+                let stageSources =
+                    stages
+                    |> List.map (fun projected ->
+                        let row = Map.find (projected.ProjectId, projected.Id) sourceRows
+                        let source =
+                            match row.SourceCommit with
+                            | Some sha when validSourceCommit sha -> ReadSourceProvenance.ReportedUnverified sha
+                            | Some _ -> ReadSourceProvenance.Unknown "Malformed recorded source SHA"
+                            | None -> ReadSourceProvenance.Unknown "No recorded source SHA"
+                        (projected.ProjectId, projected.Id), source)
+                    |> Map.ofList
                 let roles =
                     match verifiedRoleId with
                     | None -> Evidence.Unknown "No verified role selected by the authenticated channel"
@@ -182,6 +211,17 @@ let fetch (reader: IAuthenticatedWorkSnapshotReader)
                           "Work graph rows omitted: node kind/state/required status is not verified."
                       if stages.Length <> response.Stages.Length then
                           "Stage rows omitted: canonical node link/state/STOP or generation is not verified."
+                      if response.Stages |> List.exists (fun row ->
+                          row.State = Some "Claimed"
+                          && (not (row.ClaimLaunchId |> Option.exists nonblank)
+                              || row.ClaimGeneration <= 0L
+                              || row.ClaimGeneration > int64 Int32.MaxValue)) then
+                          "Claimed stage omitted: missing or invalid claim launch/generation provenance."
+                      if stageSources |> Map.exists (fun _ source ->
+                          match source with
+                          | ReadSourceProvenance.Unknown "Malformed recorded source SHA" -> true
+                          | _ -> false) then
+                          "Recorded source SHA malformed; no source provenance attested."
                       "This read-only snapshot does not grant approval, claim, or priority permissions." ]
                 Ok
                     { Snapshot =
@@ -199,4 +239,5 @@ let fetch (reader: IAuthenticatedWorkSnapshotReader)
                           Recovery = Evidence.Unknown response.RecoveryUnknownReason
                           Nodes = nodes
                           Stages = stages }
+                      StageSources = stageSources
                       Diagnostics = diagnostics }

@@ -142,3 +142,52 @@ let incomplete_node_and_stage_metadata_remains_visible_as_omission_not_a_fake_au
     match result.Snapshot.Capacity, result.Snapshot.RoleQueues with
     | Evidence.Unknown _, Evidence.Unknown _ -> ()
     | _ -> Assert.Fail("Missing capacity/roles must not become verified")
+
+[<Test>]
+let claimed_stage_preserves_distinct_stage_and_claim_generations () =
+    let claimed = { stage with State = Some "Claimed"; ClaimLaunchId = Some "launch-7"; ClaimGeneration = 7L }
+    let actual = fetchResponse { response with Stages = [ claimed ] } |> success
+    Assert.That(actual.Snapshot.Stages.Head.Generation, Is.EqualTo 3)
+    match actual.Snapshot.Stages.Head.State with
+    | StageState.Claimed claim ->
+        Assert.That(claim.LaunchId, Is.EqualTo "launch-7")
+        Assert.That(claim.Generation, Is.EqualTo 7)
+        match claim.Execution with
+        | Evidence.Unknown _ -> ()
+        | _ -> Assert.Fail("Reported claim must not attest to live execution")
+    | other -> Assert.Fail(sprintf "Expected reported claim, got %A" other)
+
+[<Test>]
+let invalid_claim_provenance_is_omitted_with_explicit_diagnostic () =
+    let claimed = { stage with State = Some "Claimed"; ClaimLaunchId = Some "launch-7"; ClaimGeneration = 7L }
+    let candidates =
+        [ { claimed with ClaimGeneration = 0L }
+          { claimed with ClaimGeneration = -1L }
+          { claimed with ClaimGeneration = int64 Int32.MaxValue + 1L }
+          { claimed with ClaimLaunchId = None } ]
+    for candidate in candidates do
+        let actual = fetchResponse { response with Stages = [ candidate ] } |> success
+        Assert.That(actual.Snapshot.Stages, Is.Empty)
+        Assert.That(actual.Diagnostics |> String.concat " ", Does.Contain("Claimed stage omitted"))
+
+[<Test>]
+let source_sha_survives_as_reported_unverified_metadata_only () =
+    let sha = String.replicate 40 "a"
+    let actual = fetchResponse response |> success
+    match Map.find ("project-A", "work-1") actual.StageSources with
+    | ReadSourceProvenance.ReportedUnverified reported -> Assert.That(reported, Is.EqualTo sha)
+    | other -> Assert.Fail(sprintf "Expected reported unverified source SHA, got %A" other)
+    match actual.Snapshot.Stages.Head.Review, actual.Snapshot.Stages.Head.Integration with
+    | ReviewStage.Unknown _, IntegrationStage.Unknown _ -> ()
+    | other -> Assert.Fail(sprintf "Source SHA must not imply review/integration acceptance: %A" other)
+
+    let malformed = fetchResponse { response with Stages = [ { stage with SourceCommit = Some "not-a-sha" } ] } |> success
+    match Map.find ("project-A", "work-1") malformed.StageSources with
+    | ReadSourceProvenance.Unknown _ -> ()
+    | other -> Assert.Fail(sprintf "Malformed SHA must be UNKNOWN, got %A" other)
+    Assert.That(malformed.Diagnostics |> String.concat " ", Does.Contain("source SHA malformed"))
+
+    let absent = fetchResponse { response with Stages = [ { stage with SourceCommit = None } ] } |> success
+    match Map.find ("project-A", "work-1") absent.StageSources with
+    | ReadSourceProvenance.Unknown _ -> ()
+    | other -> Assert.Fail(sprintf "Absent source SHA must be UNKNOWN, got %A" other)

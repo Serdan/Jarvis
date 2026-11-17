@@ -4,6 +4,7 @@ open System
 open System.Data
 open System.IO
 open System.Runtime.InteropServices
+open System.Threading
 open System.Security.Cryptography
 open System.Text
 open Microsoft.Data.Sqlite
@@ -40,6 +41,15 @@ type OriginalWriterJournalWitness =
 module OriginalGitWriterAdmissionJournal =
     [<Literal>]
     let JournalEnvironment = "JARVIS_ORIGINAL_GIT_WRITER_ADMISSION_JOURNAL"
+
+    // The environment variable is only a request to use a journal, never the
+    // enduring authority to revert an activated host to default-off.  A
+    // protected, fixed-location host binding independently pins its identity.
+    // Test-only per-execution root avoids touching the actual operator host.
+    let private fixtureRoot = AsyncLocal<string>()
+
+    let internal setDisposableBindingRoot path =
+        fixtureRoot.Value <- defaultArg path null
 
     [<DllImport("libc", EntryPoint = "open", SetLastError = true)>]
     extern int private openDirectory(string path, int flags)
@@ -93,6 +103,7 @@ module OriginalGitWriterAdmissionJournal =
             invalidOp "Original-writer journal binding unavailable or insecure."
         let builder = SqliteConnectionStringBuilder()
         builder.DataSource <- path
+        builder.Pooling <- false // Reopen the exact on-disk journal identity; no stale pooled inode.
         builder.Mode <- SqliteOpenMode.ReadWrite
         builder.Cache <- SqliteCacheMode.Private
         let connection = new SqliteConnection(builder.ToString())
@@ -135,6 +146,7 @@ module OriginalGitWriterAdmissionJournal =
             invalidArg (nameof path) "A new explicit disposable journal path is required."
         let builder = SqliteConnectionStringBuilder()
         builder.DataSource <- path
+        builder.Pooling <- false // Disposable provisioning must create the named file, not reuse a pooled handle.
         builder.Mode <- SqliteOpenMode.ReadWriteCreate
         use db = new SqliteConnection(builder.ToString())
         db.Open()
@@ -150,6 +162,10 @@ module OriginalGitWriterAdmissionJournal =
                 closed INTEGER NOT NULL CHECK(closed IN (0,1))
             );
             INSERT INTO control(id,epoch,closed) VALUES (1,1,0);
+            CREATE TABLE journal_identity (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                journal_id TEXT NOT NULL UNIQUE
+            );
             CREATE TABLE effects (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 effect_key TEXT NOT NULL UNIQUE,
@@ -163,14 +179,135 @@ module OriginalGitWriterAdmissionJournal =
             );
         """
         cmd.ExecuteNonQuery() |> ignore
+        use identity = db.CreateCommand()
+        identity.CommandText <- "INSERT INTO journal_identity(id,journal_id) VALUES(1,$id)"
+        identity.Parameters.AddWithValue("$id", Guid.NewGuid().ToString("N")) |> ignore
+        identity.ExecuteNonQuery() |> ignore
         db.Close()
         syncParent path
 
+    let private boundRoot () =
+        if String.IsNullOrWhiteSpace fixtureRoot.Value then
+            let appData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)
+            if String.IsNullOrWhiteSpace appData then
+                invalidOp "Local application-data binding root is unavailable."
+            Path.Combine(appData, "Jarvis", "original-git-writer-admission")
+        else Path.Combine(fixtureRoot.Value, "original-writer-host-binding")
+
+    let private protectedFile path =
+        try
+            File.Exists path && noRedirects path
+            && (OperatingSystem.IsWindows()
+                || (File.GetUnixFileMode path
+                    &&& (UnixFileMode.GroupRead ||| UnixFileMode.GroupWrite
+                         ||| UnixFileMode.OtherRead ||| UnixFileMode.OtherWrite)) = UnixFileMode.None)
+        with _ -> false
+
+    let private journalId path =
+        try
+            use db = openDatabase path
+            use cmd = db.CreateCommand()
+            cmd.CommandText <- "SELECT journal_id FROM journal_identity WHERE id=1"
+            let value = cmd.ExecuteScalar()
+            let id = if isNull value then "" else string value
+            let mutable parsed = Guid.Empty
+            if Guid.TryParseExact(id, "N", &parsed) && parsed <> Guid.Empty then Some id
+            else None
+        with _ -> None
+
+    let private createProtected (path: string) (content: string) =
+        use stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None)
+        if not (OperatingSystem.IsWindows()) then
+            File.SetUnixFileMode(path, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+        let bytes = Encoding.UTF8.GetBytes(content)
+        stream.Write(bytes, 0, bytes.Length)
+        stream.Flush(true)
+
+    let private bindingText path identity =
+        String.concat "\n" ["OriginalWriterHostBinding/v1"; path; identity]
+
+    let private readHostBinding path seal =
+        if not (protectedFile path && protectedFile seal) then
+            Error "OriginalWriterJournalUnknown/HostBindingMissingOrInsecure"
+        else
+            try
+                let record = File.ReadAllText path
+                let signature = File.ReadAllText seal
+                let lines = record.Split('\n')
+                if lines.Length <> 3 || lines.[0] <> "OriginalWriterHostBinding/v1"
+                   || signature <> digest record || not (safeJournalPath lines.[1])
+                   || journalId lines.[1] <> Some lines.[2] then
+                    Error "OriginalWriterJournalUnknown/HostBindingIdentityMismatch"
+                else Ok lines.[1]
+            with _ -> Error "OriginalWriterJournalUnknown/HostBindingUnreadable"
+
+    let private hostRootState (root: string) =
+        try
+            let attributes = File.GetAttributes root
+            if not (attributes.HasFlag(FileAttributes.Directory)) then
+                Error "OriginalWriterJournalUnknown/HostBindingRootNotDirectory"
+            elif not (noRedirects root) then
+                Error "OriginalWriterJournalUnknown/UntrustedHostBindingRoot"
+            elif not (OperatingSystem.IsWindows())
+                 && (File.GetUnixFileMode root
+                     &&& (UnixFileMode.GroupRead ||| UnixFileMode.GroupWrite
+                          ||| UnixFileMode.GroupExecute ||| UnixFileMode.OtherRead
+                          ||| UnixFileMode.OtherWrite ||| UnixFileMode.OtherExecute)) <> UnixFileMode.None then
+                Error "OriginalWriterJournalUnknown/UntrustedHostBindingPermissions"
+            else Ok true
+        with
+        | :? DirectoryNotFoundException | :? FileNotFoundException -> Ok false
+        | _ -> Error "OriginalWriterJournalUnknown/HostBindingRootUnreadable"
+
+    // First activation is possible only with a previously provisioned journal.
+    // Thereafter a separate pinned host binding prevents environment removal,
+    // substitution or journal replacement from silently reopening publication.
+    // Missing half of an interrupted/tampered binding is permanently UNKNOWN.
     let internal configuredPath () =
-        let path = Environment.GetEnvironmentVariable JournalEnvironment
-        if String.IsNullOrWhiteSpace path then Ok None
-        elif safeJournalPath path then Ok(Some path)
-        else Error "OriginalWriterJournalUnknown/UntrustedOrMissingJournal"
+        try
+            let requested = Environment.GetEnvironmentVariable JournalEnvironment
+            let root = boundRoot()
+            let binding = Path.Combine(root, "journal.binding")
+            let seal = Path.Combine(root, "journal.binding.sha256")
+            match hostRootState root with
+            | Error reason -> Error reason
+            | Ok rootExists when rootExists && (File.Exists binding || File.Exists seal) ->
+                match readHostBinding binding seal with
+                | Error reason -> Error reason
+                | Ok pinned when String.IsNullOrWhiteSpace requested ->
+                    Error "OriginalWriterJournalUnknown/ActivatedHostBindingMissing"
+                | Ok pinned when requested <> pinned ->
+                    Error "OriginalWriterJournalUnknown/ActivatedHostBindingChanged"
+                | Ok pinned -> Ok(Some pinned)
+            | Ok true ->
+                // The host-specific root is only created on enrollment. Even
+                // deletion of BOTH binding files must not revert to default-off.
+                Error "OriginalWriterJournalUnknown/ActivatedHostBindingDeleted"
+            | Ok false when String.IsNullOrWhiteSpace requested ->
+                // Truly never activated: retain existing default-off behavior.
+                Ok None
+            | Ok false when not (safeJournalPath requested) ->
+                Error "OriginalWriterJournalUnknown/UntrustedOrMissingJournal"
+            | Ok false ->
+                match journalId requested with
+                | None -> Error "OriginalWriterJournalUnknown/JournalIdentityUnavailable"
+                | Some identity ->
+                    // A fixed host-owned anchor, not a dynamically selected
+                    // environment-variable path after activation.
+                    Directory.CreateDirectory root |> ignore
+                    if not (OperatingSystem.IsWindows()) then
+                        File.SetUnixFileMode(root,
+                            UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+                    if not (noRedirects root) then
+                        Error "OriginalWriterJournalUnknown/UntrustedHostBindingRoot"
+                    else
+                        let contents = bindingText requested identity
+                        createProtected binding contents
+                        syncParent binding
+                        createProtected seal (digest contents)
+                        syncParent seal
+                        Ok(Some requested)
+        with _ -> Error "OriginalWriterJournalUnknown/HostBindingUnavailable"
 
     let private validateIntent (operationId: Guid) (kind: string) (authority: string) (gitRef: string) (payload: string) =
         operationId <> Guid.Empty

@@ -64,9 +64,12 @@ type LegacyWriterProtocolFenceTests() =
 
     let withFixture action =
         let oldHost = Environment.GetEnvironmentVariable LegacyWriterProtocolFence.HostBindingEnvironment
+        let oldJournal = Environment.GetEnvironmentVariable OriginalGitWriterAdmissionJournal.JournalEnvironment
         let root = Path.Combine(Path.GetTempPath(), "wq10-legacy-fence-" + Guid.NewGuid().ToString("N"))
         Directory.CreateDirectory root |> ignore
         Environment.SetEnvironmentVariable(LegacyWriterProtocolFence.HostBindingEnvironment, null)
+        Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, null)
+        OriginalGitWriterAdmissionJournal.setDisposableBindingRoot (Some root)
         try
             let ar, a1, a2 = repository root "account"
             let pr, p1, p2 = repository root "project"
@@ -98,6 +101,8 @@ type LegacyWriterProtocolFenceTests() =
             Assert.That(git p2 [ "status"; "--porcelain" ], Is.Empty)
         finally
             Environment.SetEnvironmentVariable(LegacyWriterProtocolFence.HostBindingEnvironment, oldHost)
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, oldJournal)
+            OriginalGitWriterAdmissionJournal.setDisposableBindingRoot None
             try Directory.Delete(root, true) with _ -> ()
 
     let scope fixture account project =
@@ -876,3 +881,154 @@ type LegacyWriterProtocolFenceTests() =
                 Assert.That(after.RouteCoverageProven, Is.False)
             finally
                 Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, oldJournal))
+
+
+    [<Test>]
+    member _.ActivatedJournalStopRejectsMissingChangedAndPartiallyDeletedHostBinding() =
+        withFixture (fun f ->
+            let pathA = Path.Combine(f.Root, "writer-a.db")
+            let pathB = Path.Combine(f.Root, "writer-b.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal pathA
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal pathB
+            let setting = OriginalGitWriterAdmissionJournal.JournalEnvironment
+            Environment.SetEnvironmentVariable(setting, pathA)
+            AccountCapacityLedger.setCapacity f.AccountOne (Guid.NewGuid()) "Operator" 1L 4
+            |> success |> ignore
+            let before = AccountCapacityLedger.fetch f.AccountTwo |> success
+            let closed = OriginalGitWriterAdmissionJournal.stop pathA |> success
+            Assert.That(closed.AdmissionClosed, Is.True)
+            let projectHead =
+                git f.Root [ "--git-dir=" + f.ProjectRemote; "rev-parse"; "refs/heads/jarvis-orchestration" ]
+            let accountHead =
+                git f.Root [ "--git-dir=" + f.AccountRemote; "rev-parse"; AccountCapacityLedger.AccountRef ]
+            let denied (label: string) =
+                let result =
+                    AccountCapacityLedger.setCapacity f.AccountTwo (Guid.NewGuid()) "Operator"
+                        before.State.StateVersion 5
+                Assert.That(Result.isError result, Is.True, label)
+                let operation =
+                    { OperationId = Guid.NewGuid(); Actor = "Operator"
+                      Kind = "PostStopBindingAttempt"; RequestJson = "{}" }
+                let resultProject =
+                    LedgerStore.transact f.ProjectTwo operation (fun _ ->
+                        Ok [ { Path = "records/binding-guard/" + Guid.NewGuid().ToString("N") + ".json"
+                               ExpectedBlobOid = None; Content = "{}" } ])
+                Assert.That(Result.isError resultProject, Is.True, label + ":project")
+                let currentProject =
+                    git f.Root [ "--git-dir=" + f.ProjectRemote; "rev-parse"; "refs/heads/jarvis-orchestration" ]
+                let currentAccount =
+                    git f.Root [ "--git-dir=" + f.AccountRemote; "rev-parse"; AccountCapacityLedger.AccountRef ]
+                Assert.That(currentProject, Is.EqualTo(projectHead), label + ":project-head")
+                Assert.That(currentAccount, Is.EqualTo(accountHead), label + ":account-head")
+            Environment.SetEnvironmentVariable(setting, null)
+            denied "missing activated environment binding"
+            Environment.SetEnvironmentVariable(setting, pathB)
+            denied "substituted open journal"
+            let archived = pathA + ".original"
+            File.Move(pathA, archived)
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal pathA
+            Environment.SetEnvironmentVariable(setting, pathA)
+            denied "same journal path with replaced identity"
+            File.Delete pathA
+            File.Move(archived, pathA)
+            denied "restored binding cannot reset STOP"
+            let manifest = Path.Combine(f.Root, "original-writer-host-binding", "journal.binding")
+            File.Delete manifest
+            denied "missing persistent binding after activation"
+            File.Delete(Path.Combine(f.Root, "original-writer-host-binding", "journal.binding.sha256"))
+            Environment.SetEnvironmentVariable(setting, null)
+            denied "entire binding pair deleted after activation"
+            Assert.That((OriginalGitWriterAdmissionJournal.inspect pathA |> success).AdmissionClosed,
+                        Is.True)
+            Assert.That((OriginalGitWriterAdmissionJournal.inspect pathB |> success).HighWater,
+                        Is.EqualTo(0L)))
+
+    [<Test>]
+    member _.JournalConfiguredBeforeActualProjectAndAccountInitializationFencesBothAfterStop() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "before-initialization.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            let accountRemote, accountLocal, _ = repository f.Root "new-account"
+            let projectRemote, projectLocal, _ = repository f.Root "new-project"
+            let account =
+                { f.AccountOne with RepositoryPath = accountLocal
+                                    ApprovedFetchUrl = accountRemote
+                                    ApprovedPushUrl = accountRemote
+                                    AccountId = Guid.NewGuid()
+                                    LedgerId = Guid.NewGuid() }
+            let project =
+                { f.ProjectOne with RepositoryPath = projectLocal
+                                    ApprovedFetchUrl = projectRemote
+                                    ApprovedPushUrl = projectRemote
+                                    ProjectId = Guid.NewGuid()
+                                    LedgerId = Guid.NewGuid() }
+            let accountState = AccountCapacityLedger.initialize account 2 |> success
+            let projectState = LedgerStore.initialize project true |> success
+            Assert.That(accountState.Head, Is.Not.Empty)
+            Assert.That(projectState.Commit, Is.Not.Empty)
+            let observed = OriginalGitWriterAdmissionJournal.inspect path |> success
+            Assert.That(observed.HighWater, Is.EqualTo(2L),
+                        "Both real initialization publication paths must be admitted")
+            Assert.That(observed.PendingOrUnknown, Is.Empty)
+            Assert.That(observed.SettledHighWater, Is.EqualTo(2L))
+            OriginalGitWriterAdmissionJournal.stop path |> success |> ignore
+            let stoppedAccountRemote, stoppedAccountLocal, _ = repository f.Root "blocked-account"
+            let stoppedProjectRemote, stoppedProjectLocal, _ = repository f.Root "blocked-project"
+            let blockedAccount =
+                { account with RepositoryPath = stoppedAccountLocal
+                               ApprovedFetchUrl = stoppedAccountRemote
+                               ApprovedPushUrl = stoppedAccountRemote
+                               AccountId = Guid.NewGuid(); LedgerId = Guid.NewGuid() }
+            let blockedProject =
+                { project with RepositoryPath = stoppedProjectLocal
+                               ApprovedFetchUrl = stoppedProjectRemote
+                               ApprovedPushUrl = stoppedProjectRemote
+                               ProjectId = Guid.NewGuid(); LedgerId = Guid.NewGuid() }
+            Assert.That(AccountCapacityLedger.initialize blockedAccount 3 |> Result.isError, Is.True)
+            Assert.That(LedgerStore.initialize blockedProject true |> Result.isError, Is.True)
+            let accountRef =
+                git f.Root [ "--git-dir=" + stoppedAccountRemote; "for-each-ref"
+                             "--format=%(refname)"; AccountCapacityLedger.AccountRef ]
+            let projectRef =
+                git f.Root [ "--git-dir=" + stoppedProjectRemote; "for-each-ref"
+                             "--format=%(refname)"; "refs/heads/jarvis-orchestration" ]
+            Assert.That(accountRef, Is.Empty, "STOP must prevent remote account ref creation")
+            Assert.That(projectRef, Is.Empty, "STOP must prevent remote project ref creation")
+            Assert.That((OriginalGitWriterAdmissionJournal.inspect path |> success).HighWater,
+                        Is.EqualTo(2L)))
+
+    [<Test>]
+    member _.LostGitAcknowledgmentRemainsUnknownAfterReopenAndChangedDuplicatePayloadDenied() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "lost-git-ack.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            let operation = Guid.NewGuid()
+            let authority = String.replicate 64 "c"
+            let remote, local, _ = repository f.Root "lost-ack"
+            let gitRef = "refs/heads/jarvis-review/_reviews/lost-ack/r1"
+            let publish () : Result<string,string> =
+                git local [ "push"; "origin"; "HEAD:" + gitRef ] |> ignore
+                Error "fixture intentionally discarded the successful Git push acknowledgment"
+            let result =
+                OriginalGitWriterAdmissionJournal.withPublication
+                    operation "ReviewRef" authority gitRef "first-payload"
+                    publish (fun _ -> true) id
+            Assert.That(Result.isError result, Is.True)
+            let remoteRef =
+                git f.Root [ "--git-dir=" + remote; "rev-parse"; gitRef ]
+            Assert.That(remoteRef, Is.Not.Empty, "Real fixture Git effect must have occurred")
+            let unknown = OriginalGitWriterAdmissionJournal.inspect path |> success
+            Assert.That(unknown.PendingOrUnknown.Length, Is.EqualTo(1))
+            Assert.That(unknown.PendingOrUnknown.Head.Status, Is.EqualTo("Unknown"))
+            match OriginalGitWriterAdmissionJournal.admit operation "ReviewRef"
+                      authority gitRef "first-payload" with
+            | Error reason -> Assert.That(reason, Does.Contain("RequiresReconciliation"))
+            | Ok _ -> Assert.Fail("UNKNOWN lost acknowledgment was replayed")
+            match OriginalGitWriterAdmissionJournal.admit operation "ReviewRef"
+                      authority gitRef "changed-payload" with
+            | Error reason -> Assert.That(reason, Does.Contain("RequiresReconciliation"))
+            | Ok _ -> Assert.Fail("UUID reused with different bytes was admitted")
+            Assert.That((OriginalGitWriterAdmissionJournal.inspect path |> success).PendingOrUnknown.Length,
+                        Is.EqualTo(1)))

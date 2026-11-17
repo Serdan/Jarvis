@@ -21,6 +21,10 @@ function harness(options = {}) {
   let staleSendObserved = 0;
   let draftWasCleared = false;
   let injectedTurn = false;
+  const launchStartedAt = Date.now();
+  if (options.addUserTurnBeforeModeMs) {
+    setTimeout(() => { userTurns++; }, options.addUserTurnBeforeModeMs);
+  }
   const makeMode = name => ({
     textContent: name,
     getAttribute(attribute) {
@@ -35,15 +39,17 @@ function harness(options = {}) {
       }
     }
   });
-  const chatMode = makeMode("Chat");
-  const workMode = makeMode("Work");
+  let chatMode = makeMode("Chat");
+  let workMode = makeMode("Work");
   const editor = {
     get innerText() { return content || (options.emptyRenderedNewline ? "\n" : ""); },
     get textContent() { return content; },
     focus() { focused = true; }
   };
+  let activeEditor = editor;
   const send = { click() {
     clicks++;
+    if (options.sendClickThrows) throw new Error("send click outcome could not be observed");
     if (options.noAcknowledgement) return;
     if (options.optimisticLocalRoute) {
       site.href = "https://chatgpt.com/c/local-chatgpt%3Aclient-only-placeholder";
@@ -81,6 +87,21 @@ function harness(options = {}) {
           draftWasCleared = true;
           staleSendChecks = options.staleSendChecks || 0;
           if (options.routeAfterClear) site.href = "https://chatgpt.com/c/unexpected";
+          if (options.draftReappearsAfterClearMs) {
+            setTimeout(() => { content = "Unrelated draft restored after clear"; }, options.draftReappearsAfterClearMs);
+          }
+          if (options.replaceComposerAfterClearMs) {
+            setTimeout(() => { activeEditor = Object.create(editor); }, options.replaceComposerAfterClearMs);
+          }
+          if (options.replaceModesAfterClearMs) {
+            setTimeout(() => {
+              chatMode = makeMode("Chat");
+              workMode = makeMode("Work");
+            }, options.replaceModesAfterClearMs);
+          }
+          if (options.switchToWorkAfterClearMs) {
+            setTimeout(() => { mode = "Work"; }, options.switchToWorkAfterClearMs);
+          }
         }
         return true;
       }
@@ -89,10 +110,14 @@ function harness(options = {}) {
       return true;
     },
     querySelector(selector) {
-      if (selector.includes('contenteditable="true"')) return options.noComposer ? null : editor;
+      if (selector.includes('contenteditable="true"')) return options.noComposer ? null : activeEditor;
       if (selector.includes('aria-label="Send"')) {
         if (options.noSend) return null;
         if (content || options.sendAlwaysEnabled) return send;
+        if (options.staleSendDurationMs && Date.now() - launchStartedAt < options.staleSendDurationMs) {
+          staleSendObserved++;
+          return send;
+        }
         if (staleSendChecks > 0) {
           staleSendChecks--;
           staleSendObserved++;
@@ -105,15 +130,17 @@ function harness(options = {}) {
     },
     querySelectorAll(selector) {
       if (selector === '[data-composer-input-layout] [contenteditable="true"][role="textbox"]') {
-        return options.noComposer ? [] : [editor];
+        return options.noComposer ? [] : [activeEditor];
       }
       if (selector === '[contenteditable="true"][role="textbox"]') {
-        return options.noComposer ? [] : [editor];
+        return options.noComposer ? [] : [activeEditor];
       }
       if (selector === 'button[type="submit"][aria-label="Send"]') {
         return options.noSend ? [] : [send];
       }
       if (selector === 'button[type="button"][aria-pressed]') {
+        if (options.modeButtonsAvailableAfterMs &&
+            Date.now() - launchStartedAt < options.modeButtonsAvailableAfterMs) return [];
         return options.noModeToggle ? [] : [chatMode, workMode];
       }
       if (selector === '[data-user-message-bubble]') {
@@ -129,13 +156,27 @@ function harness(options = {}) {
     }
   };
   const window = { getSelection: () => options.selectionUnavailable ? null : selection };
-  const ctx = vm.createContext({ document, window, location: site, setTimeout, Date, URL });
+  // Test-only virtual time makes the pre-Send deadline boundary deterministic.
+  // Wall-clock scheduling at 100 ms can otherwise race the third inactive sample.
+  const virtualClock = options.virtualClock ? { now: 0, delays: [] } : null;
+  const clockDate = virtualClock
+    ? class extends Date { static now() { return virtualClock.now; } }
+    : Date;
+  const schedule = virtualClock
+    ? (callback, ms) => {
+      virtualClock.delays.push(ms);
+      virtualClock.now += ms;
+      queueMicrotask(callback);
+    }
+    : setTimeout;
+  const ctx = vm.createContext({ document, window, location: site, setTimeout: schedule, Date: clockDate, URL });
   const run = async (prompt = "Start fresh\nRead Jarvis assignment", extra = {}) =>
     await vm.runInContext(source + "\nexecute(" + JSON.stringify({
       prompt, timeoutMs: options.timeoutMs || 350, ...extra
     }) + ")", ctx);
   return { run, site, get clicks() { return clicks; }, get chatClicks() { return chatClicks; },
     get mode() { return mode; }, get content() { return content; },
+    get virtualClockState() { return virtualClock && { now: virtualClock.now, delays: [...virtualClock.delays] }; },
     get staleSendObserved() { return staleSendObserved; }, get lastSubmittedText() { return lastSubmittedText; } };
 }
 
@@ -326,7 +367,7 @@ test("waits for the conversation URL after the user turn appears", async () => {
 });
 
 test("keeps the submission uncertain when route never appears", async () => {
-  const h = harness({ noRoute: true, timeoutMs: 125 });
+  const h = harness({ noRoute: true, timeoutMs: 350 });
   const result = await h.run();
   assert.equal(result.status, "outcomeUnknown");
   assert.equal(result.reason, "ConversationUrlUnavailable");
@@ -384,7 +425,7 @@ test("DOM diagnostics report selector counts, never prompt or raw HTML", async (
 });
 
 test("missing Send control is an explicit incompatibility, never a send attempt", async () => {
-  const h = harness({ noSend: true, timeoutMs: 125 });
+  const h = harness({ noSend: true, timeoutMs: 350 });
   const result = await h.run();
   assert.equal(result.status, "uiIncompatible");
   assert.equal(result.stage, "submitControl");
@@ -470,5 +511,92 @@ test("existing conversation with draft is not touched", async () => {
   assert.equal(result.status, "notSubmitted");
   assert.equal(result.reason, "UnexpectedStartUrl");
   assert.equal(h.content, "Personal text");
+  assert.equal(h.clicks, 0);
+});
+
+test("fresh empty Chat editor waits longer than the former 1800ms stabilization deadline", async () => {
+  const h = harness({ staleSendDurationMs: 2050, timeoutMs: 4400 });
+  const result = await h.run("Hydration-safe new task");
+  assert.equal(result.status, "submitted");
+  assert.equal(h.staleSendObserved > 20, true);
+  assert.equal(h.lastSubmittedText, "Hydration-safe new task");
+  assert.equal(h.clicks, 1);
+});
+
+test("a restored draft reappearing during hydration is never overwritten", async () => {
+  const h = harness({ existingDraft: "Unsaved text", draftReappearsAfterClearMs: 50, staleSendChecks: 5 });
+  const result = await h.run("Task prompt");
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.reason, "DraftReappeared");
+  assert.equal(h.content, "Unrelated draft restored after clear");
+  assert.equal(h.clicks, 0);
+});
+
+test("a replaced composer during stabilization is not trusted", async () => {
+  const h = harness({ existingDraft: "Old", replaceComposerAfterClearMs: 50, staleSendChecks: 5 });
+  const result = await h.run("Task prompt");
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.reason, "ComposerChanged");
+  assert.equal(h.clicks, 0);
+});
+
+test("replaced mode controls during stabilization are not trusted", async () => {
+  const h = harness({ existingDraft: "Old", replaceModesAfterClearMs: 50, staleSendChecks: 5 });
+  const result = await h.run("Task prompt");
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.reason, "ModeChanged");
+  assert.equal(h.clicks, 0);
+});
+
+test("mode switching away from Chat during stabilization prevents sending", async () => {
+  const h = harness({ existingDraft: "Old", switchToWorkAfterClearMs: 50, staleSendChecks: 5 });
+  const result = await h.run("Task prompt");
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.reason, "ModeChanged");
+  assert.equal(h.clicks, 0);
+});
+
+test("persistent enabled Send exhausts the overall budget without editing", async () => {
+  const h = harness({ sendAlwaysEnabled: true, timeoutMs: 220 });
+  const result = await h.run("New task");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "UnexpectedSendState");
+  assert.equal(h.content, "");
+  assert.equal(h.clicks, 0);
+});
+
+test("throwing Send click yields uncertain outcome with exactly one attempt", async () => {
+  const h = harness({ sendClickThrows: true });
+  const result = await h.run("Task prompt");
+  assert.equal(result.status, "outcomeUnknown");
+  assert.equal(result.reason, "SendClickUncertain");
+  assert.equal(h.clicks, 1);
+  assert.equal(h.lastSubmittedText, null);
+});
+
+test("deadline exactly at the third inactive sample cannot edit or send", async () => {
+  const h = harness({ timeoutMs: 100, virtualClock: true });
+  const result = await h.run("Must not send");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "LaunchDeadlineExceeded");
+  assert.equal(result.stage, "draftStabilization");
+  assert.deepEqual(h.virtualClockState, { now: 100, delays: [75, 25] });
+  assert.equal(h.content, "");
+  assert.equal(h.clicks, 0);
+});
+
+test("a conversation appearing while mode controls hydrate cannot have its mode changed", async () => {
+  const h = harness({
+    initialMode: "Work",
+    modeButtonsAvailableAfterMs: 110,
+    addUserTurnBeforeModeMs: 40,
+    timeoutMs: 500
+  });
+  const result = await h.run("Must not touch existing conversation");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "ExistingConversation");
+  assert.equal(result.safeToDisposeCreatedTab, false);
+  assert.equal(h.chatClicks, 0);
+  assert.equal(h.mode, "Work");
   assert.equal(h.clicks, 0);
 });

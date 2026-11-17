@@ -81,12 +81,27 @@ async function execute(args) {
       .filter(button => button.textContent.trim() === name);
     return matches.length === 1 ? matches[0] : null;
   };
+  // Recheck the empty-home precondition after waiting for mode controls.
+  // Otherwise a turn arriving during hydration could have its mode changed.
+  const emptyHomeFailure = () => {
+    if (location.href !== startUrl) return notSubmitted("UnexpectedStartUrl");
+    if (document.querySelectorAll('[data-message-author-role="user"]').length ||
+        document.querySelectorAll('[data-user-message-bubble]').length) {
+      return notSubmitted("ExistingConversation");
+    }
+    return null;
+  };
   const modes = await until(() => {
     const chat = modeButton("Chat");
     const work = modeButton("Work");
     return chat && work ? { chat, work } : null;
   });
   if (!modes) return incompatible("modeSelection", "ModeToggleUnavailable");
+  const beforeModeFailure = emptyHomeFailure();
+  if (beforeModeFailure) return beforeModeFailure;
+  if (Date.now() >= deadline) {
+    return { ...notSubmitted("LaunchDeadlineExceeded"), stage: "modeSelection" };
+  }
   if (modes.chat.getAttribute("aria-pressed") !== "true") {
     modes.chat.click();
   }
@@ -118,6 +133,33 @@ async function execute(args) {
   if (!composer) return incompatible("composer", "ComposerUnavailable");
   if (location.href !== startUrl) return notSubmitted("UnexpectedStartUrl");
   const readEditor = () => composer.innerText.replace(/\r\n/g, "\n").replace(/\u00a0/g, " ");
+  // The zero-turn Chat editor is a *specific* surface, not just any input
+  // that happens to match the selectors after a React hydration transition.
+  // Guard it again after every asynchronous wait and immediately before Send.
+  const surfaceFailure = stage => {
+    if (location.href !== startUrl) return notSubmitted("UnexpectedStartUrl");
+    if (document.querySelectorAll('[data-message-author-role="user"]').length !== initialTurns ||
+        document.querySelectorAll('[data-user-message-bubble]').length !== initialBubbles) {
+      return notSubmitted("ExistingConversation");
+    }
+    const chat = modeButton("Chat");
+    const work = modeButton("Work");
+    if (chat !== modes.chat || work !== modes.work ||
+        chat?.getAttribute("aria-pressed") !== "true" ||
+        work?.getAttribute("aria-pressed") !== "false") {
+      return incompatible(stage, "ModeChanged");
+    }
+    const editors = document.querySelectorAll(composerSelector);
+    if (editors.length !== 1 || editors[0] !== composer) {
+      return incompatible(stage, "ComposerChanged");
+    }
+    return null;
+  };
+  const beforeClearFailure = surfaceFailure("composer");
+  if (beforeClearFailure) return beforeClearFailure;
+  if (Date.now() >= deadline) {
+    return { ...notSubmitted("LaunchDeadlineExceeded"), stage: "composer" };
+  }
   if ((composer.textContent || "").length > 0) {
     // Only actual editor text, not a rendered empty-paragraph newline,
     // counts as a restored draft.
@@ -134,33 +176,32 @@ async function execute(args) {
     selection.removeAllRanges();
     if (!removed || (composer.textContent || "").length > 0) return incompatible("composer", "DraftClearFailed");
   }
-  // ProseMirror can clear visible text before React disables Send. Wait for
-  // three empty/inactive observations rather than inserting into stale state.
-  // Never click Send to clear an unrelated restored draft.
-  const settleDeadline = Math.min(deadline, Date.now() + 1800);
+  // ProseMirror can clear visible text before React disables Send. On a fresh
+  // tab, hydration may leave Send enabled for several seconds. Use the single
+  // launch deadline, not a second arbitrary 1800ms deadline, and only advance
+  // after three consecutive observations of the same empty/inactive editor.
+  // No enabled Send state can by itself authorize insertion or a click.
   let settledSamples = 0;
   while (true) {
-    if (location.href !== startUrl) return notSubmitted("UnexpectedStartUrl");
-    if (document.querySelectorAll('[data-message-author-role="user"]').length !== initialTurns ||
-        document.querySelectorAll('[data-user-message-bubble]').length !== initialBubbles) {
-      return notSubmitted("ExistingConversation");
-    }
-    const editors = document.querySelectorAll(composerSelector);
-    if (editors.length !== 1 || editors[0] !== composer) {
-      return incompatible("draftStabilization", "ComposerChanged");
-    }
+    const changed = surfaceFailure("draftStabilization");
+    if (changed) return changed;
     if ((composer.textContent || "").length !== 0 || readEditor().trim().length !== 0) {
       return incompatible("draftStabilization", "DraftReappeared");
     }
     settledSamples = document.querySelector(sendSelector) ? 0 : settledSamples + 1;
-    if (settledSamples >= 3) break;
-    if (Date.now() >= settleDeadline) {
+    if (settledSamples >= 3) {
+      if (Date.now() >= deadline) {
+        return { ...notSubmitted("LaunchDeadlineExceeded"), stage: "draftStabilization" };
+      }
+      break;
+    }
+    if (Date.now() >= deadline) {
       return {
         ...notSubmitted("UnexpectedSendState"), stage: "draftStabilization",
         diagnostics: { documentReadyState: document.readyState || "unknown", ...selectorCounts() }
       };
     }
-    await delay(Math.min(75, Math.max(1, settleDeadline - Date.now())));
+    await delay(Math.min(75, Math.max(1, deadline - Date.now())));
   }
 
   composer.focus();
@@ -169,15 +210,28 @@ async function execute(args) {
   if (!inserted || readEditor() !== prompt.replace(/\r\n/g, "\n")) {
     return incompatible("composer", "TextInsertionFailed");
   }
-  const send = await until(() => document.querySelector(sendSelector));
+  const afterInsertFailure = surfaceFailure("composer");
+  if (afterInsertFailure) return afterInsertFailure;
+  let pendingSurfaceFailure = null;
+  const send = await until(() => {
+    pendingSurfaceFailure = surfaceFailure("submitControl");
+    if (pendingSurfaceFailure) return true; // Stop waiting, but never send.
+    return document.querySelector(sendSelector);
+  });
+  if (pendingSurfaceFailure) return pendingSurfaceFailure;
   if (!send) return incompatible("submitControl", "SendUnavailable");
   if (readEditor() !== prompt.replace(/\r\n/g, "\n")) {
     return incompatible("composer", "ComposerChanged");
   }
-  if (location.href !== startUrl) return notSubmitted("UnexpectedStartUrl");
-  if (document.querySelectorAll('[data-message-author-role="user"]').length !== initialTurns ||
-      document.querySelectorAll('[data-user-message-bubble]').length !== initialBubbles) {
-    return notSubmitted("ExistingConversation");
+  const beforeSendFailure = surfaceFailure("submitControl");
+  if (beforeSendFailure) return beforeSendFailure;
+  if (document.querySelector(sendSelector) !== send) {
+    return incompatible("submitControl", "SendChanged");
+  }
+  // A late readiness observation must not turn an expired pre-Send budget
+  // into an unaccounted attempt with no time left for acknowledgement.
+  if (Date.now() >= deadline) {
+    return { ...notSubmitted("LaunchDeadlineExceeded"), stage: "submitControl" };
   }
   // Once this click is attempted the effect is non-idempotent. Never try again.
   try {

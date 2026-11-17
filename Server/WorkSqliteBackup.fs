@@ -1,13 +1,63 @@
 namespace Server
 
 open System
+open System.ComponentModel
 open System.Globalization
 open System.IO
+open System.Runtime.InteropServices
 open System.Security.Cryptography
 open System.Text
 open System.Text.Json
+open Microsoft.Win32.SafeHandles
 open Microsoft.Data.Sqlite
 open Jarvis.WorkSnapshots
+
+// Backup success is a durability receipt, not merely an atomic-rename receipt.
+// Syncing file data without the directory that names it is insufficient after
+// a host power loss. Unsupported filesystem/OS behavior must fail closed.
+[<RequireQualifiedAccess>]
+module internal WorkBackupDurability =
+    [<DllImport("libc", EntryPoint = "open", SetLastError = true)>]
+    extern int private openUnixDirectory(string path, int flags)
+
+    [<DllImport("kernel32.dll", EntryPoint = "CreateFileW", CharSet = CharSet.Unicode,
+                SetLastError = true)>]
+    extern SafeFileHandle private openWindowsDirectory(string path, uint32 access,
+                                                        uint32 sharing, nativeint security,
+                                                        uint32 disposition, uint32 flags,
+                                                        nativeint templateFile)
+
+    let private ioFailure operation path =
+        let code = Marshal.GetLastPInvokeError()
+        IOException(sprintf "%s failed for %s (OS error %d)" operation path code, Win32Exception(code))
+
+    let syncDirectory (directory: string) =
+        let path = Path.GetFullPath directory
+        use handle =
+            if OperatingSystem.IsLinux() then
+                // Linux O_DIRECTORY | O_CLOEXEC; refuse a regular-file handle.
+                let fd = openUnixDirectory(path, 0x10000 ||| 0x80000)
+                if fd < 0 then raise (ioFailure "Opening backup directory" path)
+                new SafeFileHandle(nativeint fd, true)
+            elif OperatingSystem.IsWindows() then
+                // NTFS: FILE_FLAG_BACKUP_SEMANTICS permits a directory handle;
+                // GENERIC_WRITE is required for FlushFileBuffers. Errors are
+                // fatal instead of silently weakening the acknowledgement.
+                let h = openWindowsDirectory(path, 0x40000000u, 0x7u, 0n,
+                                             3u, 0x02000000u, 0n)
+                if h.IsInvalid then
+                    let failure = ioFailure "Opening backup directory" path
+                    h.Dispose()
+                    raise failure
+                h
+            else
+                raise (PlatformNotSupportedException(
+                    "Durable Work backup directory publication is unsupported on this OS"))
+        RandomAccess.FlushToDisk handle
+
+    let syncFile (path: string) =
+        use handle = File.OpenHandle(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None)
+        RandomAccess.FlushToDisk handle
 
 // F1: isolated, default-off physical backup of the SQLite B authority.
 // The generic B BodyJson field is NOT a trusted credential boundary. Export
@@ -433,7 +483,13 @@ module WorkSqliteBackup =
                 | Error reason -> error $"Sealed restore verification failed: {reason}"
                 | Ok replay ->
                     ensure (replay.Files = bundle.Files) "Sealed restore differs from verified input"
+                // SQLite has closed its handles. Flush the sealed file itself
+                // before publishing its name, then sync the parent directory
+                // after rename. An error after Move is NOT an acknowledged
+                // restore: the caller must reconcile the existing target.
+                WorkBackupDurability.syncFile sealedPath
                 File.Move(sealedPath, destinationPath)
+                WorkBackupDurability.syncDirectory folder
                 Ok { CommittedSequence = state.Sequence; RequiresRecovery = true }
             with ex ->
                 Error ex.Message

@@ -46,7 +46,13 @@ type WorkBackupOutbox(authorityPath: string, spoolPath: string, sink: IWorkBacku
             | Ok bundle ->
                 let sequence = readSequence bundle
                 if sequence < 0L then invalidOp "Negative committed backup sequence"
+                let spoolParent = Path.GetDirectoryName(Path.GetFullPath spoolPath)
+                if not (Directory.Exists spoolParent) then
+                    invalidOp "Backup spool parent must already exist"
                 Directory.CreateDirectory(spoolPath) |> ignore
+                // Also reconcile a spool folder created by an earlier
+                // interrupted call whose parent metadata was never synced.
+                WorkBackupDurability.syncDirectory spoolParent
                 let destination = Path.Combine(spoolPath, sequenceName sequence)
                 // A crash may leave an orphan temporary folder. Never
                 // advertise it as a committed outbox entry.
@@ -60,11 +66,18 @@ type WorkBackupOutbox(authorityPath: string, spoolPath: string, sink: IWorkBacku
                                            4096, FileOptions.WriteThrough)
                         output.Write(bytes)
                         output.Flush(true)
+                    // Persist file-name entries in staging before moving the
+                    // directory; a rename alone does not durably publish them.
+                    WorkBackupDurability.syncDirectory temporary
                     if Directory.Exists destination then
                         if not (sameFiles bundle (readFiles destination)) then
                             invalidOp "Conflicting backup bytes at an existing committed sequence"
+                        // Retrying an interrupted acknowledgement must also
+                        // make the existing destination directory durable.
+                        WorkBackupDurability.syncDirectory destination
                     else
                         Directory.Move(temporary, destination)
+                    WorkBackupDurability.syncDirectory spoolPath
                     Ok sequence
                 finally
                     if Directory.Exists temporary then Directory.Delete(temporary, true)
@@ -100,6 +113,9 @@ type WorkBackupOutbox(authorityPath: string, spoolPath: string, sink: IWorkBacku
                             // any Git write, and publication must be idempotent.
                             do! sink.PublishAsync(sequence, bundle, cancellationToken)
                             Directory.Delete(directory, true)
+                            // Retry-safe if this metadata flush fails: the
+                            // published Git backup is already idempotent.
+                            WorkBackupDurability.syncDirectory spoolPath
                             published.Add sequence
                         return Ok(List.ofSeq published)
                 with ex ->

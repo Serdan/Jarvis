@@ -417,3 +417,31 @@ let deleting_highest_sequence_rows_does_not_rewind_restore_audit_high_water () =
         Assert.That(copied.Commit(second) |> ok |> _.Replayed, Is.True)
         Assert.That(copied.Commit(third) |> ok |> _.Replayed, Is.True)
     )
+
+[<Test>]
+let linux_directory_durability_barrier_fails_closed_for_nondirectories () =
+    if not (OperatingSystem.IsLinux()) then
+        Assert.Ignore("Linux directory-fsync syscall contract test")
+    fixture (fun _ original target ->
+        let folder = Path.GetDirectoryName original
+        // A successful backup acknowledgement depends on this actual
+        // filesystem-level barrier, not a FileStream.Flush-only surrogate.
+        WorkBackupDurability.syncDirectory folder
+        Assert.Throws<IOException>(
+            TestDelegate(fun () -> WorkBackupDurability.syncDirectory original))
+        |> ignore
+        Assert.Throws<IOException>(
+            TestDelegate(fun () -> WorkBackupDurability.syncDirectory (target + ".missing")))
+        |> ignore
+    )
+
+[<Test>]
+let outbox_refuses_missing_spool_parent_instead_of_claiming_a_durable_capture () =
+    fixture (fun authority original target ->
+        seed authority |> ignore
+        let spool = Path.Combine(target + ".absent-parent", "spool")
+        let outbox = WorkBackupOutbox(original, spool, FlakyGitSink())
+        fail (outbox.Capture())
+        Assert.That(Directory.Exists spool, Is.False)
+        Assert.That(authority.CurrentSequence() |> ok, Is.EqualTo 2L)
+    )

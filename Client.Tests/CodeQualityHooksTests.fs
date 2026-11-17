@@ -181,3 +181,20 @@ let ``Roslyn session recovers after unavailable server and explicit checkout dis
         finally
             disposeCheckout root
             Environment.SetEnvironmentVariable("JARVIS_ROSLYN_LSP_DLL", installed))
+
+
+[<Test; NonParallelizable>]
+let ``inbox prewarm avoids Git discovery for unapproved and no-hook roots`` () =
+    withTempRoot (fun root ->
+        let previous = Environment.GetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS")
+        try
+            Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", root)
+            hasApprovedPrewarmCandidate () |> shouldEqual false
+            config root """{"codeQuality":{"hooks":[{"enabled":false,"name":"format","adapter":"roslyn-format","trigger":"after-write"}]}}"""
+            hasApprovedPrewarmCandidate () |> shouldEqual false
+            config root """{"codeQuality":{"hooks":[{"enabled":true,"name":"format","adapter":"roslyn-format","trigger":"after-write"}]}}"""
+            hasApprovedPrewarmCandidate () |> shouldEqual true
+            Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", root + "-unapproved")
+            hasApprovedPrewarmCandidate () |> shouldEqual false
+        finally
+            Environment.SetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS", previous))

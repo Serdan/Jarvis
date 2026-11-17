@@ -32,6 +32,7 @@ module DispatchProbeTests =
     open System.Threading
     open System.Threading.Tasks
     open Client.SignalR
+    open Client.SignalR.Client
     open Microsoft.AspNetCore.Builder
     open Microsoft.AspNetCore.Hosting
     open Microsoft.AspNetCore.SignalR
@@ -592,4 +593,47 @@ module DispatchProbeTests =
         Assert.That(started, Is.EqualTo(3))
         Assert.That(reported.Count, Is.EqualTo(3))
         Assert.That(failures, Is.Empty)
+    }
+
+    [<Test>]
+    let ``inbox prewarm discovery never blocks reply and coalesces repeated working reads`` () = task {
+        let dispatcher = InboxPrewarmDispatcher()
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let calls = System.Collections.Concurrent.ConcurrentQueue<int>()
+        let slowDiscovery () =
+            calls.Enqueue(1)
+            entered.TrySetResult(()) |> ignore
+            release.Task.GetAwaiter().GetResult()
+            true
+        try
+            let watch = System.Diagnostics.Stopwatch.StartNew()
+            Assert.That(dispatcher.TrySchedule("no-hooks/sourced-attempt", slowDiscovery), Is.True)
+            Assert.That(watch.Elapsed, Is.LessThan(TimeSpan.FromSeconds 1.),
+                "Normal AgentInbox return must not wait for worktree Git discovery.")
+            do! entered.Task.WaitAsync(TimeSpan.FromSeconds 5.)
+            Assert.That(dispatcher.TrySchedule("no-hooks/sourced-attempt", slowDiscovery), Is.False,
+                "Repeated Working reads must not duplicate an in-flight prewarm.")
+            Assert.That(calls.Count, Is.EqualTo(1))
+        finally
+            release.TrySetResult(()) |> ignore
+    }
+
+    [<Test>]
+    let ``inbox prewarm retries unresolved source and isolates distinct assignment keys`` () = task {
+        let dispatcher = InboxPrewarmDispatcher()
+        let unknownFinished = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        Assert.That(dispatcher.TrySchedule("unknown-source", fun () ->
+            unknownFinished.TrySetResult(()) |> ignore
+            false), Is.True)
+        do! unknownFinished.Task.WaitAsync(TimeSpan.FromSeconds 5.)
+        let retried =
+            SpinWait.SpinUntil(
+                (fun () -> dispatcher.TrySchedule("unknown-source", fun () -> true)),
+                TimeSpan.FromSeconds 5.)
+        Assert.That(retried, Is.True,
+            "Unknown checkout binding must not permanently suppress future reads.")
+        Assert.That(dispatcher.TrySchedule("different-assignment", fun () -> true), Is.True)
+        Assert.That(dispatcher.TrySchedule("unknown-source", fun () -> true), Is.False,
+            "A successfully scheduled assignment must stay deduplicated.")
     }

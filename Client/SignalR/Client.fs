@@ -22,6 +22,23 @@ let receiveMessage (rt: Runtime) message =
 // Working state for ordinary calls to avoid one remote git fetch per tool.
 let private workingGuidanceCaches = ConditionalWeakTable<Runtime, WorkingTurnGuidance.AgentCache>()
 let private instructionDeliveryCaches = ConditionalWeakTable<Runtime, AgentInstructions.DeliveryCache>()
+// Worktree discovery is never allowed to delay a normal inbox read.
+// Successful per-assignment prewarms are deduplicated; unknown bindings may retry.
+type InboxPrewarmDispatcher() =
+    let gate = obj()
+    let scheduled = System.Collections.Generic.HashSet<string>(StringComparer.Ordinal)
+    member _.TrySchedule(key: string, discoverAndPrewarm: unit -> bool) =
+        let accepted = lock gate (fun () -> scheduled.Add key)
+        if accepted then
+            Task.Run(Action(fun () ->
+                let completed =
+                    try discoverAndPrewarm ()
+                    with _ -> false
+                if not completed then
+                    lock gate (fun () -> scheduled.Remove key |> ignore))) |> ignore
+        accepted
+
+let private inboxPrewarmDispatchers = ConditionalWeakTable<Runtime, InboxPrewarmDispatcher>()
 let invalidateAgentStates (rt: Runtime) (projectName: string) (agentIds: string array) =
     // Server notifications only carry the logical project identity. Worktree
     // selectors share the canonical ledger/assignment cache by ProjectId.
@@ -73,23 +90,23 @@ let private prewarmFromInbox (rt: Runtime) projectName (inbox: Client.ReviewWork
     | Some focus when inbox.Agent.Execution = "Working"
                       && not (String.IsNullOrWhiteSpace focus.Attempt.SourceRef) ->
         match ProjectPaths.resolveProjectContext projectName rt with
-        | Error _ -> ()
+        | Error _ -> false
         | Ok context ->
             let (Client.FolderPath mainRoot) = ProjectPaths.ResolvedProject.mainRoot context
             match ProjectPaths.WorktreeGit.list "git" mainRoot (TimeSpan.FromSeconds 10.) with
-            | Error _ -> ()
+            | Error _ -> false
             | Ok listing ->
                 match Worktrees.parsePorcelain mainRoot listing with
-                | Error _ -> ()
+                | Error _ -> false
                 | Ok worktrees ->
                     match Worktrees.findRegisteredBranchCheckout focus.Attempt.SourceRef worktrees with
-                    | None -> () // Unknown, detached or ambiguous source: defer.
+                    | None -> false // Unknown, detached or ambiguous source: defer.
                     | Some checkoutPath ->
                         let name = Path.GetFileName(Path.TrimEndingDirectorySeparator checkoutPath)
                         let project = ProjectPaths.ResolvedProject.target context
                                       |> ProjectPaths.ProjectTarget.projectName
                         match ProjectPaths.resolveProjectContext (project + "::" + name) rt with
-                        | Error _ -> ()
+                        | Error _ -> false
                         | Ok registered ->
                             let (Client.FolderPath validated) =
                                 ProjectPaths.ResolvedProject.sourceRoot registered
@@ -99,7 +116,9 @@ let private prewarmFromInbox (rt: Runtime) projectName (inbox: Client.ReviewWork
                             if String.Equals(Path.GetFullPath validated,
                                              Path.GetFullPath checkoutPath, comparison) then
                                 CodeQualityHooks.prewarm validated
-    | _ -> ()
+                                true
+                            else false
+    | _ -> false
 
 let private loadAgentState (rt: Runtime) (project: string) (agentId: string) =
     match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt with
@@ -802,8 +821,19 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
         let response = rt |> OrchestrationApi.TaskApi.read cmd
         match response with
         | Ok (:? Client.ReviewWorkflow.AgentInbox as inbox) when cmd.Action = "AgentInbox" ->
-            // Initialization remains asynchronous and repeated calls are idempotent.
-            try prewarmFromInbox rt cmd.ProjectName inbox with _ -> ()
+            // Discovery and Roslyn initialization must not run inside TaskRead.
+            match inbox.Focused with
+            | Some focus when inbox.Agent.Execution = "Working"
+                              && not (String.IsNullOrWhiteSpace focus.Attempt.SourceRef) ->
+                let key =
+                    String.concat "|" [ cmd.ProjectName; inbox.Agent.AgentId; focus.Attempt.AttemptId
+                                        string focus.Attempt.AssignmentGeneration; focus.Attempt.SourceRef ]
+                let dispatcher = inboxPrewarmDispatchers.GetValue(rt, fun _ -> InboxPrewarmDispatcher())
+                dispatcher.TrySchedule(key, fun () ->
+                    if CodeQualityHooks.hasApprovedPrewarmCandidate () then
+                        prewarmFromInbox rt cmd.ProjectName inbox
+                    else true) |> ignore
+            | _ -> ()
         | _ -> ()
         response |> serialize'
     | ObserveAgentCommand cmd ->

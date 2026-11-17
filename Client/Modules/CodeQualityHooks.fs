@@ -353,3 +353,21 @@ let prewarm root =
                     && (requireApproval root |> Result.isOk) ->
         RoslynLsp.prewarm root
     | _ -> ()
+
+
+// Fast negative gate before any Git worktree discovery: a checked-out
+// repository cannot launch Roslyn unless its exact root was operator-approved
+// and has an enabled built-in hook. This reads config only; it never executes
+// untrusted project code or treats main-checkout approval as sibling approval.
+let hasApprovedPrewarmCandidate () =
+    let raw = Environment.GetEnvironmentVariable("JARVIS_APPROVED_CODE_QUALITY_ROOTS")
+    if String.IsNullOrWhiteSpace raw then false
+    else
+        raw.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
+        |> Array.exists (fun item ->
+            try
+                let approved = Path.TrimEndingDirectorySeparator(Path.GetFullPath(item.Trim()))
+                match load approved with
+                | Ok hooks -> hooks |> List.exists (fun hook -> hook.Adapter = "roslyn-format")
+                | Error _ -> false
+            with _ -> false)

@@ -105,13 +105,18 @@ atomic edit lock contract.
 
 ## Lifecycle and constraints
 
-On the supported `agent_inbox` Ready-to-Working transition, Jarvis resolves the
-focused attempt's exact source branch to one non-main Git-registered worktree,
-validates its selector, and prewarms the configured/approved Roslyn session
-asynchronously. Unknown or ambiguous source refs never select the main checkout.
-An inbox read after source binding can also prewarm it; initialization
-otherwise occurs on the first matching hook. Sessions are cleaned up on Git
-worktree removal and JarvisClient shutdown. Missing/unapproved hooks do not launch a server.
+On the supported `agent_inbox` Ready-to-Working transition, Jarvis **queues**
+source binding discovery off the TaskRead response path. The inbox does not
+wait for Git worktree enumeration, registered-selector resolution, or Roslyn
+initialization. Background discovery resolves the focused attempt's exact
+source branch to one non-main Git-registered worktree and validates its selector.
+Unknown or ambiguous source refs never select main, and may retry on a later
+inbox read. In-flight discovery and successful prewarm are deduplicated by
+project, agent, attempt, generation and source ref. If no operator-approved
+checkout has an enabled Roslyn hook, the background prewarm short-circuits
+before any Git subprocess. Initialization otherwise occurs on the first matching
+hook. Sessions are cleaned up on Git worktree removal and JarvisClient shutdown.
+Missing/unapproved hooks do not launch a server.
 
 A configured pre-commit C# hook does not require approval for a nonmatching
 single-file commit (such as `README.md`); directory selections remain
@@ -148,6 +153,17 @@ disposal. These checks do not establish full acceptance.
 An unfiltered Release client-suite rerun timed out after 240 seconds without
 a verdict, with activity-persistence UnauthorizedAccessException and
 InvalidDataException diagnostics. Do not claim an unfiltered-suite pass.
+
+After independent review 7109 requested correction of the synchronous inbox
+lookup, the dispatch was changed to an asynchronous deduplicated work queue,
+with an operator-approval/configuration negative gate that avoids Git discovery
+when no eligible hook exists. The new dispatcher regression checks passed
+**13/13** under Release .NET 11. The final combined Release test filter
+(`CodeQualityHooksTests|GitCommandTests|WorktreeTests|DispatchProbeTests`)
+passed **58/58, zero skips**, with JARVIS_ROSLYN_LSP_DLL set to the installed
+official Roslyn 5.13.0-1.26514.10 DLL (exit 0; 4 seconds). Without that
+explicit DLL path, the combined filter passed 56 and skipped two live tests.
+The full client suite and Wayfold-specific acceptance measurements remain open.
 
 ## Suggested validation
 

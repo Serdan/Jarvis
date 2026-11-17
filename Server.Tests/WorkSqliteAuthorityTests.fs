@@ -270,7 +270,7 @@ let cross_record_graph_witness_fences_unrelated_stage_and_capacity () =
                 [ account "global" None (Some 1) 0 ]
         |> store.Commit |> ok |> ignore
         let graphGuard = witness graph 1L (Some 1L) None None None None None
-        let claim = 
+        let claim =
             { command [ write downstream (Some 1L) (value """{"state":"Claimed"}""") ]
                       [ account "global" (Some 1L) None 1 ] with
                 Guards = [ graphGuard ] }
@@ -316,7 +316,7 @@ let source_role_stop_and_generation_guards_are_typed_and_replayable () =
         expectMismatch "stage-generation" { guard with StageGeneration = Some 99L }
         expectMismatch "claim-generation" { guard with ClaimGeneration = Some 99L }
         expectMismatch "graph" { guard with GraphVersion = Some 99L }
-        let claim = 
+        let claim =
             { command [ write stage (Some 1L)
                           { initial with BodyJson = """{"state":"Claimed"}"""
                                          ClaimGeneration = 4L } ] [] with

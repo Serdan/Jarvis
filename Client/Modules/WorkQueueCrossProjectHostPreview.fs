@@ -44,6 +44,7 @@ type CrossProjectProjectedDemand =
       BlocksOtherWork: bool
       AvailableAt: int64
       AvailableSequence: int64
+      Priority: int
       SourceHead: string
       SourceOperationId: string
       SourceRequestHash: string
@@ -138,6 +139,7 @@ module WorkQueueCrossProjectHostPreview =
           BlocksOtherWork = candidate.BlocksOtherWork
           AvailableAt = candidate.AvailableAt
           AvailableSequence = candidate.AvailableSequence
+          Priority = candidate.Priority
           SourceHead = candidate.Source.Head
           SourceOperationId = candidate.Source.OperationId
           SourceRequestHash = candidate.Source.RequestHash
@@ -297,6 +299,7 @@ module WorkQueueCrossProjectHostPreview =
                                           QueueId = chosen.QueueId
                                           AvailableAt = chosen.AvailableAt
                                           AvailableSequence = chosen.AvailableSequence
+                                          Priority = Contracts.priorityOf pinned.Project chosen.WorkId
                                           BlocksOtherWork = chosen.BlocksUnfinishedStage
                                           RoleId = chosen.RoleId
                                           RoleVersion = chosen.RoleVersion

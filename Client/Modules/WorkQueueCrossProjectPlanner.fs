@@ -47,6 +47,7 @@ type PlannerCandidate =
       QueueId: string
       AvailableAt: int64
       AvailableSequence: int64
+      Priority: int
       BlocksOtherWork: bool
       RoleId: string
       RoleVersion: int
@@ -176,6 +177,7 @@ module WorkQueueCrossProjectPlanner =
         let compareInOrder =
             [ compare (if left.BlocksOtherWork then 0 else 1)
                       (if right.BlocksOtherWork then 0 else 1)
+              compare right.Priority left.Priority
               compare left.AvailableAt right.AvailableAt
               compareOrdinal left.ProjectId right.ProjectId
               compare left.AvailableSequence right.AvailableSequence

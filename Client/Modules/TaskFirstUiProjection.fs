@@ -113,8 +113,11 @@ let private blocksOther (project: Project) (stage: WorkStage) =
         && not (candidate.WaivedDependencies.ContainsKey stage.Id)
         && not (Contracts.isSatisfied project stage.Id))
 
-let private fifoKey project (stage: WorkStage) =
+let private fifoKey (priorities: Map<string, WorkPriorityDecision>) project (stage: WorkStage) =
     (if blocksOther project stage then 0 else 1),
+    -(int64 (priorities.TryFind stage.Id
+             |> Option.map (fun decision -> decision.Priority)
+             |> Option.defaultValue 0)),
     stage.AvailableAt, stage.ProjectId, stage.AvailableSequence, stage.Id
 
 let private unmet (project: Project) (stage: WorkStage) =
@@ -419,6 +422,7 @@ let projectDashboard projectId titles (projectResult: Result<Project, string>)
               Capacity = capacity
               QueueHealth = Evidence.Unknown reason }
         | Ok (_, available, cycles) ->
+            let priorities = Contracts.priorityDecisions project
             let cyclic = cycles |> List.collect (fun cycle -> cycle.Members) |> Set.ofList
             // Even an available stage with a waiver remains visibly held if
             // the exact hard graph contains a cycle. Preview never claims it.
@@ -432,7 +436,7 @@ let projectDashboard projectId titles (projectResult: Result<Project, string>)
                     | WorkState.Claimed launch ->
                         Some(row titles project stage (claimedRowState now staleAfter project stage launch))
                     | _ -> None)
-                |> List.sortBy (fun row -> fifoKey project project.Works.[row.WorkId])
+                |> List.sortBy (fun row -> fifoKey priorities project project.Works.[row.WorkId])
             let blocked =
                 stages
                 |> List.filter (fun stage ->
@@ -443,7 +447,7 @@ let projectDashboard projectId titles (projectResult: Result<Project, string>)
                         | WorkState.Claimed _, _ -> true
                         | (WorkState.Available | WorkState.Blocked | WorkState.GateException), _ -> true
                         | _ -> false))
-                |> List.sortBy (fifoKey project)
+                |> List.sortBy (fifoKey priorities project)
                 |> List.map (fun stage ->
                     let state =
                         match stage.State with

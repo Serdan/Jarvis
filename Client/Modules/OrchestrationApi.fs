@@ -3098,6 +3098,14 @@ module WorkQueueApi =
                 binding cmd.Action cmd.Category cmd.WorkId
             |> mapError |> Result.map box)
 
+    let setPriority (cmd: WorkPriorityCommand) rt =
+        LedgerBindingConfig.load cmd.ProjectName rt
+        |> Result.bind (fun binding ->
+            Client.WorkQueueToolFacade.WorkQueueToolFacade.setPriorityWithBinding binding
+                cmd.ActorId cmd.OperationId cmd.WorkId
+                cmd.ExpectedProjectVersion cmd.Priority cmd.Reason
+            |> mapError |> Result.map box)
+
     let write (cmd: WorkQueueWriteCommand) rt =
         LedgerBindingConfig.load cmd.ProjectName rt
         |> Result.bind (fun binding ->

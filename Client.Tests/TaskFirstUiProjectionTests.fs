@@ -564,3 +564,19 @@ let terminalPreviewSanitizesTitlesIdsCyclePathsAndUnknownReasonsWithoutChangingD
     Assert.That(text, Does.Contain("FORGED"))
     Assert.That(text, Does.Not.Contain("FORGED\nNEW ROW"))
     Assert.That((projected.Next |> known).Head.SubjectTitle, Is.EqualTo(injection))
+
+
+[<Test>]
+let leadPriorityVisibleInNextSelectionWithHardBlockingFirst () =
+    let a = { stage "A" [] with AvailableAt = 100L }
+    let b = { stage "B" [] with AvailableAt = 300L }
+    let c = { stage "C" [] with AvailableAt = 200L }
+    let held = { stage "D" ["B"] with State = WorkState.Blocked }
+    let original = snapshot [a; b; c; held]
+    let adjusted =
+        original
+        |> fun p -> Contracts.assignPriority p.Version "wq14-tui-A" "A" 10 "Ordinary low" p |> (function Ok v -> v | Error e -> failwithf "%A" e)
+        |> fun p -> Contracts.assignPriority p.Version "wq14-tui-C" "C" 40 "Ordinary high" p |> (function Ok v -> v | Error e -> failwithf "%A" e)
+        |> fun p -> Contracts.assignPriority p.Version "wq14-tui-B" "B" -20 "Hard blocker" p |> (function Ok v -> v | Error e -> failwithf "%A" e)
+    Assert.That(nextIds (view adjusted), Is.EqualTo(box ["B"; "C"; "A"]))
+    Assert.That(blockedIds (view adjusted), Does.Contain("D"))

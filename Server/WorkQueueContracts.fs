@@ -213,6 +213,14 @@ type MigrationEpoch = Frozen | Preparing | Validated | Activated
 
 // Semantic equality of complete typed command input; the future Git-ledger
 // writer must encode these cases with a versioned canonical binary/JSON format.
+// A Lead/operator priority edit is durable in the existing canonical Git
+// operation stream. Existing schema-1 projects/stages need no migration.
+type WorkPriorityDecision =
+    { WorkId: string
+      Priority: int
+      Reason: string
+      ProjectVersion: int }
+
 [<RequireQualifiedAccess>]
 type ProjectOperationPayload =
     | PublishStage of WorkStage
@@ -220,6 +228,7 @@ type ProjectOperationPayload =
     | AdmitProject of Launch
     | SourceHandoff of SourceCheckpoint
     | OtherMutation of string
+    | AssignPriority of WorkPriorityDecision
 
 type Project =
     { Version: int
@@ -355,6 +364,27 @@ module Contracts =
     let isUnfinished (stage: WorkStage) =
         stage.State <> WorkState.Completed && stage.State <> WorkState.Cancelled
 
+    // Priorities are explicit, versioned operator decisions in the original
+    // project CAS receipt map. This preserves canonical schema-1 compatibility
+    // and keeps a single source of truth on reload/reconnect/two clones.
+    let priorityDecisions (project: Project) =
+        project.Receipts
+        |> Map.toSeq
+        |> Seq.choose (fun (_, payload) ->
+            match payload with
+            | ProjectOperationPayload.AssignPriority decision -> Some decision
+            | _ -> None)
+        |> Seq.fold (fun (latest: Map<string, WorkPriorityDecision>) decision ->
+            match latest.TryFind decision.WorkId with
+            | Some previous when previous.ProjectVersion >= decision.ProjectVersion -> latest
+            | _ -> latest.Add(decision.WorkId, decision)) Map.empty
+
+    let priorityOf (project: Project) workId =
+        priorityDecisions project
+        |> Map.tryFind workId
+        |> Option.map (fun decision -> decision.Priority)
+        |> Option.defaultValue 0
+
     let private isBlockingOther (project: Project) (stage: WorkStage) =
         project.Works
         |> Map.exists (fun _ candidate ->
@@ -371,16 +401,40 @@ module Contracts =
     let orderAvailable (project: Project) =
         completeCoverage project
         |> Result.map (fun () ->
+            let priorities = priorityDecisions project
             project.Works
             |> Map.toList
             |> List.map snd
             |> List.filter (ready project)
             |> List.sortBy (fun stage ->
                 (if isBlockingOther project stage then 0 else 1),
+                -(int64 (priorities.TryFind stage.Id
+                         |> Option.map (fun decision -> decision.Priority)
+                         |> Option.defaultValue 0)),
                 stage.AvailableAt,
                 stage.ProjectId,
                 stage.AvailableSequence,
                 stage.Id))
+
+    // The mutation never writes eligibility, graph edges, generation or FIFO
+    // witnesses. An exact old operation replays its original CAS receipt.
+    let assignPriority expectedVersion operationId workId priority reason (project: Project) =
+        let decision =
+            { WorkId = workId
+              Priority = priority
+              Reason = reason
+              ProjectVersion = expectedVersion + 1 }
+        projectCasTyped expectedVersion operationId
+            (ProjectOperationPayload.AssignPriority decision)
+            (fun state ->
+                if String.IsNullOrWhiteSpace workId || not (state.Works.ContainsKey workId) then
+                    Error(Rejection.InvalidState "unknown canonical Work identity")
+                elif String.IsNullOrWhiteSpace reason || reason.Length > 1024
+                     || reason <> reason.Trim() then
+                    Error(Rejection.InvalidState "priority change requires an explicit bounded reason")
+                elif expectedVersion < 0 then
+                    Error Rejection.CasConflict
+                else Ok state) project
 
     // Tarjan on verified hard stage-generation edges, not task IDs or hint relationships.
     let circularHardDependencies (project: Project) =

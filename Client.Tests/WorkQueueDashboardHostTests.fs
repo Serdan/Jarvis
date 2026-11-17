@@ -25,7 +25,7 @@ let private binding (id: string) (tag: string) : LedgerBinding =
 
 let private work (id: string) (category: string) (dependencies: WorkDependencyReason list) : WorkToolRow =
     { WorkId = id; SubjectId = "task-" + id
-      QueueId = "implementation"; Kind = "Implementation"
+      QueueId = "implementation"; Priority = 0; Kind = "Implementation"
       State = category; Category = category
       StageGeneration = 3; ClaimGeneration = 2; GraphVersion = 12
       Gate = "Clear"; Domain = "Undecided"

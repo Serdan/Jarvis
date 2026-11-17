@@ -2015,3 +2015,101 @@ let wq01_live_plan_primary_still_claims_and_answers_own_role_message_as_ancillar
     Assert.That(handled.Works.["Plan"].State, Is.EqualTo(WorkState.Claimed "L"))
     let terminal = completeOrdinary handled.Version "finish-plan-after-role" "L" "Plan" 101L handled |> success
     Assert.That(terminal.Launches.["L"].AncillaryMessages, Is.Empty)
+
+
+// WQ14: priority is a signed Lead/operator decision inside each hard-blocker
+// bucket. Never approximate the blocker tier as a numeric priority bonus.
+[<Test>]
+let wq14_lead_priority_respects_blocking_bucket_and_skips_ineligible () =
+    let initial =
+        empty ()
+        |> fun p -> publish p (implementation "ordinary-first" 100L [])
+        |> fun p -> publish p (implementation "required-blocker" 200L [])
+        |> fun p -> publish p { implementation "unmet-dependent" 300L ["required-blocker"] with
+                                 State = WorkState.Blocked }
+        |> fun p -> publish p (implementation "ordinary-later" 400L [])
+    let highOrdinary =
+        assignPriority initial.Version "wq14-priority-ordinary" "ordinary-later"
+            1000 "Lead requests ordinary work next" initial |> success
+    let lowBlocker =
+        assignPriority highOrdinary.Version "wq14-priority-blocker" "required-blocker"
+            -1000 "Blocker still outranks ordinary" highOrdinary |> success
+    Assert.That(
+        orderAvailable lowBlocker |> success |> List.map (fun w -> w.Id),
+        Is.EqualTo(box ["required-blocker"; "ordinary-later"; "ordinary-first"]))
+    Assert.That(lowBlocker.Works = initial.Works, Is.True)
+    Assert.That(lowBlocker.GraphVersion, Is.EqualTo(initial.GraphVersion))
+    Assert.That(lowBlocker.NextAvailability, Is.EqualTo(initial.NextAvailability))
+    Assert.That(priorityOf lowBlocker "ordinary-first", Is.EqualTo(0))
+    Assert.That(priorityOf lowBlocker "ordinary-later", Is.EqualTo(1000))
+
+[<Test>]
+let wq14_lead_priority_descending_with_fifo_ties_stable_and_versioned () =
+    let original =
+        empty ()
+        |> fun p -> publish p (implementation "A" 100L [])
+        |> fun p -> publish p (implementation "B" 200L [])
+        |> fun p -> publish p (implementation "C" 300L [])
+    let first = assignPriority original.Version "wq14-edit-B" "B" 7 "Lead higher" original |> success
+    Assert.That(orderAvailable first |> success |> List.map _.Id, Is.EqualTo(box ["B"; "A"; "C"]))
+    let tied = assignPriority first.Version "wq14-edit-A" "A" 7 "Lead equal" first |> success
+    Assert.That(orderAvailable tied |> success |> List.map _.Id, Is.EqualTo(box ["A"; "B"; "C"]))
+    let retied = assignPriority tied.Version "wq14-edit-C" "C" 7 "All equal" tied |> success
+    Assert.That(orderAvailable retied |> success |> List.map _.Id, Is.EqualTo(box ["A"; "B"; "C"]))
+    Assert.That(
+        priorityDecisions retied |> Map.find "B",
+        Is.EqualTo({ WorkId = "B"; Priority = 7; Reason = "Lead higher";
+                     ProjectVersion = original.Version + 1 }))
+    Assert.That(assignPriority original.Version "wq14-edit-B" "B" 7 "Lead higher" retied |> success,
+                Is.EqualTo(retied))
+    rejected Rejection.OperationIdReused
+        (assignPriority original.Version "wq14-edit-B" "B" 8 "Changed payload" retied)
+    rejected Rejection.CasConflict
+        (assignPriority original.Version "wq14-stale" "A" 4 "Stale clone" retied)
+    rejected (Rejection.InvalidState "unknown canonical Work identity")
+        (assignPriority retied.Version "wq14-unknown" "missing" 4 "Unknown" retied)
+    rejected (Rejection.InvalidState "priority change requires an explicit bounded reason")
+        (assignPriority retied.Version "wq14-empty" "A" 4 "" retied)
+
+[<Test>]
+let wq14_fifo_witness_remains_scheduling_authority_when_priority_ties () =
+    let initial =
+        empty ()
+        |> fun p -> publish p (implementation "later-id" 100L [])
+        |> fun p -> publish p (implementation "earlier-id" 100L [])
+    let tied =
+        initial
+        |> fun p -> assignPriority p.Version "wq14-tie-a" "later-id" Int32.MinValue "Extreme low" p |> success
+        |> fun p -> assignPriority p.Version "wq14-tie-b" "earlier-id" Int32.MinValue "Extreme low" p |> success
+    // Deliberate timestamp/sequence ties use stable identity, never map enumeration.
+    Assert.That(orderAvailable tied |> success |> List.map _.Id,
+                Is.EqualTo(box ["earlier-id"; "later-id"]))
+    let dominated =
+        assignPriority tied.Version "wq14-high" "later-id" Int32.MaxValue "Extreme high" tied |> success
+    Assert.That(orderAvailable dominated |> success |> List.map _.Id,
+                Is.EqualTo(box ["later-id"; "earlier-id"]))
+
+
+[<Test>]
+let wq14_priority_tie_after_yield_observes_fresh_server_fifo_witness () =
+    let initial =
+        empty ()
+        |> fun p -> publish p (stage "A" WorkKind.Planning "planning" 100L [] WorkState.Available)
+        |> fun p -> publish p (stage "B" WorkKind.Planning "planning" 200L [] WorkState.Available)
+        |> fun p -> assignPriority p.Version "wq14-yield-priority-A" "A" 7 "Equal priority" p |> success
+        |> fun p -> assignPriority p.Version "wq14-yield-priority-B" "B" 7 "Equal priority" p |> success
+    let claimed =
+        initial
+        |> fun p -> admit p "L" "Lead"
+        |> fun p -> submit p "L"
+        |> fun p -> initialize p "L"
+        |> fun p -> claim p "L"
+    Assert.That(claimed.Launches.["L"].PrimaryWorkId, Is.EqualTo(Some "A"))
+    let afterYield =
+        yieldReadOnly claimed.Version "wq14-yield" "L" "A"
+            claimed.Works.["A"].ClaimGeneration 500L claimed |> success
+    Assert.That(afterYield.Works.["A"].AvailableAt, Is.EqualTo(500L))
+    Assert.That(afterYield.Works.["A"].AvailableSequence, Is.GreaterThan(claimed.Works.["B"].AvailableSequence))
+    Assert.That(priorityOf afterYield "A", Is.EqualTo(7))
+    Assert.That(orderAvailable afterYield |> success |> List.map _.Id,
+                Is.EqualTo(box ["B"; "A"]))

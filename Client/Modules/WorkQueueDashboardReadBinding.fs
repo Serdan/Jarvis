@@ -71,6 +71,7 @@ let private toRow (item: WorkToolRow) : WorkRow =
       SubjectId = item.SubjectId
       SubjectTitle = None // No same-head subject-title authority is supplied.
       QueueId = item.QueueId
+      Priority = item.Priority
       Kind = item.Kind
       State = item.State
       Category = item.Category

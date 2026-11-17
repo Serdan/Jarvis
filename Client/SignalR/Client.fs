@@ -139,7 +139,8 @@ let private mayReceiveResponseAlert = function
     | ObserveAgentCommand _ -> false
     | OperatorConversationReadCommand _ -> false
     | WorkQueueReadCommand _
-    | WorkQueueWriteCommand _ -> false
+    | WorkQueueWriteCommand _
+    | WorkPriorityCommand _ -> false
     | TaskReadCommand cmd when cmd.Action = "GetResponseAlerts" -> false
     | TaskWriteCommand cmd when cmd.Action = "QueueResponseAlert"
                                  || cmd.Action = "ClearResponseAlert" -> false
@@ -781,6 +782,8 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
         rt |> OrchestrationApi.WorkQueueApi.read cmd |> serialize'
     | WorkQueueWriteCommand cmd ->
         rt |> OrchestrationApi.WorkQueueApi.write cmd |> serialize'
+    | WorkPriorityCommand cmd ->
+        rt |> OrchestrationApi.WorkQueueApi.setPriority cmd |> serialize'
     | TaskReadCommand cmd -> rt |> OrchestrationApi.TaskApi.read cmd |> serialize'
     | ObserveAgentCommand cmd ->
         rt |> OrchestrationApi.AgentObservationApi.observe cmd

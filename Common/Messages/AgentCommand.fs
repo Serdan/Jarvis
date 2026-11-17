@@ -210,6 +210,17 @@ type WorkQueueReadCommand =
       Category: string
       WorkId: string }
 
+/// Explicit Lead/operator priority edit. Independent of execution bearer and
+/// launch identity; the authenticated user is the Git operation actor.
+type WorkPriorityCommand =
+    { ProjectName: string
+      ActorId: string
+      OperationId: string
+      WorkId: string
+      ExpectedProjectVersion: int
+      Priority: int
+      Reason: string }
+
 type WorkQueueWriteCommand =
     { ProjectName: string
       Action: string
@@ -856,6 +867,7 @@ type AgentCommand =
     | OperatorConversationWriteCommand of OperatorConversationWriteCommand
     | WorkQueueReadCommand of WorkQueueReadCommand
     | WorkQueueWriteCommand of WorkQueueWriteCommand
+    | WorkPriorityCommand of WorkPriorityCommand
     | TaskReadCommand of TaskReadCommand
     | ObserveAgentCommand of ObserveAgentRequest
     | TaskWriteCommand of TaskWriteCommand
@@ -923,6 +935,7 @@ module AgentCommandInfo =
             match command with
             | OperatorConversationWriteCommand cmd -> cmd.OperationId
             | WorkQueueWriteCommand cmd -> cmd.OperationId
+            | WorkPriorityCommand cmd -> cmd.OperationId
             | TaskWriteCommand cmd -> cmd.OperationId
             | CrossProjectNotificationCommand envelope -> envelope.Notification.OperationId
             | ChallengeWriteCommand cmd -> cmd.OperationId
@@ -965,6 +978,7 @@ module AgentCommandInfo =
         | OperatorConversationWriteCommand _ -> "OperatorConversationWriteCommand"
         | WorkQueueReadCommand _ -> "WorkQueueReadCommand"
         | WorkQueueWriteCommand _ -> "WorkQueueWriteCommand"
+        | WorkPriorityCommand _ -> "WorkPriorityCommand"
         | TaskReadCommand _ -> "TaskReadCommand"
         | ObserveAgentCommand _ -> "ObserveAgentCommand"
         | TaskWriteCommand _
@@ -1014,6 +1028,7 @@ module AgentCommandInfo =
         | ObserveAgentCommand _
         | WorkQueueReadCommand _
         | WorkQueueWriteCommand _
+        | WorkPriorityCommand _
         | GetJobResultCommand _
         | ListJobsCommand _
         | GetClientActivityCommand _ -> false
@@ -1063,6 +1078,7 @@ module AgentCommandInfo =
         | OperatorConversationWriteCommand _ -> "OperatorConversationWrite"
         | WorkQueueReadCommand _ -> "WorkQueueRead"
         | WorkQueueWriteCommand _ -> "WorkQueueWrite"
+        | WorkPriorityCommand _ -> "WorkPriority"
         | TaskReadCommand _ -> "TaskRead"
         | ObserveAgentCommand _ -> "ObserveAgent"
         | TaskWriteCommand _
@@ -1153,6 +1169,7 @@ module AgentCommandInfo =
         | OperatorConversationWriteCommand cmd -> Some cmd.ProjectName
         | WorkQueueReadCommand cmd -> Some cmd.ProjectName
         | WorkQueueWriteCommand cmd -> Some cmd.ProjectName
+        | WorkPriorityCommand cmd -> Some cmd.ProjectName
         | TaskReadCommand cmd -> Some cmd.ProjectName
         | ObserveAgentCommand cmd -> Some cmd.ProjectName
         | TaskWriteCommand cmd -> Some cmd.ProjectName
@@ -1273,6 +1290,7 @@ module AgentCommandInfo =
         | OperatorConversationWriteCommand cmd -> Some(compact cmd.Action)
         | WorkQueueReadCommand cmd -> Some(compact cmd.Action)
         | WorkQueueWriteCommand cmd -> Some(compact cmd.Action)
+        | WorkPriorityCommand cmd -> Some(compact cmd.WorkId)
         | TaskReadCommand cmd -> Some(compact cmd.AgentId)
         | ObserveAgentCommand cmd -> Some(compact cmd.TargetAgentId)
         | TaskWriteCommand cmd
@@ -1348,6 +1366,7 @@ module AgentCommandInfo =
         | OperatorConversationWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | WorkQueueReadCommand cmd -> Some(truncate 64 cmd.Action)
         | WorkQueueWriteCommand cmd -> Some(truncate 64 cmd.Action)
+        | WorkPriorityCommand cmd -> Some(truncate 64 cmd.WorkId)
         | TaskReadCommand cmd -> Some(truncate 64 cmd.AgentId)
         | ObserveAgentCommand cmd -> Some(truncate 64 cmd.TargetAgentId)
         | TaskWriteCommand cmd
@@ -1465,6 +1484,7 @@ module AgentProtocol =
           definition "OperatorConversationWrite" "Explicit operator conversation Post/Claim/Handle/Release/Repair, with original UUID and Git CAS." [ VersionControlWrite; NetworkAccess ] true true false
           definition "WorkQueueRead" "Read pinned canonical Work queue, dependency and ephemeral claim evidence; no launch authorization." [ ReadOnly; NetworkAccess ] false false false
           definition "WorkQueueWrite" "Typed default-off Work claim/checkpoint/complete boundary; never creates a legacy Agent owner." [ VersionControlWrite; NetworkAccess ] true true false
+          definition "WorkPriority" "OAuth-authenticated operator priority edit on a canonical Work item; version-checked Git CAS with reason and receipt, no launch." [ VersionControlWrite; NetworkAccess ] true true false
           definition "TaskRead" "Reads a registered agent inbox from a single ledger snapshot." [ ReadOnly; NetworkAccess ] false false false
           definition "ObserveAgent" "Read an explicitly named target agent without attributing tool activity or beginning a Ready turn. Observer identity is independently verified." [ ReadOnly; NetworkAccess ] false false false
           definition "TaskWrite" "Creates/assigns/starts tasks and binds immutable review base." [ VersionControlWrite; NetworkAccess ] true true false

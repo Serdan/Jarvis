@@ -1257,3 +1257,37 @@ type WorkQueueGitLedgerTests() =
             | LaunchState.Registered _ -> ()
             | other -> Assert.Fail(sprintf "Uncertain source released its token: %A" other)
             rejected b (YieldSource proof))
+
+    [<Test>]
+    member _.PriorityTwoCloneCasIsVersionedDurableAndReplaySafe() =
+        withClones (fun a b ->
+            let projectId = a.ProjectId.ToString("D")
+            let subs = Map.ofList [ "Lead", set [ "planning" ] ]
+            WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid()) subs |> success |> ignore
+            let _, before = WorkQueueGitLedger.load a |> success
+            WorkQueueGitLedger.executeInertFixtureAt a "Worker" (Guid.NewGuid())
+                before.Version 1000L (PublishStage(plan projectId "P" []))
+                |> success |> ignore
+            let _, firstView = WorkQueueGitLedger.load a |> success
+            let _, staleView = WorkQueueGitLedger.load b |> success
+            Assert.That(firstView.Version, Is.EqualTo(staleView.Version))
+            let op = Guid.NewGuid()
+            WorkQueueGitLedger.setPriority a ("operator:" + String.replicate 64 "a")
+                op firstView.Version "P" 42 "Lead reviewed dependency order"
+                |> success |> ignore
+            match WorkQueueGitLedger.setPriority b ("operator:" + String.replicate 64 "a")
+                    (Guid.NewGuid()) staleView.Version "P" -1 "Stale clone decision" with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Expected typed stale clone conflict: %A" other)
+            let _, readBack = WorkQueueGitLedger.load b |> success
+            Assert.That(Contracts.priorityOf readBack "P", Is.EqualTo(42))
+            Assert.That(readBack.GraphVersion, Is.EqualTo(firstView.GraphVersion))
+            Assert.That(readBack.Works.["P"], Is.EqualTo(firstView.Works.["P"]))
+            Assert.That(readBack.Version, Is.EqualTo(firstView.Version + 1))
+            let recorded = Contracts.priorityDecisions readBack |> Map.find "P"
+            Assert.That(recorded.Reason, Is.EqualTo("Lead reviewed dependency order"))
+            WorkQueueGitLedger.setPriority b ("operator:" + String.replicate 64 "a")
+                op firstView.Version "P" 42 "Lead reviewed dependency order"
+                |> success |> ignore
+            let _, recovered = WorkQueueGitLedger.load a |> success
+            Assert.That(recovered, Is.EqualTo(readBack)))

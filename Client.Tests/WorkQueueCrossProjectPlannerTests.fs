@@ -44,6 +44,7 @@ type WorkQueueCrossProjectPlannerTests() =
           QueueId = queue
           AvailableAt = at
           AvailableSequence = sequence
+          Priority = 0
           BlocksOtherWork = blocking
           RoleId = roleName
           RoleVersion = 4
@@ -379,3 +380,19 @@ type WorkQueueCrossProjectPlannerTests() =
         Assert.That(result.Decision, Is.EqualTo(PlannerDecision.Unknown))
         Assert.That(result.Issues |> List.exists (fun entry ->
             entry.Code = "AccountTokenProjectUnknown"), Is.True)
+
+
+    [<Test>]
+    member _.PriorityWithinBucketsDoesNotOverrideHardBlockerAndRetainsDeterministicFifo() =
+        let highOrdinary = { a with Priority = 1000 }
+        let lowBlocker = { b with Priority = -1000; BlocksOtherWork = true }
+        let ordered = WorkQueueCrossProjectPlanner.rankCandidates [ highOrdinary; lowBlocker ]
+        Assert.That((ordered = [lowBlocker; highOrdinary]), Is.True)
+        let highLater = { b with Priority = 8; BlocksOtherWork = false }
+        let lowEarlier = { a with Priority = 7 }
+        Assert.That((WorkQueueCrossProjectPlanner.rankCandidates [ lowEarlier; highLater ] = [highLater; lowEarlier]), Is.True)
+        let tiedA = { a with Priority = 8 }
+        Assert.That((WorkQueueCrossProjectPlanner.rankCandidates [ highLater; tiedA ] = [tiedA; highLater]), Is.True)
+        let result = report (account [||]) [pA; pB] roles [highOrdinary; lowBlocker] []
+        Assert.That(result.CanDispatch, Is.False)
+        Assert.That(result.Decision |> chosen, Is.EqualTo(Some lowBlocker))

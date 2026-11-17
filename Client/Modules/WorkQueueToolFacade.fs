@@ -24,6 +24,7 @@ type WorkToolRow =
     { WorkId: string
       SubjectId: string
       QueueId: string
+      Priority: int
       Kind: string
       State: string
       Category: string
@@ -49,6 +50,16 @@ type WorkToolSnapshot =
       ClaimBinding: string
       Work: WorkToolRow list
       ReadOnly: bool }
+
+type WorkPriorityTransition =
+    { Status: string
+      Applied: bool
+      OperationId: string
+      VerifiedGitHead: string
+      ProjectVersion: int
+      WorkId: string
+      Priority: int
+      Reason: string }
 
 type WorkToolTransition =
     { Status: string
@@ -149,7 +160,7 @@ module WorkQueueToolFacade =
             | _, _, Evidence.Unknown reason, _
             | _, _, _, Evidence.Unknown reason ->
                 Set.empty, Set.empty, Map.empty, "UNKNOWN: " + reason
-        // WQ09's Next retains blocker-first FIFO from the canonical WQ02
+        // WQ09's Next retains blocker-first, priority-descending, FIFO-tied ordering from WQ02
         // contract; the tool must not reorder it by raw availability timestamps.
         let nextPositions =
             match dashboard.Next with
@@ -169,6 +180,7 @@ module WorkQueueToolFacade =
                     pinned.Catalog.Revision head
             | Ok _ -> "UNKNOWN: WQ04 project/role head or content mismatch"
             | Error reason -> "UNKNOWN: WQ04 role provenance unavailable: " + reason
+        let priorities = Contracts.priorityDecisions project
         let rows =
             project.Works
             |> Map.toList
@@ -200,7 +212,11 @@ module WorkQueueToolFacade =
                        then [sprintf "Canonical %A state blocks work at graph v%d" stage.State project.GraphVersion]
                        else [])
                 { WorkId = stage.Id; SubjectId = stage.SubjectId
-                  QueueId = stage.QueueId; Kind = sprintf "%A" stage.Kind
+                  QueueId = stage.QueueId
+                  Priority = priorities.TryFind stage.Id
+                             |> Option.map (fun decision -> decision.Priority)
+                             |> Option.defaultValue 0
+                  Kind = sprintf "%A" stage.Kind
                   State = status stage; Category = category
                   StageGeneration = stage.StageGeneration
                   ClaimGeneration = stage.ClaimGeneration
@@ -244,6 +260,28 @@ module WorkQueueToolFacade =
         && actor.StartsWith("operator:", StringComparison.Ordinal)
         && (actor.Substring(9) |> Seq.forall (fun c ->
             (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+
+    let setPriorityWithBinding (binding: LedgerBinding) (actor: string)
+                               (operationId: string) (workId: string)
+                               expectedProjectVersion priority (reason: string) =
+        if not (authenticatedActor actor) || String.IsNullOrWhiteSpace workId
+           || expectedProjectVersion < 0 || String.IsNullOrWhiteSpace reason
+           || reason.Length > 1024 || reason <> reason.Trim() then
+            Error(InvalidBinding "Priority edit requires authenticated operator, Work ID, nonnegative expected version and explicit bounded reason.")
+        else
+            match Guid.TryParse operationId with
+            | true, operation when operation <> Guid.Empty ->
+                WorkQueueGitLedger.setPriority binding actor operation
+                    expectedProjectVersion workId priority reason
+                |> Result.bind (fun written ->
+                    WorkQueueGitLedger.load binding
+                    |> Result.map (fun (snapshot, state) ->
+                        { Status = if written.AlreadyApplied then "IdempotentReplay" else "Applied"
+                          Applied = true; OperationId = operation.ToString("D")
+                          VerifiedGitHead = snapshot.Commit; ProjectVersion = state.Version
+                          WorkId = workId; Priority = Contracts.priorityOf state workId
+                          Reason = reason }))
+            | _ -> Error(InvalidBinding "Priority operation UUID must be nonempty.")
 
     // Deliberately returns an explicit non-applied result. No mutation call,
     // synthetic claim owner, new UUID, source write or Task assignment occurs.

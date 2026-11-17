@@ -506,7 +506,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     let ledgerWire = set [ "TaskRead"; "TaskWrite"; "ReviewRead"; "ReviewWrite";
                           "LedgerRead"; "LedgerWrite"; "ChallengeRead"; "ChallengeWrite";
                           "OperatorConversationRead"; "OperatorConversationWrite";
-                          "WorkQueueRead"; "WorkQueueWrite" ]
+                          "WorkQueueRead"; "WorkQueueWrite"; "WorkPriority" ]
     let orchestrationTools =
         set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "GetNotificationPreferences"; "GetResponseAlerts"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
               "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"
@@ -526,7 +526,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "PostOperatorConversationMessage"; "ClaimOperatorConversationMessage"
               "HandleOperatorConversationMessage"; "ReleaseOperatorConversationMessage"; "RepairOperatorConversation"
               // WorkQueueRead/Write expose six authenticated facade methods, not raw wire tools.
-              "ListWork"; "GetWork"; "ConnectWork"; "ClaimNextWork"; "CheckpointWork"; "CompleteWork"
+              "ListWork"; "GetWork"; "ConnectWork"; "ClaimNextWork"; "CheckpointWork"; "CompleteWork"; "SetWorkPriority"
               ]
     // Retired wire cases are deleted; public CreateTask/AssignTask are canonical ledger tools.
     unionNames |> shouldEqual catalogNames
@@ -1102,7 +1102,9 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
               for name in [ "ListWork"; "GetWork" ] ->
                   name, original["WorkQueueRead"]
               for name in [ "ConnectWork"; "ClaimNextWork"; "CheckpointWork"; "CompleteWork" ] ->
-                  name, original["WorkQueueWrite"] ]
+                  name, original["WorkQueueWrite"]
+              for name in [ "SetWorkPriority" ] ->
+                  name, original["WorkPriority"] ]
         aliases |> List.fold (fun map (key, value) -> Map.add key value map) original
 
     let methods =
@@ -2818,3 +2820,17 @@ let wq06_authenticated_mcp_post_forwards_only_oauth_derived_actor_and_original_u
             Assert.That(sent.ExpectedVersion, Is.Zero)
         | command -> Assert.Fail(sprintf "Unexpected forwarded WQ06 wire command: %A" command)
     }
+
+// WQ14 public operator mutation is not an execution credential/claim surface.
+[<Test>]
+let priority_set_command_schema_is_explicit_git_cas_and_not_work_launch () =
+    let methodInfo = typeof<JarvisMcpTools>.GetMethod("SetWorkPriority")
+    let names = methodInfo.GetParameters() |> Array.map _.Name |> Set.ofArray
+    for required in ["workId"; "expectedProjectVersion"; "priority"; "reason"; "operationId"] do
+        Assert.That(names.Contains required, Is.True, required)
+    Assert.That(names.Contains "credential", Is.False)
+    Assert.That(names.Contains "launchId", Is.False)
+    let capability = McpToolHelpers.mcpListCommandsResult.Commands
+                     |> List.find (fun c -> c.Name = "SetWorkPriority")
+    Assert.That(capability.Permissions, Does.Contain(VersionControlWrite))
+    Assert.That(capability.MutatesState, Is.True)

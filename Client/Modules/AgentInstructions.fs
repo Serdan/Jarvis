@@ -189,7 +189,7 @@ let writeWarnings (rt: Runtime) command response =
 // logical; the cache keeps checkout provenance separately.
 let private resolveTargets (rt: Runtime) (project: ProjectPaths.ResolvedProject) targets =
     let (FolderPath sourceRoot) = ProjectPaths.ResolvedProject.sourceRoot project
-    let logicalProject = ProjectPaths.ProjectTarget.projectName (ProjectPaths.ResolvedProject.target project)
+    let logicalProject = ProjectPaths.ProjectTarget.displayKey (ProjectPaths.ResolvedProject.target project)
     let directories =
         targets
         |> List.fold (fun accumulated target ->
@@ -326,7 +326,7 @@ let private inspectExplicitSource (key: string) (physicalPath: string) =
 
 let private explicitSources (rt: Runtime) (project: ProjectPaths.ResolvedProject) directory =
     let (FolderPath sourceRoot) = ProjectPaths.ResolvedProject.sourceRoot project
-    let projectName = ProjectPaths.ProjectTarget.projectName (ProjectPaths.ResolvedProject.target project)
+    let projectName = ProjectPaths.ProjectTarget.displayKey (ProjectPaths.ResolvedProject.target project)
     targetDirectory rt project sourceRoot (FolderTarget directory)
     |> Result.bind (fun normalized ->
         let candidates =

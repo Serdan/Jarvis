@@ -166,18 +166,18 @@ module LedgerBindingConfig =
     // Reuse the single verified snapshot from binding resolution for advisory
     // agent-state reads, rather than fetching the same remote ledger twice.
     let loadWithSnapshot projectName rt =
-        ProjectPaths.resolveProjectRoot projectName rt
+        ProjectPaths.resolveLedgerRoot projectName rt
         |> Result.bind (fun (FolderPath root) -> loadAtRootWithSnapshot root)
 
     // A source operation already resolved its checkout when loading AGENTS.md.
-    // Reuse that physical root, but perform exactly the same pinned trust-anchor
-    // verification and ledger fetch as ordinary binding loads.
+    // The source root can be a worktree; the trusted ledger and pending journal
+    // always belong to the canonical main root.
     let loadForContext (context: ProjectPaths.ResolvedProject) =
-        let (FolderPath root) = ProjectPaths.ResolvedProject.sourceRoot context
+        let (FolderPath root) = ProjectPaths.ResolvedProject.mainRoot context
         loadAtRoot root
 
     let load projectName rt =
-        ProjectPaths.resolveProjectRoot projectName rt
+        ProjectPaths.resolveLedgerRoot projectName rt
         |> Result.bind (fun (FolderPath root) -> loadAtRoot root)
 
     // Setup is always an explicit approved action, never a side effect of a read.
@@ -192,7 +192,7 @@ module LedgerBindingConfig =
         elif projectId = Guid.Empty || ledgerId = Guid.Empty || epoch < 1 then
             Error(Client.ValidationError "A pinned project/ledger UUID and positive epoch are required.")
         else
-            match ProjectPaths.resolveProjectRoot projectName rt with
+            match ProjectPaths.resolveLedgerRoot projectName rt with
             | Error error -> Error error
             | Ok(FolderPath root) ->
                 let path = pathForRoot root
@@ -233,7 +233,7 @@ module LedgerBindingConfig =
         elif projectId = Guid.Empty || ledgerId = Guid.Empty || epoch < 1 then
             Error(Client.ValidationError "Valid new ledger identity is required.")
         else
-            match ProjectPaths.resolveProjectRoot projectName rt with
+            match ProjectPaths.resolveLedgerRoot projectName rt with
             | Error error -> Error error
             | Ok(FolderPath root) ->
                 if File.Exists(pathForRoot root) then
@@ -279,7 +279,7 @@ module LedgerBindingConfig =
             match load projectName rt with
             | Error error -> Error error
             | Ok old ->
-                match ProjectPaths.resolveProjectRoot projectName rt with
+                match ProjectPaths.resolveLedgerRoot projectName rt with
                 | Error error -> Error error
                 | Ok(FolderPath root) ->
                     let path = pathForRoot root
@@ -457,7 +457,7 @@ module PendingIntentJournal =
             Error(Client.ValidationError $"Cannot enumerate pending  operations: {ex.Message}")
 
     let listForProject projectName rt =
-        ProjectPaths.resolveProjectRoot projectName rt
+        ProjectPaths.resolveLedgerRoot projectName rt
         |> Result.bind (fun (FolderPath root) -> listAtRoot root)
 
     // Check a pending command against the exact accepted operation kind and its

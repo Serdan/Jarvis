@@ -395,7 +395,9 @@ let registered_worktrees_resolve_distinct_instructions_from_actual_checkout_root
         Assert.That(check "Demo::tree-b" |> List.map (fun d -> d.Content),
                     Is.EqualTo([ "workspace guidance"; "checkout B"; "nested B" ] :> obj))
         Assert.That(check "Demo::tree-a" |> List.map (fun d -> d.Path),
-                    Is.EqualTo([ "AGENTS.md"; "Demo/AGENTS.md"; "Demo/src/AGENTS.md" ] :> obj))
+                    Is.EqualTo([ "AGENTS.md"; "Demo::tree-a/AGENTS.md"; "Demo::tree-a/src/AGENTS.md" ] :> obj))
+        Assert.That(check "Demo::tree-b" |> List.map (fun d -> d.Path),
+                    Is.EqualTo([ "AGENTS.md"; "Demo::tree-b/AGENTS.md"; "Demo::tree-b/src/AGENTS.md" ] :> obj))
         for selector, expectedRoot, expectedNested in
             [ "Demo::tree-a", "checkout A", "nested A"
               "Demo::tree-b", "checkout B", "nested B" ] do
@@ -404,8 +406,8 @@ let registered_worktrees_resolve_distinct_instructions_from_actual_checkout_root
                 | Ok page -> page["AGENTS.md"].AsObject()
                 | Error error -> failwithf "Cannot get worktree instructions: %A" error
             Assert.That(hierarchy["."].GetValue<string>(), Is.EqualTo("workspace guidance"))
-            Assert.That(hierarchy["Demo"].GetValue<string>(), Is.EqualTo(expectedRoot))
-            Assert.That(hierarchy["Demo/src"].GetValue<string>(), Is.EqualTo(expectedNested))
+            Assert.That(hierarchy[selector].GetValue<string>(), Is.EqualTo(expectedRoot))
+            Assert.That(hierarchy[selector + "/src"].GetValue<string>(), Is.EqualTo(expectedNested))
         let rootA =
             match roots rt "Demo::tree-a" with
             | Ok docs -> docs
@@ -421,6 +423,24 @@ let registered_worktrees_resolve_distinct_instructions_from_actual_checkout_root
         Assert.That(ProjectPaths.ProjectTarget.projectName checkoutA, Is.EqualTo("Demo"))
         Assert.That(ProjectPaths.ProjectTarget.projectName checkoutB, Is.EqualTo("Demo"))
         Assert.That(checkoutA, Is.Not.EqualTo(checkoutB))
+        Assert.That(ProjectPaths.ProjectTarget.displayKey checkoutA, Is.EqualTo("Demo::tree-a"))
+        Assert.That(ProjectPaths.ProjectTarget.displayKey checkoutB, Is.EqualTo("Demo::tree-b"))
+        let context selector =
+            match ProjectPaths.resolveProjectContext selector rt with
+            | Ok resolved -> resolved
+            | Error error -> failwithf "Unable to resolve checkout %s: %A" selector error
+        let canonical = context "Demo"
+        let sourceA = context "Demo::tree-a"
+        let sourceB = context "Demo::tree-b"
+        Assert.That(ProjectPaths.ResolvedProject.mainRoot sourceA,
+                    Is.EqualTo(ProjectPaths.ResolvedProject.sourceRoot canonical))
+        Assert.That(ProjectPaths.ResolvedProject.mainRoot sourceB,
+                    Is.EqualTo(ProjectPaths.ResolvedProject.sourceRoot canonical))
+        Assert.That(ProjectPaths.ResolvedProject.sourceRoot sourceA,
+                    Is.Not.EqualTo(ProjectPaths.ResolvedProject.sourceRoot sourceB))
+        match ProjectPaths.resolveLedgerRoot "Demo::tree-a" rt with
+        | Ok root -> Assert.That(root, Is.EqualTo(ProjectPaths.ResolvedProject.mainRoot canonical))
+        | Error error -> Assert.Fail(sprintf "Worktree ledger identity lost: %A" error)
         let sourceCommand : Common.AgentCommand =
             ReadFileCommand
                 { ProjectName = "Demo::tree-a"; FilePath = "src/engine.fs"
@@ -467,6 +487,55 @@ let registered_worktrees_resolve_distinct_instructions_from_actual_checkout_root
         with
         | :? UnauthorizedAccessException -> ()
         | :? PlatformNotSupportedException -> ()
+        // Two independently registered worktrees may have the same basename.
+        // Never silently pick whichever Git enumerates first.
+        let duplicate = Path.Combine(root, ".Demo-alternate", "tree-a")
+        gitAt main ["worktree"; "add"; "-qb"; "branch-c"; duplicate; "HEAD"] |> ignore
+        match ProjectPaths.resolveProjectContext "Demo::tree-a" rt with
+        | Error(Client.ValidationError message) ->
+            Assert.That(message, Does.Contain("Ambiguous"))
+        | other -> Assert.Fail(sprintf "Ambiguous worktree selector must fail closed: %A" other)
+    )
+
+[<Test>]
+let registered_worktree_ledger_operations_share_canonical_pending_journal () =
+    workspace (fun root rt ->
+        let main = Path.Combine(root, "Demo")
+        gitAt main ["init"; "-q"] |> ignore
+        gitAt main ["config"; "user.name"; "Fixture"] |> ignore
+        gitAt main ["config"; "user.email"; "fixture@example.test"] |> ignore
+        create root "Demo/initial.txt" "baseline" |> ignore
+        gitAt main ["add"; "."] |> ignore
+        gitAt main ["commit"; "-qm"; "baseline"] |> ignore
+        let worktree = Path.Combine(root, ".Demo-worktrees", "journal")
+        gitAt main ["worktree"; "add"; "-qb"; "journal-branch"; worktree; "HEAD"] |> ignore
+        let binding : Client.LedgerStore.LedgerBinding =
+            { RepositoryPath = main
+              RemoteName = "origin"
+              ApprovedFetchUrl = "unused"
+              ApprovedPushUrl = "unused"
+              ProjectId = Guid.NewGuid()
+              LedgerId = Guid.NewGuid()
+              Epoch = 1 }
+        let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot main
+        let pendingDirectory =
+            Path.Combine(Path.GetDirectoryName configPath, "pending",
+                         Path.GetFileNameWithoutExtension configPath)
+        try
+            let operationId = Guid.NewGuid()
+            match Client.OrchestrationApi.PendingIntentJournal.persist
+                      binding operationId "TaskWrite" """{"Action":"Checkpoint"}""" with
+            | Ok () -> ()
+            | Error error -> Assert.Fail(sprintf "Cannot seed pending journal: %A" error)
+            let listed selector =
+                match Client.OrchestrationApi.PendingIntentJournal.listForProject selector rt with
+                | Ok entries -> entries |> List.map (fun item -> item.OperationId)
+                | Error error -> failwithf "Journal lookup failed for %s: %A" selector error
+            let expected = [ operationId.ToString("D") ]
+            Assert.That(listed "Demo", Is.EqualTo(expected :> obj))
+            Assert.That(listed "Demo::journal", Is.EqualTo(expected :> obj))
+        finally
+            if Directory.Exists pendingDirectory then Directory.Delete(pendingDirectory, true)
     )
 
 [<Test>]

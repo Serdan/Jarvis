@@ -44,6 +44,11 @@ module ProjectTarget =
     let projectName target = let (ProjectId name) = target.Project in name
     let checkout target = target.Checkout
     let worktreeName = function Registered (WorktreeId name) -> Some name | Main -> None
+    // A stable logical instruction/display key, never a filesystem path.
+    let displayKey target =
+        match target.Checkout with
+        | Main -> projectName target
+        | Registered (WorktreeId name) -> projectName target + "::" + name
     let identity input = parse input |> Result.map projectName
 
 module ProjectId =
@@ -243,11 +248,13 @@ let private resolveRegisteredWorktree (mainRoot: string) (selector: string) : Cl
                 | _ -> Error(Client.ValidationError "Ambiguous worktree selector.")
             with ex -> Error(Client.ExceptionError ex)
 
+let resolveLedgerRootForTarget (target: ProjectTarget) : IO<'rt, FolderPath> =
+    resolveWorkspacePath [ ProjectTarget.projectName target ] >>= FileIO.parseFolder
+
 let resolveProjectContextForTarget (target: ProjectTarget) : IO<'rt, ResolvedProject> =
     effect {
         let! (ProjectDirectory workspaceRoot) = ProjectIO.root
-        let mainName = ProjectTarget.projectName target
-        let! (FolderPath mainRoot) = resolveWorkspacePath [ mainName ] >>= FileIO.parseFolder
+        let! (FolderPath mainRoot) = resolveLedgerRootForTarget target
         let! (FolderPath sourceRoot) =
             match target.Checkout with
             | Main -> fun _ -> Ok(FolderPath mainRoot)
@@ -269,6 +276,14 @@ let resolveProjectContext (projectName: string) : IO<'rt, ResolvedProject> =
 
 let resolveProjectRoot (projectName: string) : IO<'rt, FolderPath> =
     resolveProjectContext projectName |>> fun resolved -> resolved.SourceRoot
+
+// Coordination bindings and pending operation journals are owned by the
+// canonical project, even when a command selects a different source checkout.
+let resolveLedgerRoot (projectName: string) : IO<'rt, FolderPath> =
+    effect {
+        let! target = ProjectTarget.parse projectName |> Effect.ofResult
+        return! resolveLedgerRootForTarget target
+    }
 
 let resolveSourcePath (project: ResolvedProject) (relativePath: string) : IO<'rt, string> =
     effect {

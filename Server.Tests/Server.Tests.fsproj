@@ -19,6 +19,7 @@
         <Compile Include="WorkSnapshotCodecTests.fs"/>
         <Compile Include="WorkLegacyImportPreflightTests.fs"/>
         <Compile Include="WorkLegacyImportFenceTests.fs"/>
+        <Compile Include="OriginalGitPublisherAdmissionTests.fs"/>
 
         <Compile Include="WorkCompositionTests.fs"/>
         <Compile Include="WorkSqliteAuthorityTests.fs"/>

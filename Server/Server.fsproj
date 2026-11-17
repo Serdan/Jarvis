@@ -26,6 +26,7 @@
         <Compile Include="WorkLegacyImportPreflight.fs"/>
         <Compile Include="WorkLegacyImportSqlite.fs"/>
         <Compile Include="WorkLegacyImportFence.fs"/>
+        <Compile Include="OriginalGitPublisherAdmission.fs"/>
         <Compile Include="WorkQueueSchedulerInert.fs"/>
         <Compile Include="WorkQueueDependencyDiagnostics.fs"/>
         <Compile Include="WorkBlocking.fs"/>

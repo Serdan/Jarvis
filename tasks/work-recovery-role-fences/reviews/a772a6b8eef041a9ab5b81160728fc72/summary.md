@@ -1,0 +1,1 @@
+G0 pure recovery model and typed queue; focused hermetic NUnit recovery cases, full .NET 11 Release Server.Tests 316/316, commit a7a835a85ff79667e54fed0ccc17e75dd4de2a21. Inspect account/project gap seals, STOP, scoped release and proof binding, journals, duplicate operations, deterministic output. No live cutover.

@@ -1,0 +1,1 @@
+Two .NET11 Release tests: 1 PASS intact authority restart, 1 intentional RED restored DB accepts fresh SQLite mutation despite RequiresRecovery receipt. Exact isolated test-only commit b6a35bf529d95b614b0ce0a7c7c7d1546b539478 based on 51b67bf1d5ba7e16512b915f8004456440b3489c. Review tests as expected-red evidence, not implementation acceptance.

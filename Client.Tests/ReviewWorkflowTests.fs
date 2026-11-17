@@ -1983,6 +1983,51 @@ type ReviewWorkflowTests() =
                        | Error error -> failwithf " imported page API failed: %A" error
                 Assert.That(latest.Content, Does.Contain("API imported safely"))
 
+                // Until task-spec workflows carry selected-source provenance separately
+                // from the ledger binding, every registered checkout must fail closed.
+                let mainCollisionPath = Path.Combine(sourceDirectory, "selection-collision.html")
+                let mainCollisionHtml = "<h1>main-checkout-collision</h1>"
+                File.WriteAllText(mainCollisionPath, mainCollisionHtml)
+                let ledgerHeadBeforeSelection = (LedgerStore.fetch first |> success).Commit
+                for name in [ "selected-source-a"; "selected-source-b" ] do
+                    let selectedRoot = Path.Combine(Path.GetDirectoryName one, name)
+                    git one [ "worktree"; "add"; "-b"; "test/" + name; selectedRoot; "HEAD" ] |> ignore
+                    let selectedDir = Path.Combine(selectedRoot, "specs")
+                    Directory.CreateDirectory(selectedDir) |> ignore
+                    let selectedPath = Path.Combine(selectedDir, "selection-collision.html")
+                    let selectedHtml = "<h1>" + name + "</h1>"
+                    File.WriteAllText(selectedPath, selectedHtml)
+                    let selector = "owner::" + name
+                    let selectedContext =
+                        Client.ProjectPaths.resolveProjectContext selector ctx
+                        |> function
+                           | Ok context -> context
+                           | Error error -> failwithf "Cannot resolve selected checkout: %A" error
+                    Assert.That(Client.ProjectPaths.ResolvedProject.sourceRoot selectedContext,
+                                Is.Not.EqualTo(Client.ProjectPaths.ResolvedProject.mainRoot selectedContext))
+                    let reject action =
+                        let command =
+                            { template action specTask with
+                                ProjectName = selector
+                                SourceRef = "specs/selection-collision.html"
+                                BaseOid = latest.SpecBlobOid
+                                TargetRef = latest.SpecBlobOid
+                                ExpectedVersion = 3
+                                Title = "selected checkout must be rejected" }
+                        let assertRejected = function
+                            | Error(Client.ValidationError detail) ->
+                                Assert.That(detail, Does.Contain("non-main"))
+                            | other ->
+                                Assert.Fail(sprintf "Expected early non-main rejection for %s: %A" action other)
+                        Client.OrchestrationApi.TaskApi.writeForContext selectedContext command ctx |> assertRejected
+                        Client.OrchestrationApi.TaskApi.write command ctx |> assertRejected
+                    reject "ExportTaskSpec"
+                    reject "ImportTaskSpec"
+                    Assert.That(File.ReadAllText(selectedPath), Is.EqualTo(selectedHtml))
+                    Assert.That(File.ReadAllText(mainCollisionPath), Is.EqualTo(mainCollisionHtml))
+                Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(ledgerHeadBeforeSelection),
+                            "Rejecting a selected checkout must not mutate the canonical ledger.")
+
                 Assert.That((Client.OrchestrationApi.PendingIntentJournal.listAtRoot one |> success).Length,
                             Is.EqualTo(0), "Verified  mutations must clear pending local intents.")
                 // A failed write leaves a pending journal entry: retrying it from

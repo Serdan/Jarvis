@@ -1241,8 +1241,26 @@ module TaskApi =
                     result |> Result.map OperationResponse.present))
 
 
+    // The ledger binding is deliberately rooted at main, but the source-file
+    // import/export workflow still derives file paths from that binding. Until
+    // it accepts a separately validated source checkout, reject worktrees
+    // before loading the binding or creating a pending operation journal.
+    let private rejectNonMainTaskSpec action (target: ProjectPaths.ProjectTarget) =
+        if (action = "ExportTaskSpec" || action = "ImportTaskSpec")
+           && (ProjectPaths.ProjectTarget.checkout target |> ProjectPaths.ProjectTarget.worktreeName |> Option.isSome) then
+            Error(Client.ValidationError
+                "Task-spec import/export from a non-main checkout is unavailable until selected-source provenance is supported.")
+        else Ok ()
+
     let writeForContext (context: ProjectPaths.ResolvedProject) (cmd: TaskWriteCommand) rt =
-        writeUsingContext (Some context) cmd rt
+        rejectNonMainTaskSpec cmd.Action (ProjectPaths.ResolvedProject.target context)
+        |> Result.bind (fun () -> writeUsingContext (Some context) cmd rt)
 
     let write (cmd: TaskWriteCommand) rt =
-        writeUsingContext None cmd rt
+        if cmd.Action = "ExportTaskSpec" || cmd.Action = "ImportTaskSpec" then
+            ProjectPaths.ProjectTarget.parse cmd.ProjectName
+            |> Result.bind (fun target ->
+                rejectNonMainTaskSpec cmd.Action target
+                |> Result.bind (fun () -> writeUsingContext None cmd rt))
+        else
+            writeUsingContext None cmd rt

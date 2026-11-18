@@ -1626,3 +1626,71 @@ esac
                 git f.Root
                     [ "--git-dir=" + f.ProjectRemote; "for-each-ref"; "--format=%(objectname)"; gitRef ],
                 Is.EqualTo(head)))
+
+    [<TestCase("lost-ack")>]
+    [<TestCase("concurrent-delete")>]
+    member _.ManagedGuardedDeleteUnacknowledgedOrConcurrentRemovalStaysUnknown(faultMode: string) =
+        if OperatingSystem.IsWindows() || not (File.Exists "/usr/bin/git") then
+            Assert.Ignore("Disposable two-clone guarded-delete fault injection requires /usr/bin/git on Unix.")
+        withFixture (fun f ->
+            let journal = Path.Combine(f.Root, "staged-guarded-delete-" + faultMode + ".db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal journal
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, journal)
+            let head = git f.ProjectOne.RepositoryPath [ "rev-parse"; "HEAD" ]
+            let gitRef = "refs/heads/jarvis-review/_reviews/" + Guid.NewGuid().ToString("N") + "/r1"
+            LedgerStore.publishReviewRef f.ProjectOne gitRef head |> success
+            let parent =
+                { OperationId = Guid.NewGuid(); Actor = "Worker21"
+                  Kind = "DeleteReservedReviewRef"; RequestJson = "{}" }
+            let bin = Path.Combine(f.Root, "git-delete-fault")
+            Directory.CreateDirectory bin |> ignore
+            let shim = Path.Combine(bin, "git")
+            File.WriteAllText(shim, """#!/bin/sh
+case "$*" in
+  *"push --porcelain --force-with-lease=refs/heads/jarvis-review/"*)
+    case "$JARVIS_TEST_DELETE_FAULT" in
+      lost-ack)
+        /usr/bin/git "$@"
+        result=$?
+        if [ "$result" -eq 0 ]; then
+          echo 'fixture: guarded deletion occurred but acknowledgement was lost' >&2
+          exit 1
+        fi
+        exit "$result";;
+      concurrent-delete)
+        /usr/bin/git -C "$JARVIS_TEST_DELETE_OTHER" push --porcelain "--force-with-lease=$JARVIS_TEST_DELETE_REF:$JARVIS_TEST_DELETE_OID" origin ":$JARVIS_TEST_DELETE_REF" || exit 120
+        /usr/bin/git "$@"
+        exit $?;;
+    esac;;
+esac
+exec /usr/bin/git "$@"
+            """)
+            File.SetUnixFileMode(shim, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+            let changes =
+                [ "PATH", bin + string Path.PathSeparator + Environment.GetEnvironmentVariable("PATH")
+                  "JARVIS_TEST_DELETE_FAULT", faultMode
+                  "JARVIS_TEST_DELETE_OTHER", f.ProjectTwo.RepositoryPath
+                  "JARVIS_TEST_DELETE_REF", gitRef
+                  "JARVIS_TEST_DELETE_OID", head ]
+            let previous =
+                changes |> List.map (fun (name, _) -> name, Environment.GetEnvironmentVariable(name))
+            try
+                changes |> List.iter (fun (name, value) -> Environment.SetEnvironmentVariable(name, value))
+                match LedgerStore.deleteReservedReviewRefForAction f.ProjectOne parent gitRef head with
+                | Error(OutcomeUnknown _) -> ()
+                | other ->
+                    Assert.Fail(sprintf "An absent ref cannot attribute unacknowledged/third-party deletion: %A" other)
+            finally
+                previous |> List.iter (fun (name, value) -> Environment.SetEnvironmentVariable(name, value))
+            let remote =
+                git f.Root
+                    [ "--git-dir=" + f.ProjectRemote; "for-each-ref"; "--format=%(objectname)"; gitRef ]
+            Assert.That(remote, Is.Empty,
+                        "The ref really is absent, but that does not establish this stage's authorship")
+            let witness = OriginalGitWriterAdmissionJournal.inspect journal |> success
+            Assert.That(
+                witness.PendingOrUnknown
+                |> List.exists (fun effect ->
+                    effect.Kind = "SourceRefEffectStage/ReviewGuardedDelete" && effect.Status = "Unknown"),
+                Is.True, "An unacknowledged/third-party deletion must retain the parent stage UNKNOWN")
+            Assert.That(witness.RouteCoverageProven, Is.False))

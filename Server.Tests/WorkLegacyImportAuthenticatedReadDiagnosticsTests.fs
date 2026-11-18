@@ -340,3 +340,103 @@ let ``malformed nested original source capture returns typed Unknown instead of 
     let mock = reader (Ok corrupted) (Ok corrupted) (fun target -> Ok target)
     Assert.That(WorkLegacyImportAuthenticatedReadDiagnostics.probe mock (subject WorkSqliteRecordKind.Project)
                 |> isUnknown, Is.True)
+
+
+// Regression matrix for Reviewer2 sequence/identity/digest/target findings.
+// Each malformed receipt is internally digest-consistent and has matching
+// original operations, so classification must not rely on a hash mismatch.
+let private journalEvent sequence operationId =
+    { Sequence = sequence; OperationId = operationId
+      RequestSha256 = hash; ResultSha256 = hash
+      Outcome = WorkLegacySourceEffectOutcome.Observed sha }
+
+let private journalProbe (events: WorkLegacySourceEffectEvent list)
+                         (change: WorkLegacySourceEffectJournal -> WorkLegacySourceEffectJournal) =
+    let initial = originalCapture ()
+    let projectId, ledgerId = projects.Head
+    let effectTarget = target OriginalGitRefPurpose.SourceEffect (Some projectId) ledgerId
+    let water = int64 events.Length
+    let draft =
+        { Target = effectTarget; RemoteHead = sha; Events = events
+          DurableHighWater = water; RemoteHighWater = water
+          DurableDigestSha256 = hash; RemoteDigestSha256 = hash }
+    let altered = change draft
+    let digest =
+        WorkLegacySourceWitness.effectJournalDigest
+            altered.Target altered.DurableHighWater altered.Events
+    let journal =
+        { altered with DurableDigestSha256 = digest; RemoteDigestSha256 = digest }
+    let originalOperations =
+        events
+        |> List.map (fun event ->
+            { OperationId = event.OperationId; Sequence = event.Sequence
+              RequestSha256 = event.RequestSha256; ResultSha256 = event.ResultSha256
+              Kind = "original-source-stage"; TerminalResult = None })
+    let captured =
+        { initial with
+            Inspection =
+                { initial.Inspection with
+                    Projects =
+                        initial.Inspection.Projects
+                        |> List.map (fun p ->
+                            if p.ProjectId = projectId then
+                                { p with Operations = originalOperations }
+                            else p) }
+            LedgerCaptures =
+                initial.LedgerCaptures
+                |> List.map (fun l ->
+                    if l.Target.ProjectId = Some projectId then
+                        { l with Operations = originalOperations
+                                 Fence = { l.Fence with OriginalSourceEffectHighWater = water }
+                                 EffectJournal = Some journal }
+                    else l) }
+    reader (Ok captured) (Ok captured) (fun _ -> Ok journal.Target)
+    |> fun original -> WorkLegacyImportAuthenticatedReadDiagnostics.probe
+                           original
+                           { SubjectKind = WorkSqliteRecordKind.ExternalEffect
+                             SubjectProjectId = projectId
+                             SubjectEntityId = events.Head.OperationId.ToString("D") }
+
+[<Test>]
+let ``duplicate out-of-order and skipped source effect sequences are Rejected despite matching digest`` () =
+    let first = journalEvent 1L (Guid.NewGuid())
+    let second = journalEvent 2L (Guid.NewGuid())
+    for receiptEvents in
+        [ [first; { second with Sequence = 1L }]
+          [{ first with Sequence = 2L }; { second with Sequence = 1L }]
+          [first; { second with Sequence = 3L }] ] do
+        let gap = journalProbe receiptEvents id
+        Assert.That(isRejected gap, Is.True, sprintf "Malformed ordered sequence: %A" gap)
+
+[<Test>]
+let ``reused source effect operation UUID is Rejected even with distinct sequences`` () =
+    let first = journalEvent 1L (Guid.NewGuid())
+    let second = { journalEvent 2L (Guid.NewGuid()) with OperationId = first.OperationId }
+    let gap = journalProbe [first; second] id
+    Assert.That(isRejected gap, Is.True, sprintf "Reused physical operation: %A" gap)
+
+[<Test>]
+let ``malformed original effect request and result SHA256 are Rejected`` () =
+    let validEvent = journalEvent 1L (Guid.NewGuid())
+    for malformed in
+        [ { validEvent with RequestSha256 = "not-a-sha256" }
+          { validEvent with ResultSha256 = "not-a-sha256" } ] do
+        let gap = journalProbe [malformed] id
+        Assert.That(isRejected gap, Is.True, sprintf "Invalid effect hash: %A" gap)
+
+[<Test>]
+let ``invalid observed physical Git OID is Unknown not innocently Incomplete`` () =
+    let event = { journalEvent 1L (Guid.NewGuid()) with
+                    Outcome = WorkLegacySourceEffectOutcome.Observed "not-a-git-oid" }
+    let gap = journalProbe [event] id
+    Assert.That(isUnknown gap, Is.True, sprintf "Unobservable original effect: %A" gap)
+
+[<Test>]
+let ``invalid original effect remote head and publisher ref are Rejected`` () =
+    let events = [journalEvent 1L (Guid.NewGuid())]
+    let invalidHead = journalProbe events (fun j -> { j with RemoteHead = "not-a-git-oid" })
+    Assert.That(isRejected invalidHead, Is.True, sprintf "Invalid remote OID: %A" invalidHead)
+    let invalidTarget =
+        journalProbe events (fun j ->
+            { j with Target = { j.Target with GitRef = "refs/heads/source-effects.lock" } })
+    Assert.That(isRejected invalidTarget, Is.True, sprintf "Invalid publisher ref: %A" invalidTarget)

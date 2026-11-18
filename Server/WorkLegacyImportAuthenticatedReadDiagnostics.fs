@@ -1,6 +1,7 @@
 namespace Jarvis.WorkQueues
 
 open System
+open System.Text.RegularExpressions
 open Server
 
 // Diagnostic-only C preparation; not an original-Git reader registration.
@@ -18,6 +19,16 @@ module internal WorkLegacyImportAuthenticatedReadDiagnostics =
     let private unknown text = Error(WorkLegacySourceWitnessGap.Unknown text)
     let private rejected text = Error(WorkLegacySourceWitnessGap.Rejected text)
     let private require condition gap = if condition then Ok () else Error gap
+
+    // Match WorkLegacySourceWitness.checkEffectJournal. Its validator is private
+    // to the Worker17-owned witness; this C-only negative probe cannot weaken
+    // its receipt classification or infer authority from a matching digest.
+    let private validGitOid (value: string) =
+        not (String.IsNullOrWhiteSpace value)
+        && Regex.IsMatch(value, "^[0-9a-f]{40}([0-9a-f]{24})?$")
+    let private validSha256 (value: string) =
+        not (String.IsNullOrWhiteSpace value)
+        && Regex.IsMatch(value, "^[0-9a-f]{64}$")
 
     type private ResultBuilder() =
         member _.Bind(value, next) = Result.bind next value
@@ -54,13 +65,16 @@ module internal WorkLegacyImportAuthenticatedReadDiagnostics =
         | Some journal ->
             result {
                 let target = journal.Target
-                let! () = require (target.Purpose = OriginalGitRefPurpose.SourceEffect
+                let! () = require (
+                     Result.isOk (OriginalGitPublisherAdmission.validateTarget target)
+                     && target.Purpose = OriginalGitRefPurpose.SourceEffect
                      && target.AccountId = ledger.Target.AccountId
                      && target.ProjectId = ledger.Target.ProjectId
                      && target.LedgerId = ledger.Target.LedgerId
                      && target.LedgerEpoch = ledger.Target.LedgerEpoch
                      && target.CanonicalRepositoryId = ledger.Target.CanonicalRepositoryId
-                     && target.ApprovedRemoteFingerprintSha256 = ledger.Target.ApprovedRemoteFingerprintSha256) (WorkLegacySourceWitnessGap.Rejected "Source-effect remote/ledger scope differs from original authenticated ledger.")
+                     && target.ApprovedRemoteFingerprintSha256 = ledger.Target.ApprovedRemoteFingerprintSha256
+                     && validGitOid journal.RemoteHead) (WorkLegacySourceWitnessGap.Rejected "Untrusted or wrong-scope source-effect remote/ref.")
                 // This call must be a separate original-publisher-domain read;
                 // echoing the capture is only fixture evidence, never authority.
                 let! anchor = read "independent source-effect anchor"
@@ -69,16 +83,31 @@ module internal WorkLegacyImportAuthenticatedReadDiagnostics =
                 let! () = require (journal.DurableHighWater = ledger.Fence.OriginalSourceEffectHighWater) (WorkLegacySourceWitnessGap.Unknown "Original source-effect high-water differs from STOP receipt.")
                 let! () = require (journal.DurableHighWater >= 0L
                      && journal.RemoteHighWater = journal.DurableHighWater
+                     && validSha256 journal.DurableDigestSha256
                      && journal.DurableDigestSha256 = journal.RemoteDigestSha256
-                     && int64 journal.Events.Length = journal.DurableHighWater
-                     && (journal.Events |> List.forall (fun e ->
-                         e.OperationId <> Guid.Empty && e.Sequence > 0L
-                         && e.Outcome <> WorkLegacySourceEffectOutcome.Unknown))) (WorkLegacySourceWitnessGap.Unknown "Original physical source-effect high-water, receipt or pending push is uncertain.")
+                     && int64 journal.Events.Length = journal.DurableHighWater) (WorkLegacySourceWitnessGap.Unknown "Original physical source-effect high-water, receipt or pending push is uncertain.")
+                let! () = require (
+                     journal.Events
+                     |> List.mapi (fun index effect ->
+                         effect.Sequence = int64 index + 1L
+                         && effect.OperationId <> Guid.Empty
+                         && validSha256 effect.RequestSha256
+                         && validSha256 effect.ResultSha256)
+                     |> List.forall id) (WorkLegacySourceWitnessGap.Rejected "Missing, out-of-order or invalid original effect receipt.")
+                let uniqueOperationIds = journal.Events |> List.map (fun effect -> effect.OperationId) |> Set.ofList
+                let! () = require (uniqueOperationIds.Count = journal.Events.Length)
+                            (WorkLegacySourceWitnessGap.Rejected "Duplicate one-shot original source-effect operation.")
                 let! () = require (journal.Events |> List.forall (fun effect ->
                     ledger.Operations |> List.exists (fun op ->
                         op.OperationId = effect.OperationId
                         && op.RequestSha256 = effect.RequestSha256
                         && op.ResultSha256 = effect.ResultSha256))) (WorkLegacySourceWitnessGap.Unknown "Physical effect is not covered by a durable original operation receipt.")
+                let! () = require (
+                     journal.Events |> List.forall (fun effect ->
+                         match effect.Outcome with
+                         | WorkLegacySourceEffectOutcome.NoExternalEffect -> true
+                         | WorkLegacySourceEffectOutcome.Observed commit -> validGitOid commit
+                         | WorkLegacySourceEffectOutcome.Unknown -> false)) (WorkLegacySourceWitnessGap.Unknown "Unresolved or unobserved original external effect.")
                 let! () = require (WorkLegacySourceWitness.effectJournalDigest
                         target journal.DurableHighWater journal.Events = journal.RemoteDigestSha256) (WorkLegacySourceWitnessGap.Unknown "Original effect receipts do not match the remote journal digest.")
                 return ()

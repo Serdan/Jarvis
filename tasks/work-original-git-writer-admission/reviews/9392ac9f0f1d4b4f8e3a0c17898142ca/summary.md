@@ -8,3 +8,19 @@ Fix: account CAS was re-entering the same UUID after Git force-with-lease conten
 Evidence: red-first new contention test failed with AccountOutcomeUnknown on old source; corrected test passes. New lost-ack test proves remote account effect can exist while journal remains UNKNOWN after STOP. .NET11 Release 42/42 Client legacy-fence/account tests, 488/488 Server tests; git diff --check clean.
 
 Explicit HOLD: OriginalGitWriterAdmissionJournal.inspect retains RouteCoverageProven=false; LegacyDirectWriterFence.inspectHighWater is ObservedOnly/NO-GO. Journal status is not an authenticated independent remote effect anchor nor proof of pre-journal publications, all writer routes, full project/account state, delayed push receipts, original source-effect high-water, or minimum current client protocol. Worker4's C reader/IWorkLegacyAuthenticatedSourceReader.ReadEffectAnchor production implementation is absent; Worker1 E Scheduler and Worker12 G Recovery source/receipt producers cannot inherit false Verified provenance. No production STOP, importer, activation, deployment, integration, or operator cutover is proposed.
+
+---
+
+## Independent review — Reviewer 1 (2026-11-18)
+
+**Verdict: Accepted for the exact narrow default-off account CAS journal correction only.** Frozen head `7310a144a86cfc917e83f7b74d1dce5021813fb1`, compared to previously integrated base `10d488d40540ffb709f465cc69b0d8bb711d9c21`. Only `Client/Modules/AccountCapacityLedger.fs` and `Client.Tests/LegacyWriterProtocolFenceTests.fs` differ; frozen author worktree HEAD reverified as exact and clean after tests.
+
+**Independent code checks.** The account transaction carries one request-bound `withPublicationClassified` journal permit across bounded replans, rather than re-admitting an unresolved UUID. With journal enabled, replan is permitted only when the single-ref `git push --porcelain --force-with-lease` reports nonzero exit plus explicit `[rejected]` with `(stale info)`, `(fetch first)`, or `(non-fast-forward)`, the remote fetch advances beyond the pinned parent, and the original operation receipt is absent. Ambiguous transport, failed remote inspection, incompatible receipt, and non-proven rejection are not treated as safe retry; the existing journal settles these as UNKNOWN. Rejected-only retries can terminate with a correctly classified no-effect result. The default-off path retains its prior bounded retry behavior. Existing journal `admit/markAttempt/settle/stop` semantics reviewed; its `RouteCoverageProven=false` remains intentional.
+
+**Independent execution (on exact frozen worker worktree, Linux/.NET 11 Release, `--no-restore`):**
+- `dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-restore --filter FullyQualifiedName~LegacyWriterProtocolFenceTests`: **28/28 passed**, zero skipped.
+- `dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-restore --filter 'FullyQualifiedName~AccountCapacityLedgerTests|FullyQualifiedName~AccountAdmissionAdapterTests'`: **27/27 passed**, zero skipped.
+- `git diff --check 10d488d40540ffb709f465cc69b0d8bb711d9c21 7310a144a86cfc917e83f7b74d1dce5021813fb1`: clean.
+- `git rev-parse HEAD` and `get_git_status` for `work-original-writer-admission-w21-20261117`: exact reviewed head and clean tracked checkout.
+
+**Limits / retained HOLD.** This is hermetic two-clone and source-level evidence, **not** authenticated production original-Git effect provenance, independent `ReadEffectAnchor`, route-complete STOP/high-water proof, complete project/account/ref-head and delayed push receipts, positive eight-kind typed B ingress, merged end-to-end B/C/F/G/E/H acceptance, native Windows verification, or approval for live import/dual authority/Scheduler/API activation/deploy/cutover. `LegacyDirectWriterFence` remains ObservedOnly/NO-GO. No merge, integration, source edits, or operator GO performed by Reviewer 1.

@@ -1,1 +1,7 @@
-Source d91838abaed910235c73627d037dde8e4e3b5f0c. HostState/v2 persists chained admission identity before Git publish. Red-first pre-STOP same-ID SQLite rollback and equal-high-water identity corruption both now fail closed. .NET 11 Release focused 23/23, adjacent 49/49, zero skipped; git diff --check clean. RouteCoverageProven=false, cutover and deployment HOLD.
+# Changes requested
+
+Reviewed frozen `d91838abaed910235c73627d037dde8e4e3b5f0c` against base `35f675cc1564710d10fdb2f50a03edff39368a28`, task spec v3 and prior finding decision 7273. The pre-STOP rollback correction advances an external history commitment before SQLite admission commits and checks it at STOP/inspect; the real bare-Git lost-ack stale-database fixture exercises the missing sequence. Host state ahead of SQLite fails closed. Route coverage remains false and migration/cutover/production holds remain in force.
+
+One P2 blocker is documented in `findings/contention-reentry.md`: journal-enabled project ledger contention re-enters the same unresolved admission and strands an UNKNOWN. This is source control-flow analysis, not a reproduced test; it is an availability and settlement failure, not a claim that STOP permits unsafe publication.
+
+Independent isolated checkout at the exact frozen head: .NET 11 Release `LegacyWriterProtocolFenceTests` passed 23/23, zero skipped; `git diff --check` passed. The focused suite does not exercise the cited contention interleaving. Author reported adjacent 49/49; not independently rerun. No migration, live host binding, deployment, or production GO.

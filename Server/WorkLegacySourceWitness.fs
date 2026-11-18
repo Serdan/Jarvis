@@ -81,6 +81,10 @@ type WorkLegacySourceReadFailure =
 
 type IWorkLegacyAuthenticatedSourceReader =
     abstract member ReadAuthenticated: unit -> Result<WorkLegacyAuthenticatedSourceCapture, WorkLegacySourceReadFailure>
+    // Independently authenticate the exact effect target under the original
+    // publisher enforcement domain, not from the capture or barrier list.
+    // No production implementation or durable anchor currently exists.
+    abstract member ReadEffectAnchor: OriginalGitPublisherTarget -> Result<OriginalGitPublisherTarget, WorkLegacySourceReadFailure>
     // Reinspection is a NEW authenticated read (not a cached echo). It must
     // detect delayed original pushes and mutations after the STOP barrier.
     abstract member ReinspectAuthenticated: unit -> Result<WorkLegacyAuthenticatedSourceCapture, WorkLegacySourceReadFailure>
@@ -192,7 +196,8 @@ module internal WorkLegacySourceWitness =
         SHA256.HashData(stream.ToArray()) |> Convert.ToHexStringLower
 
     let private checkEffectJournal (project: WorkLegacyImportProject)
-                                   (ledger: WorkLegacySourceLedgerCapture) =
+                                   (ledger: WorkLegacySourceLedgerCapture)
+                                   (reader: IWorkLegacyAuthenticatedSourceReader) =
         match ledger.EffectJournal with
         | None -> incomplete "Original source-effect journal/remote anchor is not bound."
         | Some journal ->
@@ -202,8 +207,13 @@ module internal WorkLegacySourceWitness =
                      && journal.Target.Purpose = OriginalGitRefPurpose.SourceEffect
                      && journal.Target.AccountId = ledger.Target.AccountId
                      && journal.Target.ProjectId = Some project.ProjectId
+                     && journal.Target.LedgerId = ledger.Target.LedgerId
+                     && journal.Target.LedgerEpoch = ledger.Target.LedgerEpoch
                      && journal.Target.CanonicalRepositoryId = ledger.Target.CanonicalRepositoryId
+                     && journal.Target.ApprovedRemoteFingerprintSha256 = ledger.Target.ApprovedRemoteFingerprintSha256
                      && valid oid journal.RemoteHead) (WorkLegacySourceWitnessGap.Rejected "Untrusted or wrong-scope source-effect remote/ref.")
+                let! anchor = readerCall "independent source-effect target anchor" (fun () -> reader.ReadEffectAnchor journal.Target)
+                let! () = require (anchor = journal.Target) (WorkLegacySourceWitnessGap.Rejected "Source-effect ref or remote differs from independently authenticated anchor.")
                 let! () = require (
                     journal.DurableHighWater >= 0L
                      && journal.DurableHighWater = journal.RemoteHighWater
@@ -240,7 +250,8 @@ module internal WorkLegacySourceWitness =
 
     let private checkLedger (inspection: WorkLegacyImportInspection)
                             (receipt: WorkLegacyFencedOfflineReceipt)
-                            (ledger: WorkLegacySourceLedgerCapture) =
+                            (ledger: WorkLegacySourceLedgerCapture)
+                            (reader: IWorkLegacyAuthenticatedSourceReader) =
         result {
             let account = inspection.Account
             let isAccount = ledger.Target.Purpose = OriginalGitRefPurpose.AccountLedger
@@ -261,6 +272,7 @@ module internal WorkLegacySourceWitness =
                 ledger.Target.LedgerId = expectedLedgerId
                  && ledger.Target.LedgerEpoch = expectedEpoch
                  && ledger.Operations = operations
+                 && ledger.Target.CanonicalRepositoryId = fence.Binding.TrustedRemoteId
                  && fence.Binding.LedgerId = expectedLedgerId
                  && fence.Binding.LedgerEpoch = expectedEpoch
                  && fence.Binding.EntityId =
@@ -290,7 +302,7 @@ module internal WorkLegacySourceWitness =
                  && ledger.UnresolvedIntentIds.IsEmpty) (WorkLegacySourceWitnessGap.Unknown "Pre-STOP intent/UNKNOWN outcome may have been rolled back or not reconciled.")
             let! effect =
                 match project with
-                | Some p -> checkEffectJournal p ledger |> Result.map Some
+                | Some p -> checkEffectJournal p ledger reader |> Result.map Some
                 | None ->
                     if ledger.EffectJournal.IsNone && fence.OriginalSourceEffectHighWater = 0L then Ok None
                     else unknown "Account-side source-effect history is not independently reconciled."
@@ -433,7 +445,7 @@ module internal WorkLegacySourceWitness =
                     let rec loop acc = function
                         | [] -> Ok(List.rev acc)
                         | ledger :: rest ->
-                            match checkLedger claimed c2 ledger with
+                            match checkLedger claimed c2 ledger reader with
                             | Error gap -> Error gap
                             | Ok journalTarget -> loop (journalTarget :: acc) rest
                     loop [] first.LedgerCaptures

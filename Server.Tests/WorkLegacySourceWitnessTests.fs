@@ -327,6 +327,14 @@ let private withFixture action =
 let private reader first second : IWorkLegacyAuthenticatedSourceReader =
     { new IWorkLegacyAuthenticatedSourceReader with
         member _.ReadAuthenticated() = Ok first
+        member _.ReadEffectAnchor target =
+            first.LedgerCaptures
+            |> List.tryPick (fun l ->
+                l.EffectJournal |> Option.bind (fun j ->
+                    if j.Target.ProjectId = target.ProjectId then Some j.Target else None))
+            |> function
+                | Some anchor -> Ok anchor
+                | None -> Error(WorkLegacySourceReadFailure.NoAuthenticatedBinding "missing fixture anchor")
         member _.ReinspectAuthenticated() = Ok second }
 
 let private inspect f captured =
@@ -511,6 +519,8 @@ let ``no authenticated original reader or missing C1 receipt remains incomplete`
             { new IWorkLegacyAuthenticatedSourceReader with
                 member _.ReadAuthenticated() =
                     Error(WorkLegacySourceReadFailure.NoAuthenticatedBinding "no real original writer gate")
+                member _.ReadEffectAnchor _ =
+                    Error(WorkLegacySourceReadFailure.NoAuthenticatedBinding "no effect anchor")
                 member _.ReinspectAuthenticated() =
                     Error(WorkLegacySourceReadFailure.NoAuthenticatedBinding "no real original writer gate") }
         Assert.That(WorkLegacySourceWitness.capture unbound f.DatabasePath f.Raw f.C2 |> isIncomplete, Is.True)
@@ -546,3 +556,33 @@ let ``C1 imported project source-head tampering is incomplete even with an intac
         | Ok _ -> ()
         | Error why -> Assert.Fail(sprintf "Disposable source mutation failed: %A" why)
         Assert.That(inspect f f.Captured |> isIncomplete, Is.True))
+
+[<Test>]
+let ``effect target cannot substitute identity remote or ref even with recomputed digest and barrier`` () =
+    withFixture (fun f ->
+        let original = f.Captured.LedgerCaptures.[1].EffectJournal.Value.Target
+        let variants =
+            [ { original with LedgerId = Guid.NewGuid() }
+              { original with LedgerEpoch = 5 }
+              { original with ApprovedRemoteFingerprintSha256 = digest "other remote" }
+              { original with GitRef = "refs/heads/other-effect" } ]
+        for target in variants do
+            let captures =
+                f.Captured.LedgerCaptures |> List.map (fun ledger ->
+                    if ledger.Target.ProjectId = Some projectOne then
+                        let journal = ledger.EffectJournal.Value
+                        let hash = WorkLegacySourceWitness.effectJournalDigest target journal.DurableHighWater journal.Events
+                        { ledger with EffectJournal = Some { journal with Target = target; DurableDigestSha256 = hash; RemoteDigestSha256 = hash } }
+                    else ledger)
+            let targets =
+                (captures |> List.map (fun c -> c.Target)) @
+                (captures |> List.choose (fun c -> c.EffectJournal |> Option.map (fun j -> j.Target)))
+            let changed = { f.Captured with LedgerCaptures = captures
+                                            OriginalBarrier = { f.Captured.OriginalBarrier with ExactTargets = targets } }
+            let anchoredReader =
+                { new IWorkLegacyAuthenticatedSourceReader with
+                    member _.ReadAuthenticated() = Ok changed
+                    member _.ReinspectAuthenticated() = Ok changed
+                    member _.ReadEffectAnchor _ = Ok original }
+            let result = WorkLegacySourceWitness.capture anchoredReader f.DatabasePath f.Raw f.C2
+            Assert.That(result |> isRejected, Is.True, sprintf "Accepted substituted target: %A" target))

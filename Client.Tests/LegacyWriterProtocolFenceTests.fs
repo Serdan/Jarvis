@@ -1132,6 +1132,97 @@ type LegacyWriterProtocolFenceTests() =
 
 
     [<Test>]
+    member _.JournalEnabledAccountCasContentionUsesOneAdmissionAndDrainsStop() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "account-cas-contention.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            let originalId, competingId = Guid.NewGuid(), Guid.NewGuid()
+            let originalLaunch, competingLaunch = Guid.NewGuid(), Guid.NewGuid()
+            let authority: ProjectLedgerAuthority =
+                { ProjectId = f.ProjectOne.ProjectId; LedgerId = f.ProjectOne.LedgerId
+                  Epoch = f.ProjectOne.Epoch
+                  ApprovedFetchUrl = f.ProjectOne.ApprovedFetchUrl
+                  ApprovedPushUrl = f.ProjectOne.ApprovedPushUrl }
+            let mutable raced = false
+            let hooks =
+                { BeforeLeasePush = fun operation _ ->
+                    if operation = originalId && not raced then
+                        raced <- true
+                        AccountCapacityLedger.reserve f.AccountTwo competingId
+                            "CompetingAccount" competingLaunch authority "Worker" 1L
+                        |> success |> ignore
+                  GitCommand = fun _ -> AccountGitTestFault.PassThrough }
+            let result =
+                AccountCapacityLedger.withTestInterposition hooks (fun () ->
+                    AccountCapacityLedger.reserve f.AccountOne originalId
+                        "OriginalAccount" originalLaunch authority "Worker" 1L)
+                |> success
+            Assert.That(raced, Is.True, "A genuine competing account Git CAS must have won")
+            Assert.That(result.Receipt.OperationId, Is.EqualTo(originalId.ToString("D")))
+            let account = AccountCapacityLedger.fetch f.AccountTwo |> success
+            Assert.That(account.State.Tokens.Length, Is.EqualTo(2))
+            let journal = OriginalGitWriterAdmissionJournal.inspect path |> success
+            Assert.That(journal.HighWater, Is.EqualTo(2L),
+                        "One original admission and one competing account admission")
+            Assert.That(journal.PendingOrUnknown, Is.Empty,
+                        "A Git-proven rejected account CAS must not poison STOP")
+            Assert.That(journal.SettledHighWater, Is.EqualTo(2L))
+            Assert.That(journal.RouteCoverageProven, Is.False)
+            let stopped = OriginalGitWriterAdmissionJournal.stop path |> success
+            Assert.That(stopped.AdmissionClosed, Is.True)
+            Assert.That(stopped.PendingOrUnknown, Is.Empty)
+            let replay =
+                AccountCapacityLedger.reserve f.AccountTwo originalId
+                    "OriginalAccount" originalLaunch authority "Worker" 1L |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That((OriginalGitWriterAdmissionJournal.inspect path |> success).HighWater,
+                        Is.EqualTo(2L)))
+    [<Test>]
+    member _.JournalEnabledAccountLostAckStaysUnknownEvenWhenRemoteEffectExists() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "account-lost-ack.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            let operationId, launch = Guid.NewGuid(), Guid.NewGuid()
+            let authority: ProjectLedgerAuthority =
+                { ProjectId = f.ProjectOne.ProjectId; LedgerId = f.ProjectOne.LedgerId
+                  Epoch = f.ProjectOne.Epoch
+                  ApprovedFetchUrl = f.ProjectOne.ApprovedFetchUrl
+                  ApprovedPushUrl = f.ProjectOne.ApprovedPushUrl }
+            let mutable pushedWithoutAck = false
+            let hooks =
+                { BeforeLeasePush = fun _ _ -> ()
+                  GitCommand = fun args ->
+                    match args with
+                    | "push" :: _ when not pushedWithoutAck ->
+                        pushedWithoutAck <- true
+                        AccountGitTestFault.ExecuteThenLoseAcknowledgment
+                    | "fetch" :: _ when pushedWithoutAck ->
+                        AccountGitTestFault.FailBeforeExecution
+                    | _ -> AccountGitTestFault.PassThrough }
+            let result =
+                AccountCapacityLedger.withTestInterposition hooks (fun () ->
+                    AccountCapacityLedger.reserve f.AccountOne operationId
+                        "AccountUnknown" launch authority "Worker" 1L)
+            match result with
+            | Error(AccountOutcomeUnknown id) when id = operationId -> ()
+            | other -> Assert.Fail(sprintf "Lost acknowledgment must remain UNKNOWN, got %A" other)
+            Assert.That(pushedWithoutAck, Is.True)
+            let _, receipt = AccountCapacityLedger.readOperation f.AccountTwo operationId |> success
+            Assert.That(receipt.IsSome, Is.True,
+                        "The original remote account mutation DID publish despite missing acknowledgment")
+            let witness = OriginalGitWriterAdmissionJournal.inspect path |> success
+            Assert.That(witness.HighWater, Is.EqualTo(1L))
+            Assert.That(witness.SettledHighWater, Is.EqualTo(0L))
+            Assert.That(witness.PendingOrUnknown.Length, Is.EqualTo(1))
+            Assert.That(witness.PendingOrUnknown.Head.Status, Is.EqualTo("Unknown"))
+            Assert.That(witness.RouteCoverageProven, Is.False)
+            let stopped = OriginalGitWriterAdmissionJournal.stop path |> success
+            Assert.That(stopped.AdmissionClosed, Is.True)
+            Assert.That(stopped.PendingOrUnknown.Length, Is.EqualTo(1),
+                        "STOP must not erase an unverified account remote effect"))
+    [<Test>]
     member _.StopAndInspectRejectModifiedAdmissionIdentityAtSameHighWater() =
         withFixture (fun f ->
             let path = Path.Combine(f.Root, "modified-admission-identity.db")

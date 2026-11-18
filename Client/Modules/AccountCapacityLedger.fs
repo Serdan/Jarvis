@@ -314,6 +314,15 @@ module AccountCapacityLedger =
 
     type private GitOutput = { Code: int; Out: string; Err: string }
 
+    // A competing remote head alone is not proof this push did not happen.
+    // Only Git's explicit porcelain non-fast-forward rejection permits replan.
+    let private provenNonFastForwardRejection (output: GitOutput) =
+        output.Code <> 0
+        && output.Out.Contains("[rejected]", StringComparison.OrdinalIgnoreCase)
+        && (output.Out.Contains("(fetch first)", StringComparison.OrdinalIgnoreCase)
+            || output.Out.Contains("(non-fast-forward)", StringComparison.OrdinalIgnoreCase)
+            || output.Out.Contains("(stale info)", StringComparison.OrdinalIgnoreCase))
+
     let private gitInterposition = System.Threading.AsyncLocal<AccountGitTestInterposition>()
 
     let withTestInterposition (hooks: AccountGitTestInterposition) operation =
@@ -634,7 +643,9 @@ module AccountCapacityLedger =
                 let fullRequest =
                     canonical (json {| schemaVersion = 1; accountId = b.AccountId.ToString("D"); actor = actor; kind = kind; request = request |})
                 let requestHash = hash fullRequest
-                let rec attempt retry =
+                let mutable journalEnabled = false
+                let mutable unresolvedRemoteEffect = false
+                let rec attempt retry admitted =
                     fetch b |> Result.bind (fun snapshot ->
                         readReceipt b snapshot.Head operationId |> Result.bind (function
                             | Some old when old.CanonicalRequestJson = fullRequest
@@ -672,47 +683,69 @@ module AccountCapacityLedger =
                                             let hooks = gitInterposition.Value
                                             if not (isNull (box hooks)) then
                                                 hooks.BeforeLeasePush operationId snapshot.Head
-                                            let pushed =
-                                                OriginalGitWriterAdmissionJournal.withPublication
+                                            // A single durable permit spans only CAS retries for which
+                                            // Git independently proved the proposed push was rejected.
+                                            // A missing/late acknowledgment never authorizes reentry.
+                                            let publishAndConfirm () =
+                                                unresolvedRemoteEffect <- true
+                                                let pushed =
+                                                    git b [ "push"; "--porcelain";
+                                                            $"--force-with-lease={AccountRef}:{snapshot.Head}";
+                                                            b.RemoteName; $"{proposed}:{AccountRef}" ]
+                                                match fetch b with
+                                                | Error _ -> Error(AccountOutcomeUnknown operationId)
+                                                | Ok current ->
+                                                    match readReceipt b current.Head operationId with
+                                                    | Error error -> Error error
+                                                    | Ok(Some observed) when observed.CanonicalRequestJson <> fullRequest
+                                                                           || observed.RequestSha256 <> requestHash ->
+                                                        Error AccountOperationIdReused
+                                                    | Ok(Some observed) ->
+                                                        isAncestor b proposed current.Head
+                                                        |> Result.map (fun ourCommit ->
+                                                            unresolvedRemoteEffect <- false
+                                                            { Receipt = observed; CurrentHead = current.Head
+                                                              AlreadyApplied = not ourCommit })
+                                                    | Ok None when journalEnabled && current.Head <> snapshot.Head
+                                                                   && (match pushed with
+                                                                       | Ok output -> provenNonFastForwardRejection output
+                                                                       | Error _ -> false) ->
+                                                        unresolvedRemoteEffect <- false
+                                                        if retry >= 8 then Error AccountContended
+                                                        else attempt (retry + 1) true
+                                                    | Ok None when not journalEnabled && current.Head <> snapshot.Head
+                                                                    && retry < 8 ->
+                                                        // Exact preactivation behavior: bounded replan
+                                                        // even when the earlier transport was uncertain.
+                                                        attempt (retry + 1) true
+                                                    | Ok None when not journalEnabled && retry >= 8 ->
+                                                        Error AccountContended
+                                                    | Ok None ->
+                                                        // A changed head or failed remote read is never
+                                                        // independent proof that our push did not publish.
+                                                        Error(AccountOutcomeUnknown operationId)
+                                            if admitted then publishAndConfirm()
+                                            else
+                                                let publication enabled =
+                                                    journalEnabled <- enabled
+                                                    match publishAndConfirm () with
+                                                    | Ok applied -> Ok(Choice1Of2 applied)
+                                                    | Error error when not unresolvedRemoteEffect ->
+                                                        Ok(Choice2Of2 error)
+                                                    | Error error -> Error error
+                                                match OriginalGitWriterAdmissionJournal.withPublicationClassified
                                                     operationId kind
                                                     (OriginalGitWriterAdmissionJournal.authoritySha256
                                                         [ "account"; b.AccountId.ToString("D"); b.LedgerId.ToString("D")
                                                           string b.Epoch; b.ApprovedFetchUrl; b.ApprovedPushUrl ])
-                                                    AccountRef proposed
-                                                    (fun () ->
-                                                        git b [ "push"; "--porcelain";
-                                                                $"--force-with-lease={AccountRef}:{snapshot.Head}";
-                                                                b.RemoteName; $"{proposed}:{AccountRef}" ])
-                                                    (fun _ ->
-                                                        match fetch b with
-                                                        | Ok witnessed ->
-                                                            match isAncestor b proposed witnessed.Head with
-                                                            | Ok true -> true
-                                                            | _ -> false
-                                                        | Error _ -> false)
-                                                    InvalidAccountBinding
-                                            match fetch b with
-                                            | Error _ -> Error(AccountOutcomeUnknown operationId)
-                                            | Ok current ->
-                                                match readReceipt b current.Head operationId with
-                                                | Error e -> Error e
-                                                | Ok(Some observed) when observed.CanonicalRequestJson <> fullRequest ->
-                                                    Error AccountOperationIdReused
-                                                | Ok(Some observed) ->
-                                                    isAncestor b proposed current.Head
-                                                    |> Result.map (fun ourCommit ->
-                                                        { Receipt = observed; CurrentHead = current.Head
-                                                          AlreadyApplied = not ourCommit })
-                                                | Ok None when current.Head <> snapshot.Head && retry < 8 ->
-                                                    attempt (retry + 1)
-                                                | Ok None when retry >= 8 -> Error AccountContended
-                                                | Ok None ->
-                                                    // Transport failure or dropped reply does not prove
-                                                    // that this Git push cannot still be applied.
-                                                    match pushed with
-                                                    | Error _ -> Error(AccountOutcomeUnknown operationId)
-                                                    | Ok _ -> Error(AccountOutcomeUnknown operationId))))))
-                attempt 0
+                                                    AccountRef requestHash publication
+                                                    (function Choice1Of2 _ -> true | _ -> false)
+                                                    (function Choice2Of2 _ -> true | _ -> false)
+                                                    InvalidAccountBinding with
+                                                | Ok(Choice1Of2 applied) -> Ok applied
+                                                | Ok(Choice2Of2 error) -> Error error
+                                                | Error error -> Error error)))))
+                attempt 0 false
             with :? ArgumentException as ex ->
                 Error(InvalidAccountBinding $"Invalid operation payload: {ex.Message}")
                | :? JsonException as ex ->

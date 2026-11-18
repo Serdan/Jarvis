@@ -40,6 +40,7 @@
         <Compile Include="WorkBlocking.fs"/>
         <Compile Include="WorkSchedulerSqlite.fs"/>
         <Compile Include="WorkLegacyImportProjection.fs"/>
+        <Compile Include="WorkLegacySourceWitness.fs"/>
         <Compile Include="WorkSchedulerSqliteDispatch.fs"/>
         <Compile Include="WorkRecoverySqlite.fs"/>
         <Compile Include="WorkQueueProducers.fs"/>

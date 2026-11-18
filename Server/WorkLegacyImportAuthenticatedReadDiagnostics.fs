@@ -127,16 +127,23 @@ module internal WorkLegacyImportAuthenticatedReadDiagnostics =
                 | [] -> incomplete (sprintf "No independently authenticated original %A/%A ledger binding." purpose projectId)
                 | _ -> rejected "Duplicate original project/account source authorities."
             let target = ledger.Target
-            let! () = require (target.AccountId = captured.Inspection.Account.AccountId
+            let fence = ledger.Fence
+            let expectedScope =
+                if projectId.IsNone then WorkLegacyGitScope.Account else WorkLegacyGitScope.Project
+            let! () = require (Result.isOk (OriginalGitPublisherAdmission.validateTarget target)
+                 && target.AccountId = captured.Inspection.Account.AccountId
                  && target.LedgerId = ledgerId
                  && target.LedgerEpoch = epoch && epoch > 0
-                 && not (String.IsNullOrWhiteSpace target.CanonicalRepositoryId)
-                 && not (String.IsNullOrWhiteSpace target.ApprovedRemoteFingerprintSha256)
-                 && not (String.IsNullOrWhiteSpace target.GitRef)
-                 && ledger.Fence.Binding.LedgerId = ledgerId
-                 && ledger.Fence.Binding.LedgerEpoch = epoch
-                 && ledger.Fence.Binding.PinnedHead = sourceHead
-                 && ledger.Fence.Binding.EntityId = defaultArg projectId captured.Inspection.Account.AccountId) (WorkLegacySourceWitnessGap.Rejected "Original account/project remote, epoch, ledger or STOP binding is inconsistent.")
+                 && target.CanonicalRepositoryId = fence.Binding.TrustedRemoteId
+                 && fence.Binding.Scope = expectedScope
+                 && validGitOid sourceHead
+                 && validGitOid ledger.CurrentRemoteHead
+                 && validGitOid fence.FencedHead
+                 && validGitOid fence.OriginalHead
+                 && fence.Binding.LedgerId = ledgerId
+                 && fence.Binding.LedgerEpoch = epoch
+                 && fence.Binding.PinnedHead = sourceHead
+                 && fence.Binding.EntityId = defaultArg projectId captured.Inspection.Account.AccountId) (WorkLegacySourceWitnessGap.Rejected "Original account/project remote, ref, head, scope or STOP binding is not canonical.")
             let! () = require (ledger.CurrentRemoteHead = ledger.Fence.FencedHead
                  && ledger.Fence.OriginalHead = sourceHead
                  && ledger.Fence.NoNewOriginalMutations

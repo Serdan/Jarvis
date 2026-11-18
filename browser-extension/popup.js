@@ -30,13 +30,22 @@ async function render() {
     $("alias").value = current?.alias || "";
     const container = $("tabs");
     container.replaceChildren();
+    $("forgetUnavailable").disabled = !state.registrations.some(r =>
+      r.agentCreated && r.availability === "needsReauthorization");
     for (const registration of state.registrations) {
       const item = document.createElement("li");
       const name = document.createElement("strong");
       name.textContent = (registration.alias || registration.registrationId) + (registration.agentCreated ? " (created by Jarvis)" : " (manual)");
       const info = document.createElement("small");
       info.textContent = " — " + registration.availability + " — " + registration.displayUrl;
-      item.append(name, info);
+      const forget = document.createElement("button");
+      forget.textContent = "Unregister";
+      forget.title = "Remove only this extension registration; leave its browser tab open";
+      forget.onclick = () => action(() => call("unregisterRegistration", {
+        registrationId: registration.registrationId,
+        registrationGeneration: registration.registrationGeneration
+      }));
+      item.append(name, info, forget);
       container.append(item);
     }
     $("error").textContent = "";
@@ -60,6 +69,7 @@ $("register").onclick = () => action(async () => {
 $("unregister").onclick = () => action(() => call("unregister", {
   tabId: currentTab?.id
 }));
+$("forgetUnavailable").onclick = () => action(() => call("forgetUnavailableAgentRegistrations"));
 $("registerWindow").onclick = () => action(async () => {
   const window = await chrome.windows.getCurrent();
   await call("registerWindow", { windowId: window.id, alias: $("windowAlias").value.trim() });

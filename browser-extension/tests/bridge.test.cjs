@@ -500,10 +500,11 @@ test("disabling automatic tab creation revokes access to all agent-created tabs"
   assert.ok(tab);
   await h.message("setAgentCreatedTabs", { allowed: false });
   const listed = ws.sent.filter(m => m.kind === "registrations").at(-1).tabs;
-  assert.equal(listed.find(r => r.registrationId === tab.registrationId).availability, "needsReauthorization");
+  assert.equal(listed.some(r => r.registrationId === tab.registrationId), false);
   const state = await h.message("getState");
   assert.equal(state.allowAgentCreatedTabs, false);
-  assert.equal(state.registrations.find(r => r.registrationId === tab.registrationId).availability, "needsReauthorization");
+  assert.equal(state.registrations.some(r => r.registrationId === tab.registrationId), false);
+  assert.equal(h.tabs.has(h.createdTabs[0].id), true, "Browser tab survives authority removal");
 });
 
 test("revoking registered window revokes created tab authority", async () => {
@@ -529,8 +530,8 @@ test("revoking registered window revokes created tab authority", async () => {
   delete h.createdTabs[0].pendingUrl;
   await h.message("unregisterWindow", { windowId: 1 });
   const state = await h.message("getState");
-  assert.equal(state.registrations.find(t => t.registrationId === opened.tab.registrationId).availability,
-    "needsReauthorization");
+  assert.equal(state.registrations.some(t => t.registrationId === opened.tab.registrationId), false);
+  assert.equal(h.tabs.has(h.createdTabs[0].id), true);
   await h.deliver(ws, {
     kind: "openTab", requestId: "blocked", connectionId: "epoch-1",
     url: "https://example.test/chat/another", alias: "another", ...(await windowPin(h)), active: false
@@ -1453,4 +1454,120 @@ test("agent-created-tab opt-out does not revoke manually registered page executi
   assert.equal(response?.kind, "result");
   assert.equal(response?.result, "Agent 7");
   assert.equal(h.calls.length, 1);
+});
+
+
+test("permanently revoked agent registration disappears without closing its tab", async () => {
+  const { h, tab, registered } = await createdTabForCloseRegression();
+  tab.url = "https://unrelated.test/";
+  h.listeners.updated(tab.id, { url: tab.url });
+  await tick(); await tick();
+  const state = await h.message("getState");
+  assert.equal(state.registrations.some(r => r.registrationId === registered.registrationId), false);
+  assert.equal(state.registrations.some(r => r.alias === "manual"), true);
+  assert.equal(h.storage.get("registrations").some(r => r.alias === registered.alias), false);
+  assert.equal(h.tabs.has(tab.id), true);
+  assert.equal(h.removedTabs.length, 0);
+  tab.url = "https://example.test/chat/new";
+  assert.equal((await h.message("getState")).registrations.some(r =>
+    r.registrationId === registered.registrationId), false);
+});
+
+test("temporary tabs API failure keeps agent-created registration", async () => {
+  const { h, tab, registered } = await createdTabForCloseRegression();
+  await h.message("unregister", { tabId: 17 });
+  h.failTabQueryOnce();
+  const state = await h.message("getState");
+  const reg = state.registrations.find(r => r.registrationId === registered.registrationId);
+  assert.ok(reg);
+  assert.equal(reg.availability, "needsReauthorization");
+  assert.equal((await h.message("getState")).registrations.find(r =>
+    r.registrationId === registered.registrationId).availability, "ready");
+  assert.equal(h.tabs.has(tab.id), true);
+});
+
+test("bulk cleanup removes only unavailable agent entries without closing browser tabs", async () => {
+  const { h, tab, registered } = await createdTabForCloseRegression();
+  h.setHostPermissionGranted(false);
+  const before = await h.message("getState");
+  assert.equal(before.registrations.find(r => r.registrationId === registered.registrationId).availability,
+    "needsReauthorization");
+  const result = await h.message("forgetUnavailableAgentRegistrations");
+  assert.equal(result.ok, true);
+  assert.equal(result.removed, 1);
+  const after = await h.message("getState");
+  assert.deepEqual(Array.from(after.registrations, r => r.alias), ["manual"]);
+  assert.equal(h.tabs.has(tab.id), true);
+  assert.equal(h.tabs.has(17), true);
+  assert.equal(h.removedTabs.length, 0);
+});
+
+test("per-row unregister checks generation and cannot be invoked by a webpage", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("register", { tabId: 17, alias: "manual" });
+  const reg = (await h.message("getState")).registrations[0];
+  const args = { registrationId: reg.registrationId,
+    registrationGeneration: reg.registrationGeneration };
+  assert.equal((await h.message("unregisterRegistration",
+    { ...args, registrationGeneration: args.registrationGeneration + 1 })).ok, false);
+  assert.equal((await h.message("unregisterRegistration", args, { id: "page" })).ok, false);
+  assert.equal((await h.message("unregisterRegistration", args)).ok, true);
+  assert.equal((await h.message("getState")).registrations.length, 0);
+  assert.equal(h.tabs.has(17), true);
+  assert.equal(h.removedTabs.length, 0);
+});
+
+
+test("browser restart prunes obsolete Jarvis-created registrations but preserves manual tabs", async () => {
+  const first = createHarness();
+  await tick(); await tick();
+  await first.message("register", { tabId: 17, alias: "manual" });
+  await first.message("registerWindow", { windowId: 1, alias: "agents" });
+  await first.message("setAgentCreatedTabs", { allowed: true });
+  await first.message("pair", { port: 43822, secret: "b".repeat(64) });
+  await tick(); await tick();
+  const ws = first.sockets[0];
+  await first.deliver(ws, { kind: "challenge", nonce: "1".repeat(64) });
+  await first.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  await first.deliver(ws, {
+    kind: "openTab", requestId: "old", connectionId: "epoch-1",
+    url: "https://example.test/chat/new", alias: "old-agent",
+    ...(await windowPin(first))
+  });
+  const created = ws.sent.find(m => m.requestId === "old" && m.kind === "tabOpened").tab;
+  const stored = {
+    registrations: JSON.parse(JSON.stringify(first.storage.get("registrations"))),
+    registeredWindows: JSON.parse(JSON.stringify(first.storage.get("registeredWindows"))),
+    allowAgentCreatedTabs: true
+  };
+  const second = createHarness(stored); // new chrome.storage.session epoch
+  second.tabs.set(first.createdTabs[0].id, {
+    id: first.createdTabs[0].id, windowId: 1,
+    url: "https://example.test/chat/new", status: "complete"
+  });
+  await tick(); await tick();
+  const state = await second.message("getState");
+  assert.deepEqual(Array.from(state.registrations, r => r.alias), ["manual"]);
+  assert.equal(second.storage.get("registrations").length, 1);
+  assert.equal(second.tabs.has(first.createdTabs[0].id), true,
+    "Garbage-collect only extension authority, never the underlying browser tab");
+  assert.equal(state.registrations.some(r => r.registrationId === created.registrationId), false);
+});
+
+test("adoption during asynchronous stale assessment cannot erase user-owned registration", async () => {
+  const { h, tab, registered } = await createdTabForCloseRegression();
+  await h.message("unregister", { tabId: 17 });
+  tab.url = "https://unrelated.test/";
+  h.beforeNextTabQuery(async () => {
+    const adopted = await h.message("register", { tabId: tab.id, alias: "adopted" });
+    assert.equal(adopted.ok, true);
+  });
+  const state = await h.message("getState");
+  const current = state.registrations.find(r => r.registrationId === registered.registrationId);
+  assert.ok(current, "Concurrent adopted registration must remain visible");
+  assert.equal(current.agentCreated, false);
+  assert.equal(current.alias, "adopted");
+  assert.ok(current.registrationGeneration > registered.registrationGeneration);
+  assert.equal(h.tabs.has(tab.id), true);
 });

@@ -35,6 +35,9 @@ small, .muted { color: #666; font-size: 12px; }
 <input id="allowAgentTabs" type="checkbox" style="width:auto;margin:3px 0 0" />
 <span><strong>Allow Jarvis to open new tabs</strong><small style="display:block">Only in a registered browser window, on sites with granted browser permission. New tabs are automatically registered; existing unregistered tabs remain private. Maximum 20 active agent-created tabs.</small></span>
 </label>
-<h2 style="font-size:14px">Registered tabs</h2><ul id="tabs"></ul>
+<h2 style="font-size:14px">Registered tabs</h2>
+<button id="forgetUnavailable">Forget unavailable Jarvis-created registrations</button>
+<small style="display:block">Removes extension registrations only; browser tabs stay open. Manually registered tabs are never bulk-removed.</small>
+<ul id="tabs"></ul>
 <p id="error" role="alert"></p>
 <script src="popup.js"></script></body></html>

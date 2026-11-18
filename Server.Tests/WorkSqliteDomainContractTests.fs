@@ -100,6 +100,7 @@ let private body kind project id =
 let private expectation project : WorkSqliteDomain.Expectation =
     { AccountId = account
       ProjectId = project
+      OriginalLedgerId = ledger
       RepositoryId = repository
       SourceRef = reference }
 
@@ -203,6 +204,41 @@ let original_source_scope_and_missing_receipt_never_promote_caller_strings () =
     rejected context { good with Source = good.Source |> Option.map (fun s -> { s with SourceCommit = reviewSha }) }
     rejected context { good with Mutation = { good.Mutation with
                                                Value = { good.Mutation.Value with SourceSha = None } } }
+
+[<Test>]
+let original_ledger_identity_is_bound_for_all_eight_structural_kinds () =
+    for kind, id in candidates do
+        let context = expectation projectA
+        accepted context (make kind projectA id) |> ignore
+        let foreign = body kind projectA id
+                      |> set "ledgerId" (text "99999999-9999-4999-8999-999999999999")
+        rejected context (fixture kind projectA id foreign)
+
+[<Test>]
+let pending_and_final_review_decisions_have_disjoint_sequence_receipt_states () =
+    let context = expectation projectA
+    let pending () = body WorkSqliteRecordKind.Review projectA "review-1"
+    accepted context (fixture WorkSqliteRecordKind.Review projectA "review-1" (pending ())) |> ignore
+    let pendingWithSequence = pending () |> set "decisionSequence" (n64 17L)
+    rejected context (fixture WorkSqliteRecordKind.Review projectA "review-1" pendingWithSequence)
+    let pendingWithReceipt = pending () |> set "decisionReceiptId" (text receipt)
+    rejected context (fixture WorkSqliteRecordKind.Review projectA "review-1" pendingWithReceipt)
+    let pendingWithBoth = pending () |> set "decisionSequence" (n64 17L)
+                                 |> set "decisionReceiptId" (text receipt)
+    rejected context (fixture WorkSqliteRecordKind.Review projectA "review-1" pendingWithBoth)
+    for decision in [ "Accepted"; "ChangesRequested" ] do
+        let final = pending () |> set "decision" (text decision)
+        rejected context (fixture WorkSqliteRecordKind.Review projectA "review-1" final)
+        let withReceipt = pending () |> set "decision" (text decision)
+                                     |> set "decisionReceiptId" (text receipt)
+        rejected context (fixture WorkSqliteRecordKind.Review projectA "review-1" withReceipt)
+        let withSequence = pending () |> set "decision" (text decision)
+                                      |> set "decisionSequence" (n64 17L)
+        rejected context (fixture WorkSqliteRecordKind.Review projectA "review-1" withSequence)
+        let complete = pending () |> set "decision" (text decision)
+                                  |> set "decisionSequence" (n64 17L)
+                                  |> set "decisionReceiptId" (text receipt)
+        accepted context (fixture WorkSqliteRecordKind.Review projectA "review-1" complete) |> ignore
 
 [<Test>]
 let review_and_integration_require_frozen_sha_and_current_decision_receipts () =

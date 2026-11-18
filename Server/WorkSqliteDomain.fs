@@ -21,6 +21,7 @@ module internal WorkSqliteDomain =
     type Expectation =
         { AccountId: string
           ProjectId: string
+          OriginalLedgerId: string
           RepositoryId: string
           SourceRef: string }
 
@@ -239,9 +240,14 @@ module internal WorkSqliteDomain =
         | WorkSqliteRecordKind.Role ->
             if value.RoleVersion <= 0L then reject "Role version must be positive."
         | WorkSqliteRecordKind.Review ->
-            if value.ReviewSha <> Some(str body "frozenCommit") ||
-               ((str body "decision" <> "Pending") <>
-                  ((num body "decisionSequence" > 0L) && (optional body "decisionReceiptId").IsSome)) then
+            let decisionSequence = num body "decisionSequence"
+            let decisionReceipt = optional body "decisionReceiptId"
+            let consistentDecision =
+                match str body "decision" with
+                | "Pending" -> decisionSequence = 0L && decisionReceipt.IsNone
+                | "Accepted" | "ChangesRequested" -> decisionSequence > 0L && decisionReceipt.IsSome
+                | _ -> false
+            if value.ReviewSha <> Some(str body "frozenCommit") || not consistentDecision then
                 reject "Unbound frozen review decision or stale sequence."
         | WorkSqliteRecordKind.Integration ->
             let integrated = str body "status" = "Integrated"
@@ -284,6 +290,7 @@ module internal WorkSqliteDomain =
         let row = input.Mutation
         let value = row.Value
         if not (uuid expectation.AccountId && uuid expectation.ProjectId &&
+                uuid expectation.OriginalLedgerId &&
                 not (isNull expectation.RepositoryId) &&
                 sha256.IsMatch expectation.RepositoryId && gitRef expectation.SourceRef) then
             invalid "Malformed local domain scope expectation."
@@ -312,8 +319,9 @@ module internal WorkSqliteDomain =
                         let body = doc.RootElement
                         checkProperties row.Key.Kind body
                         if str body "accountId" <> expectation.AccountId ||
-                           str body "projectId" <> expectation.ProjectId then
-                            reject "Body account/project scope does not match local expectation."
+                           str body "projectId" <> expectation.ProjectId ||
+                           str body "ledgerId" <> expectation.OriginalLedgerId then
+                            reject "Body account/project/original ledger scope does not match local expectation."
                         if row.Key.Kind = WorkSqliteRecordKind.ExternalEffect &&
                            (str body "repositoryId" <> expectation.RepositoryId ||
                             str body "sourceRef" <> expectation.SourceRef) then

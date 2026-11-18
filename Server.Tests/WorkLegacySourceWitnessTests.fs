@@ -328,7 +328,7 @@ let private reader first second : IWorkLegacyAuthenticatedSourceReader =
         member _.ReadAuthenticated() = Ok first
         member _.ReinspectAuthenticated() = Ok second }
 
-let private inspect f captured = 
+let private inspect f captured =
     WorkLegacySourceWitness.capture
         (reader captured captured) f.DatabasePath f.Raw f.C2
 

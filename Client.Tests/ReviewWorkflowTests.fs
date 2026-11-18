@@ -467,6 +467,138 @@ type ReviewWorkflowTests() =
             Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(expectedHead)))
 
     [<Test>]
+    member _.HistoricalSchemaTwoIntegrationsAreReadableButPartialManagedEvidenceIsRejected() =
+        withFixture (fun _ _ first second baseOid sourceRef _ _ ->
+            let taskId = "historical-integration-v2"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Historical integration receipts"
+            |> success |> ignore
+            let fields =
+                [ "reviewRef"; "reviewVersion"; "reviewedHeadOid"
+                  "integrationRef"; "targetHeadAtSubmission" ]
+            let options =
+                System.Text.Json.JsonSerializerOptions(
+                    PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase)
+            let makeOriginal (submissionId: Guid) status =
+                let value : IntegrationSubmission =
+                    { SubmissionId = submissionId.ToString("N"); TaskId = taskId
+                      ActorId = "Owner"; SourceRef = sourceRef
+                      SubmittedCommit = baseOid; ReviewId = Guid.NewGuid().ToString("N")
+                      ReviewRef = null; ReviewVersion = 0; ReviewedHeadOid = null
+                      IntegrationRef = null; TargetHeadAtSubmission = null
+                      TargetRef = sourceRef; Status = status; CreatedSequence = 8L
+                      IntegratedCommit = if status = "Integrated" then baseOid else null
+                      CompletedAtUtc = if status = "Integrated" then "2026-11-06T03:16:08Z" else null }
+                let node =
+                    System.Text.Json.Nodes.JsonNode.Parse(
+                        System.Text.Json.JsonSerializer.Serialize(value, options)).AsObject()
+                node["schemaVersion"] <- System.Text.Json.Nodes.JsonValue.Create(2)
+                for name in fields do
+                    Assert.That(node.Remove(name), Is.True)
+                node.ToJsonString()
+            let put (submissionId: Guid) content =
+                let path = $"tasks/{taskId}/integrations/{submissionId:N}.json"
+                let entry : LedgerFileChange =
+                    { Path = path; ExpectedBlobOid = None; Content = content }
+                let intent : LedgerIntent =
+                    { OperationId = Guid.NewGuid(); Actor = "Fixture"
+                      Kind = "HistoricalIntegrationShapeFixture"; RequestJson = "{}" }
+                LedgerStore.transact first intent (fun _ -> Ok [ entry ])
+                |> success |> ignore
+            let pendingId = Guid.NewGuid()
+            let integratedId = Guid.NewGuid()
+            put pendingId (makeOriginal pendingId "Pending")
+            put integratedId (makeOriginal integratedId "Integrated")
+            let before = (LedgerStore.fetch first |> success).Commit
+            let summary = ReviewWorkflow.getIntegrationSubmissions second taskId |> success
+            Assert.That(summary.Submissions.Length, Is.EqualTo(2))
+            Assert.That(summary.Submissions |> List.map _.Status,
+                        Is.EquivalentTo([ "Pending"; "Integrated" ]))
+            Assert.That(summary.Submissions |> List.forall (fun item ->
+                isNull item.IntegrationRef && isNull item.ReviewRef
+                && item.ReviewVersion = 0 && isNull item.ReviewedHeadOid
+                && isNull item.TargetHeadAtSubmission), Is.True)
+            let inbox = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(inbox.IntegrationSubmissions.Length, Is.EqualTo(2))
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(before),
+                        "Reading historical receipts must not rewrite immutable ledger data.")
+            // One new evidence field without the others is corrupt, not legacy.
+            let partialId = Guid.NewGuid()
+            let partial = System.Text.Json.Nodes.JsonNode.Parse(
+                makeOriginal partialId "Pending").AsObject()
+            partial["reviewRef"] <- System.Text.Json.Nodes.JsonValue.Create(
+                "refs/heads/jarvis-review/incorrect")
+            put partialId (partial.ToJsonString())
+            let corruptHead = (LedgerStore.fetch first |> success).Commit
+            match ReviewWorkflow.getIntegrationSubmissions second taskId with
+            | Error(LedgerIntegrityError _) -> ()
+            | other -> Assert.Fail(sprintf "Partial managed evidence was accepted: %A" other)
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(corruptHead)))
+    [<Test>]
+    member _.HistoricalSchemaThreeReviewsRemainReadableWithoutInventingPinnedSourceEvidence() =
+        withFixture (fun _ _ first second baseOid sourceRef _ _ ->
+            let taskId = "historical-review-v3"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Historical review receipts"
+            |> success |> ignore
+            let options =
+                System.Text.Json.JsonSerializerOptions(
+                    PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase)
+            let makeHistorical (reviewId: Guid) status =
+                let item : BranchReview =
+                    { ReviewId = reviewId.ToString("N"); TaskId = taskId
+                      AttemptId = null; OwnerAgentId = "Owner"; Kind = "Implementation"
+                      TaskRef = sourceRef
+                      ReviewRef = $"refs/heads/jarvis-review/{taskId}/{reviewId:N}/r1"
+                      SourceVersion = 0; ReviewedHeadOid = null; BaseCommit = baseOid
+                      TargetRef = sourceRef; Status = status
+                      ReviewerId = "Reviewer"; Version = 3; CreatedSequence = 8L
+                      DecisionSequence = 9L; Acknowledged = true }
+                let node =
+                    System.Text.Json.Nodes.JsonNode.Parse(
+                        System.Text.Json.JsonSerializer.Serialize(item, options)).AsObject()
+                node["schemaVersion"] <- System.Text.Json.Nodes.JsonValue.Create(3)
+                Assert.That(node.Remove("sourceVersion"), Is.True)
+                Assert.That(node.Remove("reviewedHeadOid"), Is.True)
+                node.ToJsonString()
+            let put (reviewId: Guid) content =
+                let record : LedgerFileChange =
+                    { Path = $"tasks/{taskId}/reviews/{reviewId:N}/review.json"
+                      ExpectedBlobOid = None; Content = content }
+                let action : LedgerIntent =
+                    { OperationId = Guid.NewGuid(); Actor = "Fixture"
+                      Kind = "HistoricalReviewShapeFixture"; RequestJson = "{}" }
+                LedgerStore.transact first action (fun _ -> Ok [ record ])
+                |> success |> ignore
+            let acceptedId, changedId = Guid.NewGuid(), Guid.NewGuid()
+            put acceptedId (makeHistorical acceptedId "Accepted")
+            put changedId (makeHistorical changedId "ChangesRequested")
+            let originalHead = (LedgerStore.fetch first |> success).Commit
+            let overview = ReviewWorkflow.listProjectTasks second |> success
+            Assert.That(overview.Reviews.Length, Is.EqualTo(2))
+            Assert.That(overview.Reviews |> List.map _.Status,
+                        Is.EquivalentTo([ "Accepted"; "ChangesRequested" ]))
+            Assert.That(overview.Reviews |> List.forall (fun review ->
+                review.SourceVersion = 0 && isNull review.ReviewedHeadOid), Is.True)
+            let inbox = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(inbox.Agent.AgentId, Is.EqualTo("Owner"))
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(originalHead))
+            // A legacy Accepted review has no immutable pinned head and cannot
+            // authorize a new managed integration or fabricate that evidence.
+            match ReviewWorkflow.submitIntegration second (Guid.NewGuid()) taskId "Owner"
+                    (Guid.NewGuid()) "" "" (acceptedId.ToString("N")) sourceRef with
+            | Error _ -> ()
+            | Ok _ -> Assert.Fail("Legacy unpinned review authorized a new integration.")
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(originalHead))
+            let partialId = Guid.NewGuid()
+            let partial = System.Text.Json.Nodes.JsonNode.Parse(
+                makeHistorical partialId "Accepted").AsObject()
+            partial["sourceVersion"] <- System.Text.Json.Nodes.JsonValue.Create(1)
+            put partialId (partial.ToJsonString())
+            let corruptHead = (LedgerStore.fetch first |> success).Commit
+            match ReviewWorkflow.listProjectTasks second with
+            | Error(LedgerIntegrityError _) -> ()
+            | other -> Assert.Fail(sprintf "Partial pinned evidence was accepted: %A" other)
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(corruptHead)))
+    [<Test>]
     member _.ReviewsAreIndependentOfTaskPhaseAndAllowMultipleClaims() =
         withFixture (fun one _ first second _ sourceRef newCommit _ ->
             let taskId = "independent-review"

@@ -120,7 +120,7 @@ let private describe (a: ScheduledAction) =
        error = a.Error
        updatedAtUtc = a.UpdatedAtUtc |}
 
-type Service(path: string, execute: ScheduledAction -> Task<Result<string,string * string>>, ?now: unit -> DateTimeOffset, ?pollMs: int, ?agentLastSeen: string -> string -> DateTimeOffset option, ?verifyIdleActivity: string -> string -> Task<Result<DateTimeOffset option,string>>) =
+type Service(path: string, execute: ScheduledAction -> Task<Result<string,string * string>>, ?now: unit -> DateTimeOffset, ?pollMs: int, ?agentLastSeen: string -> string -> DateTimeOffset option, ?verifyIdleActivity: string -> string -> Task<Result<DateTimeOffset option,string>>, ?onFault: string -> unit) =
     let gate = obj()
     // A process-wide exclusive lifetime lease, acquired BEFORE loading state.
     // A second JarvisClient cannot read stale pending and race a claim. The
@@ -146,6 +146,7 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
     // Production rejects idle until independent client/Git evidence exists.
     let verify = defaultArg verifyIdleActivity (fun _ _ ->
         Task.FromResult(Error "ActivityVerificationUnavailable: authenticated server snapshot is required."))
+    let reportFault = defaultArg onFault ignore
     let isIdle (a: ScheduledAction) = a.TriggerKind = "AfterAgentIdle"
     let mutable actions: ScheduledAction list = []
     let mutable started = false
@@ -517,7 +518,9 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
             if started then invalidOp "Execution scheduler already started."
             if interval < 10 then invalidArg "pollMs" "Polling interval is too small."
             started <- true
-            worker <- task {
+            // Run off the TUI synchronization context so the recurring loop
+            // continues after its first asynchronous delay.
+            let runLoop () = task {
                 try
                     while not cancellation.IsCancellationRequested do
                         // Local notifications may postpone a deadline, but are
@@ -708,8 +711,26 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                             }
                             Task.Run(Func<Task>(fun () -> run () :> Task)) |> ignore
                         do! Task.Delay(interval, cancellation.Token)
-                with :? OperationCanceledException -> ()
-            })
+                with
+                | :? OperationCanceledException when cancellation.IsCancellationRequested -> ()
+            }
+            // Restart only the polling loop after an internal fault. Claims
+            // are fsync-persisted before external execution; an already
+            // running occurrence is never submitted again by this supervisor.
+            let rec supervise () = task {
+                try
+                    do! runLoop ()
+                with
+                | :? OperationCanceledException when cancellation.IsCancellationRequested -> ()
+                | error ->
+                    try reportFault ("Persistent scheduler polling fault (retrying): " + error.GetType().Name + ": " + error.Message)
+                    with _ -> ()
+                    try
+                        do! Task.Delay(1000, cancellation.Token)
+                        return! supervise ()
+                    with :? OperationCanceledException when cancellation.IsCancellationRequested -> ()
+            }
+            worker <- Task.Run(Func<Task>(fun () -> supervise () :> Task)))
 
     interface IDisposable with
         member _.Dispose() =

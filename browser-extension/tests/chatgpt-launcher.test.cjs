@@ -15,8 +15,12 @@ function harness(options = {}) {
   let clicks = 0;
   let focused = false;
   let editorSelected = false;
+  let editorDeleteFlushed = true;
   let mode = options.initialMode || "Chat";
   let chatClicks = 0;
+  let modelClicks = 0;
+  const selectedModel = options.selectedModel || "GPT-6";
+  const reasoningEffort = options.reasoningEffort || "Instant";
   let staleSendChecks = 0;
   let staleSendObserved = 0;
   let draftWasCleared = false;
@@ -24,6 +28,7 @@ function harness(options = {}) {
   let afterClearEffectsScheduled = false;
   let afterInsertEffectsScheduled = false;
   let insertions = 0;
+  let beforeReadyInsertions = 0;
   const launchStartedAt = Date.now();
   const postInsert = (ms, callback) => {
     if (ms === undefined) return;
@@ -41,7 +46,13 @@ function harness(options = {}) {
     click() {
       if (name === "Chat") {
         chatClicks++;
-        if (!options.modeSwitchFails) {
+        if (chatClicks === 1 && options.addTurnAfterFirstChatClickMs !== undefined) {
+          setTimeout(() => { userTurns++; }, options.addTurnAfterFirstChatClickMs);
+        }
+        if (chatClicks === 1 && options.routeAfterFirstChatClickMs !== undefined) {
+          setTimeout(() => { site.href = "https://chatgpt.com/c/unexpected-during-selection"; }, options.routeAfterFirstChatClickMs);
+        }
+        if (!options.modeSwitchFails && chatClicks > (options.ignoreFirstChatClicks || 0)) {
           setTimeout(() => { mode = "Chat"; }, options.modeDelayMs || 0);
         }
         if (options.replaceModesDuringModeSwitchMs) {
@@ -84,7 +95,7 @@ function harness(options = {}) {
     addRange(range) { editorSelected = range.composerSelected === true; }
   };
   const document = {
-    readyState: "complete",
+    readyState: options.documentHydrationDelayMs ? "loading" : "complete",
     createRange() {
       return {
         composerSelected: false,
@@ -97,6 +108,8 @@ function harness(options = {}) {
       if (command === "delete") {
         if (!editorSelected || options.clearFails) return false;
         content = options.clearLeavesText ? "residual draft" : "";
+        editorDeleteFlushed = false;
+        queueMicrotask(() => { editorDeleteFlushed = true; });
         if (!content) {
           draftWasCleared = true;
           staleSendChecks = options.staleSendChecks || 0;
@@ -123,7 +136,10 @@ function harness(options = {}) {
         return true;
       }
       if (command !== "insertText") return false;
+      if (options.requireClearMicrotask && !editorDeleteFlushed) return false;
+      if (document.readyState !== "complete") beforeReadyInsertions++;
       insertions++;
+      if (insertions <= (options.rejectInsertCount || 0)) return false;
       content = options.insertWrong ? "wrong" : value;
       if (!afterInsertEffectsScheduled) {
         afterInsertEffectsScheduled = true;
@@ -171,7 +187,8 @@ function harness(options = {}) {
       if (selector === 'button[type="button"][aria-pressed]') {
         if (options.modeButtonsAvailableAfterMs &&
             Date.now() - launchStartedAt < options.modeButtonsAvailableAfterMs) return [];
-        return options.noModeToggle ? [] : [chatMode, workMode];
+        if (options.noModeToggle) return [];
+        return options.duplicateChatMode ? [chatMode, makeMode("Chat"), workMode] : [chatMode, workMode];
       }
       if (selector === '[data-user-message-bubble]') {
         return renderedBubble === null ? [] : [{ innerText: renderedBubble }];
@@ -185,6 +202,9 @@ function harness(options = {}) {
         ? Array(userTurns).fill({}) : [];
     }
   };
+  if (options.documentHydrationDelayMs) {
+    setTimeout(() => { document.readyState = "complete"; }, options.documentHydrationDelayMs);
+  }
   const window = { getSelection: () => options.selectionUnavailable ? null : selection };
   // Test-only virtual time makes the pre-Send deadline boundary deterministic.
   // Wall-clock scheduling at 100 ms can otherwise race the third inactive sample.
@@ -205,6 +225,7 @@ function harness(options = {}) {
       prompt, timeoutMs: options.timeoutMs || 350, ...extra
     }) + ")", ctx);
   return { run, site, get clicks() { return clicks; }, get insertions() { return insertions; }, get chatClicks() { return chatClicks; },
+    get selectedModel() { return selectedModel; }, get reasoningEffort() { return reasoningEffort; }, get modelClicks() { return modelClicks; }, get beforeReadyInsertions() { return beforeReadyInsertions; },
     get mode() { return mode; }, get content() { return content; },
     get virtualClockState() { return virtualClock && { now: virtualClock.now, delays: [...virtualClock.delays] }; },
     get staleSendObserved() { return staleSendObserved; }, get lastSubmittedText() { return lastSubmittedText; } };
@@ -229,36 +250,28 @@ test("replaces arbitrary restored draft with exact intended bootstrap once", asy
   assert.equal(JSON.stringify(result).includes("Personal unsent text"), false);
 });
 
-test("waits for delayed React Send disable after clearing restored draft", async () => {
-  const h = harness({ existingDraft: "Worker 5 stale unsent draft", staleSendChecks: 3, timeoutMs: 900 });
-  const result = await h.run("Worker 4 new prompt");
+test("always clears and replaces an unsent draft without waiting for Send to disable", async () => {
+  const h = harness({ existingDraft: "Stale text", staleSendChecks: 3, timeoutMs: 900 });
+  const result = await h.run("New exact prompt");
   assert.equal(result.status, "submitted");
-  assert.equal(h.staleSendObserved, 3);
-  assert.equal(h.lastSubmittedText, "Worker 4 new prompt");
+  assert.equal(h.lastSubmittedText, "New exact prompt");
   assert.equal(h.clicks, 1);
 });
 
-test("never sends when restored-draft Send stays enabled beyond bounded stabilization", async () => {
+test("a permanently enabled Send does not prevent clearing a restored draft", async () => {
   const h = harness({ existingDraft: "Old prompt", sendAlwaysEnabled: true, timeoutMs: 300 });
   const result = await h.run("New prompt");
-  assert.equal(result.status, "notSubmitted");
-  assert.equal(result.safeToDisposeCreatedTab, true);
-  assert.equal(result.reason, "UnexpectedSendState");
-  assert.equal(result.stage, "draftStabilization");
-  assert.equal(result.diagnostics.sendButtons, 1);
-  assert.equal(h.lastSubmittedText, null);
-  assert.equal(h.clicks, 0);
-  assert.equal(JSON.stringify(result).includes("Old prompt"), false);
+  assert.equal(result.status, "submitted");
+  assert.equal(h.lastSubmittedText, "New prompt");
+  assert.equal(h.clicks, 1);
 });
 
-test("unexpected enabled Send on an empty editor never permits insertion", async () => {
+test("an already enabled Send does not prevent an exact new prompt", async () => {
   const h = harness({ sendAlwaysEnabled: true, timeoutMs: 250 });
   const result = await h.run("New prompt");
-  assert.equal(result.status, "notSubmitted");
-  assert.equal(result.safeToDisposeCreatedTab, true);
-  assert.equal(result.reason, "UnexpectedSendState");
-  assert.equal(h.content, "");
-  assert.equal(h.clicks, 0);
+  assert.equal(result.status, "submitted");
+  assert.equal(h.lastSubmittedText, "New prompt");
+  assert.equal(h.clicks, 1);
 });
 
 test("a new user turn during restored-draft stabilization prevents submission", async () => {
@@ -544,12 +557,11 @@ test("existing conversation with draft is not touched", async () => {
   assert.equal(h.clicks, 0);
 });
 
-test("fresh empty Chat editor waits longer than the former 1800ms stabilization deadline", async () => {
+test("fresh Chat editor inserts immediately despite stale Send enabled state", async () => {
   const h = harness({ staleSendDurationMs: 2050, timeoutMs: 4400 });
-  const result = await h.run("Hydration-safe new task");
+  const result = await h.run("New task");
   assert.equal(result.status, "submitted");
-  assert.equal(h.staleSendObserved > 20, true);
-  assert.equal(h.lastSubmittedText, "Hydration-safe new task");
+  assert.equal(h.lastSubmittedText, "New task");
   assert.equal(h.clicks, 1);
 });
 
@@ -559,7 +571,7 @@ test("a restored unsent draft during hydration is replaced only on the still-zer
   assert.equal(result.status, "submitted");
   assert.equal(h.lastSubmittedText, "Task prompt");
   assert.equal(h.clicks, 1);
-  assert.equal(h.insertions, 1);
+  assert.equal(h.insertions, 2);
 });
 
 test("a replaced composer during stabilization is resnapshotted before editing", async () => {
@@ -568,7 +580,7 @@ test("a replaced composer during stabilization is resnapshotted before editing",
   assert.equal(result.status, "submitted");
   assert.equal(h.lastSubmittedText, "Task prompt");
   assert.equal(h.clicks, 1);
-  assert.equal(h.insertions, 1);
+  assert.equal(h.insertions, 2);
 });
 
 test("same-selected Chat mode controls may re-render during stabilization", async () => {
@@ -580,21 +592,20 @@ test("same-selected Chat mode controls may re-render during stabilization", asyn
   assert.equal(h.chatClicks, 0);
 });
 
-test("mode switching away from Chat during stabilization prevents sending", async () => {
-  const h = harness({ existingDraft: "Old", switchToWorkAfterClearMs: 50, staleSendChecks: 5 });
+test("mode switching away from Chat immediately after insertion prevents sending", async () => {
+  const h = harness({ switchToWorkAfterInsertMs: 0 });
   const result = await h.run("Task prompt");
   assert.equal(result.status, "uiIncompatible");
   assert.equal(result.reason, "ModeChanged");
   assert.equal(h.clicks, 0);
 });
 
-test("persistent enabled Send exhausts the overall budget without editing", async () => {
+test("persistent enabled Send does not block replacing the composer", async () => {
   const h = harness({ sendAlwaysEnabled: true, timeoutMs: 220 });
   const result = await h.run("New task");
-  assert.equal(result.status, "notSubmitted");
-  assert.equal(result.reason, "UnexpectedSendState");
-  assert.equal(h.content, "");
-  assert.equal(h.clicks, 0);
+  assert.equal(result.status, "submitted");
+  assert.equal(h.lastSubmittedText, "New task");
+  assert.equal(h.clicks, 1);
 });
 
 test("throwing Send click yields uncertain outcome with exactly one attempt", async () => {
@@ -606,15 +617,13 @@ test("throwing Send click yields uncertain outcome with exactly one attempt", as
   assert.equal(h.lastSubmittedText, null);
 });
 
-test("deadline exactly at the third inactive sample cannot edit or send", async () => {
-  const h = harness({ timeoutMs: 100, virtualClock: true });
+test("an absent Send control cannot bypass the overall deadline", async () => {
+  const h = harness({ timeoutMs: 100, virtualClock: true, noSend: true });
   const result = await h.run("Must not send");
-  assert.equal(result.status, "notSubmitted");
-  assert.equal(result.reason, "LaunchDeadlineExceeded");
-  assert.equal(result.stage, "draftStabilization");
-  assert.deepEqual(h.virtualClockState, { now: 100, delays: [75, 25] });
-  assert.equal(h.content, "");
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.reason, "SendUnavailable");
   assert.equal(h.clicks, 0);
+  assert.equal(h.virtualClockState.now, 100);
 });
 
 test("a conversation appearing while mode controls hydrate cannot have its mode changed", async () => {
@@ -718,4 +727,130 @@ test("route change after insertion always prevents a Send", async () => {
   assert.equal(result.reason, "UnexpectedStartUrl");
   assert.equal(result.safeToDisposeCreatedTab, false);
   assert.equal(h.clicks, 0);
+});
+
+
+test("ignored pre-hydration Chat click retries on the same untouched new-chat home", async () => {
+  const h = harness({ initialMode: "Work", ignoreFirstChatClicks: 1, timeoutMs: 1100,
+    selectedModel: "GPT-6", reasoningEffort: "Extra High" });
+  const result = await h.run("Hydration recovery");
+  assert.equal(result.status, "submitted");
+  assert.equal(h.chatClicks >= 2, true);
+  assert.equal(h.mode, "Chat");
+  assert.equal(h.clicks, 1);
+  assert.equal(h.lastSubmittedText, "Hydration recovery");
+  assert.equal(h.selectedModel, "GPT-6");
+  assert.equal(h.reasoningEffort, "Extra High");
+  assert.equal(h.modelClicks, 0);
+});
+
+test("multiple ignored hydration clicks eventually select Chat without duplicate Send", async () => {
+  const h = harness({ initialMode: "Work", ignoreFirstChatClicks: 2, timeoutMs: 1600 });
+  const result = await h.run("Hydration repeat");
+  assert.equal(result.status, "submitted");
+  assert.equal(h.chatClicks >= 3, true);
+  assert.equal(h.clicks, 1);
+});
+
+test("permanently ignored mode clicks fail closed before Send", async () => {
+  const h = harness({ initialMode: "Work", modeSwitchFails: true, timeoutMs: 710 });
+  const result = await h.run("Must not send");
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.reason, "ChatModeUnavailable");
+  assert.equal(result.safeToDisposeCreatedTab, true);
+  assert.equal(h.chatClicks >= 2, true);
+  assert.equal(h.mode, "Work");
+  assert.equal(h.clicks, 0);
+});
+
+test("a user turn arriving after an ignored mode click prevents all retries and Send", async () => {
+  const h = harness({ initialMode: "Work", ignoreFirstChatClicks: 2,
+    addTurnAfterFirstChatClickMs: 30, timeoutMs: 900 });
+  const result = await h.run("Must not touch another turn");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "ExistingConversation");
+  assert.equal(result.safeToDisposeCreatedTab, false);
+  assert.equal(h.chatClicks, 1);
+  assert.equal(h.clicks, 0);
+});
+
+test("route navigation after an ignored mode click prevents retry and Send", async () => {
+  const h = harness({ initialMode: "Work", ignoreFirstChatClicks: 3,
+    routeAfterFirstChatClickMs: 30, timeoutMs: 900 });
+  const result = await h.run("Must not send after navigation");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "UnexpectedStartUrl");
+  assert.equal(result.safeToDisposeCreatedTab, false);
+  assert.equal(h.chatClicks, 1);
+  assert.equal(h.clicks, 0);
+});
+
+test("ambiguous Chat buttons do not authorize a mode click or Send", async () => {
+  const h = harness({ initialMode: "Work", duplicateChatMode: true, timeoutMs: 300 });
+  const result = await h.run("No ambiguous selection");
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.reason, "ModeToggleUnavailable");
+  assert.equal(h.chatClicks, 0);
+  assert.equal(h.clicks, 0);
+});
+
+for (const { selectedModel, reasoningEffort } of [
+  { selectedModel: "GPT-6", reasoningEffort: "Instant" },
+  { selectedModel: "GPT-6", reasoningEffort: "Extra High" },
+  { selectedModel: "GPT-5.6 Sol", reasoningEffort: "Medium" },
+  { selectedModel: "Pro", reasoningEffort: "High" }
+]) {
+  test("new Chat tab leaves " + selectedModel + " and " + reasoningEffort + " unchanged", async () => {
+    const h = harness({ initialMode: "Chat", selectedModel, reasoningEffort });
+    const result = await h.run("Preserve selected model");
+    assert.equal(result.status, "submitted");
+    assert.equal(h.chatClicks, 0);
+    assert.equal(h.clicks, 1);
+    assert.equal(h.selectedModel, selectedModel);
+    assert.equal(h.reasoningEffort, reasoningEffort);
+    assert.equal(h.modelClicks, 0);
+  });
+}
+
+test("Work mode with a restored draft always sends only the intended prompt", async () => {
+  const h = harness({ initialMode: "Work", selectedModel: "GPT-6",
+    reasoningEffort: "High", existingDraft: "Saved unrelated draft", timeoutMs: 1400 });
+  const result = await h.run("Exact intended new task");
+  assert.equal(result.status, "submitted");
+  assert.equal(h.lastSubmittedText, "Exact intended new task");
+  assert.equal(h.chatClicks >= 1, true);
+  assert.equal(h.modelClicks, 0);
+  assert.equal(h.clicks, 1);
+});
+
+
+test("clear and insert waits for the editor microtask, without preserving any old text", async () => {
+  const h = harness({ existingDraft: "Old unrelated text",
+    requireClearMicrotask: true, timeoutMs: 600 });
+  const result = await h.run("Only intended prompt");
+  assert.equal(result.status, "submitted");
+  assert.equal(h.lastSubmittedText, "Only intended prompt");
+  assert.equal(h.clicks, 1);
+});
+
+
+test("temporary unhydrated editor insertion retries after clearing and succeeds once", async () => {
+  const h = harness({ initialMode: "Chat", existingDraft: "Discard me",
+    requireClearMicrotask: true, rejectInsertCount: 2, timeoutMs: 1400 });
+  const result = await h.run("Exact intended prompt");
+  assert.equal(result.status, "submitted");
+  assert.equal(h.lastSubmittedText, "Exact intended prompt");
+  assert.equal(h.insertions, 3);
+  assert.equal(h.clicks, 1);
+});
+
+
+test("composer visible before document loading completes is not edited early", async () => {
+  const h = harness({ initialMode: "Chat", existingDraft: "Discardable draft",
+    documentHydrationDelayMs: 145, timeoutMs: 900 });
+  const result = await h.run("Delayed ready prompt");
+  assert.equal(result.status, "submitted");
+  assert.equal(h.lastSubmittedText, "Delayed ready prompt");
+  assert.equal(h.beforeReadyInsertions, 0);
+  assert.equal(h.clicks, 1);
 });

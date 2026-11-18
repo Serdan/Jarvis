@@ -1,0 +1,13 @@
+# P1 — Guarded-delete source stage can falsely settle an unacknowledged/third-party deletion
+
+**Frozen source:** `8ebe779fe2286d2abcdc1c0b4860079a4a97dbbf` (parent/base `5db32e1f73b0c5b2c4988a002910832fbc3d174c`).
+
+**Location:** `Client/Modules/LedgerStore.fs`, existing `deleteReservedReviewRef` physical leaf, around lines 2097–2121, and new `deleteReservedReviewRefForAction` stage wrapper around lines 2552–2565.
+
+**Observed source behavior:** The leaf issues `git push --force-with-lease=<ref>:<expectedOid> <remote> :<ref>`, but then checks `inspectRemoteReviewRef`. If the observation returns `None`, the leaf returns `Ok "Deleted"` **without checking whether the push transport returned `Error` or a nonzero ExitCode**. The new wrapper invokes this leaf and verifies the stage using `(fun status -> status = "Deleted")`. `OriginalGitWriterAdmissionJournal.withPublicationClassified` then settles its parent-stage record as verified on that `Ok`.
+
+**Deterministic negative sequence:** (1) First observation sees the expected OID, so stage is journal-admitted. (2) A concurrent actor deletes the ref before our guarded push, so our lease-protected push fails; alternatively, our successful delete's acknowledgement is lost. (3) Subsequent remote observation sees the ref absent. (4) The leaf returns `Ok "Deleted"` even though the push returned failure/unknown, and both leaf/stage journals may settle a publication as if this parent operation's effect was proven. Absence is physical-state evidence, **not authenticated proof of the responsible action**. This defeats the task's explicit lost-response/reordered-observation/UNKNOWN boundary for guarded review-ref deletion. Existing focused tests inject a lost push response for review *creation*, not deletion.
+
+**Required correction:** In the stage-enabled guarded-delete route, do not settle a successful `Deleted` stage based only on post-push absence when the push outcome is failed/unobservable. Return and persist `OutcomeUnknown` until independent authoritative evidence can attribute the effect; preserve create/delete exact-OID lease and no production writer activation. Add disposable two-clone negative cases for deletion-acknowledgement loss and external concurrent deletion before push.
+
+**Evidence type:** Independent frozen-source control-flow inspection (not a new executed fault-injection reproduction). The five existing focused .NET 11 Release tests pass, but do not exercise this deletion response-failure branch.

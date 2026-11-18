@@ -640,13 +640,13 @@ module OriginalGitWriterAdmissionJournal =
     // not Unknown. A changed remote head alone is not that proof.
     // A settled duplicate is never a permit to publish again.
     let internal withPublicationClassified operationId kind authority gitRef payload
-                                 (publish: unit -> Result<'a, 'error>)
+                                 (publish: bool -> Result<'a, 'error>)
                                  (verified: 'a -> bool)
                                  (provenRejected: 'a -> bool)
                                  (failure: string -> 'error) : Result<'a, 'error> =
         match admit operationId kind authority gitRef payload with
         | Error reason -> Error(failure reason)
-        | Ok None -> publish() // Default-off preserves existing Git behavior.
+        | Ok None -> publish false // Default-off preserves existing Git behavior.
         | Ok(Some permit) when permit.Replay ->
             Error(failure "OriginalWriterJournalUnknown/SettledReplayMustUseCanonicalReceipt")
         | Ok(Some permit) ->
@@ -654,7 +654,7 @@ module OriginalGitWriterAdmissionJournal =
             | Error reason -> Error(failure reason)
             | Ok () ->
                 try
-                    match publish() with
+                    match publish true with
                     | Ok result when verified result ->
                         match settle permit true true with
                         | Ok () -> Ok result
@@ -680,7 +680,7 @@ module OriginalGitWriterAdmissionJournal =
                                  (verified: 'a -> bool)
                                  (failure: string -> 'error) : Result<'a, 'error> =
         withPublicationClassified operationId kind authority gitRef payload
-            publish verified (fun _ -> false) failure
+            (fun _ -> publish()) verified (fun _ -> false) failure
 
     // Identity is the logical remote authority, not an interchangeable local
     // clone path or a caller-asserted actor name. Scope and ref are both bound.

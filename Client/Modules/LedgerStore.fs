@@ -1161,6 +1161,7 @@ module LedgerStore =
         else
             let repo = binding.RepositoryPath
             let requestHash = recordHash binding change
+            let mutable journalEnabled = false
             let mutable unresolvedRemoteEffect = false
             let rec attempt retries admitted =
                 match fetch binding with
@@ -1233,7 +1234,7 @@ module LedgerStore =
                                                     | Error _ -> Error(OutcomeUnknown $"Push outcome unknown for {change.OperationId:D}.")
                                                     | Ok output when output.ExitCode <> 0 && current.Commit = head ->
                                                         Error(GitFailure $"Ledger push rejected without remote advance: {output.Stderr}")
-                                                    | Ok output when current.Commit <> head && provenNonFastForwardRejection output ->
+                                                    | Ok output when journalEnabled && current.Commit <> head && provenNonFastForwardRejection output ->
                                                         // This Git process explicitly rejected the CAS, so it
                                                         // cannot have published the proposed commit.
                                                         unresolvedRemoteEffect <- false
@@ -1241,13 +1242,18 @@ module LedgerStore =
                                                         else
                                                             System.Threading.Thread.Sleep(contentionDelay retries)
                                                             attempt (retries + 1) true
+                                                    | Ok _ when not journalEnabled && retries >= 7 -> Error LedgerContended
+                                                    | _ when not journalEnabled ->
+                                                        System.Threading.Thread.Sleep(contentionDelay retries)
+                                                        attempt (retries + 1) true
                                                     | _ ->
                                                         Error(OutcomeUnknown $"Unverified Git publication for {change.OperationId:D}; reconcile same UUID.")
                                         if admitted then publishAndConfirm()
                                         else
                                             // One durable logical admission spans only proven-rejected
                                             // CAS retries. An uncertain push never recurses.
-                                            let publication () =
+                                            let publication enabled =
+                                                journalEnabled <- enabled
                                                 match publishAndConfirm () with
                                                 | Ok applied -> Ok(Choice1Of2 applied)
                                                 | Error failure when not unresolvedRemoteEffect -> Ok(Choice2Of2 failure)
@@ -2269,6 +2275,7 @@ module LedgerStore =
         else
             let requestHash = intentHash binding intent
             let repo = binding.RepositoryPath
+            let mutable journalEnabled = false
             let mutable unresolvedRemoteEffect = false
             let rec attempt retry admitted =
                 match withPhase "prepublication-fetch" (fun () -> fetch binding) with
@@ -2392,7 +2399,7 @@ module LedgerStore =
                                                                   (transportDiagnostic "publication-push" 1
                                                                       (Some output.ExitCode) false (classifyTransport output.Stderr)
                                                                    + "; nextAction=reconcile-same-uuid"))
-                                                          | Ok output when observed.Commit <> head && provenNonFastForwardRejection output ->
+                                                          | Ok output when journalEnabled && observed.Commit <> head && provenNonFastForwardRejection output ->
                                                               // Git explicitly rejected this proposed CAS;
                                                               // any subsequent plan uses the same admission.
                                                               unresolvedRemoteEffect <- false
@@ -2400,6 +2407,10 @@ module LedgerStore =
                                                               else
                                                                   System.Threading.Thread.Sleep(contentionDelay retry)
                                                                   attempt (retry + 1) true
+                                                          | Ok _ when not journalEnabled && retry >= 7 -> Error LedgerContended
+                                                          | _ when not journalEnabled ->
+                                                              System.Threading.Thread.Sleep(contentionDelay retry)
+                                                              attempt (retry + 1) true
                                                           | _ ->
                                                               Error(OutcomeUnknown
                                                                   (transportDiagnostic "publication-push" 1 None false "unverified"
@@ -2408,7 +2419,8 @@ module LedgerStore =
                                               else
                                                   // One stable UUID/request admission spans verified
                                                   // non-fast-forward rejections and their bounded replans.
-                                                  let publication () =
+                                                  let publication enabled =
+                                                      journalEnabled <- enabled
                                                       match publishAndConfirm () with
                                                       | Ok applied -> Ok(Choice1Of2 applied)
                                                       | Error failure when not unresolvedRemoteEffect -> Ok(Choice2Of2 failure)

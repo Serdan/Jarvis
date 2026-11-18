@@ -26,6 +26,7 @@
         <Compile Include="WorkCompositionTests.fs"/>
         <Compile Include="WorkSqliteAuthorityTests.fs"/>
         <Compile Include="WorkSqliteDomainTests.fs"/>
+        <Compile Include="WorkTrustedSourceIngressTests.fs"/>
         <Compile Include="WorkStatefulApiReadTests.fs"/>
         <Compile Include="WorkSchedulerSqliteTests.fs"/>
         <Compile Include="WorkSqliteBackupTests.fs"/>

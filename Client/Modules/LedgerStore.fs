@@ -2100,16 +2100,20 @@ module LedgerStore =
                                         [ "push"; "--porcelain"
                                           $"--force-with-lease={gitRef}:{expectedOid}"
                                           binding.RemoteName; $":{gitRef}" ]
-                        inspectRemoteReviewRef binding gitRef
-                        |> Result.bind (function
-                            | None -> Ok "Deleted"
-                            | Some found when found <> expectedOid ->
-                                Error(SourceReviewRefUnavailable "Review ref changed during guarded deletion.")
-                            | Some _ ->
-                                match push with
-                                | Ok response when response.ExitCode <> 0 ->
-                                    Error(GitFailure $"Guarded review deletion rejected: {response.Stderr}")
-                                | _ ->
+                        // Ref absence after a failed or unobservable push cannot
+                        // attribute the deletion to this source-effect stage.
+                        match push with
+                        | Error _ ->
+                            Error(OutcomeUnknown "Guarded review deletion has no acknowledged push result.")
+                        | Ok response when response.ExitCode <> 0 ->
+                            Error(OutcomeUnknown "Guarded review deletion push was not acknowledged.")
+                        | Ok _ ->
+                            inspectRemoteReviewRef binding gitRef
+                            |> Result.bind (function
+                                | None -> Ok "Deleted"
+                                | Some found when found <> expectedOid ->
+                                    Error(SourceReviewRefUnavailable "Review ref changed during guarded deletion.")
+                                | Some _ ->
                                     Error(OutcomeUnknown "Cannot confirm guarded review ref deletion."))
                     OriginalGitWriterAdmissionJournal.withPublication
                         (OriginalGitWriterAdmissionJournal.deterministicOperationId "ReviewRefDelete" gitRef expectedOid)

@@ -1,0 +1,14 @@
+# P2 — The new negative probe weakens original source-effect journal validation
+
+**Frozen commit:** `dcd640eaf25d07ed654fe61b051e505a34a61f19`  
+**Location:** `Server/WorkLegacyImportAuthenticatedReadDiagnostics.fs:50-84` (especially 57-83)  
+**Existing contract:** `Server/WorkLegacySourceWitness.fs:198-248`  
+**Decision impact:** ChangesRequested; missing negative coverage and wrong typed classification, not an authorization bypass or production-positive Verified result.
+
+The new diagnostic `checkJournal` reimplements a subset of the existing `WorkLegacySourceWitness.checkEffectJournal` invariants, but only tests `event.Sequence > 0`, nonempty UUID, non-`Unknown` outcome, receipt presence in original operations, equal event count/high-water, and an internally recomputed digest. It does **not** verify contiguous ordered receipt sequences (`Sequence = index + 1`), unique one-shot effect operation IDs, SHA-256 shapes, valid observed-commit OIDs, `journal.RemoteHead` Git OID, or `OriginalGitPublisherAdmission.validateTarget journal.Target`. The existing SourceWitness validator explicitly performs each check, with `Rejected` or `Unknown` outcomes.
+
+**Concrete static negative counterexamples:** Given an otherwise self-consistent two-project fixture, a journal with `DurableHighWater = RemoteHighWater = 2`, two operations in the canonical ledger, events with `Sequence = [1; 1]`, separately matching UUID/hash fields and a freshly computed `effectJournalDigest` satisfies this helper's predicates. Similarly `journal.RemoteHead = "not-a-git-oid"` is never read by the new helper. The new `probe` therefore proceeds past the malformed journal and returns its generic final `Incomplete` rather than detecting a corrupt/out-of-order physical-effect receipt as `Rejected`/`Unknown`; the already-existing witness rejects these cases. This claim is based on a line-by-line control-flow inspection, **not** an independently executed malformed-fixture regression.
+
+The new 10 tests pass on .NET 11 Release, but omit these malformed journal negative cases. In a deliberately negative-only diagnostic, distinguishing an absent authenticated authority (`Incomplete`) from a known corrupt or uncertain effect sequence matters: the canonical task explicitly requires precise fail-closed classifications for rollback, orphaned refs and unknown external effects.
+
+**Required correction:** Avoid a second weaker source-effect validator. Extract/reuse the existing `WorkLegacySourceWitness` journal/target invariants in the default-off probe, or enforce equivalent canonical checks without creating a new authority; add focused red-first negative tests for duplicate/out-of-order event sequence, repeated operation UUID, invalid effect remote OID/target, invalid result hash and invalid `Observed` commit OID. Keep the ultimate no-production-auth positive result `Incomplete`, preserve original-Git writer STOP and all cutover HOLDs.

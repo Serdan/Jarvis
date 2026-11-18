@@ -273,8 +273,16 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                     invalidOp "Unsupported browser schedules state schema."
                 let restored =
                     JsonSerializer.Deserialize<ScheduledAction list>(root.GetProperty("actions").GetRawText())
+                // Legacy entries omit CommandArgs. A null F# list can throw
+                // during structural equality before scheduling even begins.
+                let needsMigration =
+                    restored |> List.exists (fun entry -> isNull (box entry.CommandArgs))
+                let normalized =
+                    restored |> List.map (fun entry ->
+                        if isNull (box entry.CommandArgs) then { entry with CommandArgs = [] }
+                        else entry)
                 actions <-
-                    restored
+                    normalized
                     |> List.map (fun loaded ->
                         // Assign an immutable identity to pre-revision journal entries.
                         // It changes only when an operator replaces a schedule.
@@ -317,7 +325,7 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                           Error = "WindowRegistrationRequired: reconfigure old browser schedule."
                                           UpdatedAtUtc = clock() }
                         else action)
-                if restored <> actions then persist actions
+                if needsMigration || normalized <> actions then persist actions
 
         with _ ->
             ownership.Dispose()
@@ -723,7 +731,7 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                 with
                 | :? OperationCanceledException when cancellation.IsCancellationRequested -> ()
                 | error ->
-                    try reportFault ("Persistent scheduler polling fault (retrying): " + error.GetType().Name + ": " + error.Message)
+                    try reportFault ("Persistent scheduler polling fault (retrying): " + error.ToString())
                     with _ -> ()
                     try
                         do! Task.Delay(1000, cancellation.Token)

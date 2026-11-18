@@ -125,6 +125,47 @@ let schedulerTransientFaultIsReportedAndPollingRecovers () = task {
 }
 
 [<Test>]
+let restoredProductionScheduleStatePollsWithoutFaults () = task {
+    let source = Environment.GetEnvironmentVariable("JARVIS_SCHEDULE_FIXTURE_PATH")
+    if String.IsNullOrWhiteSpace(source) || not (File.Exists(source)) then
+        Assert.Ignore("Explicit production schedule fixture not supplied")
+    else
+        let dir, path = temp()
+        let mutable failure = ""
+        let execute (_: BrowserSchedules.ScheduledAction) = task { return Ok "test-only-stub" }
+        try
+            File.Copy(source, path)
+            use scheduler = new BrowserSchedules.Service(path, execute, pollMs=25,
+                onFault=(fun details -> failure <- details))
+            scheduler.Start()
+            do! Task.Delay(150)
+            Assert.That(failure, Is.Empty, failure)
+        finally
+            Directory.Delete(dir, true)
+}
+
+[<Test>]
+let legacyMissingCommandArgsAreMigratedBeforeEquality () = task {
+    let dir, path = temp()
+    let execute (_: BrowserSchedules.ScheduledAction) = task { return Ok "test-only-stub" }
+    try
+        do
+            use initial = new BrowserSchedules.Service(path, execute, pollMs=25)
+            Assert.That((add initial "old-schema" 600).IsOk, Is.True)
+        let state = JsonNode.Parse(File.ReadAllText(path))
+        (state["actions"][0]).AsObject().Remove("CommandArgs") |> ignore
+        File.WriteAllText(path, state.ToJsonString())
+        use restored = new BrowserSchedules.Service(path, execute, pollMs=25)
+        restored.Start()
+        do! Task.Delay(100)
+        Assert.That(status restored "old-schema", Is.EqualTo("pending"))
+        let migrated = JsonNode.Parse(File.ReadAllText(path))
+        Assert.That((migrated["actions"][0]["CommandArgs"]).ToJsonString(), Is.EqualTo("[]"))
+    finally
+        Directory.Delete(dir, true)
+}
+
+[<Test>]
 let replaceAndCancel () = task {
     let dir,path = temp()
     let mutable clock = DateTimeOffset.UtcNow

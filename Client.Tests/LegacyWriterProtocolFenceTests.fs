@@ -1645,9 +1645,11 @@ esac
             let bin = Path.Combine(f.Root, "git-delete-fault")
             Directory.CreateDirectory bin |> ignore
             let shim = Path.Combine(bin, "git")
+            let attemptLog = Path.Combine(f.Root, "guarded-delete-attempts.log")
             File.WriteAllText(shim, """#!/bin/sh
 case "$*" in
   *"push --porcelain --force-with-lease=refs/heads/jarvis-review/"*)
+    printf 'guarded-delete-attempt\n' >> "$JARVIS_TEST_DELETE_ATTEMPT_LOG"
     case "$JARVIS_TEST_DELETE_FAULT" in
       lost-ack)
         /usr/bin/git "$@"
@@ -1671,7 +1673,8 @@ exec /usr/bin/git "$@"
                   "JARVIS_TEST_DELETE_FAULT", faultMode
                   "JARVIS_TEST_DELETE_OTHER", f.ProjectTwo.RepositoryPath
                   "JARVIS_TEST_DELETE_REF", gitRef
-                  "JARVIS_TEST_DELETE_OID", head ]
+                  "JARVIS_TEST_DELETE_OID", head
+                  "JARVIS_TEST_DELETE_ATTEMPT_LOG", attemptLog ]
             let previous =
                 changes |> List.map (fun (name, _) -> name, Environment.GetEnvironmentVariable(name))
             try
@@ -1693,4 +1696,85 @@ exec /usr/bin/git "$@"
                 |> List.exists (fun effect ->
                     effect.Kind = "SourceRefEffectStage/ReviewGuardedDelete" && effect.Status = "Unknown"),
                 Is.True, "An unacknowledged/third-party deletion must retain the parent stage UNKNOWN")
-            Assert.That(witness.RouteCoverageProven, Is.False))
+            Assert.That(witness.RouteCoverageProven, Is.False)
+            Assert.That(File.ReadAllLines(attemptLog).Length, Is.EqualTo(1))
+            // The ref is physically absent, but the SAME parent stage is still
+            // Unknown. Its replay must never be mistaken for a new no-op.
+            try
+                changes |> List.iter (fun (name, value) -> Environment.SetEnvironmentVariable(name, value))
+                match LedgerStore.deleteReservedReviewRefForAction f.ProjectTwo parent gitRef head with
+                | Error(OutcomeUnknown reason) ->
+                    Assert.That(reason, Does.Contain("ExistingEffectRequiresReconciliation"))
+                | other ->
+                    Assert.Fail(sprintf "Lost-ack/concurrent delete replay bypassed UNKNOWN: %A" other)
+            finally
+                previous |> List.iter (fun (name, value) -> Environment.SetEnvironmentVariable(name, value))
+            let after = OriginalGitWriterAdmissionJournal.inspect journal |> success
+            Assert.That(after.HighWater, Is.EqualTo(witness.HighWater),
+                        "Replay may not admit a second physical effect")
+            Assert.That(after.PendingOrUnknown = witness.PendingOrUnknown, Is.True)
+            Assert.That(File.ReadAllLines(attemptLog).Length, Is.EqualTo(1),
+                        "Replay must not issue a second guarded Git push")
+            Assert.That(
+                git f.Root
+                    [ "--git-dir=" + f.ProjectRemote; "for-each-ref"; "--format=%(objectname)"; gitRef ],
+                Is.Empty))
+
+    [<Test>]
+    member _.ManagedGuardedDeleteSettledReplayRequiresCanonicalReceiptButNewAbsentIsNoOp() =
+        withFixture (fun f ->
+            let journal = Path.Combine(f.Root, "staged-settled-delete.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal journal
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, journal)
+            let head = git f.ProjectOne.RepositoryPath [ "rev-parse"; "HEAD" ]
+            let gitRef = $"refs/heads/jarvis-review/_reviews/{Guid.NewGuid():N}/r1"
+            LedgerStore.publishReviewRef f.ProjectOne gitRef head |> success
+            let parent =
+                { OperationId = Guid.NewGuid(); Actor = "Worker21"
+                  Kind = "DeleteReservedReviewRef"; RequestJson = """{"delete":"once"}""" }
+            Assert.That(LedgerStore.deleteReservedReviewRefForAction f.ProjectOne parent gitRef head
+                        |> success, Is.EqualTo("Deleted"))
+            let settled = OriginalGitWriterAdmissionJournal.inspect journal |> success
+            Assert.That(settled.PendingOrUnknown, Is.Empty)
+            match LedgerStore.deleteReservedReviewRefForAction f.ProjectTwo parent gitRef head with
+            | Error(OutcomeUnknown reason) ->
+                Assert.That(reason, Does.Contain("SettledReplayMustUseCanonicalReceipt"))
+            | other -> Assert.Fail(sprintf "Settled deletion needs its canonical receipt: %A" other)
+            for changed, refName, oid in
+                [ { parent with RequestJson = """{"delete":"changed"}""" }, gitRef, head
+                  parent, $"refs/heads/jarvis-review/_reviews/{Guid.NewGuid():N}/r1", head
+                  parent, gitRef, String.replicate 40 "a" ] do
+                Assert.That(
+                    LedgerStore.deleteReservedReviewRefForAction f.ProjectTwo changed refName oid
+                    |> Result.isError, Is.True,
+                    "Same parent UUID cannot change request, ref or first selected OID")
+            Assert.That((OriginalGitWriterAdmissionJournal.inspect journal |> success).HighWater,
+                        Is.EqualTo(settled.HighWater))
+            let freshAbsentRef = $"refs/heads/jarvis-review/_reviews/{Guid.NewGuid():N}/r1"
+            let newParent = { parent with OperationId = Guid.NewGuid() }
+            Assert.That(LedgerStore.deleteReservedReviewRefForAction f.ProjectTwo newParent freshAbsentRef head
+                        |> success, Is.EqualTo("AlreadyAbsent"),
+                        "First-time absence is a no-op, not evidence of prior authorship")
+            let noOp = OriginalGitWriterAdmissionJournal.inspect journal |> success
+            Assert.That(noOp.PendingOrUnknown, Is.Empty,
+                        "A confirmed no-push absence must not be logged as physical UNKNOWN")
+            Assert.That(
+                LedgerStore.deleteReservedReviewRefForAction f.ProjectTwo newParent freshAbsentRef head
+                |> Result.isError, Is.True,
+                "Even a settled no-effect stage cannot be replayed without its receipt")
+            Assert.That(noOp.RouteCoverageProven, Is.False))
+
+    [<Test>]
+    member _.ManagedGuardedDeleteDefaultOffAbsentRefIsNoOp() =
+        // A journal may not be disabled after activation; verify default-off
+        // in a distinct never-activated disposable host fixture instead.
+        withFixture (fun f ->
+            let head = git f.ProjectOne.RepositoryPath [ "rev-parse"; "HEAD" ]
+            let parent =
+                { OperationId = Guid.NewGuid(); Actor = "Worker21"
+                  Kind = "DeleteReservedReviewRef"; RequestJson = "{}" }
+            Assert.That(
+                LedgerStore.deleteReservedReviewRefForAction f.ProjectOne parent
+                    $"refs/heads/jarvis-review/_reviews/{Guid.NewGuid():N}/r1" head
+                |> success, Is.EqualTo("AlreadyAbsent"),
+                "Unactivated default-off host preserves first-time no-effect semantics"))

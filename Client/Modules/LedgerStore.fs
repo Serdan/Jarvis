@@ -2469,7 +2469,7 @@ module LedgerStore =
         (validRef: string -> bool) gitRef firstOid
         (preflight: bool -> Result<unit, LedgerFailure>)
         (publish: bool -> Result<'a, LedgerFailure>)
-        (verified: 'a -> bool) : Result<'a, LedgerFailure> =
+        (verified: 'a -> bool) (provenNoEffect: 'a -> bool) : Result<'a, LedgerFailure> =
         if action.OperationId = Guid.Empty || action.Kind <> expectedAction
            || String.IsNullOrWhiteSpace action.Actor
            || not (validRequestJson action.RequestJson)
@@ -2499,7 +2499,7 @@ module LedgerStore =
                     match preflight enabled with
                     | Error failure -> Error failure
                     | Ok () -> publish enabled)
-                verified (fun _ -> false) OutcomeUnknown
+                verified provenNoEffect OutcomeUnknown
 
     // Keep direct leaf APIs' default-off compatibility. ReviewWorkflow's
     // original UUID and canonical request digest now follow their ref effect.
@@ -2523,6 +2523,7 @@ module LedgerStore =
                         | Error failure -> Error failure)
                 (fun enabled -> publishReviewRefCore enabled binding gitRef headOid)
                 (fun () -> true)
+                (fun _ -> false)
 
     let publishIntegrationRefForAction binding (action: LedgerIntent) gitRef headOid =
         withSourceRefEffectStage binding action "SubmitIntegration" "IntegrationCreate"
@@ -2537,6 +2538,7 @@ module LedgerStore =
                     | Error failure -> Error failure)
             (fun enabled -> publishIntegrationRefCore enabled binding gitRef headOid)
             (fun () -> true)
+            (fun _ -> false)
 
     // This bounded entrypoint is not connected to an unsanctioned cleanup route.
     // No canonical deletion action currently exists in ReviewWorkflow.
@@ -2545,24 +2547,46 @@ module LedgerStore =
            || not (safeReviewRef gitRef) || not (validSourceCommitOid expectedOid) then
             Error(InvalidBinding "Invalid guarded review source-ref deletion action.")
         else
-            // Reinspect before committing any first-selection journal stage:
-            // wrong-OID or already-absent deletes have performed no effect.
+            // A wrong-OID first attempt has no delete lease; leave the journal
+            // untouched so a corrected first selection can still be submitted.
+            // Absence is different: a prior identical stage might have removed
+            // the ref before its acknowledgement was lost. Enter its durable
+            // admission fence even when the remote ref is now missing.
             match inspectRemoteReviewRef binding gitRef with
             | Error failure -> Error failure
-            | Ok None -> Ok "AlreadyAbsent"
             | Ok(Some current) when current <> expectedOid ->
                 Error(SourceReviewRefUnavailable "Guarded source-stage delete OID mismatch.")
-            | Ok(Some _) ->
+            | Ok initialRef ->
+                let initiallyAbsent = Option.isNone initialRef
                 withSourceRefEffectStage binding action "DeleteReservedReviewRef" "ReviewGuardedDelete"
                     safeReviewRef gitRef expectedOid
                     (fun enabled ->
                         if not enabled then Ok ()
                         else
                             match inspectRemoteReviewRef binding gitRef with
-                            | Ok(Some current) when current = expectedOid -> Ok ()
+                            | Ok None when initiallyAbsent -> Ok ()
+                            | Ok(Some current) when not initiallyAbsent && current = expectedOid -> Ok ()
+                            | Ok None ->
+                                Error(OutcomeUnknown "SourceRefEffectStage/RefDisappearedAfterInitialObservation")
                             | Ok(Some _) ->
                                 Error(SourceReviewRefUnavailable "Guarded source-stage delete OID changed.")
-                            | Ok None -> Error(OutcomeUnknown "SourceRefEffectStage/PreexistingRefAbsent")
                             | Error failure -> Error failure)
-                    (fun _ -> deleteReservedReviewRef binding gitRef expectedOid)
+                    (fun _ ->
+                        if initiallyAbsent then
+                            // Fresh no-op: reconfirm absence before reporting it.
+                            // No push occurred, so this is a proven rejection of
+                            // the physical stage, never authenticated deletion.
+                            match inspectRemoteReviewRef binding gitRef with
+                            | Ok None -> Ok "AlreadyAbsent"
+                            | Ok(Some _) ->
+                                Error(OutcomeUnknown "SourceRefEffectStage/RefAppearedDuringNoOp")
+                            | Error failure -> Error failure
+                        else
+                            match deleteReservedReviewRef binding gitRef expectedOid with
+                            | Ok "AlreadyAbsent" ->
+                                // A concurrent removal between observations is
+                                // unattributed, not an acknowledged own effect.
+                                Error(OutcomeUnknown "SourceRefEffectStage/UnattributedConcurrentRemoval")
+                            | outcome -> outcome)
                     (fun status -> status = "Deleted")
+                    (fun status -> initiallyAbsent && status = "AlreadyAbsent")

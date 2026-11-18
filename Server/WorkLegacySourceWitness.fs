@@ -2,6 +2,9 @@ namespace Jarvis.WorkQueues
 
 open System
 open System.Text.RegularExpressions
+open System.Text
+open System.IO
+open System.Security.Cryptography
 open Server
 
 // C -> B source boundary. The original Git publisher contract is not yet
@@ -150,6 +153,44 @@ module internal WorkLegacySourceWitness =
         // graph, role, claim, review, integration and launch fields.
         expected = observed
 
+    // Versioned, length-prefixed UTF-8 and fixed-width little-endian integers.
+    // The remote reader must independently authenticate the anchor containing
+    // this digest; hashing alone does not establish remote authority.
+    let effectJournalDigest (target: OriginalGitPublisherTarget) (highWater: int64)
+                            (events: WorkLegacySourceEffectEvent list) =
+        use stream = new MemoryStream()
+        use writer = new BinaryWriter(stream, Encoding.UTF8, true)
+        let writeString (value: string) = writer.Write(value)
+        writeString "jarvis.work.legacy-source-effect-journal.v1"
+        writeString (match target.Purpose with
+                     | OriginalGitRefPurpose.ProjectLedger -> "project-ledger"
+                     | OriginalGitRefPurpose.AccountLedger -> "account-ledger"
+                     | OriginalGitRefPurpose.SourceEffect -> "source-effect")
+        writeString (target.AccountId.ToString("D"))
+        match target.ProjectId with
+        | Some id -> writer.Write(true); writeString (id.ToString("D"))
+        | None -> writer.Write(false)
+        writeString (target.LedgerId.ToString("D"))
+        writer.Write(target.LedgerEpoch)
+        writeString target.CanonicalRepositoryId
+        writeString target.ApprovedRemoteFingerprintSha256
+        writeString target.GitRef
+        writer.Write(highWater)
+        writer.Write(events.Length)
+        for event in events do
+            writer.Write(event.Sequence)
+            writeString (event.OperationId.ToString("D"))
+            writeString event.RequestSha256
+            writeString event.ResultSha256
+            match event.Outcome with
+            | WorkLegacySourceEffectOutcome.NoExternalEffect -> writeString "none"
+            | WorkLegacySourceEffectOutcome.Unknown -> writeString "unknown"
+            | WorkLegacySourceEffectOutcome.Observed commit ->
+                writeString "observed"
+                writeString commit
+        writer.Flush()
+        SHA256.HashData(stream.ToArray()) |> Convert.ToHexStringLower
+
     let private checkEffectJournal (project: WorkLegacyImportProject)
                                    (ledger: WorkLegacySourceLedgerCapture) =
         match ledger.EffectJournal with
@@ -192,6 +233,8 @@ module internal WorkLegacySourceWitness =
                         | WorkLegacySourceEffectOutcome.NoExternalEffect -> true
                         | WorkLegacySourceEffectOutcome.Observed commit -> valid oid commit
                         | WorkLegacySourceEffectOutcome.Unknown -> false)) (WorkLegacySourceWitnessGap.Unknown "Unresolved or unobserved original external effect.")
+                let! () = require (
+                    effectJournalDigest journal.Target journal.DurableHighWater journal.Events = journal.RemoteDigestSha256) (WorkLegacySourceWitnessGap.Unknown "Original effect audit digest does not bind target, high-water and events.")
                 return journal.Target
             }
 

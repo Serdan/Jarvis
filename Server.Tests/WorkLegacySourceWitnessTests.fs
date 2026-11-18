@@ -218,13 +218,14 @@ let private projectJournal (p: WorkLegacyImportProject) (repo: GitFixture) =
           RequestSha256 = p.Operations.Head.RequestSha256
           ResultSha256 = p.Operations.Head.ResultSha256
           Outcome = WorkLegacySourceEffectOutcome.Observed repo.Original }
+    let journalDigest = WorkLegacySourceWitness.effectJournalDigest effectTarget 1L [ e ]
     { Target = effectTarget
       RemoteHead = runGit repo.Folder [ "rev-parse"; "refs/heads/witness-effects" ]
       Events = [ e ]
       DurableHighWater = 1L
       RemoteHighWater = 1L
-      DurableDigestSha256 = digest ("effect:" + p.ProjectId.ToString("D"))
-      RemoteDigestSha256 = digest ("effect:" + p.ProjectId.ToString("D")) }
+      DurableDigestSha256 = journalDigest
+      RemoteDigestSha256 = journalDigest }
 
 let private ledgerCapture account (repo: GitFixture) ops effectJournal f =
     { Target =
@@ -420,6 +421,25 @@ let ``pending effect gaps rollback duplicate UUID high-water and UNKNOWN fail cl
                 let entries = j.Events |> List.map (fun e -> { e with Outcome = WorkLegacySourceEffectOutcome.Unknown })
                 { j with Events = entries })
         Assert.That(inspect f effectUnknown |> isUnknown, Is.True)
+        let alteredOutcome =
+            changeJournal (fun j ->
+                let events = j.Events |> List.map (fun e -> { e with Outcome = WorkLegacySourceEffectOutcome.NoExternalEffect })
+                { j with Events = events })
+        Assert.That(inspect f alteredOutcome |> isUnknown, Is.True)
+        let alteredCommit =
+            changeJournal (fun j ->
+                let events = j.Events |> List.map (fun e -> { e with Outcome = WorkLegacySourceEffectOutcome.Observed f.Repos.[2].Original })
+                { j with Events = events })
+        Assert.That(inspect f alteredCommit |> isUnknown, Is.True)
+        let originalJournal = f.Captured.LedgerCaptures.[1].EffectJournal.Value
+        let digestFor target water events = WorkLegacySourceWitness.effectJournalDigest target water events
+        Assert.That(digestFor originalJournal.Target originalJournal.DurableHighWater originalJournal.Events,
+                    Is.EqualTo originalJournal.RemoteDigestSha256)
+        let changedTarget = { originalJournal.Target with GitRef = "refs/heads/other" }
+        Assert.That(digestFor changedTarget originalJournal.DurableHighWater originalJournal.Events,
+                    Is.Not.EqualTo originalJournal.RemoteDigestSha256)
+        Assert.That(digestFor originalJournal.Target 2L originalJournal.Events,
+                    Is.Not.EqualTo originalJournal.RemoteDigestSha256)
         let forgedResult =
             changeJournal (fun j ->
                 let forged = j.Events |> List.map (fun e ->

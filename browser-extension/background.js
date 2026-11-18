@@ -197,15 +197,18 @@ function pageExecutionRevocation(pin) {
   if (socket !== pin.socket || !connected || connectionId !== pin.connectionId)
     return "ConnectionEpochMismatch";
   const reg = pin.reg;
-  if (registrations.find(r => r.registrationId === reg.registrationId) !== reg ||
-      reg.registrationGeneration !== pin.generation ||
-      (reg.agentCreated === true) !== pin.agentCreated)
-    return "RegistrationStale";
+  // An operator opt-out is the primary cause of revocation even if the
+  // stale agent-created registration was already garbage-collected during
+  // this request's asynchronous preflight. Preserve the exact failure reason.
   if (pin.agentCreated) {
     if (!allowAgentCreatedTabs) return "AgentCreatedTabsDisabled";
     if (agentTabAuthorizationEpoch !== pin.authorizationEpoch)
       return "AgentCreatedTabsAuthorizationChanged";
   }
+  if (registrations.find(r => r.registrationId === reg.registrationId) !== reg ||
+      reg.registrationGeneration !== pin.generation ||
+      (reg.agentCreated === true) !== pin.agentCreated)
+    return "RegistrationStale";
   if (reg.blocked || reg.sessionEpoch !== sessionEpoch || sessionEpoch !== pin.sessionEpoch)
     return "RegistrationStale";
   if (pin.agentCreated &&
@@ -244,20 +247,38 @@ async function authorizePageExecution(pin) {
   return null;
 }
 async function refreshRegistrations() {
-  const missing = new Set();
+  const stale = new Map();
   for (const reg of [...registrations]) {
+    const generation = reg.registrationGeneration;
     const availability = await assess(reg);
-    if (availability === "missing") missing.add(reg.registrationId);
-    else reg.availability = availability;
+    // Manually registered tabs may be reauthorized by the operator.
+    // Jarvis-created registrations that are permanently revoked cannot be
+    // reused and must not reserve aliases or accumulate across browser restarts.
+    // A transient tabs.get/permissions error is NOT proof of permanent revocation.
+    const permanentlyRevoked = reg.agentCreated === true &&
+      (reg.blocked === true || reg.sessionEpoch !== sessionEpoch);
+    if (availability === "missing" || permanentlyRevoked) {
+      stale.set(reg.registrationId, { reg, generation, missing: availability === "missing" });
+    } else if (registrations.includes(reg)) {
+      reg.availability = availability;
+    }
   }
-  if (missing.size) {
-    // Filter the current array: an async refresh must never resurrect removed tabs
-    // or discard registrations added while the availability checks were pending.
-    registrations = registrations.filter(reg => !missing.has(reg.registrationId));
-    await persist();
-    return true;
-  }
-  return false;
+  if (!stale.size) return false;
+  // An async assessment must never erase an adopted/re-authorized registration.
+  // Recheck object identity, generation and permanent revocation immediately
+  // before updating the registry. Never close the underlying browser tab.
+  const before = registrations.length;
+  registrations = registrations.filter(reg => {
+    const candidate = stale.get(reg.registrationId);
+    return !candidate || candidate.reg !== reg ||
+      candidate.generation !== reg.registrationGeneration ||
+      (!candidate.missing &&
+       !(reg.agentCreated === true &&
+         (reg.blocked === true || reg.sessionEpoch !== sessionEpoch)));
+  });
+  if (registrations.length === before) return false;
+  await persist();
+  return true;
 }
 async function advertise() {
   await refreshRegistrations();
@@ -941,6 +962,40 @@ async function unregister(tabId) {
   await persist();
   await advertise();
 }
+// UI-only registration management. This revokes extension access, NOT the tab.
+async function unregisterRegistration(registrationId, registrationGeneration) {
+  const reg = registrations.find(r => r.registrationId === registrationId);
+  if (!reg || !Number.isInteger(registrationGeneration) ||
+      reg.registrationGeneration !== registrationGeneration)
+    throw new Error("RegistrationStale");
+  registrations = registrations.filter(r => r !== reg);
+  await persist();
+  await advertise();
+}
+// An explicit operator cleanup for unavailable Jarvis-owned registrations.
+// In-flight/replaced registrations are fenced by immutable object + generation.
+async function forgetUnavailableAgentRegistrations() {
+  const candidates = new Map();
+  for (const reg of [...registrations]) {
+    if (!reg.agentCreated) continue;
+    const generation = reg.registrationGeneration;
+    const availability = await assess(reg);
+    if (availability === "needsReauthorization" || availability === "missing")
+      candidates.set(reg.registrationId, { reg, generation });
+  }
+  const before = registrations.length;
+  registrations = registrations.filter(reg => {
+    const old = candidates.get(reg.registrationId);
+    return !old || old.reg !== reg || old.generation !== reg.registrationGeneration ||
+      reg.agentCreated !== true;
+  });
+  const removed = before - registrations.length;
+  if (removed) {
+    await persist();
+    await advertise();
+  }
+  return removed;
+}
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
   // Message origin must be our own extension UI, never a webpage/content script.
   if (sender.id !== chrome.runtime.id || sender.tab) {
@@ -1003,6 +1058,13 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
     if (message.kind === "unregister") {
       await unregister(message.tabId);
       return {};
+    }
+    if (message.kind === "unregisterRegistration") {
+      await unregisterRegistration(message.registrationId, message.registrationGeneration);
+      return {};
+    }
+    if (message.kind === "forgetUnavailableAgentRegistrations") {
+      return { removed: await forgetUnavailableAgentRegistrations() };
     }
     throw new Error("Unknown extension operation");
   })().then(data => respond({ ok: true, ...data }),

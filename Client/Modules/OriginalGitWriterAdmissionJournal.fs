@@ -635,10 +635,14 @@ module OriginalGitWriterAdmissionJournal =
     // invoking Git, and its caller must verify the durable remote effect before
     // reporting success. Failed/uncertain confirmation remains UNKNOWN across
     // process restarts, including when STOP races an already-admitted push.
+    // A caller can separately prove that every attempted publication was
+    // rejected without an external effect; that outcome settles as Rejected,
+    // not Unknown. A changed remote head alone is not that proof.
     // A settled duplicate is never a permit to publish again.
-    let internal withPublication operationId kind authority gitRef payload
+    let internal withPublicationClassified operationId kind authority gitRef payload
                                  (publish: unit -> Result<'a, 'error>)
                                  (verified: 'a -> bool)
+                                 (provenRejected: 'a -> bool)
                                  (failure: string -> 'error) : Result<'a, 'error> =
         match admit operationId kind authority gitRef payload with
         | Error reason -> Error(failure reason)
@@ -655,6 +659,10 @@ module OriginalGitWriterAdmissionJournal =
                         match settle permit true true with
                         | Ok () -> Ok result
                         | Error reason -> Error(failure reason)
+                    | Ok result when provenRejected result ->
+                        match settle permit false false with
+                        | Ok () -> Ok result
+                        | Error reason -> Error(failure reason)
                     | Ok _ ->
                         match settle permit false true with
                         | Ok () -> Error(failure "OriginalWriterJournalUnknown/PublicationUnverified")
@@ -666,6 +674,13 @@ module OriginalGitWriterAdmissionJournal =
                 with _ ->
                     settle permit false true |> ignore
                     reraise()
+
+    let internal withPublication operationId kind authority gitRef payload
+                                 (publish: unit -> Result<'a, 'error>)
+                                 (verified: 'a -> bool)
+                                 (failure: string -> 'error) : Result<'a, 'error> =
+        withPublicationClassified operationId kind authority gitRef payload
+            publish verified (fun _ -> false) failure
 
     // Identity is the logical remote authority, not an interchangeable local
     // clone path or a caller-asserted actor name. Scope and ref are both bound.

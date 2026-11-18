@@ -1160,3 +1160,174 @@ type LegacyWriterProtocolFenceTests() =
                         "The full effect-identity chain must match the host commitment")
             Assert.That(OriginalGitWriterAdmissionJournal.stop path |> Result.isError, Is.True,
                         "STOP must never attest a modified history with matching row count"))
+
+
+    // Real bare-Git CAS contention must replan inside one logical journal
+    // admission, not re-enter the same unresolved UUID on each attempt.
+    [<Test>]
+    member _.JournalEnabledProjectContentionReplansSameUuidAndDrainsStop() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "project-contention.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            let operationId = Guid.NewGuid()
+            let original =
+                { OperationId = operationId; Actor = "OriginalWriter"
+                  Kind = "JournalContention"; RequestJson = "{}" }
+            let competing =
+                { OperationId = Guid.NewGuid(); Actor = "CompetingWriter"
+                  Kind = "CompetingJournalContention"; RequestJson = "{}" }
+            let mutable raced = false
+            let mutable plans = 0
+            let outcome =
+                LedgerStore.withGitTransportFaults
+                    (fun phase args ->
+                        if not raced && phase = "publication-push"
+                           && (args |> List.tryHead) = Some "push" then
+                            raced <- true
+                            LedgerStore.transact f.ProjectTwo competing (fun _ ->
+                                Ok [ { Path = "records/w21/racing-project.json"
+                                       ExpectedBlobOid = None; Content = "{}" } ])
+                            |> success |> ignore
+                        None)
+                    (fun () ->
+                        LedgerStore.transact f.ProjectOne original (fun _ ->
+                            plans <- plans + 1
+                            Ok [ { Path = "records/w21/original-project.json"
+                                   ExpectedBlobOid = None; Content = "{}" } ]))
+            let applied = outcome |> success
+            Assert.That(raced, Is.True, "Fixture must advance the actual bare-Git remote")
+            Assert.That(plans, Is.EqualTo(2), "Contention must reach the bounded same-UUID replan")
+            Assert.That(applied.Operation.OperationId, Is.EqualTo(operationId.ToString("D")))
+            let latest = LedgerStore.fetch f.ProjectTwo |> success
+            let competitor, _ = LedgerStore.readAt f.ProjectTwo latest "records/w21/racing-project.json" |> success
+            let originalRecord, _ = LedgerStore.readAt f.ProjectTwo latest "records/w21/original-project.json" |> success
+            Assert.That(competitor.IsSome, Is.True)
+            Assert.That(originalRecord.IsSome, Is.True)
+            let beforeStop = OriginalGitWriterAdmissionJournal.inspect path |> success
+            Assert.That(beforeStop.HighWater, Is.EqualTo(2L),
+                        "One original admission and one independent competitor")
+            Assert.That(beforeStop.PendingOrUnknown, Is.Empty,
+                        "A proven-rejected intermediate CAS is not a permanent UNKNOWN")
+            Assert.That(beforeStop.SettledHighWater, Is.EqualTo(beforeStop.HighWater))
+            let stopped = OriginalGitWriterAdmissionJournal.stop path |> success
+            Assert.That(stopped.AdmissionClosed, Is.True)
+            Assert.That(stopped.PendingOrUnknown, Is.Empty)
+            let replay =
+                LedgerStore.transact f.ProjectOne original (fun _ ->
+                    failwith "Already-applied UUID must not invoke the planner")
+                |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That((OriginalGitWriterAdmissionJournal.inspect path |> success).HighWater,
+                        Is.EqualTo(2L)))
+
+    [<Test>]
+    member _.JournalEnabledPutRecordContentionUsesOneAdmissionAndDrainsStop() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "put-record-contention.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            let record =
+                { OperationId = Guid.NewGuid(); Actor = "PutRecordOwner"
+                  Path = "records/w21/original-record.json"
+                  ExpectedBlobOid = None; Content = "{}" }
+            let competing =
+                { OperationId = Guid.NewGuid(); Actor = "CompetingWriter"
+                  Kind = "PutRecordContention"; RequestJson = "{}" }
+            let mutable raced = false
+            let outcome =
+                LedgerStore.withGitTransportFaults
+                    (fun phase args ->
+                        if not raced && phase = "publication-push"
+                           && (args |> List.tryHead) = Some "push" then
+                            raced <- true
+                            LedgerStore.transact f.ProjectTwo competing (fun _ ->
+                                Ok [ { Path = "records/w21/racing-put-record.json"
+                                       ExpectedBlobOid = None; Content = "{}" } ])
+                            |> success |> ignore
+                        None)
+                    (fun () -> LedgerStore.putRecord f.ProjectOne record)
+            let applied = outcome |> success
+            Assert.That(raced, Is.True, "PutRecord must encounter a real competing Git CAS")
+            Assert.That(applied.Operation.OperationId, Is.EqualTo(record.OperationId.ToString("D")))
+            let latest = LedgerStore.fetch f.ProjectTwo |> success
+            let competitor, _ = LedgerStore.readAt f.ProjectTwo latest "records/w21/racing-put-record.json" |> success
+            let originalRecord, _ = LedgerStore.readAt f.ProjectTwo latest record.Path |> success
+            Assert.That(competitor.IsSome, Is.True)
+            Assert.That(originalRecord.IsSome, Is.True)
+            let beforeStop = OriginalGitWriterAdmissionJournal.inspect path |> success
+            Assert.That(beforeStop.HighWater, Is.EqualTo(2L))
+            Assert.That(beforeStop.PendingOrUnknown, Is.Empty)
+            let stopped = OriginalGitWriterAdmissionJournal.stop path |> success
+            Assert.That(stopped.AdmissionClosed, Is.True)
+            Assert.That(stopped.SettledHighWater, Is.EqualTo(2L))
+            let duplicate = LedgerStore.putRecord f.ProjectOne record |> success
+            Assert.That(duplicate.AlreadyApplied, Is.True)
+            Assert.That((OriginalGitWriterAdmissionJournal.inspect path |> success).HighWater,
+                        Is.EqualTo(2L)))
+
+
+    [<Test>]
+    member _.JournalEnabledContentionWithUncertainPushNeverBlindlyRetriesOrDrainsStop() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "uncertain-project-contention.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            let operationId = Guid.NewGuid()
+            let original =
+                { OperationId = operationId; Actor = "OriginalWriter"
+                  Kind = "UncertainJournalContention"; RequestJson = "{}" }
+            let competing =
+                { OperationId = Guid.NewGuid(); Actor = "CompetingWriter"
+                  Kind = "CompetingUncertainContention"; RequestJson = "{}" }
+            let mutable raced = false
+            let mutable planned = 0
+            let attempt () =
+                LedgerStore.transact f.ProjectOne original (fun _ ->
+                    planned <- planned + 1
+                    Ok [ { Path = "records/w21/uncertain-original.json"
+                           ExpectedBlobOid = None; Content = "{}" } ])
+            let outcome =
+                LedgerStore.withGitTransportFaults
+                    (fun phase args ->
+                        if not raced && phase = "publication-push"
+                           && (args |> List.tryHead) = Some "push" then
+                            raced <- true
+                            LedgerStore.transact f.ProjectTwo competing (fun _ ->
+                                Ok [ { Path = "records/w21/uncertain-competitor.json"
+                                       ExpectedBlobOid = None; Content = "{}" } ])
+                            |> success |> ignore
+                            // A timed-out original push has no trustworthy
+                            // rejection receipt, even after another CAS wins.
+                            Some { FaultExitCode = 124; FaultStderr = "injected push timeout"
+                                   FaultTimedOut = true }
+                        else None)
+                    attempt
+            Assert.That(raced, Is.True)
+            match outcome with
+            | Error(OutcomeUnknown _) -> ()
+            | other -> Assert.Fail(sprintf "Uncertain push must remain UNKNOWN, got %A" other)
+            Assert.That(planned, Is.EqualTo(1), "Uncertain publication may not replan")
+            let current = LedgerStore.fetch f.ProjectTwo |> success
+            let competitor, _ = LedgerStore.readAt f.ProjectTwo current "records/w21/uncertain-competitor.json" |> success
+            let escaped, _ = LedgerStore.readAt f.ProjectTwo current "records/w21/uncertain-original.json" |> success
+            Assert.That(competitor.IsSome, Is.True)
+            Assert.That(escaped.IsNone, Is.True)
+            let witness = OriginalGitWriterAdmissionJournal.inspect path |> success
+            Assert.That(witness.PendingOrUnknown.Length, Is.EqualTo(1))
+            Assert.That(witness.PendingOrUnknown.Head.Status, Is.EqualTo("Unknown"))
+            let stopped = OriginalGitWriterAdmissionJournal.stop path |> success
+            Assert.That(stopped.AdmissionClosed, Is.True)
+            Assert.That(stopped.PendingOrUnknown.Length, Is.EqualTo(1),
+                        "STOP must retain uncertain pre-stop remote effects")
+            let originalRemoteHead =
+                git f.Root [ "--git-dir=" + f.ProjectRemote; "rev-parse"
+                             "refs/heads/jarvis-orchestration" ]
+            match attempt () with
+            | Error(OutcomeUnknown detail) ->
+                Assert.That(detail, Does.Contain("OriginalWriterAdmissionClosed"))
+            | other -> Assert.Fail(sprintf "Unknown UUID must not publish again, got %A" other)
+            Assert.That(
+                git f.Root [ "--git-dir=" + f.ProjectRemote; "rev-parse"
+                             "refs/heads/jarvis-orchestration" ],
+                Is.EqualTo(originalRemoteHead), "Same UUID must never republish after STOP"))

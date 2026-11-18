@@ -1289,7 +1289,7 @@ module ReviewWorkflow =
                 do! LedgerStore.verifySourceAncestry binding targetHead pinned
                 let managedRef = $"refs/heads/jarvis-integration/{submissionId:N}"
                 do! LegacyDirectWriterFence.preflightSourcePublication binding
-                do! LedgerStore.publishIntegrationRef binding managedRef pinned
+                do! LedgerStore.publishIntegrationRefForAction binding action managedRef pinned
                 do! LedgerStore.fetchIntegrationRef binding managedRef pinned
                 return! LegacyDirectWriterFence.transact binding action (fun current -> result {
                     let! _ = required<ReviewTask> binding current (taskPath taskId)
@@ -3416,7 +3416,7 @@ module ReviewWorkflow =
                 if existing.IsSome then
                     return! Error(StaleEntityVersion "Review ID already exists.")
                 do! LegacyDirectWriterFence.preflightSourcePublication binding
-                do! LedgerStore.publishReviewRef binding refName sourceHead
+                do! LedgerStore.publishReviewRefForAction binding action refName sourceHead
                 let writeResult = LegacyDirectWriterFence.transact binding action (fun current -> result {
                     let! existing = read<BranchReview> binding current (branchReviewPath taskId id)
                     if existing.IsSome then
@@ -3467,7 +3467,7 @@ module ReviewWorkflow =
                     else LedgerStore.reviewMergeBase binding existing.TargetRef sourceHead
                 do! LedgerStore.verifySourceObject binding sourceHead
                 do! LegacyDirectWriterFence.preflightSourcePublication binding
-                do! LedgerStore.publishReviewRef binding refName sourceHead
+                do! LedgerStore.publishReviewRefForAction binding action refName sourceHead
                 let writeResult =
                     LegacyDirectWriterFence.transact binding action (fun current -> result {
                         let! review, reviewOid =

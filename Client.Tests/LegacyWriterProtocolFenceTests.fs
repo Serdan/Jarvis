@@ -808,6 +808,83 @@ type LegacyWriterProtocolFenceTests() =
                         "Old UUID replays may not publish source refs"))
 
     [<Test>]
+    member _.ManagedSourceStagePinsParentRequestRefAndFirstOid() =
+        withFixture (fun f ->
+            let journal = Path.Combine(f.Root, "staged-ref-effects.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal journal
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, journal)
+            let head = git f.ProjectOne.RepositoryPath [ "rev-parse"; "HEAD" ]
+            let parent =
+                { OperationId = Guid.NewGuid(); Actor = "Worker21"
+                  Kind = "SubmitBranchReview"; RequestJson = "{\"reviewId\":\"one\"}" }
+            let gitRef = $"refs/heads/jarvis-review/_reviews/{Guid.NewGuid():N}/r1"
+            let readRef name =
+                git f.Root [ "--git-dir=" + f.ProjectRemote; "for-each-ref"; "--format=%(objectname)"; name ]
+            LedgerStore.publishReviewRefForAction f.ProjectOne parent gitRef head |> success
+            Assert.That(readRef gitRef, Is.EqualTo(head))
+            let before = OriginalGitWriterAdmissionJournal.inspect journal |> success
+            Assert.That(before.HighWater, Is.GreaterThanOrEqualTo(2L),
+                        "A parent stage and physical managed ref require distinct durable records")
+            Assert.That(before.PendingOrUnknown, Is.Empty)
+            Assert.That(before.RouteCoverageProven, Is.False)
+            Assert.That(
+                LedgerStore.publishReviewRefForAction f.ProjectTwo parent gitRef head
+                |> Result.isError, Is.True, "A settled stage must not republish")
+            Assert.That(
+                LedgerStore.publishReviewRefForAction f.ProjectTwo
+                    { parent with RequestJson = "{\"reviewId\":\"changed\"}" } gitRef head
+                |> Result.isError, Is.True, "Same parent stage cannot change canonical request")
+            let alternateRef = $"refs/heads/jarvis-review/_reviews/{Guid.NewGuid():N}/r1"
+            Assert.That(
+                LedgerStore.publishReviewRefForAction f.ProjectTwo parent alternateRef head
+                |> Result.isError, Is.True, "Same parent stage cannot change managed ref")
+            Assert.That(readRef alternateRef, Is.Empty)
+            git f.ProjectOne.RepositoryPath [ "commit"; "--allow-empty"; "-m"; "alternate source object" ]
+            |> ignore
+            let otherOid = git f.ProjectOne.RepositoryPath [ "rev-parse"; "HEAD" ]
+            Assert.That(
+                LedgerStore.publishReviewRefForAction f.ProjectOne parent gitRef otherOid
+                |> Result.isError, Is.True, "Same stage cannot change first intended OID")
+            Assert.That(readRef gitRef, Is.EqualTo(head))
+            let after = OriginalGitWriterAdmissionJournal.inspect journal |> success
+            Assert.That(after.HighWater, Is.EqualTo(before.HighWater)))
+
+    [<Test>]
+    member _.ManagedSourceStageRetainsOrphanAfterLedgerCasConflictAndGuardsDeletion() =
+        withFixture (fun f ->
+            let journal = Path.Combine(f.Root, "staged-orphan.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal journal
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, journal)
+            let head = git f.ProjectOne.RepositoryPath [ "rev-parse"; "HEAD" ]
+            let gitRef = $"refs/heads/jarvis-review/_reviews/{Guid.NewGuid():N}/r1"
+            let action =
+                { OperationId = Guid.NewGuid(); Actor = "Worker21"
+                  Kind = "SubmitBranchReview"; RequestJson = "{\"orphan\":true}" }
+            LedgerStore.publishReviewRefForAction f.ProjectOne action gitRef head |> success
+            let rejected =
+                LedgerStore.transact f.ProjectTwo
+                    { OperationId = Guid.NewGuid(); Actor = "Competitor"
+                      Kind = "ConcurrentLedgerCas"; RequestJson = "{}" }
+                    (fun _ -> Ok [ { Path = "records/stage-orphan.json"
+                                     ExpectedBlobOid = Some(String.replicate 40 "0")
+                                     Content = "{}" } ])
+            Assert.That(Result.isError rejected, Is.True)
+            let readRef () =
+                git f.Root [ "--git-dir=" + f.ProjectRemote; "for-each-ref"; "--format=%(objectname)"; gitRef ]
+            Assert.That(readRef (), Is.EqualTo(head),
+                        "Managed ref survives a subsequent, separate ledger failure")
+            let cleanup =
+                { OperationId = Guid.NewGuid(); Actor = "Worker21"
+                  Kind = "DeleteReservedReviewRef"; RequestJson = "{\"cleanup\":true}" }
+            Assert.That(
+                LedgerStore.deleteReservedReviewRefForAction f.ProjectTwo cleanup gitRef (String.replicate 40 "a")
+                |> Result.isError, Is.True, "Wrong-OID guarded delete must fail")
+            Assert.That(readRef (), Is.EqualTo(head))
+            Assert.That(
+                LedgerStore.deleteReservedReviewRefForAction f.ProjectTwo cleanup gitRef head
+                |> success, Is.EqualTo("Deleted"))
+            Assert.That(readRef (), Is.Empty))
+    [<Test>]
     member _.ConfiguredOriginalWriterJournalCoversProjectAccountAndSourceAndStop() =
         withFixture (fun f ->
             let path = Path.Combine(f.Root, "original-live-routes.db")
@@ -1422,3 +1499,130 @@ type LegacyWriterProtocolFenceTests() =
                 git f.Root [ "--git-dir=" + f.ProjectRemote; "rev-parse"
                              "refs/heads/jarvis-orchestration" ],
                 Is.EqualTo(originalRemoteHead), "Same UUID must never republish after STOP"))
+
+    [<Test>]
+    member _.ManagedIntegrationStageRejectsPreexistingPhysicalRefAndChangedParent() =
+        withFixture (fun f ->
+            let journal = Path.Combine(f.Root, "staged-integration.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal journal
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, journal)
+            let head = git f.ProjectOne.RepositoryPath [ "rev-parse"; "HEAD" ]
+            let gitRef = $"refs/heads/jarvis-integration/{Guid.NewGuid():N}"
+            let action =
+                { OperationId = Guid.NewGuid(); Actor = "Worker21"
+                  Kind = "SubmitIntegration"; RequestJson = "{\"submissionId\":\"one\"}" }
+            let remote name =
+                git f.Root
+                    [ "--git-dir=" + f.ProjectRemote; "for-each-ref"; "--format=%(objectname)"; name ]
+            LedgerStore.publishIntegrationRefForAction f.ProjectOne action gitRef head |> success
+            Assert.That(remote gitRef, Is.EqualTo(head))
+            let before = OriginalGitWriterAdmissionJournal.inspect journal |> success
+            Assert.That(before.HighWater, Is.GreaterThanOrEqualTo(2L))
+            Assert.That(before.PendingOrUnknown, Is.Empty)
+            let changed = { action with RequestJson = "{\"submissionId\":\"different\"}" }
+            Assert.That(
+                LedgerStore.publishIntegrationRefForAction f.ProjectTwo changed gitRef head
+                |> Result.isError, Is.True)
+            let alternative = $"refs/heads/jarvis-integration/{Guid.NewGuid():N}"
+            Assert.That(
+                LedgerStore.publishIntegrationRefForAction f.ProjectTwo action alternative head
+                |> Result.isError, Is.True)
+            Assert.That(remote alternative, Is.Empty)
+            let unrelatedParent = { action with OperationId = Guid.NewGuid() }
+            match LedgerStore.publishIntegrationRefForAction f.ProjectTwo unrelatedParent gitRef head with
+            | Error(OutcomeUnknown detail) ->
+                Assert.That(detail, Does.Contain("PreexistingIntegrationRefNotAttributable"),
+                            "Observed same head is not authenticated proof of this stage")
+            | other -> Assert.Fail(sprintf "Preexisting remote ref was treated as this publisher: %A" other)
+            Assert.That(remote gitRef, Is.EqualTo(head))
+            let after = OriginalGitWriterAdmissionJournal.inspect journal |> success
+            Assert.That(after.PendingOrUnknown, Is.Not.Empty,
+                        "A new parent with an unobservable preexisting physical ref must remain UNKNOWN"))
+
+    [<Test>]
+    member _.StoppedSourceStageRejectsNewEffectWithoutChangingRemote() =
+        withFixture (fun f ->
+            let journal = Path.Combine(f.Root, "staged-stop.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal journal
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, journal)
+            let head = git f.ProjectOne.RepositoryPath [ "rev-parse"; "HEAD" ]
+            let original = $"refs/heads/jarvis-review/_reviews/{Guid.NewGuid():N}/r1"
+            let action =
+                { OperationId = Guid.NewGuid(); Actor = "Worker21"
+                  Kind = "SubmitBranchReview"; RequestJson = "{\"action\":\"before-stop\"}" }
+            LedgerStore.publishReviewRefForAction f.ProjectOne action original head |> success
+            let stopped = OriginalGitWriterAdmissionJournal.stop journal |> success
+            Assert.That(stopped.AdmissionClosed, Is.True)
+            let afterStop = $"refs/heads/jarvis-review/_reviews/{Guid.NewGuid():N}/r1"
+            let denied =
+                LedgerStore.publishReviewRefForAction f.ProjectTwo
+                    { action with OperationId = Guid.NewGuid(); RequestJson = "{\"action\":\"after-stop\"}" }
+                    afterStop head
+            match denied with
+            | Error(OutcomeUnknown detail) ->
+                Assert.That(detail, Does.Contain("OriginalWriterAdmissionClosed"))
+            | other -> Assert.Fail(sprintf "STOP did not fence the new source stage: %A" other)
+            let remote name =
+                git f.Root
+                    [ "--git-dir=" + f.ProjectRemote; "for-each-ref"; "--format=%(objectname)"; name ]
+            Assert.That(remote original, Is.EqualTo(head))
+            Assert.That(remote afterStop, Is.Empty)
+            Assert.That((OriginalGitWriterAdmissionJournal.inspect journal |> success).HighWater,
+                        Is.EqualTo(stopped.HighWater)))
+
+    [<Test>]
+    member _.ManagedSourceStageLostPushResponseRemainsUnknownDespiteMatchingRemoteHead() =
+        if OperatingSystem.IsWindows() || not (File.Exists "/usr/bin/git") then
+            Assert.Ignore("This deterministic Git transport fault injection requires /usr/bin/git on Unix.")
+        withFixture (fun f ->
+            let journal = Path.Combine(f.Root, "staged-lost-push-response.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal journal
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, journal)
+            let head = git f.ProjectOne.RepositoryPath [ "rev-parse"; "HEAD" ]
+            let gitRef = $"refs/heads/jarvis-review/_reviews/{Guid.NewGuid():N}/r1"
+            let action =
+                { OperationId = Guid.NewGuid(); Actor = "Worker21"
+                  Kind = "SubmitBranchReview"; RequestJson = "{\"lostResponse\":true}" }
+            let bin = Path.Combine(f.Root, "git-fault")
+            Directory.CreateDirectory bin |> ignore
+            let shim = Path.Combine(bin, "git")
+            File.WriteAllText(shim, """#!/bin/sh
+case "$*" in
+  *"push --porcelain --force-with-lease=refs/heads/jarvis-review/"*)
+    /usr/bin/git "$@"
+    result=$?
+    if [ "$result" -eq 0 ]; then
+      echo 'fixture: source push occurred, response lost' >&2
+      exit 1
+    fi
+    exit "$result";;
+  *) exec /usr/bin/git "$@";;
+esac
+            """)
+            File.SetUnixFileMode(shim, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+            let previousPath = Environment.GetEnvironmentVariable("PATH")
+            try
+                Environment.SetEnvironmentVariable("PATH", bin + string Path.PathSeparator + previousPath)
+                match LedgerStore.publishReviewRefForAction f.ProjectOne action gitRef head with
+                | Error(OutcomeUnknown _) -> ()
+                | other ->
+                    Assert.Fail(sprintf "Lost push response must not be accepted as own effect: %A" other)
+            finally
+                Environment.SetEnvironmentVariable("PATH", previousPath)
+            let remote =
+                git f.Root
+                    [ "--git-dir=" + f.ProjectRemote; "for-each-ref"; "--format=%(objectname)"; gitRef ]
+            Assert.That(remote, Is.EqualTo(head),
+                        "The physical effect occurred although its response was deliberately lost")
+            let pending = OriginalGitWriterAdmissionJournal.inspect journal |> success
+            Assert.That(pending.PendingOrUnknown, Is.Not.Empty,
+                        "An observed equal ref cannot settle the unacknowledged physical stage")
+            Assert.That(pending.RouteCoverageProven, Is.False)
+            Assert.That(
+                LedgerStore.publishReviewRefForAction f.ProjectTwo action gitRef head
+                |> Result.isError, Is.True,
+                "A lost-response stage cannot be replayed into success without reconciliation")
+            Assert.That(
+                git f.Root
+                    [ "--git-dir=" + f.ProjectRemote; "for-each-ref"; "--format=%(objectname)"; gitRef ],
+                Is.EqualTo(head)))

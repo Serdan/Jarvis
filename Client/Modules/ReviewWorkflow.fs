@@ -492,6 +492,22 @@ module ReviewWorkflow =
                     |> Array.filter (fun property ->
                         not (Attribute.IsDefined(property, typeof<System.Text.Json.Serialization.JsonIgnoreAttribute>)))
                     |> Array.map (fun property -> options.PropertyNamingPolicy.ConvertName(property.Name))
+                // Historical schema-v2 integrations lack all five managed-ref
+                // evidence fields. Historical schema-v3 reviews lack both pinned
+                // source fields. Accept only these exact, all-absent shapes:
+                // incomplete or mixed provenance must continue to fail closed.
+                let historicalEvidenceFields =
+                    if typeof<'t> = typeof<IntegrationSubmission> then
+                        [ "reviewRef"; "reviewVersion"; "reviewedHeadOid"
+                          "integrationRef"; "targetHeadAtSubmission" ]
+                    elif typeof<'t> = typeof<BranchReview> then
+                        [ "sourceVersion"; "reviewedHeadOid" ]
+                    else []
+                let historicalEvidenceShape =
+                    not (List.isEmpty historicalEvidenceFields)
+                    && (historicalEvidenceFields |> List.forall (fun name ->
+                        let mutable ignored = Unchecked.defaultof<JsonElement>
+                        not (root.TryGetProperty(name, &ignored))))
                 let complete =
                     required |> Array.forall (fun property ->
                         let mutable memberValue = Unchecked.defaultof<JsonElement>
@@ -499,6 +515,7 @@ module ReviewWorkflow =
                         // FromProjectName was added after schema v2 notifications
                         // were already stored. Missing means same-project; all
                         // other notification members remain mandatory.
+                        || (historicalEvidenceShape && List.contains property historicalEvidenceFields)
                         || (typeof<'t> = typeof<AgentNotification>
                             && property = "fromProjectName")
                         || (typeof<'t> = typeof<TaskLifecycleEvent>

@@ -6,6 +6,7 @@ open System.Security.Cryptography
 open System.Text
 open System.Text.Json
 open System.Text.RegularExpressions
+open Client.OriginalGitWriterAdmissionJournal
 
 // Account-wide admission is a separate Git authority from every project work ledger.
 // These primitives intentionally have no Scheduler, browser, or migration activation hook.
@@ -596,16 +597,31 @@ module AccountCapacityLedger =
                         |> Result.bind (fun tree ->
                             commitTree b tree None "Initialize separate account admission ledger"
                             |> Result.bind (fun proposed ->
-                                // Empty expected remote ref: no overwrite, including an init race.
-                                git b [ "push"; "--porcelain"; $"--force-with-lease={AccountRef}:";
-                                        b.RemoteName; $"{proposed}:{AccountRef}" ] |> ignore
-                                // Re-read even on a lost acknowledgment; a competing initializer
-                                // with different identity will fail pinned-identity validation.
-                                match fetch b with
-                                | Ok snapshot -> Ok snapshot
-                                | Error(AccountIntegrityError message) -> Error(AccountIntegrityError message)
-                                | Error(InvalidAccountBinding message) -> Error(InvalidAccountBinding message)
-                                | Error _ -> Error(AccountOutcomeUnknown Guid.Empty)))))
+                                let publishAndConfirm () =
+                                    // Empty expected remote ref: no overwrite, including an init race.
+                                    git b [ "push"; "--porcelain"; $"--force-with-lease={AccountRef}:";
+                                            b.RemoteName; $"{proposed}:{AccountRef}" ] |> ignore
+                                    // Re-read even on a lost acknowledgment; a competing initializer
+                                    // with different identity will fail pinned-identity validation.
+                                    match fetch b with
+                                    | Ok snapshot -> Ok snapshot
+                                    | Error(AccountIntegrityError message) -> Error(AccountIntegrityError message)
+                                    | Error(InvalidAccountBinding message) -> Error(InvalidAccountBinding message)
+                                    | Error _ -> Error(AccountOutcomeUnknown Guid.Empty)
+                                OriginalGitWriterAdmissionJournal.withPublication
+                                    (OriginalGitWriterAdmissionJournal.deterministicOperationId
+                                        "AccountInitialize" AccountRef
+                                        (b.AccountId.ToString("D") + ":" + b.LedgerId.ToString("D") + ":" + string initialCapacity))
+                                    "AccountInitialize"
+                                    (OriginalGitWriterAdmissionJournal.authoritySha256
+                                        [ "account"; b.AccountId.ToString("D"); b.LedgerId.ToString("D")
+                                          string b.Epoch; b.ApprovedFetchUrl; b.ApprovedPushUrl ])
+                                    AccountRef proposed publishAndConfirm
+                                    (fun snapshot ->
+                                        match isAncestor b proposed snapshot.Head with
+                                        | Ok true -> true
+                                        | _ -> false)
+                                    (fun _ -> AccountOutcomeUnknown Guid.Empty)))))
 
     let private transact (b: AccountBinding) operationId actor kind requestJson expectedHead
                          (plan: AccountCapacityState -> Result<AccountCapacityState * string, AccountFailure>) =
@@ -657,9 +673,24 @@ module AccountCapacityLedger =
                                             if not (isNull (box hooks)) then
                                                 hooks.BeforeLeasePush operationId snapshot.Head
                                             let pushed =
-                                                git b [ "push"; "--porcelain";
-                                                        $"--force-with-lease={AccountRef}:{snapshot.Head}";
-                                                        b.RemoteName; $"{proposed}:{AccountRef}" ]
+                                                OriginalGitWriterAdmissionJournal.withPublication
+                                                    operationId kind
+                                                    (OriginalGitWriterAdmissionJournal.authoritySha256
+                                                        [ "account"; b.AccountId.ToString("D"); b.LedgerId.ToString("D")
+                                                          string b.Epoch; b.ApprovedFetchUrl; b.ApprovedPushUrl ])
+                                                    AccountRef proposed
+                                                    (fun () ->
+                                                        git b [ "push"; "--porcelain";
+                                                                $"--force-with-lease={AccountRef}:{snapshot.Head}";
+                                                                b.RemoteName; $"{proposed}:{AccountRef}" ])
+                                                    (fun _ ->
+                                                        match fetch b with
+                                                        | Ok witnessed ->
+                                                            match isAncestor b proposed witnessed.Head with
+                                                            | Ok true -> true
+                                                            | _ -> false
+                                                        | Error _ -> false)
+                                                    InvalidAccountBinding
                                             match fetch b with
                                             | Error _ -> Error(AccountOutcomeUnknown operationId)
                                             | Ok current ->

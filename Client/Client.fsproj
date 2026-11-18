@@ -75,6 +75,7 @@
         <Compile Include="Modules\JobManager.fs"/>
         <Compile Include="Modules\\Worktrees.fs"/>
         <Compile Include="Modules\BoundedFifoCache.fs"/>
+        <Compile Include="Modules\OriginalGitWriterAdmissionJournal.fs"/>
         <Compile Include="Modules\\LedgerStore.fs"/>
         <Compile Include="Modules\SourceEffectJournal.fs"/>
         <Compile Include="Modules\SourceEffectRouteBridge.fs"/>

@@ -4,18 +4,33 @@ open Client.LedgerStore
 open Client.AccountCapacityLedger
 open Client.WorkQueueGitLedger
 open Client.LegacyWriterProtocolFence
+open Client.OriginalGitWriterAdmissionJournal
 open Jarvis.WorkQueues
 
 // A verified original Git operation sequence does NOT establish the all-client
 // pending intent journal, source-effect journal or minimum-client high-water.
 // These evidence gaps remain explicit cutover NO-GO conditions.
+// A typed observation, not a cutover capability. Authority and remote refs
+// are pinned to the SAME verified scope/heads; journal coverage remains false
+// until independent route-closure and pre-admission effect audits exist.
+type OriginalGitWriterBoundaryWitness =
+    { SchemaVersion: int
+      AccountBinding: AccountBinding
+      AccountRef: string
+      AccountHead: string
+      ProjectBinding: LedgerBinding
+      ProjectRef: string
+      ProjectHead: string
+      Journal: OriginalWriterJournalWitness }
+
 type LegacyDirectHighWaterObservation =
     { AccountHead: string
       ProjectHead: string
       ProjectOperationHighWater: int64
       OriginalPendingJournal: string
       OriginalSourceEffectJournal: string
-      MinimumClientProtocol: string }
+      MinimumClientProtocol: string
+      OriginalWriterBoundary: OriginalGitWriterBoundaryWitness option }
 
 module LegacyDirectWriterFence =
     let private invalid reason =
@@ -124,10 +139,37 @@ module LegacyDirectWriterFence =
         | Ok(Some scope) ->
             match AccountCapacityLedger.fetch scope.Account, LedgerStore.fetch binding with
             | Ok account, Ok project ->
+                let boundary =
+                    if account.Head <> scope.ExpectedAccountHead
+                       || project.Commit <> scope.ExpectedProjectHead then None
+                    else
+                        match OriginalGitWriterAdmissionJournal.configuredPath () with
+                        | Error _ | Ok None -> None
+                        | Ok(Some path) ->
+                            match OriginalGitWriterAdmissionJournal.inspect path with
+                            | Error _ -> None
+                            | Ok journal ->
+                                Some { SchemaVersion = 1
+                                       AccountBinding = scope.Account
+                                       AccountRef = AccountCapacityLedger.AccountRef
+                                       AccountHead = account.Head
+                                       ProjectBinding = binding
+                                       ProjectRef = "refs/heads/jarvis-orchestration"
+                                       ProjectHead = project.Commit
+                                       Journal = journal }
+                let observed kind =
+                    match boundary with
+                    | None -> "Unknown: no current authenticated original " + kind + " journal"
+                    | Some witness ->
+                        sprintf "ObservedOnly/NO-GO: admissionClosed=%b,epoch=%d,settledHighWater=%d,pendingOrUnknown=%d,routeCoverageProven=%b"
+                            witness.Journal.AdmissionClosed witness.Journal.Epoch
+                            witness.Journal.SettledHighWater witness.Journal.PendingOrUnknown.Length
+                            witness.Journal.RouteCoverageProven
                 Ok { AccountHead = account.Head
                      ProjectHead = project.Commit
                      ProjectOperationHighWater = project.Header.NextSequence - 1L
-                     OriginalPendingJournal = "Unknown: no authenticated all-client intent journal witness"
-                     OriginalSourceEffectJournal = "Unknown: no original source-effect high-water witness"
-                     MinimumClientProtocol = "Unknown: no connected and disconnected fleet proof" }
+                     OriginalPendingJournal = observed "project/account"
+                     OriginalSourceEffectJournal = observed "source/ref"
+                     MinimumClientProtocol = "Unknown: pre-journal in-flight effects and process start boundary not proven"
+                     OriginalWriterBoundary = boundary }
             | _ -> Error(invalid "OriginalGitAuthorityUnavailable")

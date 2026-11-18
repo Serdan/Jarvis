@@ -14,6 +14,7 @@ open Client.RoleInstructions
 open Client.ChallengeWorkflow
 open Client.LegacyDirectWriterFence
 open Client.LegacyWriterProtocolFence
+open Client.OriginalGitWriterAdmissionJournal
 
 type private OldWriterFixture =
     { Root: string
@@ -63,9 +64,12 @@ type LegacyWriterProtocolFenceTests() =
 
     let withFixture action =
         let oldHost = Environment.GetEnvironmentVariable LegacyWriterProtocolFence.HostBindingEnvironment
+        let oldJournal = Environment.GetEnvironmentVariable OriginalGitWriterAdmissionJournal.JournalEnvironment
         let root = Path.Combine(Path.GetTempPath(), "wq10-legacy-fence-" + Guid.NewGuid().ToString("N"))
         Directory.CreateDirectory root |> ignore
         Environment.SetEnvironmentVariable(LegacyWriterProtocolFence.HostBindingEnvironment, null)
+        Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, null)
+        OriginalGitWriterAdmissionJournal.setDisposableBindingRoot (Some root)
         try
             let ar, a1, a2 = repository root "account"
             let pr, p1, p2 = repository root "project"
@@ -97,6 +101,8 @@ type LegacyWriterProtocolFenceTests() =
             Assert.That(git p2 [ "status"; "--porcelain" ], Is.Empty)
         finally
             Environment.SetEnvironmentVariable(LegacyWriterProtocolFence.HostBindingEnvironment, oldHost)
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, oldJournal)
+            OriginalGitWriterAdmissionJournal.setDisposableBindingRoot None
             try Directory.Delete(root, true) with _ -> ()
 
     let scope fixture account project =
@@ -505,6 +511,63 @@ type LegacyWriterProtocolFenceTests() =
             Assert.That(old.IsNone, Is.True, "CAS losing original Agent write must not publish"))
 
 
+    // RED: STOP racing a planner that already admitted the original writer
+    // must not turn a pending remote effect into a quiescence assertion.
+    [<Test>]
+    member _.AccountFreezeBetweenOriginalPlannerAndPushMustNotProduceFalseQuiescence() =
+        withFixture (fun f ->
+            let journalPath = Path.Combine(f.Root, "original-stop-race-"+Guid.NewGuid().ToString("N")+".db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal journalPath
+            let previousJournal = Environment.GetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment)
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, journalPath)
+            try
+                activateHost f (scope f f.AccountTwo f.ProjectTwo)
+                let originalHead =
+                    git f.Root [ "--git-dir=" + f.ProjectRemote
+                                 "rev-parse"; "refs/heads/jarvis-orchestration" ]
+                let mutable stopped = false
+                let id = Guid.NewGuid()
+                let original =
+                    { OperationId = id; Actor = "OldClient"
+                      Kind = "OriginalWriterStopRace"; RequestJson = "{}" }
+                let outcome =
+                    LedgerStore.withGitTransportFaults
+                        (fun phase arguments ->
+                            if not stopped && phase = "publication-push"
+                               && (arguments |> List.tryHead) = Some "push" then
+                                stopped <- true
+                                fixtureAccountPhase f "Frozen" |> ignore
+                                OriginalGitWriterAdmissionJournal.stop journalPath |> success |> ignore
+                            None)
+                        (fun () ->
+                            LegacyDirectWriterFence.transact f.ProjectOne original (fun _ ->
+                                Ok [ { Path = "records/wq10-fixture/stop-race-escaped.json"
+                                       ExpectedBlobOid = None; Content = "{}" } ]))
+                Assert.That(stopped, Is.True, "Fixture must freeze after legacy planning")
+                let latest = LedgerStore.fetch f.ProjectTwo |> success
+                let escaped, _ =
+                    LedgerStore.readAt f.ProjectTwo latest
+                        "records/wq10-fixture/stop-race-escaped.json" |> success
+                if escaped.IsSome then
+                    // A pre-STOP admission may finish after STOP, but cannot be
+                    // mistaken for quiescence without durable operation coverage.
+                    activateHost f (scope f f.AccountTwo f.ProjectTwo)
+                    let witness = LegacyDirectWriterFence.inspectHighWater f.ProjectTwo |> success
+                    let journalWitness = witness.OriginalWriterBoundary |> Option.get
+                    Assert.That(journalWitness.Journal.HighWater, Is.GreaterThan(0L))
+                    Assert.That(journalWitness.Journal.AdmissionClosed, Is.True)
+                    Assert.That(journalWitness.Journal.RouteCoverageProven, Is.False)
+                    Assert.That(journalWitness.Journal.SettledHighWater, Is.EqualTo(journalWitness.Journal.HighWater))
+                    Assert.That(witness.OriginalPendingJournal, Does.Not.StartWith("Unknown:"),
+                                "A pre-STOP operation published without a complete durable journal")
+                else
+                    Assert.That(latest.Commit, Is.EqualTo(originalHead))
+                    match outcome with
+                    | Error _ -> ()
+                    | Ok _ -> Assert.Fail("Operation returned success without publishing or settlement")
+            finally
+                Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, previousJournal))
+
     [<Test>]
     member _.FrozenDirectReviewCannotPublishOrphanSourceRefBeforeLedgerCAS() =
         withFixture (fun f ->
@@ -524,6 +587,122 @@ type LegacyWriterProtocolFenceTests() =
                              "for-each-ref"; "--format=%(refname)"; "refs/heads/jarvis-review" ]
             Assert.That(after, Is.EqualTo(before), "Frozen review must not publish orphan Git refs")
             Assert.That(after.Contains(managed, StringComparison.Ordinal), Is.False))
+
+    // RED: an independent immutable source ref is a remote effect even when
+    // its later ledger transaction is rejected by a newly frozen account.
+    [<Test>]
+    member _.SourceReviewRefPushRacingAccountStopNeedsDurableEffectCoverage() =
+        withFixture (fun f ->
+            let journalPath = Path.Combine(f.Root, "original-stop-race-"+Guid.NewGuid().ToString("N")+".db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal journalPath
+            let previousJournal = Environment.GetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment)
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, journalPath)
+            try
+                activateHost f (scope f f.AccountTwo f.ProjectTwo)
+                let request = Guid.NewGuid()
+                let sourceHead = git f.ProjectOne.RepositoryPath [ "rev-parse"; "HEAD" ]
+                let managed = $"refs/heads/jarvis-review/_reviews/{request:N}/r1"
+                let mutable stopped = false
+                let outcome =
+                    LedgerStore.withGitTransportFaults
+                        (fun _ args ->
+                            if not stopped && (args |> List.tryHead) = Some "push"
+                               && (args |> List.exists (fun a -> a.Contains(managed, StringComparison.Ordinal))) then
+                                stopped <- true
+                                fixtureAccountPhase f "Frozen" |> ignore
+                                OriginalGitWriterAdmissionJournal.stop journalPath |> success |> ignore
+                            None)
+                        (fun () ->
+                            ReviewWorkflow.submitBranchReview f.ProjectOne (Guid.NewGuid())
+                                "_reviews" "Historical" request "" sourceHead
+                                "Racing source review" "" "")
+                Assert.That(stopped, Is.True, "Fixture must stop at the source ref push")
+                let sourceRefs =
+                    git f.Root [ "--git-dir=" + f.ProjectRemote
+                                 "for-each-ref"; "--format=%(refname)"; managed ]
+                if sourceRefs.Contains(managed, StringComparison.Ordinal) then
+                    activateHost f (scope f f.AccountTwo f.ProjectTwo)
+                    let witness = LegacyDirectWriterFence.inspectHighWater f.ProjectTwo |> success
+                    let journalWitness = witness.OriginalWriterBoundary |> Option.get
+                    Assert.That(journalWitness.Journal.HighWater, Is.GreaterThan(0L))
+                    Assert.That(journalWitness.Journal.AdmissionClosed, Is.True)
+                    Assert.That(journalWitness.Journal.RouteCoverageProven, Is.False)
+                    Assert.That(journalWitness.Journal.SettledHighWater, Is.EqualTo(journalWitness.Journal.HighWater))
+                    Assert.That(witness.OriginalSourceEffectJournal, Does.Not.StartWith("Unknown:"),
+                                "A remote source ref was published without a durable source-effect journal")
+                else
+                    match outcome with
+                    | Error _ -> ()
+                    | Ok _ -> Assert.Fail("Source ref command acknowledged without a published ref")
+            finally
+                Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, previousJournal))
+
+    [<Test>]
+    member _.OriginalWriterJournalStopPreservesInflightAndFencesNewAdmissions() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "original-writer-admission.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            let prior =
+                Environment.GetEnvironmentVariable(
+                    OriginalGitWriterAdmissionJournal.JournalEnvironment)
+            Environment.SetEnvironmentVariable(
+                OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            try
+                let authority = String.replicate 64 "a"
+                let first = Guid.NewGuid()
+                let permit =
+                    OriginalGitWriterAdmissionJournal.admit first "ProjectCAS"
+                        authority "refs/heads/jarvis-orchestration" "immutable-request"
+                    |> success |> Option.get
+                OriginalGitWriterAdmissionJournal.markAttempt permit |> success
+                let stopping = OriginalGitWriterAdmissionJournal.stop path |> success
+                Assert.That(stopping.AdmissionClosed, Is.True)
+                Assert.That(stopping.PendingOrUnknown.Length, Is.EqualTo(1))
+                Assert.That(stopping.PendingOrUnknown.Head.Status, Is.EqualTo("Attempted"))
+                Assert.That(stopping.RouteCoverageProven, Is.False,
+                            "A journal alone is not exhaustive writer-route proof")
+                match OriginalGitWriterAdmissionJournal.admit (Guid.NewGuid()) "ProjectCAS"
+                          authority "refs/heads/jarvis-orchestration" "after-stop" with
+                | Error "OriginalWriterAdmissionClosed" -> ()
+                | other -> Assert.Fail(sprintf "STOP admitted a new writer: %A" other)
+                OriginalGitWriterAdmissionJournal.settle permit true true |> success
+                let settled = OriginalGitWriterAdmissionJournal.inspect path |> success
+                Assert.That(settled.PendingOrUnknown, Is.Empty)
+                Assert.That(settled.AllRecordedEffectsSettled, Is.True)
+                Assert.That(settled.RouteCoverageProven, Is.False)
+            finally
+                Environment.SetEnvironmentVariable(
+                    OriginalGitWriterAdmissionJournal.JournalEnvironment, prior))
+
+    [<Test>]
+    member _.OriginalWriterJournalUnknownRemoteEffectSurvivesReinspection() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "original-writer-unknown.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            let prior =
+                Environment.GetEnvironmentVariable(
+                    OriginalGitWriterAdmissionJournal.JournalEnvironment)
+            Environment.SetEnvironmentVariable(
+                OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            try
+                let authority = String.replicate 64 "b"
+                let operation = Guid.NewGuid()
+                let permit =
+                    OriginalGitWriterAdmissionJournal.admit operation "ReviewRef"
+                        authority "refs/heads/jarvis-review/example" "source-publish"
+                    |> success |> Option.get
+                OriginalGitWriterAdmissionJournal.markAttempt permit |> success
+                OriginalGitWriterAdmissionJournal.settle permit false true |> success
+                let reopened = OriginalGitWriterAdmissionJournal.inspect path |> success
+                Assert.That(reopened.PendingOrUnknown.Length, Is.EqualTo(1))
+                Assert.That(reopened.PendingOrUnknown.Head.Status, Is.EqualTo("Unknown"))
+                match OriginalGitWriterAdmissionJournal.admit operation "ReviewRef"
+                          authority "refs/heads/jarvis-review/example" "source-publish" with
+                | Error reason -> Assert.That(reason, Does.Contain("RequiresReconciliation"))
+                | Ok _ -> Assert.Fail("UNKNOWN remote effect was re-admitted")
+            finally
+                Environment.SetEnvironmentVariable(
+                    OriginalGitWriterAdmissionJournal.JournalEnvironment, prior))
 
     [<Test>]
     member _.FourConcreteDirectReplayFastPathsRespectFrozenPreparingAndInvalidHostProof() =
@@ -627,3 +806,528 @@ type LegacyWriterProtocolFenceTests() =
                         "Old UUID replays may not move the original project ledger ref")
             Assert.That(managedRefs (), Is.EqualTo originalRefs,
                         "Old UUID replays may not publish source refs"))
+
+    [<Test>]
+    member _.ConfiguredOriginalWriterJournalCoversProjectAccountAndSourceAndStop() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "original-live-routes.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            let oldJournal =
+                Environment.GetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment)
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            try
+                let accountOp = Guid.NewGuid()
+                AccountCapacityLedger.setCapacity f.AccountOne accountOp "Operator" 1L 4
+                |> success |> ignore
+                let projectOp =
+                    { OperationId = Guid.NewGuid(); Actor = "Operator"
+                      Kind = "OriginalProjectMutation"; RequestJson = "{}" }
+                let originalWrite =
+                    LedgerStore.transact f.ProjectOne projectOp (fun _ ->
+                        Ok [ { Path = "records/old-writer-test/positive.json"
+                               ExpectedBlobOid = None; Content = "{}" } ])
+                originalWrite |> success |> ignore
+                let sourceHead = git f.ProjectOne.RepositoryPath [ "rev-parse"; "HEAD" ]
+                let sourceRef =
+                    $"refs/heads/jarvis-review/_reviews/{Guid.NewGuid():N}/r1"
+                LedgerStore.publishReviewRef f.ProjectOne sourceRef sourceHead |> success
+                let integrationRef =
+                    $"refs/heads/jarvis-integration/{Guid.NewGuid():N}"
+                LedgerStore.publishIntegrationRef f.ProjectOne integrationRef sourceHead |> success
+                let deleted = LedgerStore.deleteReservedReviewRef f.ProjectOne sourceRef sourceHead |> success
+                Assert.That(deleted, Is.EqualTo("Deleted"))
+                let retainedRef =
+                    $"refs/heads/jarvis-review/_reviews/{Guid.NewGuid():N}/r1"
+                LedgerStore.publishReviewRef f.ProjectOne retainedRef sourceHead |> success
+                let observed = OriginalGitWriterAdmissionJournal.inspect path |> success
+                Assert.That(observed.HighWater, Is.GreaterThanOrEqualTo(6L))
+                Assert.That(observed.SettledHighWater, Is.EqualTo(observed.HighWater))
+                Assert.That(observed.PendingOrUnknown, Is.Empty)
+                Assert.That(observed.RouteCoverageProven, Is.False)
+                activateHost f (scope f f.AccountTwo f.ProjectTwo)
+                let scoped = LegacyDirectWriterFence.inspectHighWater f.ProjectTwo |> success
+                let boundary = scoped.OriginalWriterBoundary |> Option.get
+                Assert.That(boundary.AccountHead, Is.EqualTo(scoped.AccountHead))
+                Assert.That(boundary.ProjectHead, Is.EqualTo(scoped.ProjectHead))
+                Assert.That(boundary.Journal.Epoch, Is.EqualTo(1L))
+                Assert.That(boundary.Journal.RouteCoverageProven, Is.False)
+                Assert.That(scoped.OriginalPendingJournal, Does.StartWith("ObservedOnly/NO-GO:"))
+                let stopping = OriginalGitWriterAdmissionJournal.stop path |> success
+                Assert.That(stopping.AdmissionClosed, Is.True)
+                Assert.That(stopping.PendingOrUnknown, Is.Empty)
+                Assert.That(
+                    AccountCapacityLedger.setCapacity f.AccountTwo (Guid.NewGuid()) "Operator" 2L 5
+                    |> Result.isError, Is.True, "STOP must close account Git CAS")
+                let projectPostStop =
+                    { projectOp with OperationId = Guid.NewGuid()
+                                     Kind = "ProjectAfterStop" }
+                let rejectedProject =
+                    LedgerStore.transact f.ProjectTwo projectPostStop (fun _ ->
+                        Ok [ { Path = "records/old-writer-test/denied.json"
+                               ExpectedBlobOid = None; Content = "{}" } ])
+                Assert.That(Result.isError rejectedProject, Is.True,
+                            "STOP must close project Git CAS")
+                let afterRef =
+                    $"refs/heads/jarvis-review/_reviews/{Guid.NewGuid():N}/r1"
+                Assert.That(
+                    LedgerStore.publishReviewRef f.ProjectTwo afterRef sourceHead
+                    |> Result.isError, Is.True, "STOP must close independent source publishing")
+                Assert.That(
+                    LedgerStore.deleteReservedReviewRef f.ProjectTwo retainedRef sourceHead
+                    |> Result.isError, Is.True, "STOP must also close independent source deletion")
+                let after = OriginalGitWriterAdmissionJournal.inspect path |> success
+                Assert.That(after.HighWater, Is.EqualTo(stopping.HighWater))
+                Assert.That(after.AllRecordedEffectsSettled, Is.True)
+                Assert.That(after.RouteCoverageProven, Is.False)
+            finally
+                Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, oldJournal))
+
+
+    [<Test>]
+    member _.ActivatedJournalStopRejectsMissingChangedAndPartiallyDeletedHostBinding() =
+        withFixture (fun f ->
+            let pathA = Path.Combine(f.Root, "writer-a.db")
+            let pathB = Path.Combine(f.Root, "writer-b.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal pathA
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal pathB
+            let setting = OriginalGitWriterAdmissionJournal.JournalEnvironment
+            Environment.SetEnvironmentVariable(setting, pathA)
+            AccountCapacityLedger.setCapacity f.AccountOne (Guid.NewGuid()) "Operator" 1L 4
+            |> success |> ignore
+            let before = AccountCapacityLedger.fetch f.AccountTwo |> success
+            let closed = OriginalGitWriterAdmissionJournal.stop pathA |> success
+            Assert.That(closed.AdmissionClosed, Is.True)
+            let projectHead =
+                git f.Root [ "--git-dir=" + f.ProjectRemote; "rev-parse"; "refs/heads/jarvis-orchestration" ]
+            let accountHead =
+                git f.Root [ "--git-dir=" + f.AccountRemote; "rev-parse"; AccountCapacityLedger.AccountRef ]
+            let denied (label: string) =
+                let result =
+                    AccountCapacityLedger.setCapacity f.AccountTwo (Guid.NewGuid()) "Operator"
+                        before.State.StateVersion 5
+                Assert.That(Result.isError result, Is.True, label)
+                let operation =
+                    { OperationId = Guid.NewGuid(); Actor = "Operator"
+                      Kind = "PostStopBindingAttempt"; RequestJson = "{}" }
+                let resultProject =
+                    LedgerStore.transact f.ProjectTwo operation (fun _ ->
+                        Ok [ { Path = "records/binding-guard/" + Guid.NewGuid().ToString("N") + ".json"
+                               ExpectedBlobOid = None; Content = "{}" } ])
+                Assert.That(Result.isError resultProject, Is.True, label + ":project")
+                let currentProject =
+                    git f.Root [ "--git-dir=" + f.ProjectRemote; "rev-parse"; "refs/heads/jarvis-orchestration" ]
+                let currentAccount =
+                    git f.Root [ "--git-dir=" + f.AccountRemote; "rev-parse"; AccountCapacityLedger.AccountRef ]
+                Assert.That(currentProject, Is.EqualTo(projectHead), label + ":project-head")
+                Assert.That(currentAccount, Is.EqualTo(accountHead), label + ":account-head")
+            Environment.SetEnvironmentVariable(setting, null)
+            denied "missing activated environment binding"
+            Environment.SetEnvironmentVariable(setting, pathB)
+            denied "substituted open journal"
+            let archived = pathA + ".original"
+            File.Move(pathA, archived)
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal pathA
+            Environment.SetEnvironmentVariable(setting, pathA)
+            denied "same journal path with replaced identity"
+            File.Delete pathA
+            File.Move(archived, pathA)
+            denied "restored binding cannot reset STOP"
+            let manifest = Path.Combine(f.Root, "original-writer-host-binding", "journal.binding")
+            File.Delete manifest
+            denied "missing persistent binding after activation"
+            File.Delete(Path.Combine(f.Root, "original-writer-host-binding", "journal.binding.sha256"))
+            Environment.SetEnvironmentVariable(setting, null)
+            denied "entire binding pair deleted after activation"
+            Assert.That((OriginalGitWriterAdmissionJournal.inspect pathA |> success).AdmissionClosed,
+                        Is.True)
+            Assert.That((OriginalGitWriterAdmissionJournal.inspect pathB |> success).HighWater,
+                        Is.EqualTo(0L)))
+
+    [<TestCase(false)>]
+    [<TestCase(true)>]
+    member _.StoppedHostCannotPublishAfterSameIdRollbackOrWholeBindingRootLoss(deleteRoot: bool) =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "stopped-writer.db")
+            let backup = Path.Combine(f.Root, "pre-stop-writer.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            AccountCapacityLedger.setCapacity f.AccountOne (Guid.NewGuid()) "Operator" 1L 4
+            |> success |> ignore
+            // This backup has the same journal_identity UUID and closed=0.
+            File.Copy(path, backup)
+            let before = AccountCapacityLedger.fetch f.AccountTwo |> success
+            let accountHead =
+                git f.Root [ "--git-dir=" + f.AccountRemote; "rev-parse"; AccountCapacityLedger.AccountRef ]
+            let projectHead =
+                git f.Root [ "--git-dir=" + f.ProjectRemote; "rev-parse"; "refs/heads/jarvis-orchestration" ]
+            OriginalGitWriterAdmissionJournal.stop path |> success |> ignore
+            if deleteRoot then
+                Directory.Delete(Path.Combine(f.Root, "original-writer-host-binding"), true)
+                Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, null)
+            else
+                File.Copy(backup, path, true)
+                // A stale same-UUID journal must also not produce a trustworthy STOP witness.
+                Assert.That(OriginalGitWriterAdmissionJournal.inspect path |> Result.isError, Is.True)
+            let mode = if deleteRoot then "whole host-binding root loss" else "same-UUID pre-STOP rollback"
+            Assert.That(
+                AccountCapacityLedger.setCapacity f.AccountTwo (Guid.NewGuid()) "Operator"
+                    before.State.StateVersion 5 |> Result.isError, Is.True,
+                mode + ": account original Git writer must remain stopped")
+            let operation =
+                { OperationId = Guid.NewGuid(); Actor = "Operator"
+                  Kind = "RollbackOrRootLossProject"; RequestJson = "{}" }
+            Assert.That(
+                LedgerStore.transact f.ProjectTwo operation (fun _ ->
+                    Ok [ { Path = "records/stop-rollback-denied.json"
+                           ExpectedBlobOid = None; Content = "{}" } ])
+                |> Result.isError, Is.True,
+                mode + ": project original Git writer must remain stopped")
+            Assert.That(
+                git f.Root [ "--git-dir=" + f.AccountRemote; "rev-parse"; AccountCapacityLedger.AccountRef ],
+                Is.EqualTo(accountHead), mode + ": no remote account ref change")
+            Assert.That(
+                git f.Root [ "--git-dir=" + f.ProjectRemote; "rev-parse"; "refs/heads/jarvis-orchestration" ],
+                Is.EqualTo(projectHead), mode + ": no remote project ref change"))
+
+    [<Test>]
+    member _.JournalConfiguredBeforeActualProjectAndAccountInitializationFencesBothAfterStop() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "before-initialization.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            let accountRemote, accountLocal, _ = repository f.Root "new-account"
+            let projectRemote, projectLocal, _ = repository f.Root "new-project"
+            let account =
+                { f.AccountOne with RepositoryPath = accountLocal
+                                    ApprovedFetchUrl = accountRemote
+                                    ApprovedPushUrl = accountRemote
+                                    AccountId = Guid.NewGuid()
+                                    LedgerId = Guid.NewGuid() }
+            let project =
+                { f.ProjectOne with RepositoryPath = projectLocal
+                                    ApprovedFetchUrl = projectRemote
+                                    ApprovedPushUrl = projectRemote
+                                    ProjectId = Guid.NewGuid()
+                                    LedgerId = Guid.NewGuid() }
+            let accountState = AccountCapacityLedger.initialize account 2 |> success
+            let projectState = LedgerStore.initialize project true |> success
+            Assert.That(accountState.Head, Is.Not.Empty)
+            Assert.That(projectState.Commit, Is.Not.Empty)
+            let observed = OriginalGitWriterAdmissionJournal.inspect path |> success
+            Assert.That(observed.HighWater, Is.EqualTo(2L),
+                        "Both real initialization publication paths must be admitted")
+            Assert.That(observed.PendingOrUnknown, Is.Empty)
+            Assert.That(observed.SettledHighWater, Is.EqualTo(2L))
+            OriginalGitWriterAdmissionJournal.stop path |> success |> ignore
+            let stoppedAccountRemote, stoppedAccountLocal, _ = repository f.Root "blocked-account"
+            let stoppedProjectRemote, stoppedProjectLocal, _ = repository f.Root "blocked-project"
+            let blockedAccount =
+                { account with RepositoryPath = stoppedAccountLocal
+                               ApprovedFetchUrl = stoppedAccountRemote
+                               ApprovedPushUrl = stoppedAccountRemote
+                               AccountId = Guid.NewGuid(); LedgerId = Guid.NewGuid() }
+            let blockedProject =
+                { project with RepositoryPath = stoppedProjectLocal
+                               ApprovedFetchUrl = stoppedProjectRemote
+                               ApprovedPushUrl = stoppedProjectRemote
+                               ProjectId = Guid.NewGuid(); LedgerId = Guid.NewGuid() }
+            Assert.That(AccountCapacityLedger.initialize blockedAccount 3 |> Result.isError, Is.True)
+            Assert.That(LedgerStore.initialize blockedProject true |> Result.isError, Is.True)
+            let accountRef =
+                git f.Root [ "--git-dir=" + stoppedAccountRemote; "for-each-ref"
+                             "--format=%(refname)"; AccountCapacityLedger.AccountRef ]
+            let projectRef =
+                git f.Root [ "--git-dir=" + stoppedProjectRemote; "for-each-ref"
+                             "--format=%(refname)"; "refs/heads/jarvis-orchestration" ]
+            Assert.That(accountRef, Is.Empty, "STOP must prevent remote account ref creation")
+            Assert.That(projectRef, Is.Empty, "STOP must prevent remote project ref creation")
+            Assert.That((OriginalGitWriterAdmissionJournal.inspect path |> success).HighWater,
+                        Is.EqualTo(2L)))
+
+    [<Test>]
+    member _.LostGitAcknowledgmentRemainsUnknownAfterReopenAndChangedDuplicatePayloadDenied() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "lost-git-ack.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            let operation = Guid.NewGuid()
+            let authority = String.replicate 64 "c"
+            let remote, local, _ = repository f.Root "lost-ack"
+            let gitRef = "refs/heads/jarvis-review/_reviews/lost-ack/r1"
+            let publish () : Result<string,string> =
+                git local [ "push"; "origin"; "HEAD:" + gitRef ] |> ignore
+                Error "fixture intentionally discarded the successful Git push acknowledgment"
+            let result =
+                OriginalGitWriterAdmissionJournal.withPublication
+                    operation "ReviewRef" authority gitRef "first-payload"
+                    publish (fun _ -> true) id
+            Assert.That(Result.isError result, Is.True)
+            let remoteRef =
+                git f.Root [ "--git-dir=" + remote; "rev-parse"; gitRef ]
+            Assert.That(remoteRef, Is.Not.Empty, "Real fixture Git effect must have occurred")
+            let unknown = OriginalGitWriterAdmissionJournal.inspect path |> success
+            Assert.That(unknown.PendingOrUnknown.Length, Is.EqualTo(1))
+            Assert.That(unknown.PendingOrUnknown.Head.Status, Is.EqualTo("Unknown"))
+            match OriginalGitWriterAdmissionJournal.admit operation "ReviewRef"
+                      authority gitRef "first-payload" with
+            | Error reason -> Assert.That(reason, Does.Contain("RequiresReconciliation"))
+            | Ok _ -> Assert.Fail("UNKNOWN lost acknowledgment was replayed")
+            match OriginalGitWriterAdmissionJournal.admit operation "ReviewRef"
+                      authority gitRef "changed-payload" with
+            | Error reason -> Assert.That(reason, Does.Contain("RequiresReconciliation"))
+            | Ok _ -> Assert.Fail("UUID reused with different bytes was admitted")
+            Assert.That((OriginalGitWriterAdmissionJournal.inspect path |> success).PendingOrUnknown.Length,
+                        Is.EqualTo(1)))
+
+
+    [<Test>]
+    member _.PreStopStaleSameIdJournalCannotEraseRealUnknownGitPublication() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "pre-stop-rollback.db")
+            let stale = Path.Combine(f.Root, "pre-admission-same-id.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            // Activation fixes host identity, but this same-ID backup predates the publication.
+            OriginalGitWriterAdmissionJournal.configuredPath() |> success |> ignore
+            File.Copy(path, stale)
+            let remote, local, _ = repository f.Root "pre-stop-unknown"
+            let gitRef = $"refs/heads/jarvis-review/_reviews/{Guid.NewGuid():N}/r1"
+            let authority = String.replicate 64 "e"
+            let lostAck () : Result<string, string> =
+                git local [ "push"; "origin"; "HEAD:" + gitRef ] |> ignore
+                Error "fixture intentionally discarded a successful remote Git acknowledgment"
+            let result =
+                OriginalGitWriterAdmissionJournal.withPublication
+                    (Guid.NewGuid()) "ReviewRef" authority gitRef "real-remote-effect"
+                    lostAck (fun _ -> true) id
+            Assert.That(Result.isError result, Is.True)
+            let actualRemoteHead =
+                git f.Root [ "--git-dir=" + remote; "rev-parse"; gitRef ]
+            Assert.That(actualRemoteHead, Is.Not.Empty,
+                        "A real irreversible Git publication must precede the stale restore")
+            let beforeRollback = OriginalGitWriterAdmissionJournal.inspect path |> success
+            Assert.That(beforeRollback.PendingOrUnknown.Length, Is.EqualTo(1))
+            Assert.That(beforeRollback.PendingOrUnknown.Head.Status, Is.EqualTo("Unknown"))
+            // Restore the same UUID's pre-admission SQLite image BEFORE STOP.
+            // The external host binding and original Git remote are not restored.
+            File.Copy(stale, path, true)
+            Assert.That(OriginalGitWriterAdmissionJournal.stop path |> Result.isError, Is.True,
+                        "STOP must not fabricate an empty/drained witness from stale SQLite")
+            Assert.That(OriginalGitWriterAdmissionJournal.inspect path |> Result.isError, Is.True,
+                        "Inspection must detect admission history lost by pre-STOP rollback")
+            let mutable attemptedSecondPush = false
+            let second =
+                OriginalGitWriterAdmissionJournal.withPublication
+                    (Guid.NewGuid()) "ReviewRef" authority
+                    $"refs/heads/jarvis-review/_reviews/{Guid.NewGuid():N}/r1" "new-effect"
+                    (fun () -> attemptedSecondPush <- true; Ok "unexpected")
+                    (fun _ -> true) id
+            Assert.That(Result.isError second, Is.True)
+            Assert.That(attemptedSecondPush, Is.False,
+                        "An older journal cannot re-admit writes after history loss")
+            Assert.That(
+                git f.Root [ "--git-dir=" + remote; "rev-parse"; gitRef ],
+                Is.EqualTo(actualRemoteHead),
+                "The remote effect survives although the restored SQLite journal omits it"))
+
+
+    [<Test>]
+    member _.StopAndInspectRejectModifiedAdmissionIdentityAtSameHighWater() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "modified-admission-identity.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            let authority = String.replicate 64 "d"
+            let outcome =
+                OriginalGitWriterAdmissionJournal.withPublication
+                    (Guid.NewGuid()) "ReviewRef" authority
+                    "refs/heads/jarvis-review/_reviews/identity-commitment/r1" "payload"
+                    (fun () -> Ok "verified") (fun _ -> true) id
+            Assert.That(Result.isOk outcome, Is.True)
+            let original = OriginalGitWriterAdmissionJournal.inspect path |> success
+            Assert.That(original.HighWater, Is.EqualTo(1L))
+            Assert.That(original.PendingOrUnknown, Is.Empty)
+            // Same row count and sequence, but an altered effect identity.
+            // A numeric high-water-only seal would incorrectly accept it.
+            use db = new Microsoft.Data.Sqlite.SqliteConnection(
+                "Data Source=" + path + ";Pooling=False")
+            db.Open()
+            use tamper = db.CreateCommand()
+            tamper.CommandText <- "UPDATE effects SET kind='ChangedReviewRef' WHERE sequence=1"
+            Assert.That(tamper.ExecuteNonQuery(), Is.EqualTo(1))
+            db.Close()
+            Assert.That(OriginalGitWriterAdmissionJournal.inspect path |> Result.isError, Is.True,
+                        "The full effect-identity chain must match the host commitment")
+            Assert.That(OriginalGitWriterAdmissionJournal.stop path |> Result.isError, Is.True,
+                        "STOP must never attest a modified history with matching row count"))
+
+
+    // Real bare-Git CAS contention must replan inside one logical journal
+    // admission, not re-enter the same unresolved UUID on each attempt.
+    [<Test>]
+    member _.JournalEnabledProjectContentionReplansSameUuidAndDrainsStop() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "project-contention.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            let operationId = Guid.NewGuid()
+            let original =
+                { OperationId = operationId; Actor = "OriginalWriter"
+                  Kind = "JournalContention"; RequestJson = "{}" }
+            let competing =
+                { OperationId = Guid.NewGuid(); Actor = "CompetingWriter"
+                  Kind = "CompetingJournalContention"; RequestJson = "{}" }
+            let mutable raced = false
+            let mutable plans = 0
+            let outcome =
+                LedgerStore.withGitTransportFaults
+                    (fun phase args ->
+                        if not raced && phase = "publication-push"
+                           && (args |> List.tryHead) = Some "push" then
+                            raced <- true
+                            LedgerStore.transact f.ProjectTwo competing (fun _ ->
+                                Ok [ { Path = "records/w21/racing-project.json"
+                                       ExpectedBlobOid = None; Content = "{}" } ])
+                            |> success |> ignore
+                        None)
+                    (fun () ->
+                        LedgerStore.transact f.ProjectOne original (fun _ ->
+                            plans <- plans + 1
+                            Ok [ { Path = "records/w21/original-project.json"
+                                   ExpectedBlobOid = None; Content = "{}" } ]))
+            let applied = outcome |> success
+            Assert.That(raced, Is.True, "Fixture must advance the actual bare-Git remote")
+            Assert.That(plans, Is.EqualTo(2), "Contention must reach the bounded same-UUID replan")
+            Assert.That(applied.Operation.OperationId, Is.EqualTo(operationId.ToString("D")))
+            let latest = LedgerStore.fetch f.ProjectTwo |> success
+            let competitor, _ = LedgerStore.readAt f.ProjectTwo latest "records/w21/racing-project.json" |> success
+            let originalRecord, _ = LedgerStore.readAt f.ProjectTwo latest "records/w21/original-project.json" |> success
+            Assert.That(competitor.IsSome, Is.True)
+            Assert.That(originalRecord.IsSome, Is.True)
+            let beforeStop = OriginalGitWriterAdmissionJournal.inspect path |> success
+            Assert.That(beforeStop.HighWater, Is.EqualTo(2L),
+                        "One original admission and one independent competitor")
+            Assert.That(beforeStop.PendingOrUnknown, Is.Empty,
+                        "A proven-rejected intermediate CAS is not a permanent UNKNOWN")
+            Assert.That(beforeStop.SettledHighWater, Is.EqualTo(beforeStop.HighWater))
+            let stopped = OriginalGitWriterAdmissionJournal.stop path |> success
+            Assert.That(stopped.AdmissionClosed, Is.True)
+            Assert.That(stopped.PendingOrUnknown, Is.Empty)
+            let replay =
+                LedgerStore.transact f.ProjectOne original (fun _ ->
+                    failwith "Already-applied UUID must not invoke the planner")
+                |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That((OriginalGitWriterAdmissionJournal.inspect path |> success).HighWater,
+                        Is.EqualTo(2L)))
+
+    [<Test>]
+    member _.JournalEnabledPutRecordContentionUsesOneAdmissionAndDrainsStop() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "put-record-contention.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            let record =
+                { OperationId = Guid.NewGuid(); Actor = "PutRecordOwner"
+                  Path = "records/w21/original-record.json"
+                  ExpectedBlobOid = None; Content = "{}" }
+            let competing =
+                { OperationId = Guid.NewGuid(); Actor = "CompetingWriter"
+                  Kind = "PutRecordContention"; RequestJson = "{}" }
+            let mutable raced = false
+            let outcome =
+                LedgerStore.withGitTransportFaults
+                    (fun phase args ->
+                        if not raced && phase = "publication-push"
+                           && (args |> List.tryHead) = Some "push" then
+                            raced <- true
+                            LedgerStore.transact f.ProjectTwo competing (fun _ ->
+                                Ok [ { Path = "records/w21/racing-put-record.json"
+                                       ExpectedBlobOid = None; Content = "{}" } ])
+                            |> success |> ignore
+                        None)
+                    (fun () -> LedgerStore.putRecord f.ProjectOne record)
+            let applied = outcome |> success
+            Assert.That(raced, Is.True, "PutRecord must encounter a real competing Git CAS")
+            Assert.That(applied.Operation.OperationId, Is.EqualTo(record.OperationId.ToString("D")))
+            let latest = LedgerStore.fetch f.ProjectTwo |> success
+            let competitor, _ = LedgerStore.readAt f.ProjectTwo latest "records/w21/racing-put-record.json" |> success
+            let originalRecord, _ = LedgerStore.readAt f.ProjectTwo latest record.Path |> success
+            Assert.That(competitor.IsSome, Is.True)
+            Assert.That(originalRecord.IsSome, Is.True)
+            let beforeStop = OriginalGitWriterAdmissionJournal.inspect path |> success
+            Assert.That(beforeStop.HighWater, Is.EqualTo(2L))
+            Assert.That(beforeStop.PendingOrUnknown, Is.Empty)
+            let stopped = OriginalGitWriterAdmissionJournal.stop path |> success
+            Assert.That(stopped.AdmissionClosed, Is.True)
+            Assert.That(stopped.SettledHighWater, Is.EqualTo(2L))
+            let duplicate = LedgerStore.putRecord f.ProjectOne record |> success
+            Assert.That(duplicate.AlreadyApplied, Is.True)
+            Assert.That((OriginalGitWriterAdmissionJournal.inspect path |> success).HighWater,
+                        Is.EqualTo(2L)))
+
+
+    [<Test>]
+    member _.JournalEnabledContentionWithUncertainPushNeverBlindlyRetriesOrDrainsStop() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "uncertain-project-contention.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            let operationId = Guid.NewGuid()
+            let original =
+                { OperationId = operationId; Actor = "OriginalWriter"
+                  Kind = "UncertainJournalContention"; RequestJson = "{}" }
+            let competing =
+                { OperationId = Guid.NewGuid(); Actor = "CompetingWriter"
+                  Kind = "CompetingUncertainContention"; RequestJson = "{}" }
+            let mutable raced = false
+            let mutable planned = 0
+            let attempt () =
+                LedgerStore.transact f.ProjectOne original (fun _ ->
+                    planned <- planned + 1
+                    Ok [ { Path = "records/w21/uncertain-original.json"
+                           ExpectedBlobOid = None; Content = "{}" } ])
+            let outcome =
+                LedgerStore.withGitTransportFaults
+                    (fun phase args ->
+                        if not raced && phase = "publication-push"
+                           && (args |> List.tryHead) = Some "push" then
+                            raced <- true
+                            LedgerStore.transact f.ProjectTwo competing (fun _ ->
+                                Ok [ { Path = "records/w21/uncertain-competitor.json"
+                                       ExpectedBlobOid = None; Content = "{}" } ])
+                            |> success |> ignore
+                            // A timed-out original push has no trustworthy
+                            // rejection receipt, even after another CAS wins.
+                            Some { FaultExitCode = 124; FaultStderr = "injected push timeout"
+                                   FaultTimedOut = true }
+                        else None)
+                    attempt
+            Assert.That(raced, Is.True)
+            match outcome with
+            | Error(OutcomeUnknown _) -> ()
+            | other -> Assert.Fail(sprintf "Uncertain push must remain UNKNOWN, got %A" other)
+            Assert.That(planned, Is.EqualTo(1), "Uncertain publication may not replan")
+            let current = LedgerStore.fetch f.ProjectTwo |> success
+            let competitor, _ = LedgerStore.readAt f.ProjectTwo current "records/w21/uncertain-competitor.json" |> success
+            let escaped, _ = LedgerStore.readAt f.ProjectTwo current "records/w21/uncertain-original.json" |> success
+            Assert.That(competitor.IsSome, Is.True)
+            Assert.That(escaped.IsNone, Is.True)
+            let witness = OriginalGitWriterAdmissionJournal.inspect path |> success
+            Assert.That(witness.PendingOrUnknown.Length, Is.EqualTo(1))
+            Assert.That(witness.PendingOrUnknown.Head.Status, Is.EqualTo("Unknown"))
+            let stopped = OriginalGitWriterAdmissionJournal.stop path |> success
+            Assert.That(stopped.AdmissionClosed, Is.True)
+            Assert.That(stopped.PendingOrUnknown.Length, Is.EqualTo(1),
+                        "STOP must retain uncertain pre-stop remote effects")
+            let originalRemoteHead =
+                git f.Root [ "--git-dir=" + f.ProjectRemote; "rev-parse"
+                             "refs/heads/jarvis-orchestration" ]
+            match attempt () with
+            | Error(OutcomeUnknown detail) ->
+                Assert.That(detail, Does.Contain("OriginalWriterAdmissionClosed"))
+            | other -> Assert.Fail(sprintf "Unknown UUID must not publish again, got %A" other)
+            Assert.That(
+                git f.Root [ "--git-dir=" + f.ProjectRemote; "rev-parse"
+                             "refs/heads/jarvis-orchestration" ],
+                Is.EqualTo(originalRemoteHead), "Same UUID must never republish after STOP"))

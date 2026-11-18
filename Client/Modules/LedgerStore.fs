@@ -8,6 +8,7 @@ open System.Security.Cryptography
 open System.Text
 open System.Text.Json
 open System.Text.RegularExpressions
+open Client.OriginalGitWriterAdmissionJournal
 
 // Canonical Git ledger transport. Every caller requires an explicitly verified local binding.
 type LedgerFailure =
@@ -171,6 +172,15 @@ module LedgerStore =
         { ExitCode: int
           Stdout: string
           Stderr: string }
+
+    // A changed remote tip is not proof that our push did not happen. Only
+    // Git's explicit non-fast-forward rejection proves a failed CAS can be
+    // replanned without carrying an unresolved external effect.
+    let private provenNonFastForwardRejection (output: GitOutput) =
+        output.ExitCode <> 0
+        && output.Stdout.Contains("[rejected]", StringComparison.OrdinalIgnoreCase)
+        && (output.Stdout.Contains("(fetch first)", StringComparison.OrdinalIgnoreCase)
+            || output.Stdout.Contains("(non-fast-forward)", StringComparison.OrdinalIgnoreCase))
 
     /// Explicitly scoped diagnostics for reproducible ledger benchmarks.
     /// Counters are inactive outside the scope; no extra subprocess is
@@ -1117,18 +1127,29 @@ module LedgerStore =
                         match commitTree repo tree None "Initialize Jarvis orchestration ledger" with
                         | Error error -> Error error
                         | Ok commit ->
-                            match git repo [ "push"; "--porcelain"; binding.RemoteName; $"{commit}:{ledgerRef}" ] with
-                            | Error error -> Error error
-                            | Ok pushed when pushed.ExitCode <> 0 ->
-                                Error(OutcomeUnknown $"Ledger initialization push was not confirmed: {pushed.Stderr}")
-                            | Ok _ ->
-                                match fetch binding with
+                            let publishAndConfirm () =
+                                match git repo [ "push"; "--porcelain"; binding.RemoteName; $"{commit}:{ledgerRef}" ] with
                                 | Error error -> Error error
-                                | Ok snapshot ->
-                                    match isAncestor repo commit snapshot.Commit with
-                                    | Ok true -> Ok snapshot
-                                    | Ok false -> Error(OutcomeUnknown "Remote did not retain initialization commit.")
+                                | Ok pushed when pushed.ExitCode <> 0 ->
+                                    Error(OutcomeUnknown $"Ledger initialization push was not confirmed: {pushed.Stderr}")
+                                | Ok _ ->
+                                    match fetch binding with
                                     | Error error -> Error error
+                                    | Ok snapshot ->
+                                        match isAncestor repo commit snapshot.Commit with
+                                        | Ok true -> Ok snapshot
+                                        | Ok false -> Error(OutcomeUnknown "Remote did not retain initialization commit.")
+                                        | Error error -> Error error
+                            OriginalGitWriterAdmissionJournal.withPublication
+                                (OriginalGitWriterAdmissionJournal.deterministicOperationId
+                                    "ProjectInitialize" ledgerRef
+                                    (binding.ProjectId.ToString("D") + ":" + binding.LedgerId.ToString("D")
+                                     + ":" + string binding.Epoch))
+                                "ProjectInitialize"
+                                (OriginalGitWriterAdmissionJournal.authoritySha256
+                                    [ "project"; binding.ProjectId.ToString("D"); binding.LedgerId.ToString("D")
+                                      string binding.Epoch; binding.ApprovedFetchUrl; binding.ApprovedPushUrl ])
+                                ledgerRef commit publishAndConfirm (fun _ -> true) OutcomeUnknown
 
     //  prototype's generic record mutation. Task transitions are intentionally not yet wired.
     let putRecord (binding: LedgerBinding) (change: LedgerRecordChange) =
@@ -1140,7 +1161,9 @@ module LedgerStore =
         else
             let repo = binding.RepositoryPath
             let requestHash = recordHash binding change
-            let rec attempt retries =
+            let mutable journalEnabled = false
+            let mutable unresolvedRemoteEffect = false
+            let rec attempt retries admitted =
                 match fetch binding with
                 | Error error -> Error error
                 | Ok snapshot ->
@@ -1189,28 +1212,65 @@ module LedgerStore =
                                             $"Jarvis PutRecord {change.Path}\n\nJarvis-Operation-Id: {change.OperationId:D}\nJarvis-Request-Hash: {requestHash}" with
                                     | Error error -> Error error
                                     | Ok commit ->
-                                        let pushed = git repo [ "push"; "--porcelain"; binding.RemoteName; $"{commit}:{ledgerRef}" ]
-                                        // Always inspect the remote again. A failed command may have already published.
-                                        match fetch binding with
-                                        | Error _ -> Error(OutcomeUnknown $"Cannot verify operation {change.OperationId:D}.")
-                                        | Ok current ->
-                                            match checkDuplicate binding current.Commit change requestHash with
-                                            | Error error -> Error error
-                                            | Ok(Some existing) ->
-                                                match isAncestor repo commit current.Commit with
-                                                | Ok true when (match pushed with | Ok output -> output.ExitCode = 0 | _ -> false) ->
-                                                    Ok { existing with AlreadyApplied = false }
-                                                | _ -> Ok existing
-                                            | Ok None ->
-                                                match pushed with
-                                                | Error _ -> Error(OutcomeUnknown $"Push outcome unknown for {change.OperationId:D}.")
-                                                | Ok output when output.ExitCode <> 0 && current.Commit = head ->
-                                                    Error(GitFailure $"Ledger push rejected without remote advance: {output.Stderr}")
-                                                | Ok _ when retries >= 7 -> Error LedgerContended
-                                                | _ ->
-                                                    System.Threading.Thread.Sleep(contentionDelay retries)
-                                                    attempt (retries + 1)
-            attempt 0
+                                        let publishAndConfirm () =
+                                            unresolvedRemoteEffect <- true
+                                            let pushed = withPhase "publication-push" (fun () ->
+                                                git repo [ "push"; "--porcelain"; binding.RemoteName; $"{commit}:{ledgerRef}" ])
+                                            // Always inspect the remote again. A failed command may have already published.
+                                            match fetch binding with
+                                            | Error _ -> Error(OutcomeUnknown $"Cannot verify operation {change.OperationId:D}.")
+                                            | Ok current ->
+                                                match checkDuplicate binding current.Commit change requestHash with
+                                                | Error error -> Error error
+                                                | Ok(Some existing) ->
+                                                    match isAncestor repo commit current.Commit with
+                                                    | Ok true when (match pushed with | Ok output -> output.ExitCode = 0 | _ -> false) ->
+                                                        Ok { existing with AlreadyApplied = false }
+                                                    | _ ->
+                                                        unresolvedRemoteEffect <- false
+                                                        Ok existing
+                                                | Ok None ->
+                                                    match pushed with
+                                                    | Error _ -> Error(OutcomeUnknown $"Push outcome unknown for {change.OperationId:D}.")
+                                                    | Ok output when output.ExitCode <> 0 && current.Commit = head ->
+                                                        Error(GitFailure $"Ledger push rejected without remote advance: {output.Stderr}")
+                                                    | Ok output when journalEnabled && current.Commit <> head && provenNonFastForwardRejection output ->
+                                                        // This Git process explicitly rejected the CAS, so it
+                                                        // cannot have published the proposed commit.
+                                                        unresolvedRemoteEffect <- false
+                                                        if retries >= 7 then Error LedgerContended
+                                                        else
+                                                            System.Threading.Thread.Sleep(contentionDelay retries)
+                                                            attempt (retries + 1) true
+                                                    | Ok _ when not journalEnabled && retries >= 7 -> Error LedgerContended
+                                                    | _ when not journalEnabled ->
+                                                        System.Threading.Thread.Sleep(contentionDelay retries)
+                                                        attempt (retries + 1) true
+                                                    | _ ->
+                                                        Error(OutcomeUnknown $"Unverified Git publication for {change.OperationId:D}; reconcile same UUID.")
+                                        if admitted then publishAndConfirm()
+                                        else
+                                            // One durable logical admission spans only proven-rejected
+                                            // CAS retries. An uncertain push never recurses.
+                                            let publication enabled =
+                                                journalEnabled <- enabled
+                                                match publishAndConfirm () with
+                                                | Ok applied -> Ok(Choice1Of2 applied)
+                                                | Error failure when not unresolvedRemoteEffect -> Ok(Choice2Of2 failure)
+                                                | Error failure -> Error failure
+                                            match OriginalGitWriterAdmissionJournal.withPublicationClassified
+                                                change.OperationId "PutRecord"
+                                                (OriginalGitWriterAdmissionJournal.authoritySha256
+                                                    [ "project"; binding.ProjectId.ToString("D"); binding.LedgerId.ToString("D")
+                                                      string binding.Epoch; binding.ApprovedFetchUrl; binding.ApprovedPushUrl ])
+                                                ledgerRef requestHash publication
+                                                (function Choice1Of2 _ -> true | _ -> false)
+                                                (function Choice2Of2 _ -> true | _ -> false)
+                                                OutcomeUnknown with
+                                            | Ok(Choice1Of2 applied) -> Ok applied
+                                            | Ok(Choice2Of2 failure) -> Error failure
+                                            | Error failure -> Error failure
+            attempt 0 false
 
     // Pinned reads used by domain transitions. Never fetch a newer head mid-transaction.
     let readAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) (path: string) =
@@ -1902,17 +1962,25 @@ module LedgerStore =
                     | Ok(Some current) when current = headOid -> Ok ()
                     | Ok(Some _) -> Error(SourceReviewRefUnavailable "Existing immutable review ref points to another commit.")
                     | Ok None ->
-                        let result =
-                            git binding.RepositoryPath
-                                [ "push"; "--porcelain"; $"--force-with-lease={gitRef}:"; binding.RemoteName; $"{headOid}:{gitRef}" ]
-                        match remoteReviewRef binding gitRef with
-                        | Ok(Some observed) when observed = headOid -> Ok ()
-                        | Ok(Some _) -> Error(SourceReviewRefUnavailable "Immutable review ref changed or was claimed elsewhere.")
-                        | Ok None ->
-                            match result with
-                            | Ok output when output.ExitCode <> 0 -> Error(GitFailure $"Source publication rejected: {output.Stderr}")
-                            | _ -> Error(OutcomeUnknown $"Cannot confirm source publication at {gitRef}.")
-                        | Error _ -> Error(OutcomeUnknown $"Cannot verify source publication at {gitRef}.")
+                        let publishAndConfirm () =
+                            let result =
+                                git binding.RepositoryPath
+                                    [ "push"; "--porcelain"; $"--force-with-lease={gitRef}:"; binding.RemoteName; $"{headOid}:{gitRef}" ]
+                            match remoteReviewRef binding gitRef with
+                            | Ok(Some observed) when observed = headOid -> Ok ()
+                            | Ok(Some _) -> Error(SourceReviewRefUnavailable "Immutable review ref changed or was claimed elsewhere.")
+                            | Ok None ->
+                                match result with
+                                | Ok output when output.ExitCode <> 0 -> Error(GitFailure $"Source publication rejected: {output.Stderr}")
+                                | _ -> Error(OutcomeUnknown $"Cannot confirm source publication at {gitRef}.")
+                            | Error _ -> Error(OutcomeUnknown $"Cannot verify source publication at {gitRef}.")
+                        OriginalGitWriterAdmissionJournal.withPublication
+                            (OriginalGitWriterAdmissionJournal.deterministicOperationId "ReviewRef" gitRef headOid)
+                            "ReviewRef"
+                            (OriginalGitWriterAdmissionJournal.authoritySha256
+                                [ "project-source"; binding.ProjectId.ToString("D"); binding.LedgerId.ToString("D")
+                                  string binding.Epoch; binding.ApprovedFetchUrl; binding.ApprovedPushUrl ])
+                            gitRef headOid publishAndConfirm (fun () -> true) OutcomeUnknown
 
     // A submission owns a create-only source snapshot, independently fetchable on
     // a different machine even after its contributor branch moves or disappears.
@@ -1942,17 +2010,26 @@ module LedgerStore =
                     | Ok(Some current) when current = headOid -> Ok ()
                     | Ok(Some _) -> Error(SourceReviewRefUnavailable "Managed integration ref already points to another commit.")
                     | Ok None ->
-                        let pushed =
-                            git binding.RepositoryPath
-                                [ "push"; "--porcelain"; $"--force-with-lease={gitRef}:"; binding.RemoteName; $"{headOid}:{gitRef}" ]
-                        match remoteReviewRef binding gitRef with
-                        | Ok(Some observed) when observed = headOid -> Ok ()
-                        | Ok(Some _) -> Error(SourceReviewRefUnavailable "Managed integration ref changed during publication.")
-                        | Ok None ->
-                            match pushed with
-                            | Ok output when output.ExitCode <> 0 -> Error(GitFailure $"Integration snapshot publication rejected: {output.Stderr}")
-                            | _ -> Error(OutcomeUnknown $"Cannot confirm managed integration snapshot at {gitRef}.")
-                        | Error _ -> Error(OutcomeUnknown $"Cannot verify managed integration snapshot at {gitRef}.")
+                        let publishAndConfirm () =
+                            let pushed =
+                                git binding.RepositoryPath
+                                    [ "push"; "--porcelain"; $"--force-with-lease={gitRef}:"; binding.RemoteName; $"{headOid}:{gitRef}" ]
+                            match remoteReviewRef binding gitRef with
+                            | Ok(Some observed) when observed = headOid -> Ok ()
+                            | Ok(Some _) -> Error(SourceReviewRefUnavailable "Managed integration ref changed during publication.")
+                            | Ok None ->
+                                match pushed with
+                                | Ok output when output.ExitCode <> 0 -> Error(GitFailure $"Integration snapshot publication rejected: {output.Stderr}")
+                                | _ -> Error(OutcomeUnknown $"Cannot confirm managed integration snapshot at {gitRef}.")
+                            | Error _ -> Error(OutcomeUnknown $"Cannot verify managed integration snapshot at {gitRef}.")
+                        OriginalGitWriterAdmissionJournal.withPublication
+                            (OriginalGitWriterAdmissionJournal.deterministicOperationId "IntegrationRef" gitRef headOid)
+                            "IntegrationRef"
+                            (OriginalGitWriterAdmissionJournal.authoritySha256
+                                [ "project-source"; binding.ProjectId.ToString("D"); binding.LedgerId.ToString("D")
+                                  string binding.Epoch; binding.ApprovedFetchUrl; binding.ApprovedPushUrl ])
+                            gitRef headOid publishAndConfirm (fun () -> true) OutcomeUnknown
+
     // Inspect the source remote without altering a local branch/worktree.
     // Only parser-validated review refs in one task namespace are returned.
     let listRemoteReviewRefs (binding: LedgerBinding) taskId =
@@ -2002,21 +2079,30 @@ module LedgerStore =
                 | Some found when found <> expectedOid ->
                     Error(SourceReviewRefUnavailable "Remote review ref no longer matches reserved orphan SHA.")
                 | Some _ ->
-                    let push = git binding.RepositoryPath
-                                    [ "push"; "--porcelain"
-                                      $"--force-with-lease={gitRef}:{expectedOid}"
-                                      binding.RemoteName; $":{gitRef}" ]
-                    inspectRemoteReviewRef binding gitRef
-                    |> Result.bind (function
-                        | None -> Ok "Deleted"
-                        | Some found when found <> expectedOid ->
-                            Error(SourceReviewRefUnavailable "Review ref changed during guarded deletion.")
-                        | Some _ ->
-                            match push with
-                            | Ok response when response.ExitCode <> 0 ->
-                                Error(GitFailure $"Guarded review deletion rejected: {response.Stderr}")
-                            | _ ->
-                                Error(OutcomeUnknown "Cannot confirm guarded review ref deletion.")))
+                    let publishAndConfirm () =
+                        let push = git binding.RepositoryPath
+                                        [ "push"; "--porcelain"
+                                          $"--force-with-lease={gitRef}:{expectedOid}"
+                                          binding.RemoteName; $":{gitRef}" ]
+                        inspectRemoteReviewRef binding gitRef
+                        |> Result.bind (function
+                            | None -> Ok "Deleted"
+                            | Some found when found <> expectedOid ->
+                                Error(SourceReviewRefUnavailable "Review ref changed during guarded deletion.")
+                            | Some _ ->
+                                match push with
+                                | Ok response when response.ExitCode <> 0 ->
+                                    Error(GitFailure $"Guarded review deletion rejected: {response.Stderr}")
+                                | _ ->
+                                    Error(OutcomeUnknown "Cannot confirm guarded review ref deletion."))
+                    OriginalGitWriterAdmissionJournal.withPublication
+                        (OriginalGitWriterAdmissionJournal.deterministicOperationId "ReviewRefDelete" gitRef expectedOid)
+                        "ReviewRefDelete"
+                        (OriginalGitWriterAdmissionJournal.authoritySha256
+                            [ "project-source"; binding.ProjectId.ToString("D"); binding.LedgerId.ToString("D")
+                              string binding.Epoch; binding.ApprovedFetchUrl; binding.ApprovedPushUrl ])
+                        gitRef ("delete:" + expectedOid) publishAndConfirm
+                        (fun status -> status = "Deleted") OutcomeUnknown)
 
     let private fetchManagedRef (safeRef: string -> bool) (binding: LedgerBinding) gitRef headOid =
         if not (safeRef gitRef) || isNull headOid || not (oidPattern.IsMatch headOid) then
@@ -2189,7 +2275,9 @@ module LedgerStore =
         else
             let requestHash = intentHash binding intent
             let repo = binding.RepositoryPath
-            let rec attempt retry =
+            let mutable journalEnabled = false
+            let mutable unresolvedRemoteEffect = false
+            let rec attempt retry admitted =
                 match withPhase "prepublication-fetch" (fun () -> fetch binding) with
                 | Error error -> Error error
                 | Ok snapshot ->
@@ -2257,58 +2345,96 @@ module LedgerStore =
                                                       $"Jarvis {intent.Kind}\n\nJarvis-Operation-Id: {intent.OperationId:D}\nJarvis-Request-Hash: {requestHash}") with
                                           | Error error -> Error error
                                           | Ok proposed ->
-                                              let pushed = withPhase "publication-push" (fun () ->
-                                                  git repo [ "push"; "--porcelain"; binding.RemoteName; $"{proposed}:{ledgerRef}" ])
-                                              match withPhase "confirmation-fetch" (fun () -> fetch binding) with
-                                              | Error failure ->
-                                                  let phaseDiagnostic =
-                                                      match failure with
-                                                      | RemoteUnavailable detail when detail.StartsWith("operationId=", StringComparison.Ordinal) ->
-                                                          // Publication is already possible: remove the
-                                                          // transport's read retry advice before adding
-                                                          // the one safe reconciliation action below.
-                                                          withoutNextAction detail
-                                                      | LedgerIntegrityError _ ->
-                                                          transportDiagnostic "confirmation-fetch" 1 None false "integrity"
-                                                      | _ ->
-                                                          transportDiagnostic "confirmation-fetch" 1 None false "verification"
-                                                  Error(OutcomeUnknown
-                                                      (phaseDiagnostic + "; nextAction=reconcile-same-uuid"))
-                                              | Ok observed ->
-                                                  match readOperation binding observed.Commit intent.OperationId with
-                                                  | Error error -> Error error
-                                                  | Ok(Some applied) when applied.RequestHash <> requestHash ->
-                                                      Error OperationIdReused
-                                                  | Ok(Some applied) ->
-                                                      match isAncestor repo proposed observed.Commit with
-                                                      | Ok true ->
-                                                          Ok { Operation = applied
-                                                               CurrentHead = observed.Commit
-                                                               AlreadyApplied = false }
-                                                      | Ok false ->
-                                                          Ok { Operation = applied
-                                                               CurrentHead = observed.Commit
-                                                               AlreadyApplied = true }
+                                              let publishAndConfirm () =
+                                                  unresolvedRemoteEffect <- true
+                                                  let pushed = withPhase "publication-push" (fun () ->
+                                                      git repo [ "push"; "--porcelain"; binding.RemoteName; $"{proposed}:{ledgerRef}" ])
+                                                  match withPhase "confirmation-fetch" (fun () -> fetch binding) with
+                                                  | Error failure ->
+                                                      let phaseDiagnostic =
+                                                          match failure with
+                                                          | RemoteUnavailable detail when detail.StartsWith("operationId=", StringComparison.Ordinal) ->
+                                                              // Publication is already possible: remove the
+                                                              // transport's read retry advice before adding
+                                                              // the one safe reconciliation action below.
+                                                              withoutNextAction detail
+                                                          | LedgerIntegrityError _ ->
+                                                              transportDiagnostic "confirmation-fetch" 1 None false "integrity"
+                                                          | _ ->
+                                                              transportDiagnostic "confirmation-fetch" 1 None false "verification"
+                                                      Error(OutcomeUnknown
+                                                          (phaseDiagnostic + "; nextAction=reconcile-same-uuid"))
+                                                  | Ok observed ->
+                                                      match readOperation binding observed.Commit intent.OperationId with
                                                       | Error error -> Error error
-                                                  | Ok None ->
-                                                      match pushed with
-                                                      | Error(RemoteUnavailable detail) ->
-                                                          let classification = classifyTransport detail
-                                                          let timedOut = classification = "timeout"
-                                                          Error(OutcomeUnknown
-                                                              (transportDiagnostic "publication-push" 1 None timedOut classification
-                                                               + "; nextAction=reconcile-same-uuid"))
-                                                      | Error _ ->
-                                                          Error(OutcomeUnknown
-                                                              (transportDiagnostic "publication-push" 1 None false "process"
-                                                               + "; nextAction=reconcile-same-uuid"))
-                                                      | Ok output when output.ExitCode <> 0 && observed.Commit = head ->
-                                                          Error(OutcomeUnknown
-                                                              (transportDiagnostic "publication-push" 1
-                                                                  (Some output.ExitCode) false (classifyTransport output.Stderr)
-                                                               + "; nextAction=reconcile-same-uuid"))
-                                                      | Ok _ when retry >= 7 -> Error LedgerContended
-                                                      | _ ->
-                                                          System.Threading.Thread.Sleep(contentionDelay retry)
-                                                          attempt (retry + 1)
-            withTransportScope intent.OperationId (fun () -> attempt 0)
+                                                      | Ok(Some applied) when applied.RequestHash <> requestHash ->
+                                                          Error OperationIdReused
+                                                      | Ok(Some applied) ->
+                                                          match isAncestor repo proposed observed.Commit with
+                                                          | Ok true ->
+                                                              unresolvedRemoteEffect <- false
+                                                              Ok { Operation = applied
+                                                                   CurrentHead = observed.Commit
+                                                                   AlreadyApplied = false }
+                                                          | Ok false ->
+                                                              unresolvedRemoteEffect <- false
+                                                              Ok { Operation = applied
+                                                                   CurrentHead = observed.Commit
+                                                                   AlreadyApplied = true }
+                                                          | Error error -> Error error
+                                                      | Ok None ->
+                                                          match pushed with
+                                                          | Error(RemoteUnavailable detail) ->
+                                                              let classification = classifyTransport detail
+                                                              let timedOut = classification = "timeout"
+                                                              Error(OutcomeUnknown
+                                                                  (transportDiagnostic "publication-push" 1 None timedOut classification
+                                                                   + "; nextAction=reconcile-same-uuid"))
+                                                          | Error _ ->
+                                                              Error(OutcomeUnknown
+                                                                  (transportDiagnostic "publication-push" 1 None false "process"
+                                                                   + "; nextAction=reconcile-same-uuid"))
+                                                          | Ok output when output.ExitCode <> 0 && observed.Commit = head ->
+                                                              Error(OutcomeUnknown
+                                                                  (transportDiagnostic "publication-push" 1
+                                                                      (Some output.ExitCode) false (classifyTransport output.Stderr)
+                                                                   + "; nextAction=reconcile-same-uuid"))
+                                                          | Ok output when journalEnabled && observed.Commit <> head && provenNonFastForwardRejection output ->
+                                                              // Git explicitly rejected this proposed CAS;
+                                                              // any subsequent plan uses the same admission.
+                                                              unresolvedRemoteEffect <- false
+                                                              if retry >= 7 then Error LedgerContended
+                                                              else
+                                                                  System.Threading.Thread.Sleep(contentionDelay retry)
+                                                                  attempt (retry + 1) true
+                                                          | Ok _ when not journalEnabled && retry >= 7 -> Error LedgerContended
+                                                          | _ when not journalEnabled ->
+                                                              System.Threading.Thread.Sleep(contentionDelay retry)
+                                                              attempt (retry + 1) true
+                                                          | _ ->
+                                                              Error(OutcomeUnknown
+                                                                  (transportDiagnostic "publication-push" 1 None false "unverified"
+                                                                   + "; nextAction=reconcile-same-uuid"))
+                                              if admitted then publishAndConfirm()
+                                              else
+                                                  // One stable UUID/request admission spans verified
+                                                  // non-fast-forward rejections and their bounded replans.
+                                                  let publication enabled =
+                                                      journalEnabled <- enabled
+                                                      match publishAndConfirm () with
+                                                      | Ok applied -> Ok(Choice1Of2 applied)
+                                                      | Error failure when not unresolvedRemoteEffect -> Ok(Choice2Of2 failure)
+                                                      | Error failure -> Error failure
+                                                  match OriginalGitWriterAdmissionJournal.withPublicationClassified
+                                                      intent.OperationId intent.Kind
+                                                      (OriginalGitWriterAdmissionJournal.authoritySha256
+                                                          [ "project"; binding.ProjectId.ToString("D"); binding.LedgerId.ToString("D")
+                                                            string binding.Epoch; binding.ApprovedFetchUrl; binding.ApprovedPushUrl ])
+                                                      ledgerRef requestHash publication
+                                                      (function Choice1Of2 applied -> applied.Operation.RequestHash = requestHash | _ -> false)
+                                                      (function Choice2Of2 _ -> true | _ -> false)
+                                                      OutcomeUnknown with
+                                                  | Ok(Choice1Of2 applied) -> Ok applied
+                                                  | Ok(Choice2Of2 failure) -> Error failure
+                                                  | Error failure -> Error failure
+            withTransportScope intent.OperationId (fun () -> attempt 0 false)

@@ -1,0 +1,1 @@
+Source d91838abaed910235c73627d037dde8e4e3b5f0c. HostState/v2 persists chained admission identity before Git publish. Red-first pre-STOP same-ID SQLite rollback and equal-high-water identity corruption both now fail closed. .NET 11 Release focused 23/23, adjacent 49/49, zero skipped; git diff --check clean. RouteCoverageProven=false, cutover and deployment HOLD.

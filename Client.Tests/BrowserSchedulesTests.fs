@@ -4,6 +4,7 @@ open System
 open System.IO
 open System.Text.Json
 open System.Text.Json.Nodes
+open System.Threading
 open System.Threading.Tasks
 open Client
 open Common
@@ -59,6 +60,66 @@ let durableOneShot () = task {
         Assert.That(called, Is.EqualTo(1))
         Assert.That(restored.List(), Does.Contain("new-tab-registration"))
         Assert.That(restored.List(), Does.Not.Contain("private-args"))
+    finally
+        Directory.Delete(dir, true)
+}
+
+type private NonPumpingContext() =
+    inherit SynchronizationContext()
+    override _.Post(_, _) = ()
+
+[<Test>]
+let schedulerPollingDoesNotCaptureCallerSynchronizationContext () = task {
+    let dir, path = temp()
+    let mutable now = DateTimeOffset.UtcNow
+    let mutable calls = 0
+    let execute (_: BrowserSchedules.ScheduledAction) = task {
+        Interlocked.Increment(&calls) |> ignore
+        return Ok "completed"
+    }
+    try
+        use scheduler = new BrowserSchedules.Service(path, execute, now=(fun () -> now), pollMs=25)
+        let previous = SynchronizationContext.Current
+        try
+            SynchronizationContext.SetSynchronizationContext(NonPumpingContext())
+            Assert.That((add scheduler "isolated-loop" 5).IsOk, Is.True)
+            scheduler.Start()
+        finally
+            SynchronizationContext.SetSynchronizationContext(previous)
+        now <- now.AddSeconds(6.)
+        do! awaitStatus (fun () -> status scheduler "isolated-loop" = "completed")
+        Assert.That(calls, Is.EqualTo(1))
+    finally
+        Directory.Delete(dir, true)
+}
+
+[<Test>]
+let schedulerTransientFaultIsReportedAndPollingRecovers () = task {
+    let dir, path = temp()
+    let mutable failClock = false
+    let mutable diagnostic = ""
+    let mutable now = DateTimeOffset.UtcNow
+    let mutable calls = 0
+    let clock () =
+        if failClock then
+            failClock <- false
+            failwith "test-clock-failure"
+        now
+    let execute (_: BrowserSchedules.ScheduledAction) = task {
+        calls <- calls + 1
+        return Ok "completed"
+    }
+    try
+        use scheduler = new BrowserSchedules.Service(path, execute,
+            now=clock, pollMs=25, onFault=(fun reason -> diagnostic <- reason))
+        Assert.That((add scheduler "faulted-loop" 5).IsOk, Is.True)
+        now <- now.AddSeconds(6.)
+        failClock <- true
+        scheduler.Start()
+        do! awaitStatus (fun () -> status scheduler "faulted-loop" = "completed")
+        Assert.That(diagnostic, Does.Contain("Persistent scheduler polling fault (retrying)"))
+        Assert.That(diagnostic, Does.Contain("test-clock-failure"))
+        Assert.That(calls, Is.EqualTo(1), "Recovery must not duplicate a launch")
     finally
         Directory.Delete(dir, true)
 }

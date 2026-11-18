@@ -284,7 +284,8 @@ let private runClient args =
                     let checkout = project.IndexOf("::", StringComparison.Ordinal)
                     let canonical = if checkout < 0 then project else project.Substring(0, checkout)
                     tui.GetAgentLastSeen(canonical, agent)),
-                verifyIdleActivity=(fun project agent -> verifyIdleActivity project agent)))
+                verifyIdleActivity=(fun project agent -> verifyIdleActivity project agent),
+                onFault=tui.Log))
         with :? IOException as error ->
             tui.Log ("Execution scheduling inactive on this client: " + error.Message)
             None

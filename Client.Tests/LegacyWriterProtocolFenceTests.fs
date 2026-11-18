@@ -1078,3 +1078,85 @@ type LegacyWriterProtocolFenceTests() =
             | Ok _ -> Assert.Fail("UUID reused with different bytes was admitted")
             Assert.That((OriginalGitWriterAdmissionJournal.inspect path |> success).PendingOrUnknown.Length,
                         Is.EqualTo(1)))
+
+
+    [<Test>]
+    member _.PreStopStaleSameIdJournalCannotEraseRealUnknownGitPublication() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "pre-stop-rollback.db")
+            let stale = Path.Combine(f.Root, "pre-admission-same-id.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            // Activation fixes host identity, but this same-ID backup predates the publication.
+            OriginalGitWriterAdmissionJournal.configuredPath() |> success |> ignore
+            File.Copy(path, stale)
+            let remote, local, _ = repository f.Root "pre-stop-unknown"
+            let gitRef = $"refs/heads/jarvis-review/_reviews/{Guid.NewGuid():N}/r1"
+            let authority = String.replicate 64 "e"
+            let lostAck () : Result<string, string> =
+                git local [ "push"; "origin"; "HEAD:" + gitRef ] |> ignore
+                Error "fixture intentionally discarded a successful remote Git acknowledgment"
+            let result =
+                OriginalGitWriterAdmissionJournal.withPublication
+                    (Guid.NewGuid()) "ReviewRef" authority gitRef "real-remote-effect"
+                    lostAck (fun _ -> true) id
+            Assert.That(Result.isError result, Is.True)
+            let actualRemoteHead =
+                git f.Root [ "--git-dir=" + remote; "rev-parse"; gitRef ]
+            Assert.That(actualRemoteHead, Is.Not.Empty,
+                        "A real irreversible Git publication must precede the stale restore")
+            let beforeRollback = OriginalGitWriterAdmissionJournal.inspect path |> success
+            Assert.That(beforeRollback.PendingOrUnknown.Length, Is.EqualTo(1))
+            Assert.That(beforeRollback.PendingOrUnknown.Head.Status, Is.EqualTo("Unknown"))
+            // Restore the same UUID's pre-admission SQLite image BEFORE STOP.
+            // The external host binding and original Git remote are not restored.
+            File.Copy(stale, path, true)
+            Assert.That(OriginalGitWriterAdmissionJournal.stop path |> Result.isError, Is.True,
+                        "STOP must not fabricate an empty/drained witness from stale SQLite")
+            Assert.That(OriginalGitWriterAdmissionJournal.inspect path |> Result.isError, Is.True,
+                        "Inspection must detect admission history lost by pre-STOP rollback")
+            let mutable attemptedSecondPush = false
+            let second =
+                OriginalGitWriterAdmissionJournal.withPublication
+                    (Guid.NewGuid()) "ReviewRef" authority
+                    $"refs/heads/jarvis-review/_reviews/{Guid.NewGuid():N}/r1" "new-effect"
+                    (fun () -> attemptedSecondPush <- true; Ok "unexpected")
+                    (fun _ -> true) id
+            Assert.That(Result.isError second, Is.True)
+            Assert.That(attemptedSecondPush, Is.False,
+                        "An older journal cannot re-admit writes after history loss")
+            Assert.That(
+                git f.Root [ "--git-dir=" + remote; "rev-parse"; gitRef ],
+                Is.EqualTo(actualRemoteHead),
+                "The remote effect survives although the restored SQLite journal omits it"))
+
+
+    [<Test>]
+    member _.StopAndInspectRejectModifiedAdmissionIdentityAtSameHighWater() =
+        withFixture (fun f ->
+            let path = Path.Combine(f.Root, "modified-admission-identity.db")
+            OriginalGitWriterAdmissionJournal.provisionDisposableJournal path
+            Environment.SetEnvironmentVariable(OriginalGitWriterAdmissionJournal.JournalEnvironment, path)
+            let authority = String.replicate 64 "d"
+            let outcome =
+                OriginalGitWriterAdmissionJournal.withPublication
+                    (Guid.NewGuid()) "ReviewRef" authority
+                    "refs/heads/jarvis-review/_reviews/identity-commitment/r1" "payload"
+                    (fun () -> Ok "verified") (fun _ -> true) id
+            Assert.That(Result.isOk outcome, Is.True)
+            let original = OriginalGitWriterAdmissionJournal.inspect path |> success
+            Assert.That(original.HighWater, Is.EqualTo(1L))
+            Assert.That(original.PendingOrUnknown, Is.Empty)
+            // Same row count and sequence, but an altered effect identity.
+            // A numeric high-water-only seal would incorrectly accept it.
+            use db = new Microsoft.Data.Sqlite.SqliteConnection(
+                "Data Source=" + path + ";Pooling=False")
+            db.Open()
+            use tamper = db.CreateCommand()
+            tamper.CommandText <- "UPDATE effects SET kind='ChangedReviewRef' WHERE sequence=1"
+            Assert.That(tamper.ExecuteNonQuery(), Is.EqualTo(1))
+            db.Close()
+            Assert.That(OriginalGitWriterAdmissionJournal.inspect path |> Result.isError, Is.True,
+                        "The full effect-identity chain must match the host commitment")
+            Assert.That(OriginalGitWriterAdmissionJournal.stop path |> Result.isError, Is.True,
+                        "STOP must never attest a modified history with matching row count"))

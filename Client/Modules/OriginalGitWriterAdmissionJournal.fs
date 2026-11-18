@@ -63,6 +63,20 @@ module OriginalGitWriterAdmissionJournal =
         |> Convert.ToHexString
         |> fun h -> h.ToLowerInvariant()
 
+    // This commitment is stored independently of SQLite BEFORE the admitting
+    // transaction commits and before any irreversible Git publication can begin.
+    // Length-prefix fields to make the effect-identity encoding unambiguous.
+    let private emptyHistory = digest "OriginalWriterAdmissionHistory/v1"
+
+    let private extendHistory previous sequence key kind authority gitRef payloadHash epoch =
+        [ previous; string sequence; key; kind; authority; gitRef; payloadHash; string epoch ]
+        |> List.map (fun value -> string (Encoding.UTF8.GetByteCount value) + ":" + value)
+        |> String.concat ""
+        |> digest
+
+    let private isLowerSha256 (value: string) =
+        value.Length = 64 && (value |> Seq.forall Char.IsAsciiHexDigitLower)
+
     let private noRedirects path =
         try
             let rec walk current =
@@ -174,6 +188,7 @@ module OriginalGitWriterAdmissionJournal =
                 git_ref TEXT NOT NULL,
                 payload_sha256 TEXT NOT NULL,
                 epoch INTEGER NOT NULL,
+                admission_sha256 TEXT NOT NULL,
                 status TEXT NOT NULL CHECK(status IN
                     ('Admitted','Attempted','Settled','Rejected','Unknown'))
             );
@@ -232,11 +247,11 @@ module OriginalGitWriterAdmissionJournal =
     let private hostStateFile (root: string) =
         Path.Combine(Path.GetDirectoryName root, "original-git-writer-host-state")
 
-    let private hostStateText path identity stopped epoch highWater =
+    let private hostStateText path identity stopped epoch highWater history =
         String.concat "\n"
-            [ "OriginalWriterHostState/v1"; path; identity
+            [ "OriginalWriterHostState/v2"; path; identity
               (if stopped then "Stopped" else "Open")
-              string epoch; string highWater ]
+              string epoch; string highWater; history ]
 
     let private readHostState stateFile =
         if not (File.Exists stateFile) then Ok None
@@ -245,24 +260,26 @@ module OriginalGitWriterAdmissionJournal =
         else
             try
                 let fields = File.ReadAllText(stateFile).Split('\n')
-                if fields.Length <> 6 || fields.[0] <> "OriginalWriterHostState/v1"
+                if fields.Length <> 7 || fields.[0] <> "OriginalWriterHostState/v2"
                    || not (Path.IsPathFullyQualified fields.[1])
                    || (fields.[3] <> "Open" && fields.[3] <> "Stopped") then
                     Error "OriginalWriterJournalUnknown/HostStateMalformed"
                 else
                     let epochOk, epoch = Int64.TryParse fields.[4]
                     let highWaterOk, highWater = Int64.TryParse fields.[5]
-                    if not epochOk || not highWaterOk || epoch < 1L || highWater < 0L then
+                    if not epochOk || not highWaterOk || epoch < 1L || highWater < 0L
+                       || not (isLowerSha256 fields.[6]) then
                         Error "OriginalWriterJournalUnknown/HostStateWatermarkInvalid"
                     else
-                        Ok(Some(fields.[1], fields.[2], fields.[3] = "Stopped", epoch, highWater))
+                        Ok(Some(fields.[1], fields.[2], fields.[3] = "Stopped",
+                                epoch, highWater, fields.[6]))
             with _ -> Error "OriginalWriterJournalUnknown/HostStateUnreadable"
 
     let private requireBoundState root path identity =
         match readHostState (hostStateFile root) with
-        | Ok(Some(pinned, journalIdentity, stopped, epoch, highWater))
+        | Ok(Some(pinned, journalIdentity, stopped, epoch, highWater, history))
             when pinned = path && journalIdentity = identity ->
-            Ok(stopped, epoch, highWater)
+            Ok(stopped, epoch, highWater, history)
         | Ok _ -> Error "OriginalWriterJournalUnknown/HostStateMissingOrChanged"
         | Error reason -> Error reason
 
@@ -283,6 +300,41 @@ module OriginalGitWriterAdmissionJournal =
         let value = cmd.ExecuteScalar()
         if isNull value then invalidOp "OriginalWriterJournalUnknown/JournalIdentityUnavailable"
         string value
+
+    // Admission can check the latest committed row in O(1); a stale snapshot
+    // from before an admission has a different tail from the monotonic host
+    // authority. STOP and inspection also independently verify the entire
+    // identity chain, rejecting deletions or modified earlier rows.
+    let private readHistoryTail (db: SqliteConnection) (tx: SqliteTransaction) =
+        use cmd =
+            command db tx
+                "SELECT sequence,admission_sha256 FROM effects ORDER BY sequence DESC LIMIT 1" []
+        use reader = cmd.ExecuteReader()
+        if reader.Read() then reader.GetInt64 0, reader.GetString 1
+        else 0L, emptyHistory
+
+    let private readHistorySummary (db: SqliteConnection) (tx: SqliteTransaction) =
+        use cmd =
+            command db tx
+                """SELECT sequence,effect_key,kind,authority_sha256,git_ref,
+                          payload_sha256,epoch,admission_sha256
+                   FROM effects ORDER BY sequence""" []
+        use reader = cmd.ExecuteReader()
+        let mutable previousSequence = 0L
+        let mutable previousHash = emptyHistory
+        while reader.Read() do
+            let sequence = reader.GetInt64 0
+            if sequence <= previousSequence then
+                invalidOp "OriginalWriterJournalUnknown/AdmissionSequenceInvalid"
+            let nextHash =
+                extendHistory previousHash sequence
+                    (reader.GetString 1) (reader.GetString 2) (reader.GetString 3)
+                    (reader.GetString 4) (reader.GetString 5) (reader.GetInt64 6)
+            if reader.GetString 7 <> nextHash then
+                invalidOp "OriginalWriterJournalUnknown/AdmissionHistoryCorrupt"
+            previousSequence <- sequence
+            previousHash <- nextHash
+        previousSequence, previousHash
 
     let private readHostBinding path seal =
         if not (protectedFile path && protectedFile seal) then
@@ -339,7 +391,7 @@ module OriginalGitWriterAdmissionJournal =
                     | Some identity ->
                         match requireBoundState root pinned identity with
                         | Error reason -> Error reason
-                        | Ok(_, epoch, _) when epoch <> 1L ->
+                        | Ok(_, epoch, _, _) when epoch <> 1L ->
                             Error "OriginalWriterJournalUnknown/HostStateEpochMismatch"
                         | Ok _ when String.IsNullOrWhiteSpace requested ->
                             Error "OriginalWriterJournalUnknown/ActivatedHostBindingMissing"
@@ -370,7 +422,7 @@ module OriginalGitWriterAdmissionJournal =
                     if not (noRedirects parent) then
                         Error "OriginalWriterJournalUnknown/UntrustedHostAuthorityParent"
                     else
-                        createProtected state (hostStateText requested identity false 1L 0L)
+                        createProtected state (hostStateText requested identity false 1L 0L emptyHistory)
                         syncParent state
                         Directory.CreateDirectory root |> ignore
                         if not (OperatingSystem.IsWindows()) then
@@ -410,12 +462,17 @@ module OriginalGitWriterAdmissionJournal =
                     let key = digest (String.concat "\n" [operationId.ToString("D"); kind; authority; gitRef])
                     inTransaction path (fun db tx ->
                         let epoch, closed = readControl db tx
-                        // SQLite's write transaction serializes this check with
-                        // STOP's durable external watermark before any admission.
-                        match requireBoundState (boundRoot()) path (readJournalIdentity db tx) with
-                        | Ok(false, authorityEpoch, 0L) when authorityEpoch = epoch -> ()
-                        | Ok(true, _, _) -> invalidOp "OriginalWriterAdmissionClosed"
-                        | Ok _ -> invalidOp "OriginalWriterJournalUnknown/HostStateEpochMismatch"
+                        // SQLite serializes admission with STOP, while the sibling
+                        // host authority prevents a restored journal from forgetting
+                        // previously admitted irreversible or UNKNOWN effects.
+                        let existingHighWater, existingHash = readHistoryTail db tx
+                        let identity = readJournalIdentity db tx
+                        match requireBoundState (boundRoot()) path identity with
+                        | Ok(false, authorityEpoch, authorityHighWater, authorityHash)
+                            when authorityEpoch = epoch && authorityHighWater = existingHighWater
+                                 && authorityHash = existingHash -> ()
+                        | Ok(true, _, _, _) -> invalidOp "OriginalWriterAdmissionClosed"
+                        | Ok _ -> invalidOp "OriginalWriterJournalUnknown/AdmissionHistoryRollback"
                         | Error reason -> invalidOp reason
                         if closed then Error "OriginalWriterAdmissionClosed"
                         else
@@ -441,13 +498,28 @@ module OriginalGitWriterAdmissionJournal =
                             | None ->
                                 use insert =
                                     command db tx
-                                        """INSERT INTO effects(effect_key,kind,authority_sha256,git_ref,payload_sha256,epoch,status)
-                                           VALUES($key,$kind,$authority,$ref,$payload,$epoch,'Admitted')"""
+                                        """INSERT INTO effects(effect_key,kind,authority_sha256,git_ref,payload_sha256,epoch,status,admission_sha256)
+                                           VALUES($key,$kind,$authority,$ref,$payload,$epoch,'Admitted',$history)"""
                                         ["$key", box key; "$kind", box kind; "$authority", box authority;
-                                         "$ref", box gitRef; "$payload", box payloadHash; "$epoch", box epoch]
+                                         "$ref", box gitRef; "$payload", box payloadHash; "$epoch", box epoch;
+                                         "$history", box emptyHistory]
                                 insert.ExecuteNonQuery() |> ignore
                                 use seqCommand = command db tx "SELECT last_insert_rowid()" []
                                 let sequence = Convert.ToInt64(seqCommand.ExecuteScalar())
+                                let newHash =
+                                    extendHistory existingHash sequence key kind authority gitRef payloadHash epoch
+                                use recordCommitment =
+                                    command db tx
+                                        "UPDATE effects SET admission_sha256=$history WHERE sequence=$sequence"
+                                        ["$history", box newHash; "$sequence", box sequence]
+                                if recordCommitment.ExecuteNonQuery() <> 1 then
+                                    invalidOp "OriginalWriterJournalUnknown/AdmissionCommitmentNotDurable"
+                                // CRITICAL ORDER: durable host commitment first; SQLite
+                                // commit second; remote publication only after both.
+                                // A crash between the two leaves host ahead and
+                                // requires Recovery instead of fabricating clean STOP.
+                                updateHostStateAtomically (hostStateFile (boundRoot()))
+                                    (hostStateText path identity false epoch sequence newHash)
                                 Ok(Some {DatabasePath=path; EffectKey=key; Sequence=sequence;
                                          Epoch=epoch; Replay=false}))
                 with
@@ -491,18 +563,17 @@ module OriginalGitWriterAdmissionJournal =
         try
             inTransaction path (fun db tx ->
                 let epoch, closed = readControl db tx
-                use maxCmd = command db tx "SELECT COALESCE(MAX(sequence),0) FROM effects" []
-                let highWater = Convert.ToInt64(maxCmd.ExecuteScalar())
+                let highWater, history = readHistorySummary db tx
                 // A witness from restored SQLite cannot override independently
                 // durable host STOP authority or its settled-effect high-water.
                 match readHostState (hostStateFile (boundRoot())) with
                 | Error reason -> invalidOp reason
-                | Ok(Some(pinned, identity, stopped, authorityEpoch, authorityHighWater))
+                | Ok(Some(pinned, identity, stopped, authorityEpoch, authorityHighWater, authorityHistory))
                     when pinned = path ->
                     if identity <> readJournalIdentity db tx
                        || authorityEpoch <> epoch || stopped <> closed
-                       || highWater < authorityHighWater then
-                        invalidOp "OriginalWriterJournalUnknown/StopWatermarkRollback"
+                       || highWater <> authorityHighWater || history <> authorityHistory then
+                        invalidOp "OriginalWriterJournalUnknown/AdmissionHistoryRollback"
                 | Ok None ->
                     match hostRootState (boundRoot()) with
                     | Ok true ->
@@ -538,17 +609,19 @@ module OriginalGitWriterAdmissionJournal =
             inTransaction path (fun db tx ->
                 let epoch, alreadyClosed = readControl db tx
                 let identity = readJournalIdentity db tx
-                use highWaterCmd = command db tx "SELECT COALESCE(MAX(sequence),0) FROM effects" []
-                let highWater = Convert.ToInt64(highWaterCmd.ExecuteScalar())
+                let highWater, history = readHistorySummary db tx
                 match requireBoundState (boundRoot()) path identity with
-                | Ok(false, authorityEpoch, 0L) when not alreadyClosed && authorityEpoch = epoch ->
+                | Ok(false, authorityEpoch, authorityHighWater, authorityHistory)
+                    when not alreadyClosed && authorityEpoch = epoch
+                         && highWater = authorityHighWater && history = authorityHistory ->
                     // STOP is durable BEFORE updating the journal control row.
-                    // An interrupted transaction therefore fails closed.
+                    // A crash between host STOP and SQLite close requires Recovery.
                     updateHostStateAtomically (hostStateFile (boundRoot()))
-                        (hostStateText path identity true epoch highWater)
-                | Ok(true, authorityEpoch, authorityHighWater)
-                    when alreadyClosed && authorityEpoch = epoch && highWater >= authorityHighWater ->
-                    () // Idempotent already-stopped journal and same monotonic authority.
+                        (hostStateText path identity true epoch highWater history)
+                | Ok(true, authorityEpoch, authorityHighWater, authorityHistory)
+                    when alreadyClosed && authorityEpoch = epoch
+                         && highWater = authorityHighWater && history = authorityHistory ->
+                    () // Idempotent already-stopped journal with verified identity history.
                 | _ -> invalidOp "OriginalWriterJournalUnknown/StopAuthorityMismatch"
                 use cmd = command db tx "UPDATE control SET closed=1 WHERE id=1 AND epoch=$epoch"
                                     ["$epoch",box epoch]

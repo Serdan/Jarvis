@@ -46,8 +46,8 @@ let private target purpose project ledger =
       LedgerId = ledger; LedgerEpoch = 1; CanonicalRepositoryId = repoId project
       ApprovedRemoteFingerprintSha256 = hash
       GitRef = match purpose with
-               | OriginalGitRefPurpose.AccountLedger -> "refs/heads/account"
-               | OriginalGitRefPurpose.ProjectLedger -> "refs/heads/project"
+               | OriginalGitRefPurpose.AccountLedger -> "refs/heads/jarvis-account-admission"
+               | OriginalGitRefPurpose.ProjectLedger -> "refs/heads/jarvis-orchestration"
                | OriginalGitRefPurpose.SourceEffect -> "refs/heads/source-effects" }
 
 let private ledger isAccount project ledger =
@@ -440,3 +440,60 @@ let ``invalid original effect remote head and publisher ref are Rejected`` () =
         journalProbe events (fun j ->
             { j with Target = { j.Target with GitRef = "refs/heads/source-effects.lock" } })
     Assert.That(isRejected invalidTarget, Is.True, sprintf "Invalid publisher ref: %A" invalidTarget)
+
+
+// Account and project source ledgers must pass the same canonical target and
+// trusted binding invariants as WorkLegacySourceWitness.checkLedger. These
+// tests use otherwise coherent two-project/one-account negative-only captures.
+let private probeWithAlteredLedger projectId
+                                   (alter: WorkLegacySourceLedgerCapture -> WorkLegacySourceLedgerCapture) =
+    let initial = originalCapture ()
+    let changed =
+        { initial with
+            LedgerCaptures =
+                initial.LedgerCaptures
+                |> List.map (fun ledger ->
+                    if ledger.Target.ProjectId = projectId then alter ledger else ledger) }
+    let observed = reader (Ok changed) (Ok changed) (fun t -> Ok t)
+    WorkLegacyImportAuthenticatedReadDiagnostics.probe observed (subject WorkSqliteRecordKind.Project)
+
+let private assertRejectedLedgerCases title alteration =
+    for projectId in [ None; Some(fst projects.Head) ] do
+        let result = probeWithAlteredLedger projectId alteration
+        Assert.That(isRejected result, Is.True,
+                    sprintf "%s for original account/project %A: %A" title projectId result)
+
+[<Test>]
+let ``noncanonical original account and project ledger refs are Rejected rather than Incomplete`` () =
+    assertRejectedLedgerCases "Malformed account/project Git ref" (fun ledger ->
+        { ledger with Target = { ledger.Target with GitRef = "refs/heads/other-ledger" } })
+
+[<Test>]
+let ``malformed original account and project repository hashes and fingerprints are Rejected`` () =
+    assertRejectedLedgerCases "Invalid repository SHA256" (fun ledger ->
+        { ledger with Target = { ledger.Target with CanonicalRepositoryId = "invalid-repository-hash" } })
+    assertRejectedLedgerCases "Invalid approved remote SHA256" (fun ledger ->
+        { ledger with Target = { ledger.Target with ApprovedRemoteFingerprintSha256 = "invalid-fingerprint" } })
+
+[<Test>]
+let ``swapped trusted remote identity cannot authenticate original account or project`` () =
+    assertRejectedLedgerCases "Trusted remote mismatch" (fun ledger ->
+        let other = { ledger.Fence.Binding with TrustedRemoteId = String.replicate 64 "e" }
+        let updatedFence = { ledger.Fence with Binding = other }
+        { ledger with Fence = updatedFence })
+
+[<Test>]
+let ``wrong original Git binding scope is Rejected for both ledger kinds`` () =
+    assertRejectedLedgerCases "Wrong binding scope" (fun ledger ->
+        let wrongScope =
+            if ledger.Target.ProjectId.IsNone then WorkLegacyGitScope.Project
+            else WorkLegacyGitScope.Account
+        let other = { ledger.Fence.Binding with Scope = wrongScope }
+        let updatedFence = { ledger.Fence with Binding = other }
+        { ledger with Fence = updatedFence })
+
+[<Test>]
+let ``malformed yet matching remote and fenced Git heads are Rejected not Incomplete`` () =
+    assertRejectedLedgerCases "Invalid current and fenced Git OID" (fun ledger ->
+        { ledger with CurrentRemoteHead = "not-a-git-head"
+                      Fence = { ledger.Fence with FencedHead = "not-a-git-head" } })

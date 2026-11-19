@@ -230,7 +230,7 @@ type Service(port: int, pairingSecret: string) =
                                         else Some(JsonSerializer.SerializeToElement(w))) |> Seq.toList
                                 lock sync (fun () -> conn.Windows <- parsed)
                             | _ -> ()
-                        | "result" | "error" | "tabOpened" | "tabClosed" | "snapshotReady" | "snapshotChunk" ->
+                        | "result" | "error" | "tabOpened" | "tabClosed" | "tabCloseDeferred" | "snapshotReady" | "snapshotChunk" ->
                             let requestId = asString doc "requestId"
                             let mutable tcs = Unchecked.defaultof<TaskCompletionSource<string>>
                             if conn.Pending.TryRemove(requestId, &tcs) then
@@ -373,7 +373,8 @@ type Service(port: int, pairingSecret: string) =
 
     member _.CloseTab(tabRegistration: string, ?ownerConnectionId: string,
                       ?expectedRegistrationGeneration: int,
-                      ?requireFreshHomeNoTurns: bool) = task {
+                      ?requireFreshHomeNoTurns: bool,
+                      ?deferredPromptSha256: string) = task {
         let resolved = lock sync (fun () ->
             match resolveRegistration ownerConnectionId false tabRegistration with
             | Error error -> Error error
@@ -406,7 +407,8 @@ type Service(port: int, pairingSecret: string) =
                             {| version = ProtocolVersion; kind = "closeTab"
                                requestId = requestId; connectionId = conn.Id
                                registrationId = registrationId; registrationGeneration = generation
-                               requireFreshHomeNoTurns = defaultArg requireFreshHomeNoTurns false |})
+                               requireFreshHomeNoTurns = defaultArg requireFreshHomeNoTurns false
+                               deferredPromptSha256 = defaultArg deferredPromptSha256 "" |})
                         let! response = completion.Task.WaitAsync(TimeSpan.FromSeconds(15.0))
                         let root = JsonNode.Parse(response)
                         if asString root "connectionId" <> conn.Id ||
@@ -415,6 +417,8 @@ type Service(port: int, pairingSecret: string) =
                             return Error "ResponseIdentityMismatch"
                         elif asString root "kind" = "error" then
                             return Error ("BrowserCloseTabError:" + asString root "error")
+                        elif deferredPromptSha256.IsSome && asString root "kind" = "tabCloseDeferred" then
+                            return Ok """{"deferred":true}"""
                         elif asString root "kind" <> "tabClosed" then
                             return Error "UnexpectedBrowserResponse"
                         else return Ok """{"closed":true}"""
@@ -771,6 +775,29 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                             let safe = if e.Length > 100 then e.Substring(0, 100) else e
                             return Error("cleanupFailed:" + safe)
                     }
+                    // Unknown execution is not permission to resubmit or to close.
+                    // Arm an expiring, extension-verified check for the exact user
+                    // turn and durable conversation before any deferred removal.
+                    let deferConfirmedCleanup () = task {
+                        if not closeAfterExecution || url <> "https://chatgpt.com/" then
+                            return "retained"
+                        else
+                            use args = JsonDocument.Parse(argsJson)
+                            match args.RootElement.TryGetProperty("prompt") with
+                            | true, field when field.ValueKind = JsonValueKind.String ->
+                                let prompt = field.GetString()
+                                if String.IsNullOrWhiteSpace(prompt) || prompt.Length > 24000 then
+                                    return "retained"
+                                else
+                                    let normalized = prompt.Replace("\r\n", "\n").Replace("\u00a0", " ").Trim()
+                                    let hash = Convert.ToHexString(SHA256.HashData(utf8.GetBytes(normalized))).ToLowerInvariant()
+                                    match! bridge.CloseTab(registrationId, ownerConnectionId = ownerConnectionId,
+                                                           expectedRegistrationGeneration = createdGeneration,
+                                                           deferredPromptSha256 = hash) with
+                                    | Ok _ -> return "deferred"
+                                    | Error _ -> return "retained"
+                            | _ -> return "retained"
+                    }
                     // Readiness advertised by the extension is not atomic with
                     // Chrome's live tab status. A page can start another load
                     // between ListTabs and the extension's execute preflight.
@@ -833,7 +860,9 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                         let script = defaultArg execution (Error "TabUnavailable:loading")
                         match script with
                         | Error e when isLoadingPreflight e -> return! cleanupNotReady()
-                        | Error e -> return Error(registrationId, "OutcomeUnknown: " + e)
+                        | Error e ->
+                            let! cleanup = deferConfirmedCleanup()
+                            return Error(registrationId, "OutcomeUnknown: " + e + "; cleanup=" + cleanup)
                         | Ok result ->
                             use doc = JsonDocument.Parse(result)
                             let payload = doc.RootElement.GetProperty("result")
@@ -866,7 +895,8 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                                 if disposable then closeDefinitive()
                                 else task { return Ok "retained" }
                             if status = "outcomeUnknown" then
-                                return Error(registrationId, "OutcomeUnknown: page submission was not confirmed")
+                                let! cleanup = deferConfirmedCleanup()
+                                return Error(registrationId, "OutcomeUnknown: page submission was not confirmed; cleanup=" + cleanup)
                             elif status = "uiIncompatible" then
                                 // Provider scripts supply a bounded, non-sensitive stage and
                                 // reason; cleanup does not discard these diagnostics.
@@ -931,6 +961,9 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                                     cleanup <- match closed with
                                                | Ok _ -> "closed"
                                                | Error e -> "cleanupFailed:" + (if e.Length > 100 then e.Substring(0, 100) else e)
+                                    if cleanup.StartsWith("cleanupFailed:", StringComparison.Ordinal) && status = "submitted" then
+                                        let! deferred = deferConfirmedCleanup()
+                                        if deferred = "deferred" then cleanup <- cleanup + "; deferred=armed"
                                 return Ok(JsonSerializer.Serialize(
                                     {| registrationId = registrationId
                                        status = status

@@ -805,6 +805,98 @@ const FRESH_HOME_PROBE = [
 // This cleanup-only policy does not change the explicitly requested post-send
 // close behavior. An initial about:blank navigation is the one safe case where
 // a fresh tab can be disposed before its provider DOM exists.
+// Uncertain ChatGPT sends retain the tab until a fresh, exact turn matches.
+// Only a bounded hash-only obligation is persisted; no prompt or DOM text is saved.
+const DEFERRED_CLOSE_TTL_MS = 5 * 60 * 1000;
+const deferredCloseInFlight = new Set();
+const deferredCloseLastProbe = new Map();
+const DURABLE_CHATGPT_CONVERSATION = /^\/c\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/?$/i;
+
+function durableChatGptTab(tab) {
+  if (!tab || tab.status !== "complete" || tab.pendingUrl || tab.discarded || tab.frozen) return false;
+  try {
+    const url = new URL(tab.url);
+    return url.origin === "https://chatgpt.com" && DURABLE_CHATGPT_CONVERSATION.test(url.pathname);
+  } catch { return false; }
+}
+function confirmedTurnProbe(expectedHash) {
+  return [
+    "(async () => {",
+    "  try {",
+    "    if (document.readyState !== 'complete') return null;",
+    "    const bubbles = document.querySelectorAll('[data-user-message-bubble]');",
+    "    const legacy = document.querySelectorAll('[data-message-author-role=user]');",
+    "    const turns = bubbles.length ? bubbles : legacy;",
+    "    if (turns.length !== 1) return null;",
+    "    const value = (turns[0].innerText || turns[0].textContent || '')",
+    "      .replaceAll(String.fromCharCode(13,10), String.fromCharCode(10)).replaceAll(String.fromCharCode(160), ' ').trim();",
+    "    const bytes = new TextEncoder().encode(value);",
+    "    const digest = await crypto.subtle.digest('SHA-256', bytes);",
+    "    const actual = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');",
+    "    return { href: location.href, exactTurn: actual === " + JSON.stringify(expectedHash) + " };",
+    "  } catch { return null; }",
+    "})()"
+  ].join(" ");
+}
+async function tryDeferredClose(reg) {
+  const proof = reg.deferredCleanup;
+  if (!proof || deferredCloseInFlight.has(reg.registrationId)) return;
+  if (Date.now() >= proof.expiresAt) {
+    if (registrations.includes(reg) && reg.deferredCleanup === proof) {
+      delete reg.deferredCleanup;
+      try { await persist(); } catch {}
+    }
+    return;
+  }
+  const last = deferredCloseLastProbe.get(reg.registrationId) || 0;
+  if (Date.now() - last < 1000) return;
+  deferredCloseLastProbe.set(reg.registrationId, Date.now());
+  deferredCloseInFlight.add(reg.registrationId);
+  try {
+    const authorized = () =>
+      registrations.find(r => r.registrationId === reg.registrationId) === reg &&
+      reg.agentCreated && reg.deferredCleanup === proof &&
+      Date.now() < proof.expiresAt &&
+      reg.registrationGeneration === proof.generation &&
+      !reg.blocked && reg.sessionEpoch === sessionEpoch &&
+      allowAgentCreatedTabs && reg.boundUrl === CHATGPT_FRESH_HOME;
+    if (!authorized()) return;
+    const tab = await chrome.tabs.get(reg.tabId);
+    if (!durableChatGptTab(tab)) return;
+    const parent = await validWindow(reg.windowRegistration);
+    if (!parent || parent.generation !== proof.windowGeneration ||
+        parent.windowId !== tab.windowId) return;
+    if (!(await chrome.permissions.contains({ origins: ["https://chatgpt.com/*"] }))) return;
+    if (!authorized()) return;
+    const frames = await chrome.userScripts.execute({
+      target: { tabId: reg.tabId }, js: [{ code: confirmedTurnProbe(proof.hash) }],
+      world: "USER_SCRIPT"
+    });
+    const observed = frames?.length === 1 && frames[0]?.frameId === 0 ? frames[0].result : null;
+    if (!observed || observed.exactTurn !== true || observed.href !== tab.url) return;
+    // The probe awaits a page script; pending SPA navigation, adoption, a
+    // changed window or revoked permission must all fence the final remove.
+    const latest = await chrome.tabs.get(reg.tabId);
+    const latestParent = await validWindow(reg.windowRegistration);
+    const permitted = await chrome.permissions.contains({ origins: ["https://chatgpt.com/*"] });
+    if (!authorized() || !permitted || latestParent !== parent ||
+        registeredWindows.find(w => w.registrationId === reg.windowRegistration) !== parent ||
+        parent.blocked || parent.sessionEpoch !== sessionEpoch ||
+        latestParent.generation !== proof.windowGeneration ||
+        latest.windowId !== parent.windowId || latest.url !== tab.url ||
+        !durableChatGptTab(latest)) return;
+    await chrome.tabs.remove(reg.tabId);
+    registrations = registrations.filter(r => r !== reg);
+    deferredCloseLastProbe.delete(reg.registrationId);
+    await persist();
+    await advertise();
+  } catch {
+    // Missing/uncertain proof and failed Chrome operations retain the tab.
+    // Future navigation/alarms may retry only inside the bounded lease.
+  } finally {
+    deferredCloseInFlight.delete(reg.registrationId);
+  }
+}
 async function closeCreatedTab(message) {
   const { requestId, registrationId, registrationGeneration } = message;
   const requestSocket = socket;
@@ -834,6 +926,29 @@ async function closeCreatedTab(message) {
   let tab;
   try { tab = await chrome.tabs.get(reg.tabId); } catch { return reject("TabMissing"); }
   if (tab.windowId !== parent.windowId) return reject("WindowMismatch");
+  if (message.deferredPromptSha256 !== undefined && message.deferredPromptSha256 !== "") {
+    const hash = message.deferredPromptSha256;
+    if (typeof hash !== "string" || !/^[0-9a-f]{64}$/.test(hash) ||
+        reg.boundUrl !== CHATGPT_FRESH_HOME || message.requireFreshHomeNoTurns === true)
+      return reject("InvalidDeferredCleanupProof");
+    // Persist only a bounded proof tied to the agent-created tab and window.
+    // The future recheck never trusts this receipt as evidence of submission.
+    if (registrations.find(r => r.registrationId === registrationId) !== reg ||
+        !reg.agentCreated || reg.registrationGeneration !== registrationGeneration ||
+        reg.blocked || reg.sessionEpoch !== sessionEpoch || !allowAgentCreatedTabs ||
+        !finalParent || finalParent !== parent || finalParent.generation !== parentGeneration)
+      return reject("RegistrationStale");
+    if (reg.deferredCleanup && reg.deferredCleanup.hash !== hash)
+      return reject("DeferredCleanupConflict");
+    if (!reg.deferredCleanup) reg.deferredCleanup = {
+      hash, generation: registrationGeneration, windowGeneration: parentGeneration,
+      expiresAt: Date.now() + DEFERRED_CLOSE_TTL_MS
+    };
+    try { await persist(); } catch { return reject("DeferredCleanupPersistFailed"); }
+    respond({ kind: "tabCloseDeferred" });
+    void tryDeferredClose(reg);
+    return;
+  }
   if (message.requireFreshHomeNoTurns === true) {
     let current;
     try { current = await chrome.tabs.get(reg.tabId); }
@@ -1085,7 +1200,11 @@ async function observeNavigation(tabId, url) {
   if (registrations.some(r => r.tabId === tabId)) await advertise();
 }
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  void observeNavigation(tabId, changeInfo.url);
+  void observeNavigation(tabId, changeInfo.url).then(() => {
+    if (changeInfo.status === "complete" || changeInfo.url)
+      for (const reg of registrations)
+        if (reg.tabId === tabId && reg.deferredCleanup) void tryDeferredClose(reg);
+  }).catch(() => {});
   if (changeInfo.windowId !== undefined) void advertise();
 });
 chrome.windows.onRemoved.addListener(windowId => {
@@ -1096,10 +1215,19 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   void unregister(tabId);
 });
 chrome.webNavigation?.onHistoryStateUpdated?.addListener((details) => {
-  if (details.frameId === 0) void observeNavigation(details.tabId, details.url);
+  if (details.frameId === 0) {
+    void observeNavigation(details.tabId, details.url).then(() => {
+      for (const reg of registrations)
+        if (reg.tabId === details.tabId && reg.deferredCleanup) void tryDeferredClose(reg);
+    }).catch(() => {});
+  }
 });
 chrome.alarms.create("jarvis-reconnect", { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener(alarm => {
-  if (alarm.name === "jarvis-reconnect" && !connected) void connect();
+  if (alarm.name === "jarvis-reconnect") {
+    if (!connected) void connect();
+    for (const reg of registrations)
+      if (reg.deferredCleanup) void tryDeferredClose(reg);
+  }
 });
 void initialize().then(connect);

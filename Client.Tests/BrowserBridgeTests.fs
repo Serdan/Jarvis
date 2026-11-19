@@ -1310,3 +1310,80 @@ let compositeLaunchRejectsManualReRegistrationWithoutInjection () = task {
     | Error error -> Assert.That(error, Is.EqualTo("TabRegistrationChanged"))
     | Ok _ -> Assert.Fail("Stale generation must never close a user-owned tab")
 }
+
+
+// The bridge never treats an unacknowledged Send as permission to close.
+// It requests a bounded extension-owned check pinned to the intended prompt.
+[<TestCase("outcomeUnknown")>]
+[<TestCase("submitted")>]
+let launcherUnknownOrFailedImmediateCloseArmsDeferredVerifiedCleanup (scriptStatus: string) = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let! client, connectionId = handshake port "test-secret"
+    use socket = client
+    do! registerReadyAgentWindow socket bridge
+    let prompt = "Line 1\r\nLine 2"
+    let argsJson = JsonSerializer.Serialize({| prompt = prompt |})
+    let launch = BrowserBridge.runInNewTab bridge "agents" "https://chatgpt.com/" "" false
+                     "async function execute(args) { return args; }" argsJson 5000 true
+    let! opened = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property opened "kind", Is.EqualTo("openTab"))
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"deferred-tab","agentCreated":true,"availability":"ready","registrationGeneration":4}]}"""
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "tabOpened"; requestId = property opened "requestId"
+        connectionId = connectionId
+        tab = {| registrationId = "deferred-tab"; agentCreated = true
+                 availability = "ready"; registrationGeneration = 4 |}
+    |}))
+    let! executing = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property executing "kind", Is.EqualTo("executeJs"))
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "result"; requestId = property executing "requestId"
+        connectionId = connectionId; registrationId = "deferred-tab"
+        registrationGeneration = 4
+        result = {| status = scriptStatus; reason = "SubmissionUnconfirmed" |}
+    |}))
+    if scriptStatus = "submitted" then
+        let! immediateClose = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+        Assert.That(property immediateClose "kind", Is.EqualTo("closeTab"))
+        use immediate = JsonDocument.Parse(immediateClose)
+        Assert.That(immediate.RootElement.GetProperty("deferredPromptSha256").GetString(), Is.Empty)
+        do! send socket (JsonSerializer.Serialize({|
+            version = 2; kind = "error"; error = "CleanupSafetyUnverified"
+            requestId = property immediateClose "requestId"
+            connectionId = connectionId; registrationId = "deferred-tab"
+            registrationGeneration = 4
+        |}))
+    let! deferred = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property deferred "kind", Is.EqualTo("closeTab"))
+    Assert.That(property deferred "registrationId", Is.EqualTo("deferred-tab"))
+    use deferredFrame = JsonDocument.Parse(deferred)
+    let deferredRoot = deferredFrame.RootElement
+    Assert.That(deferredRoot.GetProperty("registrationGeneration").GetInt32(), Is.EqualTo(4))
+    Assert.That(deferredRoot.GetProperty("requireFreshHomeNoTurns").GetBoolean(), Is.False)
+    let expectedHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("Line 1\nLine 2"))).ToLowerInvariant()
+    Assert.That(deferredRoot.GetProperty("deferredPromptSha256").GetString(), Is.EqualTo(expectedHash))
+    Assert.That(deferred.Contains(prompt), Is.False, "Bridge must not send prompt with cleanup request")
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "tabCloseDeferred"; requestId = property deferred "requestId"
+        connectionId = connectionId; registrationId = "deferred-tab"
+        registrationGeneration = 4
+    |}))
+    match! launch.WaitAsync(TimeSpan.FromSeconds(3.0)) with
+    | Error (registrationId, reason) when scriptStatus = "outcomeUnknown" ->
+        Assert.That(registrationId, Is.EqualTo("deferred-tab"))
+        Assert.That(reason, Does.Contain("OutcomeUnknown"))
+        Assert.That(reason, Does.Contain("cleanup=deferred"))
+    | Ok result when scriptStatus = "submitted" ->
+        Assert.That(result, Does.Contain("submitted"))
+        Assert.That(result, Does.Contain("cleanupFailed:"))
+        Assert.That(result, Does.Contain("deferred=armed"))
+    | _ -> Assert.Fail("Unexpected result: no duplicate execution or immediate closing is allowed")
+    Assert.That(bridge.ListTabs() |> Result.exists (fun listing -> listing.Contains("deferred-tab")), Is.True)
+    use cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(150.0))
+    try
+        let! extra = socket.ReceiveAsync(ArraySegment<byte>(Array.zeroCreate<byte> 8192), cts.Token)
+        Assert.Fail("Deferred cleanup must not replay executeJs or immediately close the tab: " + string extra.MessageType)
+    with :? OperationCanceledException -> ()
+}

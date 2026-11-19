@@ -11,6 +11,10 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 function createHarness(initialStorage = {}, initialSession = {}) {
   const storage = new Map(Object.entries(initialStorage));
   const session = new Map(Object.entries(initialSession));
+  let clockOffsetMs = 0;
+  class ExtensionDate extends Date {
+    static now() { return Date.now() + clockOffsetMs; }
+  }
   const tabs = new Map([
     [17, { id: 17, url: "https://example.test/chat/7", title: "Agent 7", status: "complete", windowId: 1 }],
     [18, { id: 18, url: "https://example.test/other", title: "Unregistered", status: "complete", windowId: 1 }]
@@ -28,6 +32,7 @@ function createHarness(initialStorage = {}, initialSession = {}) {
   let permissionHook = null;
   let windowQueryHook = null;
   let failNextTabQuery = false;
+  let failNextTabRemove = false;
   let nextTabQueryHook = null;
   let failNextRegistryWrite = false;
   let holdNextRegistryWrite = false;
@@ -88,7 +93,10 @@ function createHarness(initialStorage = {}, initialSession = {}) {
         createdTabs.push(tab);
         return tab;
       },
-      remove: async id => { removedTabs.push(id); tabs.delete(id); listeners.removed?.(id); },
+      remove: async id => {
+        if (failNextTabRemove) { failNextTabRemove = false; throw Error('Simulated tabs.remove failure'); }
+        removedTabs.push(id); tabs.delete(id); listeners.removed?.(id);
+      },
       get: async id => {
         if (nextTabQueryHook) {
           const hook = nextTabQueryHook;
@@ -143,12 +151,19 @@ function createHarness(initialStorage = {}, initialSession = {}) {
         if (!page) throw new Error("Missing target");
         const result = await vm.runInNewContext(js[0].code, {
           location: { href: page.url, origin: new URL(page.url).origin },
+          crypto: webcrypto, TextEncoder,
           document: {
             title: page.title,
             readyState: page.documentReadyState || "complete",
-            querySelectorAll: () => Array.from({
-              length: (page.userTurns || 0) + (page.userBubbles || 0)
-            }, () => ({}))
+            querySelectorAll: selector => {
+              const combined = selector.includes("[data-message-author-role") && selector.includes("[data-user-message-bubble");
+              const bubbles = selector.includes("[data-user-message-bubble");
+              const count = combined ? (page.userTurns || 0) + (page.userBubbles || 0)
+                : bubbles ? (page.userBubbles || 0) : (page.userTurns || 0);
+              return Array.from({ length: count }, () => ({
+                innerText: page.userText || "", textContent: page.userText || ""
+              }));
+            }
           }
         });
         if (postUserScriptHook) {
@@ -161,7 +176,7 @@ function createHarness(initialStorage = {}, initialSession = {}) {
     }
   };
   vm.runInNewContext(source, {
-    chrome, crypto: webcrypto, TextEncoder, URL, WebSocket: FakeWebSocket,
+    chrome, crypto: webcrypto, TextEncoder, URL, WebSocket: FakeWebSocket, Date: ExtensionDate,
     btoa: input => Buffer.from(input, "binary").toString("base64"),
     setTimeout, clearTimeout, setInterval: () => 1, clearInterval: () => {}
   });
@@ -180,6 +195,8 @@ function createHarness(initialStorage = {}, initialSession = {}) {
     onWindowQuery: fn => { windowQueryHook = fn; },
     failPermissionQueryOnce: () => { failNextPermissionQuery = true; },
     failTabQueryOnce: () => { failNextTabQuery = true; },
+    failTabRemoveOnce: () => { failNextTabRemove = true; },
+    advanceTimeMs: ms => { clockOffsetMs += ms; },
     beforeNextTabQuery: fn => { nextTabQueryHook = fn; },
     failRegistryWriteOnce: () => { failNextRegistryWrite = true; },
     delayNextRegistryWrite: () => { holdNextRegistryWrite = true; },
@@ -1569,5 +1586,168 @@ test("adoption during asynchronous stale assessment cannot erase user-owned regi
   assert.equal(current.agentCreated, false);
   assert.equal(current.alias, "adopted");
   assert.ok(current.registrationGeneration > registered.registrationGeneration);
+  assert.equal(h.tabs.has(tab.id), true);
+});
+
+
+// Deferred close is only an expiring, hash-pinned permission to inspect a tab.
+// Neither a missing acknowledgement nor a user-script click authorizes removal.
+const deferredChatRoute = "https://chatgpt.com/c/12345678-1234-4234-8234-123456789abc";
+const deferredPrompt = "Manager: review this exact task";
+const deferredHash = createHash("sha256").update(deferredPrompt).digest("hex");
+const deferredOptions = { deferredPromptSha256: deferredHash };
+const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+async function eventuallyRemoved(h, tab) {
+  for (let i = 0; i < 80 && h.tabs.has(tab.id); i++) await pause(15);
+  assert.equal(h.tabs.has(tab.id), false, "Confirmed deferred cleanup must reclaim the tab");
+}
+function showConfirmedBubble(tab, text = deferredPrompt, route = deferredChatRoute) {
+  tab.url = route;
+  tab.status = "complete";
+  delete tab.pendingUrl;
+  tab.userBubbles = 1;
+  tab.userText = text;
+}
+
+test("deferred cleanup retains unconfirmed submission until matching user turn and durable navigation arrive", async () => {
+  const { h, ws, tab, close, registered } = await createdTabForCloseRegression("https://chatgpt.com/");
+  const armed = await close("deferred-arm", deferredOptions);
+  assert.equal(armed.kind, "tabCloseDeferred");
+  assert.equal(h.tabs.has(tab.id), true, "Click/unknown status is not close authority");
+  const stored = h.storage.get("registrations").find(r => r.registrationId === registered.registrationId);
+  assert.equal(stored.deferredCleanup.hash, deferredHash);
+  assert.equal(typeof stored.deferredCleanup.expiresAt, "number");
+  assert.equal(JSON.stringify(stored).includes(deferredPrompt), false, "Never persist prompt text");
+
+  // Simulate a route transition after the launcher script's deadline.
+  await pause(1050);
+  showConfirmedBubble(tab);
+  h.listeners.updated(tab.id, { url: tab.url, status: "complete" });
+  await eventuallyRemoved(h, tab);
+  assert.deepEqual(h.removedTabs, [tab.id], "Close at most once");
+  assert.equal(h.tabs.has(17), true, "Manual tab survives");
+  assert.equal(h.tabs.has(18), true, "Unregistered tab survives");
+  assert.equal(h.storage.get("registrations").some(r => r.registrationId === registered.registrationId),
+    false, "Persist removal, not an everlasting cleanup registration");
+  assert.equal(ws.sent.some(m => m.kind === "executeJs"), false, "Cleanup never replays Send");
+});
+
+for (const [scenario, prepare] of [
+  ["missing user turn", tab => { showConfirmedBubble(tab); tab.userBubbles = 0; }],
+  ["wrong conversation text", tab => showConfirmedBubble(tab, "A different user message")],
+  ["temporary local conversation", tab => showConfirmedBubble(tab, deferredPrompt,
+    "https://chatgpt.com/c/local-chatgpt:placeholder")],
+  ["non-durable route", tab => showConfirmedBubble(tab, deferredPrompt,
+    "https://chatgpt.com/c/not-a-server-uuid")],
+  ["pending navigation", tab => { showConfirmedBubble(tab); tab.pendingUrl = "https://chatgpt.com/c/other"; }],
+  ["extra user turn", tab => { showConfirmedBubble(tab); tab.userBubbles = 2; }],
+  ["unfinished document", tab => { showConfirmedBubble(tab); tab.documentReadyState = "loading"; }]
+]) {
+  test("deferred cleanup retains " + scenario + " without Send replay", async () => {
+    const { h, ws, tab, close } = await createdTabForCloseRegression("https://chatgpt.com/");
+    prepare(tab);
+    const armed = await close("deferred-" + scenario.replaceAll(" ", "-"), deferredOptions);
+    assert.equal(armed.kind, "tabCloseDeferred");
+    await pause(45);
+    assert.equal(h.tabs.has(tab.id), true);
+    assert.equal(h.removedTabs.length, 0);
+    assert.equal(h.tabs.has(17), true);
+    assert.equal(ws.sent.some(m => m.kind === "executeJs"), false);
+  });
+}
+
+test("deferred cleanup refuses changed registration or user-adopted tab", async () => {
+  const { h, tab, close } = await createdTabForCloseRegression("https://chatgpt.com/");
+  assert.equal((await close("arm", deferredOptions)).kind, "tabCloseDeferred");
+  assert.equal((await h.message("register", { tabId: tab.id, alias: "personal-adoption" })).ok, true);
+  showConfirmedBubble(tab);
+  await pause(1050);
+  h.listeners.updated(tab.id, { url: tab.url, status: "complete" });
+  await pause(60);
+  assert.equal(h.removedTabs.length, 0);
+  assert.equal(h.tabs.has(tab.id), true);
+});
+
+test("deferred cleanup refuses revoked parent window or site permission", async () => {
+  const a = await createdTabForCloseRegression("https://chatgpt.com/");
+  assert.equal((await a.close("arm-window", deferredOptions)).kind, "tabCloseDeferred");
+  await a.h.message("unregisterWindow", { windowId: 1 });
+  showConfirmedBubble(a.tab);
+  await pause(1050);
+  a.h.listeners.updated(a.tab.id, { url: a.tab.url, status: "complete" });
+  await pause(30);
+  assert.equal(a.h.removedTabs.length, 0, "Revoked window keeps tab");
+
+  const b = await createdTabForCloseRegression("https://chatgpt.com/");
+  assert.equal((await b.close("arm-permission", deferredOptions)).kind, "tabCloseDeferred");
+  b.h.setHostPermissionGranted(false);
+  showConfirmedBubble(b.tab);
+  await pause(1050);
+  b.h.listeners.updated(b.tab.id, { url: b.tab.url, status: "complete" });
+  await pause(30);
+  assert.equal(b.h.removedTabs.length, 0, "Permission revocation keeps tab");
+});
+
+test("deferred cleanup rejects forged generation and invalid or conflicting proof", async () => {
+  const { h, tab, close } = await createdTabForCloseRegression("https://chatgpt.com/");
+  assert.equal((await close("bad-generation", { ...deferredOptions,
+    registrationGeneration: 100 })).error, "TabNotAgentCreated");
+  assert.equal((await close("bad-hash", { deferredPromptSha256: "x".repeat(64) })).error,
+    "InvalidDeferredCleanupProof");
+  assert.equal((await close("arm", deferredOptions)).kind, "tabCloseDeferred");
+  assert.equal((await close("conflict", { deferredPromptSha256: "a".repeat(64) })).error,
+    "DeferredCleanupConflict");
+  assert.equal(h.tabs.has(tab.id), true);
+});
+
+test("deferred cleanup fails closed when navigation starts after verified page probe", async () => {
+  const { h, tab, close } = await createdTabForCloseRegression("https://chatgpt.com/");
+  showConfirmedBubble(tab);
+  h.afterNextUserScript(() => { tab.pendingUrl = "https://chatgpt.com/c/another"; });
+  const armed = await close("arm-probe-race", deferredOptions);
+  assert.equal(armed.kind, "tabCloseDeferred");
+  await pause(70);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.removedTabs.length, 0);
+  assert.equal(h.tabs.has(tab.id), true);
+});
+
+test("transient tabs.remove failure retries after fresh affirmative evidence", async () => {
+  const { h, ws, tab, close } = await createdTabForCloseRegression("https://chatgpt.com/");
+  showConfirmedBubble(tab);
+  h.failTabRemoveOnce();
+  assert.equal((await close("arm-then-fail", deferredOptions)).kind, "tabCloseDeferred");
+  await pause(75);
+  assert.equal(h.tabs.has(tab.id), true);
+  assert.equal(h.removedTabs.length, 0);
+  await pause(1050);
+  h.listeners.alarm({ name: "jarvis-reconnect" });
+  await eventuallyRemoved(h, tab);
+  assert.deepEqual(h.removedTabs, [tab.id]);
+  assert.equal(ws.sent.some(m => m.kind === "executeJs"), false);
+});
+
+
+test("deferred cleanup expires rather than closing a conversation after its evidence lease", async () => {
+  const { h, tab, close, registered } = await createdTabForCloseRegression("https://chatgpt.com/");
+  assert.equal((await close("arm-expiring", deferredOptions)).kind, "tabCloseDeferred");
+  h.advanceTimeMs(5 * 60 * 1000 + 1);
+  h.listeners.alarm({ name: "jarvis-reconnect" });
+  await tick(); await tick();
+  const stored = h.storage.get("registrations").find(r => r.registrationId === registered.registrationId);
+  assert.equal(stored.deferredCleanup, undefined, "Expiry removes persisted proof");
+  showConfirmedBubble(tab);
+  h.listeners.updated(tab.id, { url: tab.url, status: "complete" });
+  await pause(30);
+  assert.equal(h.removedTabs.length, 0, "Expired obligation cannot remove the tab");
+});
+
+test("deferred cleanup expiration during the async proof prevents late removal", async () => {
+  const { h, tab, close } = await createdTabForCloseRegression("https://chatgpt.com/");
+  showConfirmedBubble(tab);
+  h.afterNextUserScript(() => h.advanceTimeMs(5 * 60 * 1000 + 1));
+  assert.equal((await close("arm-inflight-expiring", deferredOptions)).kind, "tabCloseDeferred");
+  await pause(50);
+  assert.equal(h.removedTabs.length, 0);
   assert.equal(h.tabs.has(tab.id), true);
 });

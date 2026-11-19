@@ -41,10 +41,29 @@ async function render() {
       const forget = document.createElement("button");
       forget.textContent = "Unregister";
       forget.title = "Remove only this extension registration; leave its browser tab open";
-      forget.onclick = () => action(() => call("unregisterRegistration", {
-        registrationId: registration.registrationId,
-        registrationGeneration: registration.registrationGeneration
-      }));
+      forget.onclick = async () => {
+        forget.disabled = true;
+        item.querySelector('[data-unregister-error]')?.remove();
+        try {
+          await call("unregisterRegistration", {
+            registrationId: registration.registrationId,
+            registrationGeneration: registration.registrationGeneration
+          });
+          // Verify the registration is gone; a response alone is not UI proof.
+          const latest = await call("getState");
+          if (latest.registrations.some(r => r.registrationId === registration.registrationId))
+            throw new Error("Registration still present after Unregister");
+          await render();
+        } catch (e) {
+          const error = document.createElement("small");
+          error.setAttribute("role", "alert");
+          error.setAttribute("data-unregister-error", "");
+          error.textContent = "Unregister failed: " + (e.message || String(e));
+          item.append(error);
+        } finally {
+          forget.disabled = false;
+        }
+      };
       item.append(name, info, forget);
       container.append(item);
     }
@@ -66,9 +85,25 @@ $("register").onclick = () => action(async () => {
   if (!granted) throw new Error("Browser host permission denied");
   await call("register", { tabId: currentTab.id, alias: $("alias").value.trim() });
 });
-$("unregister").onclick = () => action(() => call("unregister", {
-  tabId: currentTab?.id
-}));
+$("unregister").onclick = async () => {
+  const error = $("currentUnregisterError");
+  error.textContent = "";
+  const button = $("unregister");
+  button.disabled = true;
+  try {
+    const tabId = currentTab?.id;
+    if (!Number.isInteger(tabId)) throw new Error("No current tab selected");
+    await call("unregister", { tabId });
+    const latest = await call("getState");
+    if (latest.registrations.some(r => r.tabId === tabId))
+      throw new Error("Current tab remains registered");
+    await render();
+  } catch (e) {
+    error.textContent = "Unregister failed: " + (e.message || String(e));
+  } finally {
+    button.disabled = false;
+  }
+};
 $("forgetUnavailable").onclick = () => action(() => call("forgetUnavailableAgentRegistrations"));
 $("registerWindow").onclick = () => action(async () => {
   const window = await chrome.windows.getCurrent();

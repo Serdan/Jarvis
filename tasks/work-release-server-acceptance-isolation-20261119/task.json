@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"work-release-server-acceptance-isolation-20261119","title":"[P0][Work/I] Pin full Linux .NET11 Server.Release acceptance to actual OS exit","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"work-release-server-acceptance-isolation-20261119","title":"[P0][Work/I] Pin full Linux .NET11 Server.Release acceptance to actual OS exit","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"b3eec13095054f57b1861b51a1a90a13"}

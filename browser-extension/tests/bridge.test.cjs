@@ -1595,7 +1595,8 @@ test("adoption during asynchronous stale assessment cannot erase user-owned regi
 const deferredChatRoute = "https://chatgpt.com/c/12345678-1234-4234-8234-123456789abc";
 const deferredPrompt = "Manager: review this exact task";
 const deferredHash = createHash("sha256").update(deferredPrompt).digest("hex");
-const deferredOptions = { deferredPromptSha256: deferredHash };
+const deferredOptions = { deferredPromptSha256: deferredHash,
+  deferredConversationUrl: deferredChatRoute };
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function eventuallyRemoved(h, tab) {
   for (let i = 0; i < 80 && h.tabs.has(tab.id); i++) await pause(15);
@@ -1616,6 +1617,7 @@ test("deferred cleanup retains unconfirmed submission until matching user turn a
   assert.equal(h.tabs.has(tab.id), true, "Click/unknown status is not close authority");
   const stored = h.storage.get("registrations").find(r => r.registrationId === registered.registrationId);
   assert.equal(stored.deferredCleanup.hash, deferredHash);
+  assert.equal(stored.deferredCleanup.conversationId, "12345678-1234-4234-8234-123456789abc");
   assert.equal(typeof stored.deferredCleanup.expiresAt, "number");
   assert.equal(JSON.stringify(stored).includes(deferredPrompt), false, "Never persist prompt text");
 
@@ -1635,6 +1637,8 @@ test("deferred cleanup retains unconfirmed submission until matching user turn a
 for (const [scenario, prepare] of [
   ["missing user turn", tab => { showConfirmedBubble(tab); tab.userBubbles = 0; }],
   ["wrong conversation text", tab => showConfirmedBubble(tab, "A different user message")],
+  ["different conversation with identical recurring prompt", tab =>
+    showConfirmedBubble(tab, deferredPrompt, "https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")],
   ["temporary local conversation", tab => showConfirmedBubble(tab, deferredPrompt,
     "https://chatgpt.com/c/local-chatgpt:placeholder")],
   ["non-durable route", tab => showConfirmedBubble(tab, deferredPrompt,
@@ -1694,8 +1698,19 @@ test("deferred cleanup rejects forged generation and invalid or conflicting proo
     registrationGeneration: 100 })).error, "TabNotAgentCreated");
   assert.equal((await close("bad-hash", { deferredPromptSha256: "x".repeat(64) })).error,
     "InvalidDeferredCleanupProof");
+  assert.equal((await close("missing-conversation", { deferredPromptSha256: deferredHash })).error,
+    "InvalidDeferredCleanupProof");
+  assert.equal((await close("non-durable-conversation", { ...deferredOptions,
+    deferredConversationUrl: "https://chatgpt.com/c/local-chatgpt:temporary" })).error,
+    "InvalidDeferredCleanupProof");
+  assert.equal((await close("other-origin", { ...deferredOptions,
+    deferredConversationUrl: "https://example.test/c/12345678-1234-4234-8234-123456789abc" })).error,
+    "InvalidDeferredCleanupProof");
   assert.equal((await close("arm", deferredOptions)).kind, "tabCloseDeferred");
-  assert.equal((await close("conflict", { deferredPromptSha256: "a".repeat(64) })).error,
+  assert.equal((await close("conflict", { ...deferredOptions, deferredPromptSha256: "a".repeat(64) })).error,
+    "DeferredCleanupConflict");
+  assert.equal((await close("conflicting-conversation", { ...deferredOptions,
+    deferredConversationUrl: "https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" })).error,
     "DeferredCleanupConflict");
   assert.equal(h.tabs.has(tab.id), true);
 });

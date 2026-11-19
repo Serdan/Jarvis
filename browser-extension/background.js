@@ -819,6 +819,14 @@ function durableChatGptTab(tab) {
     return url.origin === "https://chatgpt.com" && DURABLE_CHATGPT_CONVERSATION.test(url.pathname);
   } catch { return false; }
 }
+function durableConversationId(value) {
+  try {
+    const url = new URL(value);
+    if (url.origin !== "https://chatgpt.com" || url.search || url.hash ||
+        !DURABLE_CHATGPT_CONVERSATION.test(url.pathname)) return null;
+    return url.pathname.split("/")[2].toLowerCase();
+  } catch { return null; }
+}
 function confirmedTurnProbe(expectedHash) {
   return [
     "(async () => {",
@@ -863,6 +871,7 @@ async function tryDeferredClose(reg) {
     if (!authorized()) return;
     const tab = await chrome.tabs.get(reg.tabId);
     if (!durableChatGptTab(tab)) return;
+    if (durableConversationId(tab.url) !== proof.conversationId) return;
     const parent = await validWindow(reg.windowRegistration);
     if (!parent || parent.generation !== proof.windowGeneration ||
         parent.windowId !== tab.windowId) return;
@@ -884,6 +893,7 @@ async function tryDeferredClose(reg) {
         parent.blocked || parent.sessionEpoch !== sessionEpoch ||
         latestParent.generation !== proof.windowGeneration ||
         latest.windowId !== parent.windowId || latest.url !== tab.url ||
+        durableConversationId(latest.url) !== proof.conversationId ||
         !durableChatGptTab(latest)) return;
     await chrome.tabs.remove(reg.tabId);
     registrations = registrations.filter(r => r !== reg);
@@ -928,8 +938,9 @@ async function closeCreatedTab(message) {
   if (tab.windowId !== parent.windowId) return reject("WindowMismatch");
   if (message.deferredPromptSha256 !== undefined && message.deferredPromptSha256 !== "") {
     const hash = message.deferredPromptSha256;
+    const conversationId = durableConversationId(message.deferredConversationUrl);
     if (typeof hash !== "string" || !/^[0-9a-f]{64}$/.test(hash) ||
-        reg.boundUrl !== CHATGPT_FRESH_HOME || message.requireFreshHomeNoTurns === true)
+        !conversationId || reg.boundUrl !== CHATGPT_FRESH_HOME || message.requireFreshHomeNoTurns === true)
       return reject("InvalidDeferredCleanupProof");
     // Persist only a bounded proof tied to the agent-created tab and window.
     // The future recheck never trusts this receipt as evidence of submission.
@@ -938,10 +949,11 @@ async function closeCreatedTab(message) {
         reg.blocked || reg.sessionEpoch !== sessionEpoch || !allowAgentCreatedTabs ||
         !finalParent || finalParent !== parent || finalParent.generation !== parentGeneration)
       return reject("RegistrationStale");
-    if (reg.deferredCleanup && reg.deferredCleanup.hash !== hash)
+    if (reg.deferredCleanup &&
+        (reg.deferredCleanup.hash !== hash || reg.deferredCleanup.conversationId !== conversationId))
       return reject("DeferredCleanupConflict");
     if (!reg.deferredCleanup) reg.deferredCleanup = {
-      hash, generation: registrationGeneration, windowGeneration: parentGeneration,
+      hash, conversationId, generation: registrationGeneration, windowGeneration: parentGeneration,
       expiresAt: Date.now() + DEFERRED_CLOSE_TTL_MS
     };
     try { await persist(); } catch { return reject("DeferredCleanupPersistFailed"); }

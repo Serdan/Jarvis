@@ -1313,10 +1313,13 @@ let compositeLaunchRejectsManualReRegistrationWithoutInjection () = task {
 
 
 // The bridge never treats an unacknowledged Send as permission to close.
-// It requests a bounded extension-owned check pinned to the intended prompt.
+// Only confirmed submissions with a specific conversation route can arm a
+// bounded deferred retry if immediate close fails.
 [<TestCase("outcomeUnknown")>]
 [<TestCase("submitted")>]
-let launcherUnknownOrFailedImmediateCloseArmsDeferredVerifiedCleanup (scriptStatus: string) = task {
+[<TestCase("submittedNoRouteEvidence")>]
+[<TestCase("submittedInvalidConversation")>]
+let launcherUnknownRetainsAndConfirmedFailedCloseMayDefer (scriptStatus: string) = task {
     let port = findPort()
     use bridge = new BrowserBridge.Service(port, "test-secret")
     bridge.Start()
@@ -1342,9 +1345,15 @@ let launcherUnknownOrFailedImmediateCloseArmsDeferredVerifiedCleanup (scriptStat
         version = 2; kind = "result"; requestId = property executing "requestId"
         connectionId = connectionId; registrationId = "deferred-tab"
         registrationGeneration = 4
-        result = {| status = scriptStatus; reason = "SubmissionUnconfirmed" |}
+        result = {| status = (if scriptStatus = "outcomeUnknown" then "outcomeUnknown" else "submitted")
+                    reason = "SubmissionUnconfirmed"
+                    conversationUrl = (if scriptStatus = "submittedInvalidConversation" then
+                                           "https://chatgpt.com/c/not-a-durable-id" else
+                                           "https://chatgpt.com/c/12345678-1234-4234-8234-123456789abc")
+                    evidence = (if scriptStatus = "submittedNoRouteEvidence" then [||] else
+                                    [| "newUserTurn"; "conversationRoute" |]) |}
     |}))
-    if scriptStatus = "submitted" then
+    if scriptStatus <> "outcomeUnknown" then
         let! immediateClose = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
         Assert.That(property immediateClose "kind", Is.EqualTo("closeTab"))
         use immediate = JsonDocument.Parse(immediateClose)
@@ -1355,30 +1364,37 @@ let launcherUnknownOrFailedImmediateCloseArmsDeferredVerifiedCleanup (scriptStat
             connectionId = connectionId; registrationId = "deferred-tab"
             registrationGeneration = 4
         |}))
-    let! deferred = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
-    Assert.That(property deferred "kind", Is.EqualTo("closeTab"))
-    Assert.That(property deferred "registrationId", Is.EqualTo("deferred-tab"))
-    use deferredFrame = JsonDocument.Parse(deferred)
-    let deferredRoot = deferredFrame.RootElement
-    Assert.That(deferredRoot.GetProperty("registrationGeneration").GetInt32(), Is.EqualTo(4))
-    Assert.That(deferredRoot.GetProperty("requireFreshHomeNoTurns").GetBoolean(), Is.False)
-    let expectedHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("Line 1\nLine 2"))).ToLowerInvariant()
-    Assert.That(deferredRoot.GetProperty("deferredPromptSha256").GetString(), Is.EqualTo(expectedHash))
-    Assert.That(deferred.Contains(prompt), Is.False, "Bridge must not send prompt with cleanup request")
-    do! send socket (JsonSerializer.Serialize({|
-        version = 2; kind = "tabCloseDeferred"; requestId = property deferred "requestId"
-        connectionId = connectionId; registrationId = "deferred-tab"
-        registrationGeneration = 4
-    |}))
+    if scriptStatus = "submitted" then
+        let! deferred = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+        Assert.That(property deferred "kind", Is.EqualTo("closeTab"))
+        Assert.That(property deferred "registrationId", Is.EqualTo("deferred-tab"))
+        use deferredFrame = JsonDocument.Parse(deferred)
+        let deferredRoot = deferredFrame.RootElement
+        Assert.That(deferredRoot.GetProperty("registrationGeneration").GetInt32(), Is.EqualTo(4))
+        Assert.That(deferredRoot.GetProperty("requireFreshHomeNoTurns").GetBoolean(), Is.False)
+        let expectedHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("Line 1\nLine 2"))).ToLowerInvariant()
+        Assert.That(deferredRoot.GetProperty("deferredPromptSha256").GetString(), Is.EqualTo(expectedHash))
+        Assert.That(deferredRoot.GetProperty("deferredConversationUrl").GetString(), Is.EqualTo("https://chatgpt.com/c/12345678-1234-4234-8234-123456789abc"))
+        Assert.That(deferred.Contains(prompt), Is.False, "Bridge must not send prompt with cleanup request")
+        do! send socket (JsonSerializer.Serialize({|
+            version = 2; kind = "tabCloseDeferred"; requestId = property deferred "requestId"
+            connectionId = connectionId; registrationId = "deferred-tab"
+            registrationGeneration = 4
+        |}))
     match! launch.WaitAsync(TimeSpan.FromSeconds(3.0)) with
     | Error (registrationId, reason) when scriptStatus = "outcomeUnknown" ->
         Assert.That(registrationId, Is.EqualTo("deferred-tab"))
         Assert.That(reason, Does.Contain("OutcomeUnknown"))
-        Assert.That(reason, Does.Contain("cleanup=deferred"))
+        Assert.That(reason, Does.Contain("cleanup=retained"))
     | Ok result when scriptStatus = "submitted" ->
         Assert.That(result, Does.Contain("submitted"))
         Assert.That(result, Does.Contain("cleanupFailed:"))
         Assert.That(result, Does.Contain("deferred=armed"))
+    | Ok result when scriptStatus = "submittedNoRouteEvidence" ||
+                     scriptStatus = "submittedInvalidConversation" ->
+        Assert.That(result, Does.Contain("submitted"))
+        Assert.That(result, Does.Contain("cleanupFailed:"))
+        Assert.That(result, Does.Not.Contain("deferred=armed"))
     | _ -> Assert.Fail("Unexpected result: no duplicate execution or immediate closing is allowed")
     Assert.That(bridge.ListTabs() |> Result.exists (fun listing -> listing.Contains("deferred-tab")), Is.True)
     use cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(150.0))

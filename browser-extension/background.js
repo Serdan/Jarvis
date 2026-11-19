@@ -964,10 +964,13 @@ async function unregister(tabId) {
 }
 // UI-only registration management. This revokes extension access, NOT the tab.
 async function unregisterRegistration(registrationId, registrationGeneration) {
+  if (!Number.isInteger(registrationGeneration)) throw new Error("RegistrationStale");
   const reg = registrations.find(r => r.registrationId === registrationId);
-  if (!reg || !Number.isInteger(registrationGeneration) ||
-      reg.registrationGeneration !== registrationGeneration)
-    throw new Error("RegistrationStale");
+  // Closing a tab can concurrently remove its registration. Unregistering a
+  // record that is already gone is success (idempotent), not a stale error.
+  if (!reg) return;
+  // But never delete a currently live reauthorized/replaced generation.
+  if (reg.registrationGeneration !== registrationGeneration) throw new Error("RegistrationStale");
   registrations = registrations.filter(r => r !== reg);
   await persist();
   await advertise();

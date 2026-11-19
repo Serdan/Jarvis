@@ -55,6 +55,15 @@ async function render() {
             throw new Error("Registration still present after Unregister");
           await render();
         } catch (e) {
+          // The tab may have closed between rendering this row and the click.
+          // A stale response is success if the exact registration is now gone.
+          try {
+            const latest = await call("getState");
+            if (!latest.registrations.some(r => r.registrationId === registration.registrationId)) {
+              await render();
+              return;
+            }
+          } catch { /* Keep the original error if state cannot be verified. */ }
           const error = document.createElement("small");
           error.setAttribute("role", "alert");
           error.setAttribute("data-unregister-error", "");

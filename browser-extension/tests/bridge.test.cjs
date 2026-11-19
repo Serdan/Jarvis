@@ -1518,6 +1518,25 @@ test("per-row unregister checks generation and cannot be invoked by a webpage", 
   assert.equal(h.removedTabs.length, 0);
 });
 
+test("per-row Unregister succeeds when the tab already closed and registration was removed", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("register", { tabId: 17, alias: "manual" });
+  const reg = (await h.message("getState")).registrations[0];
+  const args = { registrationId: reg.registrationId, registrationGeneration: reg.registrationGeneration };
+  // Chrome has already closed the tab; onRemoved revoked the registration.
+  h.tabs.delete(17);
+  h.listeners.removed(17);
+  await tick(); await tick();
+  assert.equal((await h.message("getState")).registrations.length, 0);
+  assert.equal((await h.message("unregisterRegistration", args)).ok, true);
+  assert.equal((await h.message("unregisterRegistration", args)).ok, true);
+  assert.equal((await h.message("getState")).registrations.length, 0);
+  // Invalid requests remain rejected even if no registration exists.
+  assert.equal((await h.message("unregisterRegistration",
+    { ...args, registrationGeneration: null })).ok, false);
+});
+
 
 test("browser restart prunes obsolete Jarvis-created registrations but preserves manual tabs", async () => {
   const first = createHarness();

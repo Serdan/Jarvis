@@ -38,7 +38,7 @@ class Element {
   }
 }
 
-async function setup({ failRow = false, failCurrent = false, ignoreRow = false } = {}) {
+async function setup({ failRow = false, failCurrent = false, ignoreRow = false, disappearedOnFailure = false } = {}) {
   const elements = new Map();
   const document = {
     getElementById(id) {
@@ -63,7 +63,10 @@ async function setup({ failRow = false, failCurrent = false, ignoreRow = false }
           allowAgentCreatedTabs: true, windows: [], registrations: registrations.map(x => ({ ...x }))
         };
         if (message.kind === "unregisterRegistration") {
-          if (failRow) return { ok: false, error: "RegistrationStale" };
+          if (failRow) {
+            if (disappearedOnFailure) registrations = [];
+            return { ok: false, error: "RegistrationStale" };
+          }
           if (!ignoreRow) registrations = registrations.filter(r => r.registrationId !== message.registrationId);
           return { ok: true };
         }
@@ -103,6 +106,14 @@ test("a rejected row Unregister displays its error beside the clicked button", a
   assert.equal(error.attributes.role, "alert");
   assert.match(error.textContent, /RegistrationStale/);
   assert.equal(h.rowButton().disabled, false);
+});
+
+test("row Unregister treats a concurrent tab-close stale error as success once absent", async () => {
+  const h = await setup({ failRow: true, disappearedOnFailure: true });
+  await h.rowButton().onclick();
+  assert.equal(h.registrations.length, 0);
+  assert.equal(h.document.getElementById("tabs").children.length, 0);
+  assert.equal(h.document.getElementById("error").textContent, "");
 });
 
 test("acknowledged but ineffective row Unregister is reported, not shown as success", async () => {

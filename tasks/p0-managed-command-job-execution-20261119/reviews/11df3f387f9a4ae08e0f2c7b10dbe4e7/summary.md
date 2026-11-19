@@ -1,1 +1,9 @@
-Frozen commit 47376b7e4. .NET 11 Release Client build exit 0; final focused command-job tests 7/7 pass; 62-second no-explicit-deadline test passed before final wait optimization, exact-source repeat running. Validate source-scope, project/worktree permission, no transport wrapper or live autonomous Work. No merge or deployment.
+# Independent review summary — ChangesRequested
+
+**Review:** `11df3f387f9a4ae08e0f2c7b10dbe4e7`, Reviewer 3. **Exact frozen SHA:** `47376b7e4603694e803e7a75b7bdbcd6243f8253` against base `a83549a6897a4e26aa4834ff81dc38b6e16ee85e`.
+
+**Blocking finding:** `findings/scheduled-command-running-misclassified.md`. The new `runManagedCommandForContext` returns `ProcessStatus="Running", ExitCode=-1, JobId=Some` after 1.2 s for a live process; the existing scheduled `RunCommand` consumer in `Client/Program.fs:196-225` assumes every return is terminal, maps the live process to `CommandFailed`, and never polls the handle. This breaks end-to-end command semantics despite the process continuing. Coordinate with the schedule owner (Worker 18), add a >response-window scheduled-command test, and update the consumer to wait for true terminal status before accepting integration.
+
+**Independent checks:** Reviewed exact Git diff and relevant call paths. Verified a clean worktree at the frozen SHA. Ran `dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-restore --filter 'FullyQualifiedName~managedCommand&TestCategory!=P0LongRunning'` via managed `start_job/get_job_result`; actual job terminal **Completed 0**, **7 passed, 0 failed, 0 skipped**, .NET 11 Release. These unit tests establish the focused job behavior but do **not** exercise the scheduled-program consumer. Did not independently run the 62-second long test, full Client suite, live scheduler, remote-client replay or deployment; author claims earlier long test passed before final wait optimization, not an independent current-SHA acceptance result.
+
+**No source edits, merge, deployment or autonomous Work activation.** Review decision is integration-blocking ChangesRequested until the consumer contract is corrected and covered by deterministic tests.

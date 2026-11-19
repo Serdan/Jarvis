@@ -30,6 +30,7 @@
         <Compile Include="WorkTrustedSourceIngressTests.fs"/>
         <Compile Include="WorkStatefulApiReadTests.fs"/>
         <Compile Include="WorkSchedulerSqliteTests.fs"/>
+        <Compile Include="WorkStatefulRolloutAcceptanceContractTests.fs"/>
         <Compile Include="WorkSqliteBackupTests.fs"/>
         <Compile Include="WorkLegacyImportProjectionTests.fs"/>
         <Compile Include="WorkLegacySourceWitnessTests.fs"/>

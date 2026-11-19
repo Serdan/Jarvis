@@ -374,12 +374,17 @@ let private auditDetails command =
     match command with
     | ImportFileCommand cmd -> Some("ImportFile", Some cmd.ProjectName, [ WorkspaceWrite; NetworkAccess ], [ cmd.FilePath ], None, [])
     | UpdateClientCommand -> Some("UpdateClient", None, [ ProcessExecution; NetworkAccess; Destructive ], [], None, [])
-    | ScheduleBrowserExecutionCommand cmd -> Some("ScheduleBrowserExecution", Some cmd.ProjectName, [ ProcessExecution; NetworkAccess ], [cmd.ScriptPath], None, [])
+    | ScheduleBrowserExecutionCommand cmd ->
+        let source = cmd.SourceProjectName |> Option.defaultValue cmd.ProjectName
+        Some("ScheduleBrowserExecution", Some cmd.ProjectName, [ ProcessExecution; NetworkAccess ],
+             [source + "::" + cmd.ScriptPath], None, [])
     | CancelScheduledBrowserExecutionCommand _ -> Some("CancelScheduledBrowserExecution", None, [ ProcessExecution ], [], None, [])
     | ScheduleExecutionCommand cmd ->
         let rights = if cmd.ActionKind = "BrowserScript" then [ ProcessExecution; NetworkAccess ] else [ ProcessExecution ]
+        let source = cmd.SourceProjectName |> Option.defaultValue cmd.ProjectName
+        let paths = cmd.ScriptPath |> Option.toList |> List.map (fun path -> source + "::" + path)
         Some("ScheduleExecution", Some cmd.ProjectName, rights,
-             cmd.ScriptPath |> Option.toList, cmd.Executable, cmd.Args)
+             paths, cmd.Executable, cmd.Args)
     | CancelScheduledExecutionCommand _ ->
         Some("CancelScheduledExecution", None, [ ProcessExecution ], [], None, [])
     | BrowserOpenTabCommand _ -> Some("BrowserOpenTab", None, [ ProcessExecution; NetworkAccess ], [], None, [])
@@ -582,12 +587,18 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
                             | Ok _ when not (path.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
                                 Error(Client.ValidationError "Browser script must be a .js file.")
                             | Ok _ ->
-                                match ProjectPaths.resolveProjectFile cmd.ProjectName path rt with
+                                match ProjectPaths.resolveProjectFile
+                                        (cmd.SourceProjectName |> Option.defaultValue cmd.ProjectName) path rt with
                                 | Error e -> Error e
                                 | Ok(FilePath filename) ->
-                                    if FileInfo(filename).Length > int64 BrowserBridge.MaxScriptBytes then
-                                        Error(Client.ValidationError "InputTooLarge: script exceeds 64 KiB.")
-                                    else Ok()
+                                    try
+                                        if not (File.Exists filename) then
+                                            Error(Client.ValidationError "ScriptUnavailable")
+                                        elif FileInfo(filename).Length > int64 BrowserBridge.MaxScriptBytes then
+                                            Error(Client.ValidationError "InputTooLarge: script exceeds 64 KiB.")
+                                        else Ok()
+                                    with :? IOException ->
+                                        Error(Client.ValidationError "ScriptUnavailable")
                     validateBrowser()
                     |> Result.bind (fun () -> scheduler.ScheduleExecution cmd |> Result.mapError Client.ValidationError)
                     |> Result.map (fun due ->
@@ -622,7 +633,8 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
                     | Ok _ when not (cmd.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
                         Error(Client.ValidationError "Browser script must be a .js file.")
                     | Ok _ ->
-                        match ProjectPaths.resolveProjectFile cmd.ProjectName cmd.ScriptPath rt with
+                        match ProjectPaths.resolveProjectFile
+                                (cmd.SourceProjectName |> Option.defaultValue cmd.ProjectName) cmd.ScriptPath rt with
                         | Error error -> Error error
                         | Ok(FilePath filename) ->
                             try
@@ -634,7 +646,8 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
                                                     defaultArg cmd.ArgsJson "{}", defaultArg cmd.Active false,
                                                     ?windowRegistration = cmd.WindowRegistration,
                                                     ?closeAfter = cmd.CloseTabAfterExecution,
-                                                    ?repeatEverySeconds = cmd.RepeatEverySeconds)
+                                                    ?repeatEverySeconds = cmd.RepeatEverySeconds,
+                                                    ?sourceProjectName = cmd.SourceProjectName)
                                     date
                                     |> Result.map (fun due -> JsonSerializer.Serialize({| scheduleId = cmd.ScheduleId; dueAtUtc = due; status = "pending" |}))
                                     |> Result.mapError Client.ValidationError
@@ -966,7 +979,20 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
                         else
                             PermissionPolicy.authorizeWithTrust permission.TrustLevel promptWithActivityState authorizationCommand
 
-                    match authorization with
+                    // Both scheduling entry points require the source checkout's
+                    // separate permission when it differs from the schedule owner.
+                    // A denied owner is never followed by a source prompt.
+                    let! combinedAuthorization =
+                        match authorization with
+                        | Error error -> Task.FromResult(Error error)
+                        | Ok() ->
+                            match PermissionPolicy.scheduleSourceAuthorizationCommand authorizationCommand with
+                            | None -> Task.FromResult(Ok())
+                            | Some sourceCommand ->
+                                PermissionPolicy.authorizeWithTrust permission.TrustLevel
+                                    promptWithActivityState sourceCommand
+
+                    match combinedAuthorization with
                     | Error error -> return Error error
                     | Ok() ->
                         match sourceOriginalId with

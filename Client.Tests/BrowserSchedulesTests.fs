@@ -288,7 +288,8 @@ let recurringUiIncompatibilitySuspendsUntilExplicitReconfiguration () = task {
 }
 
 let private commandSchedule id trigger : ScheduleExecutionCommand =
-    { ScheduleId = id; ProjectName = "Scripts"; TriggerKind = trigger
+    { ScheduleId = id; ProjectName = "Scripts"; SourceProjectName = None
+      TriggerKind = trigger
       RunAfterSeconds = Some 600; RunAtUtc = None
       RepeatEverySeconds = None; IdleAgentId = None; IdleSeconds = None
       ActionKind = "RunCommand"; Executable = Some "dotnet"
@@ -790,4 +791,164 @@ let missingCrossDeviceActivityProofBlocksBothClientsAndRestartedIdleSchedules ()
         Assert.That(restartedB.List(), Does.Contain("ActivityProofUnavailable"))
     finally
         Directory.Delete(dir, true)
+}
+
+[<Test>]
+let distinctScheduleOwnerAndCanonicalScriptSourceAcrossBothApis () =
+    let dir, path = temp()
+    let execute (_: BrowserSchedules.ScheduledAction) = task { return Ok "unused" }
+    try
+        use store = new BrowserSchedules.Service(path, execute)
+        let script = "organon/browser-scripts/chatgpt/launchAgent.js"
+        let direct =
+            store.Schedule("favn-manager", 600, "https://chatgpt.com/", "Favn",
+                script, "", """{"privatePrompt":"never-list"}""", false,
+                windowRegistration="agents", repeatEverySeconds=600,
+                sourceProjectName="Servitor")
+        Assert.That(direct.IsOk, Is.True)
+        let general =
+            { commandSchedule "jarvis-health" "Every" with
+                ProjectName = "Jarvis"; SourceProjectName = Some "Servitor"
+                ActionKind = "BrowserScript"; Executable = None; Args = []
+                RunAfterSeconds = Some 1800; RepeatEverySeconds = Some 1800
+                WindowRegistration = Some "agents"; Url = Some "https://chatgpt.com/"
+                ScriptPath = Some script; ArgsJson = Some """{"privatePrompt":"also-private"}""" }
+        Assert.That(store.ScheduleExecution(general).IsOk, Is.True)
+        Assert.That(store.ScheduleExecution(
+            { commandSchedule "illegal-cli" "Once" with SourceProjectName = Some "Servitor" }).IsError,
+            Is.True, "RunCommand remains strictly owner-scoped")
+        use listed = JsonDocument.Parse(store.List())
+        let find id =
+            listed.RootElement.EnumerateArray()
+            |> Seq.find (fun a -> a.GetProperty("id").GetString() = id)
+        let favn = find "favn-manager"
+        let jarvis = find "jarvis-health"
+        Assert.That(favn.GetProperty("projectName").GetString(), Is.EqualTo("Favn"))
+        Assert.That(jarvis.GetProperty("projectName").GetString(), Is.EqualTo("Jarvis"))
+        Assert.That(favn.GetProperty("sourceProjectName").GetString(), Is.EqualTo("Servitor"))
+        Assert.That(jarvis.GetProperty("sourceProjectName").GetString(), Is.EqualTo("Servitor"))
+        Assert.That(favn.GetProperty("scriptPath").GetString(), Is.EqualTo(script))
+        Assert.That(store.List(), Does.Not.Contain("privatePrompt"))
+        Assert.That(File.ReadAllText(path), Does.Contain("privatePrompt"),
+            "Private arguments remain in the protected local schedule state only")
+    finally
+        Directory.Delete(dir, true)
+
+[<Test>]
+let legacySameProjectSourceMigratesWithoutGuessingOwner () =
+    let dir, path = temp()
+    let execute (_: BrowserSchedules.ScheduledAction) = task { return Ok "unused" }
+    try
+        do
+            use first = new BrowserSchedules.Service(path, execute)
+            Assert.That((add first "old-identity" 600).IsOk, Is.True)
+        let legacy = JsonNode.Parse(File.ReadAllText(path))
+        legacy["schemaVersion"] <- JsonValue.Create(3)
+        (legacy["actions"][0]).AsObject().Remove("SourceProjectName") |> ignore
+        File.WriteAllText(path, legacy.ToJsonString())
+        use restored = new BrowserSchedules.Service(path, execute)
+        use listed = JsonDocument.Parse(restored.List())
+        let entry = listed.RootElement.EnumerateArray() |> Seq.head
+        Assert.That(entry.GetProperty("projectName").GetString(), Is.EqualTo("Scripts"))
+        Assert.That(entry.GetProperty("sourceProjectName").GetString(), Is.EqualTo("Scripts"))
+        Assert.That(entry.GetProperty("status").GetString(), Is.EqualTo("pending"))
+        let persisted = JsonNode.Parse(File.ReadAllText(path))
+        Assert.That(persisted["schemaVersion"].GetValue<int>(), Is.EqualTo(4))
+        Assert.That(((persisted["actions"][0])["SourceProjectName"]).GetValue<string>(),
+                    Is.EqualTo("Scripts"))
+    finally
+        Directory.Delete(dir, true)
+
+[<Test>]
+let ambiguousV4SourceIsSuspendedAndNeverLaunched () = task {
+    let dir, path = temp()
+    let mutable called = 0
+    let mutable clock = DateTimeOffset.UtcNow
+    let execute (_: BrowserSchedules.ScheduledAction) = task {
+        called <- called + 1
+        return Ok "unexpected"
+    }
+    try
+        do
+            use first = new BrowserSchedules.Service(path, execute, now=(fun () -> clock))
+            Assert.That((add first "missing-source" 600).IsOk, Is.True)
+        let state = JsonNode.Parse(File.ReadAllText(path))
+        (state["actions"][0]).AsObject().Remove("SourceProjectName") |> ignore
+        File.WriteAllText(path, state.ToJsonString())
+        use restored = new BrowserSchedules.Service(path, execute, now=(fun () -> clock), pollMs=25)
+        Assert.That(status restored "missing-source", Is.EqualTo("suspended"))
+        clock <- clock.AddDays(1.)
+        restored.Start()
+        do! Task.Delay(100)
+        Assert.That(called, Is.Zero)
+        Assert.That(restored.List(), Does.Contain("InvalidScheduleProjectIdentity"))
+    finally
+        Directory.Delete(dir, true)
+}
+
+[<Test>]
+let idempotentGuardedOwnerRebindPreservesPrivateStateAndClaimIdentity () =
+    let dir, path = temp()
+    let execute (_: BrowserSchedules.ScheduledAction) = task { return Ok "unused" }
+    try
+        use store = new BrowserSchedules.Service(path, execute)
+        Assert.That(store.Schedule("favn-manager", 600, "https://chatgpt.com/",
+            "Servitor", "organon/browser-scripts/chatgpt/launchAgent.js", "",
+            """{"prompt":"private"}""", false, windowRegistration="agents",
+            repeatEverySeconds=600).IsOk, Is.True)
+        let before = ((JsonNode.Parse(File.ReadAllText(path)))["actions"])[0]
+        let revision = (before["RevisionId"]).GetValue<string>()
+        Assert.That(store.RebindProject("favn-manager","Servitor","wrong","Favn",revision).IsError, Is.True)
+        Assert.That(store.RebindProject("favn-manager","Servitor","Servitor","Favn","stale").IsError, Is.True)
+        Assert.That(store.RebindProject("favn-manager","Servitor","Servitor","Favn",revision).IsOk, Is.True)
+        let firstRebind = File.ReadAllText(path)
+        Assert.That(store.RebindProject("favn-manager","Servitor","Servitor","Favn",revision).IsOk, Is.True)
+        Assert.That(File.ReadAllText(path), Is.EqualTo(firstRebind),
+            "An idempotent retry must not mutate state or reschedule an occurrence")
+        let after = ((JsonNode.Parse(firstRebind))["actions"])[0]
+        Assert.That((after["ProjectName"]).GetValue<string>(), Is.EqualTo("Favn"))
+        Assert.That((after["SourceProjectName"]).GetValue<string>(), Is.EqualTo("Servitor"))
+        for field in ["RevisionId";"AttemptId";"ArgsJson";"WindowRegistration";
+                      "DueAtUtc";"Status";"UpdatedAtUtc";"RepeatEverySeconds";
+                      "RegistrationId";"LastResult";"Cleanup";"Error"] do
+            Assert.That((after[field]).ToJsonString(), Is.EqualTo((before[field]).ToJsonString()), field)
+    finally
+        Directory.Delete(dir, true)
+
+[<Test>]
+let scheduleSourcePermissionRequiresTwoIndependentProjectApprovals () = task {
+    let command =
+        ScheduleExecutionCommand
+            { commandSchedule "guarded" "Every" with
+                ProjectName = "Favn"; SourceProjectName = Some "Servitor"
+                ActionKind = "BrowserScript"; Executable = None; Args = []
+                RepeatEverySeconds = Some 600
+                WindowRegistration = Some "agents"; Url = Some "https://chatgpt.com/"
+                ScriptPath = Some "organon/browser-scripts/chatgpt/launchAgent.js"
+                ArgsJson = Some "{}" }
+    let source = PermissionPolicy.scheduleSourceAuthorizationCommand command
+    Assert.That(source.IsSome, Is.True)
+    match source.Value with
+    | BrowserExecuteFileCommand file ->
+        Assert.That(file.ProjectName, Is.EqualTo("Servitor"))
+    | _ -> Assert.Fail("Cross-project source must be separately authorized")
+    let promptOnly allowed (_: AgentCommand) (request: ConfirmationRequest) =
+        task {
+            return if request.ProjectName = Some allowed then
+                       Client.PermissionApproval.AllowOnce
+                   else Client.PermissionApproval.Deny
+        }
+    let! ownerAllowed = PermissionPolicy.authorizeWithTrust NoTrust (promptOnly "Favn") command
+    let! sourceDenied = PermissionPolicy.authorizeWithTrust NoTrust (promptOnly "Favn") source.Value
+    Assert.That(ownerAllowed.IsOk, Is.True)
+    Assert.That(sourceDenied.IsError, Is.True, "Owner authority cannot grant source authority")
+    let! ownerDenied = PermissionPolicy.authorizeWithTrust NoTrust (promptOnly "Servitor") command
+    let! sourceAllowed = PermissionPolicy.authorizeWithTrust NoTrust (promptOnly "Servitor") source.Value
+    Assert.That(ownerDenied.IsError, Is.True, "Source authority cannot grant owner authority")
+    Assert.That(sourceAllowed.IsOk, Is.True)
+    let sameProject =
+        PermissionPolicy.scheduleSourceAuthorizationCommand
+            (ScheduleExecutionCommand
+                { commandSchedule "same-project" "Once" with SourceProjectName = None })
+    Assert.That(sameProject.IsNone, Is.True)
 }

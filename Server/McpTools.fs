@@ -2366,11 +2366,12 @@ type JarvisMcpTools =
                                            [<Optional; DefaultParameterValue("")>] windowRegistration: string,
                                            [<Optional; DefaultParameterValue(false)>] closeTabAfterExecution: bool,
                                            repeatEverySeconds: Nullable<int>,
+                                           [<Optional; DefaultParameterValue("")>] sourceProjectName: string,
                                            client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (ScheduleBrowserExecutionCommand {
             ScheduleId = scheduleId; RunAfterSeconds = runAfterSeconds; Url = url
-            ProjectName = projectName; ScriptPath = scriptPath
+            ProjectName = projectName; SourceProjectName = McpToolHelpers.optionOfString sourceProjectName; ScriptPath = scriptPath
             ArgsJson = McpToolHelpers.optionOfString argsJson
             Alias = McpToolHelpers.optionOfString alias
             Active = Some active; WindowRegistration = McpToolHelpers.optionOfString windowRegistration
@@ -2411,10 +2412,13 @@ type JarvisMcpTools =
                                    [<Optional; DefaultParameterValue(false)>] active: bool,
                                    [<Optional; DefaultParameterValue(true)>] closeTabAfterExecution: bool,
                                    [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                   [<Optional; DefaultParameterValue("")>] sourceProjectName: string,
                                    client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (ScheduleExecutionCommand {
-            ScheduleId = scheduleId; ProjectName = projectName; TriggerKind = triggerKind
+            ScheduleId = scheduleId; ProjectName = projectName
+            SourceProjectName = McpToolHelpers.optionOfString sourceProjectName
+            TriggerKind = triggerKind
             ActionKind = actionKind; RunAfterSeconds = McpToolHelpers.optionOfNullable runAfterSeconds
             RunAtUtc = if runAtUtc.HasValue then Some runAtUtc.Value else None
             RepeatEverySeconds = McpToolHelpers.optionOfNullable repeatEverySeconds

@@ -17,6 +17,7 @@ type ScheduledAction =
       DueAtUtc: DateTimeOffset
       Url: string
       ProjectName: string
+      SourceProjectName: string
       ScriptPath: string
       Alias: string
       ArgsJson: string
@@ -93,6 +94,7 @@ let private describe (a: ScheduledAction) =
        dueAtUtc = a.DueAtUtc
        status = a.Status
        projectName = a.ProjectName
+       sourceProjectName = a.SourceProjectName
        actionKind = (if String.IsNullOrWhiteSpace a.ActionKind then "BrowserScript" else a.ActionKind)
        triggerKind = (if String.IsNullOrWhiteSpace a.TriggerKind then
                           (if a.RepeatEverySeconds > 0 then "Every" else "Once") else a.TriggerKind)
@@ -165,7 +167,7 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
             use file = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None)
             if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
                 File.SetUnixFileMode(temp, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
-            let bytes = JsonSerializer.SerializeToUtf8Bytes({| schemaVersion = 3; actions = items |})
+            let bytes = JsonSerializer.SerializeToUtf8Bytes({| schemaVersion = 4; actions = items |})
             file.Write(bytes)
             file.Flush(true)
             file.Close()
@@ -267,20 +269,25 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                         invalidOp "Browser schedules state file permissions are too broad."
                 use data = JsonDocument.Parse(File.ReadAllText(path))
                 let root = data.RootElement
-                if root.GetProperty("schemaVersion").GetInt32() <> 1 &&
-                   root.GetProperty("schemaVersion").GetInt32() <> 2 &&
-                   root.GetProperty("schemaVersion").GetInt32() <> 3 then
+                let schemaVersion = root.GetProperty("schemaVersion").GetInt32()
+                if schemaVersion < 1 || schemaVersion > 4 then
                     invalidOp "Unsupported browser schedules state schema."
                 let restored =
                     JsonSerializer.Deserialize<ScheduledAction list>(root.GetProperty("actions").GetRawText())
                 // Legacy entries omit CommandArgs. A null F# list can throw
                 // during structural equality before scheduling even begins.
                 let needsMigration =
-                    restored |> List.exists (fun entry -> isNull (box entry.CommandArgs))
+                    schemaVersion < 4 ||
+                    (restored |> List.exists (fun entry -> isNull (box entry.CommandArgs)))
                 let normalized =
                     restored |> List.map (fun entry ->
-                        if isNull (box entry.CommandArgs) then { entry with CommandArgs = [] }
-                        else entry)
+                        { entry with
+                            CommandArgs = if isNull (box entry.CommandArgs) then [] else entry.CommandArgs
+                            // Pre-v4 records had one identity for both the owner and the
+                            // script source. Never infer a different owner from an ID.
+                            SourceProjectName =
+                                if schemaVersion < 4 then entry.ProjectName
+                                else entry.SourceProjectName })
                 actions <-
                     normalized
                     |> List.map (fun loaded ->
@@ -290,7 +297,12 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                             if String.IsNullOrWhiteSpace(loaded.RevisionId) then
                                 { loaded with RevisionId = Guid.NewGuid().ToString("N") }
                             else loaded
-                        if action.Status = "running" then
+                        if String.IsNullOrWhiteSpace action.ProjectName ||
+                           String.IsNullOrWhiteSpace action.SourceProjectName then
+                            { action with Status = "suspended"
+                                          Error = "InvalidScheduleProjectIdentity: reconfigure explicitly."
+                                          UpdatedAtUtc = clock() }
+                        elif action.Status = "running" then
                             if isIdle action then
                                 let now = clock()
                                 let stale = action.StartedAtUtc.AddMinutes(30.)
@@ -331,7 +343,8 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
             ownership.Dispose()
             reraise()
 
-    member _.Schedule(id: string, seconds: int, url: string, project: string, script: string, alias: string, args: string, active: bool, ?windowRegistration: string, ?closeAfter: bool, ?repeatEverySeconds: int) =
+    member _.Schedule(id: string, seconds: int, url: string, project: string, script: string, alias: string, args: string, active: bool, ?windowRegistration: string, ?closeAfter: bool, ?repeatEverySeconds: int, ?sourceProjectName: string) =
+        let source = defaultArg sourceProjectName project
         let window = defaultArg windowRegistration ""
         let closeAfter = defaultArg closeAfter false
         let repeat = defaultArg repeatEverySeconds 0
@@ -344,7 +357,8 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
             Error "InvalidRepeatInterval: must be 60 seconds to 30 days."
         elif seconds < 5 || seconds > 30 * 24 * 60 * 60 then
             Error "InvalidDelay: must be between 5 seconds and 30 days."
-        elif String.IsNullOrWhiteSpace(project) || String.IsNullOrWhiteSpace(script) then
+        elif String.IsNullOrWhiteSpace(project) || String.IsNullOrWhiteSpace(source) ||
+             String.IsNullOrWhiteSpace(script) then
             Error "InvalidScriptPath"
         elif isNull alias || alias.Length > 128 || (alias |> Seq.exists Char.IsControl) then
             Error "InvalidTabAlias"
@@ -374,7 +388,8 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                             let time = clock()
                             let entry =
                                 { Id = id; DueAtUtc = time.AddSeconds(float seconds); Url = url
-                                  ProjectName = project; ScriptPath = script; Alias = alias
+                                  ProjectName = project; SourceProjectName = source
+                                  ScriptPath = script; Alias = alias
                                   ArgsJson = args; Active = active; WindowRegistration = window
                                   CloseTabAfterExecution = closeAfter; RepeatEverySeconds = repeat
                                   Status = "pending"
@@ -398,6 +413,7 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
             not (String.IsNullOrWhiteSpace id) && id.Length <= 64 &&
             (id |> Seq.forall (fun c -> Char.IsLetterOrDigit c || c = '-' || c = '_'))
         let required (text: string option) = text |> Option.defaultValue ""
+        let source = cmd.SourceProjectName |> Option.defaultValue cmd.ProjectName
         let time = clock()
         let initialSeen =
             if cmd.TriggerKind = "AfterAgentIdle" then
@@ -457,6 +473,9 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
             | _ -> Some "UnknownActionKind: expected RunCommand or BrowserScript."
         if not (validId cmd.ScheduleId) then Error "InvalidScheduleId: use 1-64 letters, numbers, - or _."
         elif String.IsNullOrWhiteSpace cmd.ProjectName then Error "ProjectNameRequired"
+        elif String.IsNullOrWhiteSpace source then Error "SourceProjectNameRequired"
+        elif cmd.ActionKind = "RunCommand" && source <> cmd.ProjectName then
+            Error "RunCommandSourceMustMatchOwner"
         else
             match due, actionError with
             | Error error, _ -> Error error
@@ -472,6 +491,7 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                     else
                         let entry =
                             { Id = cmd.ScheduleId; DueAtUtc = at; ProjectName = cmd.ProjectName
+                              SourceProjectName = source
                               Url = required cmd.Url; ScriptPath = required cmd.ScriptPath
                               Alias = required cmd.Alias; ArgsJson = cmd.ArgsJson |> Option.defaultValue "{}"
                               Active = cmd.Active |> Option.defaultValue false
@@ -493,6 +513,33 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                               Disabled = false; LastResult = "" }
                         setActions (entry :: (actions |> List.filter (fun a -> a.Id <> cmd.ScheduleId)))
                         Ok entry.DueAtUtc)
+
+    // Purely local, CAS-guarded preparation for an operator-authorized migration.
+    // No new occurrence, replacement revision, prompt, attempt, or due time is created.
+    // Do not expose as an automatic startup migration or invoke on live records
+    // until the source and authorization gates have passed independent review.
+    member _.RebindProject(id: string, expectedOwner: string, expectedSource: string,
+                           newOwner: string, expectedRevisionId: string) =
+        if String.IsNullOrWhiteSpace id || String.IsNullOrWhiteSpace expectedOwner ||
+           String.IsNullOrWhiteSpace expectedSource || String.IsNullOrWhiteSpace newOwner ||
+           String.IsNullOrWhiteSpace expectedRevisionId then
+            Error "RebindIdentityRequired"
+        else
+            lock gate (fun () ->
+                match actions |> List.tryFind (fun a -> a.Id = id) with
+                | None -> Error "ScheduleNotFound"
+                | Some a when a.RevisionId <> expectedRevisionId -> Error "ScheduleRevisionChanged"
+                | Some a when a.SourceProjectName <> expectedSource -> Error "ScheduleSourceChanged"
+                | Some a when a.ActionKind <> "BrowserScript" && not (String.IsNullOrWhiteSpace a.ActionKind) ->
+                    Error "RebindBrowserScriptOnly"
+                | Some a when a.ProjectName = newOwner -> Ok()
+                | Some a when a.ProjectName <> expectedOwner -> Error "ScheduleOwnerChanged"
+                | Some a when a.Disabled || (a.Status <> "pending" && a.Status <> "waitingActivity") ->
+                    Error "RebindRequiresPending"
+                | Some a ->
+                    setActions (actions |> List.map (fun item ->
+                        if item.Id = id then { item with ProjectName = newOwner } else item))
+                    Ok())
 
     member _.Cancel(id: string) =
         lock gate (fun () ->

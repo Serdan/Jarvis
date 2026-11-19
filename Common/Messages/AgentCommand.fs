@@ -77,6 +77,7 @@ type ScheduleBrowserExecutionCommand =
       RunAfterSeconds: int
       Url: string
       ProjectName: string
+      SourceProjectName: string option
       ScriptPath: string
       ArgsJson: string option
       Alias: string option
@@ -89,6 +90,7 @@ type CancelScheduledBrowserExecutionCommand = { ScheduleId: string }
 type ScheduleExecutionCommand =
     { ScheduleId: string
       ProjectName: string
+      SourceProjectName: string option
       TriggerKind: string
       RunAfterSeconds: int option
       RunAtUtc: DateTimeOffset option
@@ -1271,7 +1273,9 @@ module AgentCommandInfo =
         |> String.concat " "
 
     let fullDetail = function
-        | ScheduleBrowserExecutionCommand cmd -> Some($"schedule {cmd.ScheduleId}: {cmd.ProjectName}/{cmd.ScriptPath} in {cmd.RunAfterSeconds}s")
+        | ScheduleBrowserExecutionCommand cmd ->
+            let source = cmd.SourceProjectName |> Option.defaultValue cmd.ProjectName
+            Some($"schedule {cmd.ScheduleId}: {cmd.ProjectName} -> {source}/{cmd.ScriptPath} in {cmd.RunAfterSeconds}s")
         | ListScheduledBrowserExecutionsCommand -> None
         | CancelScheduledBrowserExecutionCommand cmd -> Some cmd.ScheduleId
         | ScheduleExecutionCommand cmd -> Some(sprintf "%s %s %s" cmd.ScheduleId cmd.TriggerKind cmd.ActionKind)

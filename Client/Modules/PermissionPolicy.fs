@@ -180,14 +180,17 @@ let private requiresConfirmation command =
     | MessageCommand _
     | GetClientActivityCommand _ -> readOnly
     | ScheduleBrowserExecutionCommand cmd ->
+        let source = cmd.SourceProjectName |> Option.defaultValue cmd.ProjectName
         confirmation "ScheduleBrowserExecution" (Some cmd.ProjectName) [ ProcessExecution; NetworkAccess ]
-            [ cmd.ScriptPath ] None [] ("Schedule browser execution " + cmd.ScheduleId) false
+            [ source + "::" + cmd.ScriptPath ] None [] ("Schedule browser execution " + cmd.ScheduleId) false
     | CancelScheduledBrowserExecutionCommand cmd ->
         confirmation "CancelScheduledBrowserExecution" None [ ProcessExecution ] [] None [] ("Cancel scheduled browser action " + cmd.ScheduleId) false
     | ScheduleExecutionCommand cmd ->
         let network = if cmd.ActionKind = "BrowserScript" then [ NetworkAccess ] else []
+        let source = cmd.SourceProjectName |> Option.defaultValue cmd.ProjectName
+        let scriptPaths = cmd.ScriptPath |> Option.toList |> List.map (fun path -> source + "::" + path)
         confirmation "ScheduleExecution" (Some cmd.ProjectName) ([ ProcessExecution ] @ network)
-            (cmd.ScriptPath |> Option.toList) cmd.Executable cmd.Args
+            scriptPaths cmd.Executable cmd.Args
             ("Schedule " + cmd.ActionKind + " execution " + cmd.ScheduleId) false
     | CancelScheduledExecutionCommand cmd ->
         confirmation "CancelScheduledExecution" None [ ProcessExecution ] [] None []
@@ -305,6 +308,27 @@ let private requiresConfirmation command =
         confirmation "StartJob" (Some cmd.ProjectName) [ ProcessExecution ] [] (Some cmd.Executable) cmd.Args $"Start job {cmd.Executable}" true
     | CancelJobCommand cmd ->
         confirmation "CancelJob" None [ ProcessExecution ] [] None [ cmd.JobId ] $"Cancel job {cmd.JobId}" false
+
+// A schedule is owned by cmd.ProjectName. An explicitly different browser
+// script source requires its own local permission evaluation; approving one
+// project must never implicitly authorize execution from another checkout.
+let scheduleSourceAuthorizationCommand command =
+    let make owner source path window args =
+        match source with
+        | Some project when project <> owner ->
+            Some(BrowserExecuteFileCommand
+                { ProjectName = project; ScriptPath = path; TabRegistration = window
+                  ArgsJson = args; TimeoutMs = Some 30000 })
+        | _ -> None
+    match command with
+    | ScheduleBrowserExecutionCommand cmd ->
+        make cmd.ProjectName cmd.SourceProjectName cmd.ScriptPath
+            (cmd.WindowRegistration |> Option.defaultValue "") cmd.ArgsJson
+    | ScheduleExecutionCommand cmd when cmd.ActionKind = "BrowserScript" ->
+        make cmd.ProjectName cmd.SourceProjectName
+            (cmd.ScriptPath |> Option.defaultValue "")
+            (cmd.WindowRegistration |> Option.defaultValue "") cmd.ArgsJson
+    | _ -> None
 
 let private trustAllows trustLevel command =
     match trustLevel, command with

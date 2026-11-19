@@ -232,7 +232,21 @@ let private runClient args =
                       CloseTabAfterExecution = Some action.CloseTabAfterExecution
                       TimeoutMs = Some 30000 }
             let! allowed = PermissionPolicy.authorizeWithTrust permission.TrustLevel prompt authCommand
-            match allowed with
+            let! bothAllowed =
+                match allowed with
+                | Error error -> Task.FromResult(Error error)
+                | Ok() when action.SourceProjectName = action.ProjectName -> Task.FromResult(Ok())
+                | Ok() ->
+                    // A source in another project is a distinct trust boundary,
+                    // even after the owning project's schedule was approved.
+                    let sourceAuth =
+                        BrowserExecuteFileCommand
+                            { ProjectName = action.SourceProjectName
+                              ScriptPath = action.ScriptPath
+                              TabRegistration = action.WindowRegistration
+                              ArgsJson = None; TimeoutMs = Some 30000 }
+                    PermissionPolicy.authorizeWithTrust permission.TrustLevel prompt sourceAuth
+            match bothAllowed with
             | Error error -> return Error("", "AuthorizationDenied: " + sprintf "%A" error)
             | Ok() ->
                 let script =
@@ -241,7 +255,7 @@ let private runClient args =
                     | Ok _ when not (action.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
                         Error "InvalidScriptPath"
                     | Ok _ ->
-                        match ProjectPaths.resolveProjectFile action.ProjectName action.ScriptPath rt with
+                        match ProjectPaths.resolveProjectFile action.SourceProjectName action.ScriptPath rt with
                         | Error e -> Error(sprintf "%A" e)
                         | Ok(FilePath path) ->
                             try

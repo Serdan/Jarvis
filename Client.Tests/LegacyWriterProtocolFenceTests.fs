@@ -206,7 +206,8 @@ type LegacyWriterProtocolFenceTests() =
 
     let manager =
         ScheduleExecutionCommand {
-            ScheduleId = "manager"; ProjectName = "Fixture"; TriggerKind = "AfterAgentIdle"
+            ScheduleId = "manager"; ProjectName = "Fixture"; SourceProjectName = None
+            TriggerKind = "AfterAgentIdle"
             RunAfterSeconds = None; RunAtUtc = None; RepeatEverySeconds = None
             IdleAgentId = Some "Manager"; IdleSeconds = Some 900
             ActionKind = "BrowserScript"; Executable = None; Args = []; WorkingDirectory = None

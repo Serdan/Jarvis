@@ -191,6 +191,29 @@ let private runClient args =
             tui.Log $"Browser bridge listening on 127.0.0.1:{port}; registered windows and explicit tab registrations required."
             bridge)
 
+    // Bind scheduled source provenance to actual bytes read through the normal
+    // confined project resolver. The same loader runs again immediately before
+    // dispatch, and only its verified bytes reach the browser.
+    let loadScheduledScript sourceProject scriptPath =
+        match ProjectPaths.validateProjectRelativePath scriptPath with
+        | Error e -> Error(sprintf "%A" e)
+        | Ok _ when not (scriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
+            Error "InvalidScriptPath"
+        | Ok _ ->
+            match ProjectPaths.resolveProjectFile sourceProject scriptPath rt with
+            | Error e -> Error(sprintf "%A" e)
+            | Ok(FilePath path) ->
+                try
+                    if FileInfo(path).Length > int64 BrowserBridge.MaxScriptBytes then Error "InputTooLarge"
+                    else
+                        let bytes = File.ReadAllBytes(path)
+                        if bytes.Length > BrowserBridge.MaxScriptBytes then Error "InputTooLarge"
+                        else
+                            let script = UTF8Encoding(false, true).GetString(bytes)
+                            let digest = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant()
+                            Ok(script, digest)
+                with error -> Error("ScriptUnavailable:" + error.GetType().Name)
+
     // One persistent execution scheduler for CLI and browser actions.
     // The browser bridge is optional; CLI scheduling works without an extension.
     let executeScheduledAction (action: BrowserSchedules.ScheduledAction) = task {
@@ -250,18 +273,10 @@ let private runClient args =
             | Error error -> return Error("", "AuthorizationDenied: " + sprintf "%A" error)
             | Ok() ->
                 let script =
-                    match ProjectPaths.validateProjectRelativePath action.ScriptPath with
-                    | Error e -> Error(sprintf "%A" e)
-                    | Ok _ when not (action.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
-                        Error "InvalidScriptPath"
-                    | Ok _ ->
-                        match ProjectPaths.resolveProjectFile action.SourceProjectName action.ScriptPath rt with
-                        | Error e -> Error(sprintf "%A" e)
-                        | Ok(FilePath path) ->
-                            try
-                                if FileInfo(path).Length > int64 BrowserBridge.MaxScriptBytes then Error "InputTooLarge"
-                                else Ok(File.ReadAllText(path, UTF8Encoding(false, true)))
-                            with e -> Error("ScriptUnavailable:" + e.GetType().Name)
+                    loadScheduledScript action.SourceProjectName action.ScriptPath
+                    |> Result.bind (fun (source, digest) ->
+                        BrowserSchedules.verifyScriptDigest action digest
+                        |> Result.map (fun () -> source))
                 match script, browser with
                 | Error e, _ -> return Error("", e)
                 | _, None -> return Error("", "BridgeDisabled")
@@ -299,7 +314,9 @@ let private runClient args =
                     let canonical = if checkout < 0 then project else project.Substring(0, checkout)
                     tui.GetAgentLastSeen(canonical, agent)),
                 verifyIdleActivity=(fun project agent -> verifyIdleActivity project agent),
-                onFault=tui.Log))
+                onFault=tui.Log,
+                scriptSourceSha256=(fun project script ->
+                    loadScheduledScript project script |> Result.map snd)))
         with :? IOException as error ->
             tui.Log ("Execution scheduling inactive on this client: " + error.Message)
             None

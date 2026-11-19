@@ -19,6 +19,7 @@ type ScheduledAction =
       ProjectName: string
       SourceProjectName: string
       ScriptPath: string
+      ScriptSha256: string
       Alias: string
       ArgsJson: string
       Active: bool
@@ -84,6 +85,23 @@ module private DurableScheduleFile =
             File.Move(temp, path, true)
             syncParentDirectory (Path.GetDirectoryName(Path.GetFullPath(path)))
 
+let private validSha256 (value: string) =
+    not (String.IsNullOrWhiteSpace value) && value.Length = 64 &&
+    (value |> Seq.forall Uri.IsHexDigit)
+
+// Check the digest of the SAME bytes that will be passed to the browser.
+// Legacy same-project actions may remain unpinned; new cross-project ownership
+// must have an exact content commitment.
+let verifyScriptDigest (action: ScheduledAction) (actualSha256: string) =
+    if action.SourceProjectName <> action.ProjectName && not (validSha256 action.ScriptSha256) then
+        Error "ScriptSourceDigestMissing: explicitly re-register this cross-project schedule."
+    elif validSha256 action.ScriptSha256 &&
+         not (String.Equals(action.ScriptSha256, actualSha256, StringComparison.OrdinalIgnoreCase)) then
+        Error "SourceRevisionMismatch: scheduled script content changed; explicit reauthorization required."
+    elif not (String.IsNullOrWhiteSpace action.ScriptSha256) && not (validSha256 action.ScriptSha256) then
+        Error "ScriptSourceDigestInvalid: explicitly re-register this schedule."
+    else Ok()
+
 let private describe (a: ScheduledAction) =
     let origin =
         match Uri.TryCreate(a.Url, UriKind.Absolute) with
@@ -104,6 +122,7 @@ let private describe (a: ScheduledAction) =
        timeoutSeconds = a.TimeoutSeconds
        maxOutputBytes = a.MaxOutputBytes
        scriptPath = a.ScriptPath
+       scriptSha256 = a.ScriptSha256
        origin = origin
        alias = a.Alias
        windowRegistration = a.WindowRegistration
@@ -122,7 +141,7 @@ let private describe (a: ScheduledAction) =
        error = a.Error
        updatedAtUtc = a.UpdatedAtUtc |}
 
-type Service(path: string, execute: ScheduledAction -> Task<Result<string,string * string>>, ?now: unit -> DateTimeOffset, ?pollMs: int, ?agentLastSeen: string -> string -> DateTimeOffset option, ?verifyIdleActivity: string -> string -> Task<Result<DateTimeOffset option,string>>, ?onFault: string -> unit) =
+type Service(path: string, execute: ScheduledAction -> Task<Result<string,string * string>>, ?now: unit -> DateTimeOffset, ?pollMs: int, ?agentLastSeen: string -> string -> DateTimeOffset option, ?verifyIdleActivity: string -> string -> Task<Result<DateTimeOffset option,string>>, ?onFault: string -> unit, ?scriptSourceSha256: string -> string -> Result<string,string>) =
     let gate = obj()
     // A process-wide exclusive lifetime lease, acquired BEFORE loading state.
     // A second JarvisClient cannot read stale pending and race a claim. The
@@ -149,6 +168,22 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
     let verify = defaultArg verifyIdleActivity (fun _ _ ->
         Task.FromResult(Error "ActivityVerificationUnavailable: authenticated server snapshot is required."))
     let reportFault = defaultArg onFault ignore
+    // Production supplies a confined source-project resolver. A bare test-only
+    // service preserves only legacy same-project registration semantics.
+    let bindSourceDigest owner source script =
+        match ProjectPaths.validateProjectRelativePath script with
+        | Error _ -> Error "InvalidScriptPath"
+        | Ok _ when not (script.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
+            Error "InvalidScriptPath: browser scripts must be .js files."
+        | Ok _ ->
+            match scriptSourceSha256 with
+            | None when owner = source -> Ok ""
+            | None -> Error "ScriptSourceProofUnavailable: source resolver is required."
+            | Some resolve ->
+                match resolve source script with
+                | Error reason -> Error("ScriptSourceProofUnavailable: " + reason)
+                | Ok digest when not (validSha256 digest) -> Error "InvalidScriptSourceDigest"
+                | Ok digest -> Ok(digest.ToLowerInvariant())
     let isIdle (a: ScheduledAction) = a.TriggerKind = "AfterAgentIdle"
     let mutable actions: ScheduledAction list = []
     let mutable started = false
@@ -167,7 +202,7 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
             use file = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None)
             if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
                 File.SetUnixFileMode(temp, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
-            let bytes = JsonSerializer.SerializeToUtf8Bytes({| schemaVersion = 4; actions = items |})
+            let bytes = JsonSerializer.SerializeToUtf8Bytes({| schemaVersion = 5; actions = items |})
             file.Write(bytes)
             file.Flush(true)
             file.Close()
@@ -270,19 +305,20 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                 use data = JsonDocument.Parse(File.ReadAllText(path))
                 let root = data.RootElement
                 let schemaVersion = root.GetProperty("schemaVersion").GetInt32()
-                if schemaVersion < 1 || schemaVersion > 4 then
+                if schemaVersion < 1 || schemaVersion > 5 then
                     invalidOp "Unsupported browser schedules state schema."
                 let restored =
                     JsonSerializer.Deserialize<ScheduledAction list>(root.GetProperty("actions").GetRawText())
                 // Legacy entries omit CommandArgs. A null F# list can throw
                 // during structural equality before scheduling even begins.
                 let needsMigration =
-                    schemaVersion < 4 ||
-                    (restored |> List.exists (fun entry -> isNull (box entry.CommandArgs)))
+                    schemaVersion < 5 ||
+                    (restored |> List.exists (fun entry -> isNull (box entry.CommandArgs) || isNull entry.ScriptSha256))
                 let normalized =
                     restored |> List.map (fun entry ->
                         { entry with
                             CommandArgs = if isNull (box entry.CommandArgs) then [] else entry.CommandArgs
+                            ScriptSha256 = if isNull entry.ScriptSha256 then "" else entry.ScriptSha256
                             // Pre-v4 records had one identity for both the owner and the
                             // script source. Never infer a different owner from an ID.
                             SourceProjectName =
@@ -301,6 +337,12 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                            String.IsNullOrWhiteSpace action.SourceProjectName then
                             { action with Status = "suspended"
                                           Error = "InvalidScheduleProjectIdentity: reconfigure explicitly."
+                                          UpdatedAtUtc = clock() }
+                        elif (String.IsNullOrWhiteSpace action.ActionKind || action.ActionKind = "BrowserScript") &&
+                             action.SourceProjectName <> action.ProjectName &&
+                             not (validSha256 action.ScriptSha256) then
+                            { action with Status = "suspended"
+                                          Error = "ScriptSourceDigestMissing: explicit re-registration required."
                                           UpdatedAtUtc = clock() }
                         elif action.Status = "running" then
                             if isIdle action then
@@ -348,6 +390,7 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
         let window = defaultArg windowRegistration ""
         let closeAfter = defaultArg closeAfter false
         let repeat = defaultArg repeatEverySeconds 0
+        let sourceDigest = lazy (bindSourceDigest project source script)
         if String.IsNullOrWhiteSpace(id) || id.Length > 64 ||
            (id |> Seq.exists (fun c -> not (Char.IsLetterOrDigit(c) || c = '-' || c = '_'))) then
             Error "InvalidScheduleId: use 1-64 letters, numbers, - or _."
@@ -360,6 +403,10 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
         elif String.IsNullOrWhiteSpace(project) || String.IsNullOrWhiteSpace(source) ||
              String.IsNullOrWhiteSpace(script) then
             Error "InvalidScriptPath"
+        elif sourceDigest.Value.IsError then
+            match sourceDigest.Value with
+            | Error reason -> Error reason
+            | Ok _ -> Error "ScriptSourceProofUnavailable"
         elif isNull alias || alias.Length > 128 || (alias |> Seq.exists Char.IsControl) then
             Error "InvalidTabAlias"
         elif String.IsNullOrWhiteSpace(args) then
@@ -389,7 +436,8 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                             let entry =
                                 { Id = id; DueAtUtc = time.AddSeconds(float seconds); Url = url
                                   ProjectName = project; SourceProjectName = source
-                                  ScriptPath = script; Alias = alias
+                                  ScriptPath = script; ScriptSha256 = Result.defaultValue "" sourceDigest.Value
+                                  Alias = alias
                                   ArgsJson = args; Active = active; WindowRegistration = window
                                   CloseTabAfterExecution = closeAfter; RepeatEverySeconds = repeat
                                   Status = "pending"
@@ -414,6 +462,10 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
             (id |> Seq.forall (fun c -> Char.IsLetterOrDigit c || c = '-' || c = '_'))
         let required (text: string option) = text |> Option.defaultValue ""
         let source = cmd.SourceProjectName |> Option.defaultValue cmd.ProjectName
+        let sourceDigest = lazy (
+            if cmd.ActionKind = "BrowserScript" then
+                bindSourceDigest cmd.ProjectName source (cmd.ScriptPath |> Option.defaultValue "")
+            else Ok "")
         let time = clock()
         let initialSeen =
             if cmd.TriggerKind = "AfterAgentIdle" then
@@ -480,6 +532,10 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
             match due, actionError with
             | Error error, _ -> Error error
             | _, Some error -> Error error
+            | Ok _, None when sourceDigest.Value.IsError ->
+                match sourceDigest.Value with
+                | Error reason -> Error reason
+                | Ok _ -> Error "ScriptSourceProofUnavailable"
             | Ok at, None ->
                 lock gate (fun () ->
                     if actions |> List.exists (fun a -> a.Id = cmd.ScheduleId && a.Status = "running") then
@@ -492,6 +548,7 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                         let entry =
                             { Id = cmd.ScheduleId; DueAtUtc = at; ProjectName = cmd.ProjectName
                               SourceProjectName = source
+                              ScriptSha256 = Result.defaultValue "" sourceDigest.Value
                               Url = required cmd.Url; ScriptPath = required cmd.ScriptPath
                               Alias = required cmd.Alias; ArgsJson = cmd.ArgsJson |> Option.defaultValue "{}"
                               Active = cmd.Active |> Option.defaultValue false
@@ -532,14 +589,23 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                 | Some a when a.SourceProjectName <> expectedSource -> Error "ScheduleSourceChanged"
                 | Some a when a.ActionKind <> "BrowserScript" && not (String.IsNullOrWhiteSpace a.ActionKind) ->
                     Error "RebindBrowserScriptOnly"
-                | Some a when a.ProjectName = newOwner -> Ok()
+                | Some a when a.ProjectName = newOwner ->
+                    if a.SourceProjectName <> a.ProjectName && not (validSha256 a.ScriptSha256) then
+                        Error "ScriptSourceDigestMissing: explicit re-registration required."
+                    else Ok()
                 | Some a when a.ProjectName <> expectedOwner -> Error "ScheduleOwnerChanged"
                 | Some a when a.Disabled || (a.Status <> "pending" && a.Status <> "waitingActivity") ->
                     Error "RebindRequiresPending"
                 | Some a ->
-                    setActions (actions |> List.map (fun item ->
-                        if item.Id = id then { item with ProjectName = newOwner } else item))
-                    Ok())
+                    match bindSourceDigest newOwner expectedSource a.ScriptPath with
+                    | Error reason -> Error reason
+                    | Ok digest when not (validSha256 digest) -> Error "ScriptSourceProofUnavailable"
+                    | Ok digest ->
+                        setActions (actions |> List.map (fun item ->
+                            if item.Id = id then
+                                { item with ProjectName = newOwner; ScriptSha256 = digest }
+                            else item))
+                        Ok())
 
     member _.Cancel(id: string) =
         lock gate (fun () ->
@@ -755,7 +821,10 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                     | Ok value -> update entry.Id entry.AttemptId "completed" value ""
                                     | Error (value, reason) ->
                                         let status =
-                                            if reason.StartsWith("UiIncompatible:", StringComparison.Ordinal) then "suspended"
+                                            if reason.StartsWith("UiIncompatible:", StringComparison.Ordinal) ||
+                                               reason.StartsWith("SourceRevisionMismatch:", StringComparison.Ordinal) ||
+                                               reason.StartsWith("ScriptSourceDigestMissing:", StringComparison.Ordinal) ||
+                                               reason.StartsWith("ScriptSourceDigestInvalid:", StringComparison.Ordinal) then "suspended"
                                             elif reason.Contains("OutcomeUnknown", StringComparison.OrdinalIgnoreCase) then "outcomeUnknown"
                                             else "failed"
                                         update entry.Id entry.AttemptId status value

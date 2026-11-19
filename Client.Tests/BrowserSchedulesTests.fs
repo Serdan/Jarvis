@@ -10,6 +10,9 @@ open Client
 open Common
 open NUnit.Framework
 
+let private sampleSha256 = String.replicate 64 "a"
+let private sourceProof _ _ = Ok sampleSha256
+
 let private temp () =
     let dir = Path.Combine(Path.GetTempPath(), "jarvis-schedules-" + Guid.NewGuid().ToString("N"))
     Directory.CreateDirectory(dir) |> ignore
@@ -798,7 +801,7 @@ let distinctScheduleOwnerAndCanonicalScriptSourceAcrossBothApis () =
     let dir, path = temp()
     let execute (_: BrowserSchedules.ScheduledAction) = task { return Ok "unused" }
     try
-        use store = new BrowserSchedules.Service(path, execute)
+        use store = new BrowserSchedules.Service(path, execute, scriptSourceSha256=sourceProof)
         let script = "organon/browser-scripts/chatgpt/launchAgent.js"
         let direct =
             store.Schedule("favn-manager", 600, "https://chatgpt.com/", "Favn",
@@ -828,6 +831,8 @@ let distinctScheduleOwnerAndCanonicalScriptSourceAcrossBothApis () =
         Assert.That(favn.GetProperty("sourceProjectName").GetString(), Is.EqualTo("Servitor"))
         Assert.That(jarvis.GetProperty("sourceProjectName").GetString(), Is.EqualTo("Servitor"))
         Assert.That(favn.GetProperty("scriptPath").GetString(), Is.EqualTo(script))
+        Assert.That(favn.GetProperty("scriptSha256").GetString(), Is.EqualTo(sampleSha256))
+        Assert.That(jarvis.GetProperty("scriptSha256").GetString(), Is.EqualTo(sampleSha256))
         Assert.That(store.List(), Does.Not.Contain("privatePrompt"))
         Assert.That(File.ReadAllText(path), Does.Contain("privatePrompt"),
             "Private arguments remain in the protected local schedule state only")
@@ -853,7 +858,7 @@ let legacySameProjectSourceMigratesWithoutGuessingOwner () =
         Assert.That(entry.GetProperty("sourceProjectName").GetString(), Is.EqualTo("Scripts"))
         Assert.That(entry.GetProperty("status").GetString(), Is.EqualTo("pending"))
         let persisted = JsonNode.Parse(File.ReadAllText(path))
-        Assert.That(persisted["schemaVersion"].GetValue<int>(), Is.EqualTo(4))
+        Assert.That(persisted["schemaVersion"].GetValue<int>(), Is.EqualTo(5))
         Assert.That(((persisted["actions"][0])["SourceProjectName"]).GetValue<string>(),
                     Is.EqualTo("Scripts"))
     finally
@@ -890,8 +895,12 @@ let ambiguousV4SourceIsSuspendedAndNeverLaunched () = task {
 let idempotentGuardedOwnerRebindPreservesPrivateStateAndClaimIdentity () =
     let dir, path = temp()
     let execute (_: BrowserSchedules.ScheduledAction) = task { return Ok "unused" }
+    let mutable sourceAvailable = true
+    let resolver _ _ =
+        if sourceAvailable then Ok sampleSha256
+        else Error "ScriptUnavailable"
     try
-        use store = new BrowserSchedules.Service(path, execute)
+        use store = new BrowserSchedules.Service(path, execute, scriptSourceSha256=resolver)
         Assert.That(store.Schedule("favn-manager", 600, "https://chatgpt.com/",
             "Servitor", "organon/browser-scripts/chatgpt/launchAgent.js", "",
             """{"prompt":"private"}""", false, windowRegistration="agents",
@@ -900,6 +909,14 @@ let idempotentGuardedOwnerRebindPreservesPrivateStateAndClaimIdentity () =
         let revision = (before["RevisionId"]).GetValue<string>()
         Assert.That(store.RebindProject("favn-manager","Servitor","wrong","Favn",revision).IsError, Is.True)
         Assert.That(store.RebindProject("favn-manager","Servitor","Servitor","Favn","stale").IsError, Is.True)
+        sourceAvailable <- false
+        Assert.That(store.RebindProject("favn-manager","Servitor","Servitor","Favn",revision).IsError, Is.True,
+                    "Unavailable source must never permit a rebind")
+        let stateAfterFailedRebind = JsonNode.Parse(File.ReadAllText(path))
+        let unchangedItem = stateAfterFailedRebind["actions"][0]
+        let ownerStillUnchanged = unchangedItem["ProjectName"].GetValue<string>()
+        Assert.That(ownerStillUnchanged, Is.EqualTo("Servitor"))
+        sourceAvailable <- true
         Assert.That(store.RebindProject("favn-manager","Servitor","Servitor","Favn",revision).IsOk, Is.True)
         let firstRebind = File.ReadAllText(path)
         Assert.That(store.RebindProject("favn-manager","Servitor","Servitor","Favn",revision).IsOk, Is.True)
@@ -908,6 +925,7 @@ let idempotentGuardedOwnerRebindPreservesPrivateStateAndClaimIdentity () =
         let after = ((JsonNode.Parse(firstRebind))["actions"])[0]
         Assert.That((after["ProjectName"]).GetValue<string>(), Is.EqualTo("Favn"))
         Assert.That((after["SourceProjectName"]).GetValue<string>(), Is.EqualTo("Servitor"))
+        Assert.That((after["ScriptSha256"]).GetValue<string>(), Is.EqualTo(sampleSha256))
         for field in ["RevisionId";"AttemptId";"ArgsJson";"WindowRegistration";
                       "DueAtUtc";"Status";"UpdatedAtUtc";"RepeatEverySeconds";
                       "RegistrationId";"LastResult";"Cleanup";"Error"] do
@@ -951,4 +969,98 @@ let scheduleSourcePermissionRequiresTwoIndependentProjectApprovals () = task {
             (ScheduleExecutionCommand
                 { commandSchedule "same-project" "Once" with SourceProjectName = None })
     Assert.That(sameProject.IsNone, Is.True)
+}
+
+[<Test>]
+let crossProjectRegistrationRequiresResolvedSourceDigest () =
+    let dir, path = temp()
+    let execute (_: BrowserSchedules.ScheduledAction) = task { return Ok "unexpected" }
+    let schedule (store: BrowserSchedules.Service) id script =
+        store.Schedule(id, 600, "https://chatgpt.com/", "Favn", script, "",
+            """{"privatePrompt":"never-log"}""", false,
+            windowRegistration="agents", sourceProjectName="Servitor")
+    try
+        use missingResolver = new BrowserSchedules.Service(path, execute)
+        Assert.That((schedule missingResolver "no-resolver" "organon/start.js").IsError, Is.True)
+        Assert.That(missingResolver.List(), Does.Not.Contain("no-resolver"))
+    finally
+        Directory.Delete(dir, true)
+
+    let dir2, path2 = temp()
+    try
+        use missingSource = new BrowserSchedules.Service(path2, execute,
+            scriptSourceSha256=(fun _ _ -> Error "ScriptUnavailable"))
+        Assert.That((schedule missingSource "no-source" "organon/start.js").IsError, Is.True)
+        Assert.That((schedule missingSource "escape" "../escape.js").IsError, Is.True)
+        Assert.That(missingSource.List(), Does.Not.Contain("no-source"))
+    finally
+        Directory.Delete(dir2, true)
+
+[<Test>]
+let migratedCrossProjectWithoutPinnedDigestSuspendsWithoutClaim () = task {
+    let dir, path = temp()
+    let mutable clock = DateTimeOffset.UtcNow
+    let mutable calls = 0
+    let execute (_: BrowserSchedules.ScheduledAction) = task {
+        calls <- calls + 1
+        return Ok "unexpected"
+    }
+    try
+        do
+            use initial = new BrowserSchedules.Service(path, execute, now=(fun () -> clock),
+                scriptSourceSha256=sourceProof)
+            Assert.That(initial.Schedule("favn-manager", 600, "https://chatgpt.com/",
+                "Favn", "organon/start.js", "", """{"privatePrompt":"secret"}""", false,
+                windowRegistration="agents", sourceProjectName="Servitor").IsOk, Is.True)
+        let state = JsonNode.Parse(File.ReadAllText(path))
+        state["schemaVersion"] <- JsonValue.Create(4)
+        (state["actions"][0]).AsObject().Remove("ScriptSha256") |> ignore
+        File.WriteAllText(path, state.ToJsonString())
+        use restored = new BrowserSchedules.Service(path, execute, now=(fun () -> clock),
+            pollMs=25, scriptSourceSha256=sourceProof)
+        Assert.That(status restored "favn-manager", Is.EqualTo("suspended"))
+        Assert.That(restored.List(), Does.Contain("ScriptSourceDigestMissing"))
+        clock <- clock.AddDays(1.)
+        restored.Start()
+        do! Task.Delay(100)
+        Assert.That(calls, Is.Zero)
+        Assert.That(File.ReadAllText(path), Does.Contain("secret"))
+    finally
+        Directory.Delete(dir, true)
+}
+
+[<Test>]
+let changedSourceDigestSuspendsRecurringScheduleWithoutRetry () = task {
+    let dir, path = temp()
+    let mutable clock = DateTimeOffset.UtcNow
+    let mutable actualDigest = sampleSha256
+    let mutable launched = 0
+    let execute (action: BrowserSchedules.ScheduledAction) = task {
+        match BrowserSchedules.verifyScriptDigest action actualDigest with
+        | Error reason -> return Error("", reason)
+        | Ok() ->
+            launched <- launched + 1
+            return Ok "unexpected"
+    }
+    try
+        use store = new BrowserSchedules.Service(path, execute, now=(fun () -> clock),
+            pollMs=25, scriptSourceSha256=sourceProof)
+        Assert.That(store.Schedule("favn-manager", 600, "https://chatgpt.com/",
+            "Favn", "organon/start.js", "", "{}", false,
+            windowRegistration="agents", repeatEverySeconds=600,
+            sourceProjectName="Servitor").IsOk, Is.True)
+        let state = JsonNode.Parse(File.ReadAllText(path))
+        let pinnedItem = state["actions"][0]
+        let pinnedDigest = pinnedItem["ScriptSha256"].GetValue<string>()
+        Assert.That(pinnedDigest, Is.EqualTo(sampleSha256))
+        actualDigest <- String.replicate 64 "b"
+        clock <- clock.AddSeconds(601.)
+        store.Start()
+        do! awaitStatus (fun () -> status store "favn-manager" = "suspended")
+        clock <- clock.AddHours(2.)
+        do! Task.Delay(100)
+        Assert.That(launched, Is.Zero)
+        Assert.That(store.List(), Does.Contain("SourceRevisionMismatch"))
+    finally
+        Directory.Delete(dir, true)
 }

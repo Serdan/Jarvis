@@ -1,0 +1,1 @@
+Review exact 3-file test/docs lease at 5e1798003 based on a83549a; verdict B: no authenticated independent original object reader. Validate three new Git fixture negatives/positive without production authority, source/remote matrix, and G2 HOLD. .NET 11 Release 3/3 scoped and 21/21 adjacent pass; git show --check clean. No original protected refs or live host changed.

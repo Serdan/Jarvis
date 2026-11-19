@@ -1229,3 +1229,86 @@ let managedCommandTransportDoesNotCreateASecondToolOperation () =
         Assert.That(final.Result, Is.EqualTo(direct.Result))
     finally
         Directory.Delete(root, true)
+
+
+[<Test; NonParallelizable>]
+let scheduledManagedCommandWaitsForRealExitAndDoesNotReplay () = task {
+    let root = createTempProject()
+    let mutable jobId = None
+    try
+        let script = """System.IO.File.AppendAllText("scheduled-once-count.txt", "X")
+System.Threading.Thread.Sleep(2700)
+"""
+        File.WriteAllText(Path.Combine(root, "Project1", "scheduled-once.fsx"), script)
+        let started =
+            managedStarted root
+                (managedCommand "dotnet" [ "fsi"; "--exec"; "scheduled-once.fsx" ] (Some 20) 4096)
+        let id = started.JobId |> Option.get
+        jobId <- Some id
+        Assert.That(started.ProcessStatus, Is.EqualTo("Running"),
+                    "The schedule consumer must not misclassify the initial response window")
+        Assert.That(started.ExitCode, Is.EqualTo(-1))
+        let! final = awaitScheduledCommandTerminal "Project1" started 20 (TestContext root)
+        match final with
+        | Ok (JobStatus.Completed 0, false) -> ()
+        | other -> Assert.Fail(sprintf "Schedule must observe terminal success: %A" other)
+        let marker = File.ReadAllText(Path.Combine(root, "Project1", "scheduled-once-count.txt"))
+        Assert.That(marker, Is.EqualTo("X"), "Polling must never repeat the external command")
+        match getJobResult { ProjectName = "Project1"; JobId = id; AfterSequence = None } (TestContext root) with
+        | Ok snapshot -> Assert.That(snapshot.Status, Is.EqualTo(JobStatus.Completed 0))
+        | Error error -> Assert.Fail(sprintf "Process disappeared after successful schedule poll: %A" error)
+    finally
+        jobId |> Option.iter (managedCancel root)
+        Directory.Delete(root, true)
+}
+
+[<Test; NonParallelizable>]
+let scheduledManagedCommandDistinguishesNonzeroCancellationAndDeadline () = task {
+    let root = createTempProject()
+    let active = ResizeArray<string>()
+    try
+        let nonzero = managedStarted root (managedCommand "false" [] (Some 5) 1024)
+        active.Add(nonzero.JobId |> Option.get)
+        let! failed = awaitScheduledCommandTerminal "Project1" nonzero 5 (TestContext root)
+        match failed with
+        | Ok (JobStatus.Completed 1, _) -> ()
+        | other -> Assert.Fail(sprintf "Nonzero exit must remain a terminal failure: %A" other)
+
+        let canceled = managedStarted root (managedCommand "sleep" [ "5" ] (Some 12) 1024)
+        let cancelId = canceled.JobId |> Option.get
+        active.Add(cancelId)
+        cancelJob { ProjectName = "Project1"; JobId = cancelId } (TestContext root) |> shouldEqual (Ok())
+        let! cancellation = awaitScheduledCommandTerminal "Project1" canceled 12 (TestContext root)
+        match cancellation with
+        | Ok (JobStatus.Canceled, _) -> ()
+        | other -> Assert.Fail(sprintf "Cancellation must remain distinct: %A" other)
+
+        let deadline = managedStarted root (managedCommand "sleep" [ "5" ] (Some 1) 1024)
+        active.Add(deadline.JobId |> Option.get)
+        let! timed = awaitScheduledCommandTerminal "Project1" deadline 1 (TestContext root)
+        match timed with
+        | Ok (JobStatus.TimedOut, _) -> ()
+        | other -> Assert.Fail(sprintf "Explicit deadline must remain distinct: %A" other)
+    finally
+        for id in active do managedCancel root id
+        Directory.Delete(root, true)
+}
+
+[<Test; NonParallelizable>]
+let scheduledManagedCommandUnknownJobAndMissingHandleFailClosed () = task {
+    let root = createTempProject()
+    try
+        let completed = managedStarted root (managedCommand "true" [] (Some 5) 1024)
+        let running = { completed with ProcessStatus = "Running"; ExitCode = -1 }
+        let cases =
+            [ { running with JobId = None }
+              { running with JobId = Some(Guid.NewGuid().ToString("N")) }
+              { completed with ProcessStatus = "Unrecognized" } ]
+        for candidate in cases do
+            let! result = awaitScheduledCommandTerminal "Project1" candidate 1 (TestContext root)
+            match result with
+            | Error detail when detail.StartsWith("OutcomeUnknown:", StringComparison.Ordinal) -> ()
+            | other -> Assert.Fail(sprintf "Unknown process outcome must fail closed: %A" other)
+    finally
+        Directory.Delete(root, true)
+}

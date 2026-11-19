@@ -788,6 +788,46 @@ let getJobResult (cmd: GetJobResultCommand) =
         | Error error -> Error error
         | Ok canonical -> getJobResultForProject canonical cmd rt
 
+// Scheduled commands must follow the same OS process job they started. A
+// RunCommand response can be merely the end of its short response window,
+// and is not evidence that the underlying process exited.
+let awaitScheduledCommandTerminal projectName (initial: RunCommandResult) deadlineSeconds rt = task {
+    match initial.ProcessStatus with
+    | "Completed" -> return Ok(Completed initial.ExitCode, initial.Truncated)
+    | "TimedOut" -> return Ok(TimedOut, initial.Truncated)
+    | "Canceled" -> return Ok(Canceled, initial.Truncated)
+    | "FailedToStart" ->
+        return Ok(FailedToStart "The managed process could not start.", initial.Truncated)
+    | "Running" ->
+        match initial.JobId with
+        | None -> return Error "OutcomeUnknown: running command has no process job ID"
+        | Some jobId when String.IsNullOrWhiteSpace jobId ->
+            return Error "OutcomeUnknown: running command has an empty process job ID"
+        | Some jobId ->
+            // The schedule supplies an explicit process deadline. Leave a
+            // bounded grace interval for the kill/exit event to be observed.
+            // Do not issue another RunCommand or cancel merely because polling
+            // failed; an uncertain process may still be running.
+            let maxWait = TimeSpan.FromSeconds(float (max 1 deadlineSeconds) + 30.)
+            let clock = Stopwatch.StartNew()
+            let mutable outcome : Result<JobStatus * bool, string> option = None
+            while outcome.IsNone && clock.Elapsed < maxWait do
+                match getJobResult { ProjectName = projectName; JobId = jobId; AfterSequence = None } rt with
+                | Error error ->
+                    outcome <- Some(Error(sprintf "OutcomeUnknown: process job %s cannot be read: %A" jobId error))
+                | Ok result ->
+                    match result.Status with
+                    | Running -> do! Task.Delay(100)
+                    | Completed _ | TimedOut | Canceled | FailedToStart _ ->
+                        outcome <- Some(Ok(result.Status, result.Truncated))
+                    | unexpected ->
+                        outcome <- Some(Error(sprintf "OutcomeUnknown: non-process job status %A for %s" unexpected jobId))
+            return outcome |> Option.defaultValue
+                (Error(sprintf "OutcomeUnknown: no terminal process status for %s within bounded wait" jobId))
+    | unexpected ->
+        return Error(sprintf "OutcomeUnknown: unexpected managed command status %s" unexpected)
+}
+
 let cancelJobForProjectAsAgent (canonical: ProjectPaths.ProjectId option) actor (cmd: CancelJobCommand) =
     fun rt ->
         match ToolOperations.cancel canonical actor cmd.JobId with

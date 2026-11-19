@@ -23,7 +23,21 @@
 
 1. The producer's valid local commit OID is absent from the independent bare original and reader, even when the client can `cat-file` it.
 2. A **fixture-only, unprotected** `refs/heads/fixture-object-handoff` push carries that commit to a bare original. A distinct reader can `git fetch --no-tags --no-write-fetch-head --refmap=` into a temporary ref, match the advertised SHA, inspect the commit/tree and verify the exact parent. Neither `jarvis-orchestration` nor `jarvis-account-admission` is touched.
-3. Wrong original repository, wrong ref, or wrong parent does not satisfy the pinned evidence. A later fast-forward changes the advertised head despite the reader still having the cached old object. Discarding a push acknowledgement demonstrates that absence of an acknowledged effect is not proof of no remote mutation.
+3. An unrelated bare repository deliberately advertises the **same candidate OID under the same ref**; the original also advertises that same candidate under a distinct alias ref. A fixture-only decision with an independently pinned local repository path and ref rejects both substitutions. A legitimate sibling commit is supplied as an incorrect expected parent and rejected. A later fast-forward makes the previously fetched object stale even though the reader still has its commit bytes. These assertions exercise a **non-authoritative disposable guard**, not a production authenticated original or physical effect-receipt state machine.
+
+### Negative-evidence coverage and explicit untested HOLDs
+
+| Required case | Executable evidence | What remains unproved |
+| --- | --- | --- |
+| Object absent despite matching local SHA | Independent bare repository has no local-only producer commit before push | Real authenticated source, publisher admission and custody |
+| Wrong original with identical ref/OID | Adversarial unrelated bare repository contains identical commit and ref; independently pinned fixture path rejects it | Cryptographically or administratively authenticated canonical original repository identity; Worker 16/Worker 4 must bind the real remote authority |
+| Wrong ref with identical OID | An alias ref advertises the same commit but the pinned fixture ref check rejects it | Real enforceable original ref policy and authorization |
+| Wrong parent | A valid sibling commit differs from the actual parent; explicit expected-parent comparison rejects it | Authenticated remote parent/effect-time binding and original CAS receipt |
+| Stale remote head, delayed or unknown push | Fast-forward makes cached candidate fail an independent remote-ref check | **Untested:** durable unknown-push reconciliation, actual acknowledgement loss and receipt anchoring; requires Worker 21's client effect stage and Worker 16's enforcing publisher |
+| Replayed original/stage UUIDs, including changed payload | **Not executable** with a Git-only fixture that has no operation/effect journal | HOLD pending Worker 21's durable source-effect stage receipt and Worker 16's actual original publisher idempotency/replay guard; require independent negative tests in their owned implementation |
+| Rolled-back or lost pre-STOP original effects/high-water | **Not executable** with a Git-only fixture that has no original effect-anchor/STOP ledger | HOLD pending Worker 17's real ReadEffectAnchor and Worker 4's authenticated ReadAuthenticated/ReinspectAuthenticated plus STOP coverage; require real stale/rollback negative tests in those owners' leases |
+
+The Git helper drains stdout/stderr concurrently under one 15-second process-and-stream deadline, kills the process tree on timeout, and disables global/system Git configuration, prompts and hooks. This protects a disposable local test from inherited user configuration; it does not establish production credential isolation.
 
 This demonstrates the **Git mechanism**, not that such a staging ref is permitted in a real original remote. A writer-controlled staging ref is an extra remote mutation channel and requires its own authorization; do not silently substitute it for an authenticated object-transfer/quarantine mechanism. A SHA, `ls-remote`, local log, and successful fixture fetch each prove only their corresponding narrow observations.
 

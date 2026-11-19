@@ -3,6 +3,7 @@ module OriginalGitSourceObjectHandoffTests
 open System
 open System.Diagnostics
 open System.IO
+open System.Threading.Tasks
 open NUnit.Framework
 
 // Disposable Git-native evidence only. These local remotes are NOT an authenticated
@@ -13,14 +14,29 @@ let private git directory args =
     start.RedirectStandardOutput <- true
     start.RedirectStandardError <- true
     start.UseShellExecute <- false
+    // Keep disposable Git isolated from credentials, global/system configuration and hooks.
+    start.Environment["GIT_CONFIG_NOSYSTEM"] <- "1"
+    start.Environment["GIT_CONFIG_GLOBAL"] <- Path.Combine(directory, ".fixture-no-global-config")
+    start.Environment["GIT_TERMINAL_PROMPT"] <- "0"
+    start.Environment["GIT_CONFIG_COUNT"] <- "1"
+    start.Environment["GIT_CONFIG_KEY_0"] <- "core.hooksPath"
+    start.Environment["GIT_CONFIG_VALUE_0"] <- Path.Combine(directory, ".fixture-no-hooks")
     for arg in args do start.ArgumentList.Add arg
     use child = Process.Start start
-    let stdout = child.StandardOutput.ReadToEnd().Trim()
-    let stderr = child.StandardError.ReadToEnd().Trim()
-    if not (child.WaitForExit 15000) then
-        child.Kill true
-        Assert.Fail(sprintf "Disposable git %A timed out." args)
-    child.ExitCode, stdout, stderr
+    // Concurrent drains prevent pipe-buffer deadlock; one deadline covers exit and both EOFs.
+    let stdout = child.StandardOutput.ReadToEndAsync()
+    let stderr = child.StandardError.ReadToEndAsync()
+    let completed = Task.WhenAll([| child.WaitForExitAsync(); stdout :> Task; stderr :> Task |])
+    try completed.WaitAsync(TimeSpan.FromSeconds(15.0)).GetAwaiter().GetResult()
+    with :? TimeoutException ->
+        try
+            if not child.HasExited then child.Kill true
+        with :? InvalidOperationException -> ()
+        // Never wait without a deadline during failure cleanup, including inherited pipe handles.
+        try completed.WaitAsync(TimeSpan.FromSeconds(2.0)).GetAwaiter().GetResult()
+        with _ -> ()
+        Assert.Fail(sprintf "Disposable git %A timed out before exit and both pipe EOFs." args)
+    child.ExitCode, stdout.GetAwaiter().GetResult().Trim(), stderr.GetAwaiter().GetResult().Trim()
 
 let private mustGit directory args =
     let code, output, error = git directory args
@@ -73,6 +89,19 @@ let private parent reader oid =
     Assert.That(parts[0], Is.EqualTo(oid))
     parts |> Array.skip 1 |> Array.toList
 
+// NON-authoritative fixture decision: the trusted path/ref are independently pinned,
+// not taken from the offered source. This is not real remote authentication or receipt verification.
+let private fixturePinnedSourceCheck trustedOriginal offeredRemote trustedRef offeredRef expectedOid expectedParent reader =
+    if not (String.Equals(Path.GetFullPath(trustedOriginal), Path.GetFullPath(offeredRemote), StringComparison.Ordinal)) then
+        Error "repository mismatch"
+    elif offeredRef <> trustedRef then
+        Error "ref mismatch"
+    elif advertised reader offeredRemote offeredRef <> Some expectedOid then
+        Error "remote head mismatch"
+    elif parent reader expectedOid <> [ expectedParent ] then
+        Error "parent mismatch"
+    else Ok ()
+
 [<Test>]
 let client_local_sha_does_not_make_object_available_in_independent_original () =
     withRepositories (fun producer original unrelated reader ->
@@ -111,21 +140,35 @@ let cached_object_cannot_prove_wrong_repo_ref_parent_or_stale_remote_head () =
     withRepositories (fun producer original unrelated reader ->
         let baseOid = commit producer "base"
         let candidate = commit producer "candidate"
+        // A legitimate sibling commit is a plausible but incorrect expected parent.
+        mustGit producer [ "checkout"; "-q"; "-b"; "alternate-parent"; baseOid ] |> ignore
+        let alternateParent = commit producer "alternate-parent"
+        mustGit producer [ "checkout"; "-q"; "main" ] |> ignore
+        let aliasRef = "refs/heads/fixture-object-alias"
         mustGit producer [ "push"; "--porcelain"; original; candidate + ":" + managedRef ] |> ignore
+        // Both adversarial routes advertise the SAME candidate object as the pinned original.
+        mustGit producer [ "push"; "--porcelain"; unrelated; candidate + ":" + managedRef ] |> ignore
+        mustGit producer [ "push"; "--porcelain"; original; candidate + ":" + aliasRef ] |> ignore
         mustGit reader [ "fetch"; "--no-tags"; "--no-write-fetch-head"; "--refmap=";
                          original; managedRef + ":" + localStage ] |> ignore
         Assert.That(mustGit reader [ "cat-file"; "-t"; candidate ], Is.EqualTo("commit"))
-        Assert.That(advertised reader unrelated managedRef, Is.EqualTo(None), "Wrong remote is not an authoritative source")
-        Assert.That(advertised reader original "refs/heads/unrelated", Is.EqualTo(None), "Wrong ref must fail")
-        Assert.That(parent reader candidate = [ candidate ], Is.False, "Wrong parent must fail")
-        Assert.That(parent reader candidate = [ baseOid ], Is.True)
+        Assert.That(advertised reader unrelated managedRef, Is.EqualTo(Some candidate))
+        Assert.That(advertised reader original aliasRef, Is.EqualTo(Some candidate))
+        let check repo gitRef expectedParent =
+            fixturePinnedSourceCheck original repo managedRef gitRef candidate expectedParent reader
+        Assert.That(check original managedRef baseOid = Ok (), Is.True, "Fixture positive control")
+        Assert.That(check unrelated managedRef baseOid = Error "repository mismatch", Is.True,
+                    "Wrong repository with identical OID/ref must not satisfy pinned fixture identity")
+        Assert.That(check original aliasRef baseOid = Error "ref mismatch", Is.True,
+                    "Unapproved ref alias with identical OID must not satisfy pinned ref")
+        Assert.That(check original managedRef alternateParent = Error "parent mismatch", Is.True,
+                    "Valid but different expected parent must be rejected")
         let successor = commit producer "successor"
-        // Model lost push acknowledgement: only the remote observation survives.
+        // Remote advance can be observed, but a durable effect-receipt/unknown push
+        // reconciliation state machine cannot be tested by Git operations alone.
         mustGit producer [ "push"; "--porcelain"; original; successor + ":" + managedRef ] |> ignore
-        let callerHasPushAcknowledgement = false
-        Assert.That(callerHasPushAcknowledgement, Is.False)
         Assert.That(advertised reader original managedRef, Is.EqualTo(Some successor))
-        Assert.That(advertised reader original managedRef, Is.Not.EqualTo(Some candidate),
-                    "Cached candidate is stale after delayed/unknown remote advance")
+        Assert.That(check original managedRef baseOid = Error "remote head mismatch", Is.True,
+                    "Cached candidate must fail after remote head moves")
         Assert.That(mustGit reader [ "cat-file"; "-t"; candidate ], Is.EqualTo("commit"),
                     "A cached object alone must not authorize a replay"))

@@ -2356,7 +2356,7 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "Schedule browser execution", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute","workspace:read"]}]""");
-      Description("Persist one-shot or repeating browser launch in an explicitly registered window, executing a project JavaScript file with optional cleanup. No replay of uncertain occurrences.")>]
+      Description("Persist one-shot or repeating browser launch in an explicitly registered window. Created tabs close by default; set closeTabAfterExecution=false only to retain for debugging. No replay of uncertain occurrences.")>]
     static member ScheduleBrowserExecution(scheduleId: string, runAfterSeconds: int, url: string, projectName: string, agentId: string,
                                            [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, scriptPath: string,
                                            [<Optional; DefaultParameterValue("")>] argsJson: string,
@@ -2364,7 +2364,7 @@ type JarvisMcpTools =
                                            [<Optional; DefaultParameterValue(false)>] active: bool,
                                            [<Optional; DefaultParameterValue("")>] deviceId: string,
                                            [<Optional; DefaultParameterValue("")>] windowRegistration: string,
-                                           [<Optional; DefaultParameterValue(false)>] closeTabAfterExecution: bool,
+                                           [<Optional; DefaultParameterValue(true)>] closeTabAfterExecution: bool,
                                            repeatEverySeconds: Nullable<int>,
                                            client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
@@ -2474,7 +2474,7 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "Run project script in a new browser tab", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute","workspace:read"]}]""");
-      Description("Create a new tab in a registered browser window, run a project .js file, and optionally close it. Never retries uncertain page effects.")>]
+      Description("Create a new tab in a registered browser window and run a project .js file. Closes created tabs by default; set closeTabAfterExecution=false only to retain for debugging. Never retries uncertain page effects.")>]
     static member BrowserRunInNewTab(windowRegistration: string, url: string, projectName: string, agentId: string,
                                       [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, scriptPath: string,
                                       [<Optional; DefaultParameterValue("")>] argsJson: string,

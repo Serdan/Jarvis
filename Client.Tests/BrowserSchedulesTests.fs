@@ -25,6 +25,25 @@ let private status (service: BrowserSchedules.Service) id =
     |> Seq.find (fun x -> x.GetProperty("id").GetString() = id)
     |> fun x -> x.GetProperty("status").GetString()
 
+[<Test>]
+let createdTabsCloseByDefaultAndRequireExplicitDebugOptOut () =
+    let dir, path = temp()
+    let execute (_: BrowserSchedules.ScheduledAction) = task { return Ok "no-op" }
+    try
+        use store = new BrowserSchedules.Service(path, execute)
+        Assert.That((add store "normal" 600).IsOk, Is.True)
+        let debug = store.Schedule("debug", 600, "https://example.test/chat", "Scripts", "start.js", "", "{}", false, windowRegistration="agents", closeAfter=false)
+        Assert.That(debug.IsOk, Is.True)
+        use doc = JsonDocument.Parse(store.List())
+        let closes id =
+            doc.RootElement.EnumerateArray()
+            |> Seq.find (fun entry -> entry.GetProperty("id").GetString() = id)
+            |> fun entry -> entry.GetProperty("closeTabAfterExecution").GetBoolean()
+        Assert.That(closes "normal", Is.True, "Ordinary launches should close the created tab")
+        Assert.That(closes "debug", Is.False, "Explicit debug retention must remain possible")
+    finally
+        Directory.Delete(dir, true)
+
 let private awaitStatus test = task {
     let mutable found = false
     for _ in 1..120 do

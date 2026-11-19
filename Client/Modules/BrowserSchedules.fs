@@ -333,7 +333,7 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
 
     member _.Schedule(id: string, seconds: int, url: string, project: string, script: string, alias: string, args: string, active: bool, ?windowRegistration: string, ?closeAfter: bool, ?repeatEverySeconds: int) =
         let window = defaultArg windowRegistration ""
-        let closeAfter = defaultArg closeAfter false
+        let closeAfter = defaultArg closeAfter true
         let repeat = defaultArg repeatEverySeconds 0
         if String.IsNullOrWhiteSpace(id) || id.Length > 64 ||
            (id |> Seq.exists (fun c -> not (Char.IsLetterOrDigit(c) || c = '-' || c = '_'))) then

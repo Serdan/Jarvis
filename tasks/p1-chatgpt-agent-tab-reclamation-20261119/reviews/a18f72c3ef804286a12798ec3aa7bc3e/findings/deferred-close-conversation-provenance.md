@@ -1,0 +1,13 @@
+# P1: Deferred cleanup can close an unrelated conversation with the same recurring prompt
+
+**Frozen commit:** `eaa20d48770a802f5e07b043c0f7b81d06d0b589` (base `a83549a6897a4e26aa4834ff81dc38b6e16ee85e`).
+
+**Location:** `browser-extension/background.js` — `confirmedTurnProbe` (~817-836) and `tryDeferredClose` (~838-897); `Client/Modules/BrowserBridge.fs` — `deferConfirmedCleanup` (~781-800).
+
+**Finding (blocking):** The deferred obligation pins only `SHA-256(prompt)` plus the agent-created tab/window generation. The cleanup check accepts *any* complete `https://chatgpt.com/c/<uuid>` route with exactly one matching rendered user turn. It does not prove that this conversation was created by this launch or that this particular submitted turn is the one expected. For scheduled Manager/Health prompts, first-turn content is intentionally repeated across different conversations. If an uncertain agent-created tab navigates to an older/different conversation containing that same prompt, the extension removes the tab despite lacking the required causal conversation identity. It can close a conversation the user navigated to. The 'wrong conversation' fixture covers different text, not a distinct conversation with identical text.
+
+**Independent reproduction (read-only, no source edits):** Loaded the frozen `bridge.test.cjs` harness and appended an ephemeral negative-space test in `node -e`. Armed deferred cleanup on an agent-created fresh-home tab, advanced the fixture clock by 1100 ms, navigated the tab to another valid UUID route (`/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee`) with the same sole user bubble, then emitted `tabs.onUpdated`. In 75 ms the tab was removed. The assertion `h.tabs.has(tab.id) === true` failed: actual `false`. 87 original tests passed; the added intentionally RED contract failed (87/88). `dotnet test Client.Tests --no-restore --filter FullyQualifiedName~BrowserBridge --verbosity minimal` separately passed 47/47.
+
+**Required before acceptance:** Bind a deferred removal to positive provenance for the *specific newly submitted conversation*, not just prompt-text equality and any well-formed UUID route. If provenance cannot be obtained after an uncertain send, retain for inspection rather than guess. Add a regression with distinct durable UUID and identical recurring prompt, including manual navigation/user adoption without re-registering, and verify no close/replay. Do not weaken current generation/window/permission/TTL safety fences. No live tabs, production schedules or deployments were touched.
+
+**Evidence limits:** Fixture/source-only verification; no real-browser rollout acceptance claimed.

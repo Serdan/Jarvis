@@ -1027,3 +1027,205 @@ let cancelingQueuedForwardedNotificationPreservesCommittedSourceActivation () =
         for _, completion in blockers do
             completion.WaitAsync(TimeSpan.FromSeconds(6.)).GetAwaiter().GetResult() |> ignore
         Directory.Delete(root, true)
+
+
+// Managed run_command uses the same OS-process registry as start_job. Keep
+// these negative-space regressions independent of SignalR transport timing.
+let private managedCommand executable args deadline maxOutput =
+    { ProjectName = "Project1"
+      Executable = executable
+      Args = args
+      Reason = Some "P0 managed command regression"
+      WorkingDirectory = None
+      TimeoutSeconds = deadline
+      MaxOutputBytes = Some maxOutput }
+
+let private managedStarted root command =
+    match runManagedCommand command (TestContext root) with
+    | Ok value -> value
+    | Error error -> failwithf "Managed command failed to launch: %A" error
+
+let private managedTerminal root jobId (seconds: float) =
+    let stopwatch = Stopwatch.StartNew()
+    let rec poll () =
+        match getJobResult { ProjectName = "Project1"; JobId = jobId; AfterSequence = Some 0L } (TestContext root) with
+        | Error error -> failwithf "Cannot poll managed process job %s: %A" jobId error
+        | Ok result when result.Status <> JobStatus.Running -> result
+        | Ok _ when stopwatch.Elapsed >= TimeSpan.FromSeconds(seconds) ->
+            failwithf "Managed process job %s did not exit within %A" jobId stopwatch.Elapsed
+        | Ok _ ->
+            Thread.Sleep 30
+            poll ()
+    poll ()
+
+let private managedCancel root jobId =
+    cancelJob { ProjectName = "Project1"; JobId = jobId } (TestContext root) |> ignore
+
+[<Test; NonParallelizable>]
+let managedCommandReturnsProcessHandleAcrossResponseWindowAndPollingIsIdempotent () =
+    let root = createTempProject()
+    let mutable jobId = None
+    try
+        let sw = Stopwatch.StartNew()
+        let first = managedStarted root (managedCommand "sleep" [ "3" ] None 4096)
+        let id = first.JobId |> Option.defaultWith (fun () -> failwith "Missing managed OS job ID")
+        jobId <- Some id
+        Assert.That(first.ProcessStatus, Is.EqualTo("Running"))
+        Assert.That(first.ExitCode, Is.EqualTo(-1), "Pending exit is not success")
+        Assert.That(first.TimedOut, Is.False)
+        Assert.That(sw.Elapsed, Is.LessThan(TimeSpan.FromSeconds 2.9))
+        let early = getJobResult { ProjectName = "Project1"; JobId = id; AfterSequence = None } (TestContext root)
+        match early with
+        | Ok result -> Assert.That(result.Status, Is.EqualTo(JobStatus.Running))
+        | Error error -> Assert.Fail(sprintf "Could not inspect running process: %A" error)
+        let terminal = managedTerminal root id 12.
+        Assert.That(terminal.Status, Is.EqualTo(JobStatus.Completed 0))
+        for _ in 1 .. 3 do
+            match getJobResult { ProjectName = "Project1"; JobId = id; AfterSequence = Some terminal.NextSequence } (TestContext root) with
+            | Ok repeated ->
+                Assert.That(repeated.JobId, Is.EqualTo(id))
+                Assert.That(repeated.Status, Is.EqualTo(JobStatus.Completed 0))
+                Assert.That(repeated.Events, Is.Empty, "Polling only reads; never starts another process")
+            | Error error -> Assert.Fail(sprintf "Repeated poll failed: %A" error)
+    finally
+        jobId |> Option.iter (managedCancel root)
+        Directory.Delete(root, true)
+
+[<Test; NonParallelizable>]
+let managedCommandQuickExitAndNonzeroRemainActualExitCodes () =
+    let root = createTempProject()
+    try
+        for executable, expected in [ "true", 0; "false", 1 ] do
+            let started = managedStarted root (managedCommand executable [] None 4096)
+            let jobId = started.JobId |> Option.get
+            Assert.That(started.TimedOut, Is.False)
+            Assert.That(started.ProcessStatus, Is.EqualTo("Completed"),
+                        "A prompt command must return its terminal process result")
+            Assert.That(started.ExitCode, Is.EqualTo(expected))
+            let completed = managedTerminal root jobId 5.
+            Assert.That(completed.Status, Is.EqualTo(JobStatus.Completed expected))
+    finally
+        Directory.Delete(root, true)
+
+[<Test; NonParallelizable>]
+let managedCommandExplicitDeadlineIsNotTransportTimeoutOrCancellation () =
+    let root = createTempProject()
+    let mutable jobId = None
+    try
+        let first = managedStarted root (managedCommand "sleep" [ "7" ] (Some 1) 1024)
+        let id = first.JobId |> Option.get
+        jobId <- Some id
+        Assert.That(first.ExitCode, Is.EqualTo(-1))
+        let final = managedTerminal root id 7.
+        Assert.That(final.Status, Is.EqualTo(JobStatus.TimedOut))
+        let latest = getJobResult { ProjectName = "Project1"; JobId = id; AfterSequence = None } (TestContext root)
+        match latest with
+        | Ok result -> Assert.That(result.Status, Is.EqualTo(JobStatus.TimedOut))
+        | Error error -> Assert.Fail(sprintf "Deadline result unavailable: %A" error)
+    finally
+        jobId |> Option.iter (managedCancel root)
+        Directory.Delete(root, true)
+
+[<Test; NonParallelizable>]
+let managedCommandCancellationHasDistinctTerminalStatus () =
+    let root = createTempProject()
+    let mutable jobId = None
+    try
+        let first = managedStarted root (managedCommand "sleep" [ "8" ] None 1024)
+        let id = first.JobId |> Option.get
+        jobId <- Some id
+        Assert.That(first.ProcessStatus, Is.EqualTo("Running"))
+        cancelJob { ProjectName = "Project1"; JobId = id } (TestContext root) |> shouldEqual (Ok())
+        let final = managedTerminal root id 6.
+        Assert.That(final.Status, Is.EqualTo(JobStatus.Canceled))
+    finally
+        jobId |> Option.iter (managedCancel root)
+        Directory.Delete(root, true)
+
+[<Test; NonParallelizable>]
+let managedCommandPreservesBoundedOutputAndSpawnFailures () =
+    let root = createTempProject()
+    let mutable jobId = None
+    try
+        let first = managedStarted root (managedCommand "dotnet" [ "--info" ] None 41)
+        let id = first.JobId |> Option.get
+        jobId <- Some id
+        let final = managedTerminal root id 25.
+        Assert.That(final.Status, Is.EqualTo(JobStatus.Completed 0))
+        Assert.That(final.Truncated, Is.True)
+        let size =
+            final.Events |> List.sumBy (fun event -> Encoding.UTF8.GetByteCount event.Text)
+        Assert.That(size, Is.LessThanOrEqualTo(41))
+        match runManagedCommand (managedCommand "bash" [ "-lc"; "echo forbidden" ] None 1024) (TestContext root) with
+        | Error(Client.PermissionDenied _) -> ()
+        | other -> Assert.Fail(sprintf "Shell must remain denied: %A" other)
+        match runManagedCommand (managedCommand "jarvis-command-that-does-not-exist" [] None 1024) (TestContext root) with
+        | Error _ -> ()
+        | other -> Assert.Fail(sprintf "Failed spawn must be an error, not a ghost success: %A" other)
+        match listJobs { ProjectName = Some "Project1"; IncludeCompleted = true } (TestContext root) with
+        | Ok listing ->
+            Assert.That(listing.Jobs |> List.exists (fun job -> job.Executable = "jarvis-command-that-does-not-exist"),
+                        Is.False)
+        | Error error -> Assert.Fail(sprintf "Cannot verify rejected process absent: %A" error)
+    finally
+        jobId |> Option.iter (managedCancel root)
+        Directory.Delete(root, true)
+
+[<Test; Category("P0LongRunning"); NonParallelizable>]
+let managedCommandWithoutDeadlineSurvivesSixtySeconds () =
+    let root = createTempProject()
+    let mutable jobId = None
+    try
+        let first = managedStarted root (managedCommand "sleep" [ "62" ] None 1024)
+        let id = first.JobId |> Option.get
+        jobId <- Some id
+        Assert.That(first.ProcessStatus, Is.EqualTo("Running"))
+        let final = managedTerminal root id 85.
+        Assert.That(final.Status, Is.EqualTo(JobStatus.Completed 0),
+                    "Omitted deadline must never inherit the former implicit 60-second kill")
+    finally
+        jobId |> Option.iter (managedCancel root)
+        Directory.Delete(root, true)
+
+
+[<Test; NonParallelizable>]
+let managedCommandRejectsWorkingDirectoryTraversalBeforeSpawning () =
+    let root = createTempProject()
+    try
+        let unsafeCommand =
+            { managedCommand "true" [] None 1024 with
+                WorkingDirectory = Some "../outside-project" }
+        match runManagedCommand unsafeCommand (TestContext root) with
+        | Error(Client.ValidationError _)
+        | Error(Client.PermissionDenied _)
+        | Error(Client.ContextError _) -> ()
+        | other -> Assert.Fail(sprintf "Traversal must fail before starting process: %A" other)
+    finally
+        Directory.Delete(root, true)
+
+
+[<Test; NonParallelizable>]
+let managedCommandTransportDoesNotCreateASecondToolOperation () =
+    let root = createTempProject()
+    try
+        let runtime = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+        let command : AgentCommand = RunCommandCommand (managedCommand "true" [] None 1024)
+        let wire = System.Text.Json.JsonSerializer.Serialize<AgentCommand>(command)
+        let blocked = TaskCompletionSource<AgentCommandResponse>(
+            TaskCreationOptions.RunContinuationsAsynchronously)
+        let execution =
+            Client.SignalR.Client.executeOrPromoteWith runtime wire "Worker"
+                (TimeSpan.FromMilliseconds 15.) (fun _ _ -> blocked.Task)
+        Thread.Sleep 80
+        Assert.That(execution.IsCompleted, Is.False,
+                    "Process commands must not be wrapped in another transport-only job after the response threshold")
+        let direct : AgentCommandResponse =
+            { Result = Some "terminal-process-response"; Error = None
+              Instructions = []; AgentStateChanges = []; InboxActivation = None
+              PendingJob = None }
+        blocked.SetResult direct
+        let final = execution.WaitAsync(TimeSpan.FromSeconds 3.).GetAwaiter().GetResult()
+        Assert.That(final.PendingJob.IsNone, Is.True)
+        Assert.That(final.Result, Is.EqualTo(direct.Result))
+    finally
+        Directory.Delete(root, true)

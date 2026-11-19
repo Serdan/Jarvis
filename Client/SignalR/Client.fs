@@ -853,12 +853,15 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
         rt
         |> sourceOperation resolved (fun project -> ProjectBrowser.patchFileIn project cmd) (fun () -> ProjectBrowser.patchFile cmd)
         |> serialize'
-    | RunCommandCommand cmd -> rt |> sourceOperation resolved (fun project -> ClientShell.runCommandIn project cmd) (fun () -> ClientShell.runCommand cmd) |> serialize'
+    | RunCommandCommand cmd ->
+        rt |> sourceOperation resolved (fun project -> JobManager.runManagedCommandIn project cmd) (fun () -> JobManager.runManagedCommand cmd) |> serialize'
     | ListConfiguredTasksCommand cmd -> rt |> sourceOperation resolved (fun project -> ClientShell.listConfiguredTasksIn project cmd) (fun () -> ClientShell.listConfiguredTasks cmd) |> serialize'
     | RunProjectTaskCommand cmd ->
         rt
         |> sourceOperation resolved (fun project -> ClientShell.resolveProjectTaskIn project cmd) (fun () -> ClientShell.resolveProjectTask cmd)
-        |> Result.bind (fun task -> (sourceOperation resolved (fun project -> ClientShell.runProjectTaskIn project task) (fun () -> ClientShell.runProjectTask cmd.ProjectName task)) rt)
+        |> Result.bind (fun task -> (sourceOperation resolved
+            (fun project -> JobManager.runManagedProjectTaskIn project cmd.ProjectName task)
+            (fun () -> JobManager.runManagedProjectTask cmd.ProjectName task)) rt)
         |> serialize'
     | ListSkillsCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.listSkillsIn project cmd) (fun () -> ProjectBrowser.listSkills cmd) |> serialize'
     | GetSkillCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.getSkillIn project cmd) (fun () -> ProjectBrowser.getSkill cmd) |> serialize'
@@ -1009,8 +1012,8 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
                             | Error problem, _ -> return Error(Client.ValidationError problem)
                             | Ok(), Some(cmd, task) ->
                                 let! result = (sourceOperation resolved
-                                    (fun project -> ClientShell.runProjectTaskIn project task)
-                                    (fun () -> ClientShell.runProjectTask cmd.ProjectName task)) rt |> serialize'
+                                    (fun project -> JobManager.runManagedProjectTaskIn project cmd.ProjectName task)
+                                    (fun () -> JobManager.runManagedProjectTask cmd.ProjectName task)) rt |> serialize'
                                 return result
                             | Ok(), None ->
                                 let! result = dispatch rt target resolved agentId command
@@ -1267,6 +1270,8 @@ let private shouldAutoPromote = function
     // Cheap controls must never wait for the command worker slots. They can
     // poll or inspect a slow task while every worker is occupied.
     | StartJobCommand _ // Already returns its own OS process-job handle.
+    | RunCommandCommand _ // Now returns an OS process-job handle after a short response wait.
+    | RunProjectTaskCommand _
     | ListJobsCommand _
     | GetJobResultCommand _
     | CancelJobCommand _

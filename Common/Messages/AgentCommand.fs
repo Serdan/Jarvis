@@ -39,6 +39,7 @@ type JobStatus =
     | Completed of exitCode: int
     | FailedToStart of message: string
     | Canceled
+    | TimedOut
     | ToolCompleted
     | ToolFailed of message: string
 
@@ -637,7 +638,11 @@ type RunCommandResult =
       TimedOut: bool
       StdOut: string
       StdErr: string
-      Truncated: bool }
+      Truncated: bool
+      /// Process job identity, including when the process has already exited.
+      /// ExitCode = -1 with ProcessStatus = "Running" is not a terminal exit.
+      JobId: string option
+      ProcessStatus: string }
 
 type GitStatusCommand = { ProjectName: string }
 

@@ -24,12 +24,15 @@ type private JobRecord =
       StartedAt: DateTimeOffset
       Process: Process
       SyncRoot: obj
+      Completion: TaskCompletionSource<unit>
       Events: ResizeArray<JobOutputEvent>
       MaxOutputBytes: int
       mutable OutputBytes: int
       mutable OutputTruncated: bool
       mutable NextSequence: int64
       mutable CancellationRequested: bool
+      mutable DeadlineExpired: bool
+      DeadlineCancellation: CancellationTokenSource option
       mutable Status: JobStatus
       mutable CompletedAt: DateTimeOffset option }
 
@@ -112,7 +115,7 @@ module private Core =
                 job.OutputBytes <- job.OutputBytes + addedBytes
                 job.OutputTruncated <- job.OutputTruncated || addedBytes < valueBytes)
 
-    let private startProcess projectName workingDirectory executable args reason maxOutputBytes : Client.Result<StartJobResult> =
+    let private startProcess projectName workingDirectory executable args reason maxOutputBytes deadlineSeconds : Client.Result<StartJobResult> =
         try
             match validateExecutable executable with
             | Error error -> Error error
@@ -130,6 +133,7 @@ module private Core =
                 proc.EnableRaisingEvents <- true
                 args |> List.iter proc.StartInfo.ArgumentList.Add
 
+                let deadlineCancellation = deadlineSeconds |> Option.map (fun _ -> new CancellationTokenSource())
                 let job =
                     { JobId = jobId
                       ProjectName = projectName
@@ -140,12 +144,15 @@ module private Core =
                       StartedAt = DateTimeOffset.UtcNow
                       Process = proc
                       SyncRoot = obj()
+                      Completion = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
                       Events = ResizeArray()
                       MaxOutputBytes = maxOutputBytes
                       OutputBytes = 0
                       OutputTruncated = false
                       NextSequence = 0L
                       CancellationRequested = false
+                      DeadlineExpired = false
+                      DeadlineCancellation = deadlineCancellation
                       Status = Running
                       CompletedAt = None }
 
@@ -160,12 +167,16 @@ module private Core =
                     with _ -> ()
 
                     lock job.SyncRoot (fun () ->
-                        if job.CancellationRequested then
+                        if job.DeadlineExpired then
+                            job.Status <- TimedOut
+                        elif job.CancellationRequested then
                             job.Status <- Canceled
                         else
                             try job.Status <- Completed proc.ExitCode
                             with _ -> job.Status <- FailedToStart "Process exited before an exit code was available."
                         job.CompletedAt <- Some DateTimeOffset.UtcNow)
+                    job.Completion.TrySetResult(()) |> ignore
+                    deadlineCancellation |> Option.iter (fun cancel -> cancel.Cancel())
                     pruneCompletedJobs())
 
                 if not (jobs.TryAdd(jobId, job)) then
@@ -181,10 +192,30 @@ module private Core =
                         else
                             proc.BeginOutputReadLine()
                             proc.BeginErrorReadLine()
+                            // Only an explicitly supplied command deadline can terminate a job.
+                            // Never couple process lifetime to the RPC/ToolOperation response timer.
+                            match deadlineSeconds, deadlineCancellation with
+                            | Some seconds, Some cancel ->
+                                let token = cancel.Token
+                                let deadlineTimer = Task.Delay(TimeSpan.FromSeconds(float seconds), token)
+                                deadlineTimer.ContinueWith(Action<Task>(fun finished ->
+                                    if finished.IsCompletedSuccessfully then
+                                        let shouldTerminate =
+                                            lock job.SyncRoot (fun () ->
+                                                if job.Status = Running && not proc.HasExited then
+                                                    job.DeadlineExpired <- true
+                                                    true
+                                                else false)
+                                        if shouldTerminate then
+                                            try proc.Kill(entireProcessTree = true)
+                                            with :? InvalidOperationException -> ()
+                                )) |> ignore
+                            | _ -> ()
                             Ok { JobId = jobId; StartedAt = job.StartedAt }
                     with ex ->
                         let mutable removed = Unchecked.defaultof<JobRecord>
                         jobs.TryRemove(jobId, &removed) |> ignore
+                        deadlineCancellation |> Option.iter (fun cancel -> cancel.Cancel())
                         proc.Dispose()
                         Error(ExceptionError ex)
         with ex ->
@@ -199,7 +230,7 @@ module private Core =
                 let canonical =
                     context |> ProjectPaths.ResolvedProject.target |> ProjectPaths.ProjectTarget.projectId
                 let! (FolderPath workingDirectory) = resolveWorkingDirectory context cmd.WorkingDirectory
-                let! result = fun _ -> startProcess canonical workingDirectory cmd.Executable cmd.Args cmd.Reason maxOutputBytes
+                let! result = fun _ -> startProcess canonical workingDirectory cmd.Executable cmd.Args cmd.Reason maxOutputBytes None
                 return result
         }
 
@@ -207,6 +238,58 @@ module private Core =
         effect {
             let! context = ProjectPaths.resolveProjectContextForTarget target
             return! startJobForContext context cmd
+        }
+
+    // Both command APIs use the same process registry, project scope, output
+    // cap, cancellation and polling. This waits only for a prompt RESPONSE.
+    let private commandResponseWindow = TimeSpan.FromMilliseconds 1200.
+
+    let private commandResult (job: JobRecord) : RunCommandResult =
+        lock job.SyncRoot (fun () ->
+            let exitCode, status =
+                match job.Status with
+                | Completed code -> code, "Completed"
+                | TimedOut -> -1, "TimedOut"
+                | Canceled -> -1, "Canceled"
+                | FailedToStart _ -> -1, "FailedToStart"
+                | Running -> -1, "Running"
+                | _ -> -1, "Unknown"
+            let streamOutput stream =
+                job.Events
+                |> Seq.filter (fun item -> item.Stream = stream)
+                |> Seq.map (fun item -> item.Text)
+                |> String.concat ""
+            { ExitCode = exitCode
+              TimedOut = job.Status = TimedOut
+              StdOut = streamOutput JobOutputStream.StdOut
+              StdErr = streamOutput JobOutputStream.StdErr
+              Truncated = job.OutputTruncated
+              JobId = Some job.JobId
+              ProcessStatus = status })
+
+    let runManagedCommandForContext (context: ProjectPaths.ResolvedProject) (cmd: RunCommandCommand) =
+        effect {
+            let outputLimit = cmd.MaxOutputBytes |> Option.defaultValue defaultMaxOutputBytes
+            // Task.Delay has a finite millisecond range. Do not silently
+            // ignore an explicitly requested deadline that overflows it.
+            if cmd.TimeoutSeconds |> Option.exists (fun seconds -> seconds <= 0 || seconds > 4294966) then
+                return! Client.ValidationError "TimeoutSeconds must be between 1 and 4294966 when supplied." |> Effect.ofError
+            elif outputLimit <= 0 then
+                return! Client.ValidationError "MaxOutputBytes must be greater than zero." |> Effect.ofError
+            else
+                let canonical =
+                    context |> ProjectPaths.ResolvedProject.target |> ProjectPaths.ProjectTarget.projectId
+                let! (FolderPath workingDirectory) = resolveWorkingDirectory context cmd.WorkingDirectory
+                let! started =
+                    fun _ -> startProcess canonical workingDirectory cmd.Executable cmd.Args cmd.Reason outputLimit cmd.TimeoutSeconds
+                return!
+                    fun _ ->
+                        match jobs.TryGetValue started.JobId with
+                        | false, _ ->
+                            Error(Client.ContextError "Started process job unavailable; process outcome is unknown.")
+                        | true, job ->
+                            job.Completion.Task.Wait(commandResponseWindow) |> ignore
+                            Ok(commandResult job)
         }
 
     let private toSummary (job: JobRecord) =
@@ -266,15 +349,21 @@ module private Core =
                 match validateJobProject canonical job with
                 | Error error -> Error error
                 | Ok () ->
-                    if job.Status = Running then
-                        job.CancellationRequested <- true
+                    let shouldCancel =
+                        lock job.SyncRoot (fun () ->
+                            if job.Status = Running && not job.DeadlineExpired
+                               && not job.CancellationRequested && not job.Process.HasExited then
+                                job.CancellationRequested <- true
+                                true
+                            else false)
+                    if shouldCancel then
                         try
                             if not job.Process.HasExited then job.Process.Kill(entireProcessTree = true)
-                            job.Status <- Canceled
-                            job.CompletedAt <- Some DateTimeOffset.UtcNow
                             Ok()
-                        with ex ->
-                            job.CancellationRequested <- false
+                        with
+                        | :? InvalidOperationException -> Ok()
+                        | ex ->
+                            lock job.SyncRoot (fun () -> job.CancellationRequested <- false)
                             Error(ExceptionError ex)
                     else
                         Ok()
@@ -632,6 +721,31 @@ let startJob (cmd: StartJobCommand) =
         let! target = ProjectPaths.ProjectTarget.parse cmd.ProjectName |> Effect.ofResult
         return! Core.startJobForTarget target cmd
     }
+
+let runManagedCommandIn (context: ProjectPaths.ResolvedProject) (cmd: RunCommandCommand) =
+    Core.runManagedCommandForContext context cmd
+
+let runManagedCommand (cmd: RunCommandCommand) =
+    effect {
+        let! target = ProjectPaths.ProjectTarget.parse cmd.ProjectName |> Effect.ofResult
+        let! context = ProjectPaths.resolveProjectContextForTarget target
+        return! Core.runManagedCommandForContext context cmd
+    }
+
+let private commandFromProjectTask projectName (task: ProjectTaskDefinition) =
+    { ProjectName = projectName
+      Executable = task.Executable
+      Args = task.Args
+      Reason = Some $"Configured project task: {task.Name}"
+      WorkingDirectory = task.WorkingDirectory
+      TimeoutSeconds = task.TimeoutSeconds
+      MaxOutputBytes = task.MaxOutputBytes }
+
+let runManagedProjectTaskIn context projectName task =
+    Core.runManagedCommandForContext context (commandFromProjectTask projectName task)
+
+let runManagedProjectTask projectName task =
+    runManagedCommand (commandFromProjectTask projectName task)
 
 let listJobsForProjectAsAgent (canonical: ProjectPaths.ProjectId option) actor (cmd: ListJobsCommand) =
     fun rt ->

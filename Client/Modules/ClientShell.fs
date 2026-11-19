@@ -64,7 +64,9 @@ module private Core =
                   TimedOut = result.TimedOut
                   StdOut = result.StdOut
                   StdErr = result.StdErr
-                  Truncated = result.StdOutTruncated || result.StdErrTruncated })
+                  Truncated = result.StdOutTruncated || result.StdErrTruncated
+                  JobId = None
+                  ProcessStatus = if result.TimedOut then "TimedOut" else "Completed" })
 
     let run projectName workingDirectory executable args timeoutSeconds maxOutputBytes =
         effect {
@@ -84,7 +86,9 @@ module private Core =
                       TimedOut = result.TimedOut
                       StdOut = result.StdOut
                       StdErr = result.StdErr
-                      Truncated = result.Truncated }
+                      Truncated = result.Truncated
+                      JobId = result.JobId
+                      ProcessStatus = result.ProcessStatus }
         }
 
     let runCommand (cmd: RunCommandCommand) =

@@ -15,6 +15,7 @@ let statusText = function
     | JobStatus.Running -> "Running"
     | JobStatus.Completed code -> $"Exited {code}"
     | JobStatus.Canceled -> "Canceled"
+    | JobStatus.TimedOut -> "Timed out"
     | JobStatus.FailedToStart message -> $"Failed: {message}"
     | JobStatus.ToolCompleted -> "Completed"
     | JobStatus.ToolFailed message -> $"Failed: {message}"

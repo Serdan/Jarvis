@@ -1,0 +1,1 @@
+Frozen commit 47376b7e4. .NET 11 Release Client build exit 0; final focused command-job tests 7/7 pass; 62-second no-explicit-deadline test passed before final wait optimization, exact-source repeat running. Validate source-scope, project/worktree permission, no transport wrapper or live autonomous Work. No merge or deployment.

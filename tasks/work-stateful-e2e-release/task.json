@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"work-stateful-e2e-release","title":"[P1][Stateful Work/I] Merged .NET11 Release, restore drill and rollout gates","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"work-stateful-e2e-release","title":"[P1][Stateful Work/I] Exact integrated Release, backup/Recovery drill and operator GO/NO-GO","version":2,"lifecycle":"Open","specVersion":2,"attemptId":null}

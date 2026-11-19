@@ -1,0 +1,1 @@
+Frozen c344d04604a584ac4cac0f4c2d5788054fa7bf33. Exact managed JobId polling; Completed 0 only success, distinct nonzero/TimedOut/Canceled/spawn/UNKNOWN. Three new scheduled-command regressions including >1.2s execution marker preventing replay; Linux .NET 11 Client Release focused 11/11 pass, exit 0 via start_job/get_job_result. No main merge, scheduler cutover or deployment.

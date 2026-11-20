@@ -305,8 +305,11 @@ let recurringUiIncompatibilityRetriesNextIntervalWithoutReplaying () = task {
         Directory.Delete(dir, true)
 }
 
-[<Test>]
-let previouslySuspendedRecurringUiFailureRearmsOnRestore () = task {
+[<TestCase("suspended", "UiIncompatible:composer:TextInsertionFailed")>]
+[<TestCase("suspended", "OtherFailure")>]
+[<TestCase("canceled", "UiIncompatible:composer:TextInsertionFailed")>]
+[<TestCase("canceled", "")>]
+let inactiveRecurringScheduleRemainsInactiveAcrossRestarts (inactiveStatus: string) (failure: string) = task {
     let dir,path = temp()
     let mutable clock = DateTimeOffset.UtcNow
     let mutable calls = 0
@@ -321,19 +324,33 @@ let previouslySuspendedRecurringUiFailureRearmsOnRestore () = task {
                 "launch.js", "", "{}", false, windowRegistration="agents",
                 repeatEverySeconds=3600).IsOk, Is.True)
         let saved = File.ReadAllText(path)
-        let suspended =
-            saved.Replace("\"Status\":\"pending\"", "\"Status\":\"suspended\"")
-                 .Replace("\"Error\":\"\"", "\"Error\":\"UiIncompatible:composer:TextInsertionFailed\"")
-        Assert.That(suspended, Is.Not.EqualTo(saved))
-        File.WriteAllText(path, suspended)
-        use restored = new BrowserSchedules.Service(path, action, now=(fun () -> clock), pollMs=25)
-        Assert.That(status restored "recurring", Is.EqualTo("pending"))
-        use listing = JsonDocument.Parse(restored.List())
-        Assert.That(listing.RootElement[0].GetProperty("dueAtUtc").GetDateTimeOffset(),
-                    Is.GreaterThanOrEqualTo(clock.AddSeconds(3600.)))
-        restored.Start()
-        do! Task.Delay(120)
-        Assert.That(calls, Is.Zero, "Restoring a suspended schedule must not replay a missed attempt")
+        let quote = string '"'
+        let quoted value = quote + value + quote
+        let field name value = quoted name + ":" + quoted value
+        let inactive =
+            saved.Replace(field "Status" "pending", field "Status" inactiveStatus)
+                 .Replace(field "Error" "", field "Error" failure)
+        Assert.That(inactive, Is.Not.EqualTo(saved))
+        File.WriteAllText(path, inactive)
+        clock <- clock.AddDays(3.)
+        do! task {
+            use restored = new BrowserSchedules.Service(path, action, now=(fun () -> clock), pollMs=25)
+            Assert.That(status restored "recurring", Is.EqualTo(inactiveStatus))
+            Assert.That(File.ReadAllText(path), Is.EqualTo(inactive),
+                "Restoration must not persist a new lifecycle state or deadline")
+            restored.Start()
+            do! Task.Delay(150)
+            Assert.That(calls, Is.Zero, "Inactive Work must not execute on restart")
+            Assert.That(status restored "recurring", Is.EqualTo(inactiveStatus))
+            Assert.That(File.ReadAllText(path), Is.EqualTo(inactive))
+        }
+        clock <- clock.AddDays(3.)
+        use secondRestore = new BrowserSchedules.Service(path, action, now=(fun () -> clock), pollMs=25)
+        secondRestore.Start()
+        do! Task.Delay(150)
+        Assert.That(status secondRestore "recurring", Is.EqualTo(inactiveStatus))
+        Assert.That(calls, Is.Zero, "Repeated restart never creates fresh authorization")
+        Assert.That(File.ReadAllText(path), Is.EqualTo(inactive))
     finally
         Directory.Delete(dir, true)
 }

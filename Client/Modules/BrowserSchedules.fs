@@ -290,15 +290,9 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                             if String.IsNullOrWhiteSpace(loaded.RevisionId) then
                                 { loaded with RevisionId = Guid.NewGuid().ToString("N") }
                             else loaded
-                        if action.Status = "suspended" && action.RepeatEverySeconds > 0 &&
-                           action.Error.StartsWith("UiIncompatible:", StringComparison.Ordinal) then
-                            // A failed recurring activation is a missed interval, not a
-                            // reason to disable all future attempts. Do not replay it.
-                            let now = clock()
-                            { action with Status = "pending"
-                                          DueAtUtc = now.AddSeconds(float action.RepeatEverySeconds)
-                                          UpdatedAtUtc = now }
-                        elif action.Status = "running" then
+                        // An inactive schedule cannot authorize its own reactivation.
+                        // Historical failure details are evidence, not permission.
+                        if action.Status = "running" then
                             if isIdle action then
                                 let now = clock()
                                 let stale = action.StartedAtUtc.AddMinutes(30.)

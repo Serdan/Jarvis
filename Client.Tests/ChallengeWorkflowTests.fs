@@ -97,6 +97,239 @@ type ChallengeTests() =
         Assert.That(inbox.Agent.State, Is.EqualTo("Working"))
         taskRecord.Version, attempt.Version, inbox.Agent.Version, attemptId
 
+    let readCanonicalText (binding: LedgerBinding) (snapshot: LedgerSnapshot) (path: string) : string =
+        let content, oid = LedgerStore.readAt binding snapshot path |> ok
+        Assert.That(content.IsSome, Is.True, sprintf "Missing canonical record %s." path)
+        Assert.That(oid.IsSome, Is.True, sprintf "Missing canonical blob OID for %s." path)
+        content.Value
+
+    let readWait (binding: LedgerBinding) (snapshot: LedgerSnapshot) (path: string) : AttemptChallengeWait =
+        let options = System.Text.Json.JsonSerializerOptions(PropertyNameCaseInsensitive = true)
+        System.Text.Json.JsonSerializer.Deserialize<AttemptChallengeWait>(readCanonicalText binding snapshot path, options)
+
+    let readWaitIndex (binding: LedgerBinding) (snapshot: LedgerSnapshot) (path: string) : AttemptChallengeWaitIndex =
+        let options = System.Text.Json.JsonSerializerOptions(PropertyNameCaseInsensitive = true)
+        System.Text.Json.JsonSerializer.Deserialize<AttemptChallengeWaitIndex>(readCanonicalText binding snapshot path, options)
+
+    let assertWaitIndexes (binding: LedgerBinding) (snapshot: LedgerSnapshot) (challengeId: string) (task: string) (attemptId: string) (owner: string) (generation: int) (expectedStatus: string) : AttemptChallengeWait =
+        let waitPath = $"tasks/{task}/attempts/{attemptId}/challenge-wait.json"
+        let wait = readWait binding snapshot waitPath
+        Assert.That(wait.TaskId, Is.EqualTo(task))
+        Assert.That(wait.AttemptId, Is.EqualTo(attemptId))
+        Assert.That(wait.OwnerAgentId, Is.EqualTo(owner))
+        Assert.That(wait.ChallengeIds = [ challengeId ], Is.True)
+        Assert.That(wait.Status, Is.EqualTo(expectedStatus))
+        if expectedStatus = "Requeued" then
+            Assert.That(wait.Version, Is.GreaterThanOrEqualTo(2))
+            Assert.That(String.IsNullOrWhiteSpace wait.RequeuedAtUtc, Is.False)
+
+        let ownerKey =
+            Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes owner)
+                .TrimEnd('=').Replace('+', '-').Replace('/', '_')
+        let challengePrefix = $"challenge-waits/by-challenge/{challengeId}"
+        let ownerPrefix = $"challenge-waits/by-owner/{ownerKey}"
+        let challengeIndex = $"{challengePrefix}/{task}/{attemptId}/{generation}.json"
+        let ownerIndex = $"{ownerPrefix}/{task}/{attemptId}/{generation}.json"
+        Assert.That(LedgerStore.listAt binding snapshot challengePrefix |> ok,
+                    Is.EquivalentTo([ challengeIndex ]))
+        Assert.That(LedgerStore.listAt binding snapshot ownerPrefix |> ok,
+                    Is.EquivalentTo([ ownerIndex ]))
+        for path in [ challengeIndex; ownerIndex ] do
+            let locator = readWaitIndex binding snapshot path
+            Assert.That(locator.TaskId, Is.EqualTo(task))
+            Assert.That(locator.AttemptId, Is.EqualTo(attemptId))
+            Assert.That(locator.OwnerAgentId, Is.EqualTo(owner))
+            Assert.That(locator.AssignmentGeneration, Is.EqualTo(generation))
+        wait
+
+    let assertRequeuedState (binding: LedgerBinding) (task: string) (attemptId: string) (challengeId: string) (expectedActor: string) (operationId: Guid) (expectedSequence: int64) =
+        let snapshot = LedgerStore.fetch binding |> ok
+        let _, taskRecord, maybeAttempt = ReviewWorkflow.getTask binding task |> ok
+        let attempt = maybeAttempt.Value
+        Assert.That(taskRecord.Lifecycle, Is.EqualTo("InProgress"))
+        Assert.That(attempt.AttemptId, Is.EqualTo(attemptId))
+        Assert.That(attempt.OwnerAgentId, Is.EqualTo("Agent 3"))
+        Assert.That(attempt.Phase, Is.EqualTo("Queued"))
+        Assert.That(attempt.Version, Is.EqualTo(4))
+        Assert.That(attempt.AssignmentGeneration, Is.EqualTo(2))
+
+        let inbox = ReviewWorkflow.getAgentInbox binding "Agent 3" |> ok
+        Assert.That(inbox.Agent.State, Is.EqualTo("Ready"))
+        Assert.That(inbox.Agent.Execution, Is.EqualTo("Stopped"))
+        Assert.That(inbox.Agent.CurrentAssignment.TaskId, Is.EqualTo(task))
+        Assert.That(inbox.Agent.CurrentAssignment.AttemptId, Is.EqualTo(attemptId))
+
+        let _, _, issuedAttempt, issue, receipt = ReviewWorkflow.getAssignment binding task 2 |> ok
+        Assert.That(issuedAttempt.AssignmentGeneration, Is.EqualTo(2))
+        Assert.That(issue.Generation, Is.EqualTo(2))
+        Assert.That(issue.PreviousGeneration, Is.EqualTo(1))
+        Assert.That(issue.OwnerAgentId, Is.EqualTo("Agent 3"))
+        Assert.That(issue.IssuerId, Is.EqualTo(expectedActor))
+        Assert.That(issue.IssuedSequence, Is.EqualTo(expectedSequence))
+        Assert.That(receipt.IsNone, Is.True)
+        let _, _, _, initialIssue, _ = ReviewWorkflow.getAssignment binding task 1 |> ok
+        Assert.That(initialIssue.Generation, Is.EqualTo(1))
+        failStale (ReviewWorkflow.getAssignment binding task 3)
+
+        let wait = assertWaitIndexes binding snapshot challengeId task attemptId "Agent 3" 1 "Requeued"
+        Assert.That(not (inbox.Agent.State = "NeedsWork" && wait.Status = "Eligible"), Is.True)
+
+        let _, history = ReviewWorkflow.getTaskLifecycleHistory binding task |> ok
+        let requeues = history |> List.filter (fun item -> item.Action = "RequeueChallengeBlockedAttempt")
+        Assert.That(requeues.Length, Is.EqualTo(1))
+        let requeue = requeues.Head
+        Assert.That(requeue.ActorId, Is.EqualTo(expectedActor))
+        Assert.That(requeue.OperationId, Is.EqualTo(operationId.ToString("D")))
+        Assert.That(requeue.Sequence, Is.EqualTo(expectedSequence))
+        Assert.That(requeue.PreviousGeneration, Is.EqualTo(1))
+        Assert.That(requeue.NewGeneration, Is.EqualTo(2))
+
+        let _, applied = LedgerStore.getOperationStatus binding operationId |> ok
+        Assert.That(applied.IsSome, Is.True)
+        Assert.That(applied.Value.Actor, Is.EqualTo(expectedActor))
+        Assert.That(applied.Value.Sequence, Is.EqualTo(expectedSequence))
+        let details = get binding "Agent 3" challengeId
+        Assert.That(details.Challenge.Status, Is.EqualTo("Satisfied"))
+        Assert.That(details.History.Length, Is.EqualTo(2))
+
+    let cloneBinding (binding: LedgerBinding) (name: string) =
+        let root = Path.GetDirectoryName binding.RepositoryPath
+        let bare = Path.Combine(root, "remote.git")
+        let location = Path.Combine(root, name)
+        git root [ "clone"; bare; location ] |> ignore
+        git location [ "config"; "user.name"; "Fixture" ] |> ignore
+        git location [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+        { binding with RepositoryPath = location }
+
+    let installOrderedPushBarrier (binding: LedgerBinding) (winnerId: Guid) (loserId: Guid) =
+        let root = Path.GetDirectoryName binding.RepositoryPath
+        let bare = Path.Combine(root, "remote.git")
+        let barrier = Path.Combine(root, "ordered-challenge-race-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory barrier |> ignore
+        let quote (value: string) = "'" + value.Replace("'", "'\\''") + "'"
+        let preReceive =
+            String.concat "\n"
+                [ "#!/bin/sh"
+                  "set -eu"
+                  "barrier=" + quote barrier
+                  "winner=" + quote (winnerId.ToString("D"))
+                  "loser=" + quote (loserId.ToString("D"))
+                  "while read old new ref; do"
+                  "  operation=$(git show -s --format=%B \"$new\" | sed -n 's/^Jarvis-Operation-Id: //p' | head -n 1)"
+                  "  if [ \"$operation\" = \"$winner\" ]; then"
+                  "    if [ ! -f \"$barrier/winner-parent\" ]; then printf '%s\\n' \"$old\" > \"$barrier/winner-parent\"; fi"
+                  "    : > \"$barrier/winner-entered\""
+                  "    count=0"
+                  "    while [ ! -f \"$barrier/loser-entered\" ]; do"
+                  "      count=$((count + 1))"
+                  "      if [ \"$count\" -gt 400 ]; then echo 'timed out waiting for competing challenge transaction' >&2; exit 1; fi"
+                  "      sleep 0.05"
+                  "    done"
+                  "  elif [ \"$operation\" = \"$loser\" ]; then"
+                  "    if [ ! -f \"$barrier/loser-parent\" ]; then printf '%s\\n' \"$old\" > \"$barrier/loser-parent\"; fi"
+                  "    : > \"$barrier/loser-entered\""
+                  "    count=0"
+                  "    while [ ! -f \"$barrier/winner-committed\" ]; do"
+                  "      count=$((count + 1))"
+                  "      if [ \"$count\" -gt 400 ]; then echo 'timed out waiting for winning challenge transaction' >&2; exit 1; fi"
+                  "      sleep 0.05"
+                  "    done"
+                  "  fi"
+                  "done" ]
+        let postReceive =
+            String.concat "\n"
+                [ "#!/bin/sh"
+                  "set -eu"
+                  "barrier=" + quote barrier
+                  "winner=" + quote (winnerId.ToString("D"))
+                  "while read old new ref; do"
+                  "  operation=$(git show -s --format=%B \"$new\" | sed -n 's/^Jarvis-Operation-Id: //p' | head -n 1)"
+                  "  if [ \"$operation\" = \"$winner\" ]; then : > \"$barrier/winner-committed\"; fi"
+                  "done" ]
+        let prePath = Path.Combine(bare, "hooks", "pre-receive")
+        let postPath = Path.Combine(bare, "hooks", "post-receive")
+        File.WriteAllText(prePath, preReceive + "\n")
+        File.WriteAllText(postPath, postReceive + "\n")
+        let executable =
+            UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute |||
+            UnixFileMode.GroupRead ||| UnixFileMode.GroupExecute |||
+            UnixFileMode.OtherRead ||| UnixFileMode.OtherExecute
+        File.SetUnixFileMode(prePath, executable)
+        File.SetUnixFileMode(postPath, executable)
+        barrier
+
+    let runSatisfactionReleaseRace (satisfactionWins: bool) =
+        withFixture (fun a b ->
+            let task = if satisfactionWins then "race-satisfaction-first" else "race-release-first"
+            let tv, pv, av, attemptId = assignment a task
+            let challenge =
+                ChallengeWorkflow.create b (Guid.NewGuid()) "Agent 3" "Race dependency" task
+                    [ { OwnerKind = ""; OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "Approve final dependency" } ]
+                |> ok
+            ChallengeWorkflow.blockAttempt a (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "Waiting for final dependency" [ challenge.ChallengeId ] |> ok |> ignore
+
+            let busyTask = task + "-owner-busy"
+            let _, busyAttemptVersion, busyAgentVersion, _ = assignment b busyTask
+            let satisfactionOperationId = Guid.NewGuid()
+            let releaseOperationId = Guid.NewGuid()
+            let winnerId, loserId =
+                if satisfactionWins then satisfactionOperationId, releaseOperationId
+                else releaseOperationId, satisfactionOperationId
+            let initialHead = (LedgerStore.fetch a |> ok).Commit
+            let barrier = installOrderedPushBarrier a winnerId loserId
+            use ready = new System.Threading.CountdownEvent(2)
+            use start = new System.Threading.ManualResetEventSlim(false)
+            let run (action: unit -> Result<LedgerWrite, LedgerFailure>) =
+                Task.Run<Result<LedgerWrite, LedgerFailure>>(fun () ->
+                    ready.Signal() |> ignore
+                    if not (start.Wait(TimeSpan.FromSeconds(20.))) then
+                        failwith "Timed out waiting for the deterministic challenge race start."
+                    action())
+            let satisfaction =
+                run (fun () ->
+                    ChallengeWorkflow.resolve b satisfactionOperationId "Lead" challenge.ChallengeId
+                        challenge.ConditionIds.Head 1 "approved" "")
+            let release =
+                run (fun () ->
+                    ReviewWorkflow.completeAgentWork a releaseOperationId busyTask "Agent 3"
+                        busyAttemptVersion busyAgentVersion 1 "Owner completed current work")
+            let tasks: System.Threading.Tasks.Task array =
+                [| satisfaction :> System.Threading.Tasks.Task; release :> System.Threading.Tasks.Task |]
+            try
+                Assert.That(ready.Wait(TimeSpan.FromSeconds(20.)), Is.True, "Both ledger transactions must reach the start barrier.")
+                start.Set()
+                Assert.That(System.Threading.Tasks.Task.WaitAll(tasks, TimeSpan.FromSeconds(60.)), Is.True,
+                            "Both Git-ledger transactions must finish after the ordered push barrier releases.")
+                let satisfied = satisfaction.Result |> ok
+                let released = release.Result |> ok
+                Assert.That(satisfied.Operation.OperationId, Is.EqualTo(satisfactionOperationId.ToString("D")))
+                Assert.That(released.Operation.OperationId, Is.EqualTo(releaseOperationId.ToString("D")))
+                Assert.That(satisfied.Operation.Actor, Is.EqualTo("Lead"))
+                Assert.That(released.Operation.Actor, Is.EqualTo("Agent 3"))
+                Assert.That(File.Exists(Path.Combine(barrier, "winner-entered")), Is.True)
+                Assert.That(File.Exists(Path.Combine(barrier, "loser-entered")), Is.True)
+                Assert.That(File.Exists(Path.Combine(barrier, "winner-committed")), Is.True)
+                Assert.That(File.ReadAllText(Path.Combine(barrier, "winner-parent")).Trim(), Is.EqualTo(initialHead))
+                Assert.That(File.ReadAllText(Path.Combine(barrier, "loser-parent")).Trim(), Is.EqualTo(initialHead))
+                let requeueActor, requeueOperationId, requeueSequence =
+                    if satisfactionWins then "Agent 3", releaseOperationId, released.Operation.Sequence
+                    else "Lead", satisfactionOperationId, satisfied.Operation.Sequence
+                assertRequeuedState a task attemptId challenge.ChallengeId requeueActor requeueOperationId requeueSequence
+                let _, satisfactionRecord = LedgerStore.getOperationStatus a satisfactionOperationId |> ok
+                let _, releaseRecord = LedgerStore.getOperationStatus a releaseOperationId |> ok
+                Assert.That(satisfactionRecord.IsSome, Is.True)
+                Assert.That(releaseRecord.IsSome, Is.True)
+                Assert.That(satisfactionRecord.Value.Actor, Is.EqualTo("Lead"))
+                Assert.That(releaseRecord.Value.Actor, Is.EqualTo("Agent 3"))
+            finally
+                // Always release a hook if an assertion fails before both pushes arrive.
+                File.WriteAllText(Path.Combine(barrier, "loser-entered"), "release")
+                File.WriteAllText(Path.Combine(barrier, "winner-committed"), "release")
+                try System.Threading.Tasks.Task.WaitAll(tasks, TimeSpan.FromSeconds(15.)) |> ignore
+                with _ -> ()
+        )
+
 
     // Publish canonical schema-2 records through the real CAS ledger, but omit
     // the operator index exactly as the pre-index implementation did. The
@@ -773,19 +1006,24 @@ type ChallengeTests() =
             let unassigned = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
             ReviewWorkflow.parkAgent a (Guid.NewGuid()) "Agent 3" unassigned.Agent.Version
                 "Intentional pause" |> ok |> ignore
-            ChallengeWorkflow.resolve b (Guid.NewGuid()) "Lead" challenge.ChallengeId
+            let resolutionOperationId = Guid.NewGuid()
+            ChallengeWorkflow.resolve b resolutionOperationId "Lead" challenge.ChallengeId
                 challenge.ConditionIds.Head 1 "approved" "" |> ok |> ignore
             let parked = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
             Assert.That(parked.Agent.State, Is.EqualTo("Parked"))
             Assert.That(parked.Agent.CurrentAssignment, Is.Null)
             Assert.That(parked.BlockedChallengeWaits.Head.Status, Is.EqualTo("Eligible"))
-            ReviewWorkflow.setAgentAdministrativeStateAs b "Orchestrator" (Guid.NewGuid())
-                "Agent 3" "NeedsWork" parked.Agent.Version "Unpark" |> ok |> ignore
+            let unparkOperationId = Guid.NewGuid()
+            let unpark =
+                ReviewWorkflow.setAgentAdministrativeStateAs b "Orchestrator" unparkOperationId
+                    "Agent 3" "NeedsWork" parked.Agent.Version "Unpark" |> ok
             let ready = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
             Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
             Assert.That(ready.Agent.CurrentAssignment.AttemptId, Is.EqualTo(attemptId))
             Assert.That(ready.BlockedChallengeWaits, Is.Empty)
             Assert.That(ready.RunnableQueue.Head.Attempt.AssignmentGeneration, Is.EqualTo(2))
+            assertRequeuedState a task attemptId challenge.ChallengeId "Orchestrator"
+                unparkOperationId unpark.Operation.Sequence
             Assert.That(notices a, Is.Empty)
         )
 
@@ -1565,4 +1803,107 @@ type ChallengeTests() =
             // corrupt projection, so the outstanding question still exists.
             let old = ChallengeWorkflow.getOperatorPage a legacyId 16 0L "" |> ok
             Assert.That(old.Challenge.Status, Is.EqualTo("Pending"))
+        )
+
+    [<Test>]
+    member _.FinalSatisfactionReplayWithWaiterIsIdempotentAndPreservesActor() =
+        withFixture (fun a b ->
+            let task = "final-satisfaction-replay"
+            let tv, pv, av, attemptId = assignment a task
+            let challenge =
+                ChallengeWorkflow.create b (Guid.NewGuid()) "Agent 3" "Final approval" task
+                    [ { OwnerKind = ""; OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "Approve final dependency" } ]
+                |> ok
+            ChallengeWorkflow.blockAttempt a (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "Waiting for final approval" [ challenge.ChallengeId ] |> ok |> ignore
+
+            let operationId = Guid.NewGuid()
+            let first =
+                ChallengeWorkflow.resolve b operationId "Lead" challenge.ChallengeId
+                    challenge.ConditionIds.Head 1 "approved" "" |> ok
+            Assert.That(first.AlreadyApplied, Is.False)
+            let replay =
+                ChallengeWorkflow.resolve a operationId "Lead" challenge.ChallengeId
+                    challenge.ConditionIds.Head 1 "approved" "" |> ok
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That(replay.Operation.OperationId, Is.EqualTo(first.Operation.OperationId))
+            Assert.That(replay.Operation.Sequence, Is.EqualTo(first.Operation.Sequence))
+            Assert.That(replay.Operation.RequestHash, Is.EqualTo(first.Operation.RequestHash))
+            Assert.That(replay.Operation.OriginalResultHash, Is.EqualTo(first.Operation.OriginalResultHash))
+            Assert.That(replay.Operation.OriginalResultJson, Is.EqualTo(first.Operation.OriginalResultJson))
+            Assert.That(String.concat "\n" replay.Operation.Paths, Is.EqualTo(String.concat "\n" first.Operation.Paths))
+            assertRequeuedState a task attemptId challenge.ChallengeId "Lead" operationId first.Operation.Sequence
+        )
+
+    [<Test>]
+    member _.SatisfactionWinsConcurrentOwnerReleaseAndCASReplans() =
+        runSatisfactionReleaseRace true
+
+    [<Test>]
+    member _.OwnerReleaseWinsConcurrentSatisfactionAndCASReplans() =
+        runSatisfactionReleaseRace false
+
+    [<Test>]
+    member _.FreshCloneWakesTheExactDurableBlockedGeneration() =
+        withFixture (fun a b ->
+            let task = "fresh-clone-durable-wait"
+            let tv, pv, av, attemptId = assignment a task
+            let challenge =
+                ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "Durable approval" task
+                    [ { OwnerKind = ""; OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "Approve after restart" } ]
+                |> ok
+            ChallengeWorkflow.blockAttempt b (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "Waiting across client restart" [ challenge.ChallengeId ] |> ok |> ignore
+
+            let reopened = cloneBinding a "reopened"
+            let reopenedInbox = ReviewWorkflow.getAgentInbox reopened "Agent 3" |> ok
+            Assert.That(reopenedInbox.Agent.State, Is.EqualTo("NeedsWork"))
+            Assert.That(reopenedInbox.BlockedChallengeWaits.Length, Is.EqualTo(1))
+            Assert.That(reopenedInbox.BlockedChallengeWaits.Head.Status, Is.EqualTo("Waiting"))
+            let operationId = Guid.NewGuid()
+            let resolved =
+                ChallengeWorkflow.resolve reopened operationId "Lead" challenge.ChallengeId
+                    challenge.ConditionIds.Head 1 "approved" "" |> ok
+            assertRequeuedState reopened task attemptId challenge.ChallengeId "Lead" operationId resolved.Operation.Sequence
+        )
+
+    [<Test>]
+    member _.TerminalizedTaskMakesAnEligibleWaitInertOnOwnerRelease() =
+        withFixture (fun a b ->
+            let task = "terminalized-dependent-wait"
+            let tv, pv, av, attemptId = assignment a task
+            let challenge =
+                ChallengeWorkflow.create b (Guid.NewGuid()) "Agent 3" "Close race" task
+                    [ { OwnerKind = ""; OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "Approve before closure" } ]
+                |> ok
+            ChallengeWorkflow.blockAttempt a (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "Waiting for final approval" [ challenge.ChallengeId ] |> ok |> ignore
+            let busyTask = "owner-busy-before-terminalization"
+            let _, busyAttemptVersion, busyAgentVersion, _ = assignment b busyTask
+            ChallengeWorkflow.resolve a (Guid.NewGuid()) "Lead" challenge.ChallengeId
+                challenge.ConditionIds.Head 1 "approved" "" |> ok |> ignore
+            let eligible = ReviewWorkflow.getAgentInbox b "Agent 3" |> ok
+            Assert.That(eligible.Agent.State, Is.EqualTo("Working"))
+            Assert.That(eligible.Agent.CurrentAssignment.TaskId, Is.EqualTo(busyTask))
+            Assert.That(eligible.BlockedChallengeWaits.Head.Status, Is.EqualTo("Eligible"))
+
+            let _, currentTask, _ = ReviewWorkflow.getTask a task |> ok
+            ReviewWorkflow.closeTaskAs b "Lead" (Guid.NewGuid()) task currentTask.Version |> ok |> ignore
+            ReviewWorkflow.completeAgentWork a (Guid.NewGuid()) busyTask "Agent 3"
+                busyAttemptVersion busyAgentVersion 1 "Owner completed after dependent task closure" |> ok |> ignore
+
+            let released = ReviewWorkflow.getAgentInbox b "Agent 3" |> ok
+            Assert.That(released.Agent.State, Is.EqualTo("NeedsWork"))
+            Assert.That(released.Agent.CurrentAssignment, Is.Null)
+            let _, closedTask, maybeAttempt = ReviewWorkflow.getTask a task |> ok
+            let blockedAttempt = maybeAttempt.Value
+            Assert.That(closedTask.Lifecycle, Is.EqualTo("Closed"))
+            Assert.That(blockedAttempt.Phase, Is.EqualTo("Blocked"))
+            Assert.That(blockedAttempt.AssignmentGeneration, Is.EqualTo(1))
+            let snapshot = LedgerStore.fetch a |> ok
+            let wait = assertWaitIndexes a snapshot challenge.ChallengeId task attemptId "Agent 3" 1 "Eligible"
+            Assert.That(wait.Status, Is.EqualTo("Eligible"))
+            let _, history = ReviewWorkflow.getTaskLifecycleHistory a task |> ok
+            Assert.That(history |> List.filter (fun item -> item.Action = "RequeueChallengeBlockedAttempt"), Is.Empty)
+            failStale (ReviewWorkflow.getAssignment a task 2)
         )

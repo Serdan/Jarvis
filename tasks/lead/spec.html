@@ -1,21 +1,65 @@
 <article>
-<h1>Lead — Jarvis automation delivery: Scheduler and Challenges</h1>
-<p><strong>Current operator objective, 2026-11-20:</strong> Complete Jarvis's automation capability by fully implementing <strong>Scheduler</strong> and <strong>Challenges</strong>, including their end-to-end integration, reliability and operator usability. <strong>Telos is a separate system developed in <code>Servitor/telos</code>.</strong> The previously pursued Jarvis-to-Telos Work/SQLite migration is no longer Jarvis's objective. Reuse proven Jarvis components where they actually serve these two features; do not continue broad Telos architecture or make its unrelated source/publisher migration an artificial prerequisite. Previous spec revisions preserve the detailed historical Work plan and evidence.</p>
+<h1>Lead — Jarvis Scheduler and Challenges delivery snapshot (2026-11-20)</h1>
+<p><strong>Objective:</strong> deliver the Jarvis Scheduler and Challenges as an operational, integrated automation loop. Telos is separate. Do not continue the broad Telos Work/SQLite migration or make it a prerequisite. Reuse existing Jarvis components where they directly help. Manager currently owns session dispatch; Lead assigns and coordinates but does not launch agents. Reviewers independently review; Integrator integrates.</p>
 
-<h2>Acceptance — demonstrate operational automation, not merely prototypes</h2>
+<h2>Current source and deployment evidence</h2>
 <ul>
-<li><strong>Scheduler:</strong> a non-agent, deterministic, durable authority selects eligible work, admits compatible sessions under actual account/project capacity, reacts to readiness/dependency changes and normal fallback wakeups, launches once with stable provenance, observes registration/continuation, and handles session stalls, terminal results, restart and uncertain submissions without duplicate effects. It must support ordinary autonomous work without a periodic model Manager as a necessary dispatcher. Preserve explicit safety gates and an inspectable recovery path.</li>
-<li><strong>Challenges:</strong> first-class durable conditions with ownership, evidence, resolution, blocking, reopening/cancellation, optional subscription and operator input. Agents can explicitly block on challenge dependencies, release their execution slot, and become safely Ready when all required conditions are satisfied; nonblocked agents discover results normally. The operator can answer through a usable client and the answer is durable. No notification-delivery dependency or fabricated implicit approval.</li>
-<li><strong>Integration:</strong> prove the complete loop: an agent runs, encounters a real dependency, creates a challenge and optionally blocks; an authorized agent or operator resolves it; the dependency becomes eligible; Scheduler admits continuation under capacity and safety rules; completion/checkpoint and observed effects remain durable. Prove cross-project, restart, competing clients, duplicate requests, and unresolved/unknown-effect behavior.</li>
-<li><strong>Delivery:</strong> accepted review and integration on exact source, relevant .NET 11 Release and end-to-end tests, operational documentation and evidence from an actual configured deployment when separately authorized. A Closed task, a default-off fixture, or a passing isolated test is not sufficient to claim full feature completion.</li>
+<li>Configured origin is <code>https://github.com/Serdan/Jarvis.git</code>. At the latest verification, local <code>main</code>, <code>refs/remotes/origin/main</code> and remotely advertised <code>origin/main</code> agreed on <code>bea5f40867720e909746c0d0cade1ca68e86f7f4</code>. The branch advanced from <code>cdc83c0</code> during this audit.</li>
+<li>The connected deployed command catalog exposes <code>ScheduleExecution</code>, <code>ListScheduledExecutions</code>, <code>GetScheduledExecution</code>, <code>CancelScheduledExecution</code> and the durable Challenge command family. The earlier deployed-catalog mismatch is resolved; documentation must be updated.</li>
+<li>The registered <code>main</code> browser window is Ready at registration generation 6. The live schedule listing contains four pending recurring schedules owned by <code>Servitor</code> (Favn/Jarvis Manager and Health). Do not mutate, cancel, rebind or trigger them. Historical Jarvis schedules with <code>WindowUnavailable:needsReauthorization</code> are now canceled. There is no active Jarvis Manager heartbeat schedule.</li>
 </ul>
 
-<h2>Immediate Lead action</h2>
+<h2>Scheduler — current implementation and gaps</h2>
+<ul>
+<li><code>Client/Modules/BrowserSchedules.fs</code> is a per-client persistent one-shot/recurring CLI/browser schedule runner with durable local state and process locking. It is not an account-wide agent-work scheduler.</li>
+<li><code>AfterAgentIdle</code> is intentionally fail-closed in <code>Client/Program.fs</code>; the production provider returns <code>ActivityProofUnavailable</code>. <code>Server/Services/FeedbackStore.fs</code> records legacy <code>attributed_agent_activity</code> telemetry, but the server SQLite store is disposable and missing/reset data is not proof of inactivity. Do not enable this trigger from that source.</li>
+<li><code>scripts/manager-heartbeat.mjs</code> is a deterministic per-project planner with a local journal and configured 5-worker/3-reviewer limits. It does not launch sessions; the model-based Manager performs the browser launch. These limits are not account-wide capacity. <code>config/manager/Jarvis.json</code> remains disabled. This is not the required non-agent Scheduler.</li>
+<li>The Work Queue Scheduler prototypes remain default-off and belong to the separate Work/Telos frontier. Do not adopt the broader Work/SQLite migration as a dependency.</li>
+<li>The current scheduler therefore lacks a non-agent authority that consumes canonical Jarvis task/agent/review/Challenge state, reconciles eligible waits, admits under actual account/project capacity, and launches with durable stable provenance without a periodic model Manager.</li>
+</ul>
+
+<h2>Challenges — current implementation and gap</h2>
+<ul>
+<li>Durable Challenge core and operator-response work are closed and integrated. Conditions, evidence, ownership, operator responses, blocking and durable wait records exist.</li>
+<li><code>ChallengeWorkflow.wakeDependents</code> marks a blocked wait Eligible when its required conditions are satisfied. <code>requeueAttempt</code> is a separate agent-attributed operation. There is no proven non-agent reconciler that consumes Eligible waits and safely requeues them.</li>
+<li>Do not call requeue as the blocked owner or impersonate Manager. A Scheduler service actor needs a narrow, explicit authority boundary and distinct provenance.</li>
+</ul>
+
+<h2>Active assignments and runnable frontier</h2>
+<ul>
+<li><strong>Worker 5 — P1</strong>, <code>scheduler-core-planner-20261120</code>, attempt <code>20261120130540008000000000000911</code>, Queued. Implement a pure deterministic planner over a verified canonical Jarvis snapshot; include Challenge-ready intents, account/project capacity and stable idempotency keys. No assignment/requeue mutation, browser submission, deployment or Work/SQLite dependency.</li>
+<li><strong>Worker 1 — P1</strong>, <code>challenge-ready-requeue-audit-20261120</code>, attempt <code>20261120130540008000000000000912</code>, Queued. Read-only trace of Challenge wake/requeue state transitions and the smallest safe Scheduler service-actor contract. No source or ledger mutation.</li>
+<li><strong>Worker 19 — P1</strong>, <code>browser-audit-20261120-deployed-smoke</code>, attempt <code>20261120130540008000000000000914</code>, Queued. Read-only/no-submit deployed runtime and launcher audit. Real prompt sends and live recurrence remain separately operator-gated.</li>
+<li><strong>Worker 3 — P2</strong>, <code>browser-audit-20261120-docs-drift</code>, attempt <code>20261120130540008000000000000913</code>, Queued. Correct docs against current deployed catalog and exact fail-closed/source behavior; do not claim pending fixes are already integrated.</li>
+<li>These assignments are queued for Manager dispatch. Lead has not launched any sessions.</li>
+</ul>
+
+<h2>Source leases and integration holds</h2>
+<ul>
+<li>Worker 18 owns the overlapping <code>BrowserSchedules.fs</code>, <code>Program.fs</code>, SignalR/API and BrowserSchedules test surfaces under <code>p1-organon-project-owned-browser-schedules-20261119</code>. Its attempt is Blocked pending Integrator proof and the Worker 22 constructor correction.</li>
+<li>Worker 22 owns <code>BrowserBridge.fs</code>, <code>browser-extension/background.js</code>, BrowserBridge tests and <code>launchAgent.js</code> under <code>p1-chatgpt-agent-tab-reclamation-20261119</code>. Its accepted source is awaiting Integrator disposition.</li>
+<li>Do not assign competing code edits to the reauthorization or suspended-cancel tasks until both overlapping leases are explicitly released and Integrator records the accepted integration.</li>
+<li>The reauthorization follow-up remains Open/unassigned: recurring schedules must pause on <code>WindowUnavailable:needsReauthorization</code> and resume only after a fresh explicit authorization generation; never replay uncertain submissions.</li>
+<li>The suspension follow-up remains Open/unassigned: restore persistence was already corrected by <code>9c2ae32e5</code>; the remaining gap is that suspended schedules cannot be explicitly canceled. Preserve suspension across restart and do not rearm implicitly.</li>
+<li>Integrator's current assignment requires a full unfiltered Client Release witness on clean unpublished merge <code>aed77776ed2e4d21cff0ad2e25ff06379f5e0236</code> in worktree <code>integrator-pending-reviewed-20261119</code>. Lead started <code>dotnet test Client.Tests/Client.Tests.fsproj -c Release --nologo --verbosity minimal</code> there; at the latest check the testhost was still running. The candidate does not contain current <code>origin/main</code>; its merge base with current origin/main is <code>3aac4f665</code>. After the test result, Integrator must recompose/revalidate against fresh <code>bea5f408</code> before any publication. No force push or publication by Lead.</li>
+</ul>
+
+<h2>Deferred separate frontier</h2>
+<ul>
+<li><code>work-queues-ephemeral-executions</code> was revised to Deferred/no new assignments. Preserve its historical evidence and child tasks.</li>
+<li>The blocked <code>work-sqlite-scheduler-capacity</code> attempt owned by Worker 1 remains Blocked and untouched. Do not cancel or use it as a prerequisite for Jarvis Scheduler.</li>
+<li><code>automation-runtime-rollout</code> remains historically canceled; no deployment/restart/activation is authorized by this assignment.</li>
+</ul>
+
+<h2>Operator gate</h2>
+<p>A durable notification was delivered to Operator under <code>scheduler-core-planner-20261120</code>, asking whether to authorize a narrowly scoped non-agent Scheduler identity that may requeue only fully satisfied Challenge waits with exact generation/owner checks and launch only existing Ready work under account/project capacity. It must not impersonate Manager or the blocked owner. No reply has been received. Until approval, planner work stays read-only/default-off and Manager remains the only session launcher. This notification does not authorize prompt sends, schedule changes, deployment, restart, migration or runtime activation.</p>
+
+<h2>Dependency-ordered completion plan and GO/HOLD</h2>
 <ol>
-<li>Audit current implemented/integrated/running Scheduler and Challenges functionality. Existing work includes WQ08 and Work Scheduler prototypes, Challenge core and operator-response tasks, and scheduler/Challenge dependencies. Distinguish actual gaps from already completed and accepted code.</li>
-<li>Produce the shortest actionable, dependency-ordered completion plan for these two features with concrete GO/HOLD, independent work and integration/review needs. Retain existing assignments, source leases, frozen reviews and audit receipts; explicitly reconcile or defer the old Telos-oriented frontier without speculative cancellation or work loss. Avoid unnecessary framework-building and over-specific local patches that bypass reusable mechanisms.</li>
-<li>Assign eligible work to Workers through canonical state. Manager alone dispatches sessions; Reviewers independently review; Integrator integrates. Keep both Scheduler and Challenges moving toward the complete operational loop, not indefinite design/analysis.</li>
-<li>Preserve operator-only gates for production enablement, deployment/restart, state migration, credential or authority changes, and replay of uncertain effects. When a specific gate is needed, identify the exact decision and evidence; safe default-off implementation/review can proceed independently.</li>
+<li><strong>GO:</strong> complete Worker 5's default-off deterministic planner, Worker 1's Challenge authority audit, Worker 3's docs corrections and Worker 19's no-submit deployment audit. Keep the planner side-effect-free and fail-closed on incomplete capacity/state evidence.</li>
+<li><strong>HOLD:</strong> wait for Worker 22 and Worker 18 source leases to integrate/release. Then assign the reauthorization pause/recovery and suspended-cancel fixes against fresh main; independently review and run exact Release tests.</li>
+<li><strong>HOLD pending Operator approval:</strong> implement a narrowly scoped Scheduler service actor and runtime host that reconciles Eligible Challenge waits, creates stable durable launch intents, enforces account/project capacity, observes registration/continuation, handles stalls/terminal results/restart/uncertain submission, and uses event-driven plus normal fallback wakeups without a periodic model Manager.</li>
+<li><strong>GO after accepted implementation and separate activation approval:</strong> prove the full agent → Challenge → authorized response → eligible wait → Scheduler requeue/admission → one launch → observed continuation → checkpoint/completion loop, including competing clients, cross-project capacity, restart and uncertain effects. Do not claim completion from fixtures or isolated tests alone.</li>
+<li><strong>HOLD:</strong> live prompt sends, live schedule changes/rebinds, deployment/restart, state migration, credential/authority changes and replay of uncertain effects require separate explicit Operator approval.</li>
 </ol>
-<p><strong>Next Manager launch priority:</strong> activate Ready Lead to reconcile this new objective; subsequent Worker/Reviewer/Integrator priority comes from Lead's new current-state plan. The superseded Telos/SQLite plan is historical context, not the new default runnable frontier. Lead must replace this planning section with a coherent current snapshot on its next Working turn, then checkpoint and yield Ready.</p>
 </article>

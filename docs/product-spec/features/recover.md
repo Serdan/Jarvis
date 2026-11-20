@@ -16,6 +16,6 @@ A backup may lag local authoritative state. Restoration must identify uncertain 
 
 ## Observable satisfaction
 
-A Worker finishes a bounded turn and yields; the next execution resumes the same Work with its checkpoint and without repeating its finished action. A browser tab closes after initial submission and the remote model still completes; Telos does not treat tab disappearance as permission to resubmit. After a simulated stale-backup restore, an unresolved push remains fenced while an unrelated task is still eligible to proceed.
+A bounded execution ends after checkpointing its progress; a subsequent execution resumes the same Work from that state without repeating completed actions. A browser tab closes after initial submission and the remote model still completes; Telos does not treat tab disappearance as permission to resubmit. After a simulated stale-backup restore, an unresolved push remains fenced while an unrelated task is still eligible to proceed.
 
 **Not implied:** replaying unknown effects, keeping all tabs open, pretending stale backup snapshots are current, or granting recovery a new technical implementation mandate.

@@ -16,7 +16,7 @@ The effective meaning of a Project, its Systems and Features survives the indivi
 
 Telos should organize the next useful Work, run eligible bounded Activities on authorized resources, obtain independently meaningful evidence, and carry the outcome through review and integration where applicable. Work may be planned, implemented, tested, investigated, reviewed, corrected, integrated and verified by different short-lived executions. The product must remember the objective, what was actually established, and what remains missing between those executions.
 
-A problem is not solved by repeatedly saying `HOLD`. The party responsible for an outcome must investigate reachable causes and make the smallest genuinely useful next step actionable. Conversely, available capacity is not permission to invent filler work, cross project boundaries or bypass a real safety gate.
+When progress toward an objective is constrained, Telos must represent the actual missing dependency, resource, evidence or authorization and make the next eligible action discoverable. It should preserve accountability for reaching the outcome without manufacturing work to fill idle capacity, crossing project boundaries or bypassing authority. A genuine unresolved dependency must remain explicit; progress is established by changed state and evidence, not an executor's narrative.
 
 ## Engineering intent and tradeoffs
 
@@ -32,7 +32,7 @@ A problem is not solved by repeatedly saying `HOLD`. The party responsible for a
 
 Telos must not assume that accessing a repository, tool, browser, project or device grants unlimited authority over it. Project scope, resource access, approved operations and current source lineage must be enforced by the authoritative runtime, not merely requested in a model prompt. A requested feature is not permission to deploy it.
 
-Telos is not intended to be a universal formal specification language, a second source-control system, a monolithic chat transcript, or an always-working person-like Manager supervising all agents. It should not require Servitor to run, and Servitor must not become a competing scheduler or source of truth.
+Telos is not intended to be a universal formal specification language, a second source-control system, a monolithic chat transcript, or a system that requires a continuously active conversational supervisor to coordinate execution. It should not require Servitor to run, and Servitor must not become a competing scheduler or source of truth.
 
 ## What would demonstrate the Project promise
 

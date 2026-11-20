@@ -1609,10 +1609,9 @@ module ReviewWorkflow =
                                                  alert.AlertId <> alertId.ToString("N")) } ]
                 })
 
-    let takeResponseAlerts binding agentId =
+    let takeResponseAlertsAt binding snapshot agentId =
         if not (validAgent agentId) then Error(InvalidBinding "Invalid alert target.")
         else result {
-            let! snapshot = LedgerStore.fetch binding
             let! queued, _ = responseAlertsAt binding snapshot agentId
             if queued.Pending.IsEmpty then
                 return []
@@ -1633,6 +1632,14 @@ module ReviewWorkflow =
                         })
                 return queued.Pending
         }
+
+    // Retain the standalone API for callers without a verified snapshot.
+    let takeResponseAlerts binding agentId =
+        if not (validAgent agentId) then Error(InvalidBinding "Invalid alert target.")
+        else
+            LedgerStore.fetch binding
+            |> Result.bind (fun snapshot -> takeResponseAlertsAt binding snapshot agentId)
+
     let acknowledgeNotification binding operationId agentId notificationId =
         if not (validAgent agentId) || notificationId = Guid.Empty then
             Error(InvalidBinding "Invalid notification acknowledgement.")

@@ -6238,7 +6238,11 @@ type ReviewWorkflowTests() =
                         { ProjectName = "owner"; JobId = "missing-job"; AfterSequence = None }
                 ReviewWorkflow.queueResponseAlert second (Guid.NewGuid()) "Lead"
                     "Reviewer" "Please preserve test evidence" |> success |> ignore
-                let _, _, other = invoke "Owner" poll
+                let (ownerReply, io) =
+                    LedgerStore.measureGitReads (fun () -> invoke "Owner" poll)
+                let _, _, other = ownerReply
+                Assert.That(io.RemoteFetches, Is.EqualTo(1),
+                            "A no-alert tool reply must reuse its verified ledger snapshot.")
                 Assert.That(other.Instructions |> List.exists (fun item ->
                     item.Scope = "response-alert"), Is.False)
                 Assert.That((ReviewWorkflow.getResponseAlerts first "Reviewer" |> success).Pending.Length, Is.EqualTo(1))

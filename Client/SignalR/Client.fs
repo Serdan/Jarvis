@@ -114,10 +114,12 @@ let private checkResponseAlerts (rt: Runtime) agentId (target: ProjectPaths.Proj
         | Some selected when not (oldSideEffectsAllowed rt selected) -> []
         | Some selected ->
             let project = selected |> ProjectPaths.ProjectTarget.projectId |> ProjectPaths.ProjectId.value
-            match OrchestrationApi.LedgerBindingConfig.load project rt with
+            // Binding resolution already fetched a verified snapshot.
+            // Avoid a second remote Git fetch for each tool reply.
+            match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt with
             | Error _ -> []
-            | Ok binding ->
-                match ReviewWorkflow.ReviewWorkflow.takeResponseAlerts binding agentId with
+            | Ok (binding, snapshot) ->
+                match ReviewWorkflow.ReviewWorkflow.takeResponseAlertsAt binding snapshot agentId with
                 | Error _ -> [] // Retain pending content for a later response.
                 | Ok alerts ->
                     alerts

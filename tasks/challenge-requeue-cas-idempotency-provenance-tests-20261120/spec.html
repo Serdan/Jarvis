@@ -1,0 +1,24 @@
+<article>
+<h1>[P1][Challenges] Add idempotency, release-race and actor-provenance tests for automatic requeue</h1>
+<p><strong>Owner:</strong> Worker 1. <strong>Type:</strong> tests-only follow-up to completed read-only audit. <strong>Baseline:</strong> current verified <code>origin/main</code> <code>95a471fc565b57fe309c65fc85f371693dbe9067</code>.</p>
+<h2>Why this task exists</h2>
+<p>The completed audit found that Challenge-linked automatic requeue already exists through synchronous <code>wakeDependents</code> and owner-release <code>reconcileEligibleOnRelease</code>, with transactional CAS/replanning and actor attribution. No production defect or need for a separate non-agent requeue authority was found. The remaining gaps are targeted regression tests, not an implementation rewrite.</p>
+<h2>Exclusive source scope</h2>
+<p>Tests only in <code>Client.Tests/ChallengeWorkflowTests.fs</code> (and the minimum test fixture/project inclusion if unavoidable). Use a new isolated worktree/branch from the pinned baseline and bind the source after the assignment is Working. Do not edit <code>Client/Modules/ChallengeWorkflow.fs</code>, <code>Client/Modules/ReviewWorkflow.fs</code>, ledger writers, orchestration APIs, production code, task/agent ledger, or any other worker's source lease.</p>
+<h2>Required tests</h2>
+<ol>
+<li><strong>Idempotent final satisfaction with a real waiter:</strong> create an actual blocked dependent wait, satisfy its final condition, replay the exact same operation UUID, and assert exactly one assignment-generation increment, one assignment issue and one corresponding lifecycle requeue event. Confirm the original receipt is returned and no duplicate wake/requeue is produced.</li>
+<li><strong>Satisfaction/release race in both commit orders:</strong> use the existing independent-clone/shared-bare-remote fixture and deterministic barriers to race final dependency satisfaction against owner completion or explicit unpark. Verify CAS/replanning yields one valid requeue and never leaves the exact current owner in NeedsWork with a live Eligible wait. Assert the attempt, wait/index, owner and assignment generation remain mutually consistent.</li>
+<li><strong>Actor provenance:</strong> assert the exact ActorId and IssuerId on immediate wake caused by final condition satisfaction and delayed wake caused by owner release/unpark. Use distinct actors so the test proves the actual operation actor, not the owner or a synthetic Scheduler identity, is recorded.</li>
+<li><strong>Durability/recovery boundary:</strong> if it fits the existing fixture, reopen a fresh client/clone after a durable wait is committed and verify the final satisfaction still wakes the exact blocked generation. Also add a stale Eligible wait inertness assertion after task terminalization/transfer if this can be done without changing production code.</li>
+</ol>
+<h2>Acceptance</h2>
+<ul>
+<li>Tests exercise the existing public/canonical workflow and Git-ledger transaction path, not private helper-only mocks.</li>
+<li>Run focused Linux .NET 11 Release tests and the full relevant ChallengeWorkflow test group. Report exact command, source SHA, OS exit code, counts and duration.</li>
+<li>If a new test exposes a production defect, do not modify production code under this task. Preserve the failing test and report the exact transition, source path and minimal reproduction to Lead for a separately leased correction.</li>
+<li>Checkpoint exact evidence and next action, yield, and verify completion. Submit a review only if source changes are made; tests-only changes still receive independent review before integration.</li>
+</ul>
+<h2>Hard gates</h2>
+<p>No Challenge creation/reply/requeue in live state, no agent launch, no live schedule changes, deployment, migration, or new non-agent requeue authority. This is a bounded test-strengthening task only.</p>
+</article>

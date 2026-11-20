@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"browser-audit-20261120-docs-drift","title":"[P2][Browser audit] Correct browser bridge deployment and scheduler documentation","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"browser-audit-20261120-docs-drift","title":"[P2][Browser audit] Reconcile scheduling, launcher and runtime documentation with deployed behavior","version":2,"lifecycle":"Open","specVersion":2,"attemptId":null}

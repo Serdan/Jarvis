@@ -4927,6 +4927,90 @@ type ReviewWorkflowTests() =
                     holder.WaitForExit())
 
     [<Test>]
+    member _.PendingIntentExactLockFilesReclaimAfterQuiescentOperation() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let bindingPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            let folder =
+                Path.Combine(Path.GetDirectoryName bindingPath, "pending",
+                             Path.GetFileNameWithoutExtension bindingPath, ".locks")
+            let stripe = operationId.ToString("N").Substring(0, 3) + ".lock"
+            let exact = Path.Combine(folder, operationId.ToString("N") + ".lock")
+            let command = System.Text.Json.JsonSerializer.Serialize(
+                {| Action = "CreateTask"; TaskId = "lock-reclaim"; Title = "Reclaim" |})
+            Client.OrchestrationApi.PendingIntentJournal.persist first operationId
+                "TaskWrite" command |> success
+            Assert.That(File.Exists exact, Is.False,
+                        "The exact lock can be removed under a quiescent exclusive stripe.")
+            Assert.That(File.Exists(Path.Combine(folder, stripe)), Is.True,
+                        "The legacy stripe gate must remain persistent."))
+
+    [<Test>]
+    member _.PendingIntentExactLockReclaimSkipsActiveStripeAndLaterSweeps() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let heldId = Guid.NewGuid()
+            let prefix = heldId.ToString("N").Substring(0, 3)
+            let firstId = Guid.ParseExact(prefix + String.replicate 28 "a" + "1", "N")
+            let secondId = Guid.ParseExact(prefix + String.replicate 28 "b" + "2", "N")
+            Assert.That(firstId, Is.Not.EqualTo(heldId))
+            Assert.That(secondId, Is.Not.EqualTo(heldId))
+            let bindingPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            let folder =
+                Path.Combine(Path.GetDirectoryName bindingPath, "pending",
+                             Path.GetFileNameWithoutExtension bindingPath, ".locks")
+            Directory.CreateDirectory(folder) |> ignore
+            let stripePath = Path.Combine(folder, prefix + ".lock")
+            let exact (id: Guid) = Path.Combine(folder, id.ToString("N") + ".lock")
+            let script = Path.Combine(Path.GetDirectoryName one, "hold-shared-stripe.fsx")
+            let ready = Path.Combine(Path.GetDirectoryName one, "shared-holder-ready")
+            File.WriteAllText(script,
+                String.concat "\n"
+                    [ "open System"; "open System.IO"
+                      "use gate = new FileStream(fsi.CommandLineArgs[1], FileMode.OpenOrCreate, FileAccess.Read, FileShare.Read)"
+                      "use held = new FileStream(fsi.CommandLineArgs[2], FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)"
+                      "File.WriteAllText(fsi.CommandLineArgs[3], \"held\")"
+                      "System.Threading.Thread.Sleep(2400)" ])
+            use holder = new Process()
+            holder.StartInfo.FileName <- "dotnet"
+            holder.StartInfo.UseShellExecute <- false
+            holder.StartInfo.RedirectStandardOutput <- true
+            holder.StartInfo.RedirectStandardError <- true
+            for arg in [ "fsi"; "--exec"; script; stripePath; exact heldId; ready ] do
+                holder.StartInfo.ArgumentList.Add(arg)
+            Assert.That(holder.Start(), Is.True)
+            try
+                let wait = Stopwatch.StartNew()
+                while not (File.Exists ready) && not holder.HasExited
+                      && wait.Elapsed < TimeSpan.FromSeconds(15.) do
+                    System.Threading.Thread.Sleep(25)
+                Assert.That(File.Exists ready, Is.True, "Child must hold shared gate and exact lock.")
+                let persist (id: Guid) =
+                    let command = System.Text.Json.JsonSerializer.Serialize(
+                        {| Action = "CreateTask"; TaskId = id.ToString("N"); Title = "Reclaim" |})
+                    Client.OrchestrationApi.PendingIntentJournal.persist first id
+                        "TaskWrite" command |> success
+                let unrelatedClock = Stopwatch.StartNew()
+                persist firstId
+                unrelatedClock.Stop()
+                Assert.That(unrelatedClock.ElapsedMilliseconds, Is.LessThan(1600L),
+                            "Unrelated intent sharing the stripe must still progress.")
+                Assert.That(File.Exists(exact heldId), Is.True,
+                            "Held file must not be unlinked while its shared stripe exists.")
+                Assert.That(File.Exists(exact firstId), Is.True,
+                            "Failed exclusive cleanup must leave files intact.")
+                Assert.That(holder.WaitForExit(10000), Is.True)
+                Assert.That(holder.ExitCode, Is.Zero)
+                persist secondId
+                for id in [ heldId; firstId; secondId ] do
+                    Assert.That(File.Exists(exact id), Is.False,
+                                "Later exclusive cleanup should reclaim quiescent exact locks.")
+                Assert.That(File.Exists stripePath, Is.True)
+            finally
+                if not holder.HasExited then
+                    holder.Kill(true)
+                    holder.WaitForExit())
+
+    [<Test>]
     member _.PendingLockNeverRetriesAnAmbiguousIOExceptionCallback() =
         withFixture (fun one _ first _ _ _ _ _ ->
             let operationId = Guid.NewGuid()

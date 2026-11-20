@@ -1,25 +1,35 @@
 <article>
-<h1>[P1][Challenges] Safe scheduler requeue authority audit</h1>
-<p><strong>Objective:</strong> produce a source-backed authority and state-transition contract for a non-agent Scheduler to reconcile Challenge waits that become eligible. This is a read-only investigation; no code or ledger state changes.</p>
-<h2>Current behavior to verify</h2>
+<h1>[P1][Challenges] Audit canonical automatic Challenge wake/requeue and identify residual gaps</h1>
+<p><strong>Objective:</strong> produce a source-backed audit of the existing Challenge wait state transitions and authority. This is read-only investigation; no source or ledger mutations.</p>
+
+<h2>Verified current baseline</h2>
+<p>Use the current verified original Jarvis <code>origin/main</code> baseline <code>95a471fc565b57fe309c65fc85f371693dbe9067</code>, unless a fresh remote check establishes a newer main.</p>
+
+<h2>Existing behavior Lead has verified — independently confirm</h2>
 <ul>
-<li>Trace Challenge creation, condition satisfaction, operator response, <code>wakeDependents</code>, the durable wait record, and the existing <code>requeueAttempt</code> operation.</li>
-<li>Confirm exactly when a wait becomes Eligible and whether any current production component automatically invokes requeue after that transition.</li>
-<li>Identify the actor checks and audit fields in <code>ChallengeWorkflow</code>. Do not call requeue using the blocked owner's agent ID as the actor; that would misattribute a scheduler action as the owner.</li>
+<li><code>Client/Modules/ChallengeWorkflow.fs:wakeDependents</code> runs in the same ledger transaction when a Challenge first becomes <code>Satisfied</code>. It walks the reverse index, checks every linked dependency from the same snapshot, and validates task, attempt, owner and assignment generation. If the owner has no current assignment, is <code>Stopped</code>, and has <code>UnassignedDisposition=NeedsWork</code>, it requeues the blocked attempt and writes the wait, attempt, agent, assignment and lifecycle audit atomically. If the owner is occupied or parked, it persists the wait as <code>Eligible</code>.</li>
+<li><code>Client/Modules/ReviewWorkflow.fs:reconcileEligibleOnRelease</code> consumes eligible waits on canonical owner-release transitions. It verifies the exact wait/attempt/generation/owner and every dependency, then requeues at most one eligible wait when the owner is free and eligible. Parked owners remain eligible until explicit unpark.</li>
+<li>The helper is called by canonical completion/release paths and by <code>ChallengeWorkflow.blockAttempt</code>. Enumerate every call site and the transition that invokes it; do not assume the grep list is exhaustive if additional modules or admin paths exist.</li>
+<li><code>ChallengeWorkflow.requeueAttempt</code> is a separate owner-attributed recovery operation. Its validated attempt requires <code>attempt.OwnerAgentId = actor</code>. Do not call it as a Scheduler, impersonate the blocked owner, or propose an unrestricted service identity.</li>
+<li>Existing tests include <code>SatisfiedDependenciesRemainEligibleUntilBusyOwnerReleasesTheirSlot</code>, <code>ParkedOwnerKeepsDurableWakeUntilExplicitUnpark</code>, <code>FinalChallengeResolutionRequeuesEveryDistinctDependentOwner</code>, <code>BlockingAnotherAssignmentWakesPreviouslyEligibleWork</code>, and <code>AlreadySatisfiedDependenciesCannotCreateAnUnwakeableWait</code>.</li>
 </ul>
-<h2>Required deliverable</h2>
+
+<h2>Required audit deliverable</h2>
 <ul>
-<li>A concise state-transition table from Waiting → Eligible → Requeued/Blocked, including every required condition, exact attempt generation, owner state, source lease and expected version/CAS checks.</li>
-<li>The smallest safe service-actor/operation contract for a non-agent Scheduler to requeue only eligible Challenge-blocked attempts, with distinct scheduler provenance and no ability to bypass unresolved conditions or source leases.</li>
-<li>List exact files, methods, tests and audit events required for a later default-off implementation; distinguish code authority from production activation authority.</li>
-<li>Identify whether existing operator-response and Challenge tests already cover idempotency, stale responses, partial satisfaction, restart and repeated wake delivery.</li>
+<li>Produce a state-transition table for <code>Waiting → Requeued</code> (owner already free), <code>Waiting → Eligible → Requeued</code> (owner occupied then released), and <code>Waiting → Eligible</code> while owner remains parked/occupied. Include exact required conditions, task/attempt/generation/owner identity, source lease implications, CAS/version checks, and actor/audit provenance.</li>
+<li>Trace Challenge creation, condition satisfaction, operator response, <code>wakeDependents</code>, durable wait record, every <code>reconcileEligibleOnRelease</code> caller, and explicit <code>requeueAttempt</code>. Confirm whether all supported owner-release transitions invoke reconciliation.</li>
+<li>Inspect current tests for all-satisfied versus partial dependencies, duplicate/repeated wake delivery, operation idempotency, stale attempt generation, stale Challenge versions, owner busy/parked, explicit unpark, restart/persistence and actor attribution. Identify exact missing cases rather than proposing generic test expansion.</li>
+<li>State clearly whether any real state can remain <code>Eligible</code> while its exact owner is already stopped, unassigned and <code>NeedsWork</code>. If no such gap exists, conclude that a separate non-agent requeue authority is unnecessary for the existing Challenge flow.</li>
+<li>Only if a concrete release path or state can bypass the existing automatic reconciliation, report the exact file/method/call path, minimal failing scenario and narrow correction to Lead. Do not implement it.</li>
 </ul>
+
 <h2>Boundaries</h2>
 <ul>
-<li>Read-only only: no source edits, task assignment, agent launch, requeue, Challenge creation/reply, live schedule change, deployment or migration.</li>
-<li>Do not use Telos Work/SQLite as a prerequisite. Prefer existing Jarvis Git-ledger state and Challenge workflow.</li>
-<li>Do not propose owner impersonation or an unrestricted service identity. Any new Scheduler authority must be narrowly scoped and separately approved by the Operator before live enablement.</li>
+<li>Read-only only: no source edits, task assignment, agent launch, Challenge requeue, Challenge creation/reply, live schedule change, deployment or migration.</li>
+<li>Do not use Telos Work/SQLite as a prerequisite. Prefer canonical Jarvis Git-ledger state and existing Challenge workflow.</li>
+<li>Any new Scheduler authority or runtime enablement requires a separate explicit Operator decision. Do not treat the earlier provisional request for a non-agent requeue identity as proof that such an identity is necessary or approved.</li>
 </ul>
+
 <h2>Acceptance</h2>
-<p>Deliver the state-transition/authority contract with exact source references and a minimal test matrix, suitable for the Scheduler planner/runtime follow-up. If the current workflow already provides any automatic requeue behavior, prove it from the production call path rather than inferring it from tests.</p>
+<p>Deliver a concise source-backed state-transition/authority contract with exact source references, all release call sites, current test coverage and only concrete residual gaps. If existing paths are complete, say so explicitly and recommend no additional requeue authority.</p>
 </article>

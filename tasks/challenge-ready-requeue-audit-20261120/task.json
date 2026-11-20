@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"challenge-ready-requeue-audit-20261120","title":"[P1][Challenges] Audit safe non-agent requeue authority for satisfied Challenge waits","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"20261120130540008000000000000912"}
+{"schemaVersion":2,"taskId":"challenge-ready-requeue-audit-20261120","title":"[P1][Challenges] Audit canonical automatic Challenge wake/requeue and residual gaps","version":3,"lifecycle":"InProgress","specVersion":2,"attemptId":"20261120130540008000000000000912"}

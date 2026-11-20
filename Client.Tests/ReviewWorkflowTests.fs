@@ -4919,7 +4919,26 @@ type ReviewWorkflowTests() =
                     "TaskWrite" (command unrelatedId) |> success
                 unrelatedClock.Stop()
                 Assert.That(unrelatedClock.ElapsedMilliseconds, Is.LessThan(1600L),
-                            "An unrelated UUID with the same stripe must not wait for another operation.")
+                            "An unrelated UUID with the same prefix must not wait for another operation.")
+                let mutable rejectedCallbackCalls = 0
+                let blocked : Result<int, Client.EffectError> =
+                    Client.OrchestrationApi.PendingIntentJournal.withLockAcquireTimeout
+                        (TimeSpan.FromMilliseconds(150.))
+                        (fun () ->
+                            Client.OrchestrationApi.PendingIntentJournal.execute first firstId "TaskWrite"
+                                {| Action = "CreateTask"; TaskId = firstId.ToString("N"); Title = "Timeout" |}
+                                (fun () ->
+                                    rejectedCallbackCalls <- rejectedCallbackCalls + 1
+                                    Ok 1))
+                match blocked with
+                | Error(Client.ValidationError message) ->
+                    Assert.That(message, Does.Contain("Timed out acquiring exclusive pending UUID lock"))
+                | other -> Assert.Fail(sprintf "Expected a bounded acquisition failure, got %A" other)
+                Assert.That(rejectedCallbackCalls, Is.Zero,
+                            "Timed out mutex acquisitions cannot invoke the remote callback.")
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one firstId
+                             |> success).IsNone, Is.True,
+                            "Timed out acquisitions cannot persist a pending operation.")
                 let sameClock = Stopwatch.StartNew()
                 Client.OrchestrationApi.PendingIntentJournal.persist first firstId
                     "TaskWrite" (command firstId) |> success

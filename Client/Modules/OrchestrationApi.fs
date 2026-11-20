@@ -657,6 +657,17 @@ module PendingIntentJournal =
         let name = "Jarvis.PendingIntent." + identity + "." + operationId.ToString("N")
         if OperatingSystem.IsWindows() then "Global\\" + name else name
 
+    // Short, scoped test seam for the timeout branch. Production retains
+    // the explicit 60-second default, without changing wire behavior.
+    let private lockTimeoutOverride = System.Threading.AsyncLocal<TimeSpan>()
+
+    let internal withLockAcquireTimeout timeout action =
+        if timeout <= TimeSpan.Zero then invalidArg "timeout" "Timeout must be positive."
+        let previous = lockTimeoutOverride.Value
+        lockTimeoutOverride.Value <- timeout
+        try action ()
+        finally lockTimeoutOverride.Value <- previous
+
     let private withIntentLock (binding: LedgerStore.LedgerBinding) (operationId: Guid)
                                (operation: unit -> Result<'a, EffectError>) =
         try
@@ -671,7 +682,11 @@ module PendingIntentJournal =
                     use mutex = new System.Threading.Mutex(
                         false, exactLockName binding.RepositoryPath operationId)
                     let entered =
-                        try mutex.WaitOne(TimeSpan.FromSeconds(60.))
+                        let configured = lockTimeoutOverride.Value
+                        let timeout =
+                            if configured > TimeSpan.Zero then configured
+                            else TimeSpan.FromSeconds(60.)
+                        try mutex.WaitOne(timeout)
                         with :? System.Threading.AbandonedMutexException ->
                             // Owning an abandoned mutex is not proof that the
                             // prior remote Git effect failed. Reconcile by UUID.

@@ -1,0 +1,25 @@
+<article>
+<h1>[P1][Challenges] Safe scheduler requeue authority audit</h1>
+<p><strong>Objective:</strong> produce a source-backed authority and state-transition contract for a non-agent Scheduler to reconcile Challenge waits that become eligible. This is a read-only investigation; no code or ledger state changes.</p>
+<h2>Current behavior to verify</h2>
+<ul>
+<li>Trace Challenge creation, condition satisfaction, operator response, <code>wakeDependents</code>, the durable wait record, and the existing <code>requeueAttempt</code> operation.</li>
+<li>Confirm exactly when a wait becomes Eligible and whether any current production component automatically invokes requeue after that transition.</li>
+<li>Identify the actor checks and audit fields in <code>ChallengeWorkflow</code>. Do not call requeue using the blocked owner's agent ID as the actor; that would misattribute a scheduler action as the owner.</li>
+</ul>
+<h2>Required deliverable</h2>
+<ul>
+<li>A concise state-transition table from Waiting → Eligible → Requeued/Blocked, including every required condition, exact attempt generation, owner state, source lease and expected version/CAS checks.</li>
+<li>The smallest safe service-actor/operation contract for a non-agent Scheduler to requeue only eligible Challenge-blocked attempts, with distinct scheduler provenance and no ability to bypass unresolved conditions or source leases.</li>
+<li>List exact files, methods, tests and audit events required for a later default-off implementation; distinguish code authority from production activation authority.</li>
+<li>Identify whether existing operator-response and Challenge tests already cover idempotency, stale responses, partial satisfaction, restart and repeated wake delivery.</li>
+</ul>
+<h2>Boundaries</h2>
+<ul>
+<li>Read-only only: no source edits, task assignment, agent launch, requeue, Challenge creation/reply, live schedule change, deployment or migration.</li>
+<li>Do not use Telos Work/SQLite as a prerequisite. Prefer existing Jarvis Git-ledger state and Challenge workflow.</li>
+<li>Do not propose owner impersonation or an unrestricted service identity. Any new Scheduler authority must be narrowly scoped and separately approved by the Operator before live enablement.</li>
+</ul>
+<h2>Acceptance</h2>
+<p>Deliver the state-transition/authority contract with exact source references and a minimal test matrix, suitable for the Scheduler planner/runtime follow-up. If the current workflow already provides any automatic requeue behavior, prove it from the production call path rather than inferring it from tests.</p>
+</article>

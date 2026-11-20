@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"p0-managed-command-job-execution-20261119","title":"[P0] Unify run_command/start_job into managed process-job execution","version":5,"lifecycle":"InProgress","specVersion":2,"attemptId":"e75c10da6f504f8dbf45a698f31c8420"}
+{"schemaVersion":2,"taskId":"p0-managed-command-job-execution-20261119","title":"[P0] Unify run_command and start_job into managed process-job execution","version":6,"lifecycle":"InProgress","specVersion":3,"attemptId":"e75c10da6f504f8dbf45a698f31c8420"}

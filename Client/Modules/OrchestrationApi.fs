@@ -651,46 +651,66 @@ module PendingIntentJournal =
     // Legacy clients exclusively lock a UUID-prefix stripe. New clients take
     // a shared stripe gate plus an exclusive per-UUID lock: distinct intents
     // run concurrently without allowing a legacy client to bypass exclusion.
-    // Only unlink exact-UUID files while the legacy stripe is exclusively
-    // held. Every cooperating client takes that gate before opening any
-    // exact-UUID file, so no holder/waiter can retain an inode at unlink.
-    // Cleanup is opportunistic and must never change a write result.
-    let private tryReclaimQuiescentExactLocks folder slot stripePath operationPath =
+    // File generations that may share a checkout must acquire the stripe
+    // BEFORE opening an exact-UUID file. An exclusive stripe therefore proves
+    // all cooperating holders and waiters are quiescent before unlink.
+    // The experimental mutex-only generation is NOT compatible with this
+    // protocol and must not be deployed while file clients can run.
+    //
+    // A direct exact-file probe is only a best-effort courtesy to other open
+    // handles, NOT protection against arbitrary non-cooperating openers: on
+    // Unix another process can race between probe disposal and unlink.
+    //
+    // Enumerate before taking an exclusive stripe so a huge unrelated lock
+    // directory cannot block same-prefix operations during a full scan.
+    // Drain *all* matching candidates, in small separately gated batches,
+    // rather than leaving an arbitrary fixed-size backlog after quiescence.
+    // Every cleanup failure is non-authoritative and must leave the already
+    // computed operation result unchanged.
+    let private activeReclaimFault = System.Threading.AsyncLocal<(string -> unit)>()
+
+    let internal withReclaimFault inject action =
+        let previous = activeReclaimFault.Value
+        activeReclaimFault.Value <- inject
+        try action ()
+        finally activeReclaimFault.Value <- previous
+
+    let private tryReclaimQuiescentExactLocks folder slot stripePath =
         try
-            use gate = new FileStream(stripePath, FileMode.Open, FileAccess.ReadWrite,
-                                      FileShare.None, 4096, FileOptions.None)
-            seq {
-                yield operationPath
-                yield! Directory.EnumerateFiles(folder, slot + "*.lock")
-            }
-            |> Seq.distinct
-            |> Seq.filter (fun path ->
-                let name = Path.GetFileNameWithoutExtension path
-                name.Length = 32
-                && name.StartsWith(slot, StringComparison.Ordinal)
-                && (match Guid.TryParseExact(name, "N") with
-                    | true, id -> id.ToString("N") = name
-                    | _ -> false))
-            |> Seq.truncate 32
-            |> Seq.iter (fun path ->
+            let candidates =
+                Directory.EnumerateFiles(folder, slot + "*.lock")
+                |> Seq.filter (fun path ->
+                    let name = Path.GetFileNameWithoutExtension path
+                    name.Length = 32
+                    && name.StartsWith(slot, StringComparison.Ordinal)
+                    && (match Guid.TryParseExact(name, "N") with
+                        | true, id -> id.ToString("N") = name
+                        | _ -> false))
+                |> Seq.toArray
+            let inject = activeReclaimFault.Value
+            if not (isNull (box inject)) then inject folder
+            for batch in candidates |> Array.chunkBySize 64 do
                 try
-                    let info = FileInfo(path)
-                    if info.Exists && info.LinkTarget = null
-                       && not (info.Attributes.HasFlag(FileAttributes.ReparsePoint)) then
-                        // Be conservative about non-cooperating handles too:
-                        // never unlink a file that cannot be opened exclusively.
-                        let probe () =
-                            use held = new FileStream(path, FileMode.Open, FileAccess.ReadWrite,
-                                                      FileShare.None, 4096, FileOptions.None)
-                            ()
-                        probe ()
-                        File.Delete(path)
-                with
-                | :? IOException -> ()
-                | :? UnauthorizedAccessException -> ())
-        with
-        | :? IOException -> ()  // An active shared stripe prevents cleanup.
-        | :? UnauthorizedAccessException -> ()
+                    use gate = new FileStream(stripePath, FileMode.Open, FileAccess.ReadWrite,
+                                              FileShare.None, 4096, FileOptions.None)
+                    for path in batch do
+                        try
+                            let info = FileInfo(path)
+                            if info.Exists && info.LinkTarget = null
+                               && not (info.Attributes.HasFlag(FileAttributes.ReparsePoint)) then
+                                // Courtesy check only; the stripe is the safety proof.
+                                let free =
+                                    try
+                                        use probe = new FileStream(path, FileMode.Open, FileAccess.ReadWrite,
+                                                                   FileShare.None, 4096, FileOptions.None)
+                                        true
+                                    with
+                                    | :? IOException -> false
+                                    | :? UnauthorizedAccessException -> false
+                                if free then File.Delete(path)
+                        with _ -> () // Never turn a committed write into a cleanup failure.
+                with _ -> () // A busy stripe defers only this batch.
+        with _ -> () // Even unexpected enumeration faults cannot change the result.
     let private withIntentLock (binding: LedgerStore.LedgerBinding) (operationId: Guid)
                                (operation: unit -> Result<'a, EffectError>) =
         try
@@ -743,7 +763,7 @@ module PendingIntentJournal =
                                 operation ()
                             // Both streams are disposed before requesting an exclusive
                             // cleanup gate. A busy stripe merely defers reclamation.
-                            tryReclaimQuiescentExactLocks folder slot stripePath operationPath
+                            tryReclaimQuiescentExactLocks folder slot stripePath
                             outcome
         with ex ->
             Error(Client.ValidationError $"Unable to exclusively lock pending intent: {ex.Message}")

@@ -35,6 +35,43 @@ JarvisClient-win-x64.exe
 SHA256SUMS
 ```
 
+## Pending-intent lock protocol compatibility gate
+
+The deployed exact-file protocol (introduced by source commit `95a471fc5`) holds the
+legacy UUID-prefix stripe shared and each exact-UUID file exclusively for the
+entire operation, including uncertain remote Git effects. Older clients take the
+stripe exclusively. These two file generations can coexist.
+
+The separate experimental `fix/named-uuid-lock-20261120` generation uses a
+named OS mutex instead of the exact-UUID file. **It is not compatible with
+the deployed exact-file generation:** two processes can share the stripe while
+both believe they exclusively own the same UUID. That branch has not been
+approved as a published client and MUST NOT be released, installed, rolled
+back into, or run alongside file-based clients.
+
+**Fail closed before any lock-protocol change or rollback:**
+- Identify the exact binaries/source hashes on *every* affected machine, not
+  just a nominal assembly version (currently often `1.0.0`) or the unrelated
+  `AgentProtocol.version` (`3.68` at the time of this note).
+- Obtain explicit Operator approval for the protocol-family cutover. Stop and
+  verify retirement of all incompatible clients, including disconnected
+  processes capable of resuming. Drain or reconcile uncertain in-flight effects
+  by their saved UUID; never replay a write just because a process disconnected.
+- Prevent old clients from reconnecting or restarting with a different lock
+  protocol until an enforced compatibility admission gate exists. Keep
+  incompatible rollback artifacts quarantined.
+- Prove exact-UUID exclusion for every allowed mixed generation on Linux and
+  native Windows *before* release. Do not infer coexistence from both using the
+  same shared prefix stripe.
+
+The client build-identity/versioning task
+`jarvis-p1-client-build-identity-version-protocol-ui-20261120` owns the
+enforceable identification and compatibility-admission gate. Until that gate
+and a cutover procedure have passed independent review, remain on the existing
+file-based lock family. Opportunistic file cleanup is correct only for
+cooperating clients that acquire the shared stripe **before** opening exact
+lock files. Arbitrary non-cooperating openers are not a supported guarantee.
+
 ## Upload to the droplet
 
 Recommended static file location on the Ubuntu droplet:

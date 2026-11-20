@@ -5011,6 +5011,68 @@ type ReviewWorkflowTests() =
                     holder.WaitForExit())
 
     [<Test>]
+    member _.PendingIntentReclamationDrainsLargeQuiescentBurst() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let firstId = Guid.NewGuid()
+            let prefix = firstId.ToString("N").Substring(0, 3)
+            let bindingPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            let folder =
+                Path.Combine(Path.GetDirectoryName bindingPath, "pending",
+                             Path.GetFileNameWithoutExtension bindingPath, ".locks")
+            Directory.CreateDirectory(folder) |> ignore
+            let stripePath = Path.Combine(folder, prefix + ".lock")
+            let exact (id: Guid) = Path.Combine(folder, id.ToString("N") + ".lock")
+            let many =
+                [ for i in 1 .. 130 ->
+                    Guid.ParseExact(prefix + sprintf "%029x" i, "N") ]
+            for id in many do
+                File.WriteAllText(exact id, "")
+            let persist (id: Guid) =
+                Client.OrchestrationApi.PendingIntentJournal.persist first id "TaskWrite"
+                    (System.Text.Json.JsonSerializer.Serialize(
+                        {| Action = "CreateTask"; TaskId = id.ToString("N"); Title = "Burst" |}))
+                |> success
+            // An independent shared stripe reader prevents the first pass.
+            use shared = new FileStream(stripePath, FileMode.OpenOrCreate,
+                                        FileAccess.Read, FileShare.Read)
+            persist firstId
+            Assert.That(File.Exists(exact firstId), Is.True)
+            shared.Dispose()
+            // The last finisher must drain the entire finite backlog, not 32.
+            let lastId = Guid.ParseExact(prefix + String.replicate 28 "f" + "1", "N")
+            persist lastId
+            for id in firstId :: lastId :: many do
+                Assert.That(File.Exists(exact id), Is.False,
+                            "A quiescent stripe should reclaim every stale exact file.")
+            Assert.That(File.Exists stripePath, Is.True,
+                        "Legacy stripe gate remains persistent."))
+
+    [<Test>]
+    member _.PendingIntentCleanupFaultDoesNotAlterSuccessfulOperation() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let bindingPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            let exact =
+                Path.Combine(Path.GetDirectoryName bindingPath, "pending",
+                             Path.GetFileNameWithoutExtension bindingPath, ".locks",
+                             operationId.ToString("N") + ".lock")
+            let command = System.Text.Json.JsonSerializer.Serialize(
+                {| Action = "CreateTask"; TaskId = "cleanup-error"; Title = "Cleanup" |})
+            let mutable callbacks = 0
+            Client.OrchestrationApi.PendingIntentJournal.withReclaimFault
+                (fun _ -> raise (InvalidOperationException("Injected cleanup exception")))
+                (fun () ->
+                    callbacks <- callbacks + 1
+                    Client.OrchestrationApi.PendingIntentJournal.persist first operationId "TaskWrite" command)
+            |> success
+            Assert.That(callbacks, Is.EqualTo(1))
+            Assert.That(File.Exists exact, Is.True,
+                        "Failure injection should preserve the old lock file.")
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                         |> success).IsSome, Is.True,
+                        "A successful pending operation must remain persisted."))
+
+    [<Test>]
     member _.PendingLockNeverRetriesAnAmbiguousIOExceptionCallback() =
         withFixture (fun one _ first _ _ _ _ _ ->
             let operationId = Guid.NewGuid()

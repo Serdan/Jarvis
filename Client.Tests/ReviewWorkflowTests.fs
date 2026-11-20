@@ -4864,6 +4864,69 @@ type ReviewWorkflowTests() =
                     holder.WaitForExit())
 
     [<Test>]
+    member _.PendingIntentExactLocksAllowUnrelatedUUIDsWithinLegacyStripe() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let firstId = Guid.NewGuid()
+            let prefix = firstId.ToString("N").Substring(0, 3)
+            let suffix =
+                if firstId.ToString("N").EndsWith("a") then String.replicate 29 "b"
+                else String.replicate 29 "a"
+            let unrelatedId = Guid.ParseExact(prefix + suffix, "N")
+            Assert.That(unrelatedId, Is.Not.EqualTo(firstId))
+            let bindingPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            let lockDirectory =
+                Path.Combine(Path.GetDirectoryName bindingPath, "pending",
+                             Path.GetFileNameWithoutExtension bindingPath, ".locks")
+            Directory.CreateDirectory(lockDirectory) |> ignore
+            let exactPath = Path.Combine(lockDirectory, firstId.ToString("N") + ".lock")
+            let script = Path.Combine(Path.GetDirectoryName one, "hold-exact-lock.fsx")
+            let ready = Path.Combine(Path.GetDirectoryName one, "exact-holder-ready")
+            File.WriteAllText(script,
+                String.concat "\n"
+                    [ "open System"; "open System.IO"
+                      "let lockPath = fsi.CommandLineArgs[1]"
+                      "let readyPath = fsi.CommandLineArgs[2]"
+                      "use held = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)"
+                      "File.WriteAllText(readyPath, \"held\")"
+                      "System.Threading.Thread.Sleep(3600)" ])
+            use holder = new Process()
+            holder.StartInfo.FileName <- "dotnet"
+            holder.StartInfo.UseShellExecute <- false
+            holder.StartInfo.RedirectStandardOutput <- true
+            holder.StartInfo.RedirectStandardError <- true
+            for arg in [ "fsi"; "--exec"; script; exactPath; ready ] do
+                holder.StartInfo.ArgumentList.Add(arg)
+            Assert.That(holder.Start(), Is.True)
+            try
+                let wait = Stopwatch.StartNew()
+                while not (File.Exists ready) && not holder.HasExited
+                      && wait.Elapsed < TimeSpan.FromSeconds(15.) do
+                    System.Threading.Thread.Sleep(25)
+                Assert.That(File.Exists ready, Is.True,
+                            "Separate process must own an exact-UUID lock.")
+                let command (id: Guid) =
+                    System.Text.Json.JsonSerializer.Serialize(
+                        {| Action = "CreateTask"; TaskId = id.ToString("N"); Title = "Lock isolation" |})
+                let unrelatedClock = Stopwatch.StartNew()
+                Client.OrchestrationApi.PendingIntentJournal.persist first unrelatedId
+                    "TaskWrite" (command unrelatedId) |> success
+                unrelatedClock.Stop()
+                Assert.That(unrelatedClock.ElapsedMilliseconds, Is.LessThan(1600L),
+                            "An unrelated UUID with the same stripe must not wait for another operation.")
+                let sameClock = Stopwatch.StartNew()
+                Client.OrchestrationApi.PendingIntentJournal.persist first firstId
+                    "TaskWrite" (command firstId) |> success
+                sameClock.Stop()
+                Assert.That(sameClock.ElapsedMilliseconds, Is.GreaterThan(600L),
+                            "The same UUID must still wait for its exclusive cross-process lock.")
+                Assert.That(holder.WaitForExit(10000), Is.True)
+                Assert.That(holder.ExitCode, Is.Zero)
+            finally
+                if not holder.HasExited then
+                    holder.Kill(true)
+                    holder.WaitForExit())
+
+    [<Test>]
     member _.PendingLockNeverRetriesAnAmbiguousIOExceptionCallback() =
         withFixture (fun one _ first _ _ _ _ _ ->
             let operationId = Guid.NewGuid()

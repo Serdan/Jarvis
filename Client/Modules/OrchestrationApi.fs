@@ -648,8 +648,9 @@ module PendingIntentJournal =
     let private filePath (binding: LedgerStore.LedgerBinding) (operationId: Guid) =
         Path.Combine(journalDirectory binding.RepositoryPath, operationId.ToString("N") + ".json")
 
-    // At most 4096 persistent lock stripes, regardless of journal history.
-    // FileShare.None serializes cooperating clients across processes.
+    // Legacy clients exclusively lock a UUID-prefix stripe. New clients take
+    // a shared stripe gate plus an exclusive per-UUID lock: distinct intents
+    // run concurrently without allowing a legacy client to bypass exclusion.
     // Lock files are never unlinked (unlinking a held inode is unsafe on Unix).
     let private withIntentLock (binding: LedgerStore.LedgerBinding) (operationId: Guid)
                                (operation: unit -> Result<'a, EffectError>) =
@@ -670,23 +671,33 @@ module PendingIntentJournal =
                         if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
                             File.SetUnixFileMode(folder, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
                         let slot = operationId.ToString("N").Substring(0, 3)
-                        let lockFile = Path.Combine(folder, slot + ".lock")
-                        if File.Exists(lockFile) && File.GetAttributes(lockFile).HasFlag(FileAttributes.ReparsePoint) then
+                        let stripePath = Path.Combine(folder, slot + ".lock")
+                        let operationPath = Path.Combine(folder, operationId.ToString("N") + ".lock")
+                        let isLink path =
+                            FileInfo(path).LinkTarget <> null
+                        if isLink stripePath || isLink operationPath then
                             Error(Client.ValidationError "Pending intent lock must not be a symbolic link.")
                         else
-                            // A contended lock must not grow the stack on each retry.
-                            let mutable acquired: FileStream = null
-                            let mutable attempt = 0
-                            while isNull acquired do
-                                try
-                                    acquired <- new FileStream(lockFile, FileMode.OpenOrCreate, FileAccess.ReadWrite,
-                                                               FileShare.None, 4096, FileOptions.None)
-                                with :? IOException when attempt < 1500 ->
-                                    System.Threading.Thread.Sleep(40)
-                                    attempt <- attempt + 1
-                            use held = acquired
+                            let deadline = System.Diagnostics.Stopwatch.StartNew()
+                            let acquire path access sharing =
+                                let mutable acquired: FileStream = null
+                                while isNull acquired do
+                                    try
+                                        acquired <- new FileStream(path, FileMode.OpenOrCreate, access,
+                                                                   sharing, 4096, FileOptions.None)
+                                    with :? IOException as ex
+                                        when LedgerBindingConfig.isTransientSharingViolation ex
+                                             && deadline.Elapsed < TimeSpan.FromSeconds(60.) ->
+                                        System.Threading.Thread.Sleep(40)
+                                acquired
+                            // Order is essential: the shared legacy gate must remain
+                            // held for the entire operation, including remote effects.
+                            // Old clients' FileShare.None handles exclude new readers.
+                            use stripe = acquire stripePath FileAccess.Read FileShare.Read
+                            use held = acquire operationPath FileAccess.ReadWrite FileShare.None
                             if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
-                                File.SetUnixFileMode(lockFile, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                                File.SetUnixFileMode(stripePath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                                File.SetUnixFileMode(operationPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
                             // Never retry operation() itself on IOException:
                             // an uncertain remote write must not be repeated.
                             operation ()

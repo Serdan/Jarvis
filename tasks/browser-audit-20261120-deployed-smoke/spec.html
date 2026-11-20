@@ -1,1 +1,27 @@
-<!doctype html><html><head><meta charset="utf-8"><title>[P1][Browser audit] Verify deployed browser bridge and recurring agent launches end to end</title></head><body><article><h1>[P1][Browser audit] Verify deployed browser bridge and recurring agent launches end to end</h1><h2>Finding</h2><p>Source tests and a ready browser registration do not prove production launches. The inspected live extension version was unverified; previous recurring attempts failed with WindowUnavailable:needsReauthorization. The remaining four schedules have not been positively witnessed launching and submitting once after cleanup.</p><h2>Required work</h2><p>Build an operator-gated, source-pinned release acceptance procedure: verify installed Edge extension, local client, deployed server compatibility, registered window readiness and current launcher file. First use no-submit probes; then obtain explicit operator authorization for controlled real prompt sends if needed. Observe one complete approved recurrence per logical Manager/Health schedule and confirm creation, exact-once initial submission, close behavior, and no duplicate activations. Exercise restart/reauthorization and explicit stop/cancel scenarios in a controlled fixture where feasible. Do not equate failed retries, a blank registered-tab listing, or successful service health with delivered conversation turns.</p><h2>Acceptance criteria</h2><ul><li>Record exact installed extension/client/server/launcher versions, registered window generation and environment under test.</li><li>No-submit probe passes through installed extension without opening unauthorized persistent conversations.</li><li>With explicit operator approval, a bounded canary proves initial prompt submission exactly once and proper tab reclamation; never infer uncertain submission should be replayed.</li><li>Observe and reconcile the four canonical approved recurring schedules without duplicate logical agent activation, respecting their actual recurrence configuration.</li><li>Restart and registration failure cases produce actionable status; resulting acceptance report separates observed behavior from inferred behavior and marks pass/fail for each.</li></ul><h2>Evidence and starting points</h2><p>Audit 20 Nov: registered main transitioned needsReauthorization/generation 4 to ready/generation 5; ten schedules reduced to four; no successful next-cycle real launch verified.</p><h2>Boundaries</h2><p>Writing this task does not authorize deployment, changes to live schedules, live prompt sends, or agent launch. Coordinate with existing work and use actual test and runtime evidence before completion.</p></article></body></html>
+<article>
+<h1>[P1][Browser audit] Deployed browser bridge and recurring launch verification</h1>
+<p><strong>Objective:</strong> establish an evidence-backed deployment/runtime status without changing live schedules or sending prompts. This task has two phases; only Phase 1 is currently authorized.</p>
+<h2>Verified baseline — 2026-11-20</h2>
+<ul>
+<li>The connected deployed command catalog exposes <code>ScheduleExecution</code>, <code>ListScheduledExecutions</code>, <code>GetScheduledExecution</code>, <code>CancelScheduledExecution</code>, and the durable Challenge command family. The earlier catalog mismatch is no longer current.</li>
+<li><code>browser_list_windows</code> reports one registered <code>main</code> window in <code>Ready</code> state, registration generation 6.</li>
+<li>The live schedule listing contains four pending recurring schedules under <code>ProjectName=Servitor</code> (Favn/Jarvis Manager and Health). Leave them untouched. Historical Jarvis schedule records with <code>WindowUnavailable:needsReauthorization</code> are now canceled.</li>
+<li>There is no active Jarvis Manager heartbeat schedule. The Jarvis schedules visible in the listing are historical/canceled.</li>
+<li>The separate project-owned schedule consolidation task <code>p1-organon-project-owned-browser-schedules-20261119</code> remains blocked under Worker 18. Its source-identity work must integrate before any cross-project live acceptance.</li>
+</ul>
+<h2>Phase 1 — read-only/no-submit; assignable now</h2>
+<ul>
+<li>Record exact installed extension, local client, deployed server and protocol/catalog versions using read-only diagnostics. If a version cannot be observed, mark it unknown rather than infer it.</li>
+<li>Verify the launcher script and registered-window state through the installed bridge without submitting a prompt.</li>
+<li>Record the four pending schedule IDs, owning project, trigger, interval and current status. Do not edit, cancel, recreate, rebind, or trigger them.</li>
+<li>Produce a concise PASS/FAIL/HOLD matrix for command compatibility, registration, launcher discovery, recurrence metadata and cleanup observability.</li>
+</ul>
+<h2>Phase 2 — operator-gated live canary; not authorized yet</h2>
+<p>Do not send a real prompt, trigger a live recurrence, change a schedule, deploy, restart or rebind a window unless the Operator explicitly authorizes the exact canary and the Worker 18 project-ownership integration has been independently accepted. If authorized later, use one bounded prompt per logical schedule, record the exact operation/registration provenance, prove one submission only, observe completion and cleanup, and never replay an uncertain submission.</p>
+<h2>Acceptance</h2>
+<ul>
+<li>Phase 1 returns exact observed versions and a no-submit probe result, with unknowns and blockers explicit.</li>
+<li>Phase 2 remains HOLD until the separate Operator authorization is recorded; no task text itself grants that authorization.</li>
+<li>No live schedule or prompt side effects occur in this task before that authorization.</li>
+</ul>
+</article>

@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"challenge-requeue-cas-idempotency-provenance-tests-20261120","title":"[P1][Challenges] Add idempotency, release-race and actor-provenance tests for automatic requeue","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"challenge-requeue-cas-idempotency-provenance-tests-20261120","title":"[P1][Challenges] Add idempotency, release-race and actor-provenance tests for automatic requeue","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"e84a6f7b2d3c4f9a9b1e3f2d7a8c5e61"}

@@ -290,7 +290,15 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                             if String.IsNullOrWhiteSpace(loaded.RevisionId) then
                                 { loaded with RevisionId = Guid.NewGuid().ToString("N") }
                             else loaded
-                        if action.Status = "running" then
+                        if action.Status = "suspended" && action.RepeatEverySeconds > 0 &&
+                           action.Error.StartsWith("UiIncompatible:", StringComparison.Ordinal) then
+                            // A failed recurring activation is a missed interval, not a
+                            // reason to disable all future attempts. Do not replay it.
+                            let now = clock()
+                            { action with Status = "pending"
+                                          DueAtUtc = now.AddSeconds(float action.RepeatEverySeconds)
+                                          UpdatedAtUtc = now }
+                        elif action.Status = "running" then
                             if isIdle action then
                                 let now = clock()
                                 let stale = action.StartedAtUtc.AddMinutes(30.)
@@ -708,7 +716,9 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                     | Ok value -> update entry.Id entry.AttemptId "completed" value ""
                                     | Error (value, reason) ->
                                         let status =
-                                            if reason.StartsWith("UiIncompatible:", StringComparison.Ordinal) then "suspended"
+                                            if reason.StartsWith("UiIncompatible:", StringComparison.Ordinal) then
+                                                // Retry at the next interval; never replay this attempt.
+                                                if entry.RepeatEverySeconds > 0 then "failed" else "suspended"
                                             elif reason.Contains("OutcomeUnknown", StringComparison.OrdinalIgnoreCase) then "outcomeUnknown"
                                             else "failed"
                                         update entry.Id entry.AttemptId status value

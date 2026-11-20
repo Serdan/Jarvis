@@ -277,7 +277,7 @@ let recurrenceSkipsMissedIntervalsOnRestart () = task {
 }
 
 [<Test>]
-let recurringUiIncompatibilitySuspendsUntilExplicitReconfiguration () = task {
+let recurringUiIncompatibilityRetriesNextIntervalWithoutReplaying () = task {
     let dir,path = temp()
     let mutable clock = DateTimeOffset.UtcNow
     let mutable calls = 0
@@ -292,16 +292,48 @@ let recurringUiIncompatibilitySuspendsUntilExplicitReconfiguration () = task {
             repeatEverySeconds=3600).IsOk, Is.True)
         store.Start()
         clock <- clock.AddSeconds(601.)
-        do! awaitStatus (fun () -> status store "recurring" = "suspended")
-        Assert.That(store.List(), Does.Contain("UiIncompatible:modeSelection"))
+        do! awaitStatus (fun () -> calls = 1 && status store "recurring" = "pending" &&
+                                   store.List().Contains("failed: UiIncompatible:modeSelection"))
         Assert.That(store.List(), Does.Contain("created-tab-xyz"))
         clock <- clock.AddDays(3.)
+        do! awaitStatus (fun () -> calls = 2 && status store "recurring" = "pending")
+        do! Task.Delay(150)
+        Assert.That(calls, Is.EqualTo(2), "Only one new occurrence is allowed after a long gap")
+        use listing = JsonDocument.Parse(store.List())
+        Assert.That(listing.RootElement[0].GetProperty("dueAtUtc").GetDateTimeOffset(), Is.GreaterThan(clock))
+    finally
+        Directory.Delete(dir, true)
+}
+
+[<Test>]
+let previouslySuspendedRecurringUiFailureRearmsOnRestore () = task {
+    let dir,path = temp()
+    let mutable clock = DateTimeOffset.UtcNow
+    let mutable calls = 0
+    let action (_:BrowserSchedules.ScheduledAction) = task {
+        calls <- calls + 1
+        return Error("created-tab-xyz", "UiIncompatible:composer:TextInsertionFailed")
+    }
+    try
+        do
+            use original = new BrowserSchedules.Service(path, action, now=(fun () -> clock))
+            Assert.That(original.Schedule("recurring", 600, "https://chatgpt.com/", "Scripts",
+                "launch.js", "", "{}", false, windowRegistration="agents",
+                repeatEverySeconds=3600).IsOk, Is.True)
+        let saved = File.ReadAllText(path)
+        let suspended =
+            saved.Replace("\"Status\":\"pending\"", "\"Status\":\"suspended\"")
+                 .Replace("\"Error\":\"\"", "\"Error\":\"UiIncompatible:composer:TextInsertionFailed\"")
+        Assert.That(suspended, Is.Not.EqualTo(saved))
+        File.WriteAllText(path, suspended)
+        use restored = new BrowserSchedules.Service(path, action, now=(fun () -> clock), pollMs=25)
+        Assert.That(status restored "recurring", Is.EqualTo("pending"))
+        use listing = JsonDocument.Parse(restored.List())
+        Assert.That(listing.RootElement[0].GetProperty("dueAtUtc").GetDateTimeOffset(),
+                    Is.GreaterThanOrEqualTo(clock.AddSeconds(3600.)))
+        restored.Start()
         do! Task.Delay(120)
-        Assert.That(calls, Is.EqualTo(1), "A broken UI should never trigger repeated launches")
-        Assert.That(store.Schedule("recurring", 600, "https://chatgpt.com/", "Scripts",
-            "launch.js", "", "{}", false, windowRegistration="agents",
-            repeatEverySeconds=3600).IsOk, Is.True, "Explicit reconfiguration re-enables schedule")
-        Assert.That(status store "recurring", Is.EqualTo("pending"))
+        Assert.That(calls, Is.Zero, "Restoring a suspended schedule must not replay a missed attempt")
     finally
         Directory.Delete(dir, true)
 }

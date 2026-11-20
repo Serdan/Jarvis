@@ -1,0 +1,16 @@
+<h1>Eliminate remote Git I/O from ordinary response-alert decoration</h1>
+<p><strong>Priority: P1 — client responsiveness and autonomous-operation liveness.</strong></p>
+<h2>Problem and evidence</h2>
+<p>Client/SignalR/Client.fs: checkResponseAlerts -> LedgerBindingConfig.loadWithSnapshot -> takeResponseAlertsAt currently synchronously fetches the canonical Git ledger on each eligible visible tool response, even with no queued alerts. GetJobResult can do 0 ms of command work while MCP completion waits >20 seconds. Windows FinanceFlow fetches were ~5.2–5.5 seconds each. Commit bea5f4086 removed one duplicate fetch, not the remaining fetch.</p>
+<h2>Objective</h2>
+<p>Normal no-alert tool replies (especially GetJobResult, ListJobs and failures) must complete without remote Git network reads caused solely by alert decoration. Preserve prompt STOP alert delivery, at-most-once best-effort consumption, durable canonical authority, cross-client updates, and correct behavior after restart, transport failure and lost notifications. Prefer reusing existing SignalR, ledger events and local state/cache machinery over a separate bespoke notification subsystem. Do not weaken STOP semantics, silently drop alerts, or replay uncertain external effects.</p>
+<h2>Engineering approach</h2>
+<p>Inspect existing alert publication, notification/invalidation transport, cache and reconnect capabilities. Design an event- or hint-driven fast path with a reliable reconciliation boundary for missed events. Make the latency-versus-delivery contract explicit; targeted polling may be acceptable if justified, but never a remote fetch on every ordinary no-alert reply. Avoid a new always-polling subsystem. Preserve the current legacy-Writer fencing and no Work/Scheduler cutover.</p>
+<h2>Acceptance</h2>
+<ul>
+<li>Tests prove zero remote Git fetches attributable to response decoration for repeated no-alert GetJobResult/ListJobs and failed command responses; fetch-count regression covers the entire pipeline.</li>
+<li>STOP alerts are delivered at visible reply boundaries, with cross-client publication, concurrent consumers, restarting clients, lost/reordered invalidation, disconnected/reconnected transport and failed command/job poll cases covered. Document any bounded fallback delay.</li>
+<li>Successful consumption remains at-most-once best effort; uncertainty does not silently discard or duplicate alerts.</li>
+<li>Measure and report before/after end-to-end command latency and remote Git fetch counts on a warm client, with Windows validation where feasible.</li>
+<li>Independent review before integration; no deployment or restart without Operator authorization.</li>
+</ul>

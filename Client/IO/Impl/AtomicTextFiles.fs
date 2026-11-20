@@ -34,25 +34,23 @@ let private lockKey (path: string) =
 let private acquireLock path =
     let lockPath = Path.Combine(lockDirectory(), lockKey path)
     let deadline = Stopwatch.StartNew()
-    let rec acquire () =
+    let mutable acquired: FileStream = null
+    while isNull acquired do
         if FileInfo(lockPath).LinkTarget <> null then
             raise (UnauthorizedAccessException "The file-mutation lock path is a symbolic link.")
         try
-            let stream = new FileStream(lockPath, FileMode.OpenOrCreate,
-                                        FileAccess.ReadWrite, FileShare.None)
-            try
-                if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
-                    File.SetUnixFileMode(lockPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
-                stream
-            with _ ->
-                // The exclusive OS handle must never survive an unsuccessful
-                // lock-file mode check.
-                stream.Dispose()
-                reraise()
+            acquired <- new FileStream(lockPath, FileMode.OpenOrCreate,
+                                       FileAccess.ReadWrite, FileShare.None)
         with :? IOException when deadline.Elapsed < TimeSpan.FromSeconds(30.) ->
             Thread.Sleep 25
-            acquire ()
-    acquire ()
+    try
+        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+            File.SetUnixFileMode(lockPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+        acquired
+    with _ ->
+        // The exclusive OS handle must never survive an unsuccessful mode check.
+        acquired.Dispose()
+        reraise()
 
 let private isUnderRoot (root: string) (target: string) =
     let comparison =

@@ -674,14 +674,17 @@ module PendingIntentJournal =
                         if File.Exists(lockFile) && File.GetAttributes(lockFile).HasFlag(FileAttributes.ReparsePoint) then
                             Error(Client.ValidationError "Pending intent lock must not be a symbolic link.")
                         else
-                            let rec acquire attempt =
+                            // A contended lock must not grow the stack on each retry.
+                            let mutable acquired: FileStream = null
+                            let mutable attempt = 0
+                            while isNull acquired do
                                 try
-                                    new FileStream(lockFile, FileMode.OpenOrCreate, FileAccess.ReadWrite,
-                                                   FileShare.None, 4096, FileOptions.None)
+                                    acquired <- new FileStream(lockFile, FileMode.OpenOrCreate, FileAccess.ReadWrite,
+                                                               FileShare.None, 4096, FileOptions.None)
                                 with :? IOException when attempt < 1500 ->
                                     System.Threading.Thread.Sleep(40)
-                                    acquire (attempt + 1)
-                            use held = acquire 0
+                                    attempt <- attempt + 1
+                            use held = acquired
                             if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
                                 File.SetUnixFileMode(lockFile, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
                             // Never retry operation() itself on IOException:

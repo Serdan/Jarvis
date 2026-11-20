@@ -1,35 +1,33 @@
 <article>
-<h1>[P1][Challenges] Audit canonical automatic Challenge wake/requeue and identify residual gaps</h1>
-<p><strong>Objective:</strong> produce a source-backed audit of the existing Challenge wait state transitions and authority. This is read-only investigation; no source or ledger mutations.</p>
-
-<h2>Verified current baseline</h2>
-<p>Use the current verified original Jarvis <code>origin/main</code> baseline <code>95a471fc565b57fe309c65fc85f371693dbe9067</code>, unless a fresh remote check establishes a newer main.</p>
-
-<h2>Existing behavior Lead has verified — independently confirm</h2>
+<h1>[P1][Challenges] Audit canonical automatic Challenge wake/requeue and residual gaps</h1>
+<p><strong>Disposition:</strong> completed read-only audit. No implementation change and no separate non-agent requeue authority recommended.</p>
+<h2>Verified source and execution boundary</h2>
+<p>Audit baseline: clean original Jarvis <code>origin/main</code> <code>95a471fc565b57fe309c65fc85f371693dbe9067</code>. Assignment generation 2, attempt version 3, no source binding. Applicable task and AGENTS instructions read. No prior lifecycle checkpoint/history surfaced. No tests were executed; this is source inspection only.</p>
+<h2>Transition and authority contract</h2>
 <ul>
-<li><code>Client/Modules/ChallengeWorkflow.fs:wakeDependents</code> runs in the same ledger transaction when a Challenge first becomes <code>Satisfied</code>. It walks the reverse index, checks every linked dependency from the same snapshot, and validates task, attempt, owner and assignment generation. If the owner has no current assignment, is <code>Stopped</code>, and has <code>UnassignedDisposition=NeedsWork</code>, it requeues the blocked attempt and writes the wait, attempt, agent, assignment and lifecycle audit atomically. If the owner is occupied or parked, it persists the wait as <code>Eligible</code>.</li>
-<li><code>Client/Modules/ReviewWorkflow.fs:reconcileEligibleOnRelease</code> consumes eligible waits on canonical owner-release transitions. It verifies the exact wait/attempt/generation/owner and every dependency, then requeues at most one eligible wait when the owner is free and eligible. Parked owners remain eligible until explicit unpark.</li>
-<li>The helper is called by canonical completion/release paths and by <code>ChallengeWorkflow.blockAttempt</code>. Enumerate every call site and the transition that invokes it; do not assume the grep list is exhaustive if additional modules or admin paths exist.</li>
-<li><code>ChallengeWorkflow.requeueAttempt</code> is a separate owner-attributed recovery operation. Its validated attempt requires <code>attempt.OwnerAgentId = actor</code>. Do not call it as a Scheduler, impersonate the blocked owner, or propose an unrestricted service identity.</li>
-<li>Existing tests include <code>SatisfiedDependenciesRemainEligibleUntilBusyOwnerReleasesTheirSlot</code>, <code>ParkedOwnerKeepsDurableWakeUntilExplicitUnpark</code>, <code>FinalChallengeResolutionRequeuesEveryDistinctDependentOwner</code>, <code>BlockingAnotherAssignmentWakesPreviouslyEligibleWork</code>, and <code>AlreadySatisfiedDependenciesCannotCreateAnUnwakeableWait</code>.</li>
+<li><strong>Waiting → Requeued when owner is already free:</strong> <code>ChallengeWorkflow.blockAttempt</code> validates exact task/attempt/agent versions, current attempt, owner and generation; validates dependency identity and rejects duplicates/inaccessible/cancelled/wrong-task dependencies or a nonempty set already entirely Satisfied. Zero/manual or multiple dependencies are allowed. It writes the durable wait and immutable owner/challenge indexes, blocks the attempt, stops/unassigns the owner to NeedsWork, writes audit, and reconciles older Eligible work in the same transaction (ChallengeWorkflow.fs:1656-1795). Zero-dependency waits have no indexes.</li>
+<li><strong>Waiting → Eligible → Requeued when owner is busy:</strong> first transition to Satisfied calls <code>wakeDependents</code> in the same transaction (ChallengeWorkflow.fs:887-990). It validates index/wait identity, all dependencies, current task/attempt/owner/generation and Blocked phase (774-817). If the owner is Stopped, unassigned, NeedsWork and not already claimed in this wake, it requeues immediately; otherwise it persists Eligible (818-884). At most one wait per owner per wake.</li>
+<li><strong>Eligible → Requeued on owner release:</strong> <code>ReviewWorkflow.reconcileEligibleOnRelease</code> checks owner Stopped/unassigned/NeedsWork, wait/index identity, current InProgress task/attempt, exact owner/generation, Blocked phase and all dependencies still Satisfied; at most one wait per release (ReviewWorkflow.fs:792-903).</li>
+<li><strong>All direct reconciliation call sites found:</strong> <code>completeAgentWorkWithSession</code> (ReviewWorkflow.fs:2165-2171); <code>setAgentAdministrativeStateAs</code> to NeedsWork/unpark (2319-2322); <code>clearAdministrativeFocus</code> (2755-2761), called by ParkAttempt/BlockAttempt/AbandonAttempt/CancelTask and TransferOwner (2814, 2916); and <code>ChallengeWorkflow.blockAttempt</code> (1785-1794). No other direct call sites were found in Client F# sources.</li>
+<li><strong>Manual zero-dependency wait:</strong> explicit owner-attributed <code>RequeueAttempt</code> validates exact versions/generation, actor=attempt owner, free NeedsWork slot, Waiting status and all linked dependencies Satisfied (ChallengeWorkflow.fs:1800-1869; OrchestrationApi.fs:2801-2806). Generic ResumeAttempt rejects Waiting/Eligible challenge waits (ReviewWorkflow.fs:2779-2785).</li>
 </ul>
-
-<h2>Required audit deliverable</h2>
+<h2>CAS, idempotency, audit and source provenance</h2>
 <ul>
-<li>Produce a state-transition table for <code>Waiting → Requeued</code> (owner already free), <code>Waiting → Eligible → Requeued</code> (owner occupied then released), and <code>Waiting → Eligible</code> while owner remains parked/occupied. Include exact required conditions, task/attempt/generation/owner identity, source lease implications, CAS/version checks, and actor/audit provenance.</li>
-<li>Trace Challenge creation, condition satisfaction, operator response, <code>wakeDependents</code>, durable wait record, every <code>reconcileEligibleOnRelease</code> caller, and explicit <code>requeueAttempt</code>. Confirm whether all supported owner-release transitions invoke reconciliation.</li>
-<li>Inspect current tests for all-satisfied versus partial dependencies, duplicate/repeated wake delivery, operation idempotency, stale attempt generation, stale Challenge versions, owner busy/parked, explicit unpark, restart/persistence and actor attribution. Identify exact missing cases rather than proposing generic test expansion.</li>
-<li>State clearly whether any real state can remain <code>Eligible</code> while its exact owner is already stopped, unassigned and <code>NeedsWork</code>. If no such gap exists, conclude that a separate non-agent requeue authority is unnecessary for the existing Challenge flow.</li>
-<li>Only if a concrete release path or state can bypass the existing automatic reconciliation, report the exact file/method/call path, minimal failing scenario and narrow correction to Lead. Do not implement it.</li>
+<li><code>ChallengeWorkflow.changed</code> uses <code>LegacyDirectWriterFence.transact</code> (625-627), delegating to <code>LedgerStore.transact</code> (LegacyDirectWriterFence.fs:123-128). The ledger re-fetches, checks prior operation UUID, replans against the current snapshot, validates every ExpectedBlobOid, and retries/replans on non-fast-forward publication races (LedgerStore.fs:2300-2334, 2417-2433). If release commits first, satisfaction replans and sees a free owner; if satisfaction commits first, release replans and sees Eligible. Same UUID replay returns the prior receipt before planner execution.</li>
+<li>Immediate and delayed requeue record the actual operation actor in TaskLifecycleEvent.ActorId and AssignmentIssue.IssuerId (ChallengeWorkflow.fs:843-871; ReviewWorkflow.fs:877-899). The actor is the condition finalizer, authenticated operator, or actor completing/unparking/admin-releasing/blocking the owner's current work. Explicit requeue is owner-only; no Scheduler identity or notification side channel is required.</li>
+<li>Requeue preserves the same attempt and source provenance (BaseCommit, TargetRef, repository/remotes, SourceRef) while incrementing assignment generation; no new source binding/checkout lease is created (ReviewWorkflow.fs:118-152, 756-773; ChallengeWorkflow.fs:843-855, 1641-1654).</li>
+<li>No live/current wait can remain Eligible while its exact owner is already stopped, unassigned and NeedsWork: supported transitions into that state invoke reconciliation; satisfaction immediately requeues a free owner or records Eligible for a busy/parked owner; CAS replanning closes concurrent satisfaction/release ordering.</li>
+<li>A raw Eligible wait may remain after attempt cancellation/abandonment/transfer/supersession as historical data, but it is inert: reconciliation requires task InProgress/current attempt and exact Blocked generation (ReviewWorkflow.fs:820-829); inbox projects waits only for current Blocked attempts (3285-3302). This is hygiene, not a requeue-authority gap.</li>
 </ul>
-
-<h2>Boundaries</h2>
-<ul>
-<li>Read-only only: no source edits, task assignment, agent launch, Challenge requeue, Challenge creation/reply, live schedule change, deployment or migration.</li>
-<li>Do not use Telos Work/SQLite as a prerequisite. Prefer canonical Jarvis Git-ledger state and existing Challenge workflow.</li>
-<li>Any new Scheduler authority or runtime enablement requires a separate explicit Operator decision. Do not treat the earlier provisional request for a non-agent requeue identity as proof that such an identity is necessary or approved.</li>
-</ul>
-
-<h2>Acceptance</h2>
-<p>Deliver a concise source-backed state-transition/authority contract with exact source references, all release call sites, current test coverage and only concrete residual gaps. If existing paths are complete, say so explicitly and recommend no additional requeue authority.</p>
+<h2>Existing tests and concrete gaps</h2>
+<p>Existing <code>Client.Tests/ChallengeWorkflowTests.fs</code> covers All-vs-partial and canceled/already-satisfied dependencies (276-343, 345-380, 840-882); stale Challenge versions/concurrent condition writers (142-187, 247-272); busy-owner completion (690-721); parked-owner explicit unpark (764-790); multiple owners (794-836); zero-dependency explicit owner requeue (383-422); reblock/generation 2→3 and index retention (919-955); and operation replay for create/resolve, blockAttempt, partial resolution and operator response. The fixture uses two independent clones of a shared bare Git remote (40-69), covering cross-client persistence, but no explicit process restart test was found.</p>
+<ol>
+<li>No replay of the final Satisfied operation with an actual blocked dependent waiter, asserting one generation increment, one assignment issue and one lifecycle event.</li>
+<li>No race test between final dependency satisfaction and owner completion/unpark; current concurrency coverage races condition writers only.</li>
+<li>No assertions for ActorId/IssuerId on generated immediate and delayed requeue lifecycle events/assignment issues.</li>
+<li>No process restart/reopen test; generation coverage does not actively exercise a stale old locator against the new generation.</li>
+<li>No stale Eligible-wait inertness test after terminalization/transfer, although source guards exist.</li>
+</ol>
+<h2>Conclusion</h2>
+<p>Challenge-linked automatic requeue already exists via synchronous wake plus owner-release reconciliation, with transactional CAS/replanning and actor attribution. Do not add a non-agent requeue authority or change production logic on this audit. The next proportionate work is tests-only for the idempotency, satisfaction/release race and actor-provenance gaps; add restart/stale-wait coverage if it remains bounded. If a test exposes a production defect, report the exact failing transition and stop before editing implementation.</p>
 </article>

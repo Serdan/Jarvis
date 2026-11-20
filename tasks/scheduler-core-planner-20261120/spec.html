@@ -1,0 +1,39 @@
+<article>
+<h1>[P1][Scheduler] Deterministic Jarvis-ledger work planner</h1>
+<p><strong>Phase 1 of the Scheduler delivery.</strong> Build a default-off, deterministic decision core over the existing Jarvis Git-backed task/agent/review/Challenge state. This is implementation and tests, not a deployment or live dispatcher.</p>
+<h2>Verified baseline</h2>
+<ul>
+<li><code>scripts/manager-heartbeat.mjs</code> already contains a deterministic per-project planner and a durable local launch journal, but the model-based Manager still performs actual browser launches. Its fixed 5-worker/3-reviewer limits are project settings, not account-wide capacity.</li>
+<li><code>ChallengeWorkflow.wakeDependents</code> marks blocked waits eligible when required conditions become satisfied. Requeue is a separate agent-attributed operation; no non-agent reconciler currently consumes eligible waits.</li>
+<li><code>BrowserSchedules</code> is a per-client schedule runner, not an account-wide task/agent scheduler. The Work Queue Scheduler prototypes remain default-off and are explicitly outside this task.</li>
+<li><code>AfterAgentIdle</code> is intentionally fail-closed in <code>Client/Program.fs</code>; the legacy server SQLite activity table is not authoritative proof of inactivity.</li>
+</ul>
+<h2>Deliverable</h2>
+<p>Extend/extract the existing pure planning logic where practical; do not build a parallel framework without explaining why. Add a pure planner that accepts a fully materialized, freshness-checked account/project snapshot and emits deterministic decisions for existing Ready work, eligible Challenge-blocked attempts, and unclaimed review requests.</p>
+<h2>Snapshot contract</h2>
+<ul>
+<li>Include source commit/ref, observation time, completeness/freshness, all relevant project task/attempt state, source leases, agent state/current assignment/unassigned disposition, review request identity/version/status, and Challenge wait/condition identity/status.</li>
+<li>Include account-wide and project-level capacity evidence: configured limits, observed active sessions, reservations, and uncertain/in-flight launches across projects. Missing, stale, contradictory or incomplete capacity evidence must fail closed. Unknown/uncertain sessions count against capacity; never treat missing activity data as idle.</li>
+<li>Do not use local last-seen cache or legacy <code>FeedbackStore.attributed_agent_activity</code> absence as proof that an agent is idle.</li>
+</ul>
+<h2>Deterministic decisions</h2>
+<ul>
+<li>Emit a requeue intent only for a Challenge wait whose every required condition is Satisfied and whose exact attempt generation still matches; require the owner to be stopped, unassigned and explicitly eligible for work. Preserve the exact wait, attempt, owner, generation and expected state/version as provenance.</li>
+<li>Emit worker launch candidates only for existing Ready attempts whose task is still Open/InProgress, source lease is valid, owner is available, and all capacity checks pass.</li>
+<li>Emit reviewer candidates only for exact unclaimed frozen review requests; do not route work to a named reviewer or merge review and implementation authority.</li>
+<li>Use stable idempotency keys derived from project/task/attempt/generation or review ID/version. Identical snapshots must produce identical decisions; repeated polling must not mint new launch identities.</li>
+<li>Represent Wait/Hold reasons explicitly for stale snapshots, missing capacity, busy/parked owners, source conflicts, unresolved Challenges, terminal tasks, uncertain submissions and duplicate reservations.</li>
+</ul>
+<h2>Boundaries</h2>
+<ul>
+<li>No assignment mutation, Challenge requeue mutation, agent impersonation, browser prompt submission, session launch, live schedule change, deployment, restart, migration or activation.</li>
+<li>Do not depend on Telos Work, Work Queue SQLite, or the Work Scheduler prototypes. Do not enable the Manager heartbeat or AfterAgentIdle.</li>
+<li>Do not edit the currently leased BrowserSchedules/BrowserBridge files. Keep the new planner in a narrow, independently testable surface.</li>
+</ul>
+<h2>Tests and acceptance</h2>
+<ul>
+<li>Test deterministic repeat plans and stable keys; account-wide plus project capacity; unknown/uncertain sessions; stale/incomplete snapshots; source lease conflicts; terminal tasks; unclaimed review selection; pending versus fully satisfied Challenge waits; stale attempt generation; parked versus NeedsWork owner; restart/repeated poll behavior.</li>
+<li>Provide a runnable test command and a sample snapshot/decision trace showing a satisfied Challenge wait becoming a requeue intent and then a capacity-gated worker launch candidate.</li>
+<li>Document the exact remaining authority/runtime boundary for Phase 2. This phase is accepted only when the planner is independently reviewed and no live side effects have been introduced.</li>
+</ul>
+</article>

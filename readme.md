@@ -28,6 +28,7 @@ Run JarvisClient with a workspace, sign in, and connect an MCP-capable assistant
 - [Project instructions](docs/AgentInstructions.md)
 - [Browser bridge](browser-extension/README.md)
 - [Privacy and data handling](docs/privacy.md)
+- [Telos product specification experiment](docs/product-spec/README.md)
 
 ## License
 

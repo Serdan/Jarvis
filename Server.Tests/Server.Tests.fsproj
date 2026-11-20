@@ -22,6 +22,7 @@
         <Compile Include="WorkLegacyImportFenceTests.fs"/>
         <Compile Include="OriginalGitPublisherAdmissionTests.fs"/>
         <Compile Include="OriginalGitPublisherGatewayTests.fs"/>
+        <Compile Include="OriginalGitSourceObjectHandoffTests.fs"/>
 
         <Compile Include="WorkCompositionTests.fs"/>
         <Compile Include="WorkSqliteAuthorityTests.fs"/>

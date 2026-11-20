@@ -1947,7 +1947,7 @@ module LedgerStore =
 
     // The source operation is separate from the canonical ledger commit.
     // The absent-ref lease enforces create-only publication, even for fast-forward related heads.
-    let publishReviewRef (binding: LedgerBinding) gitRef headOid =
+    let private publishReviewRefCore requireFresh (binding: LedgerBinding) gitRef headOid =
         if not (safeReviewRef gitRef) || isNull headOid || not (oidPattern.IsMatch headOid) then
             Error(InvalidBinding "Invalid review source ref or head OID.")
         else
@@ -1959,21 +1959,26 @@ module LedgerStore =
                 | Ok () ->
                     match remoteReviewRef binding gitRef with
                     | Error error -> Error error
-                    | Ok(Some current) when current = headOid -> Ok ()
+                    | Ok(Some current) when current = headOid ->
+                        if requireFresh then Error(OutcomeUnknown "SourceRefEffectStage/AlreadyPresentBeforeCreate")
+                        else Ok ()
                     | Ok(Some _) -> Error(SourceReviewRefUnavailable "Existing immutable review ref points to another commit.")
                     | Ok None ->
                         let publishAndConfirm () =
                             let result =
                                 git binding.RepositoryPath
                                     [ "push"; "--porcelain"; $"--force-with-lease={gitRef}:"; binding.RemoteName; $"{headOid}:{gitRef}" ]
-                            match remoteReviewRef binding gitRef with
-                            | Ok(Some observed) when observed = headOid -> Ok ()
-                            | Ok(Some _) -> Error(SourceReviewRefUnavailable "Immutable review ref changed or was claimed elsewhere.")
-                            | Ok None ->
-                                match result with
-                                | Ok output when output.ExitCode <> 0 -> Error(GitFailure $"Source publication rejected: {output.Stderr}")
-                                | _ -> Error(OutcomeUnknown $"Cannot confirm source publication at {gitRef}.")
-                            | Error _ -> Error(OutcomeUnknown $"Cannot verify source publication at {gitRef}.")
+                            match result, remoteReviewRef binding gitRef with
+                            | Ok output, Ok(Some observed)
+                                when observed = headOid && (not requireFresh || output.ExitCode = 0) -> Ok ()
+                            | _, Ok(Some observed) when observed = headOid ->
+                                Error(OutcomeUnknown "SourceRefEffectStage/UnattributedSameHeadAfterPush")
+                            | _, Ok(Some _) ->
+                                Error(SourceReviewRefUnavailable "Immutable review ref changed or was claimed elsewhere.")
+                            | Ok output, Ok None when output.ExitCode <> 0 ->
+                                Error(GitFailure $"Source publication rejected: {output.Stderr}")
+                            | _, Ok None -> Error(OutcomeUnknown $"Cannot confirm source publication at {gitRef}.")
+                            | _, Error _ -> Error(OutcomeUnknown $"Cannot verify source publication at {gitRef}.")
                         OriginalGitWriterAdmissionJournal.withPublication
                             (OriginalGitWriterAdmissionJournal.deterministicOperationId "ReviewRef" gitRef headOid)
                             "ReviewRef"
@@ -1981,6 +1986,9 @@ module LedgerStore =
                                 [ "project-source"; binding.ProjectId.ToString("D"); binding.LedgerId.ToString("D")
                                   string binding.Epoch; binding.ApprovedFetchUrl; binding.ApprovedPushUrl ])
                             gitRef headOid publishAndConfirm (fun () -> true) OutcomeUnknown
+
+    let publishReviewRef binding gitRef headOid =
+        publishReviewRefCore false binding gitRef headOid
 
     // A submission owns a create-only source snapshot, independently fetchable on
     // a different machine even after its contributor branch moves or disappears.
@@ -1995,7 +2003,7 @@ module LedgerStore =
             validate binding
             |> Result.bind (fun () -> remoteReviewRef binding gitRef)
 
-    let publishIntegrationRef (binding: LedgerBinding) gitRef headOid =
+    let private publishIntegrationRefCore requireFresh (binding: LedgerBinding) gitRef headOid =
         if not (safeIntegrationRef gitRef) || not (validSourceCommitOid headOid) then
             Error(InvalidBinding "Invalid managed integration ref or pinned commit.")
         else
@@ -2007,21 +2015,26 @@ module LedgerStore =
                 | Ok () ->
                     match remoteReviewRef binding gitRef with
                     | Error error -> Error error
-                    | Ok(Some current) when current = headOid -> Ok ()
+                    | Ok(Some current) when current = headOid ->
+                        if requireFresh then Error(OutcomeUnknown "SourceRefEffectStage/AlreadyPresentBeforeCreate")
+                        else Ok ()
                     | Ok(Some _) -> Error(SourceReviewRefUnavailable "Managed integration ref already points to another commit.")
                     | Ok None ->
                         let publishAndConfirm () =
                             let pushed =
                                 git binding.RepositoryPath
                                     [ "push"; "--porcelain"; $"--force-with-lease={gitRef}:"; binding.RemoteName; $"{headOid}:{gitRef}" ]
-                            match remoteReviewRef binding gitRef with
-                            | Ok(Some observed) when observed = headOid -> Ok ()
-                            | Ok(Some _) -> Error(SourceReviewRefUnavailable "Managed integration ref changed during publication.")
-                            | Ok None ->
-                                match pushed with
-                                | Ok output when output.ExitCode <> 0 -> Error(GitFailure $"Integration snapshot publication rejected: {output.Stderr}")
-                                | _ -> Error(OutcomeUnknown $"Cannot confirm managed integration snapshot at {gitRef}.")
-                            | Error _ -> Error(OutcomeUnknown $"Cannot verify managed integration snapshot at {gitRef}.")
+                            match pushed, remoteReviewRef binding gitRef with
+                            | Ok output, Ok(Some observed)
+                                when observed = headOid && (not requireFresh || output.ExitCode = 0) -> Ok ()
+                            | _, Ok(Some observed) when observed = headOid ->
+                                Error(OutcomeUnknown "SourceRefEffectStage/UnattributedSameHeadAfterPush")
+                            | _, Ok(Some _) ->
+                                Error(SourceReviewRefUnavailable "Managed integration ref changed during publication.")
+                            | Ok output, Ok None when output.ExitCode <> 0 ->
+                                Error(GitFailure $"Integration snapshot publication rejected: {output.Stderr}")
+                            | _, Ok None -> Error(OutcomeUnknown $"Cannot confirm managed integration snapshot at {gitRef}.")
+                            | _, Error _ -> Error(OutcomeUnknown $"Cannot verify managed integration snapshot at {gitRef}.")
                         OriginalGitWriterAdmissionJournal.withPublication
                             (OriginalGitWriterAdmissionJournal.deterministicOperationId "IntegrationRef" gitRef headOid)
                             "IntegrationRef"
@@ -2029,6 +2042,9 @@ module LedgerStore =
                                 [ "project-source"; binding.ProjectId.ToString("D"); binding.LedgerId.ToString("D")
                                   string binding.Epoch; binding.ApprovedFetchUrl; binding.ApprovedPushUrl ])
                             gitRef headOid publishAndConfirm (fun () -> true) OutcomeUnknown
+
+    let publishIntegrationRef binding gitRef headOid =
+        publishIntegrationRefCore false binding gitRef headOid
 
     // Inspect the source remote without altering a local branch/worktree.
     // Only parser-validated review refs in one task namespace are returned.
@@ -2084,16 +2100,20 @@ module LedgerStore =
                                         [ "push"; "--porcelain"
                                           $"--force-with-lease={gitRef}:{expectedOid}"
                                           binding.RemoteName; $":{gitRef}" ]
-                        inspectRemoteReviewRef binding gitRef
-                        |> Result.bind (function
-                            | None -> Ok "Deleted"
-                            | Some found when found <> expectedOid ->
-                                Error(SourceReviewRefUnavailable "Review ref changed during guarded deletion.")
-                            | Some _ ->
-                                match push with
-                                | Ok response when response.ExitCode <> 0 ->
-                                    Error(GitFailure $"Guarded review deletion rejected: {response.Stderr}")
-                                | _ ->
+                        // Ref absence after a failed or unobservable push cannot
+                        // attribute the deletion to this source-effect stage.
+                        match push with
+                        | Error _ ->
+                            Error(OutcomeUnknown "Guarded review deletion has no acknowledged push result.")
+                        | Ok response when response.ExitCode <> 0 ->
+                            Error(OutcomeUnknown "Guarded review deletion push was not acknowledged.")
+                        | Ok _ ->
+                            inspectRemoteReviewRef binding gitRef
+                            |> Result.bind (function
+                                | None -> Ok "Deleted"
+                                | Some found when found <> expectedOid ->
+                                    Error(SourceReviewRefUnavailable "Review ref changed during guarded deletion.")
+                                | Some _ ->
                                     Error(OutcomeUnknown "Cannot confirm guarded review ref deletion."))
                     OriginalGitWriterAdmissionJournal.withPublication
                         (OriginalGitWriterAdmissionJournal.deterministicOperationId "ReviewRefDelete" gitRef expectedOid)
@@ -2438,3 +2458,135 @@ module LedgerStore =
                                                   | Ok(Choice2Of2 failure) -> Error failure
                                                   | Error failure -> Error failure
             withTransportScope intent.OperationId (fun () -> attempt 0 false)
+
+    // A managed source ref is a physical side effect distinct from its later
+    // project-ledger CAS. Commit the immutable parent action/stage/ref/OID
+    // selection in the existing host-owned journal BEFORE the old physical
+    // leaf publishes. The old leaf separately journals the actual Git ref.
+    // This is local/default-off correlation, never remote actor attestation.
+    let private withSourceRefEffectStage
+        (binding: LedgerBinding) (action: LedgerIntent) expectedAction stageKind
+        (validRef: string -> bool) gitRef firstOid
+        (preflight: bool -> Result<unit, LedgerFailure>)
+        (publish: bool -> Result<'a, LedgerFailure>)
+        (verified: 'a -> bool) (provenNoEffect: 'a -> bool) : Result<'a, LedgerFailure> =
+        if action.OperationId = Guid.Empty || action.Kind <> expectedAction
+           || String.IsNullOrWhiteSpace action.Actor
+           || not (validRequestJson action.RequestJson)
+           || not (validRef gitRef) || not (validSourceCommitOid firstOid) then
+            Error(InvalidBinding "Invalid parent action or managed source-ref effect stage.")
+        else
+            let stageId =
+                OriginalGitWriterAdmissionJournal.deterministicOperationId
+                    ("OriginalGitSourceRefStage/v1/" + stageKind)
+                    (action.OperationId.ToString("D")) "parent-action"
+            let journalKind = "SourceRefEffectStage/" + stageKind
+            // Logical journal key stays fixed across changed ref/OID/request.
+            // The payload commitment binds the exact first physical selection.
+            let logicalStageRef = $"source-effect-stage:{stageId:N}"
+            let payload =
+                json {| schemaVersion = 1; parentOperationId = action.OperationId.ToString("D")
+                        stageId = stageId.ToString("D"); stageKind = stageKind
+                        managedRef = gitRef; firstIntendedOid = firstOid
+                        canonicalParentRequestSha256 = intentHash binding action |}
+            let authority =
+                OriginalGitWriterAdmissionJournal.authoritySha256
+                    [ "project-source"; binding.ProjectId.ToString("D"); binding.LedgerId.ToString("D")
+                      string binding.Epoch; binding.ApprovedFetchUrl; binding.ApprovedPushUrl ]
+            OriginalGitWriterAdmissionJournal.withPublicationClassified
+                stageId journalKind authority logicalStageRef payload
+                (fun enabled ->
+                    match preflight enabled with
+                    | Error failure -> Error failure
+                    | Ok () -> publish enabled)
+                verified provenNoEffect OutcomeUnknown
+
+    // Keep direct leaf APIs' default-off compatibility. ReviewWorkflow's
+    // original UUID and canonical request digest now follow their ref effect.
+    let publishReviewRefForAction binding (action: LedgerIntent) gitRef headOid =
+        let purpose =
+            match action.Kind with
+            | "SubmitBranchReview" -> Some("SubmitBranchReview", "ReviewCreate")
+            | "ReplaceBranchReview" -> Some("ReplaceBranchReview", "ReviewReplace")
+            | _ -> None
+        match purpose with
+        | None -> Error(InvalidBinding "Review source stage requires a create/replace parent action.")
+        | Some(expected, stage) ->
+            withSourceRefEffectStage binding action expected stage safeReviewRef gitRef headOid
+                (fun enabled ->
+                    if not enabled then Ok ()
+                    else
+                        match inspectRemoteReviewRef binding gitRef with
+                        | Ok None -> Ok ()
+                        | Ok(Some _) ->
+                            Error(OutcomeUnknown "SourceRefEffectStage/PreexistingReviewRefNotAttributable")
+                        | Error failure -> Error failure)
+                (fun enabled -> publishReviewRefCore enabled binding gitRef headOid)
+                (fun () -> true)
+                (fun _ -> false)
+
+    let publishIntegrationRefForAction binding (action: LedgerIntent) gitRef headOid =
+        withSourceRefEffectStage binding action "SubmitIntegration" "IntegrationCreate"
+            safeIntegrationRef gitRef headOid
+            (fun enabled ->
+                if not enabled then Ok ()
+                else
+                    match inspectRemoteIntegrationRef binding gitRef with
+                    | Ok None -> Ok ()
+                    | Ok(Some _) ->
+                        Error(OutcomeUnknown "SourceRefEffectStage/PreexistingIntegrationRefNotAttributable")
+                    | Error failure -> Error failure)
+            (fun enabled -> publishIntegrationRefCore enabled binding gitRef headOid)
+            (fun () -> true)
+            (fun _ -> false)
+
+    // This bounded entrypoint is not connected to an unsanctioned cleanup route.
+    // No canonical deletion action currently exists in ReviewWorkflow.
+    let deleteReservedReviewRefForAction binding (action: LedgerIntent) gitRef expectedOid =
+        if action.Kind <> "DeleteReservedReviewRef" || action.OperationId = Guid.Empty
+           || not (safeReviewRef gitRef) || not (validSourceCommitOid expectedOid) then
+            Error(InvalidBinding "Invalid guarded review source-ref deletion action.")
+        else
+            // A wrong-OID first attempt has no delete lease; leave the journal
+            // untouched so a corrected first selection can still be submitted.
+            // Absence is different: a prior identical stage might have removed
+            // the ref before its acknowledgement was lost. Enter its durable
+            // admission fence even when the remote ref is now missing.
+            match inspectRemoteReviewRef binding gitRef with
+            | Error failure -> Error failure
+            | Ok(Some current) when current <> expectedOid ->
+                Error(SourceReviewRefUnavailable "Guarded source-stage delete OID mismatch.")
+            | Ok initialRef ->
+                let initiallyAbsent = Option.isNone initialRef
+                withSourceRefEffectStage binding action "DeleteReservedReviewRef" "ReviewGuardedDelete"
+                    safeReviewRef gitRef expectedOid
+                    (fun enabled ->
+                        if not enabled then Ok ()
+                        else
+                            match inspectRemoteReviewRef binding gitRef with
+                            | Ok None when initiallyAbsent -> Ok ()
+                            | Ok(Some current) when not initiallyAbsent && current = expectedOid -> Ok ()
+                            | Ok None ->
+                                Error(OutcomeUnknown "SourceRefEffectStage/RefDisappearedAfterInitialObservation")
+                            | Ok(Some _) ->
+                                Error(SourceReviewRefUnavailable "Guarded source-stage delete OID changed.")
+                            | Error failure -> Error failure)
+                    (fun _ ->
+                        if initiallyAbsent then
+                            // Fresh no-op: reconfirm absence before reporting it.
+                            // No push occurred, so this is a proven rejection of
+                            // the physical stage, never authenticated deletion.
+                            match inspectRemoteReviewRef binding gitRef with
+                            | Ok None -> Ok "AlreadyAbsent"
+                            | Ok(Some _) ->
+                                Error(OutcomeUnknown "SourceRefEffectStage/RefAppearedDuringNoOp")
+                            | Error failure -> Error failure
+                        else
+                            match deleteReservedReviewRef binding gitRef expectedOid with
+                            | Ok "AlreadyAbsent" ->
+                                // A concurrent removal between observations is
+                                // unattributed, not an acknowledged own effect.
+                                Error(OutcomeUnknown "SourceRefEffectStage/UnattributedConcurrentRemoval")
+                            | outcome -> outcome)
+                    (fun status -> status = "Deleted")
+                    (fun status -> initiallyAbsent && status = "AlreadyAbsent")

@@ -1,7 +1,50 @@
 namespace Common.SignalR
 
+open System
+open System.Security.Cryptography
+open System.Text
 open System.Threading.Tasks
 open Common
+
+/// Server-authenticated provenance for one project-scoped agent MCP dispatch.
+/// The client validates every field against its live SignalR session before
+/// publishing the watermark. ConnectionId is transport metadata, not a bearer.
+[<CLIMutable>]
+type AgentActivityDispatch =
+    { SchemaVersion: int
+      ProjectName: string
+      AgentId: string
+      AccountScope: string
+      DeviceId: string
+      ConnectionId: string
+      ConnectionGeneration: int64
+      CorrelationId: string
+      EventId: string
+      CommandName: string
+      ObservedAtUtc: DateTimeOffset }
+
+/// Backwards-compatible envelope over the existing command JSON argument.
+/// Older clients do not advertise the capability and therefore never receive it.
+[<CLIMutable>]
+type AgentActivityCommandEnvelope =
+    { SchemaVersion: int
+      CommandJson: string
+      Activity: AgentActivityDispatch }
+
+module AgentActivityProtocol =
+    /// Negotiated through SupportedCommands without changing the hub contract.
+    let capability = "AgentActivityIngressV1"
+    let schemaVersion = 1
+    let recordKind = "AgentActivityWatermark"
+    let sourceKind = "AuthenticatedMcpToolIngress"
+
+    /// Stable account partition shared by the authenticated server and client.
+    /// The raw OAuth subject is never written to the project Git ledger.
+    let accountScopeFromSubject (subject: string) =
+        if String.IsNullOrWhiteSpace subject then None
+        else
+            let digest = SHA256.HashData(Encoding.UTF8.GetBytes subject)
+            Some("operator:" + Convert.ToHexString(digest).ToLowerInvariant())
 
 type IClientService =
     abstract ReceiveMessage: message: string -> Task

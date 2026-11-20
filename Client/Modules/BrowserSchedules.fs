@@ -247,6 +247,11 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                 prop "registrationId", safeUrl, prop "cleanup",
                 (if state = "notSubmitted" then "failed" else status)
             with _ -> rawResult, "", "", status
+        let outcomeUnknownError =
+            if String.IsNullOrWhiteSpace error then
+                "OutcomeUnknown: execution outcome is unknown; explicit re-registration required."
+            elif error.Contains("OutcomeUnknown", StringComparison.OrdinalIgnoreCase) then error
+            else "OutcomeUnknown: " + error
         lock gate (fun () ->
             match actions |> List.tryFind (fun a ->
                 not disposed && a.Id = id && a.AttemptId = attemptId && a.Status = "running") with
@@ -261,7 +266,13 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                 elif rawResult.Length > 200 then rawResult.Substring(0, 200)
                                 else rawResult
                             else ""
-                        if a.Disabled then
+                        if effectiveStatus = "outcomeUnknown" then
+                            // The external effect may already have happened. Keep the
+                            // occurrence and its evidence terminal until explicit recovery.
+                            { a with Status = "outcomeUnknown"; RegistrationId = registrationId
+                                     ConversationUrl = conversationUrl; Cleanup = cleanup
+                                     Error = outcomeUnknownError; LastResult = resultSummary; UpdatedAtUtc = now }
+                        elif a.Disabled then
                             { a with Status = "canceled"; Error = error; LastResult = resultSummary; UpdatedAtUtc = now }
                         elif effectiveStatus = "suspended" then
                             // A provider UI contract failure needs inspection, not another
@@ -345,26 +356,11 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                           Error = "ScriptSourceDigestMissing: explicit re-registration required."
                                           UpdatedAtUtc = clock() }
                         elif action.Status = "running" then
-                            if isIdle action then
-                                let now = clock()
-                                let stale = action.StartedAtUtc.AddMinutes(30.)
-                                { action with Status = "pending"
-                                              DueAtUtc = max now stale
-                                              Error = "outcomeUnknown: prior Manager launch interrupted; next attempt only after stale cutoff."
-                                              UpdatedAtUtc = now }
-                            elif action.RepeatEverySeconds > 0 then
-                                let now = clock()
-                                let seconds = float action.RepeatEverySeconds
-                                let elapsed = max 0.0 (now - action.DueAtUtc).TotalSeconds
-                                let skipped = floor(elapsed / seconds) + 1.0
-                                { action with Status = "pending"
-                                              DueAtUtc = action.DueAtUtc.AddSeconds(skipped * seconds)
-                                              Error = "outcomeUnknown: previous occurrence interrupted; never replayed."
-                                              UpdatedAtUtc = now }
-                            else
-                                { action with Status = "outcomeUnknown"
-                                              Error = "JarvisClient stopped after claiming this one-shot action; it was not replayed."
-                                              UpdatedAtUtc = clock() }
+                            // A persisted running claim may already have produced an
+                            // external effect. Restart must fence it, never re-arm it.
+                            { action with Status = "outcomeUnknown"
+                                          Error = "OutcomeUnknown: prior occurrence was interrupted while running; explicit re-registration required."
+                                          UpdatedAtUtc = clock() }
                         elif action.Status = "pending" && action.RepeatEverySeconds > 0 &&
                              action.DueAtUtc < clock() then
                             let now = clock()
@@ -665,19 +661,18 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                                 | _ when a.Status = "waitingActivity" &&
                                                          a.StartedAtUtc <> DateTimeOffset.MinValue &&
                                                          current >= a.StartedAtUtc.AddMinutes(30.) ->
-                                                    // A submitted Manager may never make its first
-                                                    // tool call. The old attempt is now uncertain;
-                                                    // allow ONE verified replacement after 30m.
-                                                    { a with Status = "pending"; DueAtUtc = current
-                                                             Error = "outcomeUnknown: Manager launch had no tool activity for 30 minutes."
+                                                    // No activity is not proof that a submitted
+                                                    // Manager had no external effect. Fail closed.
+                                                    { a with Status = "outcomeUnknown"
+                                                             Error = "OutcomeUnknown: Manager launch had no tool activity for 30 minutes; explicit re-registration required."
                                                              UpdatedAtUtc = current }
                                                 | _ -> a
                                             | "running" ->
                                                 let activity = latest |> Option.defaultValue DateTimeOffset.MinValue
                                                 let lastProgress = max a.StartedAtUtc activity
                                                 if current >= lastProgress.AddMinutes(30.) then
-                                                    { a with Status = "pending"; DueAtUtc = current
-                                                             Error = "outcomeUnknown: previous Manager launch stale after 30 minutes."
+                                                    { a with Status = "outcomeUnknown"
+                                                             Error = "OutcomeUnknown: previous Manager launch stale after 30 minutes; explicit re-registration required."
                                                              UpdatedAtUtc = current }
                                                 else a
                                             | _ -> a)

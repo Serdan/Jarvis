@@ -466,7 +466,7 @@ let explicitUtcAndBrowserActionsUseSameScheduleStore () =
         Directory.Delete(dir, true)
 
 [<Test>]
-let staleManagerAttemptRequiresThirtyMinutesAndRejectsLateResult () = task {
+let staleManagerAttemptBecomesTerminalUnknownAfterThirtyMinutesAndRejectsLateResult () = task {
     let dir,path = temp()
     let mutable clock = DateTimeOffset.UtcNow
     let verifiedLastSeen = clock
@@ -491,16 +491,230 @@ let staleManagerAttemptRequiresThirtyMinutesAndRejectsLateResult () = task {
         do! Task.Delay(100)
         Assert.That(calls, Is.EqualTo(1), "One running Manager before the stale cutoff")
         clock <- clock.AddMinutes(2.)
-        do! awaitStatus (fun () -> calls = 2 && status store "manager-stale" = "waitingActivity")
+        do! awaitStatus (fun () -> status store "manager-stale" = "outcomeUnknown")
+        Assert.That(calls, Is.EqualTo(1), "An uncertain Manager launch must not be re-armed")
         firstGate.TrySetResult(()) |> ignore
         do! Task.Delay(100)
-        Assert.That(calls, Is.EqualTo(2))
-        Assert.That(status store "manager-stale", Is.EqualTo("waitingActivity"),
-                    "A late first-attempt result cannot overwrite the replacement")
+        Assert.That(calls, Is.EqualTo(1))
+        Assert.That(status store "manager-stale", Is.EqualTo("outcomeUnknown"),
+                    "A late result cannot overwrite the terminal unknown occurrence")
+        Assert.That(store.List(), Does.Contain("OutcomeUnknown: previous Manager launch stale after 30 minutes"))
     finally
         firstGate.TrySetResult(()) |> ignore
         Directory.Delete(dir, true)
 }
+
+[<Test>]
+let recurringOutcomeUnknownIsTerminalAndEvidenceSurvivesRestart () = task {
+    let dir,path = temp()
+    let mutable clock = DateTimeOffset.UtcNow
+    let mutable calls = 0
+    let executor (_: BrowserSchedules.ScheduledAction) = task {
+        System.Threading.Interlocked.Increment(&calls) |> ignore
+        return Error(
+            """{"registrationId":"uncertain-tab","status":"submitted","scriptResult":{"conversationUrl":"https://chatgpt.com/c/uncertain"},"cleanup":"notAttempted"}""",
+            "OutcomeUnknown: browser job result was lost after launch")
+    }
+    try
+        let! originalDue =
+            task {
+                use first = new BrowserSchedules.Service(path, executor, now=(fun () -> clock), pollMs=25)
+                Assert.That(first.Schedule("recurring-unknown", 5, "https://chatgpt.com/", "Scripts",
+                    "launch.js", "", "{}", false, windowRegistration="agents",
+                    repeatEverySeconds=600).IsOk, Is.True)
+                let due = getDue first "recurring-unknown"
+                first.Start()
+                clock <- clock.AddSeconds(6.)
+                do! awaitStatus (fun () -> status first "recurring-unknown" = "outcomeUnknown")
+                Assert.That(calls, Is.EqualTo(1))
+                use persisted = JsonDocument.Parse(File.ReadAllText(path))
+                let entry = persisted.RootElement.GetProperty("actions")[0]
+                Assert.That(entry.GetProperty("Status").GetString(), Is.EqualTo("outcomeUnknown"))
+                Assert.That(entry.GetProperty("DueAtUtc").GetDateTimeOffset(), Is.EqualTo(due))
+                Assert.That(entry.GetProperty("RegistrationId").GetString(), Is.EqualTo("uncertain-tab"))
+                Assert.That(entry.GetProperty("ConversationUrl").GetString(),
+                            Is.EqualTo("https://chatgpt.com/c/uncertain"))
+                Assert.That(entry.GetProperty("Cleanup").GetString(), Is.EqualTo("notAttempted"))
+                Assert.That(entry.GetProperty("Error").GetString(),
+                            Does.Contain("OutcomeUnknown: browser job result was lost after launch"))
+                clock <- clock.AddDays(3.)
+                do! Task.Delay(100)
+                Assert.That(calls, Is.EqualTo(1), "An unknown recurring occurrence must not run again")
+                return due
+            }
+        use restored = new BrowserSchedules.Service(path, executor, now=(fun () -> clock), pollMs=25)
+        restored.Start()
+        do! Task.Delay(100)
+        Assert.That(status restored "recurring-unknown", Is.EqualTo("outcomeUnknown"))
+        Assert.That(getDue restored "recurring-unknown", Is.EqualTo(originalDue))
+        Assert.That(calls, Is.EqualTo(1), "Restart must not re-arm an unknown recurring occurrence")
+    finally
+        Directory.Delete(dir, true)
+}
+
+[<Test>]
+let idleOutcomeUnknownIsTerminalAndDoesNotRearmOnNewActivity () = task {
+    let dir,path = temp()
+    let mutable clock = DateTimeOffset.UtcNow
+    let mutable lastSeen = Some clock
+    let mutable calls = 0
+    let seen _ _ = lastSeen
+    let verify _ _ = Task.FromResult(Ok lastSeen)
+    let executor (_: BrowserSchedules.ScheduledAction) = task {
+        System.Threading.Interlocked.Increment(&calls) |> ignore
+        return Error("", "OutcomeUnknown: idle Manager launch result was lost")
+    }
+    try
+        use store = new BrowserSchedules.Service(path, executor, now=(fun () -> clock), pollMs=25,
+            agentLastSeen=seen, verifyIdleActivity=verify)
+        let config =
+            { commandSchedule "idle-unknown" "AfterAgentIdle" with
+                RunAfterSeconds = None; IdleAgentId = Some "Manager"; IdleSeconds = Some 60
+                ActionKind = "BrowserScript"; Executable = None; Args = []
+                WindowRegistration = Some "agents"; Url = Some "https://chatgpt.com/"
+                ScriptPath = Some "launch.js"; ArgsJson = Some "{}" }
+        Assert.That(store.ScheduleExecution(config).IsOk, Is.True)
+        let due = getDue store "idle-unknown"
+        store.Start()
+        clock <- clock.AddSeconds(61.)
+        do! awaitStatus (fun () -> status store "idle-unknown" = "outcomeUnknown")
+        Assert.That(calls, Is.EqualTo(1))
+        lastSeen <- Some(clock.AddMinutes(5.))
+        clock <- clock.AddHours(1.)
+        do! Task.Delay(150)
+        Assert.That(status store "idle-unknown", Is.EqualTo("outcomeUnknown"))
+        Assert.That(getDue store "idle-unknown", Is.EqualTo(due))
+        Assert.That(calls, Is.EqualTo(1), "Fresh activity cannot silently re-arm an unknown occurrence")
+        Assert.That(store.List(), Does.Contain("OutcomeUnknown: idle Manager launch result was lost"))
+    finally
+        Directory.Delete(dir, true)
+}
+
+[<Test>]
+let interruptedRecurringAndIdleClaimsRecoverAsTerminalUnknown () = task {
+    let dir,path = temp()
+    let start = DateTimeOffset.UtcNow
+    let mutable clock = start
+    let mutable calls = 0
+    let seen _ _ = Some start
+    let verify _ _ = Task.FromResult(Ok(Some start))
+    let executor (_: BrowserSchedules.ScheduledAction) = task {
+        System.Threading.Interlocked.Increment(&calls) |> ignore
+        return Ok "unexpected replay"
+    }
+    try
+        let! (recurringDue, idleDue) =
+            task {
+                use initial = new BrowserSchedules.Service(path, executor, now=(fun () -> clock), pollMs=25,
+                    agentLastSeen=seen, verifyIdleActivity=verify)
+                Assert.That(initial.Schedule("recurring-crash", 5, "https://chatgpt.com/", "Scripts",
+                    "launch.js", "", "{}", false, windowRegistration="agents",
+                    repeatEverySeconds=600).IsOk, Is.True)
+                let idle =
+                    { commandSchedule "idle-crash" "AfterAgentIdle" with
+                        RunAfterSeconds = None; IdleAgentId = Some "Manager"; IdleSeconds = Some 60
+                        ActionKind = "BrowserScript"; Executable = None; Args = []
+                        WindowRegistration = Some "agents"; Url = Some "https://chatgpt.com/"
+                        ScriptPath = Some "launch.js"; ArgsJson = Some "{}" }
+                Assert.That(initial.ScheduleExecution(idle).IsOk, Is.True)
+                return (getDue initial "recurring-crash", getDue initial "idle-crash")
+            }
+        let state = JsonNode.Parse(File.ReadAllText(path))
+        for item in state["actions"].AsArray() do
+            let id = item["Id"].GetValue<string>()
+            if id = "recurring-crash" || id = "idle-crash" then
+                item["Status"] <- JsonValue.Create("running")
+                item["AttemptId"] <- JsonValue.Create("interrupted-" + id)
+                item["StartedAtUtc"] <- JsonValue.Create(start.AddMinutes(-35.))
+        File.WriteAllText(path, state.ToJsonString())
+        clock <- start.AddDays(2.)
+        use restored = new BrowserSchedules.Service(path, executor, now=(fun () -> clock), pollMs=25,
+            agentLastSeen=seen, verifyIdleActivity=verify)
+        Assert.That(status restored "recurring-crash", Is.EqualTo("outcomeUnknown"))
+        Assert.That(status restored "idle-crash", Is.EqualTo("outcomeUnknown"))
+        Assert.That(getDue restored "recurring-crash", Is.EqualTo(recurringDue))
+        Assert.That(getDue restored "idle-crash", Is.EqualTo(idleDue))
+        let attemptId id =
+            use doc = JsonDocument.Parse(valueOrFail (restored.Get(id)))
+            doc.RootElement.GetProperty("attemptId").GetString()
+        Assert.That(attemptId "recurring-crash", Is.EqualTo("interrupted-recurring-crash"))
+        Assert.That(attemptId "idle-crash", Is.EqualTo("interrupted-idle-crash"))
+        restored.Start()
+        clock <- clock.AddDays(3.)
+        do! Task.Delay(150)
+        Assert.That(calls, Is.Zero, "Interrupted recurring and idle claims must never replay")
+        Assert.That(status restored "recurring-crash", Is.EqualTo("outcomeUnknown"))
+        Assert.That(status restored "idle-crash", Is.EqualTo("outcomeUnknown"))
+        Assert.That(getDue restored "recurring-crash", Is.EqualTo(recurringDue))
+        Assert.That(getDue restored "idle-crash", Is.EqualTo(idleDue))
+    finally
+        Directory.Delete(dir, true)
+}
+
+[<Test>]
+let recurringDefiniteFailureRemainsRetryable () = task {
+    let dir,path = temp()
+    let mutable clock = DateTimeOffset.UtcNow
+    let mutable calls = 0
+    let executor (_: BrowserSchedules.ScheduledAction) = task {
+        System.Threading.Interlocked.Increment(&calls) |> ignore
+        return Error("", "Process exited with code 17")
+    }
+    try
+        use store = new BrowserSchedules.Service(path, executor, now=(fun () -> clock), pollMs=25)
+        Assert.That(store.Schedule("recurring-known-failure", 5, "https://chatgpt.com/", "Scripts",
+            "launch.js", "", "{}", false, windowRegistration="agents",
+            repeatEverySeconds=600).IsOk, Is.True)
+        let originalDue = getDue store "recurring-known-failure"
+        store.Start()
+        clock <- clock.AddSeconds(6.)
+        do! awaitStatus (fun () -> calls = 1 && status store "recurring-known-failure" = "pending")
+        Assert.That(getDue store "recurring-known-failure", Is.GreaterThan(originalDue))
+        Assert.That(store.List(), Does.Contain("failed: Process exited with code 17"))
+        Assert.That(status store "recurring-known-failure", Is.EqualTo("pending"),
+                    "A known nonzero exit remains a definite retryable failure")
+    finally
+        Directory.Delete(dir, true)
+}
+
+
+[<Test>]
+let idleManagerWithoutFreshActivityBecomesTerminalUnknownAfterThirtyMinutes () = task {
+    let dir,path = temp()
+    let mutable clock = DateTimeOffset.UtcNow
+    let lastSeen = Some clock
+    let mutable calls = 0
+    let seen _ _ = lastSeen
+    let verify _ _ = Task.FromResult(Ok lastSeen)
+    let executor (_: BrowserSchedules.ScheduledAction) = task {
+        System.Threading.Interlocked.Increment(&calls) |> ignore
+        return Ok "submitted"
+    }
+    try
+        use store = new BrowserSchedules.Service(path, executor, now=(fun () -> clock), pollMs=25,
+            agentLastSeen=seen, verifyIdleActivity=verify)
+        let config =
+            { commandSchedule "idle-no-activity" "AfterAgentIdle" with
+                RunAfterSeconds = None; IdleAgentId = Some "Manager"; IdleSeconds = Some 60
+                ActionKind = "BrowserScript"; Executable = None; Args = []
+                WindowRegistration = Some "agents"; Url = Some "https://chatgpt.com/"
+                ScriptPath = Some "launch.js"; ArgsJson = Some "{}" }
+        Assert.That(store.ScheduleExecution(config).IsOk, Is.True)
+        store.Start()
+        clock <- clock.AddSeconds(61.)
+        do! awaitStatus (fun () -> status store "idle-no-activity" = "waitingActivity")
+        Assert.That(calls, Is.EqualTo(1))
+        clock <- clock.AddMinutes(31.)
+        do! awaitStatus (fun () -> status store "idle-no-activity" = "outcomeUnknown")
+        Assert.That(calls, Is.EqualTo(1), "No activity after a Manager launch is not proof it had no effect")
+        clock <- clock.AddDays(1.)
+        do! Task.Delay(150)
+        Assert.That(status store "idle-no-activity", Is.EqualTo("outcomeUnknown"))
+        Assert.That(calls, Is.EqualTo(1), "The uncertain idle occurrence must not be automatically retried")
+    finally
+        Directory.Delete(dir, true)
+}
+
 
 [<Test>]
 let independentClientsCannotBothOwnOrDispatchSameOccurrence () = task {
@@ -704,7 +918,7 @@ let replacingWaitingIdleScheduleCannotReuseOlderAgentsVerifiedSnapshot () = task
 }
 
 [<Test>]
-let submittedManagerWithoutFirstToolCallRecoversAfterThirtyMinutesAcrossRestart () = task {
+let submittedManagerWithoutFirstToolCallBecomesTerminalUnknownAfterThirtyMinutesAcrossRestart () = task {
     let dir,path = temp()
     let mutable clock = DateTimeOffset.UtcNow
     let verifiedLastSeen = clock
@@ -733,10 +947,12 @@ let submittedManagerWithoutFirstToolCallRecoversAfterThirtyMinutesAcrossRestart 
         do! Task.Delay(150)
         Assert.That(launches, Is.EqualTo(1), "No replacement before the silent-launch stale cutoff.")
         clock <- clock.AddMinutes(2.)
-        do! awaitStatus (fun () -> launches = 2 && status restored "manager-silent" = "waitingActivity")
+        do! awaitStatus (fun () -> status restored "manager-silent" = "outcomeUnknown")
+        Assert.That(launches, Is.EqualTo(1), "An uncertain Manager launch must not be automatically replaced.")
         clock <- clock.AddMinutes(1.)
         do! Task.Delay(150)
-        Assert.That(launches, Is.EqualTo(2), "Recovery is bounded by the next 30-minute stale cutoff.")
+        Assert.That(launches, Is.EqualTo(1), "The unknown occurrence remains terminal after the stale cutoff.")
+        Assert.That(status restored "manager-silent", Is.EqualTo("outcomeUnknown"))
     finally
         Directory.Delete(dir, true)
 }

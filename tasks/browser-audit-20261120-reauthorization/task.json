@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"browser-audit-20261120-reauthorization","title":"[P1][Browser audit] Make browser reauthorization explicit and recoverable for unattended schedules","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"browser-audit-20261120-reauthorization","title":"[P1][Browser audit] Pause scheduled launches safely on reauthorization and recover on a new registration","version":2,"lifecycle":"Open","specVersion":2,"attemptId":null}

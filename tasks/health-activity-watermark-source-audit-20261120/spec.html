@@ -1,0 +1,36 @@
+<article>
+<h1>[P0][Health] Trace authoritative cross-device tool-activity watermark</h1>
+<p><strong>Objective:</strong> Remove the concrete evidence blocker for deterministic native Health recovery by establishing whether Jarvis already has an authoritative, durable, cross-device per-agent tool-activity source. This is a bounded read-only source audit and design task, not implementation.</p>
+<h2>Verified starting evidence</h2>
+<ul>
+<li><code>Client/Modules/OrchestrationApi.fs</code> builds ObserveAgent.lastSeen from <code>getLocalLastSeen</code> and explicitly labels it <code>LocalClientActivityCache</code> with <code>lastSeenIsCanonical=false</code>.</li>
+<li><code>Server/Services/HubService.fs</code> currently makes <code>GetAgentActivity</code> fail with <code>ActivityProofUnavailable</code>, explicitly rejecting the server SQLite watermark as authoritative for <code>AfterAgentIdle</code>.</li>
+<li><code>Server/Services/FeedbackStore.fs</code> labels <code>attributed_agent_activity</code> as legacy, nonauthoritative diagnostics. Do not use it as recovery authority.</li>
+<li><code>Server/Services/UserService.fs</code> tracks device connection <code>LastSeenAt</code>; connection liveness is not per-agent tool activity.</li>
+<li><code>Client/Modules/BrowserSchedules.fs</code> fails closed when there is no trusted cross-device activity watermark. Keep this safety behavior.</li>
+<li>The Health implementation task <code>jarvis-native-configurable-agent-recovery-20261120</code> is preserved as Blocked pending this evidence. Its requirements include configurable 600-second default, exact CAS recovery preserving assignment/instructions, restart/reconnect correctness, and no LLM/browser dependency.</li>
+</ul>
+<h2>Audit requirements</h2>
+<ol>
+<li>Trace the actual MCP tool-call path end to end: authenticated request entry, project/agent attribution, server-to-client dispatch, canonical Git-ledger access and the point where an accepted tool invocation can be recorded. Cite exact source paths and line ranges.</li>
+<li>Search for any existing canonical per-agent activity watermark or durable activity event. Distinguish it from local TUI caches, client connection timestamps, disposable telemetry databases, Work leases and browser schedule state.</li>
+<li>If no suitable source exists, propose the smallest viable canonical activity-watermark protocol using the existing Git-backed ledger as authority. Specify identity binding (user/project/agent/device/session), monotonic timestamps/sequences, idempotency, concurrent-device ordering, clock skew, CAS conflicts, restart/reconnect behavior, coalescing/write-rate tradeoffs, retention and fail-closed semantics. Do not assume a missing watermark means inactivity.</li>
+<li>Identify exact implementation files and narrow non-overlapping source regions, plus the tests needed. Avoid Worker 11's scheduled RunCommand consumer and Worker 18's BrowserSchedules/BrowserScript ownership; propose explicit separate leases if overlap cannot be avoided.</li>
+<li>Produce a dependency-ordered, task-ready implementation and acceptance plan that unblocks the existing Health task without expanding into Telos Work/SQLite migration or a second scheduler framework.</li>
+</ol>
+<h2>Required negative cases</h2>
+<ul>
+<li>No activity record, reset/lost local cache, server restart or disconnected device must never authorize recovery.</li>
+<li>Out-of-order or duplicate activity reports must never move the watermark backwards or cause duplicate recovery.</li>
+<li>Concurrent clients and separate projects/agents must not contaminate one another's watermark.</li>
+<li>Connection activity alone must not be treated as agent tool activity.</li>
+<li>Recovery must remain disabled until an authoritative source is implemented, independently reviewed and integrated.</li>
+</ul>
+<h2>Boundaries</h2>
+<ul>
+<li>Read-only audit and design only. No source edits, commits, ledger writes, schedule creation/cancellation, browser actions, deployment, restart, migration or activation.</li>
+<li>Do not use <code>FeedbackStore.attributed_agent_activity</code>, local <code>GetAgentLastSeen</code>, connection <code>LastSeenAt</code>, or Work lease heartbeats as authority.</li>
+<li>Do not weaken <code>ActivityProofUnavailable</code> or any fail-closed path.</li>
+<li>Return a concise evidence-backed report with exact paths/lines, the recommended minimal protocol, source ownership boundaries, test matrix and the precise next task needed.</li>
+</ul>
+</article>

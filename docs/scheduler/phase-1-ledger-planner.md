@@ -28,7 +28,7 @@ The planner does not use a local last-seen cache, legacy FeedbackStore attribute
 The adapter that materializes this contract is deliberately outside Phase 1. It must read canonical Jarvis ledger state and provide a single internally consistent observation.
 
     {
-      schemaVersion: 1,
+      schemaVersion: 2,
       capturedAtUtc: "2026-11-20T14:00:00.000Z",
       source: {
         commit: "<40-64 lowercase hex>",
@@ -130,7 +130,7 @@ The adapter that materializes this contract is deliberately outside Phase 1. It 
           waitId: "wait-1",
           taskId: "task-1",
           attemptId: "attempt-1",
-          assignmentGeneration: 4,
+          waitIndexGeneration: 4,
           ownerAgentId: "Worker 1",
           status: "Pending", // Pending | Eligible | Requeued
           dependencies: [{
@@ -143,6 +143,23 @@ The adapter that materializes this contract is deliberately outside Phase 1. It 
         submissions: []
       }]
     }
+
+### Canonical-to-normalized mapping
+
+The adapter is responsible for translating canonical ledger entities into this schema; the normalized values below are not literal canonical enum values.
+
+| Canonical source | Normalized planner value |
+| --- | --- |
+| `AttemptChallengeWait.Status = "Waiting"` | `challenges[].status = "Pending"`; `Eligible` and `Requeued` pass through unchanged |
+| The current owner-wait `AttemptChallengeWaitIndex.AssignmentGeneration` entry, cross-checked against each dependency index | `challenges[].waitIndexGeneration`; this is the immutable generation of the block index, not a field on `AttemptChallengeWait` |
+| `AttemptChallengeWait.ChallengeIds` joined to canonical Challenge records | `dependencies[]`; `Satisfied` maps to `Satisfied`, valid outstanding status maps to `Pending`, an empty list remains empty and denotes a manual block, and missing/cancelled/malformed links fail closed |
+| `ReviewAttempt.Phase = "Queued"` | `attempts[].phase = "Ready"` |
+| `BranchReview.Status = "Unclaimed"` | `reviews[].status = "Pending"` |
+| `TaskLifecycleEvent.OperationId`, `Sequence`, `ActorId`, `Action`, `PreviousPhase`, `NewPhase`, `PreviousOwnerId`, `NewOwnerId`, `PreviousGeneration`, `NewGeneration` | Corresponding `requeueProvenance` fields; `AttemptChallengeWait.RequeuedAtUtc` supplies `atUtc` |
+
+The `AttemptChallengeWait` record itself has no assignment-generation field. For a dependency-linked wait blocked at generation N, the adapter selects the owner-wait index entry for the current wait and cross-checks the matching entry under every dependency index. For `Waiting`/`Eligible`, that generation must equal the current blocked attempt generation; after requeue, it remains N while the attempt, owner assignment and source lease advance to N+1. The matching lifecycle event must record `PreviousGeneration = N` and `NewGeneration = N+1`; the adapter joins the wait to its attempt by project/task/attempt identity, not by requiring the generations to be equal. Older index entries are historical and ignored; missing, ambiguous or disagreeing current index entries fail closed. For an empty manual wait, there is no current index at its blocked generation even if stale historical locators remain. The planner validates the normalized index generation, lifecycle transition, and current attempt generation independently.
+
+A zero-dependency wait has no reverse-index entry and is represented with `waitIndexGeneration: null`. It is a valid `ManualBlocked` hold while the normalized wait is `Pending` and the attempt is `Blocked`; an empty dependency list is not vacuously satisfied. It remains held until the canonical owner-attributed `RequeueChallengeBlockedAttempt` lifecycle event records `Blocked` to `Queued`, the owner on both sides, and the exact N to N+1 generation transition. For this manual path, `requeueProvenance.actor` must equal the wait owner. The planner never creates the requeue itself.
 
 Account capacity sessions and reservations cover every project. Each project's corresponding arrays must be the exact filtered subset, not a separately sampled approximation. Active and Unknown sessions count against their worker/reviewer limit. Reserved, Dispatching, Submitted and Uncertain reservations also count; terminal reservations do not consume capacity, but their idempotency keys remain visible to suppress a replay of the same identity. Unknown session status/kind, unknown reservation status/kind, missing capacity arrays, missing limits or contradictory capacity views fail closed.
 
@@ -162,9 +179,9 @@ A reviewer candidate is emitted only for a Pending, frozen request with an expli
 - The planner emits no named reviewer assignment and no task/attempt mutation.
 - requeueIntents is always empty. The canonical Challenge workflow owns condition satisfaction, owner release, requeue and audit writes.
 
-The planner emits explicit holds including SnapshotStale, SnapshotIncomplete, AccountCapacityMissing, MissingCapacityEvidence, CapacityContradiction, AccountCapacityFull, ProjectCapacityFull, OwnerBusy, OwnerParked, OwnerStateUnknown, OwnerAssignmentMismatch, SourceLeaseMissing, SourceLeaseConflict, TerminalTask, StaleAttemptGeneration, PendingSubmission, UncertainSubmission, DuplicateReservation, ChallengePending, ChallengePartiallySatisfied, ChallengeOwnerBusy, ChallengeOwnerParked and ChallengeReconciliationInvariantViolation.
+The planner emits explicit holds including SnapshotStale, SnapshotIncomplete, AccountCapacityMissing, MissingCapacityEvidence, CapacityContradiction, AccountCapacityFull, ProjectCapacityFull, OwnerBusy, OwnerParked, OwnerStateUnknown, OwnerAssignmentMismatch, SourceLeaseMissing, SourceLeaseConflict, TerminalTask, StaleAttemptGeneration, PendingSubmission, UncertainSubmission, DuplicateReservation, ChallengePending, ChallengePartiallySatisfied, ChallengeManualBlock, ChallengeOwnerBusy, ChallengeOwnerParked and ChallengeReconciliationInvariantViolation.
 
-Challenge projection states are Pending, PartiallySatisfied, EligibleOwnerBusy, EligibleOwnerParked, Requeued, RequeuedWorking, RequeuedOwnerParked, RequeuedOwnerUnknown and InvariantViolation. An Eligible wait whose owner is already stopped, unassigned and explicitly NeedsWork is an invariant violation: canonical reconciliation should already have requeued it. A Requeued wait requires its canonical requeueProvenance (operationId, ledgerSequence, actor, atUtc) and exact assignment identity. Owner-release provenance is carried through unchanged. Neither state creates a planner-side requeue or release intent.
+Challenge projection states are Pending, PartiallySatisfied, ManualBlocked, EligibleOwnerBusy, EligibleOwnerParked, Requeued, RequeuedWorking, RequeuedOwnerParked, RequeuedOwnerUnknown and InvariantViolation. A zero-dependency manual wait is a valid ManualBlocked hold, not an invariant violation; it cannot become Eligible from vacuous dependency satisfaction and remains blocked until its owner performs the explicit canonical requeue. An Eligible dependency-linked wait whose owner is already stopped, unassigned and explicitly NeedsWork is an invariant violation: canonical reconciliation should already have requeued it. A Requeued wait requires canonical requeueProvenance (operationId, ledgerSequence, actor, atUtc, action, previousPhase, newPhase, previousOwnerAgentId, newOwnerAgentId, previousGeneration, newGeneration) and a valid generation transition: the immutable wait-index generation equals PreviousGeneration and the current attempt generation equals NewGeneration. Manual requeue provenance must additionally attribute the actor to the wait owner. Owner-release provenance is carried through unchanged. Neither state creates a planner-side requeue or release intent.
 
 ## Challenge transition trace
 
@@ -174,7 +191,7 @@ This is a normalized fixture trace; the planner does not execute the workflow tr
 
 - Task task-1 is InProgress.
 - Attempt attempt-1, generation 4, is Blocked.
-- Wait wait-1 is Pending; its dependency is Pending.
+- Wait wait-1 is Pending; its dependency is Pending and its immutable wait-index generation is 4.
 - The owner is stopped, unassigned and NeedsWork.
 
 Planner projection:
@@ -187,15 +204,15 @@ Planner projection:
 
 **Canonical workflow transition**
 
-The dependency becomes Satisfied. ChallengeWorkflow performs the existing owner-eligibility/release checks and transactionally records the wait as Requeued, the attempt as Ready, and the exact owner assignment/generation. The canonical ledger event remains the source of audit provenance; the planner does not repeat the transition.
+The dependency becomes Satisfied. ChallengeWorkflow performs the existing owner-eligibility/release checks and transactionally records the wait as Requeued, the attempt as canonical Queued (normalized Ready), and the exact owner assignment at generation 5. The immutable wait index remains at generation 4. The lifecycle event records PreviousGeneration 4 and NewGeneration 5. The canonical ledger event remains the source of audit provenance; the planner does not repeat the transition.
 
 **After canonical requeue**
 
-- Wait wait-1 is Requeued; dependency is Satisfied.
-- requeueProvenance identifies the canonical operation, ledger sequence, actor and time.
-- Attempt attempt-1 is Ready, still the task's current attempt.
-- Owner Worker 1 is Ready/Stopped, with the exact task/attempt/generation assignment.
-- Source lease is valid and both capacity views show an available slot.
+- Wait wait-1 is Requeued; dependency is Satisfied and `waitIndexGeneration` remains 4.
+- `requeueProvenance` carries the canonical operation, sequence, actor, action, Blocked-to-Queued phases, owner IDs and PreviousGeneration 4 / NewGeneration 5.
+- Attempt attempt-1 is Ready, still the task's current attempt, with `assignmentGeneration: 5`.
+- Owner Worker 1 is Ready/Stopped, with the exact task/attempt assignment at generation 5.
+- Source lease is valid at generation 5 and both capacity views show an available slot.
 
 Planner projection:
 
@@ -205,23 +222,39 @@ Planner projection:
         projectName: "Jarvis",
         taskId: "task-1",
         attemptId: "attempt-1",
-        assignmentGeneration: 4,
+        assignmentGeneration: 5,
         idempotencyKey: "worker:<same stable SHA-256 identity>"
       }],
       challengeStates: [{
         state: "Requeued",
         holdReason: null,
+        waitIndexGeneration: 4,
+        assignmentGeneration: 5,
         requeueProvenance: {
           operationId: "challenge-requeue-1",
           ledgerSequence: 9188,
           actor: "ChallengeWorkflow",
-          atUtc: "2026-11-20T14:00:00.000Z"
+          atUtc: "2026-11-20T14:00:00.000Z",
+          action: "RequeueChallengeBlockedAttempt",
+          previousPhase: "Blocked",
+          newPhase: "Queued",
+          previousOwnerAgentId: "Worker 1",
+          newOwnerAgentId: "Worker 1",
+          previousGeneration: 4,
+          newGeneration: 5
         }
       }],
       requeueIntents: []
     }
 
 The candidate exists because canonical reconciliation already made the attempt Ready. If the owner has already started it, the Challenge is projected as RequeuedWorking and no second worker candidate is emitted.
+
+**Manual zero-dependency hold**
+
+- A canonical wait with an empty `ChallengeIds` list has no reverse-index entry; normalize it with `waitIndexGeneration: null` and status `Pending` while its attempt remains `Blocked`.
+- The planner projects `ManualBlocked` / `ChallengeManualBlock`, emits no worker candidate and emits no requeue intent. Empty dependencies do not mean that the wait is satisfied.
+- Only the owner's explicit canonical requeue can release it. The lifecycle event must attribute the actor and both owner IDs to that owner and record `PreviousGeneration: N`, `NewGeneration: N+1`; the current attempt and owner assignment must then carry N+1.
+- After that verified transition, the wait is `Requeued` with no wait-index generation, and ordinary source-lease, owner and capacity checks still apply before a worker candidate is emitted.
 
 ## Phase 2 authority/runtime boundary
 

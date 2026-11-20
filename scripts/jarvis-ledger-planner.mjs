@@ -55,6 +55,10 @@ function identityKey(projectName, taskId, attemptId, generation) {
   return JSON.stringify([projectName, taskId, attemptId, generation]);
 }
 
+function attemptIdentityKey(projectName, taskId, attemptId) {
+  return JSON.stringify([projectName, taskId, attemptId]);
+}
+
 function addHold(holds, scope, reason, identity = {}, details = {}) {
   holds.push({ scope, reason, ...identity, ...details });
 }
@@ -177,7 +181,7 @@ function matchingReservations(capacity, idempotencyKey, agentId = null) {
 }
 
 function validateRoot(snapshot, nowUtc, maxAgeMs, holds) {
-  if (!isRecord(snapshot) || snapshot.schemaVersion !== 1 ||
+  if (!isRecord(snapshot) || snapshot.schemaVersion !== 2 ||
       !isRecord(snapshot.completeness) || !Array.isArray(snapshot.projects)) {
     addHold(holds, "account", "SnapshotIncomplete");
     return null;
@@ -394,8 +398,7 @@ function buildChallengeProjection(project, taskById, agentById, holds) {
 
   for (const task of project.tasks) {
     for (const attempt of task.attempts) {
-      attemptsByKey.set(identityKey(project.projectName, task.taskId,
-        attempt.attemptId, attempt.assignmentGeneration), { task, attempt });
+      attemptsByKey.set(attemptIdentityKey(project.projectName, task.taskId, attempt.attemptId), { task, attempt });
     }
   }
 
@@ -406,13 +409,19 @@ function buildChallengeProjection(project, taskById, agentById, holds) {
       attemptId: wait.attemptId,
       waitId: wait.waitId
     };
-    const key = identityKey(project.projectName, wait.taskId, wait.attemptId,
-      wait.assignmentGeneration);
-    const linked = attemptsByKey.get(key);
+    const linked = attemptsByKey.get(attemptIdentityKey(project.projectName, wait.taskId, wait.attemptId));
     const task = taskById.get(wait.taskId);
     const attempt = linked?.attempt;
     const owner = agentById.get(wait.ownerAgentId);
     const dependencies = wait.dependencies;
+    const manualBlock = Array.isArray(dependencies) && dependencies.length === 0;
+    const assignmentGeneration = Number.isInteger(attempt?.assignmentGeneration)
+      ? attempt.assignmentGeneration : null;
+    const key = assignmentGeneration !== null
+      ? identityKey(project.projectName, wait.taskId, wait.attemptId, assignmentGeneration)
+      : Number.isInteger(wait.waitIndexGeneration)
+        ? identityKey(project.projectName, wait.taskId, wait.attemptId, wait.waitIndexGeneration)
+        : null;
     const requeueProvenance = wait.requeueProvenance ?? null;
     const ownerReleaseProvenance = wait.ownerReleaseProvenance ?? null;
     let state = "InvariantViolation";
@@ -421,11 +430,13 @@ function buildChallengeProjection(project, taskById, agentById, holds) {
 
     const invalid = !isNonEmptyString(wait.waitId) ||
       !isNonEmptyString(wait.taskId) || !isNonEmptyString(wait.attemptId) ||
-      !Number.isInteger(wait.assignmentGeneration) ||
+      !Object.hasOwn(wait, "waitIndexGeneration") ||
       !isNonEmptyString(wait.ownerAgentId) ||
-      !Array.isArray(dependencies) || dependencies.length === 0 ||
+      !Array.isArray(dependencies) ||
+      (manualBlock ? wait.waitIndexGeneration !== null :
+        !Number.isInteger(wait.waitIndexGeneration) || wait.waitIndexGeneration < 1) ||
       !task || !attempt || attempt.ownerAgentId !== wait.ownerAgentId ||
-      attempt.assignmentGeneration !== wait.assignmentGeneration ||
+      !Number.isInteger(attempt.assignmentGeneration) || attempt.assignmentGeneration < 1 ||
       !owner || owner.verified !== true;
 
     if (invalid) {
@@ -444,8 +455,11 @@ function buildChallengeProjection(project, taskById, agentById, holds) {
         if (dependency.status === "Satisfied") satisfiedCount++;
       }
 
-      const allSatisfied = !dependencyInvalid && satisfiedCount === dependencies.length;
+      const allSatisfied = !dependencyInvalid && dependencies.length > 0 &&
+        satisfiedCount === dependencies.length;
       const anySatisfied = satisfiedCount > 0;
+      const waitGenerationMatches = manualBlock ||
+        wait.waitIndexGeneration === attempt.assignmentGeneration;
       const isFreeNeedsWorkOwner = owner.state === "NeedsWork" &&
         owner.execution === "Stopped" && owner.currentAssignment === null &&
         owner.unassignedDisposition === "NeedsWork";
@@ -457,17 +471,37 @@ function buildChallengeProjection(project, taskById, agentById, holds) {
         isNonEmptyString(requeueProvenance.operationId) &&
         Number.isInteger(requeueProvenance.ledgerSequence) &&
         requeueProvenance.ledgerSequence > 0 &&
-        isNonEmptyString(requeueProvenance.actor) && parseTime(requeueProvenance.atUtc) !== null;
+        isNonEmptyString(requeueProvenance.actor) && parseTime(requeueProvenance.atUtc) !== null &&
+        requeueProvenance.action === "RequeueChallengeBlockedAttempt" &&
+        requeueProvenance.previousPhase === "Blocked" &&
+        requeueProvenance.newPhase === "Queued" &&
+        requeueProvenance.previousOwnerAgentId === wait.ownerAgentId &&
+        requeueProvenance.newOwnerAgentId === wait.ownerAgentId &&
+        Number.isInteger(requeueProvenance.previousGeneration) &&
+        requeueProvenance.previousGeneration > 0 &&
+        Number.isInteger(requeueProvenance.newGeneration) &&
+        requeueProvenance.newGeneration === requeueProvenance.previousGeneration + 1;
+      const requeueGenerationMatches = validRequeueProvenance &&
+        (manualBlock ? wait.waitIndexGeneration === null :
+          wait.waitIndexGeneration === requeueProvenance.previousGeneration) &&
+        attempt.assignmentGeneration === requeueProvenance.newGeneration;
 
       if (dependencyInvalid ||
-          (["Pending", "Eligible"].includes(wait.status) && attempt.phase !== "Blocked") ||
-          (wait.status === "Pending" && allSatisfied) ||
-          (wait.status === "Eligible" && !allSatisfied) ||
-          (wait.status === "Requeued" && !allSatisfied)) {
+          (["Pending", "Eligible"].includes(wait.status) &&
+            (attempt.phase !== "Blocked" || !waitGenerationMatches)) ||
+          (wait.status === "Pending" && !manualBlock && allSatisfied) ||
+          (wait.status === "Eligible" && (manualBlock || !allSatisfied)) ||
+          (wait.status === "Requeued" &&
+            (!requeueGenerationMatches || (!manualBlock && !allSatisfied)))) {
         reason = "ChallengeReconciliationInvariantViolation";
       } else if (wait.status === "Pending") {
-        state = anySatisfied ? "PartiallySatisfied" : "Pending";
-        reason = anySatisfied ? "ChallengePartiallySatisfied" : "ChallengePending";
+        if (manualBlock) {
+          state = "ManualBlocked";
+          reason = "ChallengeManualBlock";
+        } else {
+          state = anySatisfied ? "PartiallySatisfied" : "Pending";
+          reason = anySatisfied ? "ChallengePartiallySatisfied" : "ChallengePending";
+        }
       } else if (wait.status === "Eligible") {
         if (isParkedOwner) {
           state = "EligibleOwnerParked";
@@ -485,8 +519,11 @@ function buildChallengeProjection(project, taskById, agentById, holds) {
         const assignmentMatches = assignment &&
           assignment.taskId === wait.taskId &&
           assignment.attemptId === wait.attemptId &&
-          assignment.assignmentGeneration === wait.assignmentGeneration;
-        if (!validRequeueProvenance || task.currentAttemptId !== attempt.attemptId ||
+          assignment.assignmentGeneration === attempt.assignmentGeneration;
+        const ownerAttributedManualRequeue = !manualBlock ||
+          requeueProvenance.actor === wait.ownerAgentId;
+        if (!validRequeueProvenance || !requeueGenerationMatches || !ownerAttributedManualRequeue ||
+            task.currentAttemptId !== attempt.attemptId ||
             !assignmentMatches) {
           reason = "ChallengeReconciliationInvariantViolation";
         } else if (attempt.phase === "Ready" && owner.state === "Ready" &&
@@ -511,7 +548,8 @@ function buildChallengeProjection(project, taskById, agentById, holds) {
 
     states.push({
       ...identity,
-      assignmentGeneration: wait.assignmentGeneration,
+      waitIndexGeneration: wait.waitIndexGeneration ?? null,
+      assignmentGeneration,
       state,
       requeueProvenance: isRecord(requeueProvenance) ? { ...requeueProvenance } : null,
       ownerReleaseProvenance: isRecord(ownerReleaseProvenance) ? { ...ownerReleaseProvenance } : null,
@@ -520,9 +558,10 @@ function buildChallengeProjection(project, taskById, agentById, holds) {
       holdReason: reason
     });
     if (reason) {
-      blockedKeys.add(key);
+      if (key !== null) blockedKeys.add(key);
       addHold(holds, "challenge", reason, identity, {
-        assignmentGeneration: wait.assignmentGeneration,
+        waitIndexGeneration: wait.waitIndexGeneration ?? null,
+        assignmentGeneration,
         state
       });
     }
@@ -699,7 +738,7 @@ export function planLedger(snapshot, nowUtc, options = {}) {
   }
 
   const plan = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     source: isRecord(snapshot?.source) ? { ...snapshot.source } : null,
     capturedAtUtc: snapshot?.capturedAtUtc ?? null,
     workerCandidates: [],

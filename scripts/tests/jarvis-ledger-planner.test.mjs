@@ -60,6 +60,22 @@ function sourceLease(overrides = {}) {
   };
 }
 
+function challengeRequeueProvenance({
+  operationId = "challenge-requeue-1",
+  ledgerSequence = 9188,
+  actor = "ChallengeWorkflow",
+  previousGeneration = 4,
+  newGeneration = 5
+} = {}) {
+  return {
+    operationId, ledgerSequence, actor, atUtc: NOW,
+    action: "RequeueChallengeBlockedAttempt",
+    previousPhase: "Blocked", newPhase: "Queued",
+    previousOwnerAgentId: "Worker 1", newOwnerAgentId: "Worker 1",
+    previousGeneration, newGeneration
+  };
+}
+
 function review(overrides = {}) {
   return {
     reviewId: "review-1",
@@ -108,7 +124,7 @@ function project(name = "Jarvis", overrides = {}) {
 
 function snapshot(projects = [project()], accountOverrides = {}) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     capturedAtUtc: NOW,
     source: {
       commit: ACCOUNT_HEAD,
@@ -156,7 +172,7 @@ function challengeProject(status, dependencyStatuses, ownerOverrides = {}, attem
       waitId: "wait-1",
       taskId: "task-1",
       attemptId: "attempt-1",
-      assignmentGeneration: 4,
+      waitIndexGeneration: 4,
       ownerAgentId: "Worker 1",
       status,
       ownerReleaseProvenance: status === "Eligible" ? { operationId: "release-op-1", ledgerSequence: 9001, actor: "Operator", atUtc: NOW } : null,
@@ -179,6 +195,7 @@ test("identical snapshots produce identical candidates and stable idempotency ke
   const second = planLedger(input, NOW);
 
   assert.deepEqual(second, first);
+  assert.equal(first.schemaVersion, 2);
   assert.equal(first.workerCandidates.length, 1);
   assert.equal(first.reviewCandidates.length, 1);
   assert.match(first.workerCandidates[0].idempotencyKey, /^worker:[0-9a-f]{64}$/);
@@ -417,29 +434,95 @@ test("canonical Challenge requeue is projected once as Ready work, without a pla
   assert.equal(before.challengeStates[0].state, "Pending");
 
   const afterProject = project("Jarvis", {
-    tasks: [task()],
-    agents: [agent()],
+    tasks: [task({ attempts: [attempt({ assignmentGeneration: 5 })] })],
+    agents: [agent({ currentAssignment: {
+      taskId: "task-1", attemptId: "attempt-1", assignmentGeneration: 5
+    } })],
+    sourceLeases: [sourceLease({ assignmentGeneration: 5 })],
     challenges: [{
       waitId: "wait-1",
       taskId: "task-1",
       attemptId: "attempt-1",
-      assignmentGeneration: 4,
+      waitIndexGeneration: 4,
       ownerAgentId: "Worker 1",
       status: "Requeued",
       ownerReleaseProvenance: { operationId: "release-op-2", ledgerSequence: 9187, actor: "Operator", atUtc: NOW },
-      requeueProvenance: { operationId: "challenge-requeue-1", ledgerSequence: 9188, actor: "ChallengeWorkflow", atUtc: NOW },
+      requeueProvenance: challengeRequeueProvenance(),
       dependencies: [{ dependencyId: "dependency-1", status: "Satisfied" }]
     }]
   });
   const after = planLedger(snapshot([afterProject]), NOW);
 
   assert.equal(after.challengeStates[0].state, "Requeued");
-  assert.deepEqual(after.challengeStates[0].requeueProvenance, { operationId: "challenge-requeue-1", ledgerSequence: 9188, actor: "ChallengeWorkflow", atUtc: NOW });
+  assert.equal(after.challengeStates[0].waitIndexGeneration, 4);
+  assert.equal(after.challengeStates[0].assignmentGeneration, 5);
+  assert.deepEqual(after.challengeStates[0].requeueProvenance, challengeRequeueProvenance());
   assert.deepEqual(after.challengeStates[0].ownerReleaseProvenance, { operationId: "release-op-2", ledgerSequence: 9187, actor: "Operator", atUtc: NOW });
   assert.equal(after.challengeStates[0].holdReason, null);
   assert.equal(after.workerCandidates.length, 1);
   assert.equal(after.workerCandidates[0].attemptId, "attempt-1");
+  assert.equal(after.workerCandidates[0].assignmentGeneration, 5);
   assert.deepEqual(after.requeueIntents, []);
+
+  for (const invalidTransition of [
+    { previousGeneration: 3 },
+    { newGeneration: 6 },
+    { action: "WaitOnChallenges" }
+  ]) {
+    const malformed = structuredClone(afterProject);
+    Object.assign(malformed.challenges[0].requeueProvenance, invalidTransition);
+    const rejected = planLedger(snapshot([malformed]), NOW);
+    assert.equal(rejected.challengeStates[0].state, "InvariantViolation");
+    assert.equal(rejected.workerCandidates.length, 0);
+    assert.ok(hasHold(rejected, "ChallengeReconciliationInvariantViolation"));
+  }
+});
+
+test("zero-dependency manual Challenge blocks remain held until owner-attributed requeue", () => {
+  const waiting = project("Jarvis", {
+    tasks: [task({ attempts: [attempt({ phase: "Blocked" })] })],
+    agents: [agent({ state: "NeedsWork", execution: "Stopped", currentAssignment: null,
+      unassignedDisposition: "NeedsWork" })],
+    challenges: [{
+      waitId: "manual-wait-1", taskId: "task-1", attemptId: "attempt-1",
+      waitIndexGeneration: null, ownerAgentId: "Worker 1", status: "Pending",
+      dependencies: [], ownerReleaseProvenance: null, requeueProvenance: null
+    }]
+  });
+  const held = planLedger(snapshot([waiting]), NOW);
+  assert.equal(held.challengeStates[0].state, "ManualBlocked");
+  assert.equal(held.challengeStates[0].holdReason, "ChallengeManualBlock");
+  assert.equal(held.workerCandidates.length, 0);
+  assert.ok(hasHold(held, "ChallengeManualBlock"));
+  assert.deepEqual(held.requeueIntents, []);
+
+  const requeued = project("Jarvis", {
+    tasks: [task({ attempts: [attempt({ assignmentGeneration: 5 })] })],
+    agents: [agent({ currentAssignment: {
+      taskId: "task-1", attemptId: "attempt-1", assignmentGeneration: 5
+    } })],
+    sourceLeases: [sourceLease({ assignmentGeneration: 5 })],
+    challenges: [{
+      waitId: "manual-wait-1", taskId: "task-1", attemptId: "attempt-1",
+      waitIndexGeneration: null, ownerAgentId: "Worker 1", status: "Requeued",
+      dependencies: [], ownerReleaseProvenance: null,
+      requeueProvenance: challengeRequeueProvenance({ actor: "Worker 1" })
+    }]
+  });
+  const after = planLedger(snapshot([requeued]), NOW);
+  assert.equal(after.challengeStates[0].state, "Requeued");
+  assert.equal(after.challengeStates[0].waitIndexGeneration, null);
+  assert.equal(after.challengeStates[0].assignmentGeneration, 5);
+  assert.equal(after.workerCandidates.length, 1);
+  assert.equal(after.workerCandidates[0].assignmentGeneration, 5);
+  assert.deepEqual(after.requeueIntents, []);
+
+  const wrongActor = structuredClone(requeued);
+  wrongActor.challenges[0].requeueProvenance.actor = "Lead";
+  const rejected = planLedger(snapshot([wrongActor]), NOW);
+  assert.equal(rejected.challengeStates[0].state, "InvariantViolation");
+  assert.equal(rejected.workerCandidates.length, 0);
+  assert.ok(hasHold(rejected, "ChallengeReconciliationInvariantViolation"));
 });
 
 test("Requeued Challenges retain audit provenance after the owner starts work", () => {
@@ -457,10 +540,13 @@ test("Requeued Challenges retain audit provenance after the owner starts work", 
       waitId: "wait-1",
       taskId: "task-1",
       attemptId: "attempt-1",
-      assignmentGeneration: 4,
+      waitIndexGeneration: 3,
       ownerAgentId: "Worker 1",
       status: "Requeued",
-      requeueProvenance: { operationId: "challenge-requeue-2", ledgerSequence: 9189, actor: "ChallengeWorkflow", atUtc: NOW },
+      requeueProvenance: challengeRequeueProvenance({
+        operationId: "challenge-requeue-2", ledgerSequence: 9189,
+        previousGeneration: 3, newGeneration: 4
+      }),
       dependencies: [{ dependencyId: "dependency-1", status: "Satisfied" }]
     }]
   });

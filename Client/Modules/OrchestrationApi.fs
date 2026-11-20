@@ -651,7 +651,14 @@ module PendingIntentJournal =
     // Legacy clients exclusively lock a UUID-prefix stripe. New clients take
     // a shared stripe gate plus an exclusive per-UUID lock: distinct intents
     // run concurrently without allowing a legacy client to bypass exclusion.
-    // Lock files are never unlinked (unlinking a held inode is unsafe on Unix).
+    // A named OS mutex avoids one persistent file per UUID. The bounded
+    // legacy stripes must never be unlinked while old clients might hold them.
+    let internal exactLockName root (operationId: Guid) =
+        let identity = Path.GetFileNameWithoutExtension(LedgerBindingConfig.pathForRoot root)
+        let name = "Jarvis.PendingIntent." + identity + "." + operationId.ToString("N")
+        // Include all Windows logon sessions sharing the checkout.
+        if OperatingSystem.IsWindows() then "Global\\" + name else name
+
     let private withIntentLock (binding: LedgerStore.LedgerBinding) (operationId: Guid)
                                (operation: unit -> Result<'a, EffectError>) =
         try
@@ -672,10 +679,7 @@ module PendingIntentJournal =
                             File.SetUnixFileMode(folder, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
                         let slot = operationId.ToString("N").Substring(0, 3)
                         let stripePath = Path.Combine(folder, slot + ".lock")
-                        let operationPath = Path.Combine(folder, operationId.ToString("N") + ".lock")
-                        let isLink path =
-                            FileInfo(path).LinkTarget <> null
-                        if isLink stripePath || isLink operationPath then
+                        if FileInfo(stripePath).LinkTarget <> null then
                             Error(Client.ValidationError "Pending intent lock must not be a symbolic link.")
                         else
                             let deadline = System.Diagnostics.Stopwatch.StartNew()
@@ -694,13 +698,24 @@ module PendingIntentJournal =
                             // held for the entire operation, including remote effects.
                             // Old clients' FileShare.None handles exclude new readers.
                             use stripe = acquire stripePath FileAccess.Read FileShare.Read
-                            use held = acquire operationPath FileAccess.ReadWrite FileShare.None
                             if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
                                 File.SetUnixFileMode(stripePath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
-                                File.SetUnixFileMode(operationPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
-                            // Never retry operation() itself on IOException:
-                            // an uncertain remote write must not be repeated.
-                            operation ()
+                            use mutex = new System.Threading.Mutex(false, exactLockName binding.RepositoryPath operationId)
+                            let remaining = TimeSpan.FromSeconds(60.) - deadline.Elapsed
+                            let entered =
+                                try mutex.WaitOne(if remaining > TimeSpan.Zero then remaining else TimeSpan.Zero)
+                                with :? System.Threading.AbandonedMutexException ->
+                                    // Recovery must still verify the saved UUID and canonical ledger.
+                                    true
+                            if not entered then
+                                Error(Client.ValidationError "Timed out acquiring exclusive pending UUID lock.")
+                            else
+                                try
+                                    // Never retry operation() itself on IOException:
+                                    // an uncertain remote write must not be repeated.
+                                    operation ()
+                                finally
+                                    mutex.ReleaseMutex()
         with ex ->
             Error(Client.ValidationError $"Unable to exclusively lock pending intent: {ex.Message}")
 

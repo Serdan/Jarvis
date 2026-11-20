@@ -4878,23 +4878,25 @@ type ReviewWorkflowTests() =
                 Path.Combine(Path.GetDirectoryName bindingPath, "pending",
                              Path.GetFileNameWithoutExtension bindingPath, ".locks")
             Directory.CreateDirectory(lockDirectory) |> ignore
-            let exactPath = Path.Combine(lockDirectory, firstId.ToString("N") + ".lock")
+            let exactName = Client.OrchestrationApi.PendingIntentJournal.exactLockName one firstId
             let script = Path.Combine(Path.GetDirectoryName one, "hold-exact-lock.fsx")
             let ready = Path.Combine(Path.GetDirectoryName one, "exact-holder-ready")
             File.WriteAllText(script,
                 String.concat "\n"
                     [ "open System"; "open System.IO"
-                      "let lockPath = fsi.CommandLineArgs[1]"
+                      "let mutexName = fsi.CommandLineArgs[1]"
                       "let readyPath = fsi.CommandLineArgs[2]"
-                      "use held = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)"
+                      "use held = new System.Threading.Mutex(false, mutexName)"
+                      "if not (held.WaitOne(0)) then failwith \"Cannot acquire test mutex\""
                       "File.WriteAllText(readyPath, \"held\")"
-                      "System.Threading.Thread.Sleep(3600)" ])
+                      "System.Threading.Thread.Sleep(3600)"
+                      "held.ReleaseMutex()" ])
             use holder = new Process()
             holder.StartInfo.FileName <- "dotnet"
             holder.StartInfo.UseShellExecute <- false
             holder.StartInfo.RedirectStandardOutput <- true
             holder.StartInfo.RedirectStandardError <- true
-            for arg in [ "fsi"; "--exec"; script; exactPath; ready ] do
+            for arg in [ "fsi"; "--exec"; script; exactName; ready ] do
                 holder.StartInfo.ArgumentList.Add(arg)
             Assert.That(holder.Start(), Is.True)
             try
@@ -4919,6 +4921,8 @@ type ReviewWorkflowTests() =
                 sameClock.Stop()
                 Assert.That(sameClock.ElapsedMilliseconds, Is.GreaterThan(600L),
                             "The same UUID must still wait for its exclusive cross-process lock.")
+                Assert.That(File.Exists(Path.Combine(lockDirectory, firstId.ToString("N") + ".lock")), Is.False,
+                            "Exact UUID mutex must not leave a persistent lock file.")
                 Assert.That(holder.WaitForExit(10000), Is.True)
                 Assert.That(holder.ExitCode, Is.Zero)
             finally

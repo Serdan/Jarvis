@@ -4812,31 +4812,30 @@ type ReviewWorkflowTests() =
 
 
     [<Test>]
-    member _.PendingIntentLocksAreEnforcedAcrossProcesses() =
+    member _.PendingIntentNamedMutexRecoversAfterOwnerProcessExits() =
         withFixture (fun one _ first _ _ _ _ _ ->
             let operationId = Guid.NewGuid()
-            let bindingPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
-            let lockDirectory =
-                Path.Combine(Path.GetDirectoryName bindingPath, "pending",
-                             Path.GetFileNameWithoutExtension bindingPath, ".locks")
-            Directory.CreateDirectory(lockDirectory) |> ignore
-            let lockPath = Path.Combine(lockDirectory, operationId.ToString("N").Substring(0, 3) + ".lock")
-            let script = Path.Combine(Path.GetDirectoryName one, "hold-exclusive-lock.fsx")
-            let ready = Path.Combine(Path.GetDirectoryName one, "holder-ready")
+            let mutexName = Client.OrchestrationApi.PendingIntentJournal.exactLockName one operationId
+            let script = Path.Combine(Path.GetDirectoryName one, "abandon-uuid-mutex.fsx")
+            let ready = Path.Combine(Path.GetDirectoryName one, "mutex-holder-ready")
+            let exitSignal = Path.Combine(Path.GetDirectoryName one, "mutex-holder-exit")
             File.WriteAllText(script,
                 String.concat "\n"
                     [ "open System"; "open System.IO"
-                      "let lockPath = fsi.CommandLineArgs[1]"
-                      "let readyPath = fsi.CommandLineArgs[2]"
-                      "use held = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)"
-                      "File.WriteAllText(readyPath, \"held\")"
-                      "System.Threading.Thread.Sleep(2200)" ])
+                      "let name = fsi.CommandLineArgs[1]"
+                      "let ready = fsi.CommandLineArgs[2]"
+                      "let exitSignal = fsi.CommandLineArgs[3]"
+                      "use held = new System.Threading.Mutex(false, name)"
+                      "if not (held.WaitOne(0)) then failwith \"Cannot acquire mutex\""
+                      "File.WriteAllText(ready, \"held\")"
+                      "while not (File.Exists exitSignal) do System.Threading.Thread.Sleep(10)"
+                      "Environment.Exit(0)" ])
             use holder = new Process()
             holder.StartInfo.FileName <- "dotnet"
             holder.StartInfo.UseShellExecute <- false
             holder.StartInfo.RedirectStandardOutput <- true
             holder.StartInfo.RedirectStandardError <- true
-            for arg in [ "fsi"; "--exec"; script; lockPath; ready ] do
+            for arg in [ "fsi"; "--exec"; script; mutexName; ready; exitSignal ] do
                 holder.StartInfo.ArgumentList.Add(arg)
             Assert.That(holder.Start(), Is.True)
             try
@@ -4845,19 +4844,25 @@ type ReviewWorkflowTests() =
                       && wait.Elapsed < TimeSpan.FromSeconds(15.) do
                     System.Threading.Thread.Sleep(25)
                 Assert.That(File.Exists ready, Is.True,
-                            "Independent .NET process must acquire the OS lock before pending write.")
-                let elapsed = Stopwatch.StartNew()
-                Client.OrchestrationApi.PendingIntentJournal.persist first operationId "TaskWrite"
-                    (System.Text.Json.JsonSerializer.Serialize(
-                        {| Action = "CreateTask"; TaskId = "cross-process"; Title = "Cross process" |}))
-                |> success
-                elapsed.Stop()
-                Assert.That(elapsed.Elapsed.TotalMilliseconds, Is.GreaterThan(800.0),
-                            "Pending write must wait for the other process to release its FileShare.None lock.")
+                            "Independent process must acquire the named mutex.")
+                // Keep the kernel object alive after the owner dies, so the
+                // client must handle an abandoned acquisition explicitly.
+                use retained = new System.Threading.Mutex(false, mutexName)
+                File.WriteAllText(exitSignal, "exit")
                 Assert.That(holder.WaitForExit(10000), Is.True)
                 Assert.That(holder.ExitCode, Is.Zero)
+                Client.OrchestrationApi.PendingIntentJournal.persist first operationId "TaskWrite"
+                    (System.Text.Json.JsonSerializer.Serialize(
+                        {| Action = "CreateTask"; TaskId = "abandoned"; Title = "Recovery" |}))
+                |> success
                 Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
                             Is.True)
+                let bindingPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+                let lockDirectory =
+                    Path.Combine(Path.GetDirectoryName bindingPath, "pending",
+                                 Path.GetFileNameWithoutExtension bindingPath, ".locks")
+                Assert.That(Directory.Exists(lockDirectory), Is.False,
+                            "Named UUID mutexes must not generate lock files or stripe files.")
             finally
                 if not holder.HasExited then
                     holder.Kill(true)

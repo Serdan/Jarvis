@@ -375,7 +375,7 @@ let compositeLaunchRetriesOnlyConfirmedPreInjectionLoadingFailures () = task {
 
 
 [<Test>]
-let compositeLaunchNeverReplaysUncertainPostInjectionOutcome () = task {
+let compositeLaunchClosesCreatedTabWithoutReplayingUncertainPostInjectionOutcome () = task {
     let port = findPort()
     use bridge = new BrowserBridge.Service(port, "test-secret")
     bridge.Start()
@@ -400,16 +400,35 @@ let compositeLaunchNeverReplaysUncertainPostInjectionOutcome () = task {
         requestId = property executed "requestId"; connectionId = connectionId
         registrationId = "uncertain-tab"; registrationGeneration = 1
     |}))
+    // No script execution is retried after the uncertain post-injection result.
+    // The explicit default is to close the created tab, not wait for another
+    // conversation outcome or require a fresh-home proof.
+    let! closing = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property closing "kind", Is.EqualTo("closeTab"))
+    Assert.That(property closing "registrationId", Is.EqualTo("uncertain-tab"))
+    use closeFrame = JsonDocument.Parse(closing)
+    Assert.That(closeFrame.RootElement.GetProperty("registrationGeneration").GetInt32(), Is.EqualTo(1))
+    Assert.That(closeFrame.RootElement.GetProperty("requireFreshHomeNoTurns").GetBoolean(), Is.False)
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "tabClosed"; requestId = property closing "requestId"
+        connectionId = connectionId; registrationId = "uncertain-tab"
+        registrationGeneration = 1
+    |}))
+    do! send socket """{"version":2,"kind":"registrations","tabs":[]}"""
     let! outcome = launch.WaitAsync(TimeSpan.FromSeconds(3.0))
     match outcome with
     | Error (registrationId, why) ->
         Assert.That(registrationId, Is.EqualTo("uncertain-tab"))
         Assert.That(why, Does.Contain("OutcomeUnknown:RegistrationChangedDuringExecution"))
-        // Retain tab for manual reconciliation; never close after uncertain effects.
-        match bridge.ListTabs() with
-        | Ok listing -> Assert.That(listing, Does.Contain("uncertain-tab"))
-        | Error error -> Assert.Fail(error)
+        Assert.That(why, Does.Contain("cleanup=closed"))
     | Ok _ -> Assert.Fail("Post-dispatch unknown cannot be treated as a successful submission")
+    do! waitUntil (fun () ->
+        bridge.ListTabs() |> Result.exists (fun tabs -> not (tabs.Contains("uncertain-tab"))))
+    use cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200.0))
+    try
+        let! next = socket.ReceiveAsync(ArraySegment<byte>(Array.zeroCreate<byte> 8192), cts.Token)
+        Assert.Fail("Uncertain post-injection result must not replay execution: " + string next.MessageType)
+    with :? OperationCanceledException -> ()
 }
 
 [<Test>]

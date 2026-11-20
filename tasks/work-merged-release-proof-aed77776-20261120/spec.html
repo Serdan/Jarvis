@@ -1,0 +1,22 @@
+<article>
+<h1>[P1][Scheduler integration] Full .NET 11 Release witness for local aed77776 candidate</h1>
+<p><strong>Owner:</strong> Worker 6. <strong>Type:</strong> independent read-only diagnostic; no implementation lease. <strong>Purpose:</strong> obtain the missing full Release evidence for Integrator's exact local-only composition so the browser-schedule/tab-reclamation integration gate can move on evidence rather than an insufficient 180-second timeout.</p>
+<h2>Exact frozen source and provenance</h2>
+<ul>
+<li>Test only commit <code>aed77776ed2e4d21cff0ad2e25ff06379f5e0236</code>, tree <code>1dc28dc6a8c378eeff6cfcc32a509730bcc9d076</code>, parents <code>fe9ca23e9eb82299be4e8ed230c327c86ca15e71</code> and <code>36a2d776503d11109663318844fa4b08c06e1918</code>.</li>
+<li>Verified locally as a commit object; it is a descendant of reviewed main composition <code>3aac4f66559d1ebee029716d18095c56b4c180dd</code> and is not an ancestor of current <code>origin/main</code> (<code>95a471fc565b57fe309c65fc85f371693dbe9067</code>). This candidate is local-only; do not assume publisher-side custody or push it.</li>
+<li>The candidate composes the accepted Worker 4 source and Worker 22 tab-reclamation source. It does not include Worker 18's accepted schedule-source commit <code>cab748286b2252d273445b87e57ebcc226fcaca6</code> or Worker 11's ChangesRequested managed-command source <code>c344d04604a584ac4cac0f4c2d5788054fa7bf33</code>. Do not claim otherwise.</li>
+<li>Integrator's earlier full Client.Release attempt on this exact SHA ended at a 180-second wrapper timeout without true process exit or test counts. That result is UNKNOWN, not PASS; do not reuse it as evidence.</li>
+</ul>
+<h2>Bounded test procedure</h2>
+<ol>
+<li>Use a new isolated, clean registered worktree at the exact commit SHA. Do not use or modify Integrator's <code>integrator-pending-reviewed-20261119</code> worktree, main, or any feature branch. Verify <code>git rev-parse HEAD</code>, clean status, commit tree/parents, test project files, and <code>dotnet --version</code> (require .NET 11) before execution.</li>
+<li>Run full, unfiltered Release suites from that exact project root: <code>dotnet test Client.Tests/Client.Tests.fsproj -c Release --nologo</code> and <code>dotnet test Server.Tests/Server.Tests.fsproj -c Release --nologo</code>.</li>
+<li>Use managed <code>start_job</code> and poll <code>get_job_result</code> until the underlying OS process has truly exited. Allow at least 20 minutes for the full Client suite; the prior 180-second wrapper timeout was too short. A JobId, wrapper ToolCompleted, partial output, blanket timeout, or subset pass is not full PASS. Do not retry an uncertain external effect or leave a process running after completion/blockage.</li>
+<li>Use disposable HOME/XDG/TMP and an isolated NuGet cache. Do not modify user home, real Jarvis state, Git project/account ledgers, secrets, or live services.</li>
+<li>Record exact SHA, .NET version, executable/args, job IDs, true OS exit codes, durations, passed/failed/skipped counts, and log/artifact locations for both suites. If RED/UNKNOWN, preserve the full-suite result and isolate only the minimal deterministic failure; identify the source owner and do not edit their code.</li>
+<li>Checkpoint the evidence and next owner action, yield Ready, and verify completion.</li>
+</ol>
+<h2>Safety and scope</h2>
+<p>Read-only tests on one isolated source checkout. No source edits, commits, pushes, merges/cherry-picks, deployment, restart, live schedule create/rebind/cancel, browser session spawning, production secrets, original-Git publisher/ref/STOP changes, SQLite authority activation, Work Scheduler activation, or cutover. This witness does not prove Worker 18/11 source acceptance, combined current-main integration, live schedule ownership, or Operator GO. Manager alone launches Worker 6; independent reviewers self-claim.</p>
+</article>

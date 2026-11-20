@@ -1,0 +1,14 @@
+<h1>Attribute long Windows Git-backed write latency by stage</h1>
+<p><strong>Priority: P1 — production diagnostics and client responsiveness.</strong></p>
+<h2>Observed symptom</h2>
+<p>Windows FinanceFlow SetAgentState operations were observed at roughly 45–52 seconds end-to-end; an earlier crash-time pair started 13:10:54 and 13:11:16 on 2026-11-20 with no recorded completions. Existing activity records do not separate pending-intent lock wait, journal persistence, remote Git fetch/reconcile/push/retry, cleanup, and response decoration. Exact lock holder during that crash remains unverified. Commit 95a471fc5 changes lock isolation but not the duration of remote Git stages.</p>
+<h2>Scope</h2>
+<p>Instrument the existing client operation pipeline, PendingIntentJournal/withIntentLock and LedgerStore transport with bounded diagnostic timing and retry classifications. Correlate via operation UUID, project/device, thread/process identity where useful, lock path category (exact vs legacy gate), and local activity IDs. Capture acquisition wait, hold duration, journal I/O, Git stage boundaries, remote round-trips and retries. Do not disclose secret tokens, private command JSON, repository contents, or security-sensitive arguments. Use current activity/job infrastructure rather than new logging architecture where practical.</p>
+<h2>Acceptance</h2>
+<ul>
+<li>A Windows concurrency regression demonstrates that unrelated UUIDs sharing a legacy stripe do not block each other on the new client; same UUID serializes and legacy stripe locks remain compatible. Include error classification for permanent IOException.</li>
+<li>Performance fixture and real Windows measurements distinguish lock wait from Git work and response-alert fetch. Specifically revisit 45–52-second writes and remote ~5-second fetches, under both idle and concurrent load.</li>
+<li>Diagnostics identify duration of each stage and the actual holder/contender relation when known; unknown evidence remains explicitly unknown. No intrusive tracing, no replay of uncertain remote effects.</li>
+<li>Investigate the longest measured stages and propose/fix root causes where supported, without weakening canonical Git CAS guarantees or extending critical sections.</li>
+<li>Review, test and report results before Windows client release; do not deploy/restart without Operator authorization.</li>
+</ul>

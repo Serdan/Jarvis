@@ -701,6 +701,67 @@ let composedLauncherDisposalHonorsFreshHomeProof
     return ()
 }
 
+[<TestCase("outcomeUnknown")>]
+[<TestCase("notSubmitted")>]
+[<TestCase("uiIncompatible")>]
+[<TestCase("bridgeError")>]
+let closeAfterExecutionReclaimsTabEvenWhenSubmissionIsUncertain (scriptStatus: string) = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let! client, connectionId = handshake port "test-secret"
+    use socket = client
+    do! registerReadyAgentWindow socket bridge
+    let launch = BrowserBridge.runInNewTab bridge "agents" "https://chatgpt.com/" "cleanup-all" false
+                     "async function execute(args) { return args; }" "{}" 5000 true
+    let! opened = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property opened "kind", Is.EqualTo("openTab"))
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"cleanup-all-created","agentCreated":true,"availability":"ready","registrationGeneration":3},{"registrationId":"personal-tab","agentCreated":false,"availability":"ready","registrationGeneration":1}]}"""
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "tabOpened"; requestId = property opened "requestId"
+        connectionId = connectionId
+        tab = {| registrationId = "cleanup-all-created"; agentCreated = true
+                 availability = "ready"; registrationGeneration = 3 |}
+    |}))
+    let! executing = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property executing "kind", Is.EqualTo("executeJs"))
+    if scriptStatus = "bridgeError" then
+        do! send socket (JsonSerializer.Serialize({|
+            version = 2; kind = "error"; requestId = property executing "requestId"
+            connectionId = connectionId; registrationId = "cleanup-all-created"
+            registrationGeneration = 3; error = "ExecutionLost"
+        |}))
+    else
+        do! send socket (JsonSerializer.Serialize({|
+            version = 2; kind = "result"; requestId = property executing "requestId"
+            connectionId = connectionId; registrationId = "cleanup-all-created"
+            registrationGeneration = 3
+            result = {| status = scriptStatus; stage = "composer"; reason = "Unknown" |}
+        |}))
+    let! closing = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property closing "kind", Is.EqualTo("closeTab"))
+    Assert.That(property closing "registrationId", Is.EqualTo("cleanup-all-created"))
+    use frame = JsonDocument.Parse(closing)
+    Assert.That(frame.RootElement.GetProperty("requireFreshHomeNoTurns").GetBoolean(), Is.False)
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "tabClosed"; requestId = property closing "requestId"
+        connectionId = connectionId; registrationId = "cleanup-all-created"
+        registrationGeneration = 3
+    |}))
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"personal-tab","agentCreated":false,"availability":"ready","registrationGeneration":1}]}"""
+    let! result = launch.WaitAsync(TimeSpan.FromSeconds(3.0))
+    match result with
+    | Ok response when scriptStatus = "notSubmitted" ->
+        Assert.That(response, Does.Contain("\"cleanup\":\"closed\""))
+    | Error (id, reason) ->
+        Assert.That(id, Is.EqualTo("cleanup-all-created"))
+        Assert.That(reason, Does.Contain("cleanup=closed"))
+    | _ -> Assert.Fail("Expected confirmed cleanup after an uncertain or failed launch")
+    do! waitUntil (fun () ->
+        bridge.ListTabs() |> Result.exists (fun tabs ->
+            tabs.Contains("personal-tab") && not (tabs.Contains("cleanup-all-created"))))
+}
+
 [<Test>]
 let compositeNotReadyCleanupReportsFailureOrConfirmedClosure () = task {
     let port = findPort()

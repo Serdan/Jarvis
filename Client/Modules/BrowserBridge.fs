@@ -753,20 +753,17 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                 if String.IsNullOrWhiteSpace(registrationId) || createdGeneration < 1 || not agentCreated then
                     return Error(registrationId, "OutcomeUnknown: created tab identity or provenance was missing")
                 else
-                    // Definitive pre-submit failure owns a disposable tab even
-                    // when the caller opted to retain successful conversations.
-                    // Close only the pinned agent-created registration.
+                    // A detached ChatGPT execution continues when its launch
+                    // tab closes. For close-after-execution, a missed activation is
+                    // preferable to leaking tabs, including on uncertain outcomes.
+                    // Explicit debug retention keeps the old fresh-home guard.
                     let closeDefinitive () = task {
                         match! bridge.CloseTab(registrationId, ownerConnectionId = ownerConnectionId,
                                                expectedRegistrationGeneration = createdGeneration,
-                                               requireFreshHomeNoTurns = true) with
+                                               requireFreshHomeNoTurns = not closeAfterExecution) with
                         | Ok _ -> return Ok "closed"
-                        // The extension rechecks fresh-home/zero-turn at disposal.
-                        // The earlier page result is not an enduring close authority.
-                        | Error "BrowserCloseTabError:CleanupSafetyChanged" ->
+                        | Error "BrowserCloseTabError:CleanupSafetyChanged" when not closeAfterExecution ->
                             return Ok "retained"
-                        // A missing/inconclusive safety probe is not an observed changed route.
-                        // Never close/retry, but surface the error with pinned registration.
                         | Error e ->
                             let safe = if e.Length > 100 then e.Substring(0, 100) else e
                             return Error("cleanupFailed:" + safe)
@@ -833,7 +830,12 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                         let script = defaultArg execution (Error "TabUnavailable:loading")
                         match script with
                         | Error e when isLoadingPreflight e -> return! cleanupNotReady()
-                        | Error e -> return Error(registrationId, "OutcomeUnknown: " + e)
+                        | Error e ->
+                            if closeAfterExecution then
+                                match! closeDefinitive() with
+                                | Ok cleanup -> return Error(registrationId, "OutcomeUnknown: " + e + ";cleanup=" + cleanup)
+                                | Error failure -> return Error(registrationId, "OutcomeUnknown: " + e + ";" + failure)
+                            else return Error(registrationId, "OutcomeUnknown: " + e)
                         | Ok result ->
                             use doc = JsonDocument.Parse(result)
                             let payload = doc.RootElement.GetProperty("result")
@@ -863,10 +865,14 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                                     | _ -> false
                                 | _ -> false
                             let disposeFailedLaunch () =
-                                if disposable then closeDefinitive()
+                                if closeAfterExecution || disposable then closeDefinitive()
                                 else task { return Ok "retained" }
                             if status = "outcomeUnknown" then
-                                return Error(registrationId, "OutcomeUnknown: page submission was not confirmed")
+                                if closeAfterExecution then
+                                    match! closeDefinitive() with
+                                    | Ok cleanup -> return Error(registrationId, "OutcomeUnknown: page submission was not confirmed;cleanup=" + cleanup)
+                                    | Error failure -> return Error(registrationId, "OutcomeUnknown: page submission was not confirmed;" + failure)
+                                else return Error(registrationId, "OutcomeUnknown: page submission was not confirmed")
                             elif status = "uiIncompatible" then
                                 // Provider scripts supply a bounded, non-sensitive stage and
                                 // reason; cleanup does not discard these diagnostics.
@@ -937,5 +943,13 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                                        scriptResult = payload.Clone()
                                        cleanup = cleanup |}))
         with e ->
-            return Error(registrationId, "OutcomeUnknown: " + e.GetType().Name)
+            if closeAfterExecution && not (String.IsNullOrWhiteSpace(registrationId)) then
+                // This path can fail before the pinned owner/generation is read.
+                // The extension still refuses to close non-agent-created tabs.
+                let! closed = bridge.CloseTab(registrationId)
+                let cleanup = match closed with
+                              | Ok _ -> "closed"
+                              | Error reason -> "cleanupFailed:" + reason
+                return Error(registrationId, "OutcomeUnknown: " + e.GetType().Name + ";cleanup=" + cleanup)
+            else return Error(registrationId, "OutcomeUnknown: " + e.GetType().Name)
 }

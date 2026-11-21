@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"integration-accepted-source-diverged-target-20261121","title":"[P0] Accept immutable reviewed source across main advancement; verify merge, fast-forward only final publication","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"integration-accepted-source-diverged-target-20261121","title":"[P0] Accept immutable reviewed source across main advancement; verify merge, fast-forward only final publication","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"bf8f8b8e2d0a4dbeb5c013efaa774cb0"}

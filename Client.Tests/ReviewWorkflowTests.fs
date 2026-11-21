@@ -5,6 +5,7 @@ open System.Diagnostics
 open System.IO
 open Client.LedgerStore
 open Client.ReviewWorkflow
+open Client.ChallengeWorkflow
 open NUnit.Framework
 
 [<TestFixture>]
@@ -3098,6 +3099,17 @@ type ReviewWorkflowTests() =
             let notificationId = Guid.NewGuid()
             ReviewWorkflow.notifyAgent first notificationId "Reviewer" "" "Owner" taskId
                 "Please agree on the new interface" |> success |> ignore
+            // Challenge subscriptions are stored next to agents, but are not
+            // ReviewAgent records and must never hide a canonical dashboard.
+            ChallengeWorkflow.setSubscription first (Guid.NewGuid()) "Owner" true
+            |> success |> ignore
+            let withSubscription = LedgerStore.fetch first |> success
+            let dashboardRecords = LedgerStore.readDashboardRecordsAt first withSubscription |> success
+            Assert.That(
+                dashboardRecords
+                |> Map.exists (fun path _ -> path.EndsWith(".challenge-subscription.json")),
+                Is.False,
+                "Challenge subscriptions must not be projected as dashboard agent records.")
             let canonical = ReviewWorkflow.getAgentInbox first "Owner" |> success
             Assert.That(canonical.Agent.State, Is.EqualTo("Ready"))
             let context = GitCommandTests.TestContext(Path.GetDirectoryName one)

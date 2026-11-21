@@ -1485,8 +1485,10 @@ module LedgerStore =
     let internal dashboardBlobCacheStats () = dashboardBlobCache.Counts
 
     let private dashboardRecordPath includeIntegrations includeInstructionConfigs (path: string) =
-        (path.StartsWith("agents/", StringComparison.Ordinal)
-         && path.EndsWith(".json", StringComparison.Ordinal))
+        // Select only canonical agent entities. Challenge subscriptions live
+        // in the same directory but use a different record schema.
+        // agents/<key>.challenge-subscription.json must not become an agent row.
+        (Regex.IsMatch(path, "^agents/[A-Za-z0-9_-]+[.]json$"))
         || (path.StartsWith("notifications/", StringComparison.Ordinal)
             && path.EndsWith(".json", StringComparison.Ordinal))
         || (path.StartsWith("tasks/", StringComparison.Ordinal)

@@ -334,6 +334,42 @@ function historicalChallengeCreation(id) {
   };
 }
 
+function historicalReverseIndex(changes, generation = 3, namespace = "by-challenge") {
+  const locator = namespace === "by-challenge"
+    ? CHALLENGE_A : Buffer.from("Worker 1").toString("base64url");
+  const path = "challenge-waits/" + namespace + "/" + locator + "/alpha/" + ID +
+    "/" + generation + ".json";
+  changes[path] = {
+    schemaVersion: 2, taskId: "alpha", attemptId: ID,
+    ownerAgentId: "Worker 1", assignmentGeneration: generation
+  };
+  return path;
+}
+
+function moveLifecycle(changes, from, to) {
+  const source = "tasks/alpha/lifecycle/" + from + ".json";
+  const event = changes[source];
+  assert.ok(event, "missing lifecycle fixture " + source);
+  delete changes[source];
+  changes["tasks/alpha/lifecycle/" + to + ".json"] = { ...event, sequence: to };
+}
+
+function blockAtGeneration(generation, sequence) {
+  return {
+    ...historicalWaitLineage()["tasks/alpha/lifecycle/96.json"],
+    operationId: "block-" + generation + "-" + sequence, sequence,
+    previousGeneration: generation, newGeneration: generation
+  };
+}
+
+function updateHistoricalFixture(f, changes, nextSequence) {
+  // Real disposable project Git authority; the header must not trivially
+  // invalidate an otherwise authentic out-of-order history.
+  changes["ledger.json"] = {
+    ...JSON.parse(git(f.a.writer, "show", "HEAD:ledger.json")), nextSequence
+  };
+  update(f.a, changes);
+}
 test("Challenge N to N+1 joins immutable owner/dependency index and lifecycle provenance", t => {
   const f = withFixture(t);
   update(f.a, requeuedChanges());
@@ -461,6 +497,72 @@ test("audited historical by-challenge index stays valid after N4 to N5 requeue",
   assert.equal(phase2DefaultOffDiagnostic(view).sideEffects, 0);
 });
 
+test("historical N3 to N4 and N4 block/requeue preserve strictly increasing lineage", t => {
+  const f = withFixture(t);
+  const changes = { ...requeuedChanges(), ...historicalWaitLineage(),
+    ...historicalChallengeCreation(CHALLENGE_A) };
+  historicalReverseIndex(changes);
+  moveLifecycle(changes, 98, 99);
+  changes["tasks/alpha/lifecycle/98.json"] = blockAtGeneration(4, 98);
+  updateHistoricalFixture(f, changes, 101);
+  const view = capture(f);
+  assert.equal(view.snapshot.projects[0].completeness.challenges, true);
+  assert.equal(view.snapshot.projects[0].challenges[0].waitIndexGeneration, 4);
+  assert.ok(!view.diagnostics.some(d => d.scope === "challenges"));
+  assert.equal(phase2DefaultOffDiagnostic(view).sideEffects, 0);
+});
+
+for (const variant of [
+  "N3 requeue seq99 follows the already completed N4 requeue seq98",
+  "N4 block seq99 follows its own requeue seq98",
+  "N4 block seq98 precedes N3 requeue seq99 even though both pairs are ordered",
+  "N3 block seq93 precedes N2 requeue seq94 despite increasing requeue sequences"
+]) {
+  test("historical generation chronology rejects " + variant, t => {
+    const f = withFixture(t);
+    const changes = { ...requeuedChanges(), ...historicalWaitLineage(),
+      ...historicalChallengeCreation(CHALLENGE_A) };
+    let nextSequence = 101;
+    let generation = 3;
+    let namespace = "by-challenge";
+    if (variant.startsWith("N3 requeue")) {
+      moveLifecycle(changes, 97, 99);
+    } else if (variant.startsWith("N4 block seq99")) {
+      changes["tasks/alpha/lifecycle/99.json"] = blockAtGeneration(4, 99);
+    } else if (variant.startsWith("N4 block seq98")) {
+      moveLifecycle(changes, 98, 100);
+      moveLifecycle(changes, 97, 99);
+      changes["tasks/alpha/lifecycle/98.json"] = blockAtGeneration(4, 98);
+      nextSequence = 102;
+    } else {
+      // No indexed N3 dependency is required: generation-3 lifecycle events
+      // still have to follow the recorded N2->N3 transition.
+      generation = 2;
+      namespace = "by-owner";
+      moveLifecycle(changes, 96, 93);
+      moveLifecycle(changes, 97, 94);
+      changes["tasks/alpha/lifecycle/92.json"] = blockAtGeneration(2, 92);
+      changes["tasks/alpha/lifecycle/94.json"] = {
+        ...changes["tasks/alpha/lifecycle/94.json"],
+        operationId: "gen2-requeue", previousGeneration: 2, newGeneration: 3
+      };
+      changes["tasks/alpha/lifecycle/97.json"] = {
+        ...historicalWaitLineage()["tasks/alpha/lifecycle/97.json"],
+        operationId: "gen3-requeue"
+      };
+      // Distinct generation-3 block is at 93, before N2 requeues at 94.
+      delete changes["challenges/" + CHALLENGE_A + "/events/95.json"];
+    }
+    const path = historicalReverseIndex(changes, generation, namespace);
+    updateHistoricalFixture(f, changes, nextSequence);
+    const view = capture(f);
+    assert.equal(view.snapshot.projects[0].completeness.challenges, false, variant);
+    assert.ok(view.diagnostics.some(d => d.scope === "challenges" &&
+      d.reason === "HistoricalGenerationChronologyUnproven" && d.path === path),
+      JSON.stringify(view.diagnostics));
+    assert.equal(phase2DefaultOffDiagnostic(view).sideEffects, 0);
+  });
+}
 for (const variant of ["wrong canonical ID", "foreign task", "missing creation event",
   "creation after block", "missing block audit", "wrong generation requeue"]) {
   test("historical by-challenge index fails closed on " + variant, t => {

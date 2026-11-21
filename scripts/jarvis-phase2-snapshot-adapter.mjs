@@ -342,6 +342,8 @@ function normalizeProject(view, diagnostics) {
   // treating any smaller number as evidence of a real old wait.
   const historicalBlocks = new Map();
   const historicalRequeues = new Map();
+  const lineageByAttempt = new Map();
+  const chronologyByWaitGeneration = new Map();
   for (const path of listPaths(r, /^tasks\/[A-Za-z0-9_-]+\/lifecycle\/[0-9]+\.json$/)) {
     const event = r.get(path);
     if (!["WaitOnChallenges", "RequeueChallengeBlockedAttempt"].includes(event?.action)) continue;
@@ -352,6 +354,12 @@ function normalizeProject(view, diagnostics) {
     const grouped = isBlock ? historicalBlocks : historicalRequeues;
     if (!grouped.has(key)) grouped.set(key, []);
     grouped.get(key).push({ path, event });
+    const attemptKey = taskId + "/" + event.attemptId;
+    if (!lineageByAttempt.has(attemptKey)) lineageByAttempt.set(attemptKey, []);
+    lineageByAttempt.get(attemptKey).push({
+      path, event, generation: isBlock ? event.newGeneration : event.previousGeneration,
+      order: isBlock ? 0 : 1
+    });
   }
   const createdChallengeEvents = new Map();
   for (const path of listPaths(r, /^challenges\/[a-f0-9]{32}\/events\/[0-9]+\.json$/)) {
@@ -417,6 +425,45 @@ function normalizeProject(view, diagnostics) {
         validAudits.length === 1 && e.sequence > validAudits[0].event.sequence);
       if (requeues.length !== 1 || validRequeues.length !== 1)
         issue(issues, "challenges", "HistoricalRequeueAuditUnproven", path);
+      // A valid old block/requeue pair is not enough: a generation-N
+      // transition must occur before every observed successor-generation
+      // block or requeue. Compare the complete canonical event order; do
+      // not assume every intervening generation used Challenge requeue.
+      const chronologyKey = locator.taskId + "/" + locator.attemptId +
+        "/" + locator.generation;
+      if (!chronologyByWaitGeneration.has(chronologyKey)) {
+        const events = (lineageByAttempt.get(locator.taskId + "/" + locator.attemptId) ?? [])
+          .filter(x => validPositive(x.generation) &&
+            x.generation >= locator.generation && x.generation <= wait.generation)
+          .sort((a, b) => a.generation - b.generation || a.order - b.order);
+        let previous = null;
+        let proven = true;
+        for (const link of events) {
+          const e = link.event;
+          const canonical = e.schemaVersion === 2 && e.taskId === locator.taskId &&
+            e.attemptId === locator.attemptId && validPositive(e.sequence) &&
+            link.path === "tasks/" + locator.taskId + "/lifecycle/" + e.sequence + ".json" &&
+            validString(e.operationId) && e.previousOwnerId === wait.ownerAgentId &&
+            e.newOwnerId === wait.ownerAgentId;
+          const validTransition = link.order === 0
+            ? e.actorId === wait.ownerAgentId &&
+              ["Queued", "Started"].includes(e.previousPhase) && e.newPhase === "Blocked" &&
+              e.previousGeneration === link.generation && e.newGeneration === link.generation
+            : validString(e.actorId) &&
+              e.previousPhase === "Blocked" && e.newPhase === "Queued" &&
+              e.previousGeneration === link.generation && e.newGeneration === link.generation + 1;
+          if (!canonical || !validTransition || (previous &&
+              (e.sequence <= previous.event.sequence ||
+               (link.generation === previous.generation && link.order === previous.order)))) {
+            proven = false;
+            break;
+          }
+          previous = link;
+        }
+        chronologyByWaitGeneration.set(chronologyKey, proven);
+      }
+      if (!chronologyByWaitGeneration.get(chronologyKey))
+        issue(issues, "challenges", "HistoricalGenerationChronologyUnproven", path);
       if (locator.namespace.startsWith("by-challenge/")) {
         const challengeId = locator.namespace.slice("by-challenge/".length);
         const challenge = r.get("challenges/" + challengeId + "/challenge.json");

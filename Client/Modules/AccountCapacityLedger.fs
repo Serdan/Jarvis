@@ -7,6 +7,8 @@ open System.Text
 open System.Text.Json
 open System.Text.RegularExpressions
 open Client.OriginalGitWriterAdmissionJournal
+open Client.NativeSchedulerRosterPolicy
+open Client.LedgerStore
 
 // Account-wide admission is a separate Git authority from every project work ledger.
 // These primitives intentionally have no Scheduler, browser, or migration activation hook.
@@ -30,6 +32,7 @@ type AccountFailure =
     | AccountLaunchMissing
     | AccountLaunchAlreadyReleased
     | AccountTerminalProofRejected of string
+    | AccountPolicyNotAuthoritative of string
 
 type AccountBinding =
     { RepositoryPath: string
@@ -348,7 +351,9 @@ module AccountCapacityLedger =
                   StandardInput = input |> Option.map BoundedProcess.TextInput
                                         |> Option.defaultValue BoundedProcess.ClosedInput
                   ExtraEnvironment =
-                      [ "GIT_TERMINAL_PROMPT", "0"
+                      [ // Local Git replace refs are never authenticated remote history.
+                        "GIT_NO_REPLACE_OBJECTS", "1"
+                        "GIT_TERMINAL_PROMPT", "0"
                         "GIT_AUTHOR_NAME", "Jarvis Account Admission"
                         "GIT_AUTHOR_EMAIL", "jarvis-account@localhost"
                         "GIT_COMMITTER_NAME", "Jarvis Account Admission"
@@ -632,8 +637,8 @@ module AccountCapacityLedger =
                                         | _ -> false)
                                     (fun _ -> AccountOutcomeUnknown Guid.Empty)))))
 
-    let private transact (b: AccountBinding) operationId actor kind requestJson expectedHead
-                         (plan: AccountCapacityState -> Result<AccountCapacityState * string, AccountFailure>) =
+    let private transactFiles (b: AccountBinding) operationId actor kind requestJson expectedHead
+                         (plan: AccountSnapshot -> Result<AccountCapacityState * string * (string * string) list, AccountFailure>) =
         if operationId = Guid.Empty || String.IsNullOrWhiteSpace actor
            || String.IsNullOrWhiteSpace kind then
             Error(InvalidAccountBinding "Stable operation ID, actor and kind required")
@@ -656,8 +661,8 @@ module AccountCapacityLedger =
                                 (match expectedHead with
                                  | Some expected when snapshot.Head <> expected ->
                                      Error(AccountHeadChanged(expected, snapshot.Head))
-                                 | _ -> plan snapshot.State)
-                                |> Result.bind (fun (updated, resultJson) ->
+                                 | _ -> plan snapshot)
+                                |> Result.bind (fun (updated, resultJson, extraFiles) ->
                                     let next =
                                         { updated with StateVersion = snapshot.State.StateVersion + 1L
                                                        NextSequence = snapshot.State.NextSequence + 1L }
@@ -673,7 +678,8 @@ module AccountCapacityLedger =
                                           Sequence = snapshot.State.NextSequence
                                           StateVersion = next.StateVersion }
                                     writeTree b (Some snapshot.Head)
-                                        [ "state.json", json next; receiptPath operationId, json receipt ]
+                                        ([ "state.json", json next; receiptPath operationId, json receipt ]
+                                         @ extraFiles)
                                     |> Result.bind (fun tree ->
                                         commitTree b tree (Some snapshot.Head)
                                             $"Account {kind}\n\nOperation-Id: {operationId:D}\nRequest-SHA256: {requestHash}"
@@ -751,6 +757,13 @@ module AccountCapacityLedger =
                | :? JsonException as ex ->
                 Error(InvalidAccountBinding $"Invalid operation JSON: {ex.Message}")
 
+    // Original WQ07 callers retain exactly their state v1 schema, transaction
+    // semantics, receipts and publication journal. Native policy adds only a
+    // namespaced file in the SAME account-head CAS.
+    let private transact b operationId actor kind requestJson expectedHead plan =
+        transactFiles b operationId actor kind requestJson expectedHead (fun snapshot ->
+            plan snapshot.State |> Result.map (fun (updated, result) -> updated, result, []))
+
     let occupied (s: AccountCapacityState) =
         s.Tokens |> Array.sumBy (fun t -> if t.Status = "Held" then 1 else 0)
 
@@ -817,6 +830,7 @@ module AccountCapacityLedger =
                 && permissionsOk
                 && noMetadataRedirects(Path.Combine(b.RepositoryPath, ".git"))
                 && not (File.Exists(Path.Combine(b.RepositoryPath, ".git", "objects", "info", "alternates")))
+                && not (File.Exists(Path.Combine(b.RepositoryPath, ".git", "info", "grafts")))
                 && not (File.Exists(Path.Combine(b.RepositoryPath, ".git", "commondir")))
                 && bare b.ApprovedFetchUrl && bare b.ApprovedPushUrl
         with _ -> false
@@ -994,3 +1008,363 @@ module AccountCapacityLedger =
                            json {| launchId = token.LaunchId; status = "Released"
                                    terminalOperationId = proof.TerminalOperationId
                                    occupied = occupied state - 1 |}))
+
+
+    // Native Scheduler *policy only*. There are deliberately no production
+    // approval trust anchors, writer entrypoints, reservations or launch paths.
+    // The internal signer port is restricted to independently signed disposable
+    // account/project bare-Git fixtures. A real authenticated host must supply
+    // its own operator-owned root/subject/epoch/roster proof before activation.
+    let private nativeRootMatches (b: AccountBinding) (approval: NativeSignedRosterApproval)
+                                  expectedSubject =
+        let p = approval.Policy
+        p.AccountId = b.AccountId.ToString("D")
+        && p.AccountLedgerId = b.LedgerId.ToString("D")
+        && p.AccountEpoch = b.Epoch
+        && p.AuthenticatedSubject = expectedSubject
+        && p.AccountAuthoritySha256 =
+            NativeSchedulerRosterPolicy.accountAuthoritySha256
+                p.AccountId p.AccountLedgerId p.AccountEpoch
+                b.ApprovedFetchUrl b.ApprovedPushUrl
+
+    let private readNativeApproval b head =
+        let path = NativeSchedulerRosterPolicy.PolicyPath
+        command b [ "ls-tree"; head; "--"; path ]
+        |> Result.bind (fun listing ->
+            if String.IsNullOrEmpty listing then Ok None
+            elif not (Regex.IsMatch(listing,
+                      "^100644 blob [0-9a-f]{40}([0-9a-f]{24})?\\t" + Regex.Escape(path) + "$")) then
+                Error(AccountIntegrityError "Native policy path is not a regular Git blob.")
+            else
+                command b [ "show"; $"{head}:{path}" ]
+                |> Result.bind (fun raw ->
+                    try
+                        let approved =
+                            JsonSerializer.Deserialize<NativeSignedRosterApproval>(raw, options)
+                        if isNull (box approved) then
+                            Error(AccountIntegrityError "Missing native approval document.")
+                        else Ok(Some approved)
+                    with _ ->
+                        Error(AccountIntegrityError "Unreadable native roster approval document.")))
+
+    // The only source of a native policy change is its WQ07-style immutable
+    // account operation, published at that same account ref and same CAS head.
+    // A later forged path rewrite or rollback cannot inherit an old signature.
+    let private verifyNativePolicyOrigin (b: AccountBinding) snapshot
+                                         (approval: NativeSignedRosterApproval) =
+        let opId = Guid.Parse approval.OperationId
+        let expectedRequest =
+            canonical (json {| schemaVersion = 1; accountId = b.AccountId.ToString("D")
+                               actor = approval.Actor; kind = "SetNativeSchedulerRosterPolicy"
+                               request = canonical (json approval) |})
+        let expectedResult =
+            canonical (json {| version = approval.Policy.Version
+                               previousVersion = approval.PreviousVersion
+                               policySha256 = hash (json approval) |})
+        readReceipt b snapshot.Head opId
+        |> Result.bind (function
+            | Some receipt when receipt.Kind = "SetNativeSchedulerRosterPolicy"
+                                && receipt.Actor = approval.Actor
+                                && receipt.CanonicalRequestJson = expectedRequest
+                                && receipt.RequestSha256 = hash expectedRequest
+                                && receipt.OriginalResultJson = expectedResult
+                                && receipt.StateVersion <= snapshot.State.StateVersion ->
+                command b [ "log"; "--first-parent"; "--diff-filter=A"; "--format=%H";
+                            snapshot.Head; "--"; receiptPath opId ]
+                |> Result.bind (fun origin ->
+                    command b [ "log"; "--first-parent"; "-1"; "--format=%H";
+                                snapshot.Head; "--"; NativeSchedulerRosterPolicy.PolicyPath ]
+                    |> Result.bind (fun latestChange ->
+                        if not (validOid origin) || origin <> latestChange then
+                            Error(AccountIntegrityError
+                                "Native policy was rewritten independently of its immutable CAS receipt.")
+                        else
+                            // A valid operator signature for head A must never
+                            // be transplanted by a Git-only actor onto parent D.
+                            // Git commit messages/receipts are not operator signatures.
+                            command b [ "rev-parse"; $"{origin}^" ]
+                            |> Result.bind (fun parent ->
+                                if parent <> approval.ExpectedAccountHead then
+                                    Error(AccountIntegrityError
+                                        "Native signed approval was transplanted onto an unauthorized predecessor.")
+                                else
+                                    command b [ "diff-tree"; "--no-commit-id"; "--name-only"; "-r"; origin ]
+                                    |> Result.bind (fun changed ->
+                                        let paths =
+                                            changed.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                                        let expected =
+                                            [| "state.json"; receiptPath opId
+                                               NativeSchedulerRosterPolicy.PolicyPath |]
+                                        if paths.Length <> expected.Length
+                                           || Set.ofArray paths <> Set.ofArray expected then
+                                            Error(AccountIntegrityError
+                                                "Native account policy CAS commit modified unexpected paths.")
+                                        else
+                                            readState b parent
+                                            |> Result.bind (fun before ->
+                                                readState b origin
+                                                |> Result.bind (fun after ->
+                                                    if receipt.Sequence <> before.NextSequence
+                                                       || receipt.StateVersion <> after.StateVersion
+                                                       || after.StateVersion <> before.StateVersion + 1L
+                                                       || after.NextSequence <> before.NextSequence + 1L
+                                                       || after.ConfigVersion <> before.ConfigVersion
+                                                       || after.MaxConcurrentAgents <> before.MaxConcurrentAgents
+                                                       || after.MigrationPhase <> before.MigrationPhase
+                                                       || after.Tokens <> before.Tokens then
+                                                        Error(AccountIntegrityError
+                                                            "Native policy CAS changed WQ07 state beyond its sequence increment.")
+                                                    else Ok ()))))))
+            | _ ->
+                Error(AccountIntegrityError
+                    "Native policy has no matching immutable account-head operation and payload."))
+
+    // A clone-local replace ref, graft or alternate cannot authenticate a
+    // project ledger header. Check the exact approved remote in an empty private
+    // bare repository, not through LedgerStore's shared project-clone reader.
+    let private verifiedNativeProjectRemoteHead (b: LedgerBinding) =
+        try
+            let scratch = Directory.CreateTempSubdirectory("jarvis-native-project-proof-").FullName
+            try
+                let repo = Path.Combine(scratch, "verified.git")
+                let emptyGlobal = Path.Combine(scratch, "empty-gitconfig")
+                let emptyTemplate = Path.Combine(scratch, "empty-template")
+                File.WriteAllText(emptyGlobal, "")
+                Directory.CreateDirectory(emptyTemplate) |> ignore
+                let git args =
+                    BoundedProcess.run
+                        { Executable = "git"
+                          Args = args
+                          WorkingDirectory = scratch
+                          Timeout = TimeSpan.FromSeconds 30.
+                          MaxOutputBytes = Some (256 * 1024)
+                          StandardInput = BoundedProcess.ClosedInput
+                          ExtraEnvironment =
+                            [ "GIT_NO_REPLACE_OBJECTS", "1"
+                              "GIT_CONFIG_NOSYSTEM", "1"
+                              "GIT_CONFIG_GLOBAL", emptyGlobal
+                              "GIT_TEMPLATE_DIR", emptyTemplate
+                              "GIT_TERMINAL_PROMPT", "0" ]
+                          ConfigureStart = Some(fun start ->
+                              // This includes GIT_CONFIG_PARAMETERS/COUNT/KEY_n,
+                              // GIT_DIR, GIT_OBJECT_DIRECTORY and alternates.
+                              let inherited =
+                                  start.Environment.Keys
+                                  |> Seq.cast<string>
+                                  |> Seq.filter (fun key ->
+                                      key.StartsWith("GIT_", StringComparison.OrdinalIgnoreCase))
+                                  |> Seq.toArray
+                              for key in inherited do
+                                  start.Environment.Remove(key) |> ignore) }
+                    |> function
+                        | Ok output when output.ExitCode = 0 && not output.TimedOut ->
+                            output.StdOut.Trim()
+                        | _ -> invalidOp "Isolated project Git proof command failed."
+                let gitRepo args = git (("--git-dir=" + repo) :: args)
+                if String.IsNullOrWhiteSpace b.ApprovedFetchUrl
+                   || b.ApprovedFetchUrl.StartsWith("-", StringComparison.Ordinal) then
+                    invalidOp "No unambiguous approved project fetch authority."
+                git [ "init"; "--bare"; "--initial-branch=main"; repo ] |> ignore
+                let cleanMetadata () =
+                    not ([ "info/grafts"; "objects/info/alternates"
+                           "objects/info/http-alternates"; "shallow" ]
+                         |> List.exists (fun path -> File.Exists(Path.Combine(repo, path))))
+                    && not (Directory.Exists(Path.Combine(repo, "refs", "replace")))
+                if not (cleanMetadata ()) then
+                    invalidOp "Project proof repository has local history redirects."
+                let advertisedHead () =
+                    let record =
+                        gitRepo [ "ls-remote"; "--refs"; "--exit-code"
+                                  b.ApprovedFetchUrl
+                                  NativeSchedulerRosterPolicy.ProjectSourceRef ]
+                    let fields = record.Split('\t')
+                    if fields.Length <> 2 || not (validOid fields[0])
+                       || fields[1] <> NativeSchedulerRosterPolicy.ProjectSourceRef then
+                        invalidOp "Approved remote does not advertise one exact project ref."
+                    fields[0]
+                let before = advertisedHead ()
+                gitRepo [ "fetch"; "--no-tags"; "--no-write-fetch-head"; "--refmap="
+                          b.ApprovedFetchUrl
+                          NativeSchedulerRosterPolicy.ProjectSourceRef + ":refs/heads/native-roster-proof" ]
+                |> ignore
+                let head = gitRepo [ "rev-parse"; "--verify"; "refs/heads/native-roster-proof^{commit}" ]
+                if not (validOid head) || head <> before || not (cleanMetadata ()) then
+                    invalidOp "Fetched project head or local Git metadata changed."
+                // Only a raw blob fetched from the real approved ref is proof.
+                let rawHeader = gitRepo [ "show"; head + ":ledger.json" ]
+                let header = JsonSerializer.Deserialize<LedgerHeader>(rawHeader, options)
+                if isNull (box header) || header.SchemaVersion <> 2
+                   || header.ProjectId <> b.ProjectId.ToString("D")
+                   || header.LedgerId <> b.LedgerId.ToString("D")
+                   || header.Epoch <> b.Epoch || header.NextSequence < 1L
+                   || header.Status <> "active" || isNull (box header.Settings)
+                   || advertisedHead () <> head || not (cleanMetadata ()) then
+                    invalidOp "Approved remote has a foreign or changed ledger header."
+                Ok head
+            finally
+                try Directory.Delete(scratch, true) with _ -> ()
+        with _ ->
+            Error(AccountPolicyNotAuthoritative
+                "Exact project remote/ref/ledger identity cannot be independently authenticated.")
+
+    let private verifyNativeProjects (policy: NativeRosterPolicy)
+                                     (bindings: LedgerBinding array) =
+        if isNull bindings || bindings.Length <> policy.Projects.Length
+           || bindings |> Array.exists (fun b -> isNull (box b))
+           || (bindings |> Array.map _.ProjectId |> Array.distinct |> Array.length) <> bindings.Length then
+            Error(AccountPolicyNotAuthoritative
+                "Trusted complete project bindings are absent, duplicate or only a subset.")
+        else
+            policy.Projects
+            |> Array.fold (fun state project ->
+                state |> Result.bind (fun heads ->
+                    match bindings |> Array.tryFind (fun b -> b.ProjectId.ToString("D") = project.ProjectId) with
+                    | None -> Error(AccountPolicyNotAuthoritative "Unrecognized/foreign approved project.")
+                    | Some b ->
+                        let authority =
+                            { ProjectId = b.ProjectId; LedgerId = b.LedgerId; Epoch = b.Epoch
+                              ApprovedFetchUrl = b.ApprovedFetchUrl; ApprovedPushUrl = b.ApprovedPushUrl }
+                        if project.LedgerId <> b.LedgerId.ToString("D")
+                           || project.Epoch <> b.Epoch
+                           || project.SourceRef <> NativeSchedulerRosterPolicy.ProjectSourceRef
+                           || project.RemoteAuthoritySha256 <> projectAuthoritySha256 authority then
+                            Error(AccountPolicyNotAuthoritative
+                                "Project source, ledger epoch or remote mapping does not match its approved identity.")
+                        else
+                            // Keep the existing project trusted-cache semantics, but
+                            // do not let its clone-local Git metadata prove identity.
+                            match verifiedNativeProjectRemoteHead b with
+                            | Error error -> Error error
+                            | Ok genuineHead ->
+                                match LedgerStore.fetch b with
+                                | Ok snapshot when snapshot.Commit = genuineHead
+                                                   && snapshot.Header.ProjectId = project.ProjectId
+                                                   && snapshot.Header.LedgerId = project.LedgerId
+                                                   && snapshot.Header.Epoch = project.Epoch ->
+                                    Ok(Array.append heads
+                                        [| { ProjectId = project.ProjectId; LedgerId = project.LedgerId
+                                             Epoch = project.Epoch; VerifiedHead = genuineHead } |])
+                                | _ -> Error(AccountPolicyNotAuthoritative
+                                           "Project local trust cache disagrees with authenticated remote head.")))
+                (Ok [||])
+
+    let private verifiedNativeAt b operatorKey expectedSubject bindings snapshot =
+        readNativeApproval b snapshot.Head
+        |> Result.bind (function
+            | None -> Error(AccountPolicyNotAuthoritative "Complete signed account project roster is absent.")
+            | Some approval ->
+                NativeSchedulerRosterPolicy.verifySignedApproval operatorKey approval
+                |> Result.mapError AccountPolicyNotAuthoritative
+                |> Result.bind (fun () ->
+                    if not (nativeRootMatches b approval expectedSubject) then
+                        Error(AccountPolicyNotAuthoritative
+                            "Authenticated subject/account/ledger/epoch/remote approval differs.")
+                    elif snapshot.State.MigrationPhase <> "LegacyActive" then
+                        Error(AccountPolicyNotAuthoritative
+                            "WQ07 migration fence is not in the inert LegacyActive phase.")
+                    else
+                        verifyNativePolicyOrigin b snapshot approval
+                        |> Result.bind (fun () ->
+                            verifyNativeProjects approval.Policy bindings
+                            |> Result.map (fun heads -> approval, heads))))
+
+    // Host approval is intentionally DISABLED. No signed fixture capability is
+    // exposed through this public entrypoint and neither a caller-authored
+    // subject, "approved" flag, nor dashboard membership can turn it on.
+    let setNativeRosterPolicy (_: AccountBinding) (_: NativeSignedRosterApproval) =
+        Error(AccountPolicyNotAuthoritative
+            "Production host OAuth subject/operator approval trust registry is not provisioned; writer disabled.")
+
+    let readNativeRosterPolicy (b: AccountBinding) =
+        match fetch b with
+        | Error failure ->
+            NativeSchedulerRosterPolicy.hold
+                $"No verified account head: {failure}" None
+        | Ok snapshot ->
+            NativeSchedulerRosterPolicy.hold
+                "Production host OAuth subject/operator approval trust registry is not provisioned; signed roster cannot be authorized."
+                (Some snapshot.Head)
+
+    // Test-only authenticated route. The account sink cannot be a production
+    // checkout or remote: it must satisfy WQ10's private, marked /tmp bare-Git
+    // topology with no symlink/alternates/credential redirect. The disposable
+    // operator key signs the exact host subject, account, *complete* membership,
+    // version, predecessor head and operation UUID. All projects are reread
+    // against their independently pinned Git remotes before any account write.
+    let internal setVerifiedDisposableNativeRosterPolicy disposableRoot
+                         (b: AccountBinding) (operatorKey: byte array)
+                         expectedSubject (projects: LedgerBinding array)
+                         (approval: NativeSignedRosterApproval) =
+        if not (approvedDisposableAccountSink disposableRoot b) then
+            Error(AccountPolicyNotAuthoritative
+                "Native policy test writer requires an isolated, marked, private disposable account authority.")
+        else
+            NativeSchedulerRosterPolicy.verifySignedApproval operatorKey approval
+            |> Result.mapError AccountPolicyNotAuthoritative
+            |> Result.bind (fun () ->
+                if not (nativeRootMatches b approval expectedSubject) then
+                    Error(AccountPolicyNotAuthoritative
+                        "Signed approval does not bind authenticated subject and account authority.")
+                else
+                    verifyNativeProjects approval.Policy projects
+                    |> Result.bind (fun _ ->
+                        let opId = Guid.Parse approval.OperationId
+                        transactFiles b opId approval.Actor "SetNativeSchedulerRosterPolicy"
+                            (json approval) (Some approval.ExpectedAccountHead) (fun snapshot ->
+                                if snapshot.State.MigrationPhase <> "LegacyActive" then
+                                    Error(AccountMigrationWritesFenced snapshot.State.MigrationPhase)
+                                else
+                                    readNativeApproval b snapshot.Head
+                                    |> Result.bind (fun previous ->
+                                        let previousVersion =
+                                            match previous with
+                                            | None -> Ok 0L
+                                            | Some old ->
+                                                NativeSchedulerRosterPolicy.verifySignedApproval operatorKey old
+                                                |> Result.mapError AccountPolicyNotAuthoritative
+                                                |> Result.bind (fun () ->
+                                                    if not (nativeRootMatches b old expectedSubject) then
+                                                        Error(AccountPolicyNotAuthoritative
+                                                            "Existing policy is signed for a different root.")
+                                                    else
+                                                        verifyNativePolicyOrigin b snapshot old
+                                                        |> Result.map (fun () -> old.Policy.Version))
+                                        previousVersion
+                                        |> Result.bind (fun currentVersion ->
+                                            if currentVersion <> approval.PreviousVersion then
+                                                Error(AccountPolicyNotAuthoritative
+                                                    "Signed predecessor policy version differs from account head.")
+                                            else
+                                                Ok(snapshot.State,
+                                                   json {| version = approval.Policy.Version
+                                                           previousVersion = approval.PreviousVersion
+                                                           policySha256 = hash (json approval) |},
+                                                   [ NativeSchedulerRosterPolicy.PolicyPath, json approval ]))))))
+
+    let internal readVerifiedDisposableNativeRosterPolicy disposableRoot (b: AccountBinding)
+                         (operatorKey: byte array) expectedSubject (projects: LedgerBinding array) =
+        if not (approvedDisposableAccountSink disposableRoot b) then
+            NativeSchedulerRosterPolicy.hold
+                "Account is not an independently marked disposable approval authority." None
+        else
+            match fetch b with
+            | Error failure ->
+                NativeSchedulerRosterPolicy.hold $"Account head unverified: {failure}" None
+            | Ok snapshot ->
+                match verifiedNativeAt b operatorKey expectedSubject projects snapshot with
+                | Ok (approved, heads) ->
+                    // The account may have moved while separate project
+                    // remotes were checked. Never present such a stale head
+                    // as an authoritative policy projection.
+                    match fetch b with
+                    | Ok refreshed when refreshed.Head = snapshot.Head ->
+                        NativeSchedulerRosterPolicy.verified snapshot.Head heads approved.Policy
+                    | Ok _ ->
+                        NativeSchedulerRosterPolicy.hold
+                            "Account head changed during cross-project policy verification." (Some snapshot.Head)
+                    | Error error ->
+                        NativeSchedulerRosterPolicy.hold
+                            $"Unable to confirm account head after project verification: {error}"
+                            (Some snapshot.Head)
+                | Error failure ->
+                    NativeSchedulerRosterPolicy.hold $"{failure}" (Some snapshot.Head)

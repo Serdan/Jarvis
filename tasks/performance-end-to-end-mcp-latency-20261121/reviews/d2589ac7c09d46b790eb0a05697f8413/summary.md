@@ -10,11 +10,14 @@
 - `ListWorktrees` exercises actual bulk discovery cold/warm and a 1→2 physical-worktree topology advance with **one** traced `git.worktree` command each; 0/220/2200 records exercise the real porcelain parser. These synthetic 2200 records are *not* 2200 physical worktrees.
 - Source inspected: opt-in `JARVIS_MCP_STAGE_TRACE` gate; GUID correlation normalization, fixed stage/outcome whitelist, aggregate durations/counts only, no Git args, credentials, project paths or payload in `McpLatencyTrace.render`; fixed logging sites in Client/SignalR and Server. Previous independent source-bound redaction checks in review `8a981fa4` remain relevant; source changes after initial trace implementation are restricted to regression tests and documentation.
 
+- Additional **independently executed** frozen-source Release filter for `McpLatencyTraceTests` and the original `ReviewerQueueAndSelectedReadsHaveSourcePinnedBoundedGoldenFixtures`: **6/6 passed**, 0 failed/skipped, exit 0. Combined selected independent test total is **13/13**; this is not a full-suite claim.
+- Independently built `Server.Tests/Server.Tests.fsproj -c Release --no-restore` on the exact worktree: **exit 0, 0 warnings, 0 errors**; this is a build rather than execution of server tests. Post-test Git status remained clean.
+
 ## Prior P1 disposition and limits
 
 1. **Original missing hot-path goldens:** Resolved for scoped synthetic populations and explicit negative/positive paths; no per-entity subprocess regression escaped the new count gates. A 2200 physical worktree stress test is not claimed or required by these parser-focused fixtures.
 2. **Original missing real delayed remote-Git contention:** Resolved via actual blocked upload-pack, overlapping pinned LedgerStore read, transport cancellation, stage-ref absence and explicit fetch-count controls.
 
-**Limits (nonblocking):** Tests are source-pinned POSIX disposable-repository evidence, not end-to-end live MCP latency or Windows/KRUSO parity. Default-off preflight takes a zero-Git early return; enabled scope is not validated by this fixture. At 2200 recipient notifications, cold allocation was approximately 132 MB and elapsed ~558 ms on this one host: a useful diagnostic, not an absolute performance acceptance gate. The author's reported 35/35/TRX and Server.Tests build are not independently certified here.
+**Limits (nonblocking):** Tests are source-pinned POSIX disposable-repository evidence, not end-to-end live MCP latency or Windows/KRUSO parity. Default-off preflight takes a zero-Git early return; enabled scope is not validated by this fixture. At 2200 recipient notifications, cold allocation was approximately 132 MB and elapsed ~558 ms on this one host: a useful diagnostic, not an absolute performance acceptance gate. The author's reported 35/35/TRX was not independently rerun or authenticated here; the server Release build was independently repeated.
 
 **Verdict: Accepted** for the original two P1 correction obligations. No new scope or live-deployment claim is introduced.

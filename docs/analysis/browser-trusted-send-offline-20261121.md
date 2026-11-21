@@ -1,0 +1,41 @@
+# Background trusted Send transport — offline-only design, 2026-11-21
+
+**Owner:** Jarvis Worker 10. **Canonical assignment:** `browser-launcher-postreview-outcomeunknown-20261121`.
+**Status:** source-only proof, default-off and unintegrated. No authenticated ChatGPT send, browser install, main edit, deployment, scheduled action, or existing OutcomeUnknown replay.
+
+## Frozen inputs / provenance
+- Corrected browser bridge: `b7033b4b7bcdee0936cf7239a625a4ecaccf3257`, parent `a9e758fa1274b6e036708beb6da055721644fdab`. Its `acquireBackgroundFocus` enables `Emulation.setFocusEmulationEnabled` on an exact `https://chatgpt.com/` fresh-home Jarvis-created registered tab and guards URL, window and pending navigation. This experiment does not change that source.
+- Immutable synthetic Chromium lab: `598f8c331f0bcbf97c826be0381dc87fc5e7feaf`, `browser-extension/tests/cdp-background-lab.mjs`, `about:blank` in disposable Edge 157 profile, no credentials. Reproduced: background document `hidden`/not focused; JavaScript `element.click()` emits `isTrusted=false, detail=0`; after focus emulation a CDP mouse press+release emits `isTrusted=true, detail=1` while the tab remains background. No real ChatGPT Send was tested. This is Chromium input evidence only.
+- Launcher in `b7033b4b`, `browser-scripts/chatgpt/launchAgent.js`, validates unique enabled Send button, exact draft, mode/model/effort and fresh home; currently calls `send.click()` once at the irreversible boundary and independently waits for a matching user bubble and a server-issued `/c/<UUID>` route. CDP injection cannot be added as a retry after this click.
+- Original `OutcomeUnknown` sessions and their tabs must not be replayed. Their browser cleanup is not a backend negative receipt. Corrected source is not production publication.
+
+## When to select trusted input
+
+The correct first acceptance experiment is **focus emulation + existing synthetic click** on an explicitly authorized, new, uniquely identified one-shot prompt. There is no observed real-site failure of this combination yet. Trusted CDP Send must therefore remain disabled until a distinct canary with authoritative outcome evidence establishes that focus alone is insufficient, independent security review accepts the stronger capability, the operator approves the broad debugger permission and isolated profile, and publication gates pass. *Never* switch to CDP after a synthetic Send has already been attempted on that same operation.
+
+The experimental module `browser-extension/tests/fixtures/trusted-send-prototype.cjs` models a separate transport selected **before any Send**. It deliberately has no production import, no privileged browser API access and no provider network access. It requires `permitTrustedInput`, `syntheticCanaryFailed`, and `syntheticClickAttempted=false` in test-only options. Its in-memory `makeIntent` is not a durable receipt, lease, authorization or cross-process CAS.
+
+## Proposed production protocol (NOT implemented)
+
+1. **Canonical intent:** bind one durable, caller-stable operation ID to browser connection epoch, registered tab/window + generation, exact origin and fresh-home URL, selected Chat/Work model/effort, digest of the approved prompt and immutable source SHA. A compare-and-swap lease changes `Prepared -> DispatchUncertain` *before* the first irreversible input. Two browser clients cannot own the same one-shot intent. Timeout and re-connection cannot make it `Prepared` again.
+2. **Prepare without Send:** move the existing launcher pre-Send logic into a source-reviewed prepare stage. It must verify one enabled, visible, hit-testable Send button, correct editor text and model/effort and return a per-document nonce, a renderer document identity, the button center in viewport CSS pixels, and non-sensitive digest evidence. Do not let prepare call `send.click()`, form submission or keyboard Enter. No page prompt body is returned to the bridge.
+3. **Bind debugger:** only from the existing `requireAgentCreated` composite operation, on the same registered exact-home ChatGPT target, the same registered window, a complete non-discarded/non-frozen document, and a current permission/connection epoch. Attach once, enable focus emulation and verify `visibilityState === 'visible'` plus `document.hasFocus()`. No tab activation, global keyboard input, arbitrary origin or network interception.
+4. **Final read-only proof:** compare a fresh short-lived renderer proof of exact prompt digest, selector, model, document nonce and `elementFromPoint(center)` (the element or an allowed descendant must be the exact Send) against the original intent, and verify current tab URL/pending navigation + authorization. Preflight can reject as `DefinitelyNotAttempted`; record gate failure. A read-only `mouseMoved` may precede the final verification.
+5. **One irreversible gesture:** mark durable `DispatchUncertain` before CDP `mousePressed`; issue exactly one `Input.dispatchMouseEvent` with `type=mousePressed`, left button, `buttons=1`, `clickCount=1`; then, if still safe, one matching `mouseReleased` with `buttons=0`. A lost response after pressing or releasing is `OutcomeUnknown`, not `NotSent`. A completed CDP command proves only input dispatch, *not* a server-accepted conversation.
+6. **Read-only reconcile:** after input, observe matching user bubble and the server-issued UUID conversation route, using the original launcher's bounded acknowledgment logic. No second gesture on missing bubble, local route, timeout, crashed renderer, or transport disconnect. Retain uncertain operation identifiers for later read-only reconciliation.
+7. **Cleanup and independent receipts:** always try to disable focus emulation and detach the debugger, including exceptions. Tab closing must obey the existing uncertain-send cleanup guards. The authoritative completion receipt must bind exact operation, source, verified route, and backend/canonical agent continuation; an extension `executeJs` response alone is not an external effect receipt.
+
+**Race/authority caveat:** a read-only DOM probe followed by asynchronous CDP input is not atomic with SPA rendering. Revalidate immediately before input, keep a short evidence age, and fail closed on any changed target or document. Chromium provides no general transaction that locks React DOM and CDP input together. Also, debugger permission is browser-wide at install, whatever our runtime checks do; explicit security review and human approval are essential.
+
+## Isolated prototype test matrix
+
+`node --test browser-extension/tests/trusted-send-prototype.test.cjs` tests single dispatch, default-off policy, separate canary gate, no synthetic-then-CDP escalation, exact tab/window/URL, pending navigation, frozen/loading targets, focus/visibility, selected model, prompt digest, unique hit-tested button, revoked authorization, changing button after pointer move, navigation before/after press, uncertain pressed/released transport, concurrent same-intent CAS-like consumption, and independent parallel tab intents. The module returns `inputDispatched` with `providerSubmitted:false` even on a perfect mock transport.
+
+`node --test browser-extension/tests/bridge.test.cjs` validates the existing source-corrected focus and navigation race guards. Neither fixture substitutes for Chromium extension-context integration or authenticated Send acceptance. This branch changes only this document and offline test fixtures. No prototype has been wired into the production bridge or launcher.
+
+## Next decisions and gates
+
+- Operator/Lead: verify a **new** focus+synthetic test under explicit live-send authorization and reconcile its true server outcome; do not infer failure from a background tab closing.
+- If that test really fails and input trust is implicated, request independent privilege/security review of the separate CDP transport with durable CAS, read-only UI proof and uncertain outcome fencing before implementation or activation.
+- Run disposable Chrome for Testing tab fixtures and browser-extension Node suites; perform no credential-bearing browser tests in this source-only assignment.
+- Keep source publication blocked on the original trusted Git writer positive remote receipt + ledger CAS, independent of input-transport results.

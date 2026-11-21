@@ -1284,9 +1284,7 @@ module ReviewWorkflow =
                 // from the authoritative remote, even with no source branch here.
                 do! LedgerStore.fetchReviewRef binding review.ReviewRef pinned
                 let! targetHead = LedgerStore.readRemoteTarget binding targetRef
-                // No unreviewed merge or conflict-resolution commit can be a
-                // fast-forward of this snapshot. Such work needs a new review.
-                do! LedgerStore.verifySourceAncestry binding targetHead pinned
+                // Independently advancing the target does not invalidate Accepted source.
                 let managedRef = $"refs/heads/jarvis-integration/{submissionId:N}"
                 do! LegacyDirectWriterFence.preflightSourcePublication binding
                 do! LedgerStore.publishIntegrationRefForAction binding action managedRef pinned
@@ -1336,23 +1334,28 @@ module ReviewWorkflow =
                 let! currentRecord, _ = required<IntegrationSubmission> binding snapshot path
                 if currentRecord.Status <> "Pending" then
                     return! Error(StaleEntityVersion "Integration submission is already completed.")
+                // Verify and fetch the actual published remote target first.
+                // A second checkout may have neither the integration commit nor
+                // its first parent locally until this read stages their objects.
+                do! LedgerStore.verifyIntegrationOnRemote binding currentRecord.TargetRef
+                        currentRecord.SubmittedCommit integratedCommit
                 // Historical branch-only records have no IntegrationRef and
-                // retain their original completion behavior. New managed
-                // submissions never authorize an unreviewed merge commit.
+                // retain their original completion behavior. Managed submissions
+                // allow only the exact source or a proven mechanical merge.
                 if not (String.IsNullOrWhiteSpace currentRecord.IntegrationRef) then
                     let expectedRef = $"refs/heads/jarvis-integration/{submissionId:N}"
                     if currentRecord.IntegrationRef <> expectedRef
                        || currentRecord.ReviewedHeadOid <> currentRecord.SubmittedCommit
                        || not (LedgerStore.validSourceCommitOid currentRecord.TargetHeadAtSubmission) then
                         return! Error(LedgerIntegrityError "Managed integration provenance is inconsistent.")
-                    if integratedCommit <> currentRecord.SubmittedCommit then
-                        return! Error(InvalidBinding "Conflict-resolution or merge commits require a fresh Accepted review.")
                     do! LedgerStore.fetchReviewRef binding currentRecord.ReviewRef currentRecord.SubmittedCommit
                     do! LedgerStore.fetchIntegrationRef binding currentRecord.IntegrationRef currentRecord.SubmittedCommit
-                    do! LedgerStore.verifySourceAncestry binding
-                            currentRecord.TargetHeadAtSubmission currentRecord.SubmittedCommit
-                do! LedgerStore.verifyIntegrationOnRemote binding currentRecord.TargetRef
-                        currentRecord.SubmittedCommit integratedCommit
+                    if integratedCommit = currentRecord.SubmittedCommit then
+                        do! LedgerStore.verifySourceAncestry binding
+                                currentRecord.TargetHeadAtSubmission currentRecord.SubmittedCommit
+                    else
+                        do! LedgerStore.verifyMechanicalIntegrationMerge binding
+                                currentRecord.TargetHeadAtSubmission currentRecord.SubmittedCommit integratedCommit
                 return! LegacyDirectWriterFence.transact binding action (fun current -> result {
                     let! _ = required<ReviewAgent> binding current (agentPath actorId)
                     let! existing, oid = required<IntegrationSubmission> binding current path

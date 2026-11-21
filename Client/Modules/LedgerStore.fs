@@ -8,6 +8,7 @@ open System.Security.Cryptography
 open System.Text
 open System.Text.Json
 open System.Text.RegularExpressions
+open FsToolkit.ErrorHandling
 open Client.OriginalGitWriterAdmissionJournal
 
 // Canonical Git ledger transport. Every caller requires an explicitly verified local binding.
@@ -2254,6 +2255,48 @@ module LedgerStore =
                 | Ok true -> Ok ()
                 | Ok false -> Error(InvalidBinding "Source commit does not descend from the expected base.")
                 | Error error -> Error error
+
+    // A reviewed source remains immutable when the target advances. Only a
+    // conflict-free Git merge of the exact reviewed source and target lineage
+    // can be completed without an additional integration-specific review.
+    // In particular, ancestor checks alone cannot authorize arbitrary edits
+    // inserted into an otherwise plausible two-parent merge commit.
+    let verifyMechanicalIntegrationMerge (binding: LedgerBinding)
+                                         targetHeadAtSubmission submittedCommit integratedCommit =
+        result {
+            do! verifySourceObject binding targetHeadAtSubmission
+            do! verifySourceObject binding submittedCommit
+            do! verifySourceObject binding integratedCommit
+            let! parentLine =
+                run binding.RepositoryPath
+                    [ "rev-list"; "--parents"; "-n"; "1"; integratedCommit ]
+            let parents = parentLine.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            if parents.Length <> 3 || parents[0] <> integratedCommit
+               || parents[2] <> submittedCommit
+               || not (oidPattern.IsMatch parents[1]) then
+                return! Error(InvalidBinding
+                    "Integration requires exactly two parents: target first and exact Accepted source second.")
+            let targetParent = parents[1]
+            do! verifySourceAncestry binding targetHeadAtSubmission targetParent
+            // Use Git's real ort merge, not patch-id or a caller-supplied tree.
+            // A conflict requires a separately reviewed resolution; silently
+            // accepting its conflict markers or chosen content is unsafe.
+            match git binding.RepositoryPath
+                    [ "merge-tree"; "--write-tree"; "--no-messages"; targetParent; submittedCommit ] with
+            | Error failure -> return! Error failure
+            | Ok merged when merged.ExitCode <> 0 ->
+                return! Error(InvalidBinding
+                    "Integration requires conflict resolution or has no verifiable mechanical merge.")
+            | Ok merged when not (oidPattern.IsMatch merged.Stdout) ->
+                return! Error(LedgerIntegrityError "Git returned an invalid mechanical merge tree.")
+            | Ok merged ->
+                let! actualTree =
+                    run binding.RepositoryPath
+                        [ "rev-parse"; "--verify"; $"{integratedCommit}^{{tree}}" ]
+                if actualTree <> merged.Stdout then
+                    return! Error(InvalidBinding
+                        "Integration merge tree has changes beyond the exact conflict-free Git composition.")
+        }
 
     let private intentInput (binding: LedgerBinding) (intent: LedgerIntent) =
         json

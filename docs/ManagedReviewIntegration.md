@@ -31,35 +31,68 @@ new integration.
 
 A review that is Unclaimed, Claimed, ChangesRequested, missing its canonical
 SHA, or changed on the remote cannot authorize integration. The submitted
-commit must fast-forward from the observed remote target; changes needed to
-resolve conflicts must be committed and independently reviewed again.
+source SHA need **not** descend from the current target head. Independent target
+advancement does not invalidate the Accepted source or require a worker rebase
+and full source re-review. The integration record captures the advertised target
+head at submission for later ancestry verification.
 
 ## Integrator procedure (explicit, never automatic)
 
 Use a fresh isolated worktree. Read the canonical submission and accepted
 review through Jarvis first. Fetch the integration ref from the configured
 approved remote and verify that its SHA equals both `ReviewedHeadOid` and
-`SubmittedCommit`. Treat the pinned `TargetHeadAtSubmission` as the
-optimistic concurrency expectation. For example, after substituting exact
-reviewed values from the canonical record:
+`SubmittedCommit`. Fetch the current target, verify it descends from
+`TargetHeadAtSubmission`, and compose **that target** with the exact reviewed
+SHA. Keep the source ref immutable and the original Accepted review untouched.
+For example, with an isolated clean integration worktree and substituted
+canonical values:
 
 ```sh
 git fetch --no-tags origin refs/heads/jarvis-integration/<submissionId>
 test "$(git rev-parse FETCH_HEAD)" = "<reviewedSha>"
 git fetch --no-tags origin <targetRef>
-test "$(git rev-parse FETCH_HEAD)" = "<targetHeadAtSubmission>"
-git merge-base --is-ancestor <targetHeadAtSubmission> <reviewedSha>
-git push --porcelain --force-with-lease=<targetRef>:<targetHeadAtSubmission> \
-  origin <reviewedSha>:<targetRef>
+target_head="$(git rev-parse FETCH_HEAD)"
+git merge-base --is-ancestor <targetHeadAtSubmission> "$target_head"
+# In a fresh, clean integration worktree at "$target_head":
+# If "$target_head" is ancestor of <reviewedSha>, use that exact SHA directly.
+# Otherwise compose a real two-parent merge (target first, reviewed SHA second):
+git merge --no-ff --no-edit <reviewedSha>
+test "$(git rev-parse HEAD^1)" = "$target_head"
+test "$(git rev-parse HEAD^2)" = "<reviewedSha>"
+expected_tree="$(git merge-tree --write-tree --no-messages "$target_head" <reviewedSha>)"
+test "$(git rev-parse 'HEAD^{tree}')" = "$expected_tree"
+# Inspect the merged diff/scope and run merged-result Release tests.
+git push --porcelain origin HEAD:<targetRef>
 ```
 
-Do **not** use this fast-forward procedure if the target moved or if the
-target SHA is not an ancestor of the exact reviewed commit. Do not create an
-unreviewed merge commit to make the push succeed. Reconcile conflicts on a
-new isolated branch, publish and obtain a fresh independent Accepted review,
-then submit a new integration snapshot. `complete_integration` verifies the
-remote target contains the accepted exact commit; for managed submissions it
-rejects a different/unreviewed integration commit.
+The publication command is an **ordinary non-force push**. If the target moved
+before publication, the push must fail rather than overwrite it. Re-fetch,
+recompose against the latest target, re-run scope/test gates, and retry a new
+non-force push. A normal target race is not a new independent source review.
+The direct fast-forward case pushes `<reviewedSha>:<targetRef>` instead.
+Never replay an uncertain push blindly: inspect the remote receipt and the
+pending publication before choosing the next action.
+
+`complete_integration` verifies that the remote target contains the exact
+reviewed source and the claimed integrated commit. A distinct integration commit
+must have **exactly two parents**, with the first descending from
+`TargetHeadAtSubmission` and the second exactly `SubmittedCommit`. Its tree
+must equal Git's conflict-free mechanical merge of those parents. It rejects
+arbitrary extra changes, reordered/extra parents and conflict resolutions.
+If conflict resolution or nonmechanical changes are necessary, obtain a focused
+independent integration-specific review before publication. The present
+completion record has no field for such focused approval: **hold rather than
+pretend that ancestry alone authorizes the conflict resolution**. Do not re-review
+the unchanged source unnecessarily.
+
+The ledger records the Accepted source SHA/ref, submission target head, and
+distinct integrated SHA. The first parent of that immutable integrated merge
+SHA is the actual composition target, and its second parent is the exact
+reviewed source, so both remain reconstructible from the recorded receipt.
+Ordinary Git ancestry proves the final published
+target contains those objects; it cannot by itself attest hosting permissions
+or the original push flags. Host protection and publisher evidence remain
+mandatory production prerequisites.
 
 ## Host permissions: mandatory production prerequisite
 

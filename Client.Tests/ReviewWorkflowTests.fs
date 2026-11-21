@@ -487,7 +487,9 @@ type ReviewWorkflowTests() =
                       IntegrationRef = null; TargetHeadAtSubmission = null
                       TargetRef = sourceRef; Status = status; CreatedSequence = 8L
                       IntegratedCommit = if status = "Integrated" then baseOid else null
-                      CompletedAtUtc = if status = "Integrated" then "2026-11-06T03:16:08Z" else null }
+                      CompletedAtUtc = if status = "Integrated" then "2026-11-06T03:16:08Z" else null
+                      PublicationPreviousHead = null; PublicationObservedHead = null
+                      PublicationOperationId = null; PublicationMechanism = null }
                 let node =
                     System.Text.Json.Nodes.JsonNode.Parse(
                         System.Text.Json.JsonSerializer.Serialize(value, options)).AsObject()
@@ -1770,7 +1772,8 @@ type ReviewWorkflowTests() =
             | other -> Assert.Fail(sprintf "Unreviewed integration commit was allowed: %A" other)
             git one [ "checkout"; mainBranch ] |> ignore
             git one [ "merge"; "--ff-only"; firstCommit ] |> ignore
-            git one [ "push"; "origin"; mainBranch ] |> ignore
+            // Do not pre-publish: CompleteIntegration now verifies and performs
+            // the non-force target publication itself.
             let completionId = Guid.NewGuid()
             let complete () =
                 ReviewWorkflow.completeIntegration second completionId "boundary" "Reviewer"
@@ -1941,6 +1944,17 @@ type ReviewWorkflowTests() =
                 with _ -> true
             Assert.That(stalePushRejected, Is.True, "Stale integration must not overwrite remote target.")
             Assert.That(LedgerStore.readRemoteTarget second target |> success, Is.EqualTo(target2))
+            // A force-capable writer can discard racing T2 by rewriting the
+            // remote target to the stale, mechanically clean I=(T1,S).
+            // Ancestry alone must not issue a successful publication receipt.
+            git one [ "push"; "--force"; "origin"; firstMerge + ":" + target ] |> ignore
+            match ReviewWorkflow.completeIntegration first (Guid.NewGuid()) taskId "Reviewer"
+                    submission firstMerge with
+            | Error(InvalidBinding _) | Error(OutcomeUnknown _) -> ()
+            | other -> Assert.Fail(sprintf "Forced stale merge received completion: %A" other)
+            Assert.That((ReviewWorkflow.getIntegrationSubmissions second taskId |> success).Latest.Value.Status,
+                        Is.EqualTo("Pending"))
+            git two [ "push"; "--force"; "origin"; target2 + ":" + target ] |> ignore
             git one [ "fetch"; "origin"; target ] |> ignore
             git one [ "checkout"; "--detach"; "FETCH_HEAD" ] |> ignore
             git one [ "merge"; "--no-ff"; "--no-edit"; candidate ] |> ignore
@@ -1949,10 +1963,10 @@ type ReviewWorkflowTests() =
             Assert.That(integrated, Is.Not.EqualTo(firstMerge))
             Assert.That(git one [ "rev-list"; "--parents"; "-n"; "1"; integrated ],
                         Is.EqualTo(String.concat " " [ integrated; target2; candidate ]))
-            git one [ "push"; "origin"; "HEAD:" + target ] |> ignore
+            // Completion owns the ordinary non-force target publication.
             let completionId = Guid.NewGuid()
             let finish () =
-                ReviewWorkflow.completeIntegration second completionId taskId "Reviewer"
+                ReviewWorkflow.completeIntegration first completionId taskId "Reviewer"
                     submission integrated
             Assert.That((finish () |> success).AlreadyApplied, Is.False)
             Assert.That((finish () |> success).AlreadyApplied, Is.True)
@@ -1961,6 +1975,10 @@ type ReviewWorkflowTests() =
             Assert.That(completed.SubmittedCommit, Is.EqualTo(candidate))
             Assert.That(completed.IntegratedCommit, Is.EqualTo(integrated))
             Assert.That(completed.TargetHeadAtSubmission, Is.EqualTo(target1))
+            Assert.That(completed.PublicationPreviousHead, Is.EqualTo(target2))
+            Assert.That(completed.PublicationObservedHead, Is.EqualTo(integrated))
+            Assert.That(completed.PublicationOperationId, Is.EqualTo(completionId.ToString("D")))
+            Assert.That(completed.PublicationMechanism, Is.EqualTo("VerifiedNonForceGitPush/v1"))
             Assert.That(LedgerStore.readRemoteTarget first target |> success, Is.EqualTo(integrated)))
 
     [<Test>]
@@ -2009,12 +2027,30 @@ type ReviewWorkflowTests() =
             let forgedExtraTree =
                 git one [ "commit-tree"; editedTree; "-p"; targetHead; "-p"; candidate;
                           "-m"; "Unreviewed merge edit" ]
+            // A remote J with an unreviewed extra file is a legitimate
+            // fast-forward from T, but the verifying clone maps J -> clean I.
+            // Proof must use J's real remote tree, not local replacement refs.
+            git one [ "push"; "origin"; forgedExtraTree + ":" + target ] |> ignore
+            git two [ "fetch"; "origin"; target ] |> ignore
+            git two [ "fetch"; one; validMerge ] |> ignore
+            git two [ "replace"; forgedExtraTree; validMerge ] |> ignore
+            try
+                match LedgerStore.verifyMechanicalIntegrationMerge second targetHead candidate forgedExtraTree with
+                | Error(InvalidBinding _) | Error(LedgerIntegrityError _) -> ()
+                | other -> Assert.Fail(sprintf "Local Git replace spoofed merge-tree proof: %A" other)
+                match ReviewWorkflow.completeIntegration second (Guid.NewGuid()) taskId "Reviewer"
+                        submission forgedExtraTree with
+                | Error(InvalidBinding _) | Error(LedgerIntegrityError _) -> ()
+                | other -> Assert.Fail(sprintf "Replaced extra-tree merge was completed: %A" other)
+            finally
+                git two [ "replace"; "-d"; forgedExtraTree ] |> ignore
+                git two [ "push"; "--force"; "origin"; targetHead + ":" + target ] |> ignore
             // Bare-remote fixture deliberately advertises each invalid merge
             // as target HEAD: failure must be the provenance/tree gate, not
             // merely absence of the candidate object on the remote.
             for forged in [ forgedWrongSecond; forgedOldFirst; forgedThreeParents; forgedExtraTree ] do
                 git one [ "push"; "--force"; "origin"; forged + ":" + target ] |> ignore
-                match ReviewWorkflow.completeIntegration second (Guid.NewGuid()) taskId "Reviewer"
+                match ReviewWorkflow.completeIntegration first (Guid.NewGuid()) taskId "Reviewer"
                         submission forged with
                 | Error(InvalidBinding _) -> ()
                 | other -> Assert.Fail(sprintf "Invalid two-parent merge was accepted: %A" other)
@@ -2022,18 +2058,19 @@ type ReviewWorkflowTests() =
             Assert.That((ReviewWorkflow.getIntegrationSubmissions second taskId |> success).Latest.Value.Status,
                         Is.EqualTo("Pending"))
             git one [ "reset"; "--hard"; validMerge ] |> ignore
-            git one [ "push"; "origin"; "HEAD:" + target ] |> ignore
-            Assert.That(LedgerStore.readRemoteTarget second target |> success,
-                        Is.EqualTo(validMerge))
-            // An advertised remote head forcibly rewritten behind the merge
-            // does not prove that the accepted source was integrated.
-            git two [ "push"; "--force"; "origin"; targetHead + ":" + target ] |> ignore
-            match ReviewWorkflow.completeIntegration second (Guid.NewGuid()) taskId "Reviewer"
+            // A real racing target descendant of T must prohibit stale I.
+            File.WriteAllText(Path.Combine(two, "race.txt"), "racing target update")
+            git two [ "add"; "race.txt" ] |> ignore
+            git two [ "commit"; "-m"; "Target advanced beyond mechanical merge" ] |> ignore
+            git two [ "push"; "origin"; mainBranch ] |> ignore
+            match ReviewWorkflow.completeIntegration first (Guid.NewGuid()) taskId "Reviewer"
                     submission validMerge with
             | Error(InvalidBinding _) -> ()
-            | other -> Assert.Fail(sprintf "Rewritten remote falsely completed integration: %A" other)
-            git one [ "push"; "origin"; "HEAD:" + target ] |> ignore
-            ReviewWorkflow.completeIntegration second (Guid.NewGuid()) taskId "Reviewer"
+            | other -> Assert.Fail(sprintf "Racing remote falsely completed stale merge: %A" other)
+            // Restore the disposable remote to T for an ordinary clean
+            // completion; production code never performs this fixture rewind.
+            git two [ "push"; "--force"; "origin"; targetHead + ":" + target ] |> ignore
+            ReviewWorkflow.completeIntegration first (Guid.NewGuid()) taskId "Reviewer"
                 submission validMerge |> success |> ignore
             let record = (ReviewWorkflow.getIntegrationSubmissions first taskId |> success).Latest.Value
             Assert.That(record.Status, Is.EqualTo("Integrated"))
@@ -2076,7 +2113,7 @@ type ReviewWorkflowTests() =
             // Publish to the disposable bare remote so completion reaches the
             // mechanical-conflict gate rather than failing on a missing object.
             git one [ "push"; "origin"; forgedResolution + ":" + target ] |> ignore
-            match ReviewWorkflow.completeIntegration second (Guid.NewGuid()) taskId "Reviewer"
+            match ReviewWorkflow.completeIntegration first (Guid.NewGuid()) taskId "Reviewer"
                     submission forgedResolution with
             | Error(InvalidBinding _) -> ()
             | other -> Assert.Fail(sprintf "Conflicting merge was accepted without focused review: %A" other)
@@ -6133,7 +6170,9 @@ type ReviewWorkflowTests() =
                            IntegrationRef = null; TargetHeadAtSubmission = null
                            TargetRef = null; Status = "Integrated"
                            CreatedSequence = int64 i + 10L
-                           IntegratedCommit = null; CompletedAtUtc = "2026-01-01T00:00:00Z" } : IntegrationSubmission)
+                           IntegratedCommit = null; CompletedAtUtc = "2026-01-01T00:00:00Z"
+                           PublicationPreviousHead = null; PublicationObservedHead = null
+                           PublicationOperationId = null; PublicationMechanism = null } : IntegrationSubmission)
                     write $"notifications/{notificationId}.json" 2
                         ({ NotificationId = notificationId; FromAgentId = "Reviewer"
                            FromProjectName = ""; ToAgentId = (if i % 11 = 0 then "Owner" else "Reviewer")

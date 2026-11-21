@@ -66,6 +66,15 @@ type LedgerBinding =
       LedgerId: Guid
       Epoch: int }
 
+// Only the bounded Git publisher can create this proof; callers cannot supply
+// a self-attested "non-force" bit to the completion operation.
+type IntegrationPublicationReceipt =
+    { PreviousHead: string
+      PublishedCommit: string
+      ObservedHead: string
+      OperationId: string
+      Mechanism: string }
+
 [<CLIMutable>]
 type LedgerSettings =
     { MaxWorkingPerAgent: int
@@ -434,8 +443,22 @@ module LedgerStore =
                   Timeout = activeGitTimeout.Value |> Option.defaultValue (TimeSpan.FromSeconds 30.)
                   MaxOutputBytes = None // Git blob reads are intentionally not page-limited here.
                   StandardInput = input |> Option.map BoundedProcess.TextInput |> Option.defaultValue BoundedProcess.ClosedInput
-                  ExtraEnvironment = ("GIT_TERMINAL_PROMPT", "0") :: environment
-                  ConfigureStart = None }
+                  // Git replacement refs must never change trust-bearing SHA,
+                  // parent, tree, merge-base or ancestry checks. Ignore inherited
+                  // object/namespace/config overlays, while preserving explicit
+                  // per-invocation index isolation for ledger writers.
+                  ExtraEnvironment =
+                      ("GIT_NO_REPLACE_OBJECTS", "1") :: ("GIT_TERMINAL_PROMPT", "0") :: environment
+                  ConfigureStart = Some (fun startInfo ->
+                      for key in startInfo.Environment.Keys |> Seq.toArray do
+                          if key.StartsWith("GIT_CONFIG_", StringComparison.OrdinalIgnoreCase)
+                             || ([ "GIT_DIR"; "GIT_COMMON_DIR"; "GIT_WORK_TREE"
+                                   "GIT_INDEX_FILE"; "GIT_OBJECT_DIRECTORY"
+                                   "GIT_ALTERNATE_OBJECT_DIRECTORIES"; "GIT_REPLACE_REF_BASE"
+                                   "GIT_GRAFT_FILE"; "GIT_SHALLOW_FILE"; "GIT_NAMESPACE"
+                                   "GIT_EXEC_PATH" ]
+                                 |> List.exists (fun unsafe -> key.Equals(unsafe, StringComparison.OrdinalIgnoreCase))) then
+                              startInfo.Environment.Remove(key) |> ignore) }
             |> function
                 | Error(ExceptionError ex) -> Error(GitFailure $"Git process failed to start ({ex.GetType().Name}).")
                 | Error _ -> Error(GitFailure "Git process failed.")
@@ -632,12 +655,30 @@ module LedgerStore =
         | Ok result -> Error(GitFailure $"Cannot inspect ref: {result.Stderr}")
         | Error error -> Error error
 
-    let private isAncestor repo oldHead newHead =
-        match git repo [ "merge-base"; "--is-ancestor"; oldHead; newHead ] with
-        | Ok result when result.ExitCode = 0 -> Ok true
-        | Ok result when result.ExitCode = 1 -> Ok false
-        | Ok _ -> Error(LedgerHistoryUnavailable "Cannot inspect trusted Git history.")
+    // Disallow legacy grafts, shallow cutoffs, and local object alternates in
+    // any history proof. Replacement refs are disabled by the shared Git runner.
+    // A local overlay is not an authenticated remote commit graph.
+    let private ensureUnmodifiedGitHistory repo =
+        match run repo [ "rev-parse"; "--path-format=absolute"; "--git-common-dir" ] with
         | Error error -> Error error
+        | Ok commonDir ->
+            let suspect =
+                [ Path.Combine(commonDir, "info", "grafts")
+                  Path.Combine(commonDir, "shallow")
+                  Path.Combine(commonDir, "objects", "info", "alternates") ]
+            if suspect |> List.exists File.Exists then
+                Error(LedgerIntegrityError
+                    "Local Git graft, shallow boundary or object alternate cannot be used for trusted history verification.")
+            else Ok ()
+
+    let private isAncestor repo oldHead newHead =
+        ensureUnmodifiedGitHistory repo
+        |> Result.bind (fun () ->
+            match git repo [ "merge-base"; "--is-ancestor"; oldHead; newHead ] with
+            | Ok result when result.ExitCode = 0 -> Ok true
+            | Ok result when result.ExitCode = 1 -> Ok false
+            | Ok _ -> Error(LedgerHistoryUnavailable "Cannot inspect trusted Git history.")
+            | Error error -> Error error)
 
     let private remoteExists binding =
         match remoteGitWithRetries "remote-existence" binding.RepositoryPath
@@ -1595,9 +1636,11 @@ module LedgerStore =
         if not (validSourceCommitOid commit) then
             Error(InvalidBinding "Invalid source commit OID.")
         else
-            match git binding.RepositoryPath [ "cat-file"; "-t"; commit ] with
-            | Ok result when result.ExitCode = 0 && result.Stdout = "commit" -> Ok ()
-            | _ -> Error(SourceUnavailable $"Source commit {commit} is not available on this device.")
+            ensureUnmodifiedGitHistory binding.RepositoryPath
+            |> Result.bind (fun () ->
+                match git binding.RepositoryPath [ "cat-file"; "-t"; commit ] with
+                | Ok result when result.ExitCode = 0 && result.Stdout = "commit" -> Ok ()
+                | _ -> Error(SourceUnavailable $"Source commit {commit} is not available on this device."))
 
 
     // Source identity is independent of the orphan ledger project UUID and
@@ -2296,6 +2339,82 @@ module LedgerStore =
                 if actualTree <> merged.Stdout then
                     return! Error(InvalidBinding
                         "Integration merge tree has changes beyond the exact conflict-free Git composition.")
+        }
+
+    // The managed CompleteIntegration operation is its own scoped publisher:
+    // an external force push, even of a mechanically clean merge, is not proof
+    // of our non-force publication. Observe a remote target before the effect,
+    // require that exact target to be an ancestor of the proposed commit, then
+    // perform ONE ordinary push with explicit refspec. A remote race rejects;
+    // callers must construct and test a new merge rather than force or replay.
+    // The resulting before/after witness is committed with the ledger receipt.
+    let publishIntegrationTarget (binding: LedgerBinding) (operationId: Guid)
+                                 targetRef targetHeadAtSubmission submittedCommit integratedCommit =
+        result {
+            if operationId = Guid.Empty || not (validTargetRef targetRef)
+               || not (validSourceCommitOid targetHeadAtSubmission)
+               || not (validSourceCommitOid submittedCommit)
+               || not (validSourceCommitOid integratedCommit) then
+                return! Error(InvalidBinding "Invalid non-force integration publication identity.")
+            do! validate binding
+            do! verifySourceObject binding submittedCommit
+            do! verifySourceObject binding integratedCommit
+            let! previousHead = readRemoteTarget binding targetRef
+            if previousHead = integratedCommit then
+                return! Error(InvalidBinding
+                    "Remote target already contains the proposed tip without a verified publisher receipt.")
+            // These checks are against the immediately observed remote head,
+            // not the target snapshot captured when source was reviewed.
+            do! verifySourceAncestry binding targetHeadAtSubmission previousHead
+            do! verifySourceAncestry binding previousHead integratedCommit
+            let authority =
+                OriginalGitWriterAdmissionJournal.authoritySha256
+                    [ "integration-target"; binding.ProjectId.ToString("D"); binding.LedgerId.ToString("D")
+                      string binding.Epoch; binding.ApprovedFetchUrl; binding.ApprovedPushUrl ]
+            let payload = String.concat ":" [ previousHead; submittedCommit; integratedCommit ]
+            let publish _ =
+                let pushed =
+                    git binding.RepositoryPath
+                        [ "push"; "--porcelain"; "--no-verify"; "--no-follow-tags"
+                          binding.RemoteName; $"{integratedCommit}:{targetRef}" ]
+                match pushed with
+                | Ok output when provenNonFastForwardRejection output ->
+                    Ok(Choice2Of2(InvalidBinding
+                        "Target advanced during non-force publication; re-fetch, recompose and re-test."))
+                | Ok output when output.ExitCode = 0 ->
+                    // "Everything up-to-date" is not an attributed publication:
+                    // another writer may have force-replaced the target with I.
+                    let changed =
+                        output.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                        |> Array.exists (fun line -> line.StartsWith(" \t", StringComparison.Ordinal))
+                    if not changed then
+                        Error(OutcomeUnknown "Cannot attest an actual non-force target update.")
+                    else
+                        match readRemoteTarget binding targetRef with
+                        | Error _ -> Error(OutcomeUnknown "Non-force push completed but target receipt is unavailable.")
+                        | Ok observed ->
+                            match verifySourceAncestry binding integratedCommit observed with
+                            | Ok () ->
+                                Ok(Choice1Of2
+                                    { PreviousHead = previousHead
+                                      PublishedCommit = integratedCommit
+                                      ObservedHead = observed
+                                      OperationId = operationId.ToString("D")
+                                      Mechanism = "VerifiedNonForceGitPush/v1" })
+                            | Error _ ->
+                                Error(OutcomeUnknown "Remote target no longer contains the verified publication.")
+                | Ok _ ->
+                    Error(OutcomeUnknown "Target publication failed without a proven non-fast-forward rejection.")
+                | Error _ ->
+                    Error(OutcomeUnknown "Target publication outcome is unknown; never replay this effect.")
+            let! classified =
+                OriginalGitWriterAdmissionJournal.withPublicationClassified
+                    operationId "IntegrationTarget" authority targetRef payload publish
+                    (function Choice1Of2 _ -> true | _ -> false)
+                    (function Choice2Of2 _ -> true | _ -> false) OutcomeUnknown
+            match classified with
+            | Choice1Of2 receipt -> return receipt
+            | Choice2Of2 rejected -> return! Error rejected
         }
 
     let private intentInput (binding: LedgerBinding) (intent: LedgerIntent) =

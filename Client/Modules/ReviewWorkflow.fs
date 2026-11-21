@@ -316,7 +316,13 @@ type IntegrationSubmission =
       Status: string
       CreatedSequence: int64
       IntegratedCommit: string
-      CompletedAtUtc: string }
+      CompletedAtUtc: string
+      // Additive publication proof for managed submissions. Historical
+      // pre-publisher entries deserialize these fields as null.
+      PublicationPreviousHead: string
+      PublicationObservedHead: string
+      PublicationOperationId: string
+      PublicationMechanism: string }
 
 [<CLIMutable>]
 type IntegrationSummary =
@@ -1313,7 +1319,9 @@ module ReviewWorkflow =
                           ReviewedHeadOid = pinned; IntegrationRef = managedRef
                           TargetHeadAtSubmission = targetHead; TargetRef = targetRef
                           Status = "Pending"; CreatedSequence = current.Header.NextSequence
-                          IntegratedCommit = null; CompletedAtUtc = null }
+                          IntegratedCommit = null; CompletedAtUtc = null
+                          PublicationPreviousHead = null; PublicationObservedHead = null
+                          PublicationOperationId = null; PublicationMechanism = null }
                     return [ change recordPath None record ]
                 })
             }
@@ -1334,28 +1342,40 @@ module ReviewWorkflow =
                 let! currentRecord, _ = required<IntegrationSubmission> binding snapshot path
                 if currentRecord.Status <> "Pending" then
                     return! Error(StaleEntityVersion "Integration submission is already completed.")
-                // Verify and fetch the actual published remote target first.
-                // A second checkout may have neither the integration commit nor
-                // its first parent locally until this read stages their objects.
-                do! LedgerStore.verifyIntegrationOnRemote binding currentRecord.TargetRef
-                        currentRecord.SubmittedCommit integratedCommit
-                // Historical branch-only records have no IntegrationRef and
-                // retain their original completion behavior. Managed submissions
-                // allow only the exact source or a proven mechanical merge.
-                if not (String.IsNullOrWhiteSpace currentRecord.IntegrationRef) then
-                    let expectedRef = $"refs/heads/jarvis-integration/{submissionId:N}"
-                    if currentRecord.IntegrationRef <> expectedRef
-                       || currentRecord.ReviewedHeadOid <> currentRecord.SubmittedCommit
-                       || not (LedgerStore.validSourceCommitOid currentRecord.TargetHeadAtSubmission) then
-                        return! Error(LedgerIntegrityError "Managed integration provenance is inconsistent.")
-                    do! LedgerStore.fetchReviewRef binding currentRecord.ReviewRef currentRecord.SubmittedCommit
-                    do! LedgerStore.fetchIntegrationRef binding currentRecord.IntegrationRef currentRecord.SubmittedCommit
-                    if integratedCommit = currentRecord.SubmittedCommit then
-                        do! LedgerStore.verifySourceAncestry binding
-                                currentRecord.TargetHeadAtSubmission currentRecord.SubmittedCommit
-                    else
-                        do! LedgerStore.verifyMechanicalIntegrationMerge binding
-                                currentRecord.TargetHeadAtSubmission currentRecord.SubmittedCommit integratedCommit
+                // Legacy branch-only entries keep the original read-only
+                // receipt semantics. New managed entries must NEVER accept an
+                // external push merely because present ancestry looks sound:
+                // a force-rewritten racing target can satisfy that predicate.
+                let! publication =
+                    if String.IsNullOrWhiteSpace currentRecord.IntegrationRef then
+                        LedgerStore.verifyIntegrationOnRemote binding currentRecord.TargetRef
+                            currentRecord.SubmittedCommit integratedCommit
+                        |> Result.map (fun () -> None)
+                    else result {
+                        let expectedRef = $"refs/heads/jarvis-integration/{submissionId:N}"
+                        if currentRecord.IntegrationRef <> expectedRef
+                           || currentRecord.ReviewedHeadOid <> currentRecord.SubmittedCommit
+                           || not (LedgerStore.validSourceCommitOid currentRecord.TargetHeadAtSubmission) then
+                            return! Error(LedgerIntegrityError "Managed integration provenance is inconsistent.")
+                        do! LedgerStore.fetchReviewRef binding currentRecord.ReviewRef currentRecord.SubmittedCommit
+                        do! LedgerStore.fetchIntegrationRef binding currentRecord.IntegrationRef currentRecord.SubmittedCommit
+                        if integratedCommit = currentRecord.SubmittedCommit then
+                            do! LedgerStore.verifySourceAncestry binding
+                                    currentRecord.TargetHeadAtSubmission currentRecord.SubmittedCommit
+                        else
+                            do! LedgerStore.verifyMechanicalIntegrationMerge binding
+                                    currentRecord.TargetHeadAtSubmission currentRecord.SubmittedCommit integratedCommit
+                        // The bounded publisher itself observes the present
+                        // remote head, performs an ordinary non-force push and
+                        // verifies the advertised result. No caller-supplied
+                        // push flag or unsigned receipt is trusted.
+                        let! receipt = LedgerStore.publishIntegrationTarget binding operationId
+                                           currentRecord.TargetRef currentRecord.TargetHeadAtSubmission
+                                           currentRecord.SubmittedCommit integratedCommit
+                        do! LedgerStore.verifyIntegrationOnRemote binding currentRecord.TargetRef
+                                currentRecord.SubmittedCommit integratedCommit
+                        return Some receipt
+                    }
                 return! LegacyDirectWriterFence.transact binding action (fun current -> result {
                     let! _ = required<ReviewAgent> binding current (agentPath actorId)
                     let! existing, oid = required<IntegrationSubmission> binding current path
@@ -1364,7 +1384,15 @@ module ReviewWorkflow =
                     return [ change path (Some oid)
                                 { existing with Status = "Integrated"
                                                 IntegratedCommit = integratedCommit
-                                                CompletedAtUtc = DateTimeOffset.UtcNow.ToString("O") } ]
+                                                CompletedAtUtc = DateTimeOffset.UtcNow.ToString("O")
+                                                PublicationPreviousHead =
+                                                    publication |> Option.map (fun p -> p.PreviousHead) |> Option.defaultValue null
+                                                PublicationObservedHead =
+                                                    publication |> Option.map (fun p -> p.ObservedHead) |> Option.defaultValue null
+                                                PublicationOperationId =
+                                                    publication |> Option.map (fun p -> p.OperationId) |> Option.defaultValue null
+                                                PublicationMechanism =
+                                                    publication |> Option.map (fun p -> p.Mechanism) |> Option.defaultValue null } ]
                 })
             }
 

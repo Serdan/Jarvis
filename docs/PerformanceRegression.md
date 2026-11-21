@@ -38,4 +38,14 @@ These tests are not load tests of a real network, and do not yet cover all named
 
 ## Baseline provenance
 
-The original historical Linux baseline is in `docs/AgentInboxScaling.md` (November 8, .NET 10: 220 records, 10 Git processes, one fetch, one cold batch, 495 ms cold, 228.5 ms warm; later bounded-process run reported about 108 ms and 74 ms). Those numbers are **not** a .NET 11 baseline or cross-host threshold. A fresh .NET 11 Release baseline must be captured from the exact committed source and three completed local runs, and then paired with a Windows run using the same source SHA and fixture/cardinality.
+The original historical Linux baseline is in `docs/AgentInboxScaling.md` (November 8, .NET 10: 220 records, 10 Git processes, one fetch, one cold batch, 495 ms cold, 228.5 ms warm; later bounded-process run reported about 108 ms and 74 ms). Those numbers are **not** a .NET 11 baseline or cross-host threshold.
+
+Three verified .NET 11 Release runs on EndeavourOS x64 (12 processors), implementation commit `d3839c8e53dcf83563f24382f0bd073b049fc86e`, each passed all three cases. The complete nine per-run JSON reports, including cold/warm/head-change counters, allocations, tail latency and response sizes, are retained in `docs/perf-baselines/2026-11-21-endeavouros-x64-net11.json`. The local TRX receipts are named `TestResults/perf-run-{1,2,3}.trx`.
+
+| Records | Cold range, 3 runs | Warm p50 range | Warm p95 range |
+| ---: | ---: | ---: | ---: |
+| 0 | 60–102 ms | 30–46 ms | 38–130 ms |
+| 220 | 162–188 ms | 114–126 ms | 143–204 ms |
+| 2,200 | 604–727 ms | 345–470 ms | 507–1,080 ms |
+
+Every warm sample used 12 Git starts, one fetch and zero blob batches; the changed-head phase used 13 starts. The 2,200-record warm p95 variation is evidence that local contention affects latency tails, **not** a 1.08 s correctness threshold. A Windows baseline remains unmeasured and must be paired with the same implementation SHA, fixture sizes and Release configuration before making parity claims.

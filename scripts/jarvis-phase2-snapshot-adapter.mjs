@@ -215,14 +215,21 @@ function normalizeProject(view, diagnostics) {
   // in the size of the canonical ledger.
   const reverseIndexPaths = listPaths(r, /^challenge-waits\/by-(?:owner|challenge)\//);
   const reverseByWaitGeneration = new Map();
+  const reverseLocators = new Map();
+  const canonicalWaitByAttempt = new Map();
   for (const reversePath of reverseIndexPaths) {
-    const match = /^challenge-waits\/(?:by-owner\/[A-Za-z0-9_-]+|by-challenge\/[a-f0-9]{32})\/([A-Za-z0-9_-]+\/[a-f0-9]{32}\/([1-9][0-9]*)\.json)$/.exec(reversePath);
-    if (!match || !validPositive(Number(match[2]))) {
+    const match = /^challenge-waits\/(by-owner\/[A-Za-z0-9_-]+|by-challenge\/[a-f0-9]{32})\/([A-Za-z0-9_-]+)\/([a-f0-9]{32})\/([1-9][0-9]*)\.json$/.exec(reversePath);
+    if (!match || !validPositive(Number(match[4]))) {
       issue(issues, "challenges", "MalformedReverseIndexPath", reversePath);
       continue;
     }
-    if (!reverseByWaitGeneration.has(match[1])) reverseByWaitGeneration.set(match[1], []);
-    reverseByWaitGeneration.get(match[1]).push(reversePath);
+    const generation = Number(match[4]);
+    const base = match[2] + "/" + match[3] + "/" + match[4] + ".json";
+    if (!reverseByWaitGeneration.has(base)) reverseByWaitGeneration.set(base, []);
+    reverseByWaitGeneration.get(base).push(reversePath);
+    reverseLocators.set(reversePath, {
+      namespace: match[1], taskId: match[2], attemptId: match[3], generation
+    });
   }
   const waits = listPaths(r, /^tasks\/[^/]+\/attempts\/[a-f0-9]{32}\/challenge-wait\.json$/);
   for (const path of waits) {
@@ -289,6 +296,9 @@ function normalizeProject(view, diagnostics) {
     let indexGeneration = null;
     const generation = wait.status === "Requeued"
       ? requeueProvenance?.previousGeneration : attempt.assignmentGeneration;
+    canonicalWaitByAttempt.set(m[1] + "/" + m[2], {
+      generation, ownerAgentId: wait.ownerAgentId
+    });
     if (!validPositive(generation)) {
       issue(issues, "challenges", "WaitIndexGenerationUnknown", path);
     } else {
@@ -326,10 +336,33 @@ function normalizeProject(view, diagnostics) {
       canonicalPath: path
     });
   }
+  // A schema-valid reverse path is still not canonical evidence unless it
+  // matches an actual wait and its permitted generation. Requeued waits keep
+  // their indices at N, not at the active assignment's N+1 generation.
   for (const path of reverseIndexPaths) {
     const value = r.get(path);
-    if (typeof value !== "object" || value === null || value.schemaVersion !== 2) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || value.schemaVersion !== 2) {
       issue(issues, "challenges", "MalformedReverseIndex", path);
+      continue;
+    }
+    const locator = reverseLocators.get(path);
+    if (!locator) continue; // MalformedReverseIndexPath was reported above.
+    const wait = canonicalWaitByAttempt.get(locator.taskId + "/" + locator.attemptId);
+    if (!wait || !validPositive(wait.generation)) {
+      issue(issues, "challenges", "OrphanWaitReverseIndex", path);
+      continue;
+    }
+    if (value.taskId !== locator.taskId || value.attemptId !== locator.attemptId ||
+        value.assignmentGeneration !== locator.generation ||
+        value.ownerAgentId !== wait.ownerAgentId ||
+        (locator.namespace.startsWith("by-owner/") &&
+         locator.namespace !== "by-owner/" + encodedAgent(value.ownerAgentId))) {
+      issue(issues, "challenges", "ReverseIndexIdentityMismatch", path);
+    }
+    // Current-generation indices were reconciled with the exact expected set
+    // above. Older matching indices are history, not an extra active wait.
+    if (locator.generation > wait.generation) {
+      issue(issues, "challenges", "UnexpectedWaitReverseIndex", path);
     }
   }
 

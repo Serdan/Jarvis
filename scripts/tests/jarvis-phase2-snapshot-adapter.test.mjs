@@ -342,6 +342,80 @@ test("unexpected current-generation dependency reverse index is not canonical", 
   assert.ok(view.diagnostics.some(d => d.reason === "UnexpectedWaitReverseIndex" && d.path === roguePath));
 });
 
+for (const namespace of ["by-challenge", "by-owner"]) {
+  test("requeued N4 to N5 rejects a new-generation " + namespace + " reverse index", t => {
+    const f = withFixture(t);
+    const changes = requeuedChanges();
+    const locator = namespace === "by-challenge"
+      ? CHALLENGE_A : Buffer.from("Worker 1").toString("base64url");
+    const roguePath = "challenge-waits/" + namespace + "/" + locator + "/alpha/" + ID + "/5.json";
+    changes[roguePath] = {
+      schemaVersion: 2, taskId: "alpha", attemptId: ID,
+      ownerAgentId: "Worker 1", assignmentGeneration: 5
+    };
+    update(f.a, changes);
+    const view = capture(f);
+    assert.equal(view.snapshot.projects[0].challenges[0].waitIndexGeneration, 4);
+    assert.equal(view.snapshot.projects[0].completeness.challenges, false);
+    assert.ok(view.diagnostics.some(d => d.scope === "challenges" &&
+      d.reason === "UnexpectedWaitReverseIndex" && d.path === roguePath));
+    assert.equal(phase2DefaultOffDiagnostic(view).sideEffects, 0);
+  });
+
+  test("orphan " + namespace + " reverse index without a canonical wait fails closed", t => {
+    const f = withFixture(t);
+    const locator = namespace === "by-challenge"
+      ? CHALLENGE_A : Buffer.from("Worker 1").toString("base64url");
+    const roguePath = "challenge-waits/" + namespace + "/" + locator + "/alpha/" + ID + "/4.json";
+    update(f.a, {
+      [roguePath]: {
+        schemaVersion: 2, taskId: "alpha", attemptId: ID,
+        ownerAgentId: "Worker 1", assignmentGeneration: 4
+      }
+    });
+    const view = capture(f);
+    assert.deepEqual(view.snapshot.projects[0].challenges, []);
+    assert.equal(view.snapshot.projects[0].completeness.challenges, false);
+    assert.ok(view.diagnostics.some(d => d.scope === "challenges" &&
+      d.reason === "OrphanWaitReverseIndex" && d.path === roguePath));
+    assert.equal(phase2DefaultOffDiagnostic(view).sideEffects, 0);
+  });
+}
+
+test("valid older by-owner index remains immutable historical evidence", t => {
+  const f = withFixture(t);
+  const changes = requeuedChanges();
+  const path = "challenge-waits/by-owner/" + Buffer.from("Worker 1").toString("base64url") +
+    "/alpha/" + ID + "/3.json";
+  changes[path] = {
+    schemaVersion: 2, taskId: "alpha", attemptId: ID,
+    ownerAgentId: "Worker 1", assignmentGeneration: 3
+  };
+  update(f.a, changes);
+  const p = capture(f).snapshot.projects[0];
+  assert.equal(p.completeness.challenges, true);
+  assert.equal(p.challenges[0].waitIndexGeneration, 4);
+});
+
+for (const namespace of ["by-challenge", "by-owner"]) {
+  test("historical " + namespace + " reverse index must still have canonical identity", t => {
+    const f = withFixture(t);
+    const changes = requeuedChanges();
+    const locator = namespace === "by-challenge"
+      ? CHALLENGE_A : Buffer.from("Impostor").toString("base64url");
+    const path = "challenge-waits/" + namespace + "/" + locator + "/alpha/" + ID + "/3.json";
+    changes[path] = {
+      schemaVersion: 2, taskId: "alpha", attemptId: ID,
+      ownerAgentId: "Worker 1", assignmentGeneration: namespace === "by-challenge" ? 2 : 3
+    };
+    update(f.a, changes);
+    const view = capture(f);
+    assert.equal(view.snapshot.projects[0].completeness.challenges, false);
+    assert.ok(view.diagnostics.some(d => d.scope === "challenges" &&
+      d.reason === "ReverseIndexIdentityMismatch" && d.path === path));
+  });
+}
+
 test("malformed reverse-index locator with valid JSON cannot appear as complete", t => {
   const f = withFixture(t);
   const path = "challenge-waits/by-challenge/" + CHALLENGE_A + "/alpha/" + ID + "/not-a-generation.json";

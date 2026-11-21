@@ -31,11 +31,13 @@ The returned `snapshot` follows the Phase-1 schema-v2 layout and carries exact a
 | `ReviewAgent` plus current `AssignmentIssue` | Exact task/attempt/generation assignment; `Working`, `Ready`, `NeedsWork` and `Parked` distinguished; a missing or conflicting issue is incomplete, not an inferred assignment; unassigned `Working` with null disposition is explicitly unverified/incomplete (`UnassignedWorkingAgent`) |
 | Attempt source binding | Exact repository, owner, source/target refs and base commit; **`status: "Unverified"`** until the source ref and physical lease are separately checked against approved repository authority |
 | `BranchReview` | `Unclaimed` becomes `Pending`, and `claim:null` means no named reviewer; **`frozen:false`** until the exact source review ref and reviewed code commit are independently verified |
-| `AttemptChallengeWait` plus Challenge record and both owner/dependency indexes | `Waiting` becomes `Pending`; outstanding dependencies stay Pending; current-generation reverse indices in **both** namespaces must agree with the wait's dependencies and owner; a manual zero-dependency block has `waitIndexGeneration:null` and cannot have any current-generation reverse index, while historical N-to-N+1 indices remain valid |
+| `AttemptChallengeWait` plus Challenge record and both owner/dependency indexes | `Waiting` becomes `Pending`; selected-generation owner and dependency indices must exactly match the canonical wait. An audited N-to-N+1 requeue keeps indices at immutable N; manual zero-dependency waits have no current-generation indices. A global reverse-index reconciliation rejects orphan/new-generation paths and identity conflicts while retaining matching older historical indices |
 | `RequeueChallengeBlockedAttempt` lifecycle audit | Preserves canonical operation ID, ledger sequence, actor, Blocked-to-Queued transition, owner identity, and N to N+1; index remains at immutable N after requeue |
 | `IntegrationSubmission` | Preserves original submission/review/source IDs, but canonical record has no attempt generation; normalized `assignmentGeneration:null` with **`completeness.submissions:false`**, not a guessed value |
 
 An unverified source lease, unfrozen review ref, or incomplete submission is **not** evidence suitable for a Phase-1 candidate. They are visible to help diagnose missing authority without fabricating a credible dispatch. Malformed or contradictory canonical records turn the relevant domain's completeness false. There is no projection that executes a Challenge release, requeue, reviewer claim or integration.
+
+Reverse-index completeness is checked against **every** by-owner and by-challenge path in the verified Git tree, not only paths visited at the selected wait generation. A schema-valid orphan path without a canonical wait, a new/current-generation path outside an audited requeue's immutable N, or an index with a conflicting owner, attempt or generation is incomplete. Matching older generations are retained as historical records, never projected as a new current wait or dispatch authority.
 
 The WQ07 account ledger's `MaxConcurrentAgents` and Held/Released tokens are for admitted Work Queue launch tokens. They are **not an authenticated cross-project registry of current ChatGPT worker/reviewer browser tabs, unknown submissions or launch reservations**. Do not map these to `configuredLimits.worker/reviewer`, `sessions:[]`, `reservations:[]`, or a claim of free worker/reviewer slots. The adapter deliberately returns `accountCapacity.complete:false`, `configuredLimits:null`, `sessions:null`, `reservations:null` (and the same for project capacity). Even a zero-held-token account cannot prove dispatch capacity.
 
@@ -49,7 +51,7 @@ Before any later executable Phase-2 integration, require separately reviewed sea
 
 ## Regression / reproducibility
 
-The Node tests create **one real disposable bare account Git remote and two independent disposable bare project Git remotes**, with writer checkouts and immutable canonical commits. They assert exact head/source identity, Ready vs Working vs NeedsWork, unassigned Working/null disposition, missing assignment issuance, unclaimed review, no inferred source trust, N-to-N+1 lifecycle/index provenance, manual zero-dependency holds and orphan by-challenge indices, historical index retention, missing and unexpected reverse-index failures, missing submission generation, absent/foreign project membership, Held token ledger ID/epoch mismatches, invalid identity/ref/time/ancestor and default-off no-effects. There are no production remotes or browser calls.
+The Node tests create **one real disposable bare account Git remote and two independent disposable bare project Git remotes**, with writer checkouts and immutable canonical commits. They assert exact head/source identity, Ready vs Working vs NeedsWork, unassigned Working/null disposition, missing assignment issuance, unclaimed review, no inferred source trust, N-to-N+1 lifecycle/index provenance, manual zero-dependency holds, orphan by-owner **and** by-challenge reverse indices without canonical waits, unexpected N+1 indexes in both namespaces, historical index retention, missing and unexpected reverse-index failures, missing submission generation, absent/foreign project membership, Held token ledger ID/epoch mismatches, invalid identity/ref/time/ancestor and default-off no-effects. There are no production remotes or browser calls.
 
 Commands from the repository root:
 
@@ -57,6 +59,7 @@ Commands from the repository root:
 node --test scripts/tests/jarvis-phase2-snapshot-adapter.test.mjs
 node --test scripts/tests/manager-heartbeat.test.mjs scripts/tests/jarvis-phase2-snapshot-adapter.test.mjs
 dotnet test Client.Tests/Client.Tests.fsproj -c Release --filter 'FullyQualifiedName~WorkQueueSchedulerHeadBindingTests|FullyQualifiedName~WorkQueueSchedulerHostLoopTests'
+dotnet test Server.Tests/Server.Tests.fsproj -c Release --filter 'FullyQualifiedName~Scheduler'
 ```
 
 Record exact OS exit, source SHA, test counts and independently reviewed verdict before claiming these gates complete. A passing disposable fixture is not authorization to merge, start a session, deploy or activate Scheduler.

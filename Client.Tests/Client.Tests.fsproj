@@ -62,6 +62,7 @@
         <Compile Include="SourceEffectRouteBridgeTests.fs"/>
         <Compile Include="SourceEffectHostBindingTests.fs"/>
         <Compile Include="AccountCapacityLedgerTests.fs"/>
+        <Compile Include="NativeSchedulerRosterPolicyTests.fs"/>
         <Compile Include="AccountAdmissionAdapterTests.fs"/>
         <Compile Include="WorkQueueCanonicalMigrationPrepareTests.fs"/>
         <Compile Include="LegacyWriterProtocolFenceTests.fs"/>

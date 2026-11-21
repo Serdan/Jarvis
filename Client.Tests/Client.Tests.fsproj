@@ -37,6 +37,7 @@
         <Compile Include="ProjectCreationTests.fs"/>
         <Compile Include="WorktreeTests.fs"/>
         <Compile Include="LedgerStoreTests.fs"/>
+        <Compile Include="LedgerMutationStagePerfTests.fs"/>
         <Compile Include="WorkQueueGitLedgerTests.fs"/>
         <Compile Include="WQ04ProducerFixture.fs"/>
         <Compile Include="WorkQueueCredentialTests.fs"/>

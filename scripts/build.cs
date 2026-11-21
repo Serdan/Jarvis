@@ -129,7 +129,12 @@ int Test(string configuration)
     if (clientCode != 0)
         return clientCode;
 
-    return DotNet("test", "Server.Tests/Server.Tests.fsproj", "-c", configuration);
+    var serverCode = DotNet("test", "Server.Tests/Server.Tests.fsproj", "-c", configuration);
+    if (serverCode != 0)
+        return serverCode;
+
+    // Include browser bridge and Work launcher regressions in the canonical test gate.
+    return Run("node", "--test", "browser-extension/tests/*.test.cjs");
 }
 
 int Build(string configuration)
@@ -204,12 +209,15 @@ int Clean()
 }
 
 int DotNet(params string[] arguments)
+    => Run("dotnet", arguments);
+
+int Run(string executable, params string[] arguments)
 {
     Console.WriteLine();
-    Console.WriteLine("dotnet " + string.Join(' ', arguments.Select(QuoteIfNeeded)));
+    Console.WriteLine(executable + " " + string.Join(' ', arguments.Select(QuoteIfNeeded)));
 
     using var process = new Process();
-    process.StartInfo.FileName = "dotnet";
+    process.StartInfo.FileName = executable;
     process.StartInfo.WorkingDirectory = root;
     process.StartInfo.UseShellExecute = false;
 

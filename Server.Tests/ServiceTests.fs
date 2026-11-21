@@ -508,7 +508,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
                           "OperatorConversationRead"; "OperatorConversationWrite";
                           "WorkQueueRead"; "WorkQueueWrite"; "WorkPriority" ]
     let orchestrationTools =
-        set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "GetNotificationPreferences"; "GetResponseAlerts"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
+        set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "AcknowledgeNotifications"; "GetNotificationPreferences"; "GetResponseAlerts"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
               "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"
               "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"
               "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
@@ -613,7 +613,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
     // Preserve role/instruction aliases, Challenges, taskless execution and
     // recipient notifications and composition APIs, plus six public Work aliases
     // over two hidden WorkQueue wire commands, all with device routing.
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 88 + (6 - 2) + 1)
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 89 + (6 - 2) + 1)
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -1078,7 +1078,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
                   name, (if name = "AgentInbox" then
                              { taskRead with MutatesState = true }
                          else taskRead)
-              for name in [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
+              for name in [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "AcknowledgeNotifications"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
                             "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions";
                             "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork";
                             "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork";

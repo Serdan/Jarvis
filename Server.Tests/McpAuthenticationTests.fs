@@ -188,10 +188,10 @@ let write_tools_expose_optional_operation_ids () =
                 Some (methodInfo.Name, id)
             | _ -> None)
     // Preserve challenge-domain, taskless, notification, composition and default-off Work writes.
-    Assert.That(writeMethods.Length, Is.EqualTo(69), String.concat ", " (writeMethods |> Array.map fst))
+    Assert.That(writeMethods.Length, Is.EqualTo(70), String.concat ", " (writeMethods |> Array.map fst))
     for newTool in [ "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork"
                      "ConnectWork"; "ClaimNextWork"; "CheckpointWork"; "CompleteWork"
-                     "SetWorkPriority" ] do
+                     "SetWorkPriority"; "AcknowledgeNotifications" ] do
         Assert.That(writeMethods |> Array.exists (fun (name, _) -> name = newTool), Is.True,
                     $"Lifecycle tool {newTool} missing from the public MCP surface.")
     for name, id in writeMethods do

@@ -2508,6 +2508,19 @@ module TaskApi =
                                         (cmd.Reason = "Mute") cmd.Summary
                                     |> mapError
                                 | _ -> Error(Client.ValidationError "Expected Mute or Unmute.")
+                            | "AcknowledgeNotifications" ->
+                                let parsed =
+                                    try
+                                        let ids = JsonSerializer.Deserialize<Guid array>(cmd.Html)
+                                        if isNull ids then
+                                            Error(Client.ValidationError "Expected a JSON array of notification IDs.")
+                                        else Ok(Array.toList ids)
+                                    with :? JsonException ->
+                                        Error(Client.ValidationError "Expected a JSON array of notification IDs.")
+                                parsed
+                                |> Result.bind (fun ids ->
+                                    ReviewWorkflow.ReviewWorkflow.acknowledgeNotifications
+                                        binding operationId cmd.ActorId ids |> mapError)
                             | "AcknowledgeNotification" ->
                                 guid "notificationId" cmd.AttemptId
                                 |> Result.bind (fun notificationId ->

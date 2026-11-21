@@ -351,7 +351,7 @@ module McpToolHelpers =
     let private ledgerTaskReadMethods = [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint";  "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec";
                                          "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"; "GetNotificationPreferences"; "GetResponseAlerts"; "GetWorkComposition" ]
     let private ledgerTaskWriteMethods =
-        [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
+        [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "AcknowledgeNotifications"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
           "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
           "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork"
           "SetAgentState"; "CorrectAgentWorkingState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"
@@ -2045,6 +2045,11 @@ type JarvisMcpTools =
     static member AcknowledgeNotification(projectName: string, agentId: string, notificationId: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "AcknowledgeNotification" operationId "" agentId
         McpToolHelpers.send client http (TaskWriteCommand { cmd with AttemptId = notificationId })
+
+    [<McpServerTool(Title = "acknowledge notifications batch", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Recipient-only, transactional acknowledgment of 1-64 explicitly processed notification IDs in one Git CAS. Mixed invalid or foreign IDs reject the entire batch; already-acknowledged IDs are harmless. Use the original operationId to reconcile uncertain outcomes; inbox reads never acknowledge messages.")>]
+    static member AcknowledgeNotifications(projectName: string, agentId: string, notificationIds: string array, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "AcknowledgeNotifications" operationId "" agentId
+        McpToolHelpers.send client http (TaskWriteCommand { cmd with Html = JsonSerializer.Serialize(notificationIds) })
 
     [<McpServerTool(Title = "assign task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Assign a registered unoccupied agent to an Open task. The agent immediately becomes Ready; the queued attempt is separate from execution. Reviews are independent.")>]
     static member AssignTask(projectName: string, taskId: string, attemptId: string, agentId: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

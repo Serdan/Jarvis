@@ -1662,6 +1662,37 @@ module ReviewWorkflow =
                                 { notification with AcknowledgedAtUtc = DateTimeOffset.UtcNow.ToString("O") } ]
                 })
 
+    // Explicit processed IDs only: inbox reads never imply acknowledgment.
+    // Validate the entire batch before producing any canonical Git mutation.
+    let acknowledgeNotifications binding operationId agentId (notificationIds: Guid list) =
+        if not (validAgent agentId) || List.isEmpty notificationIds
+           || List.length notificationIds > 64
+           || List.contains Guid.Empty notificationIds then
+            Error(InvalidBinding "Provide 1-64 valid notification IDs to acknowledge.")
+        else
+            let ids = notificationIds |> List.distinct
+            LegacyDirectWriterFence.transact binding
+                (intent operationId agentId "AcknowledgeNotifications"
+                    {| notificationIds = ids |> List.map (fun id -> id.ToString("N"))
+                       agentId = agentId |})
+                (fun snapshot -> result {
+                    let mutable changes = []
+                    for notificationId in ids do
+                        let path = notificationPath notificationId
+                        let! notification, oid = required<AgentNotification> binding snapshot path
+                        if notification.NotificationId <> notificationId.ToString("N") then
+                            return! Error(LedgerIntegrityError "Notification identity mismatch.")
+                        if notification.ToAgentId <> agentId then
+                            return! Error(ReviewAccessDenied "Only the recipient may acknowledge a notification.")
+                        if String.IsNullOrWhiteSpace notification.AcknowledgedAtUtc then
+                            changes <- change path (Some oid)
+                                            { notification with AcknowledgedAtUtc = DateTimeOffset.UtcNow.ToString("O") }
+                                       :: changes
+                    if List.isEmpty changes then
+                        return! Error(StaleEntityVersion "Every selected notification is already acknowledged.")
+                    return List.rev changes
+                })
+
     let pendingNotifications binding snapshot agentId = result {
         let! paths = LedgerStore.listAt binding snapshot "notifications"
         let mutable pending = []

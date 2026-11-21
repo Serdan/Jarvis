@@ -1958,6 +1958,83 @@ type ReviewWorkflowTests() =
             | other -> Assert.Fail(sprintf "Already acknowledged notification: %A" other))
 
     [<Test>]
+    member _.BatchNotificationAckUsesOneReceiptAndLeavesUnlistedUnread() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let send recipient =
+                let id = Guid.NewGuid()
+                ReviewWorkflow.notifyAgent first id "Owner" "" recipient "" "Processed independently"
+                |> success |> ignore
+                id
+            let one = send "Reviewer"
+            let two = send "Reviewer"
+            let unlisted = send "Reviewer"
+            let before = (LedgerStore.fetch second |> success).Header.NextSequence
+            let operationId = Guid.NewGuid()
+            let ack () = ReviewWorkflow.acknowledgeNotifications second operationId "Reviewer" [one; two; one]
+            Assert.That((ack () |> success).AlreadyApplied, Is.False)
+            let after = (LedgerStore.fetch first |> success).Header.NextSequence
+            Assert.That(after, Is.EqualTo(before + 1L), "One Git transaction, not one per ID")
+            Assert.That((ack () |> success).AlreadyApplied, Is.True)
+            let remaining = (ReviewWorkflow.getAgentInbox first "Reviewer" |> success).PendingNotifications
+            Assert.That(remaining |> List.map (fun n -> n.NotificationId),
+                        Is.EqualTo(box [unlisted.ToString("N")])))
+
+    [<Test>]
+    member _.BatchNotificationAckRejectsMixedForeignMissingAndOversizedAtomically() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let send sender recipient =
+                let id = Guid.NewGuid()
+                ReviewWorkflow.notifyAgent first id sender "" recipient "" "Ownership probe"
+                |> success |> ignore
+                id
+            let own = send "Owner" "Reviewer"
+            let foreign = send "Reviewer" "Owner"
+            let pending agent =
+                (ReviewWorkflow.getAgentInbox second agent |> success).PendingNotifications
+                |> List.map (fun n -> n.NotificationId)
+            match ReviewWorkflow.acknowledgeNotifications second (Guid.NewGuid()) "Reviewer" [own; foreign] with
+            | Error(ReviewAccessDenied _) -> ()
+            | other -> Assert.Fail(sprintf "Cross-recipient batch must abort: %A" other)
+            match ReviewWorkflow.acknowledgeNotifications second (Guid.NewGuid()) "Reviewer" [own; Guid.NewGuid()] with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Missing ID must abort whole batch: %A" other)
+            for ids in [ []; [Guid.Empty]; [for _ in 1..65 -> Guid.NewGuid()] ] do
+                match ReviewWorkflow.acknowledgeNotifications second (Guid.NewGuid()) "Reviewer" ids with
+                | Error(InvalidBinding _) -> ()
+                | other -> Assert.Fail(sprintf "Malformed batch must be rejected: %A" other)
+            Assert.That(pending "Reviewer", Is.EqualTo(box [own.ToString("N")]))
+            Assert.That(pending "Owner", Is.EqualTo(box [foreign.ToString("N")])))
+
+    [<Test>]
+    member _.BatchNotificationAckHandlesAlreadyProcessedAndOriginalUuidAcrossClients() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let send () =
+                let id = Guid.NewGuid()
+                ReviewWorkflow.notifyAgent first id "Owner" "" "Reviewer" "" "Retry probe"
+                |> success |> ignore
+                id
+            let already = send ()
+            let fresh = send ()
+            ReviewWorkflow.acknowledgeNotification first (Guid.NewGuid()) "Reviewer" already
+            |> success |> ignore
+            let id = Guid.NewGuid()
+            let ack () = ReviewWorkflow.acknowledgeNotifications second id "Reviewer" [already; fresh]
+            Assert.That((ack () |> success).AlreadyApplied, Is.False)
+            Assert.That((ack () |> success).AlreadyApplied, Is.True)
+            Assert.That((ReviewWorkflow.getAgentInbox first "Reviewer" |> success).PendingNotifications,
+                        Is.Empty)
+            match ReviewWorkflow.acknowledgeNotifications first (Guid.NewGuid()) "Reviewer" [already; fresh] with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Entirely stale batch must not claim a new write: %A" other)
+            let different = send ()
+            match ReviewWorkflow.acknowledgeNotifications first id "Reviewer" [different] with
+            | Error OperationIdReused -> ()
+            | other -> Assert.Fail(sprintf "Original UUID cannot replay different IDs: %A" other)
+            Assert.That((ReviewWorkflow.getAgentInbox second "Reviewer" |> success).PendingNotifications
+                        |> List.map (fun n -> n.NotificationId),
+                        Is.EqualTo(box [different.ToString("N")])))
+
+    [<Test>]
     member _.ResponseAlertsAreTargetedDurableAndConsumedOnceAcrossClients() =
         withFixture (fun _ _ first second _ _ _ _ ->
             let stopId = Guid.NewGuid()

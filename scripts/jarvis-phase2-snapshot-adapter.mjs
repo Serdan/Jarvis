@@ -136,16 +136,20 @@ function normalizeProject(view, diagnostics) {
         }
       }
     }
+    const unassignedWorking = !assigned && a.execution === "Working";
     const state = a.execution === "Working" ? "Working" :
       assigned ? "Ready" : a.unassignedDisposition === "Parked" ? "Parked" : "NeedsWork";
     if ((assigned && a.unassignedDisposition != null) ||
         (!assigned && a.execution === "Stopped" &&
-         !["Parked", "NeedsWork"].includes(a.unassignedDisposition)) ||
-        (!assigned && a.execution === "Working" && a.unassignedDisposition != null)) {
+         !["Parked", "NeedsWork"].includes(a.unassignedDisposition))) {
       issue(issues, "agents", "ContradictoryAgentDisposition", path);
     }
+    // A Working agent without a current assignment has no ownership/generation
+    // proof, even when the unassigned-disposition field is null.
+    if (unassignedWorking) issue(issues, "agents", "UnassignedWorkingAgent", path);
     agents.push({
-      agentId: a.agentId, verified: true, version: a.version, state, execution: a.execution,
+      agentId: a.agentId, verified: !unassignedWorking,
+      version: a.version, state, execution: a.execution,
       currentAssignment: assignment, unassignedDisposition: a.unassignedDisposition ?? null,
       activeSessionId: a.activeSessionId ?? null, associatedSessionIds: a.associatedSessionIds ?? []
     });
@@ -207,6 +211,19 @@ function normalizeProject(view, diagnostics) {
   }
 
   const challenges = [];
+  // Index once: checking every reverse path for each wait would be quadratic
+  // in the size of the canonical ledger.
+  const reverseIndexPaths = listPaths(r, /^challenge-waits\/by-(?:owner|challenge)\//);
+  const reverseByWaitGeneration = new Map();
+  for (const reversePath of reverseIndexPaths) {
+    const match = /^challenge-waits\/(?:by-owner\/[A-Za-z0-9_-]+|by-challenge\/[a-f0-9]{32})\/([A-Za-z0-9_-]+\/[a-f0-9]{32}\/([1-9][0-9]*)\.json)$/.exec(reversePath);
+    if (!match || !validPositive(Number(match[2]))) {
+      issue(issues, "challenges", "MalformedReverseIndexPath", reversePath);
+      continue;
+    }
+    if (!reverseByWaitGeneration.has(match[1])) reverseByWaitGeneration.set(match[1], []);
+    reverseByWaitGeneration.get(match[1]).push(reversePath);
+  }
   const waits = listPaths(r, /^tasks\/[^/]+\/attempts\/[a-f0-9]{32}\/challenge-wait\.json$/);
   for (const path of waits) {
     const wait = readRecord(r, path, 2, issues, "challenges");
@@ -270,17 +287,19 @@ function normalizeProject(view, diagnostics) {
     }
 
     let indexGeneration = null;
-    if (linkedIds.size > 0) {
-      const generation = wait.status === "Requeued"
-        ? requeueProvenance?.previousGeneration : attempt.assignmentGeneration;
-      if (!validPositive(generation)) issue(issues, "challenges", "WaitIndexGenerationUnknown", path);
-      else {
-        const base = m[1] + "/" + m[2] + "/" + generation + ".json";
-        const indexFiles = [
-          "challenge-waits/by-owner/" + encodedAgent(wait.ownerAgentId) + "/" + base
-        ];
-        for (const id of linkedIds) indexFiles.push("challenge-waits/by-challenge/" + id + "/" + base);
-        for (const p of indexFiles) {
+    const generation = wait.status === "Requeued"
+      ? requeueProvenance?.previousGeneration : attempt.assignmentGeneration;
+    if (!validPositive(generation)) {
+      issue(issues, "challenges", "WaitIndexGenerationUnknown", path);
+    } else {
+      const base = m[1] + "/" + m[2] + "/" + generation + ".json";
+      const expectedIndexPaths = new Set();
+      if (linkedIds.size > 0) {
+        expectedIndexPaths.add("challenge-waits/by-owner/" +
+          encodedAgent(wait.ownerAgentId) + "/" + base);
+        for (const id of linkedIds)
+          expectedIndexPaths.add("challenge-waits/by-challenge/" + id + "/" + base);
+        for (const p of expectedIndexPaths) {
           const i = readRecord(r, p, 2, issues, "challenges");
           if (!i || i.taskId !== wait.taskId || i.attemptId !== wait.attemptId ||
               i.ownerAgentId !== wait.ownerAgentId || i.assignmentGeneration !== generation) {
@@ -289,16 +308,14 @@ function normalizeProject(view, diagnostics) {
         }
         indexGeneration = generation;
       }
-    } else {
-      // Historical reverse-index entries from earlier waits are allowed, not one
-      // at the immutable generation of this manual block.
-      const manualGeneration = wait.status === "Requeued"
-        ? requeueProvenance?.previousGeneration : attempt.assignmentGeneration;
-      const currentManualIndex = "challenge-waits/by-owner/" +
-        encodedAgent(wait.ownerAgentId) + "/" + m[1] + "/" + m[2] +
-        "/" + manualGeneration + ".json";
-      if (validPositive(manualGeneration) && r.has(currentManualIndex)) {
-        issue(issues, "challenges", "ManualWaitHasReverseIndex", currentManualIndex);
+      // Both reverse namespaces must match the canonical wait at its immutable
+      // generation. Manual holds have no dependencies and therefore no indices.
+      // Older generations are historical, notably after N-to-N+1 requeue.
+      for (const p of reverseByWaitGeneration.get(base) ?? []) {
+        if (!expectedIndexPaths.has(p)) {
+          issue(issues, "challenges",
+            linkedIds.size === 0 ? "ManualWaitHasReverseIndex" : "UnexpectedWaitReverseIndex", p);
+        }
       }
     }
     challenges.push({
@@ -309,7 +326,7 @@ function normalizeProject(view, diagnostics) {
       canonicalPath: path
     });
   }
-  for (const path of listPaths(r, /^challenge-waits\/by-(?:owner|challenge)\//)) {
+  for (const path of reverseIndexPaths) {
     const value = r.get(path);
     if (typeof value !== "object" || value === null || value.schemaVersion !== 2) {
       issue(issues, "challenges", "MalformedReverseIndex", path);
@@ -490,17 +507,36 @@ export function captureCanonicalSnapshot({ account, projects, observedAtUtc = ne
     accountHead: accountView.head
   }];
   const normalizedProjects = [];
+  const verifiedProjectHeaders = new Map();
   for (const binding of projects) {
     const view = readGitAuthority(binding, PROJECT_REF, true, observedAtUtc);
+    if (verifiedProjectHeaders.has(view.root.projectId)) fail("DuplicateConfiguredProjectIdentity");
+    verifiedProjectHeaders.set(view.root.projectId, {
+      ledgerId: view.root.ledgerId, epoch: view.root.epoch,
+      head: view.head, projectName: binding.projectName
+    });
     normalizedProjects.push(normalizeProject({ ...view, projectName: binding.projectName,
       projectId: binding.projectId }, diagnostics));
   }
-  const configuredIds = new Set(projects.map(p => p.projectId));
   for (const token of accountView.root.tokens) {
-    if (token.status === "Held" && !configuredIds.has(token.projectId)) {
+    if (token.status !== "Held") continue;
+    const project = verifiedProjectHeaders.get(token.projectId);
+    if (!project) {
       diagnostics.push({
         scope: "membership", reason: "HeldTokenProjectNotIncluded",
         projectId: token.projectId, accountHead: accountView.head
+      });
+    } else if (token.projectLedgerId !== project.ledgerId ||
+               token.projectLedgerEpoch !== project.epoch) {
+      // WQ07 Held tokens are not native browser-capacity authority. This
+      // comparison only exposes their provenance against a verified project
+      // header, never authenticates the token's projectAuthoritySha256.
+      diagnostics.push({
+        scope: "membership", reason: "HeldTokenProjectLedgerIdentityMismatch",
+        projectId: token.projectId, tokenLaunchId: token.launchId,
+        actualLedgerId: token.projectLedgerId, actualEpoch: token.projectLedgerEpoch,
+        expectedLedgerId: project.ledgerId, expectedEpoch: project.epoch,
+        projectHead: project.head, accountHead: accountView.head
       });
     }
   }

@@ -19,6 +19,8 @@ It checks the explicit remote ref twice (before and after the read), fetches tha
 
 **A present read is not proof of a complete account-wide set.** There is not yet an independently authenticated account project membership registry available to this adapter. Even an explicitly supplied array of two projects is only a configuration request and cannot demonstrate that no third project's reservations or browser sessions exist. Therefore `snapshot.completeness.projects === false` until that separate authority exists. Held WQ07 tokens referencing absent configured projects produce explicit diagnostics; an empty WQ07 token list does not prove there are no browser sessions.
 
+For each Held WQ07 token naming a configured project, the adapter compares its `projectLedgerId` and `projectLedgerEpoch` with the **independently fetched and verified** project ledger header, not only the supplied project ID. Disagreement produces `HeldTokenProjectLedgerIdentityMismatch` with token/project identity and both source heads. Duplicate configured project IDs fail closed. Neither a matching token nor its `projectAuthoritySha256` is proof of a native browser session or project membership authority.
+
 ## Exact normalized mapping and deliberate incomplete evidence
 
 The returned `snapshot` follows the Phase-1 schema-v2 layout and carries exact account/project commit SHA, ref and observation timestamp, with per-domain `completeness` and `diagnostics` identifying unresolved joins.
@@ -26,10 +28,10 @@ The returned `snapshot` follows the Phase-1 schema-v2 layout and carries exact a
 | Git-ledger record | Projected value / boundary |
 |---|---|
 | Current `ReviewTask`, every canonical `ReviewAttempt` | Task lifecycle/current attempt ID; exact owner, version and assignment generation; `Queued` becomes normalized `Ready` |
-| `ReviewAgent` plus current `AssignmentIssue` | Exact task/attempt/generation assignment; `Working`, `Ready`, `NeedsWork` and `Parked` distinguished; a missing or conflicting issue is incomplete, not an inferred assignment |
+| `ReviewAgent` plus current `AssignmentIssue` | Exact task/attempt/generation assignment; `Working`, `Ready`, `NeedsWork` and `Parked` distinguished; a missing or conflicting issue is incomplete, not an inferred assignment; unassigned `Working` with null disposition is explicitly unverified/incomplete (`UnassignedWorkingAgent`) |
 | Attempt source binding | Exact repository, owner, source/target refs and base commit; **`status: "Unverified"`** until the source ref and physical lease are separately checked against approved repository authority |
 | `BranchReview` | `Unclaimed` becomes `Pending`, and `claim:null` means no named reviewer; **`frozen:false`** until the exact source review ref and reviewed code commit are independently verified |
-| `AttemptChallengeWait` plus Challenge record and both owner/dependency indexes | `Waiting` becomes `Pending`; outstanding dependencies stay Pending; manual zero-dependency block has `waitIndexGeneration:null` |
+| `AttemptChallengeWait` plus Challenge record and both owner/dependency indexes | `Waiting` becomes `Pending`; outstanding dependencies stay Pending; current-generation reverse indices in **both** namespaces must agree with the wait's dependencies and owner; a manual zero-dependency block has `waitIndexGeneration:null` and cannot have any current-generation reverse index, while historical N-to-N+1 indices remain valid |
 | `RequeueChallengeBlockedAttempt` lifecycle audit | Preserves canonical operation ID, ledger sequence, actor, Blocked-to-Queued transition, owner identity, and N to N+1; index remains at immutable N after requeue |
 | `IntegrationSubmission` | Preserves original submission/review/source IDs, but canonical record has no attempt generation; normalized `assignmentGeneration:null` with **`completeness.submissions:false`**, not a guessed value |
 
@@ -47,7 +49,7 @@ Before any later executable Phase-2 integration, require separately reviewed sea
 
 ## Regression / reproducibility
 
-The Node tests create **one real disposable bare account Git remote and two independent disposable bare project Git remotes**, with writer checkouts and immutable canonical commits. They assert exact head/source identity, Ready vs Working vs NeedsWork, missing assignment issuance, unclaimed review, no inferred source trust, N-to-N+1 lifecycle/index provenance, manual zero-dependency blocks, missing reverse-index failures, missing submission generation, absent/foreign project membership, invalid identity/ref/time/ancestor and default-off no-effects. There are no production remotes or browser calls.
+The Node tests create **one real disposable bare account Git remote and two independent disposable bare project Git remotes**, with writer checkouts and immutable canonical commits. They assert exact head/source identity, Ready vs Working vs NeedsWork, unassigned Working/null disposition, missing assignment issuance, unclaimed review, no inferred source trust, N-to-N+1 lifecycle/index provenance, manual zero-dependency holds and orphan by-challenge indices, historical index retention, missing and unexpected reverse-index failures, missing submission generation, absent/foreign project membership, Held token ledger ID/epoch mismatches, invalid identity/ref/time/ancestor and default-off no-effects. There are no production remotes or browser calls.
 
 Commands from the repository root:
 

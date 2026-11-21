@@ -206,6 +206,21 @@ test("missing canonical assignment issue is incomplete; generation must not be g
   assert.ok(view.diagnostics.some(d => d.reason === "MissingCanonicalRecord" && d.scope === "agents"));
 });
 
+test("unassigned Working agent with null disposition is incomplete rather than free or verified", t => {
+  const f = withFixture(t);
+  const path = "agents/" + Buffer.from("Worker 1").toString("base64url") + ".json";
+  const agent = fixtureTask("alpha", "Working")[path];
+  update(f.a, { [path]: {
+    ...agent, currentAssignment: null, unassignedDisposition: null, activeSessionId: null
+  } });
+  const view = capture(f);
+  assert.equal(view.snapshot.projects[0].completeness.agents, false);
+  assert.equal(view.snapshot.projects[0].agents[0].state, "Working");
+  assert.equal(view.snapshot.projects[0].agents[0].currentAssignment, null);
+  assert.equal(view.snapshot.projects[0].agents[0].verified, false);
+  assert.ok(view.diagnostics.some(d => d.scope === "agents" && d.reason === "UnassignedWorkingAgent"));
+});
+
 test("NeedsWork is unassigned and never inferred as Ready from an old attempt", t => {
   const f = withFixture(t);
   update(f.a, fixtureTask("alpha", "NeedsWork", "Worker 1"));
@@ -313,6 +328,32 @@ test("missing one dependency reverse index fails closed instead of silently trea
   assert.ok(view.diagnostics.some(d => d.reason === "WaitIndexMismatch"));
 });
 
+test("unexpected current-generation dependency reverse index is not canonical", t => {
+  const f = withFixture(t);
+  const changes = requeuedChanges();
+  const roguePath = "challenge-waits/by-challenge/" + REVIEW + "/alpha/" + ID + "/4.json";
+  changes[roguePath] = {
+    schemaVersion: 2, taskId: "alpha", attemptId: ID,
+    ownerAgentId: "Worker 1", assignmentGeneration: 4
+  };
+  update(f.a, changes);
+  const view = capture(f);
+  assert.equal(view.snapshot.projects[0].completeness.challenges, false);
+  assert.ok(view.diagnostics.some(d => d.reason === "UnexpectedWaitReverseIndex" && d.path === roguePath));
+});
+
+test("malformed reverse-index locator with valid JSON cannot appear as complete", t => {
+  const f = withFixture(t);
+  const path = "challenge-waits/by-challenge/" + CHALLENGE_A + "/alpha/" + ID + "/not-a-generation.json";
+  update(f.a, { [path]: {
+    schemaVersion: 2, taskId: "alpha", attemptId: ID,
+    ownerAgentId: "Worker 1", assignmentGeneration: 4
+  } });
+  const view = capture(f);
+  assert.equal(view.snapshot.projects[0].completeness.challenges, false);
+  assert.ok(view.diagnostics.some(d => d.reason === "MalformedReverseIndexPath" && d.path === path));
+});
+
 test("submission lacks canonical attempt generation: retain original identity and mark incomplete", t => {
   const f = withFixture(t);
   update(f.a, {
@@ -352,6 +393,9 @@ test("unapproved ref, duplicate project roster and noncanonical time fail closed
   const dup = structuredClone(f.bindings);
   dup.projects[1].projectName = "Jarvis";
   assert.throws(() => captureCanonicalSnapshot(dup), CanonicalSnapshotError);
+  const dupIdentity = structuredClone(f.bindings);
+  dupIdentity.projects[1] = { ...dupIdentity.projects[0], projectName: "Other" };
+  assert.throws(() => captureCanonicalSnapshot(dupIdentity), CanonicalSnapshotError);
   const clock = structuredClone(f.bindings);
   clock.observedAtUtc = "yesterday";
   assert.throws(() => captureCanonicalSnapshot(clock), CanonicalSnapshotError);
@@ -368,6 +412,27 @@ test("held account token naming an unconfigured project is not ignored", t => {
   assert.ok(view.diagnostics.some(d => d.reason === "HeldTokenProjectNotIncluded"));
   assert.equal(phase2DefaultOffDiagnostic(view).sideEffects, 0);
 });
+
+for (const [field, mismatch] of [
+  ["projectLedgerId", "77777777-7777-4777-8777-777777777777"],
+  ["projectLedgerEpoch", 2]
+]) {
+  test("Held WQ07 token " + field + " must match the independently verified project ledger", t => {
+    const f = withFixture(t);
+    const state = accountRoot();
+    state.tokens[0][field] = mismatch;
+    update(f.account, { "state.json": state });
+    const view = capture(f);
+    assert.ok(view.diagnostics.some(d => d.scope === "membership" &&
+      d.reason === "HeldTokenProjectLedgerIdentityMismatch" && d.projectId === PROJECT_B &&
+      d.actualLedgerId === state.tokens[0].projectLedgerId &&
+      d.actualEpoch === state.tokens[0].projectLedgerEpoch &&
+      d.expectedLedgerId === LEDGER_B && d.expectedEpoch === 1));
+    assert.equal(view.snapshot.accountCapacity.complete, false);
+    assert.equal(view.snapshot.completeness.projects, false);
+    assert.equal(phase2DefaultOffDiagnostic(view).sideEffects, 0);
+  });
+}
 
 test("claimed review with no independent reviewer is an incomplete canonical claim", t => {
   const f = withFixture(t);
@@ -417,6 +482,46 @@ test("manual Challenge must not acquire a current-generation reverse index", t =
   const view = capture(f);
   assert.equal(view.snapshot.projects[0].completeness.challenges, false);
   assert.ok(view.diagnostics.some(d => d.reason === "ManualWaitHasReverseIndex"));
+});
+
+test("manual Challenge with only a by-challenge current-generation reverse locator is incomplete", t => {
+  const f = withFixture(t);
+  const attempt = fixtureTask("alpha", "NeedsWork")["tasks/alpha/attempts/" + ID + ".json"];
+  attempt.phase = "Blocked";
+  const path = "challenge-waits/by-challenge/" + CHALLENGE_A + "/alpha/" + ID + "/4.json";
+  update(f.a, {
+    ["tasks/alpha/attempts/" + ID + ".json"]: attempt,
+    ["tasks/alpha/attempts/" + ID + "/challenge-wait.json"]: {
+      schemaVersion: 2, taskId: "alpha", attemptId: ID, ownerAgentId: "Worker 1",
+      reason: "Manual block", challengeIds: [], status: "Waiting",
+      version: 1, blockedAtUtc: NOW, requeuedAtUtc: null
+    },
+    [path]: { schemaVersion: 2, taskId: "alpha", attemptId: ID,
+      ownerAgentId: "Worker 1", assignmentGeneration: 4 }
+  });
+  const view = capture(f);
+  assert.equal(view.snapshot.projects[0].completeness.challenges, false);
+  assert.ok(view.diagnostics.some(d => d.scope === "challenges" &&
+    d.reason === "ManualWaitHasReverseIndex" && d.path === path));
+  assert.equal(phase2DefaultOffDiagnostic(view).sideEffects, 0);
+});
+
+test("manual Challenge preserves genuinely historical reverse-index generations", t => {
+  const f = withFixture(t);
+  const attempt = fixtureTask("alpha", "NeedsWork")["tasks/alpha/attempts/" + ID + ".json"];
+  attempt.phase = "Blocked";
+  update(f.a, {
+    ["tasks/alpha/attempts/" + ID + ".json"]: attempt,
+    ["tasks/alpha/attempts/" + ID + "/challenge-wait.json"]: {
+      schemaVersion: 2, taskId: "alpha", attemptId: ID, ownerAgentId: "Worker 1",
+      reason: "Manual block", challengeIds: [], status: "Waiting",
+      version: 1, blockedAtUtc: NOW, requeuedAtUtc: null
+    },
+    ["challenge-waits/by-challenge/" + CHALLENGE_A + "/alpha/" + ID + "/3.json"]:
+      { schemaVersion: 2, taskId: "alpha", attemptId: ID,
+        ownerAgentId: "Worker 1", assignmentGeneration: 3 }
+  });
+  assert.equal(capture(f).snapshot.projects[0].completeness.challenges, true);
 });
 
 test("remote non-fast-forward rewind conflicts with pinned ancestor trust", t => {

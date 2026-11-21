@@ -1,0 +1,13 @@
+# P0 — Case-variant publication keys bypass the all-or-none compatibility gate
+
+**Pinned source:** `7fc5440f6905718285403c92e62ce2f99dd25957`
+**File:** `Client/Modules/ReviewWorkflow.fs`, lines 425–427 and 519–537 (new compatibility path), deserialization at 723–727.
+**Disposition:** Changes requested.
+
+The new `historicalPublicationShape` checks for exact-case JSON properties with `JsonElement.TryGetProperty("publicationMechanism", ...)`. It sets the legacy exemption when all four exact camelCase keys are absent. But the shared `JsonSerializerOptions` has `PropertyNameCaseInsensitive = true`. Consequently a record containing only `"PublicationMechanism": "VerifiedNonForceGitPush/v1"` (PascalCase), and none of the other three publication fields, is treated by `validEntity<IntegrationSubmission>` as having **all publication keys absent**. The normal required-member loop exempts all four properties. The subsequent deserializer recognizes the PascalCase key and produces a partially populated `PublicationMechanism`. The parser therefore accepts mixed publication evidence, violating the explicit fail-closed requirement. The case-insensitive duplicate-name guard does not help because this payload has only one key for that field.
+
+**Deterministic negative fixture:** Start with the new `HistoricalIntegrationPublisherFieldsMustBeAllPresentOrAllAbsent` record (complete managed-ref group, all four publication fields removed). Add `node["PublicationMechanism"] = JsonValue.Create("VerifiedNonForceGitPush/v1")`, leaving the camelCase publication keys absent. After writing the fixture, require `ReviewWorkflow.getIntegrationSubmissions` to return `LedgerIntegrityError`. The current source's exact-case validator instead accepts the shape. Repeat with each individual PascalCase publication key and mixed-case variants; do not confuse JSON member absence with deserialized evidence absence.
+
+**Fix direction:** Apply the same case-insensitive name equivalence in the required-member/legacy-group checks as in the deserializer, or enforce exact canonical member casing before accepting legacy omissions; preserve the ability to read truly all-absent historical groups. The adjacent existing managed-ref legacy-group check uses the same exact-case pattern and should be addressed by the shared solution.
+
+**Scope of impact:** This proves a read-time integrity gap and partially populated provenance; it does **not** independently prove a forged managed publication succeeds. `WorkCompositionAcceptanceAdapter.requireManagedCompletionAt` still checks original completion provenance and rejects blank publisher evidence. The compatibility patch must nonetheless preserve fail-closed rejection of partial records at ingress.

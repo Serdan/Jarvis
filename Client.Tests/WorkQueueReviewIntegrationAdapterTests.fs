@@ -58,7 +58,9 @@ module private Wq05Fixture =
           Status = "Pending"
           CreatedSequence = 13L
           IntegratedCommit = null
-          CompletedAtUtc = null }
+          CompletedAtUtc = null
+          PublicationPreviousHead = null; PublicationObservedHead = null
+          PublicationOperationId = null; PublicationMechanism = null }
 
     let subscriptions =
         Map.ofList [

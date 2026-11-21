@@ -175,9 +175,10 @@ type WorkCompositionQueueTransactionTests() =
         ReviewWorkflow.submitIntegration b (Guid.NewGuid()) "child-validation" "Owner"
             submission "" "" (reviewId.ToString("N")) target
         |> ok |> ignore
+        // The bounded CompleteIntegration publisher must own the actual
+        // non-force target transition. No fixture pre-push is admissible.
         git a.RepositoryPath [ "checkout"; "main" ] |> ignore
         git a.RepositoryPath [ "merge"; "--ff-only"; sha ] |> ignore
-        git a.RepositoryPath [ "push"; "origin"; "main" ] |> ignore
         ReviewWorkflow.completeIntegration b (Guid.NewGuid()) "child-validation"
             "Reviewer" submission sha |> ok |> ignore
         submission
@@ -603,3 +604,35 @@ type WorkCompositionQueueTransactionTests() =
                         Is.EqualTo(GateState.CompositionHold("dependent", 2)))
             Assert.That(Contracts.orderAvailable blocked |> ok
                         |> List.exists (fun stage -> stage.Id = workId), Is.False))
+
+
+    [<Test>]
+    member _.GenuineManagedPublisherReleasesWq02WithOneAtomicOriginalCasAndUuidReplay() =
+        // Genuine original reviewed S, bounded non-force target publication,
+        // canonical v1 completion, then one original graph+WQ02 ledger CAS.
+        withClones (fun a b workId ->
+            let submissionId = approvedChild a b
+            let source = request a workId submissionId
+            let before = LedgerStore.fetch a |> ok
+            let graphBefore, _ = WorkCompositionGitLedger.loadAt a before |> ok
+            let queueBefore = WorkQueueGitLedger.loadAt a before |> ok
+            Assert.That(WorkComposition.currentAcceptance graphBefore "prerequisite", Is.EqualTo(None))
+            Assert.That(queueBefore.Works.[workId].State, Is.EqualTo(WorkState.Blocked))
+            let operationId = Guid.NewGuid()
+            let accepted =
+                WorkCompositionQueueTransaction.acceptAndRelease b "Fixture" operationId source |> ok
+            Assert.That(accepted.AlreadyApplied, Is.False)
+            let replay =
+                WorkCompositionQueueTransaction.acceptAndRelease a "Fixture" operationId source |> ok
+            Assert.That(replay.AlreadyApplied, Is.True)
+            let after = LedgerStore.fetch b |> ok
+            let graphAfter, _ = WorkCompositionGitLedger.loadAt b after |> ok
+            let queueAfter = WorkQueueGitLedger.loadAt b after |> ok
+            Assert.That(after.Header.NextSequence, Is.EqualTo(before.Header.NextSequence + 1L))
+            let operation = LedgerStore.getOperationAt a after operationId |> ok |> Option.get
+            Assert.That(operation.Paths,
+                        Is.EquivalentTo([| WorkCompositionGitLedger.RecordPath; WorkQueueGitLedger.RecordPath |]))
+            Assert.That(WorkComposition.currentAcceptance graphAfter "prerequisite" |> Option.isSome, Is.True)
+            Assert.That(queueAfter.Works.[workId].State, Is.EqualTo(WorkState.Available))
+            Assert.That(queueAfter.Works.[workId].Gate, Is.EqualTo(GateState.Clear))
+            Assert.That(queueAfter.Migration, Is.EqualTo(MigrationEpoch.Frozen)))

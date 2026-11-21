@@ -31,35 +31,76 @@ new integration.
 
 A review that is Unclaimed, Claimed, ChangesRequested, missing its canonical
 SHA, or changed on the remote cannot authorize integration. The submitted
-commit must fast-forward from the observed remote target; changes needed to
-resolve conflicts must be committed and independently reviewed again.
+source SHA need **not** descend from the current target head. Independent target
+advancement does not invalidate the Accepted source or require a worker rebase
+and full source re-review. The integration record captures the advertised target
+head at submission for later ancestry verification.
 
 ## Integrator procedure (explicit, never automatic)
 
 Use a fresh isolated worktree. Read the canonical submission and accepted
 review through Jarvis first. Fetch the integration ref from the configured
 approved remote and verify that its SHA equals both `ReviewedHeadOid` and
-`SubmittedCommit`. Treat the pinned `TargetHeadAtSubmission` as the
-optimistic concurrency expectation. For example, after substituting exact
-reviewed values from the canonical record:
+`SubmittedCommit`. Fetch the current target, verify it descends from
+`TargetHeadAtSubmission`, and compose **that target** with the exact reviewed
+SHA. Keep the source ref immutable and the original Accepted review untouched.
+For example, with an isolated clean integration worktree and substituted
+canonical values:
 
 ```sh
 git fetch --no-tags origin refs/heads/jarvis-integration/<submissionId>
 test "$(git rev-parse FETCH_HEAD)" = "<reviewedSha>"
 git fetch --no-tags origin <targetRef>
-test "$(git rev-parse FETCH_HEAD)" = "<targetHeadAtSubmission>"
-git merge-base --is-ancestor <targetHeadAtSubmission> <reviewedSha>
-git push --porcelain --force-with-lease=<targetRef>:<targetHeadAtSubmission> \
-  origin <reviewedSha>:<targetRef>
+target_head="$(git rev-parse FETCH_HEAD)"
+git merge-base --is-ancestor <targetHeadAtSubmission> "$target_head"
+# In a fresh, clean integration worktree at "$target_head":
+# If "$target_head" is ancestor of <reviewedSha>, use that exact SHA directly.
+# Otherwise compose a real two-parent merge (target first, reviewed SHA second):
+git merge --no-ff --no-edit <reviewedSha>
+test "$(git rev-parse HEAD^1)" = "$target_head"
+test "$(git rev-parse HEAD^2)" = "<reviewedSha>"
+expected_tree="$(git merge-tree --write-tree --no-messages "$target_head" <reviewedSha>)"
+test "$(git rev-parse 'HEAD^{tree}')" = "$expected_tree"
+# Inspect the merged diff/scope and run merged-result Release tests.
+# No manual target push: CompleteIntegration publishes and verifies this SHA.
 ```
 
-Do **not** use this fast-forward procedure if the target moved or if the
-target SHA is not an ancestor of the exact reviewed commit. Do not create an
-unreviewed merge commit to make the push succeed. Reconcile conflicts on a
-new isolated branch, publish and obtain a fresh independent Accepted review,
-then submit a new integration snapshot. `complete_integration` verifies the
-remote target contains the accepted exact commit; for managed submissions it
-rejects a different/unreviewed integration commit.
+For managed submissions, invoke `complete_integration` with the exact
+prepared integration SHA **before publishing the target**. The bounded
+completion publisher fetches the current remote head, proves the proposed
+SHA descends from that observed head, invokes an explicit-refspec ordinary
+**non-force** Git push, independently fetches the advertised result, and
+records its attributed before/after target SHAs and operation ID in the
+canonical integration receipt. Already-published external commits without
+an applied receipt are rejected: ancestry alone cannot attest a non-force
+push. If the target races, re-fetch, recompose, re-test and use a fresh
+completion operation; do not force or replay an uncertain effect.
+
+The direct fast-forward case passes `<reviewedSha>` as the completion
+SHA. A distinct integration commit has exactly two parents: first,
+**the exact currently advertised remote target SHA at the publication
+boundary** (which must descend from `TargetHeadAtSubmission`), and second,
+the immutable `SubmittedCommit`. An unpublished target-side descendant
+is not authorized merely because it has the right ancestry: that would
+smuggle unreviewed extra edits through an invented first parent. The
+prepared SHA must be recomposed if the real target changes. Its tree
+must equal Git's conflict-free mechanical merge. All integrity-bearing
+Git commands disable local replacement refs
+and refuse local graft/shallow/alternate object overlays.
+If conflict resolution or nonmechanical changes are necessary, obtain a focused
+independent integration-specific review before publication. The present
+completion record has no field for such focused approval: **hold rather than
+pretend that ancestry alone authorizes the conflict resolution**. Do not re-review
+the unchanged source unnecessarily.
+
+The ledger records the Accepted source SHA/ref, submission target head, and
+distinct integrated SHA. The first parent of that immutable integrated merge
+SHA is the actual composition target, and its second parent is the exact
+reviewed source, so both remain reconstructible from the recorded receipt.
+Remote ancestry alone cannot attest publication flags or authority.
+The managed completion publisher provides a verified non-force operation
+receipt; this does not remove the need for independently verified host rules
+that deny force updates and deletion of the target branch in production.
 
 ## Host permissions: mandatory production prerequisite
 
@@ -76,7 +117,11 @@ contributors' normal credentials. No agent ID is a security principal.
 Validate this using two genuinely different remote credentials: a
 contributor must fail **all three** create/update/delete probes for both
 namespaces, and the Jarvis service identity must be able to create a
-new, exact ref. Verify advertised SHA after every service publication.
+new, exact ref. In addition, the **full target branch (normally main)**
+must have independently verified force-update and deletion protection,
+including bypass rules and the integration publisher's credential. Verify
+policy against a disposable protected target, never by force-rewriting a
+live branch. Verify advertised SHA after every service publication.
 Do not infer protections from branch names, an authenticated local agent,
 a successful push, or generic Git remote diagnostics. If the host or
 credential boundaries cannot be verified, **do not deploy or enable this

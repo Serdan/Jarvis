@@ -34,6 +34,7 @@ module LedgerErrors =
             | LedgerStore.StaleEntityVersion _ -> "StaleEntityVersion"
             | LedgerStore.OperationIdReused -> "OperationIdReused"
             | LedgerStore.OutcomeUnknown _ -> "OutcomeUnknown"
+            | LedgerStore.PublisherProvenanceUnavailable _ -> "PublisherProvenanceUnavailable"
             | LedgerStore.LedgerContended -> "LedgerContended"
             | LedgerStore.TrustBindingContended _ -> "TrustBindingContended"
             | LedgerStore.GitFailure _ -> "GitFailure"

@@ -487,7 +487,9 @@ type ReviewWorkflowTests() =
                       IntegrationRef = null; TargetHeadAtSubmission = null
                       TargetRef = sourceRef; Status = status; CreatedSequence = 8L
                       IntegratedCommit = if status = "Integrated" then baseOid else null
-                      CompletedAtUtc = if status = "Integrated" then "2026-11-06T03:16:08Z" else null }
+                      CompletedAtUtc = if status = "Integrated" then "2026-11-06T03:16:08Z" else null
+                      PublicationPreviousHead = null; PublicationObservedHead = null
+                      PublicationOperationId = null; PublicationMechanism = null }
                 let node =
                     System.Text.Json.Nodes.JsonNode.Parse(
                         System.Text.Json.JsonSerializer.Serialize(value, options)).AsObject()
@@ -1770,7 +1772,8 @@ type ReviewWorkflowTests() =
             | other -> Assert.Fail(sprintf "Unreviewed integration commit was allowed: %A" other)
             git one [ "checkout"; mainBranch ] |> ignore
             git one [ "merge"; "--ff-only"; firstCommit ] |> ignore
-            git one [ "push"; "origin"; mainBranch ] |> ignore
+            // Do not pre-publish: CompleteIntegration now verifies and performs
+            // the non-force target publication itself.
             let completionId = Guid.NewGuid()
             let complete () =
                 ReviewWorkflow.completeIntegration second completionId "boundary" "Reviewer"
@@ -1883,8 +1886,8 @@ type ReviewWorkflowTests() =
                         Is.EqualTo(None))
             Assert.That((ReviewWorkflow.getIntegrationSubmissions second taskId |> success).Submissions, Is.Empty))
     [<Test>]
-    member _.AcceptedSnapshotCannotBypassAdvancedRemoteTarget() =
-        withFixture (fun one _ first second _ _ newCommit _ ->
+    member _.AcceptedSnapshotComposesAcrossTwoIndependentTargetAdvances() =
+        withFixture (fun one two first second baseOid _ newCommit _ ->
             let mainBranch = git one [ "branch"; "--show-current" ]
             let target = "refs/heads/" + mainBranch
             let source = "refs/heads/feature/stale-target"
@@ -1893,6 +1896,7 @@ type ReviewWorkflowTests() =
             |> success |> ignore
             git one [ "checkout"; "-b"; "feature/stale-target" ] |> ignore
             let candidate = newCommit "Candidate from older main" "candidate"
+            Assert.That(git one [ "rev-parse"; candidate + "^" ], Is.EqualTo(baseOid))
             let id = Guid.NewGuid()
             ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
                 id source candidate "Old target" "" target |> success |> ignore
@@ -1900,17 +1904,267 @@ type ReviewWorkflowTests() =
             |> success |> ignore
             ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId id "Reviewer" 2 Accept
             |> success |> ignore
-            git one [ "checkout"; mainBranch ] |> ignore
-            newCommit "Independent target update" "new target" |> ignore
-            git one [ "push"; "origin"; mainBranch ] |> ignore
+            // The independent target advances on the *other* clone. The source
+            // worktree/branch remains at the immutable Accepted candidate.
+            File.WriteAllText(Path.Combine(two, "target.txt"), "advance one")
+            git two [ "add"; "target.txt" ] |> ignore
+            git two [ "commit"; "-m"; "Independent target update" ] |> ignore
+            let target1 = git two [ "rev-parse"; "HEAD" ]
+            git two [ "push"; "origin"; mainBranch ] |> ignore
             let submission = Guid.NewGuid()
-            match ReviewWorkflow.submitIntegration second (Guid.NewGuid()) taskId "Owner"
-                    submission "" "" (id.ToString("N")) target with
+            let submitId = Guid.NewGuid()
+            let submit () =
+                ReviewWorkflow.submitIntegration second submitId taskId "Owner"
+                    submission "" "" (id.ToString("N")) target
+            Assert.That((submit () |> success).AlreadyApplied, Is.False)
+            Assert.That((submit () |> success).AlreadyApplied, Is.True)
+            let record = (ReviewWorkflow.getIntegrationSubmissions first taskId |> success).Latest.Value
+            Assert.That(record.SubmittedCommit, Is.EqualTo(candidate))
+            Assert.That(record.ReviewedHeadOid, Is.EqualTo(candidate))
+            Assert.That(record.TargetHeadAtSubmission, Is.EqualTo(target1))
+            Assert.That(LedgerStore.inspectRemoteIntegrationRef second record.IntegrationRef |> success,
+                        Is.EqualTo(Some candidate))
+            git one [ "fetch"; "origin"; target ] |> ignore
+            git one [ "checkout"; "-b"; "integration/old-target"; "FETCH_HEAD" ] |> ignore
+            git one [ "merge"; "--no-ff"; "--no-edit"; candidate ] |> ignore
+            let firstMerge = git one [ "rev-parse"; "HEAD" ]
+            Assert.That(git one [ "rev-list"; "--parents"; "-n"; "1"; firstMerge ],
+                        Is.EqualTo(String.concat " " [ firstMerge; target1; candidate ]))
+            // The target races ahead before publication: an ordinary push of
+            // the stale merge MUST fail, not be rescued by a force push.
+            File.WriteAllText(Path.Combine(two, "target.txt"), "advance two")
+            git two [ "add"; "target.txt" ] |> ignore
+            git two [ "commit"; "-m"; "Second independent target advance" ] |> ignore
+            let target2 = git two [ "rev-parse"; "HEAD" ]
+            git two [ "push"; "origin"; mainBranch ] |> ignore
+            let stalePushRejected =
+                try
+                    git one [ "push"; "origin"; "HEAD:" + target ] |> ignore
+                    false
+                with _ -> true
+            Assert.That(stalePushRejected, Is.True, "Stale integration must not overwrite remote target.")
+            Assert.That(LedgerStore.readRemoteTarget second target |> success, Is.EqualTo(target2))
+            // A force-capable writer can discard racing T2 by rewriting the
+            // remote target to the stale, mechanically clean I=(T1,S).
+            // Ancestry alone must not issue a successful publication receipt.
+            git one [ "push"; "--force"; "origin"; firstMerge + ":" + target ] |> ignore
+            match ReviewWorkflow.completeIntegration first (Guid.NewGuid()) taskId "Reviewer"
+                    submission firstMerge with
+            | Error(InvalidBinding _) | Error(OutcomeUnknown _) -> ()
+            | other -> Assert.Fail(sprintf "Forced stale merge received completion: %A" other)
+            Assert.That((ReviewWorkflow.getIntegrationSubmissions second taskId |> success).Latest.Value.Status,
+                        Is.EqualTo("Pending"))
+            git two [ "push"; "--force"; "origin"; target2 + ":" + target ] |> ignore
+            git one [ "fetch"; "origin"; target ] |> ignore
+            git one [ "checkout"; "--detach"; "FETCH_HEAD" ] |> ignore
+            git one [ "merge"; "--no-ff"; "--no-edit"; candidate ] |> ignore
+            let integrated = git one [ "rev-parse"; "HEAD" ]
+            Assert.That(integrated, Is.Not.EqualTo(candidate))
+            Assert.That(integrated, Is.Not.EqualTo(firstMerge))
+            Assert.That(git one [ "rev-list"; "--parents"; "-n"; "1"; integrated ],
+                        Is.EqualTo(String.concat " " [ integrated; target2; candidate ]))
+            // Completion owns the ordinary non-force target publication.
+            let completionId = Guid.NewGuid()
+            let finish () =
+                ReviewWorkflow.completeIntegration first completionId taskId "Reviewer"
+                    submission integrated
+            Assert.That((finish () |> success).AlreadyApplied, Is.False)
+            Assert.That((finish () |> success).AlreadyApplied, Is.True)
+            let completed = (ReviewWorkflow.getIntegrationSubmissions second taskId |> success).Latest.Value
+            Assert.That(completed.Status, Is.EqualTo("Integrated"))
+            Assert.That(completed.SubmittedCommit, Is.EqualTo(candidate))
+            Assert.That(completed.IntegratedCommit, Is.EqualTo(integrated))
+            Assert.That(completed.TargetHeadAtSubmission, Is.EqualTo(target1))
+            Assert.That(completed.PublicationPreviousHead, Is.EqualTo(target2))
+            Assert.That(completed.PublicationObservedHead, Is.EqualTo(integrated))
+            Assert.That(completed.PublicationOperationId, Is.EqualTo(completionId.ToString("D")))
+            Assert.That(completed.PublicationMechanism, Is.EqualTo("VerifiedNonForceGitPush/v1"))
+            Assert.That(LedgerStore.readRemoteTarget first target |> success, Is.EqualTo(integrated)))
+
+    [<Test>]
+    member _.LocalGraftShallowAndAlternateObjectOverlaysCannotSupplyTrustedAncestry() =
+        withFixture (fun one two _ second baseOid _ _ _ ->
+            let common = git two [ "rev-parse"; "--path-format=absolute"; "--git-common-dir" ]
+            let overlays =
+                [ Path.Combine(common, "info", "grafts"), "# untrusted graft overlay\n"
+                  Path.Combine(common, "shallow"), baseOid + "\n"
+                  Path.Combine(common, "objects", "info", "alternates"),
+                    Path.Combine(one, ".git", "objects") + "\n" ]
+            for path, content in overlays do
+                Directory.CreateDirectory(Path.GetDirectoryName(path)) |> ignore
+                Assert.That(File.Exists(path), Is.False, "Fresh fixture unexpectedly had a Git graph overlay.")
+                File.WriteAllText(path, content)
+                try
+                    match LedgerStore.verifySourceObject second baseOid with
+                    | Error(LedgerIntegrityError _) -> ()
+                    | other -> Assert.Fail(sprintf "Source proof trusted local graph overlay %s: %A" path other)
+                    match LedgerStore.verifySourceAncestry second baseOid baseOid with
+                    | Error(LedgerIntegrityError _) -> ()
+                    | other -> Assert.Fail(sprintf "Ancestry proof trusted local graph overlay %s: %A" path other)
+                finally
+                    File.Delete(path))
+
+    [<Test>]
+    member _.ManagedMergeRejectsIncorrectParentsExtraTreeEditsAndRewrittenRemote() =
+        withFixture (fun one two first second baseOid _ newCommit _ ->
+            let mainBranch = git one [ "branch"; "--show-current" ]
+            let target = "refs/heads/" + mainBranch
+            let taskId = "merge-proof-negative"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Merge proof"
+            |> success |> ignore
+            git one [ "checkout"; "-b"; "feature/merge-proof-negative" ] |> ignore
+            let candidate = newCommit "Reviewed source" "reviewed"
+            let reviewId = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
+                reviewId "refs/heads/feature/merge-proof-negative" candidate "Snapshot" "" target
+            |> success |> ignore
+            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId reviewId "Reviewer" 1
+            |> success |> ignore
+            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId reviewId "Reviewer" 2 Accept
+            |> success |> ignore
+            File.WriteAllText(Path.Combine(two, "target.txt"), "independent")
+            git two [ "add"; "target.txt" ] |> ignore
+            git two [ "commit"; "-m"; "Target update" ] |> ignore
+            let targetHead = git two [ "rev-parse"; "HEAD" ]
+            git two [ "push"; "origin"; mainBranch ] |> ignore
+            let submission = Guid.NewGuid()
+            ReviewWorkflow.submitIntegration second (Guid.NewGuid()) taskId "Owner"
+                submission "" "" (reviewId.ToString("N")) target |> success |> ignore
+            git one [ "fetch"; "origin"; target ] |> ignore
+            git one [ "checkout"; "--detach"; "FETCH_HEAD" ] |> ignore
+            git one [ "merge"; "--no-ff"; "--no-edit"; candidate ] |> ignore
+            let validMerge = git one [ "rev-parse"; "HEAD" ]
+            let tree = git one [ "rev-parse"; validMerge + "^{tree}" ]
+            let forgedWrongSecond =
+                git one [ "commit-tree"; tree; "-p"; targetHead; "-p"; baseOid;
+                          "-m"; "Not the accepted second parent" ]
+            let forgedOldFirst =
+                git one [ "commit-tree"; tree; "-p"; baseOid; "-p"; candidate;
+                          "-m"; "First parent omitted target advancement" ]
+            let forgedThreeParents =
+                git one [ "commit-tree"; tree; "-p"; targetHead; "-p"; candidate;
+                          "-p"; baseOid; "-m"; "Extra parent" ]
+            File.WriteAllText(Path.Combine(one, "extra.txt"), "unreviewed change")
+            git one [ "add"; "extra.txt" ] |> ignore
+            let editedTree = git one [ "write-tree" ]
+            let forgedExtraTree =
+                git one [ "commit-tree"; editedTree; "-p"; targetHead; "-p"; candidate;
+                          "-m"; "Unreviewed merge edit" ]
+            // A remote J with an unreviewed extra file is a legitimate
+            // fast-forward from T, but the verifying clone maps J -> clean I.
+            // Proof must use J's real remote tree, not local replacement refs.
+            git one [ "push"; "origin"; forgedExtraTree + ":" + target ] |> ignore
+            git two [ "fetch"; "origin"; target ] |> ignore
+            git two [ "fetch"; one; validMerge ] |> ignore
+            git two [ "replace"; forgedExtraTree; validMerge ] |> ignore
+            try
+                match LedgerStore.verifyMechanicalIntegrationMerge second targetHead candidate forgedExtraTree with
+                | Error(InvalidBinding _) | Error(LedgerIntegrityError _) -> ()
+                | other -> Assert.Fail(sprintf "Local Git replace spoofed merge-tree proof: %A" other)
+                match ReviewWorkflow.completeIntegration second (Guid.NewGuid()) taskId "Reviewer"
+                        submission forgedExtraTree with
+                | Error(InvalidBinding _) | Error(LedgerIntegrityError _) -> ()
+                | other -> Assert.Fail(sprintf "Replaced extra-tree merge was completed: %A" other)
+            finally
+                git two [ "replace"; "-d"; forgedExtraTree ] |> ignore
+                git two [ "push"; "--force"; "origin"; targetHead + ":" + target ] |> ignore
+            // Bare-remote fixture deliberately advertises each invalid merge
+            // as target HEAD: failure must be the provenance/tree gate, not
+            // merely absence of the candidate object on the remote.
+            for forged in [ forgedWrongSecond; forgedOldFirst; forgedThreeParents; forgedExtraTree ] do
+                git one [ "push"; "--force"; "origin"; forged + ":" + target ] |> ignore
+                match ReviewWorkflow.completeIntegration first (Guid.NewGuid()) taskId "Reviewer"
+                        submission forged with
+                | Error(InvalidBinding _) -> ()
+                | other -> Assert.Fail(sprintf "Invalid two-parent merge was accepted: %A" other)
+                git two [ "push"; "--force"; "origin"; targetHead + ":" + target ] |> ignore
+            Assert.That((ReviewWorkflow.getIntegrationSubmissions second taskId |> success).Latest.Value.Status,
+                        Is.EqualTo("Pending"))
+            // Unpublished target-parent injection: every individual Git
+            // merge/tree/ancestry proof is mechanically sound, but the caller
+            // attempts to smuggle arbitrary extra.txt through a fabricated
+            // target-side descendant that was NEVER on the remote target.
+            let unadvertisedTargetParent =
+                git one [ "commit-tree"; editedTree; "-p"; targetHead;
+                          "-m"; "Unpublished target-side changes" ]
+            let injectedMechanicalTree =
+                git one [ "merge-tree"; "--write-tree"; "--no-messages";
+                          unadvertisedTargetParent; candidate ]
+            let injectedMerge =
+                git one [ "commit-tree"; injectedMechanicalTree;
+                          "-p"; unadvertisedTargetParent; "-p"; candidate;
+                          "-m"; "Unreviewed first-parent injection" ]
+            LedgerStore.verifyMechanicalIntegrationMerge first baseOid candidate injectedMerge
+            |> success |> ignore
+            match ReviewWorkflow.completeIntegration first (Guid.NewGuid()) taskId "Reviewer"
+                    submission injectedMerge with
             | Error(InvalidBinding _) -> ()
-            | other -> Assert.Fail(sprintf "Stale accepted review bypassed target advancement: %A" other)
-            Assert.That(LedgerStore.inspectRemoteIntegrationRef second
-                            ($"refs/heads/jarvis-integration/{submission:N}") |> success,
-                        Is.EqualTo(None)))
+            | other -> Assert.Fail(sprintf "Unpublished target-parent edits passed publication: %A" other)
+            Assert.That(LedgerStore.readRemoteTarget second target |> success,
+                        Is.EqualTo(targetHead), "Rejecting an injected target parent must never publish it.")
+            git one [ "reset"; "--hard"; validMerge ] |> ignore
+            // A real racing target descendant of T must prohibit stale I.
+            File.WriteAllText(Path.Combine(two, "race.txt"), "racing target update")
+            git two [ "add"; "race.txt" ] |> ignore
+            git two [ "commit"; "-m"; "Target advanced beyond mechanical merge" ] |> ignore
+            git two [ "push"; "origin"; mainBranch ] |> ignore
+            match ReviewWorkflow.completeIntegration first (Guid.NewGuid()) taskId "Reviewer"
+                    submission validMerge with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Racing remote falsely completed stale merge: %A" other)
+            // Restore the disposable remote to T for an ordinary clean
+            // completion; production code never performs this fixture rewind.
+            git two [ "push"; "--force"; "origin"; targetHead + ":" + target ] |> ignore
+            ReviewWorkflow.completeIntegration first (Guid.NewGuid()) taskId "Reviewer"
+                submission validMerge |> success |> ignore
+            let record = (ReviewWorkflow.getIntegrationSubmissions first taskId |> success).Latest.Value
+            Assert.That(record.Status, Is.EqualTo("Integrated"))
+            Assert.That(record.SubmittedCommit, Is.EqualTo(candidate))
+            Assert.That(record.IntegratedCommit, Is.EqualTo(validMerge)))
+
+    [<Test>]
+    member _.ConflictResolutionCannotMasqueradeAsMechanicalAcceptedMerge() =
+        withFixture (fun one two first second _ _ newCommit _ ->
+            let mainBranch = git one [ "branch"; "--show-current" ]
+            let target = "refs/heads/" + mainBranch
+            let taskId = "merge-conflict-review-required"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Conflicting merge"
+            |> success |> ignore
+            git one [ "checkout"; "-b"; "feature/merge-conflict" ] |> ignore
+            let source = newCommit "Reviewed change to common file" "source version"
+            let reviewId = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
+                reviewId "refs/heads/feature/merge-conflict" source "Reviewed" "" target
+            |> success |> ignore
+            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId reviewId "Reviewer" 1
+            |> success |> ignore
+            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId reviewId "Reviewer" 2 Accept
+            |> success |> ignore
+            File.WriteAllText(Path.Combine(two, "source.txt"), "target version")
+            git two [ "add"; "source.txt" ] |> ignore
+            git two [ "commit"; "-m"; "Conflicting target change" ] |> ignore
+            let targetHead = git two [ "rev-parse"; "HEAD" ]
+            git two [ "push"; "origin"; mainBranch ] |> ignore
+            let submission = Guid.NewGuid()
+            ReviewWorkflow.submitIntegration second (Guid.NewGuid()) taskId "Owner"
+                submission "" "" (reviewId.ToString("N")) target |> success |> ignore
+            git one [ "fetch"; "origin"; target ] |> ignore
+            // Even with the required parents, a hand-picked conflict
+            // resolution has no Git-mechanical tree proof.
+            let sourceTree = git one [ "rev-parse"; source + "^{tree}" ]
+            let forgedResolution =
+                git one [ "commit-tree"; sourceTree; "-p"; targetHead; "-p"; source;
+                          "-m"; "Unreviewed conflict resolution" ]
+            // Publish to the disposable bare remote so completion reaches the
+            // mechanical-conflict gate rather than failing on a missing object.
+            git one [ "push"; "origin"; forgedResolution + ":" + target ] |> ignore
+            match ReviewWorkflow.completeIntegration first (Guid.NewGuid()) taskId "Reviewer"
+                    submission forgedResolution with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Conflicting merge was accepted without focused review: %A" other)
+            Assert.That((ReviewWorkflow.getIntegrationSubmissions first taskId |> success).Latest.Value.Status,
+                        Is.EqualTo("Pending")))
+
     [<Test>]
     member _.AgentNotificationIsDurableAndAcknowledgedByRecipientOnly() =
         withFixture (fun _ _ first second _ _ _ _ ->
@@ -5961,7 +6215,9 @@ type ReviewWorkflowTests() =
                            IntegrationRef = null; TargetHeadAtSubmission = null
                            TargetRef = null; Status = "Integrated"
                            CreatedSequence = int64 i + 10L
-                           IntegratedCommit = null; CompletedAtUtc = "2026-01-01T00:00:00Z" } : IntegrationSubmission)
+                           IntegratedCommit = null; CompletedAtUtc = "2026-01-01T00:00:00Z"
+                           PublicationPreviousHead = null; PublicationObservedHead = null
+                           PublicationOperationId = null; PublicationMechanism = null } : IntegrationSubmission)
                     write $"notifications/{notificationId}.json" 2
                         ({ NotificationId = notificationId; FromAgentId = "Reviewer"
                            FromProjectName = ""; ToAgentId = (if i % 11 = 0 then "Owner" else "Reviewer")

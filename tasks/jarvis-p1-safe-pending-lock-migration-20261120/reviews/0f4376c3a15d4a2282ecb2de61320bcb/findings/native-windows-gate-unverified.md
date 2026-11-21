@@ -1,0 +1,10 @@
+# Acceptance hold: native Windows exact-UUID mutex evidence is absent
+
+**Frozen source:** `bfde56bcc79cedf923d8eaff7ea66cd0af488f23`  
+**Immutable review ref:** `refs/heads/jarvis-review/jarvis-p1-safe-pending-lock-migration-20261120/0f4376c3a15d4a2282ecb2de61320bcb/r1`
+
+Independent device inventory on 2026-11-21 identifies approved native Windows `KRUSO-PF539JMB` (`b04e8889-9ff3-4957-b058-ba50aaeab4dd`) as **Disconnected**, with last-seen timestamp `2026-11-20T16:47:42.4935386+00:00`. No native Windows test was executed during this review. Linux .NET 11 Release results and source inspection do not establish actual Windows mutex security, namespace behavior, process death semantics, filesystem symlink permissions or disposal.
+
+**Full-task/production acceptance remains HOLD.** Restored Windows connectivity must first permit a source-bound native `dotnet test -c Release` run on the exact frozen commit. The native proof must include independent-process same-UUID exclusion, distinct UUIDs sharing legacy 3-character prefixes, 60-second default or a clearly scoped timeout seam with callback exclusion, abandoned-owner death recovery without callback replay, binding isolation, symlink fail-closed, no lock files or persistent handles, and canonical receipt/journal recovery. Record actual OS/SDK, command lines, exit codes and test counts. The 60-second real-duration wait was not separately measured on Linux; source defines `TimeSpan.FromSeconds(60.)` with a scoped shorter test seam.
+
+A Linux/test-only review verdict must **not** be construed as Windows acceptance, permission to integrate or publish, client migration, stop/update/restart, effect replay, or coordinated cutover. Full rollout additionally requires explicit Operator authorization and verified safe stoppage/reconciliation of both clients.

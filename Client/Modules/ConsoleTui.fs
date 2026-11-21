@@ -1364,8 +1364,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         challengeNotice |> Option.iter (fun value -> draw.WriteLine(trim value width))
         challengeError |> Option.iter (fun error -> draw.WriteLine(trim ("Error: " + error) width))
 
-    let settingKeys = [| "machine-name"; "workspace-path"; "trust-level"; "allowed-environment-variables"; "max-import-bytes"; "browser-port" |]
-    let settingLabels = [| "Machine name"; "Workspace directory"; "Trust level"; "Allowed environment variables"; "Maximum import bytes"; "Browser bridge port" |]
+    let settingKeys = [| "machine-name"; "workspace-path"; "trust-level"; "allowed-environment-variables"; "max-import-bytes"; "browser-port"; "native-health-enabled"; "native-health-timeout-seconds" |]
+    let settingLabels = [| "Machine name"; "Workspace directory"; "Trust level"; "Allowed environment variables"; "Maximum import bytes"; "Browser bridge port"; "Native Health enabled"; "Native Health idle seconds" |]
 
     let settingsValue key (stored: ClientStoredConfig) =
         match key with
@@ -1375,6 +1375,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         | "allowed-environment-variables" -> stored.AllowedEnvironmentVariables |> Option.map (String.concat ",")
         | "max-import-bytes" -> stored.MaxImportBytes |> Option.map string
         | "browser-port" -> stored.BrowserPort |> Option.map string
+        | "native-health-enabled" -> stored.NativeHealthEnabled |> Option.map string
+        | "native-health-timeout-seconds" -> stored.NativeHealthTimeoutSeconds |> Option.map string
         | _ -> None
 
     let settingsEffective key (config: ClientEffectiveConfig) =
@@ -1385,6 +1387,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         | "allowed-environment-variables" -> String.concat "," config.AllowedEnvironmentVariables
         | "max-import-bytes" -> string config.MaxImportBytes
         | "browser-port" -> config.BrowserPort |> Option.map string |> Option.defaultValue "disabled"
+        | "native-health-enabled" -> string config.NativeHealthEnabled
+        | "native-health-timeout-seconds" -> string config.NativeHealthTimeoutSeconds
         | _ -> ""
 
     let openSettingsUnsafe () =
@@ -1409,7 +1413,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             | Error error -> settingsError <- Some error
             | Ok saved ->
                 settingsSnapshot <- Some saved
-                settingsError <- Some "Saved. Restart client for changed runtime settings; machine name updates at next registration."
+                settingsError <- Some "Saved. Native Health settings apply at next check; other runtime settings may require restart."
         | _ -> settingsError <- Some "Configuration unavailable."
 
     let applySettingsEditUnsafe () =

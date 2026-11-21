@@ -50,6 +50,8 @@ let private runConfigCommand (args: string array) =
                 printfn "Allowed environment variables: %s" (String.concat ", " config.AllowedEnvironmentVariables)
                 printfn "Maximum import bytes: %d" config.MaxImportBytes
                 printfn "Browser bridge port: %s" (config.BrowserPort |> Option.map string |> Option.defaultValue "disabled")
+                printfn "Native Health: %s" (if config.NativeHealthEnabled then "enabled" else "disabled")
+                printfn "Native Health inactivity: %d seconds" config.NativeHealthTimeoutSeconds
                 0
         match args |> Array.toList with
         | [ "config"; "path" ] -> printfn "%s" snapshot.Path; 0
@@ -470,6 +472,32 @@ let private runClient args =
             tui.Log $"SignalR connection closed: {detail}"
             Task.CompletedTask))
 
+    // Native Health is ordinary client application code, not a browser schedule
+    // or an MCP worker. The default-off switch is reloaded on each check.
+    let nativeHealthDependencies : Client.NativeHealth.Dependencies =
+        { Enumerate = (fun () -> Client.NativeHealth.NativeHealth.enumerate rt)
+          Current = Client.NativeHealth.NativeHealth.current rt
+          Activity = (fun project agent -> task {
+              if not registered || connection.State <> HubConnectionState.Connected then
+                  return Error "Authenticated server connection unavailable."
+              else
+                  try
+                      let pending = connection.InvokeCoreAsync<AgentActivitySnapshot>("GetAgentActivity", [| box project; box agent |])
+                      let! observed = pending.WaitAsync(TimeSpan.FromSeconds(8.0))
+                      return Ok observed
+                  with ex ->
+                      return Error ("Authenticated server activity failed: " + ex.GetType().Name)
+          })
+          Recover = Client.NativeHealth.NativeHealth.recover rt }
+    let nativeHealth =
+        new Client.NativeHealth.NativeHealth.Service(
+            (fun () ->
+                ClientConfig.load()
+                |> Result.map (fun current -> Client.NativeHealth.NativeHealth.settingsFromStored current.Stored)),
+            nativeHealthDependencies,
+            tui.Log)
+    nativeHealth.Start()
+
     task {
         // Own terminal modes for the entire session. SignalR disposal can still
         // redraw via its Closed callback after the input loop stops.
@@ -523,6 +551,7 @@ let private runClient args =
                     ()
 
         cts.Cancel()
+        do! nativeHealth.StopAsync()
         // Keep the connection and browser services alive while accepted MCP
         // commands and their replies drain. Stop future schedules afterward.
         try

@@ -13,7 +13,9 @@ type ClientStoredConfig =
       TrustLevel: string option
       AllowedEnvironmentVariables: string list option
       MaxImportBytes: int64 option
-      BrowserPort: int option }
+      BrowserPort: int option
+      NativeHealthEnabled: bool option
+      NativeHealthTimeoutSeconds: int option }
 
 type ClientConfigSnapshot =
     { Path: string
@@ -27,6 +29,8 @@ type ClientEffectiveConfig =
       AllowedEnvironmentVariables: string list
       MaxImportBytes: int64
       BrowserPort: int option
+      NativeHealthEnabled: bool
+      NativeHealthTimeoutSeconds: int
       Overrides: Set<string> }
 
 module ClientConfig =
@@ -36,7 +40,9 @@ module ClientConfig =
           TrustLevel = None
           AllowedEnvironmentVariables = None
           MaxImportBytes = None
-          BrowserPort = None }
+          BrowserPort = None
+          NativeHealthEnabled = None
+          NativeHealthTimeoutSeconds = None }
 
     let directoryFor (isLinux: bool) (isMac: bool) (home: string) (appData: string) (xdg: string) =
         if isLinux then
@@ -74,6 +80,7 @@ module ClientConfig =
             elif stored.AllowedEnvironmentVariables |> Option.exists (List.exists (validateVariable >> not)) then Some "allowedEnvironmentVariables contains an invalid variable name."
             elif stored.MaxImportBytes |> Option.exists (fun v -> v < 0L) then Some "maxImportBytes must be non-negative."
             elif stored.BrowserPort |> Option.exists (fun port -> port < 1024 || port > 65535) then Some "browserPort must be between 1024 and 65535."
+            elif stored.NativeHealthTimeoutSeconds |> Option.exists (fun seconds -> seconds < 1 || seconds > 604800) then Some "nativeHealthTimeoutSeconds must be between 1 and 604800."
             else None
         match issue with
         | Some error -> Error error
@@ -111,6 +118,10 @@ module ClientConfig =
                 prop key |> Option.map (fun v ->
                     if v.ValueKind <> JsonValueKind.String then failwith $"Invalid {key}: expected string."
                     v.GetString())
+            let boolProp (key: string) =
+                prop key |> Option.map (fun v ->
+                    if v.ValueKind <> JsonValueKind.True && v.ValueKind <> JsonValueKind.False then failwith $"Invalid {key}: expected boolean."
+                    v.GetBoolean())
             let numberProp (key: string) =
                 prop key |> Option.map (fun v ->
                     if v.ValueKind <> JsonValueKind.Number then failwith $"Invalid {key}: expected integer."
@@ -128,7 +139,9 @@ module ClientConfig =
               TrustLevel = stringProp "trustLevel"
               AllowedEnvironmentVariables = listProp "allowedEnvironmentVariables"
               MaxImportBytes = numberProp "maxImportBytes"
-              BrowserPort = numberProp "browserPort" |> Option.map (fun n -> if n < 1024L || n > 65535L then failwith "Invalid browserPort." else int n) }
+              BrowserPort = numberProp "browserPort" |> Option.map (fun n -> if n < 1024L || n > 65535L then failwith "Invalid browserPort." else int n)
+              NativeHealthEnabled = boolProp "nativeHealthEnabled"
+              NativeHealthTimeoutSeconds = numberProp "nativeHealthTimeoutSeconds" |> Option.map (fun n -> if n < 1L || n > 604800L then failwith "Invalid nativeHealthTimeoutSeconds." else int n) }
     let loadAt path =
         try
             let existingFile = File.Exists path
@@ -155,9 +168,11 @@ module ClientConfig =
                 arr :> JsonNode)
         | "maxImportBytes" -> stored.MaxImportBytes |> Option.map (fun value -> JsonValue.Create(value) :> JsonNode)
         | "browserPort" -> stored.BrowserPort |> Option.map (fun value -> JsonValue.Create(value) :> JsonNode)
+        | "nativeHealthEnabled" -> stored.NativeHealthEnabled |> Option.map (fun value -> JsonValue.Create(value) :> JsonNode)
+        | "nativeHealthTimeoutSeconds" -> stored.NativeHealthTimeoutSeconds |> Option.map (fun value -> JsonValue.Create(value) :> JsonNode)
         | _ -> None
 
-    let keys = [ "machineName"; "workspacePath"; "trustLevel"; "allowedEnvironmentVariables"; "maxImportBytes"; "browserPort" ]
+    let keys = [ "machineName"; "workspacePath"; "trustLevel"; "allowedEnvironmentVariables"; "maxImportBytes"; "browserPort"; "nativeHealthEnabled"; "nativeHealthTimeoutSeconds" ]
 
     let save (snapshot: ClientConfigSnapshot) (stored: ClientStoredConfig) =
         match validate stored with
@@ -211,12 +226,14 @@ module ClientConfig =
         let trust = stored.TrustLevel |> Option.defaultValue "partial"
         let maxBytes = stored.MaxImportBytes |> Option.defaultValue Common.AgentProtocol.defaultMaxImportBytes
         let browserPort = stored.BrowserPort
+        let healthEnabled = stored.NativeHealthEnabled |> Option.defaultValue false
+        let healthSeconds = stored.NativeHealthTimeoutSeconds |> Option.defaultValue 600
         let allowed = (stored.AllowedEnvironmentVariables |> Option.defaultValue []) @ environmentNames()
         let rec loop config overrides remaining =
             match remaining with
             | [] ->
                 let allowed = distinctVariables config.AllowedEnvironmentVariables
-                match validate { empty with MachineName = Some config.MachineName; WorkspacePath = (if String.IsNullOrWhiteSpace config.WorkspacePath then None else Some config.WorkspacePath); TrustLevel = Some config.TrustLevel; MaxImportBytes = Some config.MaxImportBytes; BrowserPort = config.BrowserPort; AllowedEnvironmentVariables = Some allowed } with
+                match validate { empty with MachineName = Some config.MachineName; WorkspacePath = (if String.IsNullOrWhiteSpace config.WorkspacePath then None else Some config.WorkspacePath); TrustLevel = Some config.TrustLevel; MaxImportBytes = Some config.MaxImportBytes; BrowserPort = config.BrowserPort; NativeHealthEnabled = Some config.NativeHealthEnabled; NativeHealthTimeoutSeconds = Some config.NativeHealthTimeoutSeconds; AllowedEnvironmentVariables = Some allowed } with
                 | Ok _ -> Ok { config with AllowedEnvironmentVariables = allowed; Overrides = overrides }
                 | Error e -> Error e
             | "--path" :: value :: tail -> loop { config with WorkspacePath = value } (overrides.Add "workspacePath") tail
@@ -236,7 +253,7 @@ module ClientConfig =
             | unknown :: _ -> Error $"Unknown or incomplete argument: {unknown}"
         let effective = 
             { MachineName = named; WorkspacePath = workspace; TrustLevel = trust
-              MaxImportBytes = maxBytes; BrowserPort = browserPort; AllowedEnvironmentVariables = allowed; Overrides = Set.empty }
+              MaxImportBytes = maxBytes; BrowserPort = browserPort; NativeHealthEnabled = healthEnabled; NativeHealthTimeoutSeconds = healthSeconds; AllowedEnvironmentVariables = allowed; Overrides = Set.empty }
         let environmentOverrides =
             if environmentNames() |> List.isEmpty then Set.empty else Set.singleton "allowedEnvironmentVariables"
         loop effective environmentOverrides arguments
@@ -254,6 +271,14 @@ module ClientConfig =
             match Int64.TryParse value with
             | true, n -> { stored with MaxImportBytes = Some n } |> validate
             | _ -> Error "max-import-bytes requires an integer."
+        | "native-health-enabled" ->
+            match Boolean.TryParse value with
+            | true, enabled -> { stored with NativeHealthEnabled = Some enabled } |> validate
+            | _ -> Error "native-health-enabled requires true or false."
+        | "native-health-timeout-seconds" ->
+            match Int32.TryParse value with
+            | true, seconds -> { stored with NativeHealthTimeoutSeconds = Some seconds } |> validate
+            | _ -> Error "native-health-timeout-seconds requires a positive integer (maximum 604800)."
         | "allowed-environment-variables" ->
             let vars = value.Split([| ','; ';' |], StringSplitOptions.RemoveEmptyEntries ||| StringSplitOptions.TrimEntries) |> Array.toList
             { stored with AllowedEnvironmentVariables = Some vars } |> validate
@@ -266,5 +291,7 @@ module ClientConfig =
         | "trust-level" -> Ok { stored with TrustLevel = None }
         | "max-import-bytes" -> Ok { stored with MaxImportBytes = None }
         | "browser-port" -> Ok { stored with BrowserPort = None }
+        | "native-health-enabled" -> Ok { stored with NativeHealthEnabled = None }
+        | "native-health-timeout-seconds" -> Ok { stored with NativeHealthTimeoutSeconds = None }
         | "allowed-environment-variables" -> Ok { stored with AllowedEnvironmentVariables = None }
         | _ -> Error $"Unknown setting: {key}"

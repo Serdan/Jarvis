@@ -957,6 +957,184 @@ type ChallengeTests() =
 
 
     [<Test>]
+    member _.WrongOwnerReverseMirrorFailsClosedBeforeResolutionOrInboxProjection() =
+        withFixture (fun a b ->
+            let task = "reverse-owner-mirror"
+            let tv, pv, av, attemptId = assignment a task
+            let gate =
+                ChallengeWorkflow.create b (Guid.NewGuid()) "Agent 3" "Canonical owner gate" ""
+                    [ { OwnerKind = ""; OwnerAgentId = "Lead"; SuggestedAgentId = ""
+                        Description = "Resolve canonical gate" } ] |> ok
+            ChallengeWorkflow.blockAttempt a (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "Wait for gate" [ gate.ChallengeId ] |> ok |> ignore
+            let ownerPath =
+                ReviewWorkflow.waitIndexPath (ReviewWorkflow.ownerWaitIndexPrefix "Agent 3")
+                    task attemptId 1
+            let snapshot = LedgerStore.fetch a |> ok
+            let _, priorOid = LedgerStore.readAt a snapshot ownerPath |> ok
+            let corrupted =
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| schemaVersion = 2; taskId = task; attemptId = attemptId
+                       ownerAgentId = "Intruder"; assignmentGeneration = 1 |})
+            let injection : LedgerIntent =
+                { OperationId = Guid.NewGuid(); Actor = "Fixture"
+                  Kind = "CorruptReverseOwner"; RequestJson = """{"case":"wrong-owner"}""" }
+            LedgerStore.transact a injection (fun _ ->
+                Ok [ { Path = ownerPath; ExpectedBlobOid = priorOid; Content = corrupted } ])
+            |> ok |> ignore
+            let before = (LedgerStore.fetch b |> ok).Commit
+            match ReviewWorkflow.getAgentInbox b "Agent 3" with
+            | Error(LedgerIntegrityError _) -> ()
+            | other -> Assert.Fail(sprintf "Wrong-owner index must fail closed in inbox: %A" other)
+            match ChallengeWorkflow.resolve b (Guid.NewGuid()) "Lead"
+                    gate.ChallengeId gate.ConditionIds.Head 1 "verified" "" with
+            | Error(LedgerIntegrityError _) -> ()
+            | other -> Assert.Fail(sprintf "Wrong-owner index must fail closed on resolve: %A" other)
+            Assert.That((LedgerStore.fetch a |> ok).Commit, Is.EqualTo(before))
+            Assert.That(notices b, Is.Empty)
+        )
+
+    [<Test>]
+    member _.MissingSiblingChallengeEdgeFailsClosedEvenWhenOneChallengeIsIndexed() =
+        withFixture (fun a b ->
+            let task = "reverse-missing-sibling"
+            let tv, pv, av, attemptId = assignment a task
+            let gate title =
+                ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" title ""
+                    [ { OwnerKind = ""; OwnerAgentId = "Lead"; SuggestedAgentId = ""
+                        Description = "Resolve dependency" } ] |> ok
+            let first = gate "First dependency"
+            let second = gate "Second dependency"
+            ChallengeWorkflow.blockAttempt b (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "Wait for both gates" [ first.ChallengeId; second.ChallengeId ]
+            |> ok |> ignore
+            let sibling =
+                ReviewWorkflow.waitIndexPath
+                    (ReviewWorkflow.challengeWaitIndexPrefix second.ChallengeId) task attemptId 1
+            // Delete just one reverse edge from a disposable bare-Git clone.
+            // The indexed first dependency must still detect the omission.
+            let snapshot = LedgerStore.fetch a |> ok
+            let worktree = Path.Combine(Path.GetDirectoryName(a.RepositoryPath), "missing-sibling-index")
+            git a.RepositoryPath [ "worktree"; "add"; "--detach"; worktree; snapshot.Commit ] |> ignore
+            try
+                git worktree [ "config"; "user.name"; "Fixture" ] |> ignore
+                git worktree [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+                git worktree [ "rm"; "--"; sibling ] |> ignore
+                git worktree [ "commit"; "-m"; "Fixture deletes one challenge reverse index" ] |> ignore
+                git worktree [ "push"; "origin"; "HEAD:refs/heads/jarvis-orchestration" ] |> ignore
+            finally
+                git a.RepositoryPath [ "worktree"; "remove"; "--force"; worktree ] |> ignore
+            let before = (LedgerStore.fetch b |> ok).Commit
+            match ReviewWorkflow.getAgentInbox b "Agent 3" with
+            | Error(LedgerIntegrityError _) -> ()
+            | other -> Assert.Fail(sprintf "Missing reverse edge must fail closed in inbox: %A" other)
+            match ChallengeWorkflow.resolve b (Guid.NewGuid()) "Lead"
+                    first.ChallengeId first.ConditionIds.Head 1 "verified" "" with
+            | Error(LedgerIntegrityError _) -> ()
+            | other -> Assert.Fail(sprintf "Missing sibling edge must fail closed on resolve: %A" other)
+            Assert.That((LedgerStore.fetch a |> ok).Commit, Is.EqualTo(before))
+            Assert.That(notices b, Is.Empty)
+        )
+
+    [<Test>]
+    member _.MissingCanonicalChallengeReferencedByReverseIndexFailsClosed() =
+        withFixture (fun a b ->
+            let task = "reverse-missing-challenge"
+            let tv, pv, av, attemptId = assignment a task
+            let gate =
+                ChallengeWorkflow.create b (Guid.NewGuid()) "Agent 3" "Missing gate" ""
+                    [ { OwnerKind = ""; OwnerAgentId = "Lead"; SuggestedAgentId = ""
+                        Description = "Complete required work" } ] |> ok
+            ChallengeWorkflow.blockAttempt a (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "Wait for gate" [ gate.ChallengeId ] |> ok |> ignore
+            let snapshot = LedgerStore.fetch a |> ok
+            let temp = Path.Combine(Path.GetDirectoryName(a.RepositoryPath), "missing-canonical-challenge")
+            git a.RepositoryPath [ "worktree"; "add"; "--detach"; temp; snapshot.Commit ] |> ignore
+            try
+                git temp [ "config"; "user.name"; "Fixture" ] |> ignore
+                git temp [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+                let path = "challenges/" + gate.ChallengeId + "/challenge.json"
+                git temp [ "rm"; "--"; path ] |> ignore
+                git temp [ "commit"; "-m"; "Fixture deletes indexed canonical Challenge" ] |> ignore
+                git temp [ "push"; "origin"; "HEAD:refs/heads/jarvis-orchestration" ] |> ignore
+            finally
+                git a.RepositoryPath [ "worktree"; "remove"; "--force"; temp ] |> ignore
+            let before = (LedgerStore.fetch b |> ok).Commit
+            match ReviewWorkflow.getAgentInbox b "Agent 3" with
+            | Error(LedgerIntegrityError _) -> ()
+            | other -> Assert.Fail(sprintf "Missing canonical Challenge must fail closed: %A" other)
+            Assert.That((LedgerStore.fetch a |> ok).Commit, Is.EqualTo(before))
+            Assert.That(notices b, Is.Empty)
+        )
+
+    [<Test>]
+    member _.EntirelyMissingOwnerIndexIsDetectedFromCanonicalBlockedWait() =
+        withFixture (fun a b ->
+            let task = "reverse-owner-omission"
+            let tv, pv, av, attemptId = assignment a task
+            let gate =
+                ChallengeWorkflow.create b (Guid.NewGuid()) "Agent 3" "Owner reverse gate" ""
+                    [ { OwnerKind = ""; OwnerAgentId = "Lead"; SuggestedAgentId = ""
+                        Description = "Complete owner gate" } ] |> ok
+            ChallengeWorkflow.blockAttempt a (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "Wait for owner gate" [ gate.ChallengeId ] |> ok |> ignore
+            let snapshot = LedgerStore.fetch a |> ok
+            let temp = Path.Combine(Path.GetDirectoryName(a.RepositoryPath), "missing-owner-reverse-index")
+            git a.RepositoryPath [ "worktree"; "add"; "--detach"; temp; snapshot.Commit ] |> ignore
+            try
+                git temp [ "config"; "user.name"; "Fixture" ] |> ignore
+                git temp [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+                let path =
+                    ReviewWorkflow.waitIndexPath (ReviewWorkflow.ownerWaitIndexPrefix "Agent 3")
+                        task attemptId 1
+                git temp [ "rm"; "--"; path ] |> ignore
+                git temp [ "commit"; "-m"; "Fixture deletes only owner reverse edge" ] |> ignore
+                git temp [ "push"; "origin"; "HEAD:refs/heads/jarvis-orchestration" ] |> ignore
+            finally
+                git a.RepositoryPath [ "worktree"; "remove"; "--force"; temp ] |> ignore
+            let before = (LedgerStore.fetch b |> ok).Commit
+            match ReviewWorkflow.getAgentInbox b "Agent 3" with
+            | Error(LedgerIntegrityError _) -> ()
+            | other -> Assert.Fail(sprintf "Missing owner reverse index must fail closed: %A" other)
+            Assert.That((LedgerStore.fetch a |> ok).Commit, Is.EqualTo(before))
+            Assert.That(notices b, Is.Empty)
+        )
+
+    [<Test>]
+    member _.EntirelyMissingChallengeIndexIsDetectedFromImmutablePathHistory() =
+        withFixture (fun a b ->
+            let task = "reverse-challenge-omission"
+            let tv, pv, av, attemptId = assignment a task
+            let gate =
+                ChallengeWorkflow.create b (Guid.NewGuid()) "Agent 3" "Challenge reverse gate" ""
+                    [ { OwnerKind = ""; OwnerAgentId = "Lead"; SuggestedAgentId = ""
+                        Description = "Complete challenge gate" } ] |> ok
+            ChallengeWorkflow.blockAttempt a (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "Wait for Challenge gate" [ gate.ChallengeId ] |> ok |> ignore
+            let snapshot = LedgerStore.fetch a |> ok
+            let temp = Path.Combine(Path.GetDirectoryName(a.RepositoryPath), "missing-challenge-reverse-index")
+            git a.RepositoryPath [ "worktree"; "add"; "--detach"; temp; snapshot.Commit ] |> ignore
+            try
+                git temp [ "config"; "user.name"; "Fixture" ] |> ignore
+                git temp [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+                let path =
+                    ReviewWorkflow.waitIndexPath (ReviewWorkflow.challengeWaitIndexPrefix gate.ChallengeId)
+                        task attemptId 1
+                git temp [ "rm"; "--"; path ] |> ignore
+                git temp [ "commit"; "-m"; "Fixture deletes only Challenge reverse edge" ] |> ignore
+                git temp [ "push"; "origin"; "HEAD:refs/heads/jarvis-orchestration" ] |> ignore
+            finally
+                git a.RepositoryPath [ "worktree"; "remove"; "--force"; temp ] |> ignore
+            let before = (LedgerStore.fetch b |> ok).Commit
+            match ChallengeWorkflow.resolve b (Guid.NewGuid()) "Lead"
+                    gate.ChallengeId gate.ConditionIds.Head 1 "verified" "" with
+            | Error(LedgerIntegrityError _) -> ()
+            | other -> Assert.Fail(sprintf "Missing Challenge reverse index must fail closed: %A" other)
+            Assert.That((LedgerStore.fetch a |> ok).Commit, Is.EqualTo(before))
+            Assert.That(notices b, Is.Empty)
+        )
+
+    [<Test>]
     member _.CancelledChallengeConditionsDoNotRemainActionableInInbox() =
         withFixture (fun a b ->
             let unassigned =

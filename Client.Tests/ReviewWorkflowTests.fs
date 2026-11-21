@@ -467,8 +467,9 @@ type ReviewWorkflowTests() =
             | other -> Assert.Fail(sprintf "Legacy schema was accepted: %A" other)
             Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(expectedHead)))
 
-    [<Test>]
-    member _.HistoricalSchemaTwoIntegrationsAreReadableButPartialManagedEvidenceIsRejected() =
+    [<TestCase("reviewRef")>]
+    [<TestCase("ReviewRef")>]
+    member _.HistoricalSchemaTwoIntegrationsAreReadableButPartialManagedEvidenceIsRejected(partialName: string) =
         withFixture (fun _ _ first second baseOid sourceRef _ _ ->
             let taskId = "historical-integration-v2"
             ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Historical integration receipts"
@@ -534,7 +535,7 @@ type ReviewWorkflowTests() =
             let partialId = Guid.NewGuid()
             let partial = System.Text.Json.Nodes.JsonNode.Parse(
                 makeOriginal partialId "Pending").AsObject()
-            partial["reviewRef"] <- System.Text.Json.Nodes.JsonValue.Create(
+            partial[partialName] <- System.Text.Json.Nodes.JsonValue.Create(
                 "refs/heads/jarvis-review/incorrect")
             put partialId (partial.ToJsonString())
             let corruptHead = (LedgerStore.fetch first |> success).Commit
@@ -542,8 +543,13 @@ type ReviewWorkflowTests() =
             | Error(LedgerIntegrityError _) -> ()
             | other -> Assert.Fail(sprintf "Partial managed evidence was accepted: %A" other)
             Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(corruptHead)))
-    [<Test>]
-    member _.HistoricalIntegrationPublisherFieldsMustBeAllPresentOrAllAbsent() =
+    [<TestCase("publicationMechanism")>]
+    [<TestCase("PublicationMechanism")>]
+    [<TestCase("pUbLiCaTiOnMeChAnIsM")>]
+    [<TestCase("PublicationPreviousHead")>]
+    [<TestCase("PublicationOperationId")>]
+    [<TestCase("PublicationObservedHead")>]
+    member _.HistoricalIntegrationPublisherFieldsMustBeAllPresentOrAllAbsent(partialName: string) =
         withFixture (fun _ _ first second baseOid sourceRef _ _ ->
             let taskId = "historical-publication-proof-v2"
             ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Historical publisher-proof fields"
@@ -551,7 +557,7 @@ type ReviewWorkflowTests() =
             let options =
                 System.Text.Json.JsonSerializerOptions(
                     PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase)
-            let makeReceipt (submissionId: Guid) partial =
+            let makeReceipt (submissionId: Guid) (partialField: string) =
                 let value : IntegrationSubmission =
                     { SubmissionId = submissionId.ToString("N"); TaskId = taskId
                       ActorId = "Owner"; SourceRef = sourceRef
@@ -569,8 +575,8 @@ type ReviewWorkflowTests() =
                     [ "publicationPreviousHead"; "publicationObservedHead"
                       "publicationOperationId"; "publicationMechanism" ] do
                     Assert.That(node.Remove(name), Is.True)
-                if partial then
-                    node["publicationMechanism"] <- System.Text.Json.Nodes.JsonValue.Create(
+                if not (String.IsNullOrEmpty partialField) then
+                    node[partialField] <- System.Text.Json.Nodes.JsonValue.Create(
                         "VerifiedNonForceGitPush/v1")
                 node.ToJsonString()
             let put submissionId content =
@@ -583,14 +589,14 @@ type ReviewWorkflowTests() =
                 LedgerStore.transact first intent (fun _ -> Ok [ change ])
                 |> success |> ignore
             let validId = Guid.NewGuid()
-            put validId (makeReceipt validId false)
+            put validId (makeReceipt validId "")
             let before = (LedgerStore.fetch first |> success).Commit
             let accepted = ReviewWorkflow.getIntegrationSubmissions second taskId |> success
             Assert.That(accepted.Submissions.Length, Is.EqualTo(1))
             Assert.That(accepted.Latest.Value.PublicationMechanism, Is.Null)
             Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(before))
             let partialId = Guid.NewGuid()
-            put partialId (makeReceipt partialId true)
+            put partialId (makeReceipt partialId partialName)
             let corruptHead = (LedgerStore.fetch first |> success).Commit
             match ReviewWorkflow.getIntegrationSubmissions second taskId with
             | Error(LedgerIntegrityError _) -> ()

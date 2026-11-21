@@ -513,9 +513,11 @@ module ReviewWorkflow =
                     else []
                 let historicalEvidenceShape =
                     not (List.isEmpty historicalEvidenceFields)
+                    // The serializer accepts case-insensitive property names.
+                    // Use the same equivalence when testing historic absence,
+                    // or e.g. ReviewRef bypasses the all-or-none proof gate.
                     && (historicalEvidenceFields |> List.forall (fun name ->
-                        let mutable ignored = Unchecked.defaultof<JsonElement>
-                        not (root.TryGetProperty(name, &ignored))))
+                        not (names.Contains name)))
                 let historicalPublicationFields =
                     if typeof<'t> = typeof<IntegrationSubmission> then
                         [ "publicationPreviousHead"; "publicationObservedHead"
@@ -524,8 +526,8 @@ module ReviewWorkflow =
                 let historicalPublicationShape =
                     not (List.isEmpty historicalPublicationFields)
                     && (historicalPublicationFields |> List.forall (fun name ->
-                        let mutable ignored = Unchecked.defaultof<JsonElement>
-                        not (root.TryGetProperty(name, &ignored))))
+                        // See historicalEvidenceShape: prevent mixed-case partial proof.
+                        not (names.Contains name)))
                 let complete =
                     required |> Array.forall (fun property ->
                         let mutable memberValue = Unchecked.defaultof<JsonElement>

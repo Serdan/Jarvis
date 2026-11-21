@@ -659,29 +659,80 @@ type ChallengeDependencyPropertyTests() =
                     ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3"
                         (sprintf "CAS seed %d" seed) "" ChallengeFixture.definitions
                     |> ChallengeFixture.ok
+                let before = LedgerStore.fetch a |> ChallengeFixture.ok
+                let initialEvents = ChallengeWorkflow.get b "Agent 3" created.ChallengeId |> ChallengeFixture.ok
+                let firstId = ChallengeModel.uuid seed "cas:first"
+                let secondId = ChallengeModel.uuid seed "cas:second"
                 let firstBinding, secondBinding =
                     if seed % 2 = 0 then a, b else b, a
                 let first =
                     System.Threading.Tasks.Task.Run(fun () ->
-                        ChallengeWorkflow.resolve firstBinding (Guid.NewGuid()) "Lead"
+                        ChallengeWorkflow.resolve firstBinding firstId "Lead"
                             created.ChallengeId created.ConditionIds.[0] 1 "review pass" "")
                 let second =
                     System.Threading.Tasks.Task.Run(fun () ->
-                        ChallengeWorkflow.resolve secondBinding (Guid.NewGuid()) "Agent 8"
+                        ChallengeWorkflow.resolve secondBinding secondId "Agent 8"
                             created.ChallengeId created.ConditionIds.[1] 1 "benchmark pass" "")
                 System.Threading.Tasks.Task.WaitAll([| first :> System.Threading.Tasks.Task; second :> System.Threading.Tasks.Task |])
-                let results = [ first.Result; second.Result ]
-                if (results |> List.filter Result.isOk).Length <> 1 then
+                let results =
+                    [ firstId, "Lead", 0, first.Result
+                      secondId, "Agent 8", 1, second.Result ]
+                let winners = results |> List.filter (fun (_, _, _, result) -> Result.isOk result)
+                let losers = results |> List.filter (fun (_, _, _, result) -> Result.isError result)
+                if winners.Length <> 1 || losers.Length <> 1 then
                     failwithf "seed=%d CAS admitted wrong number of winners: %A" seed results
+                let winnerId, winnerActor, winnerCondition, winnerResult = winners.Head
+                let loserId, _, _, loserResult = losers.Head
+                // The only independently authorized losing families are a changed
+                // entity version and an explicitly exhausted CAS-contention retry.
+                // Access denial, identity errors, integrity errors, uncertain push,
+                // or any other unrelated Error must fail this test.
+                match loserResult with
+                | Error(StaleEntityVersion _) | Error LedgerContended -> ()
+                | _ -> counterexample (sprintf "CASWrongLoserError#%d" seed)
+                           (sprintf "expected stale-version/CAS contention; actual=%A" loserResult)
+                let after = LedgerStore.fetch b |> ChallengeFixture.ok
+                let winnerReceipt = LedgerStore.getOperationAt b after winnerId |> ChallengeFixture.ok
+                let loserReceipt = LedgerStore.getOperationAt b after loserId |> ChallengeFixture.ok
+                let applied = winnerResult |> ChallengeFixture.ok
+                match winnerReceipt, loserReceipt with
+                | Some committed, None when
+                    committed.OperationId = winnerId.ToString("D")
+                    && committed.Actor = winnerActor
+                    && committed.Type = "ResolveChallengeCondition"
+                    && committed.Sequence = before.Header.NextSequence
+                    && applied.Operation.OperationId = committed.OperationId
+                    && applied.Operation.RequestHash = committed.RequestHash
+                    && applied.Operation.OriginalResultHash = committed.OriginalResultHash
+                    && applied.CurrentHead = after.Commit -> ()
+                | _ ->
+                    counterexample (sprintf "CASReceiptMismatch#%d" seed)
+                        (sprintf "winner=%A loser=%A result=%A" winnerReceipt loserReceipt applied)
+                if before.Commit = after.Commit
+                   || after.Header.NextSequence <> before.Header.NextSequence + 1L then
+                    counterexample (sprintf "CASRemoteSequence#%d" seed)
+                        (sprintf "before=%A after=%A" before after)
                 let authoritative = ChallengeWorkflow.get a "Agent 3" created.ChallengeId
                                     |> ChallengeFixture.ok
                 if authoritative.Challenge.Version <> 2
                    || authoritative.History.Length <> 2
                    || (authoritative.Challenge.Conditions
-                       |> List.filter (fun item -> item.Status = "Satisfied")).Length <> 1 then
+                       |> List.filter (fun item -> item.Status = "Satisfied")).Length <> 1
+                   || authoritative.Challenge.Conditions.[winnerCondition].Status <> "Satisfied"
+                   || (authoritative.History
+                       |> List.map (fun event -> event.ActorId, event.Action))
+                      <> [ "Agent 3", "Created"; winnerActor, "ResolveChallengeCondition" ]
+                   || initialEvents.History.Length <> 1 then
                     failwithf "seed=%d did not preserve single-winner state" seed
-                let snapshot = LedgerStore.fetch b |> ChallengeFixture.ok
-                if not (LedgerStore.listAt b snapshot "notifications" |> ChallengeFixture.ok |> List.isEmpty) then
+                let eventPrefix = sprintf "challenges/%s/events" created.ChallengeId
+                let eventPaths = LedgerStore.listAt b after eventPrefix |> ChallengeFixture.ok
+                if eventPaths.Length <> 2
+                   || not (List.contains (sprintf "%s/%d.json" eventPrefix before.Header.NextSequence) eventPaths) then
+                    counterexample (sprintf "CASCanonicalAudit#%d" seed) (sprintf "%A" eventPaths)
+                let indexBefore = LedgerStore.listAt a before (ReviewWorkflow.ownerWaitIndexPrefix "Agent 3") |> ChallengeFixture.ok
+                let indexAfter = LedgerStore.listAt b after (ReviewWorkflow.ownerWaitIndexPrefix "Agent 3") |> ChallengeFixture.ok
+                if indexBefore <> indexAfter
+                   || not (LedgerStore.listAt b after "notifications" |> ChallengeFixture.ok |> List.isEmpty) then
                     failwithf "seed=%d CAS race created notifications" seed)
 
 
@@ -845,6 +896,10 @@ module private MixedChallengeAttemptModel =
     type Kind =
         | WaitOn | ManualRequeue | StartAttempt | PassGate | BlockGate
         | ReopenGate | CancelGate | Observe | Retry of int * bool
+    type LifecycleExpectation =
+        { CommandNumber: int; ActorId: string; Action: string; Reason: string
+          PreviousPhase: string; NewPhase: string
+          PreviousGeneration: int; NewGeneration: int }
     type Command =
         { Number: int; Kind: Kind; Actor: int; Gate: int
           Dependencies: int list
@@ -856,6 +911,7 @@ module private MixedChallengeAttemptModel =
           Generation: int; TaskVersion: int; AttemptVersion: int; AgentVersion: int
           WaitStatus: string; WaitVersion: int; Dependencies: int list
           Historical: (int * int list) list
+          Audits: LifecycleExpectation list
           Receipts: Map<int, Command> }
 
     let initial taskVersion attemptVersion agentVersion =
@@ -864,7 +920,7 @@ module private MixedChallengeAttemptModel =
           Generation = 1; TaskVersion = taskVersion
           AttemptVersion = attemptVersion; AgentVersion = agentVersion
           WaitStatus = "Missing"; WaitVersion = 0; Dependencies = []
-          Historical = []; Receipts = Map.empty }
+          Historical = []; Audits = []; Receipts = Map.empty }
 
     let actor who = ChallengeModel.actor who
     let ownerOf gate = if gate % 2 = 0 then 1 else 2
@@ -879,6 +935,13 @@ module private MixedChallengeAttemptModel =
         | ReopenGate -> "ReopenChallengeCondition"
         | CancelGate -> "CancelChallenge"
         | Observe | Retry _ -> ""
+
+    let className = function
+        | WaitOn -> "WaitOn" | ManualRequeue -> "ManualRequeue"
+        | StartAttempt -> "StartAttempt" | PassGate -> "PassGate"
+        | BlockGate -> "BlockGate" | ReopenGate -> "ReopenGate"
+        | CancelGate -> "CancelGate" | Observe -> "Observe"
+        | Retry _ -> "Retry"
 
     let editAt index replacement (xs: 'a list) =
         xs |> List.mapi (fun i old -> if i = index then replacement else old)
@@ -898,7 +961,31 @@ module private MixedChallengeAttemptModel =
         | Some _ -> Rejected Reused, state
         | None ->
             let bad family = Rejected family, state
-            let commit (next: State) = Applied, { next with Receipts = Map.add opNumber call state.Receipts }
+            let commit (next: State) =
+                // Independent reference task lifecycle, including automatic
+                // requeue initiated by a Challenge resolution.
+                let lifecycleAction =
+                    match call.Kind with
+                    | WaitOn -> Some "WaitOnChallenges"
+                    | ManualRequeue -> Some "RequeueChallengeBlockedAttempt"
+                    | PassGate when next.Generation > state.Generation ->
+                        Some "RequeueChallengeBlockedAttempt"
+                    | _ -> None
+                let audits =
+                    match lifecycleAction with
+                    | None -> state.Audits
+                    | Some action ->
+                        state.Audits @
+                        [ { CommandNumber = opNumber; ActorId = actor call.Actor; Action = action
+                            Reason =
+                                match call.Kind with
+                                | WaitOn -> "model-wait" + (if call.Variant then "-mutated" else "")
+                                | ManualRequeue -> "model-requeue" + (if call.Variant then "-mutated" else "")
+                                | PassGate -> "All explicitly linked challenges satisfied"
+                                | _ -> failwith "Unexpected lifecycle command"
+                            PreviousPhase = state.Phase; NewPhase = next.Phase
+                            PreviousGeneration = state.Generation; NewGeneration = next.Generation } ]
+                Applied, { next with Audits = audits; Receipts = Map.add opNumber call state.Receipts }
             let versions =
                 state.TaskVersion = call.TaskVersion
                 && state.AttemptVersion = call.AttemptVersion
@@ -989,6 +1076,42 @@ module private MixedChallengeAttemptModel =
                 | 5 -> WaitOn, 0, 0, []
                 | 6 -> ManualRequeue, 0, 0, []
                 | 7 -> StartAttempt, 0, 0, []
+                // Guaranteed per-class transitions: positive, stale, unauthorized,
+                // replay, automatic and manual requeue, and multi-gate contexts.
+                // These same numbered commands run in bounded real-Git fixtures.
+                | 8 -> BlockGate, 2, 1, []
+                | 9 -> ReopenGate, 2, 0, []
+                | 10 -> PassGate, 2, 3, [] // denied while gate is Open
+                | 11 -> CancelGate, 3, 0, []
+                | 12 -> WaitOn, 2, 0, [ 2; 3 ] // cancelled dependency
+                | 13 -> WaitOn, 2, 0, [ 2 ]
+                | 14 -> ManualRequeue, 2, 0, [] // pending dependency
+                | 15 -> PassGate, 2, 1, [] // automatic N3 -> N4
+                | 16 -> StartAttempt, 2, 0, []
+                | 17 -> WaitOn, 0, 0, []
+                | 18 -> ManualRequeue, 0, 0, [] // manual N4 -> N5
+                | 19 -> StartAttempt, 0, 0, []
+                | 20 -> WaitOn, 0, 0, [ 0; 1 ] // both satisfied
+                | 21 -> Observe, 0, 0, []
+                | 22 -> Retry(1, false), 0, 0, []
+                | 23 -> Retry(1, true), 0, 0, []
+                | 24 -> WaitOn, 0, 0, [ 0; 3 ] // partly cancelled
+                | 25 -> PassGate, 0, 1, []
+                | 26 -> BlockGate, 2, 1, []
+                | 27 -> ReopenGate, 2, 0, []
+                | 28 -> CancelGate, 3, 0, []
+                | 29 -> ManualRequeue, 0, 0, []
+                | 30 -> StartAttempt, 0, 0, []
+                | 31 -> Retry(0, false), 0, 0, []
+                | 32 -> Retry(0, true), 0, 0, []
+                // Replay each mutating class after the canonical state advances.
+                | 33 -> Retry(5, false), 0, 0, []  // WaitOn
+                | 34 -> Retry(6, false), 0, 0, []  // ManualRequeue
+                | 35 -> Retry(7, false), 0, 0, []  // StartAttempt
+                | 36 -> Retry(8, false), 0, 0, []  // BlockGate
+                | 37 -> Retry(9, false), 0, 0, []  // ReopenGate
+                | 38 -> Retry(11, false), 0, 0, [] // CancelGate
+                | 39 -> Retry(3, false), 0, 0, []  // PassGate
                 | _ ->
                     let gate = rng.Next(4)
                     let validActor = if rng.Next(5) = 0 then 3 else ownerOf gate
@@ -1004,7 +1127,7 @@ module private MixedChallengeAttemptModel =
                     | 8 -> CancelGate, gate, (if rng.Next(5) = 0 then 3 else 0), []
                     | 9 -> Observe, gate, 0, []
                     | _ -> Retry(rng.Next(number), rng.Next(3) = 0), gate, 0, []
-            let stale = number > 7 && rng.Next(7) = 0
+            let stale = number > 39 && rng.Next(7) = 0
             let call =
                 { Number = number; Kind = kind; Actor = actor; Gate = gate
                   Dependencies = deps
@@ -1101,6 +1224,144 @@ module private MixedChallengeAttemptFixture =
         let notices = LedgerStore.listAt binding snapshot "notifications" |> ChallengeFixture.ok
         if not notices.IsEmpty then counterexample "MixedNotifications" (sprintf "%A" notices)
 
+    type IssueExpectation =
+        { Sequence: int64; Issuer: string; Reason: string; Instructions: string }
+
+    // No getTaskLifecycleHistory, AssignmentIssue deserializer or production
+    // transition helper is used as an oracle. Read the actual immutable Git
+    // blobs and compare their JSON fields to independently predicted records.
+    let checkCanonical seed binding task attemptId (pinned: ReviewAttempt)
+                       (state: State) (auditSequences: Map<int,int64>)
+                       (issues: Map<int,IssueExpectation>) (frozen: Map<string,string>) =
+        let snapshot = LedgerStore.fetch binding |> ChallengeFixture.ok
+        let mutable verified = frozen
+        let equals category field expected actual =
+            if expected <> actual then
+                counterexample category (sprintf "%s: expected=%A actual=%A" field expected actual)
+        let raw path =
+            match LedgerStore.readAt binding snapshot path |> ChallengeFixture.ok with
+            | Some content, Some _ -> content
+            | other -> counterexample "MixedMissingCanonicalBlob"
+                           (sprintf "path=%s record=%A" path other)
+        let inspect path verify =
+            let content = raw path
+            try
+                use document = System.Text.Json.JsonDocument.Parse(content)
+                verify document.RootElement
+            with
+            | :? ModelCounterexample -> reraise()
+            | ex -> counterexample "MixedMalformedCanonicalBlob"
+                        (sprintf "path=%s parse/field error=%s" path ex.Message)
+            content
+        let remember path content =
+            match Map.tryFind path verified with
+            | Some original when original <> content ->
+                counterexample "MixedHistoricalBlobMutation" (sprintf "path=%s" path)
+            | _ -> ()
+            verified <- Map.add path content verified
+        let str (record: System.Text.Json.JsonElement) (key: string) = record.GetProperty(key).GetString()
+        let int (record: System.Text.Json.JsonElement) (key: string) = record.GetProperty(key).GetInt32()
+        let int64 (record: System.Text.Json.JsonElement) (key: string) = record.GetProperty(key).GetInt64()
+        let taskPrefix = sprintf "tasks/%s" task
+        let attemptPrefix = sprintf "%s/attempts/%s" taskPrefix attemptId
+        let pin category (record: System.Text.Json.JsonElement) isIssue =
+            equals category "specBlobOid" pinned.SpecBlobOid (str record "specBlobOid")
+            equals category "targetRef" pinned.TargetRef (str record "targetRef")
+            equals category "sourceRepositoryId" pinned.SourceRepositoryId (str record "sourceRepositoryId")
+            equals category "sourceRemote" pinned.SourceRemote (str record "sourceRemote")
+            equals category "sourcePushRemote" pinned.SourcePushRemote (str record "sourcePushRemote")
+            equals category "sourceRef" pinned.SourceRef (str record "sourceRef")
+            equals category "baseCommit"
+                pinned.BaseCommit (str record (if isIssue then "sourceBaseCommit" else "baseCommit"))
+        let _, specOid = LedgerStore.readAt binding snapshot (taskPrefix + "/spec.html") |> ChallengeFixture.ok
+        equals "MixedPinnedSpecBlob" "spec blob" (Some pinned.SpecBlobOid) specOid
+        inspect (attemptPrefix + ".json") (fun record ->
+            pin "MixedAttemptSourcePin" record false
+            equals "MixedAttemptSourcePin" "taskId" task (str record "taskId")
+            equals "MixedAttemptSourcePin" "attemptId" attemptId (str record "attemptId")
+            equals "MixedAttemptSourcePin" "owner" "Agent 3" (str record "ownerAgentId")
+            equals "MixedAttemptSourcePin" "generation" state.Generation (int record "assignmentGeneration")
+            let issued = (Map.find state.Generation issues).Sequence
+            equals "MixedAttemptSourcePin" "issued sequence" issued (int64 record "issuedSequence"))
+        |> ignore
+        let issuePrefix = attemptPrefix + "/assignments"
+        // LedgerStore.listAt deliberately accepts only top-level allowlisted
+        // roots. Enumerate "tasks" once, then independently select exact
+        // canonical subpaths instead of requesting unsupported prefixes.
+        let taskPaths = LedgerStore.listAt binding snapshot "tasks" |> ChallengeFixture.ok
+        let actualIssues =
+            taskPaths
+            |> List.filter (fun p -> p.StartsWith(issuePrefix + "/", StringComparison.Ordinal)
+                                      && p.EndsWith(".json", StringComparison.Ordinal)
+                                      && not (p.EndsWith(".ack.json", StringComparison.Ordinal)))
+            |> Set.ofList
+        let expectedIssues =
+            issues |> Map.toList
+            |> List.map (fun (generation, _) -> sprintf "%s/%d.json" issuePrefix generation)
+            |> Set.ofList
+        equals "MixedAssignmentPathSet" "generation issue paths" expectedIssues actualIssues
+        let generations = issues |> Map.toList |> List.map fst
+        equals "MixedGenerationContinuity" "issued generations" [1 .. state.Generation] generations
+        for KeyValue(generation, expected) in issues do
+            let path = sprintf "%s/%d.json" issuePrefix generation
+            let content = inspect path (fun record ->
+                pin "MixedAssignmentSourcePin" record true
+                equals "MixedAssignmentRecord" "task" task (str record "taskId")
+                equals "MixedAssignmentRecord" "attempt" attemptId (str record "attemptId")
+                equals "MixedAssignmentRecord" "generation" generation (int record "generation")
+                equals "MixedAssignmentRecord" "prior generation" (generation - 1) (int record "previousGeneration")
+                equals "MixedAssignmentRecord" "owner" "Agent 3" (str record "ownerAgentId")
+                equals "MixedAssignmentRecord" "issuer" expected.Issuer (str record "issuerId")
+                equals "MixedAssignmentRecord" "reason" expected.Reason (str record "reason")
+                equals "MixedAssignmentRecord" "instructions" expected.Instructions (str record "instructions")
+                equals "MixedAssignmentRecord" "sequence" expected.Sequence (int64 record "issuedSequence"))
+            remember path content
+        let auditPrefix = taskPrefix + "/lifecycle"
+        let expectedAudits =
+            state.Audits
+            |> List.map (fun event ->
+                let sequence =
+                    match Map.tryFind event.CommandNumber auditSequences with
+                    | Some value -> value
+                    | None -> counterexample "MixedAuditReferenceSequence"
+                                  (sprintf "No expected sequence for %A" event)
+                sequence, event)
+        let sequences = expectedAudits |> List.map fst
+        equals "MixedAuditMonotonic" "event order" (List.sort sequences) sequences
+        equals "MixedAuditMonotonic" "unique sequence" sequences (List.distinct sequences)
+        let actualAudits =
+            taskPaths
+            |> List.filter (fun path -> path.StartsWith(auditPrefix + "/", StringComparison.Ordinal))
+            |> Set.ofList
+        let expectedPaths =
+            expectedAudits
+            |> List.map (fun (sequence, _) -> sprintf "%s/%d.json" auditPrefix sequence)
+            |> Set.ofList
+        equals "MixedLifecyclePathSet" "lifecycle events" expectedPaths actualAudits
+        for sequence, expected in expectedAudits do
+            let path = sprintf "%s/%d.json" auditPrefix sequence
+            let content = inspect path (fun record ->
+                equals "MixedLifecycleIdentity" "task" task (str record "taskId")
+                equals "MixedLifecycleIdentity" "attempt" attemptId (str record "attemptId")
+                equals "MixedLifecycleIdentity" "operation id"
+                    ((ChallengeModel.uuid seed (sprintf "mixed:%d" expected.CommandNumber)).ToString("D"))
+                    (str record "operationId")
+                equals "MixedLifecycleIdentity" "sequence" sequence (int64 record "sequence")
+                equals "MixedLifecycleActorAction" "actor" expected.ActorId (str record "actorId")
+                equals "MixedLifecycleActorAction" "action" expected.Action (str record "action")
+                equals "MixedLifecycleActorAction" "reason" expected.Reason (str record "reason")
+                equals "MixedLifecycleTransition" "old task lifecycle" "InProgress" (str record "previousLifecycle")
+                equals "MixedLifecycleTransition" "new task lifecycle" "InProgress" (str record "newLifecycle")
+                equals "MixedLifecycleTransition" "old phase" expected.PreviousPhase (str record "previousPhase")
+                equals "MixedLifecycleTransition" "new phase" expected.NewPhase (str record "newPhase")
+                equals "MixedLifecycleTransition" "old owner" "Agent 3" (str record "previousOwnerId")
+                equals "MixedLifecycleTransition" "new owner" "Agent 3" (str record "newOwnerId")
+                equals "MixedLifecycleTransition" "old generation" expected.PreviousGeneration (int record "previousGeneration")
+                equals "MixedLifecycleTransition" "new generation" expected.NewGeneration (int record "newGeneration")
+                equals "MixedLifecycleTransition" "review disposition" "Unchanged" (str record "reviewDisposition"))
+            remember path content
+        verified
+
     let actual binding task attemptId (gates: ChallengeCreated list) opId (call: Command) =
         let change = if call.Variant then "-mutated" else ""
         match call.Kind with
@@ -1133,15 +1394,28 @@ module private MixedChallengeAttemptFixture =
             let mutable state = initialState
             let mutable attempted = Map.empty
             let mutable recorded: Map<int,LedgerOperation> = Map.empty
+            let mutable auditSequences: Map<int,int64> = Map.empty
+            let mutable issues =
+                Map.ofList
+                    [ 1, { Sequence = originalAttempt.IssuedSequence
+                           Issuer = "Orchestrator"; Reason = "Assignment"
+                           Instructions =
+                               sprintf "Implement task %s against the pinned task specification." task } ]
+            let mutable frozen: Map<string,string> = Map.empty
+            let mutable realCoverage: Map<string * string,int> = Map.empty
             checkSnapshot a task attemptId gates state
+            frozen <- checkCanonical seed a task attemptId originalAttempt state auditSequences issues frozen
             for command in commands do
                 match command.Kind with
                 | Observe ->
                     let before = LedgerStore.fetch a |> ChallengeFixture.ok
                     checkSnapshot b task attemptId gates state
+                    let unchanged = checkCanonical seed b task attemptId originalAttempt state auditSequences issues frozen
                     let after = LedgerStore.fetch a |> ChallengeFixture.ok
-                    if before.Commit <> after.Commit then
-                        counterexample (sprintf "MixedReadMutation#%d" command.Number) "Read changed canonical HEAD"
+                    if before.Commit <> after.Commit || before.Header.NextSequence <> after.Header.NextSequence
+                       || unchanged <> frozen then
+                        counterexample (sprintf "MixedReadMutation#%d" command.Number)
+                            "Read changed canonical HEAD, sequence or historical records"
                 | _ ->
                     if (match command.Kind with Retry _ -> false | _ -> true) then
                         attempted <- attempted |> Map.add command.Number command
@@ -1164,6 +1438,14 @@ module private MixedChallengeAttemptFixture =
                                 (sprintf "seed=%d step=%A request=%A expected=%A observed=%A raw=%A"
                                     seed command call expected observed result)
                         let after = LedgerStore.fetch other |> ChallengeFixture.ok
+                        let outcomeName =
+                            match observed with Applied -> "Applied" | Replayed -> "Replayed" | Rejected _ -> "Rejected"
+                        let record name =
+                            let key = name, outcomeName
+                            let count = realCoverage |> Map.tryFind key |> Option.defaultValue 0
+                            realCoverage <- realCoverage |> Map.add key (count + 1)
+                        record (className call.Kind)
+                        match command.Kind with Retry _ -> record "Retry" | _ -> ()
                         if observed <> Applied then
                             let afterIndex = LedgerStore.listAt other after (ReviewWorkflow.ownerWaitIndexPrefix "Agent 3") |> ChallengeFixture.ok
                             if before.Commit <> after.Commit || before.Header.NextSequence <> after.Header.NextSequence
@@ -1195,10 +1477,32 @@ module private MixedChallengeAttemptFixture =
                                         (sprintf "before=%A after=%A receipt=%A" before after receipt.Operation)
                                 recorded <- recorded |> Map.add original receipt.Operation
                         | Error _ -> ()
+                        if observed = Applied then
+                            if next.Audits.Length = state.Audits.Length + 1 then
+                                auditSequences <- auditSequences |> Map.add original before.Header.NextSequence
+                            elif next.Audits.Length <> state.Audits.Length then
+                                counterexample "MixedAuditModelTransition" (sprintf "old=%A next=%A" state.Audits next.Audits)
+                            if next.Generation > state.Generation then
+                                if next.Generation <> state.Generation + 1 then
+                                    counterexample "MixedGenerationJump" (sprintf "%d -> %d" state.Generation next.Generation)
+                                let text =
+                                    if call.Kind = ManualRequeue then
+                                        "model-requeue" + (if call.Variant then "-mutated" else "")
+                                    else "All explicitly linked challenges satisfied"
+                                issues <- issues |> Map.add next.Generation
+                                    { Sequence = before.Header.NextSequence
+                                      Issuer = actor call.Actor; Reason = "ChallengeUnblock"
+                                      Instructions = text }
+                        let beforeFrozen = frozen
                         state <- next
                         checkSnapshot other task attemptId gates state
+                        frozen <- checkCanonical seed other task attemptId originalAttempt state auditSequences issues frozen
+                        if observed <> Applied && frozen <> beforeFrozen then
+                            counterexample "MixedRejectedHistoricalMutation"
+                                (sprintf "step=%A old=%A current=%A" command beforeFrozen frozen)
             if originalTask.TaskId <> task || originalAttempt.AttemptId <> attemptId then
-                failwith "Fixture identity drift")
+                failwith "Fixture identity drift"
+            realCoverage)
 
     let shrink seed (original: Command list) (failure: ModelCounterexample) =
         let mutable best = original
@@ -1212,7 +1516,7 @@ module private MixedChallengeAttemptFixture =
                                      |> List.choose (fun (i,item) -> if i = index then None else Some item)
                 trials <- trials + 1
                 let same =
-                    try runCommands seed candidate; false
+                    try runCommands seed candidate |> ignore; false
                     with
                     | :? ModelCounterexample as next -> next.Category = failure.Category
                     | ex -> raise (InvalidOperationException("Mixed-model shrink infrastructure failure", ex))
@@ -1226,49 +1530,128 @@ module private MixedChallengeAttemptFixture =
 type MixedChallengeAttemptPropertyTests() =
     [<Test>]
     member _.GeneratedTaskAndChallengeCommandsExercisePositiveAndNegativePaths() =
-        let mutable accepted = 0
-        let mutable rejected = 0
-        let mutable replayed = 0
-        let mutable seen = Set.empty
+        let mutable coverage: Map<string * string,int> = Map.empty
+        let mutable typedRejects: Map<string * FailureFamily,int> = Map.empty
+        let mutable contexts: Set<string> = Set.empty
+        let mutable observations = 0
+        let incr key (counts: Map<_,int>) =
+            counts |> Map.add key ((counts |> Map.tryFind key |> Option.defaultValue 0) + 1)
+        let count kind outcome = coverage |> Map.tryFind (kind, outcome) |> Option.defaultValue 0
         for seed in 1 .. 192 do
-            let commands = MixedChallengeAttemptModel.generate seed 44 (MixedChallengeAttemptModel.initial 2 2 5)
+            let commands = MixedChallengeAttemptModel.generate seed 56 (MixedChallengeAttemptModel.initial 2 2 5)
             let mutable state = MixedChallengeAttemptModel.initial 2 2 5
             let mutable attempted = Map.empty
             for command in commands do
                 match command.Kind with
-                | MixedChallengeAttemptModel.Observe -> ()
+                | MixedChallengeAttemptModel.Observe ->
+                    observations <- observations + 1
                 | _ ->
                     if (match command.Kind with MixedChallengeAttemptModel.Retry _ -> false | _ -> true) then
                         attempted <- attempted |> Map.add command.Number command
                     match MixedChallengeAttemptModel.materialize attempted command with
                     | None -> ()
                     | Some(call, original) ->
-                        seen <- Set.add (sprintf "%A" call.Kind) seen
+                        let before = state
                         let outcome, next = MixedChallengeAttemptModel.apply state original call
                         state <- next
+                        let kind = MixedChallengeAttemptModel.className call.Kind
+                        let outcomeName =
+                            match outcome with Applied -> "Applied" | Replayed -> "Replayed" | Rejected _ -> "Rejected"
+                        coverage <- incr (kind, outcomeName) coverage
+                        match command.Kind with
+                        | MixedChallengeAttemptModel.Retry _ ->
+                            coverage <- incr ("Retry", outcomeName) coverage
+                        | _ -> ()
                         match outcome with
-                        | Applied -> accepted <- accepted + 1
-                        | Replayed -> replayed <- replayed + 1
-                        | Rejected _ -> rejected <- rejected + 1
-        Assert.That(accepted, Is.GreaterThan(1000))
-        Assert.That(rejected, Is.GreaterThan(1000))
-        Assert.That(replayed, Is.GreaterThan(100))
-        for kind in [ "WaitOn"; "ManualRequeue"; "StartAttempt"; "PassGate"
-                      "BlockGate"; "ReopenGate"; "CancelGate" ] do
-            Assert.That(Set.contains kind seen, Is.True, "Missing generated command class " + kind)
+                        | Rejected family ->
+                            typedRejects <- incr (kind, family) typedRejects
+                            match command.Kind with
+                            | MixedChallengeAttemptModel.Retry _ ->
+                                typedRejects <- incr ("Retry", family) typedRejects
+                            | _ -> ()
+                        | _ -> ()
+                        if before.Generation > 1 && outcome = Applied then
+                            contexts <- Set.add "accepted-cross-generation" contexts
+                        if call.Kind = MixedChallengeAttemptModel.WaitOn
+                           && call.Dependencies.Length > 1 && outcome = Applied then
+                            contexts <- Set.add "multi-dependency-wait" contexts
+                        if call.Kind = MixedChallengeAttemptModel.ManualRequeue
+                           && before.Dependencies.Length > 1 && outcome <> Applied then
+                            contexts <- Set.add "partially-satisfied-manual-rejection" contexts
+                        if call.Kind = MixedChallengeAttemptModel.PassGate
+                           && outcome = Applied && next.Generation > before.Generation then
+                            contexts <- Set.add "automatic-requeue" contexts
+                        if call.Kind = MixedChallengeAttemptModel.ManualRequeue
+                           && outcome = Applied && next.Generation > before.Generation then
+                            contexts <- Set.add "manual-requeue" contexts
+                        if not (List.isEmpty call.Dependencies)
+                           && (call.Dependencies
+                               |> List.exists (fun i -> before.Gates.[i] = MixedChallengeAttemptModel.Abandoned))
+                           && outcome <> Applied then
+                            contexts <- Set.add "cancelled-dependency-rejection" contexts
+                        if call.Actor = 3 && outcome = Rejected Denied then
+                            contexts <- Set.add "typed-unauthorized-rejection" contexts
+                        if outcome = Rejected Stale &&
+                           (call.ChallengeVersion <> before.GateVersions.[call.Gate]
+                            || call.AttemptVersion <> before.AttemptVersion) then
+                            contexts <- Set.add "typed-version-staleness" contexts
+        let actionable =
+            [ "WaitOn"; "ManualRequeue"; "StartAttempt"; "PassGate"
+              "BlockGate"; "ReopenGate"; "CancelGate" ]
+        for kind in actionable do
+            Assert.That(count kind "Applied", Is.GreaterThan(0), kind + " lacks accepted path")
+            Assert.That(count kind "Rejected", Is.GreaterThan(0), kind + " lacks rejected path")
+            Assert.That(count kind "Replayed", Is.GreaterThan(0), kind + " lacks identical receipt replay")
+        Assert.That(count "Retry" "Replayed", Is.GreaterThan(0), "No immutable operation replay")
+        Assert.That(count "Retry" "Rejected", Is.GreaterThan(0), "No mutated-UUID rejection")
+        Assert.That(observations, Is.GreaterThan(0), "Observation-only steps were not exercised")
+        Assert.That(typedRejects |> Map.tryFind ("PassGate", Denied) |> Option.defaultValue 0,
+                    Is.GreaterThan(0), "Unauthorized gate call did not reach typed denial")
+        Assert.That(typedRejects |> Map.tryFind ("Retry", Reused) |> Option.defaultValue 0,
+                    Is.GreaterThan(0), "Mutated replay did not reach typed UUID rejection")
+        for context in
+            [ "accepted-cross-generation"; "multi-dependency-wait"
+              "partially-satisfied-manual-rejection"; "automatic-requeue"
+              "manual-requeue"; "cancelled-dependency-rejection"
+              "typed-unauthorized-rejection"; "typed-version-staleness" ] do
+            Assert.That(Set.contains context contexts, Is.True, "Missing model precondition: " + context)
+        // Creation has an independently controlled operation UUID: the same
+        // create must apply, replay identically, and reject a changed payload.
+        let mutable creationState = ChallengeModel.empty
+        let creation =
+            [ NewChallenge(0, false); NewChallenge(0, false); NewChallenge(0, true) ]
+            |> List.map (fun request ->
+                let outcome, next = ChallengeModel.apply creationState "create:0" request
+                creationState <- next
+                outcome)
+        Assert.That((creation = [ Applied; Replayed; Rejected Reused ]), Is.True,
+                    sprintf "Unexpected create/replay/changed-UUID outcomes: %A" creation)
 
     [<Test>]
     member _.GeneratedTwoCloneDependencyTracesMatchTaskWaitGenerationAndIndexModel() =
+        let mutable coverage: Map<string * string,int> = Map.empty
         for seed in [ 101; 102; 103; 104 ] do
             let commands =
-                MixedChallengeAttemptFixture.prepare (fun _ _ _ _ task attempt _ agentState ->
-                    MixedChallengeAttemptModel.generate seed 20 agentState)
-            try MixedChallengeAttemptFixture.runCommands seed commands
+                MixedChallengeAttemptFixture.prepare (fun _ _ _ _ _ _ _ agentState ->
+                    MixedChallengeAttemptModel.generate seed 56 agentState)
+            try
+                let observed = MixedChallengeAttemptFixture.runCommands seed commands
+                for KeyValue(key, count) in observed do
+                    coverage <- coverage |> Map.add key
+                        (count + (coverage |> Map.tryFind key |> Option.defaultValue 0))
             with :? ModelCounterexample as original ->
                 let shrunk, attempts = MixedChallengeAttemptFixture.shrink seed commands original
                 Assert.Fail(
                     sprintf "Mixed dependency model source=%s seed=%d category=%s original=%A shrinkAttempts=%d minimal=%A detail=%s"
                         (ChallengeFixture.sourceSha()) seed original.Category commands attempts shrunk original.Message)
+        let count name status = coverage |> Map.tryFind (name, status) |> Option.defaultValue 0
+        for name in [ "WaitOn"; "ManualRequeue"; "StartAttempt"; "PassGate"
+                      "BlockGate"; "ReopenGate"; "CancelGate" ] do
+            Assert.That(count name "Applied", Is.GreaterThan(0), "Real Git missing accepted " + name)
+            Assert.That(count name "Rejected", Is.GreaterThan(0), "Real Git missing rejected " + name)
+            Assert.That(count name "Replayed", Is.GreaterThan(0), "Real Git missing replay of " + name)
+        Assert.That(count "Retry" "Replayed", Is.GreaterThan(0), "Real Git missing replay")
+        Assert.That(count "Retry" "Rejected", Is.GreaterThan(0), "Real Git missing changed-payload rejection")
 
 
 //
@@ -1340,6 +1723,7 @@ module private ChallengeIndexFaultMatrix =
                     taskRecord.Version attemptRecord.Version agent.Version 1
                     "Model integrity wait" ids |> ChallengeFixture.ok |> ignore
             if mode = 15 || mode = 20 then block []
+            elif mode = 24 || mode = 25 then block [ first.ChallengeId; second.ChallengeId ]
             else block [ first.ChallengeId ]
             let resolveFirst () =
                 ChallengeWorkflow.resolve b (Guid.NewGuid()) "Lead"
@@ -1463,6 +1847,66 @@ module private ChallengeIndexFaultMatrix =
                     (ReviewWorkflow.waitIndexPath ownerPrefix task attemptId 2)
                     (ChallengeIndexFaults.indexBody task attemptId "Agent 3" 2)
                 checkRejected "orphan-owner-edge-after-manual-requeue" a "Integrity" (readOwner "Agent 3")
+            | 21 ->
+                // Identity matters independently of the project UUID and task locator.
+                let wrong = { b with LedgerId = Guid.NewGuid() }
+                checkRejected "wrong-ledger-identity" a "Integrity" (fun () -> LedgerStore.fetch wrong)
+            | 22 ->
+                let wrong = { b with Epoch = b.Epoch + 1 }
+                checkRejected "wrong-ledger-epoch" a "Integrity" (fun () -> LedgerStore.fetch wrong)
+            | 23 ->
+                // The same local clone cannot silently bind a different remote/ref
+                // to the approved canonical ledger.
+                let wrong = { b with RemoteName = "unapproved-remote" }
+                checkRejected "wrong-approved-remote-ref" a "Invalid" (fun () -> LedgerStore.fetch wrong)
+            | 24 | 25 ->
+                let waiting = sprintf "tasks/%s/attempts/%s/challenge-wait.json" task attemptId
+                let snapshotBefore = LedgerStore.fetch a |> ChallengeFixture.ok
+                let ownerBefore = LedgerStore.listAt a snapshotBefore ownerPrefix |> ChallengeFixture.ok
+                let firstBefore =
+                    LedgerStore.listAt a snapshotBefore (ReviewWorkflow.challengeWaitIndexPrefix first.ChallengeId)
+                    |> ChallengeFixture.ok
+                let secondBefore =
+                    LedgerStore.listAt a snapshotBefore (ReviewWorkflow.challengeWaitIndexPrefix second.ChallengeId)
+                    |> ChallengeFixture.ok
+                if ownerBefore <> [ ownerEdge ] || firstBefore <> [ challengeEdge ]
+                   || secondBefore <>
+                        [ ReviewWorkflow.waitIndexPath
+                            (ReviewWorkflow.challengeWaitIndexPrefix second.ChallengeId) task attemptId 1 ] then
+                    counterexample "MultiDependencyEdgesMissing" (sprintf "mode=%d" mode)
+                if mode = 25 then
+                    resolveFirst () |> ChallengeFixture.ok |> ignore
+                let canceled = if mode = 24 then first else second
+                ChallengeWorkflow.cancel b (Guid.NewGuid()) "Agent 3"
+                    canceled.ChallengeId 1 "partial dependency canceled"
+                |> ChallengeFixture.ok |> ignore
+                let beforeReject = LedgerStore.fetch a |> ChallengeFixture.ok
+                let waitBefore, _ = LedgerStore.readAt a beforeReject waiting |> ChallengeFixture.ok
+                let blocked = ReviewWorkflow.getAgentInbox b "Agent 3" |> ChallengeFixture.ok
+                checkRejected
+                    (if mode = 24 then "cancelled-one-other-pending"
+                     else "cancelled-one-other-satisfied")
+                    a "Stale" (fun () ->
+                    ChallengeWorkflow.requeueAttempt b (Guid.NewGuid()) "Agent 3" task attemptId
+                        taskRecord.Version blocked.Blocked.Head.Attempt.Version blocked.Agent.Version 1
+                        "partial canceled dependency must never wake")
+                let afterReject = LedgerStore.fetch b |> ChallengeFixture.ok
+                let waitAfter, _ = LedgerStore.readAt b afterReject waiting |> ChallengeFixture.ok
+                let ownerAfter = LedgerStore.listAt b afterReject ownerPrefix |> ChallengeFixture.ok
+                let firstAfter =
+                    LedgerStore.listAt b afterReject (ReviewWorkflow.challengeWaitIndexPrefix first.ChallengeId)
+                    |> ChallengeFixture.ok
+                let secondAfter =
+                    LedgerStore.listAt b afterReject (ReviewWorkflow.challengeWaitIndexPrefix second.ChallengeId)
+                    |> ChallengeFixture.ok
+                let finalInbox = ReviewWorkflow.getAgentInbox a "Agent 3" |> ChallengeFixture.ok
+                if beforeReject.Commit <> afterReject.Commit
+                   || beforeReject.Header.NextSequence <> afterReject.Header.NextSequence
+                   || waitBefore <> waitAfter || ownerBefore <> ownerAfter
+                   || firstBefore <> firstAfter || secondBefore <> secondAfter
+                   || finalInbox.Blocked.Head.Attempt.AssignmentGeneration <> 1 then
+                    counterexample "PartialCanceledDependencyMutation"
+                        (sprintf "mode=%d before=%s after=%s" mode beforeReject.Commit afterReject.Commit)
             | _ -> failwithf "Unexpected fault-matrix mode %d" mode)
 
 [<TestFixture>]
@@ -1484,5 +1928,10 @@ type ChallengeReverseIndexFaultMatrixTests() =
     [<TestCase(18)>]
     [<TestCase(19)>]
     [<TestCase(20)>]
+    [<TestCase(21)>]
+    [<TestCase(22)>]
+    [<TestCase(23)>]
+    [<TestCase(24)>]
+    [<TestCase(25)>]
     member _.MissingExtraStaleCanceledWrongIdentityAndHistoricalModesFailClosed(mode: int) =
         ChallengeIndexFaultMatrix.probe mode

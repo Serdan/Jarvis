@@ -1,5 +1,11 @@
 # Jarvis-managed review and integration snapshots
 
+**Review findings are not corrective-work authorization.** Before a decided
+review's findings are converted to new tasks, dependencies or requirements,
+follow the independent, per-finding bounded process in
+[FindingsAdjudication](reviews/FindingsAdjudication.md). This gate leaves the
+source review verdict and managed integration checks unchanged.
+
 ## Contract
 
 Jarvis publishes each review candidate as a **create-only, verified remote Git ref**

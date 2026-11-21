@@ -1,0 +1,13 @@
+# P2 — authenticated pre-v1 managed direct compatibility is not implemented
+
+**Review:** `08fdc04c145540b29d6920bd38f946f1` at frozen `2f478f79deb1fc4d1be3416550844692657d7ed7`.
+
+**Source-observed behavior:** `Client/Modules/WorkCompositionAcceptanceAdapter.fs:98-112` detects every managed direct completion with no publication fields (`IntegratedCommit=SubmittedCommit`, all four fields empty) and **always** returns `InvalidBinding "Managed legacy direct completion has no trusted pre-v1 origin proof."`, even if its canonical `CompleteIntegration` origin were genuinely old, immutable, and uniquely attested. The prior attempted compatibility test `compositionAcceptanceRetainsAuthenticatedHistoricalDirectCompletion` was replaced by the *negative* `compositionAcceptanceRejectsNewlyForgedLegacyDirectCompletion` at `Client.Tests/WorkCompositionLedgerTests.fs:319+`. No authentic historical fixture or allowlist/era anchor is retained in the new delta.
+
+**Correct security choice:** This unconditional fail-closed behavior does fix the reported *fresh legacy-shaped* acceptance bypass. An arbitrary backdated timestamp is not proof of pre-v1 origin; reopening the old shape-only path would regress security.
+
+**Missing requested positive:** Operator's review instructions explicitly require a *legitimate pre-v1 positive without fresh self-assertion*, and the pinned task asks for historical-compatible records. Source does not implement or prove **managed** historical direct acceptances. I found no independently demonstrated trusted rollout anchor or historical operation allowlist in this frozen delta. Thus compatibility is unproven, not a reason to weaken the reject predicate. Separate `ReviewWorkflow.completeIntegration` branch-only records (`IntegrationRef` blank) still have distinct read-only compatibility, and that path is not disputed here.
+
+**Required disposition:** Identify an independently verified, immutable pre-v1 ledger head/operation-set, binding genuine old CompleteIntegration operation, receipt, request and source/ref history to a trusted rollout boundary; write a positive regression from that actual provenance and a negative fresh-lookalike. If no trustworthy historical anchor or surviving legitimate records can be established, **fail closed and explicitly obtain/operator-document a compatibility waiver or migration plan** rather than claiming the requested pre-v1 compatibility test passed.
+
+**Evidence limit:** This is a source-proven absence of the requested managed compatibility path, not proof that current production contains an affected legitimate pre-v1 managed receipt.

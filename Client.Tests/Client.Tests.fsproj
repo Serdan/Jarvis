@@ -70,6 +70,7 @@
         <Compile Include="RoleInstructionsTests.fs"/>
         <Compile Include="ReviewWorkflowTests.fs"/>
         <Compile Include="ChallengeWorkflowTests.fs"/>
+        <Compile Include="ChallengeStateMachinePropertyTests.fs"/>
         <Compile Include="WorkQueueCanonicalSourceEvidenceTests.fs"/>
         <Compile Include="WorkQueueCanonicalCasBinderTests.fs"/>
         <Compile Include="WorkQueuePracticalAdmissionTests.fs"/>

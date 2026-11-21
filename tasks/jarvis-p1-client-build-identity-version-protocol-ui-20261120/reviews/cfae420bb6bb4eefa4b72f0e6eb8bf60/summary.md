@@ -21,3 +21,7 @@
 - This is an **independent source-only review**, not permission to merge, publish main, restart either client, deploy, or enable schedules. No source changes were made by the reviewer.
 
 **Assessment:** No in-scope blocking source defect found. Accept this exact frozen source on code review; retain the bounded runtime/release evidence limitations above rather than claiming unexecuted proof.
+
+## Final broad regression disposition
+
+Reviewer's independent `dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-build --no-restore` ended `TimedOut=true`, `ExitCode=-1` at the 180-second bound without a full-suite pass/fail count. Buffered test output includes activity persistence `InvalidDataException` and `UnauthorizedAccessException` (read/append/save) and one skipped schedule test. This is **not** claimed as a passing full suite; the permission errors and timeout require a separately scoped environment/fixture investigation if broad Release acceptance is required. They do not establish a reproducible in-scope regression in the frozen build-identity changes. The Accepted source-only verdict does not waive the separate runtime/release gate.

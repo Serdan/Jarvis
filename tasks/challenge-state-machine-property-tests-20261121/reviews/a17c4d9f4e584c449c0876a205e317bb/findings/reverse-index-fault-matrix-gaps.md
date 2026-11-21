@@ -1,0 +1,9 @@
+# P1 — Adversarial reverse-index matrix is materially incomplete
+
+**Frozen source:** `cd895d493b419e127ededea15f814ab53e484407`, `Client.Tests/ChallengeStateMachinePropertyTests.fs:611–674`.
+
+The fault fixture implements exactly four `mode` branches: orphan N+1 by-challenge, wrong owner on N by-challenge, orphan N+1 by-owner, and wrong task ID on N by-challenge. These are useful real-bare-Git probes. Independently reproduced at exact SHA: modes 0, 1, 2 fail as intended with production returning `Ok`; mode 3 passes. The accepted task contract also explicitly requires missing/extra reverse edge, stale challenge ID, stale task/attempt generation, duplicated *persisted canonical* dependency, canceled challenge, and mismatched identity/ref cases. The input duplicate check at 467–473 is **not** a persisted canonical dependency-corruption test; the existing probes do not exercise the missing-edge cases or a stray unrelated challenge ID.
+
+**Why it matters.** Repairing only the three currently red modes might leave other structurally broken indices silently accepted. Passing these four fixtures is not sufficient evidence for fail-closed completeness of both index directions or benign historical N→N+1 edges.
+
+**Required correction.** Add bounded, separate one-mutation real-bare-Git fixtures for the omitted contract cases, with canonical HEAD/path checks and a positive historical N→N+1 control. Mark any newly confirmed production defect deliberately red, link it to a separately scoped production correction, and do not weaken tests to turn the branch green. The tests-only deliverable should not be treated as merge-ready while known red regressions remain without an agreed integration strategy.

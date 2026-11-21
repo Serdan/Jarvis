@@ -336,6 +336,31 @@ function normalizeProject(view, diagnostics) {
       canonicalPath: path
     });
   }
+  // A previous generation may leave immutable reverse indices after requeue
+  // and reblocking. The current wait no longer records its old dependencies:
+  // require its original block and N-to-N+1 requeue audits, rather than
+  // treating any smaller number as evidence of a real old wait.
+  const historicalBlocks = new Map();
+  const historicalRequeues = new Map();
+  for (const path of listPaths(r, /^tasks\/[A-Za-z0-9_-]+\/lifecycle\/[0-9]+\.json$/)) {
+    const event = r.get(path);
+    if (!["WaitOnChallenges", "RequeueChallengeBlockedAttempt"].includes(event?.action)) continue;
+    const taskId = /^tasks\/([^/]+)\/lifecycle\//.exec(path)[1];
+    const isBlock = event.action === "WaitOnChallenges";
+    const key = taskId + "/" + event.attemptId + "/" +
+      (isBlock ? event.newGeneration : event.previousGeneration);
+    const grouped = isBlock ? historicalBlocks : historicalRequeues;
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push({ path, event });
+  }
+  const createdChallengeEvents = new Map();
+  for (const path of listPaths(r, /^challenges\/[a-f0-9]{32}\/events\/[0-9]+\.json$/)) {
+    const event = r.get(path);
+    if (event?.action !== "Created") continue;
+    const challengeId = /^challenges\/([^/]+)\/events\//.exec(path)[1];
+    if (!createdChallengeEvents.has(challengeId)) createdChallengeEvents.set(challengeId, []);
+    createdChallengeEvents.get(challengeId).push({ path, event });
+  }
   // A schema-valid reverse path is still not canonical evidence unless it
   // matches an actual wait and its permitted generation. Requeued waits keep
   // their indices at N, not at the active assignment's N+1 generation.
@@ -363,6 +388,59 @@ function normalizeProject(view, diagnostics) {
     // above. Older matching indices are history, not an extra active wait.
     if (locator.generation > wait.generation) {
       issue(issues, "challenges", "UnexpectedWaitReverseIndex", path);
+    }
+    if (locator.generation < wait.generation) {
+      const audits = historicalBlocks.get(locator.taskId + "/" + locator.attemptId +
+        "/" + locator.generation) ?? [];
+      const validAudits = audits.filter(({ path: auditPath, event: e }) =>
+        e.schemaVersion === 2 && e.taskId === locator.taskId &&
+        e.attemptId === locator.attemptId && validPositive(e.sequence) &&
+        auditPath === "tasks/" + locator.taskId + "/lifecycle/" + e.sequence + ".json" &&
+        validString(e.operationId) && e.actorId === wait.ownerAgentId &&
+        e.previousOwnerId === wait.ownerAgentId && e.newOwnerId === wait.ownerAgentId &&
+        ["Queued", "Started"].includes(e.previousPhase) && e.newPhase === "Blocked" &&
+        e.previousGeneration === locator.generation && e.newGeneration === locator.generation);
+      if (audits.length !== 1 || validAudits.length !== 1) {
+        issue(issues, "challenges", "HistoricalWaitAuditUnproven", path);
+      }
+      const requeues = historicalRequeues.get(locator.taskId + "/" + locator.attemptId +
+        "/" + locator.generation) ?? [];
+      const validRequeues = requeues.filter(({ path: auditPath, event: e }) =>
+        e.schemaVersion === 2 && e.taskId === locator.taskId &&
+        e.attemptId === locator.attemptId && validPositive(e.sequence) &&
+        auditPath === "tasks/" + locator.taskId + "/lifecycle/" + e.sequence + ".json" &&
+        validString(e.operationId) && validString(e.actorId) &&
+        e.previousOwnerId === wait.ownerAgentId && e.newOwnerId === wait.ownerAgentId &&
+        e.previousPhase === "Blocked" && e.newPhase === "Queued" &&
+        e.previousGeneration === locator.generation &&
+        e.newGeneration === locator.generation + 1 &&
+        validAudits.length === 1 && e.sequence > validAudits[0].event.sequence);
+      if (requeues.length !== 1 || validRequeues.length !== 1)
+        issue(issues, "challenges", "HistoricalRequeueAuditUnproven", path);
+      if (locator.namespace.startsWith("by-challenge/")) {
+        const challengeId = locator.namespace.slice("by-challenge/".length);
+        const challenge = r.get("challenges/" + challengeId + "/challenge.json");
+        if (!challenge || typeof challenge !== "object" || Array.isArray(challenge) ||
+            challenge.schemaVersion !== 2 || challenge.challengeId !== challengeId ||
+            !validPositive(challenge.version) || !validString(challenge.issuerAgentId) ||
+            !validTime(challenge.createdAtUtc) || challenge.completionPolicy !== "All" ||
+            !Array.isArray(challenge.conditions) || challenge.conditions.length === 0 ||
+            !["Pending", "Blocked", "Satisfied", "Cancelled"].includes(challenge.status) ||
+            (challenge.taskId !== "" && challenge.taskId !== locator.taskId)) {
+          issue(issues, "challenges", "HistoricalIndexChallengeUnproven", path);
+          continue;
+        }
+        // A current challenge.json alone cannot prove the challenge existed
+        // when the old wait was blocked. Challenge creation is a durable event.
+        const created = (createdChallengeEvents.get(challengeId) ?? []).filter(({ path: eventPath, event: e }) =>
+          e.schemaVersion === 2 && e.challengeId === challengeId && e.action === "Created" &&
+          validPositive(e.sequence) && eventPath === "challenges/" + challengeId +
+            "/events/" + e.sequence + ".json" &&
+          e.beforeStatus === "" && e.afterStatus === "Pending" &&
+          validAudits.length === 1 && e.sequence < validAudits[0].event.sequence);
+        if (created.length !== 1)
+          issue(issues, "challenges", "HistoricalChallengeCreationUnproven", path);
+      }
     }
   }
 

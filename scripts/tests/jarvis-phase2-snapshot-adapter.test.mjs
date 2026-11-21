@@ -282,7 +282,7 @@ function requeuedChanges() {
     values["challenges/" + id + "/challenge.json"] = {
       schemaVersion: 2, challengeId: id, issuerAgentId: "Worker 1", taskId: "alpha",
       title: "dependency " + id, status: "Satisfied", version: 2,
-      conditions: [], completionPolicy: "All", createdAtUtc: NOW, updatedAtUtc: NOW
+      conditions: [{ status: "Satisfied" }], completionPolicy: "All", createdAtUtc: NOW, updatedAtUtc: NOW
     };
   }
   const index = {
@@ -303,6 +303,35 @@ function requeuedChanges() {
     previousGeneration: 4, newGeneration: 5
   };
   return values;
+}
+
+function historicalWaitLineage() {
+  return {
+    "tasks/alpha/lifecycle/96.json": {
+      schemaVersion: 2, taskId: "alpha", attemptId: ID, operationId: "older-block",
+      sequence: 96, action: "WaitOnChallenges", actorId: "Worker 1",
+      previousOwnerId: "Worker 1", newOwnerId: "Worker 1",
+      previousPhase: "Started", newPhase: "Blocked",
+      previousGeneration: 3, newGeneration: 3
+    },
+    "tasks/alpha/lifecycle/97.json": {
+      schemaVersion: 2, taskId: "alpha", attemptId: ID, operationId: "older-requeue",
+      sequence: 97, action: "RequeueChallengeBlockedAttempt", actorId: "Worker 1",
+      previousOwnerId: "Worker 1", newOwnerId: "Worker 1",
+      previousPhase: "Blocked", newPhase: "Queued",
+      previousGeneration: 3, newGeneration: 4
+    }
+  };
+}
+
+function historicalChallengeCreation(id) {
+  return {
+    ["challenges/" + id + "/events/95.json"]: {
+      schemaVersion: 2, challengeId: id, conditionId: "", actorId: "Worker 1",
+      action: "Created", beforeStatus: "", afterStatus: "Pending",
+      sequence: 95, occurredAtUtc: NOW
+    }
+  };
 }
 
 test("Challenge N to N+1 joins immutable owner/dependency index and lifecycle provenance", t => {
@@ -385,6 +414,7 @@ for (const namespace of ["by-challenge", "by-owner"]) {
 test("valid older by-owner index remains immutable historical evidence", t => {
   const f = withFixture(t);
   const changes = requeuedChanges();
+  Object.assign(changes, historicalWaitLineage());
   const path = "challenge-waits/by-owner/" + Buffer.from("Worker 1").toString("base64url") +
     "/alpha/" + ID + "/3.json";
   changes[path] = {
@@ -396,6 +426,81 @@ test("valid older by-owner index remains immutable historical evidence", t => {
   assert.equal(p.completeness.challenges, true);
   assert.equal(p.challenges[0].waitIndexGeneration, 4);
 });
+
+test("requeued N4 to N5 rejects a historical by-challenge index for a nonexistent Challenge", t => {
+  const f = withFixture(t);
+  const changes = requeuedChanges();
+  Object.assign(changes, historicalWaitLineage());
+  const path = "challenge-waits/by-challenge/" + REVIEW + "/alpha/" + ID + "/3.json";
+  changes[path] = {
+    schemaVersion: 2, taskId: "alpha", attemptId: ID,
+    ownerAgentId: "Worker 1", assignmentGeneration: 3
+  };
+  update(f.a, changes);
+  const view = capture(f);
+  assert.equal(view.snapshot.projects[0].challenges[0].waitIndexGeneration, 4);
+  assert.equal(view.snapshot.projects[0].completeness.challenges, false);
+  assert.ok(view.diagnostics.some(d => d.scope === "challenges" &&
+    d.reason === "HistoricalIndexChallengeUnproven" && d.path === path));
+  assert.equal(phase2DefaultOffDiagnostic(view).sideEffects, 0);
+});
+
+test("audited historical by-challenge index stays valid after N4 to N5 requeue", t => {
+  const f = withFixture(t);
+  const changes = { ...requeuedChanges(), ...historicalWaitLineage(),
+    ...historicalChallengeCreation(CHALLENGE_A) };
+  const path = "challenge-waits/by-challenge/" + CHALLENGE_A + "/alpha/" + ID + "/3.json";
+  changes[path] = {
+    schemaVersion: 2, taskId: "alpha", attemptId: ID,
+    ownerAgentId: "Worker 1", assignmentGeneration: 3
+  };
+  update(f.a, changes);
+  const view = capture(f);
+  assert.equal(view.snapshot.projects[0].completeness.challenges, true);
+  assert.equal(view.snapshot.projects[0].challenges[0].waitIndexGeneration, 4);
+  assert.equal(phase2DefaultOffDiagnostic(view).sideEffects, 0);
+});
+
+for (const variant of ["wrong canonical ID", "foreign task", "missing creation event",
+  "creation after block", "missing block audit", "wrong generation requeue"]) {
+  test("historical by-challenge index fails closed on " + variant, t => {
+    const f = withFixture(t);
+    const changes = { ...requeuedChanges(), ...historicalWaitLineage(),
+      ...historicalChallengeCreation(CHALLENGE_A) };
+    const path = "challenge-waits/by-challenge/" + CHALLENGE_A + "/alpha/" + ID + "/3.json";
+    changes[path] = {
+      schemaVersion: 2, taskId: "alpha", attemptId: ID,
+      ownerAgentId: "Worker 1", assignmentGeneration: 3
+    };
+    const canonical = "challenges/" + CHALLENGE_A + "/challenge.json";
+    if (variant === "wrong canonical ID") changes[canonical].challengeId = REVIEW;
+    if (variant === "foreign task") changes[canonical].taskId = "beta";
+    if (variant === "missing creation event")
+      delete changes["challenges/" + CHALLENGE_A + "/events/95.json"];
+    if (variant === "creation after block") {
+      delete changes["challenges/" + CHALLENGE_A + "/events/95.json"];
+      changes["challenges/" + CHALLENGE_A + "/events/99.json"] = {
+        ...historicalChallengeCreation(CHALLENGE_A)["challenges/" + CHALLENGE_A + "/events/95.json"],
+        sequence: 99
+      };
+    }
+    if (variant === "missing block audit") delete changes["tasks/alpha/lifecycle/96.json"];
+    if (variant === "wrong generation requeue")
+      changes["tasks/alpha/lifecycle/97.json"].newGeneration = 9;
+    update(f.a, changes);
+    const view = capture(f);
+    const reason = ["wrong canonical ID", "foreign task"].includes(variant)
+      ? "HistoricalIndexChallengeUnproven"
+      : ["missing creation event", "creation after block"].includes(variant)
+        ? "HistoricalChallengeCreationUnproven"
+        : variant === "missing block audit"
+          ? "HistoricalWaitAuditUnproven" : "HistoricalRequeueAuditUnproven";
+    assert.equal(view.snapshot.projects[0].completeness.challenges, false);
+    assert.ok(view.diagnostics.some(d => d.scope === "challenges" &&
+      d.reason === reason && d.path === path));
+    assert.equal(phase2DefaultOffDiagnostic(view).sideEffects, 0);
+  });
+}
 
 for (const namespace of ["by-challenge", "by-owner"]) {
   test("historical " + namespace + " reverse index must still have canonical identity", t => {
@@ -585,6 +690,9 @@ test("manual Challenge preserves genuinely historical reverse-index generations"
   const attempt = fixtureTask("alpha", "NeedsWork")["tasks/alpha/attempts/" + ID + ".json"];
   attempt.phase = "Blocked";
   update(f.a, {
+    ...historicalWaitLineage(),
+    ...historicalChallengeCreation(CHALLENGE_A),
+    ["challenges/" + CHALLENGE_A + "/challenge.json"]: requeuedChanges()["challenges/" + CHALLENGE_A + "/challenge.json"],
     ["tasks/alpha/attempts/" + ID + ".json"]: attempt,
     ["tasks/alpha/attempts/" + ID + "/challenge-wait.json"]: {
       schemaVersion: 2, taskId: "alpha", attemptId: ID, ownerAgentId: "Worker 1",
@@ -595,6 +703,11 @@ test("manual Challenge preserves genuinely historical reverse-index generations"
       { schemaVersion: 2, taskId: "alpha", attemptId: ID,
         ownerAgentId: "Worker 1", assignmentGeneration: 3 }
   });
+  assert.equal(capture(f).snapshot.projects[0].completeness.challenges, true);
+  // The old Challenge may later be cancelled; it is no longer a dependency
+  // of this new manual wait and must not invalidate an authenticated old link.
+  const old = requeuedChanges()["challenges/" + CHALLENGE_A + "/challenge.json"];
+  update(f.a, { ["challenges/" + CHALLENGE_A + "/challenge.json"]: { ...old, status: "Cancelled" } });
   assert.equal(capture(f).snapshot.projects[0].completeness.challenges, true);
 });
 

@@ -1,0 +1,1 @@
+Base 2222f6e6; post 12b738d5; 4/4 .NET11 Release mutation fixture incl CAS race + slow fetch + failed batch negatives; 5/5 LedgerStoreTests; 120 pre and 120 post diagnostic samples; process count 41/37/52/47 to 38/35/47/44; no claimed wall-time speedup due load-confounded post samples. No main modification/deploy.

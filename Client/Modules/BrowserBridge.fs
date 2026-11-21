@@ -78,6 +78,11 @@ type Service(port: int, pairingSecret: string) =
     // A newly connected browser profile must not evict an existing one.
     let connections = ResizeArray<Connection>()
     let mutable acceptLoop: Task = Task.CompletedTask
+    // ChatGPT persists mode/effort selection across tabs in a browser profile.
+    // Concurrent launches for the same origin can invalidate pre-send state.
+    // Serialize only launch/ack/cleanup, never detached agent execution.
+    let launchGates = ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.OrdinalIgnoreCase)
+
 
     // Call under sync; explicit connection IDs pin multi-step operations.
     let selectConnections (ownerConnectionId: string option) =
@@ -265,6 +270,14 @@ type Service(port: int, pairingSecret: string) =
                     let mutable removed = Unchecked.defaultof<TaskCompletionSource<string>>
                     conn.Pending.TryRemove(requestId, &removed) |> ignore
     }
+
+    member internal _.LaunchGateFor(url: string) =
+        let mutable uri = Unchecked.defaultof<Uri>
+        let origin =
+            if Uri.TryCreate(url, UriKind.Absolute, &uri) then
+                uri.GetLeftPart(UriPartial.Authority)
+            else "invalid-origin"
+        launchGates.GetOrAdd(origin, fun _ -> new SemaphoreSlim(1, 1))
 
     member _.Start() =
         if port < 1024 || port > 65535 then invalidArg "port" "Invalid browser bridge port."
@@ -715,7 +728,7 @@ type Service(port: int, pairingSecret: string) =
 
 // Generic one-call browser workflow shared by immediate agent handoffs and scheduled actions.
 // Project scripts own site-specific semantics; Jarvis only owns created-tab lifecycle.
-let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
+let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url: string)
                 (alias: string) (makeActive: bool) (source: string) (argsJson: string)
                 (timeoutMs: int) (closeAfterExecution: bool) = task {
     let invalid =
@@ -868,11 +881,41 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                                 if closeAfterExecution || disposable then closeDefinitive()
                                 else task { return Ok "retained" }
                             if status = "outcomeUnknown" then
+                                // Preserve only known, non-sensitive failure categories and
+                                // bounded timing. The prompt, page text and DOM never leave
+                                // the extension, even on an uncertain send.
+                                let knownField (key: string) (allowed: string list) =
+                                    match payload.TryGetProperty(key) with
+                                    | true, field when field.ValueKind = JsonValueKind.String ->
+                                        let value = field.GetString()
+                                        if List.contains value allowed then value else "unknown"
+                                    | _ -> "unknown"
+                                let stage = knownField "stage"
+                                                [ "sendClick"; "acknowledgement"; "conversationRoute" ]
+                                let reason = knownField "reason"
+                                                 [ "SendClickUncertain"; "SubmissionUnconfirmed"
+                                                   "ConversationUrlUnavailable"; "UnexpectedUiErrorAfterSend" ]
+                                let timing =
+                                    match payload.TryGetProperty("timing") with
+                                    | true, data when data.ValueKind = JsonValueKind.Object ->
+                                        [ "budgetAtSendMs"; "elapsedSinceSendMs" ]
+                                        |> List.choose (fun key ->
+                                            match data.TryGetProperty(key) with
+                                            | true, value when value.ValueKind = JsonValueKind.Number ->
+                                                match value.TryGetInt32() with
+                                                | true, n when n >= 0 && n <= 30000 ->
+                                                    Some(key + "=" + string n)
+                                                | _ -> None
+                                            | _ -> None)
+                                        |> String.concat ","
+                                    | _ -> ""
+                                let detail = "OutcomeUnknown:" + stage + ":" + reason +
+                                             (if timing = "" then "" else ";" + timing)
                                 if closeAfterExecution then
                                     match! closeDefinitive() with
-                                    | Ok cleanup -> return Error(registrationId, "OutcomeUnknown: page submission was not confirmed;cleanup=" + cleanup)
-                                    | Error failure -> return Error(registrationId, "OutcomeUnknown: page submission was not confirmed;" + failure)
-                                else return Error(registrationId, "OutcomeUnknown: page submission was not confirmed")
+                                    | Ok cleanup -> return Error(registrationId, detail + ";cleanup=" + cleanup)
+                                    | Error failure -> return Error(registrationId, detail + ";" + failure)
+                                else return Error(registrationId, detail)
                             elif status = "uiIncompatible" then
                                 // Provider scripts supply a bounded, non-sensitive stage and
                                 // reason; cleanup does not discard these diagnostics.
@@ -952,4 +995,18 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                               | Error reason -> "cleanupFailed:" + reason
                 return Error(registrationId, "OutcomeUnknown: " + e.GetType().Name + ";cleanup=" + cleanup)
             else return Error(registrationId, "OutcomeUnknown: " + e.GetType().Name)
+}
+
+// The browser profile shares model/effort preferences across fresh tabs.
+// Reserve the origin until a single launch has returned and cleaned up its tab.
+// Agents continue on the server after launch, so this does not serialize work.
+let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
+                (alias: string) (makeActive: bool) (source: string) (argsJson: string)
+                (timeoutMs: int) (closeAfterExecution: bool) = task {
+    let gate = bridge.LaunchGateFor(url)
+    do! gate.WaitAsync()
+    try
+        return! runInNewTabCore bridge windowRegistration url alias makeActive source argsJson timeoutMs closeAfterExecution
+    finally
+        gate.Release() |> ignore
 }

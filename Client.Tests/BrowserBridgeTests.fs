@@ -755,7 +755,10 @@ let closeAfterExecutionReclaimsTabEvenWhenSubmissionIsUncertain (scriptStatus: s
             version = 2; kind = "result"; requestId = property executing "requestId"
             connectionId = connectionId; registrationId = "cleanup-all-created"
             registrationGeneration = 3
-            result = {| status = scriptStatus; stage = "composer"; reason = "Unknown" |}
+            result = {| status = scriptStatus
+                        stage = if scriptStatus = "outcomeUnknown" then "acknowledgement" else "composer"
+                        reason = if scriptStatus = "outcomeUnknown" then "SubmissionUnconfirmed" else "Unknown"
+                        timing = {| budgetAtSendMs = 2000; elapsedSinceSendMs = 2500 |} |}
         |}))
     let! closing = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     Assert.That(property closing "kind", Is.EqualTo("closeTab"))
@@ -775,6 +778,9 @@ let closeAfterExecutionReclaimsTabEvenWhenSubmissionIsUncertain (scriptStatus: s
     | Error (id, reason) ->
         Assert.That(id, Is.EqualTo("cleanup-all-created"))
         Assert.That(reason, Does.Contain("cleanup=closed"))
+        if scriptStatus = "outcomeUnknown" then
+            Assert.That(reason, Does.Contain("OutcomeUnknown:acknowledgement:SubmissionUnconfirmed"))
+            Assert.That(reason, Does.Contain("elapsedSinceSendMs=2500"))
     | _ -> Assert.Fail("Expected confirmed cleanup after an uncertain or failed launch")
     do! waitUntil (fun () ->
         bridge.ListTabs() |> Result.exists (fun tabs ->
@@ -790,12 +796,12 @@ let compositeNotReadyCleanupReportsFailureOrConfirmedClosure () = task {
     use socket = client
     do! registerReadyAgentWindow socket bridge
 
-    // These two workflows wait for distinct created tabs that become discarded.
-    // They exercise the real 30-second bounded readiness path concurrently,
+    // Different site origins may still launch concurrently while their tabs
+    // wait for the real 30-second bounded readiness path and become discarded.
     // including the MCP's default closeAfterExecution=false.
-    let fail = BrowserBridge.runInNewTab bridge "agents" "https://example.test/fail" "fail" false
+    let fail = BrowserBridge.runInNewTab bridge "agents" "https://fail.example.test/fail" "fail" false
                    "async function execute(args) { return args; }" "{}" 5000 false
-    let close = BrowserBridge.runInNewTab bridge "agents" "https://example.test/close" "close" false
+    let close = BrowserBridge.runInNewTab bridge "agents" "https://close.example.test/close" "close" false
                     "async function execute(args) { return args; }" "{}" 5000 false
 
     let! openA = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
@@ -803,7 +809,7 @@ let compositeNotReadyCleanupReportsFailureOrConfirmedClosure () = task {
     Assert.That(property openA "kind", Is.EqualTo("openTab"))
     Assert.That(property openB "kind", Is.EqualTo("openTab"))
     let idFor frame =
-        if property frame "url" = "https://example.test/fail" then "discarded-fail"
+        if property frame "url" = "https://fail.example.test/fail" then "discarded-fail"
         else "discarded-close"
     do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"discarded-fail","alias":"fail","agentCreated":true,"availability":"discarded","registrationGeneration":1},{"registrationId":"discarded-close","alias":"close","agentCreated":true,"availability":"discarded","registrationGeneration":1}]}"""
     for frame in [openA; openB] do
@@ -1389,4 +1395,85 @@ let compositeLaunchRejectsManualReRegistrationWithoutInjection () = task {
                            expectedRegistrationGeneration = 1) with
     | Error error -> Assert.That(error, Is.EqualTo("TabRegistrationChanged"))
     | Ok _ -> Assert.Fail("Stale generation must never close a user-owned tab")
+}
+
+
+[<Test>]
+let sameOriginCompositeLaunchesWaitThroughSubmissionAndCleanup () = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let! client, connectionId = handshake port "test-secret"
+    use socket = client
+    do! registerReadyAgentWindow socket bridge
+    let script = "async function execute(args) { return { status: 'submitted' }; }"
+    let first = BrowserBridge.runInNewTab bridge "agents" "https://chatgpt.com/" "first" false
+                    script """{"prompt":"first"}""" 5000 true
+    let! openFirst = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property openFirst "kind", Is.EqualTo("openTab"))
+
+    // This call shares the origin and must not open its tab before the first
+    // launch has finished both execution and created-tab cleanup.
+    let second = BrowserBridge.runInNewTab bridge "agents" "https://chatgpt.com/" "second" false
+                     script """{"prompt":"second"}""" 5000 true
+    let nextFrame = receive socket
+    do! Task.Delay(150)
+    Assert.That(nextFrame.IsCompleted, Is.False,
+                "Concurrent launch opened another tab while the first still owned the shared origin")
+
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"serialized-first","agentCreated":true,"availability":"ready","registrationGeneration":1}]}"""
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "tabOpened"; requestId = property openFirst "requestId"
+        connectionId = connectionId
+        tab = {| registrationId = "serialized-first"; availability = "ready"
+                 agentCreated = true; registrationGeneration = 1 |}
+    |}))
+    let! executeFirst = nextFrame.WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property executeFirst "kind", Is.EqualTo("executeJs"))
+    Assert.That(property executeFirst "registrationId", Is.EqualTo("serialized-first"))
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "result"; requestId = property executeFirst "requestId"
+        connectionId = connectionId; registrationId = "serialized-first"
+        registrationGeneration = 1; result = {| status = "submitted" |}
+    |}))
+    let! closeFirst = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property closeFirst "kind", Is.EqualTo("closeTab"))
+    Assert.That(property closeFirst "registrationId", Is.EqualTo("serialized-first"))
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "tabClosed"; requestId = property closeFirst "requestId"
+        connectionId = connectionId; registrationId = "serialized-first"; registrationGeneration = 1
+    |}))
+
+    // Only after the first cleanup is acknowledged may the second create a tab.
+    let! openSecond = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property openSecond "kind", Is.EqualTo("openTab"))
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"serialized-second","agentCreated":true,"availability":"ready","registrationGeneration":1}]}"""
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "tabOpened"; requestId = property openSecond "requestId"
+        connectionId = connectionId
+        tab = {| registrationId = "serialized-second"; availability = "ready"
+                 agentCreated = true; registrationGeneration = 1 |}
+    |}))
+    let! executeSecond = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property executeSecond "kind", Is.EqualTo("executeJs"))
+    Assert.That(property executeSecond "registrationId", Is.EqualTo("serialized-second"))
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "result"; requestId = property executeSecond "requestId"
+        connectionId = connectionId; registrationId = "serialized-second"
+        registrationGeneration = 1; result = {| status = "submitted" |}
+    |}))
+    let! closeSecond = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property closeSecond "kind", Is.EqualTo("closeTab"))
+    Assert.That(property closeSecond "registrationId", Is.EqualTo("serialized-second"))
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "tabClosed"; requestId = property closeSecond "requestId"
+        connectionId = connectionId; registrationId = "serialized-second"; registrationGeneration = 1
+    |}))
+
+    match! first with
+    | Ok result -> Assert.That(result, Does.Contain("closed"))
+    | Error (_, error) -> Assert.Fail("First launch failed: " + error)
+    match! second with
+    | Ok result -> Assert.That(result, Does.Contain("closed"))
+    | Error (_, error) -> Assert.Fail("Second launch failed: " + error)
 }

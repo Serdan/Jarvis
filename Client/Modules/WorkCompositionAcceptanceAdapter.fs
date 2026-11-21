@@ -71,6 +71,40 @@ module WorkCompositionAcceptanceAdapter =
               Prerequisites = prerequisites }
         "WorkComposition.Acceptance." + CanonicalCodec.digest (CanonicalCodec.encode target)
 
+    // The integration consumer trusts no caller-supplied publication claim.
+    // A distinct I != S must originate from the actual canonical
+    // CompleteIntegration operation, with an immutable introducing Git commit,
+    // exact original source/ref and a verified non-force Git publication.
+    let private requireManagedMergeAt (binding: LedgerBinding) (snapshot: LedgerSnapshot)
+                                      taskId (submissionId: Guid) (submission: IntegrationSubmission) = result {
+        let! publicationId =
+            match Guid.TryParseExact(submission.PublicationOperationId, "D") with
+            | true, id when id <> Guid.Empty
+                            && submission.PublicationMechanism = "VerifiedNonForceGitPush/v1" -> Ok id
+            | _ -> Error(InvalidBinding "Composition merge has no verified original non-force publisher receipt.")
+        let path = $"tasks/{taskId}/integrations/{submissionId:N}.json"
+        let! operation = LedgerStore.getOperationAt binding snapshot publicationId
+        let! completion =
+            match operation with
+            | Some op when op.Type = "CompleteIntegration"
+                           && op.Sequence > submission.CreatedSequence
+                           && not (String.IsNullOrWhiteSpace op.Actor)
+                           && (op.Paths |> Array.contains path) -> Ok op
+            | _ -> Error(InvalidBinding "Composition merge lacks its original canonical completion operation.")
+        let! originalHead = LedgerStore.getOperationOriginAt binding snapshot completion
+        let! originalSnapshot = LedgerStore.verifiedHistoricalSnapshot binding originalHead
+        let! originalReceipt = ReviewWorkflow.getIntegrationSubmissionAt
+                                    binding originalSnapshot taskId submissionId
+        if originalReceipt <> submission then
+            return! Error(InvalidBinding "Composition integration receipt differs from its original immutable completion.")
+        do! LedgerStore.fetchReviewRef binding submission.ReviewRef submission.SubmittedCommit
+        do! LedgerStore.fetchIntegrationRef binding submission.IntegrationRef submission.SubmittedCommit
+        do! LedgerStore.verifyPublishedMechanicalIntegration binding
+                submission.TargetRef submission.TargetHeadAtSubmission
+                submission.SubmittedCommit submission.IntegratedCommit
+                submission.PublicationPreviousHead submission.PublicationObservedHead
+    }
+
     let internal checkAt (binding: LedgerBinding) (snapshot: LedgerSnapshot)
                         (graph: WorkCompositionGraph) (unitId: string) (receipt: string) =
         result {
@@ -101,7 +135,7 @@ module WorkCompositionAcceptanceAdapter =
                 submission.Status = "Integrated"
                 && nonBlank submission.IntegrationRef
                 && submission.IntegrationRef = "refs/heads/jarvis-integration/" + submission.SubmissionId
-                && submission.IntegratedCommit = submission.SubmittedCommit
+                && nonBlank submission.IntegratedCommit
                 && nonBlank submission.SubmittedCommit
                 && submission.ReviewedHeadOid = submission.SubmittedCommit
                 && submission.ReviewRef = review.ReviewRef
@@ -119,6 +153,8 @@ module WorkCompositionAcceptanceAdapter =
             if not valid then
                 return! Error(InvalidBinding
                     "Composition acceptance requires an independent review of this exact spec and an integrated canonical source receipt.")
+            if submission.IntegratedCommit <> submission.SubmittedCommit then
+                do! requireManagedMergeAt binding snapshot taskId submissionId submission
             return ()
         }
 

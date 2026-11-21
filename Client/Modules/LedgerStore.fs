@@ -2350,6 +2350,35 @@ module LedgerStore =
                         "Integration merge tree has changes beyond the exact conflict-free Git composition.")
         }
 
+    // A WorkComposition consumer may encounter a completed integration long
+    // after the publishing client has left. Recheck the *original* managed
+    // receipt's Git facts instead of equating the reviewed source S with the
+    // mechanically integrated commit I. This is read-only: never publish or
+    // reconstruct an external effect during acceptance.
+    let verifyPublishedMechanicalIntegration (binding: LedgerBinding)
+                                             targetRef targetHeadAtSubmission
+                                             submittedCommit integratedCommit
+                                             publicationPreviousHead publicationObservedHead = result {
+        if not (validSourceCommitOid publicationPreviousHead)
+           || not (validSourceCommitOid publicationObservedHead)
+           || submittedCommit = integratedCommit then
+            return! Error(InvalidBinding "Missing or invalid mechanical integration publication receipt.")
+        // Fetch the authoritative remote first, making its real objects
+        // available even to a different client from the original publisher.
+        let! remoteHead = readRemoteTarget binding targetRef
+        do! verifyMechanicalIntegrationMerge binding
+                targetHeadAtSubmission submittedCommit integratedCommit
+        do! ensureUnmodifiedGitHistory binding.RepositoryPath
+        let! firstParent =
+            run binding.RepositoryPath
+                [ "rev-parse"; "--verify"; $"{integratedCommit}^1" ]
+        if firstParent <> publicationPreviousHead then
+            return! Error(InvalidBinding
+                "Mechanical integration first parent differs from the recorded publication target.")
+        do! verifySourceAncestry binding integratedCommit publicationObservedHead
+        do! verifySourceAncestry binding publicationObservedHead remoteHead
+    }
+
     // The managed CompleteIntegration operation is its own scoped publisher:
     // an external force push, even of a mechanically clean merge, is not proof
     // of our non-force publication. Observe a remote target before the effect,

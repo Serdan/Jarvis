@@ -5,6 +5,7 @@ open System.Diagnostics
 open System.IO
 open System.Text
 open System.Text.Json
+open FsToolkit.ErrorHandling
 open Common
 open NUnit.Framework
 open Client.LedgerStore
@@ -307,6 +308,147 @@ let ``composition acceptance requires exact independently reviewed and integrate
                   (Guid.NewGuid()) revised.Version "project" 2 freshSubmissionId with
         | Error(InvalidBinding _) -> ()
         | other -> Assert.Fail(sprintf "Expected stale target-review rejection: %A" other))
+
+[<Test>]
+let compositionAcceptanceRequiresOriginalNonForceReceiptForDistinctCleanMerge () =
+    withTwoClones (fun first second ->
+        let owner, reviewer = "Owner", "Reviewer"
+        let taskId = "composition-merge-acceptance"
+        let targetRef = "refs/heads/main"
+        for client in [ first; second ] do
+            git client.RepositoryPath [ "config"; "user.name"; "Fixture" ] |> ignore
+            git client.RepositoryPath [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+        let baseHead = git second.RepositoryPath [ "rev-parse"; "HEAD" ]
+        ReviewWorkflow.registerAgent first (Guid.NewGuid()) owner |> succeed |> ignore
+        ReviewWorkflow.registerAgent first (Guid.NewGuid()) reviewer |> succeed |> ignore
+        ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Clean-merge project acceptance"
+        |> succeed |> ignore
+        WorkCompositionGitLedger.execute first owner (Guid.NewGuid()) 0
+            (WorkCompositionMutation.Create(
+                "project", WorkUnitKind.Project, None, spec "Project" (Some taskId)))
+        |> succeed |> ignore
+        let _, initial = WorkCompositionGitLedger.load second |> succeed
+        let purpose = WorkCompositionAcceptanceAdapter.reviewPurpose initial initial.Units.["project"]
+
+        // Source S is independently reviewed while remote main is still B.
+        git first.RepositoryPath [ "checkout"; "-b"; "feature/composition-clean-merge" ] |> ignore
+        File.WriteAllText(Path.Combine(first.RepositoryPath, "reviewed.txt"), "exact reviewed source")
+        git first.RepositoryPath [ "add"; "reviewed.txt" ] |> ignore
+        git first.RepositoryPath [ "commit"; "-m"; "Independent reviewed outcome" ] |> ignore
+        let source = git first.RepositoryPath [ "rev-parse"; "HEAD" ]
+        let sourceRef = "refs/heads/feature/composition-clean-merge"
+        let reviewId = Guid.NewGuid()
+        ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId owner
+            reviewId sourceRef source "Source review" purpose targetRef |> succeed |> ignore
+        ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId reviewId reviewer 1
+        |> succeed |> ignore
+        ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId reviewId reviewer 2 Accept
+        |> succeed |> ignore
+
+        // A different clone independently advances remote main to T.
+        File.WriteAllText(Path.Combine(second.RepositoryPath, "target.txt"), "independent target")
+        git second.RepositoryPath [ "add"; "target.txt" ] |> ignore
+        git second.RepositoryPath [ "commit"; "-m"; "Independent target advancement" ] |> ignore
+        let target = git second.RepositoryPath [ "rev-parse"; "HEAD" ]
+        Assert.That(target, Is.Not.EqualTo(source))
+        git second.RepositoryPath [ "push"; "origin"; "main" ] |> ignore
+        let submissionId = Guid.NewGuid()
+        ReviewWorkflow.submitIntegration first (Guid.NewGuid()) taskId owner
+            submissionId "" "" (reviewId.ToString("N")) targetRef |> succeed |> ignore
+        let pending = (ReviewWorkflow.getIntegrationSubmissions second taskId |> succeed).Latest.Value
+        Assert.That(pending.SubmittedCommit, Is.EqualTo(source))
+        Assert.That(pending.TargetHeadAtSubmission, Is.EqualTo(target))
+
+        // Compose exactly I=(T,S). CompleteIntegration itself publishes I via
+        // the bounded non-force writer and commits its immutable receipt.
+        git first.RepositoryPath [ "fetch"; "origin"; "main" ] |> ignore
+        git first.RepositoryPath [ "checkout"; "--detach"; "FETCH_HEAD" ] |> ignore
+        git first.RepositoryPath [ "merge"; "--no-ff"; "--no-edit"; source ] |> ignore
+        let integrated = git first.RepositoryPath [ "rev-parse"; "HEAD" ]
+        Assert.That(integrated, Is.Not.EqualTo(source))
+        Assert.That(git first.RepositoryPath [ "rev-list"; "--parents"; "-n"; "1"; integrated ],
+                    Is.EqualTo(String.concat " " [ integrated; target; source ]))
+        let completionId = Guid.NewGuid()
+        ReviewWorkflow.completeIntegration first completionId taskId reviewer submissionId integrated
+        |> succeed |> ignore
+        let completed = (ReviewWorkflow.getIntegrationSubmissions second taskId |> succeed).Latest.Value
+        Assert.That(completed.IntegratedCommit, Is.EqualTo(integrated))
+        Assert.That(completed.PublicationPreviousHead, Is.EqualTo(target))
+        Assert.That(completed.PublicationObservedHead, Is.EqualTo(integrated))
+        Assert.That(completed.PublicationOperationId, Is.EqualTo(completionId.ToString("D")))
+        Assert.That(completed.PublicationMechanism, Is.EqualTo("VerifiedNonForceGitPush/v1"))
+        Assert.That(LedgerStore.readRemoteTarget second targetRef |> succeed, Is.EqualTo(integrated))
+
+        // Even with an otherwise valid mechanical merge, a forged or
+        // post-hoc altered canonical receipt cannot borrow publisher authority.
+        let path = "tasks/" + taskId + "/integrations/" + submissionId.ToString("N") + ".json"
+        let replaceReceipt (record: IntegrationSubmission) =
+            let action: LedgerIntent =
+                { OperationId = Guid.NewGuid()
+                  Actor = "Fixture"
+                  Kind = "Fixture.AdversarialReceiptMutation"
+                  RequestJson = CanonicalCodec.encode record }
+            LedgerStore.transact second action (fun snapshot -> result {
+                let! _, priorBlob = LedgerStore.readAt second snapshot path
+                return [ { Path = path
+                           ExpectedBlobOid = priorBlob
+                           Content = "{\"schemaVersion\":2," +
+                                     (JsonSerializer.Serialize(record, JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase))).Substring(1) } ]
+            }) |> succeed |> ignore
+        let failTampered (forged: IntegrationSubmission) =
+            replaceReceipt forged
+            match WorkCompositionAcceptanceAdapter.acceptIntegrated second owner
+                    (Guid.NewGuid()) initial.Version "project" 1 submissionId with
+            | Error(InvalidBinding _) | Error(LedgerIntegrityError _) -> ()
+            | other -> Assert.Fail(sprintf "Forged WorkComposition publication was accepted: %A" other)
+            replaceReceipt completed
+
+        failTampered { completed with PublicationMechanism = null }
+        failTampered { completed with PublicationOperationId = Guid.NewGuid().ToString("D") }
+        failTampered { completed with PublicationPreviousHead = source }
+        failTampered { completed with PublicationObservedHead = source }
+
+        // Extra edits and manually resolved conflicts cannot be mistaken
+        // for Git's exact conflict-free mechanical merge result.
+        File.WriteAllText(Path.Combine(first.RepositoryPath, "unreviewed.txt"), "unreviewed addition")
+        git first.RepositoryPath [ "add"; "unreviewed.txt" ] |> ignore
+        let editedTree = git first.RepositoryPath [ "write-tree" ]
+        let extraMerge =
+            git first.RepositoryPath [ "commit-tree"; editedTree; "-p"; target; "-p"; source;
+                                       "-m"; "Forged extra tree changes" ]
+        match LedgerStore.verifyPublishedMechanicalIntegration first targetRef target
+                source extraMerge target integrated with
+        | Error(InvalidBinding _) -> ()
+        | other -> Assert.Fail(sprintf "Extra merge-tree edits gained verified proof: %A" other)
+
+        git first.RepositoryPath [ "reset"; "--hard"; integrated ] |> ignore
+
+        // Independent source S2 adds target.txt differently from target T:
+        // Git merge-tree must report a conflict, never silently choose a side.
+        git first.RepositoryPath [ "checkout"; "-b"; "feature/conflicted-proof"; baseHead ] |> ignore
+        File.WriteAllText(Path.Combine(first.RepositoryPath, "target.txt"), "source-side conflict")
+        git first.RepositoryPath [ "add"; "target.txt" ] |> ignore
+        git first.RepositoryPath [ "commit"; "-m"; "Conflicting reviewed candidate" ] |> ignore
+        let conflictSource = git first.RepositoryPath [ "rev-parse"; "HEAD" ]
+        let targetTree = git first.RepositoryPath [ "rev-parse"; target + "^{tree}" ]
+        let fakeResolution =
+            git first.RepositoryPath [ "commit-tree"; targetTree; "-p"; target; "-p"; conflictSource;
+                                       "-m"; "Unreviewed conflict resolution" ]
+        match LedgerStore.verifyPublishedMechanicalIntegration first targetRef target
+                conflictSource fakeResolution target integrated with
+        | Error(InvalidBinding _) -> ()
+        | other -> Assert.Fail(sprintf "Unreviewed merge conflict gained verified proof: %A" other)
+
+        // Restoration of the exact original immutable receipt permits a
+        // different clone to accept the unit inside normal graph-version CAS.
+        let accepted =
+            WorkCompositionAcceptanceAdapter.acceptIntegrated second owner (Guid.NewGuid())
+                initial.Version "project" 1 submissionId |> succeed
+        Assert.That(accepted.AlreadyApplied, Is.False)
+        let _, acceptedGraph = WorkCompositionGitLedger.load first |> succeed
+        let proof = WorkComposition.currentAcceptance acceptedGraph "project" |> Option.get
+        Assert.That(proof.EvidenceRef, Is.EqualTo("integration:" + submissionId.ToString("N")))
+        Assert.That(acceptedGraph.Units.["project"].Acceptances.Count, Is.EqualTo(1)))
 
 [<Test>]
 let historicalCancellationProofLedgerRoundTrip () =

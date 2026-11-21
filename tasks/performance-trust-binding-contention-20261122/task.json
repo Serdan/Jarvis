@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"performance-trust-binding-contention-20261122","title":"[P2][Perf] Measure and harden read-only trust-binding contention under parallel MCP calls","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"performance-trust-binding-contention-20261122","title":"[P2][Perf] Measure and harden read-only trust-binding contention under parallel MCP calls","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"79e00dd361ca4df1bc0673c8cc5f9d84"}

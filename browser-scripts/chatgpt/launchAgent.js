@@ -4,6 +4,7 @@ async function execute(args) {
   const prompt = args?.prompt;
   const startUrl = "https://chatgpt.com/";
   let sendAttempted = false;
+  let sendAttemptedAt = null;
   // A non-submission does not prove that a tab is disposable: a different
   // session may have created a turn or navigated while this script was waiting.
   // Only a still-home zero-turn surface can authorize failed-launch cleanup.
@@ -45,6 +46,14 @@ async function execute(args) {
   // Leaves a three-second margin inside the bridge's 30-second execution limit.
   const overallMs = Math.min(Math.max(Number(args.timeoutMs) || 27000, 100), 27000);
   const deadline = Date.now() + overallMs;
+  // Structural timing only: never return the prompt or raw page state.
+  const unknownAfterSend = (stage, reason) => {
+    const at = sendAttemptedAt ?? Date.now();
+    return { status: "outcomeUnknown", reason, stage, timing: {
+      budgetAtSendMs: Math.max(0, deadline - at),
+      elapsedSinceSendMs: Math.max(0, Date.now() - at)
+    } };
+  };
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
   const until = async predicate => {
     while (Date.now() < deadline) {
@@ -115,6 +124,10 @@ async function execute(args) {
     .find(item => !item.closest('[aria-hidden="true"],[inert]')) || null;
   const attempts = [];
   const selectionDeadline = deadline - 4500;
+  // A slow composer must never use the time needed to confirm a Send and
+  // capture the server-issued conversation route. After Send, the effect
+  // is uncertain until confirmed and must never be replayed.
+  const preSendDeadline = deadline - 3000;
   let selected = null;
 
   const choose = async (target, untilAt) => {
@@ -339,7 +352,7 @@ async function execute(args) {
   // Rebind after any React replacement, then clear+insert in the new editor.
   // Rewriting is only allowed before Send and on the still-empty home.
   while (true) {
-    if (Date.now() >= deadline) {
+    if (Date.now() >= preSendDeadline) {
       if (lastTransient) return incompatible("composer",
         lastTransient === "ComposerChanged" && !sawComposer
           ? "ComposerUnavailable" : lastTransient);
@@ -352,7 +365,7 @@ async function execute(args) {
     // The editor may appear before the page finishes initial loading.
     // Wait for the document before touching its ProseMirror state.
     if (document.readyState !== "complete") {
-      await delay(Math.min(75, Math.max(1, deadline - Date.now())));
+      await delay(Math.min(75, Math.max(1, preSendDeadline - Date.now())));
       continue;
     }
     const stage = inserted ? "submitControl" : "composer";
@@ -389,14 +402,15 @@ async function execute(args) {
                 verified.composer === activeComposer &&
                 readEditor() === insertedPrompt &&
                 document.querySelector(sendSelector) === send) {
-              if (Date.now() >= deadline) {
+              if (Date.now() >= preSendDeadline) {
                 return { ...notSubmitted("LaunchDeadlineExceeded"), stage: "submitControl" };
               }
               try {
                 sendAttempted = true;
+                sendAttemptedAt = Date.now();
                 send.click();
               } catch {
-                return { status: "outcomeUnknown", reason: "SendClickUncertain" };
+                return unknownAfterSend("sendClick", "SendClickUncertain");
               }
               break;
             }
@@ -435,7 +449,7 @@ async function execute(args) {
           activeComposer = null;
           activeModes = null;
         } else {
-          if (Date.now() >= deadline) {
+          if (Date.now() >= preSendDeadline) {
             return { ...notSubmitted("LaunchDeadlineExceeded"), stage: "composer" };
           }
           activeComposer.focus();
@@ -457,7 +471,7 @@ async function execute(args) {
     }
     // Give React one normal UI turn to reconcile the inserted prompt
     // before proving exact text and allowing the single Send attempt.
-    await delay(Math.min(75, Math.max(1, deadline - Date.now())));
+    await delay(Math.min(75, Math.max(1, preSendDeadline - Date.now())));
   }
 
   const evidence = await until(() => {
@@ -479,7 +493,7 @@ async function execute(args) {
     }
     return null;
   });
-  if (!evidence) return { status: "outcomeUnknown", reason: "SubmissionUnconfirmed" };
+  if (!evidence) return unknownAfterSend("acknowledgement", "SubmissionUnconfirmed");
 
   // The user turn may render before SPA navigation. Wait for the actual URL,
   // never invent an identifier or resubmit the prompt.
@@ -494,7 +508,7 @@ async function execute(args) {
     current.hash = "";
     return current.href;
   });
-  if (!conversationUrl) return { status: "outcomeUnknown", reason: "ConversationUrlUnavailable" };
+  if (!conversationUrl) return unknownAfterSend("conversationRoute", "ConversationUrlUnavailable");
   return {
     status: "submitted",
     selectedMode, selectedModel, selectedEffort: selected.label,
@@ -511,7 +525,7 @@ async function execute(args) {
     // Unexpected DOM exceptions are still provider compatibility failures if
     // we have not attempted Send; after Send, the outcome is unknowable.
     return sendAttempted
-      ? { status: "outcomeUnknown", reason: "UnexpectedUiErrorAfterSend" }
+      ? unknownAfterSend("unexpected", "UnexpectedUiErrorAfterSend")
       : incompatible("unexpected", "UnexpectedUiError");
   }
 }

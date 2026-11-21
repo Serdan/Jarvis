@@ -19,8 +19,8 @@ function harness(options = {}) {
   let mode = options.initialMode || "Chat";
   let chatClicks = 0;
   let modelClicks = 0;
-  const selectedModel = options.selectedModel || "GPT-6";
-  const reasoningEffort = options.reasoningEffort || "Instant";
+  let selectedModel = options.selectedModel || "GPT-6";
+  let reasoningEffort = options.reasoningEffort || "Extra High";
   let staleSendChecks = 0;
   let staleSendObserved = 0;
   let draftWasCleared = false;
@@ -61,7 +61,7 @@ function harness(options = {}) {
             workMode = makeMode("Work");
           }, options.replaceModesDuringModeSwitchMs);
         }
-      }
+      } else { setTimeout(() => { mode = "Work"; }, options.modeDelayMs || 0); }
     }
   });
   let chatMode = makeMode("Chat");
@@ -93,6 +93,35 @@ function harness(options = {}) {
   const selection = {
     removeAllRanges() { editorSelected = false; },
     addRange(range) { editorSelected = range.composerSelected === true; }
+  };
+  let expanded = false;
+  let view = "simple";
+  const efforts = ["Instant", "Medium", "High", "Extra High"];
+  const values = ["none", "medium", "high", "max"];
+  const picker = {
+    getAttribute(name) { return name === "aria-expanded" ? String(expanded) : name === "data-selected-reasoning-effort" ? values[efforts.indexOf(reasoningEffort)] : null; },
+    click() { expanded = !expanded; }
+  };
+  const radio = name => ({
+    textContent: name,
+    getAttribute(attr) { return attr === "aria-checked" ? String(selectedModel === name) : null; },
+    hasAttribute() { return false; }, closest() { return null; },
+    click() { modelClicks++; selectedModel = name; view = "simple"; expanded = false; }
+  });
+  const toggle = { closest() { return null; }, click() { view = "advanced"; } };
+  const knob = { getAttribute(name) { return String(name === "aria-valuemax" ? (options.maxEffortStep ?? 3) : efforts.indexOf(reasoningEffort)); } };
+  const power = { closest() { return null; }, querySelector(sel) { return sel === '[role="slider"]' ? knob : null; } };
+  const keyboard = { closest() { return null; }, focus() {}, dispatchEvent(event) { const n = Math.max(0, Math.min(3, efforts.indexOf(reasoningEffort) + (event.key === "ArrowRight" ? 1 : -1))); reasoningEffort = efforts[n]; } };
+  const menu = {
+    getClientRects() { return [1]; },
+    querySelector(sel) { return sel === '[data-model-picker-view]' ? { getAttribute() { return view; } } : null; },
+    querySelectorAll(sel) {
+      if (sel === '[role="menuitemradio"]') return (view === "simple" ? [selectedModel] : ["GPT-6", "GPT-6.2 Astra"]).map(radio);
+      if (sel === '[data-model-picker-view-toggle]') return [toggle];
+      if (sel === '[data-model-picker-power-slider]') return [power];
+      if (sel === '[data-reasoning-slider]') return [keyboard];
+      return [];
+    }
   };
   const document = {
     readyState: options.documentHydrationDelayMs ? "loading" : "complete",
@@ -156,9 +185,14 @@ function harness(options = {}) {
       return true;
     },
     querySelector(selector) {
+      if (selector === 'button[aria-label="Select ChatGPT model"]') return options.noPicker ? null : picker;
+      if (selector === '[data-model-selection-label="gpt-6.2-astra-wm"]') return selectedModel === "GPT-6.2 Astra" ? {} : null;
       if (selector.includes('contenteditable="true"')) return options.noComposer ? null : activeEditor;
       if (selector.includes('aria-label="Send"')) {
         if (options.noSend) return null;
+        if (options.sendAvailableAfterMs !== undefined &&
+            (options.virtualClock ? virtualClock.now : Date.now() - launchStartedAt) <
+              options.sendAvailableAfterMs) return null;
         if (content || options.sendAlwaysEnabled) return send;
         if (options.staleSendDurationMs && Date.now() - launchStartedAt < options.staleSendDurationMs) {
           staleSendObserved++;
@@ -175,6 +209,8 @@ function harness(options = {}) {
       return null;
     },
     querySelectorAll(selector) {
+      if (selector === '[role="menu"]') return expanded ? [menu] : [];
+      if (selector === '[data-model-selection-label]') return [];
       if (selector === '[data-composer-input-layout] [contenteditable="true"][role="textbox"]') {
         return options.noComposer ? [] : [activeEditor];
       }
@@ -219,10 +255,10 @@ function harness(options = {}) {
       queueMicrotask(callback);
     }
     : setTimeout;
-  const ctx = vm.createContext({ document, window, location: site, setTimeout: schedule, Date: clockDate, URL });
+  const ctx = vm.createContext({ document, window, location: site, setTimeout: schedule, Date: clockDate, URL, KeyboardEvent: class { constructor(type, init) { Object.assign(this, init); } } });
   const run = async (prompt = "Start fresh\nRead Jarvis assignment", extra = {}) =>
     await vm.runInContext(source + "\nexecute(" + JSON.stringify({
-      prompt, timeoutMs: options.timeoutMs || 350, ...extra
+      prompt, timeoutMs: (options.timeoutMs || 350) + 5000, ...extra
     }) + ")", ctx);
   return { run, site, get clicks() { return clicks; }, get insertions() { return insertions; }, get chatClicks() { return chatClicks; },
     get selectedModel() { return selectedModel; }, get reasoningEffort() { return reasoningEffort; }, get modelClicks() { return modelClicks; }, get beforeReadyInsertions() { return beforeReadyInsertions; },
@@ -379,6 +415,9 @@ test("after clicking, missing acknowledgement is uncertain and never resent", as
   assert.equal(result.status, "outcomeUnknown");
   assert.equal(result.safeToDisposeCreatedTab, undefined);
   assert.equal(result.reason, "SubmissionUnconfirmed");
+  assert.equal(result.stage, "acknowledgement");
+  assert.equal(result.timing.budgetAtSendMs >= 3000, true);
+  assert.equal(result.timing.elapsedSinceSendMs > 0, true);
   assert.equal(h.clicks, 1);
 });
 
@@ -414,6 +453,8 @@ test("keeps the submission uncertain when route never appears", async () => {
   const result = await h.run();
   assert.equal(result.status, "outcomeUnknown");
   assert.equal(result.reason, "ConversationUrlUnavailable");
+  assert.equal(result.stage, "conversationRoute");
+  assert.equal(result.timing.budgetAtSendMs >= 3000, true);
   assert.equal(h.clicks, 1);
 });
 
@@ -437,32 +478,27 @@ test("switches Work to Chat before entering the prompt", async () => {
 test("does not submit if Work cannot be switched to Chat", async () => {
   const h = harness({ initialMode: "Work", modeSwitchFails: true, timeoutMs: 125 });
   const result = await h.run();
-  assert.equal(result.status, "uiIncompatible");
-  assert.equal(result.stage, "modeSelection");
-  assert.equal(result.diagnostics?.documentReadyState, "complete");
-  assert.equal(result.reason, "ChatModeUnavailable");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "PreferredConfigurationsUnavailable");
+  assert.equal(result.attempts[0].reason, "ModeUnavailable");
   assert.equal(h.clicks, 0);
 });
 
 test("does not submit when mode selection controls are unavailable", async () => {
   const h = harness({ noModeToggle: true, timeoutMs: 125 });
   const result = await h.run();
-  assert.equal(result.status, "uiIncompatible");
-  assert.equal(result.stage, "modeSelection");
-  assert.equal(result.diagnostics?.documentReadyState, "complete");
-  assert.equal(result.reason, "ModeToggleUnavailable");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "PreferredConfigurationsUnavailable");
+  assert.equal(result.attempts.every(a => a.reason === "ModeUnavailable"), true);
   assert.equal(h.clicks, 0);
 });
 
-test("DOM diagnostics report selector counts, never prompt or raw HTML", async () => {
-  const h = harness({ noModeToggle: true, timeoutMs: 125 });
+test("DOM diagnostics report selector counts without leaking prompt text", async () => {
+  const h = harness({ throwOnInsert: true });
   const result = await h.run("SECRET BOOTSTRAP PROMPT");
   assert.equal(result.status, "uiIncompatible");
-  assert.equal(result.stage, "modeSelection");
-  assert.equal(result.diagnostics.modeButtons, 0);
-  assert.equal(result.diagnostics.chatLabels, 0);
-  assert.equal(result.diagnostics.workLabels, 0);
   assert.equal(result.diagnostics.documentReadyState, "complete");
+  assert.equal(result.diagnostics.modeButtons, 2);
   assert.equal(JSON.stringify(result).includes("SECRET BOOTSTRAP PROMPT"), false);
   assert.equal(h.clicks, 0);
 });
@@ -613,6 +649,8 @@ test("throwing Send click yields uncertain outcome with exactly one attempt", as
   const result = await h.run("Task prompt");
   assert.equal(result.status, "outcomeUnknown");
   assert.equal(result.reason, "SendClickUncertain");
+  assert.equal(result.stage, "sendClick");
+  assert.equal(result.timing.budgetAtSendMs >= 3000, true);
   assert.equal(h.clicks, 1);
   assert.equal(h.lastSubmittedText, null);
 });
@@ -623,7 +661,7 @@ test("an absent Send control cannot bypass the overall deadline", async () => {
   assert.equal(result.status, "uiIncompatible");
   assert.equal(result.reason, "SendUnavailable");
   assert.equal(h.clicks, 0);
-  assert.equal(h.virtualClockState.now, 100);
+  assert.equal(h.virtualClockState.now, 2100);
 });
 
 test("a conversation appearing while mode controls hydrate cannot have its mode changed", async () => {
@@ -755,8 +793,9 @@ test("multiple ignored hydration clicks eventually select Chat without duplicate
 test("permanently ignored mode clicks fail closed before Send", async () => {
   const h = harness({ initialMode: "Work", modeSwitchFails: true, timeoutMs: 710 });
   const result = await h.run("Must not send");
-  assert.equal(result.status, "uiIncompatible");
-  assert.equal(result.reason, "ChatModeUnavailable");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "PreferredConfigurationsUnavailable");
+  assert.equal(result.attempts[0].reason, "ModeUnavailable");
   assert.equal(result.safeToDisposeCreatedTab, true);
   assert.equal(h.chatClicks >= 2, true);
   assert.equal(h.mode, "Work");
@@ -788,8 +827,9 @@ test("route navigation after an ignored mode click prevents retry and Send", asy
 test("ambiguous Chat buttons do not authorize a mode click or Send", async () => {
   const h = harness({ initialMode: "Work", duplicateChatMode: true, timeoutMs: 300 });
   const result = await h.run("No ambiguous selection");
-  assert.equal(result.status, "uiIncompatible");
-  assert.equal(result.reason, "ModeToggleUnavailable");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "PreferredConfigurationsUnavailable");
+  assert.equal(result.attempts[0].reason, "ModeUnavailable");
   assert.equal(h.chatClicks, 0);
   assert.equal(h.clicks, 0);
 });
@@ -800,15 +840,14 @@ for (const { selectedModel, reasoningEffort } of [
   { selectedModel: "GPT-5.6 Sol", reasoningEffort: "Medium" },
   { selectedModel: "Pro", reasoningEffort: "High" }
 ]) {
-  test("new Chat tab leaves " + selectedModel + " and " + reasoningEffort + " unchanged", async () => {
+  test("new Chat tab selects preferred model and effort from " + selectedModel + " and " + reasoningEffort, async () => {
     const h = harness({ initialMode: "Chat", selectedModel, reasoningEffort });
     const result = await h.run("Preserve selected model");
     assert.equal(result.status, "submitted");
     assert.equal(h.chatClicks, 0);
     assert.equal(h.clicks, 1);
-    assert.equal(h.selectedModel, selectedModel);
-    assert.equal(h.reasoningEffort, reasoningEffort);
-    assert.equal(h.modelClicks, 0);
+    assert.equal(h.selectedModel, "GPT-6");
+    assert.equal(h.reasoningEffort, "Extra High");
   });
 }
 
@@ -852,5 +891,50 @@ test("composer visible before document loading completes is not edited early", a
   assert.equal(result.status, "submitted");
   assert.equal(h.lastSubmittedText, "Delayed ready prompt");
   assert.equal(h.beforeReadyInsertions, 0);
+  assert.equal(h.clicks, 1);
+});
+
+test("absent model picker fails closed without sending", async () => {
+  const h = harness({ noPicker: true, virtualClock: true });
+  const result = await h.run("Never send");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "PreferredConfigurationsUnavailable");
+  assert.equal(result.attempts[0].reason, "ModelPickerUnavailable");
+  assert.equal(h.clicks, 0);
+});
+
+test("unavailable maximum effort falls back to Work Astra Medium", async () => {
+  const h = harness({ maxEffortStep: 1, reasoningEffort: "Medium", timeoutMs: 12000 });
+  const result = await h.run("Never send", { selectionOnly: true });
+  assert.equal(result.status, "selectionOnly");
+  assert.equal(result.selectedMode, "Work");
+  assert.equal(result.selectedModel, "GPT-6.2 Astra");
+  assert.equal(result.selectedEffort, "Medium");
+  assert.equal(result.attempts[0].reason, "EffortUnavailable");
+  assert.equal(h.clicks, 0);
+});
+
+
+test("does not click Send when a slow composer consumes the post-send confirmation reserve", async () => {
+  const h = harness({ virtualClock: true, sendAvailableAfterMs: 3800 });
+  const result = await h.run("Do not attempt an unconfirmable send", { timeoutMs: 6000 });
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.stage, "submitControl");
+  assert.equal(result.reason, "SendUnavailable");
+  assert.equal(h.clicks, 0);
+  assert.equal(h.virtualClockState.now <= 3100, true);
+});
+
+test("waits for delayed post-Send user bubble and durable UUID without replay", async () => {
+  const h = harness({
+    noLegacyTurnMarkers: true, renderUserBubble: true, optimisticLocalRoute: true,
+    bubbleDelayMs: 650, routeDelayMs: 1150, timeoutMs: 3000
+  });
+  const result = await h.run("Delayed acknowledgment is still one send");
+  assert.equal(result.status, "submitted");
+  assert.equal(result.conversationUrl,
+    "https://chatgpt.com/c/00000000-0000-0000-0000-000000000001");
+  assert.deepEqual(Array.from(result.evidence),
+    ["newUserTurn", "matchingUserBubble", "conversationRoute"]);
   assert.equal(h.clicks, 1);
 });

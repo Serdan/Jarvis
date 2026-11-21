@@ -1,0 +1,11 @@
+# P1: Empty terminal-effect identity can durably poison the reservation document
+
+**Frozen source:** `5e37133d5f1b7e7c6e13c890b662caf14eafa9c8`. Original task requires one-time verifier-bound terminal release with fail-closed original operation/effect provenance.
+
+**Reproducible source trace:** `NativeSchedulerAccountReservation.fs:328-380` accepts a `NativeTerminalLocator.TerminalOperationId` of type `Guid` and does **not** reject `Guid.Empty`. The terminal verifier is supplied the locator; if it returns an `Ok NativeTerminalProof` with the same empty terminal UUID and all other matching fields, lines 355-367 pass, and lines 369-381 commit `Status="Released"` with `TerminalOperationId="00000000-0000-0000-0000-000000000000"` into the same account-head CAS. On the next read, `stateValid` at lines 151-160 requires `validGuid r.TerminalOperationId` for every Released record; `validGuid` at lines 92-95 explicitly rejects `Guid.Empty`. The writer thus can create a state that its own reader must classify `AccountIntegrityError`.
+
+**Impact:** This is a disposable-scoped entrypoint with production disabled, not a live provider exploit. Nevertheless, a verifier bug/input carrying an empty terminal ID can create a durable, unreadable native occupancy namespace, forcing a hard capacity hold and manual repair. This is not ordinary conservative occupancy; it is a writer/reader invariant mismatch.
+
+**Negative acceptance control:** With an otherwise valid prior reservation and mock verifier, use `TerminalOperationId = Guid.Empty` in both locator and returned proof. The operation must reject *before the Git CAS*; then assert native state and account head unchanged and a subsequent valid terminal release still succeeds. Also test duplicate terminal ID reused against another candidate if that original identity is intended globally unique.
+
+**Proportionate fix:** Validate nonempty terminal operation identity and all state-validity invariants before serialization/commit; retain original immutable UUID, source and account head checks. No live launch, new host root or broader scheduler feature is needed.

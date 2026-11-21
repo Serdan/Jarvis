@@ -1,0 +1,13 @@
+<h1>[P0] Provider-native Jarvis executor as browser-independent recovery path</h1>
+<p>Owner: Operator. Date: 2026-11-21. Stage: design and hermetic tests only; no API charges or key handling authorized.</p>
+<p><strong>Problem:</strong> project throughput depends on consumer ChatGPT UI bootstrap, where browser background scheduling, React hydration, model picker and untrusted synthetic Send can prevent agent start even with a confirmed tool call. All projects can stall on one brittle shared UI transport. Existing browser patch 64d94fc8 and synthetic Edge evidence 598f8c33 mitigate the transport but still require privileged debug permission, security review, login and live acceptance.</p>
+<h2>Required design</h2>
+<ol>
+<li>Introduce a provider-neutral worker session transport selected by canonical Jarvis agent/task assignment. Preserve existing agentId/inbox, task/lease/review/integrator authority, no Codex-through-Jarvis, structured checkpoints and yield semantics.</li>
+<li>First adapter: OpenAI Responses API with role-focused Jarvis MCP tool catalog; bounded tool-call budget and output tokens; streamed progress/heartbeat; exact idempotency and external effect receipt reconciliation. Compatibility with another provider/local models should be explicit.</li>
+<li>Hermetic fake-provider suite: worker session start, tool call roundtrip, long prompt/continuation, retry after transport crash without duplicate effect, lease loss, spending cap, provider backoff and quota exhaustion. No browser, ChatGPT consumer account, API key, external requests or production effect in this stage.</li>
+<li>Explicit per-project/agent cost and model choice policy. Separately billed API keys must be stored in an approved secret store, not repo, logs or task ledger. No usage until user approves a spending cap and live cutover.</li>
+<li>Browser launcher remains compatibility fallback while native runtime proves production acceptance. Native Health/Challenges/Scheduler and original Git trusted-writer publication gates remain authoritative and independently gated; this task does not bypass them.</li>
+</ol>
+<p><strong>Acceptance (design stage):</strong> reviewed source and docs; deterministic fake-provider end-to-end tests; model capability/role tool filtering; durable operation receipts; measured memory/latency and exact budget/cancel behavior; Operator review of any future live billing or provider deployment.</p>
+<p><strong>Evidence:</strong> source-only plan docs/LAUNCHER_UNBLOCK_PLAN_2026-11-21.md and synthetic Edge lab commit 598f8c331 in experiment/launcher-cdp-background-lab-operator-20261121. Official Responses API supports remote MCP; ChatGPT subscription and API billing are separate.</p>

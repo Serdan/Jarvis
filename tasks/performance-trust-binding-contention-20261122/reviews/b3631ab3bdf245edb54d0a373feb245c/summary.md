@@ -1,1 +1,18 @@
-Base dcac884fc, frozen 6e9ed2c74. Matched .NET11 Release/Linux disposable Git fixture original 27/27 typed contention, final 0/27 on intentionally held cross-process locks (informational p50/p95). 8/8 final Release tests passed; raw TRX docs/testing/trust-binding-contention-20261122/final-release-8-tests.trx. Verify retry never replays callback/mutation; no network under lock; changed anchor/CAS, dangling symlink and rollback negatives. Review needs no main writes, deployment or schedules.
+# Independent review — ChangesRequested (P2 evidence gap)
+
+**Review:** `b3631ab3bdf245edb54d0a373feb245c` / `performance-trust-binding-contention-20261122`. **Reviewer:** Reviewer 2. **Immutable source:** `6e9ed2c74c720087dd80b53cd8a51958647b76d6`, base `dcac884fc061869572b12a03befc12f11c009f2f`. Clean registered worktree `trust-binding-perf3-20261122`, checked against frozen source and review details. No implementation edits or main writes.
+
+## Independently verified
+
+- Inspected complete source diff: `Client/Modules/OrchestrationApi.fs`, changed tests, evidence report, raw TRX. Source changes are confined to recognized OS sharing-violation retries around **lock FileStream opening** (32 retries / approx 75ms; 1–4ms sleep), with repeat symlink fences and original callback/CAS logic unchanged. Retry does **not** replay an operation or ambiguous mutation result. `LedgerStore.fetch` remains outside both lock-held read/CAS sections.
+- SHA-256 of production source, `ReviewWorkflowTests.fs`, `OrchestrationApiTests.fs`, and committed final TRX independently matched all four hashes in `docs/testing/trust-binding-contention-perf3-20261122.md`.
+- Independently executed `dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-restore --filter '<the eight exact trust-binding tests>' --logger 'console;verbosity=normal'` on the frozen worktree, .NET SDK **11.0.100**: **8/8 passed**, exit 0, ~15.8 seconds of tests. Only non-blocking existing F# build warnings. Our cross-process fixture produced n=1:0/1 (p95 87.94ms), n=2:0/2 (80.96ms), n=8:0/8 (111.21ms), n=16:0/16 (195.05ms); these are forced-lock synthetic values, not live MCP p95.
+- Adversarial verification included independently held external OS FileShare.None locks, bounded typed contention on a permanently held lock, damaged/mismatched remote history, changed push URL, missing ledger, delayed fetch with anchor advance, concurrent in-process readers, symlink/dangling-symlink lock and symlink binding rejection, and discrimination against unrelated I/O errors. The 2 external FSI holders enforce genuine cross-process file locking; concurrent `loadAtRootWithSnapshotUsing` callers themselves are in-process tasks on two disposable Git clones, not two external reader processes. No live service or production binding files were touched.
+
+## Finding and scope
+
+**P2 finding:** [`findings/missing-lock-retry-measurements.md`]. The original task explicitly asks to *capture* lock-hold times and acquisition retry counts, and trace both critical sections. The submitted report admits that both are uninstrumented. Whole-call p50/p95 and final head assertions cannot substitute for these measurements, particularly when every successful load includes remote Git work. Narrow fixture-only measurement and exact-source Release evidence are sufficient; no architectural rewrite or live monitoring required.
+
+The observed 27/27 original baseline versus 0/27 final forced-lock failures is credible for this synthetic fixture, but **no production availability/latency gain is claimed**, and no exploitable trust-anchor regression was found. Retain the fail-closed typed error when bounded retry expires. Do not expand this review to unrelated tooling or cutover authorization.
+
+**Decision rationale:** ChangesRequested for an explicit original P2 measurement obligation, not for a failed .NET11 Release test or a proven security vulnerability.

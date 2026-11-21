@@ -9,3 +9,5 @@ The current tests do **not** deliberately corrupt an existing activity JSON blob
 Suggested future regressions: mutate the canonical activity blob in a disposable ledger and require `ActivityProofUnavailable` on read; inject out-of-range sequence and changed operation-origin receipt; enforce a stale generation after actual re-registration; force an external-head race and assert retry convergence. Do not couple these to live services or the retired Health/Manager agents.
 
 No source changes requested by this advisory.
+
+Future policy gate: `AgentActivityLedger.readAt` accepts a caller-supplied `serverNowUtc` to calculate `Age`; it validates UTC and time order, not the clock's origin. This is safe as a passive watermark reader while native Health recovery is still blocked. **The later deterministic recovery consumer must not supply the local device wall clock as an authoritative server time.** Require an authenticated/trusted time source (or consume the durable last-activity fact without computing an idle age) before enabling policy; add an explicit forward-skew regression. This is not evidence that the current inactive Health policy misfires.

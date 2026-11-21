@@ -1791,8 +1791,10 @@ module LedgerStore =
             match fetch binding with
             | Error error -> Error error
             | Ok current ->
-                match git binding.RepositoryPath [ "merge-base"; "--is-ancestor"; commit; current.Commit ] with
-                | Ok output when output.ExitCode = 0 ->
+                // Historical ledger lineage is also trust-bearing. A local
+                // graft/alternate must not spoof an old canonical snapshot.
+                match isAncestor binding.RepositoryPath commit current.Commit with
+                | Ok true ->
                     readHeader binding commit
                     |> Result.map (fun header -> { Commit = commit; Header = header })
                 | _ -> Error(LedgerHistoryUnavailable "Pinned snapshot is unavailable or no longer trusted canonical ancestry.")
@@ -2264,12 +2266,14 @@ module LedgerStore =
         |> Result.bind (fun targetHead ->
             verifySourceObject binding headOid
             |> Result.bind (fun () ->
-                match git binding.RepositoryPath [ "merge-base"; targetHead; headOid ] with
-                | Ok output when output.ExitCode = 0 && oidPattern.IsMatch output.Stdout ->
-                    Ok output.Stdout
-                | Ok output ->
-                    Error(SourceUnavailable $"Cannot find a review merge-base: {output.Stderr}")
-                | Error error -> Error error))
+                ensureUnmodifiedGitHistory binding.RepositoryPath
+                |> Result.bind (fun () ->
+                    match git binding.RepositoryPath [ "merge-base"; targetHead; headOid ] with
+                    | Ok output when output.ExitCode = 0 && oidPattern.IsMatch output.Stdout ->
+                        Ok output.Stdout
+                    | Ok output ->
+                        Error(SourceUnavailable $"Cannot find a review merge-base: {output.Stderr}")
+                    | Error error -> Error error)))
 
     // A completion claim is valid only when the remotely advertised target
     // contains both the submitted commit and the claimed integration commit.
@@ -2310,6 +2314,9 @@ module LedgerStore =
             do! verifySourceObject binding targetHeadAtSubmission
             do! verifySourceObject binding submittedCommit
             do! verifySourceObject binding integratedCommit
+            // Explicit per-step guards; a parent/tree lookup is never allowed
+            // to inherit a previously checked graft or alternate object graph.
+            do! ensureUnmodifiedGitHistory binding.RepositoryPath
             let! parentLine =
                 run binding.RepositoryPath
                     [ "rev-list"; "--parents"; "-n"; "1"; integratedCommit ]
@@ -2324,6 +2331,7 @@ module LedgerStore =
             // Use Git's real ort merge, not patch-id or a caller-supplied tree.
             // A conflict requires a separately reviewed resolution; silently
             // accepting its conflict markers or chosen content is unsafe.
+            do! ensureUnmodifiedGitHistory binding.RepositoryPath
             match git binding.RepositoryPath
                     [ "merge-tree"; "--write-tree"; "--no-messages"; targetParent; submittedCommit ] with
             | Error failure -> return! Error failure
@@ -2333,6 +2341,7 @@ module LedgerStore =
             | Ok merged when not (oidPattern.IsMatch merged.Stdout) ->
                 return! Error(LedgerIntegrityError "Git returned an invalid mechanical merge tree.")
             | Ok merged ->
+                do! ensureUnmodifiedGitHistory binding.RepositoryPath
                 let! actualTree =
                     run binding.RepositoryPath
                         [ "rev-parse"; "--verify"; $"{integratedCommit}^{{tree}}" ]

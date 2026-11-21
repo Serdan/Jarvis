@@ -1982,6 +1982,29 @@ type ReviewWorkflowTests() =
             Assert.That(LedgerStore.readRemoteTarget first target |> success, Is.EqualTo(integrated)))
 
     [<Test>]
+    member _.LocalGraftShallowAndAlternateObjectOverlaysCannotSupplyTrustedAncestry() =
+        withFixture (fun one two _ second baseOid _ _ _ ->
+            let common = git two [ "rev-parse"; "--path-format=absolute"; "--git-common-dir" ]
+            let overlays =
+                [ Path.Combine(common, "info", "grafts"), "# untrusted graft overlay\n"
+                  Path.Combine(common, "shallow"), baseOid + "\n"
+                  Path.Combine(common, "objects", "info", "alternates"),
+                    Path.Combine(one, ".git", "objects") + "\n" ]
+            for path, content in overlays do
+                Directory.CreateDirectory(Path.GetDirectoryName(path)) |> ignore
+                Assert.That(File.Exists(path), Is.False, "Fresh fixture unexpectedly had a Git graph overlay.")
+                File.WriteAllText(path, content)
+                try
+                    match LedgerStore.verifySourceObject second baseOid with
+                    | Error(LedgerIntegrityError _) -> ()
+                    | other -> Assert.Fail(sprintf "Source proof trusted local graph overlay %s: %A" path other)
+                    match LedgerStore.verifySourceAncestry second baseOid baseOid with
+                    | Error(LedgerIntegrityError _) -> ()
+                    | other -> Assert.Fail(sprintf "Ancestry proof trusted local graph overlay %s: %A" path other)
+                finally
+                    File.Delete(path))
+
+    [<Test>]
     member _.ManagedMergeRejectsIncorrectParentsExtraTreeEditsAndRewrittenRemote() =
         withFixture (fun one two first second baseOid _ newCommit _ ->
             let mainBranch = git one [ "branch"; "--show-current" ]

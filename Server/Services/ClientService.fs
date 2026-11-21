@@ -165,7 +165,7 @@ module AgentStateInvalidationRouting =
                 project, (changes |> List.map _.AgentId |> List.distinct |> List.toArray))
 
 
-type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker, http: IHttpContextAccessor, logger: ILogger<ClientService>) =
+type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker, http: IHttpContextAccessor, logger: ILogger<ClientService>, store: OptionalFeedbackStore) =
     // Cross-device hints are nonauthoritative. Allow only one pending batch
     // globally: a hung SignalR recipient cannot create an unbounded backlog
     // of tasks, closures or device snapshots under sustained MCP traffic.
@@ -248,6 +248,27 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                 match http.HttpContext with
                 | null -> CancellationToken.None
                 | context -> context.RequestAborted
+            // Count authenticated qualifying ingress even when device routing
+            // or client execution subsequently fails. An active backend's
+            // failed attempt must not be mistaken for agent inactivity.
+            let attributedActivity =
+                match agentId, AgentCommandInfo.projectName command with
+                | Some actor, Some project
+                    when not (String.IsNullOrWhiteSpace actor) &&
+                         not (String.IsNullOrWhiteSpace project) &&
+                         AgentCommandInfo.isAgentActivity command ->
+                    Some(project, actor, DateTimeOffset.UtcNow)
+                | _ -> None
+            match attributedActivity with
+            | Some(project, actor, observedAtUtc) ->
+                try
+                    store.RecordAgentActivity(userId, project, actor, observedAtUtc)
+                    |> ignore
+                with ex ->
+                    logger.LogWarning(ex, "Server agent activity observation unavailable")
+            | None -> ()
+            // A canceled transport still reached authenticated server ingress.
+            // Browser cancellation is not proof that the agent was idle.
             requestAborted.ThrowIfCancellationRequested()
             // A verified cross-project source activation precedes destination
             // dispatch. It remains known if this transport later times out.
@@ -322,16 +343,13 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
 
                         let mutable replyStartedAt = None
                         let dispatchAt = Stopwatch.GetTimestamp()
-                        // Optional diagnostic hints never authorize AfterAgentIdle
-                        // or block client Git-CAS and process commands.
-                        match agentId, AgentCommandInfo.projectName command with
-                        | Some actor, Some project
-                            when not (String.IsNullOrWhiteSpace actor) &&
-                                 not (String.IsNullOrWhiteSpace project) &&
-                                 AgentCommandInfo.isAgentActivity command ->
-                            this.RecordAgentActivityForUser(userId, project, actor, DateTimeOffset.UtcNow)
+                        // Cross-device SignalR hints remain droppable and
+                        // display-only. They are not the SQLite proof.
+                        match attributedActivity with
+                        | Some(project, actor, observedAtUtc) ->
+                            this.RecordAgentActivityForUser(userId, project, actor, observedAtUtc)
                             |> ignore
-                        | _ -> ()
+                        | None -> ()
                         try
                                 // Preserve the original source operation UUID across
                                 // client hops; correlation IDs are not authority.

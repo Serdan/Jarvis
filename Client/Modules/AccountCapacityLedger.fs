@@ -637,7 +637,9 @@ module AccountCapacityLedger =
                                         | _ -> false)
                                     (fun _ -> AccountOutcomeUnknown Guid.Empty)))))
 
-    let private transactFiles (b: AccountBinding) operationId actor kind requestJson expectedHead
+    // Reuse the exact WQ07 account CAS/receipt transport for native admission.
+    // No second account ref, independently written ledger, or live scheduler.
+    let internal transactFiles (b: AccountBinding) operationId actor kind requestJson expectedHead
                          (plan: AccountSnapshot -> Result<AccountCapacityState * string * (string * string) list, AccountFailure>) =
         if operationId = Guid.Empty || String.IsNullOrWhiteSpace actor
            || String.IsNullOrWhiteSpace kind then
@@ -1368,3 +1370,66 @@ module AccountCapacityLedger =
                             (Some snapshot.Head)
                 | Error failure ->
                     NativeSchedulerRosterPolicy.hold $"{failure}" (Some snapshot.Head)
+    // Native admission shares the WQ07 account head and immutable receipt lineage.
+    // The production reservation entrypoint is intentionally disabled.
+    let internal readNativeReservationDocument (b: AccountBinding) head =
+        let path = "native/scheduler-reservations-v1.json"
+        command b [ "ls-tree"; head; "--"; path ]
+        |> Result.bind (fun listing ->
+            if String.IsNullOrEmpty listing then
+                // Deleting a formerly occupied native state file must never
+                // resurrect capacity by appearing to be a fresh empty namespace.
+                command b [ "log"; "--first-parent"; "-1"; "--format=%H"; head; "--"; path ]
+                |> Result.bind (fun historical ->
+                    if String.IsNullOrEmpty historical then Ok None
+                    else Error(AccountIntegrityError "Previously populated native occupancy path was deleted."))
+            elif not (Regex.IsMatch(listing,
+                      "^100644 blob [0-9a-f]{40}([0-9a-f]{24})?\\t" + Regex.Escape(path) + "$")) then
+                Error(AccountIntegrityError "Native occupancy path is not an ordinary Git blob.")
+            else
+                command b [ "show"; $"{head}:{path}" ]
+                |> Result.bind (fun raw ->
+                    command b [ "log"; "--first-parent"; "-1"; "--format=%H"; head; "--"; path ]
+                    |> Result.bind (fun origin ->
+                        if not (validOid origin) then
+                            Error(AccountIntegrityError "Native occupancy has no Git origin.")
+                        else
+                            command b [ "show"; "-s"; "--format=%B"; origin ]
+                            |> Result.bind (fun message ->
+                                let operation = Regex.Match(message, @"(?m)^Operation-Id: ([0-9a-f-]{36})$")
+                                let mutable opId = Guid.Empty
+                                if not operation.Success
+                                   || not (Guid.TryParse(operation.Groups[1].Value, &opId))
+                                   || opId = Guid.Empty then
+                                    Error(AccountIntegrityError "Native occupancy mutation lacks operation provenance.")
+                                else
+                                    readReceipt b head opId
+                                    |> Result.bind (function
+                                        | Some receipt when
+                                            (receipt.Kind = "NativeReserve" || receipt.Kind = "NativeTransition"
+                                             || receipt.Kind = "NativeTerminalRelease")
+                                            && message.Contains($"Request-SHA256: {receipt.RequestSha256}",
+                                                                StringComparison.Ordinal) ->
+                                            command b [ "log"; "--first-parent"; "--diff-filter=A"; "--format=%H";
+                                                        head; "--"; receiptPath opId ]
+                                            |> Result.bind (fun receiptOrigin ->
+                                                if receiptOrigin <> origin then
+                                                    Error(AccountIntegrityError "Native state was not written at receipt origin.")
+                                                else
+                                                    command b [ "diff-tree"; "--no-commit-id"; "--name-only"; "-r"; origin ]
+                                                    |> Result.bind (fun changed ->
+                                                        let paths = changed.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                                                        if Set.ofArray paths <>
+                                                           Set.ofList [ "state.json"; receiptPath opId; path ] then
+                                                            Error(AccountIntegrityError "Native CAS modified unexpected paths.")
+                                                        else
+                                                            try
+                                                                use doc = JsonDocument.Parse(receipt.OriginalResultJson)
+                                                                let digest = doc.RootElement.GetProperty("nativeStateSha256").GetString()
+                                                                if digest <> hash raw then
+                                                                    Error(AccountIntegrityError "Native occupancy differs from its receipt.")
+                                                                else Ok(Some raw)
+                                                            with _ ->
+                                                                Error(AccountIntegrityError "Native operation result lacks state digest.")))
+                                        | _ ->
+                                            Error(AccountIntegrityError "Native occupancy has no valid account receipt."))))))

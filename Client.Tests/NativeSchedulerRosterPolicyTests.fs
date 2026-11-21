@@ -596,3 +596,332 @@ type NativeSchedulerRosterPolicyTests() =
             Assert.That(observed.Status, Is.EqualTo("NotAuthoritative"))
             Assert.That(observed.HoldReasons[0], Does.Contain("transplanted"))
             Assert.That(observed.LaunchAuthorized, Is.False))
+
+open Client.NativeSchedulerAccountReservation
+
+module private NativeReservationFixture =
+    let success = NativeFixture.success
+    let limits = NativeFixture.limits
+
+    let establish f accountLimits projectLimits =
+        let oldHead = NativeFixture.head f.AccountOne
+        let approval = NativeFixture.approval f 1L 0L oldHead (Guid.NewGuid())
+                           accountLimits projectLimits
+        NativeFixture.writer f f.AccountOne f.ProjectsOne approval |> success |> ignore
+
+    let coverage f account projects =
+        let policy = NativeFixture.reader f account projects
+        Assert.That(policy.Status, Is.EqualTo("PolicyVerified"),
+                    String.concat ";" policy.HoldReasons)
+        { AccountHead = policy.VerifiedAccountHead.Value
+          ProjectHeads = policy.VerifiedProjectHeads
+          ObservedAtUtc = DateTimeOffset.UtcNow
+          Complete = true }
+
+    let worker f projectIndex =
+        let p = f.ProjectsOne[projectIndex]
+        { DispatchId = Guid.NewGuid().ToString("D")
+          EffectOperationId = Guid.NewGuid().ToString("D")
+          Kind = "Worker"
+          ProjectId = p.ProjectId.ToString("D")
+          ProjectLedgerId = p.LedgerId.ToString("D")
+          ProjectEpoch = p.Epoch
+          OwnerAgentId = "Worker 4"
+          TaskId = "fixture-ready-worker"
+          AttemptId = Guid.NewGuid().ToString("D")
+          AssignmentGeneration = 1L
+          SourceRepositoryId = String.replicate 64 "a"
+          SourceBaseOid = f.InitialSourceHead
+          SourceRef = "refs/heads/fixture-isolated"
+          SourceLeaseSha256 = String.replicate 64 "b"
+          ReviewId = ""; ReviewVersion = 0L; ReviewedHeadOid = ""
+          ReviewRef = ""; ClaimOperationId = "" }
+
+    let reviewer f projectIndex =
+        let c = worker f projectIndex
+        { c with Kind = "Reviewer"; OwnerAgentId = "Reviewer 1"
+                 TaskId = ""; AttemptId = ""; AssignmentGeneration = 0L
+                 ReviewId = Guid.NewGuid().ToString("D"); ReviewVersion = 2L
+                 ReviewedHeadOid = f.InitialSourceHead
+                 ReviewRef = "refs/heads/jarvis-review/fixture/r2"
+                 ClaimOperationId = Guid.NewGuid().ToString("D") }
+
+    let reserve f account projects coverage op candidate =
+        NativeSchedulerAccountReservation.reserveVerifiedDisposable
+            f.Root account f.PublicKey f.Subject projects coverage
+            op "Verified disposable fixture" candidate
+
+    let snapshot f account projects =
+        NativeSchedulerAccountReservation.readVerifiedDisposable
+            f.Root account f.PublicKey f.Subject projects (coverage f account projects)
+        |> success |> snd
+
+[<TestFixture>]
+type NativeSchedulerAccountReservationTests() =
+    [<Test>]
+    member _.TwoIndependentClonesCannotOverbookOneWorkerAcrossProjects() =
+        NativeFixture.withGit (fun f ->
+            NativeReservationFixture.establish f
+                (NativeReservationFixture.limits 1 1)
+                [| NativeReservationFixture.limits 1 1
+                   NativeReservationFixture.limits 1 1 |]
+            let first = NativeReservationFixture.worker f 0
+            let second = NativeReservationFixture.worker f 1
+            let c1 = NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne
+            let c2 = NativeReservationFixture.coverage f f.AccountTwo f.ProjectsTwo
+            use gate = new ManualResetEventSlim(false)
+            let op1, op2 = Guid.NewGuid(), Guid.NewGuid()
+            let t1 = Task.Run(fun () ->
+                gate.Wait()
+                NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne c1 op1 first)
+            let t2 = Task.Run(fun () ->
+                gate.Wait()
+                NativeReservationFixture.reserve f f.AccountTwo f.ProjectsTwo c2 op2 second)
+            gate.Set()
+            Task.WaitAll([| t1 :> Task; t2 :> Task |])
+            let winners = [| t1.Result; t2.Result |] |> Array.filter Result.isOk
+            Assert.That(winners.Length, Is.EqualTo(1))
+            let state = NativeReservationFixture.snapshot f f.AccountOne f.ProjectsOne
+            Assert.That(state.Records.Length, Is.EqualTo(1))
+            Assert.That(state.Records[0].Status, Is.EqualTo("Reserved")))
+
+    [<Test>]
+    member _.ExactUUIDReplayIsImmutableAndDifferentUUIDCannotDuplicateCandidate() =
+        NativeFixture.withGit (fun f ->
+            NativeReservationFixture.establish f
+                (NativeReservationFixture.limits 2 2)
+                [| NativeReservationFixture.limits 2 2
+                   NativeReservationFixture.limits 2 2 |]
+            let c = NativeReservationFixture.worker f 0
+            let op = Guid.NewGuid()
+            let oldCoverage = NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne
+            let first =
+                NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne oldCoverage op c
+                |> NativeReservationFixture.success
+            Assert.That(first.AlreadyApplied, Is.False)
+            let again =
+                NativeReservationFixture.reserve f f.AccountTwo f.ProjectsTwo oldCoverage op c
+                |> NativeReservationFixture.success
+            Assert.That(again.AlreadyApplied, Is.True)
+            Assert.That(again.Receipt.ResultSha256, Is.EqualTo(first.Receipt.ResultSha256))
+            match NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne
+                    oldCoverage op { c with OwnerAgentId = "different" } with
+            | Error AccountOperationIdReused -> ()
+            | result -> failwithf "Changed payload replay was not rejected: %A" result
+            let fresh = NativeReservationFixture.coverage f f.AccountTwo f.ProjectsTwo
+            match NativeReservationFixture.reserve f f.AccountTwo f.ProjectsTwo
+                    fresh (Guid.NewGuid()) { c with DispatchId = Guid.NewGuid().ToString("D")
+                                                    EffectOperationId = Guid.NewGuid().ToString("D") } with
+            | Error(AccountPolicyNotAuthoritative _) -> ()
+            | result -> failwithf "Canonical duplicate reservation was not rejected: %A" result
+            Assert.That((NativeReservationFixture.snapshot f f.AccountOne f.ProjectsOne).Records.Length,
+                        Is.EqualTo(1)))
+
+    [<Test>]
+    member _.WorkerReviewerPoolsAndProjectZeroAreDistinct() =
+        NativeFixture.withGit (fun f ->
+            NativeReservationFixture.establish f
+                (NativeReservationFixture.limits 1 2)
+                [| NativeReservationFixture.limits 0 1
+                   NativeReservationFixture.limits 1 0 |]
+            let attempt c =
+                NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne
+                    (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne)
+                    (Guid.NewGuid()) c
+            match attempt (NativeReservationFixture.worker f 0) with
+            | Error(AccountCapacityFull(0,0)) -> ()
+            | other -> failwithf "Project worker quota zero was bypassed: %A" other
+            attempt (NativeReservationFixture.reviewer f 0)
+                |> NativeReservationFixture.success |> ignore
+            attempt (NativeReservationFixture.worker f 1)
+                |> NativeReservationFixture.success |> ignore
+            match attempt (NativeReservationFixture.reviewer f 1) with
+            | Error(AccountCapacityFull(0,0)) -> ()
+            | other -> failwithf "Project reviewer quota zero was bypassed: %A" other
+            let entries = (NativeReservationFixture.snapshot f f.AccountOne f.ProjectsOne).Records
+            Assert.That(entries.Length, Is.EqualTo(2))
+            Assert.That(entries |> Array.filter (fun r -> r.Candidate.Kind = "Worker") |> Array.length,
+                        Is.EqualTo(1)))
+
+    [<Test>]
+    member _.UnknownOccupiesExactlyOneSlotUntilOriginalVerifiedTerminal() =
+        NativeFixture.withGit (fun f ->
+            NativeReservationFixture.establish f
+                (NativeReservationFixture.limits 1 1)
+                [| NativeReservationFixture.limits 1 1
+                   NativeReservationFixture.limits 1 1 |]
+            let candidate = NativeReservationFixture.worker f 0
+            let op = Guid.NewGuid()
+            NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne
+                (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne) op candidate
+                |> NativeReservationFixture.success |> ignore
+            let dispatchId = Guid.Parse(candidate.DispatchId)
+            let effectId = Guid.Parse(candidate.EffectOperationId)
+            let advance generation status session =
+                NativeSchedulerAccountReservation.transitionVerifiedDisposable
+                    f.Root f.AccountOne f.PublicKey f.Subject f.ProjectsOne
+                    (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne)
+                    (Guid.NewGuid()) "Fixture actor" dispatchId effectId generation status
+                    f.InitialSourceHead session
+            advance 1L "Dispatching" "" |> NativeReservationFixture.success |> ignore
+            advance 2L "Uncertain" "" |> NativeReservationFixture.success |> ignore
+            advance 3L "Unknown" "provider-session-1" |> NativeReservationFixture.success |> ignore
+            Assert.That((NativeReservationFixture.snapshot f f.AccountOne f.ProjectsOne).Records.Length,
+                        Is.EqualTo(1))
+            match NativeReservationFixture.reserve f f.AccountTwo f.ProjectsTwo
+                    (NativeReservationFixture.coverage f f.AccountTwo f.ProjectsTwo)
+                    (Guid.NewGuid()) (NativeReservationFixture.worker f 1) with
+            | Error(AccountCapacityFull(1,1)) -> ()
+            | other -> failwithf "Unknown session did not retain account credit: %A" other
+            let entry = (NativeReservationFixture.snapshot f f.AccountOne f.ProjectsOne).Records[0]
+            let locator =
+                { DispatchId = dispatchId; OriginalReservationId = op
+                  EffectOperationId = effectId; TerminalOperationId = Guid.NewGuid() }
+            let proof =
+                { DispatchId = dispatchId; OriginalReservationId = op
+                  EffectOperationId = effectId; TerminalOperationId = locator.TerminalOperationId
+                  ProjectId = Guid.Parse(candidate.ProjectId)
+                  ProjectLedgerId = Guid.Parse(candidate.ProjectLedgerId)
+                  ProjectEpoch = candidate.ProjectEpoch
+                  CanonicalKey = entry.CanonicalKey; ProviderSessionId = "provider-session-1"
+                  ProjectHead = f.InitialSourceHead; ProjectTerminalOid = f.InitialSourceHead
+                  ProviderTerminalOid = f.InitialSourceHead }
+            let trusted =
+                { new INativeDisposableTerminalVerifier with
+                    member _.VerifyCurrentTerminal _ = Ok proof }
+            let release uuid terminal =
+                NativeSchedulerAccountReservation.releaseVerifiedDisposable
+                    f.Root f.AccountOne f.PublicKey f.Subject f.ProjectsOne
+                    (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne)
+                    trusted uuid "Fixture verifier" terminal
+            match release (Guid.NewGuid()) { locator with OriginalReservationId = Guid.NewGuid() } with
+            | Error(AccountPolicyNotAuthoritative _) -> ()
+            | other -> failwithf "Foreign terminal was not rejected: %A" other
+            let releaseId = Guid.NewGuid()
+            let released = release releaseId locator |> NativeReservationFixture.success
+            Assert.That(released.AlreadyApplied, Is.False)
+            Assert.That((NativeReservationFixture.snapshot f f.AccountOne f.ProjectsOne).Records[0].Status,
+                        Is.EqualTo("Released"))
+            let reusable = NativeReservationFixture.worker f 1
+            NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne
+                (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne)
+                (Guid.NewGuid()) reusable |> NativeReservationFixture.success |> ignore)
+
+    [<Test>]
+    member _.LegacyHeldOrIncompleteCoverageAndUnreceiptedNativePathHoldClosed() =
+        NativeFixture.withGit (fun f ->
+            NativeReservationFixture.establish f
+                (NativeReservationFixture.limits 2 1)
+                [| NativeReservationFixture.limits 2 1
+                   NativeReservationFixture.limits 2 1 |]
+            let candidate = NativeReservationFixture.worker f 0
+            let coverage = NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne
+            match NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne
+                    { coverage with Complete = false } (Guid.NewGuid()) candidate with
+            | Error(AccountPolicyNotAuthoritative _) -> ()
+            | other -> failwithf "Incomplete session coverage admitted: %A" other
+            match NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne
+                    { coverage with ObservedAtUtc = DateTimeOffset.UtcNow.AddHours(-1.0) }
+                    (Guid.NewGuid()) candidate with
+            | Error(AccountPolicyNotAuthoritative _) -> ()
+            | other -> failwithf "Stale session coverage admitted: %A" other
+            let p = f.ProjectsOne[0]
+            let project =
+                { ProjectId = p.ProjectId; LedgerId = p.LedgerId; Epoch = p.Epoch
+                  ApprovedFetchUrl = p.ApprovedFetchUrl; ApprovedPushUrl = p.ApprovedPushUrl }
+            AccountCapacityLedger.reserve f.AccountOne (Guid.NewGuid()) "Legacy fixture"
+                (Guid.NewGuid()) project "worker" 1L
+                |> NativeReservationFixture.success |> ignore
+            match NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne
+                    (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne)
+                    (Guid.NewGuid()) candidate with
+            | Error(AccountPolicyNotAuthoritative _) -> ()
+            | other -> failwithf "Legacy Held coexistence was not fenced: %A" other)
+
+    [<Test>]
+    member _.ProductionPathHasNoCallerSuppliedAuthorityOverride() =
+        NativeFixture.withGit (fun f ->
+            let c = NativeReservationFixture.worker f 0
+            match NativeSchedulerAccountReservation.reserve f.AccountOne c with
+            | Error(AccountPolicyNotAuthoritative _) -> ()
+            | other -> failwithf "Unprovisioned production path allowed reservation: %A" other)
+
+    [<Test>]
+    member _.PublishedReservationWithLostPushAcknowledgmentDoesNotRearm() =
+        NativeFixture.withGit (fun f ->
+            NativeReservationFixture.establish f
+                (NativeReservationFixture.limits 1 1)
+                [| NativeReservationFixture.limits 1 1
+                   NativeReservationFixture.limits 1 1 |]
+            let c = NativeReservationFixture.worker f 0
+            let op = Guid.NewGuid()
+            let coverage = NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne
+            let hooks =
+                { BeforeLeasePush = fun _ _ -> ()
+                  GitCommand = function
+                    | "push" :: _ -> AccountGitTestFault.ExecuteThenLoseAcknowledgment
+                    | _ -> AccountGitTestFault.PassThrough }
+            let original =
+                AccountCapacityLedger.withTestInterposition hooks (fun () ->
+                    NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne
+                        coverage op c)
+                |> NativeReservationFixture.success
+            Assert.That(original.AlreadyApplied, Is.False)
+            let replay = NativeReservationFixture.reserve f f.AccountTwo f.ProjectsTwo
+                             coverage op c |> NativeReservationFixture.success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That(replay.Receipt.RequestSha256, Is.EqualTo(original.Receipt.RequestSha256))
+            Assert.That((NativeReservationFixture.snapshot f f.AccountTwo f.ProjectsTwo).Records.Length,
+                        Is.EqualTo(1))
+            let fresh = NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne
+            let alternateDispatch = Guid.NewGuid().ToString("D")
+            let alternateEffect = Guid.NewGuid().ToString("D")
+            let sameAttempt : NativeDispatchCandidate =
+                { c with DispatchId = alternateDispatch; EffectOperationId = alternateEffect }
+            match NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne fresh
+                    (Guid.NewGuid()) sameAttempt with
+            | Error(AccountPolicyNotAuthoritative _) -> ()
+            | other -> failwithf "Lost-ACK restart booked a second copy of candidate: %A" other)
+
+    [<Test>]
+    member _.ForgedNativeStateWithoutMatchingCASReceiptCannotAuthorizeOccupancy() =
+        NativeFixture.withGit (fun f ->
+            NativeReservationFixture.establish f
+                (NativeReservationFixture.limits 2 1)
+                [| NativeReservationFixture.limits 2 1
+                   NativeReservationFixture.limits 2 1 |]
+            NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne
+                (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne)
+                (Guid.NewGuid()) (NativeReservationFixture.worker f 0)
+                |> NativeReservationFixture.success |> ignore
+            NativeFixture.injectAccountFile f "native/scheduler-reservations-v1.json" "{}"
+            |> ignore
+            match NativeSchedulerAccountReservation.readVerifiedDisposable
+                    f.Root f.AccountTwo f.PublicKey f.Subject f.ProjectsTwo
+                    (NativeReservationFixture.coverage f f.AccountTwo f.ProjectsTwo) with
+            | Error(AccountIntegrityError _) -> ()
+            | other -> failwithf "Unreceipted Git native state rewrite was accepted: %A" other)
+
+    [<Test>]
+    member _.SameFrozenReviewerVersionCannotBeRebookedWithRewrittenReviewRef() =
+        NativeFixture.withGit (fun f ->
+            NativeReservationFixture.establish f
+                (NativeReservationFixture.limits 2 2)
+                [| NativeReservationFixture.limits 2 2
+                   NativeReservationFixture.limits 2 2 |]
+            let first = NativeReservationFixture.reviewer f 0
+            NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne
+                (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne)
+                (Guid.NewGuid()) first |> NativeReservationFixture.success |> ignore
+            let rewritten =
+                { first with DispatchId = Guid.NewGuid().ToString("D")
+                             EffectOperationId = Guid.NewGuid().ToString("D")
+                             ClaimOperationId = Guid.NewGuid().ToString("D")
+                             ReviewRef = "refs/heads/jarvis-review/fixture/altered" }
+            match NativeReservationFixture.reserve f f.AccountTwo f.ProjectsTwo
+                    (NativeReservationFixture.coverage f f.AccountTwo f.ProjectsTwo)
+                    (Guid.NewGuid()) rewritten with
+            | Error(AccountPolicyNotAuthoritative _) -> ()
+            | other -> failwithf "Rewritten immutable review source duplicated native slot: %A" other
+            Assert.That((NativeReservationFixture.snapshot f f.AccountOne f.ProjectsOne).Records.Length,
+                        Is.EqualTo(1)))

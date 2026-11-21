@@ -89,6 +89,7 @@
         <Compile Include="Modules\WorkQueueOperatorConversations.fs"/>
         <Compile Include="Modules\NativeSchedulerRosterPolicy.fs"/>
         <Compile Include="Modules\AccountCapacityLedger.fs"/>
+        <Compile Include="Modules\NativeSchedulerAccountReservation.fs"/>
         <Compile Include="Modules\LegacyWriterProtocolFence.fs"/>
         <Compile Include="Modules\LegacyDirectWriterFence.fs"/>
         <Compile Include="Modules\AccountAdmissionAdapter.fs"/>

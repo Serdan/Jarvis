@@ -716,6 +716,9 @@ type LegacyWriterProtocolFenceTests() =
             git checkout [ "add"; "direct-replay-source.txt" ] |> ignore
             git checkout [ "commit"; "-m"; "Accepted replay fixture source" ] |> ignore
             let sourceHead = git checkout [ "rev-parse"; "HEAD" ]
+            // Give the second independent client the source object without
+            // publishing it to the target; completion alone owns that push.
+            git f.ProjectTwo.RepositoryPath [ "fetch"; checkout; sourceHead ] |> ignore
             let targetRef = "refs/heads/main"
             let reviewId = Guid.NewGuid()
             let reviewSubmitId = Guid.NewGuid()

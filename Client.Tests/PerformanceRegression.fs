@@ -76,6 +76,24 @@ let statistics values =
        maxGitStdoutBytes = values |> List.maxBy (fun m -> m.GitStdoutBytes) |> fun m -> m.GitStdoutBytes
        responseBytes = values.Head.ResultBytes |}
 
+// Host metadata is informational only; it must never be used as a latency
+// acceptance threshold or imply Windows parity with a disconnected host.
+let private cpuModel () =
+    try
+        let model =
+            if OperatingSystem.IsLinux() && File.Exists("/proc/cpuinfo") then
+                File.ReadLines("/proc/cpuinfo")
+                |> Seq.tryFind (fun line -> line.StartsWith("model name", StringComparison.OrdinalIgnoreCase))
+                |> Option.map (fun line ->
+                    let separator = line.IndexOf(':')
+                    if separator >= 0 then line.Substring(separator + 1).Trim() else "")
+            else Option.ofObj (Environment.GetEnvironmentVariable("PROCESSOR_IDENTIFIER"))
+        match model with
+        | Some value when not (String.IsNullOrWhiteSpace value) ->
+            value.Substring(0, min value.Length 256)
+        | _ -> "unknown"
+    with _ -> "unknown"
+
 let report sourceSha workload recordCount cold warm mutated samples =
     let index = Environment.GetEnvironmentVariable("JARVIS_PERF_RUN_INDEX")
     let run =
@@ -96,6 +114,7 @@ let report sourceSha workload recordCount cold warm mutated samples =
            os = RuntimeInformation.OSDescription
            architecture = RuntimeInformation.ProcessArchitecture.ToString()
            processorCount = Environment.ProcessorCount
+           cpuModel = cpuModel ()
            fixtureRecords = recordCount
            synthetic = true
            run = run

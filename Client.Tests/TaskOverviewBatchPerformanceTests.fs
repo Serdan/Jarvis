@@ -270,3 +270,83 @@ type TaskOverviewBatchPerformanceTests() =
             match ReviewWorkflow.listProjectTasks reader with
             | Error(InvalidBinding _) -> ()
             | result -> Assert.Fail(sprintf "Invalid linked attempt locator was accepted: %A" result))
+
+    [<TestCase(0, 0)>]
+    [<TestCase(220, 220)>]
+    [<TestCase(2200, 2200)>]
+    member _.ReviewerQueueAndSelectedReadsHaveSourcePinnedBoundedGoldenFixtures(taskCount: int, reviewCount: int) =
+        withFixture taskCount reviewCount (fun checkout reader ->
+            let sampleQueue () =
+                let response, _, metric =
+                    PerformanceRegression.sample
+                        (fun () -> ReviewWorkflow.branchReviewerQueue reader "PerfFixture")
+                        (fun result ->
+                            let snapshot, reviews = ok result
+                            JsonSerializer.Serialize(
+                                {| snapshotCommit = snapshot; reviews = reviews |}, jsonOptions))
+                let snapshot, reviews = ok response
+                Assert.That(metric.GitProcesses, Is.LessThanOrEqualTo(12),
+                            "ReviewerInbox may not start one Git child per review.")
+                Assert.That(metric.RemoteFetches, Is.LessThanOrEqualTo(1))
+                Assert.That(metric.BatchBlobReads, Is.LessThanOrEqualTo(1))
+                Assert.That(metric.SingleBlobReads, Is.LessThanOrEqualTo(1))
+                Assert.That(metric.GitStdoutBytes,
+                            Is.LessThanOrEqualTo(int64 metric.ResultBytes * 32L + 65536L),
+                            "ReviewerInbox Git stdout must stay bounded by its response.")
+                snapshot, reviews, metric
+
+            let originalHead, originalReviews, cold = sampleQueue()
+            Assert.That(originalReviews.Length, Is.EqualTo(reviewCount / 2))
+            let warmHead, warmReviews, warm = sampleQueue()
+            Assert.That(warmHead, Is.EqualTo(originalHead))
+            Assert.That((warmReviews = originalReviews), Is.True)
+
+            if taskCount > 0 then
+                let (result, metrics) =
+                    LedgerStore.measureGitReads
+                        (fun () -> ReviewWorkflow.getTaskWithSpec reader (taskId 1))
+                let _, task, attempt, spec, specOid = ok result
+                Assert.That(task.TaskId, Is.EqualTo(taskId 1))
+                Assert.That(attempt.IsSome, Is.True)
+                Assert.That(spec, Does.Contain("Unrelated spec"))
+                Assert.That(String.IsNullOrWhiteSpace specOid, Is.False)
+                Assert.That(metrics.ProcessStarts, Is.LessThanOrEqualTo(16),
+                            "GetTaskWithSpec must have a fixed Git budget independent of task population.")
+                Assert.That(metrics.RemoteFetches, Is.LessThanOrEqualTo(1))
+                // ReviewDetails pinned entity path and integrity are exercised
+                // without inspecting live Git review refs or history.
+                let pinned = LedgerStore.fetch reader |> ok
+                let review = ReviewWorkflow.getBranchReviewAt reader pinned
+                                 (taskId 1) (Guid.ParseExact(reviewId 1, "N"))
+                Assert.That((ok review).ReviewId, Is.EqualTo(reviewId 1))
+
+            // An unrelated canonical head advance must not reuse stale
+            // membership or introduce per-record Git subprocesses.
+            if taskCount > 0 then
+                put checkout (taskPath 1) (taskContent 1 "Advanced title" (attemptId 1))
+            else
+                put checkout "synthetic-advance.txt" "unrelated snapshot advance"
+            commitAndPublish checkout
+            let advancedHead, advancedReviews, advanced = sampleQueue()
+            Assert.That(advancedHead, Is.Not.EqualTo(originalHead))
+            Assert.That((advancedReviews = originalReviews), Is.True)
+            let warmSamples =
+                [ for _ in 1 .. 30 do
+                    let _, reviews, metric = sampleQueue()
+                    Assert.That((reviews = advancedReviews), Is.True)
+                    metric ]
+            // The SHA refers to the actual compiled source checkout; the
+            // fixture snapshot is separately emitted as a stable golden pin.
+            let sourceCheckout = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../.."))
+            let sourceSha = git sourceCheckout [ "rev-parse"; "HEAD" ]
+            let report =
+                PerformanceRegression.report sourceSha "reviewer-queue"
+                    taskCount cold warm advanced warmSamples
+            TestContext.Progress.WriteLine(
+                JsonSerializer.Serialize(
+                    {| sourceSha = sourceSha
+                       fixtureHeadBefore = originalHead
+                       fixtureHeadAfter = advancedHead
+                       reportPath = Path.GetFileName(report)
+                       taskCount = taskCount
+                       reviewCount = reviewCount |}, jsonOptions)))

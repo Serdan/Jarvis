@@ -864,7 +864,7 @@ module McpToolHelpers =
             result.Content.Add(textContent $"Jarvis taskId: {taskId} (generated; use this ID for subsequent task operations).")
             result
 
-    let sendWithSourceOperationId (sourceOriginalId: string option) (manualCredential: string) (client: ClientService) (http: IHttpContextAccessor) command =
+    let private sendWithSourceOperationIdCore (sourceOriginalId: string option) (manualCredential: string) (client: ClientService) (http: IHttpContextAccessor) command =
         task {
             match Option.ofObj http.HttpContext with
             | None ->
@@ -1119,6 +1119,38 @@ module McpToolHelpers =
                     | _ -> return authorizationErrorResult context Auth.WorkspaceRead
                 | None ->
                     return authenticationErrorResult context (Some(String.concat " " scopes))
+        }
+
+    // Intentionally spans authorization, server dispatch and final MCP
+    // materialization; subtract the existing correlated server/SignalR stages
+    // rather than mislabeling it as network RTT or client-only execution.
+    let sendWithSourceOperationId (sourceOriginalId: string option) (manualCredential: string)
+                                  (client: ClientService) (http: IHttpContextAccessor) command =
+        task {
+            let started = Stopwatch.GetTimestamp()
+            let! result = sendWithSourceOperationIdCore sourceOriginalId manualCredential client http command
+            if String.Equals(Environment.GetEnvironmentVariable("JARVIS_MCP_STAGE_TRACE"),
+                             "1", StringComparison.Ordinal) then
+                try
+                    match Option.ofObj http.HttpContext with
+                    | Some context ->
+                        let correlation =
+                            if context.Items.ContainsKey("jarvis/mcp/correlation") then
+                                match context.Items["jarvis/mcp/correlation"] with
+                                | :? string as raw ->
+                                    match Guid.TryParse raw with
+                                    | true, id -> id.ToString("D")
+                                    | _ -> "none"
+                                | _ -> "none"
+                            else "none"
+                        let factory = context.RequestServices.GetService<ILoggerFactory>()
+                        if not (isNull factory) then
+                            factory.CreateLogger("Jarvis.McpEnvelope").LogInformation(
+                                "MCP envelope {CorrelationId}: fullRequestMs={FullRequestMs:F1}",
+                                correlation, Stopwatch.GetElapsedTime(started).TotalMilliseconds)
+                    | None -> ()
+                with _ -> ()
+            return result
         }
 
     // Existing MCP routes intentionally transport NO source identity.

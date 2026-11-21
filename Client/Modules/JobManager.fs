@@ -7,6 +7,7 @@ open System.IO
 open System.Threading
 open System.Threading.Tasks
 open System.Text
+open System.Text.Json
 open Common
 open Client.Effect
 open Client.IO
@@ -183,6 +184,7 @@ module private Core =
                     proc.Dispose()
                     Error(Client.ContextError "Failed to register job.")
                 else
+                    let mutable processStarted = false
                     try
                         if not (proc.Start()) then
                             let mutable removed = Unchecked.defaultof<JobRecord>
@@ -190,6 +192,7 @@ module private Core =
                             proc.Dispose()
                             Error(Client.ContextError "Failed to start job.")
                         else
+                            processStarted <- true
                             proc.BeginOutputReadLine()
                             proc.BeginErrorReadLine()
                             // Only an explicitly supplied command deadline can terminate a job.
@@ -213,11 +216,19 @@ module private Core =
                             | _ -> ()
                             Ok { JobId = jobId; StartedAt = job.StartedAt }
                     with ex ->
-                        let mutable removed = Unchecked.defaultof<JobRecord>
-                        jobs.TryRemove(jobId, &removed) |> ignore
-                        deadlineCancellation |> Option.iter (fun cancel -> cancel.Cancel())
-                        proc.Dispose()
-                        Error(ExceptionError ex)
+                        if processStarted then
+                            // The process has already been admitted and may have
+                            // executed an external effect. Preserve its job
+                            // handle for inspection/cancellation; never report
+                            // a definite spawn failure or permit safe replay.
+                            Error(Client.ProcessOutcomeUnknown
+                                (sprintf "Post-start process setup failed for job %s: %s" jobId (ex.GetType().Name)))
+                        else
+                            let mutable removed = Unchecked.defaultof<JobRecord>
+                            jobs.TryRemove(jobId, &removed) |> ignore
+                            deadlineCancellation |> Option.iter (fun cancel -> cancel.Cancel())
+                            proc.Dispose()
+                            Error(ExceptionError ex)
         with ex ->
             Error(ExceptionError ex)
 
@@ -286,7 +297,7 @@ module private Core =
                     fun _ ->
                         match jobs.TryGetValue started.JobId with
                         | false, _ ->
-                            Error(Client.ContextError "Started process job unavailable; process outcome is unknown.")
+                            Error(Client.ProcessOutcomeUnknown "Started process job unavailable; process outcome is unknown.")
                         | true, job ->
                             job.Completion.Task.Wait(commandResponseWindow) |> ignore
                             Ok(commandResult job)
@@ -800,9 +811,9 @@ let awaitScheduledCommandTerminal projectName (initial: RunCommandResult) deadli
         return Ok(FailedToStart "The managed process could not start.", initial.Truncated)
     | "Running" ->
         match initial.JobId with
-        | None -> return Error "OutcomeUnknown: running command has no process job ID"
+        | None -> return Error(Client.ProcessOutcomeUnknown "running command has no process job ID")
         | Some jobId when String.IsNullOrWhiteSpace jobId ->
-            return Error "OutcomeUnknown: running command has an empty process job ID"
+            return Error(Client.ProcessOutcomeUnknown "running command has an empty process job ID")
         | Some jobId ->
             // The schedule supplies an explicit process deadline. Leave a
             // bounded grace interval for the kill/exit event to be observed.
@@ -810,24 +821,98 @@ let awaitScheduledCommandTerminal projectName (initial: RunCommandResult) deadli
             // failed; an uncertain process may still be running.
             let maxWait = TimeSpan.FromSeconds(float (max 1 deadlineSeconds) + 30.)
             let clock = Stopwatch.StartNew()
-            let mutable outcome : Result<JobStatus * bool, string> option = None
+            let mutable outcome : Result<JobStatus * bool, Client.EffectError> option = None
             while outcome.IsNone && clock.Elapsed < maxWait do
                 match getJobResult { ProjectName = projectName; JobId = jobId; AfterSequence = None } rt with
                 | Error error ->
-                    outcome <- Some(Error(sprintf "OutcomeUnknown: process job %s cannot be read: %A" jobId error))
+                    outcome <- Some(Error(Client.ProcessOutcomeUnknown (sprintf "process job %s cannot be read: %A" jobId error)))
                 | Ok result ->
                     match result.Status with
                     | Running -> do! Task.Delay(100)
                     | Completed _ | TimedOut | Canceled | FailedToStart _ ->
                         outcome <- Some(Ok(result.Status, result.Truncated))
                     | unexpected ->
-                        outcome <- Some(Error(sprintf "OutcomeUnknown: non-process job status %A for %s" unexpected jobId))
+                        outcome <- Some(Error(Client.ProcessOutcomeUnknown (sprintf "non-process job status %A for %s" unexpected jobId)))
             return outcome |> Option.defaultValue
-                (Error(sprintf "OutcomeUnknown: no terminal process status for %s within bounded wait" jobId))
+                (Error(Client.ProcessOutcomeUnknown (sprintf "no terminal process status for %s within bounded wait" jobId)))
     | unexpected ->
-        return Error(sprintf "OutcomeUnknown: unexpected managed command status %s" unexpected)
+        return Error(Client.ProcessOutcomeUnknown (sprintf "unexpected managed command status %s" unexpected))
 }
 
+let executeScheduledRunCommand
+    (receiveCommand: RunCommandCommand -> Task<Client.Result<string>>)
+    (awaitTerminal: string -> RunCommandResult -> int -> Task<Result<JobStatus * bool, Client.EffectError>>)
+    (command: RunCommandCommand) : Task<Result<string, string * string>> =
+    task {
+        let! commandResult =
+            task {
+                try
+                    return! receiveCommand command
+                with ex ->
+                    return Error(Client.ProcessOutcomeUnknown
+                        ("run_command dispatch did not yield a response: " + ex.GetType().Name))
+            }
+
+        match commandResult with
+        | Error (Client.ProcessOutcomeUnknown reason) ->
+            return Error("", "OutcomeUnknown: " + reason)
+        | Error (Client.ExceptionError ex) ->
+            return Error("", "CommandSpawnFailed: " + ex.Message)
+        | Error error ->
+            return Error("", sprintf "%A" error)
+        | Ok responseJson ->
+            try
+                let initial = JsonSerializer.Deserialize<RunCommandResult>(responseJson)
+                if isNull (box initial) then
+                    return Error("", "OutcomeUnknown: empty run_command response")
+                else
+                    let timeoutSeconds = command.TimeoutSeconds |> Option.defaultValue 120
+                    let! terminal =
+                        task {
+                            try
+                                return! awaitTerminal command.ProjectName initial timeoutSeconds
+                            with ex ->
+                                return Error(Client.ProcessOutcomeUnknown
+                                    ("terminal process status could not be established: " + ex.GetType().Name))
+                        }
+
+                    let unknownSummary () =
+                        JsonSerializer.Serialize(
+                            {| jobId = initial.JobId |> Option.defaultValue ""
+                               processStatus = "Unknown"; exitCode = -1
+                               timedOut = false; truncated = initial.Truncated |})
+
+                    match terminal with
+                    | Error (Client.ProcessOutcomeUnknown reason) ->
+                        return Error(unknownSummary (), "OutcomeUnknown: " + reason)
+                    | Error error ->
+                        return Error(unknownSummary (),
+                            "OutcomeUnknown: terminal process status could not be established: " + sprintf "%A" error)
+                    | Ok(status, truncated) ->
+                        let processStatus, exitCode =
+                            match status with
+                            | JobStatus.Completed code -> "Completed", code
+                            | JobStatus.TimedOut -> "TimedOut", -1
+                            | JobStatus.Canceled -> "Canceled", -1
+                            | JobStatus.FailedToStart _ -> "FailedToStart", -1
+                            | _ -> "Unknown", -1
+                        let summary =
+                            JsonSerializer.Serialize(
+                                {| jobId = initial.JobId |> Option.defaultValue ""
+                                   processStatus = processStatus; exitCode = exitCode
+                                   timedOut = (status = JobStatus.TimedOut)
+                                   truncated = truncated |})
+                        match status with
+                        | JobStatus.Completed 0 -> return Ok summary
+                        | JobStatus.Completed _ -> return Error(summary, "CommandFailed")
+                        | JobStatus.TimedOut -> return Error(summary, "CommandTimedOut")
+                        | JobStatus.Canceled -> return Error(summary, "CommandCanceled")
+                        | JobStatus.FailedToStart reason ->
+                            return Error(summary, "CommandSpawnFailed: " + reason)
+                        | _ -> return Error(summary, "OutcomeUnknown: unexpected terminal job status")
+            with :? JsonException ->
+                return Error("", "OutcomeUnknown: malformed run_command response")
+    }
 let cancelJobForProjectAsAgent (canonical: ProjectPaths.ProjectId option) actor (cmd: CancelJobCommand) =
     fun rt ->
         match ToolOperations.cancel canonical actor cmd.JobId with

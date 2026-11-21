@@ -11,6 +11,7 @@ module EffectError =
         | GenericError message -> $"GenericError: {message}"
         | ValidationError message -> $"ValidationError: {message}"
         | ContextError message -> $"ContextError: {message}"
+        | ProcessOutcomeUnknown message -> $"OutcomeUnknown: {message}"
         | NotFoundError resource -> $"NotFoundError: {resource} not found"
         | PermissionDenied resource -> $"PermissionDenied: Access denied to {resource}"
         | ConfirmationRequired request -> $"ConfirmationRequired: {request.Summary}"
@@ -25,6 +26,7 @@ module EffectError =
         | GenericError message -> Common.AgentError.ExecutionFailed message
         | ValidationError message -> Common.AgentError.ValidationFailed message
         | ContextError message -> Common.AgentError.ExecutionFailed message
+        | ProcessOutcomeUnknown message -> Common.AgentError.ExecutionFailed ($"OutcomeUnknown: {message}")
         | NotFoundError resource -> Common.AgentError.NotFound resource
         | PermissionDenied resource -> Common.AgentError.PermissionDenied resource
         | ConfirmationRequired request -> Common.AgentError.ConfirmationRequired request

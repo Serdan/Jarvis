@@ -206,54 +206,10 @@ let private runClient args =
                                      else Some action.WorkingDirectory
                   TimeoutSeconds = Some action.TimeoutSeconds
                   MaxOutputBytes = Some action.MaxOutputBytes }
-            // Preserve normal run_command permission prompts, TUI activity,
-            // source-path checks and audit rather than executing an untracked process.
-            let! commandResult = Client.receiveCommand rt (RunCommandCommand cmd)
-            match commandResult with
-            | Error error -> return Error("", sprintf "%A" error)
-            | Ok responseJson ->
-                try
-                    let initial = JsonSerializer.Deserialize<RunCommandResult>(responseJson)
-                    if isNull (box initial) then
-                        return Error("", "OutcomeUnknown: empty run_command response")
-                    else
-                        // A Running response is only the short RPC response
-                        // threshold. Poll that exact managed process job; never
-                        // launch a second command or infer failure from exit=-1.
-                        let! terminal =
-                            JobManager.awaitScheduledCommandTerminal
-                                action.ProjectName initial action.TimeoutSeconds rt
-                        match terminal with
-                        | Error uncertain ->
-                            let summary = JsonSerializer.Serialize(
-                                {| jobId = initial.JobId |> Option.defaultValue ""
-                                   processStatus = "Unknown"; exitCode = -1
-                                   timedOut = false; truncated = initial.Truncated |})
-                            return Error(summary, uncertain)
-                        | Ok(status, truncated) ->
-                            let processStatus, exitCode =
-                                match status with
-                                | JobStatus.Completed code -> "Completed", code
-                                | JobStatus.TimedOut -> "TimedOut", -1
-                                | JobStatus.Canceled -> "Canceled", -1
-                                | JobStatus.FailedToStart _ -> "FailedToStart", -1
-                                | _ -> "Unknown", -1
-                            let summary = JsonSerializer.Serialize(
-                                {| jobId = initial.JobId |> Option.defaultValue ""
-                                   processStatus = processStatus; exitCode = exitCode
-                                   timedOut = (status = JobStatus.TimedOut)
-                                   truncated = truncated |})
-                            match status with
-                            | JobStatus.Completed 0 -> return Ok summary
-                            | JobStatus.Completed _ -> return Error(summary, "CommandFailed")
-                            | JobStatus.TimedOut -> return Error(summary, "CommandTimedOut")
-                            | JobStatus.Canceled -> return Error(summary, "CommandCanceled")
-                            | JobStatus.FailedToStart reason ->
-                                return Error(summary, "CommandSpawnFailed: " + reason)
-                            | _ -> return Error(summary, "OutcomeUnknown: unexpected terminal job status")
-                with :? JsonException ->
-                    // The process may have executed; no automatic replay.
-                    return Error("", "OutcomeUnknown: malformed run_command response")
+            return! JobManager.executeScheduledRunCommand
+                (fun command -> Client.receiveCommand rt (RunCommandCommand command))
+                (fun project initial timeout -> JobManager.awaitScheduledCommandTerminal project initial timeout rt)
+                cmd
         else
             let authCommand =
                 BrowserRunInNewTabCommand

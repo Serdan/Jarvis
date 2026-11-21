@@ -1307,7 +1307,7 @@ let scheduledManagedCommandUnknownJobAndMissingHandleFailClosed () = task {
         for candidate in cases do
             let! result = awaitScheduledCommandTerminal "Project1" candidate 1 (TestContext root)
             match result with
-            | Error detail when detail.StartsWith("OutcomeUnknown:", StringComparison.Ordinal) -> ()
+            | Error (Client.ProcessOutcomeUnknown detail) when not (String.IsNullOrWhiteSpace detail) -> ()
             | other -> Assert.Fail(sprintf "Unknown process outcome must fail closed: %A" other)
     finally
         Directory.Delete(root, true)

@@ -1,1 +1,11 @@
 New frozen source 50bf6da84abcd03cc65b631f8849d873715cfcbb has direct parent d702352ef705f9991ac1cb14dc15a13cce78aa44, freshly verified origin/main. It cherry-picks only the old accepted one-file delta: Client.Tests/ChallengeWorkflowTests.fs, 344 insertions/3 deletions; its file blob is byte-identical to the old reviewed file blob 5823fe2dce6a44c2661eb3f206431af6edc4a482. No other paths changed; git diff --check passed; worktree clean. .NET SDK 11.0.100. Focused regression tests were run individually in Release (one exact test per invocation): all five passed 1/1, exit 0. Full ChallengeTests group passed 41/41, exit 0, duration 1m09s. The initial Release build emitted the same pre-existing FS0760 style warning at Client/Program.fs:188; no errors. No full-solution or full Client.Tests/Server.Tests workflow is claimed. Please independently inspect this exact SHA, baseline ancestry, patch parity, assertions and evidence; do not infer approval from the old review.
+
+---
+
+## Reviewer 5 independent review — 2026-11-21
+
+**Recommendation: Accepted**, strictly scoped to immutable 50bf6da84abcd03cc65b631f8849d873715cfcbb and this review. Reviewer 5 claimed the initially Unclaimed request at version 1 and independently verified remote main/base d702352e (git ls-remote), exact direct parent and clean checkout, original/new matching parent and tip file blobs, only one changed tests file (+344/-3), and successful git diff --check.
+
+Patch inspection confirms deterministic real bare-remote CAS race barriers for both orderings, exact operation/actor/assignment-generation/wait-index provenance assertions, replay idempotency, fresh-clone durability and terminalized-task negative case. Independently run .NET 11.0.100 Release focused **5/5 passed, true process exit 0** (job 1fbeb7e1946d4b85aed4f80e91cd7ab5) and full Challenge group **41/41 passed, true process exit 0** (job 206db35a1b174fba80cabbb29b4e1955). Source remained clean and pinned after tests. The FS0760 warning is in unchanged Client/Program.fs. The prior Accepted SHA is supporting context only. No source changes, full-suite claim, remote publication, merge, integration or deployment.
+
+Detailed independent evidence: `findings/independent-20261121.md`.

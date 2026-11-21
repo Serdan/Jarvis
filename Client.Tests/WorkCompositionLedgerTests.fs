@@ -152,9 +152,17 @@ let ``composition acceptance requires exact independently reviewed and integrate
             submissionId "" "" (reviewId.ToString("N")) targetRef |> succeed |> ignore
 
         // A review accepted by its own author is not independent acceptance.
+        // Give the self-reviewed submission its own frozen descendant source
+        // so BOTH receipts must perform actual independently attributed
+        // non-force publications, rather than repeating an external push.
+        File.WriteAllText(Path.Combine(first.RepositoryPath, "self-review.txt"),
+                          "Author-only review does not qualify as independent acceptance")
+        git first.RepositoryPath [ "add"; "self-review.txt" ] |> ignore
+        git first.RepositoryPath [ "commit"; "-m"; "Distinct self-reviewed source" ] |> ignore
+        let selfReviewSha = git first.RepositoryPath [ "rev-parse"; "HEAD" ]
         let selfReviewId = Guid.NewGuid()
         ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId owner
-            selfReviewId sourceRef acceptedSha "Self-reviewed project"
+            selfReviewId sourceRef selfReviewSha "Self-reviewed project"
             purpose targetRef |> succeed |> ignore
         ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId selfReviewId owner 1
         |> succeed |> ignore
@@ -170,13 +178,14 @@ let ``composition acceptance requires exact independently reviewed and integrate
         | Error(InvalidBinding _) -> ()
         | other -> Assert.Fail(sprintf "Expected pending-integration rejection: %A" other)
 
+        // Prepare local source checkout, without advancing remote main.
+        // CompleteIntegration owns both actual fast-forward non-force pushes.
         git first.RepositoryPath [ "checkout"; "main" ] |> ignore
-        git first.RepositoryPath [ "merge"; "--ff-only"; acceptedSha ] |> ignore
-        git first.RepositoryPath [ "push"; "origin"; "main" ] |> ignore
+        git first.RepositoryPath [ "merge"; "--ff-only"; selfReviewSha ] |> ignore
         ReviewWorkflow.completeIntegration second (Guid.NewGuid()) taskId reviewer
             submissionId acceptedSha |> succeed |> ignore
         ReviewWorkflow.completeIntegration second (Guid.NewGuid()) taskId reviewer
-            selfSubmissionId acceptedSha |> succeed |> ignore
+            selfSubmissionId selfReviewSha |> succeed |> ignore
         match WorkCompositionAcceptanceAdapter.acceptIntegrated second owner
                   (Guid.NewGuid()) initial.Version "project" 1 selfSubmissionId with
         | Error(InvalidBinding _) -> ()
@@ -239,7 +248,7 @@ let ``composition acceptance requires exact independently reviewed and integrate
         |> succeed |> ignore
         git first.RepositoryPath [ "checkout"; "main" ] |> ignore
         git first.RepositoryPath [ "merge"; "--ff-only"; correctionSha ] |> ignore
-        git first.RepositoryPath [ "push"; "origin"; "main" ] |> ignore
+        // Deliberately leave bare remote unchanged until trusted publisher.
         ReviewWorkflow.completeIntegration second (Guid.NewGuid()) correctionTaskId reviewer
             correctionSubmissionId correctionSha |> succeed |> ignore
         WorkCompositionAcceptanceAdapter.acceptIntegrated second owner (Guid.NewGuid())
@@ -257,9 +266,18 @@ let ``composition acceptance requires exact independently reviewed and integrate
         let freshPurpose =
             WorkCompositionAcceptanceAdapter.reviewPurpose
                 withAcceptedChild withAcceptedChild.Units.["project"]
+        // Parent acceptance needs a fresh reviewed outcome after child
+        // integration. An already published child's exact SHA is NOT a new
+        // non-force publication and must not be rubber-stamped as one.
+        git first.RepositoryPath [ "checkout"; "feature/composition-correction" ] |> ignore
+        File.WriteAllText(Path.Combine(first.RepositoryPath, "parent-verification.txt"),
+                          "New independently reviewed composed parent outcome")
+        git first.RepositoryPath [ "add"; "parent-verification.txt" ] |> ignore
+        git first.RepositoryPath [ "commit"; "-m"; "Fresh composed parent outcome" ] |> ignore
+        let freshSha = git first.RepositoryPath [ "rev-parse"; "HEAD" ]
         let freshReviewId = Guid.NewGuid()
         ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId owner
-            freshReviewId correctionRef correctionSha "Validate composed project outcome"
+            freshReviewId correctionRef freshSha "Validate composed project outcome"
             freshPurpose targetRef |> succeed |> ignore
         ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId
             freshReviewId reviewer 1 |> succeed |> ignore
@@ -270,7 +288,7 @@ let ``composition acceptance requires exact independently reviewed and integrate
             freshSubmissionId "" "" (freshReviewId.ToString("N")) targetRef
         |> succeed |> ignore
         ReviewWorkflow.completeIntegration second (Guid.NewGuid()) taskId reviewer
-            freshSubmissionId correctionSha |> succeed |> ignore
+            freshSubmissionId freshSha |> succeed |> ignore
         WorkCompositionAcceptanceAdapter.acceptIntegrated first owner (Guid.NewGuid())
             withAcceptedChild.Version "project" 1 freshSubmissionId |> succeed |> ignore
         let _, refreshed = WorkCompositionGitLedger.load second |> succeed

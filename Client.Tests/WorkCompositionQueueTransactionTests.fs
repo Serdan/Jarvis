@@ -175,9 +175,10 @@ type WorkCompositionQueueTransactionTests() =
         ReviewWorkflow.submitIntegration b (Guid.NewGuid()) "child-validation" "Owner"
             submission "" "" (reviewId.ToString("N")) target
         |> ok |> ignore
+        // The bounded CompleteIntegration publisher must own the actual
+        // non-force target transition. No fixture pre-push is admissible.
         git a.RepositoryPath [ "checkout"; "main" ] |> ignore
         git a.RepositoryPath [ "merge"; "--ff-only"; sha ] |> ignore
-        git a.RepositoryPath [ "push"; "origin"; "main" ] |> ignore
         ReviewWorkflow.completeIntegration b (Guid.NewGuid()) "child-validation"
             "Reviewer" submission sha |> ok |> ignore
         submission

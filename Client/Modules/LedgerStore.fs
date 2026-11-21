@@ -227,6 +227,73 @@ module LedgerStore =
               OutputBytes = scope.OutputBytes }
         finally activeGitReadMetrics.Value <- previous
 
+    // Opt-in, source-exact mutation diagnostics. No additional Git commands
+    // are activated outside this scope. Time is attributed only to outer
+    // withPhase regions; planner-only Git process counts are "unscoped".
+    type MutationPhaseMeasurement =
+        { Phase: string
+          ElapsedMilliseconds: double
+          ProcessStarts: int
+          RemoteFetches: int
+          RemotePushes: int
+          CommitTrees: int
+          BlobLookups: int
+          StandardOutputBytes: int64 }
+
+    type MutationStageMeasurement =
+        { TotalElapsedMilliseconds: double
+          Phases: MutationPhaseMeasurement list }
+
+    [<AllowNullLiteral>]
+    type private MutableMutationPhase() =
+        member val ElapsedMilliseconds = 0. with get, set
+        member val ProcessStarts = 0 with get, set
+        member val RemoteFetches = 0 with get, set
+        member val RemotePushes = 0 with get, set
+        member val CommitTrees = 0 with get, set
+        member val BlobLookups = 0 with get, set
+        member val StandardOutputBytes = 0L with get, set
+
+    [<AllowNullLiteral>]
+    type private MutationStageScope() =
+        let phases =
+            System.Collections.Generic.Dictionary<string, MutableMutationPhase>(StringComparer.Ordinal)
+        member _.ForPhase(name: string) =
+            match phases.TryGetValue(name) with
+            | true, phase -> phase
+            | false, _ ->
+                let phase = MutableMutationPhase()
+                phases.Add(name, phase)
+                phase
+        member _.Snapshot() =
+            phases
+            |> Seq.map (fun kv ->
+                { Phase = kv.Key
+                  ElapsedMilliseconds = kv.Value.ElapsedMilliseconds
+                  ProcessStarts = kv.Value.ProcessStarts
+                  RemoteFetches = kv.Value.RemoteFetches
+                  RemotePushes = kv.Value.RemotePushes
+                  CommitTrees = kv.Value.CommitTrees
+                  BlobLookups = kv.Value.BlobLookups
+                  StandardOutputBytes = kv.Value.StandardOutputBytes })
+            |> Seq.sortBy (fun phase -> phase.Phase)
+            |> Seq.toList
+
+    let private activeMutationStages = System.Threading.AsyncLocal<MutationStageScope>()
+
+    let measureMutationStages operation =
+        let previous = activeMutationStages.Value
+        let scope = MutationStageScope()
+        activeMutationStages.Value <- scope
+        let clock = Stopwatch.StartNew()
+        try
+            let outcome = operation ()
+            clock.Stop()
+            outcome,
+            { TotalElapsedMilliseconds = clock.Elapsed.TotalMilliseconds
+              Phases = scope.Snapshot() }
+        finally activeMutationStages.Value <- previous
+
     // Track whether the CURRENT invocation attempted to publish any remote
     // Git ref. Rejections before a publication can be definitive; once a
     // push was attempted, its eventual outcome may be unknown. Scoping this
@@ -283,10 +350,19 @@ module LedgerStore =
         let scope = activeTransportScope.Value
         let previousPhase = activeGitPhase.Value
         let previousScopePhase = if isNull scope then "" else scope.Phase
+        let mutationScope = activeMutationStages.Value
+        // Remote fetch retries run inside the enclosing transaction phase.
+        // Only the top-level phase owns elapsed time, never its nested probes.
+        let timed = not (isNull mutationScope) && String.IsNullOrEmpty previousPhase
+        let started = if timed then Stopwatch.GetTimestamp() else 0L
         activeGitPhase.Value <- phase
         if not (isNull scope) then scope.Phase <- phase
         try action ()
         finally
+            if timed then
+                let bucket = mutationScope.ForPhase(phase)
+                bucket.ElapsedMilliseconds <-
+                    bucket.ElapsedMilliseconds + Stopwatch.GetElapsedTime(started).TotalMilliseconds
             if not (isNull scope) then scope.Phase <- previousScopePhase
             activeGitPhase.Value <- previousPhase
 
@@ -427,6 +503,22 @@ module LedgerStore =
             | "show" :: _ -> measured.IndividualBlobReads <- measured.IndividualBlobReads + 1
             | "cat-file" :: "--batch" :: _ -> measured.BatchBlobReads <- measured.BatchBlobReads + 1
             | _ -> ()
+        let mutationScope = activeMutationStages.Value
+        let mutationBucket =
+            if isNull mutationScope then null
+            else
+                mutationScope.ForPhase(
+                    if String.IsNullOrEmpty activeGitPhase.Value then "unscoped"
+                    else activeGitPhase.Value)
+        if not (isNull mutationBucket) then
+            mutationBucket.ProcessStarts <- mutationBucket.ProcessStarts + 1
+            match args with
+            | "fetch" :: _ -> mutationBucket.RemoteFetches <- mutationBucket.RemoteFetches + 1
+            | "push" :: _ -> mutationBucket.RemotePushes <- mutationBucket.RemotePushes + 1
+            | "commit-tree" :: _ -> mutationBucket.CommitTrees <- mutationBucket.CommitTrees + 1
+            | ("show" | "ls-tree" | "cat-file") :: _ ->
+                mutationBucket.BlobLookups <- mutationBucket.BlobLookups + 1
+            | _ -> ()
         let injected = activeGitFault.Value
         let fault =
             if isNull (box injected) then None
@@ -467,6 +559,9 @@ module LedgerStore =
                 | Ok output ->
                     if not (isNull measured) then
                         measured.OutputBytes <- measured.OutputBytes + int64 (encoding.GetByteCount output.StdOut)
+                    if not (isNull mutationBucket) then
+                        mutationBucket.StandardOutputBytes <-
+                            mutationBucket.StandardOutputBytes + int64 (encoding.GetByteCount output.StdOut)
                     Ok
                         { ExitCode = output.ExitCode
                           Stdout = if preserveStdout then output.StdOut else output.StdOut.TrimEnd('\n', '\r')
@@ -476,6 +571,7 @@ module LedgerStore =
     let private gitRaw repo args = execute repo args None [] true
     let private gitInput repo args input = execute repo args (Some input) [] false
     let private gitIndex repo index args = execute repo args None [ "GIT_INDEX_FILE", index ] false
+    let private gitIndexInput repo index args input = execute repo args (Some input) [ "GIT_INDEX_FILE", index ] false
 
     // Remote probes are read-only. A retry cannot publish an intent, and each
     // child is bounded by the remaining wall-clock budget. Publication pushes
@@ -821,20 +917,26 @@ module LedgerStore =
             | Error error -> Error error
             | Ok _ ->
                 let mutable failed = None
+                // One isolated index update for all exact blob OIDs. NUL
+                // delimiters prevent a path from changing index-info framing;
+                // a failed batch never reaches write-tree or publication.
+                let entries = StringBuilder()
                 for (path, content) in files do
                     if failed.IsNone then
                         match hashBlob repo content with
                         | Error error -> failed <- Some error
                         | Ok blobOid ->
-                            let updated = gitIndex repo index [ "update-index"; "--add"; "--cacheinfo"; $"100644,{blobOid},{path}" ]
-                            match requireSuccess "update-index" updated with
-                            | Error error -> failed <- Some error
-                            | Ok _ -> ()
+                            entries.Append("100644 ").Append(blobOid).Append(char 9).Append(path).Append(char 0)
+                            |> ignore
                 match failed with
                 | Some error -> Error error
                 | None ->
-                    gitIndex repo index [ "write-tree" ]
-                    |> requireSuccess "write-tree"
+                    match gitIndexInput repo index [ "update-index"; "-z"; "--index-info" ]
+                            (entries.ToString()) |> requireSuccess "update-index" with
+                    | Error error -> Error error
+                    | Ok _ ->
+                        gitIndex repo index [ "write-tree" ]
+                        |> requireSuccess "write-tree"
         finally
             if File.Exists index then File.Delete index
 

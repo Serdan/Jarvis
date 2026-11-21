@@ -598,6 +598,7 @@ type NativeSchedulerRosterPolicyTests() =
             Assert.That(observed.LaunchAuthorized, Is.False))
 
 open Client.NativeSchedulerAccountReservation
+open Client.ReviewWorkflow
 
 module private NativeReservationFixture =
     let success = NativeFixture.success
@@ -618,33 +619,126 @@ module private NativeReservationFixture =
           ObservedAtUtc = DateTimeOffset.UtcNow
           Complete = true }
 
+    let private json value =
+        JsonSerializer.Serialize(value,
+            JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase))
+
+    // Positive candidates are issued as actual immutable project-ledger
+    // task/attempt or independent claimed-review records, never random IDs.
     let worker f projectIndex =
         let p = f.ProjectsOne[projectIndex]
+        let head = (LedgerStore.fetch p |> success).Commit
+        let taskId = "native-fixture-" + Guid.NewGuid().ToString("N")
+        let attemptId = Guid.NewGuid().ToString("N")
+        let sourceRef = "refs/heads/fixture-isolated"
+        let spec = "<h1>Native disposable Worker issuer</h1>"
+        let specOid = LedgerStore.computeBlobOid p spec |> success
+        let task: ReviewTask =
+            { TaskId = taskId; Title = "Native disposable Worker issuer"
+              Version = 2; Lifecycle = "InProgress"; SpecVersion = 1
+              AttemptId = attemptId }
+        let attempt: ReviewAttempt =
+            { TaskId = taskId; AttemptId = attemptId; Version = 3
+              OwnerAgentId = "Worker 4"; Phase = "Started"
+              AssignmentGeneration = 1; Priority = 0; IssuedSequence = 1L
+              SpecBlobOid = specOid; BaseCommit = head
+              TargetRef = "refs/heads/main"
+              SourceRepositoryId = String.replicate 64 "a"
+              SourceRemote = p.ApprovedFetchUrl; SourcePushRemote = p.ApprovedPushUrl
+              SourceRef = sourceRef }
+        let attemptRaw = json attempt
+        let changes =
+            [ { Path = $"tasks/{taskId}/task.json"; ExpectedBlobOid = None
+                Content = json task }
+              { Path = $"tasks/{taskId}/spec.html"; ExpectedBlobOid = None
+                Content = spec }
+              { Path = $"tasks/{taskId}/attempts/{attemptId}.json"; ExpectedBlobOid = None
+                Content = attemptRaw } ]
+        LedgerStore.transact p
+            { OperationId = Guid.NewGuid(); Actor = "Native disposable project issuer"
+              Kind = "NativeWorkerIssued"; RequestJson = json {| taskId = taskId; attemptId = attemptId |} }
+            (fun _ -> Ok changes)
+        |> success |> ignore
         { DispatchId = Guid.NewGuid().ToString("D")
           EffectOperationId = Guid.NewGuid().ToString("D")
           Kind = "Worker"
           ProjectId = p.ProjectId.ToString("D")
           ProjectLedgerId = p.LedgerId.ToString("D")
           ProjectEpoch = p.Epoch
-          OwnerAgentId = "Worker 4"
-          TaskId = "fixture-ready-worker"
-          AttemptId = Guid.NewGuid().ToString("D")
-          AssignmentGeneration = 1L
-          SourceRepositoryId = String.replicate 64 "a"
-          SourceBaseOid = f.InitialSourceHead
-          SourceRef = "refs/heads/fixture-isolated"
-          SourceLeaseSha256 = String.replicate 64 "b"
+          OwnerAgentId = attempt.OwnerAgentId
+          TaskId = taskId
+          AttemptId = attemptId
+          AssignmentGeneration = int64 attempt.AssignmentGeneration
+          SourceRepositoryId = attempt.SourceRepositoryId
+          SourceBaseOid = head
+          SourceRef = sourceRef
+          SourceLeaseSha256 = NativeSchedulerRosterPolicy.sha256 attemptRaw
           ReviewId = ""; ReviewVersion = 0L; ReviewedHeadOid = ""
           ReviewRef = ""; ClaimOperationId = "" }
 
     let reviewer f projectIndex =
-        let c = worker f projectIndex
-        { c with Kind = "Reviewer"; OwnerAgentId = "Reviewer 1"
-                 TaskId = ""; AttemptId = ""; AssignmentGeneration = 0L
-                 ReviewId = Guid.NewGuid().ToString("D"); ReviewVersion = 2L
-                 ReviewedHeadOid = f.InitialSourceHead
-                 ReviewRef = "refs/heads/jarvis-review/fixture/r2"
-                 ClaimOperationId = Guid.NewGuid().ToString("D") }
+        let p = f.ProjectsOne[projectIndex]
+        let head = (LedgerStore.fetch p |> success).Commit
+        let reviewId = Guid.NewGuid().ToString("N")
+        let taskId = "fixture"
+        let reviewRef = $"refs/heads/jarvis-review/{taskId}/{reviewId}/r1"
+        ReviewWorkflow.submitBranchReview p (Guid.NewGuid()) taskId
+            "Worker fixture" (Guid.Parse reviewId) "" head
+            "Disposable native Reviewer claimed-ref fixture"
+            "Disposable independent reviewer claim" ""
+        |> success |> ignore
+        let claimId = Guid.NewGuid()
+        ReviewWorkflow.claimBranchReview p claimId taskId
+            (Guid.Parse reviewId) "Reviewer 1" 1
+        |> success |> ignore
+        { DispatchId = Guid.NewGuid().ToString("D")
+          EffectOperationId = Guid.NewGuid().ToString("D")
+          Kind = "Reviewer"
+          ProjectId = p.ProjectId.ToString("D")
+          ProjectLedgerId = p.LedgerId.ToString("D")
+          ProjectEpoch = p.Epoch
+          OwnerAgentId = "Reviewer 1"
+          TaskId = ""; AttemptId = ""; AssignmentGeneration = 0L
+          SourceRepositoryId = ""; SourceBaseOid = ""; SourceRef = ""; SourceLeaseSha256 = ""
+          ReviewId = reviewId; ReviewVersion = 2L; ReviewedHeadOid = head
+          ReviewRef = reviewRef; ClaimOperationId = claimId.ToString("D") }
+
+    // A provider-terminal Ok alone is never sufficient: an immutable original
+    // project operation and its session terminal blob must be on verified Git.
+    let terminalProof f (candidate: NativeDispatchCandidate) (entry: NativeReservationRecord)
+                      (locator: NativeTerminalLocator) fence session =
+        let p = f.ProjectsOne |> Array.find (fun x ->
+            x.ProjectId.ToString("D") = candidate.ProjectId)
+        let path = $"records/native-scheduler/terminals/{locator.TerminalOperationId:N}.json"
+        let evidence =
+            json {| schemaVersion = 1; state = "Terminated"
+                    dispatchId = string locator.DispatchId
+                    originalReservationId = string locator.OriginalReservationId
+                    effectOperationId = string locator.EffectOperationId
+                    terminalOperationId = string locator.TerminalOperationId
+                    canonicalKey = entry.CanonicalKey
+                    projectFenceOid = fence; providerSessionId = session |}
+        LedgerStore.transact p
+            { OperationId = locator.TerminalOperationId
+              Actor = "Disposable canonical project provider terminal"
+              Kind = "NativeProviderSessionTerminal"; RequestJson = evidence }
+            (fun _ -> Ok [ { Path = path; ExpectedBlobOid = None; Content = evidence } ])
+        |> success |> ignore
+        let snapshot = LedgerStore.fetch p |> success
+        let terminalOp = LedgerStore.getOperationAt p snapshot locator.TerminalOperationId
+                         |> success |> Option.get
+        let origin = LedgerStore.getOperationOriginAt p snapshot terminalOp |> success
+        let _, blob = LedgerStore.readAt p snapshot path |> success
+        { DispatchId = locator.DispatchId
+          OriginalReservationId = locator.OriginalReservationId
+          EffectOperationId = locator.EffectOperationId
+          TerminalOperationId = locator.TerminalOperationId
+          ProjectId = Guid.Parse candidate.ProjectId
+          ProjectLedgerId = Guid.Parse candidate.ProjectLedgerId
+          ProjectEpoch = candidate.ProjectEpoch
+          CanonicalKey = entry.CanonicalKey; ProviderSessionId = session
+          ProjectHead = snapshot.Commit; ProjectTerminalOid = origin
+          ProviderTerminalOid = blob.Value }
 
     let reserve f account projects coverage op candidate =
         NativeSchedulerAccountReservation.reserveVerifiedDisposable
@@ -752,6 +846,7 @@ type NativeSchedulerAccountReservationTests() =
                    NativeReservationFixture.limits 1 1 |]
             let candidate = NativeReservationFixture.worker f 0
             let op = Guid.NewGuid()
+            let fence = (LedgerStore.fetch f.ProjectsOne[0] |> NativeReservationFixture.success).Commit
             NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne
                 (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne) op candidate
                 |> NativeReservationFixture.success |> ignore
@@ -762,15 +857,16 @@ type NativeSchedulerAccountReservationTests() =
                     f.Root f.AccountOne f.PublicKey f.Subject f.ProjectsOne
                     (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne)
                     (Guid.NewGuid()) "Fixture actor" dispatchId effectId generation status
-                    f.InitialSourceHead session
+                    fence session
             advance 1L "Dispatching" "" |> NativeReservationFixture.success |> ignore
             advance 2L "Uncertain" "" |> NativeReservationFixture.success |> ignore
             advance 3L "Unknown" "provider-session-1" |> NativeReservationFixture.success |> ignore
             Assert.That((NativeReservationFixture.snapshot f f.AccountOne f.ProjectsOne).Records.Length,
                         Is.EqualTo(1))
+            let competingWorker = NativeReservationFixture.worker f 1
             match NativeReservationFixture.reserve f f.AccountTwo f.ProjectsTwo
                     (NativeReservationFixture.coverage f f.AccountTwo f.ProjectsTwo)
-                    (Guid.NewGuid()) (NativeReservationFixture.worker f 1) with
+                    (Guid.NewGuid()) competingWorker with
             | Error(AccountCapacityFull(1,1)) -> ()
             | other -> failwithf "Unknown session did not retain account credit: %A" other
             let entry = (NativeReservationFixture.snapshot f f.AccountOne f.ProjectsOne).Records[0]
@@ -778,14 +874,8 @@ type NativeSchedulerAccountReservationTests() =
                 { DispatchId = dispatchId; OriginalReservationId = op
                   EffectOperationId = effectId; TerminalOperationId = Guid.NewGuid() }
             let proof =
-                { DispatchId = dispatchId; OriginalReservationId = op
-                  EffectOperationId = effectId; TerminalOperationId = locator.TerminalOperationId
-                  ProjectId = Guid.Parse(candidate.ProjectId)
-                  ProjectLedgerId = Guid.Parse(candidate.ProjectLedgerId)
-                  ProjectEpoch = candidate.ProjectEpoch
-                  CanonicalKey = entry.CanonicalKey; ProviderSessionId = "provider-session-1"
-                  ProjectHead = f.InitialSourceHead; ProjectTerminalOid = f.InitialSourceHead
-                  ProviderTerminalOid = f.InitialSourceHead }
+                NativeReservationFixture.terminalProof f candidate entry locator
+                    fence "provider-session-1"
             let trusted =
                 { new INativeDisposableTerminalVerifier with
                     member _.VerifyCurrentTerminal _ = Ok proof }
@@ -797,6 +887,38 @@ type NativeSchedulerAccountReservationTests() =
             match release (Guid.NewGuid()) { locator with OriginalReservationId = Guid.NewGuid() } with
             | Error(AccountPolicyNotAuthoritative _) -> ()
             | other -> failwithf "Foreign terminal was not rejected: %A" other
+            let expectDenied label (badProof: NativeTerminalProof) =
+                let before = NativeFixture.head f.AccountOne
+                let verifier =
+                    { new INativeDisposableTerminalVerifier with
+                        member _.VerifyCurrentTerminal _ = Ok badProof }
+                match NativeSchedulerAccountReservation.releaseVerifiedDisposable
+                        f.Root f.AccountTwo f.PublicKey f.Subject f.ProjectsTwo
+                        (NativeReservationFixture.coverage f f.AccountTwo f.ProjectsTwo)
+                        verifier (Guid.NewGuid()) "Adversarial terminal" locator with
+                | Error(AccountPolicyNotAuthoritative _) -> ()
+                | other -> failwithf "%s source-unbound terminal accepted: %A" label other
+                Assert.That(NativeFixture.head f.AccountOne, Is.EqualTo(before), label)
+                Assert.That((NativeReservationFixture.snapshot f f.AccountOne f.ProjectsOne).Records[0].Status,
+                            Is.EqualTo("Unknown"), label)
+            expectDenied "Foreign syntactically valid project terminal" { proof with ProjectTerminalOid = f.InitialSourceHead }
+            expectDenied "Foreign syntactically valid provider terminal" { proof with ProviderTerminalOid = f.InitialSourceHead }
+            expectDenied "Stale foreign verified project head" { proof with ProjectHead = f.InitialSourceHead }
+            let emptyLocator = { locator with TerminalOperationId = Guid.Empty }
+            let emptyProof = { proof with TerminalOperationId = Guid.Empty }
+            let emptyVerifier =
+                { new INativeDisposableTerminalVerifier with
+                    member _.VerifyCurrentTerminal _ = Ok emptyProof }
+            let beforeEmpty = NativeFixture.head f.AccountOne
+            match NativeSchedulerAccountReservation.releaseVerifiedDisposable
+                    f.Root f.AccountOne f.PublicKey f.Subject f.ProjectsOne
+                    (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne)
+                    emptyVerifier (Guid.NewGuid()) "Adversarial empty terminal" emptyLocator with
+            | Error(AccountPolicyNotAuthoritative _) -> ()
+            | other -> failwithf "Guid.Empty terminal reached account CAS: %A" other
+            Assert.That(NativeFixture.head f.AccountOne, Is.EqualTo(beforeEmpty))
+            Assert.That((NativeReservationFixture.snapshot f f.AccountOne f.ProjectsOne).Records[0].Status,
+                        Is.EqualTo("Unknown"))
             let releaseId = Guid.NewGuid()
             let released = release releaseId locator |> NativeReservationFixture.success
             Assert.That(released.AlreadyApplied, Is.False)
@@ -806,6 +928,61 @@ type NativeSchedulerAccountReservationTests() =
             NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne
                 (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne)
                 (Guid.NewGuid()) reusable |> NativeReservationFixture.success |> ignore)
+
+    [<Test>]
+    member _.ForgedWorkerLeaseAndReviewerClaimRemainDeniedAcrossTwoClones() =
+        NativeFixture.withGit (fun f ->
+            NativeReservationFixture.establish f
+                (NativeReservationFixture.limits 2 2)
+                [| NativeReservationFixture.limits 2 2
+                   NativeReservationFixture.limits 2 2 |]
+            let worker = NativeReservationFixture.worker f 0
+            let reviewer = NativeReservationFixture.reviewer f 1
+            let assertDenied label (candidate: NativeDispatchCandidate) =
+                let before = NativeFixture.head f.AccountOne
+                let beforeState = NativeReservationFixture.snapshot f f.AccountOne f.ProjectsOne
+                match NativeReservationFixture.reserve f f.AccountTwo f.ProjectsTwo
+                        (NativeReservationFixture.coverage f f.AccountTwo f.ProjectsTwo)
+                        (Guid.NewGuid()) candidate with
+                | Error(AccountPolicyNotAuthoritative _) -> ()
+                | other -> failwithf "%s was admitted without canonical proof: %A" label other
+                Assert.That(NativeFixture.head f.AccountOne, Is.EqualTo(before), label)
+                let afterState = NativeReservationFixture.snapshot f f.AccountOne f.ProjectsOne
+                Assert.That(afterState.Records.Length, Is.EqualTo(beforeState.Records.Length), label)
+                Assert.That(afterState.Records |> Array.map _.CanonicalKey, Is.EquivalentTo(beforeState.Records |> Array.map _.CanonicalKey), label)
+            assertDenied "No such Worker task" { worker with TaskId = "forged-task" }
+            assertDenied "No such Worker attempt" { worker with AttemptId = Guid.NewGuid().ToString("N") }
+            assertDenied "Worker reassigned generation" { worker with AssignmentGeneration = 2L }
+            assertDenied "Worker forged source lease hash" { worker with SourceLeaseSha256 = String.replicate 64 "b" }
+            assertDenied "Worker forged source ref" { worker with SourceRef = "refs/heads/forged-source" }
+            assertDenied "Worker forged source base" { worker with SourceBaseOid = f.InitialSourceHead }
+            assertDenied "Worker forged repository" { worker with SourceRepositoryId = String.replicate 64 "e" }
+            assertDenied "No such Reviewer claim" { reviewer with ClaimOperationId = Guid.NewGuid().ToString("D") }
+            assertDenied "No such Reviewer review" { reviewer with ReviewId = Guid.NewGuid().ToString("N") }
+            assertDenied "Reviewer stale version" { reviewer with ReviewVersion = 1L }
+            assertDenied "Reviewer forged frozen source" { reviewer with ReviewedHeadOid = f.InitialSourceHead }
+            assertDenied "Reviewer forged review ref" { reviewer with ReviewRef = "refs/heads/jarvis-review/fixture/forged/r1" }
+            // The account head and original native occupancy remain unchanged
+            // after the project itself advances, invalidating the signed coverage.
+            let stale = NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne
+            let project = f.ProjectsOne[0]
+            LedgerStore.transact project
+                { OperationId = Guid.NewGuid()
+                  Actor = "Disposable project TOCTOU adversary"
+                  Kind = "FixtureSourceAdvance"
+                  RequestJson = """{"advance":true}""" }
+                (fun _ -> Ok [
+                    { Path = "records/native-scheduler/stale-control.json"
+                      ExpectedBlobOid = None; Content = """{"control":true}""" } ])
+            |> NativeReservationFixture.success |> ignore
+            let accountBefore = NativeFixture.head f.AccountOne
+            match NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne
+                    stale (Guid.NewGuid()) worker with
+            | Error(AccountPolicyNotAuthoritative _) -> ()
+            | other -> failwithf "Stale project-head observation admitted: %A" other
+            Assert.That(NativeFixture.head f.AccountOne, Is.EqualTo(accountBefore))
+            Assert.That((NativeReservationFixture.snapshot f f.AccountOne f.ProjectsOne).Records.Length,
+                        Is.EqualTo(0)))
 
     [<Test>]
     member _.LegacyHeldOrIncompleteCoverageAndUnreceiptedNativePathHoldClosed() =
@@ -890,9 +1067,10 @@ type NativeSchedulerAccountReservationTests() =
                 (NativeReservationFixture.limits 2 1)
                 [| NativeReservationFixture.limits 2 1
                    NativeReservationFixture.limits 2 1 |]
+            let candidate = NativeReservationFixture.worker f 0
             NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne
                 (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne)
-                (Guid.NewGuid()) (NativeReservationFixture.worker f 0)
+                (Guid.NewGuid()) candidate
                 |> NativeReservationFixture.success |> ignore
             NativeFixture.injectAccountFile f "native/scheduler-reservations-v1.json" "{}"
             |> ignore

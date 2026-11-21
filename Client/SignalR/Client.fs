@@ -1,11 +1,13 @@
 module Client.SignalR.Client
 
 open System
+open System.Collections.Concurrent
 open System.Diagnostics
 open System.IO
 open System.Runtime.CompilerServices
 open System.Text
 open System.Text.Json
+open System.Threading
 open System.Threading.Tasks
 open Client
 open Client.SignalR
@@ -22,6 +24,163 @@ let receiveMessage (rt: Runtime) message =
 // Working state for ordinary calls to avoid one remote git fetch per tool.
 let private workingGuidanceCaches = ConditionalWeakTable<Runtime, WorkingTurnGuidance.AgentCache>()
 let private instructionDeliveryCaches = ConditionalWeakTable<Runtime, AgentInstructions.DeliveryCache>()
+
+type private AlertProbe =
+    { Target: ProjectPaths.ProjectTarget
+      AgentId: string
+      Gate: obj
+      mutable Pending: bool
+      mutable Revision: int64
+      mutable Refreshing: bool
+      mutable LastAttempt: DateTimeOffset
+      mutable LastUsed: DateTimeOffset }
+
+// Active agents in one project share a single verified background snapshot.
+// Prevent N remote Git fetches for N agents and trust-binding contention.
+type private AlertProjectSnapshot =
+    { Gate: obj
+      mutable CheckedAt: DateTimeOffset
+      mutable Verified: (LedgerStore.LedgerBinding * LedgerStore.LedgerSnapshot) option }
+
+// A hint authorizes only a verified presence check, never the delivery of
+// cached alert contents. Canonical fenced CAS still runs at the visible reply.
+type private ResponseAlertReconciler(runtime: Runtime) =
+    let weak = WeakReference<Runtime>(runtime)
+    let probes = ConcurrentDictionary<ProjectPaths.ProjectId * string, AlertProbe>()
+    let snapshots = ConcurrentDictionary<ProjectPaths.ProjectId, AlertProjectSnapshot>()
+    let invalidateSnapshot projectId =
+        let mutable discarded = Unchecked.defaultof<AlertProjectSnapshot>
+        snapshots.TryRemove(projectId, &discarded) |> ignore
+    let period = TimeSpan.FromSeconds 15.
+    let idle = TimeSpan.FromMinutes 3.
+    let get target agentId =
+        probes.GetOrAdd((ProjectPaths.ProjectTarget.projectId target, agentId), fun _ ->
+            { Target = target; AgentId = agentId; Gate = obj(); Pending = false
+              Revision = 0L; Refreshing = false
+              LastAttempt = DateTimeOffset.MinValue; LastUsed = DateTimeOffset.UtcNow })
+    let read (entry: AlertProbe) forceFetch =
+        try
+            let mutable rt = Unchecked.defaultof<Runtime>
+            if not (weak.TryGetTarget(&rt)) then None
+            else
+                let projectId = ProjectPaths.ProjectTarget.projectId entry.Target
+                let state =
+                    snapshots.GetOrAdd(projectId, fun _ ->
+                        { Gate = obj(); CheckedAt = DateTimeOffset.MinValue; Verified = None })
+                // The project-level lock is used only on background threads.
+                // A verified snapshot is reused for each agent in this project.
+                let latest =
+                    lock state.Gate (fun () ->
+                        let now = DateTimeOffset.UtcNow
+                        if forceFetch || now - state.CheckedAt >= period then
+                            state.CheckedAt <- now
+                            state.Verified <-
+                                match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot
+                                          (ProjectPaths.ProjectId.value projectId) rt with
+                                | Ok verified -> Some verified
+                                | Error _ -> None
+                        state.Verified)
+                match latest with
+                | None -> None
+                | Some (binding, snapshot) ->
+                    match ReviewWorkflow.ReviewWorkflow.getResponseAlertsAt binding snapshot entry.AgentId with
+                    | Ok queue -> Some(not queue.Pending.IsEmpty)
+                    | Error _ -> None
+        with _ -> None
+    let rec schedule (entry: AlertProbe) forced =
+        let now = DateTimeOffset.UtcNow
+        let revision =
+            lock entry.Gate (fun () ->
+                if forced then
+                    entry.Revision <- entry.Revision + 1L
+                    entry.LastAttempt <- DateTimeOffset.MinValue
+                if not entry.Refreshing && now - entry.LastAttempt >= period then
+                    entry.Refreshing <- true
+                    entry.LastAttempt <- now
+                    Some entry.Revision
+                else None)
+        match revision with
+        | None -> ()
+        | Some version ->
+            Task.Run(fun () ->
+                let pending = read entry false
+                let superseded =
+                    lock entry.Gate (fun () ->
+                        entry.Refreshing <- false
+                        if entry.Revision <> version then
+                            entry.LastAttempt <- DateTimeOffset.MinValue
+                            true
+                        else
+                            // An unavailable ledger cannot assert queue emptiness.
+                            match pending with
+                            | Some value -> entry.Pending <- value
+                            | None -> ()
+                            false)
+                if superseded then schedule entry false) |> ignore
+    let mutable timer = Unchecked.defaultof<Timer>
+    do
+        timer <- new Timer(TimerCallback(fun _ ->
+            let mutable rt = Unchecked.defaultof<Runtime>
+            if not (weak.TryGetTarget(&rt)) then timer.Dispose()
+            else
+                let now = DateTimeOffset.UtcNow
+                for KeyValue(key, entry) in probes do
+                    let last = lock entry.Gate (fun () -> entry.LastUsed)
+                    if now - last > idle then probes.TryRemove(key) |> ignore
+                    else schedule entry false), null, period, period)
+    member _.MayHavePending(target, agentId) =
+        let entry = get target agentId
+        let result = lock entry.Gate (fun () ->
+            entry.LastUsed <- DateTimeOffset.UtcNow
+            entry.Pending)
+        schedule entry false
+        result
+    member _.AfterAttempt(target, agentId) =
+        let entry = get target agentId
+        // A failed consume remains durable and will be seen by reconciliation.
+        lock entry.Gate (fun () -> entry.Pending <- false)
+        invalidateSnapshot (ProjectPaths.ProjectTarget.projectId target)
+        schedule entry true
+    member _.Invalidate(projectId, agentId) =
+        // Invalidation never acquires the potentially slow project fetch lock.
+        invalidateSnapshot projectId
+        match probes.TryGetValue((projectId, agentId)) with
+        | true, entry -> schedule entry true
+        | _ -> ()
+    member _.InvalidateAll() =
+        snapshots.Clear()
+        for entry in probes.Values do schedule entry true
+    member _.ReconcileNow(target, agentId) : Task =
+        // Deterministic diagnostic/test hook; normal replies never await it.
+        let entry = get target agentId
+        let version = lock entry.Gate (fun () ->
+            entry.LastUsed <- DateTimeOffset.UtcNow
+            entry.Revision <- entry.Revision + 1L
+            entry.LastAttempt <- DateTimeOffset.UtcNow
+            entry.Revision)
+        Task.Run(fun () ->
+            let pending = read entry true
+            lock entry.Gate (fun () ->
+                if entry.Revision = version then
+                    match pending with
+                    | Some value -> entry.Pending <- value
+                    | None -> ()))
+
+let private responseAlertCaches = ConditionalWeakTable<Runtime, ResponseAlertReconciler>()
+let private responseAlertCache (rt: Runtime) =
+    responseAlertCaches.GetValue(rt, fun owner -> ResponseAlertReconciler(owner))
+
+let reconcileResponseAlerts (rt: Runtime) projectName agentId : Task =
+    if String.IsNullOrWhiteSpace agentId then Task.CompletedTask
+    else
+        match ProjectPaths.ProjectTarget.parse projectName with
+        | Ok selected -> (responseAlertCache rt).ReconcileNow(selected, agentId)
+        | Error _ -> Task.CompletedTask
+let responseAlertProbePending (rt: Runtime) projectName agentId =
+    match ProjectPaths.ProjectTarget.parse projectName with
+    | Ok selected -> (responseAlertCache rt).MayHavePending(selected, agentId)
+    | Error _ -> false
+
 let invalidateAgentStates (rt: Runtime) (projectName: string) (agentIds: string array) =
     // Server notifications only carry the logical project identity. Worktree
     // selectors share the canonical ledger/assignment cache by ProjectId.
@@ -33,6 +192,7 @@ let invalidateAgentStates (rt: Runtime) (projectName: string) (agentIds: string 
             let projectId = ProjectPaths.ProjectTarget.projectId target
             for agentId in agentIds |> Array.filter (String.IsNullOrWhiteSpace >> not) |> Array.distinct do
                 cache.Invalidate(projectId, agentId)
+                (responseAlertCache rt).Invalidate(projectId, agentId)
     | Error _ -> ()
 
 let invalidateAllAgentStates (rt: Runtime) =
@@ -40,6 +200,7 @@ let invalidateAllAgentStates (rt: Runtime) =
     let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
         WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
     cache.InvalidateAll()
+    (responseAlertCache rt).InvalidateAll()
 // Only commands addressing repository source are checkout selectors.
 // Message/activity project fields are literal history labels, not paths.
 type private CommandProject =
@@ -102,35 +263,37 @@ let private oldSideEffectsAllowed (rt: Runtime) (selected: ProjectPaths.ProjectT
         (fun name -> OrchestrationApi.LedgerBindingConfig.load name rt
                      |> Result.mapError (sprintf "%A")) project
 
-// Response alerts are distinct from cached Working-turn timing guidance.
-// A fresh canonical ledger read on each eligible response makes alerts
-// visible across devices and restarts, even if an invalidation push was lost.
-// Successful Git CAS consumption gives at-most-once best-effort delivery.
+// A client-local presence cache only decides whether to attempt delivery.
+// Never display text or write from a hint: old-writer fencing, fresh binding
+// verification, queue version, and canonical CAS remain authoritative.
 let private checkResponseAlerts (rt: Runtime) agentId (target: ProjectPaths.ProjectTarget option) =
     if String.IsNullOrWhiteSpace agentId then []
     else
         match target with
         | None -> []
-        | Some selected when not (oldSideEffectsAllowed rt selected) -> []
+        | Some selected when not ((responseAlertCache rt).MayHavePending(selected, agentId)) -> []
         | Some selected ->
-            let project = selected |> ProjectPaths.ProjectTarget.projectId |> ProjectPaths.ProjectId.value
-            // Binding resolution already fetched a verified snapshot.
-            // Avoid a second remote Git fetch for each tool reply.
-            match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt with
-            | Error _ -> []
-            | Ok (binding, snapshot) ->
-                match ReviewWorkflow.ReviewWorkflow.takeResponseAlertsAt binding snapshot agentId with
-                | Error _ -> [] // Retain pending content for a later response.
-                | Ok alerts ->
-                    alerts
-                    |> List.sortBy (fun alert ->
-                        (if alert.Message.TrimStart().StartsWith("STOP", StringComparison.OrdinalIgnoreCase)
-                         then 0 else 1), alert.QueuedAtUtc, alert.AlertId)
-                    |> List.map (fun alert ->
-                        { Scope = "response-alert"
-                          Path = $"jarvis/response-alert/{alert.AlertId}"
-                          Sha256 = ""
-                          Content = "JARVIS OPERATOR ALERT (one-shot coordination instruction):\n" + alert.Message })
+            try
+                if not (oldSideEffectsAllowed rt selected) then []
+                else
+                    let project = selected |> ProjectPaths.ProjectTarget.projectId |> ProjectPaths.ProjectId.value
+                    match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt with
+                    | Error _ -> []
+                    | Ok (binding, snapshot) ->
+                        match ReviewWorkflow.ReviewWorkflow.takeResponseAlertsAt binding snapshot agentId with
+                        | Error _ -> [] // CAS raced or failed; pending remains durable.
+                        | Ok alerts ->
+                            alerts
+                            |> List.sortBy (fun alert ->
+                                (if alert.Message.TrimStart().StartsWith("STOP", StringComparison.OrdinalIgnoreCase)
+                                 then 0 else 1), alert.QueuedAtUtc, alert.AlertId)
+                            |> List.map (fun alert ->
+                                { Scope = "response-alert"
+                                  Path = $"jarvis/response-alert/{alert.AlertId}"
+                                  Sha256 = ""
+                                  Content = "JARVIS OPERATOR ALERT (one-shot coordination instruction):\n" + alert.Message })
+            finally
+                (responseAlertCache rt).AfterAttempt(selected, agentId)
 
 let private mayReceiveResponseAlert = function
     // Neither a source-ledger health probe nor a cross-project notification

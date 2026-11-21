@@ -490,13 +490,11 @@ async function execute(message) {
         if (probe?.length !== 1 || probe[0]?.frameId !== 0 ||
             probe[0]?.result !== true) return error("BackgroundFocusNotVerified");
       }
-      const lastFocusRevocation = await authorizePageExecution(pagePin);
-      if (lastFocusRevocation) return error(lastFocusRevocation);
       if (strictFreshHome) {
-        // The origin-only generic authorization permits same-origin SPA routes.
-        // For privileged focus emulation require the exact fresh-home URL
-        // immediately before the page wrapper. The wrapper enforces the same
-        // exact URL in the renderer, closing the final async navigation race.
+        // Recheck the exact home URL before the final authorization fence.
+        // The URL inspection awaits chrome.tabs.get; any operator opt-out in
+        // that await MUST be caught by authorizePageExecution below.
+        // The wrapper independently enforces exact location.href in-frame.
         let current;
         try { current = await chrome.tabs.get(registration.tabId); }
         catch { return error("BackgroundFocusUnavailable"); }
@@ -504,6 +502,11 @@ async function execute(message) {
             current.status !== "complete" || current.discarded || current.frozen)
           return error("BackgroundFocusUnavailable");
       }
+      // Last awaited pre-execution preflight: includes the permission query,
+      // then checks epoch and registration synchronously immediately before
+      // injecting the user code. No new async gaps are allowed after this.
+      const lastFocusRevocation = await authorizePageExecution(pagePin);
+      if (lastFocusRevocation) return error(lastFocusRevocation);
       results = await api.execute({
         target: { tabId: registration.tabId },
         js: [{ code: wrapper }],

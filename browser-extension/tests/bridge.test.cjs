@@ -1513,6 +1513,38 @@ test("route drift between last tab preflight and wrapper fails inside the page",
   assert.equal(data.h.debuggerCalls.at(-1).kind, "detach");
 });
 
+for (const reenable of [false, true]) {
+  test("opt-out during final fresh-home permission preflight blocks execution" +
+    (reenable ? " even after re-enable" : ""), async () => {
+    const data = await createdPageForExecutionRace("https://chatgpt.com/");
+    const { h, tab } = data;
+    let tabQueriesAfterProbe = 0;
+    const onPostProbeTabQuery = async () => {
+      tabQueriesAfterProbe++;
+      if (tabQueriesAfterProbe === 1) {
+        // First query is exact-home preflight. Install on the next query,
+        // which is the final authorization permission+epoch fence.
+        h.beforeNextTabQuery(onPostProbeTabQuery);
+      } else {
+        assert.equal(tabQueriesAfterProbe, 2);
+        assert.equal((await h.message("setAgentCreatedTabs", { allowed: false })).ok, true);
+        if (reenable)
+          assert.equal((await h.message("setAgentCreatedTabs", { allowed: true })).ok, true);
+      }
+    };
+    h.afterNextUserScript(async () => {
+      h.beforeNextTabQuery(onPostProbeTabQuery);
+    });
+    const response = await requestPageAction(data, "executeJs", "late-revocation-" + reenable);
+    assert.equal(response.kind, "error");
+    assert.match(response.error, /AgentCreatedTabs(Disabled|AuthorizationChanged)/);
+    assert.equal(tabQueriesAfterProbe, 2);
+    assert.equal(h.calls.length, 1,
+      "Only the read-only focus probe is allowed; project script must never execute");
+    assert.equal(h.debuggerCalls.at(-1).kind, "detach");
+  });
+}
+
 test("non-ChatGPT created tab uses existing no-debugger execution path", async () => {
   const data = await createdPageForExecutionRace();
   const response = await requestPageAction(data, "executeJs", "other-origin");

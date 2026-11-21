@@ -1,0 +1,7 @@
+# P2 — Held account Work token is not reconciled with current project ledger ID/epoch
+
+Frozen source: `8ed32fd8c9f8be19afda677cc3a28bba4f4e835e`, `scripts/jarvis-phase2-snapshot-adapter.mjs` lines ~492–507.
+
+**Reproduction:** With the two-project canonical Git fixture, retain an account WQ07 token's `status:"Held"` and configured project B `projectId`, but set `projectLedgerId:"77777777-7777-4777-8777-777777777777"` and `projectLedgerEpoch:2`, whereas the verified project B ledger has a different ledger UUID and epoch 1. The adapter counts the held token and reports no identity/epoch mismatch because it only checks configured project IDs. An independently added adverse assertion expecting a diagnostic failed in job `3ed6beea671f493295d9dc56d57ee8f9`, OS exit 1.
+
+**Risk and fix:** Foreign/reincarnated project ledger tokens must not be silently treated as reconciled evidence. Compare a held token's project ledger identity/epoch to the separately verified project header/binding, explicitly diagnose mismatches and continue to hold unknown account-wide browser occupancy. Any project-authority hash without a separate trust proof must remain unverified, not guessed. This is a provenance gap in default-off preparation; `accountCapacity.complete:false` and `completeness.projects:false` already preclude dispatch.

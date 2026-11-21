@@ -1,17 +1,25 @@
-# Documentation drift audit, source-frozen review
+# Independent review — browser scheduler/Challenge documentation drift
 
-Frozen source `609157037f016f1ee4c09fd6b2b0b4991224fab3` on `refs/heads/docs/browser-audit-docs-worker3-20261120`, base `d702352ef705f9991ac1cb14dc15a13cce78aa44`. Eight documentation files only (104 additions, 65 deletions). No source code, runtime config, schedules, authenticated tabs, main edits, deployment or cutover changes.
+**Review:** `f3274c18c4d14fb6a9f70e426531928a` | **Reviewer:** Reviewer 4 | **Verdict:** ChangesRequested
+**Frozen commit:** `609157037f016f1ee4c09fd6b2b0b4991224fab3` | **Base:** `d702352ef705f9991ac1cb14dc15a13cce78aa44` | **Target:** `refs/heads/main`.
 
-## Evidence from exact isolated worktree
+## Independently checked
+- Canonical task contract and immutable review metadata, clean source-exact docs worktree, full frozen patch and eight-file scope: **104 additions / 65 deletions; no runtime/config changes**. `git diff --check` exited **0**.
+- `Client/Program.fs:365-371`: `AfterAgentIdle` independent proof returns `ActivityProofUnavailable`; docs correctly treat it fail-closed. `Client/Modules/BrowserSchedules.fs:713-721`: recurring `UiIncompatible:` maps to `failed`, one-shot to `suspended`, with uncertain-outcome path; correctly described as unresolved rearm safety risk.
+- `browser-scripts/chatgpt/launchAgent.js:78-82`: frozen model preference is GPT-6 Extra High / Work GPT-6.2 Astra Medium / Chat Instant, separate from Operator's newer High/Sol request.
+- Challenge integration commit `13d4124348f8a287673d8568a371adf918a33240` is an ancestor of frozen source (`git merge-base --is-ancestor` exit **0**). Frozen tree contains `Client/Modules/ChallengeWorkflow.fs`, `Client.Tests/ChallengeWorkflowTests.fs` and typed `ChallengeRead`/`ChallengeWrite` commands.
+- Live `list_commands`: protocol **3.68**, general and legacy scheduling plus Challenge methods. Connected callable tools **now include** `list_challenges`, `get_challenge`, `set_challenge_subscription`.
+- Independently ran `node --test scripts/tests/manager-heartbeat.test.mjs browser-extension/tests/bridge.test.cjs` in the **exact frozen, clean worktree**, exit **0**. No .NET or live browser tests run by this reviewer.
 
-- Connected public command catalog: protocol **3.68**, general `ScheduleExecution` family plus legacy `ScheduleBrowserExecution` and Challenge family; no automatic acceptance inferred.
-- `git diff --check`: exit **0**. `git merge-base --is-ancestor 13d4124348f8a287673d8568a371adf918a33240 d702352ef705f9991ac1cb14dc15a13cce78aa44`: exit **0**, grounding Challenge integration provenance.
-- Ephemeral read-only `node -e` source-bound documentation checks: **8/8 PASS** across all eight scoped files, source idleness gate, UI compatibility mapping, Challenge source integration, disabled Manager config, real vs requested model fallback, known defects and superseded historic handoff.
-- `node --test scripts/tests/manager-heartbeat.test.mjs`: **26 passed, 0 failed**.
-- `node --test browser-extension/tests/bridge.test.cjs`: **73 passed, 0 failed**.
-- `dotnet test Client.Tests/Client.Tests.fsproj -c Release --filter BrowserSchedules`: **28 passed, 1 skipped, 0 failed** (29 total; warning-only build).
-- `node --test browser-extension/tests/chatgpt-launcher.test.cjs`: **3 passed, 64 failed, 67 total** on pinned baseline. Existing launcher fixture divergence with integrated model-picker implementation yields `notSubmitted`/`PreferredConfigurationsUnavailable` in fixtures expecting `submitted`/other legacy results. This docs-only change does not resolve or conceal the failure; separate launcher tests task is owner-managed.
+## Source author's prior test evidence (not independently re-executed here)
+The pre-existing summary reports docs-specific `node -e` checks **8/8 PASS**; Manager heartbeat **26 passed**; browser bridge **73 passed**; filtered Release BrowserSchedules **28 passed, 1 skipped**. It also reports pinned baseline ChatGPT launcher tests **3 passed / 64 failed**, attributed to fixture drift around integrated model picking. Treat these as author-reported, not new independent reruns, and do not infer UI delivery acceptance or launcher correction from them.
 
-## Verification scope and gates
+## Decision
+The core source-state and safety corrections are supported. However three newly edited present-tense statements incorrectly say the ChatGPT connector lacks direct Challenge list/get/subscription operations:
+- `docs/DurableAgentChallenges.md:3`
+- `docs/DurableAgentChallengesIntegration.md:5`
+- `docs/ManagerHeartbeat.md:39-40`
 
-Reviewer should compare exact pinned main source and connected catalog to the eight docs, especially recurring `UiIncompatible:` mapping to `failed` plus later interval, `AfterAgentIdle` production `ActivityProofUnavailable`, recurring/idle `outcomeUnknown` and reauthorization retry/canceled-suspended unresolved defects, historical vs integrated Challenge state, and model fallback source (Extra High/Astra) vs Operator preference (High/Sol). Do not accept mere command advertisement as deployment acceptance. No independent review, merge, publication, live schedule, or operator cutover is implied by these test results.
+See `findings/stale-challenge-connector-exposure.md` for reproduced evidence, operational impact, and bounded correction. These are task-in-scope current-connected-capability assertions, not a net-new feature requirement. Update the statements to reflect *current* exposed actions and preserve the no-cutover, protocol, subscription and deployment caveats.
+
+**Limits:** No source edits, merges, live schedules, deployments, client restarts, remote rollout verification or full .NET test suite. No claim of end-to-end acceptance.

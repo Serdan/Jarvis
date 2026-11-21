@@ -325,10 +325,33 @@ type IntegrationSubmission =
       PublicationMechanism: string }
 
 [<CLIMutable>]
+type ExternalPublicationObservation =
+    { SubmissionId: string
+      TaskId: string
+      ObservationOperationId: string
+      RecordedBy: string
+      RecordedAtUtc: string
+      EvidenceClass: string
+      PublisherAttribution: string
+      ManagedPublisherProof: bool
+      ReviewId: string
+      ReviewRef: string
+      ReviewVersion: int
+      ReviewedHeadOid: string
+      SubmittedCommit: string
+      IntegratedCommit: string
+      FirstParent: string
+      IntegratedTree: string
+      TargetHeadAtSubmission: string
+      TargetRef: string
+      ObservedRemoteHead: string }
+
+[<CLIMutable>]
 type IntegrationSummary =
     { SnapshotCommit: string
       Latest: IntegrationSubmission option
-      Submissions: IntegrationSubmission list }
+      Submissions: IntegrationSubmission list
+      ExternalObservations: ExternalPublicationObservation list }
 
 [<CLIMutable>]
 type AgentCheckpoint =
@@ -617,6 +640,9 @@ module ReviewWorkflow =
 
     let private integrationPath taskId (submissionId: Guid) =
         $"tasks/{taskId}/integrations/" + submissionId.ToString("N") + ".json"
+
+    let private externalObservationPath taskId (submissionId: Guid) (operationId: Guid) =
+        $"tasks/{taskId}/integration-observations/{submissionId:N}/{operationId:D}.json"
 
     let private notificationPath (notificationId: Guid) =
         "notifications/" + notificationId.ToString("N") + ".json"
@@ -1239,16 +1265,136 @@ module ReviewWorkflow =
             return submission
         }
 
+    // Separate append-only observations never promote Pending to Integrated.
+    let private externalObservationsAt binding snapshot taskId = result {
+        let! paths = LedgerStore.listAt binding snapshot "tasks"
+        let prefix = $"tasks/{taskId}/integration-observations/"
+        let mutable observations = []
+        for path in paths do
+            if path.StartsWith(prefix, StringComparison.Ordinal)
+               && path.EndsWith(".json", StringComparison.Ordinal) then
+                let! record, _ = required<ExternalPublicationObservation> binding snapshot path
+                match Guid.TryParseExact(record.SubmissionId, "N"),
+                      Guid.TryParseExact(record.ObservationOperationId, "D") with
+                | (true, sid), (true, oid)
+                    when record.TaskId = taskId
+                         && path = externalObservationPath taskId sid oid
+                         && validAgent record.RecordedBy
+                         && record.EvidenceClass = "ObservedExternalGitInclusionUnattributed/v1"
+                         && record.PublisherAttribution = "Unattributed"
+                         && not record.ManagedPublisherProof
+                         && record.ReviewVersion > 0
+                         && LedgerStore.validSourceCommitOid record.ReviewedHeadOid
+                         && LedgerStore.validSourceCommitOid record.SubmittedCommit
+                         && LedgerStore.validSourceCommitOid record.IntegratedCommit
+                         && LedgerStore.validSourceCommitOid record.FirstParent
+                         && LedgerStore.validSourceCommitOid record.IntegratedTree
+                         && LedgerStore.validSourceCommitOid record.ObservedRemoteHead
+                         && LedgerStore.validSourceCommitOid record.TargetHeadAtSubmission
+                         && validBranch record.TargetRef
+                         && validBranch record.ReviewRef
+                         && record.ReviewedHeadOid = record.SubmittedCommit
+                         && (match Guid.TryParseExact(record.ReviewId, "N") with
+                             | true, id when id <> Guid.Empty -> true
+                             | _ -> false)
+                         && (match DateTimeOffset.TryParse record.RecordedAtUtc with
+                             | true, _ -> true | _ -> false) ->
+                    observations <- record :: observations
+                | _ -> return! Error(LedgerIntegrityError "Invalid external publication observation.")
+        return observations |> List.sortBy (fun item -> item.RecordedAtUtc, item.ObservationOperationId)
+    }
+
     let getIntegrationSubmissions binding taskId =
         if not (validTaskId taskId) then Error(InvalidBinding "Invalid task ID.")
         else result {
             let! snapshot = LedgerStore.fetch binding
             let! _ = required<ReviewTask> binding snapshot (taskPath taskId)
             let! submissions = integrationSubmissionsAt binding snapshot taskId
+            let! observations = externalObservationsAt binding snapshot taskId
             return { SnapshotCommit = snapshot.Commit
                      Latest = submissions |> List.tryLast
-                     Submissions = submissions }
+                     Submissions = submissions
+                     ExternalObservations = observations }
         }
+
+    // Authenticated Operator TaskWrite wraps this entrypoint. The existing
+    // original Git ledger CAS owns the immutable operation, not a publisher
+    // journal. This path performs no source publication.
+    let observeExternalPublication binding operationId taskId recordedBy
+                                   (submissionId: Guid) integratedCommit =
+        if operationId = Guid.Empty || submissionId = Guid.Empty
+           || not (validTaskId taskId) || not (validAgent recordedBy)
+           || not (LedgerStore.validSourceCommitOid integratedCommit) then
+            Error(InvalidBinding "Invalid external publication observation identity.")
+        else
+            let action = intent operationId recordedBy "ObserveExternalPublication"
+                            {| taskId = taskId; submissionId = submissionId
+                               integratedCommit = integratedCommit |}
+            match LegacyDirectWriterFence.findAppliedForLegacyWrite binding action with
+            | Error failure -> Error failure
+            | Ok(Some applied) -> Ok applied
+            | Ok None -> result {
+                let! snapshot = LedgerStore.fetch binding
+                let! _ = required<ReviewTask> binding snapshot (taskPath taskId)
+                let! submission, _ = required<IntegrationSubmission> binding snapshot
+                                        (integrationPath taskId submissionId)
+                if submission.Status <> "Pending"
+                   || submission.SubmissionId <> submissionId.ToString("N")
+                   || submission.TaskId <> taskId
+                   || submission.IntegrationRef <> $"refs/heads/jarvis-integration/{submissionId:N}"
+                   || submission.ReviewedHeadOid <> submission.SubmittedCommit
+                   || not (LedgerStore.validSourceCommitOid submission.TargetHeadAtSubmission) then
+                    return! Error(InvalidBinding "Observation requires a managed Pending submission.")
+                let! review, _ = required<BranchReview> binding snapshot
+                                    (branchReviewPath taskId submission.ReviewId)
+                if review.ReviewId <> submission.ReviewId || review.TaskId <> taskId
+                   || review.Status <> "Accepted" || review.DecisionSequence <= 0L
+                   || String.IsNullOrWhiteSpace review.ReviewerId
+                   || review.ReviewerId = review.OwnerAgentId
+                   || review.ReviewRef <> submission.ReviewRef
+                   || review.SourceVersion <> submission.ReviewVersion
+                   || review.ReviewedHeadOid <> submission.SubmittedCommit then
+                    return! Error(InvalidBinding "Observation lacks exact independent Accepted review.")
+                do! LedgerStore.fetchReviewRef binding submission.ReviewRef submission.SubmittedCommit
+                do! LedgerStore.fetchIntegrationRef binding submission.IntegrationRef submission.SubmittedCommit
+                let! firstParent, tree, remoteHead =
+                    LedgerStore.inspectExternalMechanicalIntegration binding
+                        submission.TargetRef submission.TargetHeadAtSubmission
+                        submission.SubmittedCommit integratedCommit
+                let! previous = externalObservationsAt binding snapshot taskId
+                let prior = previous |> List.filter (fun item -> item.SubmissionId = submission.SubmissionId)
+                for item in prior do
+                    do! LedgerStore.verifySourceAncestry binding item.ObservedRemoteHead remoteHead
+                let record =
+                    { SubmissionId = submission.SubmissionId; TaskId = taskId
+                      ObservationOperationId = operationId.ToString("D")
+                      RecordedBy = recordedBy
+                      RecordedAtUtc = DateTimeOffset.UtcNow.ToString("O")
+                      EvidenceClass = "ObservedExternalGitInclusionUnattributed/v1"
+                      PublisherAttribution = "Unattributed"; ManagedPublisherProof = false
+                      ReviewId = submission.ReviewId; ReviewRef = submission.ReviewRef
+                      ReviewVersion = submission.ReviewVersion
+                      ReviewedHeadOid = submission.ReviewedHeadOid
+                      SubmittedCommit = submission.SubmittedCommit
+                      IntegratedCommit = integratedCommit
+                      FirstParent = firstParent; IntegratedTree = tree
+                      TargetHeadAtSubmission = submission.TargetHeadAtSubmission
+                      TargetRef = submission.TargetRef; ObservedRemoteHead = remoteHead }
+                return! LegacyDirectWriterFence.transact binding action (fun current -> result {
+                    let! existing, _ = required<IntegrationSubmission> binding current
+                                            (integrationPath taskId submissionId)
+                    if existing <> submission || existing.Status <> "Pending" then
+                        return! Error(StaleEntityVersion "Integration changed during observation.")
+                    let! now = externalObservationsAt binding current taskId
+                    if now <> previous then
+                        return! Error(StaleEntityVersion "Observation set changed; re-read canonical state.")
+                    let path = externalObservationPath taskId submissionId operationId
+                    let! duplicate = read<ExternalPublicationObservation> binding current path
+                    if duplicate.IsSome then
+                        return! Error(StaleEntityVersion "Observation identity already exists.")
+                    return [ change path None record ]
+                })
+            }
 
     // Every new integration is authorized by an Accepted, pinned review, not
     // by the contributor's mutable branch. Old branch-only submissions remain

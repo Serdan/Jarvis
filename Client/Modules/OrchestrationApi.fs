@@ -2487,6 +2487,13 @@ module TaskApi =
                                 |> Result.bind (fun submissionId ->
                                     ReviewWorkflow.ReviewWorkflow.completeIntegration binding operationId
                                         cmd.TaskId cmd.ActorId submissionId cmd.BaseOid |> mapError)
+                            | "ObserveExternalPublication" ->
+                                guid "submissionId" cmd.AttemptId
+                                |> Result.bind (fun submissionId ->
+                                    withAdministrativeActor (fun actor ->
+                                        ReviewWorkflow.ReviewWorkflow.observeExternalPublication binding
+                                            operationId cmd.TaskId actor submissionId cmd.BaseOid
+                                        |> mapError))
                             | "QueueResponseAlert" ->
                                 withAdministrativeActor (fun actor ->
                                     ReviewWorkflow.ReviewWorkflow.queueResponseAlert binding operationId

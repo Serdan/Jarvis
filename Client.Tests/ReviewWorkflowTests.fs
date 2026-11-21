@@ -7738,3 +7738,146 @@ type ReviewWorkflowTests() =
             | other -> Assert.Fail(sprintf "Read should report only a safe read retry: %A" other)
             Assert.That(failedFetches, Is.EqualTo(3))
             Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(baseline)))
+
+    [<Test>]
+    member _.ExternalObservationRecordsExactPublishedMergeWithoutManagedPublisherProof() =
+        withFixture (fun one two first second baseOid _ newCommit _ ->
+            let taskId = "external-observation-positive"
+            let target = "refs/heads/" + git one [ "branch"; "--show-current" ]
+            let sourceRef = "refs/heads/feature/external-observation"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "External observation"
+            |> success |> ignore
+            git one [ "checkout"; "-b"; "feature/external-observation" ] |> ignore
+            let submitted = newCommit "Exact reviewed source" "external-observation-source"
+            let reviewId = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
+                reviewId sourceRef submitted "Accepted exact slice" "" target
+            |> success |> ignore
+            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId reviewId "Reviewer" 1
+            |> success |> ignore
+            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId reviewId "Reviewer" 2 Accept
+            |> success |> ignore
+            let submissionId = Guid.NewGuid()
+            ReviewWorkflow.submitIntegration second (Guid.NewGuid()) taskId "Owner"
+                submissionId "" "" (reviewId.ToString("N")) target
+            |> success |> ignore
+            File.WriteAllText(Path.Combine(two, "target-only.txt"), "target advanced")
+            git two [ "add"; "target-only.txt" ] |> ignore
+            git two [ "commit"; "-m"; "Unrelated target advancement" ] |> ignore
+            let targetParent = git two [ "rev-parse"; "HEAD" ]
+            git two [ "push"; "origin"; target ] |> ignore
+            git one [ "fetch"; "origin"; target ] |> ignore
+            git one [ "checkout"; "-b"; "integration/external-observation"; "FETCH_HEAD" ] |> ignore
+            git one [ "merge"; "--no-ff"; "--no-edit"; submitted ] |> ignore
+            let integrated = git one [ "rev-parse"; "HEAD" ]
+            let tree = git one [ "rev-parse"; integrated + "^{tree}" ]
+            Assert.That(git one [ "rev-list"; "--parents"; "-n"; "1"; integrated ],
+                Is.EqualTo(String.concat " " [ integrated; targetParent; submitted ]))
+            // The recording endpoint never publishes a prepared source itself.
+            match ReviewWorkflow.observeExternalPublication second (Guid.NewGuid()) taskId
+                    "AuthenticatedUser" submissionId integrated with
+            | Error(InvalidBinding _) | Error(SourceUnavailable _) -> ()
+            | other -> Assert.Fail(sprintf "Unpublished merge accepted as observed: %A" other)
+            Assert.That((ReviewWorkflow.getIntegrationSubmissions second taskId |> success).ExternalObservations,
+                Is.Empty)
+            git one [ "push"; "origin"; integrated + ":" + target ] |> ignore
+            let before = LedgerStore.readRemoteTarget second target |> success
+            let observationId = Guid.NewGuid()
+            let observe () =
+                ReviewWorkflow.observeExternalPublication second observationId taskId
+                    "AuthenticatedUser" submissionId integrated
+            Assert.That((observe () |> success).AlreadyApplied, Is.False)
+            Assert.That((observe () |> success).AlreadyApplied, Is.True)
+            let summary = ReviewWorkflow.getIntegrationSubmissions second taskId |> success
+            Assert.That(summary.ExternalObservations.Length, Is.EqualTo(1))
+            let observation = summary.ExternalObservations.Head
+            Assert.That(observation.EvidenceClass, Is.EqualTo("ObservedExternalGitInclusionUnattributed/v1"))
+            Assert.That(observation.PublisherAttribution, Is.EqualTo("Unattributed"))
+            Assert.That(observation.ManagedPublisherProof, Is.False)
+            Assert.That(observation.RecordedBy, Is.EqualTo("AuthenticatedUser"))
+            Assert.That(observation.ObservationOperationId, Is.EqualTo(observationId.ToString("D")))
+            Assert.That(observation.ReviewId, Is.EqualTo(reviewId.ToString("N")))
+            Assert.That(observation.SubmittedCommit, Is.EqualTo(submitted))
+            Assert.That(observation.IntegratedCommit, Is.EqualTo(integrated))
+            Assert.That(observation.IntegratedTree, Is.EqualTo(tree))
+            Assert.That(observation.FirstParent, Is.EqualTo(targetParent))
+            Assert.That(observation.ObservedRemoteHead, Is.EqualTo(before))
+            Assert.That(summary.Submissions.Head.Status, Is.EqualTo("Pending"))
+            Assert.That(summary.Submissions.Head.PublicationMechanism, Is.Null)
+            Assert.That(LedgerStore.readRemoteTarget second target |> success, Is.EqualTo(before))
+            match ReviewWorkflow.completeIntegration second (Guid.NewGuid()) taskId "Reviewer"
+                    submissionId integrated with
+            | Error(InvalidBinding _) | Error(OutcomeUnknown _) -> ()
+            | other -> Assert.Fail(sprintf "External observation manufactured managed publisher proof: %A" other)
+            // An observed remote may advance, but only along the already observed lineage.
+            File.WriteAllText(Path.Combine(two, "after-observation.txt"), "advance")
+            git two [ "fetch"; "origin"; target ] |> ignore
+            git two [ "merge"; "--ff-only"; "FETCH_HEAD" ] |> ignore
+            git two [ "add"; "after-observation.txt" ] |> ignore
+            git two [ "commit"; "-m"; "Post-observation target advance" ] |> ignore
+            let advanced = git two [ "rev-parse"; "HEAD" ]
+            git two [ "push"; "origin"; target ] |> ignore
+            ReviewWorkflow.observeExternalPublication second (Guid.NewGuid()) taskId
+                "AuthenticatedUser" submissionId integrated |> success |> ignore
+            let after = ReviewWorkflow.getIntegrationSubmissions first taskId |> success
+            Assert.That(after.ExternalObservations.Length, Is.EqualTo(2))
+            Assert.That((after.ExternalObservations |> List.last).ObservedRemoteHead,
+                Is.EqualTo(advanced))
+            Assert.That(after.Submissions.Head.Status, Is.EqualTo("Pending"))
+            // A later force rewrite that removes the previously observed head is never
+            // accepted as a monotonic observation, even if the prior receipt remains.
+            git one [ "push"; "--force"; "origin"; baseOid + ":" + target ] |> ignore
+            match ReviewWorkflow.observeExternalPublication second (Guid.NewGuid()) taskId
+                    "AuthenticatedUser" submissionId integrated with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Rewritten target accepted: %A" other)
+            Assert.That((ReviewWorkflow.getIntegrationSubmissions second taskId |> success).ExternalObservations.Length,
+                Is.EqualTo(2)))
+
+    [<Test>]
+    member _.ExternalObservationRejectsUnreviewedMergeAndWrongSubmissionOrActor() =
+        withFixture (fun one two first second _ _ newCommit _ ->
+            let taskId = "external-observation-negative"
+            let target = "refs/heads/" + git one [ "branch"; "--show-current" ]
+            let sourceRef = "refs/heads/feature/external-observation-negative"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "External negative"
+            |> success |> ignore
+            git one [ "checkout"; "-b"; "feature/external-observation-negative" ] |> ignore
+            let source = newCommit "Reviewed source" "reviewed"
+            let reviewId = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
+                reviewId sourceRef source "Source" "" target |> success |> ignore
+            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId reviewId "Reviewer" 1
+            |> success |> ignore
+            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId reviewId "Reviewer" 2 Accept
+            |> success |> ignore
+            let submissionId = Guid.NewGuid()
+            ReviewWorkflow.submitIntegration second (Guid.NewGuid()) taskId "Owner"
+                submissionId "" "" (reviewId.ToString("N")) target |> success |> ignore
+            File.WriteAllText(Path.Combine(two, "target-foreign.txt"), "target")
+            git two [ "add"; "target-foreign.txt" ] |> ignore
+            git two [ "commit"; "-m"; "Remote target" ] |> ignore
+            git two [ "push"; "origin"; target ] |> ignore
+            git one [ "fetch"; "origin"; target ] |> ignore
+            git one [ "checkout"; "-b"; "integration/external-negative"; "FETCH_HEAD" ] |> ignore
+            git one [ "merge"; "--no-ff"; "--no-edit"; source ] |> ignore
+            let integrated = git one [ "rev-parse"; "HEAD" ]
+            File.WriteAllText(Path.Combine(one, "unreviewed.txt"), "malicious")
+            git one [ "add"; "unreviewed.txt" ] |> ignore
+            git one [ "commit"; "--amend"; "--no-edit" ] |> ignore
+            let unreviewed = git one [ "rev-parse"; "HEAD" ]
+            git one [ "push"; "origin"; unreviewed + ":" + target ] |> ignore
+            let observe actor id merge =
+                ReviewWorkflow.observeExternalPublication second (Guid.NewGuid())
+                    taskId actor id merge
+            for actor, id, merge in
+                [ "AuthenticatedUser", submissionId, unreviewed
+                  "AuthenticatedUser", Guid.NewGuid(), integrated
+                  "", submissionId, unreviewed ] do
+                match observe actor id merge with
+                | Error(InvalidBinding _) | Error(LedgerIntegrityError _)
+                | Error(StaleEntityVersion _) -> ()
+                | other -> Assert.Fail(sprintf "Invalid external observation accepted: %A" other)
+            let summary = ReviewWorkflow.getIntegrationSubmissions second taskId |> success
+            Assert.That(summary.ExternalObservations, Is.Empty)
+            Assert.That(summary.Submissions.Head.Status, Is.EqualTo("Pending")))

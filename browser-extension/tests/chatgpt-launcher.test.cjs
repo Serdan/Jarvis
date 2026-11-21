@@ -122,7 +122,7 @@ function harness(options = {}) {
     getClientRects() { return [1]; },
     querySelector(sel) { return sel === '[data-model-picker-view]' ? { getAttribute() { return view; } } : null; },
     querySelectorAll(sel) {
-      if (sel === '[role="menuitemradio"]') return (view === "simple" ? [selectedModel] : ["GPT-6", "GPT-6.2 Astra"]).map(radio);
+      if (sel === '[role="menuitemradio"]') return (view === "simple" ? [selectedModel] : ["GPT-6", "GPT-6.2 Sol"]).map(radio);
       if (sel === '[data-model-picker-view-toggle]') return [toggle];
       if (sel === '[data-model-picker-power-slider]') return [power];
       if (sel === '[data-reasoning-slider]') return [keyboard];
@@ -196,7 +196,7 @@ function harness(options = {}) {
     },
     querySelector(selector) {
       if (selector === 'button[aria-label="Select ChatGPT model"]') return options.noPicker ? null : picker;
-      if (selector === '[data-model-selection-label="gpt-6.2-astra-wm"]') return selectedModel === "GPT-6.2 Astra" ? {} : null;
+      if (selector === '[data-model-selection-label="gpt-6.2-sol-wm"]') return selectedModel === "GPT-6.2 Sol" ? {} : null;
       if (selector.includes('contenteditable="true"')) return options.noComposer ? null : activeEditor;
       if (selector.includes('aria-label="Send"')) {
         if (options.noSend) return null;
@@ -956,12 +956,12 @@ test("absent model picker fails closed without sending", async () => {
   assert.equal(h.clicks, 0);
 });
 
-test("unavailable maximum effort falls back to Work Astra Medium", async () => {
+test("unavailable maximum effort falls back to Work Sol Medium", async () => {
   const h = harness({ maxEffortStep: 1, reasoningEffort: "Medium", timeoutMs: 12000 });
   const result = await h.run("Never send", { selectionOnly: true });
   assert.equal(result.status, "selectionOnly");
   assert.equal(result.selectedMode, "Work");
-  assert.equal(result.selectedModel, "GPT-6.2 Astra");
+  assert.equal(result.selectedModel, "GPT-6.2 Sol");
   assert.equal(result.selectedEffort, "Medium");
   assert.equal(result.attempts[0].reason, "EffortUnavailable");
   assert.equal(h.clicks, 0);

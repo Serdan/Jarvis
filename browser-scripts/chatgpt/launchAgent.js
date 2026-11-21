@@ -87,7 +87,7 @@ async function execute(args) {
   // The visible Work GPT-6.2 model is Astra; its default thinking effort is Medium.
   const preferences = [
     { mode: "Chat", model: "GPT-6", effort: "high", level: 2, label: "High" },
-    { mode: "Work", model: "GPT-6.2 Astra", effort: "medium", level: 1, label: "Medium" },
+    { mode: "Work", model: "GPT-6.2 Sol", effort: "medium", level: 1, label: "Medium" },
     { mode: "Chat", model: "GPT-6", effort: "none", level: 0, label: "Instant" }
   ];
   const composerSelector = '[data-composer-input-layout] [contenteditable="true"][role="textbox"]';
@@ -234,7 +234,7 @@ async function execute(args) {
         if (powerLabel?.getAttribute("data-power-disabled") === "true" ||
             power?.querySelector('[data-locked="true"]')) return "EffortUnavailable";
         if (target.mode === "Work" &&
-            !document.querySelector('[data-model-selection-label="gpt-6.2-astra-wm"]'))
+            !document.querySelector('[data-model-selection-label="gpt-6.2-sol-wm"]'))
           return "ModelUnconfirmed";
         // Close the picker before editing. No menu click can submit a prompt.
         if (control.getAttribute("aria-expanded") === "true") control.click();
@@ -346,7 +346,7 @@ async function execute(args) {
         .filter(node => node.getClientRects().length &&
           !node.closest('[aria-hidden="true"],[inert]'));
       if (labels.length && !labels.some(node =>
-          node.getAttribute("data-model-selection-label") === "gpt-6.2-astra-wm")) {
+          node.getAttribute("data-model-selection-label") === "gpt-6.2-sol-wm")) {
         return { failure: incompatible(stage, "SelectedModelChanged") };
       }
     }

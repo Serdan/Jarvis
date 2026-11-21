@@ -1,0 +1,9 @@
+# P1 — The stateful reference omits task/attempt dependency and generation state
+
+**Frozen source:** `cd895d493b419e127ededea15f814ab53e484407`, `Client.Tests/ChallengeStateMachinePropertyTests.fs`.
+
+**Evidence.** At lines 28–38 the only generated `Action` alternatives are Challenge create/respond/reopen/cancel/repeat, and the `Reference` consists only of a Challenge map and receipt map. The 256×80 reference-only seeds (lines 166–211, 384–393) therefore never express block-attempt, canonical dependency sets, owner/agent state, requeue, or assignment-generation transitions. The four dependency tests (lines 458–553) are fixed `seed % 4` scripts, not model-vs-production generated command traces; the two-clone CAS test (555–586) covers only two concurrent condition resolutions.
+
+**Why it matters.** The pinned task explicitly requires an independent state machine for task-block dependency sets, attempt/agent phases, and generations, with generated valid/invalid block/requeue actions and cross-client interleavings. A regression depending on a different operation ordering or a repeated generation cannot be found or minimized by this generator; the high fast-tier command count does not constitute coverage of that protocol.
+
+**Required correction.** Extend the small oracle and command set to cover block/requeue plus dependency/attempt/agent/generation state, generate/shrink mixed Challenge–attempt histories, and compare them to bounded real two-clone ledger traces. Assert that every essential action class actually occurs in positive and negative state contexts. Retain deterministic fixed dependency examples as complementary tests; do not copy production transitions into the oracle. No production edit is needed for this finding.

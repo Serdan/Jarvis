@@ -185,6 +185,12 @@ async function execute(args) {
         work.getAttribute("aria-pressed") !== "true") {
       return { failure: incompatible(stage, "ModeChanged") };
     }
+    const model = document.querySelector('button[aria-label="Select ChatGPT model"]');
+    if (model?.getAttribute("data-selected-reasoning-effort") !== "medium" ||
+        !Array.from(document.querySelectorAll('[data-model-selection-label]'))
+          .some(node => node.getAttribute("data-model-selection-label") === "gpt-6.1-terra-wm")) {
+      return { failure: incompatible(stage, "ModelOrEffortChanged") };
+    }
     const editors = document.querySelectorAll(composerSelector);
     if (editors.length !== 1) return { transient: "ComposerChanged" };
     return { chat, work, composer: editors[0] };

@@ -107,7 +107,7 @@ Immediate orchestrator handoff **does not need a schedule**: call `BrowserRunInN
 
 ```bash
 dotnet test Jarvis.slnx --no-restore
-node --test browser-extension/tests/bridge.test.cjs browser-extension/tests/chatgpt-launcher.test.cjs
+node --test browser-extension/tests/*.test.cjs
 ```
 
 The extension uses simulated Chromium APIs in Node tests; the F# client tests exercise a real loopback WebSocket. **A live Edge/ChatGPT acceptance run remains necessary** before deploying to normal use. See `docs/BrowserBridgeSystem.md` and `docs/ChatGPTAgentLauncher.md` for the detailed specifications.

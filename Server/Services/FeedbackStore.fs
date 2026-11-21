@@ -123,9 +123,9 @@ type FeedbackStore(databasePath: string, ?telemetryRetention: TimeSpan, ?runPrun
         | Some value -> box value
         | None -> box DBNull.Value
 
-    // Legacy attributed-activity diagnostics: production no longer reads
-    // SQLite as AfterAgentIdle authority. Never restore scheduling from these
-    // rows, including after a server restart or database replacement.
+    // A failed direct activity write poisons this store instance's read until
+    // another succeeds. The caller also needs OptionalFeedbackStore's separate
+    // current-process completeness gate: an old SQLite row alone is not proof.
     let unverifiedActivity = ConcurrentDictionary<struct (string * string * string), byte>()
 
     let optionText (reader: SqliteDataReader) ordinal =
@@ -237,9 +237,9 @@ CREATE TABLE IF NOT EXISTS connection_events (
 CREATE INDEX IF NOT EXISTS ix_connection_events_user_created
     ON connection_events(user_id, created_at DESC);
 
--- Legacy, NONAUTHORITATIVE attributed activity diagnostics, retained in
--- existing databases without destructive migration. A reset/lost row must
--- NEVER be interpreted as agent inactivity or authorize AfterAgentIdle.
+-- Existing monotonic timestamps are shared by server activity verification.
+-- A row by itself is NOT authoritative: the current-process coverage gate
+-- must rule out dropped/failed writes before Health may use its timestamp.
 CREATE TABLE IF NOT EXISTS attributed_agent_activity (
     user_id TEXT NOT NULL,
     project_name TEXT NOT NULL,

@@ -1,9 +1,14 @@
 namespace Server.Services
 
 open System
+open System.Collections.Generic
 open System.IO
 open System.Threading
 open System.Threading.Tasks
+
+type private ActivityCoverage =
+    { mutable Version: int64
+      mutable ConfirmedAtUtc: DateTimeOffset option }
 
 /// Optional, single-flight access to the disposable server diagnostics database.
 ///
@@ -30,6 +35,23 @@ type OptionalFeedbackStore(databasePath: string, ?timeout: TimeSpan, ?maxDiskByt
         lazy (new FeedbackStore(databasePath, runPruneTimer = false, maxDatabaseBytes = databaseBudget))
     let mutable inFlight = 0
     let unavailable = "TelemetryUnavailable: optional server SQLite is disabled, busy, or unresponsive."
+    // A persisted row cannot prove complete observation: writes can be dropped,
+    // including just before a server restart. Only a successful write during
+    // this process establishes coverage, revoked at each newer agent ingress.
+    // The finite proof cache fails closed at capacity; it never blocks dispatch.
+    let activityGate = obj()
+    let activityCoverage = Dictionary<struct (string * string * string), ActivityCoverage>()
+    let maxActivityKeys = 16384
+    let mutable activityCoverageExhausted = false
+    let canonicalProject (project: string) =
+        if isNull project then ""
+        else
+            let separator = project.IndexOf("::", StringComparison.Ordinal)
+            if separator < 0 then project else project.Substring(0, separator)
+    let validActivityKey (user: string) (project: string) (agent: string) =
+        not (String.IsNullOrWhiteSpace user || String.IsNullOrWhiteSpace project ||
+             String.IsNullOrWhiteSpace agent)
+        && user.Length <= 512 && project.Length <= 256 && agent.Length <= 128
     // Periodic retention must follow the same single-flight budget; the
     // underlying FeedbackStore timer is disabled for this wrapper.
     let pruneTimer =
@@ -79,6 +101,89 @@ type OptionalFeedbackStore(databasePath: string, ?timeout: TimeSpan, ?maxDiskByt
     /// this calling thread; overload, startup failure and storage loss drop data.
     member this.TryPost(operation: FeedbackStore -> unit) =
         this.TryExecute(operation) |> ignore
+
+    /// The in-process gate is invalidated SYNCHRONOUSLY before dispatch.
+    /// Rejected, failed or timed-out SQLite writes leave the key unverified.
+    /// An older write completing late cannot certify a newer agent call.
+    member this.RecordAgentActivity(userId: string, projectName: string,
+                                    agentId: string, observedAtUtc: DateTimeOffset) : Task =
+        let project = canonicalProject projectName
+        if not (validActivityKey userId project agentId) then Task.CompletedTask
+        else
+            let key = struct (userId, project, agentId)
+            let version =
+                lock activityGate (fun () ->
+                    if activityCoverageExhausted then None
+                    else
+                        match activityCoverage.TryGetValue(key) with
+                        | true, coverage ->
+                            coverage.Version <- coverage.Version + 1L
+                            coverage.ConfirmedAtUtc <- None
+                            Some coverage.Version
+                        | _ when activityCoverage.Count < maxActivityKeys ->
+                            activityCoverage[key] <- { Version = 1L; ConfirmedAtUtc = None }
+                            Some 1L
+                        | _ ->
+                            activityCoverageExhausted <- true
+                            None)
+            match version with
+            | None -> Task.CompletedTask
+            | Some currentVersion ->
+                task {
+                    try
+                        let! result =
+                            this.TryExecute(fun db ->
+                                db.RecordAttributedAgentActivity(userId, project, agentId, observedAtUtc))
+                        match result with
+                        | Ok () ->
+                            lock activityGate (fun () ->
+                                match activityCoverage.TryGetValue(key) with
+                                | true, coverage when coverage.Version = currentVersion ->
+                                    coverage.ConfirmedAtUtc <- Some observedAtUtc
+                                | _ -> ())
+                        | Error _ -> () // Fail closed, including quota and uncertain timeouts.
+                    with _ -> () // Telemetry must never change command semantics.
+                } :> Task
+
+    /// A fresh, authenticated Hub read. A row from a previous server process
+    /// is not coverage; missing rows, failed reads and concurrent ingress HOLD.
+    member this.GetVerifiedAgentActivity(userId: string, projectName: string,
+                                         agentId: string) : Task<DateTimeOffset * DateTimeOffset> =
+        task {
+            let project = canonicalProject projectName
+            if not (validActivityKey userId project agentId) then
+                invalidOp "ActivityProofUnavailable: invalid or unbounded activity identity."
+            let key = struct (userId, project, agentId)
+            let expected =
+                lock activityGate (fun () ->
+                    if activityCoverageExhausted then None
+                    else
+                        match activityCoverage.TryGetValue(key) with
+                        | true, coverage ->
+                            coverage.ConfirmedAtUtc
+                            |> Option.map (fun seen -> coverage.Version, seen)
+                        | _ -> None)
+            match expected with
+            | None ->
+                return invalidOp "ActivityProofUnavailable: no complete current-process activity evidence."
+            | Some (version, confirmedAt) ->
+                let! outcome =
+                    this.TryExecute(fun db -> db.GetAttributedAgentActivity(userId, project, agentId))
+                let serverNow = DateTimeOffset.UtcNow
+                let unchanged =
+                    lock activityGate (fun () ->
+                        if activityCoverageExhausted then false
+                        else
+                            match activityCoverage.TryGetValue(key) with
+                            | true, coverage ->
+                                coverage.Version = version && coverage.ConfirmedAtUtc = Some confirmedAt
+                            | _ -> false)
+                match outcome with
+                | Ok (Some seen) when unchanged && seen >= confirmedAt && seen <= serverNow ->
+                    return seen, serverNow
+                | _ ->
+                    return invalidOp "ActivityProofUnavailable: SQLite observation is missing, stale or unverified."
+        }
 
     interface IDisposable with
         member _.Dispose() =

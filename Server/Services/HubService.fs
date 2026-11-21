@@ -121,20 +121,22 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Optio
         )
         Task.FromResult result
 
-    // A disposable SQLite watermark is not an activity proof. Until the
-    // client/Git ledger supplies an independently durable, fresh cross-device
-    // watermark, idle-based launches are explicitly unavailable.
-    // Old clients must also fail closed instead of interpreting a reset DB
-    // row as an idle interval.
+    // Only the authenticated registered client's own user scope may read the
+    // current server-process SQLite coverage proof. A row alone, especially
+    // after restart or a missed write, is not evidence of inactivity.
     member this.GetAgentActivity(projectName: string, agentId: string) =
         match users.GetSessionByConnection(this.Context.ConnectionId) with
         | ValueSome session when session.State = Registered
-                                 && session.ConnectionId = Some this.Context.ConnectionId ->
-            Task.FromException<AgentActivitySnapshot>(
-                InvalidOperationException("ActivityProofUnavailable: server SQLite is not authoritative for AfterAgentIdle."))
+                                 && session.ConnectionId = Some this.Context.ConnectionId
+                                 && session.UserId = this.UserId ->
+            task {
+                let! seen, serverNow =
+                    store.GetVerifiedAgentActivity(this.UserId, projectName, agentId)
+                return { LastSeenAtUtc = Some seen; ServerNowUtc = serverNow }
+            }
         | _ ->
             Task.FromException<AgentActivitySnapshot>(
-                UnauthorizedAccessException("A registered Jarvis client is required to verify Manager activity."))
+                UnauthorizedAccessException("A registered Jarvis client is required to verify agent activity."))
 
     member this.SendClientResponse(correlationId: string, response: AgentCommandResponse) =
         users.TouchConnection(this.Context.ConnectionId)

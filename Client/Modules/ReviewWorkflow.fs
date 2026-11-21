@@ -3657,11 +3657,11 @@ module ReviewWorkflow =
         if not (validAgent reviewerId) then Error(InvalidBinding "Invalid reviewer.")
         else result {
             let! snapshot = LedgerStore.fetch binding
-            let! paths = LedgerStore.listAt binding snapshot "tasks"
+            let! records = LedgerStore.readReviewerQueueRecordsAt binding snapshot
             let mutable reviews = []
-            for path in paths do
+            for KeyValue(path, _) in records do
                 if path.EndsWith("/review.json", StringComparison.Ordinal) then
-                    let! review, _ = required<BranchReview> binding snapshot path
+                    let! review = requiredFromRecords<BranchReview> records path
                     if review.Status = "Unclaimed"
                        || (review.Status = "Claimed" && review.ReviewerId = reviewerId) then
                         reviews <- review :: reviews

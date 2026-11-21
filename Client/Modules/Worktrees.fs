@@ -22,7 +22,7 @@ type WorktreeInfo =
       IsClean: bool option }
 
 let private git projectName args =
-    ClientShell.runCommand
+    let command =
         { ProjectName = projectName
           Executable = "git"
           Args = args
@@ -30,6 +30,9 @@ let private git projectName args =
           WorkingDirectory = None
           TimeoutSeconds = Some 20
           MaxOutputBytes = Some(256 * 1024) }
+    fun rt ->
+        McpLatencyTrace.measure "git.worktree" (fun () ->
+            ClientShell.runCommand command rt)
 
 /// Decode Git's porcelain format. A blank line separates records.
 let parsePorcelain (mainPath: string) (output: string) : Result<WorktreeInfo list, string> =
@@ -85,16 +88,10 @@ let listWorktrees (cmd: ListWorktreesCommand) =
                 | Some mainPath ->
                     match parsePorcelain mainPath result.StdOut with
                     | Ok items ->
-                        fun rt ->
-                            items
-                            |> List.map (fun item ->
-                                if not (Directory.Exists item.Path) then item
-                                else
-                                    match git cmd.ProjectName [ "-C"; item.Path; "status"; "--porcelain" ] rt with
-                                    | Ok status when status.ExitCode = 0 && not status.TimedOut && not status.Truncated ->
-                                        { item with IsClean = Some(String.IsNullOrWhiteSpace status.StdOut) }
-                                    | _ -> item)
-                            |> Ok
+                        // Bulk discovery must not start one Git status process per worktree.
+                        // Selected lookups resolve cleanliness; removal independently
+                        // rechecks it before changing anything.
+                        fun _ -> Ok items
                     | Error message -> Client.ValidationError message |> Effect.ofError
     }
 
@@ -108,7 +105,14 @@ let getWorktree (cmd: GetWorktreeCommand) =
             if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal
         return!
             match target |> Option.bind (fun path -> entries |> List.tryFind (fun entry -> String.Equals(entry.Path, path, comparison))) with
-            | Some entry -> fun _ -> Ok entry
+            | Some entry ->
+                fun rt ->
+                    if not (Directory.Exists entry.Path) then Ok entry
+                    else
+                        match git cmd.ProjectName [ "-C"; entry.Path; "status"; "--porcelain" ] rt with
+                        | Ok status when status.ExitCode = 0 && not status.TimedOut && not status.Truncated ->
+                            Ok { entry with IsClean = Some(String.IsNullOrWhiteSpace status.StdOut) }
+                        | _ -> Ok entry
             | None -> Client.NotFoundError "Worktree is not registered with this project." |> Effect.ofError
     }
 

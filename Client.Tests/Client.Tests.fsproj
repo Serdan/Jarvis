@@ -71,6 +71,7 @@
         <Compile Include="WorkQueueMultiLedgerPreparedRecoveryTests.fs"/>
         <Compile Include="RoleInstructionsTests.fs"/>
         <Compile Include="PerformanceRegression.fs"/>
+        <Compile Include="McpLatencyTraceTests.fs"/>
         <Compile Include="ReviewWorkflowTests.fs"/>
         <Compile Include="TaskOverviewBatchPerformanceTests.fs"/>
         <Compile Include="ChallengeWorkflowTests.fs"/>

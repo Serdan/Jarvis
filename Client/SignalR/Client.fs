@@ -1096,7 +1096,8 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
         let! response =
             task {
                 try
-                    let command = JsonSerializer.Deserialize<AgentCommand>(commandJson)
+                    let command =
+                        McpLatencyTrace.measure "json.command_parse" (fun () -> JsonSerializer.Deserialize<AgentCommand>(commandJson))
                     parsedCommand <- Some command
                     // A self-inbox response must explicitly distinguish a
                     // repeated read from a newly committed activation, even
@@ -1393,8 +1394,16 @@ let private receiveCommandAndReplyCore (connection: HubConnection) (rt: Runtime)
     (sourceOriginalId: string option) (manualGrantAuthorized: bool)
     (report: string -> float -> float -> bool -> unit) : Task =
     task {
+        let previous, trace = McpLatencyTrace.beginTrace (McpLatencyTrace.optedIn ()) correlationId
         let commandStarted = Stopwatch.GetTimestamp()
-        let! agentResponse = executeOrPromote rt commandJson agentId sourceOriginalId manualGrantAuthorized
+        let! agentResponse =
+            task {
+                try
+                    return! executeOrPromote rt commandJson agentId sourceOriginalId manualGrantAuthorized
+                finally
+                    McpLatencyTrace.record "client.execute_or_promote" commandStarted
+                    McpLatencyTrace.restore previous
+            }
         let commandMilliseconds = Stopwatch.GetElapsedTime(commandStarted).TotalMilliseconds
         let replyStarted = Stopwatch.GetTimestamp()
         let! sendResult =
@@ -1405,6 +1414,13 @@ let private receiveCommandAndReplyCore (connection: HubConnection) (rt: Runtime)
                 (fun () -> connection.invokeAsync("SendClientResponse", correlationId, agentResponse))
 
         let replyMilliseconds = Stopwatch.GetElapsedTime(replyStarted).TotalMilliseconds
+        McpLatencyTrace.recordFor trace "signalr.reply_ack" replyStarted
+        let outcome =
+            if agentResponse.PendingJob.IsSome then "pending"
+            elif agentResponse.Error.IsSome || not sendResult.IsOk then "failed"
+            else "completed"
+        McpLatencyTrace.render trace outcome
+        |> Option.iter (fun diagnostic -> rt.Tui.Log ("MCP stage trace " + diagnostic))
         try
             report correlationId commandMilliseconds replyMilliseconds sendResult.IsOk
         with _ ->

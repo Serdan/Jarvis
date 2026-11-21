@@ -52,6 +52,33 @@ let ``discovery includes existing sibling worktrees outside naming convention`` 
         | Error e -> Assert.Fail($"Discovery failed: {e}"))
 
 [<Test>]
+let ``bulk worktree discovery has unknown cleanliness while selected inspection stays accurate`` () =
+    withRepo (fun root _ context ->
+        let sibling = Path.Combine(root, "bulk-discovery-linked")
+        GitCommandTests.expectGitSuccess context
+            [ "worktree"; "add"; "-b"; "feature/bulk-discovery"; sibling; "HEAD" ]
+        let command: ListWorktreesCommand = { ProjectName = "Project1" }
+        match listWorktrees command context with
+        | Error e -> Assert.Fail($"Discovery failed: {e}")
+        | Ok all ->
+            Assert.That(all.Length, Is.EqualTo(2))
+            Assert.That(all |> List.forall (fun entry -> entry.IsClean.IsNone), Is.True)
+        let selected = { ProjectName = "Project1"; WorktreePath = sibling }
+        match getWorktree selected context with
+        | Error e -> Assert.Fail($"Selected inspection failed: {e}")
+        | Ok entry -> Assert.That(entry.IsClean, Is.EqualTo(Some true))
+        File.WriteAllText(Path.Combine(sibling, "uncommitted.txt"), "dirty")
+        match getWorktree selected context with
+        | Error e -> Assert.Fail($"Selected dirty inspection failed: {e}")
+        | Ok entry -> Assert.That(entry.IsClean, Is.EqualTo(Some false))
+        let removal: InspectWorktreeRemovalCommand = { ProjectName = "Project1"; WorktreePath = sibling; TargetRef = Some "HEAD" }
+        match inspectRemoval removal context with
+        | Error e -> Assert.Fail($"Removal safety inspection failed: {e}")
+        | Ok inspected ->
+            Assert.That(inspected.IsClean, Is.False)
+            Assert.That(inspected.CanRemove, Is.False))
+
+[<Test>]
 let ``creation uses hidden project container and supports slash branches`` () =
     withRepo (fun root _ context ->
         let cmd = { ProjectName = "Project1"; Name = "input-config"; Branch = "feature/input-config"; BaseRef = "HEAD" }

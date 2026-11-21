@@ -183,6 +183,70 @@ let explicit_cancellation_terminates_bounded_process () =
         if Directory.Exists(root) then Directory.Delete(root, true)
 
 [<Test>]
+let real_delayed_git_process_allows_independent_git_and_cancelled_work_to_finish () =
+    if OperatingSystem.IsWindows() then
+        Assert.Ignore("POSIX-only Git alias delay control; KRUSO Windows parity requires a separately scoped connected run.")
+    let root = newProject ()
+    try
+        let project = Path.Combine(root, "Project1")
+        let git args (timeout: float) : BoundedProcess.Command =
+            { Executable = "git"
+              Args = args
+              WorkingDirectory = project
+              Timeout = TimeSpan.FromSeconds timeout
+              MaxOutputBytes = Some 4096
+              StandardInput = BoundedProcess.ClosedInput
+              ExtraEnvironment = []
+              ConfigureStart = None }
+        match BoundedProcess.run (git [ "init"; "-q"; "." ] 5.) with
+        | Ok result when result.ExitCode = 0 -> ()
+        | other -> Assert.Fail($"Disposable Git initialization failed: {other}")
+
+        // A real Git child executes a disposable shell alias with an actual
+        // 10-second delay. Cancellation must reap it, without monopolizing a
+        // second independent Git request against the same repository.
+        use cancellation = new CancellationTokenSource()
+        let started = Stopwatch.GetTimestamp()
+        let delayed =
+            System.Threading.Tasks.Task.Run(fun () ->
+                BoundedProcess.runWithCancellation cancellation.Token
+                    (git [ "-c"; "alias.pause=!sleep 10"; "pause" ] 15.))
+        Thread.Sleep 350
+        let fastStarted = Stopwatch.GetTimestamp()
+        let fast = BoundedProcess.run (git [ "status"; "--porcelain" ] 5.)
+        let independentMs = Stopwatch.GetElapsedTime(fastStarted).TotalMilliseconds
+        cancellation.Cancel()
+        let canceled = delayed.GetAwaiter().GetResult()
+        let canceledMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds
+        match fast with
+        | Ok result when result.ExitCode = 0 && not result.TimedOut -> ()
+        | other -> Assert.Fail($"Independent Git status was blocked: {other}")
+        match canceled with
+        | Error(Client.ContextError message) ->
+            Assert.That(message, Does.Contain("canceled"))
+        | other -> Assert.Fail($"Delayed real Git did not cancel: {other}")
+        Assert.That(canceledMs, Is.LessThan(4000.),
+                    "A canceled Git subprocess must terminate rather than run the full delay.")
+
+        // Separate uncanceled 1-second control proves the delay was executed
+        // by Git and is not a mock Stopwatch fixture.
+        let controlStarted = Stopwatch.GetTimestamp()
+        let control = BoundedProcess.run (git [ "-c"; "alias.pause=!sleep 1"; "pause" ] 5.)
+        let controlMs = Stopwatch.GetElapsedTime(controlStarted).TotalMilliseconds
+        match control with
+        | Ok result when result.ExitCode = 0 && not result.TimedOut -> ()
+        | other -> Assert.Fail($"Real delayed Git control failed: {other}")
+        TestContext.Progress.WriteLine(
+            System.Text.Json.JsonSerializer.Serialize(
+                {| controlGitMs = controlMs
+                   independentGitMs = independentMs
+                   canceledGitMs = canceledMs
+                   hostOs = System.Runtime.InteropServices.RuntimeInformation.OSDescription
+                   runtime = System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription |}))
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Test>]
 let timeout_interrupts_blocked_standard_input_write () =
     let root = newProject ()
     try

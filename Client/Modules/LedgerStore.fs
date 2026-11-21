@@ -484,7 +484,7 @@ module LedgerStore =
             true
         with _ -> false
 
-    let private execute (repo: string) (args: string list) (input: string option) (environment: (string * string) list) (preserveStdout: bool) =
+    let private executeCore (repo: string) (args: string list) (input: string option) (environment: (string * string) list) (preserveStdout: bool) =
         // Record an attempted publication BEFORE starting Git, including when
         // process creation or transport fails. Review-ref pushes and ledger
         // pushes share this path; neither can be mistaken for a preflight-only
@@ -566,6 +566,10 @@ module LedgerStore =
                         { ExitCode = output.ExitCode
                           Stdout = if preserveStdout then output.StdOut else output.StdOut.TrimEnd('\n', '\r')
                           Stderr = output.StdErr }
+
+    let private execute repo args input environment preserveStdout =
+        McpLatencyTrace.measureGit args (fun () ->
+            executeCore repo args input environment preserveStdout)
 
     let private git repo args = execute repo args None [] false
     let private gitRaw repo args = execute repo args None [] true
@@ -1718,6 +1722,14 @@ module LedgerStore =
             Regex.IsMatch(path, "^tasks/[A-Za-z0-9_-]+/task[.]json$")
             || Regex.IsMatch(path, "^tasks/[A-Za-z0-9_-]+/reviews/[a-f0-9]{32}/review[.]json$")
         readSelectedRecordsAt [ "tasks" ] canonical binding snapshot
+        |> Result.map stripOids
+
+    // ReviewerInbox needs review entities only, not the task/spec/attempt
+    // history surrounding each review. Keep the original suffix selection
+    // semantics so malformed selected records still fail closed.
+    let readReviewerQueueRecordsAt binding snapshot =
+        readSelectedRecordsAt [ "tasks" ]
+            (fun path -> path.EndsWith("/review.json", StringComparison.Ordinal)) binding snapshot
         |> Result.map stripOids
 
     // The caller has decoded canonical tasks before selecting their active

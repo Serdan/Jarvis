@@ -377,7 +377,8 @@ let private runClient args =
             8,
             128,
             fun timing ->
-                if timing.QueueMilliseconds >= 200.0
+                if McpLatencyTrace.optedIn ()
+                   || timing.QueueMilliseconds >= 200.0
                    || timing.ExecutionMilliseconds >= 2000.0
                    || timing.FailureType.IsSome then
                     let failure = timing.FailureType |> Option.defaultValue "none"
@@ -405,7 +406,8 @@ let private runClient args =
             correlationId,
             (fun () ->
                 let report id commandMs replyMs delivered =
-                        if commandMs >= 200.0 || replyMs >= 1000.0 || not delivered then
+                        if McpLatencyTrace.optedIn ()
+                           || commandMs >= 200.0 || replyMs >= 1000.0 || not delivered then
                             tui.Log
                                 $"MCP stage {id}: commandMs={commandMs:F0} replyMs={replyMs:F0} replyAck={delivered}"
                 if manualApproval then

@@ -323,6 +323,13 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                               Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
                     else
                         let correlationId, trackingTask = tracker.Register(userId, connectionId, session.Generation, this.ResponseTimeout command)
+                        // Correlate the authenticated MCP envelope with this
+                        // SignalR hop only when diagnostics are explicitly enabled.
+                        if String.Equals(Environment.GetEnvironmentVariable("JARVIS_MCP_STAGE_TRACE"),
+                                         "1", StringComparison.Ordinal) then
+                            match http.HttpContext with
+                            | null -> ()
+                            | context -> context.Items["jarvis/mcp/correlation"] <- correlationId
                         let client = ctx.Clients.Client(connectionId)
                         let commandJson = JsonSerializer.Serialize<AgentCommand>(command)
                         let routeMs = Stopwatch.GetElapsedTime(requestAcceptedAt).TotalMilliseconds
@@ -334,7 +341,9 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                             // an actual response because a logging sink failed.
                             try
                                 ServerDispatchTelemetry.record commandName outcome routeMs sendMs replyMs totalMs
-                                if totalMs >= 2000.0 || outcome <> "completed" then
+                                if String.Equals(Environment.GetEnvironmentVariable("JARVIS_MCP_STAGE_TRACE"),
+                                                 "1", StringComparison.Ordinal)
+                                   || totalMs >= 2000.0 || outcome <> "completed" then
                                     logger.LogInformation(
                                         "MCP dispatch {CorrelationId} {Command} {Outcome}: routeMs={RouteMs:F1} signalrSendMs={SendMs:F1} replyWaitMs={ReplyMs:F1} totalMs={TotalMs:F1}",
                                         correlationId, commandName, outcome, routeMs, sendMs, replyMs, totalMs)

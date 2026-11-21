@@ -2,7 +2,7 @@
 
 > **Historical handoff superseded (2026-11-21).** The durable Challenge workflow is integrated into Jarvis `main` at `d702352ef705f9991ac1cb14dc15a13cce78aa44`. The integrated submission for `task-80c12fa7cf6f42eb918bab94a3cb7bbd` and the operator-feedback task `task-8b79dd419d94405793a17aa18c1d0b28` both identify `13d4124348f8a287673d8568a371adf918a33240`, an ancestor of that main commit. The original conflict-resolution guidance below is retained as historical evidence, not current merge instructions.
 
-The connected client advertises protocol **3.68** and Challenge commands. This establishes command availability, **not** independently verified end-to-end deployment acceptance. The ChatGPT connector currently lacks direct Challenge list/get/subscription actions despite the public catalog exposing them. A `ChallengeSubscribed=false` inbox and empty triage do not prove that no unassigned challenges exist.
+The connected client advertises protocol **3.68** and Challenge commands; the refreshed ChatGPT connector exposes direct `list_challenges`, `get_challenge` and `set_challenge_subscription` actions (verified 2026-11-21). This establishes command availability, **not** independently verified end-to-end deployment acceptance. A `ChallengeSubscribed=false` inbox and empty triage do not prove that no unassigned challenges exist.
 
 Current integrated source includes `Client/Modules/ChallengeWorkflow.fs`, typed `ChallengeRead`/`ChallengeWrite` commands in `Common/Messages/AgentCommand.fs`, and `Client.Tests/ChallengeWorkflowTests.fs`. No additional deployment or autonomous dispatch is authorized by this historical note.
 

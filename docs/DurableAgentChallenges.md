@@ -1,6 +1,6 @@
 # Durable agent challenges (introduced in protocol 3.65)
 
-Protocol **3.65** identifies the Challenge feature introduction, not the current connected-client version. The connected client advertises **3.68**; its public catalog includes Challenge list/get/subscription commands, while the current ChatGPT connector wrapper does not expose those three as direct actions. A non-subscribed agent's empty triage section cannot establish that no unassigned challenges exist. Command advertisement is not end-to-end deployment acceptance.
+Protocol **3.65** identifies the Challenge feature introduction, not the current connected-client version. The connected client advertises **3.68**; its public catalog and refreshed ChatGPT connector expose direct `list_challenges`, `get_challenge` and `set_challenge_subscription` actions (verified 2026-11-21). A non-subscribed agent's empty triage section cannot establish that no unassigned challenges exist. Tool availability is not end-to-end deployment acceptance.
 
 Challenges coordinate agents through the existing **verified Git orchestration ledger**. They do not need browser tabs, hooks, a server-side scheduler, a workflow-expression language, or notification delivery. The initial completion policy is **ALL**; there is **no completion action**.
 

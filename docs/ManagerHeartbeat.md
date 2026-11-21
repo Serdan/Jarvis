@@ -36,8 +36,9 @@ Scheduler is reviewed and explicitly authorized. The local per-project
 sessions and are not that account-wide Scheduler.
 
 The public catalog also exposes `ListChallenges`, `GetChallenge` and
-`SetChallengeSubscription`, but the current ChatGPT connector wrapper has
-no corresponding direct list/get/subscription operations. A Lead inbox with
+`SetChallengeSubscription`; the refreshed ChatGPT connector now exposes
+the corresponding direct `list_challenges`, `get_challenge` and
+`set_challenge_subscription` operations (verified 2026-11-21). A Lead inbox with
 `ChallengeSubscribed=false` and empty triage cannot establish an empty
 unassigned Challenge queue; do not mark a snapshot complete on that basis.
 

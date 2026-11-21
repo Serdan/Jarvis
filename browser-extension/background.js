@@ -351,6 +351,55 @@ async function connect() {
   };
   ws.onerror = () => { try { ws.close(); } catch {} };
 }
+// DevTools focus emulation makes a *background renderer* behave as active
+// without selecting the tab in Chrome's tab strip. Chrome requires its powerful
+// debugger install permission: this is deliberately restricted in code to
+// ChatGPT fresh-home tabs created by Jarvis in a registered window.
+// Only the one composite execute call with requireAgentCreated can request it.
+const backgroundFocusOwners = new Set();
+const CHATGPT_BACKGROUND_HOME = "https://chatgpt.com/";
+async function acquireBackgroundFocus(registration, message) {
+  if (!registration.agentCreated || message.requireAgentCreated !== true ||
+      registration.boundUrl !== CHATGPT_BACKGROUND_HOME) return null;
+  const tab = await chrome.tabs.get(registration.tabId);
+  if (tab.active) return null;
+  // Never attach a privileged debugger to another origin, a pending route,
+  // a discarded document, or a tab moved out of the registered window.
+  const parent = await validWindow(registration.windowRegistration);
+  if (!parent || tab.windowId !== parent.windowId ||
+      tab.url !== CHATGPT_BACKGROUND_HOME || tab.pendingUrl ||
+      tab.status !== "complete" || tab.discarded || tab.frozen) {
+    throw new Error("BackgroundFocusUnavailable");
+  }
+  const tabId = registration.tabId;
+  if (backgroundFocusOwners.has(tabId)) throw new Error("BackgroundFocusBusy");
+  backgroundFocusOwners.add(tabId);
+  const target = { tabId };
+  let attached = false;
+  try {
+    if (!chrome.debugger?.attach || !chrome.debugger?.sendCommand ||
+        !chrome.debugger?.detach) throw new Error("DebuggerUnavailable");
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+    await chrome.debugger.sendCommand(target,
+      "Emulation.setFocusEmulationEnabled", { enabled: true });
+    return async () => {
+      try {
+        await chrome.debugger.sendCommand(target,
+          "Emulation.setFocusEmulationEnabled", { enabled: false });
+      } catch { /* A closing tab detaches its debugger session automatically. */ }
+      try { await chrome.debugger.detach(target); } catch {}
+      backgroundFocusOwners.delete(tabId);
+    };
+  } catch {
+    if (attached) {
+      try { await chrome.debugger.detach(target); } catch {}
+    }
+    backgroundFocusOwners.delete(tabId);
+    throw new Error("BackgroundFocusUnavailable");
+  }
+}
+
 async function execute(message) {
   const { requestId, registrationId, registrationGeneration, source, args } = message;
   const requestSocket = socket;
@@ -409,11 +458,42 @@ async function execute(message) {
   if (lastRevocation) return error(lastRevocation);
   inflight++;
   try {
-    const results = await api.execute({
-      target: { tabId: registration.tabId },
-      js: [{ code: wrapper }],
-      world: "USER_SCRIPT"
-    });
+    let releaseFocus = null;
+    let results;
+    try {
+      // This is a pre-execution gate: if the target cannot emulate a focused
+      // renderer, do not insert the prompt or attempt Send in a hidden tab.
+      try { releaseFocus = await acquireBackgroundFocus(registration, message); }
+      catch { return error("BackgroundFocusUnavailable"); }
+      const preExecutionRevocation = await authorizePageExecution(pagePin);
+      if (preExecutionRevocation) return error(preExecutionRevocation);
+      if (releaseFocus) {
+        // A successful DevTools command alone is not evidence that this
+        // renderer is ready to receive background input. Verify the actual
+        // page-visible state BEFORE executing any user-provided script.
+        let probe;
+        try {
+          probe = await api.execute({
+            target: { tabId: registration.tabId },
+            js: [{ code: "document.visibilityState === 'visible' && document.hasFocus()" }],
+            world: "USER_SCRIPT"
+          });
+        } catch { return error("BackgroundFocusNotVerified"); }
+        if (probe?.length !== 1 || probe[0]?.frameId !== 0 ||
+            probe[0]?.result !== true) return error("BackgroundFocusNotVerified");
+      }
+      const lastFocusRevocation = await authorizePageExecution(pagePin);
+      if (lastFocusRevocation) return error(lastFocusRevocation);
+      results = await api.execute({
+        target: { tabId: registration.tabId },
+        js: [{ code: wrapper }],
+        world: "USER_SCRIPT"
+      });
+    } finally {
+      // Keep the emulation active through the entire one-shot attempt, then
+      // detach on success, throw, revocation, or tab closure. No retry here.
+      if (releaseFocus) await releaseFocus();
+    }
     const first = results?.[0];
     if (first?.error) return error("ScriptError:" + first.error.slice(0, 300));
     // Recheck URL and registration after execution. Side effects can have occurred.

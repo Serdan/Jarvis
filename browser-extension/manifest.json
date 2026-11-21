@@ -8,6 +8,7 @@
     "storage",
     "tabs",
     "userScripts",
+    "debugger",
     "alarms", "webNavigation"
   ],
   "optional_host_permissions": [

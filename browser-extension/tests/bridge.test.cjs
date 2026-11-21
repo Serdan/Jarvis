@@ -20,6 +20,10 @@ function createHarness(initialStorage = {}, initialSession = {}) {
   const calls = [];
   const createdTabs = [];
   const removedTabs = [];
+  const debuggerCalls = [];
+  let failDebuggerAttach = false;
+  let failDebuggerEnable = false;
+  let ignoreFocusEmulation = false;
   let userScriptHook = null;
   let postUserScriptHook = null;
   let nextCreatedId = 19;
@@ -131,6 +135,27 @@ function createHarness(initialStorage = {}, initialSession = {}) {
       create: () => {},
       onAlarm: { addListener: cb => { listeners.alarm = cb; } }
     },
+    debugger: {
+      attach: async ({ tabId }, version) => {
+        debuggerCalls.push({ kind: "attach", tabId, version });
+        if (failDebuggerAttach) { failDebuggerAttach = false; throw Error("DebuggerAttachDenied"); }
+        if (!tabs.has(tabId)) throw Error("NoTab");
+      },
+      sendCommand: async ({ tabId }, method, params) => {
+        debuggerCalls.push({ kind: "command", tabId, method, params });
+        if (method !== "Emulation.setFocusEmulationEnabled") throw Error("WrongDomain");
+        if (failDebuggerEnable && params.enabled) {
+          failDebuggerEnable = false; throw Error("FocusEmulationDenied");
+        }
+        const page = tabs.get(tabId);
+        if (page && !ignoreFocusEmulation) page.focusEmulated = params.enabled;
+      },
+      detach: async ({ tabId }) => {
+        debuggerCalls.push({ kind: "detach", tabId });
+        const page = tabs.get(tabId);
+        if (page) page.focusEmulated = false;
+      }
+    },
     userScripts: {
       execute: async ({ target, js, world }) => {
         if (userScriptHook) {
@@ -145,6 +170,8 @@ function createHarness(initialStorage = {}, initialSession = {}) {
           location: { href: page.url, origin: new URL(page.url).origin },
           document: {
             title: page.title,
+            visibilityState: page.focusEmulated || page.active ? "visible" : "hidden",
+            hasFocus: () => Boolean(page.focusEmulated || page.active),
             readyState: page.documentReadyState || "complete",
             querySelectorAll: () => Array.from({
               length: (page.userTurns || 0) + (page.userBubbles || 0)
@@ -172,7 +199,10 @@ function createHarness(initialStorage = {}, initialSession = {}) {
     await tick(); await tick();
   };
   return { storage, session, tabs, createdTabs, removedTabs, sockets, calls, listeners, message, deliver,
-    userScripts: chrome.userScripts,
+    userScripts: chrome.userScripts, debuggerCalls,
+    failDebuggerAttachOnce: () => { failDebuggerAttach = true; },
+    failDebuggerEnableOnce: () => { failDebuggerEnable = true; },
+    ignoreFocusEmulation: () => { ignoreFocusEmulation = true; },
     beforeNextUserScript: fn => { userScriptHook = fn; },
     afterNextUserScript: fn => { postUserScriptHook = fn; },
     setHostPermissionGranted: granted => { hostPermissionGranted = granted; },
@@ -1330,7 +1360,7 @@ test("adoption during execute permission checks fails before page injection", as
   assert.equal(h.tabs.has(tab.id), true);
 });
 
-async function createdPageForExecutionRace() {
+async function createdPageForExecutionRace(url = "https://example.test/chat") {
   const h = createHarness();
   await tick(); await tick();
   await h.message("registerWindow", { windowId: 1, alias: "agents" });
@@ -1341,11 +1371,11 @@ async function createdPageForExecutionRace() {
   await h.deliver(ws, { kind: "challenge", nonce: "d".repeat(64) });
   await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
   await h.deliver(ws, { kind: "openTab", requestId: "page-for-race", connectionId: "epoch-1",
-    url: "https://example.test/chat", alias: "created-page", ...(await windowPin(h)) });
+    url, alias: "created-page", ...(await windowPin(h)), active: false });
   const opened = ws.sent.find(m => m.requestId === "page-for-race" && m.kind === "tabOpened")?.tab;
   assert.ok(opened);
   const tab = h.createdTabs[0];
-  tab.url = "https://example.test/chat";
+  tab.url = url;
   tab.status = "complete";
   delete tab.pendingUrl;
   return { h, ws, opened, tab };
@@ -1363,6 +1393,97 @@ async function requestPageAction({ h, ws, opened }, kind, requestId) {
   await h.deliver(ws, request);
   return ws.sent.find(m => m.requestId === requestId);
 }
+
+test("background ChatGPT created-tab execution emulates active renderer without switching the selected tab", async () => {
+  const data = await createdPageForExecutionRace("https://chatgpt.com/");
+  const { h, ws, opened, tab } = data;
+  const requestId = "background-visible";
+  await h.deliver(ws, { kind: "executeJs", requestId, connectionId: "epoch-1",
+    registrationId: opened.registrationId,
+    registrationGeneration: opened.registrationGeneration, requireAgentCreated: true,
+    source: "document.visibilityState", entrypoint: "expression", args: {} });
+  const response = ws.sent.find(m => m.requestId === requestId);
+  assert.equal(response.kind, "result");
+  assert.equal(response.result, "visible");
+  assert.equal(tab.active, false, "Real Chrome active-tab state must not be mutated");
+  assert.deepEqual(h.debuggerCalls.map(c => c.kind === "command"
+    ? c.method + ":" + String(c.params.enabled) : c.kind), [
+    "attach", "Emulation.setFocusEmulationEnabled:true",
+    "Emulation.setFocusEmulationEnabled:false", "detach"
+  ]);
+  assert.equal(h.debuggerCalls[0].tabId, tab.id);
+});
+
+test("denied background focus emulation fails before any page script or Send", async () => {
+  const data = await createdPageForExecutionRace("https://chatgpt.com/");
+  const { h } = data;
+  h.failDebuggerAttachOnce();
+  const response = await requestPageAction(data, "executeJs", "debugger-denied");
+  assert.equal(response.kind, "error");
+  assert.equal(response.error, "BackgroundFocusUnavailable");
+  assert.equal(h.calls.length, 0, "No user script executes without foreground emulation");
+  assert.equal(h.debuggerCalls.some(c => c.kind === "detach"), false);
+});
+
+test("failure enabling focus emulation detaches and never executes page script", async () => {
+  const data = await createdPageForExecutionRace("https://chatgpt.com/");
+  const { h } = data;
+  h.failDebuggerEnableOnce();
+  const response = await requestPageAction(data, "executeJs", "emulation-denied");
+  assert.equal(response.kind, "error");
+  assert.equal(response.error, "BackgroundFocusUnavailable");
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.debuggerCalls.at(-1).kind, "detach");
+});
+
+test("background focus emulation releases debugger after user script throws", async () => {
+  const data = await createdPageForExecutionRace("https://chatgpt.com/");
+  const { h } = data;
+  const response = await data.h.deliver(data.ws, {
+    kind: "executeJs", requestId: "script-failure", connectionId: "epoch-1",
+    registrationId: data.opened.registrationId,
+    registrationGeneration: data.opened.registrationGeneration,
+    requireAgentCreated: true, source: "throw Error('fixture error')",
+    entrypoint: "expression", args: {}
+  });
+  assert.equal(data.ws.sent.find(m => m.requestId === "script-failure").kind, "error");
+  assert.equal(h.debuggerCalls.at(-1).kind, "detach");
+});
+
+test("focus emulation success without visible page fails closed before the launcher script", async () => {
+  const data = await createdPageForExecutionRace("https://chatgpt.com/");
+  data.h.ignoreFocusEmulation();
+  const response = await requestPageAction(data, "executeJs", "not-visibly-focused");
+  assert.equal(response.kind, "error");
+  assert.equal(response.error, "BackgroundFocusNotVerified");
+  assert.equal(data.h.calls.length, 1, "Only read-only page preflight may execute");
+  assert.equal(data.h.debuggerCalls.at(-1).kind, "detach");
+});
+
+test("navigation away from fresh home rejects privileged debugger attachment", async () => {
+  const data = await createdPageForExecutionRace("https://chatgpt.com/");
+  data.tab.url = "https://chatgpt.com/c/preexisting-chat";
+  const response = await requestPageAction(data, "executeJs", "not-fresh-home");
+  assert.equal(response.kind, "error");
+  assert.equal(response.error, "BackgroundFocusUnavailable");
+  assert.equal(data.h.debuggerCalls.length, 0);
+  assert.equal(data.h.calls.length, 0);
+});
+
+test("already active created ChatGPT tab does not attach debugger", async () => {
+  const data = await createdPageForExecutionRace("https://chatgpt.com/");
+  data.tab.active = true;
+  const response = await requestPageAction(data, "executeJs", "already-active");
+  assert.equal(response.kind, "result");
+  assert.equal(data.h.debuggerCalls.length, 0);
+});
+
+test("non-ChatGPT created tab uses existing no-debugger execution path", async () => {
+  const data = await createdPageForExecutionRace();
+  const response = await requestPageAction(data, "executeJs", "other-origin");
+  assert.equal(response.kind, "result");
+  assert.equal(data.h.debuggerCalls.length, 0);
+});
 
 test("OpenTab opt-out during first host permission check returns definite rejection", async () => {
   const h = createHarness();

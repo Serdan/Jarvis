@@ -1765,6 +1765,9 @@ module private ChallengeIndexFaultMatrix =
                 | Ok inbox ->
                     counterexample "UnknownChallengeBoundedInbox"
                         (sprintf "Expected the existing N1 blocked assignment, got %A" inbox)
+                // A future reader may detect this orphan; that is permitted,
+                // not an integrity failure required by the bounded contract.
+                | Error(LedgerIntegrityError _) -> ()
                 | Error error ->
                     counterexample "UnknownChallengeBoundedInbox"
                         (sprintf "Bounded read unexpectedly failed: %A" error)

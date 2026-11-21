@@ -290,8 +290,29 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                           Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
                 | Registered, Some connectionId ->
                     let commandName = AgentCommandInfo.protocolName command
+                    // Only the authenticated MCP actor can acquire the durable
+                    // pre-execution activity proof. Observer and global tools
+                    // retain their existing no-activity semantics.
+                    let exactActor =
+                        agentId |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                    let requiresActivity =
+                        manualGrantApprovalRequest.IsNone
+                        && exactActor.IsSome
+                        && AgentCommandInfo.isAgentActivity command
+                        && match AgentCommandInfo.projectName command with
+                           | Some project ->
+                               not (String.IsNullOrWhiteSpace project)
+                               && not (String.Equals(project, "@global", StringComparison.OrdinalIgnoreCase))
+                           | None -> false
+                    let accountScope = AgentActivityProtocol.accountScopeFromSubject userId
 
-                    if not (session.SupportedCommands |> List.contains commandName) then
+                    if requiresActivity && accountScope.IsNone then
+                        return
+                            { Result = None
+                              Error = Some(ExecutionFailed
+                                  "ActivityProofUnavailable: an authenticated account and exact asserted agentId are required for project-scoped agent activity.")
+                              Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                    elif not (session.SupportedCommands |> List.contains commandName) then
                         return
                             { Result = None
                               Error =
@@ -300,10 +321,36 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                         $"Jarvis device {session.DeviceName} does not advertise support for {commandName}. Client {session.ClientVersion} uses protocol {session.ProtocolVersion}; the server uses protocol {AgentProtocol.version}. Update Jarvis to a compatible version and reconnect."
                                 )
                               Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                    elif requiresActivity
+                         && not (session.SupportedCommands |> List.contains AgentActivityProtocol.capability) then
+                        return
+                            { Result = None
+                              Error = Some(ExecutionFailed
+                                  "ActivityProofUnavailable: selected Jarvis client did not negotiate authenticated Git activity recording; update and reconnect before agent tool execution.")
+                              Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
                     else
                         let correlationId, trackingTask = tracker.Register(userId, connectionId, session.Generation, this.ResponseTimeout command)
                         let client = ctx.Clients.Client(connectionId)
-                        let commandJson = JsonSerializer.Serialize<AgentCommand>(command)
+                        let ordinaryCommandJson = JsonSerializer.Serialize<AgentCommand>(command)
+                        let commandJson =
+                            if requiresActivity then
+                                let event : AgentActivityDispatch =
+                                    { SchemaVersion = AgentActivityProtocol.schemaVersion
+                                      ProjectName = AgentCommandInfo.projectName command |> Option.get
+                                      AgentId = exactActor.Value
+                                      AccountScope = accountScope.Value
+                                      DeviceId = session.DeviceId
+                                      ConnectionId = connectionId
+                                      ConnectionGeneration = session.Generation
+                                      CorrelationId = correlationId
+                                      EventId = Guid.NewGuid().ToString("D")
+                                      CommandName = commandName
+                                      ObservedAtUtc = DateTimeOffset.UtcNow }
+                                JsonSerializer.Serialize
+                                    { SchemaVersion = AgentActivityProtocol.schemaVersion
+                                      CommandJson = ordinaryCommandJson
+                                      Activity = event }
+                            else ordinaryCommandJson
                         let routeMs = Stopwatch.GetElapsedTime(requestAcceptedAt).TotalMilliseconds
                         let mutable sendMs = 0.0
                         let mutable replyMs = 0.0

@@ -12,6 +12,7 @@
         <Compile Include="FeedbackStoreTests.fs"/>
         <Compile Include="OptionalFeedbackStoreTests.fs"/>
         <Compile Include="ServiceTests.fs"/>
+        <Compile Include="AgentActivityIngressTests.fs"/>
         <Compile Include="RoutingRetentionTests.fs"/>
         <Compile Include="McpCapacityTests.fs"/>
         <Compile Include="WorkQueueContractTests.fs"/>

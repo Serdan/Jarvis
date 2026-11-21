@@ -58,7 +58,7 @@ module AgentActivityLedger =
         | DuplicateActivityEvent
 
     [<CLIMutable>]
-    type private ActivityIntentRequest =
+    type ActivityIntentRequest =
         { SchemaVersion: int
           EventId: string
           ProjectId: string
@@ -75,7 +75,7 @@ module AgentActivityLedger =
           SourceKind: string }
 
     [<CLIMutable>]
-    type private ActivityIntentInput =
+    type ActivityIntentInput =
         { SchemaVersion: int
           ProjectId: string
           OperationId: string
@@ -270,7 +270,7 @@ module AgentActivityLedger =
         | Ok _ ->
             Error(unavailable "the current agent state has an incomplete Git blob proof")
 
-    let private tryCommittedBlobOid (operation: LedgerStore.LedgerOperation) path =
+    let private tryReceiptContentSha256 (operation: LedgerStore.LedgerOperation) path =
         try
             use document = JsonDocument.Parse operation.OriginalResultJson
             let changes = document.RootElement.GetProperty("changes")
@@ -278,8 +278,8 @@ module AgentActivityLedger =
             |> Seq.tryPick (fun change ->
                 let changedPath = change.GetProperty("path").GetString()
                 if changedPath = path then
-                    let oid = change.GetProperty("committedBlobOid").GetString()
-                    if String.IsNullOrWhiteSpace oid then None else Some oid
+                    let contentHash = change.GetProperty("contentSha256").GetString()
+                    if isHexDigest contentHash then Some contentHash else None
                 else None)
         with _ ->
             None
@@ -298,7 +298,7 @@ module AgentActivityLedger =
         sessionHash
         commandName
         correlationId
-        expectedCurrentBlobOid =
+        expectedCurrentContentSha256 =
         match LedgerStore.LedgerStore.getOperationAt binding snapshot (Guid.ParseExact(eventId, "D")) with
         | Error failure -> Error(unavailable (failureText failure))
         | Ok None -> Error(unavailable "the activity event operation receipt is missing")
@@ -351,13 +351,13 @@ module AgentActivityLedger =
                             | Ok origin when String.IsNullOrWhiteSpace origin ->
                                 Error(unavailable "the activity event has no verified originating Git commit")
                             | Ok _ ->
-                                match expectedCurrentBlobOid with
+                                match expectedCurrentContentSha256 with
                                 | None -> Ok ()
-                                | Some expectedOid ->
-                                    match tryCommittedBlobOid operation path with
-                                    | Some committedOid when committedOid = expectedOid -> Ok ()
+                                | Some expectedHash ->
+                                    match tryReceiptContentSha256 operation path with
+                                    | Some committedHash when committedHash = expectedHash -> Ok ()
                                     | _ ->
-                                        Error(unavailable "the current activity record was not written by its latest operation receipt")
+                                        Error(unavailable "the current activity record content does not match its latest operation receipt")
                 with _ ->
                     Error(unavailable "the activity event operation provenance is malformed")
 
@@ -370,7 +370,7 @@ module AgentActivityLedger =
         match LedgerStore.LedgerStore.readAt binding snapshot path with
         | Error failure -> Error(unavailable (failureText failure))
         | Ok (None, None) -> Ok None
-        | Ok (Some content, Some blobOid) ->
+        | Ok (Some content, Some _verifiedBlobOid) ->
             try
                 let record = JsonSerializer.Deserialize<AgentActivityRecord>(content, jsonOptions)
                 let activityAt = if isNull (box record) then None else tryUtc record.LastActivityAtUtc
@@ -429,9 +429,9 @@ module AgentActivityLedger =
                                 record.LastRecordedEventId record.LastRecordedAtUtc
                                 record.LastRecordedSequence record.LastRecordedDeviceId
                                 record.LastRecordedConnectionGeneration record.LastRecordedSessionBindingHash
-                                record.LastRecordedCommandName record.LastRecordedCorrelationId (Some blobOid) with
+                                record.LastRecordedCommandName record.LastRecordedCorrelationId (Some(sha256 content)) with
                         | Error error -> Error error
-                        | Ok () -> Ok(Some(record, blobOid))
+                        | Ok () -> Ok(Some(record, _verifiedBlobOid))
             with _ ->
                 Error(unavailable "the durable activity watermark is malformed")
         | Ok _ ->

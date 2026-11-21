@@ -85,8 +85,9 @@ let register (tui: ConsoleTui) (connection: HubConnection) deviceId (machineName
               ProtocolVersion = AgentProtocol.version
               ClientVersion = clientVersion
               SupportedCommands =
-                AgentProtocol.commandDefinitions
-                |> List.map (fun definition -> definition.Name) }
+                (AgentProtocol.commandDefinitions
+                 |> List.map (fun definition -> definition.Name))
+                @ [ AgentActivityProtocol.capability ] }
 
         let! result = connection.invokeResultAsync<ClientRegistrationResult>("Connect", registration)
 
@@ -94,10 +95,10 @@ let register (tui: ConsoleTui) (connection: HubConnection) deviceId (machineName
         | Ok registered ->
             tui.SetConnectionState(Connected, BuildInfo.ServerUrl)
             tui.Log $"Negotiated {registered.EnabledCommands.Length} commands with server protocol {registered.ServerProtocolVersion}."
-            return true
+            return Some registered
         | Error err ->
             tui.SetConnectionState(Connecting, BuildInfo.ServerUrl)
-            return false
+            return None
     }
 
 let connect (tui: ConsoleTui) (connection: HubConnection) =
@@ -319,6 +320,8 @@ let private runClient args =
     tui.Log $"Maximum import size: {importSizeDescription}"
 
     let mutable registered = false
+    let mutable activityRegistrationGeneration : int64 option = None
+    let deviceId = DeviceIdentity.getOrCreate ()
 
     let oauth =
         OAuth.login tui.Log
@@ -398,6 +401,25 @@ let private runClient args =
                 tui.Log $"MCP command {correlationId}: unhandledType={error.GetType().Name} recoveryReplyType={deliveryError.GetType().Name}"
         }
 
+    let rejectUnprovenCommand correlationId reason : Task =
+        task {
+            // This is a definite pre-execution rejection, never a claim that
+            // an unverified remote operation has been rolled back.
+            let denied : AgentCommandResponse =
+                { Result = None; Error = Some(ExecutionFailed reason)
+                  Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+            let! result =
+                ResponseDelivery.sendWithReconnectRetry
+                    (TimeSpan.FromMinutes 2.0)
+                    (TimeSpan.FromMilliseconds 250.0)
+                    (fun () -> connection.State)
+                    (fun () -> connection.invokeAsync("SendClientResponse", correlationId, denied))
+            match result with
+            | Ok () -> ()
+            | Error failure ->
+                tui.Log $"Unproven MCP activity {correlationId}: denied without execution; response delivery failed ({failure.GetType().Name})."
+        } :> Task
+
     let receiveQueuedWithSource correlationId commandJson agentId (originalId: string option) (manualGranted: bool) (manualApproval: bool) : Task =
         if dispatch.TrySubmit(
             correlationId,
@@ -408,14 +430,42 @@ let private runClient args =
                                 $"MCP stage {id}: commandMs={commandMs:F0} replyMs={replyMs:F0} replyAck={delivered}"
                 if manualApproval then
                     Client.receiveManualGrantApprovalAndReplyWithTiming connection rt correlationId commandJson agentId report
-                elif manualGranted then
-                    Client.receiveManualGrantedCommandAndReplyWithTiming connection rt correlationId commandJson agentId report
                 else
-                    match originalId with
-                    | Some original ->
-                        Client.receiveSourceCommandAndReplyWithTiming connection rt correlationId commandJson agentId original report
-                    | None ->
-                        Client.receiveCommandAndReplyWithTiming connection rt correlationId commandJson agentId report),
+                    // The registration generation comes from the authenticated
+                    // SignalR server; neither the envelope nor a local client
+                    // timestamp can supply or replace it.
+                    let liveSession : AgentActivityLedger.AgentActivitySessionContext option =
+                        if registered && connection.State = HubConnectionState.Connected then
+                            match authenticatedOperator, activityRegistrationGeneration with
+                            | Some accountScope, Some generation ->
+                                let connectionId = connection.ConnectionId
+                                if String.IsNullOrWhiteSpace connectionId then None
+                                else
+                                    Some { AccountScope = accountScope
+                                           DeviceId = deviceId
+                                           ConnectionId = connectionId
+                                           ConnectionGeneration = generation }
+                            | _ -> None
+                        else None
+                    let loadVerified projectName =
+                        match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot projectName rt with
+                        | Ok verified -> Ok verified
+                        | Error _ -> Error "trusted project ledger or remote source unavailable"
+                    match AgentActivityIngress.admitWith loadVerified liveSession correlationId agentId commandJson with
+                    | Error reason ->
+                        rejectUnprovenCommand correlationId reason
+                    | Ok acceptedCommandJson ->
+                        if manualGranted then
+                            Client.receiveManualGrantedCommandAndReplyWithTiming
+                                connection rt correlationId acceptedCommandJson agentId report
+                        else
+                            match originalId with
+                            | Some original ->
+                                Client.receiveSourceCommandAndReplyWithTiming
+                                    connection rt correlationId acceptedCommandJson agentId original report
+                            | None ->
+                                Client.receiveCommandAndReplyWithTiming
+                                    connection rt correlationId acceptedCommandJson agentId report),
             (fun error -> replyUnhandled correlationId commandJson error)) then
             Task.CompletedTask
         else
@@ -463,6 +513,7 @@ let private runClient args =
     connection.add_Closed(
         Func<Exception, Task>(fun error ->
             registered <- false
+            activityRegistrationGeneration <- None
             tui.SetConnectionState(Disconnected, BuildInfo.ServerUrl)
             let detail =
                 if isNull error then "no exception"
@@ -476,7 +527,6 @@ let private runClient args =
         use tracking = Client.TerminalMouse.Tracking.enable()
         use cts = new CancellationTokenSource()
         let inputLoop = tui.RunInputLoop(cts.Token)
-        let deviceId = DeviceIdentity.getOrCreate ()
         let mutable connectionFailureCount = 0
 
         Console.CancelKeyPress.AddHandler(ConsoleCancelEventHandler(fun _ args ->
@@ -505,16 +555,28 @@ let private runClient args =
 
                     if connected then
                         connectionFailureCount <- 0
-                        let! isRegistered = register tui connection deviceId resolveMachineName
-                        registered <- isRegistered
-                        if isRegistered then Client.invalidateAllAgentStates rt
+                        let! negotiation = register tui connection deviceId resolveMachineName
+                        registered <- negotiation.IsSome
+                        activityRegistrationGeneration <-
+                            negotiation
+                            |> Option.bind (fun value ->
+                                if value.EnabledCommands |> List.contains AgentActivityProtocol.capability then
+                                    Some value.Generation
+                                else None)
+                        if registered then Client.invalidateAllAgentStates rt
                     else
                         connectionFailureCount <- connectionFailureCount + 1
 
             elif connection.State = HubConnectionState.Connected && not registered then
-                let! isRegistered = register tui connection deviceId resolveMachineName
-                registered <- isRegistered
-                if isRegistered then Client.invalidateAllAgentStates rt
+                let! negotiation = register tui connection deviceId resolveMachineName
+                registered <- negotiation.IsSome
+                activityRegistrationGeneration <-
+                    negotiation
+                    |> Option.bind (fun value ->
+                        if value.EnabledCommands |> List.contains AgentActivityProtocol.capability then
+                            Some value.Generation
+                        else None)
+                if registered then Client.invalidateAllAgentStates rt
 
             if not tui.ShouldQuit then
                 try

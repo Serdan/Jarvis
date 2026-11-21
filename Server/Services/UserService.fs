@@ -286,8 +286,9 @@ type UserService(clock: unit -> DateTimeOffset, retention: UserRetentionPolicy) 
             |> Set.ofList
 
         let enabledCommands =
-            AgentProtocol.commandDefinitions
-            |> List.map (fun definition -> definition.Name)
+            (AgentProtocol.commandDefinitions
+             |> List.map (fun definition -> definition.Name))
+            @ [ AgentActivityProtocol.capability ]
             |> List.filter advertisedCommands.Contains
 
         lock gate (fun () ->

@@ -2400,7 +2400,7 @@ let attributed_tool_dispatch_survives_missing_sqlite_and_notifies_only_user_devi
             users.Register(user,
                 { DeviceId = device; DeviceName = device
                   ProtocolVersion = AgentProtocol.version; ClientVersion = "test"
-                  SupportedCommands = [ "RunCommand"; "ListJobs" ] }, connection)
+                  SupportedCommands = [ "RunCommand"; "ListJobs"; AgentActivityProtocol.capability ] }, connection)
         registrations[connection] <- receipt.Generation
     register "alice" "desktop" "desktop-connection"
     register "alice" "laptop" "laptop-connection"
@@ -2490,7 +2490,7 @@ let stalled_cross_device_activity_hints_drop_without_unbounded_tasks_or_blocking
             users.Register("alice",
                 { DeviceId = connection; DeviceName = connection
                   ProtocolVersion = AgentProtocol.version; ClientVersion = "test"
-                  SupportedCommands = [ "RunCommand" ] }, connection)
+                  SupportedCommands = [ "RunCommand"; AgentActivityProtocol.capability ] }, connection)
         registrations[connection] <- registered.Generation
 
     let tracker = ClientResponseTracker()

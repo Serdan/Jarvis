@@ -71,7 +71,11 @@ type TaskOverviewBatchPerformanceTests() =
         let value: BranchReview =
             { ReviewId = reviewId i; TaskId = taskId owner
               AttemptId = attemptId owner; OwnerAgentId = "PerfFixture"
-              Kind = "Implementation"; TaskRef = null; ReviewRef = null
+              Kind = "Implementation"; TaskRef = null
+              ReviewRef =
+                  if i = 1 then
+                      sprintf "refs/heads/jarvis-review/%s/%s/r1" (taskId owner) (reviewId i)
+                  else null
               SourceVersion = 1; ReviewedHeadOid = null; BaseCommit = null
               TargetRef = null; Status = if i % 2 = 0 then "Accepted" else "Unclaimed"
               ReviewerId = null; Version = 1; CreatedSequence = int64 i
@@ -154,6 +158,23 @@ type TaskOverviewBatchPerformanceTests() =
                       CreatedAtUtc = "2026-01-01T00:00:00Z"; AcknowledgedAtUtc = null }
                 put ledgerCheckout (sprintf "notifications/%s.json" (reviewId i))
                     (entityJson 2 notification)
+                // Historical list-page population is independent of task/review
+                // records: an empty challenge namespace is not a scale golden.
+                let condition: ChallengeCondition =
+                    { ConditionId = reviewId (300000 + i)
+                      OwnerKind = "Agent"; OwnerAgentId = "PerfFixture"
+                      SuggestedAgentId = ""; Description = "Historical synthetic condition"
+                      Status = "Satisfied"; Evidence = "archived"; Reason = ""
+                      UpdatedAtUtc = "2026-01-01T00:00:00Z"; ResponseEventSequence = 0L }
+                let challenge: AgentChallenge =
+                    { ChallengeId = reviewId i; IssuerAgentId = "PerfFixture"
+                      Title = sprintf "Historical challenge %04d" i; TaskId = ""
+                      Version = 1; CompletionPolicy = "All"; Status = "Cancelled"
+                      Conditions = [condition]
+                      CreatedAtUtc = "2026-01-01T00:00:00Z"
+                      UpdatedAtUtc = "2026-01-01T00:00:00Z" }
+                put ledgerCheckout (sprintf "challenges/%s/challenge.json" (reviewId i))
+                    (entityJson 2 challenge)
             // A malformed unrelated historical integration must not be decoded.
             put ledgerCheckout
                 (sprintf "tasks/%s/integrations/%s.json" (taskId 1) ((900000).ToString("x32")))
@@ -427,12 +448,27 @@ type TaskOverviewBatchPerformanceTests() =
                 else Assert.That((ok detailsResult).ReviewId, Is.EqualTo(reviewId 1))
                 bounded "ReviewDetails.pinned" 4 0 details
 
+                // The real ReviewDetails entrypoint also fetches a snapshot and
+                // checks the immutable review source ref (an absent disposable
+                // remote ref is a valid, explicit negative).
+                let fullDetailsResult, _, fullDetails =
+                    PerformanceRegression.sample
+                        (fun () -> ReviewWorkflow.getBranchReview reader
+                                        (taskId 1) (Guid.ParseExact(reviewId 1, "N")))
+                        (fun result -> sprintf "%A" result)
+                if reviewCount = 0 then Assert.That(Result.isError fullDetailsResult, Is.True)
+                else
+                    let inspected = ok fullDetailsResult
+                    Assert.That(inspected.Review.ReviewId, Is.EqualTo(reviewId 1))
+                    Assert.That(String.IsNullOrWhiteSpace inspected.HeadCommit, Is.True)
+                bounded "ReviewDetails.full" 20 1 fullDetails
+
                 let challengesResult, _, challenge =
                     PerformanceRegression.sample
                         (fun () -> ChallengeWorkflow.listPage reader "PerfFixture" 25 "" "")
                         (fun result -> sprintf "%A" result)
                 let challengePage = ok challengesResult
-                Assert.That(challengePage.Challenges, Is.Empty)
+                Assert.That(challengePage.Challenges.Length, Is.EqualTo(min 25 reviewCount))
                 bounded "ChallengeList" 20 1 challenge
 
                 let inboxResult, _, notification =
@@ -472,13 +508,59 @@ type TaskOverviewBatchPerformanceTests() =
                 Assert.That(job.GitProcesses, Is.Zero)
                 Assert.That(job.RemoteFetches, Is.Zero)
                 Assert.That(job.GitStdoutBytes, Is.Zero)
+
+                // A real completed-or-running JobResult poll, then an
+                // incremental non-repeat poll, is independent of remote Git.
+                // The process is deliberately started OUTSIDE the metric scope.
+                let jobPositive =
+                    let jobRoot = JobManagerTests.createTempProject ()
+                    let context = JobManagerTests.TestContext(jobRoot)
+                    let mutable ownedId = ""
+                    try
+                        let started =
+                            Client.JobManager.startJob
+                                { ProjectName = "Project1"; Executable = "dotnet"
+                                  Args = ["--version"]; Reason = None
+                                  WorkingDirectory = None; MaxOutputBytes = Some 2048 } context
+                            |> ok
+                        ownedId <- started.JobId
+                        let read, _, sample =
+                            PerformanceRegression.sample
+                                (fun () -> Client.JobManager.getJobResult
+                                                { ProjectName = "Project1"; JobId = ownedId
+                                                  AfterSequence = Some 0L } context)
+                                (fun result -> sprintf "%A" result)
+                        let result = ok read
+                        Assert.That(result.JobId, Is.EqualTo(ownedId))
+                        Assert.That(sample.GitProcesses, Is.Zero)
+                        Assert.That(sample.RemoteFetches, Is.Zero)
+                        Assert.That(sample.GitStdoutBytes, Is.Zero)
+                        let incremental, _, nextSample =
+                            PerformanceRegression.sample
+                                (fun () -> Client.JobManager.getJobResult
+                                                { ProjectName = "Project1"; JobId = ownedId
+                                                  AfterSequence = Some result.NextSequence } context)
+                                (fun response -> sprintf "%A" response)
+                        let nextPage = ok incremental
+                        Assert.That((nextPage.Events
+                                     |> List.forall (fun event -> event.Sequence > result.NextSequence)),
+                                    Is.True, "JobResult must not replay an already observed event.")
+                        Assert.That(nextSample.GitProcesses, Is.Zero)
+                        Assert.That(nextSample.RemoteFetches, Is.Zero)
+                        sample
+                    finally
+                        if ownedId <> "" then
+                            Client.JobManager.cancelJob
+                                { ProjectName = "Project1"; JobId = ownedId } context |> ignore
+                        if Directory.Exists jobRoot then Directory.Delete(jobRoot, true)
                 TestContext.Progress.WriteLine(
                     JsonSerializer.Serialize(
                         {| sourceSha = sourceSha; fixtureHead = snapshot.Commit
                            phase = phase; taskCount = taskCount; reviewCount = reviewCount
-                           getTask = getTask; reviewDetails = details; challengeList = challenge
+                           getTask = getTask; reviewDetailsPinned = details
+                           reviewDetailsFull = fullDetails; challengeList = challenge
                            notificationInbox = notification; preflight = preflight
-                           jobResult = job |}, jsonOptions))
+                           jobResultMissing = job; jobResultPositive = jobPositive |}, jsonOptions))
                 snapshot.Commit
 
             let coldHead = samplePaths "cold"

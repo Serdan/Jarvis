@@ -266,24 +266,33 @@ let source_pinned_worktree_bulk_read_has_one_git_command_across_synthetic_popula
     match parsePorcelain main records with
     | Ok items -> Assert.That(items.Length, Is.EqualTo(recordCount))
     | Error error -> Assert.Fail("Bulk porcelain fixture must decode: " + error)
-    withRepo (fun _ _ context ->
-        let previous, trace = McpLatencyTrace.beginTrace true (Guid.NewGuid().ToString("D"))
-        try
-            let result = listWorktrees { ProjectName = "Project1" } context
-            match result with
-            | Ok entries -> Assert.That(entries.Length, Is.EqualTo(1))
-            | Error error -> Assert.Fail(sprintf "Actual disposable Git bulk discovery failed: %A" error)
-            let diagnostic = McpLatencyTrace.render trace "completed"
-            Assert.That(diagnostic.IsSome, Is.True)
-            use json = System.Text.Json.JsonDocument.Parse(diagnostic.Value)
-            let stages = json.RootElement.GetProperty("stages").EnumerateArray() |> Seq.toList
-            Assert.That(stages.Length, Is.EqualTo(1),
-                        "Bulk ListWorktrees must issue one Git child and no fetch/status-per-worktree.")
-            Assert.That(stages.Head.GetProperty("stage").GetString(), Is.EqualTo("git.worktree"))
-            Assert.That(stages.Head.GetProperty("calls").GetInt32(), Is.EqualTo(1))
-            TestContext.Progress.WriteLine(
-                System.Text.Json.JsonSerializer.Serialize(
-                    {| records = recordCount; actualGitWorktreeCommands = 1
-                       remoteFetches = 0; synthetic = true
-                       scenario = "porcelain-population-plus-real-single-command" |}))
-        finally McpLatencyTrace.restore previous)
+    withRepo (fun root _ context ->
+        let observe (phase: string) (expectedCount: int) =
+            let previous, trace = McpLatencyTrace.beginTrace true (Guid.NewGuid().ToString("D"))
+            try
+                let result = listWorktrees { ProjectName = "Project1" } context
+                match result with
+                | Ok entries -> Assert.That(entries.Length, Is.EqualTo(expectedCount))
+                | Error error -> Assert.Fail(sprintf "Actual disposable Git bulk discovery failed: %A" error)
+                let diagnostic = McpLatencyTrace.render trace "completed"
+                Assert.That(diagnostic.IsSome, Is.True)
+                use json = System.Text.Json.JsonDocument.Parse(diagnostic.Value)
+                let stages = json.RootElement.GetProperty("stages").EnumerateArray() |> Seq.toList
+                Assert.That(stages.Length, Is.EqualTo(1),
+                            "Bulk ListWorktrees must issue one Git child and no fetch/status-per-worktree.")
+                Assert.That(stages.Head.GetProperty("stage").GetString(), Is.EqualTo("git.worktree"))
+                Assert.That(stages.Head.GetProperty("calls").GetInt32(), Is.EqualTo(1))
+                TestContext.Progress.WriteLine(
+                    System.Text.Json.JsonSerializer.Serialize(
+                        {| records = recordCount; actualWorktrees = expectedCount
+                           phase = phase; actualGitWorktreeCommands = 1
+                           remoteFetches = 0; syntheticParserPopulation = true |}))
+            finally McpLatencyTrace.restore previous
+        observe "cold" 1
+        observe "warm" 1
+        // A real topology change (not merely synthetic text) must still use
+        // one bulk command with unknown, not fabricated, cleanliness.
+        let sibling = Path.Combine(root, "perf-bulk-advanced")
+        GitCommandTests.expectGitSuccess context
+            [ "worktree"; "add"; "-b"; "feature/perf-bulk-advanced"; sibling; "HEAD" ]
+        observe "advance" 2)

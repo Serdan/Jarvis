@@ -60,3 +60,30 @@ The acceptance evidence must be rerun against the committed exact .NET 11
 Release checkout SHA, with synthetic fixture heads and operation counts.
 It does not prove live MCP wall-clock improvement, full-system privacy
 coverage, or KRUSO/Windows parity.
+
+
+### Full-path regression controls
+
+The follow-up test strengthens the original population golden instead of
+counting empty fast paths. At each 0/220/2200 population, the disposable
+ledger contains real schema-v2 historical challenge entities, schema-v2
+notifications, schema-v3 registered agents and reviews, plus source-pinned
+tasks/attempts. ChallengeList verifies a bounded, visible page of up to
+25 canonical challenge rows, not merely a successful empty list.
+
+ReviewDetails is measured twice: snapshot-pinned entity read with zero
+fetch, and the actual public getBranchReview path with one fetch and a
+real immutable-remote-ref probe. The one synthetic review ref is valid but
+intentionally absent from the test bare remote, so source absence is
+explicitly verified rather than misrepresented as a published source.
+
+JobResult tests cover unknown-job failure, a real started process with
+successful positive polling, and a subsequent incremental poll that cannot
+repeat prior events. All JobResult polling must perform zero Git operations.
+The child process is started outside the measured read scope.
+
+ListWorktrees checks one real bulk Git command separately for cold, warm,
+and actual worktree-topology advancement. The 0/220/2200 large-scale
+part is explicitly a porcelain-parser population, not 2200 physically
+registered worktrees. These controls remain count- and content-based;
+elapsed measurements are never absolute CI gates.

@@ -1,0 +1,11 @@
+# P1 — Mixed real-Git oracle does not independently verify persisted lifecycle audit or generation issuance records
+
+**Exact frozen source:** `332020cd50f3a2a3986933763edb8f81251e0b1c`.
+
+`MixedChallengeAttemptFixture.checkSnapshot` (1038-1102) compares task version, attempt phase/version/generation, owner state/version, challenge status/version, canonical wait JSON, owner/by-challenge **path sets** and notifications. `runCommands` (1131-1201) also checks authoritative HEAD/NextSequence before/after rejected or replayed actions and validates returned `LedgerOperation` actor/type/sequence and immutable replay hashes. Those are useful improvements.
+
+The oracle nevertheless **never enumerates or verifies canonical** `tasks/{task}/lifecycle/{sequence}.json` **audit records or** `tasks/{task}/attempts/{attemptId}/assignments/{generation}.json` **issuance records**, including their actor/action, assignment-generation transition, preserved pinned source/spec, and complete historical sequence. The source contains no independent expected lifecycle-history/assignment-record model for mixed commands; return-value receipts and the same production `getTask`/inbox projections are not an equivalent audit check. A writer/projection regression that updates attempt/agent fields while omitting or misattributing one of these records may escape this test.
+
+The original and follow-up contracts require per-step immutable canonical remote-head/**audit**/receipt/index/owner concordance and exact N→N+1 issue provenance. The original Challenge-only `checkActual` (338-367) does verify Challenge event history, but it is a separate trace and does not validate mixed task dependency lifecycle audits.
+
+**Required:** Extend independent reference state with the expected task lifecycle audit/issuance sequence and compare the actual canonical Git records after every accepted mixed transition, while confirming rejected/replayed steps preserve them byte-for-byte through the unchanged HEAD. Include actor/action, generation, attempt/owner identity and pinned provenance checks. Do not replace these with additional projections from the same production reader.

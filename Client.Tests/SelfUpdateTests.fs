@@ -95,3 +95,53 @@ let ``unix activation restores the original executable when exec fails`` () =
         File.ReadAllText(errorPath).Contains("execv returned", StringComparison.Ordinal) |> shouldEqual true
     finally
         Directory.Delete(directory, true)
+
+let private cleanReleaseManifest =
+    """{
+      "schemaVersion": 1,
+      "applicationVersion": "0.1.0",
+      "gitCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "dirty": false,
+      "releaseId": "0.1.0-aaaaaaaaaaaa",
+      "artifacts": [{
+        "rid": "linux-x64",
+        "fileName": "JarvisClient-linux-x64",
+        "releasePath": "releases/0.1.0-aaaaaaaaaaaa/JarvisClient-linux-x64",
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "bytes": 123456
+      }]
+    }"""
+
+[<Test>]
+let ``release pointer selects exact platform hash`` () =
+    parseReleaseManifest "linux-x64" "JarvisClient-linux-x64" cleanReleaseManifest
+    |> shouldEqual (Ok "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+
+[<Test>]
+let ``release pointer rejects dirty and cross platform artifacts`` () =
+    for payload in
+        [ cleanReleaseManifest.Replace("\"dirty\": false", "\"dirty\": true")
+          cleanReleaseManifest.Replace("releases/0.1.0-aaaaaaaaaaaa/JarvisClient-linux-x64",
+                                       "releases/old/JarvisClient-linux-x64")
+          cleanReleaseManifest.Replace("\"sha256\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"",
+                                       "\"sha256\": \"wrong\"")
+          "{bad json" ] do
+        match parseReleaseManifest "linux-x64" "JarvisClient-linux-x64" payload with
+        | Error(ValidationError _) -> ()
+        | other -> Assert.Fail($"Expected fail-closed release validation, got {other}")
+
+    match parseReleaseManifest "win-x64" "JarvisClient-win-x64.exe" cleanReleaseManifest with
+    | Error(ValidationError _) -> ()
+    | other -> Assert.Fail($"Expected missing-platform rejection, got {other}")
+
+[<Test>]
+let ``update channel requires agreement between latest and SHA256SUMS`` () =
+    let sums =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  JarvisClient-linux-x64\n"
+    verifyReleaseDownloads "linux-x64" "JarvisClient-linux-x64" sums cleanReleaseManifest
+    |> shouldEqual (Ok "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+
+    let staleSums = sums.Replace("bbbbbbbb", "cccccccc")
+    match verifyReleaseDownloads "linux-x64" "JarvisClient-linux-x64" staleSums cleanReleaseManifest with
+    | Error(ValidationError message) -> Assert.That(message, Does.Contain("disagree"))
+    | other -> Assert.Fail($"Expected mismatched download manifests to be rejected, got {other}")

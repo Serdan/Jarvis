@@ -4,6 +4,10 @@
         <OutputType>Exe</OutputType>
         <TargetFramework>net11.0</TargetFramework>
         <AssemblyName>JarvisClient</AssemblyName>
+        <Version>0.1.0</Version>
+        <JarvisBuildCommit Condition="'$(JarvisBuildCommit)' == ''">unknown</JarvisBuildCommit>
+        <JarvisBuildRid Condition="'$(JarvisBuildRid)' == ''">portable</JarvisBuildRid>
+        <JarvisBuildDirty Condition="'$(JarvisBuildDirty)' == ''">true</JarvisBuildDirty>
         <LangVersion>11.0</LangVersion>
         <JarvisServerUrl Condition="'$(JarvisServerUrl)' == ''">http://127.0.0.1:5095/client</JarvisServerUrl>
     </PropertyGroup>
@@ -18,7 +22,7 @@
         <WriteLinesToFile
             File="BuildInfo.fs"
             Overwrite="true"
-            Lines="namespace Client&#x0A;&#x0A;module BuildInfo =&#x0A;    [&lt;Literal&gt;]&#x0A;    let ServerUrl = &quot;$(JarvisServerUrl)&quot;"/>
+            Lines="namespace Client&#x0A;&#x0A;module BuildInfo =&#x0A;    [&lt;Literal&gt;]&#x0A;    let ServerUrl = &quot;$(JarvisServerUrl)&quot;&#x0A;    [&lt;Literal&gt;]&#x0A;    let GitCommit = &quot;$(JarvisBuildCommit)&quot;&#x0A;    [&lt;Literal&gt;]&#x0A;    let BuildRid = &quot;$(JarvisBuildRid)&quot;&#x0A;    [&lt;Literal&gt;]&#x0A;    let BuildDirty = $(JarvisBuildDirty)"/>
     </Target>
 
     <ItemGroup>
@@ -33,6 +37,7 @@
         <Compile Include="Misc.fs"/>
         <Compile Include="Effect.fs"/>
         <Compile Include="BuildInfo.fs"/>
+        <Compile Include="Modules\BuildIdentity.fs"/>
         <Compile Include="IO\ProjectIO.fs"/>
         <Compile Include="IO\FileIO.fs"/>
         <Compile Include="IO\WebIO.fs"/>

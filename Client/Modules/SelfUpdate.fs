@@ -1,11 +1,13 @@
 module Client.SelfUpdate
 
 open System
+open System.Collections.Generic
 open System.Diagnostics
 open System.IO
 open System.Net.Http
 open System.Runtime.InteropServices
 open System.Security.Cryptography
+open System.Text.Json
 open Common
 
 type internal PreparedUpdate =
@@ -45,6 +47,53 @@ let parseChecksum (fileName: string) (manifest: string) =
     |> function
        | Some hash -> Ok hash
        | None -> Error(Client.ValidationError $"No valid SHA-256 entry for {fileName} was found in the update manifest.")
+
+// The immutable release pointer and stable checksum channel must agree on
+// the exact binary. A dirty build or mixed-platform release is not admissible.
+let parseReleaseManifest (rid: string) (fileName: string) (manifest: string) =
+    try
+        use json = JsonDocument.Parse(manifest)
+        let root = json.RootElement
+        let version = root.GetProperty("applicationVersion").GetString()
+        let commit = root.GetProperty("gitCommit").GetString()
+        let releaseId = root.GetProperty("releaseId").GetString()
+        let dirty = root.GetProperty("dirty").GetBoolean()
+        let schema = root.GetProperty("schemaVersion").GetInt32()
+        if schema <> 1 || dirty || String.IsNullOrWhiteSpace version
+           || isNull commit || commit.Length <> 40 || not (Seq.forall Uri.IsHexDigit commit)
+           || releaseId <> version + "-" + commit.Substring(0, 12) then
+            Error(Client.ValidationError "The current release manifest has an invalid or unapproved build identity.")
+        else
+            let expectedPath = $"releases/{releaseId}/{fileName}"
+            let matching =
+                root.GetProperty("artifacts").EnumerateArray()
+                |> Seq.tryFind (fun artifact ->
+                    artifact.GetProperty("rid").GetString() = rid
+                    && artifact.GetProperty("fileName").GetString() = fileName)
+            match matching with
+            | None -> Error(Client.ValidationError $"The current release does not contain {rid}/{fileName}.")
+            | Some artifact ->
+                let path = artifact.GetProperty("releasePath").GetString()
+                let hash = artifact.GetProperty("sha256").GetString()
+                let size = artifact.GetProperty("bytes").GetInt64()
+                if path <> expectedPath || isNull hash || hash.Length <> 64
+                   || not (Seq.forall Uri.IsHexDigit hash) || size <= 0L then
+                    Error(Client.ValidationError "Release artifact identity, path, or SHA-256 is invalid.")
+                else Ok(hash.ToLowerInvariant())
+    with
+    | :? JsonException
+    | :? KeyNotFoundException
+    | :? InvalidOperationException
+    | :? NullReferenceException ->
+        Error(Client.ValidationError "The current release manifest is malformed.")
+
+let verifyReleaseDownloads (rid: string) (fileName: string) (checksums: string) (latest: string) =
+    match parseChecksum fileName checksums, parseReleaseManifest rid fileName latest with
+    | Error error, _
+    | _, Error error -> Error error
+    | Ok checksum, Ok latestHash when checksum <> latestHash ->
+        Error(Client.ValidationError "Release manifest and SHA256SUMS disagree; refusing update.")
+    | Ok expectedHash, Ok _ -> Ok expectedHash
 
 let private publishedFileName (rid: string) =
     if rid.StartsWith("win-", StringComparison.Ordinal) then $"JarvisClient-{rid}.exe"
@@ -87,7 +136,8 @@ let prepare () =
                 use http = new HttpClient()
                 http.Timeout <- TimeSpan.FromMinutes 5.0
                 let! manifest = http.GetStringAsync manifestUri
-                match parseChecksum fileName manifest with
+                let! latest = http.GetStringAsync(Uri(root, "latest.json"))
+                match verifyReleaseDownloads rid fileName manifest latest with
                 | Error error -> return Error error
                 | Ok expectedHash ->
                     use! response = http.GetAsync(downloadUri, HttpCompletionOption.ResponseHeadersRead)

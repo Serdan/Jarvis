@@ -2,7 +2,7 @@
 
 Jarvis clients are distributed as self-contained single-file executables. The client has the SignalR server URL embedded at publish time, so each public build must be stamped with the production hub URL.
 
-The self-update facility treats these files and `SHA256SUMS` as the authoritative update channel. Whenever a deployment changes the client/shared protocol, publish and upload the matching download artifacts before relying on `UpdateClient`.
+The self-update facility requires both the exact SHA-256 in `SHA256SUMS` and the corresponding platform identity in `latest.json`; mismatched, malformed, or dirty-release manifests fail closed. Whenever a deployment changes the client/shared protocol, publish and upload the matching download artifacts before relying on `UpdateClient`.
 
 On Linux and macOS, activation replaces the running process with the verified executable using `exec`, preserving the client PID and terminal session. If process replacement fails, Jarvis restores the previous executable from the `.prev` backup and reports the activation failure without exiting the current client.
 
@@ -26,14 +26,22 @@ This publishes and copies stable download files into:
 artifacts/downloads/
 ```
 
-Expected files:
+Expected stable update aliases and release metadata:
 
 ```text
 JarvisClient-linux-x64
 JarvisClient-osx-arm64
 JarvisClient-win-x64.exe
+latest.json
 SHA256SUMS
+releases/<app-version>-<git-sha12>/
 ```
+
+Each immutable release directory contains platform-specific binaries. `latest.json` pins the full source commit, application version, clean/dirty status, release ID, each RID, file path, size, and SHA-256. Existing immutable files cannot be silently replaced with different bytes. Stable aliases remain for the current Linux/macOS update workflow and the manual Windows workflow.
+
+The client executable prints application version, full Git commit, separate protocol version, embedded RID and dirty/development state offline with `--version`. TUI headers display app version and protocol even when disconnected. During client registration, the server receives the **running** version plus Git/RID/dirty identity without changing supported-command negotiation.
+
+Only deploy **clean, reviewed, approved** release artifacts. Before publishing, confirm `git status --porcelain` is empty and the selected source commit is the intended reviewed commit. Publishing never upgrades or restarts either Operator-controlled client.
 
 ## Upload to the droplet
 
@@ -97,6 +105,7 @@ https://jarvis2.kehlet.dev/downloads/JarvisClient-linux-x64
 https://jarvis2.kehlet.dev/downloads/JarvisClient-osx-arm64
 https://jarvis2.kehlet.dev/downloads/JarvisClient-win-x64.exe
 https://jarvis2.kehlet.dev/downloads/SHA256SUMS
+https://jarvis2.kehlet.dev/downloads/latest.json
 ```
 
 ## Smoke test
@@ -106,6 +115,7 @@ On Linux:
 ```bash
 curl -I https://jarvis2.kehlet.dev/downloads/JarvisClient-linux-x64
 curl -fsSL https://jarvis2.kehlet.dev/downloads/SHA256SUMS
+curl -fsSL https://jarvis2.kehlet.dev/downloads/latest.json
 ```
 
 Then download and run:
@@ -113,6 +123,7 @@ Then download and run:
 ```bash
 curl -fsSLO https://jarvis2.kehlet.dev/downloads/JarvisClient-linux-x64
 chmod +x JarvisClient-linux-x64
+./JarvisClient-linux-x64 --version
 ./JarvisClient-linux-x64 --path ~/Projects
 ```
 

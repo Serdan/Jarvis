@@ -116,6 +116,7 @@ type SettingsUiAccess =
 
 type ConsoleTui(?activityLog: ActivityLog.Store) =
     let syncRoot = obj()
+    let buildIdentity = BuildIdentity.current ()
     let activity = ResizeArray<ActivityEntry>()
     let agentSeen = Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase)
     let persistedAgentSeen = Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase)
@@ -1543,6 +1544,23 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                         (workDetailScroll + 1) lastDetail detail.Length)))
         draw.WriteLine(safe "Work is canonical; launch/session identifiers are evidence, not Work owners.")
 
+    let renderIdentityHeaderUnsafe () =
+        let compactHeader = draw.Height < 22
+        if compactHeader then
+            draw.WriteLine $"Jarvis {BuildIdentity.compact buildIdentity} · {connectionLabel connectionState} · {serverHost}"
+            writeNavigation()
+        else
+            draw.WriteLine $"Jarvis Client · {BuildIdentity.compact buildIdentity}"
+            draw.WriteLine $"Build: {buildIdentity.RuntimeIdentifier}"
+            let previous = draw.ForegroundColor
+            draw.ForegroundColor <- connectionColor connectionState
+            draw.Write(connectionLabel connectionState)
+            draw.ForegroundColor <- previous
+            draw.WriteLine $" • {serverHost}"
+            draw.WriteLine $"Key: {key}"
+            writeNavigation()
+        compactHeader
+
     let renderUnsafe () =
         let width, height =
             try
@@ -1553,20 +1571,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         mouseHits.Clear()
         try
             lastRenderError |> Option.iter (fun error -> draw.WriteLine ("Render warning: " + error))
-            let compactHeader = draw.Height < 22
-            if compactHeader then
-                draw.WriteLine $"Jarvis · {connectionLabel connectionState} · {serverHost}"
-                writeNavigation()
-            else
-                draw.WriteLine "Jarvis Client"
-                draw.WriteLine "============="
-                let previous = draw.ForegroundColor
-                draw.ForegroundColor <- connectionColor connectionState
-                draw.Write(connectionLabel connectionState)
-                draw.ForegroundColor <- previous
-                draw.WriteLine $" • {serverHost}"
-                draw.WriteLine $"Key: {key}"
-                writeNavigation()
+            let compactHeader = renderIdentityHeaderUnsafe ()
             if not compactHeader then
                 match mode with
                 | ActivityMode ->
@@ -2151,6 +2156,24 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             finally
                 draw <- previousDraw
                 workPageRows <- previousPageRows
+                mouseHits.Clear()
+                for hit in previousHits do mouseHits.Add hit)
+
+    /// Read-only capture of the real header, without network or console IO.
+    member _.InspectIdentityHeaderForFixture(width: int, height: int) =
+        lock syncRoot (fun () ->
+            let previousDraw = draw
+            let previousHits = mouseHits |> Seq.toList
+            draw <- Frame(max 1 width, max 1 height)
+            mouseHits.Clear()
+            try
+                renderIdentityHeaderUnsafe () |> ignore
+                [ for row in 0 .. draw.Height - 1 ->
+                    [ for col in 0 .. draw.Width - 1 -> draw.GetCell(row, col).Text ]
+                    |> String.concat ""
+                    |> fun text -> text.TrimEnd() ]
+            finally
+                draw <- previousDraw
                 mouseHits.Clear()
                 for hit in previousHits do mouseHits.Add hit)
 

@@ -3,6 +3,8 @@
 
 using System.CommandLine;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Xml.Linq;
 
 var root = FindRepositoryRoot();
 
@@ -139,7 +141,14 @@ int Build(string configuration)
 
 int PublishClient(string rid, string server, string configuration, string output)
 {
-    return DotNet(
+    // The source SHA is the code identity; a semver bump is not required for every commit.
+    // Dirty worktrees must never masquerade as an approved clean release.
+    var commit = Git("rev-parse", "HEAD").Trim();
+    if (commit.Length != 40 || !commit.All(Uri.IsHexDigit))
+        throw new InvalidOperationException("Could not verify the full Git source commit.");
+
+    var dirty = Git("status", "--porcelain", "--untracked-files=normal").Length != 0;
+    var code = DotNet(
         "publish",
         "Client/Client.fsproj",
         "-c", configuration,
@@ -147,8 +156,65 @@ int PublishClient(string rid, string server, string configuration, string output
         "-o", output,
         "-p:PublishSingleFile=true",
         "-p:SelfContained=true",
+        "-p:Deterministic=true",
+        $"-p:SourceRevisionId={commit}",
+        $"-p:JarvisBuildCommit={commit}",
+        $"-p:JarvisBuildRid={rid}",
+        $"-p:JarvisBuildDirty={dirty.ToString().ToLowerInvariant()}",
         $"-p:JarvisServerUrl={server}"
     );
+    if (code != 0)
+        return code;
+
+    return VerifyNativePublishedIdentity(rid, output, commit, dirty);
+}
+
+int VerifyNativePublishedIdentity(string rid, string outputDirectory, string commit, bool dirty)
+{
+    var hostRid =
+        OperatingSystem.IsLinux() && RuntimeInformation.ProcessArchitecture == Architecture.X64 ? "linux-x64" :
+        OperatingSystem.IsWindows() && RuntimeInformation.ProcessArchitecture == Architecture.X64 ? "win-x64" :
+        OperatingSystem.IsMacOS() && RuntimeInformation.ProcessArchitecture == Architecture.Arm64 ? "osx-arm64" : "";
+
+    // Cross-RID builds cannot be executed on this host; their identity comes
+    // from the same explicit compiler properties and release manifest.
+    if (rid != hostRid)
+        return 0;
+
+    var binary = Path.Combine(root, outputDirectory, rid.StartsWith("win-", StringComparison.Ordinal) ? "JarvisClient.exe" : "JarvisClient");
+    var version = XDocument.Load(Path.Combine(root, "Client", "Client.fsproj"))
+        .Descendants("Version").First().Value.Trim();
+    using var process = new Process();
+    process.StartInfo.FileName = binary;
+    process.StartInfo.WorkingDirectory = root;
+    process.StartInfo.UseShellExecute = false;
+    process.StartInfo.RedirectStandardOutput = true;
+    process.StartInfo.RedirectStandardError = true;
+    process.StartInfo.ArgumentList.Add("--version");
+    process.Start();
+    var outputTask = process.StandardOutput.ReadToEndAsync();
+    var errorTask = process.StandardError.ReadToEndAsync();
+    if (!process.WaitForExit(15_000))
+    {
+        process.Kill(entireProcessTree: true);
+        Console.Error.WriteLine($"Published {rid} --version did not exit within 15 seconds.");
+        return 1;
+    }
+    var stdout = outputTask.GetAwaiter().GetResult();
+    var stderr = errorTask.GetAwaiter().GetResult();
+    if (process.ExitCode != 0
+        || !stdout.Contains($"Jarvis Client {version}", StringComparison.Ordinal)
+        || !stdout.Contains($"Git commit: {commit}", StringComparison.Ordinal)
+        || !stdout.Contains($"RID: {rid}", StringComparison.Ordinal)
+        || !stdout.Contains("Protocol: ", StringComparison.Ordinal)
+        || !stdout.Contains(dirty ? "Build: dirty/development" : "Build: clean", StringComparison.Ordinal))
+    {
+        Console.Error.WriteLine($"Published {rid} offline build identity did not match source stamp. {stderr}");
+        return 1;
+    }
+
+    Console.WriteLine($"Verified offline build identity for {rid}: {version} @ {commit} ({(dirty ? "dirty" : "clean")}).");
+    return 0;
 }
 
 int PublishClients(IReadOnlyCollection<string> rids, string server, string configuration, string outputRoot)
@@ -201,6 +267,25 @@ int Clean()
     }
 
     return DotNet("clean", "Jarvis.slnx");
+}
+
+string Git(params string[] arguments)
+{
+    using var process = new Process();
+    process.StartInfo.FileName = "git";
+    process.StartInfo.WorkingDirectory = root;
+    process.StartInfo.UseShellExecute = false;
+    process.StartInfo.RedirectStandardOutput = true;
+    process.StartInfo.RedirectStandardError = true;
+    foreach (var argument in arguments)
+        process.StartInfo.ArgumentList.Add(argument);
+    process.Start();
+    var output = process.StandardOutput.ReadToEnd();
+    var error = process.StandardError.ReadToEnd();
+    process.WaitForExit();
+    if (process.ExitCode != 0)
+        throw new InvalidOperationException("Git source identity failed: " + error);
+    return output;
 }
 
 int DotNet(params string[] arguments)

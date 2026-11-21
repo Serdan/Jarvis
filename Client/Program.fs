@@ -74,16 +74,11 @@ let private runConfigCommand (args: string array) =
 
 let register (tui: ConsoleTui) (connection: HubConnection) deviceId (machineName: unit -> string) =
     task {
-        let clientVersion =
-            match Assembly.GetExecutingAssembly().GetName().Version with
-            | null -> "unknown"
-            | version -> version.ToString()
-
         let registration =
             { DeviceId = deviceId
               DeviceName = machineName()
               ProtocolVersion = AgentProtocol.version
-              ClientVersion = clientVersion
+              ClientVersion = BuildIdentity.registrationVersion ()
               SupportedCommands =
                 AgentProtocol.commandDefinitions
                 |> List.map (fun definition -> definition.Name) }
@@ -550,6 +545,9 @@ let private runClient args =
 let main args =
     if args.Length > 0 && args[0] = BoundedProcess.groupHostFlag then
         BoundedProcess.runInternalGroupHost (args |> Array.skip 1)
+    elif args.Length = 1 && args[0] = "--version" then
+        printfn "%s" (BuildIdentity.detail (BuildIdentity.current ()))
+        0
     elif args.Length = 2 && args[0] = "browser" && args[1] = "pair" then
         printfn "Pairing secret (keep private): %s" (BrowserBridge.getOrCreateSecret())
         0

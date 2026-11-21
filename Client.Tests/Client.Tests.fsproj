@@ -69,6 +69,7 @@
         <Compile Include="WorkQueueProjectMigrationPrepareTests.fs"/>
         <Compile Include="WorkQueueMultiLedgerPreparedRecoveryTests.fs"/>
         <Compile Include="RoleInstructionsTests.fs"/>
+        <Compile Include="PerformanceRegression.fs"/>
         <Compile Include="ReviewWorkflowTests.fs"/>
         <Compile Include="ChallengeWorkflowTests.fs"/>
         <Compile Include="WorkQueueCanonicalSourceEvidenceTests.fs"/>

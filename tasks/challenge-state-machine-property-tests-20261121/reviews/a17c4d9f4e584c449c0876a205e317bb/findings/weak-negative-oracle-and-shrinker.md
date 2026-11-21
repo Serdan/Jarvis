@@ -1,0 +1,9 @@
+# P1 — Rejected-operation oracle and shrinker can hide unrelated failures
+
+**Frozen source:** `cd895d493b419e127ededea15f814ab53e484407`, `Client.Tests/ChallengeStateMachinePropertyTests.fs`.
+
+**Evidence.** In `ChallengeFixture.runTrace` (lines 341–354), `Error _ -> Rejected` treats every production error as the expected invalid/unauthorized/stale-operation rejection. The post-step check at 305–324 compares challenge version, status, condition phases, event count and sorted unique sequences; it does not require an expected rejection *category*, canonical remote HEAD unchanged, unchanged unrelated index/receipt records, or actor/action concordance of each audit event. In `shrink` (362–380), `with _ -> true` treats *any* exception—fixture setup failure, Git error, unexpected exception, or unrelated model mismatch—as preserving the original counterexample, potentially yielding a false 'minimal' reproduction.
+
+**Impact.** The tests can pass for an invalid command when the workflow returns `LedgerIntegrityError` or another unrelated failure instead of the required authorization/version/payload error. They can also report a misleading minimal trace caused by an unrelated test infrastructure failure. Dedicated create/resolve receipt tests at 677–736 inspect the remote HEAD for two mutated UUID cases, but do not close the per-step gap for reopen/cancel/block/requeue or generated stale/unauthorized calls.
+
+**Required correction.** Define expected error classes for each generated negative action and assert the correct one; snapshot authoritative remote commit and relevant records before/after rejected and replayed commands; compare challenge audit actor/action/operation receipt identity to the model. Make the shrinker preserve the *same structured failure predicate/fingerprint*, and report infrastructure failures separately rather than treating them as counterexamples. Keep deterministic seeds and bounded attempts.

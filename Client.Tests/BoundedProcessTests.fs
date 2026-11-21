@@ -60,32 +60,43 @@ let private stopChild pid =
 let pipe_holding_descendant_is_deadline_bounded_and_reaped () =
     let root = newProject ()
     let project = Path.Combine(root, "Project1")
-    let childFile = Path.Combine(project, "child.fsx")
     let parentFile = Path.Combine(project, "parent.fsx")
     let marker = Path.Combine(project, "child-pid.txt")
     try
-        let childScript =
-            $"""open System
-open System.IO
-open System.Threading
-File.WriteAllText(@"{marker}", string Environment.ProcessId)
-printfn "descendant stdout"
-eprintfn "descendant stderr"
-Thread.Sleep 30000"""
+        // Keep the descendant cheap to start: a second "dotnet fsi" may not
+        // finish initialization before the six-second command deadline when
+        // unrelated full suites contend for CPU and process creation.
+        // The descendant itself writes its PID only after its inherited
+        // stdout/stderr have become live; the parent acknowledges that
+        // startup handshake before exiting.
         let parentScript =
             $"""open System
 open System.Diagnostics
-let startInfo = ProcessStartInfo("dotnet")
-startInfo.ArgumentList.Add("fsi")
-startInfo.ArgumentList.Add("--exec")
-startInfo.ArgumentList.Add(@"{childFile}")
+open System.IO
+open System.Threading
+let startInfo = ProcessStartInfo()
+if OperatingSystem.IsWindows() then
+    startInfo.FileName <- "powershell.exe"
+    startInfo.ArgumentList.Add("-NoProfile")
+    startInfo.ArgumentList.Add("-NonInteractive")
+    startInfo.ArgumentList.Add("-Command")
+    startInfo.ArgumentList.Add("[Console]::Out.WriteLine('descendant stdout'); [Console]::Error.WriteLine('descendant stderr'); [IO.File]::WriteAllText($env:JARVIS_CHILD_MARKER, [string]$PID); Start-Sleep -Seconds 30")
+else
+    startInfo.FileName <- "/bin/sh"
+    startInfo.ArgumentList.Add("-c")
+    startInfo.ArgumentList.Add("echo 'descendant stdout'; echo 'descendant stderr' >&2; printf '%%s' \"$$\" > \"$JARVIS_CHILD_MARKER\"; exec sleep 30")
 startInfo.UseShellExecute <- false
 startInfo.RedirectStandardOutput <- false
 startInfo.RedirectStandardError <- false
+startInfo.Environment["JARVIS_CHILD_MARKER"] <- @"{marker}"
 use child = Process.Start(startInfo)
+let startupDeadline = DateTime.UtcNow.AddSeconds(4.)
+while not (File.Exists(@"{marker}")) && not child.HasExited && DateTime.UtcNow < startupDeadline do
+    Thread.Sleep 10
+if not (File.Exists(@"{marker}")) then
+    failwith "Descendant did not report its PID before parent exit."
 printfn "parent exited"
 """
-        File.WriteAllText(childFile, childScript)
         File.WriteAllText(parentFile, parentScript)
         let watch = Stopwatch.StartNew()
         let result = runCommand (command "parent.fsx" 6 4096) (Context root)
@@ -98,6 +109,8 @@ printfn "parent exited"
             Assert.That(output.ExitCode, Is.EqualTo(-1))
             Assert.That(watch.Elapsed, Is.LessThan(TimeSpan.FromSeconds 9.))
             Assert.That(output.StdOut, Does.Contain("parent exited"))
+            Assert.That(output.StdOut, Does.Contain("descendant stdout"))
+            Assert.That(output.StdErr, Does.Contain("descendant stderr"))
             Assert.That(File.Exists marker, Is.True, "Descendant must actually have started.")
             let pid = int (File.ReadAllText marker)
             try

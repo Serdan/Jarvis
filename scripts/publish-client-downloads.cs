@@ -26,7 +26,7 @@ var dirty = Git("status", "--porcelain", "--untracked-files=normal").Length != 0
 var releaseId = version + "-" + commit[..12] + (dirty ? "-dirty" : "");
 var immutableDirectory = Path.Combine(downloads, "releases", releaseId);
 Directory.CreateDirectory(immutableDirectory);
-var artifacts = new List<object>();
+var artifacts = new List<(string Rid, string FileName, string ReleasePath, string Sha256, long Bytes)>();
 
 foreach (var rid in rids)
 {
@@ -71,14 +71,7 @@ foreach (var rid in rids)
     if (Sha256(target) != sourceHash)
         throw new InvalidOperationException($"Copied download hash mismatch: {target}");
 
-    artifacts.Add(new
-    {
-        rid,
-        fileName = targetName,
-        releasePath = $"releases/{releaseId}/{targetName}",
-        sha256 = sourceHash,
-        bytes = new FileInfo(source).Length
-    });
+    artifacts.Add((rid, targetName, $"releases/{releaseId}/{targetName}", sourceHash, new FileInfo(source).Length));
 
     if (!isWin && !RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
     {
@@ -91,17 +84,38 @@ foreach (var rid in rids)
 
 // The current pointer is written only after every immutable artifact and
 // stable update-channel alias has been verified.
-var latest = new
+// File-based scripts use a reflection-disabled runtime. Write typed JSON
+// directly; don't depend on reflection-based JsonSerializer or source generation.
+// The current pointer is atomically replaced only after all cross-RID outputs
+// and their immutable hashes have been verified.
+var latestPath = Path.Combine(downloads, "latest.json");
+var stagedLatestPath = latestPath + ".tmp";
+using (var stream = new FileStream(stagedLatestPath, FileMode.Create, FileAccess.Write, FileShare.None))
+using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true }))
 {
-    schemaVersion = 1,
-    applicationVersion = version,
-    gitCommit = commit,
-    dirty,
-    releaseId,
-    artifacts
-};
-var latestJson = JsonSerializer.Serialize(latest, new JsonSerializerOptions { WriteIndented = true });
-File.WriteAllText(Path.Combine(downloads, "latest.json"), latestJson + Environment.NewLine);
+    writer.WriteStartObject();
+    writer.WriteNumber("schemaVersion", 1);
+    writer.WriteString("applicationVersion", version);
+    writer.WriteString("gitCommit", commit);
+    writer.WriteBoolean("dirty", dirty);
+    writer.WriteString("releaseId", releaseId);
+    writer.WriteStartArray("artifacts");
+    foreach (var artifact in artifacts)
+    {
+        writer.WriteStartObject();
+        writer.WriteString("rid", artifact.Rid);
+        writer.WriteString("fileName", artifact.FileName);
+        writer.WriteString("releasePath", artifact.ReleasePath);
+        writer.WriteString("sha256", artifact.Sha256);
+        writer.WriteNumber("bytes", artifact.Bytes);
+        writer.WriteEndObject();
+    }
+    writer.WriteEndArray();
+    writer.WriteEndObject();
+    writer.Flush();
+    stream.Flush(flushToDisk: true);
+}
+File.Move(stagedLatestPath, latestPath, overwrite: true);
 WriteChecksums(downloads);
 
 Console.WriteLine();

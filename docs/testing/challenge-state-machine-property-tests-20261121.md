@@ -30,13 +30,63 @@ All corruption cases have the minimal logical trace: (1) register agents and cre
 
 Modes 0–2 are intentionally red production-facing regression tests, **not** an assertion that this tests-only branch is merge-ready. Create a separate correction task owned by Lead for canonical reverse-index completeness/fail-closed validation, with an independent source review. Do not silently fix production in this test task, ignore historical valid edges, or weaken the assertions to obtain green CI. Re-run all four corruption cases on the correction branch and verify historical N→N+1 reblocking remains valid.
 
-## Commands and results
+## Review corrections and reproducible .NET 11 Release filters
 
-- `dotnet test Client.Tests/Client.Tests.fsproj -c Release --filter FullyQualifiedName~ChallengeStateMachinePropertyTests --no-restore --verbosity minimal` — exit **0**, 2/2 passed, .NET 11 Release, 10s test duration.
-- `dotnet test Client.Tests/Client.Tests.fsproj -c Release --filter FullyQualifiedName~ChallengeDependencyPropertyTests --no-restore --verbosity minimal` — exit **0**, 2/2 passed, .NET 11 Release, 9s test duration.
-- `dotnet test Client.Tests/Client.Tests.fsproj -c Release --filter FullyQualifiedName~ChallengeReverseIndexFaultTests --no-restore --verbosity minimal` — exit **1**, 1 passed / 3 failed, 4 total, 6s test duration. This is a **confirmed production failure result** (not a fixture-setup failure).
-- Broad existing Challenge regression + generated suites (the module-prefix filter also selects the intentionally failing corruption fixtures): **exit 1, 41 passed / 3 failed / 0 skipped, 44 total, 1m20s**, .NET 11 Release. All three failures are the documented modes 0–2; no other failures.
-- `dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-restore --filter "FullyQualifiedName~Challenge&FullyQualifiedName!~ChallengeReverseIndexFaultTests" --verbosity minimal` — **exit 0, 45 passed / 0 failed / 0 skipped, 45 total, 1m29s**, .NET 11 Release, includes the immutable receipt property. The explicit exclusion is only for the three confirmed production defects. The frozen review's exact commit SHA is the final source provenance.
+This document now distinguishes **the prior frozen review source** from the follow-up test-only repair. The original source `cd895d493b419e127ededea15f814ab53e484407` and Review 1's decided ChangesRequested `a17c4d9f4e584c449c0876a205e317bb` remain immutable. The separate follow-up task `challenge-property-model-review-repair-20261121` has its own isolated branch `refs/heads/test/challenge-property-model-review-repair-worker7-20261121`; its **exact source SHA is the frozen review's ReviewedHeadOid**, not the old SHA and not the current main branch.
+
+Reviewer 1 independently executed the original source with .NET SDK 11.0.100 Release:
+- The previously documented `FullyQualifiedName~ChallengeStateMachinePropertyTests` filter **did not select only two tests**. It selected 9, exited **1**, with **6 passed / 3 failed**, exactly the known red production seeds 9000, 9001, 9002.
+- `FullyQualifiedName~Challenge&FullyQualifiedName!~ChallengeReverseIndexFaultTests` exited **0** with **45 passed**, excluding only the known-red original fault fixture.
+- `FullyQualifiedName~ChallengeReverseIndexFaultTests` exited **1** with **1 passed / 3 failed**. Those are production faults, not a claim that the model test suite was green.
+
+The follow-up introduces a **two-method filter** that unambiguously selects the original fast and sampled Challenge model methods:
+
+```sh
+dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-build --no-restore --filter "FullyQualifiedName~SeededReferenceTracesMaintainConjunctionAndTerminality|FullyQualifiedName~TwoCloneStateMachineTracesMatchCanonicalChallengeAndAudit" --verbosity minimal
+```
+
+The generated mixed dependency/attempt reference has its own filter:
+
+```sh
+dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-build --no-restore --filter "FullyQualifiedName~MixedChallengeAttemptPropertyTests" --verbosity minimal
+```
+
+Use these **separate** production-regression filters, never treating deliberately red tests as a green CI gate:
+
+```sh
+dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-build --no-restore --filter "FullyQualifiedName~ChallengeReverseIndexFaultTests" --verbosity minimal
+dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-build --no-restore --filter "FullyQualifiedName~ChallengeReverseIndexFaultMatrixTests" --verbosity minimal
+```
+
+A broader Challenge green-candidate filter excludes **both** original and expanded reverse-index corruption fixtures:
+
+```sh
+dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-build --no-restore --filter "FullyQualifiedName~Challenge&FullyQualifiedName!~ChallengeReverseIndexFault" --verbosity minimal
+```
+
+The follow-up's model generates 192 seeds × 44 mixed commands (in addition to original 256 × 80 Challenge commands), and sampled genuine two-clone bare-Git traces with independent model-versus-canonical task/agent/assignment/wait/index checks. Replay assertions check immutable receipt sequence/request/result hashes; every rejected/replayed operation checks canonical remote HEAD, sequence, and reverse index paths. The reference model's rejected actions have typed failure families; shrinking preserves the same structured failure category and treats fixture/Git exceptions as infrastructure failures. The index matrix adds missing/extra edges, orphan/stale identities, duplicate persisted dependency, cancellation/partial wait, identity mismatch, after-auto and before-manual corruption, and an **expected-positive** valid historic N→N+1→N+2 control. Original red mode 0/1/2 assertions remain unchanged. Any *new* red matrix fixture must be separately classified as a production defect or a test implementation problem; do not report this branch as fully green before confirmed fixes and independent review.
+
+## Execution results / provenance
+
+Execution environment: **.NET SDK 11.0.100**, `net11.0`, Release. A fresh isolated checkout first required `dotnet restore Client.Tests/Client.Tests.fsproj`; no restore failures or external production state was involved. `dotnet build Client.Tests/Client.Tests.fsproj -c Release --no-restore -v quiet` exited **0**, with no compiler errors. The final source contains only tests and documentation; no source files owned by Worker 4, 5 or 6 were edited.
+
+Executed precise filters on the **follow-up candidate source** with `--no-build --no-restore` after each Release compile:
+
+| Group / filter | Exit | Passed | Failed | Meaning |
+|---|---:|---:|---:|---|
+| Two-method `SeededReferenceTraces...|TwoCloneStateMachineTraces...` | **0** | **2** | 0 | Fast independent Challenge model plus sampled real bare-Git canonical/audit/receipt oracle |
+| `FullyQualifiedName~MixedChallengeAttemptPropertyTests` | **0** | **2** | 0 | Generated mixed Challenge/task/attempt/owner/assignment/dependency/generation reference and two-clone runner |
+| `FullyQualifiedName~Challenge&FullyQualifiedName!~ChallengeReverseIndexFault` | **0** | **47** | 0 | Broad existing and new non-red Challenge regression filter (2m13s measured) |
+| `FullyQualifiedName~ChallengeReverseIndexFaultTests` | **1** | **1** | **3** | Unchanged prior production regressions: seeds 9000/9001/9002 red; seed 9003 green |
+| `FullyQualifiedName~ChallengeReverseIndexFaultMatrixTests` | **1** | **6** | **11** | Additional deliberately fail-closed production probes, 17 total (24s measured) |
+
+**Exact failing expanded matrix modes:** 4 missing by-challenge; 5 missing by-owner; 6 unlinked challenge extra edge; 7 extra foreign-owner edge; 8 nonexistent challenge edge; 9 stale attempt identity; 11 duplicate persisted canonical dependency; 15 extra owner edge before manual requeue; 16 extra future-generation edge after auto requeue; 18 wrong-owner payload; 20 extra owner edge after a valid manual zero-dependency requeue. In these cases the fixture expected an integrity rejection while the existing production reader/mutator returned `Ok`, and the remote canonical commit was captured before/after the operation. These are deliberately **red, actionable production-side fail-open findings** for the independent Worker 4 correction to investigate; this tests-only task does not repair them.
+
+**Passing expanded modes:** 10 stale generation zero; 12 canceled dependency cannot requeue; 13 wrong project binding; **14 valid historical N1→N2→N3 requeue control**, retaining historical edges; 17 wrong generation field; 19 wrong task locator. The positive historical control must remain green after production fixes. The original four-mode fixture for seeds 9000–9003 was checked byte-for-byte against frozen `cd895d493b419e127ededea15f814ab53e484407` and remains unchanged.
+
+The two clean model filters and 47-test broad filter are the only **green gates**. The two fault filters are **expected red** and remain merge blockers until separately owned production fixes are reviewed. Do not call the whole suite green, silently disable fault cases, or confuse test-harness errors with production-fail-open evidence. No full unrelated project-wide suite was run.
+
+**Exact-source rule:** The test file resolves `git rev-parse HEAD` at execution. Before this follow-up is committed, that reports the old ancestor `cd895d...` even though the worktree contains changes; such precommit runs are candidate evidence only. The review request freezes the new immutable `headOid`, and the final post-commit rerun must be recorded against that exact SHA. There is no self-referential commit SHA embedded in this Markdown file.
 
 ## Constraints
 

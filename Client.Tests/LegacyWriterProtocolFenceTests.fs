@@ -707,7 +707,15 @@ type LegacyWriterProtocolFenceTests() =
     [<Test>]
     member _.FourConcreteDirectReplayFastPathsRespectFrozenPreparingAndInvalidHostProof() =
         withFixture (fun f ->
-            let sourceHead = git f.ProjectOne.RepositoryPath [ "rev-parse"; "HEAD" ]
+            // Managed integration now owns its non-force target publication.
+            // Prepare a distinct, locally available Accepted commit while the
+            // disposable bare remote target still advertises its earlier base.
+            let checkout = f.ProjectOne.RepositoryPath
+            File.WriteAllText(Path.Combine(checkout, "direct-replay-source.txt"),
+                              "Accepted frozen source for attributed publication")
+            git checkout [ "add"; "direct-replay-source.txt" ] |> ignore
+            git checkout [ "commit"; "-m"; "Accepted replay fixture source" ] |> ignore
+            let sourceHead = git checkout [ "rev-parse"; "HEAD" ]
             let targetRef = "refs/heads/main"
             let reviewId = Guid.NewGuid()
             let reviewSubmitId = Guid.NewGuid()

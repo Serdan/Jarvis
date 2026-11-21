@@ -42,12 +42,6 @@ async function execute(args) {
       document.querySelectorAll('[data-user-message-bubble]').length) {
     return notSubmitted("ExistingConversation");
   }
-  // ChatGPT has intermittently ignored a Send even when the DOM editor and
-  // submit button looked ready in hidden tabs. Do not consume an uncertain
-  // external effect from an inactive page: callers must create an active tab.
-  if (document.visibilityState !== "visible") {
-    return { ...notSubmitted("InactiveLaunchTab"), stage: "visibility" };
-  }
   // A single budget for hydration, insertion, acknowledgement and route capture.
   // Leaves a three-second margin inside the bridge's 30-second execution limit.
   const overallMs = Math.min(Math.max(Number(args.timeoutMs) || 27000, 100), 27000);
@@ -92,7 +86,7 @@ async function execute(args) {
   // Re-evaluate *every new session*; never cache a previous fallback choice.
   // The visible Work GPT-6.2 model is Astra; its default thinking effort is Medium.
   const preferences = [
-    { mode: "Chat", model: "GPT-6", effort: "max", level: 3, label: "Extra High" },
+    { mode: "Chat", model: "GPT-6", effort: "high", level: 2, label: "High" },
     { mode: "Work", model: "GPT-6.2 Astra", effort: "medium", level: 1, label: "Medium" },
     { mode: "Chat", model: "GPT-6", effort: "none", level: 0, label: "Instant" }
   ];
@@ -107,8 +101,6 @@ async function execute(args) {
     if (location.href !== startUrl) return notSubmitted("UnexpectedStartUrl");
     if (document.querySelectorAll('[data-message-author-role="user"],[data-user-message-bubble]').length)
       return notSubmitted("ExistingConversation");
-    if (document.visibilityState !== "visible")
-      return { ...notSubmitted("InactiveLaunchTab"), stage: "visibility" };
     return null;
   };
   const poll = async (predicate, untilAt) => {

@@ -21,7 +21,7 @@ function harness(options = {}) {
   let chatClicks = 0;
   let modelClicks = 0;
   let selectedModel = options.selectedModel || "GPT-6";
-  let reasoningEffort = options.reasoningEffort || "Extra High";
+  let reasoningEffort = options.reasoningEffort || "High";
   let staleSendChecks = 0;
   let staleSendObserved = 0;
   let draftWasCleared = false;
@@ -277,22 +277,20 @@ function harness(options = {}) {
     get staleSendObserved() { return staleSendObserved; }, get lastSubmittedText() { return lastSubmittedText; } };
 }
 
-test("hidden ChatGPT tab fails definitively before editing or Send", async () => {
+test("hidden launch is not rejected merely for lacking visibility", async () => {
   const h = harness({ visibilityState: "hidden" });
-  const result = await h.run("Do not submit while hidden");
-  assert.equal(result.status, "notSubmitted");
-  assert.equal(result.reason, "InactiveLaunchTab");
-  assert.equal(result.safeToDisposeCreatedTab, true);
-  assert.equal(h.clicks, 0);
-  assert.equal(h.insertions, 0);
+  const result = await h.run("Background launch is a requirement");
+  assert.equal(result.status, "submitted");
+  assert.equal(result.selectedEffort, "High");
+  assert.equal(h.clicks, 1);
 });
 
-test("visibility lost after typing prevents the only Send attempt", async () => {
+test("visibility lost after insertion cannot authorize duplicate Send", async () => {
   const h = harness({ hideTabAfterInsertMs: 0, timeoutMs: 1100 });
-  const result = await h.run("Never send from a newly hidden tab");
-  assert.equal(result.status, "notSubmitted");
-  assert.equal(result.reason, "InactiveLaunchTab");
-  assert.equal(h.clicks, 0);
+  const result = await h.run("Do not duplicate this message");
+  assert.equal(result.status, "submitted");
+  assert.equal(result.selectedEffort, "High");
+  assert.equal(h.clicks, 1);
 });
 
 test("inserts multiline prompt through editor and submits once", async () => {
@@ -660,7 +658,7 @@ test("effort resetting after prompt insertion is repaired before the sole Send",
   const h = harness({ resetEffortAfterInsertMs: 0, resetEffortTo: "Medium", timeoutMs: 2600 });
   const result = await h.run("Exact unique task prompt");
   assert.equal(result.status, "submitted");
-  assert.equal(h.reasoningEffort, "Extra High");
+  assert.equal(h.reasoningEffort, "High");
   assert.equal(h.lastSubmittedText, "Exact unique task prompt");
   assert.equal(h.clicks, 1);
 });
@@ -825,7 +823,7 @@ test("route change after insertion always prevents a Send", async () => {
 
 test("ignored pre-hydration Chat click retries on the same untouched new-chat home", async () => {
   const h = harness({ initialMode: "Work", ignoreFirstChatClicks: 1, timeoutMs: 1100,
-    selectedModel: "GPT-6", reasoningEffort: "Extra High" });
+    selectedModel: "GPT-6", reasoningEffort: "High" });
   const result = await h.run("Hydration recovery");
   assert.equal(result.status, "submitted");
   assert.equal(h.chatClicks >= 2, true);
@@ -833,7 +831,7 @@ test("ignored pre-hydration Chat click retries on the same untouched new-chat ho
   assert.equal(h.clicks, 1);
   assert.equal(h.lastSubmittedText, "Hydration recovery");
   assert.equal(h.selectedModel, "GPT-6");
-  assert.equal(h.reasoningEffort, "Extra High");
+  assert.equal(h.reasoningEffort, "High");
   assert.equal(h.modelClicks, 0);
 });
 
@@ -902,7 +900,7 @@ for (const { selectedModel, reasoningEffort } of [
     assert.equal(h.chatClicks, 0);
     assert.equal(h.clicks, 1);
     assert.equal(h.selectedModel, "GPT-6");
-    assert.equal(h.reasoningEffort, "Extra High");
+    assert.equal(h.reasoningEffort, "High");
   });
 }
 

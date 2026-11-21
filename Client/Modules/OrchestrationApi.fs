@@ -668,6 +668,25 @@ module PendingIntentJournal =
         try action ()
         finally lockTimeoutOverride.Value <- previous
 
+    // The ordinary write route must never interpret a persisted uncertain UUID
+    // (including a crashed or abandoned mutex owner) as permission to replay.
+    // Only PendingRecoveryApi.retry may grant a scoped, inspected authorization.
+    type private ExplicitRetryAuthorization =
+        { Binding: LedgerStore.LedgerBinding
+          OperationId: Guid
+          CommandSha256: string
+          VerifiedHead: string }
+
+    let private activeExplicitRetry = System.Threading.AsyncLocal<ExplicitRetryAuthorization option>()
+
+    let internal withExplicitOperatorRetry binding operationId commandSha256 verifiedHead action =
+        let previous = activeExplicitRetry.Value
+        activeExplicitRetry.Value <- Some
+            { Binding = binding; OperationId = operationId
+              CommandSha256 = commandSha256; VerifiedHead = verifiedHead }
+        try action ()
+        finally activeExplicitRetry.Value <- previous
+
     let private withIntentLock (binding: LedgerStore.LedgerBinding) (operationId: Guid)
                                (operation: unit -> Result<'a, EffectError>) =
         try
@@ -1962,7 +1981,7 @@ module PendingIntentJournal =
                         elif failure.Code = "GitFailure"
                              && failure.Message.Contains("class=reference", StringComparison.Ordinal) then
                             "inspect-remote-binding"
-                        else "retry-same-uuid"
+                        else "inspect-pending-and-reconcile"
                     String.concat "; " fields + "; nextAction=" + action
                 else failure.Message
             Client.LedgerFailureError
@@ -1976,6 +1995,31 @@ module PendingIntentJournal =
         // earlier evidence, even when today's caller supplies the same UUID.
         let previouslyPending = File.Exists(filePath binding operationId)
         persistUnsafe binding operationId commandType commandJson
+        |> Result.bind (fun () ->
+            if not previouslyPending then Ok ()
+            else
+                match activeExplicitRetry.Value with
+                | Some permission when permission.Binding = binding
+                                       && permission.OperationId = operationId
+                                       && permission.CommandSha256 = sha commandJson ->
+                    // Recheck the exact canonical head and UUID under the
+                    // mutex: the operator inspection may have become stale.
+                    LedgerStore.LedgerStore.fetch binding
+                    |> Result.mapError LedgerErrors.toEffect
+                    |> Result.bind (fun snapshot ->
+                        if snapshot.Commit <> permission.VerifiedHead then
+                            Error(Client.ValidationError
+                                "Verified ledger head changed; inspect again before retry.")
+                        else
+                            LedgerStore.LedgerStore.getOperationAt binding snapshot operationId
+                            |> Result.mapError LedgerErrors.toEffect
+                            |> Result.bind (function
+                                | Some _ -> Error(Client.ValidationError
+                                    "Canonical UUID has an applied receipt; inspect and acknowledge instead of replay.")
+                                | None -> Ok ()))
+                | _ -> Error(Client.ValidationError
+                    "Saved pending UUID has uncertain outcome; reconcile before explicit operator retry.")
+        )
         |> Result.bind (fun () ->
             let outcome, publication = LedgerStore.LedgerStore.observePublicationAttempts apply
             match outcome with
@@ -2004,7 +2048,7 @@ module PendingIntentJournal =
     // An uncertain push can have been accepted even when its response was
     // lost. Re-read the authoritative UUID index before reporting ambiguity.
     // Only a fully matching canonical request is eligible for recovery.
-    let executeLedgerWrite (binding: LedgerStore.LedgerBinding) (operationId: Guid)
+    let private executeLedgerWriteNew (binding: LedgerStore.LedgerBinding) (operationId: Guid)
                            (commandType: string) command
                            (apply: unit -> Result<LedgerStore.LedgerWrite, EffectError>) =
         execute binding operationId commandType command (fun () ->
@@ -2036,6 +2080,39 @@ module PendingIntentJournal =
                 | Error _ ->
                     Error(Client.LedgerFailureError issue)
             | other -> other)
+
+    // Recover a confirmed, exactly matching canonical receipt without
+    // invoking the original callback again. A missing or conflicting UUID
+    // remains uncertain; neither network recovery nor mutex abandonment
+    // gives permission to send the effect a second time.
+    let executeLedgerWrite (binding: LedgerStore.LedgerBinding) (operationId: Guid)
+                           (commandType: string) command
+                           (apply: unit -> Result<LedgerStore.LedgerWrite, EffectError>) =
+        if File.Exists(filePath binding operationId)
+           && activeExplicitRetry.Value.IsNone then
+            withIntentLock binding operationId (fun () ->
+                let commandJson = JsonSerializer.Serialize(command)
+                persistUnsafe binding operationId commandType commandJson
+                |> Result.bind (fun () ->
+                    findAtRoot binding.RepositoryPath operationId
+                    |> Result.bind (function
+                        | Some saved when checkBinding binding saved ->
+                            LedgerStore.LedgerStore.getOperationStatus binding operationId
+                            |> Result.mapError LedgerErrors.toEffect
+                            |> Result.bind (fun (snapshot, receipt) ->
+                                match receipt with
+                                | Some applied when identityMatches saved applied ->
+                                    retireAfterOutcome binding operationId "verified applied receipt"
+                                    let verified: LedgerStore.LedgerWrite =
+                                        { Operation = applied; CurrentHead = snapshot.Commit; AlreadyApplied = true }
+                                    Ok verified
+                                | Some _ -> Error(Client.ValidationError
+                                    "Canonical UUID identity mismatch; preserve pending operation.")
+                                | None -> Error(Client.ValidationError
+                                    "Saved pending UUID has uncertain outcome; reconcile before explicit operator retry."))
+                        | _ -> Error(Client.ValidationError
+                            "Missing or mismatched saved pending intent; manual inspection required."))))
+        else executeLedgerWriteNew binding operationId commandType command apply
 
 module OperationResponse =
     // Keep canonical agent state effects available in the client transport
@@ -2882,7 +2959,9 @@ module PendingRecoveryApi =
                                         Error(Client.ValidationError
                                             "ReplayRejectedStale: this saved TaskWrite action is not safe to retry through the current protocol; use inspected supersession.")
                                     else
-                                        TaskApi.write saved rt)
+                                        PendingIntentJournal.withExplicitOperatorRetry binding operationId
+                                            stored.CommandSha256 cmd.ExpectedVerifiedHead
+                                            (fun () -> TaskApi.write saved rt))
                             | "ReviewWrite" ->
                                 rehydrate<ReviewWriteCommand> stored
                                 |> Result.bind (fun saved ->
@@ -2895,7 +2974,10 @@ module PendingRecoveryApi =
                                               "Release"; "Withdraw" ]) then
                                         Error(Client.ValidationError
                                             "ReplayRejectedStale: saved review action cannot be retried by this operator tool.")
-                                    else ReviewApi.write saved rt)
+                                    else
+                                        PendingIntentJournal.withExplicitOperatorRetry binding operationId
+                                            stored.CommandSha256 cmd.ExpectedVerifiedHead
+                                            (fun () -> ReviewApi.write saved rt))
                             | _ ->
                                 Error(Client.ValidationError "Saved ledger setup/lifecycle command is not on the operator retry allowlist."))))
 

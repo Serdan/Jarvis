@@ -3781,7 +3781,7 @@ type ReviewWorkflowTests() =
 
 
     [<Test>]
-    member _.PendingIntentSurvivesFailedCallAndCanReplayUnchanged() =
+    member _.PendingIntentSurvivesFailedCallAndRequiresOperatorRecovery() =
         withFixture (fun one _ first _ _ _ _ _ ->
             let operationId = Guid.NewGuid()
             let command = {| action = "CreateTask"; taskId = "restart"; title = "Original" |}
@@ -3816,9 +3816,11 @@ type ReviewWorkflowTests() =
             | Error(Client.ValidationError _) -> ()
             | other -> Assert.Fail(sprintf "UUID conflict must reject altered intent: %A" other)
             Assert.That((pending ()).Length, Is.EqualTo(1))
-            let recovered = execute (fun () -> Ok 17) |> success
-            Assert.That(recovered, Is.EqualTo(17))
-            Assert.That((pending ()).Length, Is.EqualTo(0))
+            match execute (fun () -> Ok 17) with
+            | Error(Client.ValidationError message) ->
+                Assert.That(message, Does.Contain("explicit operator retry"))
+            | other -> Assert.Fail(sprintf "Unapproved restart must not replay: %A" other)
+            Assert.That((pending ()).Length, Is.EqualTo(1))
             let lostId = Guid.NewGuid()
             let retryLost f =
                 Client.OrchestrationApi.PendingIntentJournal.execute first lostId
@@ -3830,9 +3832,12 @@ type ReviewWorkflowTests() =
                 Assert.That(info.Code, Is.EqualTo("OutcomeUnknown"))
                 Assert.That(info.OperationId, Is.EqualTo(Some(lostId.ToString("D"))))
             | other -> Assert.Fail(sprintf "Unknown result must retain typed UUID: %A" other)
-            Assert.That((pending ()).Length, Is.EqualTo(1))
-            retryLost (fun () -> Ok 19) |> success |> ignore
-            Assert.That((pending ()).Length, Is.EqualTo(0)))
+            Assert.That((pending ()).Length, Is.EqualTo(2))
+            match retryLost (fun () -> Ok 19) with
+            | Error(Client.ValidationError message) ->
+                Assert.That(message, Does.Contain("explicit operator retry"))
+            | other -> Assert.Fail(sprintf "An uncertain response needs inspected retry: %A" other)
+            Assert.That((pending ()).Length, Is.EqualTo(2)))
 
 
     [<Test>]
@@ -3878,10 +3883,14 @@ type ReviewWorkflowTests() =
             let before =
                 Client.OrchestrationApi.PendingIntentJournal.findAtRoot one existingId
                 |> success |> Option.get
-            match stale existingId with
-            | Error(Client.LedgerFailureError failure) ->
-                Assert.That(failure.Code, Is.EqualTo("StaleEntityVersion"))
-            | other -> Assert.Fail(sprintf "Prior uncertain UUID must still be rejected: %A" other)
+            let mutable repeatedCallback = false
+            match execute existingId (fun () ->
+                    repeatedCallback <- true
+                    Error(Client.ValidationError "unexpected callback")) with
+            | Error(Client.ValidationError message) ->
+                Assert.That(message, Does.Contain("explicit operator retry"))
+            | other -> Assert.Fail(sprintf "Prior uncertain UUID must not be replayed: %A" other)
+            Assert.That(repeatedCallback, Is.False)
             Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one existingId |> success),
                         Is.EqualTo(Some before))
 
@@ -4851,10 +4860,24 @@ type ReviewWorkflowTests() =
                 File.WriteAllText(exitSignal, "exit")
                 Assert.That(holder.WaitForExit(10000), Is.True)
                 Assert.That(holder.ExitCode, Is.Zero)
+                let command = {| Action = "CreateTask"; TaskId = "abandoned"; Title = "Recovery" |}
                 Client.OrchestrationApi.PendingIntentJournal.persist first operationId "TaskWrite"
-                    (System.Text.Json.JsonSerializer.Serialize(
-                        {| Action = "CreateTask"; TaskId = "abandoned"; Title = "Recovery" |}))
-                |> success
+                    (System.Text.Json.JsonSerializer.Serialize(command)) |> success
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
+                            Is.True)
+                // Abandonment releases the OS lock; it does not authorize a
+                // second callback for a saved, potentially published intent.
+                let mutable callbackCalls = 0
+                let resumed : Result<int, Client.EffectError> =
+                    Client.OrchestrationApi.PendingIntentJournal.execute first operationId
+                        "TaskWrite" command (fun () ->
+                            callbackCalls <- callbackCalls + 1
+                            Ok 17)
+                match resumed with
+                | Error(Client.ValidationError message) ->
+                    Assert.That(message, Does.Contain("explicit operator retry"))
+                | other -> Assert.Fail(sprintf "Abandoned owner must not grant replay: %A" other)
+                Assert.That(callbackCalls, Is.Zero)
                 Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
                             Is.True)
                 let bindingPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
@@ -4974,6 +4997,94 @@ type ReviewWorkflowTests() =
             Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
                         Is.True)
             Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(before)))
+
+    [<Test>]
+    member _.PendingLockRefusesOrdinaryReplayAfterAmbiguousIOException() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let command = {| Action = "CreateTask"; TaskId = "ambiguous-restart" |}
+            let mutable calls = 0
+            let execute callback =
+                Client.OrchestrationApi.PendingIntentJournal.execute first operationId
+                    "TaskWrite" command callback
+            let firstOutcome : Result<int, Client.EffectError> =
+                execute (fun () ->
+                    calls <- calls + 1
+                    raise (IOException("Remote result may have been committed")))
+            match firstOutcome with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Expected uncertain IOException, got %A" other)
+            Assert.That(calls, Is.EqualTo(1))
+            let secondOutcome : Result<int, Client.EffectError> =
+                execute (fun () ->
+                    calls <- calls + 1
+                    Ok 17)
+            match secondOutcome with
+            | Error(Client.ValidationError message) ->
+                Assert.That(message, Does.Contain("explicit operator retry"))
+            | other -> Assert.Fail(sprintf "Ordinary repeat must not replay an ambiguous callback: %A" other)
+            Assert.That(calls, Is.EqualTo(1),
+                        "A persisted uncertain UUID requires canonical inspection and authorized retry.")
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                         |> success).IsSome, Is.True))
+
+    [<Test>]
+    member _.PendingNamedMutexIdentityAndHandleCleanupLeaveNoLockArtifacts() =
+        withFixture (fun one two first _ _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let differentId = Guid.NewGuid()
+            let name = Client.OrchestrationApi.PendingIntentJournal.exactLockName one operationId
+            Assert.That(name, Is.Not.EqualTo(
+                Client.OrchestrationApi.PendingIntentJournal.exactLockName one differentId))
+            Assert.That(name, Is.Not.EqualTo(
+                Client.OrchestrationApi.PendingIntentJournal.exactLockName two operationId))
+            let bindingPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            let journal = Path.Combine(Path.GetDirectoryName bindingPath, "pending",
+                                       Path.GetFileNameWithoutExtension bindingPath)
+            let value : Result<int, Client.EffectError> =
+                Client.OrchestrationApi.PendingIntentJournal.execute first operationId
+                    "TaskWrite" {| Action = "CreateTask"; TaskId = "handle-cleanup" |}
+                    (fun () -> Ok 7)
+            Assert.That(value |> success, Is.EqualTo(7))
+            Assert.That(Directory.Exists journal, Is.True)
+            Assert.That(Directory.GetFiles(journal, "*", SearchOption.AllDirectories), Is.Empty,
+                        "Completed mutex operations leave no pending or lock files.")
+            Assert.That(Directory.GetDirectories(journal, "*", SearchOption.AllDirectories), Is.Empty,
+                        "Named mutexes must not create per-UUID or stripe directories.")
+            let mutable residual : System.Threading.Mutex = null
+            let stillOpen = System.Threading.Mutex.TryOpenExisting(name, &residual)
+            if stillOpen then residual.Dispose()
+            Assert.That(stillOpen, Is.False,
+                        "The last process-local mutex handle must be disposed on completion."))
+
+    [<Test>]
+    member _.PendingNamedMutexRejectsSymlinkJournalBeforeCallback() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let bindingPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            let journal = Path.Combine(Path.GetDirectoryName bindingPath, "pending",
+                                       Path.GetFileNameWithoutExtension bindingPath)
+            let redirected = Path.Combine(Path.GetDirectoryName one, "symlink-journal-target")
+            Directory.CreateDirectory(Path.GetDirectoryName journal) |> ignore
+            Directory.CreateDirectory(redirected) |> ignore
+            Assert.That(Directory.Exists journal, Is.False)
+            try
+                try
+                    Directory.CreateSymbolicLink(journal, redirected) |> ignore
+                with :? UnauthorizedAccessException when OperatingSystem.IsWindows() ->
+                    Assert.Ignore("This Windows account cannot create a symlink for the safety test.")
+                let mutable called = false
+                let result : Result<int, Client.EffectError> =
+                    Client.OrchestrationApi.PendingIntentJournal.execute first (Guid.NewGuid())
+                        "TaskWrite" {| Action = "CreateTask"; TaskId = "symlink-denied" |}
+                        (fun () -> called <- true; Ok 1)
+                match result with
+                | Error(Client.ValidationError message) ->
+                    Assert.That(message, Does.Contain("symbolic link"))
+                | other -> Assert.Fail(sprintf "Symlinked journal must fail closed: %A" other)
+                Assert.That(called, Is.False)
+                Assert.That(Directory.GetFiles(redirected), Is.Empty)
+            finally
+                if Directory.Exists journal then Directory.Delete(journal))
 
     [<Test>]
     member _.LostResponseRecoversAcceptedRemoteOperationButNeverGuessesFailure() =
@@ -5198,7 +5309,7 @@ type ReviewWorkflowTests() =
 
 
     [<Test>]
-    member _.RemoteOutagePreservesPendingIntentUntilVerifiedRetry() =
+    member _.RemoteOutagePreservesPendingIntentAndBlocksUnapprovedReplay() =
         withFixture (fun one _ first _ _ _ _ _ ->
             let operationId = Guid.NewGuid()
             let command =
@@ -5229,14 +5340,15 @@ type ReviewWorkflowTests() =
 
             let before = Client.OrchestrationApi.PendingIntentJournal.reconcile first |> success
             Assert.That(before.Head.disposition, Is.EqualTo("NotFoundAtVerifiedHead"))
-            let recovered = execute () |> success
-            Assert.That(recovered.AlreadyApplied, Is.False)
+            // Reconnect does not retroactively authorize an ambiguous retry.
+            match execute () with
+            | Error(Client.ValidationError message) ->
+                Assert.That(message, Does.Contain("explicit operator retry"))
+            | other -> Assert.Fail(sprintf "Reconnect must not replay uncertain UUID: %A" other)
             let _, recorded = LedgerStore.getOperationStatus first operationId |> success
-            Assert.That(recorded.IsSome, Is.True)
-            Assert.That(recorded.Value.OriginalResultJson,
-                        Is.EqualTo(recovered.Operation.OriginalResultJson))
+            Assert.That(recorded.IsNone, Is.True)
             Assert.That((Client.OrchestrationApi.PendingIntentJournal.listAtRoot one |> success).Length,
-                        Is.EqualTo(0)))
+                        Is.EqualTo(1)))
 
 
     [<Test>]
@@ -6624,7 +6736,7 @@ type ReviewWorkflowTests() =
                 if File.Exists configPath then File.Delete configPath)
 
     [<Test>]
-    member _.TransientPrepublicationDnsRetriesAndSameUuidRecovery() =
+    member _.TransientPrepublicationDnsPreservesUuidWithoutUnapprovedReplay() =
         withFixture (fun one _ first _ _ _ _ _ ->
             let taskId = "transient-dns-ledger"
             let operationId = Guid.NewGuid()
@@ -6670,15 +6782,13 @@ type ReviewWorkflowTests() =
             Assert.That((ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent.Version, Is.EqualTo(ownerBefore))
             Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome, Is.True)
 
-            // Same UUID and same request recover when the remote returns.
-            let recovered = run () |> success
-            Assert.That(recovered.AlreadyApplied, Is.False)
-            Assert.That((LedgerStore.fetch first |> success).Header.NextSequence, Is.EqualTo(before + 1L))
-            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsNone, Is.True)
-            let replay = run () |> success
-            Assert.That(replay.AlreadyApplied, Is.True)
-            Assert.That(replay.Operation.OriginalResultJson, Is.EqualTo(recovered.Operation.OriginalResultJson))
-            Assert.That((LedgerStore.fetch first |> success).Header.NextSequence, Is.EqualTo(before + 1L)))
+            // Restored connectivity does not prove the original effect failed.
+            match run () with
+            | Error(Client.ValidationError message) ->
+                Assert.That(message, Does.Contain("explicit operator retry"))
+            | other -> Assert.Fail(sprintf "Reconnected client must not replay original UUID: %A" other)
+            Assert.That((LedgerStore.fetch first |> success).Header.NextSequence, Is.EqualTo(before))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome, Is.True))
 
     [<Test>]
     member _.TransientPrepublicationDnsRecoversWithoutPublishingTwice() =
@@ -6718,9 +6828,11 @@ type ReviewWorkflowTests() =
             let command =
                 {| Action = "CreateTask"; TaskId = taskId
                    Title = "Exactly once"; Html = "<h1>Exactly once</h1>" |}
+            let mutable callbackCalls = 0
             let run () =
                 Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite
                     first operationId "TaskWrite" command (fun () ->
+                        callbackCalls <- callbackCalls + 1
                         ReviewWorkflow.createTaskWithSpec first operationId taskId command.Title command.Html
                         |> Result.mapError Client.OrchestrationApi.LedgerErrors.toEffect)
             let before = (LedgerStore.fetch first |> success).Header.NextSequence
@@ -6757,6 +6869,8 @@ type ReviewWorkflowTests() =
             Assert.That(snapshot.Header.NextSequence, Is.EqualTo(before + 1L))
             let recovered = run () |> success
             Assert.That(recovered.AlreadyApplied, Is.True)
+            Assert.That(callbackCalls, Is.EqualTo(1),
+                        "Matching canonical receipt recovery must not invoke the callback twice.")
             Assert.That(recovered.Operation.OriginalResultJson, Is.EqualTo(remoteReceipt.Value.OriginalResultJson))
             Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(before + 1L))
             Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsNone, Is.True))
@@ -6855,7 +6969,7 @@ type ReviewWorkflowTests() =
             Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one localId |> success).IsSome, Is.True))
 
     [<Test>]
-    member _.YieldAgentDnsFailurePreservesWorkingAndCheckpointUntilSameUuidRecovery() =
+    member _.YieldAgentDnsFailurePreservesWorkingAndCheckpointUntilInspectedRecovery() =
         withFixture (fun one _ first second _ _ _ initTask ->
             let taskId = "p1-yield-agent-transient"
             initTask taskId
@@ -6895,26 +7009,16 @@ type ReviewWorkflowTests() =
             Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent, Is.EqualTo(before))
             Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
                         Is.True)
-            let confirmed = run () |> success
-            Assert.That(confirmed.AlreadyApplied, Is.False)
-            Assert.That(confirmed.Operation.Sequence, Is.EqualTo(sequence))
-            let after = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
-            Assert.That(after.State, Is.EqualTo("Ready"))
-            Assert.That(after.Execution, Is.EqualTo("Stopped"))
-            Assert.That(after.Version, Is.EqualTo(before.Version + 1))
-            let _, checkpoint = ReviewWorkflow.getCheckpoint second taskId sequence |> success
-            Assert.That(checkpoint.Summary, Is.EqualTo(summary))
-            Assert.That(checkpoint.NextAction, Is.EqualTo(nextAction))
-            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsNone,
-                        Is.True)
-            let repeat = run () |> success
-            Assert.That(repeat.AlreadyApplied, Is.True)
-            Assert.That(repeat.Operation.OriginalResultJson, Is.EqualTo(confirmed.Operation.OriginalResultJson))
-            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent, Is.EqualTo(after))
-            Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence + 1L)))
+            match run () with
+            | Error(Client.ValidationError message) ->
+                Assert.That(message, Does.Contain("explicit operator retry"))
+            | other -> Assert.Fail(sprintf "Yield after outage requires inspected recovery: %A" other)
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent, Is.EqualTo(before))
+            Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome, Is.True))
 
     [<Test>]
-    member _.PushTimeoutNeverBlindlyRetriesAndRecoversOriginalPendingUuid() =
+    member _.PushTimeoutNeverBlindlyRetriesAndRetainsOriginalPendingUuid() =
         withFixture (fun one _ first second _ _ _ _ ->
             let operationId = Guid.NewGuid()
             let taskId = "p1-uncertain-push-timeout"
@@ -6953,15 +7057,12 @@ type ReviewWorkflowTests() =
             Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence))
             Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
                         Is.True)
-            let recovered = run () |> success
-            Assert.That(recovered.AlreadyApplied, Is.False)
-            Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence + 1L))
-            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsNone,
-                        Is.True)
-            let replay = run () |> success
-            Assert.That(replay.AlreadyApplied, Is.True)
-            Assert.That(replay.Operation.OriginalResultJson, Is.EqualTo(recovered.Operation.OriginalResultJson))
-            Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence + 1L)))
+            match run () with
+            | Error(Client.ValidationError message) ->
+                Assert.That(message, Does.Contain("explicit operator retry"))
+            | other -> Assert.Fail(sprintf "Timeout cannot authorize same-UUID replay: %A" other)
+            Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome, Is.True))
 
     [<Test>]
     member _.PendingRenameFsyncFailureFailsClosedBeforePublicTaskFetchAndRetainsOriginalUuid() =
@@ -7045,30 +7146,21 @@ type ReviewWorkflowTests() =
                         { command with Summary = "Changed payload under original UUID" } context with
                 | Error(Client.ValidationError _) -> ()
                 | other -> Assert.Fail(sprintf "Changed payload must fail closed: %A" other)
-                let recovered = run () |> success
-                use recoveredJson = System.Text.Json.JsonDocument.Parse(
-                    System.Text.Json.JsonSerializer.Serialize recovered)
-                Assert.That(recoveredJson.RootElement.GetProperty("alreadyApplied").GetBoolean(),
-                            Is.False)
+                match run () with
+                | Error(Client.ValidationError message) ->
+                    Assert.That(message, Does.Contain("explicit operator retry"))
+                | other -> Assert.Fail(sprintf "Parent fsync recovery cannot automatically replay: %A" other)
                 Assert.That((LedgerStore.fetch second |> success).Header.NextSequence,
-                            Is.EqualTo(sequence + 1L))
-                let _, receipt = LedgerStore.getOperationStatus second operationId |> success
-                Assert.That(receipt.IsSome, Is.True)
-                Assert.That(receipt.Value.Sequence, Is.EqualTo(sequence))
+                            Is.EqualTo(sequence))
+                Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent,
+                            Is.EqualTo(agentBefore))
                 Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
-                             |> success).IsNone, Is.True)
-                let replay = run () |> success
-                use replayJson = System.Text.Json.JsonDocument.Parse(
-                    System.Text.Json.JsonSerializer.Serialize replay)
-                Assert.That(replayJson.RootElement.GetProperty("alreadyApplied").GetBoolean(),
-                            Is.True)
-                Assert.That((LedgerStore.fetch second |> success).Header.NextSequence,
-                            Is.EqualTo(sequence + 1L))
+                             |> success).IsSome, Is.True)
             finally
                 if File.Exists path then File.Delete path)
 
     [<Test>]
-    member _.FirstPendingParentFsyncFailurePreservesOriginalUuidUntilSameUuidReplay() =
+    member _.FirstPendingParentFsyncFailurePreservesUuidUntilInspectedRecovery() =
         if not (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS()) then
             Assert.Ignore("Parent directory fsync fault injection applies to Unix.")
         withFixture (fun one _ first second _ _ _ initTask ->
@@ -7150,23 +7242,18 @@ type ReviewWorkflowTests() =
                         { command with Summary = "Different payload under old UUID" } context with
                 | Error(Client.ValidationError _) -> ()
                 | other -> Assert.Fail(sprintf "Changed UUID payload must be refused: %A" other)
-                let recovered = run () |> success
-                use recoveredJson =
-                    System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize recovered)
-                Assert.That(recoveredJson.RootElement.GetProperty("alreadyApplied").GetBoolean(), Is.False)
+                match run () with
+                | Error(Client.ValidationError message) ->
+                    Assert.That(message, Does.Contain("explicit operator retry"))
+                | other -> Assert.Fail(sprintf "Parent fsync failure cannot authorize blind replay: %A" other)
                 let _, receipt = LedgerStore.getOperationStatus second operationId |> success
-                Assert.That(receipt.IsSome, Is.True)
-                Assert.That(receipt.Value.Sequence, Is.EqualTo(sequence))
+                Assert.That(receipt.IsNone, Is.True)
                 Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
-                             |> success).IsNone, Is.True)
-                let replay = run () |> success
-                use replayJson =
-                    System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize replay)
-                Assert.That(replayJson.RootElement.GetProperty("alreadyApplied").GetBoolean(), Is.True)
+                             |> success).IsSome, Is.True)
                 Assert.That((LedgerStore.fetch second |> success).Header.NextSequence,
-                            Is.EqualTo(sequence + 1L))
-                Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.State,
-                            Is.EqualTo("Ready"))
+                            Is.EqualTo(sequence))
+                Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent,
+                            Is.EqualTo(agentBefore))
             finally
                 if File.Exists path then File.Delete path)
 
@@ -7218,7 +7305,7 @@ type ReviewWorkflowTests() =
                     Assert.That(issue.OperationId, Is.EqualTo(Some(operationId.ToString("D"))))
                     Assert.That(issue.Message, Does.Contain("operationId=" + operationId.ToString("D")))
                     Assert.That(issue.Message, Does.Contain("phase=remote-fetch"))
-                    Assert.That(issue.Message, Does.Contain("nextAction=retry-same-uuid"))
+                    Assert.That(issue.Message, Does.Contain("nextAction=inspect-pending-and-reconcile"))
                     Assert.That(issue.Message.Split([| "nextAction=" |], StringSplitOptions.None).Length - 1,
                                 Is.EqualTo(1))
                     Assert.That(issue.Message, Does.Not.Contain("user:secret"))
@@ -7251,33 +7338,22 @@ type ReviewWorkflowTests() =
                 | Error _ -> ()
                 | Ok _ -> Assert.Fail("Stale generation unexpectedly yielded.")
                 Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence))
-                let recovered = run () |> success
-                use recoveredJson = System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize recovered)
-                Assert.That(recoveredJson.RootElement.GetProperty("alreadyApplied").GetBoolean(), Is.False)
+                match run () with
+                | Error(Client.ValidationError message) ->
+                    Assert.That(message, Does.Contain("explicit operator retry"))
+                | other -> Assert.Fail(sprintf "Binding outage cannot authorize task replay: %A" other)
                 let after = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
-                Assert.That(after.State, Is.EqualTo("Ready"))
-                Assert.That(after.Execution, Is.EqualTo("Stopped"))
-                Assert.That(after.Version, Is.EqualTo(before.Version + 1))
-                let _, checkpoint = ReviewWorkflow.getCheckpoint second taskId sequence |> success
-                Assert.That(checkpoint.Summary, Is.EqualTo(command.Summary))
-                Assert.That(checkpoint.NextAction, Is.EqualTo(command.NextAction))
+                Assert.That(after, Is.EqualTo(before))
                 let _, receipt = LedgerStore.getOperationStatus second operationId |> success
-                Assert.That(receipt.IsSome, Is.True)
-                Assert.That(receipt.Value.Sequence, Is.EqualTo(sequence))
-                Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence + 1L))
+                Assert.That(receipt.IsNone, Is.True)
+                Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence))
                 Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
-                             |> success).IsNone, Is.True)
-                let repeated = run () |> success
-                use repeatedJson = System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize repeated)
-                Assert.That(repeatedJson.RootElement.GetProperty("alreadyApplied").GetBoolean(), Is.True)
-                Assert.That((LedgerStore.getOperationStatus second operationId |> success |> snd).Value.OriginalResultJson,
-                            Is.EqualTo(receipt.Value.OriginalResultJson))
-                Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence + 1L))
+                             |> success).IsSome, Is.True)
             finally
                 if File.Exists path then File.Delete path)
 
     [<Test>]
-    member _.PublicReviewBindingDnsFailurePersistsOriginalCommandAndReplaysOnce() =
+    member _.PublicReviewBindingDnsFailurePreservesCommandAndBlocksReplay() =
         withFixture (fun one _ first second _ sourceRef newCommit initTask ->
             let taskId = "p1-public-binding-review"
             initTask taskId
@@ -7318,7 +7394,7 @@ type ReviewWorkflowTests() =
                     Assert.That(issue.Code, Is.EqualTo("RemoteUnavailable"))
                     Assert.That(issue.OperationId, Is.EqualTo(Some(operationId.ToString("D"))))
                     Assert.That(issue.Message, Does.Contain("operationId=" + operationId.ToString("D")))
-                    Assert.That(issue.Message, Does.Contain("nextAction=retry-same-uuid"))
+                    Assert.That(issue.Message, Does.Contain("nextAction=inspect-pending-and-reconcile"))
                     Assert.That(issue.Message.Split([| "nextAction=" |], StringSplitOptions.None).Length - 1,
                                 Is.EqualTo(1))
                 | other -> Assert.Fail(sprintf "Review API lost original intent at binding: %A" other)
@@ -7337,20 +7413,15 @@ type ReviewWorkflowTests() =
                         { command with Summary = "Unexpected changed review" } context with
                 | Error(Client.ValidationError _) -> ()
                 | other -> Assert.Fail(sprintf "Review UUID reuse with new command accepted: %A" other)
-                let recovered = run () |> success
-                use recoveredJson = System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize recovered)
-                Assert.That(recoveredJson.RootElement.GetProperty("alreadyApplied").GetBoolean(), Is.False)
-                let saved = ReviewWorkflow.getBranchReview second taskId reviewId |> success
-                Assert.That(saved.Review.Status, Is.EqualTo("Unclaimed"))
+                match run () with
+                | Error(Client.ValidationError message) ->
+                    Assert.That(message, Does.Contain("explicit operator retry"))
+                | other -> Assert.Fail(sprintf "Review binding outage must not replay: %A" other)
                 let _, receipt = LedgerStore.getOperationStatus second operationId |> success
-                Assert.That(receipt.IsSome, Is.True)
-                Assert.That(receipt.Value.Sequence, Is.EqualTo(sequence))
+                Assert.That(receipt.IsNone, Is.True)
                 Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
-                             |> success).IsNone, Is.True)
-                let repeated = run () |> success
-                use repeatedJson = System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize repeated)
-                Assert.That(repeatedJson.RootElement.GetProperty("alreadyApplied").GetBoolean(), Is.True)
-                Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence + 1L))
+                             |> success).IsSome, Is.True)
+                Assert.That((LedgerStore.fetch second |> success).Header.NextSequence, Is.EqualTo(sequence))
             finally
                 if File.Exists path then File.Delete path)
 

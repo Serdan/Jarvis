@@ -362,7 +362,9 @@ async function acquireBackgroundFocus(registration, message) {
   if (!registration.agentCreated || message.requireAgentCreated !== true ||
       registration.boundUrl !== CHATGPT_BACKGROUND_HOME) return null;
   const tab = await chrome.tabs.get(registration.tabId);
-  if (tab.active) return null;
+  // Emulate focus even when this tab is currently active: it may become
+  // inactive during the awaited permission checks before user script execution.
+  // Never depend on a one-time tab.active snapshot for Send safety.
   // Never attach a privileged debugger to another origin, a pending route,
   // a discarded document, or a tab moved out of the registered window.
   const parent = await validWindow(registration.windowRegistration);
@@ -435,16 +437,22 @@ async function execute(message) {
   let api;
   try { api = chrome.userScripts; } catch { return error("AllowUserScriptsDisabled"); }
   if (typeof api?.execute !== "function") return error("AllowUserScriptsDisabled");
+  const strictFreshHome = registration.agentCreated &&
+    message.requireAgentCreated === true &&
+    registration.boundUrl === CHATGPT_BACKGROUND_HOME;
   const invocationArguments = JSON.stringify(args ?? {});
   // Trusted project code lives in the isolated USER_SCRIPT world, not extension globals.
   // The URL check also runs inside the frame to prevent navigation races.
   const wrapper =
     "(async () => {\n" +
-    (registration.agentCreated ?
-      "if (location.origin !== " + JSON.stringify(registration.boundOrigin) +
+    (strictFreshHome ?
+      "if (location.href !== " + JSON.stringify(CHATGPT_BACKGROUND_HOME) +
         ") throw new Error('NavigationMismatch');\n" :
-      "if (location.href !== " + JSON.stringify(registration.boundUrl) +
-        ") throw new Error('NavigationMismatch');\n") +
+      registration.agentCreated ?
+        "if (location.origin !== " + JSON.stringify(registration.boundOrigin) +
+          ") throw new Error('NavigationMismatch');\n" :
+        "if (location.href !== " + JSON.stringify(registration.boundUrl) +
+          ") throw new Error('NavigationMismatch');\n") +
     (message.entrypoint === "expression" ?
       "return await (" + source + ");\n" :
       source + "\n" +
@@ -484,6 +492,18 @@ async function execute(message) {
       }
       const lastFocusRevocation = await authorizePageExecution(pagePin);
       if (lastFocusRevocation) return error(lastFocusRevocation);
+      if (strictFreshHome) {
+        // The origin-only generic authorization permits same-origin SPA routes.
+        // For privileged focus emulation require the exact fresh-home URL
+        // immediately before the page wrapper. The wrapper enforces the same
+        // exact URL in the renderer, closing the final async navigation race.
+        let current;
+        try { current = await chrome.tabs.get(registration.tabId); }
+        catch { return error("BackgroundFocusUnavailable"); }
+        if (current.url !== CHATGPT_BACKGROUND_HOME || current.pendingUrl ||
+            current.status !== "complete" || current.discarded || current.frozen)
+          return error("BackgroundFocusUnavailable");
+      }
       results = await api.execute({
         target: { tabId: registration.tabId },
         js: [{ code: wrapper }],

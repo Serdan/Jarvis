@@ -1470,12 +1470,47 @@ test("navigation away from fresh home rejects privileged debugger attachment", a
   assert.equal(data.h.calls.length, 0);
 });
 
-test("already active created ChatGPT tab does not attach debugger", async () => {
+test("initially active ChatGPT tab uses emulation and survives a foreground-to-background race", async () => {
   const data = await createdPageForExecutionRace("https://chatgpt.com/");
   data.tab.active = true;
-  const response = await requestPageAction(data, "executeJs", "already-active");
+  // Simulate another Chrome tab becoming active after focus verification,
+  // while the launcher's user script has not yet been executed.
+  data.h.afterNextUserScript(async () => { data.tab.active = false; });
+  const response = await requestPageAction(data, "executeJs", "active-to-background");
   assert.equal(response.kind, "result");
-  assert.equal(data.h.debuggerCalls.length, 0);
+  assert.equal(data.tab.active, false, "The launcher must never re-activate this tab");
+  assert.equal(data.h.calls.length, 2, "Verified focus probe followed by one page script");
+  assert.deepEqual(data.h.debuggerCalls.map(c => c.kind === "command"
+    ? c.method + ":" + String(c.params.enabled) : c.kind), [
+    "attach", "Emulation.setFocusEmulationEnabled:true",
+    "Emulation.setFocusEmulationEnabled:false", "detach"
+  ]);
+});
+
+test("route drift after privileged debugger attachment fails before launcher injection", async () => {
+  const data = await createdPageForExecutionRace("https://chatgpt.com/");
+  data.h.beforeNextUserScript(async () => {
+    data.tab.url = "https://chatgpt.com/c/foreign-existing-route";
+  });
+  const response = await requestPageAction(data, "executeJs", "drift-before-focus-probe");
+  assert.equal(response.kind, "error");
+  assert.equal(response.error, "BackgroundFocusUnavailable");
+  assert.equal(data.h.calls.length, 1, "Only read-only focus verification is allowed");
+  assert.equal(data.h.debuggerCalls.at(-1).kind, "detach");
+});
+
+test("route drift between last tab preflight and wrapper fails inside the page", async () => {
+  const data = await createdPageForExecutionRace("https://chatgpt.com/");
+  data.h.afterNextUserScript(async () => {
+    data.h.beforeNextUserScript(async () => {
+      data.tab.url = "https://chatgpt.com/c/foreign-existing-route";
+    });
+  });
+  const response = await requestPageAction(data, "executeJs", "drift-at-wrapper");
+  assert.equal(response.kind, "error");
+  assert.match(response.error, /ScriptError:.*NavigationMismatch/);
+  assert.equal(data.h.calls.length, 2, "Focus probe and rejected wrapper only");
+  assert.equal(data.h.debuggerCalls.at(-1).kind, "detach");
 });
 
 test("non-ChatGPT created tab uses existing no-debugger execution path", async () => {

@@ -54,7 +54,18 @@ Stage B must independently run the 16-case negative matrix against real disposab
 ## Execution evidence and explicit limits
 
 - Stage A offline Node fixture: `node --test scripts/tests/native-project-effect-stage-a.test.mjs` from the isolated worktree; observed **exit 0, 11 tests passed, 0 failed**.
-- Current Stage A owns only the two test files and this document. No production modules, account CAS source, roster/Phase-1/Phase-2 scripts, BrowserBridge tests, Health modules or MCP response-alert fixtures were changed.
+- Current Stage A owns only four test-only files and this document (two baseline fake-browser files plus the once-only model and its negative tests). No production modules, account CAS source, roster/Phase-1/Phase-2 scripts, BrowserBridge tests, Health modules or MCP response-alert fixtures were changed.
 - This does **not** claim acceptance of the native Scheduler, project effect fence, account capacity release or authenticated provider-session terminal proof. Production Stage B remains **HOLD** pending upstream independent acceptance, verified integration, bounded source-lease nonoverlap and explicit Operator authorization.
 
 - Existing offline .NET 11 Release baseline: `dotnet test Client.Tests/Client.Tests.fsproj -c Release --filter 'FullyQualifiedName~OriginalBrowserJournalTests|FullyQualifiedName~BrowserBridgeTests' --nologo` in the same isolated worktree; Jarvis job `d8e204f4a05a4ba6956ab265337e79c1` observed **exit 0, 56 passed, 0 failed, 0 skipped, total 56**, with existing nonfatal F# compiler warnings. This validates current baseline BrowserBridge/journal behavior, **not** the unimplemented native Scheduler CAS.
+
+
+## Stage A continuation: fake once-only project-claim and terminal oracle (2026-11-21)
+
+Additional **test-only, non-authoritative** paths:
+- `scripts/tests/fixtures/native-project-effect-fence-stage-a.mjs`: process-local fake project/account CAS, exact candidate/version/ref, reservation receipt and project/account head checks; immutable original dispatch/effect IDs; synchronous `Dispatching` marker before first asynchronous fake-browser call; at-most-one fake Send; fail-closed fake terminal/release gate.
+- `scripts/tests/native-project-effect-once-only-stage-a.test.mjs`: negative tests for competing Workers and Reviewers, third-writer CAS conflicts, reservation-with-project-claim-loss, stale assignment/review/source/account head, lost project claim ACK, concurrent and repeated sends, post-send ACK loss/timeout/crash, tab closure/reconnect/clock rollback, foreign/replayed IDs, Unknown/Active provider, forged/stale/foreign terminal proof, prestart no-send and exactly-once simulated release.
+
+**Observed isolated Node gate:** `node --test scripts/tests/native-project-effect-stage-a.test.mjs scripts/tests/native-project-effect-once-only-stage-a.test.mjs`; **exit 0, 33 passed, 0 failed, 0 skipped**. There were **zero real external browser sends**: all effects are in-memory entries in the disposable fake. The 16 negative-case names remain a Stage B acceptance checklist; these Stage A cases test a *model*, not the real two-clone Git-CAS implementation or source-authorized terminal verifier.
+
+**Safety and evidence boundary:** Fake process-local versions are not Git-ledger CAS; `FAKE_PROVIDER` and `FAKE_PROJECT_CAS` observations are not authenticated provider/session or project evidence. This model is intentionally isolated from runtime, has no scheduling or browser launch path, and cannot be used as production authority. In particular, fake release success proves only local test gating, **not** safe release of a real account reservation. Stage B remains HOLD for Worker 4 native account CAS independently Accepted/integrated, authoritative roster/Phase-1/Phase-2 composition and exact source provenance, current project-ledger CAS, provider/session terminal attestation and separate Operator live authorization.

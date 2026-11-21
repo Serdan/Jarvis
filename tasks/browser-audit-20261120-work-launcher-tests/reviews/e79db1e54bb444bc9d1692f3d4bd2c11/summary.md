@@ -17,4 +17,4 @@ Independent source-bound checks:
 
 This review approves only the pinned test-gate source. It does not approve live browser transport or newer model-selection policy changes on other branches. No author source files were edited.
 
-**Canonical full Release command:** `dotnet scripts/build.cs test --configuration Release` was launched in the isolated worktree as job `80dd65cd5f904294b883f8636f3319d9`; outcome will be appended when bounded execution completes.
+**Bounded canonical command outcome:** `dotnet scripts/build.cs test --configuration Release` in the isolated worktree timed out after 120 seconds (`ExitCode=-1`, `TimedOut=true`). It started `dotnet test Client.Tests/Client.Tests.fsproj -c Debug` (the `Release` option was not delivered as the script configuration), never reached Server.Tests or the Node gate, and emitted activity-persistence read/append errors (`InvalidDataException`, `UnauthorizedAccessException`). This is **not** a full Release pass or successful end-to-end gate witness. The direct pinned Node commands above independently establish discovery and baseline failures; no rerun/replay was attempted.

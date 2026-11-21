@@ -1,0 +1,9 @@
+# Required negative-space coverage missing for batch ACK
+
+**Frozen source:** `500c5c526698477349b6eae875dbfc694a312cc2` (direct parent `eed1fe1b74fbaf3dca867d7915ffaaeed9767c81`). **Scope:** original task, not net-new feature work.
+
+**Evidence:** `Client.Tests/ReviewWorkflowTests.fs:1960-2040` adds three tests for one transaction/duplicate IDs/unlisted unread, foreign/missing/oversized atomic rejection, and already-processed/original-operation-ID replay. `Server.Tests` updates tool metadata/catalog assertions. No batch-specific test exercises two competing clients from stale snapshots or a rejected Git CAS followed by resolution, interruption/lost-response reconciliation before an original-ID retry, or checkpoint/yield/complete coexisting with unresolved notifications. The task explicitly requires negative-space tests for concurrent CAS, stale snapshot, crash/retry original UUID, and lifecycle plus notifications. Existing generic Git CAS infrastructure is reused, which supports implementation plausibility, but does not demonstrate this new multi-record mutation under these conditions.
+
+**Impact:** A concurrent writer or interrupted response is precisely where a batch acknowledgment could falsely report success, be replayed, or drop unread notices. These are unproven acceptance gates, not a claim that the implementation presently exhibits the defect.
+
+**Bounded remedy:** Add fixture-based batch-specific contention/stale-CAS plus original-UUID unknown-outcome replay tests, and one checkpoint/yield/complete sequence proving unresolved IDs remain pending. All tests should be offline, source-exact, use disposable ledgers, and neither mutate live messages nor change STOP/response-alert behavior. Record executed .NET 11 Release results. The optional lifecycle piggyback behavior may remain deferred as documented; the requirement here is proof that existing lifecycle writes never implicitly acknowledge unlisted notifications.

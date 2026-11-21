@@ -310,6 +310,76 @@ let ``composition acceptance requires exact independently reviewed and integrate
         | other -> Assert.Fail(sprintf "Expected stale target-review rejection: %A" other))
 
 [<Test>]
+let compositionAcceptanceRetainsAuthenticatedHistoricalDirectCompletion () =
+    withTwoClones (fun first second ->
+        let owner, reviewer = "Owner", "Reviewer"
+        let taskId, targetRef = "composition-historical-direct", "refs/heads/main"
+        git first.RepositoryPath [ "config"; "user.name"; "Fixture" ] |> ignore
+        git first.RepositoryPath [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+        ReviewWorkflow.registerAgent first (Guid.NewGuid()) owner |> succeed |> ignore
+        ReviewWorkflow.registerAgent first (Guid.NewGuid()) reviewer |> succeed |> ignore
+        ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Historical direct acceptance"
+        |> succeed |> ignore
+        WorkCompositionGitLedger.execute first owner (Guid.NewGuid()) 0
+            (WorkCompositionMutation.Create(
+                "project", WorkUnitKind.Project, None, spec "Project" (Some taskId)))
+        |> succeed |> ignore
+        let _, initial = WorkCompositionGitLedger.load second |> succeed
+        let purpose = WorkCompositionAcceptanceAdapter.reviewPurpose initial initial.Units.["project"]
+        git first.RepositoryPath [ "checkout"; "-b"; "feature/composition-historical-direct" ] |> ignore
+        File.WriteAllText(Path.Combine(first.RepositoryPath, "historical-direct.txt"), "reviewed direct source")
+        git first.RepositoryPath [ "add"; "historical-direct.txt" ] |> ignore
+        git first.RepositoryPath [ "commit"; "-m"; "Historical direct source" ] |> ignore
+        let source = git first.RepositoryPath [ "rev-parse"; "HEAD" ]
+        let reviewId = Guid.NewGuid()
+        ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId owner
+            reviewId "refs/heads/feature/composition-historical-direct" source
+            "Historical direct review" purpose targetRef |> succeed |> ignore
+        ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId reviewId reviewer 1
+        |> succeed |> ignore
+        ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId reviewId reviewer 2 Accept
+        |> succeed |> ignore
+        let submissionId = Guid.NewGuid()
+        ReviewWorkflow.submitIntegration first (Guid.NewGuid()) taskId owner
+            submissionId "" "" (reviewId.ToString("N")) targetRef |> succeed |> ignore
+        let pending = (ReviewWorkflow.getIntegrationSubmissions second taskId |> succeed).Latest.Value
+        Assert.That(pending.Status, Is.EqualTo("Pending"))
+
+        // Recreate the exact pre-publisher wire shape: an immutable canonical
+        // CompleteIntegration operation for a direct S, but no v1 publisher
+        // fields. Old clients had already pushed the target before completing.
+        git first.RepositoryPath [ "push"; "origin"; $"{source}:{targetRef}" ] |> ignore
+        let historical = { pending with Status = "Integrated"
+                                        IntegratedCommit = source
+                                        CompletedAtUtc = "2026-11-06T03:16:08Z" }
+        let path = $"tasks/{taskId}/integrations/{submissionId:N}.json"
+        let operation: LedgerIntent =
+            { OperationId = Guid.NewGuid()
+              Actor = reviewer
+              Kind = "CompleteIntegration"
+              RequestJson = JsonSerializer.Serialize
+                {| taskId = taskId; submissionId = submissionId.ToString("D"); integratedCommit = source |} }
+        LedgerStore.transact second operation (fun snapshot -> result {
+            let! _, oid = LedgerStore.readAt second snapshot path
+            let serialized = JsonSerializer.Serialize(
+                historical, JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase))
+            return [ { Path = path
+                       ExpectedBlobOid = oid
+                       Content = "{\"schemaVersion\":2," + serialized.Substring(1) } ]
+        }) |> succeed |> ignore
+
+        let readBack = (ReviewWorkflow.getIntegrationSubmissions first taskId |> succeed).Latest.Value
+        Assert.That(readBack.PublicationOperationId, Is.Null)
+        Assert.That(readBack.IntegratedCommit, Is.EqualTo(source))
+        let accepted = WorkCompositionAcceptanceAdapter.acceptIntegrated first owner
+                           (Guid.NewGuid()) initial.Version "project" 1 submissionId |> succeed
+        Assert.That(accepted.AlreadyApplied, Is.False)
+        let _, graph = WorkCompositionGitLedger.load second |> succeed
+        Assert.That(
+            (WorkComposition.currentAcceptance graph "project" |> Option.get).EvidenceRef,
+            Is.EqualTo("integration:" + submissionId.ToString("N"))))
+
+[<Test>]
 let compositionAcceptanceRequiresOriginalNonForceReceiptForDistinctCleanMerge () =
     withTwoClones (fun first second ->
         let owner, reviewer = "Owner", "Reviewer"
@@ -381,8 +451,8 @@ let compositionAcceptanceRequiresOriginalNonForceReceiptForDistinctCleanMerge ()
 
         // Even with an otherwise valid mechanical merge, a forged or
         // post-hoc altered canonical receipt cannot borrow publisher authority.
-        let path = "tasks/" + taskId + "/integrations/" + submissionId.ToString("N") + ".json"
-        let replaceReceipt (record: IntegrationSubmission) =
+        let replaceReceiptFor (id: Guid) (record: IntegrationSubmission) =
+            let path = "tasks/" + taskId + "/integrations/" + id.ToString("N") + ".json"
             let action: LedgerIntent =
                 { OperationId = Guid.NewGuid()
                   Actor = "Fixture"
@@ -395,6 +465,7 @@ let compositionAcceptanceRequiresOriginalNonForceReceiptForDistinctCleanMerge ()
                            Content = "{\"schemaVersion\":2," +
                                      (JsonSerializer.Serialize(record, JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase))).Substring(1) } ]
             }) |> succeed |> ignore
+        let replaceReceipt = replaceReceiptFor submissionId
         let failTampered (forged: IntegrationSubmission) =
             replaceReceipt forged
             match WorkCompositionAcceptanceAdapter.acceptIntegrated second owner
@@ -407,6 +478,31 @@ let compositionAcceptanceRequiresOriginalNonForceReceiptForDistinctCleanMerge ()
         failTampered { completed with PublicationOperationId = Guid.NewGuid().ToString("D") }
         failTampered { completed with PublicationPreviousHead = source }
         failTampered { completed with PublicationObservedHead = source }
+        // Downgrading I to S must not disable immutable completion authentication.
+        failTampered { completed with IntegratedCommit = source }
+        failTampered
+            { completed with IntegratedCommit = source
+                             PublicationPreviousHead = null
+                             PublicationObservedHead = null
+                             PublicationOperationId = null
+                             PublicationMechanism = null }
+
+        // An Integrated-shaped record without a CompleteIntegration operation
+        // is not a valid direct receipt, even if the source is now on main.
+        let uncompletedId = Guid.NewGuid()
+        ReviewWorkflow.submitIntegration first (Guid.NewGuid()) taskId owner
+            uncompletedId "" "" (reviewId.ToString("N")) targetRef |> succeed |> ignore
+        let uncompleted = (ReviewWorkflow.getIntegrationSubmissions second taskId |> succeed).Latest.Value
+        Assert.That(uncompleted.SubmissionId, Is.EqualTo(uncompletedId.ToString("N")))
+        replaceReceiptFor uncompletedId
+            { uncompleted with Status = "Integrated"
+                               IntegratedCommit = source
+                               CompletedAtUtc = "2026-11-21T08:00:00Z" }
+        match WorkCompositionAcceptanceAdapter.acceptIntegrated second owner
+                (Guid.NewGuid()) initial.Version "project" 1 uncompletedId with
+        | Error(InvalidBinding _) | Error(LedgerIntegrityError _) -> ()
+        | other -> Assert.Fail(sprintf "Completion-less direct receipt was accepted: %A" other)
+        replaceReceiptFor uncompletedId uncompleted
 
         // Extra edits and manually resolved conflicts cannot be mistaken
         // for Git's exact conflict-free mechanical merge result.

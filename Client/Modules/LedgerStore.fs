@@ -937,6 +937,47 @@ module LedgerStore =
                         | _ -> Error(LedgerIntegrityError
                             "An operation record changed after its originating commit.")
 
+    // Publication fields did not exist on the old direct-completion records.
+    // Recover their exact completion from the immutable first-parent history
+    // of this path, not by treating a mutable Integrated status as evidence.
+    // Requiring an authenticated operation origin also rejects a later file
+    // rewrite and ambiguous multiple-completion histories.
+    let findCompletionOperationForPathAt (binding: LedgerBinding)
+                                         (snapshot: LedgerSnapshot) (path: string) = result {
+        if String.IsNullOrWhiteSpace path || not (ledgerPath.IsMatch path)
+           || path.Contains("..", StringComparison.Ordinal) then
+            return! Error(InvalidBinding "Invalid canonical completion path.")
+        let! history =
+            run binding.RepositoryPath
+                [ "log"; "--first-parent"; "--format=%H"; snapshot.Commit; "--"; path ]
+        let mutable found = None
+        for commit in history.Split('\n', StringSplitOptions.RemoveEmptyEntries) do
+            let! message = run binding.RepositoryPath [ "show"; "-s"; "--format=%B"; commit ]
+            let marker =
+                Regex.Match(message, @"(?m)^Jarvis-Operation-Id: ([0-9a-fA-F-]{36})\r?$")
+            if marker.Success then
+                match Guid.TryParseExact(marker.Groups[1].Value, "D") with
+                | true, operationId when operationId <> Guid.Empty ->
+                    let! candidate = getOperationAt binding snapshot operationId
+                    match candidate with
+                    | Some operation when operation.Type = "CompleteIntegration"
+                                          && not (isNull operation.Paths)
+                                          && Array.contains path operation.Paths ->
+                        let! origin = getOperationOriginAt binding snapshot operation
+                        if origin <> commit || found.IsSome then
+                            return! Error(LedgerIntegrityError
+                                "Integration path has multiple or displaced completion operations.")
+                        found <- Some operation
+                    | _ -> ()
+                | _ ->
+                    return! Error(LedgerIntegrityError
+                        "Integration path history has an invalid operation ID.")
+        match found with
+        | Some operation -> return operation
+        | None -> return! Error(InvalidBinding
+            "Managed integration lacks an original canonical completion operation.")
+    }
+
     let getOperationStatus (binding: LedgerBinding) (operationId: Guid) =
         if operationId = Guid.Empty then Error(InvalidBinding "Valid operation UUID required.")
         else

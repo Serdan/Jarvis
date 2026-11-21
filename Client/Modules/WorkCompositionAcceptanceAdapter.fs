@@ -71,38 +71,71 @@ module WorkCompositionAcceptanceAdapter =
               Prerequisites = prerequisites }
         "WorkComposition.Acceptance." + CanonicalCodec.digest (CanonicalCodec.encode target)
 
-    // The integration consumer trusts no caller-supplied publication claim.
-    // A distinct I != S must originate from the actual canonical
-    // CompleteIntegration operation, with an immutable introducing Git commit,
-    // exact original source/ref and a verified non-force Git publication.
-    let private requireManagedMergeAt (binding: LedgerBinding) (snapshot: LedgerSnapshot)
-                                      taskId (submissionId: Guid) (submission: IntegrationSubmission) = result {
-        let! publicationId =
-            match Guid.TryParseExact(submission.PublicationOperationId, "D") with
-            | true, id when id <> Guid.Empty
-                            && submission.PublicationMechanism = "VerifiedNonForceGitPush/v1" -> Ok id
-            | _ -> Error(InvalidBinding "Composition merge has no verified original non-force publisher receipt.")
+    // Every managed acceptance is rooted in the original canonical
+    // CompleteIntegration transaction, irrespective of whether I equals S.
+    // A mutable I-to-S downgrade (or cleared publisher fields) can never turn
+    // a modern completion into an unauthenticated historical direct receipt.
+    let private requireManagedCompletionAt (binding: LedgerBinding) (snapshot: LedgerSnapshot)
+                                           taskId (submissionId: Guid) (submission: IntegrationSubmission) = result {
         let path = $"tasks/{taskId}/integrations/{submissionId:N}.json"
-        let! operation = LedgerStore.getOperationAt binding snapshot publicationId
-        let! completion =
-            match operation with
-            | Some op when op.Type = "CompleteIntegration"
-                           && op.Sequence > submission.CreatedSequence
-                           && not (String.IsNullOrWhiteSpace op.Actor)
-                           && (op.Paths |> Array.contains path) -> Ok op
-            | _ -> Error(InvalidBinding "Composition merge lacks its original canonical completion operation.")
+        let! completion = LedgerStore.findCompletionOperationForPathAt binding snapshot path
+        if completion.Sequence <= submission.CreatedSequence
+           || String.IsNullOrWhiteSpace completion.Actor then
+            return! Error(InvalidBinding
+                "Composition integration lacks a valid canonical completion sequence and actor.")
         let! originalHead = LedgerStore.getOperationOriginAt binding snapshot completion
         let! originalSnapshot = LedgerStore.verifiedHistoricalSnapshot binding originalHead
-        let! originalReceipt = ReviewWorkflow.getIntegrationSubmissionAt
-                                    binding originalSnapshot taskId submissionId
+        let! originalReceipt =
+            ReviewWorkflow.getIntegrationSubmissionAt binding originalSnapshot taskId submissionId
         if originalReceipt <> submission then
-            return! Error(InvalidBinding "Composition integration receipt differs from its original immutable completion.")
+            return! Error(InvalidBinding
+                "Composition integration receipt differs from its original immutable completion.")
         do! LedgerStore.fetchReviewRef binding submission.ReviewRef submission.SubmittedCommit
         do! LedgerStore.fetchIntegrationRef binding submission.IntegrationRef submission.SubmittedCommit
-        do! LedgerStore.verifyPublishedMechanicalIntegration binding
-                submission.TargetRef submission.TargetHeadAtSubmission
-                submission.SubmittedCommit submission.IntegratedCommit
-                submission.PublicationPreviousHead submission.PublicationObservedHead
+
+        let legacyDirect =
+            originalReceipt.IntegratedCommit = originalReceipt.SubmittedCommit
+            && String.IsNullOrWhiteSpace originalReceipt.PublicationOperationId
+            && String.IsNullOrWhiteSpace originalReceipt.PublicationMechanism
+            && String.IsNullOrWhiteSpace originalReceipt.PublicationPreviousHead
+            && String.IsNullOrWhiteSpace originalReceipt.PublicationObservedHead
+        if legacyDirect then
+            // Pre-publisher completed direct receipts have no v1 non-force
+            // fields. Their compatibility is grounded in the unchanged
+            // historical CompleteIntegration operation, not a mutable shape.
+            // They only claim the old remote-ancestry contract, not a new
+            // retroactive non-force publication attestation.
+            do! LedgerStore.verifySourceAncestry binding
+                    originalReceipt.TargetHeadAtSubmission submission.SubmittedCommit
+            do! LedgerStore.verifyIntegrationOnRemote binding
+                    originalReceipt.TargetRef submission.SubmittedCommit submission.IntegratedCommit
+        else
+            let! _ =
+                match Guid.TryParseExact(submission.PublicationOperationId, "D") with
+                | true, id when id <> Guid.Empty
+                                && submission.PublicationMechanism = "VerifiedNonForceGitPush/v1"
+                                && completion.OperationId = id.ToString("D") -> Ok id
+                | _ -> Error(InvalidBinding
+                    "Managed integration has no original verified non-force publisher receipt.")
+            if not (LedgerStore.validSourceCommitOid submission.PublicationPreviousHead)
+               || not (LedgerStore.validSourceCommitOid submission.PublicationObservedHead)
+               || submission.PublicationPreviousHead = submission.IntegratedCommit then
+                return! Error(InvalidBinding "Invalid original integration publication heads.")
+            if submission.IntegratedCommit = submission.SubmittedCommit then
+                let! remoteHead = LedgerStore.readRemoteTarget binding submission.TargetRef
+                do! LedgerStore.verifySourceAncestry binding
+                        submission.TargetHeadAtSubmission submission.PublicationPreviousHead
+                do! LedgerStore.verifySourceAncestry binding
+                        submission.PublicationPreviousHead submission.IntegratedCommit
+                do! LedgerStore.verifySourceAncestry binding
+                        submission.IntegratedCommit submission.PublicationObservedHead
+                do! LedgerStore.verifySourceAncestry binding
+                        submission.PublicationObservedHead remoteHead
+            else
+                do! LedgerStore.verifyPublishedMechanicalIntegration binding
+                        submission.TargetRef submission.TargetHeadAtSubmission
+                        submission.SubmittedCommit submission.IntegratedCommit
+                        submission.PublicationPreviousHead submission.PublicationObservedHead
     }
 
     let internal checkAt (binding: LedgerBinding) (snapshot: LedgerSnapshot)
@@ -153,8 +186,7 @@ module WorkCompositionAcceptanceAdapter =
             if not valid then
                 return! Error(InvalidBinding
                     "Composition acceptance requires an independent review of this exact spec and an integrated canonical source receipt.")
-            if submission.IntegratedCommit <> submission.SubmittedCommit then
-                do! requireManagedMergeAt binding snapshot taskId submissionId submission
+            do! requireManagedCompletionAt binding snapshot taskId submissionId submission
             return ()
         }
 

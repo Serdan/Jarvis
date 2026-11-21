@@ -1,0 +1,15 @@
+# P1 — Unmatched reverse indices can still be reported as complete outside the visited wait generation
+
+**Frozen source:** `01265eec90356c0e753d0cb7c5e36f3304b1c348`; `scripts/jarvis-phase2-snapshot-adapter.mjs` lines 213–227, 289–334. This is a **new adverse finding** discovered while independently re-verifying the three previous defects; those original three reproductions now pass.
+
+**Independent reproduction (actual Node + disposable bare Git account and two project remotes, no source edits):**
+
+1. Create the valid N=4 to N+1=5 requeue fixture, with exact canonical wait `status=Requeued`, Challenge dependencies, owner+dependency indices at immutable generation 4, and matching lifecycle audit. Add one extra well-formed `challenge-waits/by-challenge/<challengeA>/alpha/<attemptId>/5.json` record with `assignmentGeneration:5`. The adapter reports `snapshot.projects[0].completeness.challenges === true`, `waitIndexGeneration:4`, and **no** Challenge diagnostic. The extra index belongs to the active N+1 generation, not the immutable wait generation N. A negative-space assertion expecting incomplete failed (`true !== false`).
+
+2. Create a valid current assignment at generation 4 **without any canonical `challenge-wait.json`**, and insert one well-formed `by-challenge/<challengeA>/alpha/<attemptId>/4.json` index. The adapter reports `completeness.challenges === true`, zero projected waits, and **no** Challenge diagnostic. A negative-space assertion expecting incomplete failed (`true !== false`).
+
+The unchanged source's authored Node suite passes 57/57; independent eight-case negative-space execution was **6 pass / 2 fail, OS exit 1**, with these two failures. A second independent read-only probe returned the exact JSON observations above, **OS exit 0**, `sideEffects:0` in both cases. Valid historical generation-3 index for manual N=4, valid requeue index N=4 at attempt N=5, manual current-generation reverse indices in both owner/challenge namespaces, unassigned Working agent, and Held WQ07 token mismatches all passed independent checks.
+
+**Root cause:** `reverseByWaitGeneration` collects reverse paths, but reconciliation reads only `reverseByWaitGeneration.get(base)` for a **visited** canonical wait's selected index generation. The final global scan only checks that a reverse path value has `schemaVersion:2`. Any reverse path not keyed to that visited wait generation (including active N+1 or a path without any canonical wait) can evade identity/absence reconciliation and falsely leave the domain complete.
+
+**Required:** Fail closed for reverse paths not reconciled to an applicable canonical wait/generation and for unsupported current/new-generation index entries, while retaining legitimate historical generations and existing N→N+1 requeue behavior. Include both adverse cases in disposable bare-Git regressions. Keep Scheduler strictly default-off, account membership and browser capacity incomplete, and no live effect. This is false completeness in read-only preparation, **not** evidence of dispatch.

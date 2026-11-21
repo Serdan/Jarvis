@@ -1,0 +1,1 @@
+Frozen clean source f34dd245; scoped Release tests initially 8/8; native Linux clean Release publish verified full source SHA, version, protocol and RID; final focused tests pending; full Client.Tests suite timed out at 240s (no verdict). No main publication or deployment.

@@ -1809,12 +1809,45 @@ module private ChallengeIndexFaultMatrix =
                 if found <> expected then
                     counterexample "ValidHistoricalEdges" (sprintf "expected=%A actual=%A" expected found)
             | 15 ->
+                // Pin clean-ledger versions before corrupting the owner index.
+                // No post-injection inbox preflight may mask the public writer.
+                let _, pristineTask, pristineAttempt = ReviewWorkflow.getTask b task |> ChallengeFixture.ok
+                let pristineInbox = ReviewWorkflow.getAgentInbox b "Agent 3" |> ChallengeFixture.ok
+                let pinnedAttempt = pristineAttempt.Value
+                if pristineTask.Version <> taskRecord.Version
+                   || pinnedAttempt.AssignmentGeneration <> 1
+                   || pristineInbox.Blocked.Head.Attempt.AttemptId <> attemptId then
+                    counterexample "Mode15PristineVersions"
+                        (sprintf "task=%A attempt=%A inbox=%A"
+                            pristineTask pinnedAttempt pristineInbox)
+                let taskVersion = pristineTask.Version
+                let attemptVersion = pinnedAttempt.Version
+                let agentVersion = pristineInbox.Agent.Version
                 ChallengeIndexFaults.inject a ownerEdge body
-                let blocked = ReviewWorkflow.getAgentInbox b "Agent 3" |> ChallengeFixture.ok
+                let corrupted = LedgerStore.fetch a |> ChallengeFixture.ok
+                let beforeTree = ChallengeFixture.git a.RepositoryPath
+                                    [ "ls-tree"; "-r"; corrupted.Commit ]
+                let beforeOwner = LedgerStore.listAt a corrupted ownerPrefix |> ChallengeFixture.ok
+                if beforeOwner <> [ ownerEdge ] then
+                    counterexample "Mode15CorruptionMissing"
+                        (sprintf "expected forged edge=%s actual=%A" ownerEdge beforeOwner)
                 checkRejected "extra-owner-before-manual-requeue" a "Integrity" (fun () ->
                     ChallengeWorkflow.requeueAttempt b (Guid.NewGuid()) "Agent 3" task attemptId
-                        taskRecord.Version blocked.Blocked.Head.Attempt.Version blocked.Agent.Version 1
+                        taskVersion attemptVersion agentVersion 1
                         "manual wait must validate reverse indices")
+                let unchanged = LedgerStore.fetch b |> ChallengeFixture.ok
+                let afterTree = ChallengeFixture.git b.RepositoryPath
+                                    [ "ls-tree"; "-r"; unchanged.Commit ]
+                let afterOwner = LedgerStore.listAt b unchanged ownerPrefix |> ChallengeFixture.ok
+                // Exact Git tree equality covers lifecycle audit, receipts,
+                // wait state, assignment JSON and every reverse index path.
+                if corrupted.Commit <> unchanged.Commit
+                   || corrupted.Header.NextSequence <> unchanged.Header.NextSequence
+                   || beforeTree <> afterTree || beforeOwner <> afterOwner then
+                    counterexample "Mode15RejectedMutation"
+                        (sprintf "before=%s/%d after=%s/%d owner=%A -> %A"
+                            corrupted.Commit corrupted.Header.NextSequence
+                            unchanged.Commit unchanged.Header.NextSequence beforeOwner afterOwner)
             | 16 ->
                 resolveFirst () |> ChallengeFixture.ok |> ignore
                 let third = ReviewWorkflow.waitIndexPath challengePrefix task attemptId 3
@@ -1935,3 +1968,205 @@ type ChallengeReverseIndexFaultMatrixTests() =
     [<TestCase(25)>]
     member _.MissingExtraStaleCanceledWrongIdentityAndHistoricalModesFailClosed(mode: int) =
         ChallengeIndexFaultMatrix.probe mode
+
+
+// Independent real-Git control for *nonempty* frozen source identity. The
+// initial legacy assignment is necessarily null-pinned; bindAttemptSource is
+// the public API that supplies genuine source identity after BeginAttempt.
+// Its first subsequently issued assignment and all later issues must retain
+// the exact verified pins. This complements, rather than replaces, the
+// generated legacy/null-source mixed model above.
+module private PinnedSourceAssignmentOracle =
+    let run () =
+        ChallengeFixture.withTwoClones (fun a b ->
+            let task = "pinned-source-assignment-oracle"
+            let originalTask, originalAttempt, _, attemptId = ChallengeDependencyChecks.assign a task
+            let sourceRef = ChallengeFixture.git b.RepositoryPath [ "symbolic-ref"; "HEAD" ]
+            let baseCommit = ChallengeFixture.git b.RepositoryPath [ "rev-parse"; "HEAD" ]
+            let targetRef = sourceRef
+            let repositoryId =
+                SHA256.HashData(
+                    Encoding.UTF8.GetBytes(
+                        "jarvis-source-repository-v1\n" + a.ApprovedFetchUrl + "\n" + a.ApprovedPushUrl))
+                |> Convert.ToHexString
+                |> fun hash -> hash.ToLowerInvariant()
+            if baseCommit.Length <> 40 || not (sourceRef.StartsWith("refs/heads/", StringComparison.Ordinal))
+               || String.IsNullOrWhiteSpace(repositoryId) then
+                counterexample "PinnedFixtureSourceIdentity"
+                    (sprintf "base=%s source=%s repo=%s" baseCommit sourceRef repositoryId)
+            let attemptPath = sprintf "tasks/%s/attempts/%s.json" task attemptId
+            let issuePrefix = sprintf "tasks/%s/attempts/%s/assignments" task attemptId
+            let issuePath generation = sprintf "%s/%d.json" issuePrefix generation
+            let raw binding snapshot path =
+                match LedgerStore.readAt binding snapshot path |> ChallengeFixture.ok with
+                | Some content, Some _ -> content
+                | value -> counterexample "PinnedCanonicalMissing"
+                               (sprintf "path=%s value=%A" path value)
+            let equal field expected actual =
+                if expected <> actual then
+                    counterexample "PinnedSourceIdentity"
+                        (sprintf "field=%s expected=%A actual=%A" field expected actual)
+            let mutable historic: Map<int,string> = Map.empty
+            let checkCanonical maxGeneration =
+                let snapshot = LedgerStore.fetch b |> ChallengeFixture.ok
+                let _, actualSpecOid =
+                    LedgerStore.readAt b snapshot (sprintf "tasks/%s/spec.html" task)
+                    |> ChallengeFixture.ok
+                equal "canonical spec blob" (Some originalAttempt.SpecBlobOid) actualSpecOid
+                let attemptText = raw b snapshot attemptPath
+                use attemptDoc = System.Text.Json.JsonDocument.Parse(attemptText)
+                let attempt = attemptDoc.RootElement
+                let str (node: System.Text.Json.JsonElement) (key: string) = node.GetProperty(key).GetString()
+                let num (node: System.Text.Json.JsonElement) (key: string) = node.GetProperty(key).GetInt32()
+                let seq (node: System.Text.Json.JsonElement) (key: string) = node.GetProperty(key).GetInt64()
+                let pins prefix (node: System.Text.Json.JsonElement) isIssue sourcePinned =
+                    let value whenPinned = if sourcePinned then whenPinned else null
+                    equal (prefix + " base") (value baseCommit)
+                        (str node (if isIssue then "sourceBaseCommit" else "baseCommit"))
+                    equal (prefix + " target") (value targetRef) (str node "targetRef")
+                    equal (prefix + " repository") (value repositoryId) (str node "sourceRepositoryId")
+                    equal (prefix + " fetch") (value a.ApprovedFetchUrl) (str node "sourceRemote")
+                    equal (prefix + " push") (value a.ApprovedPushUrl) (str node "sourcePushRemote")
+                    equal (prefix + " ref") (value sourceRef) (str node "sourceRef")
+                    equal (prefix + " spec") originalAttempt.SpecBlobOid (str node "specBlobOid")
+                pins "current attempt" attempt false true
+                equal "attempt task" task (str attempt "taskId")
+                equal "attempt ID" attemptId (str attempt "attemptId")
+                equal "attempt owner" "Agent 3" (str attempt "ownerAgentId")
+                equal "attempt generation" maxGeneration (num attempt "assignmentGeneration")
+                let taskPaths = LedgerStore.listAt b snapshot "tasks" |> ChallengeFixture.ok
+                let found =
+                    taskPaths
+                    |> List.filter (fun path -> path.StartsWith(issuePrefix + "/", StringComparison.Ordinal)
+                                               && path.EndsWith(".json", StringComparison.Ordinal)
+                                               && not (path.EndsWith(".ack.json", StringComparison.Ordinal)))
+                    |> Set.ofList
+                let expected = [ 1 .. maxGeneration ] |> List.map issuePath |> Set.ofList
+                equal "canonical assignment path set" expected found
+                let mutable lastSequence = 0L
+                for generation in 1 .. maxGeneration do
+                    let contents = raw b snapshot (issuePath generation)
+                    use document = System.Text.Json.JsonDocument.Parse(contents)
+                    let issue = document.RootElement
+                    // Generation 1 precedes public source binding. N2 is the
+                    // first actual source-pinned *issuance*, not a fabricated N1.
+                    pins (sprintf "issue%d" generation) issue true (generation > 1)
+                    equal "issue task" task (str issue "taskId")
+                    equal "issue attempt" attemptId (str issue "attemptId")
+                    equal "issue owner" "Agent 3" (str issue "ownerAgentId")
+                    equal "issue generation" generation (num issue "generation")
+                    equal "issue previous generation" (generation - 1) (num issue "previousGeneration")
+                    let issued = seq issue "issuedSequence"
+                    if issued <= lastSequence then
+                        counterexample "PinnedIssueSequence" (sprintf "generation=%d issued=%d previous=%d"
+                                                                  generation issued lastSequence)
+                    lastSequence <- issued
+                    match Map.tryFind generation historic with
+                    | Some bytes -> equal (sprintf "immutable issue%d bytes" generation) bytes contents
+                    | None -> historic <- Map.add generation contents historic
+                snapshot
+            let assertUnchanged label before =
+                let after = LedgerStore.fetch a |> ChallengeFixture.ok
+                let firstTree = ChallengeFixture.git a.RepositoryPath [ "ls-tree"; "-r"; before.Commit ]
+                let secondTree = ChallengeFixture.git a.RepositoryPath [ "ls-tree"; "-r"; after.Commit ]
+                if before.Commit <> after.Commit
+                   || before.Header.NextSequence <> after.Header.NextSequence
+                   || firstTree <> secondTree then
+                    counterexample "PinnedRejectedMutation"
+                        (sprintf "%s HEAD=%s->%s seq=%d->%d"
+                            label before.Commit after.Commit
+                            before.Header.NextSequence after.Header.NextSequence)
+            let versions () =
+                let _, currentTask, maybeAttempt = ReviewWorkflow.getTask b task |> ChallengeFixture.ok
+                let inbox = ReviewWorkflow.getAgentInbox b "Agent 3" |> ChallengeFixture.ok
+                currentTask.Version, maybeAttempt.Value.Version, inbox.Agent.Version
+            let afterCreation = LedgerStore.fetch b |> ChallengeFixture.ok
+            let legacyIssue = raw b afterCreation (issuePath 1)
+            ReviewWorkflow.bindAttemptSource b (Guid.NewGuid()) task "Agent 3"
+                originalAttempt.Version 1 sourceRef baseCommit targetRef false false
+            |> ChallengeFixture.ok |> ignore
+            let _, _, boundAttempt = ReviewWorkflow.getTask a task |> ChallengeFixture.ok
+            equal "public binding increments attempt version" (originalAttempt.Version + 1) boundAttempt.Value.Version
+            equal "initial legacy issue immutable on binding" legacyIssue
+                (raw a (LedgerStore.fetch a |> ChallengeFixture.ok) (issuePath 1))
+            checkCanonical 1 |> ignore
+            let block generation dependencies =
+                let taskVersion, attemptVersion, agentVersion = versions ()
+                ChallengeWorkflow.blockAttempt a (Guid.NewGuid()) "Agent 3" task attemptId
+                    taskVersion attemptVersion agentVersion generation
+                    "pinned source wait" dependencies
+                |> ChallengeFixture.ok |> ignore
+            let requeue operationId generation reason =
+                let taskVersion, attemptVersion, agentVersion = versions ()
+                ChallengeWorkflow.requeueAttempt b operationId "Agent 3" task attemptId
+                    taskVersion attemptVersion agentVersion generation reason
+                |> ChallengeFixture.ok
+            block 1 []
+            checkCanonical 1 |> ignore
+            let firstManualId = Guid.NewGuid()
+            let manualTaskVersion, manualAttemptVersion, manualAgentVersion = versions ()
+            let manualCall reason =
+                ChallengeWorkflow.requeueAttempt b firstManualId "Agent 3" task attemptId
+                    manualTaskVersion manualAttemptVersion manualAgentVersion 1 reason
+            let manualN2 = manualCall "pinned manual N1 to N2" |> ChallengeFixture.ok
+            if manualN2.AlreadyApplied then counterexample "PinnedManualN2" "Fresh manual requeue replayed"
+            checkCanonical 2 |> ignore
+            let beforeReplay = LedgerStore.fetch a |> ChallengeFixture.ok
+            let manualReplay = manualCall "pinned manual N1 to N2" |> ChallengeFixture.ok
+            if not manualReplay.AlreadyApplied
+               || manualReplay.Operation.RequestHash <> manualN2.Operation.RequestHash
+               || manualReplay.Operation.Sequence <> manualN2.Operation.Sequence then
+                counterexample "PinnedManualReplay" (sprintf "initial=%A replay=%A" manualN2 manualReplay)
+            assertUnchanged "identical manual UUID replay" beforeReplay
+            let beforeChanged = LedgerStore.fetch a |> ChallengeFixture.ok
+            let staleArgs = manualCall "pinned manual N1 to N2 changed"
+            match staleArgs with
+            | Error OperationIdReused -> ()
+            | other -> counterexample "PinnedChangedUuidType" (sprintf "%A" other)
+            assertUnchanged "changed manual UUID reused" beforeChanged
+            checkCanonical 2 |> ignore
+            let gate = ChallengeDependencyChecks.gate b task "Pinned automatic gate" "Lead"
+            // The other clone deliberately advances the remote HEAD before
+            // this writer starts and subsequently blocks generation 2.
+            checkCanonical 2 |> ignore
+            let _, _, queuedN2 = ReviewWorkflow.getTask a task |> ChallengeFixture.ok
+            ReviewWorkflow.beginAttempt a (Guid.NewGuid()) task "Agent 3"
+                queuedN2.Value.Version 2 |> ChallengeFixture.ok |> ignore
+            block 2 [ gate.ChallengeId ]
+            checkCanonical 2 |> ignore
+            let beforeAuto = LedgerStore.fetch a |> ChallengeFixture.ok
+            ChallengeWorkflow.resolve b (Guid.NewGuid()) "Lead"
+                gate.ChallengeId gate.ConditionIds.Head 1 "source pinned approved" ""
+            |> ChallengeFixture.ok |> ignore
+            let afterAuto = checkCanonical 3
+            if afterAuto.Header.NextSequence <> beforeAuto.Header.NextSequence + 1L then
+                counterexample "PinnedAutoSequence" (sprintf "%d -> %d"
+                                                      beforeAuto.Header.NextSequence afterAuto.Header.NextSequence)
+            let _, _, queuedN3 = ReviewWorkflow.getTask b task |> ChallengeFixture.ok
+            ReviewWorkflow.beginAttempt a (Guid.NewGuid()) task "Agent 3"
+                queuedN3.Value.Version 3 |> ChallengeFixture.ok |> ignore
+            block 3 []
+            let taskVersion, attemptVersion, agentVersion = versions ()
+            let beforeStale = LedgerStore.fetch a |> ChallengeFixture.ok
+            let staleCas =
+                ChallengeWorkflow.requeueAttempt b (Guid.NewGuid()) "Agent 3" task attemptId
+                    taskVersion (attemptVersion + 1) agentVersion 3 "stale pinned CAS loser"
+            match staleCas with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> counterexample "PinnedStaleCasType" (sprintf "%A" other)
+            assertUnchanged "stale direct CAS" beforeStale
+            checkCanonical 3 |> ignore
+            let lastManual = requeue (Guid.NewGuid()) 3 "pinned manual N3 to N4"
+            if lastManual.AlreadyApplied then
+                counterexample "PinnedManualN4" "Fresh manual requeue replayed"
+            checkCanonical 4 |> ignore
+            equal "source pinned attempt identity" originalTask.TaskId task
+            // The final verification re-reads all four immutable generation
+            // issue blobs, including the legacy-null control, from clone B.
+            checkCanonical 4 |> ignore)
+
+[<TestFixture>]
+type SourcePinnedChallengeAssignmentPropertyTests() =
+    [<Test>]
+    member _.TwoClonePublicBindingPreservesSourcePinsThroughManualAndAutomaticRequeue() =
+        PinnedSourceAssignmentOracle.run ()

@@ -1821,6 +1821,13 @@ module ChallengeWorkflow =
                     if wait.TaskId <> task || wait.AttemptId <> attemptId ||
                        wait.OwnerAgentId <> actor || wait.Status <> "Waiting" then
                         return! Error(StaleEntityVersion "Attempt's challenge dependency wait is missing or already requeued.")
+                    // A direct public requeue must validate owner projections
+                    // even for a legitimate manual zero-dependency block.
+                    // No reverse edge is issued for an empty dependency list.
+                    let! _ = ReviewWorkflow.verifyOwnerWaitIndexesAt binding snapshot actor
+                    // A dependency-bearing wait must also have its exact current
+                    // owner edge. The owner-wide historical scan is not a
+                    // substitute for that required positive canonical evidence.
                     if not (List.isEmpty wait.ChallengeIds) then
                         let ownerIndex =
                             ReviewWorkflow.waitIndexPath (ReviewWorkflow.ownerWaitIndexPrefix actor)

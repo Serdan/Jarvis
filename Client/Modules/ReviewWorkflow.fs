@@ -950,13 +950,32 @@ module ReviewWorkflow =
         return locator, wait, waitOid
     }
 
-    let private verifyOwnerWaitIndexesAt binding snapshot owner = result {
+    // Verify an owner's issued reverse edges in both directions at one pinned
+    // head. Each historically linked Challenge prefix is in scope, including
+    // extra future-generation records not reachable from the owner index.
+    // Unknown/unrelated Challenge IDs are deliberately not globally scanned.
+    let internal verifyOwnerWaitIndexesAt binding snapshot owner = result {
         let! paths = LedgerStore.listCompleteWaitIndexesAt binding snapshot (ownerWaitIndexPrefix owner)
+        let mutable historicallyLinkedChallenges = Set.empty<string>
         for path in paths do
             if not (path.EndsWith(".json", StringComparison.Ordinal)) then
                 return! Error(LedgerIntegrityError "Unexpected owner wait-index record.")
-            let! _ = verifiedWaitIndexAt binding snapshot path None (Some owner)
-            ()
+            let! locator, _, _ = verifiedWaitIndexAt binding snapshot path None (Some owner)
+            let! dependencyIds, _ = issuedWaitDependenciesAt binding snapshot locator
+            historicallyLinkedChallenges <-
+                Set.union historicallyLinkedChallenges (Set.ofList dependencyIds)
+        // The inverse scan is limited to Challenge IDs proved by this owner's
+        // original immutable block operations. Preserve valid N1/N2 history
+        // while rejecting unissued N3 links even when no owner mirror exists.
+        for challengeId in historicallyLinkedChallenges do
+            let! challengePaths =
+                LedgerStore.listCompleteWaitIndexesAt binding snapshot
+                    (challengeWaitIndexPrefix challengeId)
+            for indexPath in challengePaths do
+                if not (indexPath.EndsWith(".json", StringComparison.Ordinal)) then
+                    return! Error(LedgerIntegrityError "Unexpected known Challenge wait-index record.")
+                let! _ = verifiedWaitIndexAt binding snapshot indexPath (Some challengeId) None
+                ()
         return ()
     }
 

@@ -67,6 +67,24 @@ type ChallengeTests() =
             run a b
         finally
             Directory.Delete(root, true)
+    // Inject a malformed projection from a detached Git checkout, not an application client.
+    let injectExternalReverseIndex (binding: LedgerBinding) (indexPath: string) (body: string) =
+        let snapshot = LedgerStore.fetch binding |> ok
+        let checkout =
+            Path.Combine(Path.GetDirectoryName(binding.RepositoryPath),
+                         "external-reverse-index-" + Guid.NewGuid().ToString("N"))
+        git binding.RepositoryPath [ "worktree"; "add"; "--detach"; checkout; snapshot.Commit ] |> ignore
+        try
+            git checkout [ "config"; "user.name"; "Fixture" ] |> ignore
+            git checkout [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+            let file = Path.Combine(checkout, indexPath.Replace('/', Path.DirectorySeparatorChar))
+            Directory.CreateDirectory(Path.GetDirectoryName(file)) |> ignore
+            File.WriteAllText(file, body)
+            git checkout [ "add"; "--"; indexPath ] |> ignore
+            git checkout [ "commit"; "-m"; "Fixture injects unissued Challenge index" ] |> ignore
+            git checkout [ "push"; "origin"; "HEAD:refs/heads/jarvis-orchestration" ] |> ignore
+        finally
+            git binding.RepositoryPath [ "worktree"; "remove"; "--force"; checkout ] |> ignore
 
     let definitions =
         [ { OwnerKind = ""; OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "Integrate accepted changes" }
@@ -955,6 +973,122 @@ type ChallengeTests() =
             Assert.That(notices b, Is.Empty)
         )
 
+
+    [<Test>]
+    member _.ManualZeroDependencyDirectRequeueRejectsForgedCurrentOwnerIndexWithoutPublishing() =
+        withFixture (fun a b ->
+            let task = "manual-zero-corrupt-index"
+            let tv, pv, av, attemptId = assignment a task
+            ChallengeWorkflow.blockAttempt b (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "Human decision needed" [] |> ok |> ignore
+            // Capture CAS versions before injection, never preflight the corrupted inbox.
+            let blocked = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            let attemptVersion = blocked.Blocked.Head.Attempt.Version
+            let agentVersion = blocked.Agent.Version
+            let forgedPath =
+                ReviewWorkflow.waitIndexPath (ReviewWorkflow.ownerWaitIndexPrefix "Agent 3")
+                    task attemptId 1
+            let body =
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| schemaVersion = 2; taskId = task; attemptId = attemptId
+                       ownerAgentId = "Agent 3"; assignmentGeneration = 1 |})
+            injectExternalReverseIndex a forgedPath body
+            let before = LedgerStore.fetch b |> ok
+            let operation = Guid.NewGuid()
+            let outcome =
+                ChallengeWorkflow.requeueAttempt b operation "Agent 3" task attemptId
+                    tv attemptVersion agentVersion 1 "Manual decision completed"
+            let after = LedgerStore.fetch a |> ok
+            Assert.That(after.Commit, Is.EqualTo(before.Commit), "Corrupt requeue must not publish a new HEAD.")
+            Assert.That(after.Header.NextSequence, Is.EqualTo(before.Header.NextSequence))
+            Assert.That(LedgerStore.getOperationAt a after operation |> ok |> Option.isNone, Is.True,
+                        "A rejected requeue must not publish receipt or audit operation.")
+            match outcome with
+            | Error(LedgerIntegrityError _) -> ()
+            | other -> Assert.Fail(sprintf "Forged zero-dependency owner edge must fail closed: %A" other)
+            Assert.That(notices b, Is.Empty)
+        )
+
+    [<Test>]
+    member _.KnownHistoricalChallengeRejectsUnissuedFutureByChallengeEdgeAfterAutoRequeue() =
+        withFixture (fun a b ->
+            let task = "future-challenge-index"
+            let tv, pv, av, attemptId = assignment a task
+            let gate =
+                ChallengeWorkflow.create b (Guid.NewGuid()) "Agent 3" "Known gate" ""
+                    [ { OwnerKind = ""; OwnerAgentId = "Lead"; SuggestedAgentId = ""
+                        Description = "Resolve dependency" } ] |> ok
+            ChallengeWorkflow.blockAttempt a (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "Wait for known gate" [ gate.ChallengeId ] |> ok |> ignore
+            ChallengeWorkflow.resolve b (Guid.NewGuid()) "Lead" gate.ChallengeId
+                gate.ConditionIds.Head 1 "completed" "" |> ok |> ignore
+            let issued = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(issued.RunnableQueue.Head.Attempt.AssignmentGeneration, Is.EqualTo(2),
+                        "The first historical reverse edge is valid after automatic requeue.")
+            let oldPath =
+                ReviewWorkflow.waitIndexPath
+                    (ReviewWorkflow.challengeWaitIndexPrefix gate.ChallengeId) task attemptId 1
+            let intact = LedgerStore.fetch a |> ok
+            Assert.That(LedgerStore.readAt a intact oldPath |> ok |> fst |> Option.isSome, Is.True)
+            let forgedPath =
+                ReviewWorkflow.waitIndexPath
+                    (ReviewWorkflow.challengeWaitIndexPrefix gate.ChallengeId) task attemptId 3
+            let body =
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| schemaVersion = 2; taskId = task; attemptId = attemptId
+                       ownerAgentId = "Agent 3"; assignmentGeneration = 3 |})
+            injectExternalReverseIndex b forgedPath body
+            let before = LedgerStore.fetch a |> ok
+            let outcome = ReviewWorkflow.getAgentInbox b "Agent 3"
+            let after = LedgerStore.fetch a |> ok
+            Assert.That(after.Commit, Is.EqualTo(before.Commit), "Read must not alter canonical HEAD.")
+            Assert.That(after.Header.NextSequence, Is.EqualTo(before.Header.NextSequence))
+            match outcome with
+            | Error(LedgerIntegrityError _) -> ()
+            | other -> Assert.Fail(sprintf "Unissued N3 by-Challenge edge must fail closed: %A" other)
+            Assert.That(notices b, Is.Empty)
+        )
+
+    [<Test>]
+    member _.HistoricalChallengeEdgeSurvivesValidSecondGenerationManualZeroDependencyRequeue() =
+        withFixture (fun a b ->
+            let task = "historic-then-manual-requeue"
+            let tv, pv, av, attemptId = assignment a task
+            let gate =
+                ChallengeWorkflow.create b (Guid.NewGuid()) "Agent 3" "Historic gate" ""
+                    [ { OwnerKind = ""; OwnerAgentId = "Lead"; SuggestedAgentId = ""
+                        Description = "Resolve first dependency" } ] |> ok
+            ChallengeWorkflow.blockAttempt a (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "First indexed wait" [ gate.ChallengeId ] |> ok |> ignore
+            ChallengeWorkflow.resolve b (Guid.NewGuid()) "Lead" gate.ChallengeId
+                gate.ConditionIds.Head 1 "complete" "" |> ok |> ignore
+            let _, _, queued = ReviewWorkflow.getTask a task |> ok
+            Assert.That(queued.Value.AssignmentGeneration, Is.EqualTo(2))
+            ReviewWorkflow.beginAttempt a (Guid.NewGuid()) task "Agent 3" queued.Value.Version 2
+                |> ok |> ignore
+            let _, taskNow, attemptNow = ReviewWorkflow.getTask b task |> ok
+            let active = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            ChallengeWorkflow.blockAttempt b (Guid.NewGuid()) "Agent 3" task attemptId
+                taskNow.Version attemptNow.Value.Version active.Agent.Version 2
+                "Manual second-generation wait" [] |> ok |> ignore
+            let blocked = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(blocked.BlockedChallengeWaits.Head.ChallengeIds, Is.Empty)
+            ChallengeWorkflow.requeueAttempt b (Guid.NewGuid()) "Agent 3" task attemptId
+                taskNow.Version blocked.Blocked.Head.Attempt.Version blocked.Agent.Version 2
+                "Manual wait released" |> ok |> ignore
+            let ready = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(ready.RunnableQueue.Head.Attempt.AssignmentGeneration, Is.EqualTo(3))
+            let head = LedgerStore.fetch b |> ok
+            let ownerN1 =
+                ReviewWorkflow.waitIndexPath (ReviewWorkflow.ownerWaitIndexPrefix "Agent 3")
+                    task attemptId 1
+            let challengeN1 =
+                ReviewWorkflow.waitIndexPath
+                    (ReviewWorkflow.challengeWaitIndexPrefix gate.ChallengeId) task attemptId 1
+            Assert.That(LedgerStore.readAt b head ownerN1 |> ok |> fst |> Option.isSome, Is.True)
+            Assert.That(LedgerStore.readAt b head challengeN1 |> ok |> fst |> Option.isSome, Is.True)
+            Assert.That(notices a, Is.Empty)
+        )
 
     [<Test>]
     member _.WrongOwnerReverseMirrorFailsClosedBeforeResolutionOrInboxProjection() =

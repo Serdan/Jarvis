@@ -14,6 +14,7 @@ function harness(options = {}) {
   let renderedBubble = null;
   let clicks = 0;
   let focused = false;
+  let visibility = options.visibilityState || "visible";
   let editorSelected = false;
   let editorDeleteFlushed = true;
   let mode = options.initialMode || "Chat";
@@ -129,6 +130,7 @@ function harness(options = {}) {
     }
   };
   const document = {
+    get visibilityState() { return visibility; },
     readyState: options.documentHydrationDelayMs ? "loading" : "complete",
     createRange() {
       return {
@@ -184,6 +186,7 @@ function harness(options = {}) {
         });
         postInsert(options.restoreDraftAfterInsertMs, () => { content = "Competing tab restored an unsent draft"; });
         postInsert(options.switchToWorkAfterInsertMs, () => { mode = "Work"; });
+        postInsert(options.hideTabAfterInsertMs, () => { visibility = "hidden"; });
         postInsert(options.resetEffortAfterInsertMs,
           () => { reasoningEffort = options.resetEffortTo || "Medium"; });
         postInsert(options.addTurnAfterInsertMs, () => { userTurns++; });
@@ -273,6 +276,24 @@ function harness(options = {}) {
     get virtualClockState() { return virtualClock && { now: virtualClock.now, delays: [...virtualClock.delays] }; },
     get staleSendObserved() { return staleSendObserved; }, get lastSubmittedText() { return lastSubmittedText; } };
 }
+
+test("hidden ChatGPT tab fails definitively before editing or Send", async () => {
+  const h = harness({ visibilityState: "hidden" });
+  const result = await h.run("Do not submit while hidden");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "InactiveLaunchTab");
+  assert.equal(result.safeToDisposeCreatedTab, true);
+  assert.equal(h.clicks, 0);
+  assert.equal(h.insertions, 0);
+});
+
+test("visibility lost after typing prevents the only Send attempt", async () => {
+  const h = harness({ hideTabAfterInsertMs: 0, timeoutMs: 1100 });
+  const result = await h.run("Never send from a newly hidden tab");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "InactiveLaunchTab");
+  assert.equal(h.clicks, 0);
+});
 
 test("inserts multiline prompt through editor and submits once", async () => {
   const h = harness();

@@ -90,7 +90,7 @@ Example **implemented immediate command**:
   "projectName": "Jarvis",
   "scriptPath": "browser-scripts/chatgpt/launchAgent.js",
   "argsJson": "{\"role\":\"worker\",\"agentId\":\"3\",\"projectName\":\"Wayfold\",\"prompt\":\"You are Worker 3. Read the latest Jarvis assignment, relevant AGENTS.md, task and spec. Follow current instructions and continue the assigned work; do not assume previous conversation state. End with the required checkpoint/Next line.\"}",
-  "active": false,
+  "active": true,
   "closeTabAfterExecution": true
 }
 ```
@@ -121,7 +121,7 @@ Prefer the account's already configured UI defaults when the caller does not spe
 - Open a **new** agent-created tab **in the specified user-registered browser window** on the separately approved `chatgpt.com` origin. Do not claim, enumerate, or alter existing unregistered tabs.
 - Await a ready registration/document; the extension rechecks current origin and identity before execution. A subsequent explicit `TabUnavailable:loading` from the extension's **pre-injection check** is safe to retry within the 30-second readiness budget. Never retry an uncertain or post-injection failure.
 - The script must wait for React/ProseMirror hydration and composer availability with a bounded deadline; merely finding a DOM node before hydration is insufficient.
-- Support background tabs by default, but test behavior under Chromium background throttling. Configurable `active=true` exists for diagnostics or an identified site limitation; don't steal focus unconditionally.
+- For the ChatGPT-specific ephemeral launcher, set `active=true` and `closeTabAfterExecution=true`. Live 2026-11-21 tests found that an inactive hidden tab can retain the exact draft and enabled Send after `send.click()` or `form.requestSubmit()` without accepting a turn. Two foreground canaries and an agent review launch submitted with matching user bubble and route. The script now rejects hidden tabs **before Send** as `notSubmitted:InactiveLaunchTab`; the generic Browser Bridge retains its default `active=false` for other sites. The active launcher tab may briefly take focus, then is closed after submission; no agent tab is retained.
 - Reject ChatGPT login, challenge, error, suspended account, wrong project/GPT, permission prompts, or otherwise blocked UI states when detectable. Report actionable categories; do not attempt to bypass a challenge.
 
 ### 5.2 Chat/Work home-mode selection

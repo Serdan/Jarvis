@@ -99,7 +99,12 @@ function harness(options = {}) {
   const efforts = ["Instant", "Medium", "High", "Extra High"];
   const values = ["none", "medium", "high", "max"];
   const picker = {
-    getAttribute(name) { return name === "aria-expanded" ? String(expanded) : name === "data-selected-reasoning-effort" ? values[efforts.indexOf(reasoningEffort)] : null; },
+    getAttribute(name) {
+      if (name === "aria-expanded") return String(expanded);
+      if (name !== "data-selected-reasoning-effort") return null;
+      return options.forceEffortMismatchWhileDraft && content
+        ? "medium" : values[efforts.indexOf(reasoningEffort)];
+    },
     click() { expanded = !expanded; }
   };
   const radio = name => ({
@@ -179,6 +184,8 @@ function harness(options = {}) {
         });
         postInsert(options.restoreDraftAfterInsertMs, () => { content = "Competing tab restored an unsent draft"; });
         postInsert(options.switchToWorkAfterInsertMs, () => { mode = "Work"; });
+        postInsert(options.resetEffortAfterInsertMs,
+          () => { reasoningEffort = options.resetEffortTo || "Medium"; });
         postInsert(options.addTurnAfterInsertMs, () => { userTurns++; });
         postInsert(options.routeAfterInsertMs, () => { site.href = "https://chatgpt.com/c/new-route"; });
       }
@@ -626,6 +633,22 @@ test("same-selected Chat mode controls may re-render during stabilization", asyn
   assert.equal(h.lastSubmittedText, "Task prompt");
   assert.equal(h.clicks, 1);
   assert.equal(h.chatClicks, 0);
+});
+
+test("effort resetting after prompt insertion is repaired before the sole Send", async () => {
+  const h = harness({ resetEffortAfterInsertMs: 0, resetEffortTo: "Medium", timeoutMs: 2600 });
+  const result = await h.run("Exact unique task prompt");
+  assert.equal(result.status, "submitted");
+  assert.equal(h.reasoningEffort, "Extra High");
+  assert.equal(h.lastSubmittedText, "Exact unique task prompt");
+  assert.equal(h.clicks, 1);
+});
+
+test("persistent post-insert effort mismatch never submits a prompt", async () => {
+  const h = harness({ forceEffortMismatchWhileDraft: true, timeoutMs: 900 });
+  const result = await h.run("Do not send on incoherent effort");
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(h.clicks, 0);
 });
 
 test("mode switching away from Chat immediately after insertion prevents sending", async () => {

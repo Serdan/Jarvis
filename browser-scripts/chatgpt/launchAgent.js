@@ -310,6 +310,7 @@ async function execute(args) {
   let lastTransient = null;
   let rebinds = 0;
   let rewrites = 0;
+  let effortRepairs = 0;
   let lastInsertError = null;
   const readEditor = () => (activeComposer.innerText || "")
     .replace(/\r\n/g, "\n").replace(/\u00a0/g, " ");
@@ -331,7 +332,7 @@ async function execute(args) {
     const modelControl = picker();
     if (!modelControl) return { transient: "ModelControlChanged" };
     if (modelControl.getAttribute("data-selected-reasoning-effort") !== selectedEffort) {
-      return { failure: incompatible(stage, "SelectedEffortChanged") };
+      return { transient: "SelectedEffortChanged" };
     }
     if (selectedMode === "Work") {
       // Work may temporarily omit its model label as React replaces the
@@ -372,6 +373,20 @@ async function execute(args) {
     const current = surface(stage);
     if (current.failure) return current.failure;
     if (current.transient) {
+      if (current.transient === "SelectedEffortChanged") {
+        // React or another browser tab can reset the persisted effort after a
+        // successful picker selection, including after typing the prompt.
+        // Repair only before Send. Keep the exact unsent draft and prove it
+        // again; a changed editor is rebound and rewritten by the normal loop.
+        if (++effortRepairs > 2)
+          return incompatible(stage, "SelectedEffortUnstable");
+        const cutoff = Math.min(preSendDeadline, Date.now() + 2500);
+        const failure = await choose(selected, cutoff);
+        if (failure && effortRepairs >= 2)
+          return incompatible(stage, "SelectedEffortRecoveryFailed");
+        lastTransient = current.transient;
+        continue;
+      }
       if (activeComposer && ++rebinds > 10) return incompatible(stage, "SurfaceUnstable");
       activeComposer = null;
       activeModes = null;

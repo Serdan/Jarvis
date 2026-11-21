@@ -1,0 +1,33 @@
+<h1>Role-focused, overlapping Jarvis plugin catalogs</h1>
+<p><strong>Type:</strong> API architecture / agent ergonomics. <strong>Priority:</strong> P2, non-blocking; do not preempt Scheduler, Challenges, Health, or ongoing P0 security/integration work. This task creation does not assign a worker.</p>
+<h2>Problem and evidence</h2>
+<p>Jarvis currently exposes approximately 130 actions in one discoverable plugin namespace. In a direct check, their names totaled 3,917 characters. Full action schemas were retrievable individually; there is no evidence that all tool names or schemas are preloaded in every model turn. Thus token savings from new plugins must not be assumed.</p>
+<p><strong>Primary problem:</strong> Agents discovering tools encounter similarly named Worker, Reviewer, Operator and administrative operations. They must infer the correct operation from names or inspect competing schemas, repeatedly reconstructing workflow/authority intent. Role-focused catalogs should make the appropriate tool easy to find while retaining cross-role flexibility.</p>
+<h2>Decisions already made</h2>
+<ol>
+<li>Provide multiple role/workflow-focused plugin catalogs backed by the same Jarvis server. Provisional views: <strong>Worker</strong> (inbox, tasks, assignments, source leases, submissions), <strong>Reviewer</strong> (review inbox, queue, claims, evidence, verdicts), <strong>Operator</strong> (agent lifecycle, assignments, intervention, diagnostics), <strong>Scheduler</strong> (capacity, health, scheduling/dispatch), and <strong>Integration</strong> (acceptance, receipts, reconciliation, publication). Derive final grouping from actual workflows.</li>
+<li><strong>Intentional overlap:</strong> The same action may appear in several catalogs, such as agent_inbox. Overlap does not justify duplicate implementations or divergent semantics.</li>
+<li><strong>No new security boundary:</strong> All agents operate under the same user account. Catalog membership is a discovery convention, NOT per-role access control. Preserve all backend authorization, identity, independence, Git/CAS, and receipt protections.</li>
+<li><strong>Role-first, not role-exclusive:</strong> Agents normally look in their workflow catalog first but can discover another when genuinely needed. Optional compact role-specific discovery guidance is appropriate.</li>
+<li><strong>Compatibility:</strong> Retain the original monolithic Jarvis plugin initially. No mass renaming, removal, or disruptive backend refactor just to change the catalog. Any genuine redundant backend operations should be evaluated separately.</li>
+<li><strong>No arbitrary target count:</strong> Optimize tool-selection clarity, not a number of actions or unverified baseline token saving.</li>
+</ol>
+<h2>Deliverables and approach</h2>
+<ol>
+<li><strong>Action inventory:</strong> Classify every exposed action by normal workflow, cross-role usage, ambiguous neighbors and genuine redundancy. Include representative Worker/Reviewer/Operator/Scheduler/Integration task journeys.</li>
+<li><strong>Platform validation and design:</strong> Verify the supported method for publishing multiple focused plugins backed by the same backend. Document exact mappings (including overlaps), naming/description conventions, discovery instructions, limitations and compatibility strategy.</li>
+<li><strong>Task-spec architecture assessment before implementation:</strong> Review this specification for both over- and under-engineering. Prefer thin compositional views of existing capabilities over new abstractions, authorization systems, databases or service replicas.</li>
+<li><strong>Incremental implementation:</strong> Add role-focused catalogs and minimal role-specific discovery guidance if feasible. Preserve the existing monolith. Do not alter currently active/frozen source or review branches as a side effect.</li>
+<li><strong>Test and evaluate:</strong> Verify shared/overlapping tools invoke the same canonical operation and authority. Test old callers, catalog publishing/discovery, and representative agent tool-selection workflows. Measure confusing choices, unnecessary schema inspections and mistaken tool selection before/after; report only measured token effects.</li>
+<li><strong>Documentation:</strong> Publish mapping table, role-first and cross-role discovery guidance, migration/rollback plan, and explicit distinction between catalog organization and security authorization.</li>
+</ol>
+<h2>Acceptance criteria</h2>
+<ul>
+<li>All existing actions classified and role-focused catalog boundaries documented, including deliberate overlaps.</li>
+<li>At least one complete role-focused workflow is usable via a published focused plugin; if impossible, record concrete platform evidence and a minimal alternative rather than pretending success.</li>
+<li>Overlapping surfaces retain one canonical implementation, identities, receipts and authority.</li>
+<li>Representative agent discovery tasks show reduced ambiguity, with reproducible before/after evidence.</li>
+<li>Monolithic plugin remains functional during migration; existing agent/task/review/scheduler state is unaffected.</li>
+<li>Tests and independent review appropriate to the actual source changes are completed before integration.</li>
+</ul>
+<p><strong>Design criterion:</strong> Make the correct tool the obvious tool.</p>

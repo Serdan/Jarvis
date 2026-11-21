@@ -4,7 +4,11 @@ open System
 open System.Diagnostics
 open System.IO
 open System.Text.Json
+open Client
 open Client.LedgerStore
+open Client.IO
+open Client.ChallengeWorkflow
+open Client.LegacyDirectWriterFence
 open Client.ReviewWorkflow
 open NUnit.Framework
 
@@ -128,6 +132,28 @@ type TaskOverviewBatchPerformanceTests() =
                 put ledgerCheckout
                     (sprintf "tasks/%s/reviews/%s/summary.md" (taskId ownerIndex) (reviewId i))
                     "# Unrelated review history"
+            // A registered recipient and a population of *real* canonical notification
+            // records let inbox reads exercise notification batching, not just the
+            // empty-notifications fast path.
+            let fixtureAgent: ReviewAgent =
+                { AgentId = "PerfFixture"; Version = 1; CurrentAssignment = Unchecked.defaultof<AgentAssignment>
+                  Execution = "Stopped"; UnassignedDisposition = "Parked"
+                  StateReason = "Synthetic fixture"; StateSequence = 1L
+                  StateEnteredAtUtc = "2026-01-01T00:00:00Z"
+                  WorkingTurnStartedAtUtc = null; ActiveSessionId = null
+                  AssociatedSessionIds = [] }
+            let fixtureAgentKey =
+                Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes "PerfFixture")
+                    .TrimEnd('=').Replace('+', '-').Replace('/', '_')
+            put ledgerCheckout (sprintf "agents/%s.json" fixtureAgentKey) (entityJson 3 fixtureAgent)
+            for i in 1 .. reviewCount do
+                let notification: AgentNotification =
+                    { NotificationId = reviewId i; FromAgentId = "PerfFixture"
+                      FromProjectName = ""; ToAgentId = "PerfFixture"
+                      TaskId = ""; Message = sprintf "Notification %04d" i
+                      CreatedAtUtc = "2026-01-01T00:00:00Z"; AcknowledgedAtUtc = null }
+                put ledgerCheckout (sprintf "notifications/%s.json" (reviewId i))
+                    (entityJson 2 notification)
             // A malformed unrelated historical integration must not be decoded.
             put ledgerCheckout
                 (sprintf "tasks/%s/integrations/%s.json" (taskId 1) ((900000).ToString("x32")))
@@ -350,3 +376,255 @@ type TaskOverviewBatchPerformanceTests() =
                        reportPath = Path.GetFileName(report)
                        taskCount = taskCount
                        reviewCount = reviewCount |}, jsonOptions)))
+
+    [<TestCase(0, 0)>]
+    [<TestCase(220, 220)>]
+    [<TestCase(2200, 2200)>]
+    member _.OtherHotPathsHavePopulationPinnedBoundedGoldens(taskCount: int, reviewCount: int) =
+        withFixture taskCount reviewCount (fun checkout reader ->
+            // This test intentionally tests the complete inbox. The older fixture's
+            // malformed historical integration belongs to a separate negative test;
+            // remove it here, without changing that independent negative oracle.
+            let invalidHistory = Path.Combine(checkout, "tasks", taskId 1, "integrations",
+                                              (900000).ToString("x32") + ".json")
+            File.Delete invalidHistory
+            commitAndPublish checkout
+            let sourceCheckout = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../.."))
+            let sourceSha = git sourceCheckout [ "rev-parse"; "HEAD" ]
+            let bounded label maxProcesses maxFetches (sample: PerformanceRegression.Sample) =
+                Assert.That(sample.GitProcesses, Is.LessThanOrEqualTo(maxProcesses),
+                            label + " must not invoke Git per canonical record.")
+                Assert.That(sample.RemoteFetches, Is.LessThanOrEqualTo(maxFetches),
+                            label + " must not retry or independently fetch each record.")
+                Assert.That(sample.BatchBlobReads, Is.LessThanOrEqualTo(2))
+                Assert.That(sample.SingleBlobReads, Is.LessThanOrEqualTo(4))
+                Assert.That(sample.GitStdoutBytes,
+                            Is.LessThanOrEqualTo(int64 (taskCount + reviewCount + 1) * 4096L + 65536L),
+                            label + " exceeded source-population-independent per-record stdout budget.")
+
+            let samplePaths phase =
+                // The zero-population selected lookup is an expected missing entity,
+                // not an invented success. Its one-fetch budget still catches retries.
+                let taskResult, _, getTask =
+                    PerformanceRegression.sample
+                        (fun () -> ReviewWorkflow.getTaskWithSpec reader (taskId 1))
+                        (fun result -> sprintf "%A" result)
+                if taskCount = 0 then Assert.That(Result.isError taskResult, Is.True)
+                else
+                    let _, task, _, _, _ = ok taskResult
+                    Assert.That(task.TaskId, Is.EqualTo(taskId 1))
+                bounded "GetTask" 16 1 getTask
+
+                // ReviewDetails is explicitly tested as a pinned lookup. Do not
+                // replace it with an undocumented live ref or fabricated snapshot.
+                let snapshot = LedgerStore.fetch reader |> ok
+                let detailsResult, _, details =
+                    PerformanceRegression.sample
+                        (fun () -> ReviewWorkflow.getBranchReviewAt reader snapshot
+                                        (taskId 1) (Guid.ParseExact(reviewId 1, "N")))
+                        (fun result -> sprintf "%A" result)
+                if reviewCount = 0 then Assert.That(Result.isError detailsResult, Is.True)
+                else Assert.That((ok detailsResult).ReviewId, Is.EqualTo(reviewId 1))
+                bounded "ReviewDetails.pinned" 4 0 details
+
+                let challengesResult, _, challenge =
+                    PerformanceRegression.sample
+                        (fun () -> ChallengeWorkflow.listPage reader "PerfFixture" 25 "" "")
+                        (fun result -> sprintf "%A" result)
+                let challengePage = ok challengesResult
+                Assert.That(challengePage.Challenges, Is.Empty)
+                bounded "ChallengeList" 20 1 challenge
+
+                let inboxResult, _, notification =
+                    PerformanceRegression.sample
+                        (fun () -> ReviewWorkflow.getAgentInbox reader "PerfFixture")
+                        (fun result ->
+                            match result with
+                            | Ok inbox ->
+                                JsonSerializer.Serialize(
+                                    {| snapshotCommit = inbox.SnapshotCommit
+                                       notifications = inbox.PendingNotifications |}, jsonOptions)
+                            | Error error -> sprintf "%A" error)
+                let inbox = ok inboxResult
+                Assert.That(inbox.PendingNotifications.Length, Is.EqualTo(reviewCount),
+                            "Synthetic notification population must be visible to recipient.")
+                bounded "NotificationInbox" 20 1 notification
+
+                // This publication preflight is a read-only default-off check:
+                // it must never mutate or implicitly perform a remote Git fetch.
+                let _, _, preflight =
+                    PerformanceRegression.sample
+                        (fun () -> LegacyDirectWriterFence.preflightSourcePublication reader)
+                        (fun result -> sprintf "%A" result)
+                bounded "PublicationPreflight" 1 1 preflight
+
+                // JobResult is local-memory polling, including its unknown-job
+                // negative: do not couple it to any remote ledger or subprocess.
+                let unknownJob = Guid.NewGuid().ToString("N")
+                let poll, _, job =
+                    PerformanceRegression.sample
+                        (fun () ->
+                            Client.JobManager.getJobResultForProject None
+                                { ProjectName = "Jarvis"; JobId = unknownJob; AfterSequence = Some 0L }
+                                Unchecked.defaultof<_>)
+                        (fun result -> sprintf "%A" result)
+                Assert.That(Result.isError poll, Is.True)
+                Assert.That(job.GitProcesses, Is.Zero)
+                Assert.That(job.RemoteFetches, Is.Zero)
+                Assert.That(job.GitStdoutBytes, Is.Zero)
+                TestContext.Progress.WriteLine(
+                    JsonSerializer.Serialize(
+                        {| sourceSha = sourceSha; fixtureHead = snapshot.Commit
+                           phase = phase; taskCount = taskCount; reviewCount = reviewCount
+                           getTask = getTask; reviewDetails = details; challengeList = challenge
+                           notificationInbox = notification; preflight = preflight
+                           jobResult = job |}, jsonOptions))
+                snapshot.Commit
+
+            let coldHead = samplePaths "cold"
+            let warmHead = samplePaths "warm"
+            Assert.That(warmHead, Is.EqualTo(coldHead))
+            if taskCount = 0 then
+                put checkout "synthetic-other-hot-paths-advance.txt" "advance"
+            else
+                put checkout (taskPath 1) (taskContent 1 "Advanced independent task" (attemptId 1))
+            commitAndPublish checkout
+            let advancedHead = samplePaths "advance"
+            Assert.That(advancedHead, Is.Not.EqualTo(coldHead))
+
+            // Distinct disposable clones with independent local Git common dirs
+            // exercise simultaneous clients against one pinned remote head.
+            let clonePath = Path.Combine(Path.GetDirectoryName(checkout), "parallel-reader")
+            git checkout [ "clone"; reader.ApprovedFetchUrl; clonePath ] |> ignore
+            let otherReader = { reader with RepositoryPath = clonePath }
+            let first = System.Threading.Tasks.Task.Run(fun () ->
+                LedgerStore.measureGitReads (fun () -> ReviewWorkflow.branchReviewerQueue reader "PerfFixture"))
+            let second = System.Threading.Tasks.Task.Run(fun () ->
+                LedgerStore.measureGitReads (fun () -> ReviewWorkflow.branchReviewerQueue otherReader "PerfFixture"))
+            let firstResult, firstMetrics = first.GetAwaiter().GetResult()
+            let secondResult, secondMetrics = second.GetAwaiter().GetResult()
+            let firstHead, firstReviews = ok firstResult
+            let secondHead, secondReviews = ok secondResult
+            Assert.That(firstHead, Is.EqualTo(secondHead))
+            Assert.That((firstReviews = secondReviews), Is.True)
+            for metrics in [firstMetrics; secondMetrics] do
+                Assert.That(metrics.ProcessStarts, Is.LessThanOrEqualTo(16))
+                Assert.That(metrics.RemoteFetches, Is.EqualTo(1))
+                Assert.That(metrics.BatchBlobReads, Is.LessThanOrEqualTo(1))
+                Assert.That(metrics.IndividualBlobReads, Is.LessThanOrEqualTo(1)))
+
+    [<Test>]
+    member _.ActualDelayedRemoteFetchAndCancellationDoNotBlockPinnedReadsOrRetry() =
+        if OperatingSystem.IsWindows() then
+            Assert.Ignore("POSIX upload-pack wrapper; Windows remote-parity evidence is separate.")
+        withFixture 1 1 (fun _ reader ->
+            let pinned = LedgerStore.fetch reader |> ok
+            let root = Directory.GetParent(reader.RepositoryPath).FullName
+            let marker = Path.Combine(root, "remote-upload-pack-starts")
+            let gate = Path.Combine(root, "release-upload-pack")
+            let wrapper = Path.Combine(root, "controlled-upload-pack.sh")
+            // This is the real Git remote upload-pack transport, not a local
+            // alias or an independent fake sleep command. A readiness marker
+            // synchronizes the overlapping read without a timing threshold.
+            File.WriteAllText(wrapper,
+                "#!/bin/sh\n" +
+                "printf x >> '" + marker + "'\n" +
+                "while [ ! -f '" + gate + "' ]; do sleep 0.02; done\n" +
+                "sleep 1\n" +
+                "exec git-upload-pack \"$@\"\n")
+            File.SetUnixFileMode(wrapper,
+                UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+            git reader.RepositoryPath [ "config"; "remote.origin.uploadpack"; wrapper ] |> ignore
+
+            let awaitStarts expected =
+                let deadline = Stopwatch.StartNew()
+                let count () =
+                    if File.Exists marker then File.ReadAllText(marker).Length else 0
+                while count () < expected && deadline.Elapsed < TimeSpan.FromSeconds(10.) do
+                    System.Threading.Thread.Sleep 20
+                Assert.That(count (), Is.EqualTo(expected),
+                            "Actual remote upload-pack child did not enter the handshake.")
+            let release () = File.WriteAllText(gate, "released")
+            try
+                let started = Stopwatch.GetTimestamp()
+                let delayed = System.Threading.Tasks.Task.Run(fun () ->
+                    LedgerStore.measureGitReads
+                        (fun () -> ReviewWorkflow.getTaskWithSpec reader (taskId 1)))
+                awaitStarts 1
+                let taskAt, cheap =
+                    LedgerStore.measureGitReads
+                        (fun () -> LedgerStore.readAt reader pinned (taskPath 1))
+                let content, oid = ok taskAt
+                Assert.That(content.IsSome, Is.True)
+                Assert.That(oid.IsSome, Is.True)
+                Assert.That(cheap.RemoteFetches, Is.Zero,
+                            "Pinned read must not trigger a second remote fetch.")
+                Assert.That(cheap.ProcessStarts, Is.LessThanOrEqualTo(4))
+                Assert.That(cheap.BatchBlobReads, Is.Zero)
+                release ()
+                let delayedResult, remote = delayed.GetAwaiter().GetResult()
+                Assert.That(Result.isOk delayedResult, Is.True)
+                Assert.That(remote.RemoteFetches, Is.EqualTo(1),
+                            "The actual delayed remote read must not retry.")
+                Assert.That(remote.ProcessStarts, Is.LessThanOrEqualTo(16))
+                Assert.That(File.ReadAllText(marker).Length, Is.EqualTo(1))
+                let remoteDurationMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds
+                File.Delete(gate)
+
+                // Negative: cancel another ACTUAL fetch from the same delayed
+                // remote while its upload-pack is known to be running. Never
+                // substitute an unrelated local Git alias here.
+                use cancellation = new System.Threading.CancellationTokenSource()
+                let stage = "refs/jarvis/fetch/" + Guid.NewGuid().ToString("N")
+                let command: BoundedProcess.Command =
+                    { Executable = "git"
+                      Args = [ "fetch"; "--no-tags"; "--no-write-fetch-head"; "--refmap="
+                               "origin"; "refs/heads/jarvis-orchestration:" + stage ]
+                      WorkingDirectory = reader.RepositoryPath
+                      Timeout = TimeSpan.FromSeconds(10.)
+                      MaxOutputBytes = Some 4096
+                      StandardInput = BoundedProcess.ClosedInput
+                      ExtraEnvironment = []
+                      ConfigureStart = None }
+                let canceledFetch = System.Threading.Tasks.Task.Run(fun () ->
+                    BoundedProcess.runWithCancellation cancellation.Token command)
+                awaitStarts 2
+                cancellation.Cancel()
+                match canceledFetch.GetAwaiter().GetResult() with
+                | Error(Client.ContextError message) ->
+                    Assert.That(message, Does.Contain("canceled"))
+                | other -> Assert.Fail(sprintf "Remote fetch cancellation was not honored: %A" other)
+                Assert.That(File.ReadAllText(marker).Length, Is.EqualTo(2),
+                            "Cancelled remote transport must never be replayed.")
+                let probe = new Process()
+                probe.StartInfo.FileName <- "git"
+                probe.StartInfo.WorkingDirectory <- reader.RepositoryPath
+                probe.StartInfo.ArgumentList.Add("show-ref")
+                probe.StartInfo.ArgumentList.Add("--verify")
+                probe.StartInfo.ArgumentList.Add(stage)
+                probe.StartInfo.RedirectStandardOutput <- true
+                probe.StartInfo.RedirectStandardError <- true
+                Assert.That(probe.Start(), Is.True)
+                probe.WaitForExit()
+                Assert.That(probe.ExitCode, Is.Not.EqualTo(0),
+                            "Cancelled remote stage must not become a trusted local ref.")
+                release ()
+                let resumedResult, resumedMetrics =
+                    LedgerStore.measureGitReads
+                        (fun () -> ReviewWorkflow.getTaskWithSpec reader (taskId 1))
+                Assert.That(Result.isOk resumedResult, Is.True)
+                Assert.That(resumedMetrics.RemoteFetches, Is.EqualTo(1))
+                Assert.That(File.ReadAllText(marker).Length, Is.EqualTo(3))
+                TestContext.Progress.WriteLine(
+                    JsonSerializer.Serialize(
+                        {| sourceSha = git (Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../..")))
+                                             [ "rev-parse"; "HEAD" ]
+                           fixtureHead = pinned.Commit; realRemoteUploadPack = true
+                           controlledDelaySeconds = 1; remoteDurationMs = remoteDurationMs
+                           concurrentPinnedGitProcesses = cheap.ProcessStarts
+                           concurrentPinnedFetches = cheap.RemoteFetches
+                           delayedFetches = remote.RemoteFetches
+                           cancelledRemoteUploadPackStarts = 1
+                           retryFetches = resumedMetrics.RemoteFetches |}, jsonOptions))
+            finally
+                release ())

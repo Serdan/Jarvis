@@ -21,3 +21,42 @@ The reviewer queue now selects exactly review-ending paths into a snapshot-pinne
 The disposable Git child control runs real `git -c alias.pause=!sleep ... pause` processes alongside independent real `git status`, and cancels the delayed process. It is POSIX-only; Windows parity is skipped until a separately authorized KRUSO run. Cancellation/termination are correctness gates, not cross-host latency comparisons.
 
 No claim of causal improvement to live GetTask/Review (~0.8–1.3 seconds observed previously) or ListWorktrees (~3 seconds observed previously) is justified by the synthetic fixtures alone. A future authorized deployment can compare same-host before/after interleaved traces with equivalent workloads, command counts and network conditions.
+
+
+## Independent-review P1 correction
+
+The original ChangesRequested review 8a981fa4cc894b29951879fd69350288 on
+fcadb38ed2312e961e1329f54ca1bbf6e56df7cb identified two P1 gaps.
+
+TaskOverviewBatchPerformanceTests.OtherHotPathsHavePopulationPinnedBoundedGoldens
+uses synthetic populations of 0/220/2200 task, review and notification records
+with cold/warm/repeated and a published unrelated synthetic head advance.
+Selected GetTaskWithSpec is bounded to 16 Git processes and one fetch;
+pinned ReviewDetails to four processes and zero fetch; ChallengeList and
+notification AgentInbox to twenty processes and one fetch; default-off
+publication preflight to one process and one fetch; and unknown JobResult
+polling to zero Git starts, fetches or stdout. All have bounded batch/single
+blob and population-scaled stdout ceilings. Two independent disposable clones
+concurrently read the same bare remote with one fetch each; they do not mutate
+live ledger data. Existing ReviewerInbox 0/220/2200 controls remain.
+
+WorktreeTests.source_pinned_worktree_bulk_read_has_one_git_command_across_synthetic_populations
+checks 0/220/2200 synthetic porcelain records with the real parser and one
+real disposable Git worktree list command using the opt-in stage trace. This
+is a parser workload, not a claim to have created 2200 physical worktrees.
+Production bulk output retains the fixed 256 KiB cap.
+
+ActualDelayedRemoteFetchAndCancellationDoNotBlockPinnedReadsOrRetry uses a
+REAL Git fetch from a local bare remote with a controlled upload-pack
+executable. A file handshake verifies the remote child is blocked before
+the pinned LedgerStore read; the latter must succeed with zero extra fetches.
+The delayed read must perform one remote fetch, and cancellation of a second
+actual remote fetch must leave no stage ref or repeated transport attempt.
+Subsequent recovery fetch is independently checked. This POSIX test is
+separate from the older local alias sleep control. A one-second remote delay
+and file synchronization are used without absolute wall-time CI thresholds.
+
+The acceptance evidence must be rerun against the committed exact .NET 11
+Release checkout SHA, with synthetic fixture heads and operation counts.
+It does not prove live MCP wall-clock improvement, full-system privacy
+coverage, or KRUSO/Windows parity.

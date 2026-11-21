@@ -249,3 +249,41 @@ let ``active job in a selected worktree blocks safe removal`` () =
                 | Error e -> Assert.Fail($"Inspection failed: {e}")
             finally
                 Client.JobManager.cancelJob { ProjectName = "Project1::running-job"; JobId = id } context |> shouldEqual (Ok()))
+
+[<TestCase(0)>]
+[<TestCase(220)>]
+[<TestCase(2200)>]
+let source_pinned_worktree_bulk_read_has_one_git_command_across_synthetic_populations (recordCount: int) =
+    // Parsing the complete porcelain output is a pure operation, independent of
+    // worktree count. It must not reintroduce per-worktree status subprocesses.
+    let main = Path.Combine(Path.GetTempPath(), "perf-worktree-main")
+    let records =
+        [ for index in 1 .. recordCount ->
+            sprintf "worktree %s\nHEAD %s\nbranch refs/heads/synthetic-%04d\n\n"
+                (Path.Combine(Path.GetTempPath(), sprintf "perf-worktree-%04d" index))
+                (String.replicate 40 "a") index ]
+        |> String.concat ""
+    match parsePorcelain main records with
+    | Ok items -> Assert.That(items.Length, Is.EqualTo(recordCount))
+    | Error error -> Assert.Fail("Bulk porcelain fixture must decode: " + error)
+    withRepo (fun _ _ context ->
+        let previous, trace = McpLatencyTrace.beginTrace true (Guid.NewGuid().ToString("D"))
+        try
+            let result = listWorktrees { ProjectName = "Project1" } context
+            match result with
+            | Ok entries -> Assert.That(entries.Length, Is.EqualTo(1))
+            | Error error -> Assert.Fail(sprintf "Actual disposable Git bulk discovery failed: %A" error)
+            let diagnostic = McpLatencyTrace.render trace "completed"
+            Assert.That(diagnostic.IsSome, Is.True)
+            use json = System.Text.Json.JsonDocument.Parse(diagnostic.Value)
+            let stages = json.RootElement.GetProperty("stages").EnumerateArray() |> Seq.toList
+            Assert.That(stages.Length, Is.EqualTo(1),
+                        "Bulk ListWorktrees must issue one Git child and no fetch/status-per-worktree.")
+            Assert.That(stages.Head.GetProperty("stage").GetString(), Is.EqualTo("git.worktree"))
+            Assert.That(stages.Head.GetProperty("calls").GetInt32(), Is.EqualTo(1))
+            TestContext.Progress.WriteLine(
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| records = recordCount; actualGitWorktreeCommands = 1
+                       remoteFetches = 0; synthetic = true
+                       scenario = "porcelain-population-plus-real-single-command" |}))
+        finally McpLatencyTrace.restore previous)

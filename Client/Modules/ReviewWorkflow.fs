@@ -3698,21 +3698,32 @@ module ReviewWorkflow =
     let listProjectTasks binding =
         result {
             let! snapshot = LedgerStore.fetch binding
-            let! paths = LedgerStore.listAt binding snapshot "tasks"
-            let mutable tasks = []
+            let! records = LedgerStore.readTaskOverviewPrimaryRecordsAt binding snapshot
+            let mutable taskItems = []
+            let mutable activeAttempts = []
             let mutable reviews = []
-            for path in paths do
+            for KeyValue(path, _) in records do
                 if path.EndsWith("/task.json", StringComparison.Ordinal) then
-                    let! task, _ = required<ReviewTask> binding snapshot path
-                    let! attempt =
-                        if String.IsNullOrWhiteSpace task.AttemptId then Ok None
-                        else required<ReviewAttempt> binding snapshot
-                                 (attemptPath task.TaskId task.AttemptId)
-                             |> Result.map (fun (item, _) -> Some item)
-                    tasks <- {| Task = task; Attempt = attempt |} :: tasks
+                    let! task = requiredFromRecords<ReviewTask> records path
+                    taskItems <- task :: taskItems
+                    if not (String.IsNullOrWhiteSpace task.AttemptId) then
+                        activeAttempts <- attemptPath task.TaskId task.AttemptId :: activeAttempts
                 elif path.EndsWith("/review.json", StringComparison.Ordinal) then
-                    let! review, _ = required<BranchReview> binding snapshot path
+                    let! review = requiredFromRecords<BranchReview> records path
                     reviews <- review :: reviews
+            // One further pinned batch for just the linked current attempts:
+            // historical attempts, specs, events and integration receipts are
+            // never read by this overview. Missing or malformed links still fail.
+            let! attempts =
+                LedgerStore.readTaskOverviewAttemptRecordsAt binding snapshot activeAttempts
+            let mutable tasks = []
+            for task in taskItems do
+                let! attempt =
+                    if String.IsNullOrWhiteSpace task.AttemptId then Ok None
+                    else requiredFromRecords<ReviewAttempt> attempts
+                             (attemptPath task.TaskId task.AttemptId)
+                         |> Result.map Some
+                tasks <- {| Task = task; Attempt = attempt |} :: tasks
             return {| SnapshotCommit = snapshot.Commit
                       Tasks = tasks |> List.sortBy (fun item -> item.Task.TaskId)
                       Reviews = reviews |> List.sortBy (fun item -> item.CreatedSequence, item.ReviewId) |}

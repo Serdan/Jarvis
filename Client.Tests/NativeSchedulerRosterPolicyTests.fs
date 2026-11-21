@@ -457,6 +457,94 @@ type NativeSchedulerRosterPolicyTests() =
 
 
     [<Test>]
+    member _.ForgedLocalProjectReplacementCannotAuthenticateForeignBareRemote() =
+        NativeFixture.withGit (fun f ->
+            let original =
+                NativeFixture.approval f 1L 0L (NativeFixture.head f.AccountOne)
+                    (Guid.NewGuid()) (NativeFixture.limits 2 2)
+                    [| NativeFixture.limits 1 1; NativeFixture.limits 1 1 |]
+            NativeFixture.writer f f.AccountOne f.ProjectsOne original
+            |> NativeFixture.success |> ignore
+            Assert.That((NativeFixture.reader f f.AccountTwo f.ProjectsTwo).Status,
+                        Is.EqualTo("PolicyVerified"))
+            let projectOwner, projectClient = f.ProjectsOne[0], f.ProjectsTwo[0]
+            let oldHead =
+                (LedgerStore.fetch projectClient |> NativeFixture.success).Commit
+            let originalHeader =
+                NativeFixture.git projectOwner.RepositoryPath
+                    [ "show"; oldHead + ":ledger.json" ]
+            let foreignLedgerId = Guid.NewGuid().ToString("D")
+            let tamperedHeader =
+                originalHeader.Replace(projectOwner.LedgerId.ToString("D"),
+                                       foreignLedgerId, StringComparison.Ordinal)
+            Assert.That(tamperedHeader, Is.Not.EqualTo(originalHeader))
+            // Only the disposable BARE project remote changes. The signed
+            // account policy still binds the original approved project ID.
+            NativeFixture.git projectOwner.RepositoryPath
+                [ "checkout"; "--detach"; oldHead ] |> ignore
+            File.WriteAllText(Path.Combine(projectOwner.RepositoryPath, "ledger.json"),
+                              tamperedHeader)
+            NativeFixture.git projectOwner.RepositoryPath [ "add"; "ledger.json" ] |> ignore
+            NativeFixture.git projectOwner.RepositoryPath
+                [ "commit"; "-m"; "Disposable foreign project ledger header" ] |> ignore
+            let changedHead =
+                NativeFixture.git projectOwner.RepositoryPath [ "rev-parse"; "HEAD" ]
+            NativeFixture.git projectOwner.RepositoryPath
+                [ "push"; "origin";
+                  "HEAD:" + NativeSchedulerRosterPolicy.ProjectSourceRef ] |> ignore
+            let remoteRef () =
+                NativeFixture.git projectOwner.RepositoryPath
+                    [ "ls-remote"; projectOwner.ApprovedFetchUrl
+                      NativeSchedulerRosterPolicy.ProjectSourceRef ]
+            Assert.That(remoteRef(), Does.StartWith(changedHead))
+            // Fetch the new authentic object, then make only the SECOND clone
+            // interpret it as a locally forged descendant carrying OLD data.
+            NativeFixture.git projectClient.RepositoryPath
+                [ "fetch"; "--no-tags"; "origin"
+                  NativeSchedulerRosterPolicy.ProjectSourceRef ] |> ignore
+            let oldTree =
+                NativeFixture.git projectClient.RepositoryPath
+                    [ "rev-parse"; oldHead + "^{tree}" ]
+            let replacement =
+                NativeFixture.git projectClient.RepositoryPath
+                    [ "-c"; "user.name=Native Fixture"
+                      "-c"; "user.email=fixture@example.test"
+                      "commit-tree"; oldTree; "-p"; oldHead
+                      "-m"; "Forged local project ledger identity" ]
+            NativeFixture.git projectClient.RepositoryPath
+                [ "replace"; changedHead; replacement ] |> ignore
+            let localGitDir = Path.Combine(projectClient.RepositoryPath, ".git")
+            let replacedRef =
+                NativeFixture.git projectClient.RepositoryPath
+                    [ "show-ref"; "--verify"; "--hash"; "refs/replace/" + changedHead ]
+            Assert.That(replacedRef, Is.EqualTo(replacement))
+            // Poison other clone-local evidence as well: neither grafts nor
+            // object alternates may become evidence for the approved remote.
+            File.WriteAllText(Path.Combine(localGitDir, "info", "grafts"),
+                              changedHead + " " + oldHead + Environment.NewLine)
+            File.WriteAllText(Path.Combine(localGitDir, "objects", "info", "alternates"),
+                              Path.Combine(projectOwner.RepositoryPath, ".git", "objects")
+                              + Environment.NewLine)
+            let checkedProjection =
+                NativeFixture.reader f f.AccountTwo f.ProjectsTwo
+            Assert.That(checkedProjection.Status, Is.EqualTo("NotAuthoritative"))
+            Assert.That(checkedProjection.MembershipComplete, Is.False)
+            Assert.That(checkedProjection.PolicyComplete, Is.False)
+            Assert.That(checkedProjection.OccupancyComplete, Is.False)
+            Assert.That(checkedProjection.AccountCapacityComplete, Is.False)
+            Assert.That(checkedProjection.LaunchAuthorized, Is.False)
+            Assert.That(checkedProjection.VerifiedProjectHeads, Is.Empty)
+            let independentlyUnforged =
+                NativeFixture.reader f f.AccountOne f.ProjectsOne
+            Assert.That(independentlyUnforged.Status, Is.EqualTo("NotAuthoritative"))
+            Assert.That(independentlyUnforged.LaunchAuthorized, Is.False)
+            Assert.That(remoteRef(), Does.StartWith(changedHead))
+            let genuineHeader =
+                NativeFixture.git projectOwner.RepositoryPath
+                    [ "show"; changedHead + ":ledger.json" ]
+            Assert.That(genuineHeader, Does.Contain(foreignLedgerId)))
+
+    [<Test>]
     member _.SignedApprovalCannotBeTransplantedToDifferentGitPredecessor() =
         NativeFixture.withGit (fun f ->
             let initial = NativeFixture.head f.AccountOne

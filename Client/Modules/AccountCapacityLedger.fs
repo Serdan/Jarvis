@@ -1119,6 +1119,94 @@ module AccountCapacityLedger =
                 Error(AccountIntegrityError
                     "Native policy has no matching immutable account-head operation and payload."))
 
+    // A clone-local replace ref, graft or alternate cannot authenticate a
+    // project ledger header. Check the exact approved remote in an empty private
+    // bare repository, not through LedgerStore's shared project-clone reader.
+    let private verifiedNativeProjectRemoteHead (b: LedgerBinding) =
+        try
+            let scratch = Directory.CreateTempSubdirectory("jarvis-native-project-proof-").FullName
+            try
+                let repo = Path.Combine(scratch, "verified.git")
+                let emptyGlobal = Path.Combine(scratch, "empty-gitconfig")
+                let emptyTemplate = Path.Combine(scratch, "empty-template")
+                File.WriteAllText(emptyGlobal, "")
+                Directory.CreateDirectory(emptyTemplate) |> ignore
+                let git args =
+                    BoundedProcess.run
+                        { Executable = "git"
+                          Args = args
+                          WorkingDirectory = scratch
+                          Timeout = TimeSpan.FromSeconds 30.
+                          MaxOutputBytes = Some (256 * 1024)
+                          StandardInput = BoundedProcess.ClosedInput
+                          ExtraEnvironment =
+                            [ "GIT_NO_REPLACE_OBJECTS", "1"
+                              "GIT_CONFIG_NOSYSTEM", "1"
+                              "GIT_CONFIG_GLOBAL", emptyGlobal
+                              "GIT_TEMPLATE_DIR", emptyTemplate
+                              "GIT_TERMINAL_PROMPT", "0" ]
+                          ConfigureStart = Some(fun start ->
+                              // This includes GIT_CONFIG_PARAMETERS/COUNT/KEY_n,
+                              // GIT_DIR, GIT_OBJECT_DIRECTORY and alternates.
+                              let inherited =
+                                  start.Environment.Keys
+                                  |> Seq.cast<string>
+                                  |> Seq.filter (fun key ->
+                                      key.StartsWith("GIT_", StringComparison.OrdinalIgnoreCase))
+                                  |> Seq.toArray
+                              for key in inherited do
+                                  start.Environment.Remove(key) |> ignore) }
+                    |> function
+                        | Ok output when output.ExitCode = 0 && not output.TimedOut ->
+                            output.StdOut.Trim()
+                        | _ -> invalidOp "Isolated project Git proof command failed."
+                let gitRepo args = git (("--git-dir=" + repo) :: args)
+                if String.IsNullOrWhiteSpace b.ApprovedFetchUrl
+                   || b.ApprovedFetchUrl.StartsWith("-", StringComparison.Ordinal) then
+                    invalidOp "No unambiguous approved project fetch authority."
+                git [ "init"; "--bare"; "--initial-branch=main"; repo ] |> ignore
+                let cleanMetadata () =
+                    not ([ "info/grafts"; "objects/info/alternates"
+                           "objects/info/http-alternates"; "shallow" ]
+                         |> List.exists (fun path -> File.Exists(Path.Combine(repo, path))))
+                    && not (Directory.Exists(Path.Combine(repo, "refs", "replace")))
+                if not (cleanMetadata ()) then
+                    invalidOp "Project proof repository has local history redirects."
+                let advertisedHead () =
+                    let record =
+                        gitRepo [ "ls-remote"; "--refs"; "--exit-code"
+                                  b.ApprovedFetchUrl
+                                  NativeSchedulerRosterPolicy.ProjectSourceRef ]
+                    let fields = record.Split('\t')
+                    if fields.Length <> 2 || not (validOid fields[0])
+                       || fields[1] <> NativeSchedulerRosterPolicy.ProjectSourceRef then
+                        invalidOp "Approved remote does not advertise one exact project ref."
+                    fields[0]
+                let before = advertisedHead ()
+                gitRepo [ "fetch"; "--no-tags"; "--no-write-fetch-head"; "--refmap="
+                          b.ApprovedFetchUrl
+                          NativeSchedulerRosterPolicy.ProjectSourceRef + ":refs/heads/native-roster-proof" ]
+                |> ignore
+                let head = gitRepo [ "rev-parse"; "--verify"; "refs/heads/native-roster-proof^{commit}" ]
+                if not (validOid head) || head <> before || not (cleanMetadata ()) then
+                    invalidOp "Fetched project head or local Git metadata changed."
+                // Only a raw blob fetched from the real approved ref is proof.
+                let rawHeader = gitRepo [ "show"; head + ":ledger.json" ]
+                let header = JsonSerializer.Deserialize<LedgerHeader>(rawHeader, options)
+                if isNull (box header) || header.SchemaVersion <> 2
+                   || header.ProjectId <> b.ProjectId.ToString("D")
+                   || header.LedgerId <> b.LedgerId.ToString("D")
+                   || header.Epoch <> b.Epoch || header.NextSequence < 1L
+                   || header.Status <> "active" || isNull (box header.Settings)
+                   || advertisedHead () <> head || not (cleanMetadata ()) then
+                    invalidOp "Approved remote has a foreign or changed ledger header."
+                Ok head
+            finally
+                try Directory.Delete(scratch, true) with _ -> ()
+        with _ ->
+            Error(AccountPolicyNotAuthoritative
+                "Exact project remote/ref/ledger identity cannot be independently authenticated.")
+
     let private verifyNativeProjects (policy: NativeRosterPolicy)
                                      (bindings: LedgerBinding array) =
         if isNull bindings || bindings.Length <> policy.Projects.Length
@@ -1143,17 +1231,21 @@ module AccountCapacityLedger =
                             Error(AccountPolicyNotAuthoritative
                                 "Project source, ledger epoch or remote mapping does not match its approved identity.")
                         else
-                            // A signed alias or catalog entry cannot stand in for
-                            // a fresh canonical Git read of the actual project.
-                            match LedgerStore.fetch b with
-                            | Ok snapshot when snapshot.Header.ProjectId = project.ProjectId
-                                               && snapshot.Header.LedgerId = project.LedgerId
-                                               && snapshot.Header.Epoch = project.Epoch ->
-                                Ok(Array.append heads
-                                    [| { ProjectId = project.ProjectId; LedgerId = project.LedgerId
-                                         Epoch = project.Epoch; VerifiedHead = snapshot.Commit } |])
-                            | _ -> Error(AccountPolicyNotAuthoritative
-                                       "Project Git head, identity or epoch cannot be authenticated.")))
+                            // Keep the existing project trusted-cache semantics, but
+                            // do not let its clone-local Git metadata prove identity.
+                            match verifiedNativeProjectRemoteHead b with
+                            | Error error -> Error error
+                            | Ok genuineHead ->
+                                match LedgerStore.fetch b with
+                                | Ok snapshot when snapshot.Commit = genuineHead
+                                                   && snapshot.Header.ProjectId = project.ProjectId
+                                                   && snapshot.Header.LedgerId = project.LedgerId
+                                                   && snapshot.Header.Epoch = project.Epoch ->
+                                    Ok(Array.append heads
+                                        [| { ProjectId = project.ProjectId; LedgerId = project.LedgerId
+                                             Epoch = project.Epoch; VerifiedHead = genuineHead } |])
+                                | _ -> Error(AccountPolicyNotAuthoritative
+                                           "Project local trust cache disagrees with authenticated remote head.")))
                 (Ok [||])
 
     let private verifiedNativeAt b operatorKey expectedSubject bindings snapshot =

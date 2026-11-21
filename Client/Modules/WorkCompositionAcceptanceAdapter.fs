@@ -90,6 +90,8 @@ module WorkCompositionAcceptanceAdapter =
         if originalReceipt <> submission then
             return! Error(InvalidBinding
                 "Composition integration receipt differs from its original immutable completion.")
+        do! LedgerStore.verifyCompletionOperationRequest binding completion
+                taskId submissionId originalReceipt.IntegratedCommit
         do! LedgerStore.fetchReviewRef binding submission.ReviewRef submission.SubmittedCommit
         do! LedgerStore.fetchIntegrationRef binding submission.IntegrationRef submission.SubmittedCommit
 
@@ -100,15 +102,14 @@ module WorkCompositionAcceptanceAdapter =
             && String.IsNullOrWhiteSpace originalReceipt.PublicationPreviousHead
             && String.IsNullOrWhiteSpace originalReceipt.PublicationObservedHead
         if legacyDirect then
-            // Pre-publisher completed direct receipts have no v1 non-force
-            // fields. Their compatibility is grounded in the unchanged
-            // historical CompleteIntegration operation, not a mutable shape.
-            // They only claim the old remote-ancestry contract, not a new
-            // retroactive non-force publication attestation.
-            do! LedgerStore.verifySourceAncestry binding
-                    originalReceipt.TargetHeadAtSubmission submission.SubmittedCommit
-            do! LedgerStore.verifyIntegrationOnRemote binding
-                    originalReceipt.TargetRef submission.SubmittedCommit submission.IntegratedCommit
+            // A blank original v1 receipt is not evidence of pre-v1 origin:
+            // generic canonical transactions can manufacture it *today*.
+            // No independently verified pre-v1 rollout anchor or historical
+            // operation allowlist is available. Fail closed for managed
+            // composition acceptance. Legacy branch-only integration records
+            // remain covered by ReviewWorkflow's separate compatibility path.
+            return! Error(InvalidBinding
+                "Managed legacy direct completion has no trusted pre-v1 origin proof.")
         else
             let! _ =
                 match Guid.TryParseExact(submission.PublicationOperationId, "D") with

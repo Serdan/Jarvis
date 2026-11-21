@@ -187,6 +187,12 @@ let ``composition acceptance requires exact independently reviewed and integrate
             submissionId acceptedSha |> succeed |> ignore
         ReviewWorkflow.completeIntegration second (Guid.NewGuid()) taskId reviewer
             selfSubmissionId selfReviewSha |> succeed |> ignore
+        let directPath = $"tasks/{taskId}/integrations/{submissionId:N}.json"
+        let verifiedSnapshot = LedgerStore.fetch first |> succeed
+        let directCompletion =
+            LedgerStore.findCompletionOperationForPathAt first verifiedSnapshot directPath |> succeed
+        LedgerStore.verifyCompletionOperationRequest first directCompletion taskId submissionId acceptedSha
+        |> succeed
         match WorkCompositionAcceptanceAdapter.acceptIntegrated second owner
                   (Guid.NewGuid()) initial.Version "project" 1 selfSubmissionId with
         | Error(InvalidBinding _) -> ()
@@ -310,10 +316,10 @@ let ``composition acceptance requires exact independently reviewed and integrate
         | other -> Assert.Fail(sprintf "Expected stale target-review rejection: %A" other))
 
 [<Test>]
-let compositionAcceptanceRetainsAuthenticatedHistoricalDirectCompletion () =
+let compositionAcceptanceRejectsNewlyForgedLegacyDirectCompletion () =
     withTwoClones (fun first second ->
         let owner, reviewer = "Owner", "Reviewer"
-        let taskId, targetRef = "composition-historical-direct", "refs/heads/main"
+        let taskId, targetRef = "composition-forged-legacy-direct", "refs/heads/main"
         git first.RepositoryPath [ "config"; "user.name"; "Fixture" ] |> ignore
         git first.RepositoryPath [ "config"; "user.email"; "fixture@example.test" ] |> ignore
         ReviewWorkflow.registerAgent first (Guid.NewGuid()) owner |> succeed |> ignore
@@ -345,13 +351,15 @@ let compositionAcceptanceRetainsAuthenticatedHistoricalDirectCompletion () =
         let pending = (ReviewWorkflow.getIntegrationSubmissions second taskId |> succeed).Latest.Value
         Assert.That(pending.Status, Is.EqualTo("Pending"))
 
-        // Recreate the exact pre-publisher wire shape: an immutable canonical
-        // CompleteIntegration operation for a direct S, but no v1 publisher
-        // fields. Old clients had already pushed the target before completing.
+        // A NEW canonical CompleteIntegration transaction can manufacture
+        // pre-v1-looking fields with a backdated CompletedAtUtc. Even when
+        // remote main already includes S, this is not historical origin proof.
         git first.RepositoryPath [ "push"; "origin"; $"{source}:{targetRef}" ] |> ignore
-        let historical = { pending with Status = "Integrated"
-                                        IntegratedCommit = source
-                                        CompletedAtUtc = "2026-11-06T03:16:08Z" }
+        let forgedLegacy =
+            { pending with
+                Status = "Integrated"
+                IntegratedCommit = source
+                CompletedAtUtc = "2026-11-06T03:16:08Z" }
         let path = $"tasks/{taskId}/integrations/{submissionId:N}.json"
         let operation: LedgerIntent =
             { OperationId = Guid.NewGuid()
@@ -362,7 +370,7 @@ let compositionAcceptanceRetainsAuthenticatedHistoricalDirectCompletion () =
         LedgerStore.transact second operation (fun snapshot -> result {
             let! _, oid = LedgerStore.readAt second snapshot path
             let serialized = JsonSerializer.Serialize(
-                historical, JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase))
+                forgedLegacy, JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase))
             return [ { Path = path
                        ExpectedBlobOid = oid
                        Content = "{\"schemaVersion\":2," + serialized.Substring(1) } ]
@@ -371,13 +379,62 @@ let compositionAcceptanceRetainsAuthenticatedHistoricalDirectCompletion () =
         let readBack = (ReviewWorkflow.getIntegrationSubmissions first taskId |> succeed).Latest.Value
         Assert.That(readBack.PublicationOperationId, Is.Null)
         Assert.That(readBack.IntegratedCommit, Is.EqualTo(source))
-        let accepted = WorkCompositionAcceptanceAdapter.acceptIntegrated first owner
-                           (Guid.NewGuid()) initial.Version "project" 1 submissionId |> succeed
-        Assert.That(accepted.AlreadyApplied, Is.False)
+        Assert.That(LedgerStore.readRemoteTarget first targetRef |> succeed, Is.EqualTo(source))
+        let snapshot = LedgerStore.fetch first |> succeed
+        let completion = LedgerStore.findCompletionOperationForPathAt first snapshot path |> succeed
+        LedgerStore.verifyCompletionOperationRequest first completion taskId submissionId source
+        |> succeed
+        let rejectArguments task id commit =
+            match LedgerStore.verifyCompletionOperationRequest first completion task id commit with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Unbound completion request accepted: %A" other)
+        rejectArguments "different-task" submissionId source
+        rejectArguments taskId (Guid.NewGuid()) source
+        rejectArguments taskId submissionId (String.replicate 40 "a")
+
+        match WorkCompositionAcceptanceAdapter.acceptIntegrated first owner
+                  (Guid.NewGuid()) initial.Version "project" 1 submissionId with
+        | Error(InvalidBinding _) -> ()
+        | other -> Assert.Fail(sprintf "Fresh legacy-shaped completion was accepted: %A" other)
         let _, graph = WorkCompositionGitLedger.load second |> succeed
-        Assert.That(
-            (WorkComposition.currentAcceptance graph "project" |> Option.get).EvidenceRef,
-            Is.EqualTo("integration:" + submissionId.ToString("N"))))
+        Assert.That(WorkComposition.currentAcceptance graph "project", Is.EqualTo(None))
+
+        // A second new completion also cannot claim this receipt with request
+        // arguments for some OTHER submission, regardless of remote S.
+        let mismatchedId = Guid.NewGuid()
+        ReviewWorkflow.submitIntegration first (Guid.NewGuid()) taskId owner
+            mismatchedId "" "" (reviewId.ToString("N")) targetRef |> succeed |> ignore
+        let pending2 = (ReviewWorkflow.getIntegrationSubmissions second taskId |> succeed).Latest.Value
+        Assert.That(pending2.SubmissionId, Is.EqualTo(mismatchedId.ToString("N")))
+        let path2 = $"tasks/{taskId}/integrations/{mismatchedId:N}.json"
+        let fabricatedOperation: LedgerIntent =
+            { OperationId = Guid.NewGuid()
+              Actor = reviewer
+              Kind = "CompleteIntegration"
+              RequestJson = JsonSerializer.Serialize
+                {| taskId = taskId; submissionId = Guid.NewGuid().ToString("D"); integratedCommit = source |} }
+        LedgerStore.transact second fabricatedOperation (fun current -> result {
+            let! _, oid = LedgerStore.readAt second current path2
+            let forged =
+                { pending2 with
+                    Status = "Integrated"
+                    IntegratedCommit = source
+                    CompletedAtUtc = "2026-11-06T03:16:08Z" }
+            let serialized = JsonSerializer.Serialize(
+                forged, JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase))
+            return [ { Path = path2
+                       ExpectedBlobOid = oid
+                       Content = "{\"schemaVersion\":2," + serialized.Substring(1) } ]
+        }) |> succeed |> ignore
+        let snapshot2 = LedgerStore.fetch first |> succeed
+        let wrongOp = LedgerStore.findCompletionOperationForPathAt first snapshot2 path2 |> succeed
+        match LedgerStore.verifyCompletionOperationRequest first wrongOp taskId mismatchedId source with
+        | Error(InvalidBinding _) -> ()
+        | other -> Assert.Fail(sprintf "Mismatched canonical completion request accepted: %A" other)
+        match WorkCompositionAcceptanceAdapter.acceptIntegrated first owner
+                  (Guid.NewGuid()) initial.Version "project" 1 mismatchedId with
+        | Error(InvalidBinding _) -> ()
+        | other -> Assert.Fail(sprintf "Forged mismatched submission was accepted: %A" other))
 
 [<Test>]
 let compositionAcceptanceRequiresOriginalNonForceReceiptForDistinctCleanMerge () =

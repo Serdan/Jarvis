@@ -937,6 +937,54 @@ module LedgerStore =
                         | _ -> Error(LedgerIntegrityError
                             "An operation record changed after its originating commit.")
 
+    // RequestHash authenticates the stored bytes, not their relationship to
+    // the completed integration. Bind both levels of the canonical intent
+    // envelope to the exact receipt, rejecting extra or ambiguous arguments.
+    let verifyCompletionOperationRequest (binding: LedgerBinding)
+                                         (operation: LedgerOperation)
+                                         (taskId: string) (submissionId: Guid)
+                                         (integratedCommit: string) =
+        let hasFields (element: JsonElement) count =
+            element.ValueKind = JsonValueKind.Object
+            && (element.EnumerateObject() |> Seq.length) = count
+        let stringIs (element: JsonElement) (name: string) (expected: string) =
+            match element.TryGetProperty(name) with
+            | true, property ->
+                property.ValueKind = JsonValueKind.String
+                && String.Equals(property.GetString(), expected, StringComparison.Ordinal)
+            | _ -> false
+        let invalid () =
+            Error(InvalidBinding
+                "Canonical completion request does not match its integration receipt.")
+        try
+            use envelope = JsonDocument.Parse(operation.CanonicalRequestJson)
+            let root = envelope.RootElement
+            let schemaValid =
+                if hasFields root 6 then
+                    match root.TryGetProperty("schemaVersion") with
+                    | true, value -> value.ValueKind = JsonValueKind.Number
+                                     && value.GetRawText() = "2"
+                    | _ -> false
+                else false
+            if not schemaValid
+               || not (stringIs root "projectId" (binding.ProjectId.ToString("D")))
+               || not (stringIs root "operationId" operation.OperationId)
+               || not (stringIs root "actor" operation.Actor)
+               || not (stringIs root "kind" "CompleteIntegration") then
+                invalid ()
+            else
+                match root.TryGetProperty("request") with
+                | true, request when request.ValueKind = JsonValueKind.String ->
+                    use payload = JsonDocument.Parse(request.GetString())
+                    let args = payload.RootElement
+                    if hasFields args 3
+                       && stringIs args "taskId" taskId
+                       && stringIs args "submissionId" (submissionId.ToString("D"))
+                       && stringIs args "integratedCommit" integratedCommit then Ok ()
+                    else invalid ()
+                | _ -> invalid ()
+        with _ -> invalid ()
+
     // Publication fields did not exist on the old direct-completion records.
     // Recover their exact completion from the immutable first-parent history
     // of this path, not by treating a mutable Integrated status as evidence.

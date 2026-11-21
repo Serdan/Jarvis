@@ -1,5 +1,8 @@
 # Durable execution scheduling
 
+**Source/operational boundary (verified 2026-11-21):** The connected public command catalog reports protocol **3.68** and advertises `ScheduleExecution`, `ListScheduledExecutions`, `GetScheduledExecution` and `CancelScheduledExecution` alongside the legacy `ScheduleBrowserExecution` family. Tool advertisement is not an activation or deployment-acceptance receipt. The client-local schedule runner is distinct from both the account-wide deterministic agent Scheduler and the separate default-off Work Queue Scheduler. No unattended Manager/agent scheduling is authorized; the Operator stopped the old schedules and the model-based Manager is retired/Parked. The tracked Jarvis Manager heartbeat is disabled. This document describes implementation and failure behavior, **not** a live-run instruction.
+
+
 JarvisClient persists **one-off, recurring, and agent-idle** actions in the
 existing client-local `browser-schedules.json` store (schema v3; v1/v2 are
 read automatically). One scheduler runs regardless of whether the browser
@@ -21,11 +24,11 @@ schedule via `schedule_execution`, `list_scheduled_executions`,
   before re-arming; if none arrives for 30 minutes, one replacement is
   eligible only after fresh authoritative activity verification.
 
-An example Manager heartbeat is `triggerKind="AfterAgentIdle"`,
-`idleAgentId="Manager"`, `idleSeconds=900`, with the appropriate project
-and either a `RunCommand` action or a `BrowserScript` action that launches
-the Manager. Each project has its own Manager schedule. Canceling it stops
-future Manager launches.
+A historical **unactivated** Manager example uses `triggerKind="AfterAgentIdle"`,
+`idleAgentId="Manager"`, and `idleSeconds=900`. Do not register, enable, or
+reactivate it. Current `Client/Program.fs` deliberately supplies
+`ActivityProofUnavailable` instead of independent proof of inactivity, so
+this trigger must fail closed and cannot authorize an idle launch.
 
 ## Actions
 
@@ -68,39 +71,31 @@ status and bounded result summary; they do not expose command arguments or
 browser script JSON. Canceling a running schedule blocks future occurrences
 but does not kill its already running command.
 
-For Manager idle schedules, a running attempt without any activity for
-30 minutes can become stale and be relaunched; the status records uncertain
-outcome and the old attempt's eventual result cannot override the new one.
-A submitted launch that has returned successfully but generated **no first
-tool call** also becomes eligible for one verified replacement after the
-30-minute cutoff, including across restarts. Every replacement has a fresh
-attempt ID and a new 30-minute grace period; late results never overwrite
-the current attempt. This is conservative recovery from an uncertain silent
-launch, not proof the old browser tab has exited.
+### Idle proof and no-replay limits
 
-Actual agent-attributed tool invocations persist a monotonic
-user/project/agent activity watermark in the server's SQLite database
-before remote command dispatch, alongside best-effort SignalR hints.
-If that durable write fails, the attributed tool is **not dispatched**:
-an in-memory failure marker alone would not survive a server restart.
-The registered, authenticated client can query `GetAgentActivity`
-without activating or modifying the target agent. `observe_agent`,
-job polling and other read-only observations do not reset the Manager clock.
-The watermark survives server restarts and is authoritative even when the
-scheduler missed notifications while disconnected.
+The generic scheduling state machine contains a 30-minute stale-attempt path
+for `AfterAgentIdle`, but production `Client/Program.fs` deliberately
+returns `ActivityProofUnavailable` for its independent verifier. Therefore
+those code paths are **not evidence of a working, safe Manager heartbeat**.
+The legacy `attributed_agent_activity` records in
+`Server/Services/FeedbackStore.fs` are held in a disposable server SQLite
+store. Missing/reset telemetry, local notification hints, an empty activity
+result or a browser tab closing **cannot prove agent inactivity**. Never
+use these as permission to start or replace an agent launch.
 
-Before every due `AfterAgentIdle` execution, JarvisClient makes a fresh
-authenticated server roundtrip. An offline client, failed query, revoked
-registration or absent verifier fails closed, preserving the pending
-occurrence and an `AgentActivityUnverified` diagnostic. On reconnect,
-a fresh query reconciles missed remote activity and postpones the deadline.
-Waiting schedules also query for a new Manager activity episode, even if
-the notification hint was lost. The query never invokes the target's inbox.
-A verification result is bound to its immutable schedule revision and exact
-deadline snapshot. Replacing a pending or waiting schedule while the query
-is in flight invalidates that result; the replacement requires a new read.
-Separate idle schedules for the same project and Manager do not overlap
-while a previous occurrence is running within this store.
+An authenticated verification failure must fail closed; a claimed one-shot
+occurrence is never automatically replayed after a restart or uncertain
+browser Send. At the pinned source, a recurring/idle `outcomeUnknown`
+occurrence can still advance/re-arm, which is an **open safety defect**:
+no replacement attempt may be treated as authorized merely because it is
+due. Repeated `WindowUnavailable:needsReauthorization` retries and inability
+to cancel a `suspended` schedule by the ordinary cancel path are also open.
+The persisted-`suspended` restore fix is already in main at `9c2ae32e5`;
+restore does **not** automatically re-enable suspended entries. In
+`Client/Modules/BrowserSchedules.fs`, recurring `UiIncompatible:`
+currently maps to a failed occurrence and advances to the next interval,
+whereas a one-shot `UiIncompatible:` suspends. Do not describe recurring
+UI incompatibility as terminal suspension until that behavior is integrated.
 
 The exclusive file lock elects one executor for a *single local schedule
 file*, not a global leader across different machines. Opt in to a single

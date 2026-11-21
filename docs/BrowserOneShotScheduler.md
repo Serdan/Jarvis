@@ -1,6 +1,6 @@
 # Persistent browser scheduling — implementation
 
-**Status:** Implemented on `feature/browser-bridge`; not deployed or verified against live Edge/ChatGPT.
+**Status (2026-11-21):** Browser Bridge source is integrated; the bridge was live-tested with Edge/ChatGPT on 2026-11-13. This is a **per-client browser action scheduler**, not the account-wide deterministic agent Scheduler or the default-off Work Queue Scheduler. The Operator has stopped automated schedules; command availability is not authorization to activate them. The connected protocol is **3.68**. Findings below are pinned to Jarvis main `d702352ef705f9991ac1cb14dc15a13cce78aa44`, not pending review branches.
 
 JarvisClient persists browser launch schedules in its local, user-private `browser-schedules.json` file. Scheduling is **generic**: it opens a new tab in a **user-registered window** on a site with browser host permission, executes the current ordinary project JavaScript file, and optionally closes the created tab. It knows nothing about ChatGPT agent identities or tasks. Immediate agent handoffs use `BrowserRunInNewTab`, not the scheduler.
 
@@ -40,11 +40,11 @@ At due time:
 2. Read the current project script and wait briefly for the extension to reconnect.
 3. Call the same underlying open → ready → execute → optional close service as the immediate command.
 4. Store the latest registration ID, submitted conversation URL if supplied by script, cleanup result, outcome and update time.
-5. For one-shot actions, finish as completed/failed/outcomeUnknown or `suspended` (provider UI incompatibility). For recurring actions, advance to the next **future** interval after ordinary outcomes, but enter `suspended` immediately on a `UiIncompatible:` result. No further occurrences launch until the schedule is explicitly replaced.
+5. For one-shot actions, finish as completed/failed/outcomeUnknown or `suspended` (provider UI incompatibility). At the pinned source, recurring `UiIncompatible:` maps to **failed**, and the runner advances to the next future interval; it does **not** permanently suspend. A recurring/idle `outcomeUnknown` can also re-arm after an occurrence. That is a known no-replay safety defect pending independently reviewed correction; a later interval must not be interpreted as approval to retry an uncertain Send.
 
 After a client restart, a running one-shot is marked `outcomeUnknown`, **never replayed**. A running recurring occurrence is marked uncertain and skipped; the next future interval remains pending. Missed intervals are skipped rather than accumulated. There is no watchdog, strict singleton lease, or separate orchestration engine. The next orchestrator should read Jarvis activity and voluntarily exit if another is active.
 
-Cancellation prevents **future** occurrences and cannot undo an already submitted ChatGPT turn. Replacing a pending schedule ID is allowed; replacing an actively executing occurrence is rejected. The scheduler admits at most 100 pending schedule IDs.
+Cancellation prevents **future** occurrences and cannot undo an already submitted ChatGPT turn. Replacing a pending schedule ID is allowed; replacing an actively executing occurrence is rejected. The scheduler admits at most 100 pending schedule IDs. **Known defects at this source:** `WindowUnavailable:needsReauthorization` is retried repeatedly instead of requiring an explicit safe pause; the normal cancel path cannot cancel an already `suspended` entry. Neither defect is considered resolved merely because a fix branch or review exists. Persisted suspension is preserved across restore (integrated correction `9c2ae32e5`).
 
 ## Window authorization and tab cleanup
 
@@ -52,11 +52,11 @@ The user explicitly registers a browser **window** from the Edge/Chromium extens
 
 Window handles are tied to their actual browser session. After a browser restart, window closure or revocation, the user must re-register/rebind the target. Old schedules that lack a `windowRegistration` are flagged for explicit reconfiguration, not silently retargeted to another window. The legacy manually registered same-origin tab anchor is no longer required.
 
-`closeTabAfterExecution` defaults false for generic compatibility. The ChatGPT launcher convention supplies true: after a confirmed submission the client closes **only the new agent-created tab**. If it cannot confirm whether the page submitted its message, no automatic replay occurs and the tab is normally retained for inspection. A provider UI mismatch also retains its tab, reports the registration ID and sanitized structural observations, and suspends a recurring schedule until reconfigured. A cleanup error after successful submission does not convert the submission into a failure.
+`closeTabAfterExecution` defaults false for generic compatibility. The ChatGPT launcher convention supplies true: after a confirmed submission the client closes **only the new agent-created tab**. If it cannot confirm whether the page submitted its message, no automatic replay occurs and the tab is normally retained for inspection. A provider UI mismatch retains its tab and reports registration ID and sanitized diagnostics; only one-shot `UiIncompatible:` is suspended at the pinned source, while recurring failures advance to their next future interval. A cleanup error after successful submission does not convert the submission into a failure.
 
 ## Persistence and privacy
 
-Schedules persist in the JarvisClient user's config directory with owner-private permissions and atomic writes. State schema is v2; v1 is accepted for migration and incompatible pending entries are marked as needing window reconfiguration. The private file stores full URL, project script path, prompt arguments, window target and due time. It is not stored on the public Jarvis server or committed to Git.
+Schedules persist in the JarvisClient user's config directory with owner-private permissions and atomic writes. State schema is **v3**; v1/v2 are read for migration, and incompatible pending entries need explicit window reconfiguration. The private file stores full URL, project script path, prompt arguments, window target and due time. It is not stored on the public Jarvis server or committed to Git.
 
 The list command reveals schedule IDs, due times, next/last status, window, script path, sanitized origin, last registration/attempt ID, and a conversation URL if returned by the project script. It **does not reveal the prompt arguments, scripts, cookies or DOM**. Treat conversation URLs as sensitive identifiers.
 
@@ -69,6 +69,6 @@ dotnet test Jarvis.slnx --no-restore
 node --test browser-extension/tests/bridge.test.cjs browser-extension/tests/chatgpt-launcher.test.cjs
 ```
 
-The F# tests cover persistence, cancellation, no-replay, recurring restart and real loopback WebSocket framing. JavaScript tests cover extension consent/window/close behavior and simulated ChatGPT composer interaction. A live Edge/ChatGPT launch, new-session tool availability and post-close backend continuation have **not yet been exercised** on this branch.
+The F# tests cover persistence, cancellation, no-replay, recurring restart and real loopback WebSocket framing. JavaScript tests cover extension consent/window/close behavior and simulated ChatGPT composer interaction. The bridge was live-tested with Edge/ChatGPT on 2026-11-13; this is not full end-to-end acceptance of unattended agent scheduling or any replacement for explicit Operator approval.
 
 See [ChatGPTAgentLauncher.md](ChatGPTAgentLauncher.md) for the UI contract and [BrowserBridgeSystem.md](BrowserBridgeSystem.md) for the bridge security model.

@@ -6,16 +6,40 @@ scheduler service. It does not run automatically when installed. The tracked
 Jarvis config is disabled by default. Each project keeps its own role
 attachment, Manager agent, schedule ID, config and launch journal.
 
-## Current deployment boundary (2026-11-15)
+## Current operational boundary (2026-11-21)
 
-The source tree contains the reviewed general scheduler and the four
-ScheduleExecution/ListScheduledExecutions/GetScheduledExecution/
-CancelScheduledExecution MCP methods. The connected **deployed** command
-catalog currently exposes only the older ScheduleBrowserExecution family.
-It therefore cannot create the required AfterAgentIdle schedule yet.
-Do not substitute an hourly Every schedule, create live tabs, update the
-client/server or restart services without separate operator authorization.
-After deployment, inspect the actual connected command catalog again.
+The connected public catalog now advertises protocol **3.68**, including
+`ScheduleExecution`, `ListScheduledExecutions`, `GetScheduledExecution`,
+`CancelScheduledExecution`, and durable Challenge commands. The earlier
+claim that only `ScheduleBrowserExecution` is exposed is superseded.
+These commands being advertised **does not** prove end-to-end deployment
+acceptance or authorize live Manager dispatch. This is an archived, default-off
+planning runbook; **do not perform its registration, activation, launch or
+resume steps** without a new explicit Operator authorization following
+independent review and cutover acceptance.
+
+`Client/Program.fs` returns `ActivityProofUnavailable` for
+`AfterAgentIdle`: no independent durable cross-device agent-inactivity
+proof is implemented. Server `FeedbackStore`'s legacy
+`attributed_agent_activity` telemetry is disposable SQLite evidence,
+not a durable inactivity authority. Missing/reset telemetry is not proof
+of idle. `config/manager/Jarvis.json` is disabled; the connected Linux client
+has no active Jarvis Manager heartbeat. The local browser schedule store was
+observed with 44 historical records and **zero** active `pending`, `running`
+or `waitingActivity` records. The four previously approved v3 Favn/Jarvis
+Health (300 seconds) and Manager (600 seconds) records are canceled/disabled;
+preserve their history, do not recreate them. The model-based Manager role
+is retired and Parked by Operator override; its task is Cancelled/Abandoned.
+Human-directed Operator launches only until a deterministic account-wide
+Scheduler is reviewed and explicitly authorized. The local per-project
+`scripts/manager-heartbeat.mjs` planner and journal do **not** launch
+sessions and are not that account-wide Scheduler.
+
+The public catalog also exposes `ListChallenges`, `GetChallenge` and
+`SetChallengeSubscription`, but the current ChatGPT connector wrapper has
+no corresponding direct list/get/subscription operations. A Lead inbox with
+`ChallengeSubscribed=false` and empty triage cannot establish an empty
+unassigned Challenge queue; do not mark a snapshot complete on that basis.
 
 The Manager ID is an attribution/coordination label, not a principal.
 Browser and process permissions still come from the OAuth user, Jarvis
@@ -37,7 +61,11 @@ Never commit the launch journal. Use **one shared journal path per project**
 across all Manager invocations and do not use different worktrees' journals
 for the same live project.
 
-## Initial registration and role setup (operator-approved rollout)
+## Archived registration and role setup (NOT currently authorized)
+
+The following steps are historical planning material. Do not perform any of
+them against live clients, ledgers, browser windows or schedules under the
+current Operator stop.
 
 1. Confirm the browser window registration is live with
    browser_list_windows; confirm ChatGPT is authenticated, the extension is
@@ -211,7 +239,7 @@ Retain dispatched/uncertain reservations until positive attributed activity
 or explicit operator recovery. Verified Ready/Stopped stateEnteredAtUtc after
 such activity proves the worker later yielded and can resume the same task.
 
-## Start the one Manager idle heartbeat (only after approval)
+## Archived Manager idle heartbeat example (inactive; separate approval required)
 
 Once the new scheduler is **deployed and verified**, call schedule_execution
 with these exact fields, replacing only the live registered window token and

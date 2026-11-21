@@ -1,6 +1,6 @@
 # ChatGPT Ephemeral Agent Launcher — Design Specification
 
-**Status:** Browser Bridge deployed and live-tested with Edge/ChatGPT on 2026-11-13; one-command readiness and acknowledgement reliability improvements under review.
+**Status (source pinned to `d702352ef705f9991ac1cb14dc15a13cce78aa44`, 2026-11-21):** Browser Bridge integrated and live-tested with Edge/ChatGPT on 2026-11-13. One-command readiness, background-tab Send acknowledgement, and operator model preference remain separately reviewed or open; this specification's original proposals are not blanket acceptance of unattended launches. No live automated schedules or model-based Manager dispatch are authorized. The connected catalog is protocol **3.68** and advertises the general schedule command family, but this alone is not a full rollout receipt.
 **Implementation:** `browser-scripts/chatgpt/launchAgent.js` and `Client/Modules/BrowserBridge.fs`
 **Depends on:** [Browser bridge](BrowserBridgeSystem.md), [implemented one-shot scheduler](BrowserOneShotScheduler.md)
 **Scope:** User-registered browser-window targets, the implemented immediate open/execute/optional-close operation, project-owned ChatGPT UI automation, and optional scheduling.
@@ -401,11 +401,17 @@ No new task database, browser automation engine, direct HTTP ChatGPT integration
 - **Orchestrator handoffs are immediate** through the generic workflow; schedules are for intentional delayed/recurring launches.
 - **No automatic retry after possible Send**, no exactly-once promises, no orchestration leases, and no spoofing of user permission controls.
 
-## 15. Explicitly deferred
+## 15. Historical design decisions and remaining gates
+
+At the pinned `d702352e` source, `browser-scripts/chatgpt/launchAgent.js` **already contains a model/effort picker** and fallback sequence: Chat GPT-6 Extra High, Work GPT-6.2 Astra Medium, Chat Instant. Thus the original bullet below saying automatic model selection is entirely deferred is no longer accurate. The Operator's revised preference is **Chat GPT-6 High → Work GPT-6.2 Sol Medium → Chat Instant**, but branches proposing those corrections are **not** evidence of integrated or live-accepted behavior. Background-tab focus/Send reliability is also under independent review; do not substitute a foreground-only or unverified successful dispatch for exact post-Send acknowledgement. An attempted click with uncertain acknowledgement is `outcomeUnknown` and must never be automatically replayed.
+
+Local `BrowserSchedules` is a per-client persistent action runner. It is distinct from the account-wide task/agent Scheduler and the separately default-off Work Queue Scheduler. In the pinned source, recurring `UiIncompatible:` is marked failed and later intervals can run again; recurring/idle `outcomeUnknown`, repeated `WindowUnavailable:needsReauthorization`, and normal cancellation of suspended schedules have unresolved follow-on defects. A persisted `suspended` entry does not automatically rearm on restore after the integrated `9c2ae32e5` correction. `AfterAgentIdle` is fail-closed in the production client via `ActivityProofUnavailable` and cannot serve as a Manager activation mechanism. Neither code presence nor command advertisement activates schedules.
+
+## 16. Original explicitly deferred items (historical; some now implemented)
 
 - Native ChatGPT API integration or synthesis of private network payloads.
 - Parsing `usage` frames to enforce account budget, credit or model-rate limits.
-- Automated selection of models/thinking effort until robust UI selectors are tested.
+- Automated selection of models/thinking effort until robust UI selectors are tested (**historical**: picker code now exists at the pinned baseline; correct preference and background reliability remain under review).
 - Agent-side concurrency leases / strict singleton enforcement.
 - Automatic cleanup of uncertain in-flight tabs without a proven safe policy.
 - Automated detection of *agent task completion* from ChatGPT UI.

@@ -593,3 +593,54 @@ module DispatchProbeTests =
         Assert.That(reported.Count, Is.EqualTo(3))
         Assert.That(failures, Is.Empty)
     }
+
+    [<Test>]
+    let ``thirty two cheap dispatch reads bypass a stalled one second ledger operation`` () = task {
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let finished = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let observed = System.Collections.Concurrent.ConcurrentBag<CommandDispatchTiming>()
+        let completed = System.Collections.Concurrent.ConcurrentBag<unit>()
+        let queue = CommandDispatchQueue(4, 64, observed.Add)
+
+        let stalled () : Task = task {
+            entered.TrySetResult(()) |> ignore
+            do! release.Task
+        }
+        let cheap () : Task = task {
+            completed.Add(())
+            if completed.Count = 32 then finished.TrySetResult(()) |> ignore
+        }
+        Assert.That(queue.TrySubmit("stalled", stalled), Is.True)
+        do! entered.Task.WaitAsync(TimeSpan.FromSeconds 5.)
+        for _ in 1 .. 32 do
+            Assert.That(queue.TrySubmit("cheap", cheap), Is.True)
+
+        // A distinct worker drains 32 while the first is held. Causal
+        // ordering, not a machine-specific absolute latency threshold.
+        let! outcome = Task.WhenAny(finished.Task, Task.Delay(TimeSpan.FromSeconds 5.))
+        let drainedBeforeRelease = obj.ReferenceEquals(outcome, finished.Task)
+        do! Task.Delay(1000)
+        release.TrySetResult(()) |> ignore
+        do! queue.Complete().WaitAsync(TimeSpan.FromSeconds 5.)
+        Assert.That(drainedBeforeRelease, Is.True, "Slow ledger work must not serialize cheap status reads.")
+        Assert.That(completed.Count, Is.EqualTo(32))
+        Assert.That(observed.Count, Is.EqualTo(33))
+        Assert.That(observed |> Seq.forall (fun m -> m.FailureType.IsNone), Is.True)
+        let values =
+            observed
+            |> Seq.filter (fun m -> m.CorrelationId = "cheap")
+            |> Seq.map (fun m -> m.QueueMilliseconds + m.ExecutionMilliseconds)
+            |> Seq.sort |> Seq.toArray
+        let percentile p =
+            values[max 0 (min (values.Length - 1) (int (Math.Ceiling(float values.Length * p)) - 1))]
+        TestContext.Progress.WriteLine(
+            System.Text.Json.JsonSerializer.Serialize(
+                {| workload = "command-dispatch-32-plus-one-stalled"
+                   cheapReads = completed.Count
+                   stalledMs = 1000
+                   p50Ms = percentile 0.50
+                   p95Ms = percentile 0.95
+                   p99Ms = percentile 0.99
+                   maxMs = values |> Array.max |}))
+    }

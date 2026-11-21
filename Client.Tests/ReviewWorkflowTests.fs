@@ -6239,8 +6239,10 @@ type ReviewWorkflowTests() =
             |> success |> ignore
             assertError "agent.state")
 
-    [<Test>]
-    member _.AgentInboxBulkLedgerBenchmarkAndSnapshotCorrectness() =
+    [<TestCase(0)>]
+    [<TestCase(220)>]
+    [<TestCase(2200)>]
+    member _.AgentInboxBulkLedgerBenchmarkAndSnapshotCorrectness(count: int) =
         // Hundreds of canonical entities in one immutable ledger commit. Seed
         // via an isolated Git worktree so setup does not dominate measurements
         // with hundreds of unrelated push transactions.
@@ -6258,7 +6260,6 @@ type ReviewWorkflowTests() =
                     let original = System.Text.Json.JsonSerializer.Serialize(value, options)
                     let content = $"{{\"schemaVersion\":{schema}," + original.Substring(1)
                     File.WriteAllText(fullPath, content)
-                let count = 220
                 for i in 0 .. count - 1 do
                     let taskId = sprintf "history%04d" i
                     let attemptId = Guid.NewGuid().ToString("N")
@@ -6308,51 +6309,76 @@ type ReviewWorkflowTests() =
                     File.WriteAllText(Path.Combine(auxiliary, "tasks", taskId, "spec.html"),
                                       String.replicate (16 * 1024) "X")
 
-                git auxiliary [ "add"; "tasks"; "notifications" ] |> ignore
-                git auxiliary [ "commit"; "-m"; "Bulk history benchmark fixture" ] |> ignore
-                let injected = git auxiliary [ "rev-parse"; "HEAD" ]
-                git one [ "push"; "origin"; injected + ":refs/heads/jarvis-orchestration" ] |> ignore
-                let measure name =
-                    GC.Collect()
-                    GC.WaitForPendingFinalizers()
-                    GC.Collect()
-                    let allocBefore = GC.GetTotalAllocatedBytes(true)
-                    let stopwatch = Stopwatch.StartNew()
-                    let inbox, io =
-                        LedgerStore.measureGitReads(fun () ->
-                            ReviewWorkflow.getAgentInbox second "Owner" |> success)
-                    stopwatch.Stop()
-                    let allocated = GC.GetTotalAllocatedBytes(true) - allocBefore
-                    let payload = System.Text.Json.JsonSerializer.Serialize(inbox)
-                    TestContext.Progress.WriteLine(
-                        $"AgentInboxBulk {name}: {stopwatch.Elapsed.TotalMilliseconds:F1}ms; " +
-                        $"git={io.ProcessStarts}; fetch={io.RemoteFetches}; " +
-                        $"singleBlobs={io.IndividualBlobReads}; batch={io.BatchBlobReads}; " +
-                        $"outputBytes={io.OutputBytes}; allocatedBytes={allocated}; responseBytes={System.Text.Encoding.UTF8.GetByteCount(payload)}")
-                    inbox, payload
-                let cold, coldJson = measure "cold"
-                let warm, warmJson = measure "warm"
+                let injected =
+                    if count = 0 then snapshot.Commit
+                    else
+                        git auxiliary [ "add"; "tasks"; "notifications" ] |> ignore
+                        git auxiliary [ "commit"; "-m"; "Bulk history benchmark fixture" ] |> ignore
+                        let head = git auxiliary [ "rev-parse"; "HEAD" ]
+                        git one [ "push"; "origin"; head + ":refs/heads/jarvis-orchestration" ] |> ignore
+                        head
+                let measure () =
+                    PerformanceRegression.sample
+                        (fun () -> ReviewWorkflow.getAgentInbox second "Owner" |> success)
+                        (fun inbox -> System.Text.Json.JsonSerializer.Serialize(inbox))
+                let cold, coldJson, coldMetrics = measure ()
+                let warm, warmJson, warmMetrics = measure ()
+                PerformanceRegression.boundedInbox coldMetrics
+                PerformanceRegression.boundedInbox warmMetrics
                 Assert.That(cold.SnapshotCommit, Is.EqualTo(injected))
                 Assert.That(cold.Agent.AgentId, Is.EqualTo("Owner"))
-                Assert.That(cold.PendingNotifications.Length, Is.EqualTo(10))
-                Assert.That(cold.PendingReviews.Length, Is.EqualTo(8))
-                Assert.That(cold.AvailableReviews.Length, Is.EqualTo(66))
-                Assert.That(cold.UnacknowledgedFeedback.Length, Is.EqualTo(14))
-                Assert.That(cold.IntegrationSubmissions.Length, Is.EqualTo(32))
+                let countWhere predicate =
+                    [ 0 .. count - 1 ] |> List.filter predicate |> List.length
+                let ownerNotifications = countWhere (fun i -> i % 11 = 0 && i % 2 = 0)
+                let ownerPendingReviews = countWhere (fun i -> i % 10 = 0 && i % 3 = 0)
+                let ownerAvailableReviews = countWhere (fun i -> i % 10 <> 0 && i % 3 = 0)
+                let ownerFeedback = countWhere (fun i -> i % 10 = 0 && i % 3 <> 0)
+                let ownerIntegrations = countWhere (fun i -> i % 7 = 0)
+                Assert.That(cold.PendingNotifications.Length, Is.EqualTo(ownerNotifications))
+                Assert.That(cold.PendingReviews.Length, Is.EqualTo(ownerPendingReviews))
+                Assert.That(cold.AvailableReviews.Length, Is.EqualTo(ownerAvailableReviews))
+                Assert.That(cold.UnacknowledgedFeedback.Length, Is.EqualTo(ownerFeedback))
+                Assert.That(cold.IntegrationSubmissions.Length, Is.EqualTo(ownerIntegrations))
                 Assert.That(cold.Focused.IsNone, Is.True)
                 Assert.That(cold.Working.IsNone, Is.True)
                 Assert.That(cold.RunnableQueue, Is.Empty)
                 Assert.That(cold.Parked, Is.Empty)
                 Assert.That(cold.Blocked, Is.Empty)
                 let reviewer = ReviewWorkflow.getAgentInbox second "Reviewer" |> success
-                Assert.That(reviewer.PendingNotifications.Length, Is.EqualTo(100))
-                Assert.That(reviewer.PendingReviews.Length, Is.EqualTo(66))
-                Assert.That(reviewer.AvailableReviews.Length, Is.EqualTo(8))
+                Assert.That(reviewer.PendingNotifications.Length, Is.EqualTo(countWhere (fun i -> i % 11 <> 0 && i % 2 = 0)))
+                Assert.That(reviewer.PendingReviews.Length, Is.EqualTo(ownerAvailableReviews))
+                Assert.That(reviewer.AvailableReviews.Length, Is.EqualTo(ownerPendingReviews))
                 Assert.That(reviewer.UnacknowledgedFeedback, Is.Empty)
-                Assert.That(reviewer.IntegrationSubmissions.Length, Is.EqualTo(188))
+                Assert.That(reviewer.IntegrationSubmissions.Length, Is.EqualTo(count - ownerIntegrations))
                 Assert.That(reviewer.SnapshotCommit, Is.EqualTo(cold.SnapshotCommit))
                 Assert.That(coldJson, Is.EqualTo(warmJson),
                             "Canonical inbox must be byte-for-byte consistent within an immutable snapshot.")
+                let independent = ReviewWorkflow.getAgentInbox first "Owner" |> success
+                Assert.That(System.Text.Json.JsonSerializer.Serialize(independent), Is.EqualTo(coldJson),
+                            "Two independent clones must agree on the same canonical head.")
+                for _ in 1 .. 3 do measure () |> ignore
+                let warmSamples =
+                    [ for _ in 1 .. PerformanceRegression.sampleCount() do
+                        let _, payload, observed = measure ()
+                        Assert.That(payload, Is.EqualTo(coldJson))
+                        PerformanceRegression.boundedInbox observed
+                        yield observed ]
+                let notification = Guid.NewGuid()
+                ReviewWorkflow.notifyAgent first notification "Reviewer" "" "Owner" "" "synthetic-head-change"
+                |> success |> ignore
+                let updated, _, mutationMetrics = measure ()
+                PerformanceRegression.boundedAfterHeadAdvance mutationMetrics
+                Assert.That(updated.SnapshotCommit, Is.Not.EqualTo(injected),
+                            "A new verified head must invalidate the old projection.")
+                Assert.That(updated.PendingNotifications.Length, Is.EqualTo(ownerNotifications + 1))
+                Assert.That(updated.PendingNotifications
+                            |> List.exists (fun item -> item.NotificationId = notification.ToString("N")), Is.True)
+                Assert.That(System.Text.Json.JsonSerializer.Serialize(cold), Is.EqualTo(coldJson),
+                            "Old immutable result must remain unchanged after remote mutation.")
+                let sourceRoot = Path.GetFullPath(Path.Combine(__SOURCE_DIRECTORY__, ".."))
+                let sourceSha = git sourceRoot [ "rev-parse"; "HEAD" ]
+                PerformanceRegression.report sourceSha "agent-inbox" count
+                    coldMetrics warmMetrics mutationMetrics warmSamples |> ignore
             finally git one [ "worktree"; "remove"; "--force"; auxiliary ] |> ignore)
 
     [<Test>]

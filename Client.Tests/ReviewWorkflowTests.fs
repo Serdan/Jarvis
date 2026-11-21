@@ -7825,6 +7825,9 @@ type ReviewWorkflowTests() =
                             (fun () -> System.Threading.Volatile.Read(&entered) = concurrency),
                             TimeSpan.FromSeconds(10.)), Is.True, "Readers must enter before lock release")
                         System.Threading.Thread.Sleep(12) // informational contention sampling only
+                        // Signal both lock owners before waiting for either process.
+                        // Sequential release previously exaggerated second-client contention.
+                        held |> Array.iter (fun (_, _, release) -> File.WriteAllText(release, "release"))
                         held |> Array.iter releaseHolder
                         System.Threading.Tasks.Task.WaitAll(jobs |> Array.map (fun t -> t :> System.Threading.Tasks.Task))
                         let samples = jobs |> Array.map (fun t -> t.Result)

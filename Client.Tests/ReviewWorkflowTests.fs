@@ -89,6 +89,43 @@ type ReviewWorkflowTests() =
                 if Directory.Exists pendingDir then Directory.Delete(pendingDir, true)
             Directory.Delete(root, true)
 
+    // Real bare remote, two independent clones, frozen Accepted review and a
+    // published mechanical two-parent merge. Each adversarial test gets an
+    // entirely fresh ledger and may rewrite only its disposable Git fixture.
+    let withPublishedExternalObservation action =
+        withFixture (fun one two first second baseOid _ newCommit _ ->
+            let taskId = "external-observation-adversarial"
+            let target = "refs/heads/" + git one [ "branch"; "--show-current" ]
+            let sourceRef = "refs/heads/feature/external-adversarial"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "External adversarial"
+            |> success |> ignore
+            git one [ "checkout"; "-b"; "feature/external-adversarial" ] |> ignore
+            let source = newCommit "Frozen source" "external-adversarial"
+            let reviewId = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
+                reviewId sourceRef source "Independently accepted" "" target
+            |> success |> ignore
+            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId reviewId "Reviewer" 1
+            |> success |> ignore
+            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId reviewId "Reviewer" 2 Accept
+            |> success |> ignore
+            let submission = Guid.NewGuid()
+            ReviewWorkflow.submitIntegration second (Guid.NewGuid()) taskId "Owner"
+                submission "" "" (reviewId.ToString("N")) target
+            |> success |> ignore
+            File.WriteAllText(Path.Combine(two, "independent-target.txt"), "target")
+            git two [ "add"; "independent-target.txt" ] |> ignore
+            git two [ "commit"; "-m"; "Independent target" ] |> ignore
+            let targetParent = git two [ "rev-parse"; "HEAD" ]
+            git two [ "push"; "origin"; target ] |> ignore
+            git one [ "fetch"; "origin"; target ] |> ignore
+            git one [ "checkout"; "-b"; "integration/external-adversarial"; "FETCH_HEAD" ] |> ignore
+            git one [ "merge"; "--no-ff"; "--no-edit"; source ] |> ignore
+            let integrated = git one [ "rev-parse"; "HEAD" ]
+            Assert.That(git one [ "rev-list"; "--parents"; "-n"; "1"; integrated ],
+                        Is.EqualTo(String.concat " " [ integrated; targetParent; source ]))
+            git one [ "push"; "origin"; integrated + ":" + target ] |> ignore
+            action one two first second baseOid taskId target submission reviewId source integrated targetParent)
     [<Test>]
     member _.AdministrativeActorIsRecordedInReceiptAssignmentAndClosureEvent() =
         withFixture (fun _ _ first second _ _ _ _ ->
@@ -7881,3 +7918,297 @@ type ReviewWorkflowTests() =
             let summary = ReviewWorkflow.getIntegrationSubmissions second taskId |> success
             Assert.That(summary.ExternalObservations, Is.Empty)
             Assert.That(summary.Submissions.Head.Status, Is.EqualTo("Pending")))
+
+    [<Test>]
+    member _.ExternalObservationFailsClosedOnForgedRefsParentsAndReplaceOverlay() =
+        withPublishedExternalObservation
+            (fun one two first second baseOid taskId target submission _ source integrated targetParent ->
+                let receipt = (ReviewWorkflow.getIntegrationSubmissions second taskId |> success).Latest.Value
+                let expectRejected label merge =
+                    match ReviewWorkflow.observeExternalPublication second (Guid.NewGuid()) taskId
+                            "AuthenticatedUser" submission merge with
+                    | Error _ -> ()
+                    | Ok value -> Assert.Fail(sprintf "%s accepted: %A" label value)
+                    let state = ReviewWorkflow.getIntegrationSubmissions first taskId |> success
+                    Assert.That(state.ExternalObservations, Is.Empty, label)
+                    Assert.That(state.Latest.Value.Status, Is.EqualTo("Pending"))
+                    Assert.That(state.Latest.Value.PublicationMechanism, Is.Null)
+                let forceRef sourceOid name =
+                    git one [ "push"; "--force"; "origin"; sourceOid + ":" + name ] |> ignore
+                // The ref name is canonical, but its remote object no longer matches
+                // the independently accepted reviewed source.
+                forceRef baseOid receipt.ReviewRef
+                expectRejected "forged remote review ref" integrated
+                forceRef source receipt.ReviewRef
+                forceRef baseOid receipt.IntegrationRef
+                expectRejected "forged integration ref" integrated
+                forceRef source receipt.IntegrationRef
+                let tree = git one [ "rev-parse"; integrated + "^{tree}" ]
+                let make name parents =
+                    git one ([ "commit-tree"; tree ] @
+                             (parents |> List.collect (fun oid -> [ "-p"; oid ])) @
+                             [ "-m"; name ])
+                let wrongSecond = make "Wrong second parent" [ targetParent; baseOid ]
+                let wrongFirst = make "Wrong first parent" [ baseOid; source ]
+                let octopus = make "Octopus merge" [ targetParent; source; baseOid ]
+                for label, forged in
+                    [ "wrong second parent", wrongSecond
+                      "wrong first parent", wrongFirst
+                      "three parent merge", octopus ] do
+                    forceRef forged target
+                    expectRejected label forged
+                // The remote advertises a malicious extra-tree merge. A
+                // local replacement mapping that object onto the genuine
+                // reviewed merge must never satisfy the remote object proof.
+                File.WriteAllText(Path.Combine(one, "unreviewed-overlay.txt"), "forged")
+                git one [ "add"; "unreviewed-overlay.txt" ] |> ignore
+                let forgedTree = git one [ "write-tree" ]
+                let forgedOverlay =
+                    git one [ "commit-tree"; forgedTree; "-p"; targetParent;
+                              "-p"; source; "-m"; "Forged remote tree" ]
+                forceRef forgedOverlay target
+                git two [ "fetch"; "origin"; target ] |> ignore
+                git two [ "fetch"; one; integrated ] |> ignore
+                git two [ "replace"; forgedOverlay; integrated ] |> ignore
+                try expectRejected "local overlay forged remote tree" forgedOverlay
+                finally
+                    git two [ "replace"; "-d"; forgedOverlay ] |> ignore
+                    forceRef integrated target
+                    git one [ "reset"; "--hard"; integrated ] |> ignore
+                Assert.That(LedgerStore.readRemoteTarget second target |> success,
+                            Is.EqualTo(integrated)))
+
+    [<Test>]
+    member _.ExternalObservationRejectsMalformedProjectionAndSameUuidPayloadReplay() =
+        withPublishedExternalObservation
+            (fun _ _ first second _ taskId _ submission _ source integrated _ ->
+                let operationId = Guid.NewGuid()
+                let observe actor merge =
+                    ReviewWorkflow.observeExternalPublication second operationId taskId
+                        actor submission merge
+                Assert.That((observe "AuthenticatedUser" integrated |> success).AlreadyApplied, Is.False)
+                match observe "AuthenticatedUser" source with
+                | Error _ -> ()
+                | Ok value -> Assert.Fail(sprintf "Same UUID changed merge: %A" value)
+                match observe "Operator" integrated with
+                | Error _ -> ()
+                | Ok value -> Assert.Fail(sprintf "Same UUID changed actor: %A" value)
+                let foreign = { second with ProjectId = Guid.NewGuid() }
+                match ReviewWorkflow.observeExternalPublication foreign operationId taskId
+                        "AuthenticatedUser" submission integrated with
+                | Error _ -> ()
+                | Ok value -> Assert.Fail(sprintf "Cross-project observation replay: %A" value)
+                let path =
+                    sprintf "tasks/%s/integration-observations/%s/%s.json"
+                        taskId (submission.ToString("N")) (operationId.ToString("D"))
+                let originalSnapshot = LedgerStore.fetch first |> success
+                let original, _ = LedgerStore.readAt first originalSnapshot path |> success
+                let original = original.Value
+                let overwrite content =
+                    let snapshot = LedgerStore.fetch first |> success
+                    let _, oid = LedgerStore.readAt first snapshot path |> success
+                    let intent : LedgerIntent =
+                        { OperationId = Guid.NewGuid(); Actor = "Fixture"
+                          Kind = "ExternalObservationMalformedFixture"; RequestJson = "{}" }
+                    LedgerStore.transact first intent (fun _ ->
+                        Ok [ { Path = path; ExpectedBlobOid = oid; Content = content } ])
+                    |> success |> ignore
+                let badEvidence edit =
+                    let node = System.Text.Json.Nodes.JsonNode.Parse(original).AsObject()
+                    edit node
+                    overwrite (node.ToJsonString())
+                    let corruptHead = (LedgerStore.fetch first |> success).Commit
+                    match ReviewWorkflow.getIntegrationSubmissions second taskId with
+                    | Error(LedgerIntegrityError _) -> ()
+                    | other -> Assert.Fail(sprintf "Forged observation projected as valid: %A" other)
+                    match ReviewWorkflow.observeExternalPublication second (Guid.NewGuid()) taskId
+                            "AuthenticatedUser" submission integrated with
+                    | Error _ -> ()
+                    | Ok value -> Assert.Fail(sprintf "Corrupt canonical observation authorized append: %A" value)
+                    Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(corruptHead))
+                    overwrite original
+                badEvidence (fun node ->
+                    node["evidenceClass"] <- System.Text.Json.Nodes.JsonValue.Create("VerifiedNonForceGitPush/v1"))
+                badEvidence (fun node ->
+                    node["ManagedPublisherProof"] <- System.Text.Json.Nodes.JsonValue.Create(true))
+                badEvidence (fun node ->
+                    Assert.That(node.Remove("submittedCommit"), Is.True))
+                badEvidence (fun node ->
+                    node["recordedBy"] <- System.Text.Json.Nodes.JsonValue.Create(""))
+                let state = ReviewWorkflow.getIntegrationSubmissions second taskId |> success
+                Assert.That(state.ExternalObservations.Length, Is.EqualTo(1))
+                Assert.That(state.ExternalObservations.Head.ManagedPublisherProof, Is.False)
+                Assert.That(state.Latest.Value.Status, Is.EqualTo("Pending"))
+                Assert.That(state.Latest.Value.PublicationMechanism, Is.Null))
+
+    [<Test>]
+    member _.ExternalObservationTransportUnknownPreservesExactlyOneCanonicalEffect() =
+        withPublishedExternalObservation
+            (fun _ _ first second _ taskId _ submission _ _ integrated _ ->
+                let before = (LedgerStore.fetch first |> success).Header.NextSequence
+                let mutable remoteFailures = 0
+                let unreachable =
+                    LedgerStore.withGitTransportFaults (fun phase args ->
+                        match args with
+                        | "fetch" :: _ when phase = "remote-fetch" ->
+                            remoteFailures <- remoteFailures + 1
+                            Some { FaultExitCode = 128; FaultStderr = "Could not resolve host: example.invalid"
+                                   FaultTimedOut = false }
+                        | _ -> None)
+                        (fun () -> ReviewWorkflow.observeExternalPublication second (Guid.NewGuid())
+                                       taskId "AuthenticatedUser" submission integrated)
+                match unreachable with
+                | Error(RemoteUnavailable _) -> ()
+                | other -> Assert.Fail(sprintf "Unknown remote fetch allowed observation: %A" other)
+                Assert.That(remoteFailures, Is.GreaterThan(0))
+                Assert.That((LedgerStore.fetch first |> success).Header.NextSequence, Is.EqualTo(before))
+                Assert.That((ReviewWorkflow.getIntegrationSubmissions second taskId |> success).ExternalObservations,
+                            Is.Empty)
+                let operationId = Guid.NewGuid()
+                let mutable pushed = false
+                let mutable pushes = 0
+                let mutable failedConfirmations = 0
+                let run () = ReviewWorkflow.observeExternalPublication first operationId taskId
+                                 "AuthenticatedUser" submission integrated
+                let unknown =
+                    LedgerStore.withGitTransportFaults (fun phase args ->
+                        match args with
+                        | "push" :: _ when phase = "publication-push" ->
+                            pushes <- pushes + 1
+                            pushed <- true
+                            None
+                        | "fetch" :: _ when pushed && (phase = "confirmation-fetch" || phase = "remote-fetch") ->
+                            failedConfirmations <- failedConfirmations + 1
+                            Some { FaultExitCode = 128; FaultStderr = "Could not resolve host: example.invalid"
+                                   FaultTimedOut = false }
+                        | _ -> None) run
+                match unknown with
+                | Error(OutcomeUnknown _) | Error(RemoteUnavailable _) -> ()
+                | Error failure -> Assert.Fail(sprintf "Unexpected canonical write failure: %A" failure)
+                | Ok value ->
+                    Assert.Fail(sprintf "Injected missing canonical confirmation reported success: %A" value)
+                Assert.That(pushes, Is.EqualTo(1), "Exactly one canonical publication attempt")
+                Assert.That(failedConfirmations, Is.GreaterThan(0))
+                let _, receipt = LedgerStore.getOperationStatus second operationId |> success
+                Assert.That(receipt.IsSome, Is.True, "Uncertain response must have a durable original UUID")
+                let recovered = run () |> success
+                Assert.That(recovered.AlreadyApplied, Is.True)
+                let state = ReviewWorkflow.getIntegrationSubmissions second taskId |> success
+                Assert.That(state.ExternalObservations.Length, Is.EqualTo(1))
+                Assert.That(state.ExternalObservations.Head.ObservationOperationId,
+                            Is.EqualTo(operationId.ToString("D")))
+                Assert.That(state.Latest.Value.Status, Is.EqualTo("Pending"))
+                Assert.That(state.Latest.Value.PublicationMechanism, Is.Null))
+
+    [<Test>]
+    member _.ExternalObservationConcurrentTwoClientCasHasNoDuplicateOrManagedPromotion() =
+        withPublishedExternalObservation
+            (fun _ _ first second _ taskId _ submission _ _ integrated _ ->
+                let race (id1: Guid) (id2: Guid) =
+                    use ready = new System.Threading.CountdownEvent(2)
+                    use start = new System.Threading.ManualResetEventSlim(false)
+                    let participant binding operationId =
+                        System.Threading.Tasks.Task.Run(fun () ->
+                            ready.Signal() |> ignore
+                            if not (start.Wait(TimeSpan.FromSeconds(20.))) then
+                                failwith "Concurrent observation start barrier timed out"
+                            ReviewWorkflow.observeExternalPublication binding operationId taskId
+                                "AuthenticatedUser" submission integrated)
+                    let firstAttempt = participant first id1
+                    let secondAttempt = participant second id2
+                    Assert.That(ready.Wait(TimeSpan.FromSeconds(20.)), Is.True)
+                    start.Set()
+                    System.Threading.Tasks.Task.WaitAll(
+                        [| firstAttempt :> System.Threading.Tasks.Task
+                           secondAttempt :> System.Threading.Tasks.Task |])
+                    let results = [ firstAttempt.Result; secondAttempt.Result ]
+                    for result in results do
+                        match result with
+                        | Ok _ | Error(StaleEntityVersion _) | Error(OutcomeUnknown _) -> ()
+                        | other -> Assert.Fail(sprintf "Unexpected concurrent observation: %A" other)
+                    results
+                let commonId = Guid.NewGuid()
+                let same = race commonId commonId
+                Assert.That(same |> List.exists Result.isOk, Is.True)
+                let one = ReviewWorkflow.getIntegrationSubmissions second taskId |> success
+                Assert.That(one.ExternalObservations.Length, Is.EqualTo(1))
+                Assert.That(one.ExternalObservations.Head.ObservationOperationId,
+                            Is.EqualTo(commonId.ToString("D")))
+                let other1, other2 = Guid.NewGuid(), Guid.NewGuid()
+                let different = race other1 other2
+                let final = ReviewWorkflow.getIntegrationSubmissions first taskId |> success
+                let operationIds = final.ExternalObservations |> List.map _.ObservationOperationId
+                Assert.That(operationIds |> Set.ofList |> Set.count, Is.EqualTo(operationIds.Length))
+                Assert.That(operationIds, Does.Contain(commonId.ToString("D")))
+                let succeededIds =
+                    List.zip [ other1; other2 ] different
+                    |> List.choose (fun (id, result) ->
+                        match result with
+                        | Ok _ -> Some(id.ToString("D"))
+                        | _ -> None)
+                for id in succeededIds do Assert.That(operationIds, Does.Contain(id))
+                Assert.That(operationIds.Length, Is.LessThanOrEqualTo(3))
+                Assert.That(final.Latest.Value.Status, Is.EqualTo("Pending"))
+                Assert.That(final.Latest.Value.PublicationMechanism, Is.Null)
+                Assert.That(final.ExternalObservations |> List.forall (fun item ->
+                    not item.ManagedPublisherProof && item.PublisherAttribution = "Unattributed"),
+                    Is.True))
+
+    [<Test>]
+    member _.ExternalObservationTaskWriteAuthenticatesOperatorAndRejectsCrossProjectReplay() =
+        withPublishedExternalObservation
+            (fun _ two _ second _ taskId _ submission _ _ integrated _ ->
+                let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot two
+                Directory.CreateDirectory(Path.GetDirectoryName configPath) |> ignore
+                let approved : Client.OrchestrationApi.LedgerTrustBinding =
+                    { SchemaVersion = 1; Enabled = true; ProjectRoot = two
+                      ProjectId = second.ProjectId.ToString("D")
+                      LedgerId = second.LedgerId.ToString("D")
+                      Epoch = second.Epoch; RemoteName = second.RemoteName
+                      ApprovedFetchUrl = second.ApprovedFetchUrl
+                      ApprovedPushUrl = second.ApprovedPushUrl
+                      HighestTrustedHead = (LedgerStore.fetch second |> success).Commit }
+                File.WriteAllText(configPath, System.Text.Json.JsonSerializer.Serialize approved)
+                try
+                    let context = GitCommandTests.TestContext(Path.GetDirectoryName two)
+                    let operationId = Guid.NewGuid()
+                    let command : Common.TaskWriteCommand =
+                        { ProjectName = "reviewer"; Action = "ObserveExternalPublication"
+                          OperationId = operationId.ToString("D"); TaskId = taskId
+                          AttemptId = submission.ToString("D"); ActorId = "Operator"
+                          OwnerId = ""; Title = ""; Html = ""; ExpectedVersion = 0
+                          ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
+                          AssignmentGeneration = 0; Summary = ""; NextAction = ""
+                          Reason = ""; BaseOid = integrated; TargetRef = ""
+                          SourceRef = ""; AllowDetached = false; AllowUncommitted = false
+                          DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+                    match Client.OrchestrationApi.TaskApi.write command context with
+                    | Ok _ -> ()
+                    | Error failure ->
+                        Assert.Fail(sprintf "Authenticated external observation was rejected: %A" failure)
+                    let state = ReviewWorkflow.getIntegrationSubmissions second taskId |> success
+                    Assert.That(state.ExternalObservations.Length, Is.EqualTo(1))
+                    Assert.That(state.ExternalObservations.Head.RecordedBy,
+                                Is.EqualTo("AuthenticatedUser"),
+                                "Caller-supplied Operator is not the authenticated writer identity")
+                    let foreign = { command with ProjectName = "missing-project";
+                                                OperationId = Guid.NewGuid().ToString("D") }
+                    match Client.OrchestrationApi.TaskApi.write foreign context with
+                    | Error _ -> ()
+                    | Ok response ->
+                        Assert.Fail(sprintf "Cross-project public command replay authorized: %A" response)
+                    let tampered = { command with ActorId = "OtherOperator" }
+                    match Client.OrchestrationApi.TaskApi.write tampered context with
+                    | Error _ -> ()
+                    | Ok _ ->
+                        // Even if replay resolves the immutable original UUID,
+                        // it must never attribute the record to the forged actor.
+                        let saved = ReviewWorkflow.getIntegrationSubmissions second taskId |> success
+                        Assert.That(saved.ExternalObservations.Head.RecordedBy,
+                                    Is.EqualTo("AuthenticatedUser"))
+                    let final = ReviewWorkflow.getIntegrationSubmissions second taskId |> success
+                    Assert.That(final.ExternalObservations.Length, Is.EqualTo(1))
+                    Assert.That(final.Latest.Value.Status, Is.EqualTo("Pending"))
+                    Assert.That(final.Latest.Value.PublicationMechanism, Is.Null)
+                finally
+                    if File.Exists configPath then File.Delete configPath)

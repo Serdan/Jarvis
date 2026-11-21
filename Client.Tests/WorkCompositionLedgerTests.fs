@@ -976,3 +976,74 @@ let privilegedExternalPushAndCanonicalForgeryShowTrustedWriterBoundary (forceRew
         match LedgerStore.getOperationAt first (LedgerStore.fetch first |> succeed) acceptanceId with
         | Ok(Some operation) -> Assert.That(operation.Type, Is.EqualTo("Composition.Mutate"))
         | other -> Assert.Fail(sprintf "Privileged boundary fixture was not preserved: %A" other))
+
+[<Test>]
+let externalGitObservationCannotPromotePendingSubmissionToWorkCompositionAcceptance () =
+    withTwoClones (fun first second ->
+        let owner, reviewer = "Owner", "Reviewer"
+        let taskId, target = "external-observation-work-gate", "refs/heads/main"
+        for actor in [ owner; reviewer ] do
+            ReviewWorkflow.registerAgent first (Guid.NewGuid()) actor |> succeed |> ignore
+        ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Observe without acceptance"
+        |> succeed |> ignore
+        WorkCompositionGitLedger.execute first owner (Guid.NewGuid()) 0
+            (WorkCompositionMutation.Create("project", WorkUnitKind.Project, None,
+                                            spec "Project" (Some taskId)))
+        |> succeed |> ignore
+        let _, initial = WorkCompositionGitLedger.load second |> succeed
+        let purpose =
+            WorkCompositionAcceptanceAdapter.reviewPurpose initial initial.Units.["project"]
+        for path in [ first.RepositoryPath; second.RepositoryPath ] do
+            git path [ "config"; "user.name"; "Fixture" ] |> ignore
+            git path [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+        git first.RepositoryPath [ "checkout"; "-b"; "feature/external-work-proof" ] |> ignore
+        File.WriteAllText(Path.Combine(first.RepositoryPath, "accepted.txt"), "frozen accepted source")
+        git first.RepositoryPath [ "add"; "accepted.txt" ] |> ignore
+        git first.RepositoryPath [ "commit"; "-m"; "Frozen independently reviewed source" ] |> ignore
+        let source = git first.RepositoryPath [ "rev-parse"; "HEAD" ]
+        let reviewId = Guid.NewGuid()
+        ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId owner
+            reviewId "refs/heads/feature/external-work-proof" source "Accepted review"
+            purpose target
+        |> succeed |> ignore
+        ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId reviewId reviewer 1
+        |> succeed |> ignore
+        ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId reviewId reviewer 2 Accept
+        |> succeed |> ignore
+        let submission = Guid.NewGuid()
+        ReviewWorkflow.submitIntegration second (Guid.NewGuid()) taskId owner
+            submission "" "" (reviewId.ToString("N")) target
+        |> succeed |> ignore
+        File.WriteAllText(Path.Combine(second.RepositoryPath, "target.txt"), "independent target")
+        git second.RepositoryPath [ "add"; "target.txt" ] |> ignore
+        git second.RepositoryPath [ "commit"; "-m"; "Advance remote target independently" ] |> ignore
+        let targetParent = git second.RepositoryPath [ "rev-parse"; "HEAD" ]
+        git second.RepositoryPath [ "push"; "origin"; "main" ] |> ignore
+        git first.RepositoryPath [ "fetch"; "origin"; "main" ] |> ignore
+        git first.RepositoryPath [ "checkout"; "--detach"; "FETCH_HEAD" ] |> ignore
+        git first.RepositoryPath [ "merge"; "--no-ff"; "--no-edit"; source ] |> ignore
+        let integrated = git first.RepositoryPath [ "rev-parse"; "HEAD" ]
+        Assert.That(git first.RepositoryPath [ "rev-list"; "--parents"; "-n"; "1"; integrated ],
+                    Is.EqualTo(String.concat " " [ integrated; targetParent; source ]))
+        // Ordinary Git push has no managed publisher witness.
+        git first.RepositoryPath [ "push"; "origin"; integrated + ":" + target ] |> ignore
+        ReviewWorkflow.observeExternalPublication second (Guid.NewGuid()) taskId
+            "AuthenticatedUser" submission integrated
+        |> succeed |> ignore
+        let external = ReviewWorkflow.getIntegrationSubmissions first taskId |> succeed
+        Assert.That(external.ExternalObservations.Length, Is.EqualTo(1))
+        Assert.That(external.ExternalObservations.Head.ManagedPublisherProof, Is.False)
+        Assert.That(external.Latest.Value.Status, Is.EqualTo("Pending"))
+        Assert.That(external.Latest.Value.PublicationMechanism, Is.Null)
+        let acceptanceId = Guid.NewGuid()
+        match WorkCompositionAcceptanceAdapter.acceptIntegrated second owner acceptanceId
+                initial.Version "project" 1 submission with
+        | Error(InvalidBinding _) -> ()
+        | other -> Assert.Fail(sprintf "External observation promoted WorkComposition: %A" other)
+        let _, unchanged = WorkCompositionGitLedger.load first |> succeed
+        Assert.That(unchanged.Version, Is.EqualTo(initial.Version))
+        Assert.That(WorkComposition.currentAcceptance unchanged "project" |> Option.isNone,
+                    Is.True)
+        let _, receipt = LedgerStore.getOperationStatus second acceptanceId |> succeed
+        Assert.That(receipt.IsNone, Is.True, "Rejected WorkComposition CAS cannot leave an acceptance receipt")
+        Assert.That(LedgerStore.readRemoteTarget second target |> succeed, Is.EqualTo(integrated)))

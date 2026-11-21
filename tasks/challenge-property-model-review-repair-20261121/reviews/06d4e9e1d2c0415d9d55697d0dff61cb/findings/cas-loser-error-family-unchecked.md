@@ -1,0 +1,9 @@
+# P1 — CAS loser can fail for the wrong reason without failing the test
+
+**Exact frozen source:** `332020cd50f3a2a3986933763edb8f81251e0b1c`.
+
+In `Client.Tests/ChallengeStateMachinePropertyTests.fs:654-685`, `ConcurrentTwoCloneWritersAcceptAtMostOneVersionWinner` runs two real concurrent resolutions but accepts the outcomes whenever exactly one is `Ok` (lines 673-675). **It never inspects the `Error` returned by the loser.** A losing `ReviewAccessDenied`, `InvalidBinding`, `LedgerIntegrityError`, or other unrelated typed error will still satisfy the exactly-one-success assertion, provided the other call succeeds. This does not distinguish a legitimate stale-version/CAS conflict from a broken authorization or ledger path.
+
+The follow-up's `FailureFamily` (line 41) includes Invalid/Stale/Denied/Reused/Busy, and `ChallengeFixture.classifyError` (327-336) correctly rejects unmodeled errors in the sequential model, but **neither creates a typed competing-CAS conflict oracle**. The original and follow-up task contracts explicitly require expected negative error classes, including conflicts, not merely a one-winner count.
+
+**Required:** Assert the failed concurrent result is an allowed, independently specified conflict/version result, reject unrelated typed failures, and verify authoritative head/sequence/receipt/event invariants for the winner and loser. Preserve the two-clone test, deterministic seeds and exact frozen source boundary. This finding is from source inspection; the existing three CAS seeds were part of the independently passed 47-test broad filter, demonstrating that a green test currently does not close this gap.

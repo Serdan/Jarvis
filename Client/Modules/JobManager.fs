@@ -37,6 +37,14 @@ type private JobRecord =
       mutable Status: JobStatus
       mutable CompletedAt: DateTimeOffset option }
 
+// The Exited callback runs only after OS process admission. Failure to
+// retrieve an exit code is an observation failure, not a spawn failure.
+// JobStatus has no process-unknown case; ToolFailed preserves a terminal,
+// explicitly uncertain observation for both polling and scheduled commands.
+let statusAfterAdmittedProcessExit (readExitCode: unit -> int) : JobStatus =
+    try Completed(readExitCode())
+    with _ -> ToolFailed "OutcomeUnknown: admitted process exited without a verifiable exit code."
+
 module private Core =
     let private defaultMaxOutputBytes = 64 * 1024
     let private maxCompletedJobs = 100
@@ -173,8 +181,7 @@ module private Core =
                         elif job.CancellationRequested then
                             job.Status <- Canceled
                         else
-                            try job.Status <- Completed proc.ExitCode
-                            with _ -> job.Status <- FailedToStart "Process exited before an exit code was available."
+                            job.Status <- statusAfterAdmittedProcessExit (fun () -> proc.ExitCode)
                         job.CompletedAt <- Some DateTimeOffset.UtcNow)
                     job.Completion.TrySetResult(()) |> ignore
                     deadlineCancellation |> Option.iter (fun cancel -> cancel.Cancel())
@@ -182,7 +189,7 @@ module private Core =
 
                 if not (jobs.TryAdd(jobId, job)) then
                     proc.Dispose()
-                    Error(Client.ContextError "Failed to register job.")
+                    Error(Client.ProcessSpawnFailed "Failed to register process job before admission.")
                 else
                     let mutable processStarted = false
                     try
@@ -190,7 +197,7 @@ module private Core =
                             let mutable removed = Unchecked.defaultof<JobRecord>
                             jobs.TryRemove(jobId, &removed) |> ignore
                             proc.Dispose()
-                            Error(Client.ContextError "Failed to start job.")
+                            Error(Client.ProcessSpawnFailed "OS process start returned false.")
                         else
                             processStarted <- true
                             proc.BeginOutputReadLine()
@@ -224,11 +231,12 @@ module private Core =
                             Error(Client.ProcessOutcomeUnknown
                                 (sprintf "Post-start process setup failed for job %s: %s" jobId (ex.GetType().Name)))
                         else
+                            // This catch only covers a process whose Start has not succeeded.
                             let mutable removed = Unchecked.defaultof<JobRecord>
                             jobs.TryRemove(jobId, &removed) |> ignore
                             deadlineCancellation |> Option.iter (fun cancel -> cancel.Cancel())
                             proc.Dispose()
-                            Error(ExceptionError ex)
+                            Error(Client.ProcessSpawnFailed (sprintf "%s: %s" (ex.GetType().Name) ex.Message))
         with ex ->
             Error(ExceptionError ex)
 
@@ -831,6 +839,8 @@ let awaitScheduledCommandTerminal projectName (initial: RunCommandResult) deadli
                     | Running -> do! Task.Delay(100)
                     | Completed _ | TimedOut | Canceled | FailedToStart _ ->
                         outcome <- Some(Ok(result.Status, result.Truncated))
+                    | ToolFailed reason ->
+                        outcome <- Some(Error(Client.ProcessOutcomeUnknown (sprintf "process job %s exit observation failed: %s" jobId reason)))
                     | unexpected ->
                         outcome <- Some(Error(Client.ProcessOutcomeUnknown (sprintf "non-process job status %A for %s" unexpected jobId)))
             return outcome |> Option.defaultValue
@@ -856,10 +866,18 @@ let executeScheduledRunCommand
         match commandResult with
         | Error (Client.ProcessOutcomeUnknown reason) ->
             return Error("", "OutcomeUnknown: " + reason)
+        | Error (Client.ProcessSpawnFailed reason) ->
+            return Error("", "CommandSpawnFailed: " + reason)
+        | Error (Client.ValidationError reason) ->
+            return Error("", "ValidationError: " + reason)
+        | Error (Client.PermissionDenied reason) ->
+            return Error("", "PermissionDenied: " + reason)
         | Error (Client.ExceptionError ex) ->
-            return Error("", "CommandSpawnFailed: " + ex.Message)
+            // Serialization can fail AFTER the process was admitted.
+            // Generic exceptions do not establish a safe-to-retry boundary.
+            return Error("", "OutcomeUnknown: unproven command error: " + ex.GetType().Name)
         | Error error ->
-            return Error("", sprintf "%A" error)
+            return Error("", sprintf "OutcomeUnknown: unclassified command error: %A" error)
         | Ok responseJson ->
             try
                 let initial = JsonSerializer.Deserialize<RunCommandResult>(responseJson)

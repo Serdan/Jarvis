@@ -13,6 +13,7 @@ type EffectError =
     | GenericError of string
     | ValidationError of string
     | ContextError of string
+    | ProcessSpawnFailed of string
     | ProcessOutcomeUnknown of string
     | NotFoundError of string
     | PermissionDenied of string

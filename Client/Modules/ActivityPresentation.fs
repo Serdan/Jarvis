@@ -99,6 +99,7 @@ let shortError (error: EffectError) =
         | GenericError message -> "ExecutionFailed", message
         | ValidationError message -> "ValidationFailed", message
         | ContextError message -> "ExecutionFailed", message
+        | ProcessSpawnFailed message -> "ProcessSpawnFailed", message
         | Client.ProcessOutcomeUnknown message -> "OutcomeUnknown", message
         | NotFoundError resource -> "NotFound", resource
         | Client.PermissionDenied message -> "PermissionDenied", message

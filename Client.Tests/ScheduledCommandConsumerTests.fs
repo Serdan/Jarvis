@@ -174,7 +174,7 @@ let scheduledConsumerSeparatesDefiniteCommandErrorsFromUnknownEffects () = task 
     let definiteErrors : (Client.EffectError * string) list =
         [ Client.PermissionDenied "permission denied", "PermissionDenied"
           Client.ValidationError "invalid command", "ValidationError"
-          Client.ExceptionError (InvalidOperationException "executable could not be started"), "CommandSpawnFailed" ]
+          Client.ProcessSpawnFailed "verified OS start failed", "CommandSpawnFailed" ]
 
     for error, expectedKind in definiteErrors do
         let receive (_: RunCommandCommand) : Task<Client.Result<string>> =
@@ -185,7 +185,7 @@ let scheduledConsumerSeparatesDefiniteCommandErrorsFromUnknownEffects () = task 
         match result with
         | Error (_, reason) ->
             Assert.That(reason.Contains("OutcomeUnknown", StringComparison.Ordinal), Is.False,
-                        "Permission, validation and definite spawn errors must not be mislabeled as uncertain effects.")
+                        "Proven pre-start denial, validation, and typed spawn errors must remain definite.")
             Assert.That(reason.Contains(expectedKind, StringComparison.Ordinal), Is.True,
                         "The consumer must preserve the concrete definite failure class.")
         | other -> Assert.Fail(sprintf "A definite command error must remain an error, got %A" other)
@@ -364,5 +364,147 @@ let scheduledRunCommandTypedUnknownPersistsWithoutReplayingOneShot () = task {
             "The unknown outcome must survive reopening the isolated scheduler store.")
         Assert.That(starts, Is.EqualTo(1))
     finally
+        Directory.Delete(root, true)
+}
+
+
+[<Test>]
+let verifiedPreStartOsSpawnDenialRemainsDefiniteThroughScheduledConsumer () = task {
+    let root = createTempProject ()
+    let context = TestContext root
+    let executable = Path.Combine(root, "never-created-" + Guid.NewGuid().ToString("N"))
+    let command = scheduledCommand executable [] 5
+    let mutable admissions = 0
+    let mutable polls = 0
+
+    let receive (cmd: RunCommandCommand) : Task<Client.Result<string>> =
+        admissions <- admissions + 1
+        Task.FromResult(
+            JobManager.runManagedCommand cmd context
+            |> Result.map JsonSerializer.Serialize)
+    let awaitTerminal (_: string) (_: RunCommandResult) (_: int) =
+        polls <- polls + 1
+        Task.FromResult(Ok(JobStatus.Completed 0, false))
+
+    try
+        match JobManager.runManagedCommand command context with
+        | Error(Client.ProcessSpawnFailed _) -> ()
+        | other -> Assert.Fail(sprintf "The actual OS pre-start exception must be typed ProcessSpawnFailed, got %A" other)
+
+        let! result = execute receive awaitTerminal command
+        match result with
+        | Error ("", reason) when reason.StartsWith("CommandSpawnFailed:", StringComparison.Ordinal) -> ()
+        | other -> Assert.Fail(sprintf "A proven pre-start OS failure must not become uncertain, got %A" other)
+        Assert.That(admissions, Is.EqualTo(1))
+        Assert.That(polls, Is.EqualTo(0))
+    finally
+        Directory.Delete(root, true)
+}
+
+[<TestCase("post-start-serialization"); TestCase("unavailable-exit-code"); NonParallelizable>]
+let admittedProcessAdverseObservationsPersistUnknownWithoutReplay (fault: string) = task {
+    // Invoke the production scheduled RunCommand consumer from the actual
+    // scheduler action callback. The command is a real, single OS process;
+    // only the post-admission observation is fault-injected.
+    let root = createTempProject ()
+    let project = Path.Combine(root, "Project1")
+    let marker = Path.Combine(project, "admitted-effect.txt")
+    let scheduleFile = Path.Combine(root, "adverse-schedule.json")
+    let script = """System.IO.File.AppendAllText("admitted-effect.txt", "X")
+System.Threading.Thread.Sleep(600)
+"""
+    File.WriteAllText(Path.Combine(project, "admitted-effect.fsx"), script)
+    let context = TestContext root
+    let id = "adverse-run-command-" + fault
+    let mutable clock = DateTimeOffset.UtcNow
+    let mutable starts = 0
+    let mutable polls = 0
+    let mutable admittedJobId: string option = None
+
+    let status (service: Client.BrowserSchedules.Service) =
+        use document = JsonDocument.Parse(service.List())
+        document.RootElement.EnumerateArray()
+        |> Seq.find (fun item -> item.GetProperty("id").GetString() = id)
+        |> fun item -> item.GetProperty("status").GetString()
+
+    let action (scheduled: Client.BrowserSchedules.ScheduledAction) =
+        let command = scheduledCommand scheduled.Executable scheduled.CommandArgs scheduled.TimeoutSeconds
+        let receive (cmd: RunCommandCommand) : Task<Client.Result<string>> =
+            System.Threading.Interlocked.Increment(&starts) |> ignore
+            match JobManager.runManagedCommand cmd context with
+            | Error error -> Task.FromResult(Error error)
+            | Ok started ->
+                admittedJobId <- started.JobId
+                if fault = "post-start-serialization" then
+                    // Simulate the transport serializer failing AFTER OS admission.
+                    Task.FromResult(Error(Client.ExceptionError(
+                        JsonException("Injected response-serialization error after process admission"))))
+                else
+                    Task.FromResult(Ok(JsonSerializer.Serialize started))
+
+        let awaitTerminal (_: string) (_: RunCommandResult) (_: int) =
+            System.Threading.Interlocked.Increment(&polls) |> ignore
+            // The exact classifier used by Process.Exited must not claim a
+            // definite start failure when ExitCode is inaccessible.
+            let unverified = JobManager.statusAfterAdmittedProcessExit (fun () ->
+                raise (InvalidOperationException("Injected ExitCode read failure")))
+            match unverified with
+            | JobStatus.ToolFailed reason when reason.Contains("OutcomeUnknown", StringComparison.Ordinal) -> ()
+            | other -> Assert.Fail(sprintf "A started process with unverified ExitCode must be unknown, got %A" other)
+            Task.FromResult(Ok(unverified, false))
+
+        execute receive awaitTerminal command
+
+    let config: ScheduleExecutionCommand =
+        { ScheduleId = id; ProjectName = "Project1"; TriggerKind = "Once"
+          RunAfterSeconds = Some 600; RunAtUtc = None; RepeatEverySeconds = None
+          IdleAgentId = None; IdleSeconds = None
+          ActionKind = "RunCommand"; Executable = Some "dotnet"
+          Args = [ "fsi"; "--exec"; "admitted-effect.fsx" ]
+          WorkingDirectory = None; TimeoutSeconds = Some 20; MaxOutputBytes = Some 4096
+          WindowRegistration = None; Url = None; ScriptPath = None
+          ArgsJson = None; Alias = None; Active = None
+          CloseTabAfterExecution = None }
+
+    try
+        do! task {
+            use service = new Client.BrowserSchedules.Service(
+                scheduleFile, action, now=(fun () -> clock), pollMs=25)
+            Assert.That(service.ScheduleExecution(config).IsOk, Is.True)
+            service.Start()
+            clock <- clock.AddSeconds(601.)
+            let mutable observed = ""
+            let mutable attempts = 0
+            while observed <> "outcomeUnknown" && attempts < 400 do
+                do! Task.Delay(50)
+                observed <- status service
+                attempts <- attempts + 1
+            Assert.That(observed, Is.EqualTo("outcomeUnknown"),
+                "Neither post-admission fault may be classified as a definite failed spawn.")
+            Assert.That(starts, Is.EqualTo(1), "The scheduler must admit exactly one process.")
+            Assert.That(admittedJobId.IsSome, Is.True, "The actual OS process was admitted.")
+            Assert.That(polls, Is.EqualTo(if fault = "unavailable-exit-code" then 1 else 0))
+        }
+
+        let mutable markerAttempts = 0
+        while not (File.Exists(marker)) && markerAttempts < 600 do
+            do! Task.Delay(50)
+            markerAttempts <- markerAttempts + 1
+        Assert.That(File.Exists(marker), Is.True, "The admitted OS process must execute its external effect.")
+        Assert.That(File.ReadAllText(marker), Is.EqualTo("X"), "The external effect must occur once.")
+
+        use recovered = new Client.BrowserSchedules.Service(
+            scheduleFile, action, now=(fun () -> clock), pollMs=25)
+        Assert.That(status recovered, Is.EqualTo("outcomeUnknown"),
+            "The uncertain result must survive a fresh scheduler instance.")
+        recovered.Start()
+        clock <- clock.AddDays(2.)
+        do! Task.Delay(250)
+        Assert.That(status recovered, Is.EqualTo("outcomeUnknown"))
+        Assert.That(starts, Is.EqualTo(1), "An unknown one-shot must never be relaunched after recovery.")
+        Assert.That(File.ReadAllText(marker), Is.EqualTo("X"))
+    finally
+        admittedJobId |> Option.iter (fun jobId ->
+            JobManager.cancelJob { ProjectName = "Project1"; JobId = jobId } context |> ignore)
         Directory.Delete(root, true)
 }

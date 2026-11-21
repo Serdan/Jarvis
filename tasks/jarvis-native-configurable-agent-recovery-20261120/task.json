@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"jarvis-native-configurable-agent-recovery-20261120","title":"[P0] Native configurable deterministic Health recovery (default 600s)","version":3,"lifecycle":"InProgress","specVersion":2,"attemptId":"5d28cedb7a0d4f06843eae6a35698648"}
+{"schemaVersion":2,"taskId":"jarvis-native-configurable-agent-recovery-20261120","title":"[P0][Automation/Health] Native deterministic recovery \u2014 feature gate","version":4,"lifecycle":"InProgress","specVersion":3,"attemptId":"5d28cedb7a0d4f06843eae6a35698648"}

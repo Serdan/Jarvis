@@ -196,6 +196,7 @@ type WorkCompositionQueueTransactionTests() =
         Assert.That(LedgerStore.getOperationAt binding after op |> ok |> Option.isNone, Is.True)
 
     [<Test>]
+    [<Explicit("Frozen WQ02 release positive needs independent managed publisher trust root; HOLD")>]
     member _.OriginalWq04BlockedThenAcceptedGraphAndWq02ReleaseShareOneCASAndRevokeOnCancel() =
         withClones (fun a b workId ->
             let initial = request b workId Guid.Empty
@@ -259,6 +260,7 @@ type WorkCompositionQueueTransactionTests() =
             Assert.That(stillHeld.Works.[workId].State, Is.EqualTo(WorkState.Blocked)))
 
     [<Test>]
+    [<Explicit("Frozen WQ02 release race positive needs independent managed publisher trust root; HOLD")>]
     member _.TwoIndependentClonesRacingAcceptanceProduceOneWinnerWithExactUuidReplay() =
         withClones (fun a b workId ->
             Assert.That((WorkQueueGitLedger.load a |> ok |> snd).Works.[workId].State,
@@ -322,6 +324,7 @@ type WorkCompositionQueueTransactionTests() =
     [<TestCase("parent")>]
     [<TestCase("hard-edge")>]
     [<TestCase("ancestor-spec")>]
+    [<Explicit("Frozen WQ02 release positive needs independent managed publisher trust root; HOLD")>]
     member _.RelevantMutationAtomicallyRevokesOldStageAndReplaysExactOriginalUuid(kind: string) =
         withClones (fun a b workId ->
             let accepted = approvedChild a b
@@ -378,6 +381,7 @@ type WorkCompositionQueueTransactionTests() =
                             queueAfter.Works.[workId] graphAfter, Is.False))
 
     [<Test>]
+    [<Explicit("Frozen WQ02 release positive needs independent managed publisher trust root; HOLD")>]
     member _.DuplicateTaskLinkAfterReleaseIsRejectedOnCreateAndReviseAcrossTwoClones() =
         withClones (fun a b workId ->
             let accepted = approvedChild a b
@@ -464,6 +468,7 @@ type WorkCompositionQueueTransactionTests() =
                         Is.True))
 
     [<Test>]
+    [<Explicit("Frozen WQ02 release positive needs independent managed publisher trust root; HOLD")>]
     member _.UnrelatedGraphEditDoesNotRevokeVerifiedOriginalBinding() =
         withClones (fun a b workId ->
             let accepted = approvedChild a b
@@ -484,6 +489,7 @@ type WorkCompositionQueueTransactionTests() =
 
 
     [<Test>]
+    [<Explicit("Frozen WQ02 release positive needs independent managed publisher trust root; HOLD")>]
     member _.DependencyBlockedStageGainsNonWakingGraphHoldInGraphCas() =
         withClones (fun a b workId ->
             let accepted = approvedChild a b
@@ -534,6 +540,7 @@ type WorkCompositionQueueTransactionTests() =
                         Is.EqualTo(GateState.CompositionHold("dependent", dependent.SpecVersion))))
 
     [<Test>]
+    [<Explicit("Cancelled ancestor release-order test needs independent managed publisher trust root; HOLD")>]
     member _.CancelledParentMustNotReleaseHeldOriginalWq04StageWhenPrerequisiteBecomesAccepted() =
         withClones (fun a b workId ->
             let approved = approvedChild a b
@@ -604,3 +611,40 @@ type WorkCompositionQueueTransactionTests() =
                         Is.EqualTo(GateState.CompositionHold("dependent", 2)))
             Assert.That(Contracts.orderAvailable blocked |> ok
                         |> List.exists (fun stage -> stage.Id = workId), Is.False))
+
+
+    [<Test>]
+    member _.AuthenticatedPublisherAuthorityHoldMustNotReleaseOriginalWq02OrMintGraphCAS() =
+        // Genuine independently reviewed S, genuine bounded non-force push,
+        // and a canonical completion still do not authenticate the publisher
+        // to the composition reader. This is a real disposable two-clone Git
+        // regression. It must not alter either graph or held original WQ02.
+        withClones (fun a b workId ->
+            let submissionId = approvedChild a b
+            let source = request a workId submissionId
+            let before = LedgerStore.fetch a |> ok
+            let graphBefore, _ = WorkCompositionGitLedger.loadAt a before |> ok
+            let queueBefore = WorkQueueGitLedger.loadAt a before |> ok
+            let operationId = Guid.NewGuid()
+            for binding in [ b; a ] do
+                match WorkCompositionQueueTransaction.acceptAndRelease
+                        binding "Fixture" operationId source with
+                | Error(PublisherProvenanceUnavailable reason)
+                    when reason.Contains("authenticated publisher") -> ()
+                | other ->
+                    Assert.Fail(sprintf "Untrusted managed publisher released WQ02: %A" other)
+            let after = LedgerStore.fetch b |> ok
+            let graphAfter, _ = WorkCompositionGitLedger.loadAt b after |> ok
+            let queueAfter = WorkQueueGitLedger.loadAt b after |> ok
+            Assert.That(after.Commit, Is.EqualTo(before.Commit))
+            Assert.That(after.Header.NextSequence, Is.EqualTo(before.Header.NextSequence))
+            Assert.That(graphAfter, Is.EqualTo(graphBefore))
+            Assert.That(queueAfter, Is.EqualTo(queueBefore))
+            Assert.That(WorkComposition.currentAcceptance graphAfter "prerequisite", Is.EqualTo(None))
+            Assert.That(queueAfter.Works.[workId].State, Is.EqualTo(WorkState.Blocked))
+            Assert.That(
+                queueAfter.Works.[workId].Gate,
+                Is.EqualTo(GateState.CompositionHold("dependent", 2)))
+            match LedgerStore.getOperationAt a after operationId with
+            | Ok None -> ()
+            | other -> Assert.Fail(sprintf "HOLD recorded queue-release operation: %A" other))

@@ -137,6 +137,15 @@ module WorkCompositionAcceptanceAdapter =
                         submission.TargetRef submission.TargetHeadAtSubmission
                         submission.SubmittedCommit submission.IntegratedCommit
                         submission.PublicationPreviousHead submission.PublicationObservedHead
+            // Local Git push output is not independently authenticated history.
+            // Even the original immutable CompleteIntegration operation and
+            // exact v1 fields are mintable by generic LedgerStore.transact.
+            // OriginalGitWriterAdmissionJournal is local/default-off and has
+            // no independently verified cross-client publisher authority.
+            // Keep managed composition acceptance closed until an external,
+            // durable trust root can authenticate this exact publisher effect.
+            return! Error(PublisherProvenanceUnavailable
+                "Managed integration lacks independently authenticated publisher execution proof.")
     }
 
     let internal checkAt (binding: LedgerBinding) (snapshot: LedgerSnapshot)

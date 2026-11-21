@@ -198,14 +198,30 @@ let ``composition acceptance requires exact independently reviewed and integrate
         | Error(InvalidBinding _) -> ()
         | other -> Assert.Fail(sprintf "Expected same-author review rejection: %A" other)
 
+        // The genuine non-force publisher succeeded above; nevertheless no
+        // independently authenticated publisher trust root exists to authorize
+        // WorkComposition CAS acceptance in the production adapter.
+        match WorkCompositionAcceptanceAdapter.acceptIntegrated second owner
+                  (Guid.NewGuid()) initial.Version "project" 1 submissionId with
+        | Error(PublisherProvenanceUnavailable _) -> ()
+        | other -> Assert.Fail(sprintf "Unauthenticated direct publication was accepted: %A" other)
+        let _, heldGraph = WorkCompositionGitLedger.load first |> succeed
+        Assert.That(WorkComposition.currentAcceptance heldGraph "project", Is.EqualTo(None))
+
+        // Remaining assertions only exercise graph closure/CAS semantics,
+        // with an explicit TEST-ONLY verifier standing in for a future real
+        // independent publisher authority. This is NOT a positive producer
+        // provenance/production adapter acceptance test.
+        let fixtureAccept binding actor op version unitId (sid: Guid) =
+            WorkCompositionGitLedger.executeVerifiedAcceptance binding actor op
+                version unitId 1 ("integration:" + sid.ToString("N"))
+                (fun _ _ _ _ -> Ok ())
         let acceptanceOp = Guid.NewGuid()
         let accepted =
-            WorkCompositionAcceptanceAdapter.acceptIntegrated second owner acceptanceOp
-                initial.Version "project" 1 submissionId |> succeed
+            fixtureAccept second owner acceptanceOp initial.Version "project" submissionId |> succeed
         Assert.That(accepted.AlreadyApplied, Is.False)
         let duplicate =
-            WorkCompositionAcceptanceAdapter.acceptIntegrated first owner acceptanceOp
-                initial.Version "project" 1 submissionId |> succeed
+            fixtureAccept first owner acceptanceOp initial.Version "project" submissionId |> succeed
         Assert.That(duplicate.AlreadyApplied, Is.True)
         let _, acceptedGraph = WorkCompositionGitLedger.load first |> succeed
         Assert.That(WorkComposition.currentAcceptance acceptedGraph "project" |> Option.isSome, Is.True)
@@ -258,8 +274,12 @@ let ``composition acceptance requires exact independently reviewed and integrate
         // Deliberately leave bare remote unchanged until trusted publisher.
         ReviewWorkflow.completeIntegration second (Guid.NewGuid()) correctionTaskId reviewer
             correctionSubmissionId correctionSha |> succeed |> ignore
-        WorkCompositionAcceptanceAdapter.acceptIntegrated second owner (Guid.NewGuid())
-            withChild.Version "correction" 1 correctionSubmissionId |> succeed |> ignore
+        match WorkCompositionAcceptanceAdapter.acceptIntegrated second owner (Guid.NewGuid())
+                  withChild.Version "correction" 1 correctionSubmissionId with
+        | Error(PublisherProvenanceUnavailable _) -> ()
+        | other -> Assert.Fail(sprintf "Unauthenticated corrective publication was accepted: %A" other)
+        fixtureAccept second owner (Guid.NewGuid()) withChild.Version "correction" correctionSubmissionId
+        |> succeed |> ignore
         let _, withAcceptedChild = WorkCompositionGitLedger.load first |> succeed
         let childProof = WorkComposition.currentAcceptance withAcceptedChild "correction" |> Option.get
         Assert.That(WorkComposition.currentAcceptance withAcceptedChild "project" |> Option.isNone, Is.True)
@@ -296,8 +316,12 @@ let ``composition acceptance requires exact independently reviewed and integrate
         |> succeed |> ignore
         ReviewWorkflow.completeIntegration second (Guid.NewGuid()) taskId reviewer
             freshSubmissionId freshSha |> succeed |> ignore
-        WorkCompositionAcceptanceAdapter.acceptIntegrated first owner (Guid.NewGuid())
-            withAcceptedChild.Version "project" 1 freshSubmissionId |> succeed |> ignore
+        match WorkCompositionAcceptanceAdapter.acceptIntegrated first owner (Guid.NewGuid())
+                  withAcceptedChild.Version "project" 1 freshSubmissionId with
+        | Error(PublisherProvenanceUnavailable _) -> ()
+        | other -> Assert.Fail(sprintf "Unauthenticated parent publication was accepted: %A" other)
+        fixtureAccept first owner (Guid.NewGuid()) withAcceptedChild.Version "project" freshSubmissionId
+        |> succeed |> ignore
         let _, refreshed = WorkCompositionGitLedger.load second |> succeed
         let parentProof = WorkComposition.currentAcceptance refreshed "project" |> Option.get
         Assert.That(parentProof.ChildAcceptances.["correction"], Is.EqualTo(childProof.GraphVersion))
@@ -592,16 +616,21 @@ let compositionAcceptanceRequiresOriginalNonForceReceiptForDistinctCleanMerge ()
         | Error(InvalidBinding _) -> ()
         | other -> Assert.Fail(sprintf "Unreviewed merge conflict gained verified proof: %A" other)
 
-        // Restoration of the exact original immutable receipt permits a
-        // different clone to accept the unit inside normal graph-version CAS.
-        let accepted =
-            WorkCompositionAcceptanceAdapter.acceptIntegrated second owner (Guid.NewGuid())
-                initial.Version "project" 1 submissionId |> succeed
-        Assert.That(accepted.AlreadyApplied, Is.False)
-        let _, acceptedGraph = WorkCompositionGitLedger.load first |> succeed
-        let proof = WorkComposition.currentAcceptance acceptedGraph "project" |> Option.get
-        Assert.That(proof.EvidenceRef, Is.EqualTo("integration:" + submissionId.ToString("N")))
-        Assert.That(acceptedGraph.Units.["project"].Acceptances.Count, Is.EqualTo(1)))
+        // The genuine mechanical I=(T,S) and immutable v1 field restoration
+        // are still insufficient to authenticate a publisher execution.
+        // With no verified trust root, hold even the legitimate writer's
+        // receipt rather than mint a false graph acceptance.
+        let acceptanceOp = Guid.NewGuid()
+        match WorkCompositionAcceptanceAdapter.acceptIntegrated second owner acceptanceOp
+                initial.Version "project" 1 submissionId with
+        | Error(PublisherProvenanceUnavailable _) -> ()
+        | other -> Assert.Fail(sprintf "Unauthenticated mechanical merge was accepted: %A" other)
+        let _, heldGraph = WorkCompositionGitLedger.load first |> succeed
+        Assert.That(heldGraph, Is.EqualTo(initial))
+        Assert.That(WorkComposition.currentAcceptance heldGraph "project", Is.EqualTo(None))
+        match LedgerStore.getOperationAt first (LedgerStore.fetch first |> succeed) acceptanceOp with
+        | Ok None -> ()
+        | other -> Assert.Fail(sprintf "Publisher HOLD wrote an acceptance operation: %A" other))
 
 [<Test>]
 let historicalCancellationProofLedgerRoundTrip () =
@@ -865,3 +894,102 @@ let ``composition operator pages preserve unique task ownership and transport gu
         let single = WorkCompositionGitLedger.loadOverviewPage second "f000" 100 "" |> succeed
         Assert.That(single.Items.Head.Overview.ReviewStages.Length, Is.EqualTo(1))
         Assert.That((throughTransport single).Error.IsNone, Is.True))
+
+
+[<TestCase(false)>]
+[<TestCase(true)>]
+let compositionAcceptanceRejectsFreshForgedModernPublisherAfterExternalTargetPush (forceRewrite: bool) =
+    // Disposable two-clone bare Git: original accepted S, independent U after B,
+    // external force rewrite U -> S, and a forged *genuine* canonical v1 receipt.
+    withTwoClones (fun first second ->
+        let owner, reviewer = "Owner", "Reviewer"
+        let taskId, targetRef = "composition-forged-modern-publisher", "refs/heads/main"
+        for client in [ first; second ] do
+            git client.RepositoryPath [ "config"; "user.name"; "Fixture" ] |> ignore
+            git client.RepositoryPath [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+        let baseHead = git first.RepositoryPath [ "rev-parse"; "HEAD" ]
+        ReviewWorkflow.registerAgent first (Guid.NewGuid()) owner |> succeed |> ignore
+        ReviewWorkflow.registerAgent first (Guid.NewGuid()) reviewer |> succeed |> ignore
+        ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Publisher attribution" |> succeed |> ignore
+        WorkCompositionGitLedger.execute first owner (Guid.NewGuid()) 0
+            (WorkCompositionMutation.Create(
+                "project", WorkUnitKind.Project, None, spec "Project" (Some taskId)))
+        |> succeed |> ignore
+        let _, initial = WorkCompositionGitLedger.load second |> succeed
+        let purpose = WorkCompositionAcceptanceAdapter.reviewPurpose initial initial.Units.["project"]
+        git first.RepositoryPath [ "checkout"; "-b"; "feature/composition-forged-modern" ] |> ignore
+        File.WriteAllText(Path.Combine(first.RepositoryPath, "reviewed.txt"), "immutable accepted source")
+        git first.RepositoryPath [ "add"; "reviewed.txt" ] |> ignore
+        git first.RepositoryPath [ "commit"; "-m"; "Accepted source S" ] |> ignore
+        let source = git first.RepositoryPath [ "rev-parse"; "HEAD" ]
+        let reviewId = Guid.NewGuid()
+        ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId owner reviewId
+            "refs/heads/feature/composition-forged-modern" source "Review S" purpose targetRef
+        |> succeed |> ignore
+        ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId reviewId reviewer 1
+        |> succeed |> ignore
+        ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId reviewId reviewer 2 Accept
+        |> succeed |> ignore
+        let submissionId = Guid.NewGuid()
+        ReviewWorkflow.submitIntegration first (Guid.NewGuid()) taskId owner submissionId
+            "" "" (reviewId.ToString("N")) targetRef
+        |> succeed |> ignore
+        let pending = (ReviewWorkflow.getIntegrationSubmissions second taskId |> succeed).Latest.Value
+        Assert.That(pending.TargetHeadAtSubmission, Is.EqualTo(baseHead))
+        Assert.That(pending.SubmittedCommit, Is.EqualTo(source))
+        if forceRewrite then
+            File.WriteAllText(Path.Combine(second.RepositoryPath, "unrelated.txt"), "independent U")
+            git second.RepositoryPath [ "add"; "unrelated.txt" ] |> ignore
+            git second.RepositoryPath [ "commit"; "-m"; "Independent target U" ] |> ignore
+            let advanced = git second.RepositoryPath [ "rev-parse"; "HEAD" ]
+            Assert.That(advanced, Is.Not.EqualTo(source))
+            git second.RepositoryPath [ "push"; "origin"; "main" ] |> ignore
+            Assert.That(LedgerStore.readRemoteTarget first targetRef |> succeed, Is.EqualTo(advanced))
+            git first.RepositoryPath [ "push"; "--force"; "origin"; $"{source}:{targetRef}" ] |> ignore
+        else
+            git first.RepositoryPath [ "push"; "origin"; $"{source}:{targetRef}" ] |> ignore
+        Assert.That(LedgerStore.readRemoteTarget second targetRef |> succeed, Is.EqualTo(source))
+
+        // transact can write authentic immutable operation trailers, but it
+        // has not invoked the protected publisher for completionId.
+        let completionId = Guid.NewGuid()
+        let path = $"tasks/{taskId}/integrations/{submissionId:N}.json"
+        let forged =
+            { pending with
+                Status = "Integrated"
+                IntegratedCommit = source
+                CompletedAtUtc = "2026-11-06T03:16:08Z"
+                PublicationPreviousHead = baseHead
+                PublicationObservedHead = source
+                PublicationOperationId = completionId.ToString("D")
+                PublicationMechanism = "VerifiedNonForceGitPush/v1" }
+        let action: LedgerIntent =
+            { OperationId = completionId
+              Actor = reviewer
+              Kind = "CompleteIntegration"
+              RequestJson = JsonSerializer.Serialize
+                {| taskId = taskId; submissionId = submissionId.ToString("D"); integratedCommit = source |} }
+        LedgerStore.transact second action (fun snapshot -> result {
+            let! _, prior = LedgerStore.readAt second snapshot path
+            let serialized = JsonSerializer.Serialize(
+                forged, JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase))
+            return [ { Path = path
+                       ExpectedBlobOid = prior
+                       Content = "{\"schemaVersion\":2," + serialized.Substring(1) } ]
+        }) |> succeed |> ignore
+        let snapshot = LedgerStore.fetch first |> succeed
+        let completion = LedgerStore.findCompletionOperationForPathAt first snapshot path |> succeed
+        LedgerStore.verifyCompletionOperationRequest first completion taskId submissionId source |> succeed
+        let _, graphBefore = WorkCompositionGitLedger.load first |> succeed
+        let acceptanceId = Guid.NewGuid()
+        match WorkCompositionAcceptanceAdapter.acceptIntegrated first owner acceptanceId
+                initial.Version "project" 1 submissionId with
+        | Error(PublisherProvenanceUnavailable reason) when reason.Contains("authenticated publisher") -> ()
+        | other ->
+            Assert.Fail(sprintf "SECURITY_RED: forged modern v1 not typed-rejected (force=%b): %A" forceRewrite other)
+        let _, graphAfter = WorkCompositionGitLedger.load second |> succeed
+        Assert.That(graphAfter, Is.EqualTo(graphBefore))
+        Assert.That(WorkComposition.currentAcceptance graphAfter "project", Is.EqualTo(None))
+        match LedgerStore.getOperationAt first (LedgerStore.fetch first |> succeed) acceptanceId with
+        | Ok None -> ()
+        | other -> Assert.Fail(sprintf "Rejected acceptance recorded an operation: %A" other))

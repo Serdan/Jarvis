@@ -20,6 +20,7 @@ type LedgerFailure =
     | StaleEntityVersion of string
     | OperationIdReused
     | OutcomeUnknown of string
+    | PublisherProvenanceUnavailable of string
     | LedgerContended
     | TrustBindingContended of string
     | GitFailure of string

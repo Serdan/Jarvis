@@ -13,7 +13,7 @@ At `22e2ea77` the exact-home `chrome.tabs.get` inspection is now **before** the 
 - Independently ran `node --test browser-extension/tests/bridge.test.cjs` against the exact registered frozen source: **85/85 passed**, exit 0, timeout false. This includes the two newly added deterministic tests: late operator opt-out, and disable/re-enable authorization-epoch ABA, each asserting **one read-only focus probe, zero project-script executions and debugger detach**.
 - The same 85-test run also passes active-to-background focus, denied debugger, visibility proof failure, route drift after attachment and between tab preflight/in-frame wrapper, stale-registration/host-permission/window checks, and no-debugger other-origin execution.
 - `git diff --check b7033b4b7bcdee0936cf7239a625a4ecaccf3257 22e2ea77c4f3f63df27d0efdac0e7a0543259f00`: exit 0, no output. `git status` on exact worktree: clean.
-- A broad `node --test browser-extension/tests` job was initiated separately; its result is not claimed until observed terminal. Narrow negative suite above is definitive for this bounded review.
+- Independently ran broader `node --test browser-extension/tests` on the exact frozen worktree: OS exit **0**, `TimedOut=false`, stderr empty. The runner capped/truncated test output, so no total test count is claimed for this broader run.
 
 ## Limits
 

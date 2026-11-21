@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"jarvis-p1-mcp-response-alert-nonblocking-20261120","title":"[P1] Remove synchronous Git fetch from routine MCP replies without weakening STOP alerts","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"a92d1a41cb34409ea8d36f0765b9a174"}
+{"schemaVersion":2,"taskId":"jarvis-p1-mcp-response-alert-nonblocking-20261120","title":"[P1] Remove synchronous Git fetch from routine MCP replies without weakening STOP alerts","version":3,"lifecycle":"InProgress","specVersion":2,"attemptId":"a92d1a41cb34409ea8d36f0765b9a174"}

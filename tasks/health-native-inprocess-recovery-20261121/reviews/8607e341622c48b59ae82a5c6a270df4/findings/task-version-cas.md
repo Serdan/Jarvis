@@ -1,0 +1,7 @@
+# Task version is not fenced by recovery CAS
+
+Severity: P1 (original exact-version acceptance requirement). Frozen source db01a9c9aecec1bf639eba921f3abaf88bea207c.
+
+`NativeHealth.current` rechecks the candidate, including `TaskVersion`, and `NativeHealth.recover` puts it in `ExpectedTaskVersion` (NativeHealth.fs:285–309). However, TaskApi's RecoverAgentAssignment branch passes only attempt version, agent version and generation to `recoverAgentAssignmentAs` (OrchestrationApi.fs:2671–2675). That workflow reads the task but checks lifecycle, not its version, and does not put the task OID in its write set (ReviewWorkflow.fs:2594–2626). If an independent writer changes the task version after `current` and before the transaction, while leaving lifecycle, attempt and agent versions eligible, recovery can still succeed against that changed task. Git CAS retries on the new ledger head do not impose the omitted task precondition. This violates the task's explicit requirement to skip on changed state/version and invoke recovery with exact task/attempt/owner/generation versions; the task spec's assertion that the existing workflow checks task version is not borne out by source.
+
+Candidate remedy: establish the task-version precondition inside the canonical recovery transaction (or equivalent existing CAS authority), and add a two-client regression that changes only the task version between recheck and mutation. This is a finding for independent adjudication, not a mandate for a particular design.

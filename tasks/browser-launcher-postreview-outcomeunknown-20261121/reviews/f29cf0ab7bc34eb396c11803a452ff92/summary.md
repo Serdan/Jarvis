@@ -1,0 +1,1 @@
+Synthetic Edge about:blank proof; isolated source 291df407 parent b7033b4b; 17 trusted transport fixtures, 83 bridge fixtures, 6 popup fixtures all green; launcher fixture suite exit 0. No authenticated send. Gate requires separate focus+synthetic real canary failure and human permission approval.

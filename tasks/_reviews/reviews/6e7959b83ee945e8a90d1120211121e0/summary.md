@@ -1,0 +1,1 @@
+Source-only two-file patch on isolated branch; .NET11 Release focused tests: AgentsDashboardReadsCanonicalReadyInsteadOfSourceBranchTaskFiles 1/1, EntityReadersRejectUnknownPhaseAndMissingSchema 1/1, git diff --check clean. Inspect exact 2222f6e6 SHA, path filter, new real subscription dashboard test and possible bypass/negative cases; no main write or deployment.

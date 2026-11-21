@@ -123,11 +123,16 @@ async function execute(args) {
   const activeMenuControl = selector => Array.from(modelMenu()?.querySelectorAll(selector) || [])
     .find(item => !item.closest('[aria-hidden="true"],[inert]')) || null;
   const attempts = [];
-  const selectionDeadline = deadline - 4500;
+  // Selection and React hydration can consume nearly the whole UI budget.
+  // Reserve up to eight seconds after Send for the actual user bubble and
+  // server-issued route, especially on slow background tabs. Preserve the
+  // original three-second floor for deliberately short fixture timeouts.
+  const acknowledgementReserveMs = Math.min(8000, Math.max(3000, overallMs - 12000));
+  const selectionDeadline = deadline - acknowledgementReserveMs - 1500;
   // A slow composer must never use the time needed to confirm a Send and
   // capture the server-issued conversation route. After Send, the effect
   // is uncertain until confirmed and must never be replayed.
-  const preSendDeadline = deadline - 3000;
+  const preSendDeadline = deadline - acknowledgementReserveMs;
   let selected = null;
 
   const choose = async (target, untilAt) => {

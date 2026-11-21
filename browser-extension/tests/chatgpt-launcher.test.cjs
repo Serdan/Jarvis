@@ -687,6 +687,17 @@ test("an absent Send control cannot bypass the overall deadline", async () => {
   assert.equal(h.virtualClockState.now, 2100);
 });
 
+test("full launch budget keeps eight seconds exclusively for post-Send evidence", async () => {
+  const h = harness({ timeoutMs: 22000, virtualClock: true, noSend: true });
+  const result = await h.run("No Send; leave time for server route");
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.reason, "SendUnavailable");
+  assert.equal(h.clicks, 0);
+  // Harness adds 5000ms: 27000 overall; selection+composer deadline 19000.
+  // No late Send is attempted during the final 8000ms acknowledgement reserve.
+  assert.equal(h.virtualClockState.now, 19000);
+});
+
 test("a conversation appearing while mode controls hydrate cannot have its mode changed", async () => {
   const h = harness({
     initialMode: "Work",

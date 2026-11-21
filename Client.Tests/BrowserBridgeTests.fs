@@ -938,7 +938,8 @@ let everyBrowserCommandHasSafeActivityDetail () =
           BrowserListWindowsCommand
           ScheduleBrowserExecutionCommand {
               ScheduleId = "test"; RunAfterSeconds = 1; Url = "https://example.test"
-              ProjectName = "Jarvis"; ScriptPath = "test.js"; ArgsJson = None
+              ProjectName = "Jarvis"; SourceProjectName = None
+              ScriptPath = "test.js"; ArgsJson = None
               Alias = None; Active = None; WindowRegistration = Some "agents"
               CloseTabAfterExecution = None; RepeatEverySeconds = None }
           ListScheduledBrowserExecutionsCommand

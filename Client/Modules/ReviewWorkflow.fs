@@ -499,8 +499,10 @@ module ReviewWorkflow =
                         not (Attribute.IsDefined(property, typeof<System.Text.Json.Serialization.JsonIgnoreAttribute>)))
                     |> Array.map (fun property -> options.PropertyNamingPolicy.ConvertName(property.Name))
                 // Historical schema-v2 integrations lack all five managed-ref
-                // evidence fields. Historical schema-v3 reviews lack both pinned
-                // source fields. Accept only these exact, all-absent shapes:
+                // evidence fields, and integration receipts written before the
+                // managed publisher lack all four publication-proof fields.
+                // Historical schema-v3 reviews lack both pinned source fields.
+                // Accept only these exact, all-absent field groups:
                 // incomplete or mixed provenance must continue to fail closed.
                 let historicalEvidenceFields =
                     if typeof<'t> = typeof<IntegrationSubmission> then
@@ -514,6 +516,16 @@ module ReviewWorkflow =
                     && (historicalEvidenceFields |> List.forall (fun name ->
                         let mutable ignored = Unchecked.defaultof<JsonElement>
                         not (root.TryGetProperty(name, &ignored))))
+                let historicalPublicationFields =
+                    if typeof<'t> = typeof<IntegrationSubmission> then
+                        [ "publicationPreviousHead"; "publicationObservedHead"
+                          "publicationOperationId"; "publicationMechanism" ]
+                    else []
+                let historicalPublicationShape =
+                    not (List.isEmpty historicalPublicationFields)
+                    && (historicalPublicationFields |> List.forall (fun name ->
+                        let mutable ignored = Unchecked.defaultof<JsonElement>
+                        not (root.TryGetProperty(name, &ignored))))
                 let complete =
                     required |> Array.forall (fun property ->
                         let mutable memberValue = Unchecked.defaultof<JsonElement>
@@ -522,6 +534,7 @@ module ReviewWorkflow =
                         // were already stored. Missing means same-project; all
                         // other notification members remain mandatory.
                         || (historicalEvidenceShape && List.contains property historicalEvidenceFields)
+                        || (historicalPublicationShape && List.contains property historicalPublicationFields)
                         || (typeof<'t> = typeof<AgentNotification>
                             && property = "fromProjectName")
                         || (typeof<'t> = typeof<TaskLifecycleEvent>

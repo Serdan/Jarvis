@@ -475,7 +475,10 @@ type ReviewWorkflowTests() =
             |> success |> ignore
             let fields =
                 [ "reviewRef"; "reviewVersion"; "reviewedHeadOid"
-                  "integrationRef"; "targetHeadAtSubmission" ]
+                  "integrationRef"; "targetHeadAtSubmission"
+                  // Original v2 receipts predate managed non-force publication.
+                  "publicationPreviousHead"; "publicationObservedHead"
+                  "publicationOperationId"; "publicationMechanism" ]
             let options =
                 System.Text.Json.JsonSerializerOptions(
                     PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase)
@@ -520,6 +523,9 @@ type ReviewWorkflowTests() =
                 isNull item.IntegrationRef && isNull item.ReviewRef
                 && item.ReviewVersion = 0 && isNull item.ReviewedHeadOid
                 && isNull item.TargetHeadAtSubmission), Is.True)
+            Assert.That(summary.Submissions |> List.forall (fun item ->
+                isNull item.PublicationPreviousHead && isNull item.PublicationObservedHead
+                && isNull item.PublicationOperationId && isNull item.PublicationMechanism), Is.True)
             let inbox = ReviewWorkflow.getAgentInbox second "Owner" |> success
             Assert.That(inbox.IntegrationSubmissions.Length, Is.EqualTo(2))
             Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(before),
@@ -535,6 +541,60 @@ type ReviewWorkflowTests() =
             match ReviewWorkflow.getIntegrationSubmissions second taskId with
             | Error(LedgerIntegrityError _) -> ()
             | other -> Assert.Fail(sprintf "Partial managed evidence was accepted: %A" other)
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(corruptHead)))
+    [<Test>]
+    member _.HistoricalIntegrationPublisherFieldsMustBeAllPresentOrAllAbsent() =
+        withFixture (fun _ _ first second baseOid sourceRef _ _ ->
+            let taskId = "historical-publication-proof-v2"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Historical publisher-proof fields"
+            |> success |> ignore
+            let options =
+                System.Text.Json.JsonSerializerOptions(
+                    PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase)
+            let makeReceipt (submissionId: Guid) partial =
+                let value : IntegrationSubmission =
+                    { SubmissionId = submissionId.ToString("N"); TaskId = taskId
+                      ActorId = "Owner"; SourceRef = sourceRef
+                      SubmittedCommit = baseOid; ReviewId = Guid.NewGuid().ToString("N")
+                      ReviewRef = sourceRef; ReviewVersion = 1; ReviewedHeadOid = baseOid
+                      IntegrationRef = sourceRef; TargetHeadAtSubmission = baseOid
+                      TargetRef = sourceRef; Status = "Pending"; CreatedSequence = 8L
+                      IntegratedCommit = null; CompletedAtUtc = null
+                      PublicationPreviousHead = null; PublicationObservedHead = null
+                      PublicationOperationId = null; PublicationMechanism = null }
+                let node = System.Text.Json.Nodes.JsonNode.Parse(
+                    System.Text.Json.JsonSerializer.Serialize(value, options)).AsObject()
+                node["schemaVersion"] <- System.Text.Json.Nodes.JsonValue.Create(2)
+                for name in
+                    [ "publicationPreviousHead"; "publicationObservedHead"
+                      "publicationOperationId"; "publicationMechanism" ] do
+                    Assert.That(node.Remove(name), Is.True)
+                if partial then
+                    node["publicationMechanism"] <- System.Text.Json.Nodes.JsonValue.Create(
+                        "VerifiedNonForceGitPush/v1")
+                node.ToJsonString()
+            let put submissionId content =
+                let path = $"tasks/{taskId}/integrations/{submissionId:N}.json"
+                let change : LedgerFileChange =
+                    { Path = path; ExpectedBlobOid = None; Content = content }
+                let intent : LedgerIntent =
+                    { OperationId = Guid.NewGuid(); Actor = "Fixture"
+                      Kind = "HistoricalPublisherEvidenceFixture"; RequestJson = "{}" }
+                LedgerStore.transact first intent (fun _ -> Ok [ change ])
+                |> success |> ignore
+            let validId = Guid.NewGuid()
+            put validId (makeReceipt validId false)
+            let before = (LedgerStore.fetch first |> success).Commit
+            let accepted = ReviewWorkflow.getIntegrationSubmissions second taskId |> success
+            Assert.That(accepted.Submissions.Length, Is.EqualTo(1))
+            Assert.That(accepted.Latest.Value.PublicationMechanism, Is.Null)
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(before))
+            let partialId = Guid.NewGuid()
+            put partialId (makeReceipt partialId true)
+            let corruptHead = (LedgerStore.fetch first |> success).Commit
+            match ReviewWorkflow.getIntegrationSubmissions second taskId with
+            | Error(LedgerIntegrityError _) -> ()
+            | other -> Assert.Fail(sprintf "Partial publisher evidence was accepted: %A" other)
             Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(corruptHead)))
     [<Test>]
     member _.HistoricalSchemaThreeReviewsRemainReadableWithoutInventingPinnedSourceEvidence() =

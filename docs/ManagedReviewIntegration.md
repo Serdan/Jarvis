@@ -77,10 +77,15 @@ push. If the target races, re-fetch, recompose, re-test and use a fresh
 completion operation; do not force or replay an uncertain effect.
 
 The direct fast-forward case passes `<reviewedSha>` as the completion
-SHA. A distinct integration commit has exactly two parents: first, a
-descendant of `TargetHeadAtSubmission`, and second, the immutable
-`SubmittedCommit`. Its tree must equal Git's conflict-free mechanical
-merge. All integrity-bearing Git commands disable local replacement refs
+SHA. A distinct integration commit has exactly two parents: first,
+**the exact currently advertised remote target SHA at the publication
+boundary** (which must descend from `TargetHeadAtSubmission`), and second,
+the immutable `SubmittedCommit`. An unpublished target-side descendant
+is not authorized merely because it has the right ancestry: that would
+smuggle unreviewed extra edits through an invented first parent. The
+prepared SHA must be recomposed if the real target changes. Its tree
+must equal Git's conflict-free mechanical merge. All integrity-bearing
+Git commands disable local replacement refs
 and refuse local graft/shallow/alternate object overlays.
 If conflict resolution or nonmechanical changes are necessary, obtain a focused
 independent integration-specific review before publication. The present

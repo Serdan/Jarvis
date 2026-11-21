@@ -2372,6 +2372,21 @@ module LedgerStore =
             if previousHead = integratedCommit then
                 return! Error(InvalidBinding
                     "Remote target already contains the proposed tip without a verified publisher receipt.")
+            // A clean merge tree alone does not authorize an unpublished
+            // target-side parent. An attacker could insert arbitrary new files
+            // into a local descendant T3 of remote T2, mechanically merge
+            // (T3,S), then publish that as if T3 were approved target history.
+            // The merge's first parent MUST equal the currently advertised
+            // remote target from this exact publication attempt. An advance
+            // or unpublished parent requires recomposition against new T.
+            if integratedCommit <> submittedCommit then
+                do! ensureUnmodifiedGitHistory binding.RepositoryPath
+                let! actualFirstParent =
+                    run binding.RepositoryPath
+                        [ "rev-parse"; "--verify"; $"{integratedCommit}^1" ]
+                if actualFirstParent <> previousHead then
+                    return! Error(InvalidBinding
+                        "Prepared integration first parent does not equal the current remote target; recompose and retest.")
             // These checks are against the immediately observed remote head,
             // not the target snapshot captured when source was reviewed.
             do! verifySourceAncestry binding targetHeadAtSubmission previousHead

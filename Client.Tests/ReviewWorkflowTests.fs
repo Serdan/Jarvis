@@ -2080,6 +2080,28 @@ type ReviewWorkflowTests() =
                 git two [ "push"; "--force"; "origin"; targetHead + ":" + target ] |> ignore
             Assert.That((ReviewWorkflow.getIntegrationSubmissions second taskId |> success).Latest.Value.Status,
                         Is.EqualTo("Pending"))
+            // Unpublished target-parent injection: every individual Git
+            // merge/tree/ancestry proof is mechanically sound, but the caller
+            // attempts to smuggle arbitrary extra.txt through a fabricated
+            // target-side descendant that was NEVER on the remote target.
+            let unadvertisedTargetParent =
+                git one [ "commit-tree"; editedTree; "-p"; targetHead;
+                          "-m"; "Unpublished target-side changes" ]
+            let injectedMechanicalTree =
+                git one [ "merge-tree"; "--write-tree"; "--no-messages";
+                          unadvertisedTargetParent; candidate ]
+            let injectedMerge =
+                git one [ "commit-tree"; injectedMechanicalTree;
+                          "-p"; unadvertisedTargetParent; "-p"; candidate;
+                          "-m"; "Unreviewed first-parent injection" ]
+            LedgerStore.verifyMechanicalIntegrationMerge first baseOid candidate injectedMerge
+            |> success |> ignore
+            match ReviewWorkflow.completeIntegration first (Guid.NewGuid()) taskId "Reviewer"
+                    submission injectedMerge with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Unpublished target-parent edits passed publication: %A" other)
+            Assert.That(LedgerStore.readRemoteTarget second target |> success,
+                        Is.EqualTo(targetHead), "Rejecting an injected target parent must never publish it.")
             git one [ "reset"; "--hard"; validMerge ] |> ignore
             // A real racing target descendant of T must prohibit stale I.
             File.WriteAllText(Path.Combine(two, "race.txt"), "racing target update")

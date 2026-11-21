@@ -1607,6 +1607,30 @@ module LedgerStore =
     let private stripOids records =
         records |> Map.map (fun _ (struct (_, content)) -> content)
 
+    // TaskOverview only needs current canonical task/review entities. Listing
+    // every immutable history path is unavoidable for tree membership, but
+    // decoding or cat-file-reading history is not. The selected snapshot is
+    // always supplied by the caller after a fresh verified fetch.
+    let readTaskOverviewPrimaryRecordsAt binding snapshot =
+        let canonical (path: string) =
+            Regex.IsMatch(path, "^tasks/[A-Za-z0-9_-]+/task[.]json$")
+            || Regex.IsMatch(path, "^tasks/[A-Za-z0-9_-]+/reviews/[a-f0-9]{32}/review[.]json$")
+        readSelectedRecordsAt [ "tasks" ] canonical binding snapshot
+        |> Result.map stripOids
+
+    // The caller has decoded canonical tasks before selecting their active
+    // attempts. Validate each derived path exactly as readAt would, then batch
+    // only current attempts (not historical/superseded attempts).
+    let readTaskOverviewAttemptRecordsAt binding snapshot (attemptPaths: string list) =
+        let exact = Set.ofList attemptPaths
+        if exact |> Seq.exists (fun path ->
+            not (Regex.IsMatch(path, "^tasks/[A-Za-z0-9_-]+/attempts/[a-f0-9]{32}[.]json$"))) then
+            Error(InvalidBinding "Unsafe ledger entity path.")
+        elif Set.isEmpty exact then Ok Map.empty
+        else
+            readSelectedRecordsAt [ "tasks" ] (fun path -> Set.contains path exact) binding snapshot
+            |> Result.map stripOids
+
     let readDashboardRecordsAt binding snapshot =
         readViewRecordsAt false true binding snapshot |> Result.map stripOids
 

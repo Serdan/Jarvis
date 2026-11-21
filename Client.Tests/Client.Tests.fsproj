@@ -70,6 +70,7 @@
         <Compile Include="WorkQueueMultiLedgerPreparedRecoveryTests.fs"/>
         <Compile Include="RoleInstructionsTests.fs"/>
         <Compile Include="ReviewWorkflowTests.fs"/>
+        <Compile Include="TaskOverviewBatchPerformanceTests.fs"/>
         <Compile Include="ChallengeWorkflowTests.fs"/>
         <Compile Include="WorkQueueCanonicalSourceEvidenceTests.fs"/>
         <Compile Include="WorkQueueCanonicalCasBinderTests.fs"/>

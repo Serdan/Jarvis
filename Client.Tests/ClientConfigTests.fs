@@ -143,3 +143,36 @@ let browserPortValidation () =
         match ClientConfig.updateKey "browser-port" value ClientConfig.empty with
         | Error _ -> ()
         | Ok _ -> Assert.Fail("Accepted invalid port: " + value)
+
+[<Test>]
+let nativeHealthDefaultsDisabledAndUsesPositive600SecondTimeout () =
+    let config = ClientConfig.resolve ClientConfig.empty [] |> Result.defaultWith failwith
+    config.NativeHealthEnabled |> shouldEqual false
+    config.NativeHealthTimeoutSeconds |> shouldEqual 600
+
+[<Test>]
+let nativeHealthConfigSetUnsetAndValidation () =
+    let enabled =
+        ClientConfig.updateKey "native-health-enabled" "true" ClientConfig.empty
+        |> Result.defaultWith failwith
+    enabled.NativeHealthEnabled |> shouldEqual (Some true)
+    let configured =
+        ClientConfig.updateKey "native-health-timeout-seconds" "900" enabled
+        |> Result.defaultWith failwith
+    let effective = ClientConfig.resolve configured [] |> Result.defaultWith failwith
+    effective.NativeHealthEnabled |> shouldEqual true
+    effective.NativeHealthTimeoutSeconds |> shouldEqual 900
+    let reverted =
+        configured
+        |> ClientConfig.unsetKey "native-health-enabled"
+        |> Result.defaultWith failwith
+    let defaults = ClientConfig.resolve reverted [] |> Result.defaultWith failwith
+    defaults.NativeHealthEnabled |> shouldEqual false
+    for invalid in [ "0"; "-1"; "604801"; "abc" ] do
+        match ClientConfig.updateKey "native-health-timeout-seconds" invalid configured with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Accepted invalid Native Health timeout: " + invalid)
+    for invalid in [ "1"; "yes"; "on"; "" ] do
+        match ClientConfig.updateKey "native-health-enabled" invalid configured with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Accepted non-Boolean Native Health setting: " + invalid)

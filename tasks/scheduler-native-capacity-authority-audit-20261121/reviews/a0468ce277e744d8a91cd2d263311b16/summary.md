@@ -1,0 +1,1 @@
+Docs-only 95410cc5 from clean d702352; one new docs/scheduler/capacity-authority-audit.md. Please verify factual source references, proportionality, native session/roster evidence boundaries, unknown-effect fencing and test matrix. `git diff --check HEAD^ HEAD` OS exit 0; no source tests run because task is documentation-only.

@@ -1,1 +1,9 @@
-Synthetic Edge about:blank proof; isolated source 291df407 parent b7033b4b; 17 trusted transport fixtures, 83 bridge fixtures, 6 popup fixtures all green; launcher fixture suite exit 0. No authenticated send. Gate requires separate focus+synthetic real canary failure and human permission approval.
+# Reviewer 1 independent verdict — ChangesRequested (offline prototype only)
+
+**Review:** f29cf0ab7bc34eb396c11803a452ff92. **Exact source:** 291df40751acb57adc7771cfa6cdc92ad6c3fa87, parent b7033b4b7bcdee0936cf7239a625a4ecaccf3257. Scope: three newly added offline test/docs files, not active extension or launcher behavior.
+
+Independent source inspection found default-off, no production imports, no live browser Send and proper post-press OutcomeUnknown classification. No external-effect receipt is asserted. `git diff --check` clean. Isolated registered worktree verified at exact SHA; independent `node --test` runs: prototype **17/17**, bridge **83/83**, popup **6/6**, all pass.
+
+**Finding P2, reproducible:** the intended registration generation is never checked by `validTab`, the two renderer identity tokens may both be absent and still satisfy equality, and invalid viewport bounds such as NaN pass `validProbe`. An independent `node --eval` negative probe with generation mismatch + absent tokens + NaN width resulted in `inputDispatched` and mocked `mousePressed/mouseReleased`, not a blocked pre-press outcome. See `findings/prepress-proof-fail-open.md` for exact evidence and bounded correction.
+
+**Verdict:** ChangesRequested because the safety **model** demonstrates a false-positive prepress path even though its existing fixture tests are green. Correct only the offline test fixture/prototype's claimed fail-closed pins and add negative cases, or narrow the documentary claims with an independently adjudicated rationale. This does not request production CDP transport, persistent ledger implementation, a live canary, broader privilege, main merge, deployment or schedules. Original source remains immutable; future correction needs new frozen source and independent review.

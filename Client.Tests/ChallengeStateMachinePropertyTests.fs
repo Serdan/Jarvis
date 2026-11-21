@@ -1750,11 +1750,36 @@ module private ChallengeIndexFaultMatrix =
                     (ChallengeIndexFaults.indexBody task attemptId "Intruder" 1)
                 checkRejected "extra-foreign-owner-edge" a "Integrity" (readOwner "Intruder")
             | 8 ->
+                // Unknown Challenge prefixes are a bounded-reader discovery
+                // non-goal. The normal inbox may return its blocked assignment;
+                // it must not perform writes or emit audit/notification records.
                 let abandonedPrefix =
                     ReviewWorkflow.challengeWaitIndexPrefix (Guid.NewGuid().ToString("N"))
                 ChallengeIndexFaults.inject a
                     (ReviewWorkflow.waitIndexPath abandonedPrefix task attemptId 1) body
-                checkRejected "nonexistent-challenge-reverse-index" a "Integrity" (readOwner "Agent 3")
+                let before = LedgerStore.fetch b |> ChallengeFixture.ok
+                let beforeHead = remoteHead b
+                let beforeTree = ChallengeFixture.git b.RepositoryPath [ "ls-tree"; "-r"; before.Commit ]
+                match ReviewWorkflow.getAgentInbox b "Agent 3" with
+                | Ok inbox when inbox.Blocked |> List.exists (fun entry -> entry.Attempt.AssignmentGeneration = 1) -> ()
+                | Ok inbox ->
+                    counterexample "UnknownChallengeBoundedInbox"
+                        (sprintf "Expected the existing N1 blocked assignment, got %A" inbox)
+                | Error error ->
+                    counterexample "UnknownChallengeBoundedInbox"
+                        (sprintf "Bounded read unexpectedly failed: %A" error)
+                let after = LedgerStore.fetch b |> ChallengeFixture.ok
+                let afterHead = remoteHead b
+                let afterTree = ChallengeFixture.git b.RepositoryPath [ "ls-tree"; "-r"; after.Commit ]
+                // The complete Git tree includes audit, receipt, and notice
+                // records: matching tree and HEAD proves no reader-side effects.
+                if beforeHead <> afterHead || before.Commit <> after.Commit
+                   || before.Header.NextSequence <> after.Header.NextSequence
+                   || beforeTree <> afterTree then
+                    counterexample "UnknownChallengeBoundedReaderMutation"
+                        (sprintf "HEAD=%s->%s sequence=%d->%d treeUnchanged=%b"
+                            beforeHead afterHead before.Header.NextSequence
+                            after.Header.NextSequence (beforeTree = afterTree))
             | 9 ->
                 ChallengeIndexFaults.inject a ownerEdge
                     (ChallengeIndexFaults.indexBody task (Guid.NewGuid().ToString("N")) "Agent 3" 1)

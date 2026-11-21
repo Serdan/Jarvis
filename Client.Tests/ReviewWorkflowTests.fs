@@ -7738,3 +7738,126 @@ type ReviewWorkflowTests() =
             | other -> Assert.Fail(sprintf "Read should report only a safe read retry: %A" other)
             Assert.That(failedFetches, Is.EqualTo(3))
             Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(baseline)))
+
+
+    [<Test>]
+    member _.ParallelReadOnlyTrustBindingCrossProcessContentionProfile() =
+        // Source-pinned two-clone Git fixture. A separate .NET process uses the
+        // identical FileStream/FileShare.None OS lock as the live client.
+        // Distribution is informational, not an absolute CI latency gate.
+        withFixture (fun one two first second _ _ _ _ ->
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let original = (LedgerStore.fetch first |> success).Commit
+            let paths = [| one; two |] |> Array.map Client.OrchestrationApi.LedgerBindingConfig.pathForRoot
+            let roots = [| one; two |]
+            let bindings = [| first; second |]
+            let script = Path.Combine(Path.GetDirectoryName(one), "hold-trust-lock.fsx")
+            File.WriteAllText(script, String.concat "\n" [
+                "open System"
+                "open System.IO"
+                "open System.Threading"
+                "open System.Diagnostics"
+                "let lockPath, ready, release = fsi.CommandLineArgs.[1], fsi.CommandLineArgs.[2], fsi.CommandLineArgs.[3]"
+                "use held = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)"
+                "File.WriteAllText(ready, \"acquired\")"
+                "let watch = Stopwatch.StartNew()"
+                "while not (File.Exists(release)) && watch.Elapsed < TimeSpan.FromSeconds(20.) do"
+                "    Thread.Sleep(1)"
+                "if not (File.Exists(release)) then failwith \"Lock release handshake timed out\""
+                ])
+            let startHolder index =
+                let ready = Path.Combine(Path.GetDirectoryName(one), sprintf "ready-%d-%s" index (Guid.NewGuid().ToString("N")))
+                let release = ready + ".release"
+                let start = ProcessStartInfo("dotnet")
+                start.WorkingDirectory <- Path.GetDirectoryName one
+                start.RedirectStandardOutput <- true
+                start.RedirectStandardError <- true
+                for arg in [ "fsi"; "--nologo"; "--exec"; script; paths.[index] + ".lock"; ready; release ] do
+                    start.ArgumentList.Add(arg)
+                let child = Process.Start(start)
+                if isNull child then failwith "Failed to start independent trust lock process"
+                if not (System.Threading.SpinWait.SpinUntil(
+                            (fun () -> File.Exists ready || child.HasExited), TimeSpan.FromSeconds(15.))) ||
+                   not (File.Exists ready) then
+                    let error = child.StandardError.ReadToEnd()
+                    child.Dispose()
+                    failwithf "Cross-process FileStream lock did not start: %s" error
+                child, ready, release
+            let releaseHolder (child: Process, ready: string, release: string) =
+                try
+                    File.WriteAllText(release, "release")
+                    if not (child.WaitForExit(10000)) then
+                        child.Kill(true)
+                        failwith "Independent trust lock process failed to exit"
+                    if child.ExitCode <> 0 then
+                        failwithf "Independent trust lock process failed: %s" (child.StandardError.ReadToEnd())
+                finally
+                    for file in [ ready; release ] do
+                        if File.Exists file then File.Delete file
+            try
+                for i in 0 .. 1 do
+                    let binding = bindings.[i]
+                    Client.OrchestrationApi.LedgerBindingConfig.bindExisting (if i = 0 then "owner" else "reviewer") context
+                        binding.ProjectId binding.LedgerId binding.Epoch binding.RemoteName
+                        binding.ApprovedFetchUrl binding.ApprovedPushUrl original true |> success |> ignore
+                // Establish a genuine newer head through the second Git clone.
+                let newer = ReviewWorkflow.createTask second (Guid.NewGuid()) "perf3-head"
+                                "Cross-process monotonic CAS" |> success
+                let target = newer.CurrentHead
+                for concurrency in [ 1; 2; 8; 16 ] do
+                    let held = [| startHolder 0; startHolder 1 |]
+                    try
+                        use gate = new System.Threading.ManualResetEventSlim(false)
+                        let mutable entered = 0
+                        let jobs =
+                            Array.init concurrency (fun i ->
+                                System.Threading.Tasks.Task.Run(fun () ->
+                                    gate.Wait()
+                                    System.Threading.Interlocked.Increment(&entered) |> ignore
+                                    let watch = Stopwatch.StartNew()
+                                    let result =
+                                        Client.OrchestrationApi.LedgerBindingConfig.loadAtRootWithSnapshotUsing
+                                            LedgerStore.fetch roots.[i % 2]
+                                    watch.Stop()
+                                    (watch.Elapsed.TotalMilliseconds, result)))
+                        gate.Set()
+                        Assert.That(System.Threading.SpinWait.SpinUntil(
+                            (fun () -> System.Threading.Volatile.Read(&entered) = concurrency),
+                            TimeSpan.FromSeconds(10.)), Is.True, "Readers must enter before lock release")
+                        System.Threading.Thread.Sleep(12) // informational contention sampling only
+                        held |> Array.iter releaseHolder
+                        System.Threading.Tasks.Task.WaitAll(jobs |> Array.map (fun t -> t :> System.Threading.Tasks.Task))
+                        let samples = jobs |> Array.map (fun t -> t.Result)
+                        let latency = samples |> Array.map fst |> Array.sort
+                        let pct p = latency.[min (latency.Length-1) (int (Math.Ceiling(float latency.Length * p)) - 1)]
+                        let contended = samples |> Array.sumBy (fun (_,result) ->
+                            match result with
+                            | Error(Client.LedgerFailureError issue) when issue.Code = "TrustBindingContended" -> 1
+                            | _ -> 0)
+                        TestContext.WriteLine(sprintf
+                            "Perf3 cross-process n=%d contention=%d/%d p50=%.2fms p95=%.2fms max=%.2fms"
+                            concurrency contended concurrency (pct 0.5) (pct 0.95) latency.[latency.Length-1])
+                        for (_,result) in samples do
+                            match result with
+                            | Ok (_, snapshot) -> Assert.That(snapshot.Commit, Is.EqualTo(target))
+                            | Error(Client.LedgerFailureError issue) when issue.Code = "TrustBindingContended" -> ()
+                            | Error issue -> Assert.Fail(sprintf "Unexpected read error under contention: %A" issue)
+                        // Retried reads after both external holders exit must converge, never lower trust.
+                        for root in roots do
+                            match Client.OrchestrationApi.LedgerBindingConfig.loadAtRootWithSnapshotUsing
+                                    LedgerStore.fetch root with
+                            | Ok (_, snapshot) -> Assert.That(snapshot.Commit, Is.EqualTo(target))
+                            | other -> Assert.Fail(sprintf "Post-contention recovery: %A" other)
+                    finally
+                        for holder in held do
+                            let child, ready, release = holder
+                            if not child.HasExited then releaseHolder holder
+                            child.Dispose()
+                for path in paths do
+                    let record = System.Text.Json.JsonSerializer.Deserialize<Client.OrchestrationApi.LedgerTrustBinding>(
+                                    File.ReadAllText(path))
+                    Assert.That(record.HighestTrustedHead, Is.EqualTo(target))
+            finally
+                for path in paths do
+                    if File.Exists(path) then File.Delete(path)
+                    if File.Exists(path + ".lock") then File.Delete(path + ".lock"))

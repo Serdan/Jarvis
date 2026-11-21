@@ -1087,9 +1087,16 @@ module PendingIntentJournal =
                                "ExpectedVersion", "expectedAttemptVersion"
                                "ExpectedAgentVersion", "expectedAgentVersion"
                                "AssignmentGeneration", "generation"; "Reason", "reason" ]
-                | "TaskWrite", "ReissueQueuedAttempt"
-                | "TaskWrite", "RecoverAgentAssignment" ->
+                | "TaskWrite", "ReissueQueuedAttempt" ->
                     attempt @ [ "Reason", "reason" ]
+                | "TaskWrite", "RecoverAgentAssignment" ->
+                    // Versioned recoveries must match the exact task-version
+                    // intent; historical pre-versioned receipts remain readable.
+                    attempt @ [ "Reason", "reason" ] @
+                        (if remote.EnumerateObject()
+                            |> Seq.exists (fun property -> property.Name = "expectedTaskVersion") then
+                            [ "ExpectedTaskVersion", "expectedTaskVersion" ]
+                         else [])
                 | "TaskWrite", ("ParkAttempt" | "BlockAttempt" | "ResumeAttempt"
                                    | "AbandonAttempt" | "CancelTask") ->
                     attempt @ [ "ExpectedTaskVersion", "expectedTaskVersion";
@@ -2670,8 +2677,8 @@ module TaskApi =
                                         cmd.AssignmentGeneration cmd.Reason |> mapError)
                             | "RecoverAgentAssignment" ->
                                 withAdministrativeActor (fun actor ->
-                                    ReviewWorkflow.ReviewWorkflow.recoverAgentAssignmentAs binding actor operationId
-                                        cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                    ReviewWorkflow.ReviewWorkflow.recoverAgentAssignmentWithTaskVersionAs binding actor operationId
+                                        cmd.TaskId cmd.ActorId cmd.ExpectedTaskVersion cmd.ExpectedVersion cmd.ExpectedAgentVersion
                                         cmd.AssignmentGeneration cmd.Reason |> mapError)
                             | "AcknowledgeFeedback" ->
                                 ReviewWorkflow.ReviewWorkflow.acknowledgeBranchReview binding operationId

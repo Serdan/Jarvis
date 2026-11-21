@@ -2576,24 +2576,34 @@ module ReviewWorkflow =
     let reissueAssignment binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation instructions newSpecHtml =
         reissueAssignmentAs binding legacyAdministrativeActor operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation instructions newSpecHtml
 
-    let recoverAgentAssignmentAs binding actor operationId taskId ownerId expectedAttemptVersion
+    let recoverAgentAssignmentWithTaskVersionAs binding actor operationId taskId ownerId expectedTaskVersion expectedAttemptVersion
                                expectedAgentVersion generation reason =
         if not (validTaskId taskId) || not (validAgent ownerId)
-           || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1
+           || expectedTaskVersion < 0 || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1
            || not (validText 2048 reason) then
             Error(InvalidBinding "Recovery requires exact versions and an explicit reason.")
         else
+            let recoveryIntent =
+                if expectedTaskVersion = 0 then
+                    intent operationId actor "RecoverAgentAssignment"
+                        {| taskId = taskId; ownerId = ownerId
+                           expectedAttemptVersion = expectedAttemptVersion
+                           expectedAgentVersion = expectedAgentVersion
+                           generation = generation; reason = reason |}
+                else
+                    intent operationId actor "RecoverAgentAssignment"
+                        {| taskId = taskId; ownerId = ownerId; expectedTaskVersion = expectedTaskVersion
+                           expectedAttemptVersion = expectedAttemptVersion
+                           expectedAgentVersion = expectedAgentVersion
+                           generation = generation; reason = reason |}
             LegacyDirectWriterFence.transact binding
-                (intent operationId actor "RecoverAgentAssignment"
-                    {| taskId = taskId; ownerId = ownerId
-                       expectedAttemptVersion = expectedAttemptVersion
-                       expectedAgentVersion = expectedAgentVersion
-                       generation = generation; reason = reason |})
+                recoveryIntent
                 (fun snapshot ->
                     result {
                         let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
                         let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
                         if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
+                           || (expectedTaskVersion > 0 && task.Version <> expectedTaskVersion)
                            || attempt.Version <> expectedAttemptVersion
                            || attempt.AssignmentGeneration <> generation
                            || agent.Version <> expectedAgentVersion
@@ -2625,6 +2635,10 @@ module ReviewWorkflow =
                                 (issue taskId attempt (attempt.AssignmentGeneration + 1)
                                     actor "Recovery" reason snapshot.Header.NextSequence) ]
                     })
+
+    let recoverAgentAssignmentAs binding actor operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation reason =
+        recoverAgentAssignmentWithTaskVersionAs binding actor operationId taskId ownerId 0
+            expectedAttemptVersion expectedAgentVersion generation reason
 
     let recoverAgentAssignment binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation reason =
         recoverAgentAssignmentAs binding legacyAdministrativeActor operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation reason

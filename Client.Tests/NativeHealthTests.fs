@@ -10,6 +10,7 @@ open Client.LedgerStore
 open Client.NativeHealth
 open Client.NativeHealth.NativeHealth
 open Client.ReviewWorkflow
+open Common
 open Common.SignalR
 open NUnit.Framework
 
@@ -324,3 +325,158 @@ type NativeHealthTests() =
                     "Old generation cannot checkpoint" "No progress" null "" with
             | Error(StaleEntityVersion _) -> ()
             | other -> Assert.Fail(sprintf "Old assignment must not checkpoint: %A" other))
+
+    [<Test>]
+    member _.TaskOnlyInterveningChangeFencesRecovery() =
+        withGitFixture (fun first second taskId ->
+            let snapshot = LedgerStore.fetch first |> success
+            let before = (NativeHealth.candidateAt "Fixture" first snapshot "Owner" |> success).Value
+            ReviewWorkflow.reviseTaskSpecPinned second (Guid.NewGuid()) taskId before.TaskVersion before.SpecBlobOid
+                "Revised title" "<h1>Revised spec</h1>" |> success |> ignore
+            let afterSnapshot = LedgerStore.fetch first |> success
+            let after = (NativeHealth.candidateAt "Fixture" first afterSnapshot "Owner" |> success).Value
+            Assert.That(after.TaskVersion, Is.EqualTo(before.TaskVersion + 1))
+            Assert.That(after.AgentVersion, Is.EqualTo(before.AgentVersion))
+            Assert.That(after.AttemptVersion, Is.EqualTo(before.AttemptVersion))
+            Assert.That(after.Generation, Is.EqualTo(before.Generation))
+            match ReviewWorkflow.recoverAgentAssignmentWithTaskVersionAs first "AuthenticatedUser"
+                    (NativeHealth.recoveryOperationId before) taskId "Owner" before.TaskVersion
+                    before.AttemptVersion before.AgentVersion before.Generation "Stale recovery" with
+            | Error(StaleEntityVersion _) -> ()
+            | result -> Assert.Fail(sprintf "Task version must fence recovery: %A" result)
+            let finalSnapshot = LedgerStore.fetch second |> success
+            let finalCandidate = (NativeHealth.candidateAt "Fixture" second finalSnapshot "Owner" |> success).Value
+            Assert.That(finalCandidate.Generation, Is.EqualTo(before.Generation)))
+
+    [<Test>]
+    member _.ConcurrentNativeAdaptersShareOneLogicalRecovery() =
+        withGitFixture (fun first second taskId ->
+            let head = (LedgerStore.fetch first |> success).Commit
+            let root = Path.GetDirectoryName(first.RepositoryPath)
+            let context = Runtime(root)
+            let configs = [ first; second ] |> List.map (fun binding ->
+                let path = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot binding.RepositoryPath
+                Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
+                let approved : Client.OrchestrationApi.LedgerTrustBinding =
+                    { SchemaVersion = 1; Enabled = true; ProjectRoot = binding.RepositoryPath
+                      ProjectId = binding.ProjectId.ToString("D"); LedgerId = binding.LedgerId.ToString("D")
+                      Epoch = binding.Epoch; RemoteName = binding.RemoteName
+                      ApprovedFetchUrl = binding.ApprovedFetchUrl; ApprovedPushUrl = binding.ApprovedPushUrl
+                      HighestTrustedHead = head }
+                File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize(approved))
+                path)
+            try
+                let getCandidate binding name =
+                    let snap = LedgerStore.fetch binding |> success
+                    (NativeHealth.candidateAt name binding snap "Owner" |> success).Value
+                let one = getCandidate first "one"
+                let two = getCandidate second "two"
+                Assert.That(NativeHealth.recoveryOperationId one, Is.EqualTo(NativeHealth.recoveryOperationId two))
+                use barrier = new System.Threading.Barrier(2)
+                let runClient candidate =
+                    let deps : Dependencies =
+                        { Enumerate = fun () -> Ok [ candidate ]
+                          Current = NativeHealth.current context
+                          Activity = fun _ _ -> Task.FromResult(Ok(snapshot 900))
+                          Recover = fun c id ->
+                              if not (barrier.SignalAndWait(TimeSpan.FromSeconds 30.)) then failwith "Recovery barrier timed out"
+                              NativeHealth.recover context c id }
+                    Task.Run(fun () -> run enabled deps)
+                let a, b = runClient one, runClient two
+                Task.WaitAll [| a :> Task; b :> Task |]
+                let operationId = NativeHealth.recoveryOperationId one
+                let _, receipt = LedgerStore.getOperationStatus second operationId |> success
+                Assert.That(receipt.IsSome, Is.True)
+                Assert.That(receipt.Value.Type, Is.EqualTo("RecoverAgentAssignment"))
+                let _, _, attempt = ReviewWorkflow.getTask second taskId |> success
+                Assert.That(attempt.Value.AssignmentGeneration, Is.EqualTo(one.Generation + 1))
+                Assert.That(attempt.Value.Phase, Is.EqualTo("Queued"))
+                Assert.That(a.Result.Recoveries + b.Result.Recoveries, Is.GreaterThanOrEqualTo(1))
+            finally
+                for path in configs do
+                    if File.Exists path then File.Delete path)
+
+    [<TestCase("Ready")>]
+    [<TestCase("ParkAttempt")>]
+    [<TestCase("BlockAttempt")>]
+    member _.CanonicalIneligibleStatesAreNotCandidates(state: string) =
+        withGitFixture (fun first second taskId ->
+            let snap = LedgerStore.fetch first |> success
+            let before = (NativeHealth.candidateAt "Fixture" first snap "Owner" |> success).Value
+            if state = "Ready" then
+                ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner"
+                    before.AttemptVersion before.AgentVersion before.Generation "Fixture yield" "Continue"
+                |> success |> ignore
+            else
+                ReviewWorkflow.changeAttemptAdministration first (Guid.NewGuid()) taskId state
+                    before.TaskVersion before.AttemptVersion before.AgentVersion before.Generation "Fixture transition"
+                |> success |> ignore
+            let finalSnapshot = LedgerStore.fetch second |> success
+            let agent = ReviewWorkflow.getAgentWorkingTurnAt second finalSnapshot "Owner" |> success
+            let _, attempt = ReviewWorkflow.getTaskAt second finalSnapshot taskId |> success
+            if state = "Ready" then Assert.That(agent.State, Is.EqualTo("Ready"))
+            elif state = "ParkAttempt" then Assert.That(attempt.Value.Phase, Is.EqualTo("Deferred"))
+            else Assert.That(attempt.Value.Phase, Is.EqualTo("Blocked"))
+            Assert.That((NativeHealth.candidateAt "Fixture" second finalSnapshot "Owner" |> success).IsNone, Is.True))
+
+    [<Test>]
+    member _.LostPostPublicationAcknowledgmentUsesOriginalIdAndJournal() =
+        withGitFixture (fun first second taskId ->
+            let head = (LedgerStore.fetch first |> success).Commit
+            let root = Path.GetDirectoryName(first.RepositoryPath)
+            let context = Runtime(root)
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot first.RepositoryPath
+            Directory.CreateDirectory(Path.GetDirectoryName configPath) |> ignore
+            let approved : Client.OrchestrationApi.LedgerTrustBinding =
+                { SchemaVersion = 1; Enabled = true; ProjectRoot = first.RepositoryPath
+                  ProjectId = first.ProjectId.ToString("D"); LedgerId = first.LedgerId.ToString("D")
+                  Epoch = first.Epoch; RemoteName = first.RemoteName
+                  ApprovedFetchUrl = first.ApprovedFetchUrl; ApprovedPushUrl = first.ApprovedPushUrl
+                  HighestTrustedHead = head }
+            File.WriteAllText(configPath, System.Text.Json.JsonSerializer.Serialize(approved))
+            try
+                let beforeSnapshot = LedgerStore.fetch first |> success
+                let before = (NativeHealth.candidateAt "one" first beforeSnapshot "Owner" |> success).Value
+                let operationId = NativeHealth.recoveryOperationId before
+                // Publish the canonical mutation inside the REAL pending-intent journal,
+                // then lose its response before the journal can acknowledge success.
+                let lostAck (cmd: TaskWriteCommand) (_: Runtime) : Result<obj, EffectError> =
+                    // Persist exactly the original TaskWrite intent before the real
+                    // canonical mutation. A dropped transport response prevents its
+                    // local acknowledgment, leaving the journal for reconciliation.
+                    Client.OrchestrationApi.PendingIntentJournal.persist
+                        first operationId "TaskWrite" (System.Text.Json.JsonSerializer.Serialize(cmd)) |> success |> ignore
+                    Assert.That(
+                        (Client.OrchestrationApi.PendingIntentJournal.findAtRoot first.RepositoryPath operationId
+                         |> success).IsSome, Is.True, "Intent must be durable before Git write.")
+                    match ReviewWorkflow.recoverAgentAssignmentWithTaskVersionAs first
+                            "AuthenticatedUser" operationId taskId "Owner" before.TaskVersion
+                            before.AttemptVersion before.AgentVersion before.Generation cmd.Reason with
+                    | Ok _ ->
+                        Assert.That(
+                            (Client.OrchestrationApi.PendingIntentJournal.findAtRoot first.RepositoryPath operationId
+                             |> success).IsSome, Is.True, "Intent must survive Git publication without ACK.")
+                        Error(Client.ValidationError "Injected lost ACK after Git publication")
+                    | Error issue ->
+                        Error(Client.OrchestrationApi.LedgerErrors.toEffect issue)
+                match NativeHealth.recoverWithWrite lostAck context before operationId with
+                | Ok () -> ()
+                | other -> Assert.Fail(sprintf "Original-ID status lookup must recover lost ACK: %A" other)
+                let pending =
+                    Client.OrchestrationApi.PendingIntentJournal.findAtRoot first.RepositoryPath operationId
+                    |> success
+                Assert.That(pending.IsSome, Is.True, "Unacknowledged published intent must persist.")
+                let _, receipt = LedgerStore.getOperationStatus second operationId |> success
+                Assert.That(receipt.IsSome, Is.True)
+                Assert.That(receipt.Value.Type, Is.EqualTo("RecoverAgentAssignment"))
+                let inspection = Client.OrchestrationApi.PendingIntentJournal.reconcile first |> success
+                Assert.That(inspection.Head.disposition, Is.EqualTo("Applied"))
+                Client.OrchestrationApi.PendingIntentJournal.acknowledge first operationId
+                    receipt.Value.RequestHash |> success |> ignore
+                Assert.That(
+                    (Client.OrchestrationApi.PendingIntentJournal.findAtRoot first.RepositoryPath operationId
+                     |> success).IsNone, Is.True)
+                let _, _, afterAttempt = ReviewWorkflow.getTask second taskId |> success
+                Assert.That(afterAttempt.Value.AssignmentGeneration, Is.EqualTo(before.Generation + 1))
+            finally
+                if File.Exists configPath then File.Delete configPath)

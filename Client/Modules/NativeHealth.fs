@@ -292,7 +292,7 @@ module NativeHealth =
 
     // Uses the existing task-write pending-intent journal and Git CAS recovery
     // mutation. This code never creates a browser/session/workflow execution.
-    let recover (rt: Runtime) (candidate: Candidate) (operationId: Guid) =
+    let internal recoverWithWrite write (rt: Runtime) (candidate: Candidate) (operationId: Guid) =
         let command : TaskWriteCommand =
             { ProjectName = candidate.ProjectName
               Action = "RecoverAgentAssignment"
@@ -318,7 +318,7 @@ module NativeHealth =
               DecisionSequence = 0L
               Evidence = ""
               SessionId = "" }
-        match OrchestrationApi.TaskApi.write command rt with
+        match write command rt with
         | Ok _ -> Ok ()
         | Error error ->
             // A lost response is not proof of failure. Inspect the ORIGINAL ID;
@@ -329,6 +329,9 @@ module NativeHealth =
                 match LedgerStore.getOperationStatus binding operationId with
                 | Ok (_, Some receipt) when receipt.Type = "RecoverAgentAssignment" -> Ok ()
                 | _ -> Error (sprintf "Outcome unconfirmed: %A. Reconcile the pending intent by original UUID." error)
+
+    let recover (rt: Runtime) (candidate: Candidate) (operationId: Guid) =
+        recoverWithWrite (fun command _ -> OrchestrationApi.TaskApi.write command rt) rt candidate operationId
 
     type Service(settings: unit -> Result<Settings, string>,
                  dependencies: Dependencies,

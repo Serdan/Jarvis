@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"performance-task-overview-batch-git-20261121","title":"[P1][Perf] Batch TaskOverview reads to eliminate per-entity Git subprocesses","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"performance-task-overview-batch-git-20261121","title":"[P1][Perf] Batch TaskOverview reads to eliminate per-entity Git subprocesses","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"a96b6d8c2d6e4678a0c7b51b1ce2da62"}

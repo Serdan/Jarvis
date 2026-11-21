@@ -83,8 +83,9 @@ async function execute(args) {
     diagnostics: { documentReadyState: document.readyState || "unknown", ...selectorCounts() }
   });
   try {
-  // Re-evaluate *every new session*; never cache a previous fallback choice.
-  // The visible Work GPT-6.2 model is Astra; its default thinking effort is Medium.
+  // Re-evaluate on every fresh launch; never cache usage availability.
+  // Strict fallback order: Chat GPT-6 High, Work GPT-6.2 Sol Medium, Chat GPT-6 Instant.
+  // Advance only when the current selection cannot be confirmed before Send.
   const preferences = [
     { mode: "Chat", model: "GPT-6", effort: "high", level: 2, label: "High" },
     { mode: "Work", model: "GPT-6.2 Sol", effort: "medium", level: 1, label: "Medium" },

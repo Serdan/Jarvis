@@ -968,6 +968,22 @@ test("unavailable maximum effort falls back to Work Sol Medium", async () => {
 });
 
 
+test("when Chat High and Work Sol Medium cannot be selected, fall back to Chat Instant", async () => {
+  const h = harness({ maxEffortStep: 0, reasoningEffort: "Instant", timeoutMs: 18000 });
+  const result = await h.run("Exactly one fallback", { selectionOnly: true });
+  assert.equal(result.status, "selectionOnly");
+  assert.equal(result.selectedMode, "Chat");
+  assert.equal(result.selectedModel, "GPT-6");
+  assert.equal(result.selectedEffort, "Instant");
+  assert.deepEqual(Array.from(result.attempts, item => ({
+    mode: item.mode, model: item.model, effort: item.effort, reason: item.reason
+  })), [
+    { mode: "Chat", model: "GPT-6", effort: "High", reason: "EffortUnavailable" },
+    { mode: "Work", model: "GPT-6.2 Sol", effort: "Medium", reason: "EffortUnavailable" }
+  ]);
+  assert.equal(h.clicks, 0);
+});
+
 test("does not click Send when a slow composer consumes the post-send confirmation reserve", async () => {
   const h = harness({ virtualClock: true, sendAvailableAfterMs: 3800 });
   const result = await h.run("Do not attempt an unconfirmable send", { timeoutMs: 6000 });

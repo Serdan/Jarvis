@@ -1,0 +1,1 @@
+Adds Node browser test suite to canonical build.cs test command; dedicated Work suite 23/23 passes; full suite currently fails in existing chatgpt-launcher tests; Release .NET direct commands exit 0 but test discovery not confirmed. Review exact source and gate.

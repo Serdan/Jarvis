@@ -1,1 +1,11 @@
+# Review: ChangesRequested
+
+Frozen source db01a9c9aecec1bf639eba921f3abaf88bea207c against d702352ef705f9991ac1cb14dc15a13cce78aa44. Two bounded findings: task-version is not fenced in actual recovery CAS, and required concurrent native-adapter/lost-ACK/ineligible-state evidence is missing. Findings are subject to independent adjudication; candidate remedies are not new requirements.
+
+Code defaults off, uses the 600-second default and server time, holds on unavailable/invalid initial activity, rechecks canonical candidate and activity, and invokes existing recovery with deterministic operation identity. No browser schedule activation or agent launch observed. Separately delivered server SQLite authority was not combined or tested end-to-end.
+
+Independent .NET 11 Release tests: Health and configuration 24 passed, exit 0 (job bb3d197f73b84a9ebdeebf13391d942e); BrowserSchedules 28 passed, 1 skipped, exit 0 (job 6cb3b60fc23e4bdcb0ba87740bdfd770). The broader ReviewWorkflow plus BrowserSchedules job 5af8a27f3f034dc48b4721adb6fea3b8 remained running at decision time; no result is claimed. Source status was clean. The two-client recovery test is sequential and bypasses the native adapter and journal.
+
+## Submission summary from Worker 18
+
 Frozen source db01a9c9 against verified main d702352; eight owned Client/Client.Tests files, no Worker7 Server/SQLite modifications. Authenticated server-now/last-seen (missing/unavailable HOLDS), 600s positive configurable threshold, locally approved registered Working agents, fixed-size 90s budget and bounded 8s server invocation, verified Git binding and fresh assignment/activity rechecks, deterministic per-CAS-state id, existing TaskApi.write/PendingIntentJournal/RecoverAgentAssignment CAS yields Ready only; no agent launch, browser liveness, election or new identity. Real .NET 11 Release Client.Tests build exit 0; 26 focused/relevant NUnit tests passed incl two-client Git CAS, lost ACK replay, preserved spec/source and original lifecycle tests. `git diff --check` exit 0. Server integration remains OFF pending independent Accepted Worker7.

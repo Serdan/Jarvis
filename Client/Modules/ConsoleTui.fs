@@ -111,8 +111,8 @@ type OperatorChallengeUiAccess =
 
 type SettingsUiAccess =
     { Load: unit -> Result<ClientConfigSnapshot, string>
-      Save: ClientConfigSnapshot -> ClientStoredConfig -> Result<ClientConfigSnapshot, string>
-      Effective: ClientEffectiveConfig }
+      Save: bool -> ClientConfigSnapshot -> ClientStoredConfig -> Result<SettingsApplyResult, SettingsApplyError>
+      Effective: unit -> ClientEffectiveConfig }
 
 type ConsoleTui(?activityLog: ActivityLog.Store) =
     let syncRoot = obj()
@@ -1406,14 +1406,25 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 settingsStaged <- snapshot.Stored
         mode <- SettingsMode
 
-    let saveSettingsUnsafe () =
+    let saveSettingsUnsafe confirmed =
         match settingsAccess, settingsSnapshot with
         | Some access, Some snapshot ->
-            match access.Save snapshot settingsStaged with
-            | Error error -> settingsError <- Some error
-            | Ok saved ->
+            match access.Save confirmed snapshot settingsStaged with
+            | Error SettingsConfirmationRequired when not confirmed ->
+                mode <- SettingsConfirmMode
+                settingsError <- None
+            | Error error -> settingsError <- Some(ClientConfig.settingsErrorMessage error)
+            | Ok applied ->
+                let saved = applied.After
                 settingsSnapshot <- Some saved
-                settingsError <- Some "Saved. Native Health settings apply at next check; other runtime settings may require restart."
+                settingsStaged <- saved.Stored
+                let restart = if applied.RestartRequired then " Client restart required for changed runtime settings." else " No client restart needed."
+                let registry = if applied.RegistryRefreshPending then " Device registry name awaits the connected-client check." else ""
+                let health = if applied.NativeHealthRefreshPending then " Native Health reloads on the next check." else ""
+                let overrides = if not applied.Overrides.IsEmpty then " Startup/environment overrides remain in effect." else ""
+                settingsError <- Some(
+                    $"Saved and read back {saved.Path} (revision {saved.Revision.Substring(0, 12)})." +
+                    restart + registry + health + overrides)
         | _ -> settingsError <- Some "Configuration unavailable."
 
     let applySettingsEditUnsafe () =
@@ -1433,7 +1444,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         | None -> draw.WriteLine "Config unavailable."
         | Some snapshot ->
             draw.WriteLine(trim (safe snapshot.Path) width)
-            let effective = settingsAccess |> Option.map _.Effective
+            let effective = settingsAccess |> Option.map (fun x -> x.Effective())
             for index = 0 to settingKeys.Length - 1 do
                 let key = settingKeys[index]
                 let value = settingsValue key settingsStaged |> Option.defaultValue "(default)"
@@ -1446,15 +1457,20 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                         | "trust-level" -> "trustLevel"
                         | "allowed-environment-variables" -> "allowedEnvironmentVariables"
                         | "browser-port" -> "browserPort"
-                        | _ -> "maxImportBytes") -> " [startup override]"
+                        | "max-import-bytes" -> "maxImportBytes"
+                        | "native-health-enabled" -> "nativeHealthEnabled"
+                        | "native-health-timeout-seconds" -> "nativeHealthTimeoutSeconds"
+                        | _ -> "") -> " [startup override]"
                     | _ -> ""
+                let unsaved =
+                    if settingsValue key settingsStaged <> settingsValue key snapshot.Stored then " [unsaved]" else ""
                 let marker = if settingsSelected = index then ">" else " "
                 registerMouseHit 0 width (SelectSetting index)
-                draw.WriteLine(trim (safe $"{marker} {settingLabels[index]}: {value}{source}") width)
+                draw.WriteLine(trim (safe $"{marker} {settingLabels[index]}: {value}{source}{unsaved}") width)
             match effective with
             | Some e ->
                 draw.WriteLine ""
-                draw.WriteLine "Startup effective values (changes may require restart):"
+                draw.WriteLine "Current runtime values (changes may require restart):"
                 for index = 0 to settingKeys.Length - 1 do
                     draw.WriteLine(trim (safe $"{settingLabels[index]}: {settingsEffective settingKeys[index] e}") width)
             | None -> ()
@@ -1465,8 +1481,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             if settingsSelected = 3 then
                 draw.WriteLine "Warning: allowlisted variables can expose credentials to processes started by agents."
         elif mode = SettingsConfirmMode then
-            draw.WriteLine "WARNING: Full trust disables local confirmation for agent operations."
-            draw.WriteLine "Press y to save, n/Esc to cancel."
+            draw.WriteLine "WARNING: Increasing effective trust (including none to default partial) or"
+            draw.WriteLine "expanding the environment allowlist can give agents additional privileges."
+            draw.WriteLine "Press y to confirm local elevation and save; n/Esc cancels."
         else
             draw.WriteLine "Up/Down select, Enter edit, u restore default, s save, Esc back."
             draw.WriteLine "Saved changes to workspace, trust and limits require restart."
@@ -2377,7 +2394,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                             elif mode = SettingsConfirmMode then
                                 lock syncRoot (fun () ->
                                     match keyInfo.Key with
-                                    | ConsoleKey.Y -> saveSettingsUnsafe(); mode <- SettingsMode
+                                    | ConsoleKey.Y -> saveSettingsUnsafe true; mode <- SettingsMode
                                     | ConsoleKey.N | ConsoleKey.Escape -> mode <- SettingsMode
                                     | _ -> ()
                                     renderUnsafe())
@@ -2622,10 +2639,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                         renderUnsafe())
                                 | _, ConsoleKey.S when mode = SettingsMode ->
                                     lock syncRoot (fun () ->
-                                        let original = settingsSnapshot |> Option.map (fun snap -> snap.Stored.TrustLevel)
-                                        if settingsStaged.TrustLevel = Some "full" && original <> Some (Some "full") then
-                                            mode <- SettingsConfirmMode
-                                        else saveSettingsUnsafe()
+                                        // Centralized authorization checks the effective rank, including
+                                        // explicit no-trust -> unset/default-partial elevation.
+                                        saveSettingsUnsafe false
                                         renderUnsafe())
                                 | _, ConsoleKey.Escape when mode = SettingsMode ->
                                     lock syncRoot (fun () ->

@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"jarvis-client-settings-persistence-runtime-fix-20261122","title":"[P0][Client settings] Fix TUI settings save, workspace root precedence, startup application and restart persistence","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"jarvis-client-settings-persistence-runtime-fix-20261122","title":"[P0][Client settings] End-to-end fix ALL settings: machine name, workspace path, persistence and actual runtime effects","version":2,"lifecycle":"Open","specVersion":2,"attemptId":null}

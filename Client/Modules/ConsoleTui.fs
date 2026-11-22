@@ -1413,7 +1413,15 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             | Error error -> settingsError <- Some error
             | Ok saved ->
                 settingsSnapshot <- Some saved
-                settingsError <- Some "Saved. Native Health settings apply at next check; other runtime settings may require restart."
+                settingsStaged <- saved.Stored
+                let machineStatus =
+                    if snapshot.Stored.MachineName <> saved.Stored.MachineName then
+                        " Machine name refreshes in the device registry on the next connected-client check."
+                    else ""
+                settingsError <- Some(
+                    $"Saved and read back {saved.Path} (revision {saved.Revision.Substring(0, 12)}). " +
+                    "Workspace, trust, environment, import and browser settings require client restart; Native Health applies at next check." +
+                    machineStatus)
         | _ -> settingsError <- Some "Configuration unavailable."
 
     let applySettingsEditUnsafe () =
@@ -1446,11 +1454,16 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                         | "trust-level" -> "trustLevel"
                         | "allowed-environment-variables" -> "allowedEnvironmentVariables"
                         | "browser-port" -> "browserPort"
-                        | _ -> "maxImportBytes") -> " [startup override]"
+                        | "max-import-bytes" -> "maxImportBytes"
+                        | "native-health-enabled" -> "nativeHealthEnabled"
+                        | "native-health-timeout-seconds" -> "nativeHealthTimeoutSeconds"
+                        | _ -> "") -> " [startup override]"
                     | _ -> ""
+                let unsaved =
+                    if settingsValue key settingsStaged <> settingsValue key snapshot.Stored then " [unsaved]" else ""
                 let marker = if settingsSelected = index then ">" else " "
                 registerMouseHit 0 width (SelectSetting index)
-                draw.WriteLine(trim (safe $"{marker} {settingLabels[index]}: {value}{source}") width)
+                draw.WriteLine(trim (safe $"{marker} {settingLabels[index]}: {value}{source}{unsaved}") width)
             match effective with
             | Some e ->
                 draw.WriteLine ""
@@ -1465,7 +1478,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             if settingsSelected = 3 then
                 draw.WriteLine "Warning: allowlisted variables can expose credentials to processes started by agents."
         elif mode = SettingsConfirmMode then
-            draw.WriteLine "WARNING: Full trust disables local confirmation for agent operations."
+            draw.WriteLine "WARNING: Full trust or environment allowlist expansion can expose credentials to agent processes."
             draw.WriteLine "Press y to save, n/Esc to cancel."
         else
             draw.WriteLine "Up/Down select, Enter edit, u restore default, s save, Esc back."
@@ -2623,7 +2636,15 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                 | _, ConsoleKey.S when mode = SettingsMode ->
                                     lock syncRoot (fun () ->
                                         let original = settingsSnapshot |> Option.map (fun snap -> snap.Stored.TrustLevel)
-                                        if settingsStaged.TrustLevel = Some "full" && original <> Some (Some "full") then
+                                        let oldVariables =
+                                            settingsSnapshot
+                                            |> Option.bind (fun snap -> snap.Stored.AllowedEnvironmentVariables)
+                                            |> Option.defaultValue []
+                                        let expandsVariables =
+                                            settingsStaged.AllowedEnvironmentVariables
+                                            |> Option.defaultValue []
+                                            |> List.exists (fun variable -> not (List.contains variable oldVariables))
+                                        if (settingsStaged.TrustLevel = Some "full" && original <> Some (Some "full")) || expandsVariables then
                                             mode <- SettingsConfirmMode
                                         else saveSettingsUnsafe()
                                         renderUnsafe())

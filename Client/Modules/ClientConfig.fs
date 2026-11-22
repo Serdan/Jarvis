@@ -174,42 +174,82 @@ module ClientConfig =
 
     let keys = [ "machineName"; "workspacePath"; "trustLevel"; "allowedEnvironmentVariables"; "maxImportBytes"; "browserPort"; "nativeHealthEnabled"; "nativeHealthTimeoutSeconds" ]
 
+    // A stable sibling lock serializes revision checking and atomic replacement
+    // across clients sharing the same user-level configuration.
+    let private withSaveLock (path: string) (action: unit -> Result<ClientConfigSnapshot, string>) =
+        let directory = Path.GetDirectoryName(Path.GetFullPath(path))
+        let directoryWasMissing = not (Directory.Exists directory)
+        Directory.CreateDirectory(directory) |> ignore
+        if directoryWasMissing && (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS()) then
+            File.SetUnixFileMode(directory, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+        let lockPath = Path.Combine(directory, ".config.json.lock")
+        if File.Exists lockPath && File.GetAttributes(lockPath).HasFlag(FileAttributes.ReparsePoint) then
+            invalidOp "Configuration lock must not be a symbolic link."
+        let rec acquire attempts =
+            try new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)
+            with :? IOException when attempts < 40 ->
+                System.Threading.Thread.Sleep(25)
+                acquire (attempts + 1)
+        use handle = acquire 0
+        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+            File.SetUnixFileMode(lockPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+        action()
+
+    // Existing config files may contain an obsolete root and must remain
+    // readable for repair. A new save, however, must never acknowledge a
+    // workspace root that will fail at the next application startup.
+    let private validateForSave stored =
+        validate stored
+        |> Result.bind (fun values ->
+            match values.WorkspacePath with
+            | Some path when not (Directory.Exists path) -> Error "workspacePath must name an existing directory."
+            | _ -> Ok values)
+
     let save (snapshot: ClientConfigSnapshot) (stored: ClientStoredConfig) =
-        match validate stored with
+        match validateForSave stored with
         | Error message -> Error message
         | Ok validated ->
             let path = snapshot.Path
             let mutable temporary = ""
             try
-                let original = readRaw path
-                if revision original <> snapshot.Revision then
-                    Error "Config was changed by another process. Reload before saving."
-                else
-                    let doc =
-                        if original = "" then JsonObject()
-                        else
-                            match JsonNode.Parse(original) with
-                            | :? JsonObject as obj -> obj
-                            | _ -> failwith "Configuration is not a JSON object."
-                    doc["schemaVersion"] <- JsonValue.Create(1)
-                    for key in keys do
-                        match jsonValue key validated with
-                        | Some value -> doc[key] <- value
-                        | None -> doc.Remove(key) |> ignore
-                    let encoded = doc.ToJsonString(JsonSerializerOptions(WriteIndented = true)) + Environment.NewLine
-                    let directory = Path.GetDirectoryName(path)
-                    let directoryWasMissing = not (Directory.Exists directory)
-                    Directory.CreateDirectory(directory) |> ignore
-                    if directoryWasMissing && (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS()) then
-                        File.SetUnixFileMode(directory, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
-                    temporary <- Path.Combine(directory, $".config-{Guid.NewGuid():N}.tmp")
-                    File.WriteAllText(temporary, encoded, UTF8Encoding(false))
-                    if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
-                        File.SetUnixFileMode(temporary, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
-                    File.Move(temporary, path, true)
-                    temporary <- ""
-                    Ok { Path = path; Revision = revision encoded; Stored = validated }
-            with ex -> 
+                withSaveLock path (fun () ->
+                    let original = readRaw path
+                    if File.Exists path && String.IsNullOrWhiteSpace original then
+                        Error "Existing configuration is empty or corrupt; repair it explicitly before saving."
+                    elif revision original <> snapshot.Revision then
+                        Error "Config was changed by another process. Reload before saving."
+                    else
+                        let doc =
+                            if original = "" then JsonObject()
+                            else
+                                match JsonNode.Parse(original) with
+                                | :? JsonObject as obj -> obj
+                                | _ -> failwith "Configuration is not a JSON object."
+                        doc["schemaVersion"] <- JsonValue.Create(1)
+                        for key in keys do
+                            match jsonValue key validated with
+                            | Some value -> doc[key] <- value
+                            | None -> doc.Remove(key) |> ignore
+                        let encoded = doc.ToJsonString(JsonSerializerOptions(WriteIndented = true)) + Environment.NewLine
+                        let directory = Path.GetDirectoryName(Path.GetFullPath(path))
+                        temporary <- Path.Combine(directory, $".config-{Guid.NewGuid():N}.tmp")
+                        do
+                            use file = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None)
+                            if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                                File.SetUnixFileMode(temporary, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                            use writer = new StreamWriter(file, UTF8Encoding(false), 1024, true)
+                            writer.Write(encoded)
+                            writer.Flush()
+                            file.Flush(true)
+                        File.Move(temporary, path, true)
+                        temporary <- ""
+                        // The success result comes only from reopening the destination.
+                        match loadAt path with
+                        | Ok readback when readback.Stored = validated && readback.Revision = revision encoded ->
+                            Ok readback
+                        | Ok _ -> Error "Saved config readback did not match the requested values."
+                        | Error error -> Error $"Saved config could not be verified: {error}")
+            with ex ->
                 if temporary <> "" && File.Exists temporary then
                     try File.Delete temporary with _ -> ()
                 Error $"Failed to save Jarvis configuration: {ex.Message}"
@@ -261,7 +301,10 @@ module ClientConfig =
     let updateKey key value (stored: ClientStoredConfig) =
         match key with
         | "machine-name" -> { stored with MachineName = Some value } |> validate
-        | "workspace-path" -> { stored with WorkspacePath = Some value } |> validate
+        | "workspace-path" ->
+            if not (Path.IsPathFullyQualified value) then Error "workspace-path must be absolute."
+            elif not (Directory.Exists value) then Error "workspace-path must name an existing directory."
+            else { stored with WorkspacePath = Some value } |> validate
         | "trust-level" -> { stored with TrustLevel = Some value } |> validate
         | "browser-port" ->
             match Int32.TryParse value with
@@ -295,3 +338,47 @@ module ClientConfig =
         | "native-health-timeout-seconds" -> Ok { stored with NativeHealthTimeoutSeconds = None }
         | "allowed-environment-variables" -> Ok { stored with AllowedEnvironmentVariables = None }
         | _ -> Error $"Unknown setting: {key}"
+    // All single-setting clients (CLI and remote tool) enter the same
+    // validation, cross-process CAS, replace and readback pipeline as TUI Save.
+    let applyAt path (expectedRevision: string option) key (value: string option) =
+        loadAt path
+        |> Result.bind (fun snapshot ->
+            if expectedRevision |> Option.exists (fun revision -> revision <> snapshot.Revision) then
+                Error "Config revision conflict. Reload before saving."
+            else
+                (match value with
+                 | Some text -> updateKey key text snapshot.Stored
+                 | None -> unsetKey key snapshot.Stored)
+                |> Result.bind (save snapshot))
+
+    let applyKey key value = applyAt (configPath()) None key (Some value)
+    let applyUnset key = applyAt (configPath()) None key None
+
+
+    // Remote agents cannot authorize their own additional local privileges.
+    // Local TUI confirmation and explicitly invoked CLI remain separate local
+    // operator paths; the tool must call this fail-closed variant.
+    let applyRemoteAt path (expectedRevision: string option) key (value: string option) =
+        loadAt path
+        |> Result.bind (fun before ->
+            if expectedRevision |> Option.exists (fun revision -> revision <> before.Revision) then
+                Error "Config revision conflict. Reload before saving."
+            else
+                (match value with
+                 | Some text -> updateKey key text before.Stored
+                 | None -> unsetKey key before.Stored)
+                |> Result.bind (fun next ->
+                    let trustRank = function
+                        | Some "none" -> 0
+                        | Some "full" -> 2
+                        | _ -> 1
+                    let increasedTrust = trustRank next.TrustLevel > trustRank before.Stored.TrustLevel
+                    let priorVars = before.Stored.AllowedEnvironmentVariables |> Option.defaultValue []
+                    let nextVars = next.AllowedEnvironmentVariables |> Option.defaultValue []
+                    let expandedEnvironment =
+                        nextVars |> List.exists (fun name -> not (List.contains name priorVars))
+                    if increasedTrust || expandedEnvironment then
+                        Error "Local operator confirmation required for trust or environment-allowlist expansion."
+                    else
+                        applyAt path (Some before.Revision) key value))
+    let applyRemote key value expectedRevision = applyRemoteAt (configPath()) expectedRevision key value

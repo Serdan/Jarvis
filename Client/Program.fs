@@ -44,6 +44,9 @@ let private runConfigCommand (args: string array) =
             | Error error -> eprintfn "%s" error; 2
             | Ok config ->
                 printfn "File: %s" snapshot.Path
+                printfn "Revision: %s" snapshot.Revision
+                printfn "Stored machine name: %s" (stored.MachineName |> Option.defaultValue "(default)")
+                printfn "Stored workspace root: %s" (stored.WorkspacePath |> Option.defaultValue "(default)")
                 printfn "Machine name: %s" config.MachineName
                 printfn "Workspace: %s" config.WorkspacePath
                 printfn "Trust: %s" config.TrustLevel
@@ -57,19 +60,13 @@ let private runConfigCommand (args: string array) =
         | [ "config"; "path" ] -> printfn "%s" snapshot.Path; 0
         | [ "config"; "show" ] -> show ()
         | [ "config"; "set"; key; value ] ->
-            match ClientConfig.updateKey key value snapshot.Stored with
+            match ClientConfig.applyKey key value with
+            | Ok saved -> printfn "Saved %s to %s (revision %s)" key saved.Path saved.Revision; 0
             | Error error -> eprintfn "%s" error; 2
-            | Ok stored ->
-                match ClientConfig.save snapshot stored with
-                | Ok _ -> printfn "Saved %s" key; 0
-                | Error error -> eprintfn "%s" error; 2
         | [ "config"; "unset"; key ] ->
-            match ClientConfig.unsetKey key snapshot.Stored with
+            match ClientConfig.applyUnset key with
+            | Ok saved -> printfn "Unset %s in %s (revision %s)" key saved.Path saved.Revision; 0
             | Error error -> eprintfn "%s" error; 2
-            | Ok stored ->
-                match ClientConfig.save snapshot stored with
-                | Ok _ -> printfn "Unset %s" key; 0
-                | Error error -> eprintfn "%s" error; 2
         | _ ->
             eprintfn "Usage: JarvisClient config path|show|set <key> <value>|unset <key>"
             2
@@ -158,6 +155,9 @@ let private runClient args =
             exit 2
 
     let dir = effective.WorkspacePath
+    if not (Directory.Exists dir) then
+        eprintfn "Configured workspace directory '%s' is unavailable. Create it or use: JarvisClient config set workspace-path <existing-absolute-directory>" dir
+        exit 2
     let allowedEnvironmentVariables = effective.AllowedEnvironmentVariables
     let maxImportBytes = effective.MaxImportBytes
     let resolveMachineName () =
@@ -172,6 +172,7 @@ let private runClient args =
             | Error error ->
                 tui.Log $"Unable to reload configured machine name: {error}"
                 effective.MachineName
+    let mutable registeredMachineName = effective.MachineName
     let trustLevel =
         match TrustLevel.parse effective.TrustLevel with
         | Ok level -> level
@@ -533,16 +534,34 @@ let private runClient args =
 
                     if connected then
                         connectionFailureCount <- 0
-                        let! isRegistered = register tui connection deviceId resolveMachineName
+                        let name = resolveMachineName()
+                        let! isRegistered = register tui connection deviceId (fun () -> name)
                         registered <- isRegistered
-                        if isRegistered then Client.invalidateAllAgentStates rt
+                        if isRegistered then
+                            registeredMachineName <- name
+                            Client.invalidateAllAgentStates rt
                     else
                         connectionFailureCount <- connectionFailureCount + 1
 
             elif connection.State = HubConnectionState.Connected && not registered then
-                let! isRegistered = register tui connection deviceId resolveMachineName
+                let name = resolveMachineName()
+                let! isRegistered = register tui connection deviceId (fun () -> name)
                 registered <- isRegistered
-                if isRegistered then Client.invalidateAllAgentStates rt
+                if isRegistered then
+                    registeredMachineName <- name
+                    Client.invalidateAllAgentStates rt
+
+            elif connection.State = HubConnectionState.Connected && registered then
+                // A setting saved by TUI, CLI or the remote tool must reach the
+                // actual device registry without restarting the live client.
+                // The startup CLI --machine-name override still takes precedence.
+                let name = resolveMachineName()
+                if name <> registeredMachineName then
+                    let! isRegistered = register tui connection deviceId (fun () -> name)
+                    registered <- isRegistered
+                    if isRegistered then
+                        registeredMachineName <- name
+                        Client.invalidateAllAgentStates rt
 
             if not tui.ShouldQuit then
                 try

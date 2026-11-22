@@ -1,6 +1,9 @@
 module ServerNamedClientSettingToolTests
 
 open System
+open System.Threading.Tasks
+open Microsoft.AspNetCore.SignalR
+open Microsoft.Extensions.DependencyInjection
 open System.Text.Json
 open Common
 open Common.SignalR
@@ -148,3 +151,132 @@ let deviceIdentityIsAccountScopedAndExplicitSelectionNeverFallsBack () =
     match users.GetSelectedSession("alice", Some "conversation-one", None) with
     | ValueSome selected -> Assert.That(selected.DeviceId, Is.EqualTo("beta"))
     | _ -> Assert.Fail("Conversation-specific selection was lost.")
+
+
+[<Test>]
+let authenticatedNamedSettingRoutingTargetsOnlyExactConnectedDevice () =
+    // In-process production ClientService/typed SignalR dispatch, with disposable
+    // account sessions. No operator client or persisted user settings are touched.
+    let users = UserService()
+    let tracker = ClientResponseTracker()
+    let arrivals = ResizeArray<string * string>()
+    let responseFor device : AgentCommandResponse =
+        { Result = Some(sprintf """{"device":"%s","revision":"%s"}""" device revision)
+          Error = None
+          Instructions = []
+          AgentStateChanges = []
+          InboxActivation = None
+          PendingJob = None }
+    let endpoint device connection =
+        { new IClientService with
+            member _.ReceiveMessage _ = Task.CompletedTask
+            member _.ReceiveCommand(correlation, json, _actor) =
+                match JsonSerializer.Deserialize<AgentCommand>(json) with
+                | UpdateNamedSettingCommand cmd ->
+                    arrivals.Add((device, NamedClientSettingWire.canonicalName cmd.Setting))
+                    match users.GetSessionByDevice("alice", device) with
+                    | ValueSome active ->
+                        Assert.That(tracker.Complete(correlation, "alice", connection,
+                                                     active.Generation, responseFor device), Is.True)
+                    | ValueNone -> Assert.Fail("Test session disappeared.")
+                | _ -> Assert.Fail("Wrong command crossed named-setting transport.")
+                Task.CompletedTask
+            member _.ReceiveSourceCommand(_, _, _, _) = Task.CompletedTask
+            member _.ReceiveManualGrantedCommand(_, _, _) = Task.CompletedTask
+            member _.ReceiveManualGrantApproval(_, _, _) = Task.CompletedTask
+            member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+            member _.InvalidateAllAgentStates() = Task.CompletedTask
+            member _.RecordAgentActivity(_, _, _) = Task.CompletedTask }
+    let endpoints =
+        dict [ "alice-alpha", endpoint "alpha" "alice-alpha"
+               "alice-beta", endpoint "beta" "alice-beta" ]
+    let clients =
+        { new IHubClients<IClientService> with
+            member _.All = Unchecked.defaultof<_>
+            member _.AllExcept _ = Unchecked.defaultof<_>
+            member _.Client id = endpoints[id]
+            member _.Clients _ = Unchecked.defaultof<_>
+            member _.Group _ = Unchecked.defaultof<_>
+            member _.GroupExcept(_, _) = Unchecked.defaultof<_>
+            member _.Groups _ = Unchecked.defaultof<_>
+            member _.User _ = Unchecked.defaultof<_>
+            member _.Users _ = Unchecked.defaultof<_> }
+    let groups =
+        { new IGroupManager with
+            member _.AddToGroupAsync(_, _, _) = Task.CompletedTask
+            member _.RemoveFromGroupAsync(_, _, _) = Task.CompletedTask }
+    let hub =
+        { new IHubContext<HubService, IClientService> with
+            member _.Clients = clients
+            member _.Groups = groups }
+    for device, connection in [ "alpha", "alice-alpha"; "beta", "alice-beta" ] do
+        users.TransportConnected("alice", connection)
+        users.Register("alice",
+            { DeviceId = device; DeviceName = device; ProtocolVersion = AgentProtocol.version
+              ClientVersion = "disposable"; SupportedCommands = [ "UpdateNamedSetting" ] },
+            connection) |> ignore
+    let fixture = IO.Path.Combine(IO.Path.GetTempPath(), "jarvis-w25-auth-route-" + Guid.NewGuid().ToString("N"))
+    IO.Directory.CreateDirectory(fixture) |> ignore
+    try
+        let feedback = OptionalFeedbackStore(IO.Path.Combine(fixture, "optional.db"))
+        let options =
+            { Auth0Domain = "fixture.example"; Audience = "https://fixture.example"
+              OpenAIAppsChallenge = ""; EnableOperatorConversations = false }
+        let services = Microsoft.Extensions.DependencyInjection.ServiceCollection()
+        services.AddSingleton<UserService>(users) |> ignore
+        services.AddSingleton<OptionalFeedbackStore>(feedback) |> ignore
+        services.AddSingleton<Microsoft.Extensions.Options.IOptions<JarvisOptions>>(
+            Microsoft.Extensions.Options.Options.Create(options)) |> ignore
+        services.AddSingleton<Microsoft.Extensions.Logging.ILoggerFactory>(
+            Microsoft.Extensions.Logging.Abstractions.NullLoggerFactory.Instance) |> ignore
+        use provider = services.BuildServiceProvider()
+        let context = Microsoft.AspNetCore.Http.DefaultHttpContext()
+        context.RequestServices <- provider
+        let accessor = Microsoft.AspNetCore.Http.HttpContextAccessor()
+        accessor.HttpContext <- context
+        let client =
+            ClientService(hub, users, tracker, accessor,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance, feedback)
+        let principal user scope =
+            System.Security.Claims.ClaimsPrincipal(
+                System.Security.Claims.ClaimsIdentity(
+                    [ System.Security.Claims.Claim("sub", user)
+                      System.Security.Claims.Claim("scope", scope) ], "disposable-test"))
+        let invoke user scope target =
+            task {
+                context.User <- principal user scope
+                let arguments = System.Collections.Generic.Dictionary<string, JsonElement>()
+                arguments["deviceId"] <- JsonSerializer.SerializeToElement(target)
+                let request =
+                    ModelContextProtocol.Protocol.CallToolRequestParams(
+                        Name = "UpdateNamedSetting", Arguments = arguments)
+                return!
+                    RequestDeviceRouting.withMetadata request (fun () ->
+                        McpToolHelpers.updateNamedSetting client accessor "machine-name" "read"
+                            (Unchecked.defaultof<JsonElement>) "" target)
+            }
+        let count() = arrivals.Count
+        let first = invoke "alice" "workspace:write" "beta" |> Async.AwaitTask |> Async.RunSynchronously
+        Assert.That(first.IsError, Is.Not.EqualTo(true))
+        Assert.That(arrivals |> Seq.toList, Is.EqualTo(box [("beta", "machine-name")]),
+                    "Explicit beta must win even with alpha as account default.")
+        let before = count()
+        let missing = invoke "alice" "workspace:write" "retired" |> Async.AwaitTask |> Async.RunSynchronously
+        Assert.That(missing.IsError, Is.EqualTo(true))
+        Assert.That(count(), Is.EqualTo(before), "Missing target must not fall back.")
+        users.Disconnect("alice-beta", Some "disposable offline simulation")
+        let disconnected = invoke "alice" "workspace:write" "beta" |> Async.AwaitTask |> Async.RunSynchronously
+        Assert.That(disconnected.IsError, Is.EqualTo(true), "Disconnected beta must fail closed.")
+        Assert.That(count(), Is.EqualTo(before), "Disconnected beta must not fall back to alpha.")
+        let otherAccount = invoke "bob" "workspace:write" "alpha" |> Async.AwaitTask |> Async.RunSynchronously
+        Assert.That(otherAccount.IsError, Is.EqualTo(true))
+        Assert.That(count(), Is.EqualTo(before), "Foreign account must not reach alpha.")
+        let insufficient = invoke "alice" "workspace:read" "alpha" |> Async.AwaitTask |> Async.RunSynchronously
+        Assert.That(insufficient.IsError, Is.EqualTo(true))
+        Assert.That(count(), Is.EqualTo(before), "Unscoped caller must not reach alpha.")
+        let second = invoke "alice" "workspace:write" "alpha" |> Async.AwaitTask |> Async.RunSynchronously
+        Assert.That(second.IsError, Is.Not.EqualTo(true))
+        Assert.That(arrivals |> Seq.toList,
+                    Is.EqualTo(box [("beta", "machine-name"); ("alpha", "machine-name")]))
+    finally
+        try IO.Directory.Delete(fixture, true) with _ -> ()

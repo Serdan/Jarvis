@@ -1,0 +1,1 @@
+Clean private test-only composite 6e95f0e. New scoped positive/negative device routing 1/1, full Server .NET 11 Release 568/568 terminal exit0 TRX /tmp/jarvis-w25-two-device-full-final/w25-two-device-full-final.trx. Synthetic scoped principal + mock SignalR; do not claim signed OAuth or live-device tests. Hold managed integration.

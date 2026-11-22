@@ -306,3 +306,109 @@ test("adversarial independent mutation is rejected and deterministic delete-shri
   assert.equal(replay(minimized), true, "minimized counterexample must replay");
   assert.deepEqual(minimized.map(x => x.kind), ["claim", "start", "send", "noSend"]);
 });
+
+
+// Conditional Phase B: exact accepted native F# B1, disposable only. This
+// augments the reviewed harness in a temporary project; no StageB edits.
+if (process.env.JARVIS_STAGEB_SOURCE_ROOT) {
+  test("Phase B accepted native F# seeded differential safety projection", async () => {
+    const { readFileSync, writeFileSync, mkdtempSync: temp, rmSync: remove } = await import("node:fs");
+    const { resolve, join: pathJoin } = await import("node:path");
+    const { tmpdir: tempRoot } = await import("node:os");
+    const { spawnSync } = await import("node:child_process");
+    const root = resolve(process.env.JARVIS_STAGEB_SOURCE_ROOT);
+    const accepted = "74fcda395857669c5db0f80ef997b4f2d6e37fcd";
+    const command = (exe, args, options = {}) =>
+      spawnSync(exe, args, { encoding: "utf8", maxBuffer: 16 * 1024 * 1024,
+        timeout: 300000, ...options });
+    const sha = command("git", ["-C", root, "rev-parse", "--verify", "HEAD"]);
+    assert.equal(sha.status, 0, sha.stderr);
+    assert.equal(sha.stdout.trim(), accepted, "Native source must equal accepted SHA");
+    const clean = command("git", ["-C", root, "status", "--porcelain"]);
+    assert.equal(clean.status, 0, clean.stderr);
+    assert.equal(clean.stdout.trim(), "", "Accepted native source must be clean");
+    const nativeDir = pathJoin(root, "scripts/tests/native-project-effect-stage-b");
+    const project = readFileSync(pathJoin(nativeDir, "NativeProjectEffectStageB.fsproj"), "utf8");
+    const program = readFileSync(pathJoin(nativeDir, "Program.fs"), "utf8");
+    const marker = "let main _ =\n    try\n";
+    assert.equal(program.split(marker).length, 2, "Native entrypoint changed; fail closed");
+    const seeds = Array.from({ length: 8 }, (_, i) => i + 101);
+    for (const seed of seeds) {
+      const generated = generateEffectTrace(seed);
+      assert.equal(generated.sent, seed % 2 === 1);
+      assert.ok(generated.trace.some(e => e.kind ===
+        (generated.sent ? "sendLost" : "attemptLateSend")));
+      assert.ok(generated.trace.some(e => e.expect === "FakeAccountReleased"));
+    }
+    const injected = String.raw`        test "PhaseB generated oracle projection 8 seeded three-clone traces" (fun () ->
+            for seed in [| @@SEEDS@@ |] do
+                withFixture (fun f ->
+                    let c = makeClaim f f.Worker
+                    let mutable callbackCount = 0
+                    let port (_: NativeEffectRecord) =
+                        callbackCount <- callbackCount + 1
+                        Ok (fakeTerminal c.EffectId "Unknown")
+                    claim f.One c |> success |> ignore
+                    if seed % 2 = 1 then
+                        let first = dispatchFakePort f.Two f.Worker c.EffectId (Guid.NewGuid()) port |> success
+                        check (first.Status = "Unknown") "Expected uncertain first callback"
+                        dispatchFakePort f.Three f.Worker c.EffectId (Guid.NewGuid()) port |> denied
+                        let noSend = { Marker = "STAGE_B_DISPOSABLE_FAKE_NO_SEND/v1"; Reason = "uncertain" }
+                        recordFakeNoSend f.One f.Worker c.EffectId (Guid.NewGuid()) noSend |> denied
+                        releaseFakeReservation f.One f.AccountTwo f.Worker c.EffectId (Guid.NewGuid()) (Guid.NewGuid()) |> denied
+                        check ((fakeState f c.Account).Status = "Reserved") "Unknown released account"
+                        let terminalId = Guid.NewGuid()
+                        let terminal = fakeTerminal c.EffectId "Terminal"
+                        recordFakeTerminal f.Three f.Worker c.EffectId terminalId terminal |> success |> ignore
+                        recordFakeTerminal f.One f.Worker c.EffectId terminalId { terminal with Status = "Unknown" } |> reused
+                        releaseFakeReservation f.Two f.AccountThree f.Worker c.EffectId terminalId (Guid.NewGuid()) |> success |> ignore
+                        check ((get f f.Worker).Status = "VerifiedFakeTerminal") "Native terminal projection"
+                    else
+                        let noSend = { Marker = "STAGE_B_DISPOSABLE_FAKE_NO_SEND/v1"; Reason = "prestart" }
+                        let terminalId = Guid.NewGuid()
+                        recordFakeNoSend f.Two f.Worker c.EffectId terminalId noSend |> success |> ignore
+                        dispatchFakePort f.Three f.Worker c.EffectId (Guid.NewGuid()) port |> denied
+                        releaseFakeReservation f.One f.AccountTwo f.Worker c.EffectId terminalId (Guid.NewGuid()) |> success |> ignore
+                        check ((get f f.Worker).Status = "VerifiedNoSend") "Native prestart no-send projection"
+                        // Synthetic RED canary deliberately bypasses the native guard.
+                        // It represents a stale external callback, not a production claim.
+                        if seed = 102 && Environment.GetEnvironmentVariable("NATIVE_DIFF_MUTANT") = "1" then
+                            port (get f f.Worker) |> ignore
+                    let expected = if seed % 2 = 1 then 1 else 0
+                    check (callbackCount = expected) "UnsafeLateProviderAccept"
+                    check ((fakeState f c.Account).Status = "Released") "Fake account once-release"
+                    dispatchFakePort f.Three f.Worker c.EffectId (Guid.NewGuid()) port |> denied
+                    check (callbackCount = expected) "Native rearmed fake callback"
+                ))
+`;
+    const source = program.replace(marker, marker + injected.replace("@@SEEDS@@", seeds.join("; ")));
+    const scratch = temp(pathJoin(tempRoot(), "jarvis-native-phaseb-w13-"));
+    try {
+      const fsproj = project
+        .replace("../../../Client/Client.fsproj", pathJoin(root, "Client/Client.fsproj"))
+        .replace("../../../Client/Modules/NativeProjectEffectFence.fs",
+          pathJoin(root, "Client/Modules/NativeProjectEffectFence.fs"));
+      assert.notEqual(fsproj, project, "Native F# exact-source reference missing");
+      writeFileSync(pathJoin(scratch, "NativeProjectEffectStageB.fsproj"), fsproj);
+      writeFileSync(pathJoin(scratch, "Program.fs"), source);
+      const result = command("dotnet", ["run", "-c", "Release",
+        "-p:BuildProjectReferences=false", "--project",
+        pathJoin(scratch, "NativeProjectEffectStageB.fsproj")],
+        { cwd: scratch, env: { ...process.env, DOTNET_NOLOGO: "1" } });
+      const transcript = (result.stdout || "") + "\n" + (result.stderr || "");
+      console.log("Native accepted SHA:", accepted, "seeds:", seeds.join(","));
+      console.log("Scoped .NET11 Release exit:", result.status, "signal:", result.signal);
+      console.log(transcript);
+      if (process.env.NATIVE_DIFF_MUTANT === "1") {
+        assert.notEqual(result.status, 0, "Unsafe late-send mutant must be RED");
+        assert.match(transcript, /UnsafeLateProviderAccept/);
+      } else {
+        assert.equal(result.status, 0, "Native source-bound GREEN failed:\n" + transcript);
+        assert.match(transcript, /PASS PhaseB generated oracle projection/);
+        assert.match(transcript, /STAGE_B_DISPOSABLE_TEST_ONLY .NET 11 Release PASS 24/);
+      }
+    } finally {
+      remove(scratch, { recursive: true, force: true });
+    }
+  });
+}

@@ -197,3 +197,23 @@ restarts and **7 retained stale Dispatching sends denied after seal**.
 Seed 102 seal-bypass mutation caused independent oracle RED and reproduced
 on the shrunk counterexample. Source commit and fresh frozen review will be
 recorded separately in the canonical task checkpoint.
+
+
+## Conditional Phase B accepted-source native differential probe
+
+The canonical StageB task scheduler-native-project-effect-stageb-20261121 is Closed/Finished. Independent Reviewer 1 Accepted decision 10938, review c82ba0618d8b41f395b12ef1adab22b1, exact immutable source SHA 74fcda395857669c5db0f80ef997b4f2d6e37fcd based on dcac884f. Before the probe, the registered scheduler-project-effect-stageb-worker22-20261122 worktree had that HEAD and a clean status. StageB B1 remains guarded by STAGE_B_DISPOSABLE_TEST_ONLY, never registered into the live Client.
+
+The original leased effect-traces.test.mjs conditionally runs the accepted native F# implementation when JARVIS_STAGEB_SOURCE_ROOT names the clean source worktree. It refuses a different HEAD or dirty tree. The runner creates an automatically removed standalone .NET11 Release project from the exact accepted StageB fsproj, F# module, and harness, inserting only a temporary F# test extension. It retains real Client.LedgerStore, three disposable project Git clones and one separate fake-account Git repository. No Worker22 files, shared fsproj, production source, main, or external account/provider state is changed.
+
+Eight seeded Phase A reference histories (101–108; four sent/Unknown and four prospective no-send) determine the overlapping B1 safety projection: exactly one guarded fake callback, retries denied after an uncertain dispatch, no-send forbidden after dispatch, foreign/changed terminal proof denied, fake account reserved until a terminal, once-only fake release, and pre-dispatch no-send denying any later GUARDED callback. The synthetic negative mutation invokes a stale callback outside the B1 guard after fake no-send/release, and independent callback accounting must report UnsafeLateProviderAccept. That negative oracle is not a discovered production exploit.
+
+This is a projected invariant comparison, not exact state equivalence. In particular StageB B1 can accept pre-dispatch fake no-send, while the broader Phase A oracle requires an independent prospective provider no-session seal. B1 does not authenticate provider sessions or prove provider quiescence. Actual external in-flight effects, account capacity CAS, cross-store atomicity, B2, BrowserBridge, schedules, migration, activation and deployment remain HOLD.
+
+
+### Phase B executed source-bound terminal receipts
+
+RED-first job 04aac6a83e434a5eb27ae138874b5a5e: outer Node test runner exit 0 (6/6, zero failed/skipped), deliberately mutated temporary native .NET11 Release harness exit 1 with the expected UnsafeLateProviderAccept on seed 102. That is the intentional negative oracle, not a production failure. StageB HEAD/source verification passed, no native source edit.
+
+Unmutated GREEN job ff54b94063844d3d97f97c1286f4682f: outer Node runner exit 0 (6/6, zero failed/skipped), nested source-bound native .NET11 Release exit 0 (24/24 PASS, including all 23 originally accepted StageB harness tests and the eight-seed differential projection). Seeds: 101, 102, 103, 104, 105, 106, 107, 108. Accepted immutable native source SHA 74fcda395857669c5db0f80ef997b4f2d6e37fcd. Exactly four send/Unknown traces and four pre-dispatch no-send traces. No broad Client suite rerun. No BrowserBridge/provider send, real account state, main, deploy, B2, scheduling or cutover.
+
+Evidence interpretation: the extra native run establishes guarded B1 fake-port project CAS and separate fake-account release behavior under these seeded safety projections. It does not establish provider-owned prospective no-session seals, full Phase-A/B1 state equivalence, multi-process external-provider atomicity or trusted production integration. These remain open beyond the original lease. Independent review of the exact test/docs-only frozen source is still required.

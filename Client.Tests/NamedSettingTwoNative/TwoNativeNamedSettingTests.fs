@@ -164,11 +164,34 @@ let authenticatedTwoNativeClientsKeepCASAndWorkspaceAndRegistrationIsolated () =
         let alphaInitial = snapshot homeA
         let betaInitial = snapshot homeB
         expectOk (invoke "alpha" "machine-name" "read" "null" "")
-        expectOk (invoke "beta" "machine-name" "read" "null" "")
+        let betaOriginalRead = invoke "beta" "machine-name" "read" "null" ""
+        expectOk betaOriginalRead
+        let betaOriginalResponse = json (firstText betaOriginalRead)
+        Assert.That(betaOriginalResponse.GetProperty("NewPersistedValue").GetString(),
+                    Is.EqualTo("beta-original"))
+        Assert.That(betaOriginalResponse.GetProperty("Revision").GetString(),
+                    Is.EqualTo(betaInitial.Revision))
+        // Positive opposite-device route: the real selected-client server tool
+        // must mutate Beta with Beta's own CAS, not silently fall back to Alpha.
+        let alphaBytesBeforeBeta = File.ReadAllBytes(config homeA)
+        expectOk (invoke "beta" "machine-name" "set" "\"beta-updated\"" betaInitial.Revision)
+        let betaNamed = snapshot homeB
+        Assert.That(betaNamed.Stored.MachineName, Is.EqualTo(Some "beta-updated"))
+        Assert.That(betaNamed.Revision, Is.Not.EqualTo(betaInitial.Revision))
+        Assert.That((snapshot homeA).Revision, Is.EqualTo(alphaInitial.Revision))
+        Assert.That(Convert.ToHexString(File.ReadAllBytes(config homeA)),
+                    Is.EqualTo(Convert.ToHexString(alphaBytesBeforeBeta)))
+        let betaReadBack = invoke "beta" "machine-name" "read" "null" ""
+        expectOk betaReadBack
+        let betaReadResponse = json (firstText betaReadBack)
+        Assert.That(betaReadResponse.GetProperty("NewPersistedValue").GetString(),
+                    Is.EqualTo("beta-updated"))
+        Assert.That(betaReadResponse.GetProperty("Revision").GetString(),
+                    Is.EqualTo(betaNamed.Revision))
         expectOk (invoke "alpha" "machine-name" "set" "\"alpha-updated\"" alphaInitial.Revision)
         let alphaNamed = snapshot homeA
         Assert.That(alphaNamed.Stored.MachineName, Is.EqualTo(Some "alpha-updated"))
-        Assert.That((snapshot homeB).Revision, Is.EqualTo(betaInitial.Revision))
+        Assert.That((snapshot homeB).Revision, Is.EqualTo(betaNamed.Revision))
         expectError (invoke "alpha" "machine-name" "set" "\"CAS-stale\"" alphaInitial.Revision)
         Assert.That((snapshot homeA).Revision, Is.EqualTo(alphaNamed.Revision))
         expectOk (invoke "alpha" "workspace-path" "set" (JsonSerializer.Serialize a1) alphaNamed.Revision)
@@ -185,7 +208,7 @@ let authenticatedTwoNativeClientsKeepCASAndWorkspaceAndRegistrationIsolated () =
         context.User <- principal alice
         expectOk (invoke "alpha" "machine-name" "unset" "null" moved.Revision)
         Assert.That((snapshot homeA).Stored.MachineName, Is.EqualTo(None))
-        Assert.That((snapshot homeB).Stored.MachineName, Is.EqualTo(Some "beta-original"))
+        Assert.That((snapshot homeB).Stored.MachineName, Is.EqualTo(Some "beta-updated"))
         // A fresh native OS process consumes persisted workspace; the running
         // process correctly keeps old runtime until restart, without switching beta.
         use freshAlpha = new NativeAgent(homeA)
@@ -213,5 +236,24 @@ let authenticatedTwoNativeClientsKeepCASAndWorkspaceAndRegistrationIsolated () =
         match users.GetSelectedSession(alice, None, Some "beta") with
         | ValueSome session -> Assert.That(session.DeviceName, Is.EqualTo("beta"))
         | _ -> Assert.Fail("Beta registration was lost during alpha re-registration")
+        // A formerly valid Beta connection now becomes stale. An exact Beta
+        // selection must fail closed, even with Alpha still connected and ready.
+        let alphaBytesBeforeStaleBeta = File.ReadAllBytes(config homeA)
+        let betaBytesBeforeStaleBeta = File.ReadAllBytes(config homeB)
+        let alphaRevisionBeforeStaleBeta = (snapshot homeA).Revision
+        users.Disconnect(connB, Some "disposable Beta transport ended")
+        match users.GetSelectedSession(alice, None, Some "beta") with
+        | ValueSome session ->
+            Assert.That(session.Generation, Is.EqualTo(generationB))
+            Assert.That(session.ConnectionId, Is.EqualTo(None))
+        | _ -> Assert.Fail("Expected retained disconnected Beta registration")
+        expectError (invoke "beta" "machine-name" "set" "\"must-not-fall-back\"" betaNamed.Revision)
+        Assert.That(Convert.ToHexString(File.ReadAllBytes(config homeB)),
+                    Is.EqualTo(Convert.ToHexString(betaBytesBeforeStaleBeta)))
+        Assert.That((snapshot homeB).Revision, Is.EqualTo(betaNamed.Revision))
+        Assert.That(Convert.ToHexString(File.ReadAllBytes(config homeA)),
+                    Is.EqualTo(Convert.ToHexString(alphaBytesBeforeStaleBeta)))
+        Assert.That((snapshot homeA).Revision, Is.EqualTo(alphaRevisionBeforeStaleBeta))
+        expectOk (invoke "alpha" "machine-name" "read" "null" "")
     finally
         try Directory.Delete(root, true) with _ -> ()

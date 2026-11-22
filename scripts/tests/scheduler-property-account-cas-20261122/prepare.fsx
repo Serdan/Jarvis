@@ -10,6 +10,7 @@ let pin = "5607baf9913f4976add13c984e0182906d4fe8c7"
 let source = "Client/Modules/NativeSchedulerAccountReservation.fs"
 let fixture = Path.Combine(root, "Client.Tests", "NativeSchedulerRosterPolicyTests.fs")
 let property = Path.Combine(here, "Property.fs")
+let differential = Path.Combine(here, "Differential.fs")
 let output = Path.Combine(here, "Generated.NativeReservation.Property.fs")
 
 let git (args: string list) =
@@ -65,6 +66,7 @@ let standalone =
             .Replace("let limits = NativeFixture.limits",
                      "let limits w r = NativeFixture.limits w r")
 let body = File.ReadAllText(property)
-File.WriteAllText(output, standalone + body)
+let nativeDifferential = File.ReadAllText(differential)
+File.WriteAllText(output, standalone + body + Environment.NewLine + nativeDifferential)
 printfn "PREPARED_SOURCE_EXACT pin=%s sourceBlob=%s fixtureBlob=%s output=%s"
     pin actual frozenFixture output

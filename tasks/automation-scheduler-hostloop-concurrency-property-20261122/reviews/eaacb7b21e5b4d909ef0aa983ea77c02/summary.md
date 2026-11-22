@@ -1,1 +1,21 @@
-Main dcac884; Worker14 planner 0f732e34 unchanged host-loop blobs. NUnit line318 RED reproduced 1/4 isolated .NET11 Release runs; adjacent 34/34 green; 500 source-bound seeded properties pass with 126 early external task-wrapper observations; injected duplicate-port negative exits1. Exactly three new lease-scoped files, no production/shared fsproj/main changes.
+# Independent Review — Accepted (bounded test-only diagnostic)
+
+- Task: `automation-scheduler-hostloop-concurrency-property-20261122`
+- Request: `eaacb7b21e5b4d909ef0aa983ea77c02`
+- Reviewer: Reviewer 2 (independent of Worker 19)
+- Immutable source: `25c03f82b6b5257f4feb3904527211e1833383b4`, direct parent/main baseline `dcac884fc061869572b12a03befc12f11c009f2f`; verified `git rev-parse HEAD`, `git show --format=%H %P`.
+- Original task scope checked: source-exact, test-only host-loop Stop/ManualStep investigation; three new paths only (standalone F# fsproj and Program.fs under `scripts/tests/scheduler-hostloop-concurrency-20261122/`, plus `docs/testing/scheduler-hostloop-concurrency-20261122.md`). No production, shared project, existing test, main, or browser changes. No adjudicated expansion needed.
+- SDK: .NET `11.0.100`; Release, Linux. New tests actually link production `Client/Client.fsproj` and call `WorkQueueSchedulerHostLoop.Host` with deliberately inert, gated external ports; not a copied/mocked Host.
+
+## Reviewer-executed evidence
+1. `dotnet run --project scripts/tests/scheduler-hostloop-concurrency-20261122/HostLoopConcurrency.fsproj -c Release -- 20261122 250`: exit 0, 250/250 PASS, 184 early external-wrapper completion observations. Job `36c158d3895241feb14b0dc5187198ec`.
+2. `dotnet run --no-build --no-restore --project .../HostLoopConcurrency.fsproj -c Release -- 90317 250`: exit 0, 250/250 PASS, 127 early external-wrapper observations. Job `cdd00e89de454e13af349f5b3064edbd`.
+3. Identical runner with `20261122 1 --negative`: expected exit 1; trace `iteration=0 scenario=2 ... unexpected number of coordinator invocations`, proving deliberately duplicated Wake port-accounting mutation is detected, not a real production mutant. Job `fa2039ea89e04a10829d2c49a3d40518`.
+4. Original existing NUnit case `FullyQualifiedName~StopJoinsConcurrentManualStepWithoutBackgroundLoops`, `dotnet test Client.Tests/Client.Tests.fsproj -c Release`: initial fresh testhost exit 0, 1/1 PASS, TRX `/tmp/jarvis-reviewer2-hostloop-original/review2-hostloop-baseline.trx`, job `9fe593606129465ba7d0a4b3f4115965`. Six further independent Release `--no-build --no-restore` testhosts: **4 PASS, 2 RED** (r4, r6; exits 1), both at `WorkQueueSchedulerHostLoopTests.fs:318`. TRX `/tmp/jarvis-reviewer2-hostloop-r{1..6}/review2-r{1..6}.trx`. Jobs `7fbd78d3`, `96adb41e`, `cf2871f0`, `e636beb7` (RED), `669fc88d`, `a752fef4` (RED). The original flaky test is NOT fixed or concealed.
+5. Neighbors original `WorkQueueSchedulerHostLoopTests|WorkQueueReactiveWakeTests|WorkQueueSchedulerHostPreviewTests`: 34/34 PASS, exit 0, TRX `/tmp/jarvis-reviewer2-hostloop-neighbors/review2-hostloop-neighbors.trx`, job `6d231b11e726414f8c56b057a313ee09`. Same selection excluding known intermittent case: 33/33 PASS, exit 0, TRX `/tmp/jarvis-reviewer2-hostloop-neighbors-excluding-red/review2-hostloop-neighbors-excluding-red.trx`, job `6fde7675f7c44842a4a35c1268b47c1c`.
+6. Reviewer Git status after runs: clean. Node not applicable to three F# / documentation-only files; no new JS runner. No actual live scheduler, browser effect, account CAS or client shutdown cutover exercised.
+
+## Decision rationale
+The frozen addition meets its bounded diagnostic/test-only assignment and states its evidence limits. The real Host clears and signals `stepFinished` within `RunOnce` before the external caller-owned `Task.Run` wrapper necessarily transitions to `IsCompletedSuccessfully`; `StopAsync` joins host-owned completion, not arbitrary outside wrapper tasks. Reviewer-executed native tests and independently reproduced NUnit RED support the author's conclusion that line 318 assumes an unsupported completion ordering; no permanent host deadlock or duplicate production effect is demonstrated here. Source path/scope and mutation detection verified.
+
+**Accepted for bounded test-only investigation, NOT an assertion that the known existing NUnit RED is repaired, all scheduling interleavings are proven, or Stage B/unattended scheduler is authorized.** See individual findings `findings/known-original-test-race.md` and `findings/coverage-limits.md`.

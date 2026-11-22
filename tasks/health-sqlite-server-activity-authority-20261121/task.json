@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"health-sqlite-server-activity-authority-20261121","title":"[P0][Automation/Health] Server-authoritative SQLite agent-activity timestamp","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"b2663f73b51f49dc8ca6c638c809a107"}
+{"schemaVersion":2,"taskId":"health-sqlite-server-activity-authority-20261121","title":"[P0][Automation/Health] Server-authoritative SQLite agent-activity timestamp","version":3,"lifecycle":"Closed","specVersion":1,"attemptId":"b2663f73b51f49dc8ca6c638c809a107"}

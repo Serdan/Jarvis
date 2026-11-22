@@ -1,0 +1,1 @@
+Single new docs/platform/linux-wsl2-client-retirement-inventory-2026-11-22.md against exact clean main dcac884f; no existing source touched; preserve WSL2 browser extension, security, W6/WQ11 provenance. Future packaging edits HOLD pending explicit Lead/Integrator source lease.

@@ -1,0 +1,9 @@
+# F1 — Issuer-pinning and spoofed-principal negative are not covered
+
+**Requirement:** Original task/spec explicitly says “Pin auth issuer and ensure client cannot spoof server activity/role by local input.” The harness may mock external transport, but is intended to verify an authenticated server-to-native-client trust boundary.
+
+**Frozen source:** `HealthCoupledTests.fs:26-33` constructs `ClaimsPrincipal(ClaimsIdentity([Claim("sub", user)], "isolated-test-issuer"))` directly. `:130-145` calls `UserService.TransportConnected/Register` directly, constructs `HubService` and assigns `CallerContext`; no ASP.NET auth/issuer/signature verification runs. `:210-239` checks missing, other-user, and unregistered sessions, which is valuable, but does not reject wrong token issuer, invalid signature, or a claimed identity supplied via untrusted client input. `docs/testing/automation-health-coupled-20261122.md` explicitly acknowledges issuer/JWT middleware is unexercised.
+
+**Impact:** Green 8/8 proves server session-scoped reads after *assumed* authentication; it cannot prove issuer-pinned authentication or reject a forged/foreign principal at the real entry. Calling this “authenticated” without this boundary would overstate evidence. This is a missing acceptance test, not proof that production middleware is vulnerable.
+
+**Proportional remedy candidate (subject to independent adjudication):** Exercise actual disposable auth-host middleware with a signed fixture issuer and wrong-issuer/signature negatives, retaining real HubService/SQLite and no live transport. Alternatively demonstrate the exact typed API barrier that makes the original requirement uncomposable in the exclusive test-only scope and request a separate narrow app-host/test lease, explicitly leaving the issuer gate incomplete. Do not change production auth or activate live service.

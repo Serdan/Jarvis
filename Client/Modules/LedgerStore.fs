@@ -1522,6 +1522,7 @@ module LedgerStore =
         if prefix <> "tasks" && prefix <> "agents" && prefix <> "notifications"
            && prefix <> "records/roles"
            && prefix <> "challenges"
+           && not (Regex.IsMatch(prefix, "^tasks/[A-Za-z0-9_-]+/lifecycle$"))
            && not (Regex.IsMatch(prefix, "^challenges/[a-f0-9]{32}/events$"))
            && not (Regex.IsMatch(prefix, "^challenge-waits/by-challenge/[a-f0-9]{32}$"))
            && not (Regex.IsMatch(prefix, "^challenge-waits/by-owner/[A-Za-z0-9_-]{1,160}$")) then
@@ -1533,6 +1534,31 @@ module LedgerStore =
                 |> Array.filter (fun path -> ledgerPath.IsMatch path && not (path.Contains("..")))
                 |> Array.toList)
 
+
+    // Immutable Git additions witness completeness even if the last indexed
+    // edge is deleted. Read only one scoped prefix on the verified Git head.
+    let listCompleteWaitIndexesAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) (prefix: string) =
+        if not (prefix.StartsWith("challenge-waits/by-challenge/", StringComparison.Ordinal)
+                || prefix.StartsWith("challenge-waits/by-owner/", StringComparison.Ordinal)) then
+            Error(InvalidBinding "Complete wait-index listing needs one scoped owner or Challenge prefix.")
+        else
+            listAt binding snapshot prefix
+            |> Result.bind (fun present ->
+                run binding.RepositoryPath
+                    [ "log"; "--first-parent"; "--diff-filter=A"; "--format="
+                      "--name-only"; snapshot.Commit; "--"; prefix ]
+                |> Result.bind (fun history ->
+                    let found = present |> Set.ofList
+                    let historical =
+                        history.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                        |> Array.map _.Trim()
+                        |> Array.filter (fun path -> path <> "")
+                    if historical |> Array.exists (fun path ->
+                        not (ledgerPath.IsMatch path)
+                        || not (path.StartsWith(prefix + "/", StringComparison.Ordinal))
+                        || not (Set.contains path found)) then
+                        Error(LedgerIntegrityError "A previously issued Challenge reverse index is missing.")
+                    else Ok present))
 
     // Read-only full-tree evidence for default-off Agent => Work retirement.
     // Domain listAt readers omit ops, alerts, indexes and future record

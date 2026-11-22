@@ -774,22 +774,17 @@ module ChallengeWorkflow =
     let private wakeDependents binding snapshot (operationId: Guid) actor
                                (completed: AgentChallenge) timestamp = result {
         let prefix = ReviewWorkflow.challengeWaitIndexPrefix completed.ChallengeId
-        let! paths = LedgerStore.listAt binding snapshot prefix
-        let linkedWaits =
-            paths
-            |> List.filter (fun p -> p.EndsWith(".json", StringComparison.Ordinal))
-            |> List.sort
+        let! paths = LedgerStore.listCompleteWaitIndexesAt binding snapshot prefix
+        if paths |> List.exists (fun p -> not (p.EndsWith(".json", StringComparison.Ordinal))) then
+            return! Error(LedgerIntegrityError "Unexpected challenge wait-index record.")
+        let linkedWaits = paths |> List.sort
         let mutable writes : LedgerFileChange list = []
         let mutable claimedOwners = Set.empty<string>
         for indexPath in linkedWaits do
-            let! locator, _ = pinned<AttemptChallengeWaitIndex> binding snapshot indexPath 2
-            if indexPath <> ReviewWorkflow.waitIndexPath prefix locator.TaskId locator.AttemptId locator.AssignmentGeneration
-               || locator.AssignmentGeneration < 1 then
-                return! Error(LedgerIntegrityError "Challenge wait-index identity mismatch.")
+            let! locator, wait, waitOid =
+                ReviewWorkflow.verifiedWaitIndexAt binding snapshot indexPath
+                    (Some completed.ChallengeId) None
             let file = $"tasks/{locator.TaskId}/attempts/{locator.AttemptId}/challenge-wait.json"
-            let! wait, waitOid = pinned<AttemptChallengeWait> binding snapshot file 2
-            if file <> $"tasks/{wait.TaskId}/attempts/{wait.AttemptId}/challenge-wait.json" then
-                return! Error(LedgerIntegrityError "Challenge wait identity/path mismatch.")
             if wait.Status = "Waiting" && wait.OwnerAgentId = locator.OwnerAgentId
                && List.contains completed.ChallengeId wait.ChallengeIds then
                 let mutable allSatisfied = true
@@ -1826,6 +1821,20 @@ module ChallengeWorkflow =
                     if wait.TaskId <> task || wait.AttemptId <> attemptId ||
                        wait.OwnerAgentId <> actor || wait.Status <> "Waiting" then
                         return! Error(StaleEntityVersion "Attempt's challenge dependency wait is missing or already requeued.")
+                    // A direct public requeue must validate owner projections
+                    // even for a legitimate manual zero-dependency block.
+                    // No reverse edge is issued for an empty dependency list.
+                    let! _ = ReviewWorkflow.verifyOwnerWaitIndexesAt binding snapshot actor
+                    // A dependency-bearing wait must also have its exact current
+                    // owner edge. The owner-wide historical scan is not a
+                    // substitute for that required positive canonical evidence.
+                    if not (List.isEmpty wait.ChallengeIds) then
+                        let ownerIndex =
+                            ReviewWorkflow.waitIndexPath (ReviewWorkflow.ownerWaitIndexPrefix actor)
+                                task attemptId generation
+                        let! _ = ReviewWorkflow.verifiedWaitIndexAt binding snapshot
+                                     ownerIndex None (Some actor)
+                        ()
                     for dependency in wait.ChallengeIds do
                         match guidN dependency with
                         | None -> return! Error(LedgerIntegrityError "Invalid stored challenge dependency ID.")

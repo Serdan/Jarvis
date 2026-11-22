@@ -46,6 +46,9 @@ type Fixture =
       One: LedgerBinding
       Two: LedgerBinding
       Three: LedgerBinding
+      AccountOne: LedgerBinding
+      AccountTwo: LedgerBinding
+      AccountThree: LedgerBinding
       Worker: NativeCandidate
       Reviewer: NativeCandidate
       AccountHead: string }
@@ -89,6 +92,18 @@ let withFixture body =
               ProjectId = projectId; LedgerId = ledgerId; Epoch = 1 }
         let one, two, three = binding first, binding second, binding third
         LedgerStore.initialize one true |> success |> ignore
+        let fakeAccountId, fakeAccountLedgerId = Guid.NewGuid(), Guid.NewGuid()
+        let accountBinding dir =
+            { RepositoryPath = dir; RemoteName = "origin"
+              ApprovedFetchUrl = accountBare; ApprovedPushUrl = accountBare
+              ProjectId = fakeAccountId; LedgerId = fakeAccountLedgerId; Epoch = 1 }
+        let accountOne = accountBinding account
+        LedgerStore.initialize accountOne true |> success |> ignore
+        let accountSecond, accountThird =
+            Path.Combine(root, "fake-account-second"), Path.Combine(root, "fake-account-third")
+        git root ["clone"; accountBare; accountSecond] |> ignore
+        git root ["clone"; accountBare; accountThird] |> ignore
+        let accountTwo, accountThree = accountBinding accountSecond, accountBinding accountThird
         let worker =
             { Kind = "Worker"; TaskId = taskId; AttemptId = attemptId
               ReviewId = ""; OwnerAgentId = "Worker_A"
@@ -121,24 +136,27 @@ let withFixture body =
         |> success |> ignore
         body { Root = root; Bare = bare; AccountBare = accountBare
                One = one; Two = two; Three = three
+               AccountOne = accountOne; AccountTwo = accountTwo; AccountThree = accountThree
                Worker = worker; Reviewer = reviewer; AccountHead = accountHead }
     finally
         if Directory.Exists(root) then Directory.Delete(root, true)
 
 let receipt (fixture: Fixture) kind =
     { Marker = "STAGE_B_DISPOSABLE_FAKE_ACCOUNT_RECEIPT/v1"
-      AccountLedgerId = Guid.NewGuid().ToString("D")
-      AccountEpoch = 1
-      AccountHead = fixture.AccountHead
+      AccountLedgerId = fixture.AccountOne.LedgerId.ToString("D")
+      AccountEpoch = fixture.AccountOne.Epoch
+      AccountHead = (LedgerStore.fetch fixture.AccountOne |> success).Commit
       OriginalReservationOperationId = Guid.NewGuid().ToString("D")
       ReservationId = Guid.NewGuid().ToString("D")
       ProjectId = fixture.One.ProjectId.ToString("D")
       Kind = kind }
 
 let makeClaim fixture candidate =
+    let account = receipt fixture candidate.Kind
+    seedFakeReservation fixture.AccountOne account |> success |> ignore
     { OperationId = Guid.NewGuid()
       ExpectedProjectHead = (LedgerStore.fetch fixture.One |> success).Commit
-      Account = receipt fixture candidate.Kind
+      Account = account
       Candidate = candidate
       DispatchId = Guid.NewGuid()
       EffectId = Guid.NewGuid()
@@ -147,6 +165,18 @@ let makeClaim fixture candidate =
 
 let get fixture c =
     observe fixture.Two c |> success |> snd
+
+let fakeState fixture account =
+    observeFakeReservation fixture.AccountThree account |> success
+
+let fakeTerminal effectId status =
+    { Marker = "STAGE_B_DISPOSABLE_FAKE_PROVIDER/v1"
+      EffectId = effectId; ProviderSessionId = "disposable-session-1"; Status = status }
+
+let reused = function
+    | Error OperationIdReused -> ()
+    | Error other -> failwithf "Expected OperationIdReused, got %A" other
+    | Ok _ -> failwith "Changed immutable operation UUID intent was replayed"
 
 [<EntryPoint>]
 let main _ =
@@ -176,6 +206,7 @@ let main _ =
                 claim f.One a |> denied
                 check ((LedgerStore.readRecord f.One "records/external-change.json" |> success |> snd).IsSome)
                       "Concurrent writer missing"
+                check ((fakeState f a.Account).Status = "Reserved") "Failed project CAS released fake account"
                 observe f.One f.Worker |> denied))
         test "stale worker generation, owner and source lease are rejected" (fun () ->
             withFixture (fun f ->
@@ -221,13 +252,14 @@ let main _ =
             withFixture (fun f ->
                 let c = makeClaim f f.Worker
                 claim f.One c |> success |> ignore
-                beginFakeEffect f.One f.Worker c.EffectId (Guid.NewGuid()) |> success |> ignore
                 let mutable providerSubmissions = 0
-                // A non-idempotent fake port. One accepted start permits exactly one invocation.
-                providerSubmissions <- providerSubmissions + 1
+                let fakePort (_: NativeEffectRecord) =
+                    providerSubmissions <- providerSubmissions + 1
+                    Ok (fakeTerminal c.EffectId "Unknown")
+                dispatchFakePort f.One f.Worker c.EffectId (Guid.NewGuid()) fakePort |> success |> ignore
                 let _fakeClockRollback = DateTimeOffset.UnixEpoch
-                beginFakeEffect f.Two f.Worker c.EffectId (Guid.NewGuid()) |> denied
-                beginFakeEffect f.Three f.Worker c.EffectId (Guid.NewGuid()) |> denied
+                dispatchFakePort f.Two f.Worker c.EffectId (Guid.NewGuid()) fakePort |> denied
+                dispatchFakePort f.Three f.Worker c.EffectId (Guid.NewGuid()) fakePort |> denied
                 check (providerSubmissions = 1) "Duplicate provider send"
                 check ((get f f.Worker).Status = "Dispatching") "Uncertain effect was rearmed"))
         test "provider Unknown and foreign terminal fail closed" (fun () ->
@@ -258,6 +290,129 @@ let main _ =
                 recordFakeTerminal f.One f.Worker c.EffectId (Guid.NewGuid()) terminal |> denied
                 check ((get f f.Worker).Status = "VerifiedFakeTerminal") "No terminal record"
                 check ((get f f.Worker).TerminalOperationId <> Guid.Empty) "No terminal ID"))
+        test "same terminal UUID exact replay accepts, changed immutable proof refuses" (fun () ->
+            withFixture (fun f ->
+                let c = makeClaim f f.Worker
+                claim f.One c |> success |> ignore
+                let startId, terminalId = Guid.NewGuid(), Guid.NewGuid()
+                beginFakeEffect f.Two f.Worker c.EffectId startId |> success |> ignore
+                let proof = fakeTerminal c.EffectId "Terminal"
+                let first = recordFakeTerminal f.One f.Worker c.EffectId terminalId proof |> success
+                check (not first.AlreadyApplied) "First terminal must be a new CAS"
+                let replay = recordFakeTerminal f.Two f.Worker c.EffectId terminalId proof |> success
+                check replay.AlreadyApplied "Exact proof replay must reuse original receipt"
+                check (replay.Operation.OriginalResultHash = first.Operation.OriginalResultHash)
+                      "Exact proof replay changed terminal receipt"
+                for altered in
+                    [{ proof with Status = "Unknown" }
+                     { proof with Marker = "foreign" }
+                     { proof with ProviderSessionId = "different-provider-session" }
+                     { proof with EffectId = Guid.NewGuid() }] do
+                    recordFakeTerminal f.Three f.Worker c.EffectId terminalId altered |> reused
+                check ((get f f.Worker).ProviderSessionId = proof.ProviderSessionId)
+                      "Mutated proof displaced original terminal"))
+        test "real disposable fake port is fenced on lost ACK across three clients" (fun () ->
+            withFixture (fun f ->
+                let c = makeClaim f f.Worker
+                let mutable sends = 0
+                let port (record: NativeEffectRecord) =
+                    sends <- sends + 1
+                    check (record.EffectId = c.EffectId) "Fake port got foreign effect"
+                    Ok (fakeTerminal c.EffectId "Unknown")
+                dispatchFakePort f.One f.Worker c.EffectId (Guid.NewGuid()) port |> denied
+                check (sends = 0) "Fake port invoked before project claim"
+                claim f.One c |> success |> ignore
+                let startId = Guid.NewGuid()
+                let unknown = dispatchFakePort f.Two f.Worker c.EffectId startId port |> success
+                check (unknown.Status = "Unknown") "Expected uncertain fake provider"
+                check (sends = 1) "Fake port did not perform exactly one initial submission"
+                recordFakeTerminal f.One f.Worker c.EffectId (Guid.NewGuid()) unknown |> denied
+                let _rolledBackClock = DateTimeOffset.UnixEpoch
+                dispatchFakePort f.One f.Worker c.EffectId startId port |> denied
+                dispatchFakePort f.Three f.Worker c.EffectId (Guid.NewGuid()) port |> denied
+                releaseFakeReservation f.One f.AccountTwo f.Worker c.EffectId (Guid.NewGuid()) (Guid.NewGuid())
+                |> denied
+                check (sends = 1) "Fake port was called twice after uncertain return"
+                check ((get f f.Worker).Status = "Dispatching") "Uncertain dispatch was rearmed"
+                check ((fakeState f c.Account).Status = "Reserved") "Uncertain provider released account"))
+        test "verified fake terminal releases original disposable Git reservation once" (fun () ->
+            withFixture (fun f ->
+                let c = makeClaim f f.Worker
+                let mutable sends = 0
+                let port (record: NativeEffectRecord) =
+                    sends <- sends + 1
+                    check (record.EffectId = c.EffectId) "Foreign fake effect"
+                    Ok (fakeTerminal c.EffectId "Terminal")
+                claim f.One c |> success |> ignore
+                let terminalProof = dispatchFakePort f.Two f.Worker c.EffectId (Guid.NewGuid()) port |> success
+                check (sends = 1) "Expected one real fake-port invocation"
+                let terminalId = Guid.NewGuid()
+                recordFakeTerminal f.Three f.Worker c.EffectId terminalId terminalProof |> success |> ignore
+                let releaseId = Guid.NewGuid()
+                releaseFakeReservation f.One f.AccountOne f.Worker c.EffectId (Guid.NewGuid()) releaseId |> denied
+                check ((fakeState f c.Account).Status = "Reserved") "Foreign terminal released fake reservation"
+                let release = releaseFakeReservation f.Two f.AccountTwo f.Worker c.EffectId terminalId releaseId |> success
+                check (not release.AlreadyApplied) "First account release should be new"
+                let replay = releaseFakeReservation f.Three f.AccountThree f.Worker c.EffectId terminalId releaseId |> success
+                check replay.AlreadyApplied "Same UUID fake account release did not replay"
+                releaseFakeReservation f.One f.AccountOne f.Worker c.EffectId terminalId (Guid.NewGuid()) |> denied
+                let state = fakeState f c.Account
+                check (state.Status = "Released" && state.ReleaseOperationId = releaseId
+                       && state.TerminalOperationId = terminalId) "Fake account not once-only terminal released"
+                check (sends = 1) "Fake provider was sent twice during release"))
+        test "verified no-send cannot invoke fake port and releases fake account once" (fun () ->
+            withFixture (fun f ->
+                let c = makeClaim f f.Worker
+                let mutable sends = 0
+                let port (_: NativeEffectRecord) =
+                    sends <- sends + 1
+                    Ok (fakeTerminal c.EffectId "Terminal")
+                claim f.One c |> success |> ignore
+                let noSend = { Marker = "STAGE_B_DISPOSABLE_FAKE_NO_SEND/v1"; Reason = "fake-dispatch-cancelled-before-start" }
+                let terminalId = Guid.NewGuid()
+                recordFakeNoSend f.Two f.Worker c.EffectId terminalId noSend |> success |> ignore
+                dispatchFakePort f.Three f.Worker c.EffectId (Guid.NewGuid()) port |> denied
+                recordFakeNoSend f.One f.Worker c.EffectId (Guid.NewGuid()) noSend |> denied
+                check (sends = 0) "No-send state invoked fake provider"
+                check ((fakeState f c.Account).Status = "Reserved") "Fake reservation released before terminal CAS"
+                let releaseId = Guid.NewGuid()
+                releaseFakeReservation f.Three f.AccountOne f.Worker c.EffectId terminalId releaseId |> success |> ignore
+                check ((fakeState f c.Account).Status = "Released") "No-send fake account release missing"
+                releaseFakeReservation f.Two f.AccountTwo f.Worker c.EffectId terminalId (Guid.NewGuid()) |> denied
+                check (sends = 0) "Fake port called after no-send release"))
+        test "no-send terminal cannot be forged after uncertain dispatch" (fun () ->
+            withFixture (fun f ->
+                let c = makeClaim f f.Worker
+                claim f.One c |> success |> ignore
+                let fakePort (_: NativeEffectRecord) = Ok (fakeTerminal c.EffectId "Unknown")
+                dispatchFakePort f.Two f.Worker c.EffectId (Guid.NewGuid()) fakePort |> success |> ignore
+                let noSend = { Marker = "STAGE_B_DISPOSABLE_FAKE_NO_SEND/v1"; Reason = "after-uncertain" }
+                recordFakeNoSend f.One f.Worker c.EffectId (Guid.NewGuid()) noSend |> denied
+                check ((get f f.Worker).Status = "Dispatching") "Uncertain effect mislabeled as no-send"
+                check ((fakeState f c.Account).Status = "Reserved") "Uncertain effect released fake account"))
+        test "three-client fake-port dispatch race calls non-idempotent port once" (fun () ->
+            withFixture (fun f ->
+                let c = makeClaim f f.Worker
+                claim f.One c |> success |> ignore
+                let portCalls = [| 0 |]
+                let fakePort (_: NativeEffectRecord) =
+                    System.Threading.Interlocked.Increment(&portCalls[0]) |> ignore
+                    Ok (fakeTerminal c.EffectId "Unknown")
+                use gate = new System.Threading.ManualResetEventSlim(false)
+                let clients = [| f.One; f.Two; f.Three |]
+                let tasks =
+                    [| for i in 0 .. 2 do
+                           yield Task.Run(fun () ->
+                               gate.Wait()
+                               dispatchFakePort clients[i] f.Worker c.EffectId (Guid.NewGuid()) fakePort) |]
+                gate.Set()
+                Task.WaitAll(tasks |> Array.map (fun t -> t :> Task))
+                let winners = tasks |> Array.filter (fun t ->
+                    match t.Result with Ok _ -> true | Error _ -> false)
+                check (winners.Length = 1) (sprintf "Expected one fake-send winner, got %i" winners.Length)
+                check (portCalls[0] = 1) "Concurrent clients invoked fake browser more than once"
+                check ((get f f.Worker).Status = "Dispatching") "Race lost durable effect fence"
+                check ((fakeState f c.Account).Status = "Reserved") "Uncertain raced effect released fake account"))
         test "three-client simultaneous claim admits at most one" (fun () ->
             withFixture (fun f ->
                 let baseClaim = makeClaim f f.Worker

@@ -76,6 +76,18 @@ type FakeProviderTerminal =
       Status: string }
 
 [<CLIMutable>]
+type FakeNoSendProof =
+    { Marker: string
+      Reason: string }
+
+[<CLIMutable>]
+type FakeReservationState =
+    { Account: FakeAccountReservationReceipt
+      Status: string
+      TerminalOperationId: Guid
+      ReleaseOperationId: Guid }
+
+[<CLIMutable>]
 type CanonicalTask =
     { TaskId: string
       Lifecycle: string
@@ -234,6 +246,7 @@ let private update
     (effectId: Guid)
     (operationId: Guid)
     (kind: string) (expectedStatus: string) (nextStatus: string)
+    (intentEvidence: string)
     (extraValidate: NativeEffectRecord -> Result<unit, LedgerFailure>)
     (modify: NativeEffectRecord -> NativeEffectRecord) =
     if operationId = Guid.Empty || effectId = Guid.Empty then reject "Empty transition UUID"
@@ -241,7 +254,8 @@ let private update
         let path = recordPath candidate
         let intent = { OperationId = operationId; Actor = candidate.OwnerAgentId
                        Kind = kind
-                       RequestJson = serialize {| candidate = candidate; effectId = effectId; expectedStatus = expectedStatus; nextStatus = nextStatus |} }
+                       RequestJson = serialize {| candidate = candidate; effectId = effectId; expectedStatus = expectedStatus
+                                                  nextStatus = nextStatus; intentEvidence = intentEvidence |} }
         LedgerStore.transact binding intent (fun snapshot -> result {
             let! original, beforeOid = read<NativeEffectRecord> binding snapshot path
             if original.Candidate <> candidate || original.EffectId <> effectId
@@ -262,6 +276,7 @@ let private update
 /// A lost marker ACK is never permission to invoke the effect.
 let beginFakeEffect (binding: LedgerBinding) (candidate: NativeCandidate) (effectId: Guid) (operationId: Guid) =
     update binding candidate effectId operationId "NativeStageBBeginEffectTestOnly" "Claimed" "Dispatching"
+        ""
         (fun _ -> Ok ())
         (fun record -> { record with StartOperationId = operationId })
 
@@ -269,8 +284,10 @@ let beginFakeEffect (binding: LedgerBinding) (candidate: NativeCandidate) (effec
 /// It only proves the project-side monotonic terminal record using disposable fixtures.
 let recordFakeTerminal (binding: LedgerBinding) (candidate: NativeCandidate) (effectId: Guid) (operationId: Guid) (proof: FakeProviderTerminal) =
     update binding candidate effectId operationId "NativeStageBTerminalTestOnly" "Dispatching" "VerifiedFakeTerminal"
+        (serialize proof)
         (fun r ->
-            if proof.Marker = "STAGE_B_DISPOSABLE_FAKE_PROVIDER/v1"
+            if not (isNull (box proof))
+               && proof.Marker = "STAGE_B_DISPOSABLE_FAKE_PROVIDER/v1"
                && proof.Status = "Terminal" && proof.EffectId = r.EffectId
                && notBlank proof.ProviderSessionId && r.StartOperationId <> Guid.Empty then Ok ()
             else reject "Unknown/foreign/forged provider terminal")
@@ -287,4 +304,102 @@ let observe (binding: LedgerBinding) (candidate: NativeCandidate) =
             return! reject "Foreign project record"
         return snapshot.Commit, record
     }
+
+/// Explicit test-only no-send terminal is legal only before the dispatch marker.
+/// A begun or uncertain fake send can never be relabelled as no-send.
+let recordFakeNoSend (binding: LedgerBinding) (candidate: NativeCandidate) (effectId: Guid)
+                     (operationId: Guid) (proof: FakeNoSendProof) =
+    update binding candidate effectId operationId "NativeStageBNoSendTestOnly" "Claimed" "VerifiedNoSend"
+        (serialize proof)
+        (fun _ ->
+            if not (isNull (box proof))
+               && proof.Marker = "STAGE_B_DISPOSABLE_FAKE_NO_SEND/v1"
+               && notBlank proof.Reason then Ok ()
+            else reject "Invalid fake no-send evidence")
+        (fun r -> { r with TerminalOperationId = operationId })
+
+/// This is the ONLY B1 fake-port dispatch adapter. Persist and confirm the
+/// project marker before calling the injected non-idempotent disposable port.
+let dispatchFakePort (binding: LedgerBinding) (candidate: NativeCandidate) (effectId: Guid)
+                     (operationId: Guid) (fakePort: NativeEffectRecord -> Result<FakeProviderTerminal, LedgerFailure>) =
+    result {
+        let! started = beginFakeEffect binding candidate effectId operationId
+        if started.AlreadyApplied then
+            return! stale "Replayed/uncertain start cannot invoke fake provider again"
+        let! _, durable = observe binding candidate
+        if durable.Status <> "Dispatching" || durable.EffectId <> effectId
+           || durable.StartOperationId <> operationId then
+            return! stale "Start marker not durably confirmed before fake port"
+        return! fakePort durable
+    }
+
+let private fakeReservationPath (account: FakeAccountReservationReceipt) =
+    "records/native-stageb-fake-account/" + sha256 (account.AccountLedgerId + "|" + account.ReservationId) + ".json"
+
+/// Disposable fake account repository state, not Worker4 account CAS.
+let seedFakeReservation (accountBinding: LedgerBinding) (account: FakeAccountReservationReceipt) =
+    if account.Marker <> "STAGE_B_DISPOSABLE_FAKE_ACCOUNT_RECEIPT/v1"
+       || account.AccountLedgerId <> accountBinding.LedgerId.ToString("D")
+       || account.AccountEpoch <> accountBinding.Epoch
+       || notBlank account.ReservationId = false then
+        reject "Foreign disposable fake account binding"
+    else
+        let originalId = Guid.Parse(account.OriginalReservationOperationId)
+        let intent = { OperationId = originalId; Actor = "StageBFakeAccount"
+                       Kind = "NativeStageBSeedFakeAccountTestOnly"; RequestJson = serialize account }
+        LedgerStore.transact accountBinding intent (fun snapshot -> result {
+            if snapshot.Commit <> account.AccountHead then
+                return! stale "Fake account head changed before seed"
+            let path = fakeReservationPath account
+            let! existing, _ = LedgerStore.readAt accountBinding snapshot path
+            if existing.IsSome then return! stale "Fake reservation already exists"
+            let state = { Account = account; Status = "Reserved"
+                          TerminalOperationId = Guid.Empty; ReleaseOperationId = Guid.Empty }
+            return [ { Path = path; ExpectedBlobOid = None; Content = serialize state } ]
+        })
+
+/// Release is a separate, request-hashed disposable account Git CAS. It is
+/// eligible only after an exact verified project terminal, never after Unknown.
+let releaseFakeReservation (projectBinding: LedgerBinding) (accountBinding: LedgerBinding)
+                           (candidate: NativeCandidate) (effectId: Guid)
+                           (terminalOperationId: Guid) (releaseOperationId: Guid) =
+    result {
+        if terminalOperationId = Guid.Empty || releaseOperationId = Guid.Empty
+           || terminalOperationId = releaseOperationId then
+            return! reject "Invalid fake release UUID"
+        let! _, project = observe projectBinding candidate
+        if project.EffectId <> effectId || project.TerminalOperationId <> terminalOperationId
+           || (project.Status <> "VerifiedFakeTerminal" && project.Status <> "VerifiedNoSend") then
+            return! stale "Fake account release requires original verified terminal"
+        let account = project.Account
+        if account.AccountLedgerId <> accountBinding.LedgerId.ToString("D")
+           || account.AccountEpoch <> accountBinding.Epoch then
+            return! reject "Foreign fake account ledger"
+        let intent = { OperationId = releaseOperationId; Actor = candidate.OwnerAgentId
+                       Kind = "NativeStageBReleaseFakeAccountTestOnly"
+                       RequestJson = serialize {| account = account; candidate = candidate
+                                                  effectId = effectId; terminalOperationId = terminalOperationId
+                                                  releaseOperationId = releaseOperationId |} }
+        return! LedgerStore.transact accountBinding intent (fun snapshot -> result {
+            let path = fakeReservationPath account
+            let! state, beforeOid = read<FakeReservationState> accountBinding snapshot path
+            if state.Account <> account || state.Status <> "Reserved"
+               || state.TerminalOperationId <> Guid.Empty || state.ReleaseOperationId <> Guid.Empty then
+                return! stale "Original fake reservation already released or mutated"
+            let amended = { state with Status = "Released"
+                                       TerminalOperationId = terminalOperationId
+                                       ReleaseOperationId = releaseOperationId }
+            return [ { Path = path; ExpectedBlobOid = Some beforeOid; Content = serialize amended } ]
+        })
+    }
+
+/// Source-exact observation of fake account authority across disposable clones.
+let observeFakeReservation (accountBinding: LedgerBinding) (account: FakeAccountReservationReceipt) =
+    result {
+        let! snapshot = LedgerStore.fetch accountBinding
+        let! state, _ = read<FakeReservationState> accountBinding snapshot (fakeReservationPath account)
+        if state.Account <> account then return! reject "Foreign fake account reservation"
+        return state
+    }
+
 #endif

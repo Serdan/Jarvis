@@ -1,9 +1,15 @@
 module AutomationRealPortProbe20261122.ProbeTests
 
 open System
+open System.Collections.Generic
 open System.Diagnostics
 open System.IO
+open System.Security.Claims
+open System.Text.Json
+open System.Threading
 open System.Threading.Tasks
+open Microsoft.AspNetCore.Http.Features
+open Microsoft.AspNetCore.SignalR
 open NUnit.Framework
 open Client.LedgerStore
 open Client.ReviewWorkflow
@@ -14,6 +20,19 @@ open Client.WorkQueueSchedulerHostLoop
 open Client.WorkQueueSchedulerHeadBinding
 open Client.WorkQueueNativePrivateHostBridge
 open Client.NativeSchedulerAccountReservation
+
+// Actual SignalR HubCallerContext, but never connected or registered. This
+// exercises HubService's real guard without a network session or activity DB.
+type UnregisteredHubContext() =
+    inherit HubCallerContext()
+    let items = Dictionary<obj,obj>() :> IDictionary<obj,obj>
+    override _.ConnectionId = "w23-unregistered"
+    override _.UserIdentifier = null
+    override _.User = ClaimsPrincipal()
+    override _.Items = items
+    override _.Features = FeatureCollection() :> IFeatureCollection
+    override _.ConnectionAborted = CancellationToken.None
+    override _.Abort() = ()
 
 [<TestFixture>]
 type PortCallability() =
@@ -137,6 +156,105 @@ type PortCallability() =
         )
 
     [<Test>]
+    member _.ChallengeBlockedAttemptWakesViaCanonicalReverseIndex() =
+        withTwoDisposableGitClones (fun first second ->
+            let taskId = "w23-real-wake"
+            let attemptId = Guid.NewGuid()
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Disposable wake" |> ok |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId attemptId "Owner" |> ok |> ignore
+            let conditions : ChallengeConditionSpec list =
+                [{ OwnerKind = ""; OwnerAgentId = "Owner"; SuggestedAgentId = ""
+                   Description = "disposable wake dependency" }]
+            let challenge =
+                ChallengeWorkflow.create first (Guid.NewGuid()) "Owner" "Wake owner" taskId conditions |> ok
+            let _, task, attemptOpt = ReviewWorkflow.getTask first taskId |> ok
+            let attempt = attemptOpt.Value
+            let owner = ReviewWorkflow.getAgentWorkingTurn first "Owner" |> ok
+            ChallengeWorkflow.blockAttempt first (Guid.NewGuid()) "Owner" taskId attempt.AttemptId
+                task.Version attempt.Version owner.Version 1
+                "waiting for canonical condition" [challenge.ChallengeId] |> ok |> ignore
+            let blockedSnapshot = LedgerStore.fetch second |> ok
+            let indexes =
+                LedgerStore.listIssuedWaitIndexPathsAt second blockedSnapshot
+                    ("challenge-waits/by-challenge/" + challenge.ChallengeId) |> ok
+            Assert.That(indexes.Length, Is.EqualTo(1))
+            Assert.That(indexes.Head, Is.EqualTo(
+                sprintf "challenge-waits/by-challenge/%s/%s/%s/1.json"
+                    challenge.ChallengeId taskId attempt.AttemptId))
+            let _, blockedTask, blockedOpt = ReviewWorkflow.getTask second taskId |> ok
+            let blocked = blockedOpt.Value
+            Assert.That(blockedTask.Lifecycle, Is.EqualTo("InProgress"))
+            Assert.That(blocked.Phase, Is.EqualTo("Blocked"))
+            let waitingPath = sprintf "tasks/%s/attempts/%s/challenge-wait.json" taskId attempt.AttemptId
+            let waitingJson, _ = LedgerStore.readAt second blockedSnapshot waitingPath |> ok
+            use waiting = JsonDocument.Parse(waitingJson.Value)
+            Assert.That(waiting.RootElement.GetProperty("status").GetString(), Is.EqualTo("Waiting"))
+            let resolutionId = Guid.NewGuid()
+            let resolved =
+                ChallengeWorkflow.resolve second resolutionId "Owner" challenge.ChallengeId
+                    challenge.ConditionIds.Head 1 "disposable evidence" "" |> ok
+            Assert.That(resolved.AlreadyApplied, Is.False)
+            let _, _, awakenedOpt = ReviewWorkflow.getTask first taskId |> ok
+            Assert.That(awakenedOpt.Value.Phase, Is.EqualTo("Queued"))
+            Assert.That(awakenedOpt.Value.AssignmentGeneration, Is.EqualTo(2))
+            let readyOwner = ReviewWorkflow.getAgentWorkingTurn first "Owner" |> ok
+            Assert.That(readyOwner.State, Is.EqualTo("Ready"))
+            Assert.That(readyOwner.CurrentAssignment.AttemptId, Is.EqualTo(attempt.AttemptId))
+            let finalSnapshot = LedgerStore.fetch first |> ok
+            let requeuedJson, _ = LedgerStore.readAt first finalSnapshot waitingPath |> ok
+            use requeued = JsonDocument.Parse(requeuedJson.Value)
+            Assert.That(requeued.RootElement.GetProperty("status").GetString(), Is.EqualTo("Requeued"))
+            let replay =
+                ChallengeWorkflow.resolve first resolutionId "Owner" challenge.ChallengeId
+                    challenge.ConditionIds.Head 1 "disposable evidence" "" |> ok
+            Assert.That(replay.AlreadyApplied, Is.True)
+            let _, _, replayedOpt = ReviewWorkflow.getTask first taskId |> ok
+            Assert.That(replayedOpt.Value.AssignmentGeneration, Is.EqualTo(2))
+            match ChallengeWorkflow.blockAttempt first (Guid.NewGuid()) "Owner" taskId attempt.AttemptId
+                      task.Version attempt.Version owner.Version 1 "stale generation" [challenge.ChallengeId] with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Expected stale generation denial: %A" other)
+            match ChallengeWorkflow.requeueAttempt second (Guid.NewGuid()) "Owner" taskId attempt.AttemptId
+                      task.Version blocked.Version (owner.Version + 1) 1 "late stale requeue" with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Expected stale requeue denial: %A" other)
+        )
+
+    [<Test>]
+    member _.ChallengeManualBlockHasExactCASRequeueAndLateNegative() =
+        withTwoDisposableGitClones (fun first second ->
+            let taskId = "w23-manual-requeue"
+            let attemptId = Guid.NewGuid()
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Manual wait" |> ok |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId attemptId "Owner" |> ok |> ignore
+            let _, task, attemptOpt = ReviewWorkflow.getTask first taskId |> ok
+            let attempt = attemptOpt.Value
+            let owner = ReviewWorkflow.getAgentWorkingTurn first "Owner" |> ok
+            ChallengeWorkflow.blockAttempt first (Guid.NewGuid()) "Owner" taskId attempt.AttemptId
+                task.Version attempt.Version owner.Version 1 "explicit manual wait" [] |> ok |> ignore
+            let _, blockedTask, blockedOpt = ReviewWorkflow.getTask second taskId |> ok
+            let blocked = blockedOpt.Value
+            let releasedOwner = ReviewWorkflow.getAgentWorkingTurn second "Owner" |> ok
+            Assert.That(blocked.Phase, Is.EqualTo("Blocked"))
+            let op = Guid.NewGuid()
+            let ready =
+                ChallengeWorkflow.requeueAttempt second op "Owner" taskId attempt.AttemptId
+                    blockedTask.Version blocked.Version releasedOwner.Version 1 "manual recovery" |> ok
+            Assert.That(ready.AlreadyApplied, Is.False)
+            let _, _, recoveredOpt = ReviewWorkflow.getTask first taskId |> ok
+            Assert.That(recoveredOpt.Value.Phase, Is.EqualTo("Queued"))
+            Assert.That(recoveredOpt.Value.AssignmentGeneration, Is.EqualTo(2))
+            let replay =
+                ChallengeWorkflow.requeueAttempt first op "Owner" taskId attempt.AttemptId
+                    blockedTask.Version blocked.Version releasedOwner.Version 1 "manual recovery" |> ok
+            Assert.That(replay.AlreadyApplied, Is.True)
+            match ChallengeWorkflow.requeueAttempt first (Guid.NewGuid()) "Owner" taskId attempt.AttemptId
+                      blockedTask.Version blocked.Version releasedOwner.Version 1 "late duplicate" with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Expected late generation denial: %A" other)
+        )
+
+    [<Test>]
     member _.ProductionHeadBindingAndHostRefuseUnapprovedScope() =
         let mutable executions = 0
         let wakePorts : WorkWakePorts =
@@ -180,3 +298,19 @@ type PortCallability() =
         Assert.That(args.Length, Is.EqualTo(2))
         Assert.That(args[0].ParameterType, Is.EqualTo(typeof<string>))
         Assert.That(args[1].ParameterType, Is.EqualTo(typeof<string>))
+
+    [<Test>]
+    member _.ActualHubServiceRejectsUnregisteredAgentActivityWithoutDbOrNetwork() =
+        let users = new Server.Services.UserService()
+        let tracker = new Server.Services.ClientResponseTracker()
+        let hub =
+            new Server.Services.HubService(
+                users, tracker, null,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<Server.Services.HubService>.Instance)
+        hub.Context <- new UnregisteredHubContext()
+        let mutable rejected = false
+        try
+            hub.GetAgentActivity("Jarvis", "Owner").GetAwaiter().GetResult() |> ignore
+        with :? UnauthorizedAccessException as ex ->
+            rejected <- ex.Message.Contains("registered Jarvis client")
+        Assert.That(rejected, Is.True, "Must execute real HubService unregistered-session guard")

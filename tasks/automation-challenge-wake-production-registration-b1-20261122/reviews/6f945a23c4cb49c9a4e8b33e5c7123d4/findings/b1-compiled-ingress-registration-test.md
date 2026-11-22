@@ -1,0 +1,17 @@
+# P1 — B1 production registration lacks its mandated compiled ingress/lifecycle regression
+
+**Frozen source:** `5cb0c9992dd8139577712e44c94f670160f45bca` based on accepted-only `175b6fb709906a941c2f4f31b226d0487b0a652b`.
+
+**Original task requirement:** B1 explicitly requires a **new compiled host registration test**, over and above accepted W17 standalone adapter tests, plus deterministic proof that the authenticated original Resolve success receipt passes through the post-journal callback and that failed/unknown/replayed writes cannot wake; host lifecycle and duplicate/reconnect ordering must be demonstrated.
+
+**Reproduction by source inspection:**
+- `Client/Program.fs:335-365,439-448,586-589` introduces the only production Coordinator/Host ownership, ingress callback injection and shutdown. `Client/SignalR/Client.fs:804-822,1466-1473` introduces the postwrite callback and typed ingress wrapper.
+- The only new positive test, `tests/AutomationChallengeWake20261122/WakeTests.fs:232-319`, constructs `ChallengeWorkflow.resolve` and `OperationResponse.present` **directly**, invokes `inspectCommitted` / `notifyCommitted` directly and injects a **test-owned** Host. It never drives the compiled authenticated SignalR dispatch through `ChallengeApi.write`, never exercises the `Program.fs` callback registration/shutdown, and does not test the original-operation-ID propagation across that wiring.
+- `WakeTests.fs:321-346` independently creates a disabled Host. `ExpectedRedHostHook.fsx` loads the production DLL but tests only that `inspectCommitted false` returns Off. Both remain green if the new `Program.fs` registration and `SignalR/Client.fs` callback propagation are absent; no test asserts these production links.
+- Independent `dotnet test tests/AutomationChallengeWake20261122/AutomationChallengeWake20261122.fsproj -c Release --no-restore` succeeded **10/10**, and `dotnet fsi --exec tests/AutomationChallengeWake20261122/ExpectedRedHostHook.fsx` succeeded. Those results establish the bounded adapter/isolated-host behavior, **not** the mandated compiled ingress/registration behavior.
+
+**Impact:** A regression omitting/delaying the postcommit callback, propagating the wrong original operation context, or breaking host lifetime can pass every present B1 test; the required end-to-end source acceptance gate is unproved. This is an unmet explicit B1 requirement, not a request for new live scheduler functionality.
+
+**Bounded remedy to consider (author/Lead choose design):** Extend only the already leased B1 source and standalone tests with a production-compiled, injected ingress/lifetime regression that proves exact authenticated post-journal dispatch, unchanged original UUID, no callback for failed/unknown/replay/foreign actor, and ordered default-OFF Host lifetime. Keep all real scheduling, provider, main, deployment and cutover OFF; do not add a fourth existing production-file lease. Verify two-client duplicate/reconnect/replay negatives at this boundary rather than relying solely on adapter-local fixtures.
+
+**Evidence boundary:** No independent defect in the existing default-OFF guard itself is asserted. No full Client suite, live host or production E2E was run.

@@ -1,0 +1,1 @@
+Seven disjoint W25 source files, typed eight-setting command and strict exact-device/CAS boundaries, 5/5 focused server, 565/565 unfiltered server .NET11 Release, standalone FSI positive/negatives; full client E2E pending.

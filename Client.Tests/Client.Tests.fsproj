@@ -75,6 +75,7 @@
         <Compile Include="ReviewWorkflowTests.fs"/>
         <Compile Include="TaskOverviewBatchPerformanceTests.fs"/>
         <Compile Include="ChallengeWorkflowTests.fs"/>
+        <Compile Include="ChallengeStateMachinePropertyTests.fs"/>
         <Compile Include="WorkQueueCanonicalSourceEvidenceTests.fs"/>
         <Compile Include="WorkQueueCanonicalCasBinderTests.fs"/>
         <Compile Include="WorkQueuePracticalAdmissionTests.fs"/>

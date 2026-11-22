@@ -1,0 +1,225 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="dd544282-70e0-4a7f-8890-4714d1350d3a" name="@Serdan-Home 2026-11-22 01:33:19" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-11-22T01:33:19.6681763+01:00" queuing="2026-11-22T01:33:19.6681764+01:00" start="2026-11-22T01:33:17.9223764+01:00" finish="2026-11-22T01:33:50.4916681+01:00" />
+  <TestSettings name="default" id="81be9001-e131-4537-8f9e-f29732f42e72">
+    <Deployment runDeploymentRoot="_Serdan-Home_2026-11-22_01_33_19" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="42bade7b-f8e8-4358-b514-563779ed85d7" testId="c85c76d1-ae0e-ecab-5fb6-6191e2c2e3fe" testName="SameSubscriptionRoleCatalogChangesBlockHostsUntilIndependentlyReapproved(&quot;disabled&quot;)" computerName="Serdan-Home" duration="00:00:02.7091050" startTime="2026-11-22T01:33:37.2108648+01:00" endTime="2026-11-22T01:33:39.9199688+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="42bade7b-f8e8-4358-b514-563779ed85d7" />
+    <UnitTestResult executionId="13c1abae-29fb-4bdd-bfad-6fe0b308ce17" testId="d74d5404-a292-c6c5-1b4d-b26ed3f29f95" testName="ManualStepDoesNotRetryUnknownOutcomeInAnUnboundedLoop" computerName="Serdan-Home" duration="00:00:00.0006750" startTime="2026-11-22T01:33:50.3628410+01:00" endTime="2026-11-22T01:33:50.3635160+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="13c1abae-29fb-4bdd-bfad-6fe0b308ce17" />
+    <UnitTestResult executionId="e899758e-5780-48c7-8e18-c2d65b84c952" testId="edd8ed6b-8add-f0af-c420-ee07f5318560" testName="ManualStepRechecksVerifiedHeadsBeforeTheCoordinator" computerName="Serdan-Home" duration="00:00:00.0033440" startTime="2026-11-22T01:33:50.3637487+01:00" endTime="2026-11-22T01:33:50.3670921+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="e899758e-5780-48c7-8e18-c2d65b84c952" />
+    <UnitTestResult executionId="b160d763-aad5-4259-9fa6-7d791589f6f0" testId="50f1644e-9feb-3e2b-a6f6-e96a46e069d5" testName="NullProjectScopeNeverThrowsOrInvokesManualHost" computerName="Serdan-Home" duration="00:00:01.0099000" startTime="2026-11-22T01:33:32.1124419+01:00" endTime="2026-11-22T01:33:33.1223408+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="b160d763-aad5-4259-9fa6-7d791589f6f0" />
+    <UnitTestResult executionId="385e975a-4b04-4d2b-ae9c-726c2e6e42b0" testId="55da78f1-e94e-1889-9dfc-df8f1aa0a815" testName="DefaultOffIsQuiescentEvenWhenStartedOrManuallySignalled" computerName="Serdan-Home" duration="00:00:00.0007450" startTime="2026-11-22T01:33:50.3553374+01:00" endTime="2026-11-22T01:33:50.3560820+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="385e975a-4b04-4d2b-ae9c-726c2e6e42b0" />
+    <UnitTestResult executionId="2b15f67b-102e-4a93-8321-0688eb8b87d4" testId="d92bff18-fd7f-b82c-b63a-00b38c0dfe84" testName="HardDependencyAndCapacityRemainDormantUntilBothAreDurablyReady" computerName="Serdan-Home" duration="00:00:00.0008210" startTime="2026-11-22T01:33:50.3605788+01:00" endTime="2026-11-22T01:33:50.3614000+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="2b15f67b-102e-4a93-8321-0688eb8b87d4" />
+    <UnitTestResult executionId="9601c570-8887-4718-88b9-d3808b12d55d" testId="9cac8498-2c85-1dad-1f6f-144e37343511" testName="NoApprovalOrContradictoryMembershipNeverStartsGitOrHostCallbacks" computerName="Serdan-Home" duration="00:00:01.0261050" startTime="2026-11-22T01:33:31.0862883+01:00" endTime="2026-11-22T01:33:32.1123931+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="9601c570-8887-4718-88b9-d3808b12d55d" />
+    <UnitTestResult executionId="8fa0a60c-4c63-4d70-9a9b-adef8954f847" testId="76475a36-a13c-28ee-46a1-329497d4decf" testName="StopJoinsTheInflightStepAndCancelsTheClock" computerName="Serdan-Home" duration="00:00:00.0047830" startTime="2026-11-22T01:33:50.3978272+01:00" endTime="2026-11-22T01:33:50.4026101+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="8fa0a60c-4c63-4d70-9a9b-adef8954f847" />
+    <UnitTestResult executionId="aced9622-5e41-4c03-aa6c-72123431fd03" testId="df3a5fa2-27dc-635e-1d3a-030e53d891d7" testName="ChangedSnapshotUnreachableRemoteAndCrossProjectTokensNeedAttention" computerName="Serdan-Home" duration="00:00:01.7614770" startTime="2026-11-22T01:33:25.4627030+01:00" endTime="2026-11-22T01:33:27.2241796+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="aced9622-5e41-4c03-aa6c-72123431fd03" />
+    <UnitTestResult executionId="af86646c-ed65-4281-ba64-2fa5a232e498" testId="1a65dbff-7f4b-4c33-c9d6-df9d7967d14d" testName="ManualStepUsesOnlyApprovedHostsAndNeverCallsPlannerOrProviderWithoutProvenance" computerName="Serdan-Home" duration="00:00:03.8620350" startTime="2026-11-22T01:33:27.2242136+01:00" endTime="2026-11-22T01:33:31.0862481+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="af86646c-ed65-4281-ba64-2fa5a232e498" />
+    <UnitTestResult executionId="17625e49-bf2c-42b7-acb2-cff19d8bdd56" testId="9aea486a-7c0a-da5e-3344-c296d4f61d4c" testName="MissingUnapprovedDuplicateForeignAndInconsistentMembershipFailClosed" computerName="Serdan-Home" duration="00:00:00.7382550" startTime="2026-11-22T01:33:21.2468354+01:00" endTime="2026-11-22T01:33:21.9850899+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="17625e49-bf2c-42b7-acb2-cff19d8bdd56" />
+    <UnitTestResult executionId="ac9b965a-3bb2-49ae-9a6b-606f421b31f0" testId="a0ad3498-94f6-6565-13bd-a65e1340c02a" testName="PeriodicFullRescanRecoversLostHintsAndRestartState" computerName="Serdan-Home" duration="00:00:00.0024460" startTime="2026-11-22T01:33:50.3671117+01:00" endTime="2026-11-22T01:33:50.3695578+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="ac9b965a-3bb2-49ae-9a6b-606f421b31f0" />
+    <UnitTestResult executionId="d0324fad-a8a1-4fa9-a252-f2ae20e8b05b" testId="33629c86-3201-2ab7-e503-58e28c5aefc7" testName="TwoClientCompetingVersionedUpdatesHaveExactlyOneWinner" computerName="Serdan-Home" duration="00:00:01.0092980" startTime="2026-11-22T01:33:24.4502771+01:00" endTime="2026-11-22T01:33:25.4595741+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="d0324fad-a8a1-4fa9-a252-f2ae20e8b05b" />
+    <UnitTestResult executionId="2dd3bb8a-98ad-44ad-8b28-4db37a3ad32d" testId="9a9d622e-a678-bedd-c346-a18d2a9a515f" testName="HeadFailuresAndCoordinatorExceptionsCannotAuthorizeAnEffect" computerName="Serdan-Home" duration="00:00:00.0012860" startTime="2026-11-22T01:33:50.3614156+01:00" endTime="2026-11-22T01:33:50.3627010+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="2dd3bb8a-98ad-44ad-8b28-4db37a3ad32d" />
+    <UnitTestResult executionId="6a840537-6038-437a-b3a6-ad49e85d848a" testId="8f1144a0-dbec-9c7b-99ef-d676ce1d82f6" testName="SignedApprovalCannotBeTransplantedToDifferentGitPredecessor" computerName="Serdan-Home" duration="00:00:00.6185230" startTime="2026-11-22T01:33:22.5961706+01:00" endTime="2026-11-22T01:33:23.2146930+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="6a840537-6038-437a-b3a6-ad49e85d848a" />
+    <UnitTestResult executionId="fc6832eb-8e12-4242-8171-39cc528c64fd" testId="59564ce4-4db9-cf17-eba3-15faa230ebae" testName="PolicyProofCannotBeReusedAfterOutOfBandGitRewrite" computerName="Serdan-Home" duration="00:00:00.6110080" startTime="2026-11-22T01:33:21.9851272+01:00" endTime="2026-11-22T01:33:22.5961352+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="fc6832eb-8e12-4242-8171-39cc528c64fd" />
+    <UnitTestResult executionId="d4890bf1-aa4a-4219-9c6b-a0e1cd12d8b7" testId="a9114a3d-3842-b59d-f519-e75828124ff8" testName="RoleSubscriptionChangeRequiresRenewedApprovalInsteadOfSelectingAnotherRole" computerName="Serdan-Home" duration="00:00:01.5959410" startTime="2026-11-22T01:33:33.1223745+01:00" endTime="2026-11-22T01:33:34.7183141+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="d4890bf1-aa4a-4219-9c6b-a0e1cd12d8b7" />
+    <UnitTestResult executionId="806b1895-48b5-439e-8beb-6d1589db91f3" testId="915c2470-de01-ab25-fa99-ef5ece668a3b" testName="SameThreadReentryIsDeferredRatherThanNestingWake" computerName="Serdan-Home" duration="00:00:00.0011010" startTime="2026-11-22T01:33:50.3697651+01:00" endTime="2026-11-22T01:33:50.3708663+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="806b1895-48b5-439e-8beb-6d1589db91f3" />
+    <UnitTestResult executionId="e2d1a5a0-5e54-41f6-88e7-b11a2b07b0c9" testId="736aff6b-052a-0269-270a-02be585a269f" testName="SignedCompletePolicyUsesSameAccountHeadButNeverAuthorizesLaunch" computerName="Serdan-Home" duration="00:00:01.2355090" startTime="2026-11-22T01:33:23.2147281+01:00" endTime="2026-11-22T01:33:24.4502358+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="e2d1a5a0-5e54-41f6-88e7-b11a2b07b0c9" />
+    <UnitTestResult executionId="2d12eb64-68a3-4959-b762-00f907447fcb" testId="34c89fd0-b801-2f4a-0e18-a591e47fe5cf" testName="TwoHostInstancesCannotBypassAnInjectedCanonicalOriginalClaim" computerName="Serdan-Home" duration="00:00:00.0014360" startTime="2026-11-22T01:33:50.4026538+01:00" endTime="2026-11-22T01:33:50.4040899+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="2d12eb64-68a3-4959-b762-00f907447fcb" />
+    <UnitTestResult executionId="1dfd4e54-7e40-4ad6-a74d-8584731c92b9" testId="e4bed957-7549-a588-e561-4a6704668fb8" testName="CoalescesConcurrentHintsInOneInitialGitReconciliation" computerName="Serdan-Home" duration="00:00:00.0125880" startTime="2026-11-22T01:33:50.3424181+01:00" endTime="2026-11-22T01:33:50.3550058+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="1dfd4e54-7e40-4ad6-a74d-8584731c92b9" />
+    <UnitTestResult executionId="b86a095d-9774-43a8-a777-bba7b3d38124" testId="ed6bc5a7-085c-81e3-fc29-aaf820776a8e" testName="DisposeFromSameThreadCallbackDoesNotDeadlockThePump" computerName="Serdan-Home" duration="00:00:00.0041490" startTime="2026-11-22T01:33:50.3562113+01:00" endTime="2026-11-22T01:33:50.3603607+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="b86a095d-9774-43a8-a777-bba7b3d38124" />
+    <UnitTestResult executionId="944e81d4-321b-4d7d-b4c0-0b4f203870e9" testId="ab972f33-2d14-59a4-1bae-755b41ea2002" testName="ForgedLocalProjectReplacementCannotAuthenticateForeignBareRemote" computerName="Serdan-Home" duration="00:00:00.9446870" startTime="2026-11-22T01:33:19.5330401+01:00" endTime="2026-11-22T01:33:20.4777267+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="944e81d4-321b-4d7d-b4c0-0b4f203870e9" />
+    <UnitTestResult executionId="28b0dbe1-2008-4dc1-a4a4-19b72900b3bd" testId="74b1fcf2-f94a-ad84-84ea-d5932dca80b1" testName="FrozenWq07StateFencesNativePolicyEvenWithValidSignatureAndAccountHead" computerName="Serdan-Home" duration="00:00:00.7690270" startTime="2026-11-22T01:33:20.4777777+01:00" endTime="2026-11-22T01:33:21.2468045+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="28b0dbe1-2008-4dc1-a4a4-19b72900b3bd" />
+    <UnitTestResult executionId="91ed76dd-ff88-4204-93f9-d86eea89faac" testId="22eeadf2-4758-7c2e-a547-330e260faaec" testName="StopJoinsConcurrentManualStepWithoutBackgroundLoops" computerName="Serdan-Home" duration="00:00:00.0242920" startTime="2026-11-22T01:33:50.3709753+01:00" endTime="2026-11-22T01:33:50.3952664+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="91ed76dd-ff88-4204-93f9-d86eea89faac">
+      <Output>
+        <ErrorInfo>
+          <Message>  Assert.That(, )
+  Expected: True
+  But was:  False
+</Message>
+          <StackTrace>   at Client.Tests.WorkQueueSchedulerHostLoopTests.StopJoinsConcurrentManualStepWithoutBackgroundLoops@298.MoveNext() in /home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/WorkQueueSchedulerHostLoopTests.fs:line 318
+   at Client.Tests.WorkQueueSchedulerHostLoopTests.StopJoinsConcurrentManualStepWithoutBackgroundLoops@298.MoveNext() in /home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/WorkQueueSchedulerHostLoopTests.fs:line 319
+   at NUnit.Framework.Internal.TaskAwaitAdapter.GenericAdapter`1.BlockUntilCompleted()
+   at NUnit.Framework.Internal.MessagePumpStrategy.NoMessagePumpStrategy.WaitForCompletion(AwaitAdapter awaiter)
+   at NUnit.Framework.Internal.AsyncToSyncAdapter.Await[TResult](TestExecutionContext context, Func`1 invoke)
+   at NUnit.Framework.Internal.AsyncToSyncAdapter.Await(TestExecutionContext context, Func`1 invoke)
+   at NUnit.Framework.Internal.Commands.TestMethodCommand.RunTestMethod(TestExecutionContext context)
+   at NUnit.Framework.Internal.Commands.TestMethodCommand.Execute(TestExecutionContext context)
+   at NUnit.Framework.Internal.Execution.SimpleWorkItem.&lt;&gt;c__DisplayClass3_0.&lt;PerformWork&gt;b__0()
+   at NUnit.Framework.Internal.ContextUtils.&lt;&gt;c__DisplayClass1_0`1.&lt;DoIsolated&gt;b__0(Object _)
+
+1)    at Client.Tests.WorkQueueSchedulerHostLoopTests.StopJoinsConcurrentManualStepWithoutBackgroundLoops@298.MoveNext() in /home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/WorkQueueSchedulerHostLoopTests.fs:line 318
+   at System.Runtime.CompilerServices.AsyncTaskMethodBuilder`1.AsyncStateMachineBox`1.ExecutionContextCallback(Object s)
+
+</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="152fd787-a1cd-4f77-b223-270c966e4467" testId="7ac952e8-9f8b-7fd9-a876-41a5ea220b73" testName="TwoProjectsTwoClientsReadExactCanonicalRefsAndOnlySignalChangedHeads" computerName="Serdan-Home" duration="00:00:07.9685460" startTime="2026-11-22T01:33:42.3727646+01:00" endTime="2026-11-22T01:33:50.3413100+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="152fd787-a1cd-4f77-b223-270c966e4467" />
+    <UnitTestResult executionId="672b6551-be78-4fc6-ae03-8c51583e56af" testId="f06903a1-81b3-b997-2d57-0f29069260c6" testName="SameSubscriptionRoleCatalogChangesBlockHostsUntilIndependentlyReapproved(&quot;version&quot;)" computerName="Serdan-Home" duration="00:00:02.4922930" startTime="2026-11-22T01:33:34.7185024+01:00" endTime="2026-11-22T01:33:37.2107950+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="672b6551-be78-4fc6-ae03-8c51583e56af" />
+    <UnitTestResult executionId="25864d1d-942b-4299-bfce-59e124f780ae" testId="2f219524-8b65-701d-1157-96d16925d082" testName="SameSubscriptionRoleCatalogChangesBlockHostsUntilIndependentlyReapproved(&quot;instructions&quot;)" computerName="Serdan-Home" duration="00:00:02.4525320" startTime="2026-11-22T01:33:39.9200165+01:00" endTime="2026-11-22T01:33:42.3725477+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="25864d1d-942b-4299-bfce-59e124f780ae" />
+    <UnitTestResult executionId="b8bbf782-5d48-455e-adbf-cf85cce83787" testId="82360c15-e5b1-1928-fd1c-ab8ea29ed954" testName="ExactReplayChangedPayloadAndLostAcknowledgmentRemainReceiptBound" computerName="Serdan-Home" duration="00:00:01.1291770" startTime="2026-11-22T01:33:18.4025100+01:00" endTime="2026-11-22T01:33:19.5316377+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="b8bbf782-5d48-455e-adbf-cf85cce83787" />
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="SignedCompletePolicyUsesSameAccountHeadButNeverAuthorizesLaunch" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="736aff6b-052a-0269-270a-02be585a269f">
+      <Execution id="e2d1a5a0-5e54-41f6-88e7-b11a2b07b0c9" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.NativeSchedulerRosterPolicyTests+NativeSchedulerRosterPolicyTests" name="SignedCompletePolicyUsesSameAccountHeadButNeverAuthorizesLaunch" />
+    </UnitTest>
+    <UnitTest name="HardDependencyAndCapacityRemainDormantUntilBothAreDurablyReady" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="d92bff18-fd7f-b82c-b63a-00b38c0dfe84">
+      <Execution id="2b15f67b-102e-4a93-8321-0688eb8b87d4" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHostLoopTests+WorkQueueSchedulerHostLoopTests" name="HardDependencyAndCapacityRemainDormantUntilBothAreDurablyReady" />
+    </UnitTest>
+    <UnitTest name="ChangedSnapshotUnreachableRemoteAndCrossProjectTokensNeedAttention" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="df3a5fa2-27dc-635e-1d3a-030e53d891d7">
+      <Execution id="aced9622-5e41-4c03-aa6c-72123431fd03" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHeadBindingTests+WorkQueueSchedulerHeadBindingTests" name="ChangedSnapshotUnreachableRemoteAndCrossProjectTokensNeedAttention" />
+    </UnitTest>
+    <UnitTest name="NullProjectScopeNeverThrowsOrInvokesManualHost" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="50f1644e-9feb-3e2b-a6f6-e96a46e069d5">
+      <Execution id="b160d763-aad5-4259-9fa6-7d791589f6f0" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHeadBindingTests+WorkQueueSchedulerHeadBindingTests" name="NullProjectScopeNeverThrowsOrInvokesManualHost" />
+    </UnitTest>
+    <UnitTest name="ForgedLocalProjectReplacementCannotAuthenticateForeignBareRemote" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="ab972f33-2d14-59a4-1bae-755b41ea2002">
+      <Execution id="944e81d4-321b-4d7d-b4c0-0b4f203870e9" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.NativeSchedulerRosterPolicyTests+NativeSchedulerRosterPolicyTests" name="ForgedLocalProjectReplacementCannotAuthenticateForeignBareRemote" />
+    </UnitTest>
+    <UnitTest name="SameSubscriptionRoleCatalogChangesBlockHostsUntilIndependentlyReapproved(&quot;version&quot;)" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="f06903a1-81b3-b997-2d57-0f29069260c6">
+      <Execution id="672b6551-be78-4fc6-ae03-8c51583e56af" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHeadBindingTests+WorkQueueSchedulerHeadBindingTests" name="SameSubscriptionRoleCatalogChangesBlockHostsUntilIndependentlyReapproved(&quot;version&quot;)" />
+    </UnitTest>
+    <UnitTest name="HeadFailuresAndCoordinatorExceptionsCannotAuthorizeAnEffect" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="9a9d622e-a678-bedd-c346-a18d2a9a515f">
+      <Execution id="2dd3bb8a-98ad-44ad-8b28-4db37a3ad32d" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHostLoopTests+WorkQueueSchedulerHostLoopTests" name="HeadFailuresAndCoordinatorExceptionsCannotAuthorizeAnEffect" />
+    </UnitTest>
+    <UnitTest name="PolicyProofCannotBeReusedAfterOutOfBandGitRewrite" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="59564ce4-4db9-cf17-eba3-15faa230ebae">
+      <Execution id="fc6832eb-8e12-4242-8171-39cc528c64fd" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.NativeSchedulerRosterPolicyTests+NativeSchedulerRosterPolicyTests" name="PolicyProofCannotBeReusedAfterOutOfBandGitRewrite" />
+    </UnitTest>
+    <UnitTest name="TwoHostInstancesCannotBypassAnInjectedCanonicalOriginalClaim" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="34c89fd0-b801-2f4a-0e18-a591e47fe5cf">
+      <Execution id="2d12eb64-68a3-4959-b762-00f907447fcb" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHostLoopTests+WorkQueueSchedulerHostLoopTests" name="TwoHostInstancesCannotBypassAnInjectedCanonicalOriginalClaim" />
+    </UnitTest>
+    <UnitTest name="SameThreadReentryIsDeferredRatherThanNestingWake" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="915c2470-de01-ab25-fa99-ef5ece668a3b">
+      <Execution id="806b1895-48b5-439e-8beb-6d1589db91f3" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHostLoopTests+WorkQueueSchedulerHostLoopTests" name="SameThreadReentryIsDeferredRatherThanNestingWake" />
+    </UnitTest>
+    <UnitTest name="FrozenWq07StateFencesNativePolicyEvenWithValidSignatureAndAccountHead" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="74b1fcf2-f94a-ad84-84ea-d5932dca80b1">
+      <Execution id="28b0dbe1-2008-4dc1-a4a4-19b72900b3bd" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.NativeSchedulerRosterPolicyTests+NativeSchedulerRosterPolicyTests" name="FrozenWq07StateFencesNativePolicyEvenWithValidSignatureAndAccountHead" />
+    </UnitTest>
+    <UnitTest name="DisposeFromSameThreadCallbackDoesNotDeadlockThePump" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="ed6bc5a7-085c-81e3-fc29-aaf820776a8e">
+      <Execution id="b86a095d-9774-43a8-a777-bba7b3d38124" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHostLoopTests+WorkQueueSchedulerHostLoopTests" name="DisposeFromSameThreadCallbackDoesNotDeadlockThePump" />
+    </UnitTest>
+    <UnitTest name="ExactReplayChangedPayloadAndLostAcknowledgmentRemainReceiptBound" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="82360c15-e5b1-1928-fd1c-ab8ea29ed954">
+      <Execution id="b8bbf782-5d48-455e-adbf-cf85cce83787" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.NativeSchedulerRosterPolicyTests+NativeSchedulerRosterPolicyTests" name="ExactReplayChangedPayloadAndLostAcknowledgmentRemainReceiptBound" />
+    </UnitTest>
+    <UnitTest name="PeriodicFullRescanRecoversLostHintsAndRestartState" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="a0ad3498-94f6-6565-13bd-a65e1340c02a">
+      <Execution id="ac9b965a-3bb2-49ae-9a6b-606f421b31f0" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHostLoopTests+WorkQueueSchedulerHostLoopTests" name="PeriodicFullRescanRecoversLostHintsAndRestartState" />
+    </UnitTest>
+    <UnitTest name="SameSubscriptionRoleCatalogChangesBlockHostsUntilIndependentlyReapproved(&quot;disabled&quot;)" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="c85c76d1-ae0e-ecab-5fb6-6191e2c2e3fe">
+      <Execution id="42bade7b-f8e8-4358-b514-563779ed85d7" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHeadBindingTests+WorkQueueSchedulerHeadBindingTests" name="SameSubscriptionRoleCatalogChangesBlockHostsUntilIndependentlyReapproved(&quot;disabled&quot;)" />
+    </UnitTest>
+    <UnitTest name="RoleSubscriptionChangeRequiresRenewedApprovalInsteadOfSelectingAnotherRole" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="a9114a3d-3842-b59d-f519-e75828124ff8">
+      <Execution id="d4890bf1-aa4a-4219-9c6b-a0e1cd12d8b7" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHeadBindingTests+WorkQueueSchedulerHeadBindingTests" name="RoleSubscriptionChangeRequiresRenewedApprovalInsteadOfSelectingAnotherRole" />
+    </UnitTest>
+    <UnitTest name="DefaultOffIsQuiescentEvenWhenStartedOrManuallySignalled" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="55da78f1-e94e-1889-9dfc-df8f1aa0a815">
+      <Execution id="385e975a-4b04-4d2b-ae9c-726c2e6e42b0" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHostLoopTests+WorkQueueSchedulerHostLoopTests" name="DefaultOffIsQuiescentEvenWhenStartedOrManuallySignalled" />
+    </UnitTest>
+    <UnitTest name="StopJoinsTheInflightStepAndCancelsTheClock" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="76475a36-a13c-28ee-46a1-329497d4decf">
+      <Execution id="8fa0a60c-4c63-4d70-9a9b-adef8954f847" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHostLoopTests+WorkQueueSchedulerHostLoopTests" name="StopJoinsTheInflightStepAndCancelsTheClock" />
+    </UnitTest>
+    <UnitTest name="CoalescesConcurrentHintsInOneInitialGitReconciliation" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="e4bed957-7549-a588-e561-4a6704668fb8">
+      <Execution id="1dfd4e54-7e40-4ad6-a74d-8584731c92b9" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHostLoopTests+WorkQueueSchedulerHostLoopTests" name="CoalescesConcurrentHintsInOneInitialGitReconciliation" />
+    </UnitTest>
+    <UnitTest name="StopJoinsConcurrentManualStepWithoutBackgroundLoops" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="22eeadf2-4758-7c2e-a547-330e260faaec">
+      <Execution id="91ed76dd-ff88-4204-93f9-d86eea89faac" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHostLoopTests+WorkQueueSchedulerHostLoopTests" name="StopJoinsConcurrentManualStepWithoutBackgroundLoops" />
+    </UnitTest>
+    <UnitTest name="MissingUnapprovedDuplicateForeignAndInconsistentMembershipFailClosed" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="9aea486a-7c0a-da5e-3344-c296d4f61d4c">
+      <Execution id="17625e49-bf2c-42b7-acb2-cff19d8bdd56" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.NativeSchedulerRosterPolicyTests+NativeSchedulerRosterPolicyTests" name="MissingUnapprovedDuplicateForeignAndInconsistentMembershipFailClosed" />
+    </UnitTest>
+    <UnitTest name="ManualStepDoesNotRetryUnknownOutcomeInAnUnboundedLoop" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="d74d5404-a292-c6c5-1b4d-b26ed3f29f95">
+      <Execution id="13c1abae-29fb-4bdd-bfad-6fe0b308ce17" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHostLoopTests+WorkQueueSchedulerHostLoopTests" name="ManualStepDoesNotRetryUnknownOutcomeInAnUnboundedLoop" />
+    </UnitTest>
+    <UnitTest name="SignedApprovalCannotBeTransplantedToDifferentGitPredecessor" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="8f1144a0-dbec-9c7b-99ef-d676ce1d82f6">
+      <Execution id="6a840537-6038-437a-b3a6-ad49e85d848a" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.NativeSchedulerRosterPolicyTests+NativeSchedulerRosterPolicyTests" name="SignedApprovalCannotBeTransplantedToDifferentGitPredecessor" />
+    </UnitTest>
+    <UnitTest name="ManualStepUsesOnlyApprovedHostsAndNeverCallsPlannerOrProviderWithoutProvenance" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="1a65dbff-7f4b-4c33-c9d6-df9d7967d14d">
+      <Execution id="af86646c-ed65-4281-ba64-2fa5a232e498" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHeadBindingTests+WorkQueueSchedulerHeadBindingTests" name="ManualStepUsesOnlyApprovedHostsAndNeverCallsPlannerOrProviderWithoutProvenance" />
+    </UnitTest>
+    <UnitTest name="TwoProjectsTwoClientsReadExactCanonicalRefsAndOnlySignalChangedHeads" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="7ac952e8-9f8b-7fd9-a876-41a5ea220b73">
+      <Execution id="152fd787-a1cd-4f77-b223-270c966e4467" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHeadBindingTests+WorkQueueSchedulerHeadBindingTests" name="TwoProjectsTwoClientsReadExactCanonicalRefsAndOnlySignalChangedHeads" />
+    </UnitTest>
+    <UnitTest name="SameSubscriptionRoleCatalogChangesBlockHostsUntilIndependentlyReapproved(&quot;instructions&quot;)" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="2f219524-8b65-701d-1157-96d16925d082">
+      <Execution id="25864d1d-942b-4299-bfce-59e124f780ae" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHeadBindingTests+WorkQueueSchedulerHeadBindingTests" name="SameSubscriptionRoleCatalogChangesBlockHostsUntilIndependentlyReapproved(&quot;instructions&quot;)" />
+    </UnitTest>
+    <UnitTest name="ManualStepRechecksVerifiedHeadsBeforeTheCoordinator" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="edd8ed6b-8add-f0af-c420-ee07f5318560">
+      <Execution id="e899758e-5780-48c7-8e18-c2d65b84c952" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHostLoopTests+WorkQueueSchedulerHostLoopTests" name="ManualStepRechecksVerifiedHeadsBeforeTheCoordinator" />
+    </UnitTest>
+    <UnitTest name="NoApprovalOrContradictoryMembershipNeverStartsGitOrHostCallbacks" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="9cac8498-2c85-1dad-1f6f-144e37343511">
+      <Execution id="9601c570-8887-4718-88b9-d3808b12d55d" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.WorkQueueSchedulerHeadBindingTests+WorkQueueSchedulerHeadBindingTests" name="NoApprovalOrContradictoryMembershipNeverStartsGitOrHostCallbacks" />
+    </UnitTest>
+    <UnitTest name="TwoClientCompetingVersionedUpdatesHaveExactlyOneWinner" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-planner-worker14-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="33629c86-3201-2ab7-e503-58e28c5aefc7">
+      <Execution id="d0324fad-a8a1-4fa9-a252-f2ae20e8b05b" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.NativeSchedulerRosterPolicyTests+NativeSchedulerRosterPolicyTests" name="TwoClientCompetingVersionedUpdatesHaveExactlyOneWinner" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="c85c76d1-ae0e-ecab-5fb6-6191e2c2e3fe" executionId="42bade7b-f8e8-4358-b514-563779ed85d7" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="d74d5404-a292-c6c5-1b4d-b26ed3f29f95" executionId="13c1abae-29fb-4bdd-bfad-6fe0b308ce17" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="edd8ed6b-8add-f0af-c420-ee07f5318560" executionId="e899758e-5780-48c7-8e18-c2d65b84c952" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="50f1644e-9feb-3e2b-a6f6-e96a46e069d5" executionId="b160d763-aad5-4259-9fa6-7d791589f6f0" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="55da78f1-e94e-1889-9dfc-df8f1aa0a815" executionId="385e975a-4b04-4d2b-ae9c-726c2e6e42b0" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="d92bff18-fd7f-b82c-b63a-00b38c0dfe84" executionId="2b15f67b-102e-4a93-8321-0688eb8b87d4" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="9cac8498-2c85-1dad-1f6f-144e37343511" executionId="9601c570-8887-4718-88b9-d3808b12d55d" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="76475a36-a13c-28ee-46a1-329497d4decf" executionId="8fa0a60c-4c63-4d70-9a9b-adef8954f847" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="df3a5fa2-27dc-635e-1d3a-030e53d891d7" executionId="aced9622-5e41-4c03-aa6c-72123431fd03" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="1a65dbff-7f4b-4c33-c9d6-df9d7967d14d" executionId="af86646c-ed65-4281-ba64-2fa5a232e498" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="9aea486a-7c0a-da5e-3344-c296d4f61d4c" executionId="17625e49-bf2c-42b7-acb2-cff19d8bdd56" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="a0ad3498-94f6-6565-13bd-a65e1340c02a" executionId="ac9b965a-3bb2-49ae-9a6b-606f421b31f0" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="33629c86-3201-2ab7-e503-58e28c5aefc7" executionId="d0324fad-a8a1-4fa9-a252-f2ae20e8b05b" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="9a9d622e-a678-bedd-c346-a18d2a9a515f" executionId="2dd3bb8a-98ad-44ad-8b28-4db37a3ad32d" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="8f1144a0-dbec-9c7b-99ef-d676ce1d82f6" executionId="6a840537-6038-437a-b3a6-ad49e85d848a" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="59564ce4-4db9-cf17-eba3-15faa230ebae" executionId="fc6832eb-8e12-4242-8171-39cc528c64fd" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="a9114a3d-3842-b59d-f519-e75828124ff8" executionId="d4890bf1-aa4a-4219-9c6b-a0e1cd12d8b7" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="915c2470-de01-ab25-fa99-ef5ece668a3b" executionId="806b1895-48b5-439e-8beb-6d1589db91f3" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="736aff6b-052a-0269-270a-02be585a269f" executionId="e2d1a5a0-5e54-41f6-88e7-b11a2b07b0c9" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="34c89fd0-b801-2f4a-0e18-a591e47fe5cf" executionId="2d12eb64-68a3-4959-b762-00f907447fcb" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="e4bed957-7549-a588-e561-4a6704668fb8" executionId="1dfd4e54-7e40-4ad6-a74d-8584731c92b9" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="ed6bc5a7-085c-81e3-fc29-aaf820776a8e" executionId="b86a095d-9774-43a8-a777-bba7b3d38124" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="ab972f33-2d14-59a4-1bae-755b41ea2002" executionId="944e81d4-321b-4d7d-b4c0-0b4f203870e9" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="74b1fcf2-f94a-ad84-84ea-d5932dca80b1" executionId="28b0dbe1-2008-4dc1-a4a4-19b72900b3bd" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="22eeadf2-4758-7c2e-a547-330e260faaec" executionId="91ed76dd-ff88-4204-93f9-d86eea89faac" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="7ac952e8-9f8b-7fd9-a876-41a5ea220b73" executionId="152fd787-a1cd-4f77-b223-270c966e4467" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="f06903a1-81b3-b997-2d57-0f29069260c6" executionId="672b6551-be78-4fc6-ae03-8c51583e56af" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="2f219524-8b65-701d-1157-96d16925d082" executionId="25864d1d-942b-4299-bfce-59e124f780ae" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="82360c15-e5b1-1928-fd1c-ab8ea29ed954" executionId="b8bbf782-5d48-455e-adbf-cf85cce83787" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Failed">
+    <Counters total="29" executed="29" passed="28" failed="1" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>NUnit Adapter 4.6.0.0: Test execution started
+Running selected tests in /home/serdan/Projects/.Jarvis-worktrees/scheduler-property-planner-worker14-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll
+   NUnit3TestExecutor discovered 29 of 29 NUnit test cases using Current Discovery mode, Non-Explicit run
+NUnit Adapter 4.6.0.0: Test execution complete
+</StdOut>
+    </Output>
+  </ResultSummary>
+</TestRun>

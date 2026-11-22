@@ -1,0 +1,9 @@
+# F2 — Canonical owner/role and stale-generation changes are absent from stateful traces
+
+**Requirement:** The original frozen task explicitly requires negative traces for “stale generation, owner/role changes” and no false recovery/duplicate owned recovered assignment.
+
+**Frozen source:** `HealthCoupledTests.fs:82-94` creates only a single `Owner` role/agent and one assignment. `:117-128` hardcodes `AgentId = "Owner"`; the positive and concurrent cases (`:173-308`) do not change owner or role. The seeded negative (`:311-389`) includes `intervening-canonical-yield` at `:363-371`, which changes Working state, **not** owner/role or generation; it otherwise varies only activity/transport clock observations. `:293-306` confirms the successful single-generation increment, but not rejection of a preexisting stale-generation candidate independently induced before recovery.
+
+**Impact:** The suite demonstrates useful real Git CAS and fail-closed Working→Ready state recheck. It does not establish that a stale client can never recover a task after a canonical owner/role or generation transition, despite those transitions being specifically requested. This is a test-evidence gap, not a known production recovery bug.
+
+**Proportional remedy candidate (adjudication required):** Add source-exact isolated native Git/CAS traces in which the first client snapshots the old candidate and the canonical ledger changes owner/role or generation before the second read/recovery. Assert zero old-owner recovery, no new duplicate assignment and preserved spec/source/head invariants; include original operation status and deterministic seed/replay. If a particular role rewrite is not expressible through existing production APIs under this test-only lease, record its precise typed blocker rather than invent a mock.

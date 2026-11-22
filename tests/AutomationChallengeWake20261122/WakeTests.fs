@@ -4,6 +4,8 @@ open System
 open System.Diagnostics
 open System.IO
 open NUnit.Framework
+open Common
+open Client.WorkQueueSchedulerHostLoop
 open Client.LedgerStore
 open Client.ReviewWorkflow
 open Client.ChallengeWorkflow
@@ -224,3 +226,122 @@ type CanonicalChallengeWake() =
             Assert.That(altered, Is.Not.EqualTo(accepted.CurrentHead))
             expectHold "IndexMismatch" (inspect true a { good with Commit = altered })
         )
+
+
+    [<Test>]
+    member _.NewPostCommitReceiptDerivesOnlyCanonicalRequeueAndRejectsReplayOrForgery() =
+        withClones (fun a b ->
+            let task, attempt, challenge = startBlocked a b
+            let original = Guid.NewGuid()
+            let oldHead = (LedgerStore.fetch a |> ok).Commit
+            let resolved = ChallengeWorkflow.resolve a original "Lead" challenge.ChallengeId
+                               challenge.ConditionIds.Head 1 "approved" "" |> ok
+            let receipt =
+                Client.OrchestrationApi.OperationResponse.present resolved
+                :?> Client.OrchestrationApi.OperationResponse.Presented
+            let cmd : ChallengeWriteCommand =
+                { ProjectName = "Jarvis"
+                  ActorId = "Lead"
+                  OperationId = original.ToString("D")
+                  Action = "Resolve"
+                  ChallengeId = challenge.ChallengeId
+                  ConditionId = challenge.ConditionIds.Head
+                  ExpectedVersion = 1
+                  Title = ""
+                  TaskId = ""
+                  AttemptId = ""
+                  DependencyChallengeIds = []
+                  ExpectedTaskVersion = 0
+                  ExpectedAttemptVersion = 0
+                  ExpectedAgentVersion = 0
+                  AssignmentGeneration = 0
+                  Conditions = []
+                  Evidence = "approved"
+                  Reason = ""
+                  Outcome = "Satisfied"
+                  NewOwnerAgentId = ""
+                  Subscribe = false }
+            let hold (expected: string) value =
+                match value with
+                | CommittedWakeDecision.Hold code ->
+                    Assert.That(code, Is.EqualTo(expected))
+                | other -> Assert.Fail(sprintf "Expected committed HOLD %s, got %A" expected other)
+            match inspectCommitted true b cmd receipt with
+            | CommittedWakeDecision.Ready [candidate] ->
+                Assert.That(candidate.TaskId, Is.EqualTo(task))
+                Assert.That(candidate.AttemptId, Is.EqualTo(attempt))
+                Assert.That(candidate.OwnerAgentId, Is.EqualTo("Agent 3"))
+                Assert.That(candidate.BlockedGeneration, Is.EqualTo(1))
+                Assert.That(candidate.Commit, Is.EqualTo(resolved.CurrentHead))
+                Assert.That(candidate.OperationId, Is.EqualTo(original))
+            | other -> Assert.Fail(sprintf "Canonical new resolution was not signalled: %A" other)
+            // Test-only enabled Host runs an injected, inert coordinator; no
+            // production scheduler, browser, account store or send is activated.
+            let mutable hints = 0
+            let mutable reports = 0
+            let ports : SchedulerHostPorts =
+                { ReadVerifiedHeads = fun () ->
+                    Ok { AccountHead = resolved.CurrentHead; ProjectHead = resolved.CurrentHead }
+                  Wake = fun signals ->
+                    Assert.That((signals = [WorkWakeTrigger.DependencyCommitted]), Is.True)
+                    hints <- hints + 1
+                    WorkWakeResult.Disabled
+                  Report = fun _ -> reports <- reports + 1
+                  Delay = fun _ _ -> System.Threading.Tasks.Task.CompletedTask }
+            use fixtureHost = new WorkQueueSchedulerHostLoop.Host(ports, enabled=true)
+            match notifyCommitted true b cmd receipt fixtureHost with
+            | CommittedWakeDecision.Ready [_] -> ()
+            | other -> Assert.Fail(sprintf "Verified postcommit hint rejected: %A" other)
+            Assert.That(hints, Is.Zero, "Notify must not execute scheduler synchronously")
+            match fixtureHost.RunOnce [] with
+            | SchedulerHostOutcome.Reconciled WorkWakeResult.Disabled -> ()
+            | other -> Assert.Fail(sprintf "Unexpected fixture host outcome: %A" other)
+            Assert.That(hints, Is.EqualTo(1))
+            Assert.That(reports, Is.EqualTo(1))
+            Assert.That(fixtureHost.RunOnce [], Is.EqualTo(SchedulerHostOutcome.Dormant))
+            Assert.That(hints, Is.EqualTo(1))
+            hold "ReceiptMismatch" (inspectCommitted true b { cmd with ActorId = "Intruder" } receipt)
+            hold "ReceiptMismatch" (inspectCommitted true b cmd
+                                         { receipt with operation = { receipt.operation with Type = "Forged" } })
+            hold "NotSatisfiedResolution" (inspectCommitted true b { cmd with Outcome = "Blocked" } receipt)
+            hold "NotSatisfiedResolution" (inspectCommitted true b { cmd with Action = "Reopen" } receipt)
+            hold "ResolutionMismatch" (inspectCommitted true b
+                                         { cmd with ConditionId = Guid.NewGuid().ToString("N") } receipt)
+            hold "StaleHead" (inspectCommitted true b cmd { receipt with head = oldHead })
+            let repeated = ChallengeWorkflow.resolve b original "Lead" challenge.ChallengeId
+                               challenge.ConditionIds.Head 1 "approved" "" |> ok
+            Assert.That(repeated.AlreadyApplied, Is.True)
+            let replay =
+                Client.OrchestrationApi.OperationResponse.present repeated
+                :?> Client.OrchestrationApi.OperationResponse.Presented
+            hold "AlreadyApplied" (inspectCommitted true b cmd replay)
+        )
+
+    [<Test>]
+    member _.DefaultOffProductionHostHasZeroReadsThreadsOrNotifications() =
+        let mutable reads = 0
+        let mutable executes = 0
+        let mutable reports = 0
+        let wakePorts : WorkWakePorts =
+            { ReadVerified = fun () -> reads <- reads + 1; failwith "unapproved Git read"
+              Plan = fun _ -> failwith "unapproved planner"
+              Execute = fun _ -> executes <- executes + 1; WorkExecutorResult.Rejected "disabled" }
+        let coordinator = WorkQueueReactiveWake.Coordinator(wakePorts)
+        let hostPorts =
+            WorkQueueSchedulerHostLoop.productionPorts coordinator
+                (fun () -> reads <- reads + 1; Error "unapproved head read")
+                (fun _ -> reports <- reports + 1)
+        use host = new WorkQueueSchedulerHostLoop.Host(hostPorts)
+        Assert.That(host.Start(), Is.False)
+        Assert.That(host.IsRunning, Is.False)
+        Assert.That(host.Notify WorkWakeTrigger.DependencyCommitted, Is.False)
+        let decision =
+            notifyCommitted false
+                (Unchecked.defaultof<LedgerBinding>)
+                (Unchecked.defaultof<ChallengeWriteCommand>)
+                (Unchecked.defaultof<Client.OrchestrationApi.OperationResponse.Presented>)
+                host
+        Assert.That(decision, Is.EqualTo(CommittedWakeDecision.Off))
+        Assert.That(reads, Is.Zero)
+        Assert.That(executes, Is.Zero)
+        Assert.That(reports, Is.Zero)

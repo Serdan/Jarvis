@@ -273,3 +273,107 @@ let deliver enabled binding candidate (coordinator:WorkQueueReactiveWake.Coordin
         try WakeDelivery.Emitted(coordinator.Wake [WorkWakeTrigger.DependencyCommitted])
         with _ -> WakeDelivery.Rejected(WakeDecision.Hold "CoordinatorFailure")
     | other -> WakeDelivery.Rejected other
+
+
+/// A production ingress may supply a typed, successful post-journal write receipt.
+/// No caller-supplied attempt or generation is trusted: both come from verified
+/// canonical assignment issuance paths in that exact committed operation.
+[<RequireQualifiedAccess>]
+type CommittedWakeDecision =
+    | Off
+    | Hold of string
+    | Ready of ChallengeWakeCandidate list
+
+let inspectCommitted enabled (binding: LedgerBinding) (cmd: Common.ChallengeWriteCommand)
+                     (receipt: Client.OrchestrationApi.OperationResponse.Presented) =
+    if not enabled then CommittedWakeDecision.Off
+    elif isNull (box binding) || isNull (box cmd) || isNull (box receipt) then
+        CommittedWakeDecision.Hold "MissingReceipt"
+    elif cmd.Action <> "Resolve" || cmd.Outcome <> "Satisfied" then
+        CommittedWakeDecision.Hold "NotSatisfiedResolution"
+    elif receipt.alreadyApplied then
+        // A duplicate original UUID/ACK recovery is not a second event.
+        CommittedWakeDecision.Hold "AlreadyApplied"
+    else
+        try
+            let operation = receipt.operation
+            if isNull (box operation)
+               || operation.Type <> "ResolveChallengeCondition"
+               || operation.Actor <> cmd.ActorId
+               || String.IsNullOrWhiteSpace cmd.ActorId
+               || operation.Sequence < 1L
+               || not (Canonical.validHead receipt.head) then
+                Canonical.fail "ReceiptMismatch"
+            let originalId =
+                match Guid.TryParse cmd.OperationId with
+                | true, id when id <> Guid.Empty -> id
+                | _ -> Canonical.fail "ReceiptMismatch"
+            if operation.OperationId <> originalId.ToString("D") then
+                Canonical.fail "ReceiptMismatch"
+            // Only a canonical newly-issued assignment, included among THIS
+            // operation's changed paths, can identify the blocked attempt.
+            let issuancePaths =
+                if isNull operation.Paths then [] else
+                operation.Paths
+                |> Array.toList
+                |> List.choose (fun path ->
+                    let parts = path.Split('/')
+                    if parts.Length = 6
+                       && parts.[0] = "tasks"
+                       && parts.[2] = "attempts"
+                       && parts.[4] = "assignments"
+                       && parts.[5].EndsWith(".json", StringComparison.Ordinal) then
+                        let number = parts.[5].Substring(0, parts.[5].Length - 5)
+                        match Int32.TryParse number with
+                        | true, generation when generation > 1 ->
+                            Some(path, parts.[1], parts.[3], generation)
+                        | _ -> None
+                    else None)
+            if List.isEmpty issuancePaths then Canonical.fail "NoRequeueIssued"
+            if (issuancePaths |> List.map (fun (p,_,_,_) -> p) |> Set.ofList |> Set.count)
+               <> issuancePaths.Length then
+                Canonical.fail "DuplicateIssuance"
+            let snapshot = LedgerStore.fetch binding |> Canonical.fromLedger "CanonicalReadFailure"
+            if snapshot.Commit <> receipt.head then Canonical.fail "StaleHead"
+            let candidates =
+                issuancePaths
+                |> List.map (fun (path, task, attempt, generation) ->
+                    let issue: AssignmentIssue = Canonical.required binding snapshot path
+                    if issue.TaskId <> task || issue.AttemptId <> attempt
+                       || issue.Generation <> generation
+                       || issue.IssuedSequence <> operation.Sequence
+                       || issue.Reason <> "ChallengeUnblock"
+                       || issue.PreviousGeneration < 1
+                       || String.IsNullOrWhiteSpace issue.OwnerAgentId then
+                        Canonical.fail "IssuanceMismatch"
+                    { ProjectId = binding.ProjectId
+                      LedgerId = binding.LedgerId
+                      Epoch = binding.Epoch
+                      Commit = receipt.head
+                      OperationId = originalId
+                      ChallengeId = cmd.ChallengeId
+                      ConditionId = cmd.ConditionId
+                      TaskId = issue.TaskId
+                      AttemptId = issue.AttemptId
+                      OwnerAgentId = issue.OwnerAgentId
+                      BlockedGeneration = issue.PreviousGeneration })
+            for candidate in candidates do
+                match inspect true binding candidate with
+                | WakeDecision.Ready _ -> ()
+                | WakeDecision.Off -> Canonical.fail "UnexpectedDisabled"
+                | WakeDecision.Hold code -> Canonical.fail code
+            CommittedWakeDecision.Ready candidates
+        with
+        | Canonical.Reject code -> CommittedWakeDecision.Hold code
+        | _ -> CommittedWakeDecision.Hold "CanonicalReadFailure"
+
+/// The host coalesces a verified committed-resolution hint; the coordinator
+/// independently rereads approved Git and never treats a hint as admission.
+/// Disabled means no binding read, no host notification and no thread.
+let notifyCommitted enabled binding cmd receipt
+                    (host: Client.WorkQueueSchedulerHostLoop.WorkQueueSchedulerHostLoop.Host) =
+    match inspectCommitted enabled binding cmd receipt with
+    | CommittedWakeDecision.Ready _ as ready ->
+        if host.Notify WorkWakeTrigger.DependencyCommitted then ready
+        else CommittedWakeDecision.Hold "HostNotAccepting"
+    | decision -> decision

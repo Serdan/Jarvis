@@ -526,6 +526,97 @@ let private fromBrowser (operation: ValueTask<Result<string, EffectError>>) =
             { Payload = payload; ChangedAgentIds = [] })
     })
 
+/// Remote settings writes are intentionally a thin adapter over the exact
+/// client-local TUI/CLI CAS/save/readback boundary, never a second file writer.
+let private updateNamedSetting (rt: Runtime) (cmd: UpdateNamedSettingCommand) =
+    let key =
+        match cmd.Setting with
+        | NamedClientSetting.MachineName -> "machine-name"
+        | NamedClientSetting.WorkspacePath -> "workspace-path"
+        | NamedClientSetting.TrustLevel -> "trust-level"
+        | NamedClientSetting.AllowedEnvironmentVariables -> "allowed-environment-variables"
+        | NamedClientSetting.MaxImportBytes -> "max-import-bytes"
+        | NamedClientSetting.BrowserPort -> "browser-port"
+        | NamedClientSetting.NativeHealthEnabled -> "native-health-enabled"
+        | NamedClientSetting.NativeHealthTimeoutSeconds -> "native-health-timeout-seconds"
+    let textValue =
+        match cmd.Value, cmd.Setting with
+        | None, _ -> Ok None
+        | Some(NamedClientSettingValue.Text text),
+          (NamedClientSetting.MachineName | NamedClientSetting.WorkspacePath | NamedClientSetting.TrustLevel) ->
+            Ok(Some text)
+        | Some(NamedClientSettingValue.TextList names), NamedClientSetting.AllowedEnvironmentVariables ->
+            Ok(Some(String.concat "," names))
+        | Some(NamedClientSettingValue.Integer value),
+          (NamedClientSetting.BrowserPort | NamedClientSetting.MaxImportBytes | NamedClientSetting.NativeHealthTimeoutSeconds) ->
+            Ok(Some(string value))
+        | Some(NamedClientSettingValue.Boolean value), NamedClientSetting.NativeHealthEnabled ->
+            Ok(Some(if value then "true" else "false"))
+        | _ -> Error "Setting value wire type does not match setting name."
+    let storedValue (stored: ClientStoredConfig) =
+        match cmd.Setting with
+        | NamedClientSetting.MachineName -> stored.MachineName
+        | NamedClientSetting.WorkspacePath -> stored.WorkspacePath
+        | NamedClientSetting.TrustLevel -> stored.TrustLevel
+        | NamedClientSetting.AllowedEnvironmentVariables ->
+            // Environment variable allowlists can reveal credentials or host policy.
+            // Return presence/redaction, not the list contents.
+            stored.AllowedEnvironmentVariables |> Option.map (fun _ -> "[redacted]")
+        | NamedClientSetting.MaxImportBytes -> stored.MaxImportBytes |> Option.map string
+        | NamedClientSetting.BrowserPort -> stored.BrowserPort |> Option.map string
+        | NamedClientSetting.NativeHealthEnabled -> stored.NativeHealthEnabled |> Option.map string
+        | NamedClientSetting.NativeHealthTimeoutSeconds ->
+            stored.NativeHealthTimeoutSeconds |> Option.map string
+    let outcome =
+        (if cmd.ExpectedRevision.IsNone then
+             Error "Remote settings mutation requires a pinned expectedRevision."
+         else textValue)
+        |> Result.bind (fun text ->
+            ClientConfig.load()
+            |> Result.bind (fun before ->
+                let apply =
+                    if Some before.Revision <> cmd.ExpectedRevision then
+                        Error "Config revision conflict. Reload before saving."
+                    else ClientConfig.applyRemote key text cmd.ExpectedRevision
+                apply
+                |> Result.map (fun after ->
+                    let changed = before.Stored <> after.Stored
+                    let nextCheck =
+                        changed &&
+                        (cmd.Setting = NamedClientSetting.NativeHealthEnabled || cmd.Setting = NamedClientSetting.NativeHealthTimeoutSeconds)
+                    let reconnect = changed && cmd.Setting = NamedClientSetting.MachineName
+                    let restart = changed && not nextCheck && not reconnect
+                    let runtimeValue, runtimeStatus =
+                        match cmd.Setting with
+                        | NamedClientSetting.MaxImportBytes ->
+                            Some(string rt.MaxImportBytes), "Observed: current Runtime.MaxImportBytes"
+                        | _ ->
+                            None, "NotObserved: startup-effective value is not exposed by Runtime; never infer it from the saved config"
+                    { SettingName = key
+                      Operation = (if cmd.Value.IsSome then "set" else "unset")
+                      OldPersistedValue = storedValue before.Stored
+                      NewPersistedValue = storedValue after.Stored
+                      ValuesRedacted = (cmd.Setting = NamedClientSetting.AllowedEnvironmentVariables)
+                      OldRevision = before.Revision
+                      Revision = after.Revision
+                      ConfigSource = after.Path
+                      EffectiveRuntimeValue = runtimeValue
+                      RuntimeObservation = runtimeStatus
+                      StartupOverride = None
+                      AppliedNow = false
+                      RestartRequired = restart
+                      ReconnectRequired = reconnect
+                      Activation =
+                        if not changed then "unchanged"
+                        elif nextCheck then "next-native-health-check"
+                        elif reconnect then "next-device-registration"
+                        else "persisted-for-restart" })))
+    outcome
+    |> Result.mapError (fun message ->
+        if message.Contains("Local operator confirmation required", StringComparison.OrdinalIgnoreCase)
+           then Client.PermissionDenied message
+        else Client.ValidationError message)
+
 let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
                      (resolved: ProjectPaths.ResolvedProject option) (agentId: string) (command: AgentCommand) =
     match command with
@@ -851,6 +942,7 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
         |> sourceOperation resolved (fun project -> ProjectBrowser.exportFileIn project cmd) (fun () -> ProjectBrowser.exportFile cmd)
         |> serialize'
     | ImportFileCommand cmd -> rt |> importFile resolved cmd |> serialize'
+    | UpdateNamedSettingCommand cmd -> updateNamedSetting rt cmd |> serialize'
     | UpdateClientCommand -> SelfUpdate.prepare () |> Async.AwaitTask |> Async.RunSynchronously |> serialize'
     | WriteFileCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.writeFileIn project cmd) (fun () -> ProjectBrowser.writeFile cmd) |> serialize'
     | PatchFileCommand cmd ->

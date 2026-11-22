@@ -1081,6 +1081,44 @@ type NativeSchedulerAccountReservationTests() =
             | other -> failwithf "Unreceipted Git native state rewrite was accepted: %A" other)
 
     [<Test>]
+    member _.ReviewerVersionAliasesCannotBookTheSameVerifiedClaimAcrossTwoClones() =
+        NativeFixture.withGit (fun f ->
+            NativeReservationFixture.establish f
+                (NativeReservationFixture.limits 2 2)
+                [| NativeReservationFixture.limits 2 2
+                   NativeReservationFixture.limits 2 2 |]
+            let canonical = NativeReservationFixture.reviewer f 0
+            Assert.That(canonical.ReviewVersion, Is.EqualTo(2L))
+            NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne
+                (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne)
+                (Guid.NewGuid()) canonical
+                |> NativeReservationFixture.success |> ignore
+            let before = NativeFixture.head f.AccountOne
+            let original = (NativeReservationFixture.snapshot f f.AccountOne f.ProjectsOne).Records
+            Assert.That(original.Length, Is.EqualTo(1))
+            Assert.That(original[0].Candidate.ReviewVersion, Is.EqualTo(2L))
+            // A 64-bit value truncated to int would pass the real Version=2
+            // claim comparison yet create a distinct 64-bit canonical key.
+            let forgedVersions =
+                [| 4294967298L; 2147483648L; int64 Int32.MaxValue
+                   Int64.MaxValue; -1L; 0L; Int64.MinValue |]
+            for version in forgedVersions do
+                let forged =
+                    { canonical with ReviewVersion = version
+                                     DispatchId = Guid.NewGuid().ToString("D")
+                                     EffectOperationId = Guid.NewGuid().ToString("D") }
+                match NativeReservationFixture.reserve f f.AccountTwo f.ProjectsTwo
+                        (NativeReservationFixture.coverage f f.AccountTwo f.ProjectsTwo)
+                        (Guid.NewGuid()) forged with
+                | Error(AccountPolicyNotAuthoritative _) -> ()
+                | other -> failwithf "Reviewer version alias %d admitted against immutable claim: %A" version other
+                Assert.That(NativeFixture.head f.AccountOne, Is.EqualTo(before),
+                            sprintf "Version %d changed account remote head" version)
+                let current = (NativeReservationFixture.snapshot f f.AccountOne f.ProjectsOne).Records
+                Assert.That(current.Length, Is.EqualTo(1))
+                Assert.That(current[0].CanonicalKey, Is.EqualTo(original[0].CanonicalKey))
+                Assert.That(current[0].Status, Is.EqualTo("Reserved")))
+    [<Test>]
     member _.SameFrozenReviewerVersionCannotBeRebookedWithRewrittenReviewRef() =
         NativeFixture.withGit (fun f ->
             NativeReservationFixture.establish f

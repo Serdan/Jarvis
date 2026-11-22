@@ -145,6 +145,7 @@ module NativeSchedulerAccountReservation =
                     else
                         validGuidN c.ReviewId
                         && c.ReviewVersion > 0L
+                        && c.ReviewVersion <= int64 Int32.MaxValue
                         && validOid c.ReviewedHeadOid
                         && not (String.IsNullOrEmpty c.ReviewRef)
                         && c.ReviewRef.StartsWith("refs/heads/jarvis-review/", StringComparison.Ordinal)
@@ -163,6 +164,9 @@ module NativeSchedulerAccountReservation =
             && validGuid r.OriginalOperationId && r.Generation > 0L
             && validGuid r.Candidate.DispatchId && validGuid r.Candidate.EffectOperationId
             && r.CanonicalKey = key b r.Candidate
+            && (r.Candidate.Kind <> "Reviewer"
+                || (r.Candidate.ReviewVersion > 0L
+                    && r.Candidate.ReviewVersion <= int64 Int32.MaxValue))
             && List.contains r.Candidate.Kind kinds
             && List.contains r.Status
                  [ "Reserved"; "Dispatching"; "Submitted"; "Uncertain"; "Active"; "Unknown"; "Released" ]
@@ -302,7 +306,7 @@ module NativeSchedulerAccountReservation =
                            || review.TaskId <> taskId
                            || review.Status <> "Claimed"
                            || review.ReviewerId <> c.OwnerAgentId
-                           || review.Version <> int c.ReviewVersion
+                           || int64 review.Version <> c.ReviewVersion
                            || review.SourceVersion.ToString() <> bits[5].Substring(1)
                            || review.ReviewRef <> c.ReviewRef
                            || review.ReviewedHeadOid <> c.ReviewedHeadOid then

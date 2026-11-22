@@ -71,6 +71,32 @@ let remoteWritesRequireExactSha256RevisionAndLengthBounds () =
     Assert.That(parse "machine-name" "set" oversized revision |> Result.isError, Is.True)
     let manyNames = "[" + String.concat "," (List.replicate 129 "\"X\"") + "]"
     Assert.That(parse "allowed-environment-variables" "set" manyNames revision |> Result.isError, Is.True)
+[<Test>]
+let readFirstUseDiscoversRevisionWithoutRemovingWriteCas () =
+    match parse "machine-name" "read" "null" "" with
+    | Ok cmd ->
+        Assert.That(cmd.Setting, Is.EqualTo(NamedClientSetting.MachineName))
+        Assert.That(cmd.Value, Is.EqualTo(None))
+        Assert.That(cmd.ExpectedRevision, Is.EqualTo(None))
+    | Error reason -> Assert.Fail("First-use authenticated read must work: " + reason)
+    Assert.That(parse "machine-name" "read" "\"injected\"" "" |> Result.isError, Is.True)
+    Assert.That(parse "machine-name" "read" "null" revision |> Result.isError, Is.True)
+    Assert.That(parse "machine-name" "set" "\"changed\"" "" |> Result.isError, Is.True)
+    Assert.That(parse "machine-name" "unset" "null" "" |> Result.isError, Is.True)
+
+[<Test>]
+let allowlistElementsAreNotRetokenizedOrSilentlyDeduplicated () =
+    let bad = [ "[\"SAFE_A;SAFE_B\"]"; "[\"SAFE_A,SAFE_B\"]"; "[\"\"]";
+                "[\"SAFE_A\",\"SAFE_A\"]"; "[\"safe_a\",\"SAFE_A\"]";
+                "[\"9BAD\"]"; "[\"BAD-NAME\"]"; "[\" SAFE_A\"]" ]
+    for payload in bad do
+        Assert.That(parse "allowed-environment-variables" "set" payload revision |> Result.isError,
+                    Is.True, "Malformed typed array must be rejected: " + payload)
+    match parse "allowed-environment-variables" "set" "[\"SAFE_A\",\"SAFE_B\"]" revision with
+    | Ok cmd ->
+        Assert.That(cmd.Value, Is.EqualTo(Some(NamedClientSettingValue.TextList [ "SAFE_A"; "SAFE_B" ])))
+    | Error reason -> Assert.Fail("Valid two-element allowlist rejected: " + reason)
+
 
 [<Test>]
 let namedSettingProtocolAdvertisedAndRoundTripsAsTypedMessage () =

@@ -1148,6 +1148,9 @@ module McpToolHelpers =
         let parsed =
             match setting, operation with
             | None, _ -> Error "Unknown settingName; use exactly one of the eight canonical kebab-case setting names."
+            | _, "read" when value.ValueKind = JsonValueKind.Null || value.ValueKind = JsonValueKind.Undefined ->
+                Ok None
+            | _, "read" -> Error "Read requires a null or omitted value."
             | _, "unset" when value.ValueKind = JsonValueKind.Null || value.ValueKind = JsonValueKind.Undefined ->
                 Ok None
             | _, "unset" -> Error "Unset requires a null or omitted value."
@@ -1161,11 +1164,13 @@ module McpToolHelpers =
                 if value.ValueKind <> JsonValueKind.Array then typeError "string array"
                 else
                     let elements = value.EnumerateArray() |> Seq.toList
-                    if elements.Length > 128 || elements |> List.exists (fun x ->
-                        x.ValueKind <> JsonValueKind.String ||
-                        isNull (x.GetString()) || x.GetString().Length > 128) then
-                        typeError "string array of no more than 128 names (128 characters each)"
-                    else Ok(Some(NamedClientSettingValue.TextList(elements |> List.map _.GetString())))
+                    if elements |> List.exists (fun x -> x.ValueKind <> JsonValueKind.String) then
+                        typeError "string array of environment variable names"
+                    else
+                        elements
+                        |> List.map _.GetString()
+                        |> NamedClientSettingWire.validateEnvironmentNames
+                        |> Result.map (NamedClientSettingValue.TextList >> Some)
             | Some (NamedClientSetting.BrowserPort | NamedClientSetting.MaxImportBytes | NamedClientSetting.NativeHealthTimeoutSeconds), "set" ->
                 let mutable integer = 0L
                 if value.ValueKind = JsonValueKind.Number && value.TryGetInt64(&integer) then
@@ -1175,9 +1180,12 @@ module McpToolHelpers =
                 if value.ValueKind = JsonValueKind.True || value.ValueKind = JsonValueKind.False then
                     Ok(Some(NamedClientSettingValue.Boolean(value.GetBoolean())))
                 else typeError "boolean"
-            | _, _ -> Error "operation must be exactly 'set' or 'unset'."
+            | _, _ -> Error "operation must be exactly 'read', 'set' or 'unset'."
         let revision =
-            if String.IsNullOrWhiteSpace expectedRevision then Error "expectedRevision is required for remote updates; obtain a current readback revision."
+            if operation = "read" then
+                if String.IsNullOrWhiteSpace expectedRevision then Ok None
+                else Error "Read does not accept expectedRevision."
+            elif String.IsNullOrWhiteSpace expectedRevision then Error "expectedRevision is required for remote mutations; call read on this device first."
             elif expectedRevision.Length = 64 &&
                  (expectedRevision |> Seq.forall Char.IsAsciiHexDigit) then
                 Ok(Some expectedRevision)
@@ -1196,7 +1204,7 @@ module McpToolHelpers =
         | Error message -> Task.FromResult(errorResult (ValidationFailed message))
         | Ok _ when String.IsNullOrWhiteSpace deviceId || deviceId.Length > 256 ->
             Task.FromResult(errorResult (ValidationFailed
-                "Settings mutations require an exact connected deviceId from ListDevices; never fall back to an account default or another conversation."))
+                "Named settings requests require an exact connected deviceId from ListDevices; never fall back to an account default or another conversation."))
         | Ok command ->
             // RequestDeviceRouting takes this exact tool parameter as an
             // override; SendCommandToUser refuses any missing/offline target.
@@ -1782,11 +1790,11 @@ type JarvisMcpTools =
         McpToolHelpers.getServerUpdateStatus http
 
 
-    [<McpServerTool(Title = "Update named client setting", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Set or unset one of eight canonical client settings on the explicitly selected connected device, using the same revision-checked durable client-local settings service as the TUI/CLI. Pass settingName (e.g. workspace-path or machine-name), operation set/unset, typed JSON value, required exact deviceId from ListDevices, and required current expectedRevision SHA-256. No implicit device or revision fallback. Remote trust elevation and environment allowlist expansion require local confirmation and are rejected. Never restarts the client.")>]
+    [<McpServerTool(Title = "Update named client setting", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Read, set or unset exactly one of eight canonical client settings on the selected connected device using the shared client-local settings boundary. First call operation=read with value=null, exact deviceId from ListDevices and no expectedRevision; the result contains the current revision. Then use operation=set/unset and supply that SHA-256 expectedRevision for CAS. Read is non-mutating. Never omit deviceId, and no implicit device fallback. Remote trust elevation and environment allowlist expansion are rejected. Never restarts the client.")>]
     static member UpdateNamedSetting(
         settingName: string, operation: string, value: JsonElement,
         [<Optional; DefaultParameterValue("")>] deviceId: string,
-        expectedRevision: string,
+        [<Optional; DefaultParameterValue("")>] expectedRevision: string,
         client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.updateNamedSetting client http settingName operation value expectedRevision deviceId
 

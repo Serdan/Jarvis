@@ -57,6 +57,24 @@ check "valid SHA-256 revision"
 let oversized = "\"" + String.replicate 4097 "a" + "\""
 check "oversize value"
     (McpToolHelpers.parseNamedSetting "machine-name" "set" (json oversized) pinnedRevision |> Result.isError)
+// First-use authenticated read returns the existing device revision without writes.
+for name, _, expected in valid do
+    match McpToolHelpers.parseNamedSetting name "read" (json "null") "" with
+    | Ok cmd -> check ("read revision " + name)
+                    (cmd.Setting = expected && cmd.Value.IsNone && cmd.ExpectedRevision.IsNone)
+    | Error error -> failures.Add("read " + name + " rejected: " + error)
+check "read may not inject a value"
+    (McpToolHelpers.parseNamedSetting "machine-name" "read" (json "\"injected\"") "" |> Result.isError)
+check "read may not supply a revision"
+    (McpToolHelpers.parseNamedSetting "machine-name" "read" (json "null") pinnedRevision |> Result.isError)
+check "unset still requires CAS"
+    (McpToolHelpers.parseNamedSetting "machine-name" "unset" (json "null") "" |> Result.isError)
+for payload in [ "[\"SAFE_A;SAFE_B\"]"; "[\"SAFE_A,SAFE_B\"]"; "[\"\"]";
+                 "[\"SAFE_A\",\"SAFE_A\"]"; "[\"safe_a\",\"SAFE_A\"]";
+                 "[\"9BAD\"]"; "[\"BAD-NAME\"]"; "[\" SAFE_A\"]" ] do
+    check ("allowlist identity " + payload)
+        (McpToolHelpers.parseNamedSetting "allowed-environment-variables" "set" (json payload) pinnedRevision |> Result.isError)
+
 if failures.Count > 0 then
     for failure in failures do eprintfn "FAIL %s" failure
     failwithf "%d named-setting contract failures" failures.Count

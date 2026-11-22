@@ -529,16 +529,7 @@ let private fromBrowser (operation: ValueTask<Result<string, EffectError>>) =
 /// Remote settings writes are intentionally a thin adapter over the exact
 /// client-local TUI/CLI CAS/save/readback boundary, never a second file writer.
 let private updateNamedSetting (rt: Runtime) (cmd: UpdateNamedSettingCommand) =
-    let key =
-        match cmd.Setting with
-        | NamedClientSetting.MachineName -> "machine-name"
-        | NamedClientSetting.WorkspacePath -> "workspace-path"
-        | NamedClientSetting.TrustLevel -> "trust-level"
-        | NamedClientSetting.AllowedEnvironmentVariables -> "allowed-environment-variables"
-        | NamedClientSetting.MaxImportBytes -> "max-import-bytes"
-        | NamedClientSetting.BrowserPort -> "browser-port"
-        | NamedClientSetting.NativeHealthEnabled -> "native-health-enabled"
-        | NamedClientSetting.NativeHealthTimeoutSeconds -> "native-health-timeout-seconds"
+    let key = NamedClientSettingWire.canonicalName cmd.Setting
     let textValue =
         match cmd.Value, cmd.Setting with
         | None, _ -> Ok None
@@ -546,7 +537,10 @@ let private updateNamedSetting (rt: Runtime) (cmd: UpdateNamedSettingCommand) =
           (NamedClientSetting.MachineName | NamedClientSetting.WorkspacePath | NamedClientSetting.TrustLevel) ->
             Ok(Some text)
         | Some(NamedClientSettingValue.TextList names), NamedClientSetting.AllowedEnvironmentVariables ->
-            Ok(Some(String.concat "," names))
+            // Validate element identity AGAIN at the client boundary: a hostile
+            // wire message must never retokenize one invalid name into two.
+            NamedClientSettingWire.validateEnvironmentNames names
+            |> Result.map (String.concat "," >> Some)
         | Some(NamedClientSettingValue.Integer value),
           (NamedClientSetting.BrowserPort | NamedClientSetting.MaxImportBytes | NamedClientSetting.NativeHealthTimeoutSeconds) ->
             Ok(Some(string value))
@@ -567,15 +561,18 @@ let private updateNamedSetting (rt: Runtime) (cmd: UpdateNamedSettingCommand) =
         | NamedClientSetting.NativeHealthEnabled -> stored.NativeHealthEnabled |> Option.map string
         | NamedClientSetting.NativeHealthTimeoutSeconds ->
             stored.NativeHealthTimeoutSeconds |> Option.map string
+    let readOnly = cmd.ExpectedRevision.IsNone && cmd.Value.IsNone
     let outcome =
-        (if cmd.ExpectedRevision.IsNone then
+        (if readOnly then Ok None
+         elif cmd.ExpectedRevision.IsNone then
              Error "Remote settings mutation requires a pinned expectedRevision."
          else textValue)
         |> Result.bind (fun text ->
             ClientConfig.load()
             |> Result.bind (fun before ->
                 let apply =
-                    if Some before.Revision <> cmd.ExpectedRevision then
+                    if readOnly then Ok before
+                    elif Some before.Revision <> cmd.ExpectedRevision then
                         Error "Config revision conflict. Reload before saving."
                     else ClientConfig.applyRemote key text cmd.ExpectedRevision
                 apply
@@ -593,7 +590,7 @@ let private updateNamedSetting (rt: Runtime) (cmd: UpdateNamedSettingCommand) =
                         | _ ->
                             None, "NotObserved: startup-effective value is not exposed by Runtime; never infer it from the saved config"
                     { SettingName = key
-                      Operation = (if cmd.Value.IsSome then "set" else "unset")
+                      Operation = (if readOnly then "read" elif cmd.Value.IsSome then "set" else "unset")
                       OldPersistedValue = storedValue before.Stored
                       NewPersistedValue = storedValue after.Stored
                       ValuesRedacted = (cmd.Setting = NamedClientSetting.AllowedEnvironmentVariables)
@@ -607,7 +604,8 @@ let private updateNamedSetting (rt: Runtime) (cmd: UpdateNamedSettingCommand) =
                       RestartRequired = restart
                       ReconnectRequired = reconnect
                       Activation =
-                        if not changed then "unchanged"
+                        if readOnly then "read-only"
+                        elif not changed then "unchanged"
                         elif nextCheck then "next-native-health-check"
                         elif reconnect then "next-device-registration"
                         else "persisted-for-restart" })))

@@ -540,9 +540,33 @@ type NamedClientSettingValue =
     | Boolean of bool
     | TextList of string list
 
+/// Preserve element identity before the legacy comma/semicolon TUI parser.
+module NamedClientSettingWire =
+    let canonicalName = function
+        | NamedClientSetting.MachineName -> "machine-name"
+        | NamedClientSetting.WorkspacePath -> "workspace-path"
+        | NamedClientSetting.TrustLevel -> "trust-level"
+        | NamedClientSetting.AllowedEnvironmentVariables -> "allowed-environment-variables"
+        | NamedClientSetting.MaxImportBytes -> "max-import-bytes"
+        | NamedClientSetting.BrowserPort -> "browser-port"
+        | NamedClientSetting.NativeHealthEnabled -> "native-health-enabled"
+        | NamedClientSetting.NativeHealthTimeoutSeconds -> "native-health-timeout-seconds"
+    let validateEnvironmentNames (names: string list) =
+        let validName (name: string) =
+            not (String.IsNullOrWhiteSpace name)
+            && name.Length <= 128
+            && (Char.IsLetter name[0] || name[0] = '_')
+            && (name |> Seq.forall (fun ch -> Char.IsLetterOrDigit ch || ch = '_'))
+        if names.Length > 128 || names |> List.exists (validName >> not) then
+            Error "Allowed environment variables must be valid individual names (letter or underscore first, then letters, digits or underscores), no more than 128."
+        elif (names |> List.distinctBy (fun name -> name.ToUpperInvariant()) |> List.length) <> names.Length then
+            Error "Allowed environment variables must not contain duplicate names."
+        else Ok names
+
 type UpdateNamedSettingCommand =
     { Setting: NamedClientSetting
-      /// None restores the default; no untyped or arbitrary JSON edits.
+      /// None restores the default when ExpectedRevision is present;
+      /// None/None is the explicit read-only revision-discovery request.
       Value: NamedClientSettingValue option
       ExpectedRevision: string option }
 

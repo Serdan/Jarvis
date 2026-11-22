@@ -196,6 +196,52 @@ type ContractFixture() =
                           Locator = locator; Proof = proof }
         |> holds InvalidTerminalProof
 
+    [<Test>]
+    member _.MalformedB1MissingAccountReturnsTypedHold() =
+        inspectB1 { Account = Unchecked.defaultof<AccountObservation>
+                    FakeClaim = fakeClaim; FakeProject = fakeProject
+                    CanonicalProjectWorkerPhase = "Ready" }
+        |> holds MissingObservation
+
+    [<Test>]
+    member _.MalformedB1MissingExpectedCandidateReturnsTypedHold() =
+        inspectB1 { Account = { observation with ExpectedCandidate = Unchecked.defaultof<NativeDispatchCandidate> }
+                    FakeClaim = fakeClaim; FakeProject = fakeProject
+                    CanonicalProjectWorkerPhase = "Ready" }
+        |> holds MissingObservation
+
+    [<Test>]
+    member _.MalformedB1MissingFakeClaimCandidateReturnsTypedHold() =
+        inspectB1 { Account = observation
+                    FakeClaim = { fakeClaim with Candidate = Unchecked.defaultof<_> }
+                    FakeProject = fakeProject; CanonicalProjectWorkerPhase = "Ready" }
+        |> holds MissingObservation
+
+    [<Test>]
+    member _.MalformedB1MissingFakeClaimAccountReturnsTypedHold() =
+        inspectB1 { Account = observation
+                    FakeClaim = { fakeClaim with Account = Unchecked.defaultof<_> }
+                    FakeProject = fakeProject; CanonicalProjectWorkerPhase = "Ready" }
+        |> holds MissingObservation
+
+    [<Test>]
+    member _.MalformedActiveTerminalMissingCandidateReturnsTypedHold() =
+        let locator =
+            { DispatchId = guid dispatch; OriginalReservationId = guid original
+              EffectOperationId = guid effect; TerminalOperationId = guid terminal }
+        let proof =
+            { DispatchId = locator.DispatchId; OriginalReservationId = locator.OriginalReservationId
+              EffectOperationId = locator.EffectOperationId; TerminalOperationId = locator.TerminalOperationId
+              ProjectId = guid accountId; ProjectLedgerId = guid ledgerId; ProjectEpoch = 1
+              CanonicalKey = digest; ProviderSessionId = "s1"; ProjectHead = head
+              ProjectTerminalOid = oid; ProviderTerminalOid = head }
+        inspectTerminal { Reservation = { reserved with
+                                            Status = "Active"
+                                            Candidate = Unchecked.defaultof<NativeDispatchCandidate>
+                                            ProjectFenceOid = oid; ProviderSessionId = "s1" }
+                          Locator = locator; Proof = proof }
+        |> holds MissingObservation
+
     [<Test; Explicit("RED: trusted Started project ingress, provider issuer and account release are absent")>]
     member _.ProductionNativeAccountProviderTerminalRemainsUnsupported() =
         Assert.Fail("RED: no trusted Started project ingress, real provider issuer, or connected B2 release call site exists")

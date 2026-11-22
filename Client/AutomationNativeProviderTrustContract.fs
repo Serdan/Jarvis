@@ -120,7 +120,12 @@ type B1Observation =
 /// remain a HOLD. This function never returns production authorization.
 let inspectB1 (observation: B1Observation) : Result<unit, HoldReason list> =
     if isNull (box observation)
+       || isNull (box observation.Account)
+       || isNull (box observation.Account.Reservation)
+       || isNull (box observation.Account.ExpectedCandidate)
        || isNull (box observation.FakeClaim)
+       || isNull (box observation.FakeClaim.Candidate)
+       || isNull (box observation.FakeClaim.Account)
        || isNull (box observation.FakeProject) then
         Error [ MissingObservation; DisposableReceiptNotAuthority ]
     else
@@ -173,6 +178,7 @@ type NonAuthorizingTerminalShape =
 
 let inspectTerminal (observation: TerminalObservation) : Result<NonAuthorizingTerminalShape, HoldReason list> =
     if isNull (box observation) || isNull (box observation.Reservation)
+       || isNull (box observation.Reservation.Candidate)
        || isNull (box observation.Locator) || isNull (box observation.Proof) then
         Error [ MissingObservation ]
     else

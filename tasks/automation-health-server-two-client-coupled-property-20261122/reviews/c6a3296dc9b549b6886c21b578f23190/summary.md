@@ -1,1 +1,16 @@
-Pinned baseline dcac884; source 380cac50; SDK11.0.100; Release unfiltered 8/8 passed (health-coupled-8.trx). Review server authenticated ingress fixture/SQLite + two clone NativeHealth current/recover Git CAS, seeded negatives, bad comparator mutation witness, fail-closed simultaneous SQLite read RED diagnostic, and documented JWT/full Client.Tests/Windows limitations. Three new test/docs files only; no production/main changes.
+# Independent Reviewer 2 — ChangesRequested
+
+**Frozen object:** `380cac50eb3aac51457bef1b78f571bcf85119fe` (base `dcac884fc061869572b12a03befc12f11c009f2f`; review `c6a3296dc9b549b6886c21b578f23190`). The commit changes exactly three test/doc paths: `HealthCoupledTests.fs`, its standalone `HealthCoupled.Tests.fsproj`, and `docs/testing/automation-health-coupled-20261122.md`. The registered worker worktree was clean and pinned to the frozen SHA.
+
+**Independent native rerun:** `dotnet --version` = `11.0.100`; `dotnet test scripts/tests/automation-health-coupled-20261122/HealthCoupled.Tests.fsproj -c Release --no-restore -p:BuildProjectReferences=false --logger 'trx;LogFileName=reviewer2-health-coupled.trx' --results-directory /tmp/jarvis-health-coupled-reviewer2-results`; terminal exit 0, **8 passed / 0 failed / 0 skipped**, 15s, unfiltered TRX at `/tmp/jarvis-health-coupled-reviewer2-results/reviewer2-health-coupled.trx`. Node is not a requirement of this Health-only F# harness.
+
+**Verified substantive positives:** References unmodified production `Server.fsproj` and `Client.fsproj`; tests traverse `ClientService.SendCommandToUser`, `OptionalFeedbackStore` SQLite, registered `HubService.GetAgentActivity`, `NativeHealth.checkOnce/current/recover`, and two disposable Git LedgerStore clones with a shared bare remote, real operation receipts and canonical generation CAS. Registered/missing/wrong-user activity negatives, active suppression, source/spec retention, repeated UUID, transport failures, and a concurrent Git CAS barrier are exercised. The fixture serializes concurrent SQLite reads, and documents previous read contention RED without mislabeling it.
+
+**Changes requested on original acceptance requirements, not a mandate for new production design:**
+1. [F1](findings/issuer-authorization-gap.md): Explicit issuer-pinning/client-identity spoof negative requirement is not discharged; the test manufactures an already-authenticated principal and bypasses issuer/signature middleware.
+2. [F2](findings/owner-role-stale-view-gap.md): Required owner/role-change and stale-generation adversarial transitions are not covered by the fixed-Owner fixture; intervening yield changes state, not ownership/role.
+3. [F3](findings/mutation-not-coupled-to-sut.md): The deliberate comparator mutant lives only in an independent local reference function, so it does not demonstrate the production-path gate fails when the decision is mutated. Wall-clock 600s boundary is also not controlled exactly.
+
+**Evidence boundary:** The focused 8/8 is genuine **source-only acceptance-harness evidence**, not a complete native Client.Tests pass, signed JWT host/auth verification, unrestricted concurrent SQLite availability, Windows parity, or full Automation activation. Complete Client.Tests remains **INCONCLUSIVE** as documented; no main merge, source edit, live send, deployment, migration or schedules were performed by this reviewer.
+
+Findings identify deficiencies relative to the original task contract. Any proposed fix or scope addition requires separate independent adjudication under Reviewer policy.

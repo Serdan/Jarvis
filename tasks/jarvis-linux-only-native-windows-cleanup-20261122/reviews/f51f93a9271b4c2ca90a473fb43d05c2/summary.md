@@ -1,0 +1,1 @@
+Source-only four leased paths from main dcac884f. Release solution build exit0 db516cb1; real Linux/macOS Release publish exit0 4f7632b1; checksums both OK 90bde72f; SelfUpdate .NET11 Release 4/4 d8ee0782; isolated Node negatives/mutants 10/10 885492f8; git diff --check exit0 72d434b6. No integration or deployment.

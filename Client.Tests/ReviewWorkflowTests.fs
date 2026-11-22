@@ -7751,6 +7751,26 @@ type ReviewWorkflowTests() =
             let paths = [| one; two |] |> Array.map Client.OrchestrationApi.LedgerBindingConfig.pathForRoot
             let roots = [| one; two |]
             let bindings = [| first; second |]
+            let reportLockSamples concurrency window
+                                  (observed: Client.OrchestrationApi.LedgerBindingConfig.LockSample[]) =
+                for phase in [ "initial-read"; "post-fetch-cas" ] do
+                    let matching = observed |> Array.filter (fun x -> x.Phase = phase)
+                    let acquired = matching |> Array.filter (fun x -> x.Acquired)
+                    let held = acquired |> Array.map (fun x -> x.HeldMilliseconds) |> Array.sort
+                    let retries = matching |> Array.map (fun x -> x.AcquisitionRetries)
+                    let pct p =
+                        if held.Length = 0 then 0.
+                        else held.[max 0 (min (held.Length - 1) (int (Math.Ceiling(float held.Length * p)) - 1))]
+                    Assert.That(matching |> Array.forall (fun x ->
+                        x.AcquisitionRetries >= 0 && x.AcquisitionRetries <= 33
+                        && x.HeldMilliseconds >= 0.), Is.True, "Invalid lock diagnostic sample")
+                    TestContext.WriteLine(sprintf
+                        "Perf3 lock n=%d window=%s phase=%s acquisitions=%d held=%d failed=%d retry-total=%d retry-max=%d hold-p50=%.3fms hold-p95=%.3fms hold-max=%.3fms"
+                        concurrency window phase matching.Length acquired.Length
+                        (matching.Length - acquired.Length) (Array.sum retries)
+                        (if retries.Length = 0 then 0 else Array.max retries)
+                        (pct 0.5) (pct 0.95)
+                        (if held.Length = 0 then 0. else held.[held.Length - 1]))
             let script = Path.Combine(Path.GetDirectoryName(one), "hold-trust-lock.fsx")
             File.WriteAllText(script, String.concat "\n" [
                 "open System"
@@ -7805,6 +7825,8 @@ type ReviewWorkflowTests() =
                                 "Cross-process monotonic CAS" |> success
                 let target = newer.CurrentHead
                 for concurrency in [ 1; 2; 8; 16 ] do
+                    let lockSamples =
+                        System.Collections.Concurrent.ConcurrentBag<Client.OrchestrationApi.LedgerBindingConfig.LockSample>()
                     let held = [| startHolder 0; startHolder 1 |]
                     try
                         use gate = new System.Threading.ManualResetEventSlim(false)
@@ -7816,8 +7838,11 @@ type ReviewWorkflowTests() =
                                     System.Threading.Interlocked.Increment(&entered) |> ignore
                                     let watch = Stopwatch.StartNew()
                                     let result =
-                                        Client.OrchestrationApi.LedgerBindingConfig.loadAtRootWithSnapshotUsing
-                                            LedgerStore.fetch roots.[i % 2]
+                                        Client.OrchestrationApi.LedgerBindingConfig.withLockSampleSink
+                                            (fun sample -> lockSamples.Add sample)
+                                            (fun () ->
+                                                Client.OrchestrationApi.LedgerBindingConfig.loadAtRootWithSnapshotUsing
+                                                    LedgerStore.fetch roots.[i % 2])
                                     watch.Stop()
                                     (watch.Elapsed.TotalMilliseconds, result)))
                         gate.Set()
@@ -7840,17 +7865,31 @@ type ReviewWorkflowTests() =
                         TestContext.WriteLine(sprintf
                             "Perf3 cross-process n=%d contention=%d/%d p50=%.2fms p95=%.2fms max=%.2fms"
                             concurrency contended concurrency (pct 0.5) (pct 0.95) latency.[latency.Length-1])
+                        reportLockSamples concurrency "concurrent-held" (lockSamples.ToArray())
+                        Assert.That(lockSamples.ToArray() |> Array.exists (fun x -> x.Phase = "initial-read"),
+                                    Is.True, "Concurrent readers must sample initial lock")
                         for (_,result) in samples do
                             match result with
                             | Ok (_, snapshot) -> Assert.That(snapshot.Commit, Is.EqualTo(target))
                             | Error(Client.LedgerFailureError issue) when issue.Code = "TrustBindingContended" -> ()
                             | Error issue -> Assert.Fail(sprintf "Unexpected read error under contention: %A" issue)
-                        // Retried reads after both external holders exit must converge, never lower trust.
+                        // The same fixture captures both phase durations after holders exit,
+                        // even if every contending call exhausted its finite retry budget.
+                        let recoverySamples =
+                            System.Collections.Concurrent.ConcurrentBag<Client.OrchestrationApi.LedgerBindingConfig.LockSample>()
                         for root in roots do
-                            match Client.OrchestrationApi.LedgerBindingConfig.loadAtRootWithSnapshotUsing
-                                    LedgerStore.fetch root with
+                            match Client.OrchestrationApi.LedgerBindingConfig.withLockSampleSink
+                                    (fun sample -> recoverySamples.Add sample)
+                                    (fun () ->
+                                        Client.OrchestrationApi.LedgerBindingConfig.loadAtRootWithSnapshotUsing
+                                            LedgerStore.fetch root) with
                             | Ok (_, snapshot) -> Assert.That(snapshot.Commit, Is.EqualTo(target))
                             | other -> Assert.Fail(sprintf "Post-contention recovery: %A" other)
+                        let recoveredTraces = recoverySamples.ToArray()
+                        reportLockSamples concurrency "post-release-recovery" recoveredTraces
+                        for phase in [ "initial-read"; "post-fetch-cas" ] do
+                            Assert.That(recoveredTraces |> Array.exists (fun x -> x.Phase = phase && x.Acquired),
+                                        Is.True, sprintf "Missing successful %s lock-hold sample" phase)
                     finally
                         for holder in held do
                             let child, ready, release = holder

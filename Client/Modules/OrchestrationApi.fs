@@ -53,6 +53,33 @@ module LedgerErrors =
               VerifiedLedgerHead = None }
 
 module LedgerBindingConfig =
+    // Per-execution diagnostic samples only when a disposable test opts in.
+    // The normal runtime installs no observer and emits no lock telemetry.
+    type internal LockSample =
+        { Phase: string
+          AcquisitionRetries: int
+          HeldMilliseconds: float
+          Acquired: bool }
+
+    let private lockSampleSink = AsyncLocal<LockSample -> unit>()
+
+    let internal withLockSampleSink sink operation =
+        let previous = lockSampleSink.Value
+        lockSampleSink.Value <- sink
+        try operation ()
+        finally lockSampleSink.Value <- previous
+
+    let private sampleLock phase retries heldMillis acquired =
+        let sink = lockSampleSink.Value
+        if not (isNull (box sink)) then
+            // A diagnostic callback cannot change the trusted-head result.
+            try
+                sink { Phase = phase
+                       AcquisitionRetries = retries
+                       HeldMilliseconds = heldMillis
+                       Acquired = acquired }
+            with _ -> ()
+
     let pathForRoot (root: string) =
         let baseDirectory = Path.GetDirectoryName(ClientConfig.configPath())
         let hash =
@@ -78,7 +105,7 @@ module LedgerBindingConfig =
             | 11 | 32 | 33 | 35 -> true // Linux EAGAIN, Windows sharing/lock, macOS EAGAIN
             | _ -> false
 
-    let private withConfigLock (path: string) operation =
+    let private withConfigLockNamed phase (path: string) operation =
         try
             let dir = Path.GetDirectoryName path
             Directory.CreateDirectory(dir) |> ignore
@@ -105,10 +132,11 @@ module LedgerBindingConfig =
                             else
                               try
                                   Ok (new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite,
-                                                     FileShare.None, 4096, FileOptions.None))
+                                                     FileShare.None, 4096, FileOptions.None), retries)
                               with
                               | :? IOException as ex when isTransientSharingViolation ex ->
                                   if retries >= 32 || Stopwatch.GetElapsedTime(started) >= TimeSpan.FromMilliseconds(75.) then
+                                      sampleLock phase (retries + 1) 0. false
                                       Error(LedgerErrors.toEffect (LedgerStore.TrustBindingContended ex.Message))
                                   else
                                       Thread.Sleep(Random.Shared.Next(1, 5))
@@ -120,16 +148,23 @@ module LedgerBindingConfig =
                         tryOpen 0
                     match acquired with
                     | Error error -> Error error
-                    | Ok stream ->
-                        use held = stream
-                        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
-                            File.SetUnixFileMode(lockPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
-                        operation ()
+                    | Ok (stream, retries) ->
+                        let acquiredAt = Stopwatch.GetTimestamp()
+                        try
+                            use held = stream
+                            if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                                File.SetUnixFileMode(lockPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                            operation ()
+                        finally
+                            sampleLock phase retries (Stopwatch.GetElapsedTime(acquiredAt).TotalMilliseconds) true
         with
         | :? UnauthorizedAccessException as ex ->
             Error(Client.PermissionDenied $"Cannot access trust binding: {ex.Message}")
         | ex ->
             Error(Client.ValidationError $"Cannot access trust binding: {ex.Message}")
+
+    let private withConfigLock path operation =
+        withConfigLockNamed "other" path operation
 
     let private readStored (path: string) =
         try
@@ -200,7 +235,7 @@ module LedgerBindingConfig =
         else
             let rec load remaining =
                 let initial =
-                    withConfigLock path (fun () ->
+                    withConfigLockNamed "initial-read" path (fun () ->
                         readStored path
                         |> Result.bind (fun stored ->
                             validStored root stored
@@ -217,7 +252,7 @@ module LedgerBindingConfig =
                         | Error error -> Error error
                         | Ok () ->
                             let committed =
-                                withConfigLock path (fun () ->
+                                withConfigLockNamed "post-fetch-cas" path (fun () ->
                                     readStored path
                                     |> Result.bind (fun current ->
                                         validStored root current

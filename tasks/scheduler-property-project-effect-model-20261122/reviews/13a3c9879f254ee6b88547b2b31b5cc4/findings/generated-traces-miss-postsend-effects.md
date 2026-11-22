@@ -1,0 +1,15 @@
+# P2 — Generated property traces omit post-send side effects; Git oracle self-compares
+
+**Severity:** P2 (original Phase A generated safety coverage). This finding supplements P1 and does not demand premature Phase B integration.
+
+**Required:** Canonical spec blob `bbfa80507371662399fdd2e1e59f6787605d0b90`, Phase A: generated seeded multi-client command traces with typed outcomes, negative oracles, "at most one send", "no release on unknown outcome", "no repeat send after ambiguous observation", restart/replay, exact state-equivalence. Genuine source-binding must be made explicit or the unavailable production seam must be disclosed.
+
+**Exact SHA:** `731fa5245bf7a278756aa5fee832bbfdd950c12c`.
+- `model.mjs:154-187`: `generate()` has commands for claim/start/terminal/noSend/release/observe/restart, but no fake-provider send/ACK loss or independent fake observation. `runTrace()` calls only `step()`; `fakeProviderResult()` never executes for those 256 pure random traces.
+- `Program.cs:217-238`: 512 x 48 randomly chosen operations never call `SendAfterCommittedStart()`, so this large randomized C# run cannot reach provider-sent/unknown paths.
+- `property.test.mjs:268-307`: each of six real-Git runs injects exactly one hardcoded send before the generated 28-command suffix; the generated command set itself has no second send or external provider retry command. Independent read-only job `d9e240cdd6cd4a22a486999404915393` found **zero successful Released** outcomes across all six suffixes.
+- `model.mjs:278-299` + `property.test.mjs:274-300`: `RealGitFixture.apply(client,command)` defaults its adapter to the same `step()` used to compute the reference; their state equality can catch persistence/CAS serialization errors but cannot detect logical faults shared by the reference and adapter, or test F# production. The documentation appropriately discloses this Phase A limit.
+
+**Independent coverage measurement:** Jarvis job `262575b24939445b8e32c466172cfcf7`, exit 0, instrumented precisely the 256 x 48 Node seed recipe. Counts: 98 Claimed, 48 StartAuthorized, 42 VerifiedNoSend, 12 Released, **0 provider submissions**. Meanwhile Node tests job `9640caf3...` exit 0 14/14; C# net11 Release job `1b685791...` exit 0 8/8. Passing green counts alone therefore do not demonstrate generated ambiguous-send properties.
+
+**Bounded remedy:** Extend generated command alphabet to include independently observable fake provider send/ACK loss/crash/unknown and negative no-session observation, and verify coverage counters for at least one send, unknown and valid/invalid terminal, denied false no-send and single release (or explicit per-seed classification). Re-run against two+ disposable Git project clones and separately persisted fake provider/account while keeping source lease. Include mutation controls that fail the *generated tests* when a second send or premature release is introduced. Until a production seam exists, explicitly retain the existing Phase A-only disclaimer; no invented B1/B2 certification.

@@ -71,6 +71,15 @@ let private firstText (result: CallToolResult) =
     |> Seq.choose (function :? TextContentBlock as block -> Some block.Text | _ -> None)
     |> String.concat "\n"
 
+let private firstResultJson (result: CallToolResult) =
+    // MCP includes separately serialized operation and evidence blocks after
+    // the actual result. Joining them yields invalid multi-document JSON.
+    result.Content
+    |> Seq.choose (function :? TextContentBlock as block -> Some block.Text | _ -> None)
+    |> Seq.tryHead
+    |> Option.defaultWith (fun () -> failwith "Tool response had no JSON content")
+    |> json
+
 [<Test; NonParallelizable>]
 let authenticatedTwoNativeClientsKeepCASAndWorkspaceAndRegistrationIsolated () =
     let root = Path.Combine(Path.GetTempPath(), "jarvis-w25-two-native-" + Guid.NewGuid().ToString("N"))
@@ -166,7 +175,7 @@ let authenticatedTwoNativeClientsKeepCASAndWorkspaceAndRegistrationIsolated () =
         expectOk (invoke "alpha" "machine-name" "read" "null" "")
         let betaOriginalRead = invoke "beta" "machine-name" "read" "null" ""
         expectOk betaOriginalRead
-        let betaOriginalResponse = json (firstText betaOriginalRead)
+        let betaOriginalResponse = firstResultJson betaOriginalRead
         Assert.That(betaOriginalResponse.GetProperty("NewPersistedValue").GetString(),
                     Is.EqualTo("beta-original"))
         Assert.That(betaOriginalResponse.GetProperty("Revision").GetString(),
@@ -183,7 +192,7 @@ let authenticatedTwoNativeClientsKeepCASAndWorkspaceAndRegistrationIsolated () =
                     Is.EqualTo(Convert.ToHexString(alphaBytesBeforeBeta)))
         let betaReadBack = invoke "beta" "machine-name" "read" "null" ""
         expectOk betaReadBack
-        let betaReadResponse = json (firstText betaReadBack)
+        let betaReadResponse = firstResultJson betaReadBack
         Assert.That(betaReadResponse.GetProperty("NewPersistedValue").GetString(),
                     Is.EqualTo("beta-updated"))
         Assert.That(betaReadResponse.GetProperty("Revision").GetString(),

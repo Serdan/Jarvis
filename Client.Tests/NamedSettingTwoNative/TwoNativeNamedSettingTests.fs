@@ -121,12 +121,18 @@ let authenticatedTwoNativeClientsKeepCASAndWorkspaceAndRegistrationIsolated () =
             | ValueSome status -> status.Generation
             | _ -> failwith "beta registration lost"
         let tracker = ClientResponseTracker()
+        // A wrong-device fallback can still return an error through Alpha CAS.
+        // Count both Alpha hub lookup and actual recipient dispatch.
+        let mutable alphaHubLookups = 0
+        let mutable alphaCommandDispatches = 0
         let recipient owner connection generation (native: NativeAgent) =
             { new IClientService with
                 member _.ReceiveMessage(_) = Task.CompletedTask
                 member _.ReceiveManualGrantedCommand(_, _, _) = Task.CompletedTask
                 member _.ReceiveManualGrantApproval(_, _, _) = Task.CompletedTask
                 member _.ReceiveCommand(correlation, wire, _) =
+                    if connection = connA then
+                        alphaCommandDispatches <- alphaCommandDispatches + 1
                     let response = native.Command(wire)
                     tracker.Complete(correlation, owner, connection, generation, response) |> ignore
                     Task.CompletedTask
@@ -139,6 +145,8 @@ let authenticatedTwoNativeClientsKeepCASAndWorkspaceAndRegistrationIsolated () =
         let clients =
             { new IHubClients<IClientService> with
                 member _.Client(connection) =
+                    if connection = connA then
+                        alphaHubLookups <- alphaHubLookups + 1
                     if connection = connA then alphaRecipient else betaRecipient
                 member _.All = alphaRecipient
                 member _.AllExcept(_) = alphaRecipient
@@ -256,7 +264,13 @@ let authenticatedTwoNativeClientsKeepCASAndWorkspaceAndRegistrationIsolated () =
             Assert.That(session.Generation, Is.EqualTo(generationB))
             Assert.That(session.ConnectionId, Is.EqualTo(None))
         | _ -> Assert.Fail("Expected retained disconnected Beta registration")
+        let alphaLookupsBeforeStaleBeta = alphaHubLookups
+        let alphaDispatchesBeforeStaleBeta = alphaCommandDispatches
         expectError (invoke "beta" "machine-name" "set" "\"must-not-fall-back\"" betaNamed.Revision)
+        Assert.That(alphaHubLookups - alphaLookupsBeforeStaleBeta, Is.EqualTo(0),
+                    "Disconnected Beta must not trigger any Alpha hub.Client lookup")
+        Assert.That(alphaCommandDispatches - alphaDispatchesBeforeStaleBeta, Is.EqualTo(0),
+                    "Disconnected Beta must not dispatch ReceiveCommand to Alpha")
         Assert.That(Convert.ToHexString(File.ReadAllBytes(config homeB)),
                     Is.EqualTo(Convert.ToHexString(betaBytesBeforeStaleBeta)))
         Assert.That((snapshot homeB).Revision, Is.EqualTo(betaNamed.Revision))

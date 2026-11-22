@@ -1,0 +1,11 @@
+# P2 — Required lock/fence/uncertain-terminal adversarial controls are absent from new source-bound gate
+
+**Frozen source:** `a2e57bf59a7b967fafbcb821640bf41851d92738`, `scripts/tests/scheduler-property-account-cas-20261122/Property.fs`.
+
+**Original task obligations:** adversarial `lock/contention/fetch unknown`, forged account/**fence** evidence, unknown/foreign terminal and exact remote HEAD/replay behavior, not merely a healthy-path green.
+
+**Observed:** `RealGitDeterministicTwoClientWorkerAndReviewerBarriers` runs genuine concurrent disposable account clones and asserts exactly one winner; `RealGitZeroQuotaStaleClaimsAndUncertainFetchFailClosed` injects `AccountGitTestFault.FailBeforeExecution` **only for `fetch`** and correctly checks unchanged account HEAD. The other real-Git test checks foreign original reservation UUID and Guid.Empty locator, plus a legitimate signed terminal/release. There is no explicit lock-acquisition failure or ambiguous post-push remote result, and no mutated original project send fence, terminal-proof project head/OID, or terminal operation absent from authenticated project Git presented to the release API. The abstract model's `Terminal(..., verified=false)` is not a substitute for a production no-release check on a forged session/fence.
+
+**Impact:** Incomplete negative-space evidence against the task's listed hostile boundaries; no actual native source vulnerability established. The passed real-Git gate proves many important cases but not the above failure modes.
+
+**Bounded remedy:** In test-only disposable fixtures, inject a lock/busy or ambiguous account CAS outcome through available original production test interposition; verify typed reject/unknown, no duplicate capacity, and exact canonical head/receipt reconciliation. Present a forged project-terminal fence/OID or missing authenticated terminal operation to `releaseVerifiedDisposable` and assert no release/no account HEAD write, with a distinct valid-proof positive control. If the existing default-off disposable port cannot expose one case safely, provide explicit unsupported-interface evidence and request independent narrow adjudication rather than modifying production/shared project files or claiming that case passed.

@@ -1,0 +1,1 @@
+Worker22 scripts/docs-only source: TRX ResultSummary/counters fail-closed with native NUnit skipped semantics; exact .NET11 Release invocation syntax, conflicting flags fail closed; Python focused 22/22, native real TRX schema+mutant verified, diff --check PASS. Original unfiltered Client main run 900.126s timeout, no TRX: UNKNOWN. No product/fsproj/main/deploy changes.

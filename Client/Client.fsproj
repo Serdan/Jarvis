@@ -97,6 +97,7 @@
         <Compile Include="Modules\WorkQueueMultiLedgerPreparedRecovery.fs"/>
         <Compile Include="Modules\RoleInstructions.fs"/>
         <Compile Include="Modules\\ReviewWorkflow.fs"/>
+        <Compile Include="Modules\NativeSchedulerAccountReservation.fs"/>
         <Compile Include="Modules\WorkCompositionAcceptanceAdapter.fs"/>
         <Compile Include="Modules\WorkCompositionOperatorInputs.fs"/>
         <Compile Include="Modules\WorkCompositionQueueBinder.fs"/>

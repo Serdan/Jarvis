@@ -1,0 +1,1 @@
+Exact clean test-only SHA 731fa5245, GA11.0.100 Release 8/8 job 78fc3f20, Node 14/14 job f7431a5b; accepted StageA Node 33/33 job b111e927. Six seeded 3-clone Git traces, separate disposable account/provider boundary, typed replay and negative mutant controls. Only five lease files. No production, shared fsproj, main or live effects.

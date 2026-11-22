@@ -807,6 +807,199 @@ module ReviewWorkflow =
             return issuance
         }
 
+    // Index corruption is a ledger-integrity failure, not a stale caller CAS.
+    let private indexRequired<'t> binding snapshot file : Result<'t * string, LedgerFailure> =
+        read<'t> binding snapshot file
+        |> Result.bind (function
+            | Some value -> Ok value
+            | None -> Error(LedgerIntegrityError ("Missing canonical index evidence: " + file)))
+
+    // A reverse edge is a locator, never proof that a wait was issued.
+    // Historical generations survive reblocking, but require the immutable
+    // original block command and lifecycle event. Future edges have no origin.
+    let private issuedWaitDependenciesAt binding snapshot
+                                             (locator: AttemptChallengeWaitIndex) = result {
+        let! paths = LedgerStore.listAt binding snapshot
+                         ($"tasks/{locator.TaskId}/lifecycle")
+        let mutable matches: TaskLifecycleEvent list = []
+        for path in paths do
+            if path.EndsWith(".json", StringComparison.Ordinal) then
+                let! event, _ = indexRequired<TaskLifecycleEvent> binding snapshot path
+                if event.Action = "WaitOnChallenges"
+                   && event.TaskId = locator.TaskId
+                   && event.AttemptId = locator.AttemptId
+                   && event.NewGeneration = locator.AssignmentGeneration then
+                    if path <> lifecycleEventPath locator.TaskId event.Sequence
+                       || event.PreviousGeneration <> locator.AssignmentGeneration
+                       || event.NewPhase <> "Blocked"
+                       || event.PreviousOwnerId <> locator.OwnerAgentId
+                       || event.NewOwnerId <> locator.OwnerAgentId
+                       || event.ActorId <> locator.OwnerAgentId then
+                        return! Error(LedgerIntegrityError "Historical challenge block provenance mismatch.")
+                    matches <- event :: matches
+        let! event =
+            match matches with
+            | [ event ] -> Ok event
+            | _ -> Error(LedgerIntegrityError "Missing or ambiguous historical challenge block event.")
+        let! operationId =
+            match Guid.TryParse event.OperationId with
+            | true, id when id <> Guid.Empty -> Ok id
+            | _ -> Error(LedgerIntegrityError "Invalid historical challenge block operation ID.")
+        let! operation =
+            match LedgerStore.getOperationAt binding snapshot operationId with
+            | Ok(Some value) -> Ok value
+            | Ok None -> Error(LedgerIntegrityError "Historical challenge block operation is missing.")
+            | Error error -> Error error
+        let! _ = LedgerStore.getOperationOriginAt binding snapshot operation
+        if operation.Type <> "WaitOnChallenges" || operation.Actor <> locator.OwnerAgentId
+           || operation.Sequence <> event.Sequence || isNull operation.Paths
+           || not (Array.contains (challengeWaitPath locator.TaskId locator.AttemptId) operation.Paths)
+           || not (Array.contains (lifecycleEventPath locator.TaskId event.Sequence) operation.Paths) then
+            return! Error(LedgerIntegrityError "Historical block operation does not corroborate its event.")
+        let! dependencies =
+            try
+                use envelope = JsonDocument.Parse operation.CanonicalRequestJson
+                if envelope.RootElement.GetProperty("kind").GetString() <> "WaitOnChallenges"
+                   || envelope.RootElement.GetProperty("actor").GetString() <> locator.OwnerAgentId
+                   || envelope.RootElement.GetProperty("operationId").GetString() <> event.OperationId then
+                    Error(LedgerIntegrityError "Historical block request identity mismatch.")
+                else
+                    use request = JsonDocument.Parse(envelope.RootElement.GetProperty("request").GetString())
+                    let data = request.RootElement
+                    let dependencies =
+                        data.GetProperty("challengeIds").EnumerateArray()
+                        |> Seq.map (fun item -> item.GetString()) |> Seq.toList
+                    if data.GetProperty("taskId").GetString() <> locator.TaskId
+                       || data.GetProperty("attemptId").GetString() <> locator.AttemptId
+                       || data.GetProperty("generation").GetInt32() <> locator.AssignmentGeneration then
+                        Error(LedgerIntegrityError "Historical block request/locator mismatch.")
+                    else Ok dependencies
+            with ex -> Error(LedgerIntegrityError ("Invalid historical block request: " + ex.Message))
+        return dependencies, operation.Paths
+    }
+
+    /// One pinned-snapshot validation for both index directions and all the
+    /// sibling edges belonging to the same block. Never infer permission from
+    /// an uncorroborated materialized index.
+    let internal verifiedWaitIndexAt binding snapshot indexPath
+                                     (challengeId: string option)
+                                     (ownerId: string option) = result {
+        let! locator, _ = indexRequired<AttemptChallengeWaitIndex> binding snapshot indexPath
+        if not (validTaskId locator.TaskId)
+           || (match Guid.TryParseExact(locator.AttemptId, "N") with | true, _ -> false | _ -> true)
+           || not (validAgent locator.OwnerAgentId) || locator.AssignmentGeneration < 1 then
+            return! Error(LedgerIntegrityError "Invalid challenge wait-index locator.")
+        let prefix =
+            match challengeId, ownerId with
+            | Some id, None -> challengeWaitIndexPrefix id
+            | None, Some id -> ownerWaitIndexPrefix id
+            | _ -> ""
+        if String.IsNullOrEmpty prefix
+           || indexPath <> waitIndexPath prefix locator.TaskId locator.AttemptId locator.AssignmentGeneration
+           || (ownerId |> Option.exists ((<>) locator.OwnerAgentId)) then
+            return! Error(LedgerIntegrityError "Challenge wait-index path/owner identity mismatch.")
+        let path = challengeWaitPath locator.TaskId locator.AttemptId
+        let! wait, waitOid = indexRequired<AttemptChallengeWait> binding snapshot path
+        let! task, _ = indexRequired<ReviewTask> binding snapshot (taskPath locator.TaskId)
+        let! attempt, _ = indexRequired<ReviewAttempt> binding snapshot
+                              (attemptPath locator.TaskId locator.AttemptId)
+        if wait.TaskId <> locator.TaskId || wait.AttemptId <> locator.AttemptId
+           || task.TaskId <> locator.TaskId || attempt.TaskId <> locator.TaskId
+           || attempt.AttemptId <> locator.AttemptId
+           || locator.AssignmentGeneration > attempt.AssignmentGeneration then
+            return! Error(LedgerIntegrityError "Challenge wait-index canonical lineage mismatch.")
+        let current =
+            attempt.AssignmentGeneration = locator.AssignmentGeneration
+            && wait.Status <> "Requeued"
+        let! dependencies, recordedPaths =
+            if current then
+                if wait.OwnerAgentId <> locator.OwnerAgentId
+                   || attempt.OwnerAgentId <> locator.OwnerAgentId
+                   || isNull (box wait.ChallengeIds) then
+                    Error(LedgerIntegrityError "Current challenge wait/index owner mismatch.")
+                else result {
+                    let! issued, originalPaths = issuedWaitDependenciesAt binding snapshot locator
+                    if issued <> wait.ChallengeIds then
+                        return! Error(LedgerIntegrityError "Canonical active wait disagrees with original Challenge block.")
+                    return issued, originalPaths
+                }
+            elif locator.AssignmentGeneration < attempt.AssignmentGeneration then
+                issuedWaitDependenciesAt binding snapshot locator
+            else
+                Error(LedgerIntegrityError "Challenge wait-index has no current or historical generation.")
+        if List.isEmpty dependencies || dependencies.Length > 16
+           || (dependencies |> List.distinct).Length <> dependencies.Length
+           || (dependencies |> List.exists (fun id ->
+                match Guid.TryParseExact(id, "N") with | true, _ -> false | _ -> true))
+           || (challengeId |> Option.exists (fun id -> not (List.contains id dependencies))) then
+            return! Error(LedgerIntegrityError "Challenge wait-index dependency provenance mismatch.")
+        // An indexed Challenge must still exist at this exact verified head.
+        // Cancellation is valid history, but a dangling canonical identity is not.
+        for dependency in dependencies do
+            let file = "challenges/" + dependency + "/challenge.json"
+            let! content, oid = LedgerStore.readAt binding snapshot file
+            match content, oid with
+            | Some body, Some _ ->
+                try
+                    use document = JsonDocument.Parse body
+                    let root = document.RootElement
+                    let challengeTask = root.GetProperty("taskId").GetString()
+                    let state = root.GetProperty("status").GetString()
+                    if root.GetProperty("schemaVersion").GetInt32() <> 2
+                       || root.GetProperty("challengeId").GetString() <> dependency
+                       || (not (String.IsNullOrEmpty challengeTask) && challengeTask <> locator.TaskId)
+                       || root.GetProperty("completionPolicy").GetString() <> "All"
+                       || root.GetProperty("conditions").GetArrayLength() < 1
+                       || not (List.contains state [ "Pending"; "Blocked"; "Satisfied"; "Cancelled" ]) then
+                        return! Error(LedgerIntegrityError "Indexed canonical Challenge identity mismatch.")
+                with ex ->
+                    return! Error(LedgerIntegrityError ("Invalid indexed canonical Challenge: " + ex.Message))
+            | _ -> return! Error(LedgerIntegrityError ("Indexed canonical Challenge is missing: " + dependency))
+        let expectedPaths =
+            [ waitIndexPath (ownerWaitIndexPrefix locator.OwnerAgentId)
+                  locator.TaskId locator.AttemptId locator.AssignmentGeneration ]
+            @ [ for id in dependencies ->
+                    waitIndexPath (challengeWaitIndexPrefix id)
+                        locator.TaskId locator.AttemptId locator.AssignmentGeneration ]
+        if expectedPaths |> List.exists (fun edge ->
+            not (Array.contains edge recordedPaths)) then
+            return! Error(LedgerIntegrityError "Historical challenge indexes were not issued by the block command.")
+        for edge in expectedPaths do
+            let! linked, _ = indexRequired<AttemptChallengeWaitIndex> binding snapshot edge
+            if linked <> locator then
+                return! Error(LedgerIntegrityError "Challenge wait reverse-index pair is missing or inconsistent.")
+        return locator, wait, waitOid
+    }
+
+    // Verify an owner's issued reverse edges in both directions at one pinned
+    // head. Each historically linked Challenge prefix is in scope, including
+    // extra future-generation records not reachable from the owner index.
+    // Unknown/unrelated Challenge IDs are deliberately not globally scanned.
+    let internal verifyOwnerWaitIndexesAt binding snapshot owner = result {
+        let! paths = LedgerStore.listCompleteWaitIndexesAt binding snapshot (ownerWaitIndexPrefix owner)
+        let mutable historicallyLinkedChallenges = Set.empty<string>
+        for path in paths do
+            if not (path.EndsWith(".json", StringComparison.Ordinal)) then
+                return! Error(LedgerIntegrityError "Unexpected owner wait-index record.")
+            let! locator, _, _ = verifiedWaitIndexAt binding snapshot path None (Some owner)
+            let! dependencyIds, _ = issuedWaitDependenciesAt binding snapshot locator
+            historicallyLinkedChallenges <-
+                Set.union historicallyLinkedChallenges (Set.ofList dependencyIds)
+        // The inverse scan is limited to Challenge IDs proved by this owner's
+        // original immutable block operations. Preserve valid N1/N2 history
+        // while rejecting unissued N3 links even when no owner mirror exists.
+        for challengeId in historicallyLinkedChallenges do
+            let! challengePaths =
+                LedgerStore.listCompleteWaitIndexesAt binding snapshot
+                    (challengeWaitIndexPrefix challengeId)
+            for indexPath in challengePaths do
+                if not (indexPath.EndsWith(".json", StringComparison.Ordinal)) then
+                    return! Error(LedgerIntegrityError "Unexpected known Challenge wait-index record.")
+                let! _ = verifiedWaitIndexAt binding snapshot indexPath (Some challengeId) None
+                ()
+        return ()
+    }
+
     // Called by canonical agent-slot release transitions. Eligibility is
     // durable; release requeues at most one blocked attempt and never preempts
     // an occupied owner or enters Working.
@@ -819,6 +1012,7 @@ module ReviewWorkflow =
             return released, []
         else
             let ownerPrefix = ownerWaitIndexPrefix ownerId
+            let! _ = verifyOwnerWaitIndexesAt binding snapshot ownerId
             let! paths = LedgerStore.listAt binding snapshot ownerPrefix
             let indexPaths =
                 paths
@@ -3222,6 +3416,7 @@ module ReviewWorkflow =
         if not (validAgent agentId) then Error(InvalidBinding "Invalid inbox agent ID.")
         else
             result {
+                let! _ = verifyOwnerWaitIndexesAt binding snapshot agentId
                 let! records = LedgerStore.readAgentInboxRecordsAt binding snapshot
                 let! agent = requiredFromRecords<ReviewAgent> records (agentPath agentId)
                 let! instructionLayers = RoleInstructions.resolveAtKnownAgent binding snapshot agentId
@@ -3359,6 +3554,16 @@ module ReviewWorkflow =
                                || record.OwnerAgentId <> agentId
                                || not (List.contains record.Status [ "Waiting"; "Eligible" ]) then
                                 return! Error(LedgerIntegrityError "Blocked challenge dependency record disagrees with its attempt.")
+                            // The canonical blocked attempt is an independent
+                            // completeness witness: an entirely omitted owner
+                            // index directory must not look like an empty queue.
+                            if not (List.isEmpty record.ChallengeIds) then
+                                let ownerIndex =
+                                    waitIndexPath (ownerWaitIndexPrefix agentId)
+                                        entry.Task.TaskId entry.Attempt.AttemptId
+                                        entry.Attempt.AssignmentGeneration
+                                let! _ = verifiedWaitIndexAt binding snapshot ownerIndex None (Some agentId)
+                                ()
                             blockedWaits <- record :: blockedWaits
                     let reviewOrder (review: BranchReview) =
                         review.CreatedSequence, review.TaskId, review.ReviewId

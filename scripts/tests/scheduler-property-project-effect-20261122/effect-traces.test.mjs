@@ -62,13 +62,14 @@ export function generateEffectTrace(seed) {
     );
   } else {
     trace.push(
+      event("captureDispatch", "SnapshotRetained"),
       command(noSend(op("unknown-proof"), { ...goodNoSend(), provider: "Unknown" }),
         "UnknownOrForeignProof", client()),
       event("restart", "Restarted"),
       command(noSend(op("verified-no-session")), "VerifiedNoSend", client()),
       command(release(op("release")), "Released", client()),
       event("accountRelease", "FakeAccountReleased"),
-      event("attemptLateSend", "DeniedWithoutCommittedStart"),
+      event("attemptLateSend", "DeniedByNoSessionSeal"),
       command(release(op("again"), 2), "AlreadyReleased", client()),
       event("accountRelease", "AlreadyReleasedOrForeign")
     );
@@ -89,6 +90,9 @@ function independentOracle(f) {
   const receipt = f.provider.restart().observe(CANDIDATE.effect);
   const account = f.fakeAccount();
   checkInvariants(state, f.provider);
+  if (state.phase === "VerifiedNoSend")
+    assert.equal(f.provider.restart().noSessionSealed(CANDIDATE.effect), true,
+      "durable provider seal is mandatory even when no receipt exists");
   assert.ok(!receipt || receipt.acceptedCount === 1, "provider accepts at most one send");
   if (receipt && state.phase === "VerifiedNoSend")
     throw new Error("FalseNoSendDurableProvider");
@@ -106,10 +110,11 @@ function independentOracle(f) {
 
 export function runEffectTrace(seed, trace, mutate = null) {
   const f = new RealGitFixture();
+  let staleDispatch = null;
   const coverage = {
     sent: 0, unknown: 0, retried: 0, deniedNoSend: 0,
     deniedRelease: 0, terminal: 0, released: 0, noSession: 0,
-    accountReleased: 0, restarts: 0
+    accountReleased: 0, restarts: 0, lateDenied: 0
   };
   try {
     for (let index = 0; index < trace.length; index++) {
@@ -145,8 +150,15 @@ export function runEffectTrace(seed, trace, mutate = null) {
       } else if (action.kind === "accountRelease") {
         actual = f.releaseFakeAccount();
         if (actual.code === "FakeAccountReleased") coverage.accountReleased++;
+      } else if (action.kind === "captureDispatch") {
+        staleDispatch = structuredClone(f.actual());
+        assert.equal(staleDispatch.phase, "Dispatching");
+        actual = { code: "SnapshotRetained" };
       } else if (action.kind === "attemptLateSend") {
-        actual = f.provider.send(f.actual(), CANDIDATE.effect, "ackLost");
+        assert.ok(staleDispatch, "late send MUST use cached authorization, not fresh project");
+        actual = f.provider.send(staleDispatch, CANDIDATE.effect, "ackLost",
+          mutate?.kind === "ignoreSeal" ? { ignoreNoSessionSeal: true } : {});
+        if (actual.code === "DeniedByNoSessionSeal") coverage.lateDenied++;
       } else if (action.kind === "restart") {
         f.provider = f.provider.restart();
         actual = { code: "Restarted" };
@@ -163,7 +175,7 @@ export function runEffectTrace(seed, trace, mutate = null) {
 test("generated multi-client post-send traces have mandatory coverage and independent durable receipts", () => {
   const combined = { sent: 0, unknown: 0, retried: 0, deniedNoSend: 0,
     deniedRelease: 0, terminal: 0, released: 0, noSession: 0,
-    accountReleased: 0, restarts: 0 };
+    accountReleased: 0, restarts: 0, lateDenied: 0 };
   for (let seed = 101; seed <= 114; seed++) {
     const { sent, trace } = generateEffectTrace(seed);
     assert.ok(trace.length >= 24, "generated trace must be a multi-step history");
@@ -182,6 +194,7 @@ test("generated multi-client post-send traces have mandatory coverage and indepe
       assert.equal(result.sent, 0);
       assert.equal(result.noSession, 1);
       assert.equal(result.released, 1);
+      assert.equal(result.lateDenied, 1, "sealed provider rejects retained stale Dispatching");
     }
   }
   for (const key of Object.keys(combined))
@@ -203,6 +216,49 @@ test("lost ACK survives provider object restart and denies false project/account
     assert.equal(f.releaseFakeAccount().code, "DeniedByProjectProof");
     assert.equal(f.fakeAccount().active, true);
   } finally { f.close(); }
+});
+
+test("RED: retained Dispatching snapshot cannot send after project and account no-send release", () => {
+  const f = new RealGitFixture();
+  try {
+    assert.equal(f.apply(0, claim("stale-claim")).code, "Claimed");
+    assert.equal(f.apply(1, start("stale-start")).code, "StartAuthorized");
+    const staleDispatch = structuredClone(f.actual());
+    assert.equal(staleDispatch.phase, "Dispatching");
+    assert.equal(f.apply(2, noSend("stale-nosend")).code, "VerifiedNoSend");
+    assert.equal(f.apply(0, release("stale-release")).code, "Released");
+    assert.equal(f.releaseFakeAccount().code, "FakeAccountReleased");
+    f.provider = f.provider.restart();
+    assert.equal(f.provider.send(staleDispatch, CANDIDATE.effect, "ackLost").code,
+      "DeniedByNoSessionSeal");
+    assert.equal(f.provider.restart().acceptedCount(CANDIDATE.effect), 0);
+    assert.equal(f.fakeAccount().active, false);
+    independentOracle(f);
+  } finally { f.close(); }
+});
+
+test("seeded stale-dispatch negative mutation goes RED and delete-shrink replays", () => {
+  const { sent, trace } = generateEffectTrace(102);
+  assert.equal(sent, false);
+  assert.throws(() => runEffectTrace(102, trace, { kind: "ignoreSeal" }),
+    /FalseNoSendDurableProvider/);
+  const terminalIndex = trace.findIndex(action => action.kind === "attemptLateSend");
+  const prefix = trace.slice(0, terminalIndex + 1);
+  const reproduces = candidate => {
+    try {
+      runEffectTrace(102, candidate, { kind: "ignoreSeal" });
+      return false;
+    } catch (error) {
+      if (/FalseNoSendDurableProvider/.test(error.message)) return true;
+      return false;
+    }
+  };
+  assert.equal(reproduces(prefix), true);
+  const minimal = shrink(prefix, reproduces);
+  assert.ok(minimal.length < prefix.length);
+  assert.equal(reproduces(minimal), true);
+  assert.deepEqual(minimal.filter(action => action.kind !== "project").map(action => action.kind),
+    ["captureDispatch", "attemptLateSend"]);
 });
 
 test("adversarial independent mutation is rejected and deterministic delete-shrink replays", () => {

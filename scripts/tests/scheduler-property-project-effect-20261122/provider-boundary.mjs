@@ -7,7 +7,9 @@ export class DurableFakeProvider {
   constructor(file) {
     this.file = file;
     mkdirSync(dirname(file), { recursive: true });
-    if (!existsSync(file)) writeFileSync(file, JSON.stringify({ revision: 0, sessions: {} }));
+    if (!existsSync(file)) writeFileSync(file, JSON.stringify({
+      revision: 0, sessions: {}, noSessionSeals: {}
+    }));
   }
   read() { return JSON.parse(readFileSync(this.file, "utf8")); }
   save(next) {
@@ -20,10 +22,16 @@ export class DurableFakeProvider {
     const result = this.read().sessions[effect];
     return result ? structuredClone(result) : null;
   }
-  send(project, effect, ack = "ackLost") {
+  noSessionSealed(effect) {
+    const state = this.read();
+    return !state.sessions[effect] && Number.isInteger(state.noSessionSeals?.[effect]);
+  }
+  send(project, effect, ack = "ackLost", testMutation = {}) {
     if (project.phase !== "Dispatching" || project.claim?.effect !== effect)
       return { code: "DeniedWithoutCommittedStart" };
     const next = this.read();
+    if (Number.isInteger(next.noSessionSeals?.[effect]) && !testMutation.ignoreNoSessionSeal)
+      return { code: "DeniedByNoSessionSeal" };
     if (next.sessions[effect])
       return { code: "AlreadySubmitted", receipt: structuredClone(next.sessions[effect]) };
     const receipt = {
@@ -44,10 +52,22 @@ export class DurableFakeProvider {
     this.save(next);
     return { code: "TerminalObserved", receipt: this.observe(effect) };
   }
+  // Prospective disposable provider-owned revocation. Absence at observation
+  // is not enough: seal and send share one durable provider state transition.
+  sealNoSession(effect) {
+    const next = this.read();
+    if (next.sessions[effect]) return false; // send won
+    next.noSessionSeals ??= {};
+    if (Number.isInteger(next.noSessionSeals[effect])) return true;
+    next.revision++;
+    next.noSessionSeals[effect] = next.revision;
+    this.save(next); // seal wins, stale snapshots can no longer send
+    return true;
+  }
   verifyNoSession(proof, effect) {
     return proof?.project === "VerifiedNoSend" &&
       proof?.provider === "VerifiedNoProviderSession" &&
-      proof?.effect === effect && this.observe(effect) === null;
+      proof?.effect === effect && this.sealNoSession(effect);
   }
   verifyTerminal(proof, effect) {
     const receipt = this.observe(effect);

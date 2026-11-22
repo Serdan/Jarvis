@@ -125,3 +125,75 @@ The first pre-correction Node job `31998430fa5247df8d36376c12ae5c5c`
 was red (15/17) for a test-generator proof argument bug and mutant assertion
 ordering; fixed before the passing terminal execution. None of these jobs
 invoked production browser/account sends.
+
+
+## Adjudicated stale-dispatch authorization correction (2026-11-22)
+
+**Authority:** independent Reviewer4 ChangesRequested decision 10944 on frozen test-only
+`c4494998c29089b624d5b458361fa973a9a14639`, finding
+`findings/stale-dispatch-after-nosend-release.md`; independent Adjudicator2
+**NARROW**, checkpoint 10983, authorizes ONLY this original Phase A test/docs
+lease. This is a defect in the *disposable reference boundary*, not evidence of
+a bug in production F# StageB or a real browser/provider send.
+
+**RED-first canary:** Jarvis job `77c339f14e834e70942d710c521b9f3a`
+ran the new held-Dispatching-snapshot test before the provider correction, exited
+1: 3/4 tests passed, the held snapshot sent *after* VerifiedNoSend, project
+Released and FakeAccountReleased; expected `DeniedByNoSessionSeal`, observed
+`Unknown`. That result establishes the original late-send counterexample.
+
+**Bounded repair:** `DurableFakeProvider` owns a separate persisted
+`noSessionSeals[effect]` alongside receipts, independent of both project Git
+and fake-account Git. The verified no-send reference transition checks the
+supplied project/provider/effect proof and attempts a prospective seal *before*
+committing VerifiedNoSend. If a durable send receipt already exists, sealing
+fails and neither project nor fake account may release (send-wins). If sealing
+persists first, all later sends for that effect, including a retained
+`Dispatching` snapshot across provider recreation, return
+`DeniedByNoSessionSeal` without accepting a receipt (seal-wins). Project
+release and the separately versioned fake-account release require the provider
+seal, not mere absence of a session. A denied/incomplete project transition may
+leave a conservative provider seal; this is fail-closed safety, not a claim of
+cross-store atomic liveness.
+
+**Reachable tests:** seeded even-numbered post-send traces retain a frozen
+`Dispatching` snapshot before no-send, commit VerifiedNoSend and project +
+separate fake-account releases from three disposable project clones, restart
+the provider, then try the stale snapshot. A separate explicit canary inspects
+provider acceptedCount=0, retained account release and independent invariants.
+Odd-numbered seeded traces send first, retain Unknown and the account
+reservation, and reject the no-session proof/release. Independent negative
+mutation deliberately bypasses the test-provider seal; a persisted late
+receipt then fails `FalseNoSendDurableProvider`. Deterministic seed 102 replay
+plus a delete-chunk shrinker retain the safety counterexample; the shrunk
+history need not retain account release because the contradiction is already
+observable upon VerifiedNoSend. Prior terminal-proof hash and false no-send
+mutants remain in the suite.
+
+The standalone .NET11 simulator independently mirrors file-backed provider
+receipt versus prospective seal across restart, tests 64 send-wins and 64
+seal-wins deterministic seeds, and verifies a deliberate late-send mutation is
+rejected by its independent invariant. **Release model terminal proof:**
+`dotnet run --project ProjectEffectModel.csproj -c Release` exited 0,
+**11/11** standalone checks; it is *not* a native F# implementation test.
+
+**Residual, deliberately unproven:** the file-backed providers serialize
+sequential test events and do not implement production multi-process atomic
+compare-and-swap, live provider authorization, browser send, real in-flight
+calls, crash windows between provider/project/account stores, distributed
+quiescence, native F# B1 or B2 differential checks, or deployment authority.
+A passing Phase A model is not an acceptance or cutover receipt. Phase B stays
+HOLD pending separate exact-source native adapter proof and authorization;
+no shared fsproj, production implementation, main, live account, browser,
+deployment, migration or scheduler activation was changed.
+
+**Unfiltered post-correction Node terminal evidence (before freeze):**
+Jarvis job `2ac537375ba848aaa075251b3b09ac78`,
+`node --test property.test.mjs effect-traces.test.mjs` exit 0,
+**19/19** passed, 0 failed/skip. Generated 14 three-project-clone histories
+covered 7 durable sends, 7 lost ACKs, 7 retries, 14 denied false no-session,
+7 denied premature releases, 14 project/account releases, 84 provider
+restarts and **7 retained stale Dispatching sends denied after seal**.
+Seed 102 seal-bypass mutation caused independent oracle RED and reproduced
+on the shrunk counterexample. Source commit and fresh frozen review will be
+recorded separately in the canonical task checkpoint.

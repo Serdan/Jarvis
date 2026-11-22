@@ -123,9 +123,9 @@ export function step(original, cmd, options = {}) {
     if (cmd.expectedAccount !== state.accountVersion) return response(state, "AccountConflict");
     if (state.released || !state.reservationActive) return response(state, "AlreadyReleased");
     if (!["VerifiedTerminal", "VerifiedNoSend"].includes(state.phase)) return response(state, "NotTerminal");
-    // A static claim is not durable authority: recheck independent provider on release.
+    // A static absence is not prospective authority: require the durable seal.
     if (state.phase === "VerifiedNoSend" &&
-        (!options.provider || options.provider.observe(state.claim.effect)))
+        !options.provider?.noSessionSealed(state.claim.effect))
       return response(state, "UnknownOrForeignProof");
     state.reservationActive = false;
     state.released++;
@@ -159,6 +159,9 @@ export function checkInvariants(s, provider = null) {
     throw new Error("FalseNoSend");
   if (provider?.observe(CANDIDATE.effect) && s.phase === "VerifiedNoSend")
     throw new Error("FalseNoSendDurableProvider");
+  if (provider && s.phase === "VerifiedNoSend" &&
+      !provider.noSessionSealed(CANDIDATE.effect))
+    throw new Error("NoSendWithoutDurableProviderSeal");
   if (s.completed !== Boolean(s.released)) throw new Error("FalseCompletion");
   return true;
 }
@@ -278,7 +281,7 @@ export class RealGitFixture {
         !["VerifiedTerminal", "VerifiedNoSend"].includes(state.phase))
       return { code: "DeniedByProjectProof" };
     const receipt = this.provider.observe(state.candidate.effect);
-    if (state.phase === "VerifiedNoSend" && receipt)
+    if (state.phase === "VerifiedNoSend" && !this.provider.noSessionSealed(state.candidate.effect))
       return { code: "DeniedByDurableProvider" };
     if (state.phase === "VerifiedTerminal" &&
         (!receipt || receipt.status !== "Terminal" ||

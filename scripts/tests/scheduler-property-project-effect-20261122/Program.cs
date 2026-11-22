@@ -36,12 +36,24 @@ sealed record State {
 // This is a disposable simulator, NOT a native provider/account implementation.
 sealed class DurableProvider(string root) {
     readonly string path = Path.Combine(root, "provider-receipt.txt");
+    readonly string sealPath = Path.Combine(root, "provider-no-session-seal.txt");
     public bool HasSession => File.Exists(path);
     public int AcceptedCount => HasSession ? 1 : 0;
     public string Status => HasSession ? File.ReadAllText(path) : "Absent";
-    public string Send(State project) {
+    public bool IsNoSessionSealed => File.Exists(sealPath) && !HasSession;
+    public bool SealNoSession() {
+        if (HasSession) return false; // durable send won
+        if (IsNoSessionSealed) return true;
+        Directory.CreateDirectory(Path.GetDirectoryName(sealPath)!);
+        File.WriteAllText(sealPath + ".pending", "RevokedFutureDispatch");
+        File.Move(sealPath + ".pending", sealPath);
+        return true;
+    }
+    public string Send(State project, bool ignoreSealForMutation = false) {
         if (project.Phase != "Dispatching" || !project.Claimed)
             return "DeniedWithoutCommittedStart";
+        if (File.Exists(sealPath) && !ignoreSealForMutation)
+            return "DeniedByNoSessionSeal";
         if (HasSession) return "AlreadySubmitted";
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         File.WriteAllText(path + ".pending", "Active");
@@ -129,7 +141,7 @@ static class Program {
             if (s.Phase != "Dispatching" || s.Sends != 0 ||
                 proof is null || proof.Marker != "VerifiedNoSend" ||
                 proof.Status != "VerifiedNoProviderSession" || proof.Effect != s.Candidate.Effect ||
-                provider is null || provider.HasSession)
+                provider is null || !provider.SealNoSession())
                 return (s, Outcome.UntrustedProof);
             return Record(s with { Phase = "VerifiedNoSend", ProjectVersion = s.ProjectVersion + 1 },
                 Outcome.VerifiedNoSend);
@@ -141,7 +153,7 @@ static class Program {
                 return (s, Outcome.AlreadyReleased);
             if (s.Phase is not ("VerifiedTerminal" or "VerifiedNoSend"))
                 return (s, Outcome.NotTerminal);
-            if (s.Phase == "VerifiedNoSend" && (provider is null || provider.HasSession))
+            if (s.Phase == "VerifiedNoSend" && provider?.IsNoSessionSealed != true)
                 return (s, Outcome.UntrustedProof);
             return Record(s with { AccountVersion = s.AccountVersion + 1,
                 ReservationActive = false, Releases = 1, Completed = true }, Outcome.Released);
@@ -158,6 +170,8 @@ static class Program {
         if (provider?.AcceptedCount > 1) throw new InvalidOperationException("Duplicate durable send");
         if (provider?.HasSession == true && s.Phase == "VerifiedNoSend")
             throw new InvalidOperationException("FalseNoSendDurableProvider");
+        if (provider is not null && s.Phase == "VerifiedNoSend" && !provider.IsNoSessionSealed)
+            throw new InvalidOperationException("NoSendWithoutDurableProviderSeal");
         if (s.Sends > 1 || s.Releases > 1)
             throw new InvalidOperationException("Duplicate side effect");
         if (s.Releases != 0 && (s.ReservationActive ||
@@ -172,7 +186,7 @@ static class Program {
         var (next, got) = Move(s, cmd, provider: provider);
         if (expected != got)
             throw new InvalidOperationException($"Expected {expected}, got {got} for {cmd}");
-        Invariants(next);
+        Invariants(next, provider);
         return next;
     }
     static Command Claim(string op = "claim", Candidate? candidate = null,
@@ -255,6 +269,55 @@ static class Program {
                 s = Do(s, Release(), Outcome.Released, provider);
                 Assert(s.Sends == 0 && s.Releases == 1, "prestart-negative");
             } finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+        });
+        Test("file-backed send-wins denies no-session proof and holds reservation", () => {
+            for (int seed = 1; seed <= 64; seed++) {
+                string root = Path.Combine(Path.GetTempPath(),
+                    "project-effect-send-wins-" + seed + "-" + Guid.NewGuid());
+                try {
+                    var provider = new DurableProvider(root);
+                    var s = Do(Do(new(), Claim(), Outcome.Claimed), Start(), Outcome.Started);
+                    var valid = new Proof("VerifiedNoSend", "VerifiedNoProviderSession", "effect-a", "");
+                    Assert(provider.Send(s) == "Unknown", "durable send wins " + seed);
+                    provider = provider.Restart();
+                    Assert(!provider.IsNoSessionSealed, "send cannot produce seal");
+                    Assert(Move(s, new("NoSend", "late-no-send", Proof: valid),
+                        provider: provider).Item2 == Outcome.UntrustedProof, "deny no-session " + seed);
+                    Assert(Move(s, Release(), provider: provider).Item2 == Outcome.NotTerminal,
+                        "deny release " + seed);
+                    Assert(s.ReservationActive && provider.AcceptedCount == 1, "account held " + seed);
+                } finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+            }
+        });
+        Test("file-backed seal-wins rejects retained stale dispatch; mutation violates oracle", () => {
+            for (int seed = 1; seed <= 64; seed++) {
+                string root = Path.Combine(Path.GetTempPath(),
+                    "project-effect-seal-wins-" + seed + "-" + Guid.NewGuid());
+                try {
+                    var provider = new DurableProvider(root);
+                    var s = Do(Do(new(), Claim(), Outcome.Claimed), Start(), Outcome.Started);
+                    var staleDispatch = s;
+                    var proof = new Proof("VerifiedNoSend", "VerifiedNoProviderSession", "effect-a", "");
+                    s = Do(s, new("NoSend", "nosend", Proof: proof), Outcome.VerifiedNoSend, provider);
+                    s = Do(s, Release(), Outcome.Released, provider);
+                    provider = provider.Restart();
+                    Assert(provider.IsNoSessionSealed, "durable seal survives restart " + seed);
+                    Assert(provider.Send(staleDispatch) == "DeniedByNoSessionSeal",
+                        "stale sender denied " + seed);
+                    Assert(provider.AcceptedCount == 0 && s.Completed && !s.ReservationActive,
+                        "independent provider and account truth " + seed);
+                    Invariants(s, provider);
+                    // An intentionally unsound fake provider ignores the seal.
+                    Assert(provider.Send(staleDispatch, ignoreSealForMutation: true) == "Unknown",
+                        "mutation creates late receipt " + seed);
+                    bool mutationDetected = false;
+                    try { Invariants(s, provider); }
+                    catch (InvalidOperationException ex) {
+                        mutationDetected = ex.Message == "FalseNoSendDurableProvider";
+                    }
+                    Assert(mutationDetected, "independent negative mutation must fail " + seed);
+                } finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+            }
         });
         Test("adversarial seeded 512 x 48 typed traces", () => {
             for (int seed = 1; seed <= 512; seed++) {

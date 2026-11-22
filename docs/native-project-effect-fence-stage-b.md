@@ -1,0 +1,29 @@
+# Native Scheduler Stage B: disposable project effect CAS (default-off)
+
+**Owner:** Worker 22, task `scheduler-native-project-effect-stageb-20261121`, attempt `f614e7b520204724aefa2fb8ae4a162b` generation 1.
+
+## B0 source and ownership boundary
+
+Baseline `dcac884fc061869572b12a03befc12f11c009f2f` is the verified current main (includes accepted Stage A `a2e244bf`, authenticated roster `bfa9cbe`, Phase 1 `34facab5`, Phase 2 `3ea482c5`). Stage A document: `docs/native-project-effect-fence-stage-a.md`. Current baseline has the single canonical project Git ref `refs/heads/jarvis-orchestration`, `Client/Modules/LedgerStore.fs` `LedgerStore.transact` (line 2721) with optimistic remote CAS, request-hashed immutable operation records, post-push confirmation and same-UUID reconciliation. `LedgerStore.readAt` reads pinned snapshot. BrowserBridge `OpenTab` is an external-effect transport, NOT a verified provider submission or terminal proof.
+
+Worker 4 exclusively owns the still-unaccepted account reservation CAS, with no production provider/session authority. Do **not** touch `AccountCapacityLedger.fs`, `NativeSchedulerRosterPolicy.fs`, BrowserBridge, ledger transport, the shared Client / Client.Tests project files, accepted Stage A fixtures, or roster/planner. The only source here is NEW `Client/Modules/NativeProjectEffectFence.fs`, the standalone `scripts/tests/native-project-effect-stage-b/` harness and this document, in an isolated worktree `feature/scheduler-project-effect-stageb-worker22-20261122`.
+
+## B1 deliberately offline contract
+
+The entire F# module is wrapped in `#if STAGE_B_DISPOSABLE_TEST_ONLY`; no production application project includes it, no live command, schedule or BrowserBridge is exported. The standalone .NET 11 executable has that constant, links the unchanged real Client project and the isolated F# module, and exercises disposable three-clone / one bare project Git authority plus a separate fake bare account Git repository. Every test-injected account receipt is a **typed fake**, marked `STAGE_B_DISPOSABLE_FAKE_ACCOUNT_RECEIPT/v1`: exact reservation UUID, project ID, account ledger ID/epoch/head and Worker/Reviewer kind. It is not signed, authenticated, or proof of capacity.
+
+The claim identifies canonical Worker task/attempt/owner/generation/source fields, or Reviewer claimed frozen review/version/ref/owner, and binds the original dispatch and effect UUIDs, device and browser window to a single immutable project-ledger record. One `LedgerStore.transact` writes the exclusive claim only after re-reading exactly the expected project head and canonical candidate. A second project CAS writes `Dispatching` before the test driver could call a fake effect port. Any competing operation or reattempt after uncertain start retains the original record; no second start marker is available. A third CAS records a **fake** terminal only if its typed test proof matches; no account release is implemented. All transitions leave the project ledger on its original epoch/ref and retain request-hashed operation receipts. A same-UUID replay reuses its receipt, while altered payloads reject.
+
+**What is explicitly not proved:** authenticity of the account receipt or provider terminal, a production source lease/claim issuer, provider session reconciliation, actual BrowserRunInNewTab effect, authenticated no-send outcome, a real account-slot release, Scheduler activation or safe account+project composition. The fake terminal marker is not a production trust root. The tested project transitions cannot be imported into production or used to authorize WorkComposition without additional independent source and provider proofs.
+
+## Negative-space evidence
+
+The .NET Release console harness covers two Workers/one attempt and distinct operation UUIDs, two Reviewers/one frozen review, account-reservation-won/project-CAS-lost, strict expected project head, stale assignment/owner/source lease and reviewer claim/ref/version, forged typed fake account receipt, same-UUID exact retry versus changed payload, two-clone start serialization, three-client simultaneous claim, post-send ACK uncertainty/reconnect/clock rollback suppressing another marker, provider Unknown/foreign terminal and one-time fake terminal transition. The companion Node Stage A port is intentionally non-idempotent and tests an accepted fake send, lost ACK, timeout, crash, tab close/reconnect/clock rollback, fake no-send, active/unknown provider and forged terminal.
+
+**Observed Node gate:** `node --test scripts/tests/native-project-effect-stage-a.test.mjs scripts/tests/native-project-effect-once-only-stage-a.test.mjs`: exit 0, **33 passed / 0 failed** (Jarvis job `826bccff9eb641e99c216beccee9af73`).
+
+**Observed .NET11 Release gate:** `dotnet run -c Release --no-restore -p:BuildProjectReferences=false --project scripts/tests/native-project-effect-stage-b/NativeProjectEffectStageB.fsproj`: exit 0, **11 passed / 0 failed** (Jarvis job `2cd40abcacb74d42943d1ca495dedb6a`). The Client project reference was built previously from this isolated baseline in the same worktree; BuildProjectReferences=false only avoided rebuilding that unchanged dependency. Project effect source was compiled and executed in this Release job. The test suite constructed disposable real Git project/account remotes, three independent project clones and typed fake account/provider receipts. No production browser or account session source was called.
+
+## B2 — explicit HOLD
+
+Do not integrate real Worker 4 account authority, invoke live BrowserBridge, release capacity, write main, change a production Git ledger, deploy, migrate, restart, schedule or activate the Scheduler. The native account CAS needs independent acceptance/incorporation and authenticated provider/session proof. Independent B1 source review is required before even considering composition; external source inclusion alone is not a managed publisher receipt.

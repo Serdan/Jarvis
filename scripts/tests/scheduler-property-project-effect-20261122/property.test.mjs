@@ -23,8 +23,8 @@ const release = (op = "release-1", expectedAccount = 1) => ({
   kind: "release", op, token: "claim-token-a", effect: CANDIDATE.effect,
   expectedAccount
 });
-const apply = (s, command, expected) => {
-  const result = step(s, command);
+const apply = (s, command, expected, options = {}) => {
+  const result = step(s, command, options);
   assert.equal(result.code, expected, JSON.stringify(command));
   checkInvariants(result.state);
   return result.state;
@@ -164,16 +164,22 @@ test("terminal release requires authenticated-looking independent fake proofs, o
   assert.equal(s.completed, true);
 });
 
-test("no-send demands independently matching project/provider negative proofs", () => {
-  let s = apply(initial(), claim(), "Claimed");
-  s = apply(s, start(), "StartAuthorized");
-  assert.equal(step(s, noSend("bad", { ...goodNoSend(), provider: "Unknown" })).code,
-    "UnknownOrForeignProof");
-  s = apply(s, noSend(), "VerifiedNoSend");
-  s = apply(s, release(), "Released");
-  assert.equal(s.providerSubmissions, 0);
-  assert.equal(s.released, 1);
-  assert.equal(step(s, start("again")).code, "AlreadyStarted");
+test("no-send demands independent durable provider negative evidence", () => {
+  const f = new RealGitFixture();
+  try {
+    const options = { provider: f.provider };
+    let s = apply(initial(), claim(), "Claimed");
+    s = apply(s, start(), "StartAuthorized");
+    assert.equal(step(s, noSend("bad", { ...goodNoSend(), provider: "Unknown" }), options).code,
+      "UnknownOrForeignProof");
+    assert.equal(step(s, noSend(), {}).code, "UnknownOrForeignProof",
+      "unsigned static claim without provider must never be accepted");
+    s = apply(s, noSend(), "VerifiedNoSend", options);
+    s = apply(s, release(), "Released", options);
+    assert.equal(s.providerSubmissions, 0);
+    assert.equal(s.released, 1);
+    assert.equal(step(s, start("again")).code, "AlreadyStarted");
+  } finally { f.close(); }
 });
 
 test("negative oracle mutation: unknown effect cannot become Released or fake no-send", () => {
@@ -223,14 +229,15 @@ test("three Git clones: durable start before fake send, ACK loss, terminal, once
     assert.equal(f.apply(0, claim()).code, "Claimed");
     assert.equal(f.apply(1, start()).code, "StartAuthorized");
     // Only AFTER durable start does disposable fake boundary perform one send.
-    const inject = old => ({ state: fakeProviderResult(old, "ackLost"), code: "FakeAckLost" });
-    assert.equal(f.apply(2, { kind: "fakeBoundary" }, inject).code, "FakeAckLost");
+    const sent = f.provider.send(f.actual(), CANDIDATE.effect, "ackLost");
+    assert.equal(sent.code, "Unknown");
+    assert.equal(f.provider.restart().acceptedCount(CANDIDATE.effect), 1);
     assert.equal(f.apply(0, start("retry", { expectedProject: 2 })).code, "AlreadyStarted");
     assert.equal(f.apply(1, release()).code, "NotTerminal");
     assert.equal(f.fakeAccount().active, true, "unknown effect must occupy fake account");
-    assert.equal(f.actual().providerSubmissions, 1);
-    const finish = old => ({ state: { ...old, providerStatus: "Terminal" }, code: "FakeProviderTerminal" });
-    assert.equal(f.apply(2, { kind: "fakeObserve" }, finish).code, "FakeProviderTerminal");
+    assert.equal(f.actual().providerSubmissions, 0, "lost ACK must not update project state");
+    assert.equal(f.apply(0, noSend("false-nosend")).code, "UnknownOrForeignProof");
+    assert.equal(f.provider.restart().terminal(CANDIDATE.effect).code, "TerminalObserved");
     assert.equal(f.apply(0, terminal()).code, "VerifiedTerminal");
     assert.equal(f.apply(1, terminal("term-1", { ...goodProof(), session: "foreign" })).code,
       "OperationIdReused");
@@ -279,20 +286,16 @@ test("seeded adversarial traces replay on three real project Git clones and sepa
       }
       // Recorded project marker pre-exists any fake external send.
       assert.equal(f.actual().providerSubmissions, 0);
-      const inject = old => ({ state: fakeProviderResult(old, "ackLost"), code: "FakeAckLost" });
-      assert.equal(f.apply((seed + 1) % 3, { kind: "fakeBoundary" }, inject).code, "FakeAckLost");
-      ref = fakeProviderResult(ref, "ackLost");
+      assert.equal(f.provider.send(f.actual(), CANDIDATE.effect, "ackLost").code, "Unknown");
+      assert.equal(f.provider.restart().acceptedCount(CANDIDATE.effect), 1);
       assert.equal(f.fakeAccount().active, true);
       const commands = generate(seed * 1597334677 >>> 0, 28);
       for (let i = 0; i < commands.length; i++) {
         if (i === 9) {
-          const observe = old => ({ state: { ...old, providerStatus: "Terminal" },
-            code: "FakeObservedTerminal" });
-          assert.equal(f.apply(2, { kind: "fakeObserve" }, observe).code, "FakeObservedTerminal");
-          ref = { ...ref, providerStatus: "Terminal" };
+          assert.equal(f.provider.restart().terminal(CANDIDATE.effect).code, "TerminalObserved");
         }
         const command = commands[i];
-        const expected = step(ref, command);
+        const expected = step(ref, command, { provider: f.provider });
         const actual = f.apply(i % 3, command);
         assert.equal(actual.code, expected.code, "seed " + seed + " index " + i);
         ref = expected.state;
@@ -303,7 +306,7 @@ test("seeded adversarial traces replay on three real project Git clones and sepa
           assert.equal(f.releaseFakeAccount().code, "FakeAccountReleased");
         }
       }
-      assert.equal(f.actual().providerSubmissions, 1);
+      assert.equal(f.provider.restart().acceptedCount(CANDIDATE.effect), 1);
       assert.ok(f.fakeAccount().releaseCount <= 1);
       assert.equal(f.fakeAccount().active, ref.released === 0);
     } catch (error) {

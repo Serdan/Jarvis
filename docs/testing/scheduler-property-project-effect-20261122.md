@@ -50,3 +50,78 @@ Earlier job b3ba57badf0f428f95d11464bc23b6d7 failed 11/12 from a test-mutant set
 Hold source-bound actual StageB implementation traces until a fresh StageB B1 correction is independently Accepted and source custody verified. Then adapt generated commands to the actual guarded F# project-side seam against disposable Git clones, preserving its owner and making no edits to its source. Distinguish Stage B1 from B2 production account/provider integration. Passing a model, external Git ancestry, fake receipts or the old ChangesRequested review cannot authorize B2, main publication, real account release, browser send, schedules, migration or deployment.
 
 Submit this test-only branch to the shared independent review queue. Reviewer should verify seeds, source pins, Git race loser, mutated-proof oracle, fake-account negative release, exact allowed paths and that no test or document claims production source acceptance.
+
+
+## Adjudicated Phase-A correction — 2026-11-22
+
+Independent Adjudicator 3 terminal checkpoint **10877** on the frozen
+`731fa5245bf7a278756aa5fee832bbfdd950c12c` review
+`13a3c9879f254ee6b88547b2b31b5cc4` authorized P1 **ACCEPT** (unpersisted
+external receipt permits false no-session/release) and P2 **NARROW** (seeded
+post-send, Unknown/retry/terminal/release assurance). Both are test-harness
+defects; neither is evidence of an actual production defect.
+
+The test-only `provider-boundary.mjs` persists a single provider session/receipt
+**outside** the project and fake-account Git state before returning ACK or
+Unknown. A restarted provider object reads the same receipt. The project
+transition no longer accepts a static `VerifiedNoProviderSession` string without
+consulting this independent store. Release rechecks the independent provider.
+A matching terminal command consults the provider receipt and records its
+observed terminal session in disposable project state; replay includes the
+complete terminal proof in the operation identity. The separate fake-account
+release also rejects contradictory provider receipts.
+
+`effect-traces.test.mjs` constructs reproducible guided seed histories with
+three disposable project Git clients, a separate fake-account bare repository,
+and the independently persisted fake provider. Sent traces include committed
+start, accepted send with **lost ACK and unpersisted project result**, restarted
+receipt recovery, duplicate send attempt (not a new submission), false no-session
+denial, denied Unknown release, forged and premature terminal denial, eventual
+valid terminal, same-UUID changed-proof denial, exactly-once project/account
+release, and retry after release. Truly unsent histories include a verified
+provider-absence control and valid no-send release. Per-seed mandatory coverage
+counters ensure these paths are reached rather than merely included in an
+unreachable random alphabet. The independent safety oracle reads the provider
+and account stores and rejects a false no-session even if the project adapter
+produces internally plausible self-consistent state. A deliberate false-no-send
+mutation is killed by this oracle, and a delete-chunk shrinker must reproduce a
+smaller counterexample. Git persistence equality is still **not** F# production
+differential testing.
+
+The original 256 x 48 Node abstract traces and 512 x 48 .NET abstract traces
+remain separately labeled **pre-send abstract/reference exploration**. Their
+historical zero generated provider sends must not be mistaken for the new
+seeded post-send evidence. The .NET11 standalone simulator also now reads a
+separate file-backed fake receipt after lost ACK/restart and runs 128 seeded
+48-noise-step post-send and true no-send histories with typed denials. Its
+`Move` refuses static no-session claims without independent provider evidence.
+
+**Release terminal evidence:** .NET job
+`188af3ed315945b9b1e6c980760f61b6`, exit 0, **9/9**. Generated .NET
+coverage: accepted sends 64, lost ACK 64, duplicate retries 64, denied false
+no-session 64, valid terminal 64, valid releases 128 (64 sent and 64 truly
+unsent), provider restarts 128. The fake provider and account are strictly
+disposable. They do not authorize any real BrowserBridge/account send.
+
+**Phase B HOLD:** StageB B1 corrected candidate
+`67e2ed9d` remained **ChangesRequested** at this correction's authority
+checkpoint. This task does not verify production F# `NativeProjectEffectFence`,
+and no accepted native B1 adapter is available under the original lease. No
+claim of source-bound native B1 proof, B2 end-to-end integration, trusted writer
+incorporation, main publication, deployment or unattended scheduling is made.
+Phase B requires a fresh independently Accepted StageB correction and exact
+source custody before a real disposable F# comparison can legitimately run.
+
+**Node terminal evidence after correction:** job
+`6f0923944ed44c0bb58132e6fa2be628`, exit 0, **17/17** tests,
+zero failures/skips. The 14 generated Git histories (seeds 101–114) recorded:
+7 independent accepted sends with lost ACK, 7 duplicate-send retries,
+14 denied false/no-session claims, 7 denied premature releases,
+7 verified terminal transitions, 7 true no-session transitions,
+14 project releases, 14 matching separate-account releases, and
+84 provider restarts. The adversarial false-no-send adapter mutation failed
+the independent provider oracle; deterministic delete-shrink/replay passed.
+The first pre-correction Node job `31998430fa5247df8d36376c12ae5c5c`
+was red (15/17) for a test-generator proof argument bug and mutant assertion
+ordering; fixed before the passing terminal execution. None of these jobs
+invoked production browser/account sends.

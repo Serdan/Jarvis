@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DurableFakeProvider } from "./provider-boundary.mjs";
 
 const copy = value => structuredClone(value);
 const fingerprint = obj => createHash("sha256").update(JSON.stringify(obj)).digest("hex");
@@ -88,12 +89,20 @@ export function step(original, cmd, options = {}) {
   }
   if (cmd.kind === "terminal") {
     const proof = cmd.proof || {};
-    if (state.phase !== "Dispatching" || state.providerSubmissions !== 1)
-      return response(state, "NotTerminal");
-    const valid = proof.marker === "DISPOSABLE_PROVIDER_TERMINAL" &&
-      proof.status === "Terminal" && proof.effect === state.claim.effect &&
-      proof.session === state.providerSession && state.providerStatus === "Terminal";
+    if (state.phase !== "Dispatching") return response(state, "NotTerminal");
+    const valid = options.provider
+      ? options.provider.verifyTerminal(proof, state.claim.effect)
+      : state.providerSubmissions === 1 &&
+        proof.marker === "DISPOSABLE_PROVIDER_TERMINAL" &&
+        proof.status === "Terminal" && proof.effect === state.claim.effect &&
+        proof.session === state.providerSession && state.providerStatus === "Terminal";
     if (!valid) return response(state, "UnknownOrForeignProof");
+    if (options.provider) {
+      const receipt = options.provider.observe(state.claim.effect);
+      state.providerSubmissions = receipt.acceptedCount;
+      state.providerStatus = receipt.status;
+      state.providerSession = receipt.session;
+    }
     state.phase = "VerifiedTerminal";
     state.projectVersion++;
     return record("VerifiedTerminal");
@@ -103,7 +112,8 @@ export function step(original, cmd, options = {}) {
     if (state.phase !== "Dispatching" || state.providerSubmissions !== 0 ||
         proof.project !== "VerifiedNoSend" ||
         proof.provider !== "VerifiedNoProviderSession" ||
-        proof.effect !== state.claim.effect)
+        proof.effect !== state.claim.effect ||
+        !options.provider?.verifyNoSession(proof, state.claim.effect))
       return response(state, "UnknownOrForeignProof");
     state.phase = "VerifiedNoSend";
     state.projectVersion++;
@@ -113,6 +123,10 @@ export function step(original, cmd, options = {}) {
     if (cmd.expectedAccount !== state.accountVersion) return response(state, "AccountConflict");
     if (state.released || !state.reservationActive) return response(state, "AlreadyReleased");
     if (!["VerifiedTerminal", "VerifiedNoSend"].includes(state.phase)) return response(state, "NotTerminal");
+    // A static claim is not durable authority: recheck independent provider on release.
+    if (state.phase === "VerifiedNoSend" &&
+        (!options.provider || options.provider.observe(state.claim.effect)))
+      return response(state, "UnknownOrForeignProof");
     state.reservationActive = false;
     state.released++;
     state.accountVersion++;
@@ -133,14 +147,18 @@ export function fakeProviderResult(original, effect = "ackLost") {
   }
   return s;
 }
-export function checkInvariants(s) {
+export function checkInvariants(s, provider = null) {
   if (s.providerSubmissions > 1) throw new Error("DuplicateProviderSend");
+  if (provider?.acceptedCount(CANDIDATE.effect) > 1)
+    throw new Error("DuplicateDurableProviderSend");
   if (s.released > 1) throw new Error("DuplicateRelease");
   if (s.released && s.reservationActive) throw new Error("ReleaseStateContradiction");
   if (s.released && !["VerifiedTerminal", "VerifiedNoSend"].includes(s.phase))
     throw new Error("ReleaseBeforeProof");
   if (s.providerSubmissions && s.phase === "VerifiedNoSend")
     throw new Error("FalseNoSend");
+  if (provider?.observe(CANDIDATE.effect) && s.phase === "VerifiedNoSend")
+    throw new Error("FalseNoSendDurableProvider");
   if (s.completed !== Boolean(s.released)) throw new Error("FalseCompletion");
   return true;
 }
@@ -247,6 +265,7 @@ export class RealGitFixture {
     git(this.accountClient, "commit", "-qm", "seed fake account reservation");
     git(this.accountClient, "push", "-q", "origin", "HEAD:refs/heads/main");
     git(this.accountBare, "symbolic-ref", "HEAD", "refs/heads/main");
+    this.provider = new DurableFakeProvider(join(this.root, "provider", "receipts.json"));
   }
   fakeAccount() {
     git(this.accountClient, "fetch", "-q", "origin", "main");
@@ -258,6 +277,13 @@ export class RealGitFixture {
     if (!state.completed || state.released !== 1 ||
         !["VerifiedTerminal", "VerifiedNoSend"].includes(state.phase))
       return { code: "DeniedByProjectProof" };
+    const receipt = this.provider.observe(state.candidate.effect);
+    if (state.phase === "VerifiedNoSend" && receipt)
+      return { code: "DeniedByDurableProvider" };
+    if (state.phase === "VerifiedTerminal" &&
+        (!receipt || receipt.status !== "Terminal" ||
+         receipt.session !== state.providerSession))
+      return { code: "DeniedByDurableProvider" };
     const account = this.fakeAccount();
     if (!account.active || account.receipt !== state.candidate.reservation)
       return { code: "AlreadyReleasedOrForeign" };
@@ -275,7 +301,7 @@ export class RealGitFixture {
     git(cwd, "checkout", "-q", "-B", "test-txn", "origin/main");
     return JSON.parse(readFileSync(join(cwd, "state.json"), "utf8"));
   }
-  stage(client, command, adapter = step) {
+  stage(client, command, adapter = (s, cmd) => step(s, cmd, { provider: this.provider })) {
     const cwd = this.clients[client];
     const before = this.snapshot(client);
     const out = adapter(before, command);
@@ -290,7 +316,7 @@ export class RealGitFixture {
     const result = spawnSync("git", ["-C", cwd, "push", "-q", "origin", "HEAD:refs/heads/main"], { encoding: "utf8" });
     return { accepted: result.status === 0, stderr: result.stderr, status: result.status };
   }
-  apply(client, command, adapter = step) {
+  apply(client, command, adapter = (s, cmd) => step(s, cmd, { provider: this.provider })) {
     const out = this.stage(client, command, adapter);
     if (!out.committed) return out;
     const push = this.publish(client);

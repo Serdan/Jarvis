@@ -32,6 +32,29 @@ sealed record State {
     public string? Session { get; init; }
     public Dictionary<string, string> Operations { get; init; } = [];
 }
+// File-backed fake receipt is independent from the in-memory project state.
+// This is a disposable simulator, NOT a native provider/account implementation.
+sealed class DurableProvider(string root) {
+    readonly string path = Path.Combine(root, "provider-receipt.txt");
+    public bool HasSession => File.Exists(path);
+    public int AcceptedCount => HasSession ? 1 : 0;
+    public string Status => HasSession ? File.ReadAllText(path) : "Absent";
+    public string Send(State project) {
+        if (project.Phase != "Dispatching" || !project.Claimed)
+            return "DeniedWithoutCommittedStart";
+        if (HasSession) return "AlreadySubmitted";
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path + ".pending", "Active");
+        File.Move(path + ".pending", path);
+        return "Unknown"; // External receipt committed; ACK deliberately lost.
+    }
+    public void MarkTerminal() {
+        if (!HasSession) throw new InvalidOperationException("No durable send");
+        File.WriteAllText(path + ".pending", "Terminal");
+        File.Move(path + ".pending", path, overwrite: true);
+    }
+    public DurableProvider Restart() => new(root);
+}
 static class Program {
     public static readonly Candidate Candidate =
         new("task-a", "attempt-a", 7, "refs/heads/immutable-source", "Worker A",
@@ -44,7 +67,8 @@ static class Program {
             : JsonSerializer.Serialize(cmd);
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(serialized)));
     }
-    static (State, Outcome) Move(State source, Command command, bool omitTerminalProof = false) {
+    static (State, Outcome) Move(State source, Command command,
+        bool omitTerminalProof = false, DurableProvider? provider = null) {
         var s = source with { Operations = new(source.Operations) };
         if (command.Kind == "Observe" || command.Kind == "Restart")
             return (s, Outcome.Observed);
@@ -86,19 +110,26 @@ static class Program {
         }
         if (command.Kind == "Terminal") {
             var proof = command.Proof;
-            if (s.Phase != "Dispatching" || s.Sends != 1)
+            if (s.Phase != "Dispatching" || (provider is null && s.Sends != 1))
                 return (s, Outcome.NotTerminal);
-            if (proof != ValidTerminal || s.ProviderStatus != "Terminal"
-                || s.Session != ValidTerminal.Session)
+            if (proof != ValidTerminal ||
+                (provider is null
+                    ? s.ProviderStatus != "Terminal" || s.Session != ValidTerminal.Session
+                    : provider.Status != "Terminal"))
                 return (s, Outcome.UntrustedProof);
-            return Record(s with { Phase = "VerifiedTerminal", ProjectVersion = s.ProjectVersion + 1 },
-                Outcome.VerifiedTerminal);
+            var verified = provider is null ? s : s with {
+                Sends = provider.AcceptedCount, ProviderStatus = provider.Status,
+                Session = ValidTerminal.Session
+            };
+            return Record(verified with { Phase = "VerifiedTerminal",
+                ProjectVersion = s.ProjectVersion + 1 }, Outcome.VerifiedTerminal);
         }
         if (command.Kind == "NoSend") {
             var proof = command.Proof;
             if (s.Phase != "Dispatching" || s.Sends != 0 ||
                 proof is null || proof.Marker != "VerifiedNoSend" ||
-                proof.Status != "VerifiedNoProviderSession" || proof.Effect != s.Candidate.Effect)
+                proof.Status != "VerifiedNoProviderSession" || proof.Effect != s.Candidate.Effect ||
+                provider is null || provider.HasSession)
                 return (s, Outcome.UntrustedProof);
             return Record(s with { Phase = "VerifiedNoSend", ProjectVersion = s.ProjectVersion + 1 },
                 Outcome.VerifiedNoSend);
@@ -110,6 +141,8 @@ static class Program {
                 return (s, Outcome.AlreadyReleased);
             if (s.Phase is not ("VerifiedTerminal" or "VerifiedNoSend"))
                 return (s, Outcome.NotTerminal);
+            if (s.Phase == "VerifiedNoSend" && (provider is null || provider.HasSession))
+                return (s, Outcome.UntrustedProof);
             return Record(s with { AccountVersion = s.AccountVersion + 1,
                 ReservationActive = false, Releases = 1, Completed = true }, Outcome.Released);
         }
@@ -121,7 +154,10 @@ static class Program {
         return s with { Sends = s.Sends + 1, Session = "fake-session-" + (s.Sends + 1),
             ProviderStatus = status };
     }
-    static void Invariants(State s) {
+    static void Invariants(State s, DurableProvider? provider = null) {
+        if (provider?.AcceptedCount > 1) throw new InvalidOperationException("Duplicate durable send");
+        if (provider?.HasSession == true && s.Phase == "VerifiedNoSend")
+            throw new InvalidOperationException("FalseNoSendDurableProvider");
         if (s.Sends > 1 || s.Releases > 1)
             throw new InvalidOperationException("Duplicate side effect");
         if (s.Releases != 0 && (s.ReservationActive ||
@@ -132,8 +168,8 @@ static class Program {
         if (s.Completed != (s.Releases == 1))
             throw new InvalidOperationException("False completion");
     }
-    static State Do(State s, Command cmd, Outcome expected) {
-        var (next, got) = Move(s, cmd);
+    static State Do(State s, Command cmd, Outcome expected, DurableProvider? provider = null) {
+        var (next, got) = Move(s, cmd, provider: provider);
         if (expected != got)
             throw new InvalidOperationException($"Expected {expected}, got {got} for {cmd}");
         Invariants(next);
@@ -206,13 +242,19 @@ static class Program {
             Assert(s.Releases == 1 && !s.ReservationActive, "account released once");
         });
         Test("two independently matching no-send proofs required", () => {
-            var s = Do(Do(new(), Claim(), Outcome.Claimed), Start(), Outcome.Started);
-            var valid = new Proof("VerifiedNoSend", "VerifiedNoProviderSession", "effect-a", "");
-            Assert(Move(s, new("NoSend", "bad", Proof: valid with { Status = "Unknown" })).Item2
-                == Outcome.UntrustedProof, "Unknown no-send");
-            s = Do(s, new("NoSend", "nosend", Proof: valid), Outcome.VerifiedNoSend);
-            s = Do(s, Release(), Outcome.Released);
-            Assert(s.Sends == 0 && s.Releases == 1, "prestart-negative");
+            string root = Path.Combine(Path.GetTempPath(), "project-effect-dotnet-" + Guid.NewGuid());
+            try {
+                var provider = new DurableProvider(root);
+                var s = Do(Do(new(), Claim(), Outcome.Claimed), Start(), Outcome.Started);
+                var valid = new Proof("VerifiedNoSend", "VerifiedNoProviderSession", "effect-a", "");
+                Assert(Move(s, new("NoSend", "bad", Proof: valid with { Status = "Unknown" }),
+                    provider: provider).Item2 == Outcome.UntrustedProof, "Unknown no-send");
+                Assert(Move(s, new("NoSend", "unbound", Proof: valid)).Item2
+                    == Outcome.UntrustedProof, "missing provider must fail closed");
+                s = Do(s, new("NoSend", "nosend", Proof: valid), Outcome.VerifiedNoSend, provider);
+                s = Do(s, Release(), Outcome.Released, provider);
+                Assert(s.Sends == 0 && s.Releases == 1, "prestart-negative");
+            } finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
         });
         Test("adversarial seeded 512 x 48 typed traces", () => {
             for (int seed = 1; seed <= 512; seed++) {
@@ -235,6 +277,67 @@ static class Program {
                     Invariants(s);
                 }
             }
+        });
+        Test("seeded 128 file-backed independent provider ACK-loss and no-session traces", () => {
+            int sent = 0, unknown = 0, retries = 0, deniedNoSend = 0;
+            int terminal = 0, released = 0, unsent = 0, restarts = 0;
+            for (int seed = 1; seed <= 128; seed++) {
+                string root = Path.Combine(Path.GetTempPath(),
+                    "project-effect-dotnet-" + seed + "-" + Guid.NewGuid());
+                try {
+                    var provider = new DurableProvider(root);
+                    var s = Do(Do(new(), Claim("claim-" + seed), Outcome.Claimed),
+                        Start("start-" + seed), Outcome.Started);
+                    var negative = new Command("NoSend", "no-send-" + seed, Proof:
+                        new("VerifiedNoSend", "VerifiedNoProviderSession", "effect-a", ""));
+                    var release = Release("release-" + seed);
+                    if (seed % 2 == 1) {
+                        Assert(provider.Send(s) == "Unknown", "lost ACK " + seed);
+                        sent++; unknown++;
+                        provider = provider.Restart(); restarts++;
+                        Assert(provider.AcceptedCount == 1, "restart receipt " + seed);
+                        Assert(s.Sends == 0, "project ACK not persisted " + seed);
+                        Assert(provider.Send(s) == "AlreadySubmitted", "retry " + seed);
+                        retries++;
+                        Assert(Move(s, negative, provider: provider).Item2 == Outcome.UntrustedProof,
+                            "deny false no-session " + seed);
+                        deniedNoSend++;
+                        Assert(Move(s, release, provider: provider).Item2 == Outcome.NotTerminal,
+                            "retain reservation on Unknown " + seed);
+                        Assert(Move(s, Terminal("terminal-" + seed), provider: provider).Item2
+                            == Outcome.UntrustedProof, "nonterminal receipt " + seed);
+                        provider.MarkTerminal();
+                        s = Do(s, Terminal("terminal-" + seed), Outcome.VerifiedTerminal, provider);
+                        terminal++;
+                        Assert(Move(s, Terminal("terminal-" + seed,
+                            ValidTerminal with { Session = "forged" }), provider: provider).Item2
+                            == Outcome.OperationIdReused, "forged replay " + seed);
+                    } else {
+                        provider = provider.Restart(); restarts++;
+                        s = Do(s, negative, Outcome.VerifiedNoSend, provider);
+                        unsent++;
+                    }
+                    s = Do(s, release, Outcome.Released, provider);
+                    released++;
+                    Assert(s.Releases == 1 && !s.ReservationActive, "release once " + seed);
+                    Assert(Move(s, Release("retry-" + seed, 2), provider: provider).Item2
+                        == Outcome.AlreadyReleased, "double release " + seed);
+                    uint random = (uint)seed * 2654435761u;
+                    for (int i = 0; i < 48; i++) {
+                        var cmd = Next(ref random) % 3 == 0
+                            ? Start("noise-" + seed + "-" + i)
+                            : Next(ref random) % 2 == 0
+                                ? Release("noise-" + seed + "-" + i, 2)
+                                : new Command("Observe");
+                        (s, _) = Move(s, cmd, provider: provider);
+                        Invariants(s, provider);
+                    }
+                } finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+            }
+            Assert(sent > 0 && unknown > 0 && retries > 0 && deniedNoSend > 0 &&
+                terminal > 0 && released > 0 && unsent > 0 && restarts > 0,
+                "seeded post-send mandatory coverage");
+            Console.WriteLine($"EFFECT_COVERAGE sent={sent} unknown={unknown} retries={retries} deniedNoSend={deniedNoSend} terminal={terminal} release={released} noSend={unsent} restart={restarts}");
         });
         Console.WriteLine($"PASS {tests}/{tests} independent .NET11 Release model checks");
     }

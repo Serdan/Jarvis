@@ -495,7 +495,10 @@ module ClientConfig =
                                       AfterEffective = afterEffective
                                       Source = caller
                                       Overrides = afterEffective.Overrides
-                                      AppliedNow = caller <> LocalCli && currentRuntime = afterEffective
+                                      // This transaction only saves and reads back configuration.
+                                      // Even when the effective values equal the current runtime
+                                      // (for example through a CLI override), no live effect ran.
+                                      AppliedNow = false
                                       RestartRequired = restartRequired
                                       ReconnectRequired = false // Connected-loop registry refresh needs no hub reconnect.
                                       RegistryRefreshPending = currentRuntime.MachineName <> afterEffective.MachineName

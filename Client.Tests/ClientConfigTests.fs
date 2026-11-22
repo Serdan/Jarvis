@@ -958,3 +958,33 @@ let nativeHealthPersistedSwitchAndTimeoutDriveServerClockThresholdActions () =
             Assert.That(recovered, Is.EqualTo(expected))
     finally
         Directory.Delete(sandbox, true)
+
+[<Test>]
+let persistedOnlySettingsTransactionNeverClaimsLiveApplyUnderCliOverride () =
+    let sandbox = Path.Combine(Path.GetTempPath(), "w24-applied-now-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(sandbox) |> ignore
+    let path = Path.Combine(sandbox, "config.json")
+    let cliArgs = ["--machine-name"; "CLI-override"]
+    try
+        let initial = ClientConfig.applyAt path None "machine-name" (Some "Stored-before") |> Result.defaultWith failwith
+        let actualRuntime = ClientConfig.resolve initial.Stored cliArgs |> Result.defaultWith failwith
+        let after =
+            ClientConfig.applySettingsAt path RemoteAgent actualRuntime cliArgs (Some initial.Revision)
+                (Set("machine-name", "Stored-after"))
+            |> Result.defaultWith (ClientConfig.settingsErrorMessage >> failwith)
+        Assert.That(after.After.Stored.MachineName, Is.EqualTo(Some "Stored-after"))
+        Assert.That(after.AfterEffective.MachineName, Is.EqualTo("CLI-override"))
+        Assert.That(after.CurrentRuntime.MachineName, Is.EqualTo("CLI-override"))
+        Assert.That(after.Overrides.Contains("machineName"), Is.True)
+        Assert.That(after.RegistryRefreshPending, Is.False)
+        Assert.That(after.RestartRequired, Is.False)
+        Assert.That(after.AppliedNow, Is.False, "Persisted-only remote update must not claim a live effect while CLI override masks it")
+        let noOverrideRuntime = ClientConfig.resolve after.After.Stored [] |> Result.defaultWith failwith
+        let local =
+            ClientConfig.applySettingsAt path LocalTuiUnconfirmed noOverrideRuntime [] (Some after.After.Revision)
+                (Set("machine-name", "Deferred-registration"))
+            |> Result.defaultWith (ClientConfig.settingsErrorMessage >> failwith)
+        Assert.That(local.RegistryRefreshPending, Is.True)
+        Assert.That(local.AppliedNow, Is.False, "Pending registration is not an applied runtime mutation")
+    finally
+        Directory.Delete(sandbox, true)

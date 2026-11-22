@@ -1,0 +1,11 @@
+sourceBase=dcac884fc061869572b12a03befc12f11c009f2f
+Phase1 accepted=34facab5db97b2f238d2415c8f7ae6b59866b754 ancestor=yes
+Phase2 accepted=3ea482c5fedd95b3a88817f0b8a432e93955fd34 ancestor=yes
+Roster accepted=bfa9cbe94a1e4a10aa18c3f78add6d3fec54a859 ancestor=yes
+SDK=11.0.100
+NODE own=job f7f981fb54ad4d448f3d59dae2eecd1e exit0 11/11
+NODE regression=job 7a439fbd2a0e4c3f932beb698b2d17af exit0 76/76
+DOTNET broad=job c151806e04be4662b8de830dab1412d9 exit1 28/29 (host-loop line318)
+DOTNET narrow=job 3377b112b7dd4f6486d5e225e73f3657 exit0 17/17
+
+No production or live scheduler effects.

@@ -299,24 +299,47 @@ type WorkQueueSchedulerHostLoopTests() =
             let clock = ControlledClock()
             let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let reported = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let wakeCalls = [| 0 |]
+            let reportCalls = [| 0 |]
             use host =
                 new WorkQueueSchedulerHostLoop.Host(
                     ports clock heads
                         (fun _ ->
+                            Interlocked.Increment(&wakeCalls[0]) |> ignore
                             entered.TrySetResult(()) |> ignore
                             release.Task.GetAwaiter().GetResult()
                             WorkWakeResult.Dormant)
-                        ignore, enabled = true)
+                        (fun _ ->
+                            Interlocked.Increment(&reportCalls[0]) |> ignore
+                            reported.TrySetResult(()) |> ignore), enabled = true)
             let manuallyRunning =
                 Task.Run(Func<SchedulerHostOutcome>(fun () ->
                     host.RunOnce [WorkWakeTrigger.ManualReconcile]))
-            do! entered.Task.WaitAsync(TimeSpan.FromSeconds 5.0)
-            let stopped = host.StopAsync()
-            Assert.That(stopped.IsCompleted, Is.False)
-            release.TrySetResult(()) |> ignore
-            do! stopped.WaitAsync(TimeSpan.FromSeconds 5.0)
-            Assert.That(manuallyRunning.IsCompletedSuccessfully, Is.True)
-            Assert.That(host.IsRunning, Is.False)
+            try
+                do! entered.Task.WaitAsync(TimeSpan.FromSeconds 5.0)
+                let stopped = host.StopAsync()
+                try
+                    // Stop owns the in-flight Wake/Report, not the caller's Task.Run wrapper.
+                    Assert.That(stopped.IsCompleted, Is.False)
+                finally
+                    release.TrySetResult(()) |> ignore
+                do! stopped.WaitAsync(TimeSpan.FromSeconds 5.0)
+                Assert.That(reported.Task.IsCompletedSuccessfully, Is.True)
+                Assert.That(Volatile.Read(&wakeCalls[0]), Is.EqualTo(1))
+                Assert.That(Volatile.Read(&reportCalls[0]), Is.EqualTo(1))
+                Assert.That(host.IsRunning, Is.False)
+                Assert.That(host.Notify WorkWakeTrigger.ManualReconcile, Is.False)
+                Assert.That(host.RunOnce [WorkWakeTrigger.WorkCreated],
+                            Is.EqualTo(SchedulerHostOutcome.Stopped))
+                Assert.That(Volatile.Read(&wakeCalls[0]), Is.EqualTo(1))
+                Assert.That(Volatile.Read(&reportCalls[0]), Is.EqualTo(1))
+                // The external wrapper may finish after Stop; await it separately.
+                let! outcome = manuallyRunning.WaitAsync(TimeSpan.FromSeconds 5.0)
+                Assert.That(outcome,
+                            Is.EqualTo(SchedulerHostOutcome.Reconciled WorkWakeResult.Dormant))
+            finally
+                release.TrySetResult(()) |> ignore
         } :> Task
 
     [<Test>]

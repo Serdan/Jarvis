@@ -1,0 +1,1 @@
+Test/docs only, exact StageB Accepted 74fcda39 decision10938. RED job 04aac6a83e434a5eb27ae138874b5a5e: intentional UnsafeLateProviderAccept native exit1, outer Node6/6. GREEN job ff54b94063844d3d97f97c1286f4682f: native .NET11 Release24/24, Node6/6. Eight seeded three-clone traces, no production/B2/provider effects.

@@ -320,14 +320,15 @@ open Microsoft.AspNetCore.SignalR.Client
 open Microsoft.Extensions.DependencyInjection
 
 type SettingsRegistrationProbe() =
-    let observed = System.Collections.Concurrent.ConcurrentQueue<string>()
-    member _.Record(name: string) = observed.Enqueue(name)
-    member _.Names = observed.ToArray()
+    let observed = System.Collections.Concurrent.ConcurrentQueue<string * string>()
+    member _.Record(deviceId: string, name: string) = observed.Enqueue((deviceId, name))
+    member _.Names = observed.ToArray() |> Array.map snd
+    member _.DeviceIds = observed.ToArray() |> Array.map fst
 
 type SettingsRegistrationHub(probe: SettingsRegistrationProbe) =
     inherit Hub()
     member _.Connect(registration: Common.SignalR.ClientRegistration) =
-        probe.Record(registration.DeviceName)
+        probe.Record(registration.DeviceId, registration.DeviceName)
         System.Threading.Tasks.Task.FromResult<Common.SignalR.ClientRegistrationResult>(
             { Generation = 1L
               RegisteredAt = DateTimeOffset.UtcNow
@@ -360,10 +361,26 @@ let configuredMachineNameReRegistersThroughRealDisposableSignalRHub () = task {
         Assert.That(initialRegistration, Is.True)
         let second = ClientConfig.applyAt file (Some first.Revision) "machine-name" (Some "W24-Second")
                      |> Result.defaultWith failwith
-        let! subsequentRegistration = Program.register tui connection "disposable-device-w24" loadMachineName
+        let! subsequentRegistration, name, changed =
+            Program.refreshRegisteredMachineName tui connection "disposable-device-w24" loadMachineName "W24-First"
         Assert.That(subsequentRegistration, Is.True)
+        Assert.That(changed, Is.True, "Real connected-loop refresh must register name changes")
+        Assert.That(name, Is.EqualTo("W24-Second"))
         let probe = server.Services.GetRequiredService<SettingsRegistrationProbe>()
         probe.Names |> shouldEqual [| "W24-First"; "W24-Second" |]
+        let! identical, sameName, duplicate =
+            Program.refreshRegisteredMachineName tui connection "disposable-device-w24" loadMachineName name
+        Assert.That(identical, Is.True)
+        Assert.That(sameName, Is.EqualTo(name))
+        Assert.That(duplicate, Is.False, "Unchanged name must not cause periodic duplicate Connect calls")
+        probe.Names |> shouldEqual [| "W24-First"; "W24-Second" |]
+        do! connection.StopAsync()
+        do! connection.StartAsync()
+        let! reconnected = Program.register tui connection "disposable-device-w24" loadMachineName
+        Assert.That(reconnected, Is.True)
+        probe.Names |> shouldEqual [| "W24-First"; "W24-Second"; "W24-Second" |]
+        Assert.That(probe.DeviceIds, Is.All.EqualTo("disposable-device-w24"),
+            "Refresh and reconnect must retain the same device identity")
         let cliOverride = ClientConfig.resolve second.Stored ["--machine-name"; "W24-CLI"]
                           |> Result.defaultWith failwith
         Assert.That(cliOverride.MachineName, Is.EqualTo("W24-CLI"))
@@ -572,7 +589,7 @@ let actualOfflineTuiKeyboardAllEightFieldsSaveThenRestoreDefaults () =
         let resetKeys =
             ["g"]
             @ ([0..7] |> List.collect (fun index -> (if index = 0 then [] else ["\u001b[B"]) @ ["u"]))
-            @ ["s"]
+            @ ["s"; "y"] // Restore default partial from explicit no-trust requires local approval.
         let _, reopened = driveOfflineSettingsTui sandbox resetKeys
         Assert.That(reopened.Contains("Settings"), Is.True)
         (ClientConfig.loadAt path |> Result.defaultWith failwith).Stored |> shouldEqual ClientConfig.empty
@@ -646,5 +663,298 @@ let persistedSettingsReachRealRuntimePermissionImportEnvironmentHealthAndBrowser
         let response = http.GetAsync($"http://127.0.0.1:{port}/").GetAwaiter().GetResult()
         Assert.That(response.StatusCode, Is.EqualTo(System.Net.HttpStatusCode.Forbidden),
             "Actual loopback browser listener must reject unauthenticated HTTP, not merely expose a port number")
+    finally
+        Directory.Delete(sandbox, true)
+
+[<Test>]
+let typedSettingsBoundaryRejectsRemoteAndUnconfirmedPrivilegeElevation () =
+    let sandbox = Path.Combine(Path.GetTempPath(), "w24-typed-trust-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(sandbox) |> ignore
+    let path = Path.Combine(sandbox, "config.json")
+    try
+        let before = ClientConfig.applyAt path None "trust-level" (Some "none") |> Result.defaultWith failwith
+        let active = ClientConfig.resolve before.Stored [] |> Result.defaultWith failwith
+        for caller in [ RemoteAgent; LocalTuiUnconfirmed ] do
+            match ClientConfig.applySettingsAt path caller active [] (Some before.Revision) (Unset "trust-level") with
+            | Error SettingsConfirmationRequired -> ()
+            | value -> Assert.Fail(sprintf "none -> default partial must need local confirmation: %A" value)
+            Assert.That((ClientConfig.loadAt path |> Result.defaultWith failwith).Revision, Is.EqualTo(before.Revision))
+        match ClientConfig.applySettingsAt path RemoteAgent active [] None (Set("machine-name", "unversioned")) with
+        | Error (SettingsRevisionConflict _) -> ()
+        | value -> Assert.Fail(sprintf "Remote mutation must supply expected revision: %A" value)
+        let applied =
+            ClientConfig.applySettingsAt path LocalTuiConfirmed active [] (Some before.Revision) (Unset "trust-level")
+            |> Result.defaultWith (ClientConfig.settingsErrorMessage >> failwith)
+        Assert.That(applied.Before.Revision, Is.EqualTo(before.Revision))
+        Assert.That(applied.After.Stored.TrustLevel, Is.EqualTo(None))
+        Assert.That(applied.AfterEffective.TrustLevel, Is.EqualTo("partial"))
+        Assert.That(applied.CurrentRuntime.TrustLevel, Is.EqualTo("none"))
+        Assert.That(applied.RestartRequired, Is.True)
+        Assert.That(applied.AppliedNow, Is.False)
+        match ClientConfig.applySettingsAt path LocalCli active [] (Some before.Revision) (Set("machine-name", "stale")) with
+        | Error (SettingsRevisionConflict _) -> ()
+        | value -> Assert.Fail(sprintf "Stale CAS must fail: %A" value)
+        Assert.That((ClientConfig.loadAt path |> Result.defaultWith failwith).Revision, Is.EqualTo(applied.After.Revision))
+    finally
+        Directory.Delete(sandbox, true)
+
+[<Test>]
+let typedSettingsBoundaryReportsOverridesAndDeferredWorkspaceEffect () =
+    let sandbox = Path.Combine(Path.GetTempPath(), "w24-typed-runtime-" + Guid.NewGuid().ToString("N"))
+    let rootA = Path.Combine(sandbox, "rootA")
+    let rootB = Path.Combine(sandbox, "rootB")
+    Directory.CreateDirectory(rootA) |> ignore
+    Directory.CreateDirectory(rootB) |> ignore
+    let path = Path.Combine(sandbox, "config.json")
+    try
+        let initial = ClientConfig.applyAt path None "workspace-path" (Some rootA) |> Result.defaultWith failwith
+        let active = ClientConfig.resolve initial.Stored ["--machine-name"; "CLI-wins"] |> Result.defaultWith failwith
+        let modified =
+            ClientConfig.applySettingsAt path LocalTuiUnconfirmed active ["--machine-name"; "CLI-wins"]
+                (Some initial.Revision) (Set("workspace-path", rootB))
+            |> Result.defaultWith (ClientConfig.settingsErrorMessage >> failwith)
+        Assert.That(modified.After.Stored.WorkspacePath, Is.EqualTo(Some rootB))
+        Assert.That(modified.CurrentRuntime.WorkspacePath, Is.EqualTo(rootA))
+        Assert.That(modified.AfterEffective.WorkspacePath, Is.EqualTo(rootB))
+        Assert.That(modified.RestartRequired, Is.True)
+        Assert.That(modified.RegistryRefreshPending, Is.False)
+        let name =
+            ClientConfig.applySettingsAt path LocalTuiUnconfirmed active ["--machine-name"; "CLI-wins"]
+                (Some modified.After.Revision) (Set("machine-name", "Stored-name"))
+            |> Result.defaultWith (ClientConfig.settingsErrorMessage >> failwith)
+        Assert.That(name.After.Stored.MachineName, Is.EqualTo(Some "Stored-name"))
+        Assert.That(name.AfterEffective.MachineName, Is.EqualTo("CLI-wins"))
+        Assert.That(name.Overrides.Contains("machineName"), Is.True)
+        Assert.That(name.RegistryRefreshPending, Is.False, "Masked machine name cannot trigger re-registration")
+        Assert.That(name.RestartRequired, Is.True, "Pending workspace root still needs a restart")
+    finally
+        Directory.Delete(sandbox, true)
+
+[<Test>]
+let actualOfflineTuiNoneToUnsetRequiresConfirmationAndDeclinePreservesBytes () =
+    let sandbox = Path.Combine(Path.GetTempPath(), "w24-tui-trust-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(sandbox) |> ignore
+    let path = Path.Combine(sandbox, "xdg", "Jarvis", "config.json")
+    try
+        let original = ClientConfig.applyAt path None "trust-level" (Some "none") |> Result.defaultWith failwith
+        let _, declined = driveOfflineSettingsTui sandbox ["g"; "\u001b[B"; "\u001b[B"; "u"; "s"; "n"]
+        Assert.That(declined.Contains("default partial"), Is.True)
+        let unchanged = ClientConfig.loadAt path |> Result.defaultWith failwith
+        Assert.That(unchanged.Revision, Is.EqualTo(original.Revision), "Declining must leave persisted no-trust unchanged")
+        Assert.That(unchanged.Stored.TrustLevel, Is.EqualTo(Some "none"))
+        let _, accepted = driveOfflineSettingsTui sandbox ["g"; "\u001b[B"; "\u001b[B"; "u"; "s"; "y"]
+        Assert.That(accepted.Contains("Settings"), Is.True)
+        let updated = ClientConfig.loadAt path |> Result.defaultWith failwith
+        Assert.That(updated.Stored.TrustLevel, Is.EqualTo(None), "Only explicit local confirmation can restore partial default")
+        Assert.That((ClientConfig.resolve updated.Stored [] |> Result.defaultWith failwith).TrustLevel, Is.EqualTo("partial"))
+    finally
+        Directory.Delete(sandbox, true)
+
+[<Test>]
+let persistedAllowlistFiltersRealSpawnedChildEnvironment () =
+    if not (OperatingSystem.IsLinux()) || not (File.Exists("/usr/bin/env")) then
+        Assert.Ignore("Actual process environment test requires Linux /usr/bin/env")
+    let stored = { ClientConfig.empty with AllowedEnvironmentVariables = Some ["W24_TOKEN"] }
+    let allowed = (ClientConfig.resolve stored [] |> Result.defaultWith failwith).AllowedEnvironmentVariables
+    let psi = System.Diagnostics.ProcessStartInfo("/usr/bin/env")
+    psi.UseShellExecute <- false
+    psi.RedirectStandardOutput <- true
+    psi.Environment["W24_TOKEN"] <- "exposed-allowed-value"
+    psi.Environment["W24_PASSWORD"] <- "withheld-secret-value"
+    Client.ProcessEnvironment.applyWithAllowed allowed psi
+    use child = System.Diagnostics.Process.Start(psi)
+    let stdout = child.StandardOutput.ReadToEnd()
+    Assert.That(child.WaitForExit(3000), Is.True)
+    Assert.That(child.ExitCode, Is.Zero)
+    Assert.That(stdout.Contains("W24_TOKEN=exposed-allowed-value"), Is.True)
+    Assert.That(stdout.Contains("withheld-secret-value"), Is.False)
+
+[<Test>]
+let freshOfflineClientProcessDiscoversProjectsOnlyFromPersistedReplacementWorkspace () =
+    if not (OperatingSystem.IsLinux()) then Assert.Ignore("Linux disposable process fixture required")
+    let sandbox = Path.Combine(Path.GetTempPath(), "w24-fresh-projects-" + Guid.NewGuid().ToString("N").Substring(0, 8))
+    let rootA = Path.Combine(sandbox, "projects-A")
+    let rootB = Path.Combine(sandbox, "projects-B")
+    Directory.CreateDirectory(Path.Combine(rootA, "Only-A")) |> ignore
+    Directory.CreateDirectory(Path.Combine(rootB, "Only-B")) |> ignore
+    let xdg = Path.Combine(sandbox, "xdg")
+    let home = Path.Combine(sandbox, "home")
+    Directory.CreateDirectory(xdg) |> ignore
+    Directory.CreateDirectory(home) |> ignore
+    let path = Path.Combine(xdg, "Jarvis", "config.json")
+    let harness = Path.GetFullPath(Path.Combine(__SOURCE_DIRECTORY__, "SettingsHarness", "bin", "Release", "net11.0", "SettingsHarness.dll"))
+    let probe () =
+        let psi = System.Diagnostics.ProcessStartInfo("dotnet")
+        psi.ArgumentList.Add(harness)
+        psi.ArgumentList.Add("--project-probe")
+        psi.UseShellExecute <- false
+        psi.RedirectStandardOutput <- true
+        psi.RedirectStandardError <- true
+        psi.Environment["HOME"] <- home
+        psi.Environment["XDG_CONFIG_HOME"] <- xdg
+        psi.Environment["DOTNET_CLI_HOME"] <- home
+        psi.Environment["JARVIS_W24_ISOLATED_TUI"] <- "yes"
+        use child = System.Diagnostics.Process.Start(psi)
+        let stdout = child.StandardOutput.ReadToEnd()
+        let stderr = child.StandardError.ReadToEnd()
+        if not (child.WaitForExit(10000)) then child.Kill(true); Assert.Fail("Fresh project probe timed out")
+        Assert.That(child.ExitCode, Is.Zero, stderr)
+        stdout
+    try
+        Assert.That(File.Exists(harness), Is.True, "Source-exact Release harness required")
+        ClientConfig.applyAt path None "workspace-path" (Some rootA) |> Result.defaultWith failwith |> ignore
+        let first = probe()
+        Assert.That(first.Contains("ROOT " + rootA), Is.True)
+        Assert.That(first.Contains("PROJECT Only-A " + Path.Combine(rootA, "Only-A")), Is.True)
+        Assert.That(first.Contains("Only-B"), Is.False)
+        let _, _ = driveOfflineSettingsTui sandbox ["g"; "\u001b[B"; "u"; "\r"; rootB; "\r"; "s"]
+        let saved = ClientConfig.loadAt path |> Result.defaultWith failwith
+        Assert.That(saved.Stored.WorkspacePath, Is.EqualTo(Some rootB))
+        let second = probe()
+        Assert.That(second.Contains("ROOT " + rootB), Is.True)
+        Assert.That(second.Contains("PROJECT Only-B " + Path.Combine(rootB, "Only-B")), Is.True)
+        Assert.That(second.Contains("Only-A"), Is.False, "Fresh runtime must not reuse old workspace project discovery")
+    finally
+        Directory.Delete(sandbox, true)
+
+type private SettingsImportResponseHandler(body: byte[]) =
+    inherit System.Net.Http.HttpMessageHandler()
+    override _.SendAsync(_, _) =
+        let response = new System.Net.Http.HttpResponseMessage(System.Net.HttpStatusCode.OK)
+        response.Content <- new System.Net.Http.ByteArrayContent(body)
+        System.Threading.Tasks.Task.FromResult(response)
+
+[<Test>]
+let savedTrustAndImportLimitDriveActualPermissionAndBoundedDownload () =
+    let sandbox = Path.Combine(Path.GetTempPath(), "w24-consumer-import-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(sandbox) |> ignore
+    let path = Path.Combine(sandbox, "config.json")
+    let command =
+        Common.ImportFileCommand
+            { ProjectName = "Fixture"
+              FilePath = "import.txt"
+              DownloadUrl = "https://files.oaiusercontent.com/document"
+              FileId = "test"
+              FileName = None
+              MimeType = None
+              Overwrite = false
+              CreateParents = false
+              MaxBytes = None }
+    let download (effective: ClientEffectiveConfig) file =
+        use handler = new SettingsImportResponseHandler(System.Text.Encoding.UTF8.GetBytes("0123456789"))
+        use http = new System.Net.Http.HttpClient(handler)
+        Client.ImportNetwork.downloadTo http Client.ImportNetwork.ProviderOriginsOnly
+            "https://files.oaiusercontent.com/document" file effective.MaxImportBytes System.Threading.CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+    try
+        let none = ClientConfig.applyAt path None "trust-level" (Some "none") |> Result.defaultWith failwith
+        let limited = ClientConfig.applyAt path (Some none.Revision) "max-import-bytes" (Some "5") |> Result.defaultWith failwith
+        let effective = ClientConfig.resolve limited.Stored [] |> Result.defaultWith failwith
+        let trust = Client.TrustLevel.parse effective.TrustLevel |> Result.defaultWith failwith
+        Client.PermissionPolicy.clearGrants()
+        Assert.That(Client.PermissionPolicy.evaluateWithTrust trust command |> Result.isError, Is.True,
+            "Persisted no-trust must require local permission for import")
+        let tooLarge = Path.Combine(sandbox, "blocked.stage")
+        Assert.That(download effective tooLarge |> Result.isError, Is.True)
+        Assert.That(File.Exists tooLarge, Is.False, "Over-budget import must not leave a stage")
+        let enlarged = ClientConfig.applyAt path (Some limited.Revision) "max-import-bytes" (Some "10") |> Result.defaultWith failwith
+        let partial = ClientConfig.applyAt path (Some enlarged.Revision) "trust-level" (Some "partial") |> Result.defaultWith failwith
+        let allowed = ClientConfig.resolve partial.Stored [] |> Result.defaultWith failwith
+        let trust = Client.TrustLevel.parse allowed.TrustLevel |> Result.defaultWith failwith
+        Assert.That(Client.PermissionPolicy.evaluateWithTrust trust command |> Result.isOk, Is.True,
+            "Trusted provider import under persisted partial trust must be permitted")
+        let stage = Path.Combine(sandbox, "accepted.stage")
+        match download allowed stage with
+        | Ok receipt -> Assert.That(receipt.BytesWritten, Is.EqualTo(10L))
+        | Error error -> Assert.Fail(sprintf "Under-limit import rejected: %A" error)
+        Assert.That(File.ReadAllText(stage), Is.EqualTo("0123456789"))
+    finally
+        Client.PermissionPolicy.clearGrants()
+        Directory.Delete(sandbox, true)
+
+[<Test>]
+let browserConfigDisableAndPortChangeControlsRealLoopbackListener () =
+    let sandbox = Path.Combine(Path.GetTempPath(), "w24-browser-port-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(sandbox) |> ignore
+    let path = Path.Combine(sandbox, "config.json")
+    let freshPort () =
+        use listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0)
+        listener.Start()
+        (listener.LocalEndpoint :?> System.Net.IPEndPoint).Port
+    let portA = freshPort()
+    use http = new System.Net.Http.HttpClient()
+    http.Timeout <- TimeSpan.FromSeconds 2.
+    let probe port =
+        http.GetAsync(sprintf "http://127.0.0.1:%d/" port).GetAwaiter().GetResult().StatusCode
+    try
+        let portB = let rec other () = let p = freshPort() in if p = portA then other () else p in other ()
+        let enabled = ClientConfig.applyAt path None "browser-port" (Some (string portA)) |> Result.defaultWith failwith
+        let configA = ClientConfig.resolve enabled.Stored [] |> Result.defaultWith failwith
+        let bridgeA = new Client.BrowserBridge.Service(configA.BrowserPort.Value, "w24-test-secret")
+        bridgeA.Start()
+        Assert.That(probe portA, Is.EqualTo(System.Net.HttpStatusCode.Forbidden))
+        (bridgeA :> IDisposable).Dispose()
+        let disabled = ClientConfig.applyAt path (Some enabled.Revision) "browser-port" None |> Result.defaultWith failwith
+        Assert.That((ClientConfig.resolve disabled.Stored [] |> Result.defaultWith failwith).BrowserPort, Is.EqualTo(None))
+        let rebound = ClientConfig.applyAt path (Some disabled.Revision) "browser-port" (Some (string portB)) |> Result.defaultWith failwith
+        let configB = ClientConfig.resolve rebound.Stored [] |> Result.defaultWith failwith
+        use bridgeB = new Client.BrowserBridge.Service(configB.BrowserPort.Value, "w24-test-secret")
+        bridgeB.Start()
+        Assert.That(probe portB, Is.EqualTo(System.Net.HttpStatusCode.Forbidden))
+        Assert.Throws<System.Net.Http.HttpRequestException>(fun () -> probe portA |> ignore) |> ignore
+    finally
+        Directory.Delete(sandbox, true)
+
+[<Test>]
+let nativeHealthPersistedSwitchAndTimeoutDriveServerClockThresholdActions () =
+    let sandbox = Path.Combine(Path.GetTempPath(), "w24-health-clock-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(sandbox) |> ignore
+    let path = Path.Combine(sandbox, "config.json")
+    let candidate: Client.NativeHealth.Candidate =
+        { ProjectName = "Fixture"
+          ProjectId = Guid.Parse("11111111-1111-1111-1111-111111111111")
+          LedgerId = Guid.Parse("22222222-2222-2222-2222-222222222222")
+          Epoch = 1
+          ApprovedFetchUrl = "test://ledger"
+          ApprovedPushUrl = "test://ledger"
+          GitHead = "source"
+          AgentId = "Worker Test"
+          AgentVersion = 1
+          TaskId = "test-health"
+          TaskVersion = 1
+          AttemptId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          AttemptVersion = 1
+          Generation = 1
+          SpecBlobOid = "blob"
+          SourceRef = "refs/heads/test" }
+    let serverNow = DateTimeOffset(2026, 11, 22, 12, 0, 0, TimeSpan.Zero)
+    let run settings age =
+        let mutable enumCalls, recoveries = 0, 0
+        let activity: Common.SignalR.AgentActivitySnapshot =
+            { ServerNowUtc = serverNow
+              LastSeenAtUtc = Some(serverNow.AddSeconds(-float age)) }
+        let deps: Client.NativeHealth.Dependencies =
+            { Enumerate = (fun () -> enumCalls <- enumCalls + 1; Ok [candidate])
+              Current = (fun _ -> Ok(Some candidate))
+              Activity = (fun _ _ -> System.Threading.Tasks.Task.FromResult(Ok activity))
+              Recover = (fun _ _ -> recoveries <- recoveries + 1; Ok ()) }
+        let result = Client.NativeHealth.NativeHealth.checkOnce settings deps
+                     |> fun task -> task.GetAwaiter().GetResult()
+        result, enumCalls, recoveries
+    try
+        let off = Client.NativeHealth.NativeHealth.settingsFromStored ClientConfig.empty
+        let disabled, enumerated, recovered = run off 9999
+        Assert.That(off.Enabled, Is.False, "Default remains opt-out")
+        Assert.That(disabled.Recoveries, Is.Zero)
+        Assert.That(enumerated, Is.Zero)
+        Assert.That(recovered, Is.Zero)
+        let enabled = ClientConfig.applyAt path None "native-health-enabled" (Some "true") |> Result.defaultWith failwith
+        let timed = ClientConfig.applyAt path (Some enabled.Revision) "native-health-timeout-seconds" (Some "600") |> Result.defaultWith failwith
+        let settings = Client.NativeHealth.NativeHealth.settingsFromStored timed.Stored
+        for age, expected in [599, 0; 600, 1; 601, 1] do
+            let result, enumerated, recovered = run settings age
+            Assert.That(enumerated, Is.EqualTo(1))
+            Assert.That(result.Recoveries, Is.EqualTo(expected), sprintf "Server-clock age=%d" age)
+            Assert.That(recovered, Is.EqualTo(expected))
     finally
         Directory.Delete(sandbox, true)

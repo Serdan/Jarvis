@@ -44,3 +44,37 @@ TUI shows a per-field `[unsaved]` marker and separately labels startup effective
 Independent RED-first proof of the operator-observed already-connected machine-name no-effect and complete live-client loop behavior (no live operator device was touched). TUI mouse path, actual import under/over-limit action, process spawn, BrowserBridge disable, Native Health fake-clock SUT checks, XDG/HOME variations and negative power-loss/permissions are still beyond the focused source-bound matrix. Source-bound full unfiltered Client Release TRX with honest existing unrelated fanout RED, a negative mutant, exact frozen source commit, independent review, and accepted-only integration under separate Operator GO are still separate gates.
 
 Do not interpret any checkpoint or partial suite as global P0 acceptance.
+
+## Adjudicated narrow correction (after immutable Review 2c5ba92 / seq11280)
+
+The source review on `55fdbcb93681abaa07d94cc62da2d2fef6ce59b3` was **ChangesRequested**, with Adjudicator 3 independently disposing findings F1–F4 as **NARROW**, not acceptance. Previous matrix and “still required” entries above describe the initial frozen revision and must not be mistaken for the current correction's final status.
+
+### Correction ownership and typed service
+
+Worker 24 owns only `Client/Modules/ClientConfig.fs`, `Client/Modules/ConsoleTui.fs`, `Client/Program.fs`, local settings tests, offline harness and this evidence. Worker 25 exclusively owns protocol/SignalR dispatch/server MCP tool wiring. No shared `*.fsproj` edit, live WSL mutation or main integration occurred.
+
+`ClientConfig.applySettingsAt path caller currentRuntime startupArgs expectedRevision mutation` has:
+- `SettingsMutation = Replace(stored) | Set(canonicalKey,value) | Unset(canonicalKey)`.
+- `SettingsCaller = LocalTuiUnconfirmed | LocalTuiConfirmed | LocalCli | RemoteAgent`; actual adapters fix provenance, and remote wire cannot select local approval.
+- Typed validation/confirmation/revision/storage failures; remote requires a concrete expected revision and denies trust or env allowlist increases. Especially, **`Some "none" -> None` elevates to default partial and requires explicit local TUI confirmation**. CLI `config set/unset` is an explicitly invoked local command, not a remote approval path.
+- Snapshot `Before` and verified readback `After`, `CurrentRuntime`, `BeforeEffective`, `AfterEffective`, `Overrides`, `AppliedNow`, `RestartRequired`, `ReconnectRequired`, `RegistryRefreshPending`, `NativeHealthRefreshPending`. The existing locked CAS, 0600 temp/atomic replacement/fsync and readback remain the sole writer; no second implementation.
+- `ClientConfig.installRunningContext` is only called from actual locally parsed `Program.runClient`; `tryRunningContext` exposes its startup runtime and flags for the **selected** client tool adapter; `recordRegisteredMachineName` tracks successful connected-loop registration. A running client's settings that require restart are not represented as immediately applied. Native Health's configured changes are evaluated at its next check.
+
+The TUI saves via this same service and shows a separate local confirmation screen, while CLI `config set/unset` uses it with `LocalCli`; Worker 25's selected-device path must use `RemoteAgent` and fail closed if a real startup context is unavailable. `applyRemote` remains a low-level compatibility seam, not the shared result contract.
+
+### Bounded fresh behavior evidence (no invented historical RED)
+
+The operator's historical two failures were not directly reproducible on the live machine, and **no historical RED has been fabricated**. The only original source RED was the adjacent nonexistent workspace acceptance described above. New tests exercise the **production code paths** in disposable sandboxes:
+- Real PTY TUI editing/saving workspace root B after A, then a *fresh executable process* loading persisted configuration, constructing the actual `Runtime` and executing `ProjectBrowser.listProjects`. The expected B-only project path is observed and the A-only project disappears. This is offline startup/project access, **not** a live logged-in remote client.
+- Production connected-loop `Program.refreshRegisteredMachineName` against an actual disposable SignalR registration hub: A→B name updates on same device ID; unchanged B does not produce duplicate Connect calls; reconnect re-registers B. Startup CLI machine-name override masks persisted changes.
+- TUI PTY explicit no-trust→unset negative decline retains identical JSON revision, positive Y persists default partial; typed remote no-elevation and missing/stale revision negatives.
+- Eight setting consumers verified through representative actual actions: permission evaluator no-trust/partial known provider decision; real spawned child filtered environment; bounded HTTP fake-response download too-large rejection/no stage and exact-under-limit success; real loopback listener disable/port rebind/HTTP 403; Native Health fake authenticated server clock default-off and 599/600/601-second recoveries. The full combination matrix, actual live extensions, and arbitrary power-loss cannot be inferred.
+- `ClientConfig` typed transaction checks readback, current effective runtime versus persisted effective settings, startup overrides, restart/reconnect/registry/Health status; actual full service integration with Worker 25 remains a **separate** gate.
+
+### Test ledger and acceptance boundary
+
+Focused corrective Release test run prior to adding a small running-context observation accessor: `/tmp/w24-settings-focused/w24-settings-focused-v3.trx` **31 pass / 0 fail / 0 skip**. Two preceding PTY fixture failures were test input errors (reset to default partial needed Y; editing nonempty workspace required U before typing B), explicitly corrected. This is not the final source-exact acceptance receipt; re-run after final source and pin new commit.
+
+Required final gates: compile final source, fresh source-exact .NET 11 Release focused and full unfiltered Client TRX, preserve exact CAS/negative control, create immutable candidate SHA and request **new independent review**. Until the new review is Accepted, the original CR source and this candidate are excluded from accepted-only composition. Worker25's separate selected-device server/tool acceptance is likewise held.
+
+Final corrective focus on the complete W24 candidate after the running-context accessor: `/tmp/w24-settings-final/w24-settings-final-focused.trx`: **31 PASS / 0 FAIL / 0 SKIP**, .NET 11 Release, job `d94ed4d173e44cba82403e91f53f343d` terminal exit 0. This supersedes the 31/31 pre-accessor receipt above. The full unfiltered Release Client run is a separate running job `cd5327f6ed95489c981d0a5e4d01f94e` writing `/tmp/w24-client-full-final/w24-client-full-unfiltered.trx`; its result must not be assumed from this focused pass.

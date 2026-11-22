@@ -33,7 +33,51 @@ type ClientEffectiveConfig =
       NativeHealthTimeoutSeconds: int
       Overrides: Set<string> }
 
+// The caller is fixed by the local entrypoint; it is not deserialized from agent wire.
+type SettingsCaller = LocalTuiUnconfirmed | LocalTuiConfirmed | LocalCli | RemoteAgent
+type SettingsMutation = Replace of ClientStoredConfig | Set of string * string | Unset of string
+type SettingsApplyError =
+    | SettingsValidationError of string
+    | SettingsRevisionConflict of string
+    | SettingsConfirmationRequired
+    | SettingsStorageError of string
+type SettingsApplyResult =
+    { Before: ClientConfigSnapshot
+      After: ClientConfigSnapshot
+      CurrentRuntime: ClientEffectiveConfig
+      BeforeEffective: ClientEffectiveConfig
+      AfterEffective: ClientEffectiveConfig
+      Source: SettingsCaller
+      Overrides: Set<string>
+      AppliedNow: bool
+      RestartRequired: bool
+      ReconnectRequired: bool
+      RegistryRefreshPending: bool
+      NativeHealthRefreshPending: bool }
+
 module ClientConfig =
+    // One client process has one active startup context. It must come from
+    // Program.runClient after local CLI parsing; remote commands may only read
+    // this context, not forge overrides or pretend persisted settings are live.
+    let private runningContextLock = obj()
+    let mutable private runningContext: (ClientEffectiveConfig * string list) option = None
+
+    let installRunningContext (runtime: ClientEffectiveConfig) (startupArgs: string list) =
+        lock runningContextLock (fun () ->
+            runningContext <- Some(runtime, startupArgs))
+
+    let tryRunningContext () =
+        lock runningContextLock (fun () -> runningContext)
+
+    // The connected registration loop is the only writer of this actual
+    // registry observation. On failure, the previous name remains current.
+    let recordRegisteredMachineName name =
+        lock runningContextLock (fun () ->
+            runningContext <-
+                runningContext
+                |> Option.map (fun (effective, args) ->
+                    ({ effective with MachineName = name }, args)))
+
     let empty =
         { MachineName = None
           WorkspacePath = None
@@ -382,3 +426,81 @@ module ClientConfig =
                     else
                         applyAt path (Some before.Revision) key value))
     let applyRemote key value expectedRevision = applyRemoteAt (configPath()) expectedRevision key value
+
+    let settingsErrorMessage = function
+        | SettingsValidationError message
+        | SettingsRevisionConflict message
+        | SettingsStorageError message -> message
+        | SettingsConfirmationRequired ->
+            "Local operator confirmation required for a trust increase or environment allowlist expansion."
+
+    let private storedTrustRank = function
+        | Some "none" -> 0
+        | Some "full" -> 2
+        | _ -> 1 // Unset explicitly resolves to the default partial trust.
+
+    let settingsNeedsConfirmation (before: ClientStoredConfig) (after: ClientStoredConfig) =
+        let increasedTrust = storedTrustRank after.TrustLevel > storedTrustRank before.TrustLevel
+        let oldVariables = before.AllowedEnvironmentVariables |> Option.defaultValue []
+        let newVariables = after.AllowedEnvironmentVariables |> Option.defaultValue []
+        increasedTrust || (newVariables |> List.exists (fun name -> not (List.contains name oldVariables)))
+
+    // Shared application boundary: existing locked CAS + atomic save + readback.
+    // Runtime is observed, never silently mutated or claimed to have restarted.
+    let applySettingsAt path caller (currentRuntime: ClientEffectiveConfig)
+                        (startupArgs: string list) (expectedRevision: string option)
+                        mutation : Result<SettingsApplyResult, SettingsApplyError> =
+        loadAt path
+        |> Result.mapError SettingsStorageError
+        |> Result.bind (fun before ->
+            if caller = RemoteAgent && expectedRevision.IsNone then
+                Error(SettingsRevisionConflict "Remote setting updates require an expected config revision.")
+            elif expectedRevision |> Option.exists ((<>) before.Revision) then
+                Error(SettingsRevisionConflict "Config revision conflict. Reload before saving.")
+            else
+                let candidate =
+                    match mutation with
+                    | Replace stored -> validateForSave stored
+                    | Set(key, value) -> updateKey key value before.Stored |> Result.bind validateForSave
+                    | Unset key -> unsetKey key before.Stored |> Result.bind validateForSave
+                candidate
+                |> Result.mapError SettingsValidationError
+                |> Result.bind (fun next ->
+                    if settingsNeedsConfirmation before.Stored next
+                       && (caller = RemoteAgent || caller = LocalTuiUnconfirmed) then
+                        Error SettingsConfirmationRequired
+                    else
+                        resolve before.Stored startupArgs
+                        |> Result.mapError SettingsValidationError
+                        |> Result.bind (fun beforeEffective ->
+                            resolve next startupArgs
+                            |> Result.mapError SettingsValidationError
+                            |> Result.bind (fun afterEffective ->
+                                save before next
+                                |> Result.mapError (fun message ->
+                                    if message.Contains("changed by another process") then
+                                        SettingsRevisionConflict message
+                                    else SettingsStorageError message)
+                                |> Result.map (fun after ->
+                                    let restartRequired =
+                                        currentRuntime.WorkspacePath <> afterEffective.WorkspacePath
+                                        || currentRuntime.TrustLevel <> afterEffective.TrustLevel
+                                        || currentRuntime.AllowedEnvironmentVariables <> afterEffective.AllowedEnvironmentVariables
+                                        || currentRuntime.MaxImportBytes <> afterEffective.MaxImportBytes
+                                        || currentRuntime.BrowserPort <> afterEffective.BrowserPort
+                                    { Before = before
+                                      After = after
+                                      CurrentRuntime = currentRuntime
+                                      BeforeEffective = beforeEffective
+                                      AfterEffective = afterEffective
+                                      Source = caller
+                                      Overrides = afterEffective.Overrides
+                                      AppliedNow = caller <> LocalCli && currentRuntime = afterEffective
+                                      RestartRequired = restartRequired
+                                      ReconnectRequired = false // Connected-loop registry refresh needs no hub reconnect.
+                                      RegistryRefreshPending = currentRuntime.MachineName <> afterEffective.MachineName
+                                      NativeHealthRefreshPending =
+                                          currentRuntime.NativeHealthEnabled <> afterEffective.NativeHealthEnabled
+                                          || currentRuntime.NativeHealthTimeoutSeconds <> afterEffective.NativeHealthTimeoutSeconds })))))
+    let applySettings caller runtime startupArgs expectedRevision mutation =
+        applySettingsAt (configPath()) caller runtime startupArgs expectedRevision mutation

@@ -56,17 +56,29 @@ let private runConfigCommand (args: string array) =
                 printfn "Native Health: %s" (if config.NativeHealthEnabled then "enabled" else "disabled")
                 printfn "Native Health inactivity: %d seconds" config.NativeHealthTimeoutSeconds
                 0
+        // An explicitly invoked local CLI command is local consent; remote
+        // protocol callers cannot select LocalCli or TUI-confirmed origin.
+        let applyLocal mutation =
+            ClientConfig.resolve snapshot.Stored []
+            |> Result.mapError SettingsValidationError
+            |> Result.bind (fun runtime ->
+                ClientConfig.applySettingsAt snapshot.Path LocalCli runtime [] (Some snapshot.Revision) mutation)
+        let printSaved action key (result: SettingsApplyResult) =
+            let restart = if result.RestartRequired then " Active clients require restart for changed runtime settings." else ""
+            let registry = if result.RegistryRefreshPending then " Connected devices must refresh their registry name." else ""
+            printfn "%s %s in %s (revision %s). Persisted; no running client was mutated.%s%s"
+                action key result.After.Path result.After.Revision restart registry
         match args |> Array.toList with
         | [ "config"; "path" ] -> printfn "%s" snapshot.Path; 0
         | [ "config"; "show" ] -> show ()
         | [ "config"; "set"; key; value ] ->
-            match ClientConfig.applyKey key value with
-            | Ok saved -> printfn "Saved %s to %s (revision %s)" key saved.Path saved.Revision; 0
-            | Error error -> eprintfn "%s" error; 2
+            match applyLocal (Set(key, value)) with
+            | Ok result -> printSaved "Saved" key result; 0
+            | Error error -> eprintfn "%s" (ClientConfig.settingsErrorMessage error); 2
         | [ "config"; "unset"; key ] ->
-            match ClientConfig.applyUnset key with
-            | Ok saved -> printfn "Unset %s in %s (revision %s)" key saved.Path saved.Revision; 0
-            | Error error -> eprintfn "%s" error; 2
+            match applyLocal (Unset key) with
+            | Ok result -> printSaved "Unset" key result; 0
+            | Error error -> eprintfn "%s" (ClientConfig.settingsErrorMessage error); 2
         | _ ->
             eprintfn "Usage: JarvisClient config path|show|set <key> <value>|unset <key>"
             2
@@ -97,6 +109,19 @@ let register (tui: ConsoleTui) (connection: HubConnection) deviceId (machineName
         | Error err ->
             tui.SetConnectionState(Connecting, BuildInfo.ServerUrl)
             return false
+    }
+
+// The connected-client loop and offline registry tests share this exact
+// refresh step. The registered device ID is stable; a failed update is retried
+// through the loop's ordinary not-registered branch.
+let refreshRegisteredMachineName (tui: ConsoleTui) (connection: HubConnection)
+                                 deviceId (machineName: unit -> string) registeredMachineName =
+    task {
+        let current = machineName()
+        if current = registeredMachineName then return true, registeredMachineName, false
+        else
+            let! success = register tui connection deviceId (fun () -> current)
+            return success, (if success then current else registeredMachineName), success
     }
 
 let connect (tui: ConsoleTui) (connection: HubConnection) =
@@ -158,6 +183,7 @@ let private runClient args =
     if not (Directory.Exists dir) then
         eprintfn "Configured workspace directory '%s' is unavailable. Create it or use: JarvisClient config set workspace-path <existing-absolute-directory>" dir
         exit 2
+    ClientConfig.installRunningContext effective (args |> Array.toList)
     let allowedEnvironmentVariables = effective.AllowedEnvironmentVariables
     let maxImportBytes = effective.MaxImportBytes
     let resolveMachineName () =
@@ -180,7 +206,10 @@ let private runClient args =
 
     tui.SetSettingsAccess
         { Load = ClientConfig.load
-          Save = ClientConfig.save
+          Save = (fun confirmed snapshot staged ->
+              ClientConfig.applySettingsAt snapshot.Path
+                  (if confirmed then LocalTuiConfirmed else LocalTuiUnconfirmed)
+                  effective (args |> Array.toList) (Some snapshot.Revision) (Replace staged))
           Effective = effective }
     ProcessEnvironment.configureAllowedEnvironmentVariables allowedEnvironmentVariables
     let rt = Runtime(getDir dir, tui, trustLevel, maxImportBytes)
@@ -539,6 +568,7 @@ let private runClient args =
                         registered <- isRegistered
                         if isRegistered then
                             registeredMachineName <- name
+                            ClientConfig.recordRegisteredMachineName name
                             Client.invalidateAllAgentStates rt
                     else
                         connectionFailureCount <- connectionFailureCount + 1
@@ -549,19 +579,20 @@ let private runClient args =
                 registered <- isRegistered
                 if isRegistered then
                     registeredMachineName <- name
+                    ClientConfig.recordRegisteredMachineName name
                     Client.invalidateAllAgentStates rt
 
             elif connection.State = HubConnectionState.Connected && registered then
                 // A setting saved by TUI, CLI or the remote tool must reach the
                 // actual device registry without restarting the live client.
                 // The startup CLI --machine-name override still takes precedence.
-                let name = resolveMachineName()
-                if name <> registeredMachineName then
-                    let! isRegistered = register tui connection deviceId (fun () -> name)
-                    registered <- isRegistered
-                    if isRegistered then
-                        registeredMachineName <- name
-                        Client.invalidateAllAgentStates rt
+                let! isRegistered, name, changed =
+                    refreshRegisteredMachineName tui connection deviceId resolveMachineName registeredMachineName
+                registered <- isRegistered
+                if changed then
+                    registeredMachineName <- name
+                    ClientConfig.recordRegisteredMachineName name
+                    Client.invalidateAllAgentStates rt
 
             if not tui.ShouldQuit then
                 try

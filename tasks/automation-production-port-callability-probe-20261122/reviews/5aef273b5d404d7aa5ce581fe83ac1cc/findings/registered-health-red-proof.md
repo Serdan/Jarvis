@@ -1,0 +1,11 @@
+# P2 — Missing source-bound RED for the registered Health activity seam
+
+**Frozen source:** `b9a3c223de9164fa827a4bac6b4a3e09e2d722fd`.
+
+**Original obligation:** task spec, real-port matrix item 1: reference the genuine registered `HubService.GetAgentActivity` path; *if the authentic SignalR/registration seam cannot be called from the standalone probe, record its exact type/constructor/callsite and a RED proof*. Item 4 repeats the explicit failing diagnostic requirement for missing seams.
+
+**Observed:** `PortCallability.ServerAuthenticatedActivityMethodIsCompiledButNotAnUnregisteredTestProof` (`ProbeTests.fs`) only reflects the method name and its two string argument types. The other Health tests pass artificial `NativeHealth.Dependencies`, not the `Program.fs:477-490` registered `HubConnection.InvokeCoreAsync` closure. The production `HubService.fs:127-139` authenticates the current server connection/session/user and otherwise faults with `UnauthorizedAccessException`; none of that guard or its negative result is exercised. The documentation accurately labels this **compiled, not authenticated E2E**, and identifies a missing reusable registered adapter, but the only retained expected-RED source and failed process is `ExpectedRedB2.fsx`, which checks `NativeProjectEffectFence` absence, not Health registration.
+
+**Impact and evidence boundary:** No false live/authenticated claim is made, so this is a bounded diagnostic completeness gap, not proof of an unsafe production change. However the required minimal reproducible negative evidence for this unavailable ingress is absent.
+
+**Proportional remedy:** Keep all real sessions and network effects disabled. Add a reproducible test/compile diagnostic against the exact registered-activity ingress, demonstrating unavailable standalone registration binding or a real unregistered-session rejection, with the concrete expected failure and source-bound process/terminal result. If this cannot be expressed without unauthorized effects or shared production changes, document that specific blocker and request Lead's bounded adjudication rather than substituting the fake `Dependencies.Activity` closure or claiming B2 readiness. No production implementation or full Client run is requested.

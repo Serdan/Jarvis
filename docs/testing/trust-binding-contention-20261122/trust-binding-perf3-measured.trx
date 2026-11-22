@@ -1,0 +1,77 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="eeeae4a5-2a5d-48e7-b775-9a297b65fa95" name="@Serdan-Home 2026-11-22 01:04:38" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-11-22T01:04:38.8421819+01:00" queuing="2026-11-22T01:04:38.8421820+01:00" start="2026-11-22T01:04:25.3151656+01:00" finish="2026-11-22T01:04:38.8498966+01:00" />
+  <TestSettings name="default" id="bce93cc0-a91f-4be8-beaa-cd19f0b1e89c">
+    <Deployment runDeploymentRoot="_Serdan-Home_2026-11-22_01_04_38" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="ec9dfc81-94f9-4501-86bd-03159c2e6284" testId="6e3d1765-6d5e-6cca-3393-67486155c1c3" testName="ParallelReadOnlyTrustBindingCrossProcessContentionProfile" computerName="Serdan-Home" duration="00:00:12.8464320" startTime="2026-11-22T01:04:25.9071633+01:00" endTime="2026-11-22T01:04:38.7535323+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="ec9dfc81-94f9-4501-86bd-03159c2e6284">
+      <Output>
+        <StdOut>Perf3 cross-process n=1 contention=0/1 p50=85.13ms p95=85.13ms max=85.13ms
+Perf3 lock n=1 window=concurrent-held phase=initial-read acquisitions=1 held=1 failed=0 retry-total=12 retry-max=12 hold-p50=3.800ms hold-p95=3.800ms hold-max=3.800ms
+Perf3 lock n=1 window=concurrent-held phase=post-fetch-cas acquisitions=1 held=1 failed=0 retry-total=0 retry-max=0 hold-p50=1.791ms hold-p95=1.791ms hold-max=1.791ms
+Perf3 lock n=1 window=post-release-recovery phase=initial-read acquisitions=2 held=2 failed=0 retry-total=0 retry-max=0 hold-p50=0.050ms hold-p95=0.118ms hold-max=0.118ms
+Perf3 lock n=1 window=post-release-recovery phase=post-fetch-cas acquisitions=2 held=2 failed=0 retry-total=0 retry-max=0 hold-p50=0.125ms hold-p95=0.260ms hold-max=0.260ms
+Perf3 cross-process n=2 contention=0/2 p50=94.00ms p95=98.28ms max=98.28ms
+Perf3 lock n=2 window=concurrent-held phase=initial-read acquisitions=2 held=2 failed=0 retry-total=47 retry-max=24 hold-p50=0.109ms hold-p95=0.251ms hold-max=0.251ms
+Perf3 lock n=2 window=concurrent-held phase=post-fetch-cas acquisitions=2 held=2 failed=0 retry-total=0 retry-max=0 hold-p50=0.122ms hold-p95=0.274ms hold-max=0.274ms
+Perf3 lock n=2 window=post-release-recovery phase=initial-read acquisitions=2 held=2 failed=0 retry-total=0 retry-max=0 hold-p50=0.052ms hold-p95=0.120ms hold-max=0.120ms
+Perf3 lock n=2 window=post-release-recovery phase=post-fetch-cas acquisitions=2 held=2 failed=0 retry-total=0 retry-max=0 hold-p50=0.187ms hold-p95=0.245ms hold-max=0.245ms
+Perf3 cross-process n=8 contention=0/8 p50=115.10ms p95=122.30ms max=122.30ms
+Perf3 lock n=8 window=concurrent-held phase=initial-read acquisitions=8 held=8 failed=0 retry-total=123 retry-max=18 hold-p50=0.074ms hold-p95=3.679ms hold-max=3.679ms
+Perf3 lock n=8 window=concurrent-held phase=post-fetch-cas acquisitions=8 held=8 failed=0 retry-total=2 retry-max=1 hold-p50=0.072ms hold-p95=0.132ms hold-max=0.132ms
+Perf3 lock n=8 window=post-release-recovery phase=initial-read acquisitions=2 held=2 failed=0 retry-total=0 retry-max=0 hold-p50=0.047ms hold-p95=0.059ms hold-max=0.059ms
+Perf3 lock n=8 window=post-release-recovery phase=post-fetch-cas acquisitions=2 held=2 failed=0 retry-total=0 retry-max=0 hold-p50=0.125ms hold-p95=0.128ms hold-max=0.128ms
+Perf3 cross-process n=16 contention=0/16 p50=231.04ms p95=255.50ms max=255.50ms
+Perf3 lock n=16 window=concurrent-held phase=initial-read acquisitions=16 held=16 failed=0 retry-total=230 retry-max=19 hold-p50=0.056ms hold-p95=3.426ms hold-max=3.426ms
+Perf3 lock n=16 window=concurrent-held phase=post-fetch-cas acquisitions=16 held=16 failed=0 retry-total=1 retry-max=1 hold-p50=0.091ms hold-p95=0.756ms hold-max=0.756ms
+Perf3 lock n=16 window=post-release-recovery phase=initial-read acquisitions=2 held=2 failed=0 retry-total=0 retry-max=0 hold-p50=0.049ms hold-p95=0.090ms hold-max=0.090ms
+Perf3 lock n=16 window=post-release-recovery phase=post-fetch-cas acquisitions=2 held=2 failed=0 retry-total=0 retry-max=0 hold-p50=0.093ms hold-p95=0.178ms hold-max=0.178ms</StdOut>
+      </Output>
+    </UnitTestResult>
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="ParallelReadOnlyTrustBindingCrossProcessContentionProfile" storage="/home/serdan/projects/.jarvis-worktrees/trust-binding-perf3-20261122/client.tests/bin/release/net11.0/client.tests.dll" id="6e3d1765-6d5e-6cca-3393-67486155c1c3">
+      <Execution id="ec9dfc81-94f9-4501-86bd-03159c2e6284" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/trust-binding-perf3-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.ReviewWorkflowTests+ReviewWorkflowTests" name="ParallelReadOnlyTrustBindingCrossProcessContentionProfile" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="6e3d1765-6d5e-6cca-3393-67486155c1c3" executionId="ec9dfc81-94f9-4501-86bd-03159c2e6284" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Completed">
+    <Counters total="1" executed="1" passed="1" failed="0" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>NUnit Adapter 4.6.0.0: Test execution started
+Running selected tests in /home/serdan/Projects/.Jarvis-worktrees/trust-binding-perf3-20261122/Client.Tests/bin/Release/net11.0/Client.Tests.dll
+   NUnit3TestExecutor discovered 1 of 1 NUnit test cases using Current Discovery mode, Non-Explicit run
+Perf3 cross-process n=1 contention=0/1 p50=85.13ms p95=85.13ms max=85.13ms
+Perf3 lock n=1 window=concurrent-held phase=initial-read acquisitions=1 held=1 failed=0 retry-total=12 retry-max=12 hold-p50=3.800ms hold-p95=3.800ms hold-max=3.800ms
+Perf3 lock n=1 window=concurrent-held phase=post-fetch-cas acquisitions=1 held=1 failed=0 retry-total=0 retry-max=0 hold-p50=1.791ms hold-p95=1.791ms hold-max=1.791ms
+Perf3 lock n=1 window=post-release-recovery phase=initial-read acquisitions=2 held=2 failed=0 retry-total=0 retry-max=0 hold-p50=0.050ms hold-p95=0.118ms hold-max=0.118ms
+Perf3 lock n=1 window=post-release-recovery phase=post-fetch-cas acquisitions=2 held=2 failed=0 retry-total=0 retry-max=0 hold-p50=0.125ms hold-p95=0.260ms hold-max=0.260ms
+Perf3 cross-process n=2 contention=0/2 p50=94.00ms p95=98.28ms max=98.28ms
+Perf3 lock n=2 window=concurrent-held phase=initial-read acquisitions=2 held=2 failed=0 retry-total=47 retry-max=24 hold-p50=0.109ms hold-p95=0.251ms hold-max=0.251ms
+Perf3 lock n=2 window=concurrent-held phase=post-fetch-cas acquisitions=2 held=2 failed=0 retry-total=0 retry-max=0 hold-p50=0.122ms hold-p95=0.274ms hold-max=0.274ms
+Perf3 lock n=2 window=post-release-recovery phase=initial-read acquisitions=2 held=2 failed=0 retry-total=0 retry-max=0 hold-p50=0.052ms hold-p95=0.120ms hold-max=0.120ms
+Perf3 lock n=2 window=post-release-recovery phase=post-fetch-cas acquisitions=2 held=2 failed=0 retry-total=0 retry-max=0 hold-p50=0.187ms hold-p95=0.245ms hold-max=0.245ms
+Perf3 cross-process n=8 contention=0/8 p50=115.10ms p95=122.30ms max=122.30ms
+Perf3 lock n=8 window=concurrent-held phase=initial-read acquisitions=8 held=8 failed=0 retry-total=123 retry-max=18 hold-p50=0.074ms hold-p95=3.679ms hold-max=3.679ms
+Perf3 lock n=8 window=concurrent-held phase=post-fetch-cas acquisitions=8 held=8 failed=0 retry-total=2 retry-max=1 hold-p50=0.072ms hold-p95=0.132ms hold-max=0.132ms
+Perf3 lock n=8 window=post-release-recovery phase=initial-read acquisitions=2 held=2 failed=0 retry-total=0 retry-max=0 hold-p50=0.047ms hold-p95=0.059ms hold-max=0.059ms
+Perf3 lock n=8 window=post-release-recovery phase=post-fetch-cas acquisitions=2 held=2 failed=0 retry-total=0 retry-max=0 hold-p50=0.125ms hold-p95=0.128ms hold-max=0.128ms
+Perf3 cross-process n=16 contention=0/16 p50=231.04ms p95=255.50ms max=255.50ms
+Perf3 lock n=16 window=concurrent-held phase=initial-read acquisitions=16 held=16 failed=0 retry-total=230 retry-max=19 hold-p50=0.056ms hold-p95=3.426ms hold-max=3.426ms
+Perf3 lock n=16 window=concurrent-held phase=post-fetch-cas acquisitions=16 held=16 failed=0 retry-total=1 retry-max=1 hold-p50=0.091ms hold-p95=0.756ms hold-max=0.756ms
+Perf3 lock n=16 window=post-release-recovery phase=initial-read acquisitions=2 held=2 failed=0 retry-total=0 retry-max=0 hold-p50=0.049ms hold-p95=0.090ms hold-max=0.090ms
+Perf3 lock n=16 window=post-release-recovery phase=post-fetch-cas acquisitions=2 held=2 failed=0 retry-total=0 retry-max=0 hold-p50=0.093ms hold-p95=0.178ms hold-max=0.178ms
+
+NUnit Adapter 4.6.0.0: Test execution complete
+</StdOut>
+    </Output>
+  </ResultSummary>
+</TestRun>

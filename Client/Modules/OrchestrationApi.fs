@@ -1,10 +1,12 @@
 module Client.OrchestrationApi
 
 open System
+open System.Diagnostics
 open System.IO
 open System.Security.Cryptography
 open System.Text
 open System.Text.Json
+open System.Threading
 open Common
 open Client
 open Client.IO
@@ -51,6 +53,33 @@ module LedgerErrors =
               VerifiedLedgerHead = None }
 
 module LedgerBindingConfig =
+    // Per-execution diagnostic samples only when a disposable test opts in.
+    // The normal runtime installs no observer and emits no lock telemetry.
+    type internal LockSample =
+        { Phase: string
+          AcquisitionRetries: int
+          HeldMilliseconds: float
+          Acquired: bool }
+
+    let private lockSampleSink = AsyncLocal<LockSample -> unit>()
+
+    let internal withLockSampleSink sink operation =
+        let previous = lockSampleSink.Value
+        lockSampleSink.Value <- sink
+        try operation ()
+        finally lockSampleSink.Value <- previous
+
+    let private sampleLock phase retries heldMillis acquired =
+        let sink = lockSampleSink.Value
+        if not (isNull (box sink)) then
+            // A diagnostic callback cannot change the trusted-head result.
+            try
+                sink { Phase = phase
+                       AcquisitionRetries = retries
+                       HeldMilliseconds = heldMillis
+                       Acquired = acquired }
+            with _ -> ()
+
     let pathForRoot (root: string) =
         let baseDirectory = Path.GetDirectoryName(ClientConfig.configPath())
         let hash =
@@ -76,7 +105,7 @@ module LedgerBindingConfig =
             | 11 | 32 | 33 | 35 -> true // Linux EAGAIN, Windows sharing/lock, macOS EAGAIN
             | _ -> false
 
-    let private withConfigLock (path: string) operation =
+    let private withConfigLockNamed phase (path: string) operation =
         try
             let dir = Path.GetDirectoryName path
             Directory.CreateDirectory(dir) |> ignore
@@ -84,34 +113,58 @@ module LedgerBindingConfig =
                 Error(Client.ValidationError " binding directory must not be a symlink.")
             else
                 let lockPath = path + ".lock"
-                if File.Exists(lockPath) && File.GetAttributes(lockPath).HasFlag(FileAttributes.ReparsePoint) then
+                if not (isNull (FileInfo(lockPath).LinkTarget)) then
                     Error(Client.ValidationError " binding lock must not be a symlink.")
                 else
-                    // One nonblocking attempt. The caller's next dashboard refresh
-                    // retries transient contention; remote fetches never run here.
+                    // Only retry an OS sharing violation on opening the lock.
+                    // No callback or possible mutation result is ever replayed.
+                    // Keep the dashboard's bounded synchronous refresh semantics:
+                    // these sleeps do not hold the lock and Git fetch is outside it.
                     let acquired =
-                        try
-                            Ok (new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite,
-                                               FileShare.None, 4096, FileOptions.None))
-                        with
-                        | :? IOException as ex when isTransientSharingViolation ex ->
-                            Error(LedgerErrors.toEffect (LedgerStore.TrustBindingContended ex.Message))
-                        | :? UnauthorizedAccessException as ex ->
-                            Error(Client.PermissionDenied $"Cannot access trust-binding lock: {ex.Message}")
-                        | :? IOException as ex ->
-                            Error(Client.ValidationError $"Cannot open trust-binding lock: {ex.Message}")
+                        let started = Stopwatch.GetTimestamp()
+                        let rec tryOpen retries =
+                            // A contender may replace paths during backoff. Re-check
+                            // both existing symlink fences before every delayed open.
+                            if retries > 0 && DirectoryInfo(dir).Attributes.HasFlag(FileAttributes.ReparsePoint) then
+                                Error(Client.ValidationError " binding directory must not be a symlink.")
+                            elif retries > 0 && not (isNull (FileInfo(lockPath).LinkTarget)) then
+                                Error(Client.ValidationError " binding lock must not be a symlink.")
+                            else
+                              try
+                                  Ok (new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite,
+                                                     FileShare.None, 4096, FileOptions.None), retries)
+                              with
+                              | :? IOException as ex when isTransientSharingViolation ex ->
+                                  if retries >= 32 || Stopwatch.GetElapsedTime(started) >= TimeSpan.FromMilliseconds(75.) then
+                                      sampleLock phase (retries + 1) 0. false
+                                      Error(LedgerErrors.toEffect (LedgerStore.TrustBindingContended ex.Message))
+                                  else
+                                      Thread.Sleep(Random.Shared.Next(1, 5))
+                                      tryOpen (retries + 1)
+                              | :? UnauthorizedAccessException as ex ->
+                                  Error(Client.PermissionDenied $"Cannot access trust-binding lock: {ex.Message}")
+                              | :? IOException as ex ->
+                                  Error(Client.ValidationError $"Cannot open trust-binding lock: {ex.Message}")
+                        tryOpen 0
                     match acquired with
                     | Error error -> Error error
-                    | Ok stream ->
-                        use held = stream
-                        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
-                            File.SetUnixFileMode(lockPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
-                        operation ()
+                    | Ok (stream, retries) ->
+                        let acquiredAt = Stopwatch.GetTimestamp()
+                        try
+                            use held = stream
+                            if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                                File.SetUnixFileMode(lockPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                            operation ()
+                        finally
+                            sampleLock phase retries (Stopwatch.GetElapsedTime(acquiredAt).TotalMilliseconds) true
         with
         | :? UnauthorizedAccessException as ex ->
             Error(Client.PermissionDenied $"Cannot access trust binding: {ex.Message}")
         | ex ->
             Error(Client.ValidationError $"Cannot access trust binding: {ex.Message}")
+
+    let private withConfigLock path operation =
+        withConfigLockNamed "other" path operation
 
     let private readStored (path: string) =
         try
@@ -182,7 +235,7 @@ module LedgerBindingConfig =
         else
             let rec load remaining =
                 let initial =
-                    withConfigLock path (fun () ->
+                    withConfigLockNamed "initial-read" path (fun () ->
                         readStored path
                         |> Result.bind (fun stored ->
                             validStored root stored
@@ -199,7 +252,7 @@ module LedgerBindingConfig =
                         | Error error -> Error error
                         | Ok () ->
                             let committed =
-                                withConfigLock path (fun () ->
+                                withConfigLockNamed "post-fetch-cas" path (fun () ->
                                     readStored path
                                     |> Result.bind (fun current ->
                                         validStored root current

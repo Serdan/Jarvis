@@ -386,3 +386,53 @@ let unreadableTrustBindingReportsPermissionDeniedInsteadOfMalformedData () =
                 File.Delete(path)
             if File.Exists(path + ".lock") then File.Delete(path + ".lock")
             Directory.Delete(root, true)
+
+
+[<Test>]
+let trustBindingRejectsSymlinkLockAndBindingBeforeReadingOrUpdating () =
+    if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+        let root, project = GitCommandTests.createTempProject ()
+        let path = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot project
+        let lockPath = path + ".lock"
+        let decoyLock = Path.Combine(root, "decoy-lock")
+        let realBinding = Path.Combine(root, "real-binding.json")
+        try
+            let context = GitCommandTests.TestContext root
+            GitCommandTests.initRepo context
+            Directory.CreateDirectory(Path.GetDirectoryName(path)) |> ignore
+            let record : Client.OrchestrationApi.LedgerTrustBinding =
+                { SchemaVersion = 1; Enabled = true; ProjectRoot = Path.GetFullPath(project)
+                  ProjectId = Guid.NewGuid().ToString("D")
+                  LedgerId = Guid.NewGuid().ToString("D"); Epoch = 1
+                  RemoteName = "origin"; ApprovedFetchUrl = "local-test"
+                  ApprovedPushUrl = "local-test"; HighestTrustedHead = String.replicate 40 "a" }
+            File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize(record))
+            File.WriteAllText(decoyLock, "immutable-decoy")
+            File.CreateSymbolicLink(lockPath, decoyLock) |> ignore
+            match Client.OrchestrationApi.LedgerBindingConfig.inspectLocal "Project1" context with
+            | Error(Client.ValidationError message) ->
+                Assert.That(message, Does.Contain("binding lock must not be a symlink"))
+            | other -> Assert.Fail(sprintf "Symlink lock must fail closed: %A" other)
+            Assert.That(File.ReadAllText(decoyLock), Is.EqualTo("immutable-decoy"))
+            File.Delete(lockPath)
+            let missingTarget = Path.Combine(root, "missing-dangling-target")
+            File.CreateSymbolicLink(lockPath, missingTarget) |> ignore
+            match Client.OrchestrationApi.LedgerBindingConfig.inspectLocal "Project1" context with
+            | Error(Client.ValidationError message) ->
+                Assert.That(message, Does.Contain("binding lock must not be a symlink"))
+            | other -> Assert.Fail(sprintf "Dangling symlink lock must fail closed: %A" other)
+            Assert.That(File.Exists(missingTarget), Is.False,
+                        "A failed open may not materialize the dangling symlink target")
+            File.Delete(lockPath)
+            File.Move(path, realBinding)
+            File.CreateSymbolicLink(path, realBinding) |> ignore
+            match Client.OrchestrationApi.LedgerBindingConfig.inspectLocal "Project1" context with
+            | Error(Client.ValidationError message) ->
+                Assert.That(message, Does.Contain("regular, bounded file"))
+            | other -> Assert.Fail(sprintf "Symlink binding must fail closed: %A" other)
+            Assert.That(File.ReadAllText(realBinding),
+                        Does.Contain(record.HighestTrustedHead))
+        finally
+            if File.Exists(lockPath) then File.Delete(lockPath)
+            if File.Exists(path) then File.Delete(path)
+            Directory.Delete(root, true)

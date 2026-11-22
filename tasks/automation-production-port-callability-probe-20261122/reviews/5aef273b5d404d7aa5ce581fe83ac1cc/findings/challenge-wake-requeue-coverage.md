@@ -1,0 +1,11 @@
+# P1 — Canonical Challenge wake/requeue requirement is unexercised
+
+**Frozen source:** `b9a3c223de9164fa827a4bac6b4a3e09e2d722fd`; accepted-only parent `d312f1cc83685e781ce69e57ad0d4bf613bfb843`.
+
+**Original obligation:** the canonical task spec's *Real production adapter matrix* item 2 requires invoking the accepted Challenge condition **resolution/wake/requeue path** on verified disposable Git, including stale generation and history-index negatives; item 4 requires a reproducible RED/unsupported seam if traversal cannot be performed. This is source-review coverage, not a request to activate B2.
+
+**Reproduction by inspection:** `tests/AutomationRealPortProbe20261122/ProbeTests.fs` `ChallengeRealGitTwoClonesResolveCASAndHistory` creates only a challenge and registered agents. It calls `ChallengeWorkflow.create/get/resolve` and checks condition ownership, idempotent operation replay, stale **challenge version**, and challenge history. It does not create a task/attempt, invoke `ChallengeWorkflow.blockAttempt` or `requeueAttempt`, create any `AttemptChallengeWait`, or check the reverse wait index and attempt generation. Production `Client/Modules/ChallengeWorkflow.fs:774-880` makes `wakeDependents` traverse only canonical wait-index paths; with no wait, the successful resolve cannot prove any wake. `ChallengeWorkflow.fs:1677` and `:1795` expose the actual block/requeue paths. The documentation explicitly acknowledges “No linked ChallengeWait test record was created.”
+
+**Impact:** The six green Release tests prove a legitimate subset, but do not test the critical Challenge-to-dependent-Work transition or stale-generation/index fencing that this scoped probe was assigned. The broader composed B2 gate remains HOLD irrespective of this fix.
+
+**Proportional remedy:** Within the same isolated new test path, add a source-bound disposable Git ledger task/attempt/owner and canonical `blockAttempt` wait, then verify `resolve` wakes or marks eligible and check at least one stale-generation/index negative (and whichever explicit `requeueAttempt` path is applicable). If genuinely uncallable in this scope, retain a minimal reproducible RED with the exact missing source seam instead of marking that row verified. No production edits, full Client suite, live ports or B2 are required to remedy this finding.

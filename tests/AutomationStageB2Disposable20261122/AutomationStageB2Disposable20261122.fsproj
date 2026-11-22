@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>Client.Tests</AssemblyName>
+    <GenerateProgramFile>false</GenerateProgramFile>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <DefineConstants>$(DefineConstants);STAGE_B_DISPOSABLE_TEST_ONLY</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../Client/Modules/NativeProjectEffectFence.fs" Link="NativeProjectEffectFence.fs" />
+    <Compile Include="../../Client.Tests/NativeSchedulerRosterPolicyTests.fs" Link="NativeSchedulerRosterPolicyTests.fs" />
+    <Compile Include="StageB2Tests.fs" />
+    <Compile Include="StageB1Tests.fs" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="NUnit" Version="4.3.2" />
+    <PackageReference Include="NUnit3TestAdapter" Version="4.6.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../Client/Client.fsproj" />
+  </ItemGroup>
+</Project>

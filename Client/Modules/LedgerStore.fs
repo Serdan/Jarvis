@@ -1522,6 +1522,7 @@ module LedgerStore =
         if prefix <> "tasks" && prefix <> "agents" && prefix <> "notifications"
            && prefix <> "records/roles"
            && prefix <> "challenges"
+           && not (Regex.IsMatch(prefix, "^tasks/[A-Za-z0-9_-]+/lifecycle$"))
            && not (Regex.IsMatch(prefix, "^challenges/[a-f0-9]{32}/events$"))
            && not (Regex.IsMatch(prefix, "^challenge-waits/by-challenge/[a-f0-9]{32}$"))
            && not (Regex.IsMatch(prefix, "^challenge-waits/by-owner/[A-Za-z0-9_-]{1,160}$")) then
@@ -1534,6 +1535,29 @@ module LedgerStore =
                 |> Array.toList)
 
 
+    // First-parent additions witness historical issuance even when the edge is
+    // now deleted. Every caller MUST verify every returned path with
+    // verifiedWaitIndexAt at this same snapshot, including missing current
+    // blobs, malformed owner, and future-generation records.
+    // One Git log replaces the former unconditional ls-tree + log pair.
+    let listIssuedWaitIndexPathsAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) (prefix: string) =
+        if not (Regex.IsMatch(prefix, "^challenge-waits/by-challenge/[a-f0-9]{32}$")
+                || Regex.IsMatch(prefix, "^challenge-waits/by-owner/[A-Za-z0-9_-]{1,160}$")) then
+            Error(InvalidBinding "Issued wait-index listing needs one scoped owner or Challenge prefix.")
+        else
+            run binding.RepositoryPath
+                [ "log"; "--first-parent"; "--no-renames"; "--diff-filter=A"; "--format="
+                  "--name-only"; snapshot.Commit; "--"; prefix ]
+            |> Result.bind (fun history ->
+                let issued =
+                    history.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    |> Array.map _.Trim()
+                if issued |> Array.exists (fun path ->
+                    not (ledgerPath.IsMatch path)
+                    || path.Contains("..")
+                    || not (path.StartsWith(prefix + "/", StringComparison.Ordinal))) then
+                    Error(LedgerIntegrityError "Invalid historically issued Challenge reverse-index path.")
+                else Ok (issued |> Array.distinct |> Array.sort |> Array.toList))
     // Read-only full-tree evidence for default-off Agent => Work retirement.
     // Domain listAt readers omit ops, alerts, indexes and future record
     // families; discarding them here would silently lose migration evidence.
@@ -1736,8 +1760,21 @@ module LedgerStore =
     let readDashboardRecordsAt binding snapshot =
         readViewRecordsAt false true binding snapshot |> Result.map stripOids
 
+    // Preserve the original general reader for callers that need precisely
+    // the original canonical inbox record set.
     let readAgentInboxRecordsAt binding snapshot =
         readViewRecordsAt true false binding snapshot |> Result.map stripOids
+
+    // Reuse the inbox's pinned tree traversal for this ONE agent's
+    // optional instructions config; a missing config is proven absent
+    // without another Git invocation.
+    let readAgentInboxRecordsForAgentAt binding snapshot agentKey =
+        let configPath = "records/agent-instructions/" + agentKey + ".json"
+        let included path =
+            dashboardRecordPath true false path || path = configPath
+        readSelectedRecordsAt
+            [ "agents"; "tasks"; "notifications"; configPath ]
+            included binding snapshot |> Result.map stripOids
 
     // Challenge inbox projections consult only scoped materialized indexes.
     // Prefixes cannot escape the caller's encoded agent key. Missing indexes

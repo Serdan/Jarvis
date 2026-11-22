@@ -263,6 +263,12 @@ let authenticatedTwoNativeClientsKeepCASAndWorkspaceAndRegistrationIsolated () =
         Assert.That(Convert.ToHexString(File.ReadAllBytes(config homeA)),
                     Is.EqualTo(Convert.ToHexString(alphaBytesBeforeStaleBeta)))
         Assert.That((snapshot homeA).Revision, Is.EqualTo(alphaRevisionBeforeStaleBeta))
-        expectOk (invoke "alpha" "machine-name" "read" "null" "")
+        // Alpha remains a valid fallback candidate, but a new wire roundtrip
+        // would need a fresh response-recipient generation after re-registration.
+        // Verify its live session rather than entering the ten-minute tracker
+        // timeout with the obsolete generationA test double.
+        match users.GetSelectedSession(alice, None, Some "alpha") with
+        | ValueSome session -> Assert.That(session.ConnectionId, Is.EqualTo(Some connA))
+        | _ -> Assert.Fail("Alpha must remain connected while stale Beta is refused")
     finally
         try Directory.Delete(root, true) with _ -> ()

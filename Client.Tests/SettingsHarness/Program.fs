@@ -48,7 +48,7 @@ let main args =
                               ClientConfig.applySettingsAt before.Path
                                   (if confirmed then LocalTuiConfirmed else LocalTuiUnconfirmed)
                                   effective [] (Some before.Revision) (Replace staged))
-                          Effective = effective }
+                          Effective = (fun () -> effective) }
                     tui.SetConnectionState(Disconnected, "offline isolated settings fixture")
                     use cancel = new CancellationTokenSource(TimeSpan.FromSeconds(25.))
                     try

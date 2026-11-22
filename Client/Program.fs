@@ -124,6 +124,18 @@ let refreshRegisteredMachineName (tui: ConsoleTui) (connection: HubConnection)
             return success, (if success then current else registeredMachineName), success
     }
 
+// Live runtime observation is updated only after successful connected registration.
+// Save and the TUI display must share it: a second Save after A-to-B may not
+// resurrect the startup name A or advertise a nonexistent registry refresh.
+let createSettingsAccess load (currentRuntime: unit -> ClientEffectiveConfig)
+                         (startupArgs: string list) : SettingsUiAccess =
+    { Load = load
+      Save = (fun confirmed snapshot staged ->
+          ClientConfig.applySettingsAt snapshot.Path
+              (if confirmed then LocalTuiConfirmed else LocalTuiUnconfirmed)
+              (currentRuntime()) startupArgs (Some snapshot.Revision) (Replace staged))
+      Effective = currentRuntime }
+
 let connect (tui: ConsoleTui) (connection: HubConnection) =
     task {
         tui.SetConnectionState(Connecting, BuildInfo.ServerUrl)
@@ -204,13 +216,11 @@ let private runClient args =
         | Ok level -> level
         | Error error -> eprintfn "%s" error; exit 2
 
-    tui.SetSettingsAccess
-        { Load = ClientConfig.load
-          Save = (fun confirmed snapshot staged ->
-              ClientConfig.applySettingsAt snapshot.Path
-                  (if confirmed then LocalTuiConfirmed else LocalTuiUnconfirmed)
-                  effective (args |> Array.toList) (Some snapshot.Revision) (Replace staged))
-          Effective = effective }
+    let currentSettingsRuntime () =
+        ClientConfig.tryRunningContext()
+        |> Option.map fst
+        |> Option.defaultValue effective
+    tui.SetSettingsAccess (createSettingsAccess ClientConfig.load currentSettingsRuntime (args |> Array.toList))
     ProcessEnvironment.configureAllowedEnvironmentVariables allowedEnvironmentVariables
     let rt = Runtime(getDir dir, tui, trustLevel, maxImportBytes)
     // Opt-in local browser bridge. The extension must authenticate and register a tab.

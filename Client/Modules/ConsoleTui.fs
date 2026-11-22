@@ -112,7 +112,7 @@ type OperatorChallengeUiAccess =
 type SettingsUiAccess =
     { Load: unit -> Result<ClientConfigSnapshot, string>
       Save: bool -> ClientConfigSnapshot -> ClientStoredConfig -> Result<SettingsApplyResult, SettingsApplyError>
-      Effective: ClientEffectiveConfig }
+      Effective: unit -> ClientEffectiveConfig }
 
 type ConsoleTui(?activityLog: ActivityLog.Store) =
     let syncRoot = obj()
@@ -1444,7 +1444,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         | None -> draw.WriteLine "Config unavailable."
         | Some snapshot ->
             draw.WriteLine(trim (safe snapshot.Path) width)
-            let effective = settingsAccess |> Option.map _.Effective
+            let effective = settingsAccess |> Option.map (fun x -> x.Effective())
             for index = 0 to settingKeys.Length - 1 do
                 let key = settingKeys[index]
                 let value = settingsValue key settingsStaged |> Option.defaultValue "(default)"
@@ -1470,7 +1470,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             match effective with
             | Some e ->
                 draw.WriteLine ""
-                draw.WriteLine "Startup effective values (changes may require restart):"
+                draw.WriteLine "Current runtime values (changes may require restart):"
                 for index = 0 to settingKeys.Length - 1 do
                     draw.WriteLine(trim (safe $"{settingLabels[index]}: {settingsEffective settingKeys[index] e}") width)
             | None -> ()

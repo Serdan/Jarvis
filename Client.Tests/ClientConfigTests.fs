@@ -321,6 +321,7 @@ open Microsoft.Extensions.DependencyInjection
 
 type SettingsRegistrationProbe() =
     let observed = System.Collections.Concurrent.ConcurrentQueue<string * string>()
+    member val RejectName: string option = None with get, set
     member _.Record(deviceId: string, name: string) = observed.Enqueue((deviceId, name))
     member _.Names = observed.ToArray() |> Array.map snd
     member _.DeviceIds = observed.ToArray() |> Array.map fst
@@ -328,13 +329,17 @@ type SettingsRegistrationProbe() =
 type SettingsRegistrationHub(probe: SettingsRegistrationProbe) =
     inherit Hub()
     member _.Connect(registration: Common.SignalR.ClientRegistration) =
-        probe.Record(registration.DeviceId, registration.DeviceName)
-        System.Threading.Tasks.Task.FromResult<Common.SignalR.ClientRegistrationResult>(
-            { Generation = 1L
-              RegisteredAt = DateTimeOffset.UtcNow
-              RegistrationReason = "isolated settings test"
-              ServerProtocolVersion = "test"
-              EnabledCommands = [] })
+        if probe.RejectName = Some registration.DeviceName then
+            System.Threading.Tasks.Task.FromException<Common.SignalR.ClientRegistrationResult>(
+                InvalidOperationException("Disposable registration rejected"))
+        else
+            probe.Record(registration.DeviceId, registration.DeviceName)
+            System.Threading.Tasks.Task.FromResult<Common.SignalR.ClientRegistrationResult>(
+                { Generation = 1L
+                  RegisteredAt = DateTimeOffset.UtcNow
+                  RegistrationReason = "isolated settings test"
+                  ServerProtocolVersion = "test"
+                  EnabledCommands = [] })
 
 [<Test>]
 let configuredMachineNameReRegistersThroughRealDisposableSignalRHub () = task {
@@ -988,3 +993,79 @@ let persistedOnlySettingsTransactionNeverClaimsLiveApplyUnderCliOverride () =
         Assert.That(local.AppliedNow, Is.False, "Pending registration is not an applied runtime mutation")
     finally
         Directory.Delete(sandbox, true)
+
+
+[<Test>]
+let connectedF5SecondTuiSaveTracksActualRegistrationAndFailsClosed () = task {
+    let sandbox = Path.Combine(Path.GetTempPath(), "w24-f5-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(sandbox) |> ignore
+    let path = Path.Combine(sandbox, "config.json")
+    let builder = WebApplication.CreateBuilder()
+    builder.WebHost.UseUrls("http://127.0.0.1:0") |> ignore
+    builder.Services.AddSingleton<SettingsRegistrationProbe>() |> ignore
+    builder.Services.AddSignalR() |> ignore
+    use server = builder.Build()
+    server.MapHub<SettingsRegistrationHub>("/settings") |> ignore
+    do! server.StartAsync()
+    let connection = HubConnectionBuilder().WithUrl((server.Urls |> Seq.head) + "/settings").Build()
+    try
+        let a = ClientConfig.applyAt path None "machine-name" (Some "F5-A") |> Result.defaultWith failwith
+        let mutable observed = ClientConfig.resolve a.Stored [] |> Result.defaultWith failwith
+        let access = Program.createSettingsAccess (fun () -> ClientConfig.loadAt path) (fun () -> observed) []
+        let tui = Client.ConsoleTui.ConsoleTui()
+        tui.SetSettingsAccess access
+        let name () =
+            let s = (ClientConfig.loadAt path |> Result.defaultWith failwith).Stored
+            (ClientConfig.resolve s [] |> Result.defaultWith failwith).MachineName
+        do! connection.StartAsync()
+        let device = "f5-disposable-device"
+        let! initial = Program.register tui connection device name
+        Assert.That(initial, Is.True)
+        let save snapshot stored = access.Save false snapshot stored
+                                   |> Result.defaultWith (ClientConfig.settingsErrorMessage >> failwith)
+        let b = save a { a.Stored with MachineName = Some "F5-B" }
+        Assert.That(b.RegistryRefreshPending, Is.True)
+        let pre = save b.After b.After.Stored
+        Assert.That(pre.RegistryRefreshPending, Is.True, "Before registration B remains pending")
+        let! okB, nameB, changedB = Program.refreshRegisteredMachineName tui connection device name "F5-A"
+        Assert.That(okB && changedB, Is.True)
+        Assert.That(nameB, Is.EqualTo("F5-B"))
+        observed <- { observed with MachineName = nameB }
+        let second = save pre.After pre.After.Stored
+        Assert.That(second.CurrentRuntime.MachineName, Is.EqualTo("F5-B"), "F5: stale startup A must not persist")
+        Assert.That(second.RegistryRefreshPending, Is.False, "F5: no false pending flag after registration B")
+        Assert.That(access.Effective().MachineName, Is.EqualTo("F5-B"), "TUI effective display must not show stale A")
+        Assert.That(second.AppliedNow, Is.False)
+        let probe = server.Services.GetRequiredService<SettingsRegistrationProbe>()
+        probe.Names |> shouldEqual [| "F5-A"; "F5-B" |]
+        let c = save second.After { second.After.Stored with MachineName = Some "F5-C" }
+        probe.RejectName <- Some "F5-C"
+        let! okC, nameC, changedC = Program.refreshRegisteredMachineName tui connection device name "F5-B"
+        Assert.That(okC || changedC, Is.False, "Failed registry refresh must not acknowledge C")
+        Assert.That(nameC, Is.EqualTo("F5-B"))
+        let pending = save c.After c.After.Stored
+        Assert.That(pending.CurrentRuntime.MachineName, Is.EqualTo("F5-B"))
+        Assert.That(pending.RegistryRefreshPending, Is.True)
+        Assert.That(access.Effective().MachineName, Is.EqualTo("F5-B"))
+        let flags = ["--machine-name"; "F5-override"]
+        let overridden = ClientConfig.resolve pending.After.Stored flags |> Result.defaultWith failwith
+        let cliAccess = Program.createSettingsAccess (fun () -> ClientConfig.loadAt path) (fun () -> overridden) flags
+        let d = cliAccess.Save false pending.After { pending.After.Stored with MachineName = Some "F5-D" }
+                |> Result.defaultWith (ClientConfig.settingsErrorMessage >> failwith)
+        Assert.That(d.CurrentRuntime.MachineName, Is.EqualTo("F5-override"))
+        Assert.That(d.RegistryRefreshPending, Is.False)
+        Assert.That(d.AppliedNow, Is.False)
+        match access.Save false second.After second.After.Stored with
+        | Error (SettingsRevisionConflict _) -> ()
+        | other -> Assert.Fail(sprintf "Stale CAS incorrectly saved: %A" other)
+        let locked = ClientConfig.applyAt path (Some d.After.Revision) "trust-level" (Some "none")
+                     |> Result.defaultWith failwith
+        match access.Save false locked { locked.Stored with TrustLevel = None } with
+        | Error SettingsConfirmationRequired -> ()
+        | other -> Assert.Fail(sprintf "Declined trust elevation incorrectly saved: %A" other)
+        Assert.That((ClientConfig.loadAt path |> Result.defaultWith failwith).Revision, Is.EqualTo(locked.Revision))
+    finally
+        connection.DisposeAsync().AsTask().GetAwaiter().GetResult()
+        server.StopAsync().GetAwaiter().GetResult()
+        Directory.Delete(sandbox, true)
+}

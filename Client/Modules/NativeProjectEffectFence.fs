@@ -247,6 +247,7 @@ let private update
     (operationId: Guid)
     (kind: string) (expectedStatus: string) (nextStatus: string)
     (intentEvidence: string)
+    (requireCurrentLease: bool)
     (extraValidate: NativeEffectRecord -> Result<unit, LedgerFailure>)
     (modify: NativeEffectRecord -> NativeEffectRecord) =
     if operationId = Guid.Empty || effectId = Guid.Empty then reject "Empty transition UUID"
@@ -266,6 +267,10 @@ let private update
                || operationId = original.ClaimOperationId
                || operationId = original.DispatchId || operationId = original.EffectId then
                 return! stale "Original effect/claim already advanced or mismatched"
+            // Linearize original canonical authorization at the exact project CAS
+            // that writes Dispatching. Terminal/no-send reconciliation deliberately
+            // remains available when the lease is revoked after dispatch.
+            do! (if requireCurrentLease then checkCandidate binding snapshot original.Candidate else Ok ())
             do! extraValidate original
             let amended = modify original
             return [ { Path = path; ExpectedBlobOid = Some beforeOid
@@ -277,6 +282,7 @@ let private update
 let beginFakeEffect (binding: LedgerBinding) (candidate: NativeCandidate) (effectId: Guid) (operationId: Guid) =
     update binding candidate effectId operationId "NativeStageBBeginEffectTestOnly" "Claimed" "Dispatching"
         ""
+        true
         (fun _ -> Ok ())
         (fun record -> { record with StartOperationId = operationId })
 
@@ -285,6 +291,7 @@ let beginFakeEffect (binding: LedgerBinding) (candidate: NativeCandidate) (effec
 let recordFakeTerminal (binding: LedgerBinding) (candidate: NativeCandidate) (effectId: Guid) (operationId: Guid) (proof: FakeProviderTerminal) =
     update binding candidate effectId operationId "NativeStageBTerminalTestOnly" "Dispatching" "VerifiedFakeTerminal"
         (serialize proof)
+        false
         (fun r ->
             if not (isNull (box proof))
                && proof.Marker = "STAGE_B_DISPOSABLE_FAKE_PROVIDER/v1"
@@ -311,6 +318,7 @@ let recordFakeNoSend (binding: LedgerBinding) (candidate: NativeCandidate) (effe
                      (operationId: Guid) (proof: FakeNoSendProof) =
     update binding candidate effectId operationId "NativeStageBNoSendTestOnly" "Claimed" "VerifiedNoSend"
         (serialize proof)
+        false
         (fun _ ->
             if not (isNull (box proof))
                && proof.Marker = "STAGE_B_DISPOSABLE_FAKE_NO_SEND/v1"

@@ -178,6 +178,33 @@ let reused = function
     | Error other -> failwithf "Expected OperationIdReused, got %A" other
     | Ok _ -> failwith "Changed immutable operation UUID intent was replayed"
 
+let mutateCanonical (f: Fixture) path (oldValue: string) (newValue: string) =
+    let intent =
+        { OperationId = Guid.NewGuid(); Actor = "RevocationFixture"
+          Kind = "NativeStageBRevokeTestOnly"; RequestJson = "{}" }
+    LedgerStore.transact f.Two intent (fun snapshot ->
+        let text, blob = LedgerStore.readAt f.Two snapshot path |> success
+        match text, blob with
+        | Some content, Some originalBlob ->
+            check (content.Contains(oldValue)) "Original canonical mutation marker absent"
+            Ok [ { Path = path; ExpectedBlobOid = Some originalBlob
+                   Content = content.Replace(oldValue, newValue) } ]
+        | _ -> failwith "Missing original canonical entity for revocation")
+    |> success |> ignore
+
+let assertRevokedNoDispatch (f: Fixture) (candidate: NativeCandidate) path oldValue newValue =
+    let c = makeClaim f candidate
+    claim f.One c |> success |> ignore
+    mutateCanonical f path oldValue newValue
+    let mutable calls = 0
+    let fakePort (_: NativeEffectRecord) =
+        calls <- calls + 1
+        Ok (fakeTerminal c.EffectId "Unknown")
+    dispatchFakePort f.Three candidate c.EffectId (Guid.NewGuid()) fakePort |> denied
+    check (calls = 0) "Revoked canonical lease invoked the fake callback"
+    check ((get f candidate).Status = "Claimed") "Revoked lease advanced to Dispatching"
+    check ((fakeState f c.Account).Status = "Reserved") "Revoked lease released fake account"
+
 [<EntryPoint>]
 let main _ =
     try
@@ -239,6 +266,50 @@ let main _ =
                      { originals with OriginalReservationOperationId = Guid.Empty.ToString("D") }] do
                     claim f.One { a with Account = fake } |> denied
                 observe f.One f.Worker |> denied))
+        test "postclaim Worker cancellation rejects pre-send across three clones" (fun () ->
+            withFixture (fun f ->
+                let path = "tasks/" + f.Worker.TaskId + "/attempts/" + f.Worker.AttemptId + ".json"
+                assertRevokedNoDispatch f f.Worker path
+                    "\"phase\":\"Ready\"" "\"phase\":\"Cancelled\""))
+        test "postclaim Worker assignment generation change rejects pre-send" (fun () ->
+            withFixture (fun f ->
+                let path = "tasks/" + f.Worker.TaskId + "/attempts/" + f.Worker.AttemptId + ".json"
+                assertRevokedNoDispatch f f.Worker path
+                    "\"assignmentGeneration\":2" "\"assignmentGeneration\":3"))
+        test "postclaim Worker source lease change rejects pre-send" (fun () ->
+            withFixture (fun f ->
+                let path = "tasks/" + f.Worker.TaskId + "/attempts/" + f.Worker.AttemptId + ".json"
+                assertRevokedNoDispatch f f.Worker path
+                    ("\"sourceRef\":\"" + f.Worker.SourceRef + "\"")
+                    "\"sourceRef\":\"refs/heads/revoked-worker-lease\""))
+        test "postclaim Reviewer decision rejects pre-send" (fun () ->
+            withFixture (fun f ->
+                let path = "tasks/" + f.Reviewer.TaskId + "/reviews/" + f.Reviewer.ReviewId + "/review.json"
+                assertRevokedNoDispatch f f.Reviewer path
+                    "\"status\":\"Claimed\"" "\"status\":\"Accepted\""))
+        test "postclaim Reviewer version change rejects pre-send" (fun () ->
+            withFixture (fun f ->
+                let path = "tasks/" + f.Reviewer.TaskId + "/reviews/" + f.Reviewer.ReviewId + "/review.json"
+                assertRevokedNoDispatch f f.Reviewer path
+                    "\"version\":5" "\"version\":6"))
+        test "terminal reconciliation and account release survive post-dispatch revocation" (fun () ->
+            withFixture (fun f ->
+                let c = makeClaim f f.Worker
+                claim f.One c |> success |> ignore
+                let mutable calls = 0
+                let port (_: NativeEffectRecord) =
+                    calls <- calls + 1
+                    Ok (fakeTerminal c.EffectId "Terminal")
+                let terminal = dispatchFakePort f.Three f.Worker c.EffectId (Guid.NewGuid()) port |> success
+                let path = "tasks/" + f.Worker.TaskId + "/attempts/" + f.Worker.AttemptId + ".json"
+                mutateCanonical f path "\"phase\":\"Ready\"" "\"phase\":\"Cancelled\""
+                let terminalId = Guid.NewGuid()
+                recordFakeTerminal f.One f.Worker c.EffectId terminalId terminal |> success |> ignore
+                releaseFakeReservation f.Three f.AccountThree f.Worker c.EffectId terminalId (Guid.NewGuid())
+                |> success |> ignore
+                check (calls = 1) "Terminal reconciliation re-sent fake effect"
+                check ((get f f.Worker).Status = "VerifiedFakeTerminal") "Terminal reconciliation blocked after revocation"
+                check ((fakeState f c.Account).Status = "Released") "Post-dispatch terminal release blocked"))
         test "confirmed durable Dispatching is at most once across two clones" (fun () ->
             withFixture (fun f ->
                 let c = makeClaim f f.Worker

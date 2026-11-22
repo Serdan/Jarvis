@@ -1,0 +1,1 @@
+Main dcac884; Worker14 planner 0f732e34 unchanged host-loop blobs. NUnit line318 RED reproduced 1/4 isolated .NET11 Release runs; adjacent 34/34 green; 500 source-bound seeded properties pass with 126 early external task-wrapper observations; injected duplicate-port negative exits1. Exactly three new lease-scoped files, no production/shared fsproj/main changes.

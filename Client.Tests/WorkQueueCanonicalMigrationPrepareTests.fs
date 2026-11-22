@@ -63,7 +63,14 @@ type WorkQueueCanonicalMigrationPrepareTests() =
 
     let withClones action =
         let root = Path.Combine(Path.GetTempPath(), "wq10-canonical-" + Guid.NewGuid().ToString("N"))
-        Directory.CreateDirectory root |> ignore
+        if OperatingSystem.IsWindows() then
+            Directory.CreateDirectory root |> ignore
+        else
+            Directory.CreateDirectory(
+                root, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+            |> ignore
+            Assert.That(File.GetUnixFileMode root,
+                        Is.EqualTo(UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute))
         File.WriteAllText(Path.Combine(root, ".wq10-disposable-fixture"), "WQ10_DISPOSABLE_FIXTURE_V1")
         try
             let ar, a1, a2 = repository root "account"
@@ -338,6 +345,23 @@ type WorkQueueCanonicalMigrationPrepareTests() =
             Assert.That(traversing.AccountHead.IsNone, Is.True)
             Assert.That(contains (function CanonicalPrepareGap.UnapprovedDisposableAuthority _ -> true | _ -> false) traversing, Is.True)
             assertNoCanonicalWrite fixture original)
+
+    [<Test>]
+    member _.GroupOrWorldWritableDisposableRootIsRejectedBeforeFetch() =
+        if not (OperatingSystem.IsWindows()) then
+            withClones (fun fixture ->
+                let original = snapshotRemoteHeads fixture
+                let input = request fixture CanonicalPrepareMode.AttemptOnDisposable
+                let privateMode = File.GetUnixFileMode fixture.Root
+                try
+                    for unsafeBit in [ UnixFileMode.GroupWrite; UnixFileMode.OtherWrite ] do
+                        File.SetUnixFileMode(fixture.Root, privateMode ||| unsafeBit)
+                        let result = WorkQueueCanonicalMigrationPrepare.attemptCanonicalPrepare input |> blocked
+                        Assert.That(result.AccountHead.IsNone, Is.True)
+                        Assert.That(contains (function CanonicalPrepareGap.UnapprovedDisposableAuthority _ -> true | _ -> false) result, Is.True)
+                        assertNoCanonicalWrite fixture original
+                finally
+                    File.SetUnixFileMode(fixture.Root, privateMode))
 
     [<Test>]
     member _.UnapprovedAuthorityOutsidePrivateScratchIsRejectedBeforeFetch() =

@@ -54,7 +54,14 @@ type WorkQueueProjectMigrationPrepareTests() =
 
     let withFixture action =
         let root = Path.Combine(Path.GetTempPath(), "wq10-positive-" + Guid.NewGuid().ToString("N"))
-        Directory.CreateDirectory root |> ignore
+        if OperatingSystem.IsWindows() then
+            Directory.CreateDirectory root |> ignore
+        else
+            Directory.CreateDirectory(
+                root, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+            |> ignore
+            Assert.That(File.GetUnixFileMode root,
+                        Is.EqualTo(UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute))
         File.WriteAllText(Path.Combine(root, ".wq10-disposable-fixture"), "WQ10_DISPOSABLE_FIXTURE_V1")
         try
             let ab, a1, a2 = repo root "account"
@@ -138,6 +145,22 @@ type WorkQueueProjectMigrationPrepareTests() =
             action root first second a aOther command sourceSha
         finally
             try Directory.Delete(root,true) with _ -> ()
+
+    [<Test>]
+    member _.GroupOrWorldWritableDisposableRootCannotPrepareProject() =
+        if not (OperatingSystem.IsWindows()) then
+            withFixture (fun root first _ _ _ command _ ->
+                let originalHead = (LedgerStore.fetch first |> ok).Commit
+                let privateMode = File.GetUnixFileMode root
+                try
+                    for unsafeBit in [ UnixFileMode.GroupWrite; UnixFileMode.OtherWrite ] do
+                        File.SetUnixFileMode(root, privateMode ||| unsafeBit)
+                        match WorkQueueProjectMigrationPrepare.attemptOnDisposableFixture command with
+                        | Error(InvalidBinding _) -> ()
+                        | other -> Assert.Fail(sprintf "Writable disposable root accepted: %A" other)
+                        Assert.That((LedgerStore.fetch first |> ok).Commit, Is.EqualTo(originalHead))
+                finally
+                    File.SetUnixFileMode(root, privateMode))
 
     [<Test>]
     member _.PositiveProjectPreparedIsOneAtomicInertGitCasWithOriginalHistory() =

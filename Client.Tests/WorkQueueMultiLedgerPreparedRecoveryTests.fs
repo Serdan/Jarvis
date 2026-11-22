@@ -164,7 +164,14 @@ type WorkQueueMultiLedgerPreparedRecoveryTests() =
 
     let withFixture action =
         let root = Path.Combine(Path.GetTempPath(), "wq10-multiledger-" + Guid.NewGuid().ToString("N"))
-        Directory.CreateDirectory root |> ignore
+        if OperatingSystem.IsWindows() then
+            Directory.CreateDirectory root |> ignore
+        else
+            Directory.CreateDirectory(
+                root, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+            |> ignore
+            Assert.That(File.GetUnixFileMode root,
+                        Is.EqualTo(UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute))
         File.WriteAllText(Path.Combine(root, ".wq10-disposable-fixture"), "WQ10_DISPOSABLE_FIXTURE_V1")
         try
             let ar, a1, a2 = repository root "account"

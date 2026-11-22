@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"automation-adjudicate-stageb-revocation-20261122","title":"[P0][Automation/Scheduler] Adjudicate StageB post-claim revocation before fake send","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"automation-adjudicate-stageb-revocation-20261122","title":"[P0][Automation/Scheduler] Adjudicate StageB post-claim revocation before fake send","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"ff7be3740f664bc4b1132672fc0ed3a1"}

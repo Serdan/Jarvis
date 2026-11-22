@@ -1,0 +1,14 @@
+# P2 — malformed nested observations can throw instead of returning a typed HOLD
+
+**Frozen source:** `8b0eba172ab8171c35f2c7f3c4b4921b8698dc23`, `Client/AutomationNativeProviderTrustContract.fs` (NEW, unwired). This is an original-task fail-closed malformed-evidence issue; it does not imply provider send/release authority or real B2 functionality.
+
+**Evidence and reproducible source paths**
+
+1. `inspectB1` checks null for the outer observation, `FakeClaim`, and `FakeProject` (lines 121–125), but not `Account`. With `Account = Unchecked.defaultof<AccountObservation>`, the nested `inspectAccount` correctly returns `Error [MissingObservation]` (lines 132–134), then `account.CanonicalWorkerPhase` (line 135) dereferences null. Likewise a nonnull `Account` with `ExpectedCandidate = Unchecked.defaultof<NativeDispatchCandidate>` triggers `inspectAccount`'s typed error but `account.ExpectedCandidate.DispatchId` at line 138 can dereference null. The advertised `Result<_, HoldReason list>` does not survive a malformed caller-supplied observation.
+2. `inspectTerminal` checks `Reservation`, `Locator`, and `Proof` but not `Reservation.Candidate` (lines 174–177). For an `Active` reservation with `Candidate = Unchecked.defaultof<NativeDispatchCandidate>`, `r.Candidate.DispatchId` at line 183 dereferences null before returning `Error [InvalidTerminalProof]`. The accepted native reservation types are `[<CLIMutable>]` records intended to admit deserialized or otherwise malformed input at trust boundaries.
+
+**Impact:** These pure, default-off validators do not grant a send or release (the explicit production host is still absent), so this is **P2**, not a cutover or live-effect bypass. However an unexpected exception in the proposed fail-closed validation boundary violates the task's requested malformed-evidence handling and can interrupt future reconciliation when reused. Existing 24 passing pure tests omit these malformed nested cases; the selected explicit production RED is unrelated.
+
+**Bounded remedy for independent adjudication:** Within the existing one NEW Client module and NEW standalone test-harness lease, short-circuit absent nested `Account`, `ExpectedCandidate`, `Reservation.Candidate`, and any dereferenced fake nested records into `Error [MissingObservation]` or the appropriate existing hold reason before field reads. Add narrow negative tests asserting typed `Error`, never an exception. Do not wire a host, broaden to B2, change accepted modules/fsproj/main, or require a real provider call. This is a recommendation, not independent scope authorization.
+
+**Evidence limit:** Independently verified source control flow and original managed Release/TRX, not a separate dynamic malformed-null execution; the defect follows directly from the unchecked field accesses above.

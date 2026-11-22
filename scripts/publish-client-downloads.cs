@@ -1,65 +1,132 @@
 #!/usr/bin/env dotnet
 
 using System.Diagnostics;
-using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 
 const string ServerUrl = "https://jarvis2.kehlet.dev/client";
 
-string[] rids = ["linux-x64", "win-x64", "osx-arm64"];
+// Keep these names aligned with Client/Modules/SelfUpdate.fs. Native Windows
+// clients are retired; Windows Chrome -> WSL localhost is a separate bridge.
+string[] rids = ["linux-x64", "osx-arm64"];
 
 var root = FindRepositoryRoot();
-var downloads = Path.Combine(root, "artifacts", "downloads");
+var artifacts = Path.Combine(root, "artifacts");
+var downloads = Path.Combine(artifacts, "downloads");
+var stageRoot = Path.Combine(artifacts, $".downloads-stage-{Guid.NewGuid():N}");
+var stageBuild = Path.Combine(stageRoot, "published");
+var stageDownloads = Path.Combine(stageRoot, "downloads");
+var backup = Path.Combine(artifacts, $".downloads-backup-{Guid.NewGuid():N}");
 
-Directory.CreateDirectory(downloads);
-
-foreach (var rid in rids)
+try
 {
-    var isWin = rid.StartsWith("win", StringComparison.OrdinalIgnoreCase);
-    var code = DotNet(
-        "scripts/build.cs",
-        "publish-client",
-        "--rid", rid,
-        "--server", ServerUrl);
+    // Never discard unknown files or follow a symlinked release directory.
+    ValidateExistingDownloads(downloads);
+    Directory.CreateDirectory(stageDownloads);
 
-    if (code != 0)
-        return code;
-
-    var sourceName = isWin ? "JarvisClient.exe" : "JarvisClient";
-    var targetName = isWin ? $"JarvisClient-{rid}.exe" : $"JarvisClient-{rid}";
-
-    var source = Path.Combine(root, "artifacts", "client", rid, sourceName);
-    var target = Path.Combine(downloads, targetName);
-
-    if (!File.Exists(source))
+    foreach (var rid in rids)
     {
-        Console.Error.WriteLine($"Expected published client was not found: {source}");
-        return 1;
+        var output = Path.Combine(stageBuild, rid);
+        var code = DotNet(
+            "scripts/build.cs", "publish-client",
+            "--rid", rid,
+            "--server", ServerUrl,
+            "--configuration", "Release",
+            "--output", output);
+
+        if (code != 0)
+            throw new InvalidOperationException($"Client publish failed for {rid} (exit {code}); previous downloads were preserved.");
+
+        var source = Path.Combine(output, "JarvisClient");
+        var target = Path.Combine(stageDownloads, $"JarvisClient-{rid}");
+
+        if (!File.Exists(source) || new FileInfo(source).Length == 0)
+            throw new InvalidDataException($"Expected nonempty published client was not found: {source}");
+
+        File.Copy(source, target);
+
+        if (!OperatingSystem.IsWindows())
+            File.SetUnixFileMode(target,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+                UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
     }
 
-    File.Copy(source, target, overwrite: true);
+    WriteChecksums(stageDownloads, rids);
 
-    if (!isWin && !RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+    // The public directory changes only after every artifact and checksum exists.
+    // Replacing the whole directory eliminates stale Windows downloads and hashes.
+    var previousMoved = false;
+    if (Directory.Exists(downloads))
     {
-        File.SetUnixFileMode(target, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute | UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+        Directory.Move(downloads, backup);
+        previousMoved = true;
+    }
+
+    try
+    {
+        Directory.Move(stageDownloads, downloads);
+    }
+    catch
+    {
+        if (previousMoved)
+            Directory.Move(backup, downloads);
+        throw;
+    }
+
+    // A failed cleanup is not a failed publish; retain backup for manual cleanup.
+    if (previousMoved)
+    {
+        try { Directory.Delete(backup, recursive: true); }
+        catch (Exception ex) { Console.Error.WriteLine($"Warning: old release backup remains at {backup}: {ex.Message}"); }
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("Client downloads are ready:");
+    foreach (var file in Directory.GetFiles(downloads).OrderBy(Path.GetFileName))
+        Console.WriteLine($"  {Path.GetRelativePath(root, file)}");
+
+    return 0;
+}
+catch (Exception ex)
+{
+    Console.Error.WriteLine($"Client downloads were not published: {ex.Message}");
+    return 1;
+}
+finally
+{
+    if (Directory.Exists(stageRoot))
+    {
+        try { Directory.Delete(stageRoot, recursive: true); }
+        catch (Exception ex) { Console.Error.WriteLine($"Warning: staging cleanup failed at {stageRoot}: {ex.Message}"); }
     }
 }
 
-WriteChecksums(downloads);
-
-Console.WriteLine();
-Console.WriteLine("Client downloads are ready:");
-foreach (var file in Directory.GetFiles(downloads).OrderBy(Path.GetFileName))
-    Console.WriteLine($"  {Path.GetRelativePath(root, file)}");
-
-return 0;
-
-void WriteChecksums(string directory)
+void ValidateExistingDownloads(string directory)
 {
-    var lines = Directory.GetFiles(directory)
-        .Where(path => Path.GetFileName(path) != "SHA256SUMS")
-        .OrderBy(Path.GetFileName)
-        .Select(path => $"{Sha256(path)}  {Path.GetFileName(path)}")
+    if (File.Exists(directory))
+        throw new InvalidDataException($"Download destination is a file: {directory}");
+
+    if (!Directory.Exists(directory))
+        return;
+
+    if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0)
+        throw new InvalidDataException($"Refusing symlinked download directory: {directory}");
+
+    foreach (var entry in Directory.EnumerateFileSystemEntries(directory))
+    {
+        var name = Path.GetFileName(entry);
+        if (!File.Exists(entry) ||
+            (File.GetAttributes(entry) & FileAttributes.ReparsePoint) != 0 ||
+            (name != "SHA256SUMS" && !name.StartsWith("JarvisClient-", StringComparison.Ordinal)))
+            throw new InvalidDataException($"Refusing to replace unmanaged or linked download entry: {entry}");
+    }
+}
+
+void WriteChecksums(string directory, IReadOnlyList<string> runtimeIds)
+{
+    var names = runtimeIds.Select(rid => $"JarvisClient-{rid}").ToArray();
+    var lines = names.Order(StringComparer.Ordinal)
+        .Select(name => $"{Sha256(Path.Combine(directory, name))}  {name}")
         .ToArray();
 
     File.WriteAllLines(Path.Combine(directory, "SHA256SUMS"), lines);
@@ -98,7 +165,6 @@ string FindRepositoryRoot()
     {
         if (File.Exists(Path.Combine(current.FullName, "Jarvis.slnx")))
             return current.FullName;
-
         current = current.Parent;
     }
 
@@ -108,7 +174,6 @@ string FindRepositoryRoot()
     {
         if (File.Exists(Path.Combine(current.FullName, "Jarvis.slnx")))
             return current.FullName;
-
         current = current.Parent;
     }
 
@@ -119,6 +184,5 @@ string QuoteIfNeeded(string value)
 {
     if (value.Any(char.IsWhiteSpace))
         return '"' + value.Replace("\"", "\\\"") + '"';
-
     return value;
 }

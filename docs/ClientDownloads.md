@@ -20,20 +20,23 @@ From the repository root:
 dotnet scripts/publish-client-downloads.cs
 ```
 
-This publishes and copies stable download files into:
+This stages and publishes a complete validated client download set into:
 
 ```text
 artifacts/downloads/
 ```
 
-Expected files:
+Expected files (the only supported self-update clients are Linux x64 and macOS ARM64):
 
 ```text
 JarvisClient-linux-x64
 JarvisClient-osx-arm64
-JarvisClient-win-x64.exe
 SHA256SUMS
 ```
+
+The script stages both .NET 11 Release clients and a fresh SHA256SUMS manifest outside the public download directory. Only after both publish successfully does it replace artifacts/downloads, retaining the prior directory for rollback on a failed switch. Old native Windows artifacts are not carried into the new manifest. A missing or empty client, unsupported RID, or malformed output fails closed. If artifacts/downloads contains unmanaged files or symlinks, publishing refuses to overwrite it. Keep personal files outside this generated directory.
+
+The separate Windows Chrome browser extension can still connect to Jarvis running on WSL via localhost. Retiring the Windows-native Jarvis client does not retire that bridge, nor does it restrict generic server publishing.
 
 ## Upload to the droplet
 
@@ -95,8 +98,7 @@ sudo systemctl reload nginx
 ```text
 https://jarvis2.kehlet.dev/downloads/JarvisClient-linux-x64
 https://jarvis2.kehlet.dev/downloads/JarvisClient-osx-arm64
-https://jarvis2.kehlet.dev/downloads/JarvisClient-win-x64.exe
-https://jarvis2.kehlet.dev/downloads/SHA256SUMS
+https://jarvis2.kehlet.dev/downloads/https://jarvis2.kehlet.dev/downloads/SHA256SUMS
 ```
 
 ## Smoke test

@@ -5,6 +5,11 @@ using System.CommandLine;
 using System.Diagnostics;
 
 var root = FindRepositoryRoot();
+var supportedClientRids = new HashSet<string>(StringComparer.Ordinal)
+{
+    "linux-x64",
+    "osx-arm64"
+};
 
 var configurationOption = new Option<string>("--configuration")
 {
@@ -20,7 +25,7 @@ var publishConfigurationOption = new Option<string>("--configuration")
 
 var ridOption = new Option<string>("--rid")
 {
-    Description = "Runtime identifier, for example linux-x64, win-x64, or osx-arm64.",
+    Description = "Runtime identifier (client: linux-x64 or osx-arm64; server: any supported .NET RID).",
     Required = true
 };
 
@@ -139,6 +144,12 @@ int Build(string configuration)
 
 int PublishClient(string rid, string server, string configuration, string output)
 {
+    if (!supportedClientRids.Contains(rid))
+    {
+        Console.Error.WriteLine($"Unsupported Jarvis client RID '{rid}'. Supported: linux-x64, osx-arm64.");
+        return 2;
+    }
+
     return DotNet(
         "publish",
         "Client/Client.fsproj",
@@ -153,6 +164,14 @@ int PublishClient(string rid, string server, string configuration, string output
 
 int PublishClients(IReadOnlyCollection<string> rids, string server, string configuration, string outputRoot)
 {
+    // Reject mixed valid/invalid requests before publishing any RID.
+    if (rids.Count == 0 || rids.Distinct(StringComparer.Ordinal).Count() != rids.Count ||
+        rids.Any(rid => !supportedClientRids.Contains(rid)))
+    {
+        Console.Error.WriteLine("Client RIDs must be unique and supported: linux-x64, osx-arm64.");
+        return 2;
+    }
+
     foreach (var rid in rids)
     {
         var code = PublishClient(rid, server, configuration, Path.Combine(outputRoot, rid));

@@ -5,6 +5,8 @@ open System.Collections.Generic
 open System.Diagnostics
 open System.IO
 open System.Security.Claims
+open Microsoft.Extensions.DependencyInjection
+open Microsoft.AspNetCore.Authentication.JwtBearer
 open System.Threading
 open System.Threading.Tasks
 open Client
@@ -23,14 +25,18 @@ open Server.Services
 // The only substituted boundary is the SignalR transport: the production authenticated
 // HubService reads actual production OptionalFeedbackStore SQLite, and production
 // NativeHealth executes real Git-backed recovery in TWO independent local clones.
-type private CallerContext(connection: string, user: string) =
+type private CallerContext(connection: string, user: string, ?validatedPrincipal: ClaimsPrincipal) =
     inherit HubCallerContext()
     let items = Dictionary<obj,obj>() :> IDictionary<obj,obj>
     let features = FeatureCollection() :> IFeatureCollection
     override _.ConnectionId = connection
-    override _.UserIdentifier = user
+    override _.UserIdentifier =
+        match validatedPrincipal with
+        | Some principal -> Server.Auth.tryUserId principal |> Option.defaultValue ""
+        | None -> user
     override _.User =
-        ClaimsPrincipal(ClaimsIdentity([Claim("sub", user)], "isolated-test-issuer"))
+        defaultArg validatedPrincipal
+            (ClaimsPrincipal(ClaimsIdentity([Claim("sub", user)], "isolated-test-issuer")))
     override _.Items = items
     override _.Features = features
     override _.ConnectionAborted = CancellationToken.None
@@ -493,3 +499,270 @@ type CoupledHealthPropertyTests() =
                 Assert.That(attempt.Value.AssignmentGeneration, Is.EqualTo(1))
             finally
                 File.Delete(cfg1); File.Delete(cfg2))
+
+
+    [<TestCase(599, false)>]
+    [<TestCase(600, true)>]
+    [<TestCase(601, true)>]
+    member _.ImmutableBoundaryObservationRunsThroughRealNativeHealthAndGitCas(age: int, shouldRecover: bool) =
+        // Unlike the SQLite integration test, these are exact immutable server
+        // observations injected ONLY at the already-authenticated transport port.
+        // Current and Recover are the real native Git-backed implementations.
+        fixture (fun one two taskId ->
+            let root = Path.GetDirectoryName one.RepositoryPath
+            let cfg1, cfg2 = config one, config two
+            try
+                let initial = candidate one "one"
+                let now = DateTimeOffset(2026, 11, 22, 0, 0, 0, TimeSpan.Zero)
+                let observation : AgentActivitySnapshot =
+                    { ServerNowUtc = now
+                      LastSeenAtUtc = Some(now.AddSeconds(-float age)) }
+                let mutable reads = 0
+                let dependencies : Dependencies =
+                    { Enumerate = (fun () -> Ok [initial])
+                      Current = NativeHealth.current (Runtime(root))
+                      Activity = (fun _ _ ->
+                          reads <- reads + 1
+                          Task.FromResult(Ok observation))
+                      Recover = NativeHealth.recover (Runtime(root)) }
+                let outcome = NativeHealth.checkOnce
+                                  { Enabled = true; InactivitySeconds = 600 } dependencies
+                              |> fun t -> t.GetAwaiter().GetResult()
+                Assert.That(outcome.Recoveries, Is.EqualTo(if shouldRecover then 1 else 0),
+                            sprintf "exact-age=%d NativeHealth SUT result=%A" age outcome)
+                Assert.That(reads, Is.EqualTo(if shouldRecover then 2 else 1))
+                let _, _, finalAttempt = ReviewWorkflow.getTask two taskId |> success
+                Assert.That(finalAttempt.Value.AssignmentGeneration,
+                            Is.EqualTo(initial.Generation + (if shouldRecover then 1 else 0)))
+                Assert.That(finalAttempt.Value.SpecBlobOid, Is.EqualTo(initial.SpecBlobOid))
+                Assert.That(finalAttempt.Value.SourceRef, Is.EqualTo(initial.SourceRef))
+                let _, receipt = LedgerStore.getOperationStatus two (recoveryOperationId initial) |> success
+                Assert.That(receipt.IsSome, Is.EqualTo(shouldRecover))
+            finally
+                File.Delete(cfg1); File.Delete(cfg2))
+
+    [<Test>]
+    member _.TransportPortNegativeCanaryFailsActualNativeHealthBoundaryAssertion() =
+        // Deliberately mutate ONLY a disposable transport observation by +1s
+        // in LastSeenAtUtc. 600s -> 599s must suppress the REAL SUT recovery,
+        // and an assertion expecting recovery must RED. A local comparator does
+        // not provide this evidence; the real Current/Recover/Git paths do.
+        fixture (fun one two taskId ->
+            let root = Path.GetDirectoryName one.RepositoryPath
+            let cfg1, cfg2 = config one, config two
+            try
+                let original = candidate one "one"
+                let now = DateTimeOffset(2026, 11, 22, 0, 0, 0, TimeSpan.Zero)
+                let mutated : AgentActivitySnapshot =
+                    { ServerNowUtc = now; LastSeenAtUtc = Some(now.AddSeconds(-599.)) }
+                let dependencies : Dependencies =
+                    { Enumerate = (fun () -> Ok [original])
+                      Current = NativeHealth.current (Runtime(root))
+                      Activity = (fun _ _ -> Task.FromResult(Ok mutated))
+                      Recover = NativeHealth.recover (Runtime(root)) }
+                let outcome = NativeHealth.checkOnce
+                                  { Enabled = true; InactivitySeconds = 600 } dependencies
+                              |> fun t -> t.GetAwaiter().GetResult()
+                let rejectedGate = Assert.Throws<AssertionException>(
+                    TestDelegate(fun () ->
+                        Assert.That(outcome.Recoveries, Is.EqualTo(1),
+                                    "600s exact-boundary gate must reject +1s last-seen mutant")))
+                Assert.That(rejectedGate, Is.Not.Null)
+                Assert.That(outcome.Recoveries, Is.Zero)
+                let _, _, attempt = ReviewWorkflow.getTask two taskId |> success
+                Assert.That(attempt.Value.AssignmentGeneration, Is.EqualTo(original.Generation))
+                let _, receipt = LedgerStore.getOperationStatus two (recoveryOperationId original) |> success
+                Assert.That(receipt.IsNone, Is.True)
+            finally
+                File.Delete(cfg1); File.Delete(cfg2))
+
+    [<Test>]
+    member _.OwnerTransferRevokesStaleNativeCandidateAndPreservesNewCanonicalOwner() =
+        fixture (fun one two taskId ->
+            let root = Path.GetDirectoryName one.RepositoryPath
+            let cfg1, cfg2 = config one, config two
+            try
+                use store = new OptionalFeedbackStore(Path.Combine(root, "activity.sqlite"))
+                let users = UserService()
+                let tracker = ClientResponseTracker()
+                let hub = registeredHub users tracker store "alice" "one"
+                let old = candidate two "one"
+                store.RecordAgentActivity("alice", "one", "Owner",
+                    DateTimeOffset.UtcNow.AddSeconds(-701.)).GetAwaiter().GetResult()
+                verified store "alice" "one" "Owner"
+                |> fun t -> t.GetAwaiter().GetResult() |> ignore
+                ReviewWorkflow.registerAgent one (Guid.NewGuid()) "Successor" |> success |> ignore
+                let _, task, attempt = ReviewWorkflow.getTask one taskId |> success
+                let owner = ReviewWorkflow.getAgentWorkingTurn one "Owner" |> success
+                let successorAttempt = Guid.NewGuid()
+                ReviewWorkflow.transferAttemptOwner one (Guid.NewGuid()) taskId
+                    successorAttempt "Successor" task.Version attempt.Value.Version
+                    owner.Version attempt.Value.AssignmentGeneration "Canonical handoff before stale health"
+                |> success |> ignore
+                let summary = runCheck (Runtime(root)) hub old
+                              |> fun t -> t.GetAwaiter().GetResult()
+                Assert.That(summary.Recoveries, Is.Zero)
+                let _, finalTask, finalAttempt = ReviewWorkflow.getTask two taskId |> success
+                Assert.That(finalTask.AttemptId, Is.EqualTo(successorAttempt.ToString("N")))
+                Assert.That(finalAttempt.Value.OwnerAgentId, Is.EqualTo("Successor"))
+                Assert.That(finalAttempt.Value.Phase, Is.EqualTo("Queued"))
+                Assert.That(finalAttempt.Value.SpecBlobOid, Is.EqualTo(old.SpecBlobOid))
+                Assert.That(finalAttempt.Value.SourceRef, Is.EqualTo(old.SourceRef))
+                let oldRecovery = NativeHealth.recover (Runtime(root)) old (recoveryOperationId old)
+                Assert.That(oldRecovery.IsError, Is.True,
+                            "A pre-transfer old-owner candidate must not recover the successor")
+                let _, after, live = ReviewWorkflow.getTask two taskId |> success
+                Assert.That(after.AttemptId, Is.EqualTo(successorAttempt.ToString("N")))
+                Assert.That(live.Value.OwnerAgentId, Is.EqualTo("Successor"))
+                let _, receipt = LedgerStore.getOperationStatus two (recoveryOperationId old) |> success
+                Assert.That(receipt.IsNone, Is.True)
+            finally
+                File.Delete(cfg1); File.Delete(cfg2))
+
+    [<Test>]
+    member _.CanonicalRoleAttachmentCannotForgeWorkingAssignmentOrRecoveryOwner() =
+        fixture (fun one two taskId ->
+            let root = Path.GetDirectoryName one.RepositoryPath
+            let cfg1, cfg2 = config one, config two
+            try
+                let original = candidate two "one"
+                ReviewWorkflow.registerAgent one (Guid.NewGuid()) "Successor" |> success |> ignore
+                Client.RoleInstructions.RoleInstructions.createRole one
+                    "FixtureAuditor" (Guid.NewGuid()) "Auditor" "Disposable role" "Never authorize native recovery"
+                |> success |> ignore
+                Client.RoleInstructions.RoleInstructions.attachRole one
+                    "FixtureAuditor" (Guid.NewGuid()) "Successor" "Auditor" 0
+                |> success |> ignore
+                // A role attachment is not a transfer, nor a generation change.
+                let stillOwner = NativeHealth.current (Runtime(root)) original |> success
+                Assert.That(stillOwner.IsSome, Is.True)
+                Assert.That(stillOwner.Value.AgentId, Is.EqualTo("Owner"))
+                let forged = { original with AgentId = "Successor" }
+                let forgedCurrent = NativeHealth.current (Runtime(root)) forged |> success
+                Assert.That(forgedCurrent.IsNone, Is.True)
+                let denied = NativeHealth.recover (Runtime(root)) forged (recoveryOperationId forged)
+                Assert.That(denied.IsError, Is.True)
+                let _, task, attempt = ReviewWorkflow.getTask two taskId |> success
+                Assert.That(task.TaskId, Is.EqualTo(taskId))
+                Assert.That(attempt.Value.OwnerAgentId, Is.EqualTo("Owner"))
+                Assert.That(attempt.Value.AssignmentGeneration, Is.EqualTo(original.Generation))
+                Assert.That(attempt.Value.SpecBlobOid, Is.EqualTo(original.SpecBlobOid))
+                let _, receipt = LedgerStore.getOperationStatus two (recoveryOperationId forged) |> success
+                Assert.That(receipt.IsNone, Is.True)
+            finally
+                File.Delete(cfg1); File.Delete(cfg2))
+
+
+    [<Test>]
+    member _.OfflineAspNetBearerIssuerSignatureScopeAndRealSQLiteHubBinding() =
+        // Real ASP.NET JwtBearerHandler + IAuthorizationService policy on an
+        // offline DefaultHttpContext. No fake ClaimsPrincipal is used for token
+        // authentication. This is component-level, NOT a full live Program host.
+        let issuerOptions : Server.JarvisOptions =
+            { Auth0Domain = "issuer.fixture.example.test"
+              Audience = "https://jarvis-api.fixture.example.test"
+              OpenAIAppsChallenge = ""
+              EnableOperatorConversations = false }
+        let issuer = Server.Auth.issuer issuerOptions
+        let audience = issuerOptions.Audience
+        let key = Microsoft.IdentityModel.Tokens.SymmetricSecurityKey(
+            System.Text.Encoding.UTF8.GetBytes("offline-fixture-hmac-key-0123456789-abcdefghijklmnopqrstuvwxyz"))
+        let wrongKey = Microsoft.IdentityModel.Tokens.SymmetricSecurityKey(
+            System.Text.Encoding.UTF8.GetBytes("offline-fixture-wrong-key-0123456789-abcdefghijklmnopqrstuvwxyz"))
+        let services = Microsoft.Extensions.DependencyInjection.ServiceCollection()
+        Microsoft.Extensions.DependencyInjection.LoggingServiceCollectionExtensions.AddLogging(services)
+        |> ignore
+        let authentication = services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+        authentication.AddJwtBearer(fun options ->
+                options.MapInboundClaims <- false
+                options.TokenValidationParameters <-
+                    Microsoft.IdentityModel.Tokens.TokenValidationParameters(
+                        ValidateIssuer = true,
+                        ValidIssuer = issuer,
+                        ValidateAudience = true,
+                        ValidAudiences = Server.Auth.validAudiences issuerOptions,
+                        ValidateIssuerSigningKey = true,
+                        IssuerSigningKey = key,
+                        ValidateLifetime = true,
+                        RequireExpirationTime = true,
+                        ClockSkew = TimeSpan.Zero))
+        |> ignore
+        services.AddAuthorization(fun options ->
+                options.AddPolicy(Server.Auth.ClientConnectPolicy, fun policy ->
+                    policy.RequireAuthenticatedUser() |> ignore
+                    policy.RequireAssertion(
+                        Func<Microsoft.AspNetCore.Authorization.AuthorizationHandlerContext,bool>(
+                            fun context -> Server.Auth.hasScope Server.Auth.ClientConnect context.User))
+                    |> ignore))
+        |> ignore
+        use provider = services.BuildServiceProvider()
+        let issue issuer scope signingKey subject =
+            let claims = [ Claim("sub", subject); Claim("scope", scope) ]
+            let token = System.IdentityModel.Tokens.Jwt.JwtSecurityToken(
+                issuer = issuer, audience = audience, claims = claims,
+                notBefore = DateTime.UtcNow.AddMinutes(-1.),
+                expires = DateTime.UtcNow.AddMinutes(10.),
+                signingCredentials = Microsoft.IdentityModel.Tokens.SigningCredentials(
+                    signingKey, Microsoft.IdentityModel.Tokens.SecurityAlgorithms.HmacSha256))
+            System.IdentityModel.Tokens.Jwt.JwtSecurityTokenHandler().WriteToken(token)
+        let validate token =
+            // HandlerProvider caches schemes within one DI scope; a fresh
+            // ASP.NET request MUST get a fresh service scope, or the earlier
+            // authenticated principal could be spuriously reused.
+            use requestScope = provider.CreateScope()
+            let context = Microsoft.AspNetCore.Http.DefaultHttpContext()
+            context.RequestServices <- requestScope.ServiceProvider
+            context.Request.Headers.Authorization <- Microsoft.Extensions.Primitives.StringValues("Bearer " + token)
+            let auth =
+                (Microsoft.AspNetCore.Authentication.AuthenticationHttpContextExtensions.AuthenticateAsync(
+                    context, JwtBearerDefaults.AuthenticationScheme)).GetAwaiter().GetResult()
+            if not auth.Succeeded then None
+            else
+                context.User <- auth.Principal
+                let authorization = context.RequestServices.GetRequiredService<Microsoft.AspNetCore.Authorization.IAuthorizationService>()
+                let result =
+                    (authorization.AuthorizeAsync(context.User, null,
+                                                  Server.Auth.ClientConnectPolicy)).GetAwaiter().GetResult()
+                if result.Succeeded then Some context.User else None
+        let valid = issue issuer Server.Auth.ClientConnect key "alice"
+        let accepted = validate valid
+        Assert.That(accepted.IsSome, Is.True, "Signed issuer/scope must pass actual ASP.NET bearer+policy")
+        Assert.That(Server.Auth.tryUserId accepted.Value, Is.EqualTo(Some "alice"))
+        let badCases =
+            [ "wrong issuer", issue "https://attacker.fixture.example.test/" Server.Auth.ClientConnect key "alice"
+              "wrong signature", issue issuer Server.Auth.ClientConnect wrongKey "alice"
+              "missing scope", issue issuer Server.Auth.WorkspaceRead key "alice" ]
+        for (label, token) in badCases do
+            Assert.That((validate token).IsNone, Is.True, label)
+        // ClientConnectPolicy checks auth + scope, NOT a subject claim. Do
+        // not invent a production requirement; the registered Hub user gate
+        // must instead block an absent/unregistered identity.
+        let subjectless = validate (issue issuer Server.Auth.ClientConnect key "")
+        Assert.That(subjectless.IsSome, Is.True)
+        Assert.That(Server.Auth.tryUserId subjectless.Value, Is.EqualTo(None))
+        // A verified principal is explicitly propagated to the existing real
+        // SQLite-backed HubService after bearer/scope gates pass; a mismatched
+        // session or unregistered identity still cannot read Alice's activity.
+        fixture (fun one two _ ->
+            let root = Path.GetDirectoryName one.RepositoryPath
+            use store = new OptionalFeedbackStore(Path.Combine(root, "jwt-activity.sqlite"))
+            let users = UserService()
+            let tracker = ClientResponseTracker()
+            store.RecordAgentActivity("alice", "one", "Owner", DateTimeOffset.UtcNow)
+                .GetAwaiter().GetResult()
+            verified store "alice" "one" "Owner" |> fun t -> t.GetAwaiter().GetResult() |> ignore
+            users.TransportConnected("alice", "verified-token-connection")
+            users.Register("alice",
+                { DeviceId = "one"; DeviceName = "one"; ProtocolVersion = AgentProtocol.version
+                  ClientVersion = "test"; SupportedCommands = ["RunCommand"; "ListJobs"] },
+                "verified-token-connection") |> ignore
+            let hub = new HubService(users, tracker, store, NullLogger<HubService>.Instance)
+            hub.Context <- CallerContext("verified-token-connection", "alice", accepted.Value)
+            let realRead = readActivity hub "one" "Owner" |> fun t -> t.GetAwaiter().GetResult()
+            Assert.That(realRead.IsOk, Is.True)
+            let unexpectedUser = issue issuer Server.Auth.ClientConnect key "mallory"
+            let mallory = validate unexpectedUser
+            Assert.That(mallory.IsSome, Is.True, "Valid token is not itself authorization to another session")
+            hub.Context <- CallerContext("verified-token-connection", "alice", mallory.Value)
+            let denied = readActivity hub "one" "Owner" |> fun t -> t.GetAwaiter().GetResult()
+            Assert.That(denied.IsError, Is.True, "JWT subject cannot spoof an existing Alice device"))

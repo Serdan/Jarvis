@@ -21,7 +21,7 @@ with an offline bare remote, distinct disposable trust bindings, original
 canonical task/agent records and real CAS. All external transport responses are
 simulated only at the server-client boundary, and no live tool runs.
 
-**Auth limitation:** The test injects an already-authenticated
+**Original eight-test auth limitation:** The original fixture injects an already-authenticated
 `ClaimsPrincipal` with a fixture `sub` claim; the ASP.NET JWT-signature and
 issuer-validation middleware is *not* exercised. Test clients cannot forge the
 `HubService` registered user/session or SQLite row by supplying client-local
@@ -87,7 +87,7 @@ reason payload; the final test replays the exact native request and passes.
 - Concurrent authenticated SQLite read availability and any need for
   bounded transport retry remain explicit fail-closed coverage, not green
   high-concurrency availability proof.
-- Test suite does not establish production signed JWT issuer validation,
+- Original eight-test suite did not establish production signed JWT issuer validation,
   full owner/role rewrite transitions, external network conditions, native
   Windows behavior, or an active/standby multi-server deployment.
 - Worker 21's unfiltered **complete Client.Tests** run exceeded 10 minutes
@@ -101,3 +101,118 @@ reason payload; the final test replays the exact native request and passes.
 If Lead/Integrator needs real JWT issuer-signature acceptance, request a
 separate narrowly scoped disposable ASP.NET test-host lease. Do not weaken
 production authorization or add fake authority to this harness.
+
+## Adjudicated independent review corrections (2026-11-22)
+
+Original frozen source `380cac50eb3aac51457bef1b78f571bcf85119fe`
+received independent `ChangesRequested` review
+`c6a3296dc9b549b6886c21b578f23190` (decision 11045).
+Independent Adjudicator 3 checkpoint **11058** authorized only the original
+standalone test/docs lease: F1 **NARROW**, F2 **ACCEPT**, F3 **NARROW**.
+No Server/Client production source, shared project file, main, live state,
+service, schedules, or deployment was changed.
+
+### F1 — real ASP.NET offline bearer handler/policy (NARROW)
+
+`OfflineAspNetBearerIssuerSignatureScopeAndRealSQLiteHubBinding` constructs
+an actual .NET11 ASP.NET `JwtBearerHandler` with a disposable HMAC fixture key,
+fresh per-request scoped DI, issuer and audience taken from production
+`Server.Auth.issuer` and `Server.Auth.validAudiences`, and an actual
+`IAuthorizationService` policy invoking production
+`Server.Auth.hasScope ClientConnect`. It tests issuer- and signature-invalid
+tokens, missing `client:connect` scope, a valid signed token, and a valid
+different-subject token. The accepted verified principal is bound to the
+production `HubService`/registered-session identity before reading an actual
+disposable `OptionalFeedbackStore` SQLite record. A different valid subject
+cannot adopt Alice's registered session. An auth handler's scoped cache is
+reset for each tested request; sharing one root-service scope would have
+produced a false issuer-negative green.
+
+**Explicit boundary:** this exercises the real ASP.NET handler plus
+authorization service and production `Auth` rules in an offline request
+context. It does **not** host production `Program.configureApp` behind
+Kestrel/TestServer, retrieve Auth0 OIDC signing metadata, or prove the live
+`/client` SignalR handshake. The policy requires authenticated identity and
+`client:connect` but **not** `sub` directly; a subjectless signed token
+passes that policy but lacks the registered user identity required by the hub.
+Do not invent a stricter production policy or claim complete host JWT parity.
+For literal full-host issuer parity, a separate disposable app-host test lease
+with offline metadata/configuration override is still required.
+
+### F2 — canonical owner transfer and role mutation (ACCEPT)
+
+`OwnerTransferRevokesStaleNativeCandidateAndPreservesNewCanonicalOwner`
+captures the original candidate from a separate clone, records authenticated
+stale server SQLite activity, registers a successor, and invokes genuine
+`ReviewWorkflow.transferAttemptOwner` with exact task, attempt, agent and
+generation versions. The stale native health check and direct Git CAS recovery
+are denied; the successor's queued attempt, immutable spec/source, new
+attempt ID, and no recovery receipt are verified from the second clone.
+
+`CanonicalRoleAttachmentCannotForgeWorkingAssignmentOrRecoveryOwner`
+separately creates and attaches a canonical role to a registered successor.
+Role association is **not** an ownership handoff; the incumbent remains
+eligible under existing policy. A client-supplied candidate impersonating
+the role-holder cannot resolve a working assignment or perform native
+recovery. The task owner, generation, spec and no forged recovery receipt
+are verified from the independent clone. No synthetic ledger edits or invented
+role-as-CAS-invalidation rule were used.
+
+### F3 — exact boundary reaching production NativeHealth (NARROW)
+
+`ImmutableBoundaryObservationRunsThroughRealNativeHealthAndGitCas`
+injects only the already-authenticated transport `AgentActivitySnapshot`
+with a frozen server clock at exact **599, 600 and 601 seconds**.
+The actual `NativeHealth.checkOnce`, `NativeHealth.current`,
+`NativeHealth.recover` and native Git CAS receipt and generation are
+asserted for each independent disposable two-clone fixture.
+
+`TransportPortNegativeCanaryFailsActualNativeHealthBoundaryAssertion`
+perturbs the transport `LastSeenAtUtc` from exactly 600 to 599 seconds,
+runs the **real** native production decision/recovery path and captures the
+intentionally failing must-recover assertion as a negative canary. The
+mutated input cannot produce a recovery receipt or generation increment.
+This is a mutation at the transport port **reaching the production SUT**,
+not a tracked production-source mutation; the original local comparator
+witness remains merely supplemental.
+
+### Full-suite source and evidence
+
+The original **8/8** positive harness tests remain in the same standalone
+project. The correction adds **7** independently named cases (three
+exact-boundary cases, the transport negative canary, owner transfer,
+role attachment, and JWT policy/SQLite identity integration), for **15** unfiltered tests. The final source-bound Release run is
+independently TRX-checked as **15 passed, 0 failed, 0 skipped**.
+
+The source-pinned Release invocation is:
+
+```sh
+dotnet test scripts/tests/automation-health-coupled-20261122/HealthCoupled.Tests.fsproj \
+  -c Release --no-restore -p:BuildProjectReferences=false \
+  --logger 'trx;LogFileName=health-adjudicated-full-release.trx' \
+  --results-directory /tmp/jarvis-health-coupled-worker19-results
+```
+
+The full `Client.Tests` suite remains **INCONCLUSIVE** as independently
+reported earlier, and unrestricted simultaneous SQLite reads, actual external
+identity-provider metadata, host-network JWT ingress and native Windows are
+outside this isolated proof. No test result should be used to activate Health,
+Scheduler, deployment, migration or any live effect.
+
+**Final terminal evidence (new correction):** `start_job`
+`01ac1d21e3dc43509f2e611f90d9707c` completed exit **0**:
+`Passed: 15; Failed: 0; Skipped: 0; Total: 15; Duration: 33s`.
+Exact unfiltered TRX:
+`/tmp/jarvis-health-coupled-worker19-results/health-adjudicated-full-release.trx`.
+A separate XML parse found `total=15, executed=15, passed=15, failed=0`,
+and 15 `UnitTestResult` entries all with `outcome=Passed`.
+SDK `dotnet --version`: `11.0.100`. Target `net11.0`,
+configuration `Release`, Linux, standalone `HealthCoupled.Tests.fsproj`,
+`--no-restore -p:BuildProjectReferences=false` using earlier compiled
+first-party Release project references. Earlier parser/compile/test REDs for
+the new JWT fixture were retained in distinct job/TRX records and not
+relabeled; the final correction includes fresh per-request DI isolation and
+production-matching scope semantics. The original 8/8 and focused 6/6
+F2/F3 and 1/1 JWT proof remain separate positive evidence, not a substitute
+for this unfiltered 15/15 gate. The earlier **full Client.Tests INCONCLUSIVE**
+status is unchanged.

@@ -226,6 +226,14 @@ let private requiresConfirmation command =
             [ cmd.FilePath ] None [ host ] $"Import from {host} to {cmd.FilePath}" false
     | UpdateClientCommand ->
         confirmation "UpdateClient" None [ ProcessExecution; NetworkAccess; Destructive ] [] None [] "Update and restart Jarvis client" false
+    | UpdateNamedSettingCommand cmd when cmd.ExpectedRevision.IsNone && cmd.Value.IsNone ->
+        // Read-only revision discovery cannot change settings.
+        readOnly
+    | UpdateNamedSettingCommand cmd ->
+        // Only canonical setting name reaches the local confirmation text;
+        // never echo allowlist contents or an arbitrary user-supplied value.
+        confirmation "UpdateNamedSetting" None [ WorkspaceWrite ] [] None []
+            ("Update client setting " + NamedClientSettingWire.canonicalName cmd.Setting) false
     | WriteFileCommand cmd ->
         confirmation "WriteFile" (Some cmd.ProjectName) [ WorkspaceWrite ] [ cmd.FilePath ] None [] $"Write file {cmd.FilePath}" true
     | PatchFileCommand cmd ->

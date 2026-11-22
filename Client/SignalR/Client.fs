@@ -526,6 +526,129 @@ let private fromBrowser (operation: ValueTask<Result<string, EffectError>>) =
             { Payload = payload; ChangedAgentIds = [] })
     })
 
+/// Remote settings writes are intentionally a thin adapter over the exact
+/// client-local TUI/CLI CAS/save/readback boundary, never a second file writer.
+let private updateNamedSetting (rt: Runtime) (cmd: UpdateNamedSettingCommand) =
+    let key = NamedClientSettingWire.canonicalName cmd.Setting
+    let textValue =
+        match cmd.Value, cmd.Setting with
+        | None, _ -> Ok None
+        | Some(NamedClientSettingValue.Text text),
+          (NamedClientSetting.MachineName | NamedClientSetting.WorkspacePath | NamedClientSetting.TrustLevel) ->
+            Ok(Some text)
+        | Some(NamedClientSettingValue.TextList names), NamedClientSetting.AllowedEnvironmentVariables ->
+            // Validate element identity AGAIN at the client boundary: a hostile
+            // wire message must never retokenize one invalid name into two.
+            NamedClientSettingWire.validateEnvironmentNames names
+            |> Result.map (String.concat "," >> Some)
+        | Some(NamedClientSettingValue.Integer value),
+          (NamedClientSetting.BrowserPort | NamedClientSetting.MaxImportBytes | NamedClientSetting.NativeHealthTimeoutSeconds) ->
+            Ok(Some(string value))
+        | Some(NamedClientSettingValue.Boolean value), NamedClientSetting.NativeHealthEnabled ->
+            Ok(Some(if value then "true" else "false"))
+        | _ -> Error "Setting value wire type does not match setting name."
+    let storedValue (stored: ClientStoredConfig) =
+        match cmd.Setting with
+        | NamedClientSetting.MachineName -> stored.MachineName
+        | NamedClientSetting.WorkspacePath -> stored.WorkspacePath
+        | NamedClientSetting.TrustLevel -> stored.TrustLevel
+        | NamedClientSetting.AllowedEnvironmentVariables ->
+            // Environment variable allowlists can reveal credentials or host policy.
+            // Return presence/redaction, not the list contents.
+            stored.AllowedEnvironmentVariables |> Option.map (fun _ -> "[redacted]")
+        | NamedClientSetting.MaxImportBytes -> stored.MaxImportBytes |> Option.map string
+        | NamedClientSetting.BrowserPort -> stored.BrowserPort |> Option.map string
+        | NamedClientSetting.NativeHealthEnabled -> stored.NativeHealthEnabled |> Option.map string
+        | NamedClientSetting.NativeHealthTimeoutSeconds ->
+            stored.NativeHealthTimeoutSeconds |> Option.map string
+    let readOnly = cmd.ExpectedRevision.IsNone && cmd.Value.IsNone
+    // Remote provenance and runtime arguments come from Program's connected
+    // client context, never from a caller-supplied command field.
+    let runningContext = ClientConfig.tryRunningContext()
+    let runtimeValue (runtime: ClientEffectiveConfig) =
+        match cmd.Setting with
+        | NamedClientSetting.MachineName -> Some runtime.MachineName
+        | NamedClientSetting.WorkspacePath -> Some runtime.WorkspacePath
+        | NamedClientSetting.TrustLevel -> Some runtime.TrustLevel
+        | NamedClientSetting.AllowedEnvironmentVariables -> Some "[redacted]"
+        | NamedClientSetting.MaxImportBytes -> Some(string runtime.MaxImportBytes)
+        | NamedClientSetting.BrowserPort -> runtime.BrowserPort |> Option.map string
+        | NamedClientSetting.NativeHealthEnabled -> Some(string runtime.NativeHealthEnabled)
+        | NamedClientSetting.NativeHealthTimeoutSeconds -> Some(string runtime.NativeHealthTimeoutSeconds)
+    let overrideName =
+        match cmd.Setting with
+        | NamedClientSetting.MachineName -> "machineName"
+        | NamedClientSetting.WorkspacePath -> "workspacePath"
+        | NamedClientSetting.TrustLevel -> "trustLevel"
+        | NamedClientSetting.AllowedEnvironmentVariables -> "allowedEnvironmentVariables"
+        | NamedClientSetting.MaxImportBytes -> "maxImportBytes"
+        | NamedClientSetting.BrowserPort -> "browserPort"
+        | NamedClientSetting.NativeHealthEnabled -> "nativeHealthEnabled"
+        | NamedClientSetting.NativeHealthTimeoutSeconds -> "nativeHealthTimeoutSeconds"
+    let outcome =
+        (if readOnly then Ok None
+         elif cmd.ExpectedRevision.IsNone then
+             Error "Remote settings mutation requires a pinned expectedRevision."
+         else textValue)
+        |> Result.bind (fun text ->
+            match runningContext, readOnly with
+            | None, false ->
+                Error "Named setting mutation requires an active connected-client startup context."
+            | _ ->
+                ClientConfig.load()
+                |> Result.bind (fun observed ->
+                    let transaction =
+                        if readOnly then Ok (observed, observed, None)
+                        else
+                            match runningContext with
+                            | None -> Error "No authenticated running settings context."
+                            | Some (runtime, startupArgs) ->
+                                let mutation =
+                                    match text with
+                                    | Some value -> SettingsMutation.Set(key, value)
+                                    | None -> SettingsMutation.Unset key
+                                ClientConfig.applySettings RemoteAgent runtime startupArgs cmd.ExpectedRevision mutation
+                                |> Result.mapError ClientConfig.settingsErrorMessage
+                                |> Result.map (fun applied -> applied.Before, applied.After, Some applied)
+                    transaction
+                    |> Result.map (fun (before, after, applied) ->
+                        let changed = before.Stored <> after.Stored
+                        let restart = applied |> Option.exists (fun x -> x.RestartRequired)
+                        let registryPending = applied |> Option.exists (fun x -> x.RegistryRefreshPending)
+                        let healthPending = applied |> Option.exists (fun x -> x.NativeHealthRefreshPending)
+                        let reconnect = applied |> Option.exists (fun x -> x.ReconnectRequired)
+                        { SettingName = key
+                          Operation = (if readOnly then "read" elif cmd.Value.IsSome then "set" else "unset")
+                          OldPersistedValue = storedValue before.Stored
+                          NewPersistedValue = storedValue after.Stored
+                          ValuesRedacted = (cmd.Setting = NamedClientSetting.AllowedEnvironmentVariables)
+                          OldRevision = before.Revision
+                          Revision = after.Revision
+                          ConfigSource = after.Path
+                          EffectiveRuntimeValue =
+                              runningContext |> Option.bind (fun (runtime, _) -> runtimeValue runtime)
+                          RuntimeObservation =
+                              (if runningContext.IsSome then
+                                   "Observed connected-client startup context; persisted values are not assumed live"
+                               else "NotObserved: no running startup context (read-only discovery)")
+                          StartupOverride =
+                              runningContext |> Option.map (fun (runtime, _) -> runtime.Overrides.Contains overrideName)
+                          AppliedNow = false // Saving persisted settings alone never applies live process changes.
+                          RestartRequired = restart
+                          ReconnectRequired = reconnect
+                          Activation =
+                              if readOnly then "read-only"
+                              elif not changed then "unchanged"
+                              elif registryPending then "next-device-registration"
+                              elif healthPending then "next-native-health-check"
+                              elif restart then "persisted-for-restart"
+                              else "persisted; running context unchanged" })))
+    outcome
+    |> Result.mapError (fun message ->
+        if message.Contains("Local operator confirmation required", StringComparison.OrdinalIgnoreCase)
+           then Client.PermissionDenied message
+        else Client.ValidationError message)
+
 let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
                      (resolved: ProjectPaths.ResolvedProject option) (agentId: string) (command: AgentCommand) =
     match command with
@@ -851,6 +974,7 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
         |> sourceOperation resolved (fun project -> ProjectBrowser.exportFileIn project cmd) (fun () -> ProjectBrowser.exportFile cmd)
         |> serialize'
     | ImportFileCommand cmd -> rt |> importFile resolved cmd |> serialize'
+    | UpdateNamedSettingCommand cmd -> updateNamedSetting rt cmd |> serialize'
     | UpdateClientCommand -> SelfUpdate.prepare () |> Async.AwaitTask |> Async.RunSynchronously |> serialize'
     | WriteFileCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.writeFileIn project cmd) (fun () -> ProjectBrowser.writeFile cmd) |> serialize'
     | PatchFileCommand cmd ->

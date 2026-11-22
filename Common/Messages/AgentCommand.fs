@@ -521,6 +521,73 @@ type ImportFileResult =
 
 type UpdateClientCommand = struct end
 
+/// A closed wire enum; values are typed, not arbitrary config paths.
+[<JsonConverter(typeof<TypeSafeEnumConverter<NamedClientSetting>>)>]
+type NamedClientSetting =
+    | MachineName
+    | WorkspacePath
+    | TrustLevel
+    | AllowedEnvironmentVariables
+    | MaxImportBytes
+    | BrowserPort
+    | NativeHealthEnabled
+    | NativeHealthTimeoutSeconds
+
+[<JsonConverter(typeof<UnionConverter<NamedClientSettingValue>>)>]
+type NamedClientSettingValue =
+    | Text of string
+    | Integer of int64
+    | Boolean of bool
+    | TextList of string list
+
+/// Preserve element identity before the legacy comma/semicolon TUI parser.
+module NamedClientSettingWire =
+    let canonicalName = function
+        | NamedClientSetting.MachineName -> "machine-name"
+        | NamedClientSetting.WorkspacePath -> "workspace-path"
+        | NamedClientSetting.TrustLevel -> "trust-level"
+        | NamedClientSetting.AllowedEnvironmentVariables -> "allowed-environment-variables"
+        | NamedClientSetting.MaxImportBytes -> "max-import-bytes"
+        | NamedClientSetting.BrowserPort -> "browser-port"
+        | NamedClientSetting.NativeHealthEnabled -> "native-health-enabled"
+        | NamedClientSetting.NativeHealthTimeoutSeconds -> "native-health-timeout-seconds"
+    let validateEnvironmentNames (names: string list) =
+        let validName (name: string) =
+            not (String.IsNullOrWhiteSpace name)
+            && name.Length <= 128
+            && (Char.IsLetter name[0] || name[0] = '_')
+            && (name |> Seq.forall (fun ch -> Char.IsLetterOrDigit ch || ch = '_'))
+        if names.Length > 128 || names |> List.exists (validName >> not) then
+            Error "Allowed environment variables must be valid individual names (letter or underscore first, then letters, digits or underscores), no more than 128."
+        elif (names |> List.distinctBy (fun name -> name.ToUpperInvariant()) |> List.length) <> names.Length then
+            Error "Allowed environment variables must not contain duplicate names."
+        else Ok names
+
+type UpdateNamedSettingCommand =
+    { Setting: NamedClientSetting
+      /// None restores the default when ExpectedRevision is present;
+      /// None/None is the explicit read-only revision-discovery request.
+      Value: NamedClientSettingValue option
+      ExpectedRevision: string option }
+
+type UpdateNamedSettingResult =
+    { SettingName: string
+      Operation: string
+      OldPersistedValue: string option
+      NewPersistedValue: string option
+      ValuesRedacted: bool
+      OldRevision: string
+      Revision: string
+      ConfigSource: string
+      /// Runtime fields are explicitly nullable when not actually observable.
+      EffectiveRuntimeValue: string option
+      RuntimeObservation: string
+      StartupOverride: bool option
+      AppliedNow: bool
+      RestartRequired: bool
+      ReconnectRequired: bool
+      Activation: string }
+
 type UpdateClientResult =
     { RuntimeIdentifier: string
       Sha256: string
@@ -901,6 +968,7 @@ type AgentCommand =
     | ExportFileCommand of ExportFileCommand
     | ImportFileCommand of ImportFileCommand
     | UpdateClientCommand
+    | UpdateNamedSettingCommand of UpdateNamedSettingCommand
     | WriteFileCommand of WriteFileCommand
     | PatchFileCommand of PatchFileCommand
     | RunCommandCommand of RunCommandCommand
@@ -1031,6 +1099,7 @@ module AgentCommandInfo =
         | ExportFileCommand _ -> "ExportFileCommand"
         | ImportFileCommand _ -> "ImportFileCommand"
         | UpdateClientCommand -> "UpdateClientCommand"
+        | UpdateNamedSettingCommand _ -> "UpdateNamedSettingCommand"
         | WriteFileCommand _ -> "WriteFileCommand"
         | PatchFileCommand _ -> "PatchFileCommand"
         | RunCommandCommand _ -> "RunCommandCommand"
@@ -1131,6 +1200,7 @@ module AgentCommandInfo =
         | ExportFileCommand _ -> "ExportFile"
         | ImportFileCommand _ -> "ImportFile"
         | UpdateClientCommand -> "UpdateClient"
+        | UpdateNamedSettingCommand _ -> "UpdateNamedSetting"
         | WriteFileCommand _ -> "WriteFile"
         | PatchFileCommand _ -> "PatchFile"
         | RunCommandCommand _ -> "RunCommand"
@@ -1178,6 +1248,7 @@ module AgentCommandInfo =
         | BrowserCaptureDomCommand _
         | CreateProjectCommand _
         | UpdateClientCommand -> None
+        | UpdateNamedSettingCommand _ -> None
         | GetJobResultCommand cmd -> Some cmd.ProjectName
         | CancelJobCommand cmd -> Some cmd.ProjectName
         | MessageCommand cmd -> cmd.ProjectName
@@ -1301,6 +1372,7 @@ module AgentCommandInfo =
         | ExportFileCommand cmd -> Some(compact cmd.FilePath)
         | ImportFileCommand cmd -> Some(compact cmd.FilePath)
         | UpdateClientCommand -> Some "latest published client"
+        | UpdateNamedSettingCommand cmd -> Some(sprintf "client setting %A" cmd.Setting)
         | WriteFileCommand cmd -> Some(compact cmd.FilePath)
         | PatchFileCommand cmd -> Some(compact cmd.FilePath)
         | RunCommandCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
@@ -1377,6 +1449,7 @@ module AgentCommandInfo =
         | ExportFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | ImportFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | UpdateClientCommand -> Some "self-update"
+        | UpdateNamedSettingCommand cmd -> Some(sprintf "setting %A" cmd.Setting)
         | WriteFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | PatchFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | RunCommandCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
@@ -1461,7 +1534,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.68"
+    let version = "3.69"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -1537,6 +1610,7 @@ module AgentProtocol =
           definition "ExportFile" "Copies one bounded project file to a short-lived user download URL." [ ReadOnly ] false false false
           definition "ImportFile" "Downloads a ChatGPT-provided file into a project path." [ WorkspaceWrite; NetworkAccess ] true true false
           definition "UpdateClient" "Downloads, verifies, installs, and restarts into the latest published Jarvis client." [ ProcessExecution; NetworkAccess; Destructive ] true false false
+          definition "UpdateNamedSetting" "Update exactly one named setting on the selected client through its local CAS settings service; remote privilege expansion is denied." [ WorkspaceWrite ] true true false
           definition "WriteFile" "Writes or appends one file." [ WorkspaceWrite ] true true false
           definition "PatchFile" "Applies an atomic unified diff to one file." [ WorkspaceWrite ] true true true
           definition "RunCommand" "Runs a bounded local process." [ ProcessExecution ] true true false

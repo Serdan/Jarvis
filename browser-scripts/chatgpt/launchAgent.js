@@ -84,11 +84,11 @@ async function execute(args) {
   });
   try {
   // Re-evaluate on every fresh launch; never cache usage availability.
-  // Strict fallback order: Chat GPT-6 High, Work GPT-6.2 Sol Medium, Chat GPT-6 Instant.
+  // Strict fallback order: Chat GPT-6 Medium, Work GPT-6.1 Terra Medium, Chat GPT-6 Instant.
   // Advance only when the current selection cannot be confirmed before Send.
   const preferences = [
-    { mode: "Chat", model: "GPT-6", effort: "high", level: 2, label: "High" },
-    { mode: "Work", model: "GPT-6.2 Sol", effort: "medium", level: 1, label: "Medium" },
+    { mode: "Chat", model: "GPT-6", effort: "medium", level: 1, label: "Medium" },
+    { mode: "Work", model: "GPT-6.1 Terra", effort: "medium", level: 1, label: "Medium" },
     { mode: "Chat", model: "GPT-6", effort: "none", level: 0, label: "Instant" }
   ];
   const composerSelector = '[data-composer-input-layout] [contenteditable="true"][role="textbox"]';
@@ -235,7 +235,7 @@ async function execute(args) {
         if (powerLabel?.getAttribute("data-power-disabled") === "true" ||
             power?.querySelector('[data-locked="true"]')) return "EffortUnavailable";
         if (target.mode === "Work" &&
-            !document.querySelector('[data-model-selection-label="gpt-6.2-sol-wm"]'))
+            !document.querySelector('[data-model-selection-label="gpt-6.1-terra-wm"]'))
           return "ModelUnconfirmed";
         // Close the picker before editing. No menu click can submit a prompt.
         if (control.getAttribute("aria-expanded") === "true") control.click();
@@ -347,7 +347,7 @@ async function execute(args) {
         .filter(node => node.getClientRects().length &&
           !node.closest('[aria-hidden="true"],[inert]'));
       if (labels.length && !labels.some(node =>
-          node.getAttribute("data-model-selection-label") === "gpt-6.2-sol-wm")) {
+          node.getAttribute("data-model-selection-label") === "gpt-6.1-terra-wm")) {
         return { failure: incompatible(stage, "SelectedModelChanged") };
       }
     }

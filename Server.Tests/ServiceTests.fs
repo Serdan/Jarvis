@@ -627,8 +627,9 @@ let ``public integration command selects a fail closed wire action for every sha
     Assert.That(legacy.Summary, Is.Empty)
     Assert.That(legacy.NextAction, Is.Empty)
     Assert.That(legacy.Evidence, Is.Empty)
-    for ns, refName, approval in [ "_reviews", "refs/heads/jarvis-review/_reviews/review/r1", "approval"
-                                  "_reviews", "", ""; "", "ref", ""; "", "", "approval" ] do
+    for ns, refName, approval in
+        [ ("_reviews", "refs/heads/jarvis-review/_reviews/review/r1", "approval")
+          ("_reviews", "", ""); ("", "ref", ""); ("", "", "approval") ] do
         let wire = command ns refName approval
         let cmd = unpack wire
         Assert.That(cmd.Action, Is.EqualTo("SubmitSharedAcceptedIntegration"))

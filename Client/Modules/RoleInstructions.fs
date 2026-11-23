@@ -404,3 +404,132 @@ module RoleInstructions =
             let! snapshot = LedgerStore.fetch binding
             return! resolveAt binding snapshot agentId
         }
+
+
+    // The launch template is project-scoped and deliberately independent of
+    // role membership, source worktree and assignment. Only the two literal
+    // identity tokens are recognized; substitutions are never reparsed.
+    [<CLIMutable>]
+    type LaunchTemplateRecord =
+        { Template: string
+          Version: int
+          UpdatedBy: string
+          UpdatedSequence: int64 }
+
+    [<CLIMutable>]
+    type LaunchTemplateSnapshot =
+        { SnapshotCommit: string
+          Template: LaunchTemplateRecord option
+          BlobOid: string option }
+
+    [<CLIMutable>]
+    type RenderedLaunchPrompt =
+        { SnapshotCommit: string
+          ProjectId: Guid
+          ProjectName: string
+          AgentId: string
+          TemplateVersion: int
+          TemplateBlobOid: string
+          PromptSha256: string
+          Prompt: string }
+
+    let private launchTemplatePath = "records/launch-template.json"
+    let private agentToken = "{{agentId}}"
+    let private projectToken = "{{projectName}}"
+    let private launchTokens = Regex(@"\{\{agentId\}\}|\{\{projectName\}\}|\{\{|\}\}", RegexOptions.CultureInvariant)
+
+    let private strictUtf8 = UTF8Encoding(false, true)
+    let private wellFormedUtf8 (value: string) =
+        try
+            not (isNull value) && strictUtf8.GetByteCount(value) >= 0
+        with :? EncoderFallbackException -> false
+
+    let private validLaunchTemplate body =
+        wellFormedUtf8 body && validBody false body
+        && (body |> Seq.forall (fun c -> not (Char.IsControl c) || c = '\n' || c = '\r' || c = '\t'))
+        && body.Contains(agentToken, StringComparison.Ordinal)
+        && body.Contains(projectToken, StringComparison.Ordinal)
+        && (launchTokens.Matches body
+            |> Seq.cast<Match>
+            |> Seq.forall (fun m -> m.Value = agentToken || m.Value = projectToken))
+
+    let private validLaunchRecord (record: LaunchTemplateRecord) =
+        validLaunchTemplate record.Template
+        && record.Version >= 1
+        && not (String.IsNullOrWhiteSpace record.UpdatedBy)
+        && record.UpdatedSequence > 0L
+
+    // As with other pinned domain reads, snapshot must originate from the
+    // verified ledger path. Explicitly reject mismatched project/epoch use.
+    let private readLaunchTemplateAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) =
+        if snapshot.Header.ProjectId <> string binding.ProjectId
+           || snapshot.Header.LedgerId <> string binding.LedgerId
+           || snapshot.Header.Epoch <> binding.Epoch then
+            Error(InvalidBinding "Launch template snapshot belongs to a different project ledger or epoch.")
+        else
+            readEntity validLaunchRecord binding snapshot launchTemplatePath
+
+    let getLaunchTemplateAt binding snapshot =
+        result {
+            let! current = readLaunchTemplateAt binding snapshot
+            return
+                { SnapshotCommit = snapshot.Commit
+                  Template = current |> Option.map fst
+                  BlobOid = current |> Option.map snd }
+        }
+
+    let getLaunchTemplate binding =
+        result {
+            let! snapshot = LedgerStore.fetch binding
+            return! getLaunchTemplateAt binding snapshot
+        }
+
+    // The calling command boundary authenticates and explicitly authorizes the
+    // operator; actor is journal provenance, never a caller-supplied role.
+    let setLaunchTemplate binding actor operationId expectedVersion body =
+        if expectedVersion < 0 || expectedVersion = Int32.MaxValue
+           || not (validLaunchTemplate body) || String.IsNullOrWhiteSpace actor then
+            Error(InvalidBinding "Invalid launch template: supply both literal identity tokens, no unknown or unmatched double braces, and a bounded nonblank body.")
+        else
+            LegacyDirectWriterFence.transact binding
+                (intent operationId actor "SetLaunchTemplate"
+                    {| expectedVersion = expectedVersion; templateSha256 = hash body |})
+                (fun snapshot -> result {
+                    let! current = readLaunchTemplateAt binding snapshot
+                    let version = current |> Option.map (fun (record, _) -> record.Version) |> Option.defaultValue 0
+                    if version <> expectedVersion then
+                        return! Error(StaleEntityVersion $"Launch template version conflict: expected {expectedVersion}, current {version}.")
+                    let next: LaunchTemplateRecord =
+                        { Template = body; Version = version + 1
+                          UpdatedBy = actor; UpdatedSequence = snapshot.Header.NextSequence }
+                    return [ change launchTemplatePath (current |> Option.map snd) (entityJson next) ]
+                })
+
+    let renderLaunchPromptAt (binding: LedgerBinding) snapshot projectName agentId =
+        if not (wellFormedUtf8 projectName && isAgentId projectName)
+           || not (wellFormedUtf8 agentId && isAgentId agentId) then
+            Error(InvalidBinding "Invalid launch project or agent identity.")
+        else result {
+            let! current = readLaunchTemplateAt binding snapshot
+            do! requireRegisteredAgent binding snapshot agentId
+            match current with
+            | None -> return! Error(InvalidBinding "Project launch template is not configured; an authorized Operator must set version 0.")
+            | Some(record, blob) ->
+                let prompt =
+                    launchTokens.Replace(record.Template,
+                        MatchEvaluator(fun m -> if m.Value = agentToken then agentId else projectName))
+                if prompt.Length > 24000 || utf8.GetByteCount prompt > 65536
+                   || utf8.GetByteCount(JsonSerializer.Serialize(prompt, options)) > 131072 then
+                    return! Error(InvalidBinding "Rendered launch prompt exceeds the transport byte budget.")
+                return
+                    { SnapshotCommit = snapshot.Commit; ProjectId = binding.ProjectId
+                      ProjectName = projectName; AgentId = agentId
+                      TemplateVersion = record.Version; TemplateBlobOid = blob
+                      PromptSha256 = hash prompt; Prompt = prompt }
+        }
+
+    let renderLaunchPrompt binding projectName agentId =
+        result {
+            let! snapshot = LedgerStore.fetch binding
+            return! renderLaunchPromptAt binding snapshot projectName agentId
+        }

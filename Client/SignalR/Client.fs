@@ -143,9 +143,11 @@ let private mayReceiveResponseAlert = function
     | WorkQueueReadCommand _
     | WorkQueueWriteCommand _
     | WorkPriorityCommand _ -> false
-    | TaskReadCommand cmd when cmd.Action = "GetResponseAlerts" -> false
+    | TaskReadCommand cmd when cmd.Action = "GetResponseAlerts" || cmd.Action = "GetLaunchTemplate"
+                               || cmd.Action = "RenderLaunchPrompt" -> false
     | TaskWriteCommand cmd when cmd.Action = "QueueResponseAlert"
-                                 || cmd.Action = "ClearResponseAlert" -> false
+                                 || cmd.Action = "ClearResponseAlert"
+                                 || cmd.Action = "SetLaunchTemplate" -> false
     | LedgerReadCommand cmd when cmd.Action = "Health" -> false
     | TaskWriteCommand cmd when cmd.Action = "NotifyAgent"
                                  && not (String.IsNullOrWhiteSpace cmd.SourceRef) -> false

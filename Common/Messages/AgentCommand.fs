@@ -1060,9 +1060,10 @@ module AgentCommandInfo =
         | ListJobsCommand _
         | GetClientActivityCommand _ -> false
         | LedgerReadCommand cmd when cmd.Action = "Health" -> false
-        | TaskReadCommand cmd when cmd.Action = "GetResponseAlerts" -> false
+        | TaskReadCommand cmd when cmd.Action = "GetResponseAlerts"
+                                || cmd.Action = "GetLaunchTemplate" || cmd.Action = "RenderLaunchPrompt" -> false
         | TaskWriteCommand cmd when cmd.Action = "QueueResponseAlert"
-                                  || cmd.Action = "ClearResponseAlert" -> false
+                                  || cmd.Action = "ClearResponseAlert" || cmd.Action = "SetLaunchTemplate" -> false
         | TaskWriteCommand cmd when cmd.Action = "NotifyAgent" &&
                                    not (String.IsNullOrWhiteSpace cmd.SourceRef) &&
                                    cmd.SourceRef <> cmd.ProjectName -> false

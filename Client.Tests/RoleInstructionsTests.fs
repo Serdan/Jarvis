@@ -555,3 +555,103 @@ type RoleInstructionsTests() =
                 Assert.That(detail.Code, Is.EqualTo("LedgerIntegrityError"))
             | other ->
                 Assert.Fail(sprintf "Malformed agent config must not degrade into incomplete-role success: %A" other))
+
+
+    [<Test>]
+    member _.LaunchTemplateVersionsReplayAndHistoricalEvidence() =
+        fixture (fun one two ->
+            let template = "Agent {{agentId}} in {{projectName}}. Again {{agentId}}."
+            Assert.That((RoleInstructions.getLaunchTemplate two |> success).Template, Is.Null)
+            match RoleInstructions.renderLaunchPrompt two "Project A" "Worker A" with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Expected absent template failure: %A" other)
+            let op = Guid.NewGuid()
+            let created = RoleInstructions.setLaunchTemplate one "AuthenticatedUser" op 0 template |> success
+            Assert.That(created.AlreadyApplied, Is.False)
+            let rendered = RoleInstructions.renderLaunchPrompt two "Project A" "Worker A" |> success
+            Assert.That(rendered.Prompt, Is.EqualTo("Agent Worker A in Project A. Again Worker A."))
+            Assert.That(rendered.TemplateVersion, Is.EqualTo(1))
+            Assert.That(rendered.TemplateBlobOid, Is.Not.Empty)
+            let replay = RoleInstructions.setLaunchTemplate two "AuthenticatedUser" op 0 template |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            expectStale (RoleInstructions.setLaunchTemplate two "AuthenticatedUser" (Guid.NewGuid()) 0 template)
+            RoleInstructions.setLaunchTemplate two "AuthenticatedUser" (Guid.NewGuid()) 1
+                "{{projectName}} / {{agentId}}" |> success |> ignore
+            let current = RoleInstructions.renderLaunchPrompt one "Project A" "Worker A" |> success
+            Assert.That(current.TemplateVersion, Is.EqualTo(2))
+            Assert.That(current.Prompt, Is.EqualTo("Project A / Worker A"))
+            let historical = LedgerStore.verifiedHistoricalSnapshot one rendered.SnapshotCommit |> success
+            let again = RoleInstructions.renderLaunchPromptAt one historical "Project A" "Worker A" |> success
+            Assert.That(again, Is.EqualTo(rendered))
+            Assert.That(current.TemplateBlobOid, Is.Not.EqualTo(rendered.TemplateBlobOid)))
+
+    [<Test>]
+    member _.LaunchTemplateRejectsInvalidSyntaxAndIdentity() =
+        fixture (fun one two ->
+            let invalid = [ null; ""; "Only {{agentId}}"; "{{projectName}} {{agentId}} {{unknown}}"
+                            "{{projectName}} {{agentId}} {{broken"; "{{projectName}} {{agentId}} }}"
+                            "{{projectName}} {{agentId}}" + String.replicate 33000 "x" ]
+            for body in invalid do
+                match RoleInstructions.setLaunchTemplate one "AuthenticatedUser" (Guid.NewGuid()) 0 body with
+                | Error(InvalidBinding _) -> ()
+                | other -> Assert.Fail(sprintf "Expected invalid template failure: %A" other)
+            RoleInstructions.setLaunchTemplate one "AuthenticatedUser" (Guid.NewGuid()) 0
+                "{{projectName}} / {{agentId}}" |> success |> ignore
+            match RoleInstructions.renderLaunchPrompt two "Project A" "Unknown agent" with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Expected unknown target failure: %A" other)
+            match RoleInstructions.renderLaunchPrompt two "Project\nA" "Worker A" with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Expected invalid project identity: %A" other)
+            let result = RoleInstructions.renderLaunchPrompt two "Project {{agentId}}" "Worker A" |> success
+            Assert.That(result.Prompt, Is.EqualTo("Project {{agentId}} / Worker A")))
+
+    [<Test>]
+    member _.LaunchTemplateIsProjectScopedAndRenderAtMatchesExplicitRead() =
+        fixture (fun one two ->
+            fixture (fun other _ ->
+                RoleInstructions.setLaunchTemplate one "AuthenticatedUser" (Guid.NewGuid()) 0
+                    "First {{agentId}} {{projectName}}" |> success |> ignore
+                RoleInstructions.setLaunchTemplate other "AuthenticatedUser" (Guid.NewGuid()) 0
+                    "Second {{agentId}} {{projectName}}" |> success |> ignore
+                let first = RoleInstructions.renderLaunchPrompt two "First Project" "Worker A" |> success
+                let second = RoleInstructions.renderLaunchPrompt other "Second Project" "Worker A" |> success
+                Assert.That(first.ProjectId, Is.Not.EqualTo(second.ProjectId))
+                Assert.That(first.Prompt, Is.EqualTo("First Worker A First Project"))
+                Assert.That(second.Prompt, Is.EqualTo("Second Worker A Second Project"))
+                let pinned = LedgerStore.fetch two |> success
+                let at = RoleInstructions.renderLaunchPromptAt two pinned "First Project" "Worker A" |> success
+                Assert.That(at, Is.EqualTo(first))
+                match RoleInstructions.renderLaunchPromptAt other pinned "Second Project" "Worker A" with
+                | Error(InvalidBinding _) -> ()
+                | failure -> Assert.Fail(sprintf "Cross-project pinned render must fail: %A" failure)))
+
+    [<Test>]
+    member _.LaunchTemplateFailsClosedOnInvalidRecordAndUnboundedExpansion() =
+        fixture (fun one two ->
+            let invalidUnicode = "{{projectName}} {{agentId}}" + string (char 0xD800)
+            match RoleInstructions.setLaunchTemplate one "AuthenticatedUser" (Guid.NewGuid()) 0 invalidUnicode with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Expected invalid Unicode failure: %A" other)
+            let op = Guid.NewGuid()
+            let body = "{{agentId}}" + String.replicate 560 "{{projectName}}"
+            RoleInstructions.setLaunchTemplate one "AuthenticatedUser" op 0 body |> success |> ignore
+            match RoleInstructions.setLaunchTemplate two "AuthenticatedUser" op 0 ("changed " + body) with
+            | Error OperationIdReused -> ()
+            | other -> Assert.Fail(sprintf "Expected operation identity conflict: %A" other)
+            match RoleInstructions.renderLaunchPrompt two (String.replicate 120 "x") "Worker A" with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Expected expansion limit failure: %A" other)
+            let snapshot = LedgerStore.fetch one |> success
+            let path = "records/launch-template.json"
+            let _, oid = LedgerStore.readAt one snapshot path |> success
+            LedgerStore.transact one
+                { OperationId = Guid.NewGuid(); Actor = "Fixture"; Kind = "CorruptLaunchTemplateFixture"
+                  RequestJson = """{"fixture":true}""" }
+                (fun _ ->
+                    Ok [ { Path = path; ExpectedBlobOid = oid
+                           Content = """{"schemaVersion":1,"template":"{{agentId}} {{bogus}}","version":2,"updatedBy":"Fixture","updatedSequence":1}""" } ])
+            |> success |> ignore
+            match RoleInstructions.getLaunchTemplate two with
+            | Error(LedgerIntegrityError _) -> ()
+            | other -> Assert.Fail(sprintf "Expected corrupt record failure: %A" other))

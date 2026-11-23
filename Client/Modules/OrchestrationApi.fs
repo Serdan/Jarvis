@@ -2367,6 +2367,12 @@ module TaskApi =
         LedgerBindingConfig.load cmd.ProjectName rt
         |> Result.bind (fun binding ->
             match cmd.Action with
+            | "GetLaunchTemplate" ->
+                RoleInstructions.RoleInstructions.getLaunchTemplate binding
+                |> mapError |> Result.map box
+            | "RenderLaunchPrompt" ->
+                RoleInstructions.RoleInstructions.renderLaunchPrompt binding cmd.ProjectName cmd.TaskId
+                |> mapError |> Result.map box
             | "GetRole" ->
                 RoleInstructions.RoleInstructions.getRole binding cmd.TaskId
                 |> mapError |> Result.map box
@@ -2427,7 +2433,7 @@ module TaskApi =
         | Ok(_, Some applied) -> Ok applied.Actor
         | Ok(_, None) -> Ok "AuthenticatedUser"
 
-    let private writeUsingContext (context: ProjectPaths.ResolvedProject option) (cmd: TaskWriteCommand) rt =
+    let private writeUsingContext (context: ProjectPaths.ResolvedProject option) (expectedBinding: LedgerStore.LedgerBinding option) (cmd: TaskWriteCommand) rt =
         let inspectLocal () =
             match context with
             | Some resolved -> LedgerBindingConfig.inspectLocalForContext resolved
@@ -2437,6 +2443,11 @@ module TaskApi =
             | Some resolved -> LedgerBindingConfig.loadForContext resolved
             | None -> LedgerBindingConfig.load cmd.ProjectName rt
         inspectLocal ()
+        |> Result.bind (fun (binding, head) ->
+            if expectedBinding |> Option.exists ((<>) binding) then
+                Error(Client.ValidationError "Selected project ledger binding changed before publication.")
+            else
+                Ok(binding, head))
         |> Result.bind (fun (binding, _) ->
             guid "operationId" cmd.OperationId
             |> Result.bind (fun operationId ->
@@ -2555,6 +2566,10 @@ module TaskApi =
                             | "YieldTasklessWork" ->
                                 ReviewWorkflow.ReviewWorkflow.yieldTasklessWork binding operationId
                                     cmd.ActorId cmd.ExpectedAgentVersion cmd.Summary |> mapError
+                            | "SetLaunchTemplate" ->
+                                withAdministrativeActor (fun actor ->
+                                    RoleInstructions.RoleInstructions.setLaunchTemplate binding actor operationId
+                                        cmd.ExpectedVersion cmd.Html |> mapError)
                             | "CreateRole" ->
                                 withAdministrativeActor (fun actor ->
                                     RoleInstructions.RoleInstructions.createRole binding actor operationId
@@ -2705,10 +2720,13 @@ module TaskApi =
 
 
     let writeForContext (context: ProjectPaths.ResolvedProject) (cmd: TaskWriteCommand) rt =
-        writeUsingContext (Some context) cmd rt
+        writeUsingContext (Some context) None cmd rt
+
+    let writeForExpectedBinding context binding cmd rt =
+        writeUsingContext (Some context) (Some binding) cmd rt
 
     let write (cmd: TaskWriteCommand) rt =
-        writeUsingContext None cmd rt
+        writeUsingContext None None cmd rt
 
 module ChallengeApi =
     let private mapError (result: Result<'a, LedgerStore.LedgerFailure>) =

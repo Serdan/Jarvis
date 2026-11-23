@@ -3660,8 +3660,9 @@ type ReviewWorkflowTests() =
             finally
                 if File.Exists configPath then File.Delete configPath)
 
-    [<Test>]
-    member _.ImplicitActivityStartsReadyAssignmentAndPreservesWorkingClock() =
+    [<TestCase(false)>]
+    [<TestCase(true)>]
+    member _.ImplicitActivityStartsReadyAssignmentAndPreservesWorkingClock(forceContention: bool) =
         withFixture (fun one _ first second _ _ _ _ ->
             let taskId = "implicit-inbox-start"
             ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Implicit inbox"
@@ -3781,12 +3782,33 @@ type ReviewWorkflowTests() =
                             Is.EqualTo([ "Owner" ] :> obj))
                 let remoteReady = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
                 Assert.That(remoteReady.State, Is.EqualTo("Ready"))
-                for mutation in yieldedResponse.AgentStateChanges do
-                    Client.SignalR.Client.invalidateAgentStates rt mutation.ProjectName [| mutation.AgentId |]
+                let invalidate () =
+                    for mutation in yieldedResponse.AgentStateChanges do
+                        Client.SignalR.Client.invalidateAgentStates rt mutation.ProjectName [| mutation.AgentId |]
+                if forceContention then
+                    use held = new FileStream(configPath + ".lock", FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)
+                    invalidate ()
+                    match Client.OrchestrationApi.LedgerBindingConfig.loadWithSnapshot "owner" rt with
+                    | Error(Client.LedgerFailureError issue) ->
+                        Assert.That(issue.Code, Is.EqualTo("TrustBindingContended"))
+                    | other -> Assert.Fail(sprintf "Expected typed contention: %A" other)
+                    let _, lockedResult, lockedResponse = readSource()
+                    Assert.That(lockedResult.IsOk, Is.True)
+                    Assert.That(lockedResponse.AgentStateChanges, Is.Empty)
+                    let whileLocked = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                    Assert.That(whileLocked.State, Is.EqualTo("Ready"))
+                else invalidate ()
                 let _, resumedResult, resumedResponse = readSource()
                 Assert.That(resumedResult.IsOk, Is.True)
+                let afterFirst = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                let diagnostic =
+                    if resumedResponse.AgentStateChanges.IsEmpty then
+                        let _, nextResult, nextResponse = readSource()
+                        let afterNext = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                        sprintf "forceContention=%b; first canonical state=%s; next read=%A; next metadata=%A; next canonical state=%s" forceContention afterFirst.State nextResult nextResponse.AgentStateChanges afterNext.State
+                    else "activation metadata present"
                 Assert.That(resumedResponse.AgentStateChanges,
-                            Is.EqualTo([ ({ ProjectName = "owner"; AgentId = "Owner" } : Common.AgentStateChange) ] :> obj))
+                            Is.EqualTo([ ({ ProjectName = "owner"; AgentId = "Owner" } : Common.AgentStateChange) ] :> obj), diagnostic)
                 Assert.That(resumedResponse.Instructions, Is.Empty)
                 let remoteWorking = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
                 Assert.That(remoteWorking.State, Is.EqualTo("Working"))

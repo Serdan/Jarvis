@@ -280,6 +280,30 @@ type TaskWriteCommand =
       Evidence: string
       SessionId: string }
 
+
+[<CLIMutable>]
+type AggregateReviewEvidence =
+    { TaskId: string
+      ReviewId: Guid
+      DecisionOperationId: Guid }
+
+[<CLIMutable>]
+type AggregatePathCorrection =
+    { Path: string
+      Review: AggregateReviewEvidence }
+
+// The aggregate reviewer explicitly attests inclusion of this exact task-bound
+// submission. Correction reviews are evidence for individual final paths, not
+// new per-task integration receipts.
+[<CLIMutable>]
+type AggregateInclusionEvidence =
+    { AggregateSubmissionId: Guid
+      AggregateCompletionOperationId: Guid
+      AggregateReview: AggregateReviewEvidence
+      ConstituentReview: AggregateReviewEvidence
+      AggregateTree: string
+      Corrections: AggregatePathCorrection array }
+
 /// Challenge condition owners and descriptions are explicit typed wire fields.
 type ChallengeConditionDefinition =
     { OwnerKind: string
@@ -944,7 +968,7 @@ module AgentCommandInfo =
             List.contains cmd.Action [ "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions" ] ->
             Some "SchedulingAdmin"
         | ReviewWriteCommand _ -> Some "Review"
-        | TaskWriteCommand cmd when List.contains cmd.Action [ "SubmitIntegration"; "SubmitSharedAcceptedIntegration"; "CompleteIntegration" ] ->
+        | TaskWriteCommand cmd when List.contains cmd.Action [ "SubmitIntegration"; "SubmitSharedAcceptedIntegration"; "CompleteIntegration"; "RecordAggregateInclusion" ] ->
             Some "Integration"
         | _ -> None
 

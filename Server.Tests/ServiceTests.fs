@@ -2900,3 +2900,40 @@ let priority_set_command_schema_is_explicit_git_cas_and_not_work_launch () =
                      |> List.find (fun c -> c.Name = "SetWorkPriority")
     Assert.That(capability.Permissions, Does.Contain(VersionControlWrite))
     Assert.That(capability.MutatesState, Is.True)
+
+[<Test>]
+let ``aggregate inclusion exposes a separate typed evidence command with stable operation identity`` () =
+    let method = typeof<JarvisMcpTools>.GetMethod("RecordAggregateInclusion")
+    Assert.That(method, Is.Not.Null)
+    let parameters = method.GetParameters()
+    let evidence = parameters |> Array.find (fun p -> p.Name = "evidence")
+    Assert.That(evidence.ParameterType, Is.EqualTo(typeof<AggregateInclusionEvidence>))
+    Assert.That(evidence.IsOptional, Is.False)
+    let operation = parameters |> Array.find (fun p -> p.Name = "operationId")
+    Assert.That(operation.IsOptional, Is.False)
+    Assert.That(parameters |> Array.map _.Name, Does.Not.Contain("integratedCommit"))
+    let aggregateReview: AggregateReviewEvidence =
+        { TaskId = "aggregate"; ReviewId = Guid.NewGuid(); DecisionOperationId = Guid.NewGuid() }
+    let constituentReview: AggregateReviewEvidence =
+        { TaskId = "constituent"; ReviewId = Guid.NewGuid(); DecisionOperationId = Guid.NewGuid() }
+    let proof: AggregateInclusionEvidence =
+        { AggregateSubmissionId = Guid.NewGuid(); AggregateCompletionOperationId = Guid.NewGuid()
+          AggregateReview = aggregateReview; ConstituentReview = constituentReview
+          AggregateTree = String.replicate 40 "a"; Corrections = [||] }
+    let operationId, submissionId = Guid.NewGuid().ToString("D"), Guid.NewGuid().ToString("D")
+    let wire = IntegrationCommands.recordAggregateInclusion "Fixture" "Reviewer" "constituent" submissionId operationId proof
+    Assert.That(AgentCommandInfo.manualGrantFamily wire, Is.EqualTo(Some "Integration"))
+    match wire with
+    | TaskWriteCommand cmd ->
+        Assert.That(cmd.Action, Is.EqualTo("RecordAggregateInclusion"))
+        Assert.That(cmd.TaskId, Is.EqualTo("constituent"))
+        Assert.That(cmd.ActorId, Is.EqualTo("Reviewer"))
+        Assert.That(cmd.AttemptId, Is.EqualTo(submissionId))
+        Assert.That(cmd.OperationId, Is.EqualTo(operationId))
+        Assert.That(cmd.BaseOid, Is.Empty)
+        Assert.That(cmd.TargetRef, Is.Empty)
+        Assert.That(cmd.SourceRef, Is.Empty)
+        let options = System.Text.Json.JsonSerializerOptions(PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase)
+        let decoded = System.Text.Json.JsonSerializer.Deserialize<AggregateInclusionEvidence>(cmd.Evidence, options)
+        Assert.That(decoded, Is.EqualTo(proof))
+    | _ -> Assert.Fail("Expected separate typed task write")

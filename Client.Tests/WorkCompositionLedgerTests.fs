@@ -1272,3 +1272,223 @@ let sharedAcceptedIntegrationUsesExactOperatorBinding taskId reviewKey branch ow
         let finalReview = (ReviewWorkflow.getBranchReview second reviewNamespace reviewId |> succeed).Review
         Assert.That(finalReview.ReviewedHeadOid, Is.EqualTo(pinned))
         Assert.That(finalReview.DecisionSequence, Is.EqualTo(review.DecisionSequence)))
+
+[<Test>]
+let ``aggregate attribution verifies original receipts exact scope and never publishes or accepts`` () =
+    withTwoClones (fun first second ->
+        let owner, reviewer = "Owner", "Reviewer"
+        let taskId, aggregateTask, unrelatedTask, revertedTask = "constituent", "aggregate", "unrelated", "reverted"
+        let target, source = "refs/heads/main", "refs/heads/feature/aggregate"
+        let repo = first.RepositoryPath
+        for agent in [owner; reviewer] do
+            ReviewWorkflow.registerAgent first (Guid.NewGuid()) agent |> succeed |> ignore
+        for task in [taskId; aggregateTask; unrelatedTask; revertedTask] do
+            ReviewWorkflow.createTask first (Guid.NewGuid()) task ("Fixture " + task) |> succeed |> ignore
+        git repo ["config"; "user.name"; "Fixture"] |> ignore
+        git repo ["config"; "user.email"; "fixture@example.test"] |> ignore
+        let baseOid = git repo ["rev-parse"; "HEAD"]
+        git repo ["checkout"; "-b"; "feature/aggregate"] |> ignore
+        let write name (content: string) = File.WriteAllText(Path.Combine(repo, name), content)
+        let commit message =
+            git repo ["add"; "-A"] |> ignore
+            git repo ["commit"; "-m"; message] |> ignore
+            git repo ["rev-parse"; "HEAD"]
+        let review task refName sha verdict =
+            let reviewId, decision = Guid.NewGuid(), Guid.NewGuid()
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) task owner reviewId
+                refName sha "Fixture scope" "Source" target |> succeed |> ignore
+            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) task reviewId reviewer 1 |> succeed |> ignore
+            ReviewWorkflow.decideBranchReview second decision task reviewId reviewer 2 verdict |> succeed |> ignore
+            ({ TaskId = task; ReviewId = reviewId; DecisionOperationId = decision }: AggregateReviewEvidence)
+        let submit (proof: AggregateReviewEvidence) =
+            let id = Guid.NewGuid()
+            ReviewWorkflow.submitIntegration second (Guid.NewGuid()) proof.TaskId owner id "" ""
+                (proof.ReviewId.ToString("N")) target |> succeed |> ignore
+            id
+        write "scope.txt" "original contribution"
+        git repo ["rm"; "bootstrap.txt"] |> ignore
+        let originalSha = commit "Original contribution plus removal"
+        let originalProof = review taskId source originalSha Accept
+        let originalId = submit originalProof
+        write "scope.txt" "independently accepted corrected contribution"
+        let correctionSha = commit "Correct scope"
+        let correctionProof = review taskId source correctionSha Accept
+        let correctionId = submit correctionProof
+        write "reverted.txt" "ancestor does not prove inclusion"
+        let revertedSha = commit "Separate constituent"
+        let revertedProof = review revertedTask source revertedSha Accept
+        let revertedId = submit revertedProof
+        File.Delete(Path.Combine(repo, "reverted.txt"))
+        let rejectedSha = commit "Reverted constituent"
+        let rejectedProof = review taskId source rejectedSha RequestChanges
+        write "aggregate.txt" "additional reviewed scope"
+        let aggregateSha = commit "Final aggregate"
+        let aggregateTree = git repo ["rev-parse"; "HEAD^{tree}"]
+        // Another accepted submission, but its independent branch is NOT in the aggregate.
+        git repo ["checkout"; "-b"; "feature/unrelated"; baseOid] |> ignore
+        write "unrelated.txt" "unrelated"
+        let unrelatedSha = commit "Unrelated"
+        let unrelatedProof = review unrelatedTask "refs/heads/feature/unrelated" unrelatedSha Accept
+        let unrelatedId = submit unrelatedProof
+        git repo ["checkout"; "feature/aggregate"] |> ignore
+        let aggregateProof = review aggregateTask source aggregateSha Accept
+        let aggregateId = submit aggregateProof
+        let completionId = Guid.NewGuid()
+        let publication = ReviewWorkflow.completeIntegration second completionId aggregateTask reviewer aggregateId aggregateSha |> succeed
+        let before = (ReviewWorkflow.getIntegrationSubmissions first aggregateTask |> succeed).Latest.Value
+        let remoteRefs () =
+            git repo ["ls-remote"; "origin"; "refs/heads/main"; "refs/heads/jarvis-review/*"; "refs/heads/jarvis-integration/*"]
+        let frozenRefs = remoteRefs ()
+        let baseline = LedgerStore.fetch first |> succeed
+        let originalPending = ReviewWorkflow.getIntegrationSubmissionAt first baseline taskId originalId |> succeed
+        let correctionPending = ReviewWorkflow.getIntegrationSubmissionAt first baseline taskId correctionId |> succeed
+        let proof =
+            { AggregateSubmissionId = aggregateId; AggregateCompletionOperationId = completionId
+              AggregateReview = aggregateProof; ConstituentReview = originalProof
+              AggregateTree = aggregateTree
+              Corrections = [| { Path = "scope.txt"; Review = correctionProof } |] }
+        let record binding actor operation task id evidence =
+            ReviewWorkflow.recordAggregateInclusion binding operation task actor id
+                (ReviewWorkflow.aggregateInclusionEvidenceText evidence)
+        let deny actor task id evidence =
+            match record second actor (Guid.NewGuid()) task id evidence with
+            | Error _ -> ()
+            | Ok _ -> Assert.Fail("Invalid aggregate inclusion was accepted.")
+        deny owner taskId originalId proof
+        deny reviewer taskId originalId { proof with AggregateCompletionOperationId = Guid.NewGuid() }
+        deny reviewer taskId originalId { proof with AggregateReview = { aggregateProof with DecisionOperationId = Guid.NewGuid() } }
+        deny reviewer taskId originalId { proof with AggregateTree = originalSha }
+        deny reviewer taskId originalId { proof with Corrections = [||] }
+        deny reviewer taskId originalId { proof with Corrections = Array.append proof.Corrections proof.Corrections }
+        deny reviewer taskId originalId { proof with Corrections = [| { Path = "scope.txt"; Review = rejectedProof } |] }
+        deny reviewer taskId originalId { proof with Corrections = [| { Path = "aggregate.txt"; Review = correctionProof } |] }
+        deny reviewer taskId originalId { proof with ConstituentReview = correctionProof }
+        deny reviewer unrelatedTask unrelatedId { proof with ConstituentReview = unrelatedProof; Corrections = [||] }
+        deny reviewer revertedTask revertedId { proof with ConstituentReview = revertedProof; Corrections = [||] }
+        deny reviewer "_reviews" originalId proof
+        Assert.That((LedgerStore.fetch second |> succeed).Commit, Is.EqualTo(baseline.Commit))
+        Assert.That(remoteRefs (), Is.EqualTo(frozenRefs))
+
+        // Disposable fixture only: corruption of current managed records must
+        // not be accepted even when the remote source objects still match.
+        let overwrite path (change: System.Text.Json.Nodes.JsonObject -> unit) =
+            let action: LedgerIntent =
+                { OperationId = Guid.NewGuid(); Actor = "Fixture"; Kind = "CorruptFixture"; RequestJson = "{}" }
+            LedgerStore.transact first action (fun snapshot -> result {
+                let! raw, prior = LedgerStore.readAt first snapshot path
+                let node = System.Text.Json.Nodes.JsonNode.Parse(raw.Value).AsObject()
+                change node
+                return [ { Path = path; ExpectedBlobOid = prior; Content = node.ToJsonString() } ]
+            }) |> succeed |> ignore
+        let set path (name: string) (value: string) =
+            overwrite path (fun node -> node.[name] <- System.Text.Json.Nodes.JsonValue.Create(value: string))
+        let aggregatePath = $"tasks/{aggregateTask}/integrations/{aggregateId:N}.json"
+        let originalPath = $"tasks/{taskId}/integrations/{originalId:N}.json"
+        set aggregatePath "publicationOperationId" (Guid.NewGuid().ToString("D"))
+        deny reviewer taskId originalId proof
+        set aggregatePath "publicationOperationId" (completionId.ToString("D"))
+        set originalPath "reviewedHeadOid" correctionSha
+        deny reviewer taskId originalId proof
+        set originalPath "reviewedHeadOid" originalSha
+        // Missing immutable source refs and target rewrites must fail closed.
+        let bare = first.ApprovedFetchUrl
+        let updateRef refName sha = git bare ["update-ref"; refName; sha] |> ignore
+        git bare ["update-ref"; "-d"; originalPending.IntegrationRef] |> ignore
+        deny reviewer taskId originalId proof
+        updateRef originalPending.IntegrationRef originalSha
+        updateRef target baseOid
+        deny reviewer taskId originalId proof
+        updateRef target aggregateSha
+        write "scope.txt" "later target reversion"
+        let revertedTarget = commit "Later target overwrites reviewed scope"
+        // Publish the new object to this fixture's bare remote before testing
+        // the independently advanced target (no production remote involved).
+        git repo ["push"; "origin"; $"{revertedTarget}:{target}"] |> ignore
+        deny reviewer taskId originalId proof
+        updateRef target aggregateSha
+        Assert.That(remoteRefs (), Is.EqualTo(frozenRefs))
+
+        // Exercise the actual pending journal's response-loss reconciliation:
+        // two immutable effects and the original caller/evidence must match.
+        let operation = Guid.NewGuid()
+        let evidenceJson = ReviewWorkflow.aggregateInclusionEvidenceText proof
+        let command : TaskWriteCommand =
+            { ProjectName = "Disposable"; Action = "RecordAggregateInclusion"; OperationId = operation.ToString("D")
+              TaskId = taskId; AttemptId = originalId.ToString("D"); ActorId = reviewer; OwnerId = ""
+              Title = ""; Html = ""; ExpectedVersion = 0; ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
+              AssignmentGeneration = 0; Summary = ""; NextAction = ""; Reason = ""; BaseOid = ""; TargetRef = ""
+              SourceRef = ""; AllowDetached = false; AllowUncommitted = false; DecisionSequence = 0L
+              Evidence = evidenceJson; SessionId = "" }
+        let attributed =
+            Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite second operation "TaskWrite" command (fun () ->
+                let write = record second reviewer operation taskId originalId proof |> succeed
+                Assert.That(write.AlreadyApplied, Is.False)
+                Error(Client.OrchestrationApi.LedgerErrors.toEffect (OutcomeUnknown "Fixture lost response")))
+            |> succeed
+        Assert.That(attributed.AlreadyApplied, Is.True)
+        let mismatchCommand = { command with Evidence = ReviewWorkflow.aggregateInclusionEvidenceText { proof with Corrections = [||] } }
+        let config = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot first.RepositoryPath
+        let pendingPath = Path.Combine(Path.GetDirectoryName config, "pending",
+                                       Path.GetFileNameWithoutExtension config, operation.ToString("N") + ".json")
+        try
+            let wrong =
+                Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite first operation "TaskWrite" mismatchCommand
+                    (fun () -> Error(Client.OrchestrationApi.LedgerErrors.toEffect (OutcomeUnknown "Fixture uncertain changed evidence")))
+            match wrong with
+            | Error(Client.LedgerFailureError failure) -> Assert.That(failure.Code, Is.EqualTo("OutcomeUnknown"))
+            | other -> Assert.Fail(sprintf "Changed inclusion intent was falsely reconciled: %A" other)
+            let unresolved = Client.OrchestrationApi.PendingIntentJournal.inspect first operation |> succeed
+            Assert.That(unresolved.PresentLocally, Is.True)
+            Assert.That(unresolved.Disposition, Is.EqualTo(Some "IdentityMismatch"))
+        finally
+            if File.Exists pendingPath then File.Delete pendingPath
+        Assert.That((record first reviewer operation taskId originalId proof |> succeed).AlreadyApplied, Is.True)
+        match record first reviewer operation taskId originalId { proof with AggregateTree = originalSha } with
+        | Error OperationIdReused -> ()
+        | other -> Assert.Fail(sprintf "Changed replay was accepted: %A" other)
+        deny reviewer taskId originalId proof
+        let correctionEvidence = { proof with ConstituentReview = correctionProof; Corrections = [||] }
+        record first reviewer (Guid.NewGuid()) taskId correctionId correctionEvidence |> succeed |> ignore
+        let summary = ReviewWorkflow.getIntegrationSubmissions second taskId |> succeed
+        Assert.That(summary.Submissions.Length, Is.EqualTo(2))
+        Assert.That(summary.AggregateInclusions.Length, Is.EqualTo(2))
+        for prior in [originalPending; correctionPending] do
+            let now = summary.Submissions |> List.find (fun submission -> submission.SubmissionId = prior.SubmissionId)
+            Assert.That(now, Is.EqualTo({ prior with Status = "IncludedInAggregate" }))
+        let attribution = summary.AggregateInclusions |> List.find (fun x -> x.SubmissionId = originalId.ToString("N"))
+        Assert.That(attribution.Evidence, Is.EqualTo(proof))
+        Assert.That(attribution.PublishedCommit, Is.EqualTo(aggregateSha))
+        Assert.That(attribution.ObservedTargetHead, Is.EqualTo(aggregateSha))
+        Assert.That(attribution.OperationId, Is.EqualTo(operation.ToString("D")))
+        Assert.That((ReviewWorkflow.getIntegrationSubmissions second aggregateTask |> succeed).Latest.Value, Is.EqualTo(before))
+        let snapshot = LedgerStore.fetch second |> succeed
+        Assert.That((LedgerStore.getOperationAt second snapshot completionId |> succeed).Value, Is.EqualTo(publication.Operation))
+        Assert.That((ReviewWorkflow.getIntegrationSubmissions first unrelatedTask |> succeed).Latest.Value.Status, Is.EqualTo("Pending"))
+        Assert.That((ReviewWorkflow.getIntegrationSubmissions first revertedTask |> succeed).Latest.Value.Status, Is.EqualTo("Pending"))
+        match ReviewWorkflow.completeIntegration first (Guid.NewGuid()) taskId reviewer originalId originalSha with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Included disposition allowed another publication.")
+        WorkCompositionGitLedger.execute first owner (Guid.NewGuid()) 0
+            (WorkCompositionMutation.Create("project", WorkUnitKind.Project, None, spec "Project" (Some taskId)))
+        |> succeed |> ignore
+        let _, graph = WorkCompositionGitLedger.load second |> succeed
+        match WorkCompositionAcceptanceAdapter.acceptIntegrated second owner (Guid.NewGuid()) graph.Version "project" 1 originalId with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Source inclusion was treated as operational acceptance.")
+        Assert.That(remoteRefs (), Is.EqualTo(frozenRefs))
+        // A corrupt disposition cannot silently re-open the publication path,
+        // and a historical receipt cannot be rewritten in place.
+        set originalPath "status" "Pending"
+        match ReviewWorkflow.getIntegrationSubmissions first taskId with
+        | Error(LedgerIntegrityError _) -> ()
+        | other -> Assert.Fail(sprintf "Inconsistent disposition was readable: %A" other)
+        match ReviewWorkflow.completeIntegration first (Guid.NewGuid()) taskId reviewer originalId originalSha with
+        | Error(LedgerIntegrityError _) -> ()
+        | other -> Assert.Fail(sprintf "Orphan attribution permitted completion: %A" other)
+        set originalPath "status" "IncludedInAggregate"
+        let attributionPath = $"records/integration-attributions/{taskId}/{originalId:N}.json"
+        set attributionPath "aggregateTree" originalSha
+        match ReviewWorkflow.getIntegrationSubmissions first taskId with
+        | Error(LedgerIntegrityError _) -> ()
+        | other -> Assert.Fail(sprintf "Rewritten attribution was readable: %A" other)
+        Assert.That(remoteRefs (), Is.EqualTo(frozenRefs)))

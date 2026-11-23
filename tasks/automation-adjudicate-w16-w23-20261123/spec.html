@@ -1,0 +1,18 @@
+<h1>Automation — independent adjudication of W16 and W23 review findings</h1>
+<p><strong>Owner:</strong> Adjudicator 3. This task is decision-only; do not edit code, tests, reviews, branches, or ledgers. It is independent of Worker 16, Worker 23, Reviewer 1, and Reviewer 2.</p>
+<h2>Finding set A — Worker 16 native account-to-project adapter</h2>
+<p>Original task <code>automation-native-account-project-ingress-terminal-20261123</code>, frozen source <code>931b7dc93abb76fb3c5fc2f80208b974466e597e</code>, review <code>6055c83c9dd64ab09ef12c4b0dc249dd</code>, ChangesRequested decision sequence 12273.</p>
+<ul>
+<li><strong>P1:</strong> The source does not re-check current signed Worker authorization before pre-send CAS after roster revocation. A still-present historical worker reservation/receipt can pass even when the current signed roster denies Workers.</li>
+<li><strong>P2:</strong> Tests mutate the account candidate, causing an earlier ingress mismatch; they do not exercise a stale canonical project attempt/source/generation change while the account reservation and candidate remain unchanged.</li>
+</ul>
+<p>Decide each finding separately: Accept/Narrow/Defer/Reject. Verify original v2 contract, exact source lines and negative-control evidence. If accepted, define the smallest correction and whether it fits the existing five-new-path lease <code>Client/AutomationNativeAccountProjectIngress.fs</code>, <code>tests/AutomationNativeAccountProjectIngress20261123/**</code>, and documentation path. No existing production modules, fsproj, Program, SignalR, terminal issuer, provider-send path or B2 activation.</p>
+<h2>Finding set B — Worker 23 hosted Health fixture</h2>
+<p>Original task <code>automation-health-hosted-loopback-two-client-cas-20261123</code>, frozen source <code>2cb0af39012e416946cd32a1de033748d7bc4e56</code>, review <code>6dc6477b03ea47e4a202c4926e50f28a</code>, ChangesRequested decision sequence 12309.</p>
+<ul>
+<li><strong>P2:</strong> The hosted negative test passes alone but fails in the complete two-test Release fixture suite at the authenticated ingress assertion. Root cause is unconfirmed.</li>
+<li><strong>P2:</strong> The reversed-clock test does not detect removal of the monotonic-clock guard because the second projected time independently falls below the 600-second timeout; a proposed test-only projection is +601 seconds followed by +600 seconds.</li>
+</ul>
+<p>Decide each finding separately: Accept/Narrow/Defer/Reject. Preserve the independently green original two-client authenticated positive. If accepted, authorize only test/docs changes within Worker 23's original new paths <code>tests/AutomationHealthHosted20261123/**</code> and <code>docs/testing/automation-health-hosted-loopback-20261123.md</code>. Do not authorize production or fsproj edits. Separate in-process hosted DI reset coverage from OS-process restart proof; never describe the former as the latter.</p>
+<h2>Decision record</h2>
+<p>For all four findings, cite exact source/review evidence, original acceptance criterion, severity, whether it is a demonstrated defect or only an evidence gap, proportionality, smallest lawful correction, source-lease fit, and unsupported boundaries. A single immutable checkpoint must record four separate terminal decisions. No recursive adjudication. No source edits, test runs, publication, push, deployment, provider effects, schedules or cutover.</p>

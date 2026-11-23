@@ -62,7 +62,10 @@ function harness(options = {}) {
             workMode = makeMode("Work");
           }, options.replaceModesDuringModeSwitchMs);
         }
-      } else { setTimeout(() => { mode = "Work"; }, options.modeDelayMs || 0); }
+      } else { setTimeout(() => {
+        mode = "Work";
+        if (reasoningEffort === "Pro") reasoningEffort = "Medium";
+      }, options.modeDelayMs || 0); }
     }
   });
   let chatMode = makeMode("Chat");
@@ -99,12 +102,15 @@ function harness(options = {}) {
   let view = "simple";
   const efforts = ["Instant", "Medium", "High", "Extra High"];
   const values = ["none", "medium", "high", "max"];
+  const activeEfforts = () => mode === "Chat" && options.chatInstantAndProOnly
+    ? ["Instant", "Pro"] : efforts;
+  let proSelections = 0;
   const picker = {
     getAttribute(name) {
       if (name === "aria-expanded") return String(expanded);
       if (name !== "data-selected-reasoning-effort") return null;
       return options.forceEffortMismatchWhileDraft && content
-        ? "medium" : values[efforts.indexOf(reasoningEffort)];
+        ? "high" : reasoningEffort === "Pro" ? "medium" : values[efforts.indexOf(reasoningEffort)];
     },
     click() { expanded = !expanded; }
   };
@@ -115,14 +121,35 @@ function harness(options = {}) {
     click() { modelClicks++; selectedModel = name; view = "simple"; expanded = false; }
   });
   const toggle = { closest() { return null; }, click() { view = "advanced"; } };
-  const knob = { getAttribute(name) { return String(name === "aria-valuemax" ? (options.maxEffortStep ?? 3) : efforts.indexOf(reasoningEffort)); } };
+  const knob = { getAttribute(name) { return String(name === "aria-valuemax" ? (options.maxEffortStep ?? activeEfforts().length - 1) : activeEfforts().indexOf(reasoningEffort)); } };
   const power = { closest() { return null; }, querySelector(sel) { return sel === '[role="slider"]' ? knob : null; } };
-  const keyboard = { closest() { return null; }, focus() {}, dispatchEvent(event) { const n = Math.max(0, Math.min(3, efforts.indexOf(reasoningEffort) + (event.key === "ArrowRight" ? 1 : -1))); reasoningEffort = efforts[n]; } };
+  const powerLabel = {
+    closest() { return null; },
+    get textContent() { return reasoningEffort; },
+    getAttribute(name) { return name === "data-power-disabled" ? "false" : null; }
+  };
+  const disabledMedium = {
+    textContent: "Medium", closest() { return null; },
+    getAttribute(name) { return name === "aria-disabled" ? "true" : "false"; },
+    hasAttribute(name) { return name === "data-disabled"; }
+  };
+  const keyboard = { closest() { return null; }, focus() {}, dispatchEvent(event) {
+    const available = activeEfforts();
+    const n = Math.max(0, Math.min(available.length - 1, available.indexOf(reasoningEffort) + (event.key === "ArrowRight" ? 1 : -1)));
+    reasoningEffort = available[n];
+    if (reasoningEffort === "Pro") proSelections++;
+  } };
   const menu = {
     getClientRects() { return [1]; },
     querySelector(sel) { return sel === '[data-model-picker-view]' ? { getAttribute() { return view; } } : null; },
     querySelectorAll(sel) {
-      if (sel === '[role="menuitemradio"]') return (view === "simple" ? [selectedModel] : ["GPT-6", "GPT-6.2 Sol"]).map(radio);
+      if (sel === '[role="menuitemradio"]') {
+        const items = (view === "simple" ? [selectedModel] : ["GPT-6", "GPT-6.1 Terra"]).map(radio);
+        if (mode === "Chat" && options.chatInstantAndProOnly && !options.omitEffortOption)
+          items.push(disabledMedium);
+        return items;
+      }
+      if (sel === '[data-power-disabled]') return options.missingEffortLabel ? [] : [powerLabel];
       if (sel === '[data-model-picker-view-toggle]') return [toggle];
       if (sel === '[data-model-picker-power-slider]') return [power];
       if (sel === '[data-reasoning-slider]') return [keyboard];
@@ -196,7 +223,7 @@ function harness(options = {}) {
     },
     querySelector(selector) {
       if (selector === 'button[aria-label="Select ChatGPT model"]') return options.noPicker ? null : picker;
-      if (selector === '[data-model-selection-label="gpt-6.2-sol-wm"]') return selectedModel === "GPT-6.2 Sol" ? {} : null;
+      if (selector === '[data-model-selection-label="gpt-6.1-terra-wm"]') return selectedModel === "GPT-6.1 Terra" ? {} : null;
       if (selector.includes('contenteditable="true"')) return options.noComposer ? null : activeEditor;
       if (selector.includes('aria-label="Send"')) {
         if (options.noSend) return null;
@@ -272,7 +299,7 @@ function harness(options = {}) {
     }) + ")", ctx);
   return { run, site, get clicks() { return clicks; }, get insertions() { return insertions; }, get chatClicks() { return chatClicks; },
     get selectedModel() { return selectedModel; }, get reasoningEffort() { return reasoningEffort; }, get modelClicks() { return modelClicks; }, get beforeReadyInsertions() { return beforeReadyInsertions; },
-    get mode() { return mode; }, get content() { return content; },
+    get proSelections() { return proSelections; }, get mode() { return mode; }, get content() { return content; },
     get virtualClockState() { return virtualClock && { now: virtualClock.now, delays: [...virtualClock.delays] }; },
     get staleSendObserved() { return staleSendObserved; }, get lastSubmittedText() { return lastSubmittedText; } };
 }
@@ -281,7 +308,7 @@ test("hidden launch is not rejected merely for lacking visibility", async () => 
   const h = harness({ visibilityState: "hidden" });
   const result = await h.run("Background launch is a requirement");
   assert.equal(result.status, "submitted");
-  assert.equal(result.selectedEffort, "High");
+  assert.equal(result.selectedEffort, "Medium");
   assert.equal(h.clicks, 1);
 });
 
@@ -289,7 +316,7 @@ test("visibility lost after insertion cannot authorize duplicate Send", async ()
   const h = harness({ hideTabAfterInsertMs: 0, timeoutMs: 1100 });
   const result = await h.run("Do not duplicate this message");
   assert.equal(result.status, "submitted");
-  assert.equal(result.selectedEffort, "High");
+  assert.equal(result.selectedEffort, "Medium");
   assert.equal(h.clicks, 1);
 });
 
@@ -655,10 +682,10 @@ test("same-selected Chat mode controls may re-render during stabilization", asyn
 });
 
 test("effort resetting after prompt insertion is repaired before the sole Send", async () => {
-  const h = harness({ resetEffortAfterInsertMs: 0, resetEffortTo: "Medium", timeoutMs: 2600 });
+  const h = harness({ resetEffortAfterInsertMs: 0, resetEffortTo: "Instant", timeoutMs: 2600 });
   const result = await h.run("Exact unique task prompt");
   assert.equal(result.status, "submitted");
-  assert.equal(h.reasoningEffort, "High");
+  assert.equal(h.reasoningEffort, "Medium");
   assert.equal(h.lastSubmittedText, "Exact unique task prompt");
   assert.equal(h.clicks, 1);
 });
@@ -831,7 +858,7 @@ test("ignored pre-hydration Chat click retries on the same untouched new-chat ho
   assert.equal(h.clicks, 1);
   assert.equal(h.lastSubmittedText, "Hydration recovery");
   assert.equal(h.selectedModel, "GPT-6");
-  assert.equal(h.reasoningEffort, "High");
+  assert.equal(h.reasoningEffort, "Medium");
   assert.equal(h.modelClicks, 0);
 });
 
@@ -900,7 +927,7 @@ for (const { selectedModel, reasoningEffort } of [
     assert.equal(h.chatClicks, 0);
     assert.equal(h.clicks, 1);
     assert.equal(h.selectedModel, "GPT-6");
-    assert.equal(h.reasoningEffort, "High");
+    assert.equal(h.reasoningEffort, "Medium");
   });
 }
 
@@ -956,19 +983,20 @@ test("absent model picker fails closed without sending", async () => {
   assert.equal(h.clicks, 0);
 });
 
-test("unavailable maximum effort falls back to Work Sol Medium", async () => {
-  const h = harness({ maxEffortStep: 1, reasoningEffort: "Medium", timeoutMs: 12000 });
+test("disabled Chat Medium falls back to Work Terra without selecting Pro", async () => {
+  const h = harness({ chatInstantAndProOnly: true, reasoningEffort: "Instant", timeoutMs: 12000 });
   const result = await h.run("Never send", { selectionOnly: true });
   assert.equal(result.status, "selectionOnly");
   assert.equal(result.selectedMode, "Work");
-  assert.equal(result.selectedModel, "GPT-6.2 Sol");
+  assert.equal(result.selectedModel, "GPT-6.1 Terra");
   assert.equal(result.selectedEffort, "Medium");
   assert.equal(result.attempts[0].reason, "EffortUnavailable");
   assert.equal(h.clicks, 0);
+  assert.equal(h.proSelections, 0);
 });
 
 
-test("when Chat High and Work Sol Medium cannot be selected, fall back to Chat Instant", async () => {
+test("when Chat Medium and Work Terra Medium cannot be selected, fall back to Chat Instant", async () => {
   const h = harness({ maxEffortStep: 0, reasoningEffort: "Instant", timeoutMs: 18000 });
   const result = await h.run("Exactly one fallback", { selectionOnly: true });
   assert.equal(result.status, "selectionOnly");
@@ -978,8 +1006,8 @@ test("when Chat High and Work Sol Medium cannot be selected, fall back to Chat I
   assert.deepEqual(Array.from(result.attempts, item => ({
     mode: item.mode, model: item.model, effort: item.effort, reason: item.reason
   })), [
-    { mode: "Chat", model: "GPT-6", effort: "High", reason: "EffortUnavailable" },
-    { mode: "Work", model: "GPT-6.2 Sol", effort: "Medium", reason: "EffortUnavailable" }
+    { mode: "Chat", model: "GPT-6", effort: "Medium", reason: "EffortUnavailable" },
+    { mode: "Work", model: "GPT-6.1 Terra", effort: "Medium", reason: "EffortUnavailable" }
   ]);
   assert.equal(h.clicks, 0);
 });
@@ -1006,4 +1034,24 @@ test("waits for delayed post-Send user bubble and durable UUID without replay", 
   assert.deepEqual(Array.from(result.evidence),
     ["newUserTurn", "matchingUserBubble", "conversationRoute"]);
   assert.equal(h.clicks, 1);
+});
+
+test("Pro with a medium attribute cannot pass as Medium even without an effort option", async () => {
+  const h = harness({ chatInstantAndProOnly: true, omitEffortOption: true,
+    reasoningEffort: "Pro", timeoutMs: 12000 });
+  const result = await h.run("No paid message for a selection check", { selectionOnly: true });
+  assert.equal(result.status, "selectionOnly");
+  assert.equal(result.selectedMode, "Work");
+  assert.equal(result.selectedModel, "GPT-6.1 Terra");
+  assert.equal(result.selectedEffort, "Medium");
+  assert.equal(result.attempts[0].reason, "EffortUnavailable");
+  assert.equal(h.clicks, 0);
+  assert.equal(h.proSelections, 0);
+});
+
+test("missing visible effort label cannot authorize a send from an attribute alone", async () => {
+  const h = harness({ missingEffortLabel: true, reasoningEffort: "Medium", virtualClock: true });
+  const result = await h.run("Never send");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(h.clicks, 0);
 });

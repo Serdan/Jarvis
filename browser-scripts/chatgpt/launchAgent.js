@@ -231,9 +231,29 @@ async function execute(args) {
       const effort = control.getAttribute("data-selected-reasoning-effort");
       const power = activeMenuControl('[data-model-picker-power-slider]');
       const powerLabel = activeMenuControl('[data-power-disabled]');
-      if (effort === target.effort) {
-        if (powerLabel?.getAttribute("data-power-disabled") === "true" ||
-            power?.querySelector('[data-locked="true"]')) return "EffortUnavailable";
+      // Quota filtering compresses the slider: position 1 can be Pro while
+      // the trigger still reports "medium". Check the named option and label.
+      const effortOption = radio(target.label);
+      if (effortOption && unavailableRadio(effortOption)) return "EffortUnavailable";
+      const knob = power?.querySelector('[role="slider"]');
+      const position = knob?.getAttribute("aria-valuenow");
+      const maximum = knob?.getAttribute("aria-valuemax");
+      const step = position == null || position.trim() === "" ? NaN : Number(position);
+      const maxStep = maximum == null || maximum.trim() === "" ? NaN : Number(maximum);
+      const keyboard = activeMenuControl('[data-reasoning-slider]');
+      const visibleEffort = powerLabel?.textContent?.trim();
+      // Missing controls or labels may be transient during hydration.
+      if (!keyboard || !visibleEffort || !Number.isInteger(step) ||
+          !Number.isInteger(maxStep) || step < 0 || step > maxStep) {
+        await retryWait();
+        continue;
+      }
+      if (powerLabel.getAttribute("data-power-disabled") === "true" ||
+          power?.querySelector('[data-locked="true"]') || target.level > maxStep)
+        return "EffortUnavailable";
+      if (step === target.level && visibleEffort !== target.label)
+        return "EffortUnavailable";
+      if (effort === target.effort && visibleEffort === target.label) {
         if (target.mode === "Work" &&
             !document.querySelector('[data-model-selection-label="gpt-6.1-terra-wm"]'))
           return "ModelUnconfirmed";
@@ -246,18 +266,6 @@ async function execute(args) {
           return "SelectionChanged";
         return null;
       }
-      const knob = power?.querySelector('[role="slider"]');
-      const step = Number(knob?.getAttribute("aria-valuenow"));
-      const maxStep = Number(knob?.getAttribute("aria-valuemax"));
-      const keyboard = activeMenuControl('[data-reasoning-slider]');
-      // The slider can become visible before its keyboard handler and value
-      // finish hydrating. Treat missing controls as transient, not exhausted.
-      if (!keyboard || !Number.isFinite(step) || !Number.isFinite(maxStep)) {
-        await retryWait();
-        continue;
-      }
-      if (target.level > maxStep || power?.querySelector('[data-locked="true"]'))
-        return "EffortUnavailable";
       if (lastValue === step) stalls++;
       else stalls = 0;
       if (stalls >= 12) return "EffortUnavailable";

@@ -1,1 +1,7 @@
-Release solution build succeeded; focused Client ledger/bridge tests 51/51; full Node launcher suite passed; git diff --check passed. Intent snapshots target assignment before browser side effects; outcome writes preserve observed UI labels and uncertainty. No deployment or cutover.
+# Independent review — frozen 415ef34cf6717be2d0aad00c3dc5b3a224ed6828
+
+Inspected the exact diff against 9f6b9760955f0acb2673e2cab8b8a852ec4dd2ac, including bridge execution/error classification, client dispatch, immutable Git intent/outcome records, structured targetAgentId propagation, rendered-UI label capture, and F#/Node regression tests. No concrete violation of the original P0 contract found in source inspection. Intent is committed before browser effects and snapshots the target assignment; outcome is linked by launchId, preserves observed labels or null, and keeps uncertain sends distinct from not-submitted. No automatic Send replay or storage cutover introduced.
+
+Independent execution: dotnet test compilation succeeded, but the selected NUnit test filter reported *no matching tests* (not counted as a passing test). Node launcher regression suite was started and showed passing cases through the observed output, with final completion to be confirmed. Author's summary reports 51/51 focused tests and a full Node pass; these are author-reported, not independently verified by this review.
+
+Review boundary: source/test inspection and bounded local checks, not a live ChatGPT UI integration run, actual model-token accounting, or deployment authorization.

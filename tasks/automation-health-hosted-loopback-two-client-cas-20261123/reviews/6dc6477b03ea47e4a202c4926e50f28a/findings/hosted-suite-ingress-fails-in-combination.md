@@ -1,0 +1,7 @@
+# P2 — Negative matrix passes in isolation and fails in the two-test suite
+
+Frozen candidate: `2cb0af39012e416946cd32a1de033748d7bc4e56`. The original task requires a focused standalone Release suite that exercises the real authenticated hosted path.
+
+In the registered worktree at the frozen head, the independent .NET 11 Release full fixture build/run `1ddcd8da30cc454c95b27ed310e40516` and subsequent full no-build run `ec3aa46f7cf84182b69302e4fbb52242` each exited 1 with one pass and one failure. The new test fails at `HostedNegativeTests.fs:165`: “Qualified MCP ingress must reach verified hosted SQLite.” Its registered Alice Hub gets `ActivityProofUnavailable: no complete current-process activity evidence`. The new test passes alone using the same compiled fixture, job `dee299c6332948068a1c00ef5f5182ea`, exit 0, 1/1. The submitted 2/2 job and TRX were verified, so there is also a prior positive result.
+
+Reproduce with `dotnet test tests/AutomationHealthHosted20261123/AutomationHealthHosted20261123.fsproj -c Release --no-build --no-restore` after building the pinned fixture. Compare with `--filter FullyQualifiedName~hosted_negative_matrix_requires_real_coverage`. The observed failure is before the matrix assertions and prevented the full run from exercising them. Root cause is unconfirmed. Keep any correction in the existing test-only lease. Preserve genuine authenticated ingress and verified Hub/SQLite activity while making the two tests pass together.

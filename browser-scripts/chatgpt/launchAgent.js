@@ -299,9 +299,9 @@ async function execute(args) {
     // recurring schedule. The next invocation will re-evaluate from #1.
     return { ...notSubmitted("PreferredConfigurationsUnavailable"), attempts };
   }
-  const selectedMode = selected.mode;
-  const selectedModel = selected.model;
-  const selectedEffort = selected.effort;
+  let selectedMode = selected.mode;
+  let selectedModel = selected.model;
+  let selectedEffort = selected.effort;
   if (args.selectionOnly === true) {
     return { status: "selectionOnly", selectedMode, selectedModel,
       selectedEffort: selected.label, attempts };
@@ -326,6 +326,8 @@ async function execute(args) {
   let rewrites = 0;
   let effortRepairs = 0;
   let lastInsertError = null;
+  let sendDisabledSince = null;
+  let sendFallbackAttempted = false;
   const readEditor = () => (activeComposer.innerText || "")
     .replace(/\r\n/g, "\n").replace(/\u00a0/g, " ");
 
@@ -422,6 +424,37 @@ async function execute(args) {
           inserted = false;
         } else {
           const send = document.querySelector(sendSelector);
+          if (!send && selectedMode === "Work" && !sendFallbackAttempted) {
+            // The picker may still offer Work after its quota is exhausted.
+            // Wait for the normal composer hydration, then fall back before
+            // any Send attempt. Never retry after clicking Send.
+            sendDisabledSince ??= Date.now();
+            if (Date.now() - sendDisabledSince >= 1500 &&
+                preSendDeadline - Date.now() >= 3500) {
+              sendFallbackAttempted = true;
+              attempts.push({ mode: selectedMode, model: selectedModel,
+                effort: selected.label, reason: "SendUnavailable" });
+              const fallback = preferences[2];
+              const failure = await choose(fallback, preSendDeadline - 1000);
+              if (failure) {
+                attempts.push({ mode: fallback.mode, model: fallback.model,
+                  effort: fallback.label, reason: failure });
+                return { ...notSubmitted("PreferredConfigurationsUnavailable"), attempts };
+              }
+              selected = fallback;
+              selectedMode = fallback.mode;
+              selectedModel = fallback.model;
+              selectedEffort = fallback.effort;
+              activeComposer = null;
+              activeModes = null;
+              inserted = false;
+              lastTransient = null;
+              sendDisabledSince = null;
+              continue;
+            }
+          } else if (send) {
+            sendDisabledSince = null;
+          }
           if (send) {
             const verified = surface("submitControl");
             if (verified.failure) return verified.failure;

@@ -307,7 +307,7 @@ async function execute(args) {
       selectedEffort: selected.label, attempts };
   }
 
-  const sendSelector = 'button[type="submit"][aria-label="Send"]:not(:disabled)';
+  const sendSelector = 'button[type="submit"][aria-label="Send"]:not(:disabled):not([aria-disabled="true"])';
   const initialUrl = location.href;
   const initialTurns = document.querySelectorAll('[data-message-author-role="user"]').length;
   // Modern ChatGPT user messages use the bubble marker instead of the old role.

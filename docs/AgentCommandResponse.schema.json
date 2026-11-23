@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:jarvis:agent-command-response",
   "title": "AgentCommandResponse",
-  "description": "Client-to-server Jarvis command response. Instructions are repository guidance; AgentStateChanges are verified ledger mutation hints for cache invalidation.",
+  "description": "Client-to-server Jarvis command response. Instructions is the compatibility envelope for operational controls; legacy repository documents are ignored by MCP projection. AgentStateChanges are verified ledger mutation hints for cache invalidation.",
   "type": "object",
   "required": [
     "Result",
@@ -28,7 +28,7 @@
     "Instructions": {
       "type": "array",
       "maxItems": 35,
-      "description": "Applicable instructions ordered from workspace to project root to deeper directories; empty for no applicable guidance.",
+      "description": "Legacy wire-compatible instruction documents; new clients emit only operational controls (response-alert, working-turn), and new servers ignore repository documents and notices.",
       "items": {
         "$ref": "#/$defs/InstructionDocument"
       }

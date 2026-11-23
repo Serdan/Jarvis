@@ -21,7 +21,6 @@ let receiveMessage (rt: Runtime) message =
 // Explicit agent labels identify the current work slot. Cache canonical
 // Working state for ordinary calls to avoid one remote git fetch per tool.
 let private workingGuidanceCaches = ConditionalWeakTable<Runtime, WorkingTurnGuidance.AgentCache>()
-let private instructionDeliveryCaches = ConditionalWeakTable<Runtime, AgentInstructions.DeliveryCache>()
 let invalidateAgentStates (rt: Runtime) (projectName: string) (agentIds: string array) =
     // Server notifications only carry the logical project identity. Worktree
     // selectors share the canonical ledger/assignment cache by ProjectId.
@@ -265,34 +264,6 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                         | Error error ->
                             Error(Client.ValidationError($"Automatic agent activation failed: {error}"))
             | _ -> Ok ([], None)
-
-// Only the Working turn identifies a stable delivery scope. Ledger calls bootstrap
-// root guidance, while normal source operations discover deeper instructions.
-let private incrementalInstructions (rt: Runtime) (agentId: string)
-                                    (target: ProjectPaths.ProjectTarget option)
-                                    provenance documents =
-    if String.IsNullOrWhiteSpace agentId then documents
-    else
-        match target with
-        | None -> documents
-        | Some target ->
-            let projectId = ProjectPaths.ProjectTarget.projectId target
-            let project = ProjectPaths.ProjectId.value projectId
-            let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
-                WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
-            let now = DateTimeOffset.UtcNow
-            let agent =
-                cache.Get(now, projectId, agentId, fun () ->
-                    loadAgentState rt project agentId)
-            match agent with
-            | Some active when active.State = "Working" ->
-                let turn = string active.StateSequence + ":" + active.WorkingTurnStartedAtUtc
-                let delivery = instructionDeliveryCaches.GetValue(rt, fun _ -> AgentInstructions.DeliveryCache())
-                delivery.Filter(target, agentId, turn, provenance, documents, fun () ->
-                    // Ledger status reads remain usable; failed instruction
-                    // resolution is surfaced as a retryable warning.
-                    AgentInstructions.rootsForTarget rt target)
-            | _ -> documents
 
 let private serialize<'a> (value: 'a) =
     try
@@ -1045,40 +1016,81 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
         return result |> Result.map (fun outcome -> outcome.Payload)
     }
 
-let private receiveCommandWithTypedInstructions (rt: Runtime)
-                                                (target: ProjectPaths.ProjectTarget option) (agentId: string) command
-                                                (sourceOriginalId: string option) (manualGrantAuthorized: bool) =
-    task {
-        match command with
-        | GetJobResultCommand _ | ListJobsCommand _ | CancelJobCommand _ ->
-            // Cheap controls must bypass source instruction preparation and
-            // remain responsive even while source/ledger commands are blocked.
-            let! response = receiveCommandForTarget rt target None None agentId command sourceOriginalId manualGrantAuthorized
-            return response, [], AgentInstructions.RootBootstrapRequired
-        | _ ->
-            match AgentInstructions.prepareOperationWithTarget rt target command with
-            | Error error ->
-                return Error error, [], AgentInstructions.RootBootstrapRequired
-            | Ok prepared ->
-                let! response =
-                    receiveCommandForTarget rt target prepared.Source prepared.ProjectTask agentId command sourceOriginalId manualGrantAuthorized
-                let provenance =
-                    if prepared.Source.IsSome then AgentInstructions.HierarchyLoaded
-                    else AgentInstructions.RootBootstrapRequired
-                return response,
-                       prepared.Instructions
-                       @ AgentInstructions.writeWarningsForContext rt prepared.Source command response,
-                       provenance
-    }
+// Prepare the source checkout and configured-task definition once, independently
+// of explicit instruction retrieval. Authorization and execution consume the
+// same snapshot; neither may re-resolve a worktree or re-read .jarvis.json.
+type internal PreparedSourceOperation =
+    { Source: ProjectPaths.ResolvedProject option
+      ProjectTask: ProjectTaskDefinition option }
 
-let receiveCommandWithInstructions (rt: Runtime) command =
+let internal prepareSourceOperation (rt: Runtime) (target: ProjectPaths.ProjectTarget option) command =
+    let empty = Ok { Source = None; ProjectTask = None }
+    match command with
+    | TaskReadCommand _
+    | LedgerReadCommand _
+    | LedgerWriteCommand _
+    | ReviewReadCommand _
+    | ReviewWriteCommand _
+    | GetAgentInstructionsCommand _
+    | GetJobResultCommand _
+    | ListJobsCommand _
+    | CancelJobCommand _ -> empty
+    | TaskWriteCommand cmd when cmd.Action <> "ExportTaskSpec" && cmd.Action <> "ImportTaskSpec" -> empty
+    | _ ->
+        match target with
+        | None -> empty
+        | Some selected ->
+            ProjectPaths.resolveProjectContextForTarget selected rt
+            |> Result.bind (fun project ->
+                let definition =
+                    match command with
+                    | RunProjectTaskCommand cmd ->
+                        ClientShell.resolveProjectTaskIn project cmd rt |> Result.map Some
+                    | _ -> Ok None
+                definition
+                |> Result.bind (fun task ->
+                    // Preserve existing pre-authorization path checks, but do
+                    // not enumerate ancestors or examine any guidance files.
+                    let paths =
+                        match command with
+                        | ListDirectoryCommand c -> [ c.FolderPath ]
+                        | SearchFilesCommand c -> [ defaultArg c.FolderPath "" ]
+                        | SearchTextCommand c -> [ defaultArg c.FolderPath "" ]
+                        | ReadFileCommand c -> [ c.FilePath ]
+                        | ReadFilePageCommand c -> [ c.FilePath ]
+                        | ReadFilesCommand c -> c.FilePaths
+                        | ReadImageCommand c -> [ c.FilePath ]
+                        | ExportFileCommand c -> [ c.FilePath ]
+                        | ImportFileCommand c -> [ c.FilePath ]
+                        | WriteFileCommand c -> [ c.FilePath ]
+                        | PatchFileCommand c -> [ c.FilePath ]
+                        | RunCommandCommand c -> [ defaultArg c.WorkingDirectory "" ]
+                        | StartJobCommand c -> [ defaultArg c.WorkingDirectory "" ]
+                        | RunProjectTaskCommand _ ->
+                            task |> Option.map (fun configured -> defaultArg configured.WorkingDirectory "") |> Option.toList
+                        | TaskWriteCommand c -> [ c.SourceRef ]
+                        | GitCommitCommand c -> c.Paths
+                        | GetGitDiffCommand c -> [ defaultArg c.Path "" ]
+                        | GetSkillCommand c -> [ ProjectPaths.ProjectSkillPaths.primaryFile c.SkillName ]
+                        | CreateSkillCommand c -> [ ProjectPaths.ProjectSkillPaths.primaryFile c.SkillName ]
+                        | _ -> []
+                    paths
+                    |> List.filter (String.IsNullOrWhiteSpace >> not)
+                    |> List.fold (fun checkedPaths path ->
+                        checkedPaths |> Result.bind (fun () ->
+                            ProjectPaths.validateProjectRelativePath path
+                            |> Result.bind (fun valid -> ProjectPaths.resolveSourcePath project valid rt)
+                            |> Result.map ignore)) (Ok ())
+                    |> Result.map (fun () -> { Source = Some project; ProjectTask = task })))
+
+let private receivePreparedCommand (rt: Runtime)
+                                   (target: ProjectPaths.ProjectTarget option) (agentId: string) command
+                                   (sourceOriginalId: string option) (manualGrantAuthorized: bool) =
     task {
-        match classifyProject command with
-        | Error error -> return Error error, []
-        | Ok scope ->
-            let! response, instructions, _ =
-                receiveCommandWithTypedInstructions rt (projectTarget scope) "" command None false
-            return response |> Result.map (fun outcome -> outcome.Payload), instructions
+        match prepareSourceOperation rt target command with
+        | Error error -> return Error error
+        | Ok prepared ->
+            return! receiveCommandForTarget rt target prepared.Source prepared.ProjectTask agentId command sourceOriginalId manualGrantAuthorized
     }
 
 // Shared by SignalR receive and tests. Identity is supplied by the MCP call,
@@ -1174,11 +1186,11 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                             | TaskReadCommand inbox, Some receipt when inbox.Action = "AgentInbox" ->
                                 inboxActivation <- Some receipt
                             | _ -> ()
-                            let! result, applicable, provenance =
+                            let! result =
                                 // Polling does not activate or record local
                                 // agent activity, but access checks still need
                                 // the initiating actor label from the transport.
-                                receiveCommandWithTypedInstructions rt target agentId command sourceOriginalId manualGrantAuthorized
+                                receivePreparedCommand rt target agentId command sourceOriginalId manualGrantAuthorized
                             // A write may alter another agent's state, or none
                             // at all. Invalidate precisely the affected local
                             // cache entries before preparing turn guidance.
@@ -1190,15 +1202,7 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                                 for changed in outcome.ChangedAgentIds do
                                     cache.Invalidate(projectId, changed)
                             | _ -> ()
-                            instructions <-
-                                match command with
-                                | GetAgentInstructionsCommand _ ->
-                                    // The explicit result includes the complete hierarchy.
-                                    // Do not double-inject automatic AGENTS.md payloads.
-                                    checkWorkingGuidance rt localAgentId target command
-                                | _ ->
-                                    incrementalInstructions rt localAgentId target provenance applicable
-                                    @ checkWorkingGuidance rt localAgentId target command
+                            instructions <- checkWorkingGuidance rt localAgentId target command
                             return result
                 with ex ->
                     unexpectedFailure <- true

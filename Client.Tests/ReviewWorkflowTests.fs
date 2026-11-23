@@ -2970,11 +2970,11 @@ type ReviewWorkflowTests() =
                 match Client.OrchestrationApi.TaskApi.read diffCmd ctx with
                 | Ok value -> Assert.That((unbox<TaskSpecDiff> value).Diff, Does.Contain("API revised"))
                 | Error error -> Assert.Fail(sprintf " diff API failed: %A" error)
-                // Source spec operations must use the checkout already
-                // resolved for AGENTS.md, including nested instructions.
+                // Source spec operations must use the checkout prepared once,
+                // independently of malformed nested guidance.
                 let sourceDirectory = Path.Combine(one, "specs")
                 Directory.CreateDirectory(sourceDirectory) |> ignore
-                File.WriteAllText(Path.Combine(sourceDirectory, "AGENTS.md"), "Task spec instructions")
+                File.WriteAllBytes(Path.Combine(sourceDirectory, "AGENTS.md"), [| 0xffuy |])
                 let sourceContext =
                     Client.ProjectPaths.resolveProjectContext "owner" ctx
                     |> function Ok value -> value | Error error -> failwithf "Cannot resolve source checkout: %A" error
@@ -2988,13 +2988,11 @@ type ReviewWorkflowTests() =
                 let exportCmd = { template "ExportTaskSpec" specTask with
                                     SourceRef = "specs/spec-api-export.html"
                                     BaseOid = pageAfter.SpecBlobOid }
-                match Client.AgentInstructions.prepareWithTarget instructionRuntime (Some target) (Common.TaskWriteCommand exportCmd) with
-                | Ok (instructions, Some preparedContext) ->
-                    Assert.That(instructions |> List.map (fun instruction -> instruction.Path),
-                                Does.Contain("owner/specs/AGENTS.md"))
+                match Client.SignalR.Client.prepareSourceOperation instructionRuntime (Some target) (Common.TaskWriteCommand exportCmd) with
+                | Ok { Source = Some preparedContext } ->
                     Assert.That(Client.ProjectPaths.ResolvedProject.sourceRoot preparedContext,
                                 Is.EqualTo(Client.ProjectPaths.ResolvedProject.sourceRoot sourceContext))
-                | other -> Assert.Fail(sprintf "Could not prepare task-spec instructions: %A" other)
+                | other -> Assert.Fail(sprintf "Could not prepare task-spec source: %A" other)
                 let exportReceipt = runPrepared exportCmd
                 Assert.That((unbox<TaskSpecExport> exportReceipt).AlreadyApplied, Is.False)
                 Assert.That((unbox<TaskSpecExport> exportReceipt).Authority,
@@ -3020,11 +3018,9 @@ type ReviewWorkflowTests() =
                         ExpectedVersion = 2; BaseOid = pageAfter.SpecBlobOid
                         TargetRef = sourceDraft.BlobOid; SourceRef = "specs/spec-api-import.html"
                         Title = "Spec API imported" }
-                match Client.AgentInstructions.prepareWithTarget instructionRuntime (Some target) (Common.TaskWriteCommand importCommand) with
-                | Ok (instructions, Some _) ->
-                    Assert.That(instructions |> List.map (fun instruction -> instruction.Path),
-                                Does.Contain("owner/specs/AGENTS.md"))
-                | other -> Assert.Fail(sprintf "Could not prepare import instructions: %A" other)
+                match Client.SignalR.Client.prepareSourceOperation instructionRuntime (Some target) (Common.TaskWriteCommand importCommand) with
+                | Ok { Source = Some _ } -> ()
+                | other -> Assert.Fail(sprintf "Could not prepare import source: %A" other)
                 runPrepared importCommand |> ignore
                 let latest =
                     Client.OrchestrationApi.TaskApi.read pageCmd ctx
@@ -3672,12 +3668,12 @@ type ReviewWorkflowTests() =
             |> success |> ignore
             ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
             |> success |> ignore
-            // The first inbox call should deliver root guidance even though
-            // ordinary ledger reads deliberately skip source instructions.
-            File.WriteAllText(Path.Combine(Path.GetDirectoryName one, "AGENTS.md"), "workspace guidance")
-            File.WriteAllText(Path.Combine(one, "AGENTS.md"), "project guidance")
+            // The first inbox must activate and return canonical context even
+            // when repository guidance is malformed or oversized.
+            File.WriteAllBytes(Path.Combine(Path.GetDirectoryName one, "AGENTS.md"), [| 0xffuy |])
+            File.WriteAllText(Path.Combine(one, "AGENTS.md"), String('g', 1500000))
             Directory.CreateDirectory(Path.Combine(one, "src")) |> ignore
-            File.WriteAllText(Path.Combine(one, "src", "AGENTS.md"), "source guidance")
+            File.WriteAllBytes(Path.Combine(one, "src", "AGENTS.md"), [| 0xffuy |])
             File.WriteAllText(Path.Combine(one, "src", "example.fs"), "module Example")
             let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
             let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
@@ -3697,8 +3693,7 @@ type ReviewWorkflowTests() =
                     Client.SignalR.Client.processIncomingCommand rt payload "Owner"
                     |> Async.AwaitTask |> Async.RunSynchronously
                 let _, initialResult, initialResponse = invoke()
-                Assert.That(initialResponse.Instructions |> List.map (fun d -> d.Path),
-                            Is.EqualTo([ "AGENTS.md"; "owner/AGENTS.md" ] :> obj))
+                Assert.That(initialResponse.Instructions, Is.Empty)
                 Assert.That(initialResponse.AgentStateChanges |> List.map _.AgentId |> String.concat ",",
                             Is.EqualTo("Owner"), sprintf "%A" initialResponse.AgentStateChanges)
                 match initialResult with
@@ -3724,13 +3719,11 @@ type ReviewWorkflowTests() =
                     |> Async.AwaitTask |> Async.RunSynchronously
                 let _, srcResult, srcResponse = readSource()
                 Assert.That(srcResult.IsOk, Is.True)
-                Assert.That(srcResponse.Instructions |> List.map (fun d -> d.Path),
-                            Is.EqualTo([ "owner/src/AGENTS.md" ] :> obj))
+                Assert.That(srcResponse.Instructions, Is.Empty)
                 let _, _, repeatSource = readSource()
                 Assert.That(repeatSource.Instructions, Is.Empty)
-                // A warm Working-state cache must avoid GitHub for ordinary
-                // local source reads. Disable the bound remote temporarily;
-                // a forced refresh would surface as duplicate AGENTS.md.
+                // A warm Working-state cache permits ordinary local source
+                // reads during a temporary outage of the bound remote.
                 let originalRemote = git one [ "remote"; "get-url"; "origin" ]
                 let unavailable = Path.Combine(Path.GetTempPath(), "jarvis-missing-" + Guid.NewGuid().ToString("N"))
                 git one [ "remote"; "set-url"; "origin"; unavailable ] |> ignore
@@ -3742,8 +3735,7 @@ type ReviewWorkflowTests() =
                     git one [ "remote"; "set-url"; "origin"; originalRemote ] |> ignore
                 File.WriteAllText(Path.Combine(one, "src", "AGENTS.md"), "changed source guidance")
                 let _, _, updatedSource = readSource()
-                Assert.That(updatedSource.Instructions |> List.map (fun d -> d.Path),
-                            Is.EqualTo([ "owner/src/AGENTS.md" ] :> obj))
+                Assert.That(updatedSource.Instructions, Is.Empty)
                 match repeatResult with
                 | Ok _ -> ()
                 | Error error -> Assert.Fail(sprintf "Second inbox should succeed: %A" error)
@@ -3752,9 +3744,8 @@ type ReviewWorkflowTests() =
                 Assert.That(again.WorkingTurnStartedAtUtc, Is.EqualTo(agent.WorkingTurnStartedAtUtc))
 
                 // A second client changes the assignment while this client's
-                // Working-state and instruction-delivery caches are still warm.
-                // The next ordinary call must refresh the ledger state, activate
-                // Ready, and re-deliver roots for the new Working turn.
+                // Working-state cache is warm. The next ordinary call must
+                // refresh canonical state and activate Ready without guidance.
                 let _, _, currentAttempt = ReviewWorkflow.getTask second taskId |> success
                 let attempt = currentAttempt.Value
                 // This second client goes through the real TaskWrite command
@@ -3796,8 +3787,7 @@ type ReviewWorkflowTests() =
                 Assert.That(resumedResult.IsOk, Is.True)
                 Assert.That(resumedResponse.AgentStateChanges,
                             Is.EqualTo([ ({ ProjectName = "owner"; AgentId = "Owner" } : Common.AgentStateChange) ] :> obj))
-                Assert.That(resumedResponse.Instructions |> List.map (fun d -> d.Path),
-                            Is.EqualTo([ "AGENTS.md"; "owner/AGENTS.md"; "owner/src/AGENTS.md" ] :> obj))
+                Assert.That(resumedResponse.Instructions, Is.Empty)
                 let remoteWorking = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
                 Assert.That(remoteWorking.State, Is.EqualTo("Working"))
                 Assert.That(remoteWorking.WorkingTurnStartedAtUtc,

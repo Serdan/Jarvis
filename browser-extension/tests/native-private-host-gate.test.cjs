@@ -11,10 +11,11 @@ const source = fs.readFileSync(
   'utf8'
 );
 
-function fakePage() {
+function fakePage(href = 'https://chatgpt.com/') {
   let touched = 0;
   const page = {
-    location: { href: 'https://chatgpt.com/' },
+    URL,
+    location: { href },
     document: {
       querySelectorAll() {
         touched += 1;
@@ -56,4 +57,17 @@ test('page-facing launcher rejects null, array and arbitrary future flags', asyn
     assert.equal(response.status, 'notSubmitted');
     assert.equal(response.reason, 'UnsupportedPrivateBootstrapArguments');
   }
+});
+
+test('project-scoped launcher rejects private bootstrap arguments and only checks zero turns', async () => {
+  const startUrl = 'https://chatgpt.com/g/g-p-abc123/project';
+  const page = fakePage(startUrl);
+  const response = await page.execute({ prompt: 'ordinary instruction', startUrl,
+    modelOverride: 'gpt-5.6-instant', credential: 'DO_NOT_RELAY_SECRET' });
+  assert.equal(response.status, 'notSubmitted');
+  assert.equal(response.reason, 'UnsupportedPrivateBootstrapArguments');
+  assert.equal(response.safeToDisposeCreatedTab, true);
+  assert.equal(response.observedSelection, null);
+  assert.doesNotMatch(JSON.stringify(response), /DO_NOT_RELAY_SECRET/);
+  assert.equal(page.touches(), 2);
 });

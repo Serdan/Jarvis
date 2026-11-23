@@ -20,7 +20,7 @@ function harness(options = {}) {
   let mode = options.initialMode || "Chat";
   let chatClicks = 0;
   let modelClicks = 0;
-  let selectedModel = options.selectedModel || "GPT-6";
+  let selectedModel = options.selectedModel || "Latest";
   let reasoningEffort = options.reasoningEffort || "High";
   let staleSendChecks = 0;
   let staleSendObserved = 0;
@@ -36,11 +36,18 @@ function harness(options = {}) {
     if (ms === 0) queueMicrotask(callback);
     else setTimeout(callback, ms);
   };
+  const scheduleImmediateEffect = (callback, ms = 0) => {
+    if (options.virtualClock && ms === 0) queueMicrotask(callback);
+    else setTimeout(callback, ms);
+  };
   if (options.addUserTurnBeforeModeMs) {
     setTimeout(() => { userTurns++; }, options.addUserTurnBeforeModeMs);
   }
   const makeMode = name => ({
     textContent: name,
+    get innerText() { return options.observableLabels === false ? undefined : name; },
+    getClientRects() { return options.observableLabels === false ? [] : [1]; },
+    closest() { return null; },
     getAttribute(attribute) {
       return attribute === "aria-pressed" ? String(mode === name) : null;
     },
@@ -54,7 +61,11 @@ function harness(options = {}) {
           setTimeout(() => { site.href = "https://chatgpt.com/c/unexpected-during-selection"; }, options.routeAfterFirstChatClickMs);
         }
         if (!options.modeSwitchFails && chatClicks > (options.ignoreFirstChatClicks || 0)) {
-          setTimeout(() => { mode = "Chat"; }, options.modeDelayMs || 0);
+          scheduleImmediateEffect(() => {
+            mode = "Chat";
+            if (options.chatInstantAndProOnly && !["Instant", "Pro"].includes(reasoningEffort))
+              reasoningEffort = "Instant";
+          }, options.modeDelayMs || 0);
         }
         if (options.replaceModesDuringModeSwitchMs) {
           setTimeout(() => {
@@ -62,7 +73,7 @@ function harness(options = {}) {
             workMode = makeMode("Work");
           }, options.replaceModesDuringModeSwitchMs);
         }
-      } else { setTimeout(() => {
+      } else { scheduleImmediateEffect(() => {
         mode = "Work";
         if (reasoningEffort === "Pro") reasoningEffort = "Medium";
       }, options.modeDelayMs || 0); }
@@ -83,7 +94,10 @@ function harness(options = {}) {
     if (options.optimisticLocalRoute) {
       site.href = "https://chatgpt.com/c/local-chatgpt%3Aclient-only-placeholder";
     }
-    if (!options.noRoute) setTimeout(() => { site.href = "https://chatgpt.com/c/00000000-0000-0000-0000-000000000001"; }, options.routeDelayMs || 0);
+    if (!options.noRoute) scheduleImmediateEffect(() => {
+      const prefix = options.startUrl?.endsWith("/project") ? options.startUrl.slice(0, -"/project".length) : "https://chatgpt.com";
+      site.href = prefix + "/c/00000000-0000-0000-0000-000000000001";
+    }, options.routeDelayMs || 0);
     const submittedText = content;
     lastSubmittedText = submittedText;
     content = "";
@@ -116,14 +130,25 @@ function harness(options = {}) {
   };
   const radio = name => ({
     textContent: name,
-    getAttribute(attr) { return attr === "aria-checked" ? String(selectedModel === name) : null; },
-    hasAttribute() { return false; }, closest() { return null; },
-    click() { modelClicks++; selectedModel = name; view = "simple"; expanded = false; }
+    get innerText() { return options.observableLabels === false ? undefined : name; },
+    getClientRects() { return options.observableLabels === false ? [] : [1]; },
+    getAttribute(attr) {
+      if (attr === "aria-disabled" && options.disabledModels?.includes(name)) return "true";
+      return attr === "aria-checked" ? String(selectedModel === name) : null;
+    },
+    hasAttribute() { return false; },
+    closest() { return options.hiddenModelRadiosInSimple && view === "simple" ? {} : null; },
+    click() {
+      if (this.closest()) throw new Error("Hidden model radio was clicked");
+      modelClicks++; selectedModel = name; view = "simple"; expanded = false;
+    }
   });
   const toggle = { closest() { return null; }, click() { view = "advanced"; } };
   const knob = { getAttribute(name) { return String(name === "aria-valuemax" ? (options.maxEffortStep ?? activeEfforts().length - 1) : activeEfforts().indexOf(reasoningEffort)); } };
   const power = { closest() { return null; }, querySelector(sel) { return sel === '[role="slider"]' ? knob : null; } };
   const powerLabel = {
+    get innerText() { return options.observableLabels === false ? undefined : reasoningEffort; },
+    getClientRects() { return options.observableLabels === false ? [] : [1]; },
     closest() { return null; },
     get textContent() { return reasoningEffort; },
     getAttribute(name) { return name === "data-power-disabled" ? "false" : null; }
@@ -144,7 +169,8 @@ function harness(options = {}) {
     querySelector(sel) { return sel === '[data-model-picker-view]' ? { getAttribute() { return view; } } : null; },
     querySelectorAll(sel) {
       if (sel === '[role="menuitemradio"]') {
-        const items = (view === "simple" ? [selectedModel] : ["GPT-6", "GPT-6.1 Terra"]).map(radio);
+        const choices = options.modelChoices || ["Latest", "GPT-6.2", "GPT-6", "GPT-5.6 Sol", "GPT-6.1 Terra"];
+        const items = (view === "simple" && !options.hiddenModelRadiosInSimple ? [selectedModel] : choices).map(radio);
         if (mode === "Chat" && options.chatInstantAndProOnly && !options.omitEffortOption)
           items.push(disabledMedium);
         return items;
@@ -226,7 +252,7 @@ function harness(options = {}) {
       if (selector === '[data-model-selection-label="gpt-6.1-terra-wm"]') return selectedModel === "GPT-6.1 Terra" ? {} : null;
       if (selector.includes('contenteditable="true"')) return options.noComposer ? null : activeEditor;
       if (selector.includes('aria-label="Send"')) {
-        if (options.noSend) return null;
+        if (options.noSend || (options.workSendDisabled && mode === "Work")) return null;
         if (options.sendAvailableAfterMs !== undefined &&
             (options.virtualClock ? virtualClock.now : Date.now() - launchStartedAt) <
               options.sendAvailableAfterMs) return null;
@@ -850,14 +876,14 @@ test("route change after insertion always prevents a Send", async () => {
 
 test("ignored pre-hydration Chat click retries on the same untouched new-chat home", async () => {
   const h = harness({ initialMode: "Work", ignoreFirstChatClicks: 1, timeoutMs: 1100,
-    selectedModel: "GPT-6", reasoningEffort: "High" });
+    selectedModel: "Latest", reasoningEffort: "High" });
   const result = await h.run("Hydration recovery");
   assert.equal(result.status, "submitted");
   assert.equal(h.chatClicks >= 2, true);
   assert.equal(h.mode, "Chat");
   assert.equal(h.clicks, 1);
   assert.equal(h.lastSubmittedText, "Hydration recovery");
-  assert.equal(h.selectedModel, "GPT-6");
+  assert.equal(h.selectedModel, "Latest");
   assert.equal(h.reasoningEffort, "Medium");
   assert.equal(h.modelClicks, 0);
 });
@@ -915,7 +941,8 @@ test("ambiguous Chat buttons do not authorize a mode click or Send", async () =>
 });
 
 for (const { selectedModel, reasoningEffort } of [
-  { selectedModel: "GPT-6", reasoningEffort: "Instant" },
+  { selectedModel: "Latest", reasoningEffort: "Instant" },
+  { selectedModel: "GPT-6.2", reasoningEffort: "Medium" },
   { selectedModel: "GPT-6", reasoningEffort: "Extra High" },
   { selectedModel: "GPT-5.6 Sol", reasoningEffort: "Medium" },
   { selectedModel: "Pro", reasoningEffort: "High" }
@@ -926,13 +953,13 @@ for (const { selectedModel, reasoningEffort } of [
     assert.equal(result.status, "submitted");
     assert.equal(h.chatClicks, 0);
     assert.equal(h.clicks, 1);
-    assert.equal(h.selectedModel, "GPT-6");
+    assert.equal(h.selectedModel, "Latest");
     assert.equal(h.reasoningEffort, "Medium");
   });
 }
 
 test("Work mode with a restored draft always sends only the intended prompt", async () => {
-  const h = harness({ initialMode: "Work", selectedModel: "GPT-6",
+  const h = harness({ initialMode: "Work", selectedModel: "Latest",
     reasoningEffort: "High", existingDraft: "Saved unrelated draft", timeoutMs: 1400 });
   const result = await h.run("Exact intended new task");
   assert.equal(result.status, "submitted");
@@ -1001,12 +1028,12 @@ test("when Chat Medium and Work Terra Medium cannot be selected, fall back to Ch
   const result = await h.run("Exactly one fallback", { selectionOnly: true });
   assert.equal(result.status, "selectionOnly");
   assert.equal(result.selectedMode, "Chat");
-  assert.equal(result.selectedModel, "GPT-6");
+  assert.equal(result.selectedModel, "Latest");
   assert.equal(result.selectedEffort, "Instant");
   assert.deepEqual(Array.from(result.attempts, item => ({
     mode: item.mode, model: item.model, effort: item.effort, reason: item.reason
   })), [
-    { mode: "Chat", model: "GPT-6", effort: "Medium", reason: "EffortUnavailable" },
+    { mode: "Chat", model: "Latest", effort: "Medium", reason: "EffortUnavailable" },
     { mode: "Work", model: "GPT-6.1 Terra", effort: "Medium", reason: "EffortUnavailable" }
   ]);
   assert.equal(h.clicks, 0);
@@ -1055,3 +1082,139 @@ test("missing visible effort label cannot authorize a send from an attribute alo
   assert.equal(result.status, "notSubmitted");
   assert.equal(h.clicks, 0);
 });
+
+test("Latest is selected instead of explicit GPT-6.2 and the checked alias is observed without inventing a version", async () => {
+  const h = harness({ selectedModel: "GPT-6.2", reasoningEffort: "Medium", virtualClock: true });
+  const result = await h.run("Selection only", { selectionOnly: true, timeoutMs: 18000 });
+  assert.equal(result.status, "selectionOnly");
+  assert.equal(h.selectedModel, "Latest");
+  assert.equal(result.selectedModel, "Latest");
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: "Chat", model: "Latest", effort: "Medium" });
+  assert.equal(h.clicks, 0);
+});
+
+test("explicit 5.6 Instant override uses the rendered Sol label on the current account", async () => {
+  const h = harness({ selectedModel: "Latest", reasoningEffort: "High", virtualClock: true });
+  const result = await h.run("Selection only", { modelOverride: "gpt-5.6-instant", selectionOnly: true, timeoutMs: 18000 });
+  assert.equal(result.status, "selectionOnly");
+  assert.equal(h.selectedModel, "GPT-5.6 Sol");
+  assert.equal(result.selectedModel, "GPT-5.6 Sol");
+  assert.equal(result.observedSelection.model, "GPT-5.6 Sol");
+  assert.equal(result.selectedEffort, "Instant");
+  assert.equal(h.clicks, 0);
+});
+
+test("legacy explicit 5.6 label is supported without reporting Sol", async () => {
+  const h = harness({ modelChoices: ["Latest", "GPT-5.6"], virtualClock: true });
+  const result = await h.run("Selection only", { modelOverride: "gpt-5.6-instant", selectionOnly: true, timeoutMs: 18000 });
+  assert.equal(result.status, "selectionOnly");
+  assert.equal(result.selectedModel, "GPT-5.6");
+  assert.equal(result.observedSelection.model, "GPT-5.6");
+  assert.equal(h.clicks, 0);
+});
+
+test("explicit Work override cannot silently fall back when its Send is disabled", async () => {
+  const h = harness({ selectedModel: "Latest", reasoningEffort: "Medium", workSendDisabled: true, virtualClock: true });
+  const result = await h.run("Must not send", { modelOverride: "work-terra-medium", timeoutMs: 18000 });
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.reason, "SendUnavailable");
+  assert.equal(h.mode, "Work");
+  assert.equal(h.clicks, 0);
+});
+
+test("explicit override rejects prototype property and unsupported value without selecting or sending", async () => {
+  for (const modelOverride of ["constructor", "__proto__", "toString", "unknown"]) {
+    const h = harness({ virtualClock: true });
+    const result = await h.run("Must not send", { modelOverride, timeoutMs: 18000 });
+    assert.equal(result.status, "notSubmitted");
+    assert.equal(result.reason, "UnsupportedModelOverride");
+    assert.equal(h.modelClicks, 0);
+    assert.equal(h.clicks, 0);
+  }
+});
+
+test("project entry selects Latest Medium without a Chat/Work mode toggle and sends once", async () => {
+  const startUrl = "https://chatgpt.com/g/g-p-abc123/project";
+  const h = harness({ startUrl, noModeToggle: true, selectedModel: "GPT-6", reasoningEffort: "High" });
+  const result = await h.run("Project launch", { startUrl, timeoutMs: 18000 });
+  assert.equal(result.status, "submitted");
+  assert.equal(result.selectedModel, "Latest");
+  assert.equal(result.selectedEffort, "Medium");
+  assert.equal(result.observedSelection.model, "Latest");
+  assert.equal(result.observedSelection.mode, null);
+  assert.equal(result.conversationUrl, "https://chatgpt.com/g/g-p-abc123/c/00000000-0000-0000-0000-000000000001");
+  assert.equal(h.clicks, 1);
+});
+
+test("when Latest and Work are unavailable no explicit model or Send is silently chosen", async () => {
+  const h = harness({ modelChoices: ["GPT-6.2", "GPT-6"], selectedModel: "GPT-6.2", virtualClock: true });
+  const result = await h.run("Must not send", { timeoutMs: 18000 });
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "PreferredConfigurationsUnavailable");
+  assert.equal(h.selectedModel, "GPT-6.2");
+  assert.equal(h.clicks, 0);
+});
+
+test("observations are unknown if the picker label cannot be rendered, not inferred from the preference", async () => {
+  const h = harness({ observableLabels: false, virtualClock: true });
+  const result = await h.run("Selection only", { selectionOnly: true, timeoutMs: 18000 });
+  assert.equal(result.status, "selectionOnly");
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: null, model: null, effort: null });
+  assert.equal(h.clicks, 0);
+});
+
+test("default disabled Work Send falls back to confirmed Latest Instant before the one Send", async () => {
+  const h = harness({ chatInstantAndProOnly: true, reasoningEffort: "Instant", workSendDisabled: true, virtualClock: true });
+  const result = await h.run("One fallback send", { timeoutMs: 27000 });
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.equal(result.selectedMode, "Chat");
+  assert.equal(result.selectedModel, "Latest");
+  assert.equal(result.selectedEffort, "Instant");
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: "Chat", model: "Latest", effort: "Instant" });
+  assert.equal(h.clicks, 1);
+});
+
+test("disabled Latest uses only the explicit Work fallback and reports its checked model", async () => {
+  const h = harness({ disabledModels: ["Latest"], selectedModel: "GPT-6.2", reasoningEffort: "Medium", virtualClock: true });
+  const result = await h.run("Selection only", { selectionOnly: true, timeoutMs: 18000 });
+  assert.equal(result.status, "selectionOnly");
+  assert.equal(result.selectedMode, "Work");
+  assert.equal(result.selectedModel, "GPT-6.1 Terra");
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: "Work", model: "GPT-6.1 Terra", effort: "Medium" });
+  assert.equal(result.attempts[0].reason, "ModelUnavailable");
+  assert.equal(h.clicks, 0);
+});
+
+test("unavailable explicit 5.6 override does not fall back to Latest", async () => {
+  const h = harness({ modelChoices: ["Latest", "GPT-6.2"], virtualClock: true });
+  const result = await h.run("Must not send", { modelOverride: "gpt-5.6-instant", timeoutMs: 18000 });
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "PreferredConfigurationsUnavailable");
+  assert.equal(result.observedSelection, null);
+  assert.equal(h.modelClicks, 0);
+  assert.equal(h.clicks, 0);
+});
+
+test("project entry rejects explicit Work without switching or sending", async () => {
+  const startUrl = "https://chatgpt.com/g/g-p-abc123/project";
+  const h = harness({ startUrl, noModeToggle: true, virtualClock: true });
+  const result = await h.run("Must not send", { startUrl, modelOverride: "work-terra-medium", timeoutMs: 18000 });
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.attempts[0].reason, "ModeUnavailable");
+  assert.equal(result.observedSelection, null);
+  assert.equal(h.modelClicks, 0);
+  assert.equal(h.clicks, 0);
+});
+
+for (const selectedModel of ["Latest", "GPT-6.2"]) {
+  test(`hidden simple-view model radios: confirm visible checked Latest from ${selectedModel}`, async () => {
+    const h = harness({ selectedModel, hiddenModelRadiosInSimple: true,
+      reasoningEffort: "High", virtualClock: true });
+    const result = await h.run("Selection only", { selectionOnly: true, timeoutMs: 18000 });
+    assert.equal(result.status, "selectionOnly", JSON.stringify(result));
+    assert.equal(h.selectedModel, "Latest");
+    assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)),
+      { mode: "Chat", model: "Latest", effort: "Medium" });
+    assert.equal(h.clicks, 0);
+  });
+}

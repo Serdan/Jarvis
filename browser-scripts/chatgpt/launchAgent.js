@@ -1,6 +1,12 @@
 // Project-owned ChatGPT UI automation. Jarvis opens and closes the tab separately.
 // The browser extension evaluates execute(args) in a USER_SCRIPT world.
 async function execute(args) {
+  let observedSelection = null;
+  const result = await executeLaunch(args, value => { observedSelection = value; });
+  return { ...result, observedSelection };
+}
+
+async function executeLaunch(args, observeSelection) {
   const prompt = args?.prompt;
   // Explicit launch destination; the ordinary home remains the default.
   const startUrl = args?.startUrl ?? "https://chatgpt.com/";
@@ -47,7 +53,7 @@ async function execute(args) {
   // Callers must NOT place secrets in argsJson even when this check rejects it.
   // Preserve the historically ignored non-secret prior-send hint; it is
   // not evidence of a private host execution and has no send effect.
-  const permittedArgs = new Set(["prompt", "timeoutMs", "confirmedSubmittedPrompts", "selectionOnly", "startUrl"]);
+  const permittedArgs = new Set(["prompt", "timeoutMs", "confirmedSubmittedPrompts", "selectionOnly", "startUrl", "modelOverride"]);
   if (!args || typeof args !== "object" || Array.isArray(args) ||
       Object.keys(args).some(key => !permittedArgs.has(key))) {
     return notSubmitted("UnsupportedPrivateBootstrapArguments");
@@ -105,13 +111,26 @@ async function execute(args) {
   });
   try {
   // Re-evaluate on every fresh launch; never cache usage availability.
-  // Strict fallback order: Chat GPT-6 Medium, Work GPT-6.1 Terra Medium, Chat GPT-6 Instant.
+  // Strict fallback order: Chat Latest Medium, Work GPT-6.1 Terra Medium, Chat Latest Instant.
   // Advance only when the current selection cannot be confirmed before Send.
-  const preferences = [
-    { mode: "Chat", model: "GPT-6", effort: "medium", level: 1, label: "Medium" },
+  const defaultPreferences = [
+    { mode: "Chat", model: "Latest", effort: "medium", level: 1, label: "Medium" },
     { mode: "Work", model: "GPT-6.1 Terra", effort: "medium", level: 1, label: "Medium" },
-    { mode: "Chat", model: "GPT-6", effort: "none", level: 0, label: "Instant" }
+    { mode: "Chat", model: "Latest", effort: "none", level: 0, label: "Instant" }
   ];
+  // Latest is a selectable alias, not a hard-coded version. Do not infer
+  // the alias's backing model from this account's current version.
+  const modelOverrides = new Map([
+    ["gpt-5.6-instant", [{ mode: "Chat", model: "GPT-5.6", alternateModels: ["GPT-5.6 Sol"], effort: "none", level: 0, label: "Instant" }]],
+    ["work-terra-medium", [defaultPreferences[1]]]
+  ]);
+  if (args.modelOverride !== undefined && !modelOverrides.has(args.modelOverride)) {
+    return notSubmitted("UnsupportedModelOverride");
+  }
+  const preferences = args.modelOverride === undefined
+    ? defaultPreferences : modelOverrides.get(args.modelOverride);
+  // Only the default sequence permits pre-Send Work -> Chat Instant fallback.
+  const sendFallback = preferences.find(target => target.mode === "Chat" && target.effort === "none");
   const composerSelector = '[data-composer-input-layout] [contenteditable="true"][role="textbox"]';
   const pickerSelector = 'button[aria-label="Select ChatGPT model"]';
   const projectChat = { getAttribute: name => name === "aria-pressed" ? "true" : null };
@@ -141,8 +160,28 @@ async function execute(args) {
   const modelMenu = () => Array.from(document.querySelectorAll('[role="menu"]'))
     .find(menu => menu.getClientRects().length && menu.querySelector('[data-model-picker-view]')) || null;
   const menuView = () => modelMenu()?.querySelector('[data-model-picker-view]')?.getAttribute('data-model-picker-view');
-  const radio = model => Array.from(modelMenu()?.querySelectorAll('[role="menuitemradio"]') || [])
-    .find(item => (item.innerText || item.textContent || "").trim() === model) || null;
+  const radioText = item => (item?.innerText || item?.textContent || "").trim();
+  const radio = model => {
+    const matches = Array.from(modelMenu()?.querySelectorAll('[role="menuitemradio"]') || [])
+      .filter(item => radioText(item) === model);
+    return matches.length === 1 ? matches[0] : null;
+  };
+  const modelRadio = target => {
+    for (const name of [target.model, ...(target.alternateModels || [])]) {
+      const item = radio(name);
+      if (item) return item;
+    }
+    return null;
+  };
+  // Observation is intentionally narrower than selector confirmation: do not
+  // report a hidden label or infer a version from the checked Latest alias.
+  const renderedLabel = node => {
+    try {
+      if (!node?.getClientRects?.().length || node.closest('[aria-hidden="true"],[inert]')) return null;
+      const value = (node.innerText || "").trim();
+      return value && value.length <= 128 ? value : null;
+    } catch { return null; }
+  };
   const unavailableRadio = item => !item || item.getAttribute("aria-disabled") === "true" ||
     item.hasAttribute("data-disabled");
   const activeMenuControl = selector => Array.from(modelMenu()?.querySelectorAll(selector) || [])
@@ -159,27 +198,20 @@ async function execute(args) {
   // is uncertain until confirmed and must never be replayed.
   const preSendDeadline = deadline - acknowledgementReserveMs;
   let selected = null;
+  let confirmedModelLabel = null;
 
   const choose = async (target, untilAt) => {
-    if (projectStart) {
-      // Project landing pages expose a Chat composer without Chat/Work tabs.
-      // Only use the already selected Instant model; never infer a model from
-      // missing controls or silently downgrade an explicitly selected mode.
-      if (target.mode !== "Chat" || target.effort !== "none") return "ModeUnavailable";
-      const ready = await poll(() => {
-        if (emptyHomeFailure() || document.readyState !== "complete") return null;
-        const control = picker();
-        if (!control || document.querySelectorAll(composerSelector).length !== 1) return null;
-        return control.getAttribute("data-selected-reasoning-effort") === "none" &&
-          (control.textContent || "").trim() === "Instant";
-      }, untilAt);
-      return ready ? null : "ProjectInstantUnavailable";
-    }
+    // A failed selection or repair must not leave a stale observed model.
+    confirmedModelLabel = null;
+    observeSelection(null);
+    // Project landing pages expose the Chat model picker, but no mode switch.
+    // Use the same checked-radio and effort verification as ordinary Chat.
+    if (projectStart && target.mode !== "Chat") return "ModeUnavailable";
     const home = () => emptyHomeFailure();
     const retryWait = () => delay(Math.min(100, Math.max(1, untilAt - Date.now())));
     // Chat/Work controls can appear before their React click handlers hydrate.
     let lastModeClick = -Infinity;
-    const modeReady = await poll(() => {
+    const modeReady = projectStart || await poll(() => {
       if (home()) return null;
       const chat = modeButton("Chat");
       const work = modeButton("Work");
@@ -212,38 +244,56 @@ async function execute(args) {
       return null;
     }, untilAt);
 
-    if (!await openPicker()) return "ModelPickerUnavailable";
-    let model = radio(target.model);
-    if (!model && menuView() === "simple") {
+    const enterAdvanced = async () => {
+      if (home()) return false;
+      if (menuView() === "advanced") return true;
+      if (menuView() !== "simple") return false;
       const toggle = activeMenuControl('[data-model-picker-view-toggle]');
-      if (toggle) toggle.click();
-      await poll(() => menuView() === "advanced", untilAt);
-      model = radio(target.model);
+      if (!toggle) return false;
+      toggle.click();
+      return Boolean(await poll(() => !home() && menuView() === "advanced", untilAt));
+    };
+    const checked = item => !unavailableRadio(item) && item.getAttribute("aria-checked") === "true";
+    const hidden = item => Boolean(item?.closest('[aria-hidden="true"],[inert]'));
+
+    if (!await openPicker()) return "ModelPickerUnavailable";
+    let model = modelRadio(target);
+    if (!model && menuView() === "simple") {
+      if (!await enterAdvanced()) return "ModelListUnavailable";
+      model = modelRadio(target);
     }
     if (unavailableRadio(model)) return "ModelUnavailable";
-    if (model.getAttribute("aria-checked") !== "true") {
-      if (menuView() !== "advanced") {
-        const toggle = activeMenuControl('[data-model-picker-view-toggle]');
-        if (!toggle) return "ModelListUnavailable";
-        toggle.click();
-        if (!await poll(() => menuView() === "advanced", untilAt)) return "ModelListUnavailable";
-      }
-      model = radio(target.model);
-      if (unavailableRadio(model) || model.closest('[aria-hidden="true"],[inert]'))
-        return "ModelUnavailable";
+    if (!checked(model)) {
+      if (!await enterAdvanced()) return "ModelListUnavailable";
+      model = modelRadio(target);
+      if (unavailableRadio(model) || hidden(model)) return "ModelUnavailable";
       if (home()) return "HomeChanged";
+      const clickedLabel = radioText(model);
       model.click();
       await retryWait();
       if (!await openPicker()) return "ModelSelectionUnconfirmed";
-      if (!await poll(() => radio(target.model)?.getAttribute("aria-checked") === "true", untilAt))
+      if (!await poll(() => checked(radio(clickedLabel)), untilAt))
         return "ModelSelectionUnconfirmed";
+      model = radio(clickedLabel);
     }
+    if (!checked(model)) return "ModelSelectionUnconfirmed";
+    const checkedModelLabel = radioText(model);
 
-    // The model list and reasoning slider are separate, mutually exclusive
-    // views. Re-selecting the already checked radio returns to the slider.
+    // The simple view can retain hidden model radios. Their checked state
+    // verifies selection, but their hidden text is not a rendered observation.
+    // Observe the same checked label in the advanced view when necessary.
+    if (hidden(model)) {
+      if (!await enterAdvanced()) return "ModelListUnavailable";
+      model = radio(checkedModelLabel);
+      if (!checked(model) || hidden(model)) return "ModelSelectionUnconfirmed";
+    }
+    const modelObservation = renderedLabel(model);
+
+    // Return to the effort slider by re-selecting only the visible, already
+    // checked radio. Verify that exact model again in the simple view.
     if (menuView() !== "simple") {
-      const selectedRadio = radio(target.model);
-      if (!selectedRadio || selectedRadio.closest('[aria-hidden="true"],[inert]'))
+      const selectedRadio = radio(checkedModelLabel);
+      if (!checked(selectedRadio) || hidden(selectedRadio) || home())
         return "EffortPickerUnavailable";
       selectedRadio.click();
       await retryWait();
@@ -263,8 +313,8 @@ async function execute(args) {
         await retryWait();
         continue;
       }
-      const selectedRadio = radio(target.model);
-      if (unavailableRadio(selectedRadio) || selectedRadio.getAttribute("aria-checked") !== "true")
+      const selectedRadio = radio(checkedModelLabel);
+      if (!checked(selectedRadio))
         return "ModelChanged";
       const effort = control.getAttribute("data-selected-reasoning-effort");
       const power = activeMenuControl('[data-model-picker-power-slider]');
@@ -295,6 +345,13 @@ async function execute(args) {
         if (target.mode === "Work" &&
             !document.querySelector('[data-model-selection-label="gpt-6.1-terra-wm"]'))
           return "ModelUnconfirmed";
+        const activeModes = projectStart ? [] : [modeButton("Chat"), modeButton("Work")]
+          .filter(button => button?.getAttribute("aria-pressed") === "true");
+        const observation = {
+          mode: activeModes.length === 1 ? renderedLabel(activeModes[0]) : null,
+          model: modelObservation,
+          effort: renderedLabel(powerLabel)
+        };
         // Close the picker before editing. No menu click can submit a prompt.
         if (control.getAttribute("aria-expanded") === "true") control.click();
         await delay(80);
@@ -302,6 +359,8 @@ async function execute(args) {
             modeButton(target.mode)?.getAttribute("aria-pressed") !== "true" ||
             picker()?.getAttribute("data-selected-reasoning-effort") !== target.effort)
           return "SelectionChanged";
+        confirmedModelLabel = checkedModelLabel;
+        observeSelection(observation);
         return null;
       }
       if (lastValue === step) stalls++;
@@ -338,7 +397,7 @@ async function execute(args) {
     return { ...notSubmitted("PreferredConfigurationsUnavailable"), attempts };
   }
   let selectedMode = selected.mode;
-  let selectedModel = selected.model;
+  let selectedModel = confirmedModelLabel;
   let selectedEffort = selected.effort;
   if (args.selectionOnly === true) {
     return { status: "selectionOnly", selectedMode, selectedModel,
@@ -439,12 +498,16 @@ async function execute(args) {
         // successful picker selection, including after typing the prompt.
         // Repair only before Send. Keep the exact unsent draft and prove it
         // again; a changed editor is rebound and rewritten by the normal loop.
-        if (++effortRepairs > 2)
-          return incompatible(stage, "SelectedEffortUnstable");
-        const cutoff = Math.min(preSendDeadline, Date.now() + 2500);
-        const failure = await choose(selected, cutoff);
-        if (failure && effortRepairs >= 2)
-          return incompatible(stage, "SelectedEffortRecoveryFailed");
+        let failure;
+        do {
+          if (++effortRepairs > 2)
+            return incompatible(stage, "SelectedEffortUnstable");
+          const cutoff = Math.min(preSendDeadline, Date.now() + 2500);
+          failure = await choose(selected, cutoff);
+          // Never proceed using a stale confirmation after a failed repair.
+        } while (failure && effortRepairs < 2 && Date.now() < preSendDeadline);
+        if (failure) return incompatible(stage, "SelectedEffortRecoveryFailed");
+        selectedModel = confirmedModelLabel;
         lastTransient = current.transient;
         continue;
       }
@@ -469,7 +532,7 @@ async function execute(args) {
           inserted = false;
         } else {
           const send = document.querySelector(sendSelector);
-          if (!send && selectedMode === "Work" && !sendFallbackAttempted) {
+          if (!send && selectedMode === "Work" && !sendFallbackAttempted && sendFallback) {
             // The picker may still offer Work after its quota is exhausted.
             // Wait for the normal composer hydration, then fall back before
             // any Send attempt. Never retry after clicking Send.
@@ -479,7 +542,7 @@ async function execute(args) {
               sendFallbackAttempted = true;
               attempts.push({ mode: selectedMode, model: selectedModel,
                 effort: selected.label, reason: "SendUnavailable" });
-              const fallback = preferences[2];
+              const fallback = sendFallback;
               const failure = await choose(fallback, preSendDeadline - 1000);
               if (failure) {
                 attempts.push({ mode: fallback.mode, model: fallback.model,
@@ -488,7 +551,7 @@ async function execute(args) {
               }
               selected = fallback;
               selectedMode = fallback.mode;
-              selectedModel = fallback.model;
+              selectedModel = confirmedModelLabel;
               selectedEffort = fallback.effort;
               activeComposer = null;
               activeModes = null;

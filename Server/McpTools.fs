@@ -153,6 +153,20 @@ module private TaskCommands =
           Evidence = ""
           SessionId = "" }
 
+module IntegrationCommands =
+    let submit projectName agentId taskId submissionId sourceRef submittedCommit targetRef operationId reviewId
+               reviewNamespace reviewRef bindingApprovalOperationId =
+        // Old clients reject the distinct shared action instead of ignoring its locator.
+        let action =
+            if [ reviewNamespace; reviewRef; bindingApprovalOperationId ] |> List.forall String.IsNullOrEmpty then
+                "SubmitIntegration"
+            else "SubmitSharedAcceptedIntegration"
+        let cmd = TaskCommands.write projectName action operationId taskId agentId
+        TaskWriteCommand
+            { cmd with AttemptId = submissionId; SourceRef = sourceRef; BaseOid = submittedCommit
+                       TargetRef = targetRef; Reason = reviewId; Summary = reviewNamespace
+                       NextAction = reviewRef; Evidence = bindingApprovalOperationId }
+
 module NotificationCommands =
     // Retain the caller's original selected checkout until source ledger
     // verification succeeds. A fabricated checkout must not inherit authority
@@ -1967,10 +1981,12 @@ type JarvisMcpTools =
     static member GetIntegrationSubmissions(projectName: string, agentId: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (TaskReadCommand { ProjectName = projectName; AgentId = ""; Action = "GetIntegrationSubmissions"; TaskId = taskId; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
-    [<McpServerTool(Title = "submit integration boundary", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Submit an Accepted immutable review snapshot for integration. reviewId is required; empty sourceRef and submittedCommit select its exact pinned SHA. Jarvis verifies the reviewed remote snapshot and publishes a create-only managed integration ref; it does not advance the target. An independently advanced target may require a new mechanically clean merge before completion. A nonempty submittedCommit must match the Accepted review; sourceRef is descriptive. submissionId is caller-stable and uncertain effects require reconciliation before any retry.")>]
-    static member SubmitIntegration(projectName: string, taskId: string, agentId: string, submissionId: string, sourceRef: string, submittedCommit: string, targetRef: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] reviewId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "SubmitIntegration" operationId taskId agentId
-        McpToolHelpers.sendWithManualGrant manualGrantCredential client http (TaskWriteCommand { cmd with AttemptId = submissionId; SourceRef = sourceRef; BaseOid = submittedCommit; TargetRef = targetRef; Reason = reviewId })
+    [<McpServerTool(Title = "submit integration boundary", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Submit an Accepted immutable review snapshot for integration. reviewId is required. For a task-bound review, empty sourceRef and submittedCommit select its exact pinned SHA. For a shared Accepted review, supply reviewNamespace=_reviews, exact immutable reviewRef, sourceRef, submittedCommit, and the authenticated Operator binding approval operation UUID. Partial shared locators are rejected. Jarvis verifies the reviewed remote snapshot and publishes a create-only managed integration ref; it does not advance the target. An independently advanced target may require a new mechanically clean merge before completion. A nonempty submittedCommit must match the Accepted review; sourceRef is descriptive. submissionId is caller-stable and uncertain effects require reconciliation before any retry.")>]
+    static member SubmitIntegration(projectName: string, taskId: string, agentId: string, submissionId: string, sourceRef: string, submittedCommit: string, targetRef: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] reviewId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, [<Optional; DefaultParameterValue("")>] reviewNamespace: string, [<Optional; DefaultParameterValue("")>] reviewRef: string, [<Optional; DefaultParameterValue("")>] bindingApprovalOperationId: string, client: ClientService, http: IHttpContextAccessor) =
+        let command =
+            IntegrationCommands.submit projectName agentId taskId submissionId sourceRef submittedCommit targetRef operationId reviewId
+                reviewNamespace reviewRef bindingApprovalOperationId
+        McpToolHelpers.sendWithManualGrant manualGrantCredential client http command
 
     [<McpServerTool(Title = "complete integration boundary", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Complete a Pending integration against its exact accepted review and source S. The authorized publisher reads current target T, checks direct S or a mechanically clean I=(T,S), performs ONE bounded ordinary non-force target push with remote readback, then records a v1 canonical completion with the original operation UUID. It neither force-pushes nor replays uncertain external effects; reconcile unknown outcomes before retry. Does not merge source branches or alter task/review lifecycle.")>]
     static member CompleteIntegration(projectName: string, taskId: string, agentId: string, submissionId: string, integratedCommit: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =

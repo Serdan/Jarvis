@@ -302,7 +302,7 @@ type NotificationDelivery =
 // An explicit typed locator; shared review IDs never fall back to a task lookup.
 type IntegrationReviewLocator =
     | TaskBound of reviewId: Guid
-    | SharedAccepted of reviewId: Guid * approvalOperationId: Guid
+    | SharedAccepted of reviewId: Guid * approvalOperationId: Guid * reviewRef: string
 
 // Exact evidence approved by the authenticated local Operator Challenge reply
 // route. The approval is an existing immutable canonical operation, not a
@@ -1491,10 +1491,10 @@ module ReviewWorkflow =
     // readable and completable, but cannot be created after this migration.
     let submitIntegrationWithReview binding operationId taskId actorId submissionId
                                     sourceRef submittedCommit locator targetRef =
-        let reviewId, approvalId, namespaceId =
+        let reviewId, approvalId, namespaceId, requestedReviewRef =
             match locator with
-            | TaskBound id -> id, None, taskId
-            | SharedAccepted(id, approval) -> id, Some approval, sharedNamespace
+            | TaskBound id -> id, None, taskId, None
+            | SharedAccepted(id, approval, reviewRef) -> id, Some approval, sharedNamespace, Some reviewRef
         if not (realIntegrationTaskId taskId) || not (validAgent actorId)
            || submissionId = Guid.Empty || not (validBranch targetRef)
            || targetRef = "refs/heads/jarvis-orchestration"
@@ -1503,7 +1503,10 @@ module ReviewWorkflow =
            || (not (String.IsNullOrWhiteSpace sourceRef) && not (validBranch sourceRef))
            || (not (String.IsNullOrWhiteSpace submittedCommit)
                && not (LedgerStore.validSourceCommitOid submittedCommit))
-           || reviewId = Guid.Empty || approvalId = Some Guid.Empty then
+           || reviewId = Guid.Empty || approvalId = Some Guid.Empty
+           || (approvalId.IsSome
+               && (String.IsNullOrWhiteSpace sourceRef || String.IsNullOrWhiteSpace submittedCommit
+                   || (requestedReviewRef |> Option.exists String.IsNullOrWhiteSpace))) then
             Error(InvalidBinding "Integration requires a valid Accepted review ID and a normal target branch.")
         else
             // Normalize D and N UUID spellings before creating the ledger intent.
@@ -1521,6 +1524,7 @@ module ReviewWorkflow =
                         {| taskId = taskId; submissionId = submissionId
                            sourceRef = sourceRef; submittedCommit = submittedCommit
                            reviewId = reviewId; targetRef = targetRef
+                           reviewNamespace = sharedNamespace; reviewRef = requestedReviewRef.Value
                            sharedBindingOperationId = approval.ToString("D") |}
             match LegacyDirectWriterFence.findAppliedForLegacyWrite binding action with
             | Error failure -> Error failure
@@ -1548,7 +1552,8 @@ module ReviewWorkflow =
                     return! Error(InvalidBinding "Integration requires an Accepted canonical review.")
                 let expectedReviewRef = reviewRef namespaceId reviewId review.SourceVersion
                 if review.SourceVersion < 1
-                   || review.ReviewRef <> expectedReviewRef then
+                   || review.ReviewRef <> expectedReviewRef
+                   || (requestedReviewRef |> Option.exists ((<>) expectedReviewRef)) then
                     return! Error(LedgerIntegrityError "Accepted review has an invalid managed source ref.")
                 if not (LedgerStore.validSourceCommitOid review.ReviewedHeadOid) then
                     return! Error(InvalidBinding "Historical review has no canonical pinned SHA; resubmit it for independent review.")
@@ -1676,6 +1681,7 @@ module ReviewWorkflow =
                                 {| taskId = taskId; submissionId = submissionId
                                    sourceRef = requestedSource; submittedCommit = requestedCommit
                                    reviewId = submission.ReviewId; targetRef = submission.TargetRef
+                                   reviewNamespace = sharedNamespace; reviewRef = submission.ReviewRef
                                    sharedBindingOperationId = approvalId.ToString("D") |})
                     let! review, approvalSequence =
                         verifiedSharedApproval binding snapshot taskId submission.ReviewId approvalId
@@ -1686,8 +1692,8 @@ module ReviewWorkflow =
                        || submission.SubmittedCommit <> review.ReviewedHeadOid
                        || submission.SourceRef <> review.TaskRef || submission.TargetRef <> review.TargetRef
                        || submission.IntegrationRef <> $"refs/heads/jarvis-integration/{submissionId:N}"
-                       || (not (String.IsNullOrWhiteSpace requestedSource) && requestedSource <> review.TaskRef)
-                       || (not (String.IsNullOrWhiteSpace requestedCommit) && requestedCommit <> review.ReviewedHeadOid) then
+                       || requestedSource <> review.TaskRef
+                       || requestedCommit <> review.ReviewedHeadOid then
                         return! Error(InvalidBinding "Shared integration source or approval changed.")
                     return Some review
                 with

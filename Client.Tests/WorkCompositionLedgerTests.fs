@@ -1054,22 +1054,26 @@ let sharedAcceptedIntegrationUsesExactOperatorBinding taskId reviewKey branch ow
             match result with
             | Error _ -> ()
             | Ok value -> Assert.Fail(sprintf "Unapproved shared integration unexpectedly succeeded: %A" value)
+        let shared approvalId = SharedAccepted(reviewId, approvalId, review.ReviewRef)
         let submit operation id task locator refName commit =
             ReviewWorkflow.submitIntegrationWithReview second operation task owner id refName commit locator target
         let deny task locator refName commit =
             submit (Guid.NewGuid()) (Guid.NewGuid()) task locator refName commit |> reject
         if adversarial then
             deny taskId (TaskBound reviewId) "" ""
-            deny taskId (SharedAccepted(reviewId, Guid.NewGuid())) "" ""
-            deny taskId (SharedAccepted(reviewId, decision)) "" ""
+            deny taskId (shared (Guid.NewGuid())) source pinned
+            deny taskId (shared decision) source pinned
             ReviewWorkflow.createTask first (Guid.NewGuid()) "unrelated-task" "Unrelated task" |> succeed |> ignore
-            deny "unrelated-task" (SharedAccepted(reviewId, bindingId)) "" ""
+            deny "unrelated-task" (shared bindingId) source pinned
             ReviewWorkflow.createTask first (Guid.NewGuid()) "_reviews" "Synthetic namespace task" |> succeed |> ignore
             deny "_reviews" (TaskBound reviewId) "" ""
-            deny taskId (SharedAccepted(reviewId, approve { approval with ReviewedHeadOid = baseOid })) "" ""
-            deny taskId (SharedAccepted(reviewId, approve { approval with AssignmentGeneration = 2 })) "" ""
-            deny taskId (SharedAccepted(reviewId, approve { approval with TaskId = "unrelated-task" })) "" ""
-            deny taskId (SharedAccepted(reviewId, bindingId)) "" baseOid
+            deny taskId (shared (approve { approval with ReviewedHeadOid = baseOid })) source pinned
+            deny taskId (shared (approve { approval with AssignmentGeneration = 2 })) source pinned
+            deny taskId (shared (approve { approval with TaskId = "unrelated-task" })) source pinned
+            deny taskId (shared bindingId) source baseOid
+            deny taskId (shared bindingId) "" pinned
+            deny taskId (shared bindingId) source ""
+            deny taskId (SharedAccepted(reviewId, bindingId, review.ReviewRef + "-wrong")) source pinned
             let bogusConditions: Client.ChallengeWorkflow.ChallengeConditionSpec list =
                 [ { OwnerKind = "Agent"; OwnerAgentId = owner; SuggestedAgentId = ""; Description = "Agent is not the Operator" } ]
             let bogus =
@@ -1079,7 +1083,7 @@ let sharedAcceptedIntegrationUsesExactOperatorBinding taskId reviewKey branch ow
             Client.ChallengeWorkflow.ChallengeWorkflow.resolve first bogusId owner bogus.ChallengeId
                 bogus.ConditionIds.Head 1 (ReviewWorkflow.sharedAcceptedBindingApprovalText approval) ""
             |> succeed |> ignore
-            deny taskId (SharedAccepted(reviewId, bogusId)) "" ""
+            deny taskId (shared bogusId) source pinned
             let reviewPath = $"tasks/_reviews/reviews/{reviewId:N}/review.json"
             let originalBody, _ = LedgerStore.readAt first (LedgerStore.fetch first |> succeed) reviewPath |> succeed
             let setReview (body: string) =
@@ -1094,11 +1098,11 @@ let sharedAcceptedIntegrationUsesExactOperatorBinding taskId reviewKey branch ow
                 node.[name] <- value
                 setReview (node.ToJsonString())
             changeReview "sourceVersion" (System.Text.Json.Nodes.JsonValue.Create(0))
-            deny taskId (SharedAccepted(reviewId, bindingId)) "" ""
+            deny taskId (shared bindingId) source pinned
             changeReview "status" (System.Text.Json.Nodes.JsonValue.Create("ChangesRequested"))
-            deny taskId (SharedAccepted(reviewId, bindingId)) "" ""
+            deny taskId (shared bindingId) source pinned
             changeReview "reviewerId" (System.Text.Json.Nodes.JsonValue.Create(owner))
-            deny taskId (SharedAccepted(reviewId, bindingId)) "" ""
+            deny taskId (shared bindingId) source pinned
             setReview originalBody.Value
         // The mutable contributor branch advances. Neither submission nor
         // completion may substitute that branch's new head for the review.
@@ -1107,17 +1111,82 @@ let sharedAcceptedIntegrationUsesExactOperatorBinding taskId reviewKey branch ow
         git first.RepositoryPath [ "commit"; "-m"; "Further unreviewed work" ] |> ignore
         git first.RepositoryPath [ "push"; "origin"; source ] |> ignore
         let newer = git first.RepositoryPath [ "rev-parse"; "HEAD" ]
-        let locator = if taskBound then TaskBound reviewId else SharedAccepted(reviewId, bindingId)
+        let locator = if taskBound then TaskBound reviewId else shared bindingId
         deny taskId locator source newer
         let submissionId, submitOperation = Guid.NewGuid(), Guid.NewGuid()
-        let submitted = submit submitOperation submissionId taskId locator "" "" |> succeed
-        Assert.That(submitted.AlreadyApplied, Is.False)
-        Assert.That((submit submitOperation submissionId taskId locator "" "" |> succeed).AlreadyApplied, Is.True)
-        match submit submitOperation submissionId taskId locator source pinned with
+        let requestedSource, requestedCommit = if taskBound then "", "" else source, pinned
+        let command : TaskWriteCommand =
+            { ProjectName = "Disposable"; Action = (if taskBound then "SubmitIntegration" else "SubmitSharedAcceptedIntegration"); OperationId = submitOperation.ToString("D")
+              TaskId = taskId; AttemptId = submissionId.ToString("D"); ActorId = owner; OwnerId = ""
+              Title = ""; Html = ""; ExpectedVersion = 0; ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
+              AssignmentGeneration = 0; Summary = if taskBound then "" else "_reviews"
+              NextAction = if taskBound then "" else review.ReviewRef
+              Reason = reviewId.ToString("D"); BaseOid = requestedCommit; TargetRef = target
+              SourceRef = requestedSource; AllowDetached = false; AllowUncommitted = false
+              DecisionSequence = 0L; Evidence = (if taskBound then "" else bindingId.ToString("D")); SessionId = "" }
+        let decoded = JsonSerializer.Deserialize<TaskWriteCommand>(JsonSerializer.Serialize(command))
+        let parse = Client.OrchestrationApi.TaskApi.integrationSubmissionLocator
+        let parsed = parse decoded |> succeed
+        Assert.That(parsed, Is.EqualTo(locator))
+        let lost () : Result<LedgerWrite, Client.EffectError> =
+            Error(Client.OrchestrationApi.LedgerErrors.toEffect
+                (OutcomeUnknown "Fixture: remote outcome not returned"))
+        let execute binding id cmd apply =
+            Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite binding id "TaskWrite" cmd apply
+        let inspect binding id = Client.OrchestrationApi.PendingIntentJournal.inspect binding id |> succeed
+        let submitted =
+            execute second submitOperation decoded (fun () ->
+                let actual = submit submitOperation submissionId taskId parsed decoded.SourceRef decoded.BaseOid |> succeed
+                Assert.That(actual.AlreadyApplied, Is.False)
+                lost ()) |> succeed
+        Assert.That(submitted.AlreadyApplied, Is.True)
+        Assert.That((inspect second submitOperation).PresentLocally, Is.False)
+        let assertUncertain (binding: LedgerBinding) (operation: Guid) (cmd: TaskWriteCommand) expected =
+            let config = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot binding.RepositoryPath
+            let fixturePath = Path.Combine(Path.GetDirectoryName config, "pending",
+                                           Path.GetFileNameWithoutExtension config, operation.ToString("N") + ".json")
+            try
+                let before = (LedgerStore.fetch binding |> succeed).Commit
+                match execute binding operation cmd lost with
+                | Error(Client.LedgerFailureError failure) ->
+                    Assert.That(failure.Code, Is.EqualTo("OutcomeUnknown"))
+                    Assert.That(failure.OperationId, Is.EqualTo(Some(operation.ToString("D"))))
+                | other -> Assert.Fail(sprintf "Uncertain effect must stay unresolved: %A" other)
+                let pending = inspect binding operation
+                Assert.That(pending.PresentLocally, Is.True)
+                Assert.That(pending.Disposition, Is.EqualTo(Some expected))
+                Assert.That((LedgerStore.fetch binding |> succeed).Commit, Is.EqualTo(before))
+            finally
+                // Remove only this disposable test's exact local journal file.
+                if File.Exists fixturePath then File.Delete fixturePath
+        if adversarial then
+            for partial in [ { command with Action = "SubmitIntegration" }; { command with Summary = ""; NextAction = ""; Evidence = "" }
+                             { command with Summary = "" }; { command with NextAction = "" }
+                             { command with Evidence = "" }; { command with BaseOid = "" }
+                             { command with SourceRef = "" }; { command with Summary = taskId } ] do
+                match parse partial with
+                | Error _ -> ()
+                | Ok value -> Assert.Fail(sprintf "Partial shared locator was accepted: %A" value)
+            for mismatch in [ { command with Action = "SubmitIntegration" }; { command with ActorId = reviewer }; { command with TaskId = "unrelated-task" }
+                              { command with AttemptId = Guid.NewGuid().ToString("D") }
+                              { command with Reason = Guid.NewGuid().ToString("D") }
+                              { command with Summary = ""; NextAction = ""; Evidence = "" }
+                              { command with NextAction = review.ReviewRef + "-wrong" }
+                              { command with Evidence = Guid.NewGuid().ToString("D") }
+                              { command with BaseOid = newer }; { command with SourceRef = target }
+                              { command with TargetRef = source } ] do
+                assertUncertain first submitOperation mismatch "IdentityMismatch"
+            let absent = Guid.NewGuid()
+            let targetBefore = LedgerStore.readRemoteTarget first target |> succeed
+            assertUncertain first absent { command with OperationId = absent.ToString("D"); AttemptId = Guid.NewGuid().ToString("D") } "NotFoundAtVerifiedHead"
+            Assert.That(LedgerStore.readRemoteTarget first target |> succeed, Is.EqualTo(targetBefore))
+        Assert.That((submit submitOperation submissionId taskId locator requestedSource requestedCommit |> succeed).AlreadyApplied, Is.True)
+        let changedCommit = if taskBound then pinned else newer
+        match submit submitOperation submissionId taskId locator source changedCommit with
         | Error OperationIdReused -> ()
         | other -> Assert.Fail(sprintf "Changed idempotent payload was accepted: %A" other)
         if adversarial then
-            match submit submitOperation submissionId taskId (SharedAccepted(reviewId, approve approval)) "" "" with
+            match submit submitOperation submissionId taskId (shared (approve approval)) source pinned with
             | Error OperationIdReused -> ()
             | other -> Assert.Fail(sprintf "Changed approval reused operation: %A" other)
         let pending = (ReviewWorkflow.getIntegrationSubmissions first taskId |> succeed).Latest.Value
@@ -1168,8 +1237,23 @@ let sharedAcceptedIntegrationUsesExactOperatorBinding taskId reviewKey branch ow
                 mechanical
             else pinned
         let completion = Guid.NewGuid()
-        Assert.That((complete completion integrated |> succeed).AlreadyApplied, Is.False)
+        let completeCommand =
+            { command with Action = "CompleteIntegration"; OperationId = completion.ToString("D")
+                           ActorId = reviewer; Reason = ""; Summary = ""; NextAction = ""; Evidence = ""
+                           BaseOid = integrated; SourceRef = ""; TargetRef = "" }
+        let completedWrite =
+            execute second completion completeCommand (fun () ->
+                Assert.That((complete completion integrated |> succeed).AlreadyApplied, Is.False)
+                lost ()) |> succeed
+        Assert.That(completedWrite.AlreadyApplied, Is.True)
+        Assert.That((inspect second completion).PresentLocally, Is.False)
         Assert.That((complete completion integrated |> succeed).AlreadyApplied, Is.True)
+        if adversarial then
+            for mismatch in [ { completeCommand with ActorId = owner }
+                              { completeCommand with TaskId = "unrelated-task" }
+                              { completeCommand with AttemptId = Guid.NewGuid().ToString("D") }
+                              { completeCommand with BaseOid = newer } ] do
+                assertUncertain first completion mismatch "IdentityMismatch"
         let completed = (ReviewWorkflow.getIntegrationSubmissions first taskId |> succeed).Latest.Value
         Assert.That(completed.IntegratedCommit, Is.EqualTo(integrated))
         Assert.That(completed.PublicationMechanism, Is.EqualTo("VerifiedNonForceGitPush/v1"))

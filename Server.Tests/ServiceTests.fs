@@ -598,6 +598,47 @@ let ``public SubmitReview accepts arbitrary commit and optional context without 
     Assert.That(typeof<JarvisMcpTools>.GetMethod("ReleaseReview"), Is.Not.Null)
 
 [<Test>]
+let ``shared integration locator is additive and explicit on public SubmitIntegration`` () =
+    let submit = typeof<JarvisMcpTools>.GetMethod("SubmitIntegration")
+    let parameters = submit.GetParameters()
+    for name in [ "reviewNamespace"; "reviewRef"; "bindingApprovalOperationId" ] do
+        let field = parameters |> Array.find (fun parameter -> parameter.Name = name)
+        Assert.That(field.ParameterType, Is.EqualTo(typeof<string>), name)
+        Assert.That(field.IsOptional, Is.True, name)
+        Assert.That(field.DefaultValue, Is.EqualTo(""), name)
+    let complete = typeof<JarvisMcpTools>.GetMethod("CompleteIntegration")
+    let completionFields = complete.GetParameters() |> Array.map _.Name
+    // Completion dereferences the original canonical submission; it must not
+    // offer a second caller-controlled source or approval override.
+    for name in [ "reviewNamespace"; "reviewRef"; "bindingApprovalOperationId" ] do
+        Assert.That(completionFields, Does.Not.Contain(name))
+
+[<Test>]
+let ``public integration command selects a fail closed wire action for every shared locator`` () =
+    let command ns refName approval =
+        IntegrationCommands.submit "Jarvis" "Worker" "task" "submission" "refs/heads/source"
+            "pinned" "refs/heads/main" "operation" "review" ns refName approval
+    let unpack = function
+        | TaskWriteCommand cmd -> cmd
+        | _ -> failwith "Expected TaskWrite command"
+    let legacy = command "" "" "" |> unpack
+    Assert.That(legacy.Action, Is.EqualTo("SubmitIntegration"))
+    Assert.That(legacy.Reason, Is.EqualTo("review"))
+    Assert.That(legacy.Summary, Is.Empty)
+    Assert.That(legacy.NextAction, Is.Empty)
+    Assert.That(legacy.Evidence, Is.Empty)
+    for ns, refName, approval in [ "_reviews", "refs/heads/jarvis-review/_reviews/review/r1", "approval"
+                                  "_reviews", "", ""; "", "ref", ""; "", "", "approval" ] do
+        let wire = command ns refName approval
+        let cmd = unpack wire
+        Assert.That(cmd.Action, Is.EqualTo("SubmitSharedAcceptedIntegration"))
+        Assert.That(cmd.Summary, Is.EqualTo(ns))
+        Assert.That(cmd.NextAction, Is.EqualTo(refName))
+        Assert.That(cmd.Evidence, Is.EqualTo(approval))
+        Assert.That({ cmd with Action = legacy.Action; Summary = ""; NextAction = ""; Evidence = "" }, Is.EqualTo(legacy))
+        Assert.That(AgentCommandInfo.manualGrantFamily wire, Is.EqualTo(Some "Integration"))
+
+[<Test>]
 let ``task assignment and owner transfer do not accept reviewer IDs`` () =
     for methodName in [ "AssignTask"; "TransferOwner" ] do
         let methodInfo = typeof<JarvisMcpTools>.GetMethod(methodName)

@@ -174,7 +174,7 @@ let private activatesAgent (agentId: string) command =
               "AcknowledgeFeedback"; "AcknowledgeNotification"; "NotifyAgent"
               "SetNotificationSenderBlock"; "SetNotificationMute"
               "BindAttemptSource"; "RebindAttemptSource"; "BindReviewBase"
-              "SetAttemptSource"; "SubmitIntegration"; "CompleteIntegration" ]
+              "SetAttemptSource"; "SubmitIntegration"; "SubmitSharedAcceptedIntegration"; "CompleteIntegration" ]
     // Administrative alert inspection must never start the inspector's Ready task.
     | TaskReadCommand cmd when cmd.Action = "GetResponseAlerts" -> false
     | TaskReadCommand cmd ->

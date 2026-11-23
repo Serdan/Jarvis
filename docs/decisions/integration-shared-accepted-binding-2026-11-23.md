@@ -10,9 +10,11 @@ is in that ancestry. This is not evidence of a managed receipt for it.
 The existing task-bound UUID-only `submitIntegration` entry point and its
 canonical request bytes remain unchanged. The typed core
 `submitIntegrationWithReview` accepts either `TaskBound(reviewId)` or
-`SharedAccepted(reviewId, approvalOperationId)`. Shared always resolves
-`_reviews` explicitly, not by trying one namespace and falling back to another.
-The destination must be a real task, never the shared namespace itself.
+`SharedAccepted(reviewId, approvalOperationId, reviewRef)`. Shared always
+resolves `_reviews` explicitly, not by trying one namespace and falling back
+to another. Its source ref, source SHA and immutable review ref must all be
+explicit and exact. The destination must be a real task, never the shared
+namespace itself.
 
 Use the existing canonical Operator Challenge response, not a new authority,
 boolean flag, agent response, free-text similarity or an inferred task link.
@@ -40,7 +42,8 @@ The canonical task's existing IntegrationSubmission gains optional
 `sharedBinding` with approval and submission operation UUIDs. The exact
 review ref already stores the namespace; no duplicate review or parallel
 integration database is needed. The shared submission request hash includes
-the approval UUID, and old task-bound operations retain their original hash.
+the namespace, immutable review ref and approval UUID, as well as exact source
+ref and SHA. Old task-bound operations retain their original hash.
 Completion and WorkComposition acceptance recover the original submission
 operation from canonical path history (so deleting the shared marker and
 changing the ref cannot downgrade it to task-bound history), compare the
@@ -100,15 +103,35 @@ self-review, branch drift, wrong SHA, exact retry and changed intent,
 historical task-bound direct compatibility, target advance, mechanical merge,
 extra tree edits, receipt downgrade/tampering and composition acceptance.
 
-The public wire remains UUID-only/default-off at this stage. The existing
-`OrchestrationApi.PendingIntentJournal.identityMatches` has no
-SubmitIntegration/CompleteIntegration matching cases. Exposing the new
-locator requires exact transport/request reconciliation for the task-bound
-and shared variants, including the approval UUID, not a permissive fallback.
-That function is in Worker 23's shared lease; canonical coordination
-challenge `9462a0c5908a4d698b872ad8e1e1653a` requests Lead's explicit
-scope decision. No unrelated notification, settings, pending-intent or
-WorkQueue protocol machinery was modified. Independent source review and
+The independently Accepted core commit
+`03bc394272002dd0198674c40d1fa8e48191c2e9` (review
+`b7c1827c8c4c44619fc78bebf5092d51`, decision 12659) retained the old wire.
+Lead's Decision B on challenge `9462a0c5908a4d698b872ad8e1e1653a`
+authorizes this additive, source-only transport completion and exact integration
+reconciliation cases, without changing Worker 23's launch-template matcher.
+
+The existing SubmitIntegration tool takes three optional strings:
+reviewNamespace, reviewRef and bindingApprovalOperationId. Omitting all three
+keeps the old wire action and six-field canonical request. Providing any
+selects the distinct SubmitSharedAcceptedIntegration wire action; older clients
+reject the unknown action instead of silently ignoring the shared locator.
+The new client rejects incomplete locators, wrong namespaces, or shared data
+on the legacy action. It uses the existing TaskWrite envelope and Integration
+manual-grant/activity classification, not a new tool or authorization class.
+Both actions produce canonical SubmitIntegration ledger operations. Completion
+has no new caller-controlled locator: it resolves the original submission.
+
+Pending-intent reconciliation checks the exact local action, canonical
+operation kind, project, actor and original operation UUID, complete request
+identity (including all nine shared fields), and the single task integration
+path, receipt status, sequence and matching change/effect digest. A shared
+submission's receipt must also name the exact review ref. Completion matches
+its three-field request and Integrated receipt. Mismatches and absent
+operations retain the uncertain local record; reconciliation never replays a
+Git effect. Disposable fixtures simulate lost acknowledgments of successful
+submissions and completions, wrong command identities and absent operations.
+No unrelated notification, settings, pending-intent or WorkQueue protocol
+machinery was modified. Independent source review and
 separate Operator publication approval are mandatory. W14 and Operator
 challenge `69b0752cce6f4905823bff2c1d170444` remain the live boundary:
 no production submission, actual source-task approval, target push,

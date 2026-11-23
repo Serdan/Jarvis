@@ -49,3 +49,31 @@ env JARVIS_HEALTH_HOSTED_NEGATIVE_MUTANT=1 dotnet test tests/AutomationHealthHos
 - Compiled Release assembly SHA-256: Server `643239351d22467016d2b4823aa1de8987eafada8703669a98ce054df4c163e0`, Client `1f31e0e2ee609f1602a1e1bfbf59f0b16c58c5aeeb2e06d992de335fb5ab7987`, standalone hosted fixture `24b46b219665d4b4c0384b636478fa5d7ed0c36608b4dce16c4d202a0d428e8a`.
 - All artifacts and test input state under `tests/AutomationHealthHosted20261123/` and `/tmp/jarvis-health-hosted-<random>`; fixture finally disposes both connections, stops hosted server and deletes disposable SQL/Git data. TRXs are local evidence, intentionally **not** part of committed source snapshot.
 - No full Client or Server suites executed, no shared files touched, no production Git push/integration/deploy/scheduling/cutover.
+
+## Reviewer 2 corrections after adjudication 12322
+
+Review `6dc6477b03ea47e4a202c4926e50f28a` at `2cb0af39012e416946cd32a1de033748d7bc4e56` requested two changes in decision 12309. The source correction is confined to `HostedNegativeTests.fs`. The original two-client test, Git fixture, and project file retain their exact blobs.
+
+- The full pair reproduced the missing current-process proof before the matrix. Waiting for registration diagnostics to drain, parsing the actual JSON-RPC result, and polling after one qualifying dispatch still reproduced the failure. The response identified the expected missing fixture device through production `ClientService`.
+- `McpToolHelpers.beginOperation` posts an audit write before `ClientService.SendCommandToUser` records qualifying activity. Both use the same nonwaiting `OptionalFeedbackStore` single-flight gate under ordinary host wiring. A pending audit write can drop the activity record. The fixture now isolates only the direct MCP request audit-store lookup in its middleware. The separate audit SQLite file is disposable. Real Program-registered ClientService and HubService still share the ordinary activity store. With audit isolation added to the failing one-dispatch version, both full-suite cases passed. This is evidence for the collision in this fixture, without a claim about every prior failed write or production scheduling.
+- The negative matrix verifies registration, waits for the connection diagnostics to drain, asserts the authenticated JSON-RPC routing result, dispatches once, and polls registered Hub proof with a bounded retry. The original two-client CAS, original foreign-project mutant, and retained-row service-provider reset denial are covered. Separate OS-process restart and successful requalification after restart remain unverified.
+- Both clock observations read the registered Hub and assert unchanged server-authoritative LastSeen. Projected ages of +601s then +600s are both eligible under the inclusive threshold. The production check yields one HOLD, two reads, zero errors, and zero calls to the recovery spy, with Git HEAD unchanged. A +601s/+601s control reaches that spy with the deterministic operation ID. The guard-removal control temporarily compiled the exact production recovery ID, eligibility, candidate equality and check loop in a test-local module, deleting only the `fresh.ServerNowUtc < observation.ServerNowUtc` clause. Only the reversed case called that copy. The matrix failed at the spy assertion with a recovery UUID. The temporary compile item and source were removed before the final build, and the production file was never edited.
+
+.NET SDK 11.0.100. Run from the registered worktree with the original Release project references already built. Use `--logger trx;LogFileName=<file>` and `--results-directory tests/AutomationHealthHosted20261123/TestResults` for each run.
+
+```bash
+dotnet test tests/AutomationHealthHosted20261123/AutomationHealthHosted20261123.fsproj -c Release --no-restore -p:BuildProjectReferences=false --verbosity minimal
+dotnet test tests/AutomationHealthHosted20261123/AutomationHealthHosted20261123.fsproj -c Release --no-build --no-restore --verbosity minimal
+env JARVIS_HEALTH_HOSTED_NEGATIVE_MUTANT=1 dotnet test tests/AutomationHealthHosted20261123/AutomationHealthHosted20261123.fsproj -c Release --no-build --no-restore --filter FullyQualifiedName~registered_loopback_clients_and_sqlite_ingress_must_be_composed --verbosity minimal
+```
+
+| Run | Terminal job | TRX | SHA-256 | Result |
+| --- | --- | --- | --- | --- |
+| Reviewed pair reproduced | `fcee1311e3464225ac66132fd9a72024` | `w23-combined-baseline.trx` | `c29b27e7ce8a34848355a52cd6c1ded19e00eeedee3e121dc5d6c895e6ae8d4d` | 1 pass, 1 fail, exit 1 |
+| One dispatch with shared audit store | `2b658ad9de9f4b15a99e592091dd38ae` | `w23-combined-repair2.trx` | `718d70e2e1158270c2b10a009c74030fdba4851b6c8a2445a63546672b94c967` | 1 pass, 1 fail, exit 1 |
+| Final build and complete fixture | `118082c47fba43c78c5b0756aafb4cc0` | `w23-combined-final-green.trx` | `bfcf2606870447bb13898b85ded6597ce38f909128da814d5d31f58dff0c28c4` | 2 pass, exit 0 |
+| Same-binary complete confirmation | `54acaa728fb841989cd8c38764b38f4d` | `w23-same-binary-green.trx` | `b57bab9b5c45bb0f23b76b6598383c4a93af56aba655291b8906dbc6d53504fa` | 2 pass, exit 0 |
+| Focused clock guard-removal mutant | `dd4f2f1b253543f7b90dbbb53ba4894c` | `w23-clock-mutant-spy.trx` | `a9066a3d9941788b2013e9314e5b7fac6f9de222f501f50ed7ef42cc58360dc6` | 1 fail, exit 1, recovery spy called |
+| Original foreign-project mutant | `7116da5c33954d26884f338246f5e2a8` | `w23-foreign-mutant.trx` | `9399b89590809b5f9ed4adf0b561f515ec6bf1194cb01eb3fe9d07afac264653` | 1 fail, exit 1, Hub proof denied |
+
+Zero skips in all six runs. Assembly SHA-256 from the final Release output: Server `643239351d22467016d2b4823aa1de8987eafada8703669a98ce054df4c163e0`, Client `1f31e0e2ee609f1602a1e1bfbf59f0b16c58c5aeeb2e06d992de335fb5ab7987`, fixture `cdccab6d1206abf3f5a61a73f9542e1d0dc3ca09d2ff2ad8af34f3f5a5760f6e`. Corrected `HostedNegativeTests.fs` SHA-256 `002f2cb712a9493017bf8320469effb765d033dc69c2b819831ad7de1a97ff7c`. Hash and TRX counter extraction job `7faef0e790a84a059cb82424f0a5648f`.

@@ -12,6 +12,7 @@ open System.Threading.Tasks
 open Microsoft.AspNetCore.Authentication.JwtBearer
 open Microsoft.AspNetCore.Builder
 open Microsoft.AspNetCore.Hosting
+open Microsoft.AspNetCore.Http
 open Microsoft.AspNetCore.SignalR
 open Microsoft.AspNetCore.SignalR.Client
 open Microsoft.Extensions.Configuration
@@ -29,6 +30,12 @@ open global.Client.NativeHealth
 open global.Client.NativeHealth.NativeHealth
 open global.Client.ReviewWorkflow
 open AutomationHealthHostedFixture
+
+type private McpAuditStore(path: string) =
+    let store = new Server.Services.OptionalFeedbackStore(path)
+    member _.Store = store
+    interface IDisposable with
+        member _.Dispose() = (store :> IDisposable).Dispose()
 
 [<Test>]
 let hosted_negative_matrix_requires_real_coverage () =
@@ -58,6 +65,8 @@ let hosted_negative_matrix_requires_real_coverage () =
                   KeyValuePair("Audience", audience)
                   KeyValuePair("DatabasePath", databasePath) ]) |> ignore
             Program.configureServices builder.Services builder.Configuration
+            builder.Services.AddSingleton<McpAuditStore>(fun _ ->
+                new McpAuditStore(System.IO.Path.Combine(root, "mcp-audit.sqlite"))) |> ignore
             builder.Services.PostConfigure<JwtBearerOptions>(
                 JwtBearerDefaults.AuthenticationScheme,
                 fun options ->
@@ -73,6 +82,26 @@ let hosted_negative_matrix_requires_real_coverage () =
                     options.TokenValidationParameters.ValidateIssuerSigningKey <- true
                     options.TokenValidationParameters.ValidateLifetime <- true) |> ignore
             let app = builder.Build()
+            app.Use(Func<HttpContext, Func<Task>, Task>(fun context next ->
+                task {
+                    if context.Request.Path = PathString("/mcp") then
+                        let services = context.RequestServices
+                        // MCP operation diagnostics race the qualifying activity write
+                        // for the same single-flight store. Route only the request's
+                        // direct diagnostics lookup to a second disposable store.
+                        // ClientService and HubService still resolve and share the
+                        // Program-registered activity store through ordinary DI.
+                        let audit = services.GetRequiredService<McpAuditStore>()
+                        context.RequestServices <-
+                            { new IServiceProvider with
+                                member _.GetService(serviceType) =
+                                    if serviceType = typeof<Server.Services.OptionalFeedbackStore> then box audit.Store
+                                    else services.GetService(serviceType) }
+                        try do! next.Invoke()
+                        finally context.RequestServices <- services
+                    else
+                        do! next.Invoke()
+                } :> Task)) |> ignore
             Program.configureApp app |> ignore
             app
 
@@ -88,8 +117,8 @@ let hosted_negative_matrix_requires_real_coverage () =
         let register (hub: HubConnection) device =
             task {
                 do! hub.StartAsync()
-                let! _ = hub.InvokeAsync<ClientRegistrationResult>("Connect", registration device)
-                return ()
+                let! result = hub.InvokeAsync<ClientRegistrationResult>("Connect", registration device)
+                Assert.That(result.Generation, Is.GreaterThan(0), "Hub must return a registered session generation.")
             }
         let unavailable (hub: HubConnection) (label: string) =
             task {
@@ -112,8 +141,18 @@ let hosted_negative_matrix_requires_real_coverage () =
                 use! response = http.SendAsync(request)
                 let! body = response.Content.ReadAsStringAsync()
                 Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.OK), body)
-                Assert.That(body.Contains("device", StringComparison.OrdinalIgnoreCase),
-                            Is.True, "Ingress must reach the real authenticated ClientService routing branch.")
+                let payload =
+                    if response.Content.Headers.ContentType.MediaType = "text/event-stream" then
+                        body.Split('\n')
+                        |> Array.find (fun line -> line.StartsWith("data: ", StringComparison.Ordinal))
+                        |> fun line -> line.Substring(6)
+                    else body
+                use envelope = System.Text.Json.JsonDocument.Parse(payload)
+                let result = envelope.RootElement.GetProperty("result")
+                Assert.That(envelope.RootElement.GetProperty("id").GetInt32(), Is.EqualTo(55))
+                Assert.That(result.GetProperty("isError").GetBoolean(), Is.True)
+                let message = result.GetProperty("content").[0].GetProperty("text").GetString()
+                Assert.That(message, Is.EqualTo("NotFound: Jarvis device 'test-missing-device' is not registered for the authenticated user. Use ListDevices to find available devices."))
             }
 
         // The only positive timestamps originate in actual registered hub reads.
@@ -152,17 +191,30 @@ let hosted_negative_matrix_requires_real_coverage () =
                     do! register alice "alice-new-negative"
                     // The isolation assertion deliberately follows the genuine
                     // qualifying ingress and presence of Alice's persisted row.
+                    let store = firstHost.Services.GetRequiredService<Server.Services.OptionalFeedbackStore>()
+                    // Hub Connect posts a diagnostic write to the same single-flight
+                    // store. Wait for that flight to drain before the one MCP call.
+                    use proofDeadline = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds 2.)
+                    let mutable ready = false
+                    while not ready && not proofDeadline.IsCancellationRequested do
+                        let! status = store.TryExecute(fun _ -> ())
+                        match status with
+                        | Ok () -> ready <- true
+                        | Error _ -> do! Task.Delay(25)
+                    Assert.That(ready, Is.True, "SQLite did not finish the registered connection diagnostics.")
+                    do! qualifyingIngress address
                     let mutable confirmed : AgentActivitySnapshot option = None
+                    let mutable lastProofError = ""
                     let mutable attempts = 0
-                    while confirmed.IsNone && attempts < 20 do
+                    while confirmed.IsNone && attempts < 40 do
                         attempts <- attempts + 1
-                        do! qualifyingIngress address
-                        do! Task.Delay(100)
                         try
                             let! actual = alice.InvokeAsync<AgentActivitySnapshot>("GetAgentActivity", "Fixture", "Worker")
                             confirmed <- Some actual
-                        with :? HubException -> ()
-                    Assert.That(confirmed.IsSome, Is.True, "Qualified MCP ingress must reach verified hosted SQLite.")
+                        with :? HubException as ex ->
+                            lastProofError <- ex.Message
+                            do! Task.Delay(50)
+                    Assert.That(confirmed.IsSome, Is.True, "Qualified MCP ingress must reach verified hosted SQLite: " + lastProofError)
                     Assert.That(confirmed.Value.LastSeenAtUtc.IsSome, Is.True)
                     do! register bob "bob-after-alice-ingress"
                     do! unavailable bob "Bob must not observe Alice's persisted row after qualifying ingress."
@@ -188,21 +240,29 @@ let hosted_negative_matrix_requires_real_coverage () =
                     // test-only server clock on the second. No fake Git recovery.
                     let reverseBinding, _, reverseRt, _, reverseCandidate = fixture "reversed-clock"
                     let reverseHead = (LedgerStore.fetch reverseBinding |> success).Commit
-                    let mutable readCount, recoveryCalls = 0, 0
+                    let mutable readCount = 0
+                    let mutable recoveredOperation = None
                     let reversedActivity (project: string) (agent: string) =
                         task {
                             let! real = alice.InvokeAsync<AgentActivitySnapshot>("GetAgentActivity", project, agent)
+                            Assert.That(real.LastSeenAtUtc, Is.EqualTo(confirmed.Value.LastSeenAtUtc))
                             readCount <- readCount + 1
-                            let age = if readCount = 1 then TimeSpan.FromSeconds 600. else TimeSpan.FromSeconds 599.
+                            let age = if readCount = 1 then TimeSpan.FromSeconds 601. else TimeSpan.FromSeconds 600.
                             return Ok { real with ServerNowUtc = real.LastSeenAtUtc.Value.Add(age) }
                         }
                     let reversedDeps =
                         { dependencies reverseCandidate reverseRt reversedActivity with
-                            Recover = (fun _ _ -> recoveryCalls <- recoveryCalls + 1; Ok ()) }
+                            Recover = (fun _ operationId -> recoveredOperation <- Some operationId; Ok ()) }
                     let! reversed = NativeHealth.checkOnce settings reversedDeps
                     Assert.That(readCount, Is.EqualTo(2), "Both observations must traverse the authenticated Hub.")
+                    Assert.That(reversed.Errors, Is.Empty)
+                    Assert.That(recoveredOperation, Is.EqualTo(None), "Reversed time cannot invoke recovery.")
                     Assert.That(reversed.Holds, Is.EqualTo(1))
-                    Assert.That(recoveryCalls, Is.Zero, "Reversed time cannot invoke recovery.")
+                    let monotonicDeps = { reversedDeps with Activity = hubActivity alice (Some(TimeSpan.FromSeconds 601.)) }
+                    let! monotonic = NativeHealth.checkOnce settings monotonicDeps
+                    Assert.That(monotonic.Errors, Is.Empty)
+                    Assert.That(monotonic.Recoveries, Is.EqualTo(1))
+                    Assert.That(recoveredOperation, Is.EqualTo(Some (NativeHealth.recoveryOperationId reverseCandidate)))
                     Assert.That((LedgerStore.fetch reverseBinding |> success).Commit, Is.EqualTo(reverseHead))
 
                     // Source and attempt-version drift is a genuine canonical Git

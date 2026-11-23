@@ -147,8 +147,8 @@ function harness(options = {}) {
   let activePicker = picker;
   const radio = name => ({
     textContent: name,
-    get innerText() { return options.observableLabels === false ? undefined : name; },
-    getClientRects() { return options.observableLabels === false ? [] : [1]; },
+    get innerText() { return options.observableLabels === false ? undefined : (this.labelObserved ? (options.displayedModelLabel ?? name) : name); },
+    getClientRects() { this.labelObserved = true; return options.observableLabels === false ? [] : [1]; },
     getAttribute(attr) {
       if (attr === "aria-disabled" && options.disabledModels?.includes(name)) return "true";
       return attr === "aria-checked" ? String(selectedModel === name) : null;
@@ -1357,5 +1357,44 @@ test("final model identity: uncertain click retains only the freshly checked obs
   assert.equal(result.reason, "SendClickUncertain");
   assert.equal(result.observedSelection.model, "Latest");
   assert.equal(h.modelAtSend, "Latest");
+  assert.equal(h.clicks, 1);
+});
+
+test("unobservable rendered selection remains unknown and does not duplicate Send", async () => {
+  const h = harness({ observableLabels: false });
+  const result = await h.run();
+  assert.equal(result.status, "submitted");
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: null, model: null, effort: null });
+  assert.equal(h.clicks, 1);
+});
+
+
+test("records visible selection labels from rendered controls", async () => {
+  const h = harness({ observableLabels: true });
+  const result = await h.run();
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: "Chat", model: "Latest", effort: "Medium" });
+  assert.equal(h.clicks, 1);
+});
+
+
+test("observes Work fallback labels from the rendered selection", async () => {
+  const h = harness({ observableLabels: true, chatInstantAndProOnly: true, reasoningEffort: "Instant", timeoutMs: 12000 });
+  const result = await h.run("No submission", { selectionOnly: true });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: "Work", model: "GPT-6.1 Terra", effort: "Medium" });
+  assert.equal(h.clicks, 0);
+});
+
+test("observes Chat Instant fallback labels from the rendered selection", async () => {
+  const h = harness({ observableLabels: true, maxEffortStep: 0, reasoningEffort: "Instant", timeoutMs: 18000 });
+  const result = await h.run("No submission", { selectionOnly: true });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: "Chat", model: "Latest", effort: "Instant" });
+  assert.equal(h.clicks, 0);
+});
+
+
+test("reports rendered model text even when it differs from the requested model", async () => {
+  const h = harness({ observableLabels: true, displayedModelLabel: "Displayed model label" });
+  const result = await h.run();
+  assert.equal(result.observedSelection.model, "Displayed model label");
   assert.equal(h.clicks, 1);
 });

@@ -730,7 +730,7 @@ type Service(port: int, pairingSecret: string) =
 // Project scripts own site-specific semantics; Jarvis only owns created-tab lifecycle.
 let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url: string)
                 (alias: string) (makeActive: bool) (source: string) (argsJson: string)
-                (timeoutMs: int) (closeAfterExecution: bool) = task {
+                (timeoutMs: int) (closeAfterExecution: bool) (observe: JsonElement -> unit) = task {
     let invalid =
         if String.IsNullOrWhiteSpace(windowRegistration) then Some "WindowNotRegistered"
         elif utf8.GetByteCount(source) > MaxScriptBytes then Some "InputTooLarge: script exceeds 64 KiB"
@@ -852,6 +852,7 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
                         | Ok result ->
                             use doc = JsonDocument.Parse(result)
                             let payload = doc.RootElement.GetProperty("result")
+                            observe (payload.Clone())
                             let status =
                                 match payload.ValueKind with
                                 | JsonValueKind.Object ->
@@ -1000,13 +1001,16 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
 // The browser profile shares model/effort preferences across fresh tabs.
 // Reserve the origin until a single launch has returned and cleaned up its tab.
 // Agents continue on the server after launch, so this does not serialize work.
-let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
+let runInNewTabWithObservation (bridge: Service) (windowRegistration: string) (url: string)
                 (alias: string) (makeActive: bool) (source: string) (argsJson: string)
-                (timeoutMs: int) (closeAfterExecution: bool) = task {
+                (timeoutMs: int) (closeAfterExecution: bool) (observe: JsonElement -> unit) = task {
     let gate = bridge.LaunchGateFor(url)
     do! gate.WaitAsync()
     try
-        return! runInNewTabCore bridge windowRegistration url alias makeActive source argsJson timeoutMs closeAfterExecution
+        return! runInNewTabCore bridge windowRegistration url alias makeActive source argsJson timeoutMs closeAfterExecution observe
     finally
         gate.Release() |> ignore
 }
+
+let runInNewTab bridge windowRegistration url alias makeActive source argsJson timeoutMs closeAfterExecution =
+    runInNewTabWithObservation bridge windowRegistration url alias makeActive source argsJson timeoutMs closeAfterExecution ignore

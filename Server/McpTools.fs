@@ -2477,6 +2477,7 @@ type JarvisMcpTools =
       Description("Create a new tab in a registered browser window and run a project .js file. Closes created tabs by default; set closeTabAfterExecution=false only to retain for debugging. Never retries uncertain page effects.")>]
     static member BrowserRunInNewTab(windowRegistration: string, url: string, projectName: string, agentId: string,
                                       [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, scriptPath: string,
+                                      [<Optional; DefaultParameterValue(""); Description("Required for chatgpt/launchAgent.js: canonical target agent, distinct from the calling agent.")>] targetAgentId: string,
                                       [<Optional; DefaultParameterValue("")>] argsJson: string,
                                       [<Optional; DefaultParameterValue(false)>] active: bool,
                                       [<Optional; DefaultParameterValue(true)>] closeTabAfterExecution: bool,
@@ -2485,6 +2486,7 @@ type JarvisMcpTools =
                                       client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (BrowserRunInNewTabCommand {
+            TargetAgentId = McpToolHelpers.optionOfString targetAgentId
             WindowRegistration = windowRegistration; Url = url; ProjectName = projectName
             ScriptPath = scriptPath; ArgsJson = McpToolHelpers.optionOfString argsJson
             Active = Some active; CloseTabAfterExecution = Some closeTabAfterExecution

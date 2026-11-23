@@ -120,7 +120,8 @@ type BrowserOpenTabCommand =
 
 type BrowserCloseTabCommand = { TabRegistration: string }
 type BrowserRunInNewTabCommand =
-    { WindowRegistration: string
+    { TargetAgentId: string option
+      WindowRegistration: string
       Url: string
       ProjectName: string
       ScriptPath: string

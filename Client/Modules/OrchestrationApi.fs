@@ -1020,18 +1020,26 @@ module PendingIntentJournal =
                 let result = receipt.RootElement
                 let effects = result.GetProperty("entityResults")
                 let changes = result.GetProperty("changes")
+                let matchingContentDigest =
+                    match commandProperty effects.[0] "contentSha256", commandProperty changes.[0] "contentSha256" with
+                    | Some effectHash, Some changeHash ->
+                        effectHash.Length = 64 && (effectHash |> Seq.forall Uri.IsHexDigit)
+                        && effectHash = changeHash
+                    | _ -> false
                 operation.SchemaVersion = 2
                 && taskId <> "_reviews" && not (String.IsNullOrWhiteSpace taskId)
                 && record.OperationId = id.ToString("D")
                 && operation.OperationId = record.OperationId
                 && operation.Actor = actor
                 && (envelope.EnumerateObject() |> Seq.length) = 6
+                && envelope.GetProperty("schemaVersion").GetInt32() = 2
                 && commandProperty envelope "projectId" = Some record.ProjectId
                 && commandProperty envelope "operationId" = Some record.OperationId
                 && commandProperty envelope "actor" = Some actor
                 && commandProperty envelope "kind" = Some operation.Type
                 && (remote.EnumerateObject() |> Seq.length) = fieldCount
                 && operation.Path = path && operation.Paths = [| path |]
+                && result.GetProperty("schemaVersion").GetInt32() = 2
                 && commandProperty result "operationId" = Some record.OperationId
                 && commandProperty result "kind" = Some operation.Type
                 && result.GetProperty("sequence").GetInt64() = operation.Sequence
@@ -1040,7 +1048,7 @@ module PendingIntentJournal =
                 && commandProperty effects.[0] "taskId" = Some taskId
                 && commandProperty effects.[0] "status" = Some expectedStatus
                 && commandProperty changes.[0] "path" = Some path
-                && commandProperty effects.[0] "contentSha256" = commandProperty changes.[0] "contentSha256"
+                && matchingContentDigest
                 && (expectedReviewRef |> Option.forall (fun value -> commandProperty effects.[0] "reviewRef" = Some value))
             | _ -> false
         | _ -> false

@@ -309,6 +309,34 @@ type Service(port: int, pairingSecret: string) =
                 let windows = live |> List.collect (fun conn -> conn.Windows |> List.map (fun x -> x.Clone()))
                 Ok (serialize {| windows = windows |}))
 
+    /// Transport provenance only: this connection completed the pairing handshake.
+    /// Exact IDs (not aliases), unique ready registrations and positive generation
+    /// are required. A snapshot is not a provider session or terminal capability.
+    member internal _.TryGetExactWindowOwner(windowRegistration: string) =
+        lock sync (fun () ->
+            if String.IsNullOrWhiteSpace windowRegistration then Error "WindowNotRegistered"
+            else
+                let getString (window: JsonElement) name =
+                    match window.TryGetProperty(name: string) with
+                    | true, value when value.ValueKind = JsonValueKind.String -> value.GetString()
+                    | _ -> ""
+                let matches =
+                    connections |> Seq.collect (fun conn ->
+                        conn.Windows |> Seq.choose (fun window ->
+                            if getString window "windowRegistration" = windowRegistration then
+                                Some(conn, window)
+                            else None)) |> Seq.toArray
+                match matches with
+                | [| conn, window |] when conn.Socket.State = WebSocketState.Open &&
+                                          getString window "availability" = "ready" ->
+                    match window.TryGetProperty("registrationGeneration") with
+                    | true, value when value.ValueKind = JsonValueKind.Number ->
+                        match value.TryGetInt32() with
+                        | true, generation when generation > 0 -> Ok(conn.Id, generation)
+                        | _ -> Error "WindowRegistrationInvalid"
+                    | _ -> Error "WindowRegistrationInvalid"
+                | _ -> Error "WindowRegistrationUnavailableOrAmbiguous")
+
     member _.OpenTab(windowRegistration: string, url: string, alias: string, makeActive: bool) = task {
         let isValid =
             match Uri.TryCreate(url, UriKind.Absolute) with

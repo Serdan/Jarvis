@@ -9,8 +9,8 @@ open Client.NativeSchedulerAccountReservation
 open Client.NativeSchedulerRosterPolicy
 open Client.ReviewWorkflow
 
-// This file is NOT in Client.fsproj. Only the standalone, signed disposable
-// fixture compiles it. No public caller-supplied record grants launch authority.
+// Compiled default-off ingress; writes require the signed disposable fixture.
+// No public caller-supplied record grants production launch authority.
 type NativeIssuerStatus = Disabled of string | Enabled
 let productionStatus () =
     Disabled "Authenticated account/provider issuer absent; production ingress remains default OFF."
@@ -237,11 +237,23 @@ let private claimValid (claim: StartedProjectClaim) =
 // Exposed only to the separately compiled disposable test harness. NOT linked
 // into Client, not a session issuer, and does not invoke any provider effect.
 // Account proof is reread both before and during the project head CAS.
-let internal claimVerifiedDisposable root (account: AccountBinding) operatorKey subject
-                                     (projects: LedgerBinding array)
-                                     (coverage: NativeDisposableCoverage) (claim: StartedProjectClaim) =
+let private claimVerifiedDisposableCore root (account: AccountBinding) operatorKey subject
+                                        (projects: LedgerBinding array)
+                                        (coverage: NativeDisposableCoverage) (claim: StartedProjectClaim)
+                                        (launchIntent: (LedgerFileChange * LedgerFileChange) option) =
     if not (claimValid claim) then bad "Invalid original UUID or immutable source/head binding"
     elif isNull projects || isNull (box coverage) then bad "No complete signed disposable roster"
+    elif launchIntent |> Option.exists (fun (metadata, arguments) ->
+        let invalid (change: LedgerFileChange) =
+            isNull (box change) || change.ExpectedBlobOid.IsSome
+            || String.IsNullOrWhiteSpace change.Content
+        invalid metadata || invalid arguments
+        || (match Guid.TryParse claim.Candidate.EffectOperationId with
+            | true, effectId ->
+                metadata.Path <> $"records/native-scheduler/launch-intents/{effectId:N}.json"
+                || arguments.Path <> $"records/native-scheduler/launch-arguments/{effectId:N}.json"
+            | _ -> true)) then
+        bad "Invalid original launch intent path or content"
     else
         match projects |> Array.tryFind (fun p ->
             p.ProjectId.ToString("D") = claim.Candidate.ProjectId
@@ -256,8 +268,14 @@ let internal claimVerifiedDisposable root (account: AccountBinding) operatorKey 
                 let intent =
                     { OperationId = claim.OperationId
                       Actor = c.OwnerAgentId
-                      Kind = "NativeStartedPreSendClaimDisposable"
-                      RequestJson = json claim }
+                      Kind = if launchIntent.IsSome then "NativeStartedLaunchIntentDisposable" else "NativeStartedPreSendClaimDisposable"
+                      RequestJson =
+                          match launchIntent with
+                          | None -> json claim
+                          | Some (metadata, arguments) ->
+                              json {| claim = claim
+                                      launchIntentSha256 = NativeSchedulerRosterPolicy.sha256 metadata.Content
+                                      argumentsSha256 = NativeSchedulerRosterPolicy.sha256 arguments.Content |} }
                 LedgerStore.transact project intent (fun snapshot ->
                     if snapshot.Commit <> claim.ExpectedProjectHead then
                         stale "Project head changed before original pre-send CAS"
@@ -301,5 +319,15 @@ let internal claimVerifiedDisposable root (account: AccountBinding) operatorKey 
                                           Status = "HeldBeforeSend"
                                           ProviderSessionId = ""
                                           TerminalOriginOid = "" }
-                                    Ok [ { Path = path; ExpectedBlobOid = None
-                                           Content = json effect } ])
+                                    Ok ([ { Path = path; ExpectedBlobOid = None
+                                            Content = json effect } ] @
+                                        (launchIntent |> Option.map (fun (metadata, arguments) -> [ metadata; arguments ]) |> Option.defaultValue [])))
+
+// Preserve the previously reviewed ingress and operation format. The extra
+// immutable intent is admitted only at its exact original-effect path in the
+// same disposable Started/project-head CAS, never as a provider capability.
+let internal claimVerifiedDisposable root account operatorKey subject projects coverage claim =
+    claimVerifiedDisposableCore root account operatorKey subject projects coverage claim None
+
+let internal claimVerifiedDisposableWithLaunchIntent root account operatorKey subject projects coverage claim metadata arguments =
+    claimVerifiedDisposableCore root account operatorKey subject projects coverage claim (Some (metadata, arguments))

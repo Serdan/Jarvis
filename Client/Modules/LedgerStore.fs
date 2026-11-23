@@ -1040,6 +1040,22 @@ module LedgerStore =
                         | _ -> Error(LedgerIntegrityError
                             "An operation record changed after its originating commit.")
 
+    // Resolve an integration witness against the exact already-verified
+    // snapshot used by the caller's CAS. Do not refetch a moving ledger head
+    // for every historical decision, approval or submission witness.
+    let verifiedIntegrationOperationSnapshotAt (binding: LedgerBinding)
+                                               (snapshot: LedgerSnapshot)
+                                               (operation: LedgerOperation) = result {
+        let! origin = getOperationOriginAt binding snapshot operation
+        let! ancestor = isAncestor binding.RepositoryPath origin snapshot.Commit
+        if not ancestor then
+            return! Error(LedgerHistoryUnavailable "Integration witness is not in verified snapshot ancestry.")
+        let! header = readHeader binding origin
+        if header.NextSequence <> operation.Sequence + 1L then
+            return! Error(LedgerIntegrityError "Integration witness sequence differs from its originating snapshot.")
+        return { Commit = origin; Header = header }
+    }
+
     // RequestHash authenticates the stored bytes, not their relationship to
     // the completed integration. Bind both levels of the canonical intent
     // envelope to the exact receipt, rejecting extra or ambiguous arguments.
@@ -1093,8 +1109,8 @@ module LedgerStore =
     // of this path, not by treating a mutable Integrated status as evidence.
     // Requiring an authenticated operation origin also rejects a later file
     // rewrite and ambiguous multiple-completion histories.
-    let findCompletionOperationForPathAt (binding: LedgerBinding)
-                                         (snapshot: LedgerSnapshot) (path: string) = result {
+    let private findIntegrationOperationForPathAt (binding: LedgerBinding)
+                                         (snapshot: LedgerSnapshot) (path: string) kind = result {
         if String.IsNullOrWhiteSpace path || not (ledgerPath.IsMatch path)
            || path.Contains("..", StringComparison.Ordinal) then
             return! Error(InvalidBinding "Invalid canonical completion path.")
@@ -1111,23 +1127,32 @@ module LedgerStore =
                 | true, operationId when operationId <> Guid.Empty ->
                     let! candidate = getOperationAt binding snapshot operationId
                     match candidate with
-                    | Some operation when operation.Type = "CompleteIntegration"
+                    | Some operation when operation.Type = kind
                                           && not (isNull operation.Paths)
                                           && Array.contains path operation.Paths ->
                         let! origin = getOperationOriginAt binding snapshot operation
                         if origin <> commit || found.IsSome then
                             return! Error(LedgerIntegrityError
-                                "Integration path has multiple or displaced completion operations.")
+                                "Integration path has multiple or displaced operations of the same kind.")
                         found <- Some operation
                     | _ -> ()
                 | _ ->
                     return! Error(LedgerIntegrityError
                         "Integration path history has an invalid operation ID.")
-        match found with
-        | Some operation -> return operation
-        | None -> return! Error(InvalidBinding
-            "Managed integration lacks an original canonical completion operation.")
+        return found
     }
+
+    let findCompletionOperationForPathAt binding snapshot path =
+        findIntegrationOperationForPathAt binding snapshot path "CompleteIntegration"
+        |> Result.bind (function
+            | Some operation -> Ok operation
+            | None -> Error(InvalidBinding
+                "Managed integration lacks an original canonical completion operation."))
+
+    // Read-only origin lookup also detects a shared receipt rewritten to look
+    // like a historical task-bound submission.
+    let findIntegrationSubmissionOperationForPathAt binding snapshot path =
+        findIntegrationOperationForPathAt binding snapshot path "SubmitIntegration"
 
     let getOperationStatus (binding: LedgerBinding) (operationId: Guid) =
         if operationId = Guid.Empty then Error(InvalidBinding "Valid operation UUID required.")
@@ -2735,6 +2760,15 @@ module LedgerStore =
                request = canonicalRequestJson intent.RequestJson |}
 
     let private intentHash binding intent = digest (intentInput binding intent)
+
+    // Exact canonical request comparison for integration binding evidence.
+    // The operation must already have been read from a verified ledger snapshot.
+    let verifyIntegrationOperationIntent binding (operation: LedgerOperation) (expected: LedgerIntent) =
+        if operation.OperationId = expected.OperationId.ToString("D")
+           && operation.Actor = expected.Actor && operation.Type = expected.Kind
+           && operation.CanonicalRequestJson = intentInput binding expected
+           && operation.RequestHash = intentHash binding expected then Ok ()
+        else Error(InvalidBinding "Canonical integration evidence operation does not match its exact request.")
 
 
     let findApplied (binding: LedgerBinding) (intent: LedgerIntent) =

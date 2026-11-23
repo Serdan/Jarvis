@@ -527,7 +527,7 @@ type ReviewWorkflowTests() =
                       IntegratedCommit = if status = "Integrated" then baseOid else null
                       CompletedAtUtc = if status = "Integrated" then "2026-11-06T03:16:08Z" else null
                       PublicationPreviousHead = null; PublicationObservedHead = null
-                      PublicationOperationId = null; PublicationMechanism = null }
+                      PublicationOperationId = null; PublicationMechanism = null; SharedBinding = None }
                 let node =
                     System.Text.Json.Nodes.JsonNode.Parse(
                         System.Text.Json.JsonSerializer.Serialize(value, options)).AsObject()
@@ -600,7 +600,7 @@ type ReviewWorkflowTests() =
                       TargetRef = sourceRef; Status = "Pending"; CreatedSequence = 8L
                       IntegratedCommit = null; CompletedAtUtc = null
                       PublicationPreviousHead = null; PublicationObservedHead = null
-                      PublicationOperationId = null; PublicationMechanism = null }
+                      PublicationOperationId = null; PublicationMechanism = null; SharedBinding = None }
                 let node = System.Text.Json.Nodes.JsonNode.Parse(
                     System.Text.Json.JsonSerializer.Serialize(value, options)).AsObject()
                 node["schemaVersion"] <- System.Text.Json.Nodes.JsonValue.Create(2)
@@ -6420,7 +6420,7 @@ type ReviewWorkflowTests() =
                            CreatedSequence = int64 i + 10L
                            IntegratedCommit = null; CompletedAtUtc = "2026-01-01T00:00:00Z"
                            PublicationPreviousHead = null; PublicationObservedHead = null
-                           PublicationOperationId = null; PublicationMechanism = null } : IntegrationSubmission)
+                           PublicationOperationId = null; PublicationMechanism = null; SharedBinding = None } : IntegrationSubmission)
                     write $"notifications/{notificationId}.json" 2
                         ({ NotificationId = notificationId; FromAgentId = "Reviewer"
                            FromProjectName = ""; ToAgentId = (if i % 11 = 0 then "Owner" else "Reviewer")

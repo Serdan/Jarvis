@@ -991,6 +991,7 @@ module PendingIntentJournal =
         let action = commandProperty root "Action"
         match normalizeCommandType record.CommandType, action with
         | "TaskWrite", Some "AcknowledgeFeedback" -> Some "AcknowledgeBranchReview"
+        | "TaskWrite", Some "SubmitSharedAcceptedIntegration" -> Some "SubmitIntegration"
         | "TaskWrite", Some action -> Some action
         | "ReviewWrite", Some "PutDocument" -> Some "PutReviewDocument"
         | "ReviewWrite", Some "Submit" -> Some "SubmitBranchReview"
@@ -1002,6 +1003,55 @@ module PendingIntentJournal =
 
         | "ReviewWrite", Some "AcknowledgeFeedback" -> Some "AcknowledgeBranchReview"
         | _ -> None
+
+    // Integration receipt identity includes the original caller UUID, actor,
+    // exact canonical entity path and terminal receipt kind. A matching UUID
+    // or reviewed commit alone is insufficient to retire uncertain evidence.
+    let private integrationReceiptMatches (record: PendingIntent) (operation: LedgerStore.LedgerOperation)
+                                          (own: JsonElement) (envelope: JsonElement) (remote: JsonElement)
+                                          fieldCount expectedStatus expectedReviewRef =
+        match commandProperty own "OperationId", commandProperty own "AttemptId",
+              commandProperty own "TaskId", commandProperty own "ActorId" with
+        | Some ownId, Some submission, Some taskId, Some actor ->
+            match Guid.TryParse ownId, Guid.TryParse submission with
+            | (true, id), (true, submissionId) when id <> Guid.Empty && submissionId <> Guid.Empty ->
+                let path = $"tasks/{taskId}/integrations/{submissionId:N}.json"
+                use receipt = JsonDocument.Parse(operation.OriginalResultJson)
+                let result = receipt.RootElement
+                let effects = result.GetProperty("entityResults")
+                let changes = result.GetProperty("changes")
+                let matchingContentDigest =
+                    match commandProperty effects.[0] "contentSha256", commandProperty changes.[0] "contentSha256" with
+                    | Some effectHash, Some changeHash ->
+                        effectHash.Length = 64 && (effectHash |> Seq.forall Uri.IsHexDigit)
+                        && effectHash = changeHash
+                    | _ -> false
+                operation.SchemaVersion = 2
+                && taskId <> "_reviews" && not (String.IsNullOrWhiteSpace taskId)
+                && record.OperationId = id.ToString("D")
+                && operation.OperationId = record.OperationId
+                && operation.Actor = actor
+                && (envelope.EnumerateObject() |> Seq.length) = 6
+                && envelope.GetProperty("schemaVersion").GetInt32() = 2
+                && commandProperty envelope "projectId" = Some record.ProjectId
+                && commandProperty envelope "operationId" = Some record.OperationId
+                && commandProperty envelope "actor" = Some actor
+                && commandProperty envelope "kind" = Some operation.Type
+                && (remote.EnumerateObject() |> Seq.length) = fieldCount
+                && operation.Path = path && operation.Paths = [| path |]
+                && result.GetProperty("schemaVersion").GetInt32() = 2
+                && commandProperty result "operationId" = Some record.OperationId
+                && commandProperty result "kind" = Some operation.Type
+                && result.GetProperty("sequence").GetInt64() = operation.Sequence
+                && effects.GetArrayLength() = 1 && changes.GetArrayLength() = 1
+                && commandProperty effects.[0] "path" = Some path
+                && commandProperty effects.[0] "taskId" = Some taskId
+                && commandProperty effects.[0] "status" = Some expectedStatus
+                && commandProperty changes.[0] "path" = Some path
+                && matchingContentDigest
+                && (expectedReviewRef |> Option.forall (fun value -> commandProperty effects.[0] "reviewRef" = Some value))
+            | _ -> false
+        | _ -> false
 
     let private identityMatches (record: PendingIntent) (operation: LedgerStore.LedgerOperation) =
         try
@@ -1025,6 +1075,26 @@ module PendingIntentJournal =
                 match normalizeCommandType record.CommandType, operation.Type with
                 | "TaskWrite", "SetLaunchTemplate" ->
                     [ "ExpectedVersion", "expectedVersion"; "Html", "templateSha256" ]
+                | "TaskWrite", "SubmitIntegration" ->
+                    let exactFields = common @ [ "AttemptId", "submissionId"; "SourceRef", "sourceRef"
+                                                 "BaseOid", "submittedCommit"; "Reason", "reviewId"
+                                                 "TargetRef", "targetRef" ]
+                    let blank name = commandProperty own name |> Option.forall String.IsNullOrEmpty
+                    if commandProperty own "Action" = Some "SubmitIntegration"
+                       && blank "Summary" && blank "NextAction" && blank "Evidence"
+                       && integrationReceiptMatches record operation own full.RootElement remote 6 "Pending" None then
+                        exactFields
+                    elif commandProperty own "Action" = Some "SubmitSharedAcceptedIntegration"
+                         && commandProperty own "Summary" = Some "_reviews"
+                         && not (blank "NextAction" || blank "Evidence" || blank "SourceRef" || blank "BaseOid")
+                         && integrationReceiptMatches record operation own full.RootElement remote 9 "Pending"
+                                (commandProperty own "NextAction") then
+                        exactFields @ [ "Summary", "reviewNamespace"; "NextAction", "reviewRef"
+                                        "Evidence", "sharedBindingOperationId" ]
+                    else []
+                | "TaskWrite", "CompleteIntegration"
+                    when integrationReceiptMatches record operation own full.RootElement remote 3 "Integrated" None ->
+                    common @ [ "AttemptId", "submissionId"; "BaseOid", "integratedCommit" ]
                 | "TaskWrite", "CreateTask" ->
                     common @ [ "Title", "title"; "Html", "specSha256" ]
                 | "TaskWrite", "ReviseTaskSpec" ->
@@ -2403,6 +2473,28 @@ module TaskApi =
     let integrationSubmissionReferences (cmd: TaskWriteCommand) =
         cmd.Reason, cmd.TargetRef
 
+    // The legacy task-write envelope already carries these three unused
+    // integration slots. A distinct wire action prevents older clients from
+    // silently downgrading a shared locator to the legacy task-bound route.
+    // No general protocol record or task-bound intent hash changes.
+    let integrationSubmissionLocator (cmd: TaskWriteCommand) =
+        let blank = String.IsNullOrEmpty
+        match Guid.TryParse cmd.Reason with
+        | true, reviewId when reviewId <> Guid.Empty ->
+            if cmd.Action = "SubmitIntegration"
+               && blank cmd.Summary && blank cmd.NextAction && blank cmd.Evidence then
+                Ok (ReviewWorkflow.TaskBound reviewId)
+            elif cmd.Action = "SubmitSharedAcceptedIntegration" && cmd.Summary = "_reviews"
+                 && not (String.IsNullOrWhiteSpace cmd.NextAction
+                         || String.IsNullOrWhiteSpace cmd.SourceRef
+                         || String.IsNullOrWhiteSpace cmd.BaseOid) then
+                match Guid.TryParse cmd.Evidence with
+                | true, approvalId when approvalId <> Guid.Empty ->
+                    Ok (ReviewWorkflow.SharedAccepted(reviewId, approvalId, cmd.NextAction))
+                | _ -> Error(Client.ValidationError "Shared integration requires an exact binding approval operation UUID.")
+            else Error(Client.ValidationError "Expected a task-bound review or a complete _reviews shared Accepted locator.")
+        | _ -> Error(Client.ValidationError "Integration requires a valid Accepted review UUID.")
+
     let private guid label (text: string) =
         match Guid.TryParse text with
         | true, id when id <> Guid.Empty -> Ok id
@@ -2531,13 +2623,14 @@ module TaskApi =
                                         WorkCompositionAcceptanceAdapter.WorkCompositionAcceptanceAdapter.acceptIntegrated
                                             binding actor operationId cmd.ExpectedVersion cmd.TaskId cmd.ExpectedTaskVersion submissionId
                                         |> mapError))
-                            | "SubmitIntegration" ->
+                            | "SubmitIntegration" | "SubmitSharedAcceptedIntegration" ->
                                 guid "submissionId" cmd.AttemptId
                                 |> Result.bind (fun submissionId ->
-                                    let reviewId, targetRef = integrationSubmissionReferences cmd
-                                    ReviewWorkflow.ReviewWorkflow.submitIntegration binding operationId
-                                        cmd.TaskId cmd.ActorId submissionId cmd.SourceRef cmd.BaseOid
-                                        reviewId targetRef |> mapError)
+                                    integrationSubmissionLocator cmd
+                                    |> Result.bind (fun locator ->
+                                        ReviewWorkflow.ReviewWorkflow.submitIntegrationWithReview binding operationId
+                                            cmd.TaskId cmd.ActorId submissionId cmd.SourceRef cmd.BaseOid
+                                            locator cmd.TargetRef |> mapError))
                             | "CompleteIntegration" ->
                                 guid "submissionId" cmd.AttemptId
                                 |> Result.bind (fun submissionId ->

@@ -944,7 +944,7 @@ module AgentCommandInfo =
             List.contains cmd.Action [ "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions" ] ->
             Some "SchedulingAdmin"
         | ReviewWriteCommand _ -> Some "Review"
-        | TaskWriteCommand cmd when cmd.Action = "SubmitIntegration" || cmd.Action = "CompleteIntegration" ->
+        | TaskWriteCommand cmd when List.contains cmd.Action [ "SubmitIntegration"; "SubmitSharedAcceptedIntegration"; "CompleteIntegration" ] ->
             Some "Integration"
         | _ -> None
 

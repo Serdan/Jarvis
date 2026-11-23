@@ -1,0 +1,1 @@
+Release solution build succeeded; focused Client ledger/bridge tests 51/51; full Node launcher suite passed; git diff --check passed. Intent snapshots target assignment before browser side effects; outcome writes preserve observed UI labels and uncertainty. No deployment or cutover.

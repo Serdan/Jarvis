@@ -1023,6 +1023,8 @@ module PendingIntentJournal =
                                           "ExpectedVersion", "expectedVersion" ]
 
                 match normalizeCommandType record.CommandType, operation.Type with
+                | "TaskWrite", "SetLaunchTemplate" ->
+                    [ "ExpectedVersion", "expectedVersion"; "Html", "templateSha256" ]
                 | "TaskWrite", "CreateTask" ->
                     common @ [ "Title", "title"; "Html", "specSha256" ]
                 | "TaskWrite", "ReviseTaskSpec" ->
@@ -1136,7 +1138,7 @@ module PendingIntentJournal =
                                "ExpectedVersion", "expectedVersion" ]
                 | _ -> []
 
-            let equalField (source, dest) =
+            let equalLegacyField (source, dest) =
                 match commandProperty own source, commandProperty remote dest with
                 | Some localValue, Some remoteValue ->
                     let localValue =
@@ -1167,7 +1169,50 @@ module PendingIntentJournal =
                          && operation.Type = "ReassignReviewer"
                          && optionalEmpty localValue && optionalEmpty remoteValue))
 
+            // Launch-template writes have a typed administrative command. Do
+            // not accept JSON type coercion, duplicate fields, or a different
+            // embedded UUID as evidence of the exact journaled command.
+            let typedProperty (root: JsonElement) name kind =
+                match root.EnumerateObject()
+                      |> Seq.filter (fun prop -> String.Equals(prop.Name, name, StringComparison.OrdinalIgnoreCase))
+                      |> Seq.toList with
+                | [ prop ] when prop.Value.ValueKind = kind -> Some prop.Value
+                | _ -> None
+            let launchCommandIdentity =
+                if operation.Type <> "SetLaunchTemplate" then true
+                else
+                    match typedProperty own "OperationId" JsonValueKind.String,
+                          typedProperty own "Action" JsonValueKind.String with
+                    | Some id, Some action ->
+                        action.GetString() = "SetLaunchTemplate"
+                        && (match Guid.TryParse(id.GetString()), Guid.TryParse(record.OperationId) with
+                            | (true, a), (true, b) -> a = b
+                            | _ -> false)
+                    | _ -> false
+            let equalField (source, dest) =
+                if operation.Type <> "SetLaunchTemplate" then equalLegacyField (source, dest)
+                else
+                    match source, dest with
+                    | "ExpectedVersion", "expectedVersion" ->
+                        match typedProperty own source JsonValueKind.Number, typedProperty remote dest JsonValueKind.Number with
+                        | Some a, Some b ->
+                            match a.TryGetInt32(), b.TryGetInt32() with
+                            | (true, x), (true, y) -> x = y
+                            | _ -> false
+                        | _ -> false
+                    | "Html", "templateSha256" ->
+                        match typedProperty own source JsonValueKind.String, typedProperty remote dest JsonValueKind.String with
+                        | Some a, Some b ->
+                            let body = a.GetString()
+                            // Require well-formed Unicode before using the
+                            // same exact prefixed hash as the canonical setter.
+                            UTF8Encoding(false, true).GetByteCount(body) |> ignore
+                            RoleInstructions.RoleInstructions.launchTemplateSha256 body = b.GetString()
+                        | _ -> false
+                    | _ -> false
+
             operationKind record = Some operation.Type
+            && launchCommandIdentity
             && not (List.isEmpty pairs)
             && List.forall equalField pairs
         with _ -> false
@@ -2367,6 +2412,12 @@ module TaskApi =
         LedgerBindingConfig.load cmd.ProjectName rt
         |> Result.bind (fun binding ->
             match cmd.Action with
+            | "GetLaunchTemplate" ->
+                RoleInstructions.RoleInstructions.getLaunchTemplate binding
+                |> mapError |> Result.map box
+            | "RenderLaunchPrompt" ->
+                RoleInstructions.RoleInstructions.renderLaunchPrompt binding cmd.ProjectName cmd.TaskId
+                |> mapError |> Result.map box
             | "GetRole" ->
                 RoleInstructions.RoleInstructions.getRole binding cmd.TaskId
                 |> mapError |> Result.map box
@@ -2427,7 +2478,7 @@ module TaskApi =
         | Ok(_, Some applied) -> Ok applied.Actor
         | Ok(_, None) -> Ok "AuthenticatedUser"
 
-    let private writeUsingContext (context: ProjectPaths.ResolvedProject option) (cmd: TaskWriteCommand) rt =
+    let private writeUsingContext (context: ProjectPaths.ResolvedProject option) (expectedBinding: LedgerStore.LedgerBinding option) (cmd: TaskWriteCommand) rt =
         let inspectLocal () =
             match context with
             | Some resolved -> LedgerBindingConfig.inspectLocalForContext resolved
@@ -2437,6 +2488,11 @@ module TaskApi =
             | Some resolved -> LedgerBindingConfig.loadForContext resolved
             | None -> LedgerBindingConfig.load cmd.ProjectName rt
         inspectLocal ()
+        |> Result.bind (fun (binding, head) ->
+            if expectedBinding |> Option.exists ((<>) binding) then
+                Error(Client.ValidationError "Selected project ledger binding changed before publication.")
+            else
+                Ok(binding, head))
         |> Result.bind (fun (binding, _) ->
             guid "operationId" cmd.OperationId
             |> Result.bind (fun operationId ->
@@ -2555,6 +2611,10 @@ module TaskApi =
                             | "YieldTasklessWork" ->
                                 ReviewWorkflow.ReviewWorkflow.yieldTasklessWork binding operationId
                                     cmd.ActorId cmd.ExpectedAgentVersion cmd.Summary |> mapError
+                            | "SetLaunchTemplate" ->
+                                withAdministrativeActor (fun actor ->
+                                    RoleInstructions.RoleInstructions.setLaunchTemplate binding actor operationId
+                                        cmd.ExpectedVersion cmd.Html |> mapError)
                             | "CreateRole" ->
                                 withAdministrativeActor (fun actor ->
                                     RoleInstructions.RoleInstructions.createRole binding actor operationId
@@ -2705,10 +2765,13 @@ module TaskApi =
 
 
     let writeForContext (context: ProjectPaths.ResolvedProject) (cmd: TaskWriteCommand) rt =
-        writeUsingContext (Some context) cmd rt
+        writeUsingContext (Some context) None cmd rt
+
+    let writeForExpectedBinding context binding cmd rt =
+        writeUsingContext (Some context) (Some binding) cmd rt
 
     let write (cmd: TaskWriteCommand) rt =
-        writeUsingContext None cmd rt
+        writeUsingContext None None cmd rt
 
 module ChallengeApi =
     let private mapError (result: Result<'a, LedgerStore.LedgerFailure>) =

@@ -257,6 +257,11 @@ let private requiresConfirmation command =
     | ChallengeWriteCommand cmd ->
         confirmation "ChallengeWrite" (Some cmd.ProjectName) [ VersionControlWrite; NetworkAccess ]
             [] None [ cmd.Action ] "Persist durable challenge transition" false
+    | TaskWriteCommand cmd when cmd.Action = "SetLaunchTemplate" ->
+        confirmation "SetLaunchTemplate (operator only)" (Some cmd.ProjectName)
+            [ VersionControlWrite; NetworkAccess ] [] (Some "git")
+            [ string cmd.ExpectedVersion; cmd.OperationId; cmd.Html ]
+            "Replace the project launch prompt for future agent sessions" false
     | TaskWriteCommand cmd
     | CrossProjectNotificationCommand { Notification = cmd } ->
         confirmation ("Task" + cmd.Action) (Some cmd.ProjectName)
@@ -330,10 +335,16 @@ let private trustAllows trustLevel command =
     | NoTrust, _ -> false
 
 let evaluateWithTrust trustLevel command =
-    if hasGrant command || hasExecutableGrant command || trustAllows trustLevel command then
-        Ok()
-    else
+    match command with
+    // The project prompt influences all future sessions. It is never a
+    // delegable or trust-level-approved agent mutation.
+    | TaskWriteCommand cmd when cmd.Action = "SetLaunchTemplate" ->
         requiresConfirmation command
+    | _ ->
+        if hasGrant command || hasExecutableGrant command || trustAllows trustLevel command then
+            Ok()
+        else
+            requiresConfirmation command
 
 let evaluate command = evaluateWithTrust NoTrust command
 
@@ -346,6 +357,7 @@ let authorizeWithTrust trustLevel (prompt: AgentCommand -> ConfirmationRequest -
 
             match approval with
             | AllowOnce -> return Ok()
+            | AllowExactForSession when (match command with TaskWriteCommand cmd -> cmd.Action = "SetLaunchTemplate" | _ -> false) -> return Ok()
             | AllowExactForSession ->
                 grant command request None |> ignore
                 return Ok()

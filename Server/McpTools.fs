@@ -349,14 +349,14 @@ module McpToolHelpers =
           OutputSchemaJson = None }
 
     let private ledgerTaskReadMethods = [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint";  "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec";
-                                         "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"; "GetNotificationPreferences"; "GetResponseAlerts"; "GetWorkComposition" ]
+                                         "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"; "GetNotificationPreferences"; "GetResponseAlerts"; "GetWorkComposition"; "GetLaunchTemplate"; "RenderLaunchPrompt" ]
     let private ledgerTaskWriteMethods =
         [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
           "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
           "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork"
           "SetAgentState"; "CorrectAgentWorkingState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"
           "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"
-          "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"
+          "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"; "SetLaunchTemplate"
           "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec"; "MutateWorkComposition"; "AcceptWorkCompositionIntegrated" ]
 
     let private ledgerReadMethods =
@@ -1921,6 +1921,19 @@ type JarvisMcpTools =
     static member RegisterAgent(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "RegisterAgent" operationId "" agentId
         McpToolHelpers.send client http (TaskWriteCommand cmd)
+
+    [<McpServerTool(Title = "get launch template", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read the canonical project launch template and its version/blob provenance. An absent template has version zero for initial setup.")>]
+    static member GetLaunchTemplate(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (TaskCommands.read projectName "GetLaunchTemplate" "" "")
+
+    [<McpServerTool(Title = "set launch template", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Operator-only project launch template update: requires explicit local human approval even under FullTrust. Set expectedVersion to zero only for initial creation. Include literal {{agentId}} and {{projectName}} tokens. No launch or permission grant.")>]
+    static member SetLaunchTemplate(projectName: string, agentId: string, expectedVersion: int, template: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "SetLaunchTemplate" operationId "" TaskCommands.legacyAdministrativePlaceholder
+        McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedVersion; Html = template })
+
+    [<McpServerTool(Title = "render launch prompt", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Render the configured template for one registered targetAgentId and explicit projectName from a verified ledger snapshot. Does not activate the target, authorize a launch or submit a browser message.")>]
+    static member RenderLaunchPrompt(projectName: string, agentId: string, targetAgentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (TaskCommands.read projectName "RenderLaunchPrompt" "" targetAgentId)
 
     [<McpServerTool(Title = "get role", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a versioned shared role, including content and Git ledger blob provenance.")>]
     static member GetRole(projectName: string, agentId: string, roleId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

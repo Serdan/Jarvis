@@ -18,7 +18,7 @@ let ProtocolVersion = 2
 [<Literal>]
 let MaxScriptBytes = 65536
 [<Literal>]
-let MaxArgumentsBytes = 65536
+let MaxArgumentsBytes = BrowserArguments.MaxBytes
 [<Literal>]
 let MaxResultBytes = 262144
 [<Literal>]
@@ -444,7 +444,7 @@ type Service(port: int, pairingSecret: string) =
                      ?expectedRegistrationGeneration: int, ?requireAgentCreated: bool) = task {
         let sourceBytes = utf8.GetByteCount(source)
         if sourceBytes > MaxScriptBytes then return Error "InputTooLarge: script exceeds 64 KiB."
-        elif utf8.GetByteCount(argsJson) > MaxArgumentsBytes then return Error "InputTooLarge: arguments exceed 64 KiB."
+        elif not (BrowserArguments.fits argsJson) then return Error "InputTooLarge: arguments exceed 64 KiB."
         elif timeoutMs < 1 || timeoutMs > 30000 then return Error "InvalidTimeout"
         else
             try
@@ -734,7 +734,7 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
     let invalid =
         if String.IsNullOrWhiteSpace(windowRegistration) then Some "WindowNotRegistered"
         elif utf8.GetByteCount(source) > MaxScriptBytes then Some "InputTooLarge: script exceeds 64 KiB"
-        elif utf8.GetByteCount(argsJson) > MaxArgumentsBytes then Some "InputTooLarge: arguments exceed 64 KiB"
+        elif not (BrowserArguments.fits argsJson) then Some "InputTooLarge: arguments exceed 64 KiB"
         elif timeoutMs < 1 || timeoutMs > 30000 then Some "InvalidTimeout"
         else
             try

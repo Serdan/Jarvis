@@ -365,6 +365,47 @@ let private runClient args =
               Reply = (fun request ->
                   OrchestrationApi.OperatorChallengeApi.reply actor request rt
                   |> Result.map ignore |> Result.mapError toReplyError) }
+        let resolveLaunchBinding projectName =
+            ProjectPaths.resolveProjectContext projectName rt
+            |> Result.bind (fun context ->
+                OrchestrationApi.LedgerBindingConfig.loadForContext context
+                |> Result.map (fun binding -> context, binding))
+        tui.SetLaunchTemplateAccess
+            { Load = (fun projectName ->
+                resolveLaunchBinding projectName
+                |> Result.bind (fun (_, binding) ->
+                    RoleInstructions.RoleInstructions.getLaunchTemplate binding
+                    |> Result.mapError OrchestrationApi.LedgerErrors.toEffect
+                    |> Result.map (fun snapshot ->
+                        { LaunchProjectName = projectName
+                          ProjectId = binding.ProjectId
+                          LedgerId = binding.LedgerId
+                          Epoch = binding.Epoch
+                          Version = snapshot.Template |> Option.map _.Version |> Option.defaultValue 0
+                          Template = snapshot.Template |> Option.map _.Template |> Option.defaultValue "" }))
+                |> toUiError)
+              Save = (fun snapshot operationId body ->
+                resolveLaunchBinding snapshot.LaunchProjectName
+                |> Result.mapError (fun error -> TemplateUncertain(sprintf "%A" error))
+                |> Result.bind (fun (context, binding) ->
+                    if binding.ProjectId <> snapshot.ProjectId || binding.LedgerId <> snapshot.LedgerId
+                       || binding.Epoch <> snapshot.Epoch then
+                        Error(TemplateUncertain "Project binding changed; restore the original trusted binding before retrying.")
+                    else
+                        let cmd: TaskWriteCommand =
+                            { ProjectName = snapshot.LaunchProjectName; Action = "SetLaunchTemplate"
+                              OperationId = operationId.ToString("D"); TaskId = ""; AttemptId = ""
+                              ActorId = "Orchestrator"; OwnerId = ""; Title = ""; Html = body
+                              ExpectedVersion = snapshot.Version; ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
+                              AssignmentGeneration = 0; Summary = ""; NextAction = ""; Reason = ""
+                              BaseOid = ""; TargetRef = ""; SourceRef = ""; AllowDetached = false
+                              AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+                        OrchestrationApi.TaskApi.writeForExpectedBinding context binding cmd rt
+                        |> Result.map ignore
+                        |> Result.mapError (function
+                            | LedgerFailureError failure when failure.Code = "StaleEntityVersion" -> TemplateStale failure.Message
+                            | LedgerFailureError failure when failure.Code = "InvalidBinding" -> TemplateRejected failure.Message
+                            | error -> TemplateUncertain(sprintf "%A" error)))) }
     | None ->
         tui.Log "Operator challenge replies unavailable: authenticated OAuth subject missing."
 

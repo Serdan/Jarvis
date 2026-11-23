@@ -450,6 +450,39 @@ let compositeLaunchRejectsInvalidInputsBeforeOpeningTab () = task {
         | Ok _ -> Assert.Fail("Invalid composite launch was accepted")
 }
 
+[<Test>]
+let launchArgumentBudgetIncludesOptionalMetadataAndExactEscaping () = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let options = JsonSerializerOptions(Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping)
+    let prefix = String.replicate 21800 "界" + "\"\\\n"
+    let compose prompt = JsonSerializer.Serialize({| prompt = prompt; timeoutMs = 1000; selectionOnly = true |}, options)
+    let padding = BrowserBridge.MaxArgumentsBytes - System.Text.Encoding.UTF8.GetByteCount(compose prefix)
+    let prompt = prefix + String.replicate padding "x"
+    let exact = compose prompt
+    Assert.That(Client.BrowserArguments.byteCount exact, Is.EqualTo(BrowserBridge.MaxArgumentsBytes))
+    Assert.That(Client.BrowserArguments.fits (Client.BrowserArguments.serializeMinimalLaunchPrompt prompt), Is.True)
+    use decoded = JsonDocument.Parse(exact)
+    Assert.That(decoded.RootElement.GetProperty("prompt").GetString(), Is.EqualTo(prompt))
+    let run args =
+        BrowserBridge.runInNewTab bridge "agents" "https://chatgpt.com/" "" false "async function execute(args) { return args; }" args 15000 true
+    // No extension is connected. The exact boundary must reach the
+    // ordinary connection check, whereas one extra byte fails before it.
+    match! run exact with
+    | Error (registrationId, reason) ->
+        Assert.That(registrationId, Is.Empty)
+        Assert.That(reason, Is.EqualTo("ExtensionDisconnected"))
+    | Ok _ -> Assert.Fail("No browser extension was connected")
+    let oversized = compose (prompt + "x")
+    Assert.That(Client.BrowserArguments.byteCount oversized, Is.EqualTo(BrowserBridge.MaxArgumentsBytes + 1))
+    match! run oversized with
+    | Error (registrationId, reason) ->
+        Assert.That(registrationId, Is.Empty)
+        Assert.That(reason, Does.Contain("InputTooLarge"))
+    | Ok _ -> Assert.Fail("Oversized arguments must fail before tab creation")
+}
+
 [<TestCase("notSubmitted", true)>]
 [<TestCase("uiIncompatible", true)>]
 [<TestCase("outcomeUnknown", false)>]

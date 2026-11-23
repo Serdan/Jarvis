@@ -4,9 +4,9 @@ This document describes the approved next-generation Jarvis command surface.
 
 Jarvis should not try to be a complete coding-agent runtime. Its purpose is to expose a small, safe, local bridge from the assistant to a user-selected workspace. The command surface should focus on project discovery, file access, patching, controlled execution, and git review/commit operations.
 
-## Automatic repository guidance
+## Explicit repository guidance
 
-Project-scoped operations automatically carry applicable AGENTS.md guidance from the local workspace and project ancestry. The client-to-server AgentCommandResponse envelope adds an ordered Instructions array of Scope, Path, Sha256, and Content; existing Result and Error semantics remain intact. The MCP server presents each applicable document as a distinct labeled text block before the ordinary tool result. See [AgentInstructions.md](AgentInstructions.md) and [AgentCommandResponse.schema.json](AgentCommandResponse.schema.json).
+Ordinary operations return requested results, errors and necessary operational receipts or alerts, not automatic repository documents. Read applicable repository guidance with `get_agent_instructions` and obtain dynamic role/assignment context through the self-agent inbox. During staged compatibility the existing `AgentCommandResponse.Instructions` wire field carries only operational controls from the new client; the new server ignores legacy repository documents/notices, including in terminal job results. This source behavior is gated on canonical launch-template readiness and coordinated cutover; see [AgentInstructions.md](AgentInstructions.md) and [AgentCommandResponse.schema.json](AgentCommandResponse.schema.json).
 
 ## Implicit agent activation (protocol 3.58)
 
@@ -66,7 +66,7 @@ different client's observations or agent activity may not be reflected there.
 evidence that an agent has progressed or as a global heartbeat.
 
 The observation transport is explicitly excluded from implicit Ready-to-Working
-activation, `Seen` updates, per-turn AGENTS.md delivery, and the receiver's
+activation, `Seen` updates, and the receiver's
 Working clock; both observer and target remain untouched. Unknown actors,
 missing targets, mismatched actor labels and inaccessible projects fail without
 changing the target. The regular self-`agent_inbox` has **different semantics**:
@@ -390,7 +390,7 @@ type ReadFilesCommand =
 
 ### `GetAgentInstructions` (protocol 3.59)
 
-Read the complete applicable `AGENTS.md` hierarchy for a checkout-relative directory, including the workspace root, selected main/registered-worktree root, and every ancestor. Unlike automatic delivery, this explicit tool has **no per-file size, aggregate content, or document-count limit** and never uses the instruction delivery cache.
+Read the complete applicable `AGENTS.md` hierarchy for a checkout-relative directory, including the workspace root, selected main/registered-worktree root, and every ancestor. This explicit tool has **no instruction-specific per-file size, aggregate content, or document-count limit**; transport-bounded pages allow complete retrieval.
 
 The result contains an `"AGENTS.md"` mapping such as `{".": "workspace rules", "Wayfold": "project rules", "Wayfold/src": "source rules"}`. A response that cannot fit in the standard 900 KiB tool transport provides `nextCursor`. Repeat the same call with this cursor until it is absent. For a file split across pages, `chunk` identifies the path, start/end byte offsets, total size, and SHA-256; concatenate segments by path and byte offset. Continuations are stateless and rejected if the applicable hierarchy changes.
 

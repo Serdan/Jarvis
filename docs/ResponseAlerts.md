@@ -19,7 +19,7 @@ affect operator alerts.
 The destination client checks the verified ledger when constructing each
 eligible agent tool response, **including an operation error or a job-result
 poll**, and prepends alerts to the typed `Instructions` envelope. Existing
-AGENTS.md and Working-turn duration guidance remain intact. Polling neither
+Working-turn duration guidance remains intact; repository guidance is explicitly retrieved, not automatically delivered. Polling neither
 records agent activity nor activates Ready assignments. Project health probes,
 cross-project coordination routing and observer-only operations must not
 establish the destination agent identity.

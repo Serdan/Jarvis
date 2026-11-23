@@ -1364,7 +1364,7 @@ let run_command_reason_parameter_is_optional_for_mcp_compatibility () =
     reason.DefaultValue |> shouldEqual ""
 
 [<Test>]
-let mcp_guidance_blocks_precede_result_without_changing_success () =
+let mcp_legacy_repository_documents_are_not_rendered () =
     let instructions =
         [ { Scope = "workspace"; Path = "AGENTS.md"; Sha256 = "sha256:" + String('b', 64)
             Content = "Workspace guidance" }
@@ -1378,20 +1378,12 @@ let mcp_guidance_blocks_precede_result_without_changing_success () =
           Instructions = instructions; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
     let result = response |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions instructions
     Assert.That(result.IsError, Is.EqualTo(Nullable false))
-    Assert.That(result.Content.Count, Is.EqualTo(2))
-    let guidance = result.Content[0] :?> TextContentBlock
-    use json = JsonDocument.Parse(guidance.Text)
-    let map = json.RootElement.GetProperty("AGENTS.md")
-    Assert.That(json.RootElement.EnumerateObject() |> Seq.length, Is.EqualTo(1))
-    Assert.That(map.GetProperty(".").GetString(), Is.EqualTo("Workspace guidance"))
-    Assert.That(map.GetProperty("Demo").GetString(), Is.EqualTo("Project guidance"))
-    Assert.That(map.GetProperty("Demo/src").GetString(), Is.EqualTo("Source guidance"))
-    Assert.That(guidance.Text, Does.Not.Contain("This is workspace content"))
-    let operation = result.Content[1] :?> TextContentBlock
+    Assert.That(result.Content.Count, Is.EqualTo(1))
+    let operation = result.Content[0] :?> TextContentBlock
     Assert.That(operation.Text, Is.EqualTo("""{"result":"ok"}"""))
 
 [<Test>]
-let operator_alert_blocks_precede_guidance_timing_and_failed_tool_result () =
+let operator_alert_blocks_precede_timing_and_failed_tool_result () =
     let alerts : InstructionDocument list =
         [ { Scope = "workspace"; Path = "AGENTS.md"; Sha256 = ""
             Content = "Repository instructions" }
@@ -1406,30 +1398,28 @@ let operator_alert_blocks_precede_guidance_timing_and_failed_tool_result () =
           Instructions = alerts; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
     let shown = failure |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions alerts
     Assert.That(shown.IsError, Is.EqualTo(Nullable true))
-    Assert.That(shown.Content.Count, Is.EqualTo(5))
+    Assert.That(shown.Content.Count, Is.EqualTo(4))
     Assert.That((shown.Content[0] :?> TextContentBlock).Text, Does.Contain("STOP — yield"))
     Assert.That((shown.Content[1] :?> TextContentBlock).Text, Does.Contain("save test output"))
-    use guidance = JsonDocument.Parse((shown.Content[2] :?> TextContentBlock).Text)
-    let map = guidance.RootElement.GetProperty("AGENTS.md")
-    Assert.That(map.EnumerateObject() |> Seq.length, Is.EqualTo(1),
-                "Response alerts must never be buried as synthetic AGENTS.md keys")
-    Assert.That(map.GetProperty(".").GetString(), Is.EqualTo("Repository instructions"))
-    Assert.That((shown.Content[3] :?> TextContentBlock).Text, Does.Contain("HARD STOP"))
-    Assert.That((shown.Content[4] :?> TextContentBlock).Text, Does.Contain("Unrelated error"))
+    Assert.That((shown.Content[2] :?> TextContentBlock).Text, Does.Contain("HARD STOP"))
+    Assert.That((shown.Content[3] :?> TextContentBlock).Text, Does.Contain("Unrelated error"))
 [<Test>]
-let mcp_agency_write_warning_precedes_success_without_marking_error () =
+let mcp_legacy_repository_notices_are_not_rendered () =
     let notes =
         [ { Scope = "write-warning"; Path = "Demo/AGENTS.md"; Sha256 = ""
-            Content = "WARNING: Demo/AGENTS.md is unusually large. The write succeeded." } ]
+            Content = "WARNING: Demo/AGENTS.md is unusually large. The write succeeded." }
+          { Scope = "instruction-warning"; Path = "Demo/src/AGENTS.md"; Sha256 = ""
+            Content = "Omitted repository guidance." }
+          { Scope = "unknown"; Path = "unexpected"; Sha256 = ""
+            Content = "Unrecognized ambient guidance." } ]
     let response = { Result = Some """{"ok":true}"""; Error = None; Instructions = notes; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
     let shown = response |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions notes
     Assert.That(shown.IsError, Is.EqualTo(Nullable false))
-    Assert.That(shown.Content.Count, Is.EqualTo(2))
-    Assert.That((shown.Content[0] :?> TextContentBlock).Text, Does.StartWith("Jarvis instruction notice:"))
-    Assert.That((shown.Content[1] :?> TextContentBlock).Text, Is.EqualTo("""{"ok":true}"""))
+    Assert.That(shown.Content.Count, Is.EqualTo(1))
+    Assert.That((shown.Content[0] :?> TextContentBlock).Text, Is.EqualTo("""{"ok":true}"""))
 
 [<Test>]
-let mcp_guidance_preserves_errors_and_non_text_blocks () =
+let mcp_legacy_guidance_filter_preserves_errors_and_non_text_blocks () =
     let instructions =
         [ { Scope = "workspace"
             Path = "AGENTS.md"
@@ -1441,21 +1431,22 @@ let mcp_guidance_preserves_errors_and_non_text_blocks () =
           Instructions = instructions; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
     let error = failure |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions instructions
     Assert.That(error.IsError, Is.EqualTo(Nullable true))
-    Assert.That((error.Content[1] :?> TextContentBlock).Text, Is.EqualTo("ValidationFailed: Unrelated error"))
+    Assert.That(error.Content.Count, Is.EqualTo(1))
+    Assert.That((error.Content[0] :?> TextContentBlock).Text, Is.EqualTo("ValidationFailed: Unrelated error"))
     let image = CallToolResult()
     image.Content <- ResizeArray<ContentBlock>([ ImageContentBlock.FromBytes([| 137uy; 80uy; 78uy; 71uy |], "image/png") :> ContentBlock ])
     let augmented = McpToolHelpers.attachInstructions instructions image
-    Assert.That(augmented.Content.Count, Is.EqualTo(2))
-    Assert.That(augmented.Content[1], Is.InstanceOf<ImageContentBlock>())
-    Assert.That(augmented.Content[0], Is.InstanceOf<TextContentBlock>())
+    Assert.That(augmented.Content.Count, Is.EqualTo(1))
+    Assert.That(augmented.Content[0], Is.InstanceOf<ImageContentBlock>())
 
 [<Test>]
 let mcp_server_instructions_are_static_and_concise () =
-    Assert.That(InstructionGuidance.Text, Does.Contain("AGENTS.md"))
+    Assert.That(InstructionGuidance.Text, Does.Contain("get_agent_instructions"))
+    Assert.That(InstructionGuidance.Text, Does.Contain("agent_inbox"))
     Assert.That(InstructionGuidance.Text.Length, Is.LessThan(512))
 
 [<Test>]
-let response_json_carries_typed_hierarchical_instructions () =
+let response_json_retains_legacy_instruction_wire_compatibility () =
     let response =
         { Result = Some """{"ok":true}"""
           Error = None
@@ -1474,7 +1465,14 @@ let response_json_carries_typed_hierarchical_instructions () =
     Assert.That(mutation.GetProperty("ProjectName").GetString(), Is.EqualTo("Demo"))
     Assert.That(mutation.GetProperty("AgentId").GetString(), Is.EqualTo("Owner"))
     let restored = JsonSerializer.Deserialize<AgentCommandResponse>(json)
-    Assert.That(restored.AgentStateChanges, Is.EqualTo(response.AgentStateChanges :> obj))
+    Assert.That(restored, Is.EqualTo(response))
+    let projected = restored |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions restored.Instructions
+    Assert.That(projected.Content.Count, Is.EqualTo(1))
+    let newResponse = { response with Instructions = [] }
+    let newWire = JsonSerializer.Serialize(newResponse)
+    use newDocument = JsonDocument.Parse(newWire)
+    Assert.That(newDocument.RootElement.GetProperty("Instructions").GetArrayLength(), Is.Zero)
+    Assert.That(JsonSerializer.Deserialize<AgentCommandResponse>(newWire), Is.EqualTo(newResponse))
 
 
 [<Test>]
@@ -1849,7 +1847,7 @@ let post_commit_uncertain_client_reply_remains_unknown_across_server_dispatch_an
 
 
 [<Test>]
-let polledToolJobsRestoreExactInstructionsAndMutationEvidence () =
+let polledToolJobsFilterLegacyRepositoryGuidanceAndPreserveMutationEvidence () =
     let guidance =
         [ { Scope = "project"; Path = "Jarvis/AGENTS.md"
             Sha256 = "sha256:" + String('c', 64)
@@ -1887,24 +1885,52 @@ let polledToolJobsRestoreExactInstructionsAndMutationEvidence () =
         Assert.That({ effective with Instructions = guidance }, Is.EqualTo(original))
         Assert.That(effective.Instructions = pollGuidance @ guidance, Is.True)
         let displayed =
-            poll |> McpToolHelpers.toCallToolResult
+            poll |> McpToolHelpers.projectJobResultWithoutRepositoryGuidance command |> McpToolHelpers.toCallToolResult
             |> McpToolHelpers.attachStateEffects effective
             |> McpToolHelpers.attachInstructions effective.Instructions
         Assert.That(displayed.IsError, Is.EqualTo(Nullable false))
         Assert.That(displayed.Meta["jarvis/agent_state_changes"].ToJsonString(), Does.Contain("Worker 1"))
         Assert.That(displayed.Meta["jarvis/inbox_activation"].ToJsonString(), Does.Contain("activation-id"))
-        Assert.That(displayed.Content.Count, Is.EqualTo(5))
+        Assert.That(displayed.Content.Count, Is.EqualTo(4))
         Assert.That((displayed.Content[0] :?> TextContentBlock).Text,
                     Does.Contain("STOP - preserve safe work and yield"))
         Assert.That((displayed.Content[1] :?> TextContentBlock).Text,
-                    Does.Contain("Canonical instructions from the original command"))
-        Assert.That((displayed.Content[2] :?> TextContentBlock).Text,
                     Does.Contain("HARD STOP: preserve work"))
-        use terminalJson = JsonDocument.Parse((displayed.Content[3] :?> TextContentBlock).Text)
+        use terminalJson = JsonDocument.Parse((displayed.Content[2] :?> TextContentBlock).Text)
+        Assert.That(terminalJson.RootElement.GetProperty("OperationId").GetString(), Is.EqualTo("stable-operation-id"))
+        Assert.That(terminalJson.RootElement.GetRawText(), Does.Not.Contain("Canonical instructions from the original command"))
         let terminal = terminalJson.RootElement.GetProperty("ToolResponse")
         Assert.That(terminal.GetProperty("AgentStateChanges").GetArrayLength(), Is.EqualTo(1))
-        Assert.That(terminal.GetProperty("Instructions").GetArrayLength(), Is.EqualTo(1))
+        Assert.That(terminal.GetProperty("Instructions").GetArrayLength(), Is.Zero)
+        let projected = McpToolHelpers.projectJobResultWithoutRepositoryGuidance command poll
+        let parsed = JsonSerializer.Deserialize<JobResult>(projected.Result.Value)
+        Assert.That(parsed.ToolResponse.Value, Is.EqualTo({ original with Instructions = [] }))
+        Assert.That(JsonSerializer.Deserialize<JobResult>(poll.Result.Value), Is.EqualTo(job),
+                    "MCP projection must not mutate the immutable original job evidence.")
         Assert.That(terminal.GetProperty("InboxActivation").GetProperty("ActivatedByThisCall").GetBoolean(), Is.True)
+
+[<Test>]
+let polledToolJobsKeepLegacyOperationalFieldsWithoutChangingOtherPayloads () =
+    let controls =
+        [ { Scope = "working-turn"; Path = ""; Sha256 = ""; Content = "Historical turn control" }
+          { Scope = "response-alert"; Path = "jarvis/response-alert/old"; Sha256 = ""; Content = "Historical alert" } ]
+    let legacy = { Scope = "write-warning"; Path = "AGENTS.md"; Sha256 = ""; Content = "Obsolete notice" }
+    let original : AgentCommandResponse =
+        { Result = Some """{"Instructions":[{"Scope":"project","Content":"explicit operation content"}]}"""
+          Error = None; Instructions = legacy :: controls
+          AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+    let job : JobResult =
+        { JobId = "job"; Status = ToolCompleted; Events = []; NextSequence = 0L
+          Truncated = false; ToolResponse = Some original; OperationId = None }
+    let poll = { original with Result = Some(JsonSerializer.Serialize job); Instructions = [] }
+    let command = GetJobResultCommand { ProjectName = "Jarvis"; JobId = job.JobId; AfterSequence = None }
+    let projected = McpToolHelpers.projectJobResultWithoutRepositoryGuidance command poll
+    let parsed = JsonSerializer.Deserialize<JobResult>(projected.Result.Value)
+    Assert.That(parsed, Is.EqualTo({ job with ToolResponse = Some { original with Instructions = controls } }))
+    let clean = { poll with Result = Some(JsonSerializer.Serialize parsed) }
+    Assert.That(McpToolHelpers.projectJobResultWithoutRepositoryGuidance command clean, Is.EqualTo(clean))
+    let read = ReadFileCommand { ProjectName = "Jarvis"; FilePath = "AGENTS.md"; StartLine = None; EndLine = None; IncludeLineNumbers = None }
+    Assert.That(McpToolHelpers.projectJobResultWithoutRepositoryGuidance read poll, Is.EqualTo(poll))
 
 [<Test>]
 let completedPollsNeverReplayAlertsEmbeddedInAnOriginalPromotedJobResponse () =

@@ -332,6 +332,25 @@ let private runClient args =
             oauth.GetAccessTokenAsync().GetAwaiter().GetResult()
             |> operatorActorFromAccessToken
         with _ -> None
+    // B1 is a compiled, client-owned postcommit seam, NOT scheduler activation.
+    // No environment switch can enable this unfinished admission boundary.
+    let challengeWakeEnabled = false
+    let challengeWakePorts : Client.WorkQueueReactiveWake.WorkWakePorts =
+        { ReadVerified = (fun () -> failwith "B1 has no approved production scheduler admission read.")
+          Plan = (fun _ -> Error "B1 scheduler admission is not authorized.")
+          Execute = (fun _ -> Client.WorkQueueReactiveWake.WorkExecutorResult.Rejected "B1 scheduler execution disabled.") }
+    let challengeCoordinator =
+        Client.WorkQueueReactiveWake.WorkQueueReactiveWake.Coordinator(challengeWakePorts)
+    let challengeHostPorts =
+        Client.WorkQueueSchedulerHostLoop.WorkQueueSchedulerHostLoop.productionPorts
+            challengeCoordinator
+            (fun () -> Error "B1 default-off host has no authorized production head reader.")
+            (fun _ -> ())
+    let challengeHost, onChallengeCommit =
+        Client.AutomationChallengeWakeAdapter.registerHost
+            challengeWakeEnabled challengeHostPorts
+            (fun project -> OrchestrationApi.LedgerBindingConfig.load project rt)
+            tui.Log
     let toUiError result = result |> Result.mapError (fun error -> sprintf "%A" error)
     let toReplyError = function
         | LedgerFailureError failure when failure.Code = "StaleEntityVersion" ->
@@ -411,13 +430,13 @@ let private runClient args =
                 if manualApproval then
                     Client.receiveManualGrantApprovalAndReplyWithTiming connection rt correlationId commandJson agentId report
                 elif manualGranted then
-                    Client.receiveManualGrantedCommandAndReplyWithTiming connection rt correlationId commandJson agentId report
+                    Client.receiveAuthenticatedCommandAndReplyWithChallengeWakeTiming connection rt correlationId commandJson agentId None true report onChallengeCommit
                 else
                     match originalId with
                     | Some original ->
-                        Client.receiveSourceCommandAndReplyWithTiming connection rt correlationId commandJson agentId original report
+                        Client.receiveAuthenticatedCommandAndReplyWithChallengeWakeTiming connection rt correlationId commandJson agentId (Some original) false report onChallengeCommit
                     | None ->
-                        Client.receiveCommandAndReplyWithTiming connection rt correlationId commandJson agentId report),
+                        Client.receiveAuthenticatedCommandAndReplyWithChallengeWakeTiming connection rt correlationId commandJson agentId None false report onChallengeCommit),
             (fun error -> replyUnhandled correlationId commandJson error)) then
             Task.CompletedTask
         else
@@ -558,6 +577,8 @@ let private runClient args =
             do! dispatch.Complete().WaitAsync(TimeSpan.FromMinutes 2.0)
         with :? TimeoutException ->
             tui.Log "MCP dispatch shutdown exceeded two minutes; some command outcomes may be uncertain."
+        // Stop the explicit default-off Challenge host after draining its ingress.
+        do! challengeHost.StopAsync()
         scheduler |> Option.iter (fun service -> (service :> IDisposable).Dispose())
         browser |> Option.iter (fun bridge -> (bridge :> IDisposable).Dispose())
         do! connection.DisposeAsync()

@@ -121,6 +121,7 @@
         <Compile Include="Modules\WorkQueueDurableLaunchIntent.fs"/>
         <Compile Include="Modules\WorkQueueReactiveWake.fs"/>
         <Compile Include="Modules\WorkQueueSchedulerHostLoop.fs"/>
+        <Compile Include="AutomationChallengeWakeAdapter.fs"/>
         <Compile Include="Modules\WorkQueueSchedulerHeadBinding.fs"/>
         <Compile Include="Modules\WorkQueueVerifiedDispatchAdapter.fs"/>
         <Compile Include="Modules\WorkQueueNativePrivateHostBridge.fs"/>

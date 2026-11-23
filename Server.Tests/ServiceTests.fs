@@ -1933,6 +1933,43 @@ let polledToolJobsKeepLegacyOperationalFieldsWithoutChangingOtherPayloads () =
     Assert.That(McpToolHelpers.projectJobResultWithoutRepositoryGuidance read poll, Is.EqualTo(poll))
 
 [<Test>]
+let operational_contract_legacy_terminal_alert_never_reappears_in_raw_mcp_result () =
+    let alert =
+        { Scope = "response-alert"; Path = "jarvis/response-alert/stale"; Sha256 = ""
+          Content = "STOP - previously consumed" }
+    let original : AgentCommandResponse =
+        { Result = Some "terminal"; Error = None; Instructions = [alert]
+          AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+    let job : JobResult =
+        { JobId = "job"; Status = ToolCompleted; Events = []; NextSequence = 0L
+          Truncated = false; ToolResponse = Some original; OperationId = Some "original-id" }
+    let poll = { original with Result = Some(JsonSerializer.Serialize job); Instructions = [] }
+    let command = GetJobResultCommand { ProjectName = "Jarvis"; JobId = job.JobId; AfterSequence = None }
+    let projected = McpToolHelpers.projectJobResultWithoutRepositoryGuidance command poll
+    Assert.That(projected.Result.Value, Does.Not.Contain("previously consumed"))
+    Assert.That(JsonSerializer.Deserialize<JobResult>(projected.Result.Value).ToolResponse.Value.Result,
+                Is.EqualTo(original.Result))
+
+[<Test>]
+let operational_contract_missing_state_receipt_is_not_confirmed_zero () =
+    let reply : AgentCommandResponse =
+        { Result = Some "ok"; Error = None; Instructions = []
+          AgentStateChanges = Unchecked.defaultof<_>; InboxActivation = None; PendingJob = None }
+    Assert.That(AgentStateEvidence.isUnknown reply, Is.True)
+    let rendered = reply |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachStateEffects reply
+    Assert.That(rendered.Meta["jarvis/agent_state_changes_status"].GetValue<string>(), Is.EqualTo("unknown"))
+    Assert.That(rendered.Meta.ContainsKey("jarvis/agent_state_changes"), Is.False)
+
+[<Test>]
+let operational_contract_sender_alert_survives_destination_failure () =
+    let source : AgentCommandResponse =
+        { Result = Some "{}"; Error = None
+          Instructions = [{ Scope = "response-alert"; Path = "jarvis/response-alert/source"; Sha256 = ""; Content = "STOP - source" }]
+          AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+    let destination = { source with Result = None; Error = Some(NotFound "destination"); Instructions = [] }
+    Assert.That((McpToolHelpers.mergeStateEffects source destination).Instructions, Is.EqualTo(source.Instructions :> obj))
+
+[<Test>]
 let completedPollsNeverReplayAlertsEmbeddedInAnOriginalPromotedJobResponse () =
     // A previously stored original completion may contain an alert consumed
     // before the caller ever saw the job. It cannot become a recurring alert.

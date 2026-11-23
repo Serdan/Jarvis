@@ -3,7 +3,7 @@ set -eu
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 GENERATED="$HERE/Generated.NativeReservation.Property.fs"
 # The F# generator pins source and original fixture Git blobs, validates the
-# accepted immutable ancestor, and refuses to overwrite any generated file.
+# exact reviewed source and fixture blobs, and refuses to overwrite any generated file.
 if [ "$#" -gt 0 ]; then
   dotnet fsi --exec "$HERE/prepare.fsx" "$1"
 else

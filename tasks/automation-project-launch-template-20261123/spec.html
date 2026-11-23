@@ -1,0 +1,27 @@
+<article><h1>Canonical project launch template and shared rendering</h1><p>Operator approved this narrowly scoped Automation milestone addition on 2026-11-23. Fresh agents repeatedly stop after partial work despite AGENTS.md workflow instructions. Persist stable execution instructions in a canonical versioned project-level prompt template, independent of source branches/worktrees. Operators and native Scheduler use the same renderer; dynamic role, assignment, specs, checkpoints and challenges remain in Jarvis inbox. The browser launcher remains a generic prompt submission mechanism.</p><h2>Deliverables</h2><ul><li>One canonical template per project in the existing authoritative Git project ledger, with versioned/idempotent updates and established authorization boundaries; no new storage or Work migration.</li><li>Expose get_launch_template, set_launch_template (authorized Operator only, exact version), render_launch_prompt (read-only, explicit agent/project identity); TUI Operator editing using existing interaction patterns. Use only literal {{agentId}} and {{projectName}} substitutions, no general-purpose templating language. Define missing/invalid template behavior, input bounds, unknown placeholder handling and stable deterministic rendering. Preserve historic launch evidence and don't retrospectively change already submitted prompts.</li><li>Operator can fetch/render and inject prompt into existing BrowserRunInNewTab; native Scheduler consumes identical renderer on its existing default-off launch path, without enabling it. Preserve source/role/credential and one-shot effect fences; do not inject secrets into browser script arguments or conflate template with authorization. If source ownership overlap exists, coordinate via canonical tasks/Lead and isolate edits; do not overwrite local Operator launcher edits.</li><li>Seed initial Jarvis template via reviewed migration/configuration or explicit authorized setter, not source worktree AGENTS.md. No removal of duplicated instructions until all launch paths verified and explicit follow-up approval. Document usage, test version conflicts, authorization, rendering, cross-project isolation, missing/default behavior and manual/Scheduler equivalence; independent exact-source review and managed integration.</li></ul><h2>Approved initial text</h2><pre>Your agent ID is {{agentId}}. Your project is {{projectName}}.
+
+You are an autonomous engineering agent. Your primary output is completed work through tools, not conversational responses.
+
+Call agent_inbox and execute your assignment.
+
+## Execution
+
+Continue working until completion or genuinely blocked. After each tool result, take the next concrete action.
+
+Do not end your turn to report intermediate progress. If one action is blocked, pursue other available avenues of progress.
+
+## Engineering
+
+Prioritize long-term correctness, architecture, maintainability, performance and usability. Do not compromise quality for speed.
+
+Address root causes rather than symptoms. Seek local simplicity and global coherence. Preserve semantics and respect evidence boundaries.
+
+## Coordination
+
+Use canonical Jarvis state for coordination. Use notifications only when exceptional action is required and no structured mechanism exists.
+
+## Lifecycle
+
+When finished, record completion through Jarvis. If genuinely blocked or forced to stop, checkpoint and yield with actionable continuation instructions.
+
+Never voluntarily end your turn while Working. Verify the lifecycle transition before responding.</pre><h2>Scope and acceptance</h2><p>Read applicable guidance and existing ledger/settings/MCP/Scheduler patterns; no speculative infrastructure, no live deployment, restart, unattended scheduling or cutover. Use isolated source and focused .NET 11 tests, independent review. Record exact source/test evidence and submit for managed integration; do not push main directly. If Scheduler wiring has an existing source lease, deliver reviewed common renderer and operator surface first and record precise linked remaining dependency. Operator approved implementation, not blanket activation. Continue until completed or genuine blocker; checkpoint and yield only as required.</p></article>

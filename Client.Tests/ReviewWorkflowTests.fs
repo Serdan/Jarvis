@@ -90,6 +90,39 @@ type ReviewWorkflowTests() =
             Directory.Delete(root, true)
 
     [<Test>]
+    member _.BrowserLaunchAttributionPersistsSnapshotAndIdempotentOutcome() =
+        withFixture (fun _ _ first second _ _ _ initTask ->
+            initTask "attribution-task"
+            let launch = Guid.NewGuid()
+            Client.SignalR.Client.beginAttributedLaunch first "Operator" "Owner" launch |> success |> ignore
+            let read path =
+                let snapshot = LedgerStore.fetch second |> success
+                let content, _ = LedgerStore.readAt second snapshot path |> success
+                System.Text.Json.JsonDocument.Parse(content.Value)
+            use intent = read $"records/browser-launches/{launch:N}/intent.json"
+            Assert.That(intent.RootElement.GetProperty("targetAgentId").GetString(), Is.EqualTo("Owner"))
+            Assert.That(intent.RootElement.GetProperty("taskId").GetString(), Is.EqualTo("attribution-task"))
+            let outcome = """{"outcome":"submitted","model":"observed","mode":"Chat","effort":null}"""
+            Client.SignalR.Client.finishAttributedLaunch first "Operator" launch outcome |> success |> ignore
+            let retry = Client.SignalR.Client.finishAttributedLaunch first "Operator" launch outcome |> success
+            Assert.That(retry.AlreadyApplied, Is.True)
+            use saved = read $"records/browser-launches/{launch:N}/outcome.json"
+            Assert.That(saved.RootElement.GetProperty("model").GetString(), Is.EqualTo("observed"))
+            let unassigned = Guid.NewGuid()
+            Client.SignalR.Client.beginAttributedLaunch first "Operator" "Reviewer" unassigned |> success |> ignore
+            use empty = read $"records/browser-launches/{unassigned:N}/intent.json"
+            Assert.That(empty.RootElement.GetProperty("taskId").ValueKind, Is.EqualTo(System.Text.Json.JsonValueKind.Null))
+            ReviewWorkflow.createTask first (Guid.NewGuid()) "later-task" "later-task" |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) "later-task" (Guid.NewGuid()) "Reviewer" |> success |> ignore
+            let retryStart = Client.SignalR.Client.beginAttributedLaunch first "Operator" "Reviewer" unassigned |> success
+            Assert.That(retryStart.AlreadyApplied, Is.True)
+            use unchanged = read $"records/browser-launches/{unassigned:N}/intent.json"
+            Assert.That(unchanged.RootElement.GetProperty("taskId").ValueKind, Is.EqualTo(System.Text.Json.JsonValueKind.Null))
+            match Client.SignalR.Client.finishAttributedLaunch first "Operator" launch "{\"outcome\":\"other\"}" with
+            | Error OperationIdReused -> ()
+            | other -> Assert.Fail(sprintf "Changed retry must fail: %A" other))
+
+    [<Test>]
     member _.AdministrativeActorIsRecordedInReceiptAssignmentAndClosureEvent() =
         withFixture (fun _ _ first second _ _ _ _ ->
             let taskId = "administrative-actor-provenance"

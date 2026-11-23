@@ -976,7 +976,7 @@ module ReviewWorkflow =
     // extra future-generation records not reachable from the owner index.
     // Unknown/unrelated Challenge IDs are deliberately not globally scanned.
     let internal verifyOwnerWaitIndexesAt binding snapshot owner = result {
-        let! paths = LedgerStore.listCompleteWaitIndexesAt binding snapshot (ownerWaitIndexPrefix owner)
+        let! paths = LedgerStore.listIssuedWaitIndexPathsAt binding snapshot (ownerWaitIndexPrefix owner)
         let mutable historicallyLinkedChallenges = Set.empty<string>
         for path in paths do
             if not (path.EndsWith(".json", StringComparison.Ordinal)) then
@@ -990,7 +990,7 @@ module ReviewWorkflow =
         // while rejecting unissued N3 links even when no owner mirror exists.
         for challengeId in historicallyLinkedChallenges do
             let! challengePaths =
-                LedgerStore.listCompleteWaitIndexesAt binding snapshot
+                LedgerStore.listIssuedWaitIndexPathsAt binding snapshot
                     (challengeWaitIndexPrefix challengeId)
             for indexPath in challengePaths do
                 if not (indexPath.EndsWith(".json", StringComparison.Ordinal)) then
@@ -3417,9 +3417,22 @@ module ReviewWorkflow =
         else
             result {
                 let! _ = verifyOwnerWaitIndexesAt binding snapshot agentId
-                let! records = LedgerStore.readAgentInboxRecordsAt binding snapshot
+                let key = agentKey agentId
+                let! records = LedgerStore.readAgentInboxRecordsForAgentAt binding snapshot key
                 let! agent = requiredFromRecords<ReviewAgent> records (agentPath agentId)
-                let! instructionLayers = RoleInstructions.resolveAtKnownAgent binding snapshot agentId
+                let configPath = "records/agent-instructions/" + key + ".json"
+                let! instructionLayers =
+                    if records.ContainsKey configPath then
+                        // Existing configs (including malformed ones) remain
+                        // decoded and verified by the canonical resolver.
+                        RoleInstructions.resolveAtKnownAgent binding snapshot agentId
+                    else
+                        // The same pinned tree listing proves the config absent.
+                        Ok ({ SnapshotCommit = snapshot.Commit
+                              RoleIds = []; AgentConfigVersion = 0
+                              Precedence = [ "global"; "workspace"; "project/directory"
+                                             "role (attachment order)"; "agent"; "assignment" ]
+                              Documents = [] } : InstructionResolution)
                 let paths = records |> Map.toList |> List.map fst
                 let mutable notifications = []
                 for path in paths do

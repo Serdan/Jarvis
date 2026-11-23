@@ -774,7 +774,7 @@ module ChallengeWorkflow =
     let private wakeDependents binding snapshot (operationId: Guid) actor
                                (completed: AgentChallenge) timestamp = result {
         let prefix = ReviewWorkflow.challengeWaitIndexPrefix completed.ChallengeId
-        let! paths = LedgerStore.listCompleteWaitIndexesAt binding snapshot prefix
+        let! paths = LedgerStore.listIssuedWaitIndexPathsAt binding snapshot prefix
         if paths |> List.exists (fun p -> not (p.EndsWith(".json", StringComparison.Ordinal))) then
             return! Error(LedgerIntegrityError "Unexpected challenge wait-index record.")
         let linkedWaits = paths |> List.sort

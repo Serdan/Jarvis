@@ -103,6 +103,7 @@ module RoleInstructions =
     let private hash (value: string) =
         SHA256.HashData(utf8.GetBytes value)
         |> Convert.ToHexString |> fun value -> "sha256:" + value.ToLowerInvariant()
+    let internal launchTemplateSha256 (value: string) = hash value
     let private intent operationId actor kind payload : LedgerIntent =
         { OperationId = operationId
           Actor = actor
@@ -493,7 +494,7 @@ module RoleInstructions =
         else
             LegacyDirectWriterFence.transact binding
                 (intent operationId actor "SetLaunchTemplate"
-                    {| expectedVersion = expectedVersion; templateSha256 = hash body |})
+                    {| expectedVersion = expectedVersion; templateSha256 = launchTemplateSha256 body |})
                 (fun snapshot -> result {
                     let! current = readLaunchTemplateAt binding snapshot
                     let version = current |> Option.map (fun (record, _) -> record.Version) |> Option.defaultValue 0
@@ -518,9 +519,10 @@ module RoleInstructions =
                 let prompt =
                     launchTokens.Replace(record.Template,
                         MatchEvaluator(fun m -> if m.Value = agentToken then agentId else projectName))
-                if prompt.Length > 24000 || utf8.GetByteCount prompt > 65536
-                   || utf8.GetByteCount(JsonSerializer.Serialize(prompt, options)) > 131072 then
-                    return! Error(InvalidBinding "Rendered launch prompt exceeds the transport byte budget.")
+                if prompt.Length > 24000 || utf8.GetByteCount prompt > BrowserArguments.MaxBytes
+                   || utf8.GetByteCount(JsonSerializer.Serialize(prompt, options)) > 131072
+                   || not (BrowserArguments.fits (BrowserArguments.serializeMinimalLaunchPrompt prompt)) then
+                    return! Error(InvalidBinding "Rendered launch prompt exceeds the transport byte budget (including the minimal JSON argument envelope).")
                 return
                     { SnapshotCommit = snapshot.Commit; ProjectId = binding.ProjectId
                       ProjectName = projectName; AgentId = agentId

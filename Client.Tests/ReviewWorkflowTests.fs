@@ -4349,6 +4349,97 @@ type ReviewWorkflowTests() =
                         Is.True))
 
     [<Test>]
+    member _.LaunchTemplatePendingIntentReconciliationMatchesExactTypedCommand() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let body = "界 {{agentId}}\n{{projectName}} "
+            let command (id: Guid) version html : Common.TaskWriteCommand =
+                { ProjectName = "Project"; Action = "SetLaunchTemplate"; OperationId = id.ToString("D")
+                  TaskId = ""; AttemptId = ""; ActorId = "Owner"; OwnerId = ""; Title = ""; Html = html
+                  ExpectedVersion = version; ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
+                  AssignmentGeneration = 0; Summary = ""; NextAction = ""; Reason = ""
+                  BaseOid = ""; TargetRef = ""; SourceRef = ""; AllowDetached = false
+                  AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+            let persist binding id cmd =
+                Client.OrchestrationApi.PendingIntentJournal.persist binding id "TaskWrite"
+                    (System.Text.Json.JsonSerializer.Serialize(cmd)) |> success
+            let publish id version html =
+                Client.RoleInstructions.RoleInstructions.setLaunchTemplate second "AuthenticatedUser" id version html
+                |> success
+            let acceptedId = Guid.NewGuid()
+            persist first acceptedId (command acceptedId 0 body)
+            let applied = publish acceptedId 0 body
+            let inspect id = Client.OrchestrationApi.PendingIntentJournal.inspect first id |> success
+            Assert.That((inspect acceptedId).Disposition, Is.EqualTo(Some "Applied"))
+            Assert.That(applied.Operation.Actor, Is.EqualTo("AuthenticatedUser"))
+            let reconciled = Client.OrchestrationApi.PendingIntentJournal.reconcile first |> success
+            Assert.That(reconciled.Head.disposition, Is.EqualTo("Applied"))
+            let ack id hash = Client.OrchestrationApi.PendingIntentJournal.acknowledge first id hash
+            ack acceptedId applied.Operation.RequestHash |> success |> ignore
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one acceptedId |> success).IsNone, Is.True)
+            let reject id disposition hash =
+                Assert.That((inspect id).Disposition, Is.EqualTo(Some disposition))
+                match ack id hash with
+                | Error(Client.ValidationError _) -> ()
+                | other -> Assert.Fail(sprintf "Unexpected acknowledgment: %A" other)
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one id |> success).IsSome, Is.True)
+            let wrongBody = Guid.NewGuid()
+            persist first wrongBody (command wrongBody 1 (body.TrimEnd()))
+            let receipt = publish wrongBody 1 body
+            reject wrongBody "IdentityMismatch" receipt.Operation.RequestHash
+            let wrongVersion = Guid.NewGuid()
+            persist first wrongVersion (command wrongVersion 1 body)
+            let receipt = publish wrongVersion 2 body
+            reject wrongVersion "IdentityMismatch" receipt.Operation.RequestHash
+            let wrongKind = Guid.NewGuid()
+            persist first wrongKind { command wrongKind 3 body with Action = "CreateTask" }
+            let receipt = publish wrongKind 3 body
+            reject wrongKind "IdentityMismatch" receipt.Operation.RequestHash
+            let wrongId = Guid.NewGuid()
+            persist first wrongId (command wrongId 4 body)
+            reject wrongId "NotFoundAtVerifiedHead" receipt.Operation.RequestHash
+            let mutable version = 4
+            let publishNext id =
+                let receipt = publish id version body
+                version <- version + 1
+                receipt.Operation.RequestHash
+            let unicodeMismatch = Guid.NewGuid()
+            persist first unicodeMismatch (command unicodeMismatch version (body.Replace("界", "海")))
+            reject unicodeMismatch "IdentityMismatch" (publishNext unicodeMismatch)
+            let embeddedUuidMismatch = Guid.NewGuid()
+            persist first embeddedUuidMismatch (command (Guid.NewGuid()) version body)
+            reject embeddedUuidMismatch "IdentityMismatch" (publishNext embeddedUuidMismatch)
+            // These malformed journal commands still have a valid outer UUID
+            // and an actual matching remote receipt, but cannot prove intent.
+            for edit in [
+                fun (node: System.Text.Json.Nodes.JsonObject) -> node.Remove("Html") |> ignore
+                fun node -> node["ExpectedVersion"] <- System.Text.Json.Nodes.JsonValue.Create(string version)
+                fun node -> node["Html"] <- System.Text.Json.Nodes.JsonValue.Create(42)
+                fun node -> node["expectedVersion"] <- System.Text.Json.Nodes.JsonValue.Create(version) ] do
+                let id = Guid.NewGuid()
+                let node = System.Text.Json.JsonSerializer.SerializeToNode(command id version body).AsObject()
+                edit node
+                Client.OrchestrationApi.PendingIntentJournal.persist first id "TaskWrite" (node.ToJsonString()) |> success
+                reject id "IdentityMismatch" (publishNext id)
+            for foreign in [ { first with ProjectId = Guid.NewGuid() }; { first with LedgerId = Guid.NewGuid() }; { first with Epoch = first.Epoch + 1 } ] do
+                let id = Guid.NewGuid()
+                persist foreign id (command id version body)
+                reject id "BindingMismatch" (publishNext id)
+            let recoveredId = Guid.NewGuid()
+            let mutable calls = 0
+            let recovered =
+                Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite first recoveredId
+                    "TaskWrite" (command recoveredId version body) (fun () ->
+                        calls <- calls + 1
+                        publish recoveredId version body |> ignore
+                        Error(Client.OrchestrationApi.LedgerErrors.toEffect (OutcomeUnknown "Injected lost reply")))
+                |> success
+            Assert.That(calls, Is.EqualTo(1))
+            Assert.That(recovered.AlreadyApplied, Is.True)
+            Assert.That(recovered.Operation.OperationId, Is.EqualTo(recoveredId.ToString("D")))
+            Assert.That((Client.RoleInstructions.RoleInstructions.getLaunchTemplate first |> success).Template.Value.Version, Is.EqualTo(version + 1))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one recoveredId |> success).IsNone, Is.True))
+
+    [<Test>]
     member _.ReconciliationNeedsVerifiedRemoteReceiptAndExplicitAcknowledgment() =
         withFixture (fun one _ first _ _ _ _ _ ->
             let command taskId =

@@ -627,6 +627,38 @@ type RoleInstructionsTests() =
                 | failure -> Assert.Fail(sprintf "Cross-project pinned render must fail: %A" failure)))
 
     [<Test>]
+    member _.LaunchTemplateMeasuresExactMinimalArgumentEnvelope() =
+        fixture (fun one two ->
+            let agent = String.replicate 40 "界"
+            ReviewWorkflow.registerAgent one (Guid.NewGuid()) agent |> success |> ignore
+            let set version body =
+                RoleInstructions.setLaunchTemplate one "AuthenticatedUser" (Guid.NewGuid()) version body |> success |> ignore
+            let render () = RoleInstructions.renderLaunchPrompt two "Jarvis" agent
+            let tooLarge () =
+                match render () with
+                | Error(InvalidBinding _) -> ()
+                | other -> Assert.Fail(sprintf "Expected minimal envelope rejection: %A" other)
+            let options = JsonSerializerOptions(Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping)
+            let encode prompt = JsonSerializer.Serialize({| prompt = prompt |}, options)
+            let bytes (value: string) = System.Text.Encoding.UTF8.GetByteCount value
+            let repeated = String.replicate 545 "{{agentId}}"
+            let exact = repeated + "{{projectName}}" + String.replicate 117 "x"
+            set 0 exact
+            let accepted = render () |> success
+            Assert.That(bytes (encode accepted.Prompt), Is.EqualTo(Client.BrowserBridge.MaxArgumentsBytes))
+            Assert.That(accepted.Prompt, Is.EqualTo(String.replicate 545 agent + "Jarvis" + String.replicate 117 "x"))
+            set 1 (exact + "x")
+            tooLarge ()
+            set 2 (String.replicate 546 "{{agentId}}" + "{{projectName}}123456789")
+            tooLarge ()
+            let escaped = "{{agentId}} \" \\ \n {{projectName}}"
+            set 3 escaped
+            let rendered = render () |> success
+            use decoded = JsonDocument.Parse(encode rendered.Prompt)
+            Assert.That(decoded.RootElement.GetProperty("prompt").GetString(), Is.EqualTo(rendered.Prompt))
+            Assert.That(rendered.Prompt, Is.EqualTo(agent + " \" \\ \n Jarvis")))
+
+    [<Test>]
     member _.LaunchTemplateFailsClosedOnInvalidRecordAndUnboundedExpansion() =
         fixture (fun one two ->
             let invalidUnicode = "{{projectName}} {{agentId}}" + string (char 0xD800)

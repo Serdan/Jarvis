@@ -1,0 +1,7 @@
+# P2 — Reversed-clock test passes if the native clock guard is removed
+
+Frozen candidate: `2cb0af39012e416946cd32a1de033748d7bc4e56`. Original obligation: canonical spec `e5c8d455b90d5eb58ea5f22971f669cdce7bb989`, negative matrix point 4, and prior decision 12222 require coverage of reversed activity/clock.
+
+`tests/AutomationHealthHosted20261123/HostedNegativeTests.fs:189-206` projects the first real Hub read to LastSeen +600 s and the second to LastSeen +599 s. At `Client/Modules/NativeHealth.fs:142-149`, removing only the reversed-clock comparison still reaches the second idle check at 599 s. That check independently returns false under the configured 600 s timeout. Both paths yield two reads, one HOLD, zero recovery calls, and unchanged Git HEAD. The current test therefore cannot detect loss of the monotonic-clock guard. This follows directly from the frozen control flow. No production mutant was applied.
+
+A bounded option inside the existing test lease is to project the first read to +601 s and the second to +600 s while retaining the same real LastSeen. Both observations then qualify independently, so the clock reversal is required to stop recovery. This is a test coverage defect. The production guard is present in the pinned source.

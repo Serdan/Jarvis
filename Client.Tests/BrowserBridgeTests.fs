@@ -764,8 +764,9 @@ let closeAfterExecutionReclaimsTabEvenWhenSubmissionIsUncertain (scriptStatus: s
     let! client, connectionId = handshake port "test-secret"
     use socket = client
     do! registerReadyAgentWindow socket bridge
-    let launch = BrowserBridge.runInNewTab bridge "agents" "https://chatgpt.com/" "cleanup-all" false
-                     "async function execute(args) { return args; }" "{}" 5000 true
+    let mutable captured : JsonElement option = None
+    let launch = BrowserBridge.runInNewTabWithObservation bridge "agents" "https://chatgpt.com/" "cleanup-all" false
+                     "async function execute(args) { return args; }" "{}" 5000 true (fun payload -> captured <- Some payload)
     let! opened = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     Assert.That(property opened "kind", Is.EqualTo("openTab"))
     do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"cleanup-all-created","agentCreated":true,"availability":"ready","registrationGeneration":3},{"registrationId":"personal-tab","agentCreated":false,"availability":"ready","registrationGeneration":1}]}"""
@@ -791,7 +792,8 @@ let closeAfterExecutionReclaimsTabEvenWhenSubmissionIsUncertain (scriptStatus: s
             result = {| status = scriptStatus
                         stage = if scriptStatus = "outcomeUnknown" then "acknowledgement" else "composer"
                         reason = if scriptStatus = "outcomeUnknown" then "SubmissionUnconfirmed" else "Unknown"
-                        timing = {| budgetAtSendMs = 2000; elapsedSinceSendMs = 2500 |} |}
+                        timing = {| budgetAtSendMs = 2000; elapsedSinceSendMs = 2500 |}
+                        observedSelection = {| mode = "Work"; model = "shown model"; effort = "Medium" |} |}
         |}))
     let! closing = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     Assert.That(property closing "kind", Is.EqualTo("closeTab"))
@@ -805,6 +807,10 @@ let closeAfterExecutionReclaimsTabEvenWhenSubmissionIsUncertain (scriptStatus: s
     |}))
     do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"personal-tab","agentCreated":false,"availability":"ready","registrationGeneration":1}]}"""
     let! result = launch.WaitAsync(TimeSpan.FromSeconds(3.0))
+    if scriptStatus = "bridgeError" then Assert.That(captured.IsNone, Is.True)
+    else
+        Assert.That(captured.IsSome, Is.True)
+        Assert.That(captured.Value.GetProperty("observedSelection").GetProperty("model").GetString(), Is.EqualTo("shown model"))
     match result with
     | Ok response when scriptStatus = "notSubmitted" ->
         Assert.That(response, Does.Contain("\"cleanup\":\"closed\""))
@@ -1066,6 +1072,7 @@ let everyBrowserCommandHasSafeActivityDetail () =
               WindowRegistration = "agents"; Url = "https://example.test"; Alias = None; Active = None }
           BrowserCloseTabCommand { TabRegistration = "tab" }
           BrowserRunInNewTabCommand {
+              TargetAgentId = None
               WindowRegistration = "agents"; Url = "https://example.test"; ProjectName = "Jarvis"
               ScriptPath = "test.js"; ArgsJson = None; Active = None
               CloseTabAfterExecution = None; TimeoutMs = None }

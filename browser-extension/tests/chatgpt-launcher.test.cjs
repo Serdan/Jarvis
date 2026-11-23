@@ -41,6 +41,9 @@ function harness(options = {}) {
   }
   const makeMode = name => ({
     textContent: name,
+    get innerText() { return options.observableLabels ? name : undefined; },
+    getClientRects() { return options.observableLabels ? [1] : []; },
+    closest() { return null; },
     getAttribute(attribute) {
       return attribute === "aria-pressed" ? String(mode === name) : null;
     },
@@ -116,6 +119,8 @@ function harness(options = {}) {
   };
   const radio = name => ({
     textContent: name,
+    get innerText() { return options.observableLabels ? (this.labelObserved ? (options.displayedModelLabel ?? name) : name) : undefined; },
+    getClientRects() { this.labelObserved = true; return options.observableLabels ? [1] : []; },
     getAttribute(attr) { return attr === "aria-checked" ? String(selectedModel === name) : null; },
     hasAttribute() { return false; }, closest() { return null; },
     click() { modelClicks++; selectedModel = name; view = "simple"; expanded = false; }
@@ -124,6 +129,8 @@ function harness(options = {}) {
   const knob = { getAttribute(name) { return String(name === "aria-valuemax" ? (options.maxEffortStep ?? activeEfforts().length - 1) : activeEfforts().indexOf(reasoningEffort)); } };
   const power = { closest() { return null; }, querySelector(sel) { return sel === '[role="slider"]' ? knob : null; } };
   const powerLabel = {
+    get innerText() { return options.observableLabels ? reasoningEffort : undefined; },
+    getClientRects() { return options.observableLabels ? [1] : []; },
     closest() { return null; },
     get textContent() { return reasoningEffort; },
     getAttribute(name) { return name === "data-power-disabled" ? "false" : null; }
@@ -1054,4 +1061,44 @@ test("missing visible effort label cannot authorize a send from an attribute alo
   const result = await h.run("Never send");
   assert.equal(result.status, "notSubmitted");
   assert.equal(h.clicks, 0);
+});
+
+
+test("unobservable rendered selection remains unknown and does not duplicate Send", async () => {
+  const h = harness();
+  const result = await h.run();
+  assert.equal(result.status, "submitted");
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: null, model: null, effort: null });
+  assert.equal(h.clicks, 1);
+});
+
+
+test("records visible selection labels from rendered controls", async () => {
+  const h = harness({ observableLabels: true });
+  const result = await h.run();
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: "Chat", model: "GPT-6", effort: "Medium" });
+  assert.equal(h.clicks, 1);
+});
+
+
+test("observes Work fallback labels from the rendered selection", async () => {
+  const h = harness({ observableLabels: true, chatInstantAndProOnly: true, reasoningEffort: "Instant", timeoutMs: 12000 });
+  const result = await h.run("No submission", { selectionOnly: true });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: "Work", model: "GPT-6.1 Terra", effort: "Medium" });
+  assert.equal(h.clicks, 0);
+});
+
+test("observes Chat Instant fallback labels from the rendered selection", async () => {
+  const h = harness({ observableLabels: true, maxEffortStep: 0, reasoningEffort: "Instant", timeoutMs: 18000 });
+  const result = await h.run("No submission", { selectionOnly: true });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: "Chat", model: "GPT-6", effort: "Instant" });
+  assert.equal(h.clicks, 0);
+});
+
+
+test("reports rendered model text even when it differs from the requested model", async () => {
+  const h = harness({ observableLabels: true, displayedModelLabel: "Displayed model label" });
+  const result = await h.run();
+  assert.equal(result.observedSelection.model, "Displayed model label");
+  assert.equal(h.clicks, 1);
 });

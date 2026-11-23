@@ -228,7 +228,8 @@ let private runClient args =
         else
             let authCommand =
                 BrowserRunInNewTabCommand
-                    { ProjectName = action.ProjectName; WindowRegistration = action.WindowRegistration
+                    { TargetAgentId = None
+                      ProjectName = action.ProjectName; WindowRegistration = action.WindowRegistration
                       Url = action.Url; ScriptPath = action.ScriptPath
                       ArgsJson = Some action.ArgsJson; Active = Some action.Active
                       CloseTabAfterExecution = Some action.CloseTabAfterExecution

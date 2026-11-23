@@ -299,6 +299,39 @@ type NotificationDelivery =
       NotificationId: string
       AutoReply: string }
 
+// An explicit typed locator; shared review IDs never fall back to a task lookup.
+type IntegrationReviewLocator =
+    | TaskBound of reviewId: Guid
+    | SharedAccepted of reviewId: Guid * approvalOperationId: Guid * reviewRef: string
+
+// Exact evidence approved by the authenticated local Operator Challenge reply
+// route. The approval is an existing immutable canonical operation, not a
+// second integration ledger or a caller-supplied "approved" flag.
+[<CLIMutable>]
+type SharedAcceptedBindingApproval =
+    { Kind: string
+      TaskId: string
+      AttemptId: string
+      AssignmentGeneration: int
+      SpecBlobOid: string
+      ReviewId: string
+      ReviewRef: string
+      ReviewVersion: int
+      ReviewedHeadOid: string
+      SourceRef: string
+      BaseCommit: string
+      TargetRef: string
+      OwnerAgentId: string
+      ReviewerId: string
+      DecisionSequence: int64
+      DecisionOperationId: string
+      SourceRepositoryId: string }
+
+[<CLIMutable>]
+type SharedIntegrationBinding =
+    { ApprovalOperationId: string
+      SubmissionOperationId: string }
+
 [<CLIMutable>]
 type IntegrationSubmission =
     { SubmissionId: string
@@ -322,7 +355,10 @@ type IntegrationSubmission =
       PublicationPreviousHead: string
       PublicationObservedHead: string
       PublicationOperationId: string
-      PublicationMechanism: string }
+      PublicationMechanism: string
+      // Null/absent only for historical task-bound integrations. Shared
+      // reviews must carry their original approval and submission locators.
+      SharedBinding: SharedIntegrationBinding option }
 
 [<CLIMutable>]
 type IntegrationSummary =
@@ -537,6 +573,8 @@ module ReviewWorkflow =
                         // other notification members remain mandatory.
                         || (historicalEvidenceShape && List.contains property historicalEvidenceFields)
                         || (historicalPublicationShape && List.contains property historicalPublicationFields)
+                        || (typeof<'t> = typeof<IntegrationSubmission>
+                            && property = "sharedBinding")
                         || (typeof<'t> = typeof<AgentNotification>
                             && property = "fromProjectName")
                         || (typeof<'t> = typeof<TaskLifecycleEvent>
@@ -1444,12 +1482,214 @@ module ReviewWorkflow =
                      Submissions = submissions }
         }
 
+    // Use the existing authenticated local Operator Challenge reply as the
+    // durable approval. The evidence is a versioned exact identity, not a
+    // human-readable similarity match or a new generic ledger write.
+    let sharedAcceptedBindingApprovalText (approval: SharedAcceptedBindingApproval) =
+        entityJson approval
+
+    let private sharedNamespace = "_reviews"
+    let private realIntegrationTaskId taskId =
+        validTaskId taskId && taskId <> sharedNamespace
+
+    let private exactGuid (format: string) (value: string) =
+        match Guid.TryParseExact(value, format) with
+        | true, id when id <> Guid.Empty && id.ToString(format) = value -> Ok id
+        | _ -> Error(InvalidBinding "Invalid canonical integration evidence UUID.")
+
+    let private operationOrigin binding snapshot operationId = result {
+        let! maybeOperation = LedgerStore.getOperationAt binding snapshot operationId
+        let! operation =
+            match maybeOperation with
+            | Some operation -> Ok operation
+            | None -> Error(InvalidBinding "Missing canonical integration evidence operation.")
+        let! original = LedgerStore.verifiedIntegrationOperationSnapshotAt binding snapshot operation
+        return operation, original
+    }
+
+    let private operationPayload (operation: LedgerOperation) =
+        try
+            use envelope = JsonDocument.Parse(operation.CanonicalRequestJson)
+            use payload = JsonDocument.Parse(envelope.RootElement.GetProperty("request").GetString())
+            if payload.RootElement.ValueKind <> JsonValueKind.Object then
+                Error(InvalidBinding "Canonical integration evidence request must be an object.")
+            else Ok(payload.RootElement.Clone())
+        with _ -> Error(InvalidBinding "Malformed canonical integration evidence request.")
+
+    let private jsonAt binding snapshot path = result {
+        let! body, _ = LedgerStore.readAt binding snapshot path
+        match body with
+        | None -> return! Error(InvalidBinding "Missing canonical integration evidence record.")
+        | Some body ->
+            try
+                use parsed = JsonDocument.Parse(body)
+                return parsed.RootElement.Clone()
+            with _ -> return! Error(LedgerIntegrityError "Malformed canonical integration evidence record.")
+    }
+
+    let private stringMember (element: JsonElement) (name: string) =
+        element.GetProperty(name).GetString()
+
+    let private operationWrote (operation: LedgerOperation) path =
+        not (isNull operation.Paths) && Array.contains path operation.Paths
+
+    let private sameAcceptedReview (original: BranchReview) (current: BranchReview) =
+        (current = original
+         || (not original.Acknowledged && current.Acknowledged
+             && current.Version = original.Version + 1
+             && { current with Version = original.Version; Acknowledged = false } = original))
+
+    let private verifiedSharedDecision binding snapshot (approval: SharedAcceptedBindingApproval) = result {
+        let! reviewId = exactGuid "N" approval.ReviewId
+        let path = branchReviewPath sharedNamespace approval.ReviewId
+        let! review, _ = required<BranchReview> binding snapshot path
+        if review.TaskId <> sharedNamespace || review.ReviewId <> reviewId.ToString("N")
+           || review.Status <> "Accepted" || review.SourceVersion < 1
+           || review.DecisionSequence <= review.CreatedSequence
+           || not (validAgent review.OwnerAgentId && validAgent review.ReviewerId)
+           || review.OwnerAgentId = review.ReviewerId
+           || not (validBranch review.TaskRef && validBranch review.TargetRef)
+           || review.ReviewRef <> reviewRef sharedNamespace approval.ReviewId review.SourceVersion
+           || not (LedgerStore.validSourceCommitOid review.ReviewedHeadOid
+                   && LedgerStore.validSourceCommitOid review.BaseCommit)
+           || approval.ReviewRef <> review.ReviewRef || approval.ReviewVersion <> review.SourceVersion
+           || approval.ReviewedHeadOid <> review.ReviewedHeadOid
+           || approval.SourceRef <> review.TaskRef || approval.BaseCommit <> review.BaseCommit
+           || approval.TargetRef <> review.TargetRef || approval.OwnerAgentId <> review.OwnerAgentId
+           || approval.ReviewerId <> review.ReviewerId || approval.DecisionSequence <> review.DecisionSequence then
+            return! Error(InvalidBinding "Operator binding does not identify an independent immutable Accepted shared review.")
+        let! decisionId = exactGuid "D" approval.DecisionOperationId
+        let! decision, original = operationOrigin binding snapshot decisionId
+        let! accepted, _ = required<BranchReview> binding original path
+        if decision.Sequence <> review.DecisionSequence || not (operationWrote decision path)
+           || not (sameAcceptedReview accepted review) || accepted.Version < 3
+           || accepted.Acknowledged then
+            return! Error(InvalidBinding "Shared review differs from its original canonical decision.")
+        do! LedgerStore.verifyIntegrationOperationIntent binding decision
+                (intent decisionId review.ReviewerId "DecideBranchReview"
+                    {| taskId = sharedNamespace; reviewId = approval.ReviewId
+                       reviewerId = review.ReviewerId; expectedVersion = accepted.Version - 1
+                       status = "Accepted" |})
+        do! LedgerStore.fetchReviewRef binding review.ReviewRef review.ReviewedHeadOid
+        do! LedgerStore.verifySourceAncestry binding review.BaseCommit review.ReviewedHeadOid
+        return review, original
+    }
+
+    let private verifyApprovedTask binding snapshot (review: BranchReview) (approval: SharedAcceptedBindingApproval) = result {
+        if not (realIntegrationTaskId approval.TaskId) || approval.AssignmentGeneration < 1 then
+            return! Error(InvalidBinding "Shared integration requires a real historical task assignment.")
+        let! _ = exactGuid "N" approval.AttemptId
+        let! task, _ = required<ReviewTask> binding snapshot (taskPath approval.TaskId)
+        let! attempt, _ = required<ReviewAttempt> binding snapshot (attemptPath approval.TaskId approval.AttemptId)
+        let! issue, _ = required<AssignmentIssue> binding snapshot
+                            (issuePath approval.TaskId approval.AttemptId approval.AssignmentGeneration)
+        if task.TaskId <> approval.TaskId || task.Lifecycle = "Cancelled"
+           || attempt.TaskId <> approval.TaskId || attempt.AttemptId <> approval.AttemptId
+           || attempt.OwnerAgentId <> approval.OwnerAgentId
+           || attempt.AssignmentGeneration <> approval.AssignmentGeneration
+           || attempt.SpecBlobOid <> approval.SpecBlobOid
+           || issue.TaskId <> approval.TaskId || issue.AttemptId <> approval.AttemptId
+           || issue.Generation <> approval.AssignmentGeneration
+           || issue.IssuedSequence <> attempt.IssuedSequence || issue.IssuedSequence >= review.DecisionSequence
+           || issue.OwnerAgentId <> approval.OwnerAgentId || issue.SpecBlobOid <> approval.SpecBlobOid
+           || not (LedgerStore.validSourceCommitOid approval.SpecBlobOid) then
+            return! Error(InvalidBinding "Operator binding does not match the original task assignment and spec.")
+        let! repository = LedgerStore.sourceRepositoryIdentity binding
+        if approval.SourceRepositoryId <> repository.RepositoryId then
+            return! Error(InvalidBinding "Operator binding refers to another source repository.")
+        // A genuinely unbound historical attempt is supported only with this
+        // explicit immutable approval. A conflicting or partial lease is not.
+        let absent = String.IsNullOrWhiteSpace
+        let unbound = [ attempt.SourceRef; attempt.BaseCommit; attempt.TargetRef
+                        attempt.SourceRepositoryId; attempt.SourceRemote; attempt.SourcePushRemote ]
+                      |> List.forall absent
+        if not unbound then
+            if attempt.SourceRepositoryId <> repository.RepositoryId
+               || attempt.SourceRemote <> repository.FetchUrl
+               || attempt.SourcePushRemote <> repository.PushUrl
+               || attempt.TargetRef <> approval.TargetRef
+               || (not (absent attempt.SourceRef) && attempt.SourceRef <> approval.SourceRef)
+               || not (LedgerStore.validSourceCommitOid attempt.BaseCommit) then
+                return! Error(InvalidBinding "Operator binding conflicts with the historical source lease.")
+            do! LedgerStore.verifySourceAncestry binding attempt.BaseCommit approval.BaseCommit
+        return ()
+    }
+
+    let private verifiedSharedApproval binding snapshot taskId reviewId approvalOperationId = result {
+        let! operation, original = operationOrigin binding snapshot approvalOperationId
+        if operation.Type <> "RespondOperatorCondition"
+           || not (validAgent operation.Actor)
+           || not (operation.Actor.StartsWith("operator:", StringComparison.Ordinal))
+           || operation.Actor.Length <= "operator:".Length then
+            return! Error(ReviewAccessDenied "Shared integration requires an authenticated Operator approval operation.")
+        let! payload = operationPayload operation
+        try
+            let challengeId = stringMember payload "challengeId"
+            let conditionId = stringMember payload "conditionId"
+            let version = payload.GetProperty("expectedVersion").GetInt32()
+            let evidence = stringMember payload "evidence"
+            let! _ = exactGuid "N" challengeId
+            let! _ = exactGuid "N" conditionId
+            do! LedgerStore.verifyIntegrationOperationIntent binding operation
+                    (intent approvalOperationId operation.Actor "RespondOperatorCondition"
+                        {| challengeId = challengeId; conditionId = conditionId; expectedVersion = version
+                           evidence = evidence; reason = "" |})
+            let! approval = decodeEntity<SharedAcceptedBindingApproval> "Operator shared integration approval" evidence
+            use evidenceJson = JsonDocument.Parse(evidence)
+            if (evidenceJson.RootElement.EnumerateObject() |> Seq.length)
+                    <> typeof<SharedAcceptedBindingApproval>.GetProperties().Length + 1
+               || approval.Kind <> "SharedAcceptedIntegrationBinding/v1"
+               || approval.TaskId <> taskId || approval.ReviewId <> reviewId
+               || operation.Sequence <= approval.DecisionSequence then
+                return! Error(InvalidBinding "Operator approval names another task, review or decision.")
+            let challengePath = $"challenges/{challengeId}/challenge.json"
+            let eventPath = $"challenges/{challengeId}/events/{operation.Sequence}.json"
+            if not (operationWrote operation challengePath && operationWrote operation eventPath) then
+                return! Error(InvalidBinding "Operator approval lacks its original challenge event.")
+            let! challenge = jsonAt binding original challengePath
+            let! event = jsonAt binding original eventPath
+            let conditions =
+                challenge.GetProperty("conditions").EnumerateArray()
+                |> Seq.filter (fun condition -> stringMember condition "conditionId" = conditionId)
+                |> Seq.toList
+            if stringMember challenge "challengeId" <> challengeId
+               || stringMember challenge "taskId" <> taskId
+               || challenge.GetProperty("version").GetInt32() <> version + 1
+               || stringMember event "challengeId" <> challengeId
+               || stringMember event "conditionId" <> conditionId
+               || stringMember event "actorId" <> operation.Actor
+               || stringMember event "action" <> operation.Type
+               || stringMember event "evidence" <> evidence
+               || event.GetProperty("sequence").GetInt64() <> operation.Sequence then
+                return! Error(InvalidBinding "Operator approval does not match its original task and event.")
+            match conditions with
+            | [ condition ] when stringMember condition "ownerKind" = "Operator"
+                                 && String.IsNullOrWhiteSpace(stringMember condition "ownerAgentId")
+                                 && stringMember condition "status" = "Satisfied"
+                                 && stringMember condition "evidence" = evidence
+                                 && condition.GetProperty("responseEventSequence").GetInt64() = operation.Sequence -> ()
+            | _ -> return! Error(ReviewAccessDenied "Approval was not the original satisfied Operator condition.")
+            let! review, decisionSnapshot = verifiedSharedDecision binding snapshot approval
+            // Resolve the historical assignment at the decision, not an
+            // arbitrary later attempt which happens to have the same owner.
+            do! verifyApprovedTask binding decisionSnapshot review approval
+            return review, operation.Sequence
+        with
+        | :? JsonException | :? InvalidOperationException | :? System.Collections.Generic.KeyNotFoundException
+        | :? ArgumentException | :? FormatException ->
+            return! Error(InvalidBinding "Malformed canonical Operator binding evidence.")
+    }
+
     // Every new integration is authorized by an Accepted, pinned review, not
     // by the contributor's mutable branch. Old branch-only submissions remain
     // readable and completable, but cannot be created after this migration.
-    let submitIntegration binding operationId taskId actorId submissionId
-                          sourceRef submittedCommit (reviewId: string) targetRef =
-        if not (validTaskId taskId) || not (validAgent actorId)
+    let submitIntegrationWithReview binding operationId taskId actorId submissionId
+                                    sourceRef submittedCommit locator targetRef =
+        let reviewId, approvalId, namespaceId, requestedReviewRef =
+            match locator with
+            | TaskBound id -> id, None, taskId, None
+            | SharedAccepted(id, approval, reviewRef) -> id, Some approval, sharedNamespace, Some reviewRef
+        if not (realIntegrationTaskId taskId) || not (validAgent actorId)
            || submissionId = Guid.Empty || not (validBranch targetRef)
            || targetRef = "refs/heads/jarvis-orchestration"
            || targetRef.StartsWith("refs/heads/jarvis-review/", StringComparison.Ordinal)
@@ -1457,32 +1697,57 @@ module ReviewWorkflow =
            || (not (String.IsNullOrWhiteSpace sourceRef) && not (validBranch sourceRef))
            || (not (String.IsNullOrWhiteSpace submittedCommit)
                && not (LedgerStore.validSourceCommitOid submittedCommit))
-           || (not (match Guid.TryParse reviewId with
-                    | true, id when id <> Guid.Empty -> true
-                    | _ -> false)) then
+           || reviewId = Guid.Empty || approvalId = Some Guid.Empty
+           || (approvalId.IsSome
+               && (String.IsNullOrWhiteSpace sourceRef || String.IsNullOrWhiteSpace submittedCommit
+                   || (requestedReviewRef |> Option.exists String.IsNullOrWhiteSpace))) then
             Error(InvalidBinding "Integration requires a valid Accepted review ID and a normal target branch.")
         else
             // Normalize D and N UUID spellings before creating the ledger intent.
-            let reviewId = (Guid.Parse reviewId).ToString("N")
-            let action = intent operationId actorId "SubmitIntegration"
-                            {| taskId = taskId; submissionId = submissionId
-                               sourceRef = sourceRef; submittedCommit = submittedCommit
-                               reviewId = reviewId; targetRef = targetRef |}
+            let reviewId = reviewId.ToString("N")
+            let action =
+                match approvalId with
+                | None ->
+                    // Preserve the historic task-bound operation hash exactly.
+                    intent operationId actorId "SubmitIntegration"
+                        {| taskId = taskId; submissionId = submissionId
+                           sourceRef = sourceRef; submittedCommit = submittedCommit
+                           reviewId = reviewId; targetRef = targetRef |}
+                | Some approval ->
+                    intent operationId actorId "SubmitIntegration"
+                        {| taskId = taskId; submissionId = submissionId
+                           sourceRef = sourceRef; submittedCommit = submittedCommit
+                           reviewId = reviewId; targetRef = targetRef
+                           reviewNamespace = sharedNamespace; reviewRef = requestedReviewRef.Value
+                           sharedBindingOperationId = approval.ToString("D") |}
             match LegacyDirectWriterFence.findAppliedForLegacyWrite binding action with
             | Error failure -> Error failure
             | Ok(Some applied) -> Ok applied
             | Ok None -> result {
                 let! snapshot = LedgerStore.fetch binding
-                let! _ = required<ReviewTask> binding snapshot (taskPath taskId)
-                let path = branchReviewPath taskId reviewId
-                let! review, _ = required<BranchReview> binding snapshot path
-                if review.TaskId <> taskId || review.ReviewId <> reviewId
+                let! task, _ = required<ReviewTask> binding snapshot (taskPath taskId)
+                if task.TaskId <> taskId then
+                    return! Error(LedgerIntegrityError "Integration task identity mismatch.")
+                if approvalId.IsSome then
+                    if task.Lifecycle = "Cancelled" then
+                        return! Error(InvalidBinding "Cancelled task cannot receive shared integration.")
+                    let! _ = required<ReviewAgent> binding snapshot (agentPath actorId)
+                    let! existing, _ = LedgerStore.readAt binding snapshot (integrationPath taskId submissionId)
+                    if existing.IsSome then
+                        return! Error(InvalidBinding "Integration submission ID already exists.")
+                let path = branchReviewPath namespaceId reviewId
+                let! review =
+                    match approvalId with
+                    | None -> required<BranchReview> binding snapshot path |> Result.map fst
+                    | Some approval -> verifiedSharedApproval binding snapshot taskId reviewId approval |> Result.map fst
+                if review.TaskId <> namespaceId || review.ReviewId <> reviewId
                    || review.Status <> "Accepted" || review.DecisionSequence <= 0L
                    || String.IsNullOrWhiteSpace review.ReviewerId then
                     return! Error(InvalidBinding "Integration requires an Accepted canonical review.")
-                let expectedReviewRef = reviewRef taskId reviewId review.SourceVersion
+                let expectedReviewRef = reviewRef namespaceId reviewId review.SourceVersion
                 if review.SourceVersion < 1
-                   || review.ReviewRef <> expectedReviewRef then
+                   || review.ReviewRef <> expectedReviewRef
+                   || (requestedReviewRef |> Option.exists ((<>) expectedReviewRef)) then
                     return! Error(LedgerIntegrityError "Accepted review has an invalid managed source ref.")
                 if not (LedgerStore.validSourceCommitOid review.ReviewedHeadOid) then
                     return! Error(InvalidBinding "Historical review has no canonical pinned SHA; resubmit it for independent review.")
@@ -1505,9 +1770,17 @@ module ReviewWorkflow =
                 do! LedgerStore.publishIntegrationRefForAction binding action managedRef pinned
                 do! LedgerStore.fetchIntegrationRef binding managedRef pinned
                 return! LegacyDirectWriterFence.transact binding action (fun current -> result {
-                    let! _ = required<ReviewTask> binding current (taskPath taskId)
+                    let! currentTask, _ = required<ReviewTask> binding current (taskPath taskId)
                     let! _ = required<ReviewAgent> binding current (agentPath actorId)
-                    let! latestReview, _ = required<BranchReview> binding current path
+                    if currentTask.TaskId <> taskId then
+                        return! Error(LedgerIntegrityError "Integration task identity mismatch.")
+                    let! latestReview =
+                        match approvalId with
+                        | None -> required<BranchReview> binding current path |> Result.map fst
+                        | Some approval ->
+                            if currentTask.Lifecycle = "Cancelled" then
+                                Error(InvalidBinding "Cancelled task cannot receive shared integration.")
+                            else verifiedSharedApproval binding current taskId reviewId approval |> Result.map fst
                     if latestReview.Status <> "Accepted"
                        || latestReview.Version <> review.Version
                        || latestReview.ReviewRef <> review.ReviewRef
@@ -1530,12 +1803,114 @@ module ReviewWorkflow =
                           Status = "Pending"; CreatedSequence = current.Header.NextSequence
                           IntegratedCommit = null; CompletedAtUtc = null
                           PublicationPreviousHead = null; PublicationObservedHead = null
-                          PublicationOperationId = null; PublicationMechanism = null }
+                          PublicationOperationId = null; PublicationMechanism = null
+                          SharedBinding =
+                            match approvalId with
+                            | None -> None
+                            | Some approval ->
+                                Some { ApprovalOperationId = approval.ToString("D")
+                                       SubmissionOperationId = operationId.ToString("D") } }
                     return [ change recordPath None record ]
                 })
             }
+    // Existing task-bound transport and operation identity stay unchanged.
+    let submitIntegration binding operationId taskId actorId submissionId
+                          sourceRef submittedCommit (reviewId: string) targetRef =
+        match Guid.TryParse reviewId with
+        | true, id ->
+            submitIntegrationWithReview binding operationId taskId actorId submissionId
+                sourceRef submittedCommit (TaskBound id) targetRef
+        | _ -> Error(InvalidBinding "Integration requires a valid Accepted review ID.")
+
+    let private sharedRefPrefix = "refs/heads/jarvis-review/_reviews/"
+
+    let private sharedReceipt (submission: IntegrationSubmission) =
+        submission.SharedBinding.IsSome
+        || (not (isNull submission.ReviewRef)
+            && submission.ReviewRef.StartsWith(sharedRefPrefix, StringComparison.Ordinal))
+
+    let private asPending (submission: IntegrationSubmission) =
+        { submission with Status = "Pending"; IntegratedCommit = null; CompletedAtUtc = null
+                          PublicationPreviousHead = null; PublicationObservedHead = null
+                          PublicationOperationId = null; PublicationMechanism = null }
+
+    // Always recover the original SubmitIntegration operation for managed
+    // records: clearing the locator and rewriting the review ref must not
+    // downgrade a shared binding into an unrelated historical task-bound one.
+    let private verifySharedIntegrationAt binding snapshot taskId (submissionId: Guid)
+                                          (submission: IntegrationSubmission) = result {
+        if not (realIntegrationTaskId taskId) || submission.TaskId <> taskId
+           || submission.SubmissionId <> submissionId.ToString("N") then
+            return! Error(InvalidBinding "Integration receipt does not name a real canonical task.")
+        let path = integrationPath taskId submissionId
+        let! originalOperation = LedgerStore.findIntegrationSubmissionOperationForPathAt binding snapshot path
+        match originalOperation with
+        | None when sharedReceipt submission ->
+            return! Error(InvalidBinding "Shared integration lacks its original submission operation.")
+        | None -> return None
+        | Some operation ->
+            let! payload = operationPayload operation
+            let originalShared = payload.TryGetProperty("sharedBindingOperationId") |> fst
+            if not originalShared && not (sharedReceipt submission) then
+                return None
+            elif not originalShared || submission.SharedBinding.IsNone then
+                return! Error(InvalidBinding "Shared integration locator differs from the original submission.")
+            else
+                let! submissionOperationId = exactGuid "D" submission.SharedBinding.Value.SubmissionOperationId
+                let! approvalId = exactGuid "D" submission.SharedBinding.Value.ApprovalOperationId
+                if operation.OperationId <> submissionOperationId.ToString("D")
+                   || operation.Sequence <> submission.CreatedSequence
+                   || operation.Actor <> submission.ActorId then
+                    return! Error(InvalidBinding "Shared integration submission operation identity mismatch.")
+                let! original = LedgerStore.verifiedIntegrationOperationSnapshotAt binding snapshot operation
+                let! pending = getIntegrationSubmissionAt binding original taskId submissionId
+                if pending.Status <> "Pending" || pending.SharedBinding.IsNone
+                   || pending <> asPending submission then
+                    return! Error(InvalidBinding "Shared integration receipt differs from its original immutable submission.")
+                try
+                    let requestedSource = stringMember payload "sourceRef"
+                    let requestedCommit = stringMember payload "submittedCommit"
+                    do! LedgerStore.verifyIntegrationOperationIntent binding operation
+                            (intent submissionOperationId submission.ActorId "SubmitIntegration"
+                                {| taskId = taskId; submissionId = submissionId
+                                   sourceRef = requestedSource; submittedCommit = requestedCommit
+                                   reviewId = submission.ReviewId; targetRef = submission.TargetRef
+                                   reviewNamespace = sharedNamespace; reviewRef = submission.ReviewRef
+                                   sharedBindingOperationId = approvalId.ToString("D") |})
+                    let! review, approvalSequence =
+                        verifiedSharedApproval binding snapshot taskId submission.ReviewId approvalId
+                    if approvalSequence >= operation.Sequence
+                       || submission.ReviewRef <> review.ReviewRef
+                       || submission.ReviewVersion <> review.SourceVersion
+                       || submission.ReviewedHeadOid <> review.ReviewedHeadOid
+                       || submission.SubmittedCommit <> review.ReviewedHeadOid
+                       || submission.SourceRef <> review.TaskRef || submission.TargetRef <> review.TargetRef
+                       || submission.IntegrationRef <> $"refs/heads/jarvis-integration/{submissionId:N}"
+                       || requestedSource <> review.TaskRef
+                       || requestedCommit <> review.ReviewedHeadOid then
+                        return! Error(InvalidBinding "Shared integration source or approval changed.")
+                    return Some review
+                with
+                | :? InvalidOperationException | :? System.Collections.Generic.KeyNotFoundException ->
+                    return! Error(InvalidBinding "Malformed shared integration submission operation.")
+    }
+
+    // The WorkComposition consumer and completion share the same locator
+    // resolution. No fallback from a failed shared proof to task-bound review.
+    let getIntegrationReviewAt binding snapshot taskId submissionId submission = result {
+        let! shared = verifySharedIntegrationAt binding snapshot taskId submissionId submission
+        match shared with
+        | Some review -> return review
+        | None ->
+            let! reviewId = exactGuid "N" submission.ReviewId
+            let! review, _ = required<BranchReview> binding snapshot (branchReviewPath taskId submission.ReviewId)
+            if review.TaskId <> taskId || review.ReviewId <> reviewId.ToString("N") then
+                return! Error(LedgerIntegrityError "Canonical integration review identity mismatch.")
+            return review
+    }
+
     let completeIntegration binding operationId taskId actorId submissionId integratedCommit =
-        if not (validTaskId taskId) || not (validAgent actorId)
+        if not (realIntegrationTaskId taskId) || not (validAgent actorId)
            || submissionId = Guid.Empty then
             Error(InvalidBinding "Invalid integration completion.")
         else
@@ -1548,9 +1923,10 @@ module ReviewWorkflow =
             | Ok None -> result {
                 let! snapshot = LedgerStore.fetch binding
                 let path = integrationPath taskId submissionId
-                let! currentRecord, _ = required<IntegrationSubmission> binding snapshot path
+                let! currentRecord, currentOid = required<IntegrationSubmission> binding snapshot path
                 if currentRecord.Status <> "Pending" then
                     return! Error(StaleEntityVersion "Integration submission is already completed.")
+                let! shared = verifySharedIntegrationAt binding snapshot taskId submissionId currentRecord
                 // Legacy branch-only entries keep the original read-only
                 // receipt semantics. New managed entries must NEVER accept an
                 // external push merely because present ancestry looks sound:
@@ -1590,6 +1966,11 @@ module ReviewWorkflow =
                     let! existing, oid = required<IntegrationSubmission> binding current path
                     if existing.Status <> "Pending" then
                         return! Error(StaleEntityVersion "Integration submission is already completed.")
+                    if oid <> currentOid then
+                        return! Error(StaleEntityVersion "Integration receipt changed during publication.")
+                    if shared.IsSome then
+                        let! _ = verifySharedIntegrationAt binding current taskId submissionId existing
+                        ()
                     return [ change path (Some oid)
                                 { existing with Status = "Integrated"
                                                 IntegratedCommit = integratedCommit

@@ -170,12 +170,8 @@ module WorkCompositionAcceptanceAdapter =
                     | _ -> Error(InvalidBinding "Invalid composition integration receipt ID.")
             let! submission =
                 ReviewWorkflow.getIntegrationSubmissionAt binding snapshot taskId submissionId
-            let! reviewId =
-                match Guid.TryParseExact(submission.ReviewId, "N") with
-                | true, id when id <> Guid.Empty -> Ok id
-                | _ -> Error(LedgerIntegrityError "Composition integration has an invalid review ID.")
             let! review =
-                ReviewWorkflow.getBranchReviewAt binding snapshot taskId reviewId
+                ReviewWorkflow.getIntegrationReviewAt binding snapshot taskId submissionId submission
             let valid =
                 submission.Status = "Integrated"
                 && nonBlank submission.IntegrationRef

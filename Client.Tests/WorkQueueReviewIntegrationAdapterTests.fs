@@ -60,7 +60,7 @@ module private Wq05Fixture =
           IntegratedCommit = null
           CompletedAtUtc = null
           PublicationPreviousHead = null; PublicationObservedHead = null
-          PublicationOperationId = null; PublicationMechanism = null }
+          PublicationOperationId = null; PublicationMechanism = null; SharedBinding = None }
 
     let subscriptions =
         Map.ofList [

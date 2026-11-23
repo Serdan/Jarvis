@@ -332,56 +332,216 @@ if (process.env.JARVIS_STAGEB_SOURCE_ROOT) {
     const program = readFileSync(pathJoin(nativeDir, "Program.fs"), "utf8");
     const marker = "let main _ =\n    try\n";
     assert.equal(program.split(marker).length, 2, "Native entrypoint changed; fail closed");
+    const { createHash } = await import("node:crypto");
     const seeds = Array.from({ length: 8 }, (_, i) => i + 101);
-    for (const seed of seeds) {
-      const generated = generateEffectTrace(seed);
-      assert.equal(generated.sent, seed % 2 === 1);
-      assert.ok(generated.trace.some(e => e.kind ===
-        (generated.sent ? "sendLost" : "attemptLateSend")));
-      assert.ok(generated.trace.some(e => e.expect === "FakeAccountReleased"));
-    }
-    const injected = String.raw`        test "PhaseB generated oracle projection 8 seeded three-clone traces" (fun () ->
-            for seed in [| @@SEEDS@@ |] do
+    const guidFor = name => {
+      const h = createHash("sha256").update("phaseb-w13:" + name).digest("hex");
+      return [h.slice(0, 8), h.slice(8, 12), h.slice(12, 16),
+        h.slice(16, 20), h.slice(20, 32)].join("-");
+    };
+    // Execute the actual generated commands, in order, on disposable B1 clones.
+    // Projection intentionally does not silently equate provider authentication,
+    // prospective seals, or independent provider/account histories with B1.
+    const projectTrace = seed => {
+      const { trace } = generateEffectTrace(seed);
+      let state = "None", account = "Reserved", callbacks = 0;
+      let terminalOp = null, providerTerminal = false;
+      const events = [], unsupported = [];
+      const note = (index, reason) => unsupported.push({ index, kind: trace[index].kind,
+        op: trace[index].cmd?.op ?? null, reason });
+      for (const [index, action] of trace.entries()) {
+        const cmd = action.cmd;
+        const client = action.client ?? ((seed + index) % 3);
+        const op = cmd?.op ?? ("s" + seed + "-" + action.kind + "-" + index);
+        let kind, code = "Observed", proofStatus = "Terminal";
+        if (action.kind === "project") {
+          switch (cmd.kind) {
+            case "claim":
+              kind = "claim";
+              if (state === "None") { state = "Claimed"; code = "Applied"; }
+              else code = "Denied";
+              break;
+            case "start":
+              kind = "start";
+              if (state === "Claimed") {
+                state = "Dispatching"; callbacks++; code = "Applied";
+                note(index, "B1 combines dispatch marker and fake callback; Phase A separates start/send");
+              } else code = "Denied";
+              break;
+            case "noSend":
+              kind = "noSend";
+              if (state === "Claimed") { state = "VerifiedNoSend"; terminalOp = op; code = "Applied"; }
+              else code = "Denied";
+              note(index, "B1 allows pre-dispatch fake no-send only; Phase A provider seal and post-start proof are not equivalent");
+              break;
+            case "terminal":
+              if (cmd.proof?.session === "forged") {
+                note(index, "B1 cannot authenticate a provider session; foreign-session proof unsupported");
+                continue;
+              }
+              if (!providerTerminal && cmd.proof?.status === "Terminal") {
+                note(index, "B1 cannot prove real provider terminal timing; premature terminal omitted");
+                continue;
+              }
+              kind = "terminal";
+              proofStatus = cmd.proof?.status ?? "Unknown";
+              if (state === "Dispatching" && proofStatus === "Terminal") {
+                state = "VerifiedFakeTerminal"; terminalOp = op; code = "Applied";
+              } else if (state === "VerifiedFakeTerminal" && op === terminalOp) {
+                code = proofStatus === "Terminal" ? "AlreadyApplied" : "Reused";
+              } else code = "Denied";
+              note(index, "B1 fake terminal marker is not authenticated provider receipt");
+              break;
+            case "release":
+              kind = "release";
+              if ((state === "VerifiedFakeTerminal" || state === "VerifiedNoSend") &&
+                  account === "Reserved") { account = "Released"; code = "Applied"; }
+              else code = "Denied";
+              note(index, "B1 release writes fake account CAS without a separate Phase A project Released state");
+              break;
+            case "observe":
+              kind = "observe"; break;
+            default: throw new Error("Unprojected project command: " + cmd.kind);
+          }
+        } else {
+          switch (action.kind) {
+            case "restart":
+              kind = "observe";
+              note(index, "Native fresh ledger read is not provider process restart");
+              break;
+            case "sendLost":
+              kind = "observe";
+              note(index, "Native port callback occurs in start; independent provider ACK-loss is unsupported");
+              break;
+            case "retrySend":
+              kind = "retry";
+              code = "Denied";
+              note(index, "Native guarded retry proves no new callback, not provider receipt deduplication");
+              break;
+            case "markTerminal":
+              kind = "observe";
+              providerTerminal = true;
+              note(index, "Provider terminal observation has no independent native provider store");
+              break;
+            case "captureDispatch":
+              kind = "observe";
+              note(index, "Retained stale provider authorization is outside B1 fake-port adapter");
+              break;
+            case "attemptLateSend":
+              kind = "late"; code = "Denied";
+              note(index, "Native guarded retry is not an external stale-provider callback");
+              break;
+            case "accountRelease":
+              kind = "observe";
+              note(index, "Native fake-account release occurred with prior release command");
+              break;
+            default: throw new Error("Unprojected effect event: " + action.kind);
+          }
+        }
+        events.push({ kind, op, operationId: guidFor(op), client, code,
+          state, account, callbacks, proofStatus, index });
+      }
+      assert.ok(events.length >= 20, "Generated native-representable event coverage missing");
+      assert.ok(events.some(x => x.kind === "claim") && events.some(x => x.kind === "start"));
+      return { seed, events, unsupported };
+    };
+    const projected = seeds.map(projectTrace);
+    assert.ok(new Set(projected.map(p => p.events.map(e => e.op).join("|"))).size === seeds.length,
+      "Generated histories must remain genuinely seed-distinct");
+    assert.ok(projected.every(p => p.unsupported.length > 0),
+      "B1 must not claim full cross-provider Phase A history parity");
+    const quote = JSON.stringify;
+    const histories = projected.map(p => "(" + p.seed + ", [| " +
+      p.events.map(e => "(" + [
+        quote(e.kind), quote(e.op), quote(e.operationId), String(e.client),
+        quote(e.code), quote(e.state), quote(e.account),
+        String(e.callbacks), quote(e.proofStatus)
+      ].join(", ") + ")").join("; ") + " |])").join(";\n                ");
+    const injected = String.raw`        test "PhaseB projected generated per-event B1 safety (full traces unsupported)" (fun () ->
+            let classify result =
+                match result with
+                | Ok written when written.AlreadyApplied -> "AlreadyApplied"
+                | Ok _ -> "Applied"
+                | Error OperationIdReused -> "Reused"
+                | Error _ -> "Denied"
+            let histories = [| @@HISTORIES@@ |]
+            for (seed, history) in histories do
                 withFixture (fun f ->
                     let c = makeClaim f f.Worker
-                    let mutable callbackCount = 0
+                    let mutable calls = 0
+                    let mutable terminalId = Guid.Empty
                     let port (_: NativeEffectRecord) =
-                        callbackCount <- callbackCount + 1
+                        calls <- calls + 1
                         Ok (fakeTerminal c.EffectId "Unknown")
-                    claim f.One c |> success |> ignore
-                    if seed % 2 = 1 then
-                        let first = dispatchFakePort f.Two f.Worker c.EffectId (Guid.NewGuid()) port |> success
-                        check (first.Status = "Unknown") "Expected uncertain first callback"
-                        dispatchFakePort f.Three f.Worker c.EffectId (Guid.NewGuid()) port |> denied
-                        let noSend = { Marker = "STAGE_B_DISPOSABLE_FAKE_NO_SEND/v1"; Reason = "uncertain" }
-                        recordFakeNoSend f.One f.Worker c.EffectId (Guid.NewGuid()) noSend |> denied
-                        releaseFakeReservation f.One f.AccountTwo f.Worker c.EffectId (Guid.NewGuid()) (Guid.NewGuid()) |> denied
-                        check ((fakeState f c.Account).Status = "Reserved") "Unknown released account"
-                        let terminalId = Guid.NewGuid()
-                        let terminal = fakeTerminal c.EffectId "Terminal"
-                        recordFakeTerminal f.Three f.Worker c.EffectId terminalId terminal |> success |> ignore
-                        recordFakeTerminal f.One f.Worker c.EffectId terminalId { terminal with Status = "Unknown" } |> reused
-                        releaseFakeReservation f.Two f.AccountThree f.Worker c.EffectId terminalId (Guid.NewGuid()) |> success |> ignore
-                        check ((get f f.Worker).Status = "VerifiedFakeTerminal") "Native terminal projection"
-                    else
-                        let noSend = { Marker = "STAGE_B_DISPOSABLE_FAKE_NO_SEND/v1"; Reason = "prestart" }
-                        let terminalId = Guid.NewGuid()
-                        recordFakeNoSend f.Two f.Worker c.EffectId terminalId noSend |> success |> ignore
-                        dispatchFakePort f.Three f.Worker c.EffectId (Guid.NewGuid()) port |> denied
-                        releaseFakeReservation f.One f.AccountTwo f.Worker c.EffectId terminalId (Guid.NewGuid()) |> success |> ignore
-                        check ((get f f.Worker).Status = "VerifiedNoSend") "Native prestart no-send projection"
-                        // Synthetic RED canary deliberately bypasses the native guard.
-                        // It represents a stale external callback, not a production claim.
-                        if seed = 102 && Environment.GetEnvironmentVariable("NATIVE_DIFF_MUTANT") = "1" then
-                            port (get f f.Worker) |> ignore
-                    let expected = if seed % 2 = 1 then 1 else 0
-                    check (callbackCount = expected) "UnsafeLateProviderAccept"
-                    check ((fakeState f c.Account).Status = "Released") "Fake account once-release"
-                    dispatchFakePort f.Three f.Worker c.EffectId (Guid.NewGuid()) port |> denied
-                    check (callbackCount = expected) "Native rearmed fake callback"
+                    for (index, (kind, op, operation, client, expectedCode,
+                                 expectedStatus, expectedAccount, expectedCalls, proofStatus))
+                                 in history |> Array.indexed do
+                        let id = Guid.Parse operation
+                        let binding = match client with
+                                      | 0 -> f.One | 1 -> f.Two | _ -> f.Three
+                        let accountBinding = match client with
+                                             | 0 -> f.AccountTwo
+                                             | 1 -> f.AccountThree
+                                             | _ -> f.AccountOne
+                        let code =
+                            match kind with
+                            | "claim" ->
+                                claim binding { c with OperationId = id } |> classify
+                            | "start" | "retry" | "late" ->
+                                let result =
+                                    match dispatchFakePort binding f.Worker c.EffectId id port with
+                                    | Ok _ -> "Applied"
+                                    | Error _ -> "Denied"
+                                // A controlled synthetic mutation bypasses only the
+                                // fixture's guarded port, never the accepted B1 source.
+                                if kind = "late" && seed = 102 &&
+                                   Environment.GetEnvironmentVariable("NATIVE_DIFF_MUTANT") = "1" then
+                                    port (get f f.Worker) |> ignore
+                                result
+                            | "noSend" ->
+                                let proof =
+                                    { Marker = "STAGE_B_DISPOSABLE_FAKE_NO_SEND/v1"
+                                      Reason = "projected-" + op }
+                                let result =
+                                    recordFakeNoSend binding f.Worker c.EffectId id proof |> classify
+                                if result = "Applied" then terminalId <- id
+                                result
+                            | "terminal" ->
+                                let result =
+                                    recordFakeTerminal binding f.Worker c.EffectId id
+                                        (fakeTerminal c.EffectId proofStatus) |> classify
+                                if result = "Applied" then terminalId <- id
+                                result
+                            | "release" ->
+                                releaseFakeReservation binding accountBinding f.Worker
+                                    c.EffectId terminalId id |> classify
+                            | "observe" ->
+                                get f f.Worker |> ignore
+                                "Observed"
+                            | _ -> failwithf "Unknown projected kind %s" kind
+                        let state = (get f f.Worker).Status
+                        let account = (fakeState f c.Account).Status
+                        check (code = expectedCode)
+                            (sprintf "NativeOutcome seed=%d index=%d op=%s got=%s expected=%s"
+                                seed index op code expectedCode)
+                        check (state = expectedStatus)
+                            (sprintf "NativeStateDifferential seed=%d index=%d op=%s got=%s expected=%s"
+                                seed index op state expectedStatus)
+                        check (account = expectedAccount)
+                            (sprintf "NativeAccountDifferential seed=%d index=%d op=%s got=%s expected=%s"
+                                seed index op account expectedAccount)
+                        check (calls = expectedCalls)
+                            (sprintf "UnsafeLateProviderAccept seed=%d index=%d op=%s calls=%d expected=%d"
+                                seed index op calls expectedCalls)
+                        printfn "NATIVE_PHASEB_EVENT %d|%d|%s|%s|%s|%s|%d|%d"
+                            seed index op code state account calls client
                 ))
 `;
-    const source = program.replace(marker, marker + injected.replace("@@SEEDS@@", seeds.join("; ")));
+    const source = program.replace(marker, marker + injected.replace("@@HISTORIES@@", histories));
+    for (const seed of seeds) {
+      assert.ok(source.includes("s" + seed + "-claim"),
+        "Generated native history missing seed " + seed + " command identity");
+    }
     const scratch = temp(pathJoin(tempRoot(), "jarvis-native-phaseb-w13-"));
     try {
       const fsproj = project
@@ -398,13 +558,27 @@ if (process.env.JARVIS_STAGEB_SOURCE_ROOT) {
       const transcript = (result.stdout || "") + "\n" + (result.stderr || "");
       console.log("Native accepted SHA:", accepted, "seeds:", seeds.join(","));
       console.log("Scoped .NET11 Release exit:", result.status, "signal:", result.signal);
-      console.log(transcript);
+      for (const p of projected)
+        console.log("NATIVE_PHASEB_UNSUPPORTED " + JSON.stringify({
+          seed: p.seed, count: p.unsupported.length,
+          reasons: [...new Set(p.unsupported.map(e => e.reason))] }));
+      console.log(result.status === 0
+        ? transcript.split(/\r?\n/).filter(s => /PASS |Release PASS/.test(s)).join("\n")
+        : transcript.split(/\r?\n/).filter(s => /error FS|FAIL|UnsafeLate|NativeOutcome|NativeState|NativeAccount|Unexpected/.test(s)).slice(0, 22).join("\n"));
       if (process.env.NATIVE_DIFF_MUTANT === "1") {
         assert.notEqual(result.status, 0, "Unsafe late-send mutant must be RED");
         assert.match(transcript, /UnsafeLateProviderAccept/);
       } else {
         assert.equal(result.status, 0, "Native source-bound GREEN failed:\n" + transcript);
-        assert.match(transcript, /PASS PhaseB generated oracle projection/);
+        assert.match(transcript, /PASS PhaseB projected generated per-event B1 safety/);
+        const expectedEvents = projected.flatMap(p => p.events.map((e, ordinal) =>
+          [p.seed, ordinal, e.op, e.code, e.state, e.account,
+            e.callbacks, e.client].join("|")));
+        const nativeEvents = result.stdout.split(/\r?\n/).filter(x =>
+          x.startsWith("NATIVE_PHASEB_EVENT ")).map(x =>
+          x.slice("NATIVE_PHASEB_EVENT ".length));
+        assert.deepEqual(nativeEvents, expectedEvents,
+          "Each native typed event/outcome/account/callback must match the generated projection");
         assert.match(transcript, /STAGE_B_DISPOSABLE_TEST_ONLY .NET 11 Release PASS 24/);
       }
     } finally {

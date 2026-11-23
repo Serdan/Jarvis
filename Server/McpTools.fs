@@ -997,6 +997,28 @@ module McpToolHelpers =
                                     if not (isNull factory) then
                                         let logger = factory.CreateLogger("Jarvis.AgentStateInvalidation")
                                         logger.LogWarning(ex, "Could not deliver agent-state invalidation hints.")
+
+                            // Queue/clear do not mutate the agent record, so
+                            // they must not be reported as AgentStateChanges.
+                            // Reuse the existing targeted SignalR invalidation
+                            // solely as a hint for other devices' alert probes.
+                            match command with
+                            | TaskWriteCommand alert
+                                when (alert.Action = "QueueResponseAlert"
+                                      || alert.Action = "ClearResponseAlert")
+                                     && not (String.IsNullOrWhiteSpace alert.OwnerId)
+                                     && response.Result.IsSome
+                                     && response.Error.IsNone
+                                     && response.PendingJob.IsNone ->
+                                try
+                                    do! client.InvalidateAgentStatesForUser(
+                                        userId, alert.ProjectName, [| alert.OwnerId |])
+                                with ex ->
+                                    let factory = context.RequestServices.GetService<ILoggerFactory>()
+                                    if not (isNull factory) then
+                                        factory.CreateLogger("Jarvis.ResponseAlertInvalidation")
+                                            .LogWarning(ex, "Could not deliver response-alert invalidation hint.")
+                            | _ -> ()
                         }
                     // Cross-project notifications validate the sender before
                     // dispatching to the destination. A promoted source read

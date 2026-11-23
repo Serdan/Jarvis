@@ -1608,13 +1608,15 @@ module ReviewWorkflow =
             return queue, Some oid
     }
 
+    let getResponseAlertsAt binding snapshot agentId =
+        if not (validAgent agentId) then Error(InvalidBinding "Invalid alert target.")
+        else responseAlertsAt binding snapshot agentId |> Result.map fst
+
     let getResponseAlerts binding agentId =
         if not (validAgent agentId) then Error(InvalidBinding "Invalid alert target.")
         else
             LedgerStore.fetch binding
-            |> Result.bind (fun snapshot ->
-                responseAlertsAt binding snapshot agentId
-                |> Result.map fst)
+            |> Result.bind (fun snapshot -> getResponseAlertsAt binding snapshot agentId)
 
     let queueResponseAlert binding operationId actorId targetAgentId message =
         if not (validAgent targetAgentId) || not (validText 1536 message) then

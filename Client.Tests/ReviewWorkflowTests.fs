@@ -6679,16 +6679,18 @@ type ReviewWorkflowTests() =
                         { ProjectName = "owner"; JobId = "missing-job"; AfterSequence = None }
                 ReviewWorkflow.queueResponseAlert second (Guid.NewGuid()) "Lead"
                     "Reviewer" "Please preserve test evidence" |> success |> ignore
+                (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" "Owner").GetAwaiter().GetResult()
                 let (ownerReply, io) =
                     LedgerStore.measureGitReads (fun () -> invoke "Owner" poll)
                 let _, _, other = ownerReply
-                Assert.That(io.RemoteFetches, Is.EqualTo(1),
-                            "A no-alert tool reply must reuse its verified ledger snapshot.")
+                Assert.That(io.RemoteFetches, Is.EqualTo(0),
+                            "A verified no-alert job poll must do zero synchronous remote Git fetches.")
                 Assert.That(other.Instructions |> List.exists (fun item ->
                     item.Scope = "response-alert"), Is.False)
                 Assert.That((ReviewWorkflow.getResponseAlerts first "Reviewer" |> success).Pending.Length, Is.EqualTo(1))
                 ReviewWorkflow.queueResponseAlert first (Guid.NewGuid()) "Lead"
                     "Reviewer" "STOP — commit safe changes and yield" |> success |> ignore
+                (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" "Reviewer").GetAwaiter().GetResult()
                 let _, polled, delivered = invoke "Reviewer" poll
                 Assert.That(polled.IsError, Is.True)
                 let alerts = delivered.Instructions |> List.filter (fun item ->
@@ -6715,6 +6717,7 @@ type ReviewWorkflowTests() =
                     Common.ReadFileCommand
                         { ProjectName = "owner"; FilePath = "missing-file"; StartLine = None
                           EndLine = None; IncludeLineNumbers = None }
+                (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" "Reviewer").GetAwaiter().GetResult()
                 let _, missingResult, missingReply = invoke "Reviewer" missing
                 Assert.That(missingResult.IsError, Is.True)
                 Assert.That(missingReply.Instructions |> List.exists (fun item ->
@@ -6723,6 +6726,93 @@ type ReviewWorkflowTests() =
             finally
                 if File.Exists configPath then File.Delete configPath
                 if File.Exists(configPath + ".lock") then File.Delete(configPath + ".lock"))
+    [<Test>]
+    member _.ResponseAlertPresenceIsNonblockingAndRecoversClearsAndLostHints() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            try
+                let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+                let head = (LedgerStore.fetch first |> success).Commit
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" context first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl head true
+                |> success |> ignore
+                let runtime =
+                    Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+                let poll : Common.AgentCommand =
+                    Common.GetJobResultCommand
+                        { ProjectName = "owner"; JobId = "missing-job"; AfterSequence = None }
+                let invoke actor =
+                    Client.SignalR.Client.processIncomingCommand runtime
+                        (System.Text.Json.JsonSerializer.Serialize(poll)) actor
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                let refresh actor =
+                    (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" actor).GetAwaiter().GetResult()
+                let shown (reply: Common.AgentCommandResponse) =
+                    reply.Instructions |> List.filter (fun item -> item.Scope = "response-alert")
+
+                refresh "Owner"
+                refresh "Reviewer"
+                let (ownerPoll, count) = LedgerStore.measureGitReads (fun () -> invoke "Owner")
+                Assert.That(count.RemoteFetches, Is.EqualTo(0),
+                            "A no-alert poll cannot wait on a remote Git fetch.")
+                let _, _, ownerResponse = ownerPoll
+                Assert.That(shown ownerResponse, Is.Empty)
+
+                // A lost hint does not convert the cache into ledger authority.
+                let firstId = Guid.NewGuid()
+                ReviewWorkflow.queueResponseAlert first firstId "Lead" "Reviewer"
+                    "STOP — deliver only after a verified refresh" |> success |> ignore
+                let _, _, before = invoke "Reviewer"
+                Assert.That(shown before, Is.Empty)
+                Assert.That((ReviewWorkflow.getResponseAlerts second "Reviewer" |> success).Pending.Length,
+                            Is.EqualTo(1))
+                // SignalR invalidation triggers background reconciliation;
+                // this explicit diagnostic refresh makes the test deterministic.
+                Client.SignalR.Client.invalidateAgentStates runtime "owner" [| "Reviewer" |]
+                refresh "Reviewer"
+                Assert.That(Client.SignalR.Client.responseAlertProbePending runtime "owner" "Reviewer",
+                            Is.True, "The refresh must verify a pending alert in the client-local probe.")
+                let _, _, delivered = invoke "Reviewer"
+                Assert.That(shown delivered |> List.map _.Content,
+                            Has.Some.Contains("deliver only after a verified refresh"))
+                Assert.That((ReviewWorkflow.getResponseAlerts first "Reviewer" |> success).Pending, Is.Empty)
+
+                // A queued but subsequently cleared alert must never be
+                // reconstructed from a stale positive presence observation.
+                let clearedId = Guid.NewGuid()
+                ReviewWorkflow.queueResponseAlert first clearedId "Lead" "Reviewer"
+                    "STOP — clear before reply" |> success |> ignore
+                refresh "Reviewer"
+                ReviewWorkflow.clearResponseAlert second (Guid.NewGuid()) "Lead" "Reviewer" clearedId
+                |> success |> ignore
+                // The receiver still has an earlier positive presence hint,
+                // but a clear won the canonical queue race. A fresh CAS read
+                // must never resurrect that cleared message.
+                let _, _, stalePositive = invoke "Reviewer"
+                Assert.That(shown stalePositive, Is.Empty)
+                Client.SignalR.Client.invalidateAgentStates runtime "owner" [| "Reviewer" |]
+                refresh "Reviewer"
+                let _, _, cleared = invoke "Reviewer"
+                Assert.That(shown cleared, Is.Empty)
+
+                // Periodic reconciliation does not depend on a fresh hint.
+                // Invoke the same canonical reconciler used by its 15-second timer.
+                ReviewWorkflow.queueResponseAlert second (Guid.NewGuid()) "Lead" "Reviewer"
+                    "STOP — recover after missed hint" |> success |> ignore
+                let _, _, missed = invoke "Reviewer"
+                Assert.That(shown missed, Is.Empty)
+                refresh "Reviewer"
+                let _, _, recovered = invoke "Reviewer"
+                Assert.That(shown recovered |> List.map _.Content,
+                            Has.Some.Contains("recover after missed hint"))
+                Assert.That((ReviewWorkflow.getResponseAlerts first "Reviewer" |> success).Pending, Is.Empty)
+                let _, _, after = invoke "Reviewer"
+                Assert.That(shown after, Is.Empty, "Consumed STOP may not replay.")
+            finally
+                if File.Exists configPath then File.Delete configPath
+                if File.Exists(configPath + ".lock") then File.Delete(configPath + ".lock"))
+
     [<Test>]
     member _.PromotedJobAlertsOnlyConsumeAtVisibleResponsesWithoutReplayOrStranding() =
         withFixture (fun one _ first second _ _ _ _ ->
@@ -6799,6 +6889,7 @@ type ReviewWorkflowTests() =
                 Assert.That((stored firstHandle.JobId).ToolResponse, Is.EqualTo(Some original))
                 Assert.That((ReviewWorkflow.getResponseAlerts second actor |> success).Pending.Length,
                             Is.EqualTo(1), "Background completion must not consume STOP.")
+                (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" actor).GetAwaiter().GetResult()
                 let firstPoll = visiblePoll firstHandle.JobId
                 Assert.That(alertInstructions firstPoll |> List.map _.Content,
                             Has.Some.Contains("only first completed poll"))
@@ -6823,6 +6914,7 @@ type ReviewWorkflowTests() =
                           TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let unrelatedReply = { original with Instructions = []; AgentStateChanges = [] }
+                (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" actor).GetAwaiter().GetResult()
                 let visible =
                     Client.SignalR.Client.executeOrPromoteWith runtime (serialize unrelated)
                         actor (TimeSpan.FromSeconds 3.)
@@ -6879,6 +6971,7 @@ type ReviewWorkflowTests() =
                 let poll : Common.AgentCommand =
                     Common.GetJobResultCommand
                         { ProjectName = "owner"; JobId = "missing-job"; AfterSequence = None }
+                (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" "Owner").GetAwaiter().GetResult()
                 let _, polled, response = invoke poll
                 Assert.That(polled.IsError, Is.True)
                 Assert.That(response.Instructions |> List.exists (fun item ->

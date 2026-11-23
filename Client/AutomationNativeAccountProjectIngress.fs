@@ -122,6 +122,34 @@ let private receiptBinds (receipt: AccountOperationReceipt) (record: NativeReser
             && outcome.RootElement.GetProperty("canonicalKey").GetString() = record.CanonicalKey
     with _ -> false
 
+let private verifiedWorkerPolicy root (account: AccountBinding) operatorKey subject projects
+                                 (coverage: NativeDisposableCoverage) (claim: StartedProjectClaim) =
+    let projection =
+        AccountCapacityLedger.readVerifiedDisposableNativeRosterPolicy
+            root account operatorKey subject projects
+    let candidate = claim.Candidate
+    match projection.Policy with
+    | Some policy when
+        projection.Status = "PolicyVerified"
+        && projection.VerifiedAccountHead = Some claim.AccountHead
+        && coverage.AccountHead = claim.AccountHead
+        && Set.ofArray projection.VerifiedProjectHeads = Set.ofArray coverage.ProjectHeads
+        && policy.MembershipComplete
+        && policy.AccountId = account.AccountId.ToString("D")
+        && policy.AccountLedgerId = account.LedgerId.ToString("D")
+        && policy.AccountEpoch = account.Epoch ->
+        let memberProject =
+            policy.Projects |> Array.tryFind (fun project ->
+                project.ProjectId = candidate.ProjectId
+                && project.LedgerId = candidate.ProjectLedgerId
+                && project.Epoch = candidate.ProjectEpoch)
+        match memberProject with
+        | Some project when candidate.Kind = "Worker"
+                            && policy.AccountLimits.Worker > 0
+                            && project.Limits.Worker > 0 -> Ok ()
+        | _ -> bad "Current signed roster denies Worker pre-send"
+    | _ -> stale "Current signed roster does not match the verified account and project heads"
+
 let private verifiedReservation root (account: AccountBinding) operatorKey subject
                                 (projects: LedgerBinding array)
                                 (coverage: NativeDisposableCoverage) (claim: StartedProjectClaim) =
@@ -151,11 +179,13 @@ let private verifiedReservation root (account: AccountBinding) operatorKey subje
                 || not (String.IsNullOrEmpty record.TerminalOperationId) ->
                 stale "Original account occupancy/source/role/UUID differs from Started claim"
             | Some record ->
-                match AccountCapacityLedger.readOperation account claim.OriginalReservationOperationId with
-                | Ok (originSnapshot, Some receipt)
-                    when originSnapshot.Head = claim.AccountHead && receiptBinds receipt record ->
-                    Ok record
-                | _ -> bad "Original native account reservation has no matching immutable CAS receipt"
+                verifiedWorkerPolicy root account operatorKey subject projects coverage claim
+                |> Result.bind (fun () ->
+                    match AccountCapacityLedger.readOperation account claim.OriginalReservationOperationId with
+                    | Ok (originSnapshot, Some receipt)
+                        when originSnapshot.Head = claim.AccountHead && receiptBinds receipt record ->
+                        Ok record
+                    | _ -> bad "Original native account reservation has no matching immutable CAS receipt")
 
 let private checkStartedProject (binding: LedgerBinding) snapshot
                                 (claim: StartedProjectClaim) =
@@ -231,6 +261,12 @@ let internal claimVerifiedDisposable root (account: AccountBinding) operatorKey 
                 LedgerStore.transact project intent (fun snapshot ->
                     if snapshot.Commit <> claim.ExpectedProjectHead then
                         stale "Project head changed before original pre-send CAS"
+                    elif not (coverage.ProjectHeads |> Array.exists (fun head ->
+                        head.ProjectId = c.ProjectId
+                        && head.LedgerId = c.ProjectLedgerId
+                        && head.Epoch = c.ProjectEpoch
+                        && head.VerifiedHead = snapshot.Commit)) then
+                        stale "Signed roster coverage does not witness the pre-send project head"
                     else
                         match checkStartedProject project snapshot claim with
                         | Error e -> Error e

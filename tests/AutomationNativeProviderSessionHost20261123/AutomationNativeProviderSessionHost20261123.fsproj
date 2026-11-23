@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <AssemblyName>Client.Tests</AssemblyName>
+    <GenerateProgramFile>false</GenerateProgramFile>
+    <IsPackable>false</IsPackable>
+    <LangVersion>latest</LangVersion>
+    <DefineConstants>$(DefineConstants);STAGE_B_DISPOSABLE_TEST_ONLY</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../Client/Client.fsproj" />
+    <Compile Include="../../Client/AutomationNativeAccountProjectIngress.fs" />
+    <Compile Include="../../Client/AutomationNativeProviderSessionHost.fs" />
+    <Compile Include="HostTests.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="NUnit" Version="4.3.2" />
+    <PackageReference Include="NUnit3TestAdapter" Version="4.6.0" />
+  </ItemGroup>
+</Project>

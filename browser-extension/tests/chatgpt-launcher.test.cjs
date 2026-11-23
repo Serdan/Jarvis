@@ -13,6 +13,8 @@ function harness(options = {}) {
   let lastSubmittedText = null;
   let renderedBubble = null;
   let clicks = 0;
+  let modelAtSend = null;
+  let draftPickerOpens = 0;
   let focused = false;
   let visibility = options.visibilityState || "visible";
   let editorSelected = false;
@@ -89,6 +91,7 @@ function harness(options = {}) {
   let activeEditor = editor;
   const send = { click() {
     clicks++;
+    modelAtSend = selectedModel;
     if (options.sendClickThrows) throw new Error("send click outcome could not be observed");
     if (options.noAcknowledgement) return;
     if (options.optimisticLocalRoute) {
@@ -126,8 +129,22 @@ function harness(options = {}) {
       return options.forceEffortMismatchWhileDraft && content
         ? "high" : reasoningEffort === "Pro" ? "medium" : values[efforts.indexOf(reasoningEffort)];
     },
-    click() { expanded = !expanded; }
+    click() {
+      expanded = !expanded;
+      if (expanded && content) draftPickerOpens++;
+      if (!expanded && content && draftPickerOpens === 1 &&
+          options.replaceComposerOnFinalPickerClose) {
+        activeEditor = Object.create(editor);
+        selectedModel = "GPT-6";
+      }
+      if (!expanded && content && (options.replacePickerOnEveryDraftClose ||
+          (draftPickerOpens === 1 && options.replacePickerOnFinalClose))) {
+        activePicker = Object.create(picker);
+        selectedModel = "GPT-6";
+      }
+    }
   };
+  let activePicker = picker;
   const radio = name => ({
     textContent: name,
     get innerText() { return options.observableLabels === false ? undefined : name; },
@@ -141,6 +158,8 @@ function harness(options = {}) {
     click() {
       if (this.closest()) throw new Error("Hidden model radio was clicked");
       modelClicks++; selectedModel = name; view = "simple"; expanded = false;
+      if (content && options.unstableModelWhileDraft)
+        queueMicrotask(() => { selectedModel = "GPT-6"; });
     }
   });
   const toggle = { closest() { return null; }, click() { view = "advanced"; } };
@@ -242,13 +261,15 @@ function harness(options = {}) {
         postInsert(options.hideTabAfterInsertMs, () => { visibility = "hidden"; });
         postInsert(options.resetEffortAfterInsertMs,
           () => { reasoningEffort = options.resetEffortTo || "Medium"; });
+        postInsert(options.changeModelAfterInsertMs,
+          () => { selectedModel = "GPT-6"; });
         postInsert(options.addTurnAfterInsertMs, () => { userTurns++; });
         postInsert(options.routeAfterInsertMs, () => { site.href = "https://chatgpt.com/c/new-route"; });
       }
       return true;
     },
     querySelector(selector) {
-      if (selector === 'button[aria-label="Select ChatGPT model"]') return options.noPicker ? null : picker;
+      if (selector === 'button[aria-label="Select ChatGPT model"]') return options.noPicker ? null : activePicker;
       if (selector === '[data-model-selection-label="gpt-6.1-terra-wm"]') return selectedModel === "GPT-6.1 Terra" ? {} : null;
       if (selector.includes('contenteditable="true"')) return options.noComposer ? null : activeEditor;
       if (selector.includes('aria-label="Send"')) {
@@ -324,6 +345,7 @@ function harness(options = {}) {
       prompt, timeoutMs: (options.timeoutMs || 350) + 5000, ...extra
     }) + ")", ctx);
   return { run, site, get clicks() { return clicks; }, get insertions() { return insertions; }, get chatClicks() { return chatClicks; },
+    get modelAtSend() { return modelAtSend; }, get draftPickerOpens() { return draftPickerOpens; },
     get selectedModel() { return selectedModel; }, get reasoningEffort() { return reasoningEffort; }, get modelClicks() { return modelClicks; }, get beforeReadyInsertions() { return beforeReadyInsertions; },
     get proSelections() { return proSelections; }, get mode() { return mode; }, get content() { return content; },
     get virtualClockState() { return virtualClock && { now: virtualClock.now, delays: [...virtualClock.delays] }; },
@@ -1218,3 +1240,122 @@ for (const selectedModel of ["Latest", "GPT-6.2"]) {
     assert.equal(h.clicks, 0);
   });
 }
+
+for (const [name, modelOverride, model, effort] of [
+  ["Latest default", undefined, "Latest", "Medium"],
+  ["strict 5.6 override", "gpt-5.6-instant", "GPT-5.6 Sol", "Instant"]
+]) {
+  for (const drift of [false, true]) {
+    test(`final model identity: ${name}, ${drift ? "same-effort drift" : "stable"}`, async () => {
+      const h = harness({ selectedModel: model, reasoningEffort: effort, virtualClock: true,
+        changeModelAfterInsertMs: drift ? 0 : undefined });
+      const result = await h.run("One exact prompt", {
+        ...(modelOverride ? { modelOverride } : {}), timeoutMs: 18000
+      });
+      assert.equal(result.status, "submitted", JSON.stringify(result));
+      assert.equal(h.modelAtSend, model);
+      assert.equal(result.selectedModel, model);
+      assert.equal(result.observedSelection.model, model);
+      assert.equal(h.reasoningEffort, effort);
+      assert.equal(h.lastSubmittedText, "One exact prompt");
+      assert.equal(h.clicks, 1);
+    });
+  }
+
+  test(`final model identity: ${name}, unstable selection fails before Send`, async () => {
+    const h = harness({ selectedModel: model, reasoningEffort: effort, virtualClock: true,
+      changeModelAfterInsertMs: 0, unstableModelWhileDraft: true });
+    const result = await h.run("Do not send", {
+      ...(modelOverride ? { modelOverride } : {}), timeoutMs: 27000
+    });
+    assert.equal(result.status, "uiIncompatible", JSON.stringify(result));
+    assert.equal(result.observedSelection, null);
+    assert.equal(result.selectedModel, undefined);
+    assert.equal(h.clicks, 0);
+    assert.ok(h.virtualClockState.now <= 19000);
+  });
+}
+
+test("final model identity is re-proved when closing the picker replaces the composer", async () => {
+  const h = harness({ selectedModel: "Latest", reasoningEffort: "Medium",
+    virtualClock: true, replaceComposerOnFinalPickerClose: true });
+  const result = await h.run("One exact prompt", { timeoutMs: 18000 });
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.equal(h.modelAtSend, "Latest");
+  assert.equal(result.observedSelection.model, "Latest");
+  assert.ok(h.draftPickerOpens >= 2);
+  assert.equal(h.lastSubmittedText, "One exact prompt");
+  assert.equal(h.clicks, 1);
+});
+
+test("final model identity: hidden simple radios are observed only in advanced view before Send", async () => {
+  const h = harness({ selectedModel: "Latest", reasoningEffort: "Medium",
+    hiddenModelRadiosInSimple: true, virtualClock: true, changeModelAfterInsertMs: 0 });
+  const result = await h.run("One exact prompt", { timeoutMs: 18000 });
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.equal(result.observedSelection.model, "Latest");
+  assert.equal(h.modelAtSend, "Latest");
+  assert.equal(h.clicks, 1);
+});
+
+test("final model identity: selection-only never inserts or clicks Send", async () => {
+  const h = harness({ virtualClock: true, changeModelAfterInsertMs: 0 });
+  const result = await h.run("Selection only", { selectionOnly: true, timeoutMs: 18000 });
+  assert.equal(result.status, "selectionOnly");
+  assert.equal(result.observedSelection.model, "Latest");
+  assert.equal(h.insertions, 0);
+  assert.equal(h.clicks, 0);
+});
+
+test("final model identity is re-proved when the picker control itself is replaced", async () => {
+  const h = harness({ selectedModel: "Latest", reasoningEffort: "Medium",
+    virtualClock: true, replacePickerOnFinalClose: true });
+  const result = await h.run("One exact prompt", { timeoutMs: 18000 });
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.equal(result.observedSelection.model, "Latest");
+  assert.equal(h.modelAtSend, "Latest");
+  assert.equal(h.insertions, 1);
+  assert.equal(h.clicks, 1);
+});
+
+test("final model identity: repeated picker replacement cannot authorize Send or stale attribution", async () => {
+  const h = harness({ selectedModel: "Latest", reasoningEffort: "Medium",
+    virtualClock: true, replacePickerOnEveryDraftClose: true });
+  const result = await h.run("Do not send", { timeoutMs: 27000 });
+  assert.equal(result.status, "uiIncompatible", JSON.stringify(result));
+  assert.equal(result.reason, "SelectedModelUnstable");
+  assert.equal(result.observedSelection, null);
+  assert.equal(h.clicks, 0);
+  assert.ok(h.draftPickerOpens <= 6);
+});
+
+test("final model identity: Work Terra override sends exactly once on confirmed selection", async () => {
+  const h = harness({ selectedModel: "GPT-6.1 Terra", initialMode: "Work",
+    reasoningEffort: "Medium", virtualClock: true });
+  const result = await h.run("One exact prompt", { modelOverride: "work-terra-medium", timeoutMs: 18000 });
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.equal(result.observedSelection.model, "GPT-6.1 Terra");
+  assert.equal(result.selectedMode, "Work");
+  assert.equal(h.modelAtSend, "GPT-6.1 Terra");
+  assert.equal(h.clicks, 1);
+});
+
+test("final model identity: unavailable rendered labels stay unknown on submission", async () => {
+  const h = harness({ virtualClock: true, observableLabels: false, changeModelAfterInsertMs: 0 });
+  const result = await h.run("One exact prompt", { timeoutMs: 18000 });
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)),
+    { mode: null, model: null, effort: null });
+  assert.equal(h.modelAtSend, "Latest");
+  assert.equal(h.clicks, 1);
+});
+
+test("final model identity: uncertain click retains only the freshly checked observation and never replays", async () => {
+  const h = harness({ virtualClock: true, changeModelAfterInsertMs: 0, sendClickThrows: true });
+  const result = await h.run("One exact prompt", { timeoutMs: 18000 });
+  assert.equal(result.status, "outcomeUnknown");
+  assert.equal(result.reason, "SendClickUncertain");
+  assert.equal(result.observedSelection.model, "Latest");
+  assert.equal(h.modelAtSend, "Latest");
+  assert.equal(h.clicks, 1);
+});

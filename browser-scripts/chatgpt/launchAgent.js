@@ -199,11 +199,15 @@ async function executeLaunch(args, observeSelection) {
   const preSendDeadline = deadline - acknowledgementReserveMs;
   let selected = null;
   let confirmedModelLabel = null;
+  let confirmedObservation = null;
+  let confirmedPicker = null;
 
-  const choose = async (target, untilAt) => {
-    // A failed selection or repair must not leave a stale observed model.
+  const choose = async (target, untilAt, finalCheck = false) => {
+    // Selection is provisional until selectionOnly completes or Send is
+    // attempted on the re-verified surface. Never publish a failed repair.
     confirmedModelLabel = null;
-    observeSelection(null);
+    confirmedObservation = null;
+    confirmedPicker = null;
     // Project landing pages expose the Chat model picker, but no mode switch.
     // Use the same checked-radio and effort verification as ordinary Chat.
     if (projectStart && target.mode !== "Chat") return "ModeUnavailable";
@@ -221,7 +225,7 @@ async function executeLaunch(args, observeSelection) {
       if (chatOn === workOn) return null;
       if (target.mode === "Chat" ? chatOn : workOn) return true;
       const wanted = target.mode === "Chat" ? chat : work;
-      if (document.readyState === "complete" &&
+      if (!finalCheck && document.readyState === "complete" &&
           document.querySelectorAll(composerSelector).length === 1 &&
           !wanted.disabled && Date.now() - lastModeClick >= 220) {
         lastModeClick = Date.now();
@@ -352,15 +356,27 @@ async function executeLaunch(args, observeSelection) {
           model: modelObservation,
           effort: renderedLabel(powerLabel)
         };
-        // Close the picker before editing. No menu click can submit a prompt.
+        // Close the picker before editing or sending. No menu click can
+        // submit a prompt. At the final boundary avoid an extra settling
+        // delay after the checked-radio proof; wait only for closure if needed.
         if (control.getAttribute("aria-expanded") === "true") control.click();
-        await delay(80);
+        if (finalCheck) {
+          // Closure may replace the trigger. Keep the checked trigger's
+          // identity below so the caller must re-prove on a replacement.
+          const closed = () => !home() &&
+            picker()?.getAttribute("aria-expanded") === "false" && !modelMenu();
+          if (!closed() && !await poll(closed, Math.min(untilAt, Date.now() + 250)))
+            return "SelectionChanged";
+        } else {
+          await delay(80);
+        }
         if (home() || !modeButton(target.mode) ||
             modeButton(target.mode)?.getAttribute("aria-pressed") !== "true" ||
             picker()?.getAttribute("data-selected-reasoning-effort") !== target.effort)
           return "SelectionChanged";
         confirmedModelLabel = checkedModelLabel;
-        observeSelection(observation);
+        confirmedObservation = observation;
+        confirmedPicker = control;
         return null;
       }
       if (lastValue === step) stalls++;
@@ -400,6 +416,7 @@ async function executeLaunch(args, observeSelection) {
   let selectedModel = confirmedModelLabel;
   let selectedEffort = selected.effort;
   if (args.selectionOnly === true) {
+    observeSelection(confirmedObservation);
     return { status: "selectionOnly", selectedMode, selectedModel,
       selectedEffort: selected.label, attempts };
   }
@@ -429,6 +446,7 @@ async function executeLaunch(args, observeSelection) {
   let rebinds = 0;
   let rewrites = 0;
   let effortRepairs = 0;
+  let finalChecks = 0;
   let lastInsertError = null;
   let sendDisabledSince = null;
   let sendFallbackAttempted = false;
@@ -467,7 +485,7 @@ async function executeLaunch(args, observeSelection) {
     }
     const editors = document.querySelectorAll(composerSelector);
     if (editors.length !== 1) return { transient: "ComposerChanged" };
-    return { chat, work, composer: editors[0] };
+    return { chat, work, modelControl, composer: editors[0] };
   };
 
   // Rebind after any React replacement, then clear+insert in the new editor.
@@ -572,17 +590,54 @@ async function executeLaunch(args, observeSelection) {
                 verified.composer === activeComposer &&
                 readEditor() === insertedPrompt &&
                 document.querySelector(sendSelector) === send) {
-              if (Date.now() >= preSendDeadline) {
-                return { ...notSubmitted("LaunchDeadlineExceeded"), stage: "submitControl" };
+              // Chat has no grounded closed-picker model identity signal.
+              // Reopen and re-prove (or repair) the selected configuration
+              // only when the exact draft and enabled Send are ready. This
+              // is a bounded pre-Send check, not a model polling loop.
+              if (++finalChecks > 3)
+                return incompatible("submitControl", "SelectedModelUnstable");
+              const cutoff = Math.min(preSendDeadline, Date.now() + 2500);
+              const failure = await choose(selected, cutoff, true);
+              const homeFailure = emptyHomeFailure();
+              if (homeFailure) return homeFailure;
+              if (failure)
+                return incompatible("submitControl", "FinalSelectionUnconfirmed");
+              const final = surface("submitControl");
+              if (final.failure) return final.failure;
+              if (!final.transient &&
+                  final.chat === activeModes.chat &&
+                  final.work === activeModes.work &&
+                  final.modelControl === confirmedPicker &&
+                  final.composer === activeComposer &&
+                  readEditor() === insertedPrompt &&
+                  document.querySelector(sendSelector) === send &&
+                  confirmedPicker.getAttribute("aria-expanded") === "false" &&
+                  !modelMenu()) {
+                if (Date.now() >= preSendDeadline) {
+                  return { ...notSubmitted("LaunchDeadlineExceeded"), stage: "submitControl" };
+                }
+                // Report only the last checked UI model, never Latest's
+                // inferred backing version or an earlier provisional choice.
+                selectedModel = confirmedModelLabel;
+                observeSelection(confirmedObservation);
+                try {
+                  sendAttempted = true;
+                  sendAttemptedAt = Date.now();
+                  send.click();
+                } catch {
+                  return unknownAfterSend("sendClick", "SendClickUncertain");
+                }
+                break;
               }
-              try {
-                sendAttempted = true;
-                sendAttemptedAt = Date.now();
-                send.click();
-              } catch {
-                return unknownAfterSend("sendClick", "SendClickUncertain");
+              // Picker activity can replace controls or disturb the draft.
+              // An unchanged editor with the exact draft does not need a
+              // destructive rewrite just because the controls re-rendered.
+              // Either way, the next Send candidate needs fresh model proof.
+              if (!final.transient && final.composer === activeComposer &&
+                  readEditor() === insertedPrompt) {
+                activeModes = { chat: final.chat, work: final.work };
+                continue;
               }
-              break;
             }
             activeComposer = null;
             activeModes = null;

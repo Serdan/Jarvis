@@ -427,12 +427,6 @@ async function executeLaunch(args, observeSelection) {
   // Modern ChatGPT user messages use the bubble marker instead of the old role.
   const initialBubbles = document.querySelectorAll('[data-user-message-bubble]').length;
   const projectPrefix = projectStart ? new URL(startUrl).pathname.replace(/\/project\/?$/, "") : null;
-  const projectLinks = () => projectPrefix
-    ? Array.from(document.querySelectorAll('a[href]'))
-      .map(a => a.getAttribute("href") || "")
-      .filter(href => new RegExp("^" + projectPrefix + "/c/[0-9a-f-]{36}$", "i").test(href))
-    : [];
-  const initialProjectLinks = new Set(projectLinks());
   if (!atStart() || initialTurns || initialBubbles) {
     return notSubmitted("ExistingConversation");
   }
@@ -699,15 +693,75 @@ async function executeLaunch(args, observeSelection) {
     await delay(Math.min(75, Math.max(1, preSendDeadline - Date.now())));
   }
 
+  // Only the browser's current route can identify the conversation. Project
+  // sidebar links are shared mutable state and have no causal binding to Send.
+  const expectedOrigin = new URL(startUrl).origin;
+  const currentPage = () => {
+    const current = new URL(location.href);
+    return current.origin === expectedOrigin ? current : null;
+  };
+  const durableRoute = current => {
+    if (!current) return null;
+    const prefix = (projectPrefix || "") + "/c/";
+    const routePath = projectStart ? current.pathname : current.pathname.toLowerCase();
+    if (!routePath.startsWith(prefix) ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/?$/i
+          .test(routePath.slice(prefix.length))) return null;
+    current.username = "";
+    current.password = "";
+    current.search = "";
+    current.hash = "";
+    return current.href;
+  };
+  const matchesPrompt = turn => (turn.innerText || "")
+    .replace(/\r\n/g, "\n").replace(/\u00a0/g, " ").trim() === normalizedPrompt;
+  const newBubbles = () => Array.from(document.querySelectorAll('[data-user-message-bubble]'))
+    .slice(initialBubbles);
+  const submitted = (conversationUrl, evidence) => ({
+    status: "submitted",
+    selectedMode, selectedModel, selectedEffort: selected.label,
+    attempts, conversationUrl, evidence,
+    submittedAtUtc: new Date().toISOString()
+  });
+
+  if (projectStart) {
+    // A matching new rendered turn acknowledges the prompt, but not a sidebar
+    // URL. Re-prove the matching turn on the actual scoped durable route in
+    // the same poll; a previous acknowledgement cannot bind a later unrelated
+    // navigation. A legacy rendered turn can also provide exact text evidence.
+    let projectRouteAcknowledgement = null;
+    const bound = await until(() => {
+      const current = currentPage();
+      if (!current) return null;
+      const bubbles = newBubbles();
+      const matchingTurn = bubbles.some(matchesPrompt) ? "matchingUserBubble"
+        : bubbles.length === 0 && Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+          .slice(initialTurns).some(matchesPrompt) ? "matchingLegacyUserTurn" : null;
+      if (!matchingTurn) return null;
+      projectRouteAcknowledgement = matchingTurn;
+      const conversationUrl = durableRoute(current);
+      return conversationUrl ? { conversationUrl, matchingTurn } : null;
+    });
+    if (bound) return submitted(bound.conversationUrl,
+      ["newUserTurn", bound.matchingTurn, "conversationRoute"]);
+    if (!projectRouteAcknowledgement)
+      return unknownAfterSend("acknowledgement", "SubmissionUnconfirmed");
+    // Typed, bounded acknowledgement for the bridge's narrow retention
+    // policy. This is not submission success and supplies no conversation ID.
+    return {
+      ...unknownAfterSend("conversationRoute", "ConversationUrlUnavailable"),
+      conversationUrl: null,
+      projectRouteAcknowledgement,
+      evidence: ["newUserTurn", projectRouteAcknowledgement]
+    };
+  }
+
+  // Preserve ordinary home/legacy acknowledgement behavior.
   const evidence = await until(() => {
     const legacyTurn = document.querySelectorAll('[data-message-author-role="user"]').length > initialTurns;
-    // Match the actual newly rendered user bubble, not a sidebar title or
-    // arbitrary page text. Never include prompt content in diagnostics.
-    const matchingBubble = Array.from(document.querySelectorAll('[data-user-message-bubble]'))
-      .slice(initialBubbles)
-      .some(bubble => (bubble.innerText || "").replace(/\r\n/g, "\n").replace(/\u00a0/g, " ").trim() === normalizedPrompt);
+    const matchingBubble = newBubbles().some(matchesPrompt);
     const newUserTurn = legacyTurn || matchingBubble;
-    const routeChanged = location.href !== initialUrl && location.origin === new URL(startUrl).origin;
+    const routeChanged = location.href !== initialUrl && location.origin === expectedOrigin;
     const composerCleared = readEditor().trim().length === 0;
     // Some builds only expose route transition plus cleared composer and a
     // generation control. A matching user bubble is stronger evidence even if
@@ -720,44 +774,14 @@ async function executeLaunch(args, observeSelection) {
   });
   if (!evidence) return unknownAfterSend("acknowledgement", "SubmissionUnconfirmed");
 
-  // The user turn may render before SPA navigation. Wait for the actual URL,
-  // never invent an identifier or resubmit the prompt.
-  const conversationUrl = await until(() => {
-    if (location.origin !== new URL(startUrl).origin) return null;
-    const current = new URL(location.href);
-    // ChatGPT can first navigate to a temporary /c/local-chatgpt:... route.
-    // Only the server-issued UUID is a durable conversation URL. Closing
-    // an agent tab on the optimistic route risks interrupting creation.
-    const expectedPrefix = projectStart
-      ? new URL(startUrl).pathname.replace(/\/project\/?$/, "") : "";
-    const routePattern = new RegExp("^" + expectedPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
-      "/c/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/?$", "i");
-    if (!routePattern.test(current.pathname)) {
-      // The project landing page can create a conversation in its sidebar
-      // without navigating. Require both a verified matching user turn and
-      // exactly one newly created, project-scoped server UUID link.
-      if (!projectStart || !evidence.matchingBubble) return null;
-      const fresh = [...new Set(projectLinks().filter(href => !initialProjectLinks.has(href)))];
-      if (fresh.length !== 1 || !routePattern.test(fresh[0])) return null;
-      return new URL(fresh[0], startUrl).href;
-    }
-    current.search = "";
-    current.hash = "";
-    return current.href;
-  });
+  // A temporary /c/local-chatgpt:... route is not a server-issued UUID.
+  const conversationUrl = await until(() => durableRoute(currentPage()));
   if (!conversationUrl) return unknownAfterSend("conversationRoute", "ConversationUrlUnavailable");
-  return {
-    status: "submitted",
-    selectedMode, selectedModel, selectedEffort: selected.label,
-    attempts,
-    conversationUrl,
-    evidence: [
-      ...(evidence.newUserTurn ? ["newUserTurn"] : []),
-      ...(evidence.matchingBubble ? ["matchingUserBubble"] : []),
-      "conversationRoute"
-    ],
-    submittedAtUtc: new Date().toISOString()
-  };
+  return submitted(conversationUrl, [
+    ...(evidence.newUserTurn ? ["newUserTurn"] : []),
+    ...(evidence.matchingBubble ? ["matchingUserBubble"] : []),
+    "conversationRoute"
+  ]);
   } catch {
     // Unexpected DOM exceptions are still provider compatibility failures if
     // we have not attempted Send; after Send, the outcome is unknowable.

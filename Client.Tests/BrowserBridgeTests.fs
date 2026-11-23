@@ -793,6 +793,131 @@ let closeAfterExecutionReclaimsTabEvenWhenSubmissionIsUncertain (scriptStatus: s
             tabs.Contains("personal-tab") && not (tabs.Contains("cleanup-all-created"))))
 }
 
+// Only the typed, acknowledged project-route-unknown result can override
+// close-after-execution. Arbitrary evidence, unbound entry and generic
+// unknowns retain their existing disposition; successful launches still close.
+[<TestCase("matchingBubble", true, false)>]
+[<TestCase("matchingBubble", false, false)>]
+[<TestCase("matchingLegacy", true, false)>]
+[<TestCase("genericRoute", true, true)>]
+[<TestCase("genericEvidence", true, true)>]
+[<TestCase("malformedMarker", true, true)>]
+[<TestCase("unrecognizedMarker", true, true)>]
+[<TestCase("missingUrl", true, true)>]
+[<TestCase("nonNullUrl", true, true)>]
+[<TestCase("wrongStage", true, true)>]
+[<TestCase("wrongReason", true, true)>]
+[<TestCase("home", true, true)>]
+[<TestCase("wrongOrigin", true, true)>]
+[<TestCase("differentArgumentProject", true, true)>]
+[<TestCase("missingArgumentProject", true, true)>]
+[<TestCase("submitted", true, true)>]
+let projectRouteAcknowledgementRetainsOnlyBoundUnknown
+    (scenario: string, closeAfterExecution: bool, shouldClose: bool) = task {
+    let projectUrl = "https://chatgpt.com/g/g-p-abc123/project"
+    let conversationUrl = "https://chatgpt.com/g/g-p-abc123/c/00000000-0000-0000-0000-000000000001"
+    let url =
+        match scenario with
+        | "home" -> "https://chatgpt.com/"
+        | "wrongOrigin" -> "https://other.example/g/g-p-abc123/project"
+        | _ -> projectUrl
+    let args =
+        match scenario with
+        | "differentArgumentProject" -> """{"prompt":"Go","startUrl":"https://chatgpt.com/g/g-p-other/project"}"""
+        | "missingArgumentProject" -> """{"prompt":"Go"}"""
+        | _ -> JsonSerializer.Serialize({| prompt = "Go"; startUrl = projectUrl |})
+    let stage = if scenario = "wrongStage" then "acknowledgement" else "conversationRoute"
+    let reason = if scenario = "wrongReason" then "SubmissionUnconfirmed" else "ConversationUrlUnavailable"
+    let fields = Collections.Generic.Dictionary<string, obj>()
+    if scenario = "submitted" then
+        fields["status"] <- box "submitted"
+        fields["conversationUrl"] <- box conversationUrl
+        fields["evidence"] <- box [| "newUserTurn"; "matchingUserBubble"; "conversationRoute" |]
+    else
+        fields["status"] <- box "outcomeUnknown"
+        fields["stage"] <- box stage
+        fields["reason"] <- box reason
+        match scenario with
+        | "genericRoute" | "genericEvidence" -> ()
+        | "matchingLegacy" -> fields["projectRouteAcknowledgement"] <- box "matchingLegacyUserTurn"
+        | "malformedMarker" -> fields["projectRouteAcknowledgement"] <- box true
+        | "unrecognizedMarker" -> fields["projectRouteAcknowledgement"] <- box "other"
+        | _ -> fields["projectRouteAcknowledgement"] <- box "matchingUserBubble"
+        match scenario with
+        | "missingUrl" -> ()
+        | "nonNullUrl" -> fields["conversationUrl"] <- box conversationUrl
+        | _ -> fields["conversationUrl"] <- null
+        if scenario <> "genericRoute" then
+            let turn = if scenario = "matchingLegacy" then "matchingLegacyUserTurn" else "matchingUserBubble"
+            fields["evidence"] <- box [| "newUserTurn"; turn |]
+        fields["timing"] <- box {| budgetAtSendMs = 8000; elapsedSinceSendMs = 8000 |}
+        fields["observedSelection"] <- box {| mode = (null: string); model = "Latest"; effort = "Medium" |}
+    let payload = JsonSerializer.SerializeToElement(fields)
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let! client, connectionId = handshake port "test-secret"
+    use socket = client
+    do! registerReadyAgentWindow socket bridge
+    let mutable captured : JsonElement option = None
+    let launch = BrowserBridge.runInNewTabWithObservation bridge "agents" url "project-route" false
+                     "async function execute(args) { return args; }" args 5000 closeAfterExecution
+                     (fun value -> captured <- Some value)
+    let! opened = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property opened "kind", Is.EqualTo("openTab"))
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"project-created","agentCreated":true,"availability":"ready","registrationGeneration":3},{"registrationId":"personal-tab","agentCreated":false,"availability":"ready","registrationGeneration":1}]}"""
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "tabOpened"; requestId = property opened "requestId"
+        connectionId = connectionId
+        tab = {| registrationId = "project-created"; agentCreated = true
+                 availability = "ready"; registrationGeneration = 3 |}
+    |}))
+    let! executing = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property executing "kind", Is.EqualTo("executeJs"))
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "result"; requestId = property executing "requestId"
+        connectionId = connectionId; registrationId = "project-created"
+        registrationGeneration = 3; result = payload
+    |}))
+    if shouldClose then
+        let! closing = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+        Assert.That(property closing "kind", Is.EqualTo("closeTab"))
+        Assert.That(property closing "registrationId", Is.EqualTo("project-created"))
+        use frame = JsonDocument.Parse(closing)
+        Assert.That(frame.RootElement.GetProperty("registrationGeneration").GetInt32(), Is.EqualTo(3))
+        Assert.That(frame.RootElement.GetProperty("requireFreshHomeNoTurns").GetBoolean(), Is.False)
+        do! send socket (JsonSerializer.Serialize({|
+            version = 2; kind = "tabClosed"; requestId = property closing "requestId"
+            connectionId = connectionId; registrationId = "project-created"
+            registrationGeneration = 3
+        |}))
+        do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"personal-tab","agentCreated":false,"availability":"ready","registrationGeneration":1}]}"""
+    let! result = launch.WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(captured.IsSome, Is.True)
+    Assert.That(captured.Value.GetRawText(), Is.EqualTo(payload.GetRawText()))
+    match result with
+    | Ok response when scenario = "submitted" ->
+        Assert.That(response, Does.Contain("\"cleanup\":\"closed\""))
+    | Error (id, detail) ->
+        Assert.That(id, Is.EqualTo("project-created"))
+        Assert.That(detail, Does.Contain("OutcomeUnknown:" + stage + ":" + reason))
+        Assert.That(detail, Does.Contain("elapsedSinceSendMs=8000"))
+        if shouldClose then Assert.That(detail, Does.Contain("cleanup=closed"))
+        elif closeAfterExecution then Assert.That(detail, Does.Contain("cleanup=retained"))
+        else Assert.That(detail, Does.Not.Contain("cleanup="))
+    | _ -> Assert.Fail("Unexpected project launch disposition")
+    do! waitUntil (fun () ->
+        bridge.ListTabs() |> Result.exists (fun tabs ->
+            tabs.Contains("personal-tab") && (tabs.Contains("project-created") <> shouldClose)))
+    if not shouldClose then
+        use cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200.0))
+        try
+            let! frame = socket.ReceiveAsync(ArraySegment<byte>(Array.zeroCreate<byte> 8192), cts.Token)
+            Assert.Fail("Unexpected close or replay after acknowledged route-unknown: " + string frame.MessageType)
+        with :? OperationCanceledException -> ()
+    return ()
+}
+
 [<Test>]
 let compositeNotReadyCleanupReportsFailureOrConfirmedClosure () = task {
     let port = findPort()

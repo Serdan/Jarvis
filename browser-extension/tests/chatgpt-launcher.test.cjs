@@ -12,6 +12,10 @@ function harness(options = {}) {
   let userTurns = options.initialUserTurns || 0;
   let lastSubmittedText = null;
   let renderedBubble = null;
+  let legacyRenderedText = null;
+  let projectLinks = [...(options.initialProjectLinks || [])];
+  const pendingProjectEvents = [];
+  let navigationAttempts = 0;
   let clicks = 0;
   let modelAtSend = null;
   let draftPickerOpens = 0;
@@ -105,6 +109,13 @@ function harness(options = {}) {
     lastSubmittedText = submittedText;
     content = "";
     userTurns++;
+    legacyRenderedText = options.legacyTextOverride ?? submittedText;
+    if (options.projectEvents) {
+      // Deterministic provider-side DOM/route events; no navigation by the launcher.
+      for (const event of options.projectEvents) {
+        pendingProjectEvents.push({ ...event, at: virtualClock.now + event.afterMs });
+      }
+    }
     if (options.renderUserBubble) {
       setTimeout(() => {
         renderedBubble = options.bubbleTextOverride ?? submittedText;
@@ -293,6 +304,10 @@ function harness(options = {}) {
       return null;
     },
     querySelectorAll(selector) {
+      if (selector === 'a[href]') return projectLinks.map(href => ({
+        getAttribute(name) { return name === "href" ? href : null; },
+        click() { navigationAttempts++; throw new Error("Unbound sidebar navigation"); }
+      }));
       if (selector === '[role="menu"]') return expanded ? [menu] : [];
       if (selector === '[data-model-selection-label]') return [];
       if (selector === '[data-composer-input-layout] [contenteditable="true"][role="textbox"]') {
@@ -319,7 +334,7 @@ function harness(options = {}) {
         injectedTurn = true;
       }
       return selector.includes('data-message-author-role="user"') && !options.noLegacyTurnMarkers
-        ? Array(userTurns).fill({}) : [];
+        ? Array(userTurns).fill({ innerText: legacyRenderedText ?? "" }) : [];
     }
   };
   if (options.documentHydrationDelayMs) {
@@ -336,15 +351,32 @@ function harness(options = {}) {
     ? (callback, ms) => {
       virtualClock.delays.push(ms);
       virtualClock.now += ms;
-      queueMicrotask(callback);
+      queueMicrotask(() => {
+        for (let i = 0; i < pendingProjectEvents.length;) {
+          const event = pendingProjectEvents[i];
+          if (event.at > virtualClock.now) { i++; continue; }
+          pendingProjectEvents.splice(i, 1);
+          if (event.href !== undefined) site.href = event.href;
+          if (event.links !== undefined) projectLinks = event.links;
+          if (event.bubble !== undefined) renderedBubble = event.bubble;
+        }
+        callback();
+      });
     }
     : setTimeout;
-  const ctx = vm.createContext({ document, window, location: site, setTimeout: schedule, Date: clockDate, URL, KeyboardEvent: class { constructor(type, init) { Object.assign(this, init); } } });
+  const location = {
+    get href() { return site.href; },
+    get origin() { return new URL(site.href).origin; },
+    set href(_) { navigationAttempts++; throw new Error("Launcher must not navigate"); },
+    assign() { navigationAttempts++; throw new Error("Launcher must not navigate"); },
+    replace() { navigationAttempts++; throw new Error("Launcher must not navigate"); }
+  };
+  const ctx = vm.createContext({ document, window, location, setTimeout: schedule, Date: clockDate, URL, KeyboardEvent: class { constructor(type, init) { Object.assign(this, init); } } });
   const run = async (prompt = "Start fresh\nRead Jarvis assignment", extra = {}) =>
     await vm.runInContext(source + "\nexecute(" + JSON.stringify({
       prompt, timeoutMs: (options.timeoutMs || 350) + 5000, ...extra
     }) + ")", ctx);
-  return { run, site, get clicks() { return clicks; }, get insertions() { return insertions; }, get chatClicks() { return chatClicks; },
+  return { run, site, get navigationAttempts() { return navigationAttempts; }, get clicks() { return clicks; }, get insertions() { return insertions; }, get chatClicks() { return chatClicks; },
     get modelAtSend() { return modelAtSend; }, get draftPickerOpens() { return draftPickerOpens; },
     get selectedModel() { return selectedModel; }, get reasoningEffort() { return reasoningEffort; }, get modelClicks() { return modelClicks; }, get beforeReadyInsertions() { return beforeReadyInsertions; },
     get proSelections() { return proSelections; }, get mode() { return mode; }, get content() { return content; },
@@ -1397,4 +1429,107 @@ test("reports rendered model text even when it differs from the requested model"
   const result = await h.run();
   assert.equal(result.observedSelection.model, "Displayed model label");
   assert.equal(h.clicks, 1);
+});
+
+const projectRouteStart = "https://chatgpt.com/g/g-p-abc123/project";
+const projectRouteA = "https://chatgpt.com/g/g-p-abc123/c/00000000-0000-0000-0000-000000000001";
+const projectRouteB = "/g/g-p-abc123/c/00000000-0000-0000-0000-000000000002";
+const projectRouteC = "/g/g-p-abc123/c/00000000-0000-0000-0000-000000000003";
+const projectPrompt = "Exact project prompt";
+async function runProjectRoute(events, extra = {}) {
+  const h = harness({ startUrl: projectRouteStart, noModeToggle: true,
+    virtualClock: true, noLegacyTurnMarkers: true, noRoute: true,
+    selectedModel: "Latest", reasoningEffort: "Medium", projectEvents: events, ...extra });
+  const result = await h.run(projectPrompt, { startUrl: projectRouteStart, timeoutMs: 18000 });
+  assert.equal(h.clicks, 1);
+  assert.equal(h.navigationAttempts, 0);
+  assert.equal(h.lastSubmittedText, projectPrompt);
+  assert.equal(result.observedSelection.model, "Latest");
+  return { h, result };
+}
+
+for (const [label, links, afterMs] of [
+  ["zero links", [], 150],
+  ["single unrelated fresh link", [projectRouteB], 150],
+  ["multiple fresh links", [projectRouteB, projectRouteC], 150],
+  ["duplicate unrelated link", [projectRouteB, projectRouteB], 150],
+  ["late unrelated link", [projectRouteB], 8000],
+  ["malformed fresh link", ["/g/g-p-abc123/c/000000000000000000000000000000000000"], 150],
+  ["existing sidebar link", [projectRouteB], 150]
+]) {
+  test("project route binding: matching bubble without durable navigation, " + label, async () => {
+    const { h, result } = await runProjectRoute([
+      { afterMs: 75, bubble: projectPrompt },
+      { afterMs, links }
+    ], label === "existing sidebar link" ? { initialProjectLinks: links } : {});
+    assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
+    assert.equal(result.reason, "ConversationUrlUnavailable");
+    assert.equal(result.stage, "conversationRoute");
+    assert.equal(result.conversationUrl, null);
+    assert.equal(result.projectRouteAcknowledgement, "matchingUserBubble");
+    assert.deepEqual(Array.from(result.evidence), ["newUserTurn", "matchingUserBubble"]);
+    assert.equal(h.site.href, projectRouteStart);
+    assert.equal(result.timing.elapsedSinceSendMs, result.timing.budgetAtSendMs);
+    assert.equal(JSON.stringify(result).includes(projectPrompt), false);
+  });
+}
+
+test("project route binding: unrelated link B cannot preempt delayed actual route A", async () => {
+  const { h, result } = await runProjectRoute([
+    { afterMs: 75, bubble: projectPrompt, links: [projectRouteB] },
+    { afterMs: 300, href: projectRouteA + "?model=secret#fragment" }
+  ]);
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.equal(result.conversationUrl, projectRouteA);
+  assert.deepEqual(Array.from(result.evidence), ["newUserTurn", "matchingUserBubble", "conversationRoute"]);
+  assert.equal(h.site.href, projectRouteA + "?model=secret#fragment");
+});
+
+for (const [label, href] of [
+  ["temporary", "https://chatgpt.com/g/g-p-abc123/c/local-chatgpt%3Atemp"],
+  ["malformed", "https://chatgpt.com/g/g-p-abc123/c/000000000000000000000000000000000000"],
+  ["wrong project", "https://chatgpt.com/g/g-p-other/c/00000000-0000-0000-0000-000000000001"],
+  ["ordinary home conversation", "https://chatgpt.com/c/00000000-0000-0000-0000-000000000001"]
+]) {
+  test("project route binding: " + label + " route does not bind even with matching turn", async () => {
+    const { result } = await runProjectRoute([{ afterMs: 75, bubble: projectPrompt, href, links: [projectRouteB] }]);
+    assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
+    assert.equal(result.reason, "ConversationUrlUnavailable");
+    assert.equal(result.conversationUrl, null);
+    assert.equal(result.projectRouteAcknowledgement, "matchingUserBubble");
+  });
+}
+
+test("project route binding: a mismatched turn and valid route do not acknowledge", async () => {
+  const { result } = await runProjectRoute([{ afterMs: 75, bubble: "Different prompt", href: projectRouteA, links: [projectRouteB] }]);
+  assert.equal(result.status, "outcomeUnknown");
+  assert.equal(result.reason, "SubmissionUnconfirmed");
+  assert.equal(result.projectRouteAcknowledgement, undefined);
+});
+
+test("project route binding: a prior matching turn cannot bind a later route displaying a different turn", async () => {
+  const { result } = await runProjectRoute([
+    { afterMs: 75, bubble: projectPrompt },
+    { afterMs: 300, bubble: "Different prompt", href: projectRouteA }
+  ]);
+  assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
+  assert.equal(result.reason, "ConversationUrlUnavailable");
+  assert.equal(result.conversationUrl, null);
+  assert.equal(result.projectRouteAcknowledgement, "matchingUserBubble");
+});
+
+test("project route binding: matching legacy rendered user turn and exact route remain supported", async () => {
+  const { result } = await runProjectRoute([{ afterMs: 150, href: projectRouteA }], { noLegacyTurnMarkers: false });
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.equal(result.conversationUrl, projectRouteA);
+  assert.deepEqual(Array.from(result.evidence), ["newUserTurn", "matchingLegacyUserTurn", "conversationRoute"]);
+});
+
+test("project route binding: mismatched legacy text cannot bind a valid route", async () => {
+  const { result } = await runProjectRoute([{ afterMs: 150, href: projectRouteA }], {
+    noLegacyTurnMarkers: false, legacyTextOverride: "Different prompt"
+  });
+  assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
+  assert.equal(result.reason, "SubmissionUnconfirmed");
+  assert.equal(result.projectRouteAcknowledgement, undefined);
 });

@@ -8,6 +8,7 @@
   <ItemGroup>
     <Compile Include="GitFixture.fs" />
     <Compile Include="HostedTests.fs" />
+    <Compile Include="HostedNegativeTests.fs" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />

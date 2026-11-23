@@ -1,0 +1,1 @@
+Bounded signed Worker policy and Started assignment-generation fail-closed correction; 10/10 Release focused tests and negative mutation controls. Default OFF; provider terminal and production activation HOLD.

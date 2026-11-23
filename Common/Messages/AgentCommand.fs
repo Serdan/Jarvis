@@ -1,6 +1,7 @@
 namespace Common
 
 open System
+open System.Text.Json
 open System.Text.Json.Serialization
 open FsCodec.SystemTextJson
 
@@ -779,11 +780,103 @@ type AgentError =
     | OutputTruncated of string
     | LedgerFailure of LedgerFailureInfo
 
+/// Legacy v3.68 projection, not a domain instruction channel. Older peers
+/// deserialize this shape; new peers accept only the two operational scopes.
 type InstructionDocument =
     { Scope: string
       Path: string
       Sha256: string
       Content: string }
+
+[<RequireQualifiedAccess; JsonConverter(typeof<TypeSafeEnumConverter<WorkingTurnLimitLevel>>)>]
+type WorkingTurnLimitLevel =
+    | Soft
+    | Hard
+
+/// The only operational controls that may accompany a command outcome.
+/// Timing text is the existing WorkingTurnGuidance policy, not repository
+/// guidance. An exceptional alert is a distinct, one-shot ledger message.
+[<RequireQualifiedAccess; JsonConverter(typeof<UnionConverter<OperationalControl>>)>]
+type OperationalControl =
+    | WorkingTurnLimit of level: WorkingTurnLimitLevel * advisory: string
+    | QueuedResponseAlert of alertId: string * text: string
+
+module OperationalControl =
+    let private alertPath = "jarvis/response-alert/"
+    let private alertHeader = "JARVIS OPERATOR ALERT (one-shot coordination instruction):\n"
+    let private oldAlertHeader = "JARVIS OPERATOR ALERT:\n"
+
+    let workingTurn advisory =
+        if String.IsNullOrWhiteSpace advisory then None
+        elif advisory.StartsWith("HARD STOP", StringComparison.OrdinalIgnoreCase) then
+            Some(OperationalControl.WorkingTurnLimit(WorkingTurnLimitLevel.Hard, advisory))
+        elif advisory.StartsWith("SOFT STOP", StringComparison.OrdinalIgnoreCase) then
+            Some(OperationalControl.WorkingTurnLimit(WorkingTurnLimitLevel.Soft, advisory))
+        else None
+
+    let queuedAlert alertId message =
+        OperationalControl.QueuedResponseAlert(alertId, alertHeader + message)
+
+    let isAlert = function
+        | OperationalControl.QueuedResponseAlert _ -> true
+        | _ -> false
+
+    let text = function
+        | OperationalControl.QueuedResponseAlert(_, text) -> text
+        | OperationalControl.WorkingTurnLimit(_, advisory) -> advisory
+
+    let private isStop control =
+        match control with
+        | OperationalControl.QueuedResponseAlert(_, content) when not (isNull content) ->
+            let message =
+                if content.StartsWith(alertHeader, StringComparison.Ordinal) then content.Substring(alertHeader.Length)
+                elif content.StartsWith(oldAlertHeader, StringComparison.Ordinal) then content.Substring(oldAlertHeader.Length)
+                else content
+            message.TrimStart().StartsWith("STOP", StringComparison.OrdinalIgnoreCase)
+        | _ -> false
+
+    /// Stable STOP-first ordering even when source and destination replies
+    /// are combined. Within each category retain the ledger's queue order.
+    let ordered controls =
+        let controls = if isNull (box controls) then [] else controls
+        let alerts, timing = List.partition isAlert controls
+        let stops, others = List.partition isStop alerts
+        stops @ others @ timing
+
+    let withoutOneShot controls =
+        ordered controls |> List.filter (isAlert >> not)
+
+    let private valid = function
+        | OperationalControl.WorkingTurnLimit(level, advisory) ->
+            match workingTurn advisory with
+            | Some(OperationalControl.WorkingTurnLimit(actual, _)) -> level = actual
+            | _ -> false
+        | OperationalControl.QueuedResponseAlert(_, text) -> not (String.IsNullOrWhiteSpace text)
+
+    let normalize controls = ordered controls |> List.filter valid
+
+    let fromLegacy (documents: InstructionDocument list) =
+        (if isNull (box documents) then [] else documents)
+        |> List.choose (fun doc ->
+            if isNull (box doc) then None
+            else
+                match doc.Scope with
+                | "working-turn" -> workingTurn doc.Content
+                | "response-alert" when not (String.IsNullOrWhiteSpace doc.Content) ->
+                    let id =
+                        if not (isNull doc.Path) && doc.Path.StartsWith(alertPath, StringComparison.Ordinal) then
+                            doc.Path.Substring(alertPath.Length)
+                        else ""
+                    Some(OperationalControl.QueuedResponseAlert(id, doc.Content))
+                | _ -> None)
+        |> normalize
+
+    let toLegacy controls =
+        normalize controls |> List.map (function
+            | OperationalControl.WorkingTurnLimit(_, advisory) ->
+                { Scope = "working-turn"; Path = "jarvis/working-turn"; Sha256 = ""; Content = advisory }
+            | OperationalControl.QueuedResponseAlert(id, text) ->
+                { Scope = "response-alert"; Path = alertPath + id; Sha256 = ""; Content = text })
 
 /// A canonical ledger mutation changed the assignment or Working-turn state
 /// of this agent. Advisory to other clients; never an authorization claim.
@@ -804,7 +897,7 @@ type AgentInboxActivation =
       OperationId: string option }
 
 /// A pending tool call is still executing in this exact client process.
-/// An agent must poll by ID; neither state changes nor instructions are final yet.
+/// An agent must poll by ID; the original outcome and state effects are not final yet.
 type ToolJobHandle =
     { JobId: string
       Kind: JobKind
@@ -817,13 +910,86 @@ type ToolJobHandle =
       CommandName: string
       StartedAt: DateTimeOffset }
 
+[<RequireQualifiedAccess>]
+type StateChangeEvidence =
+    | Pending
+    | Confirmed of AgentStateChange list
+    | Unknown of knownChanges: AgentStateChange list
+
+module private StateChangeEvidenceProjection =
+    let ofParts error changes pending =
+        let known = if isNull (box changes) then [] else changes
+        if Option.isSome pending then StateChangeEvidence.Pending
+        else
+            match error with
+            | Some(UncertainOutcome _) -> StateChangeEvidence.Unknown known
+            | _ when isNull (box changes) -> StateChangeEvidence.Unknown known
+            | _ -> StateChangeEvidence.Confirmed known
+
+    let status = function
+        | StateChangeEvidence.Pending -> "pending"
+        | StateChangeEvidence.Confirmed _ -> "confirmed"
+        | StateChangeEvidence.Unknown _ -> "unknown"
+
+// A single adapter for mixed-version client/server transport. The old field
+// remains a compatibility projection only when operational controls exist.
+// New peers prefer the closed typed field; no ambient document survives
+// decoding. Keep the receipt list untouched, including null/unknown.
+type private AgentCommandResponseWire =
+    { Result: string option
+      Error: AgentError option
+      [<JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)>]
+      Instructions: InstructionDocument list
+      [<JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)>]
+      OperationalControls: OperationalControl list
+      AgentStateChanges: AgentStateChange list
+      AgentStateChangesStatus: string
+      InboxActivation: AgentInboxActivation option
+      PendingJob: ToolJobHandle option }
+
+[<JsonConverter(typeof<AgentCommandResponseConverter>)>]
 type AgentCommandResponse =
     { Result: string option
       Error: AgentError option
-      Instructions: InstructionDocument list
+      // Source-compatible field name for existing empty-response constructors.
+      // Its type is closed; only the wire adapter knows the legacy document DTO.
+      Instructions: OperationalControl list
       AgentStateChanges: AgentStateChange list
       InboxActivation: AgentInboxActivation option
       PendingJob: ToolJobHandle option }
+
+    member this.OperationalControls = OperationalControl.normalize this.Instructions
+    member this.StateChangeEvidence =
+        StateChangeEvidenceProjection.ofParts this.Error this.AgentStateChanges this.PendingJob
+
+and AgentCommandResponseConverter() =
+    inherit JsonConverter<AgentCommandResponse>()
+
+    override _.Read(reader: byref<Utf8JsonReader>, _typeToConvert: Type, options: JsonSerializerOptions) =
+        let wire = JsonSerializer.Deserialize<AgentCommandResponseWire>(&reader, options)
+        if isNull (box wire) then raise (JsonException("Missing command response."))
+        let controls =
+            if isNull (box wire.OperationalControls) then OperationalControl.fromLegacy wire.Instructions
+            else OperationalControl.normalize wire.OperationalControls
+        let changes = wire.AgentStateChanges
+        let inferred = StateChangeEvidenceProjection.ofParts wire.Error changes wire.PendingJob
+        if not (String.IsNullOrEmpty wire.AgentStateChangesStatus)
+           && wire.AgentStateChangesStatus <> StateChangeEvidenceProjection.status inferred then
+            raise (JsonException("Command response state-change status contradicts its evidence."))
+        { Result = wire.Result; Error = wire.Error; Instructions = controls
+          AgentStateChanges = changes; InboxActivation = wire.InboxActivation
+          PendingJob = wire.PendingJob }
+
+    override _.Write(writer: Utf8JsonWriter, response: AgentCommandResponse, options: JsonSerializerOptions) =
+        let controls = response.OperationalControls
+        let wire: AgentCommandResponseWire =
+            { Result = response.Result; Error = response.Error
+              Instructions = if controls.IsEmpty then Unchecked.defaultof<_> else OperationalControl.toLegacy controls
+              OperationalControls = if controls.IsEmpty then Unchecked.defaultof<_> else controls
+              AgentStateChanges = response.AgentStateChanges
+              AgentStateChangesStatus = StateChangeEvidenceProjection.status response.StateChangeEvidence
+              InboxActivation = response.InboxActivation; PendingJob = response.PendingJob }
+        JsonSerializer.Serialize(writer, wire, options)
 
 /// Internal server-to-client envelope for verified source-side mutation
 /// evidence of a cross-project notification. The destination client owns the
@@ -919,12 +1085,14 @@ type AgentCommand =
     | MessageCommand of MessageCommand
     | GetClientActivityCommand of GetClientActivityCommand
 
-/// An empty list is definitive only for a confirmed response. After a
-/// transport/dispatch exception, the list can at most contain known changes.
+/// An empty list is definitive only when evidence is present and confirmed.
+/// Legacy omission/null is not evidence of an empty confirmed transition set.
 module AgentStateEvidence =
+    let classify (response: AgentCommandResponse) = response.StateChangeEvidence
+
     let isUnknown (response: AgentCommandResponse) =
-        match response.Error with
-        | Some(UncertainOutcome _) -> true
+        match classify response with
+        | StateChangeEvidence.Unknown _ -> true
         | _ -> false
 
 module AgentCommandInfo =

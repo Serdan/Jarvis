@@ -43,12 +43,18 @@ let control =
 if control <> actual then
     failwithf "SOURCE_PIN_MISMATCH expected=%s actual=%s" control actual
 
-let ancestor, _, _ = git [ "merge-base"; "--is-ancestor"; pin; "HEAD" ]
-if ancestor <> 0 then failwith "SOURCE_LINEAGE_MISMATCH: accepted source not an ancestor."
+// Immutable reviewed pin and exact source/fixture blob identity attest tested bytes.
+// Ancestry alone rejects valid accepted-only cherry-pick compositions.
+let onDiskSource = requireGit [ "hash-object"; Path.Combine(root, source) ]
+if onDiskSource <> actual then
+    failwith "WORKTREE_SOURCE_MISMATCH: source differs from attested HEAD blob."
 let frozenFixture = requireGit [ "rev-parse"; pin + ":Client.Tests/NativeSchedulerRosterPolicyTests.fs" ]
 let worktreeFixture = requireGit [ "rev-parse"; "HEAD:Client.Tests/NativeSchedulerRosterPolicyTests.fs" ]
 if frozenFixture <> worktreeFixture then
     failwith "FROZEN_FIXTURE_MISMATCH: original fixture changed from reviewed source."
+let onDiskFixture = requireGit [ "hash-object"; fixture ]
+if onDiskFixture <> frozenFixture then
+    failwith "WORKTREE_FIXTURE_MISMATCH: fixture differs from attested HEAD blob."
 if File.Exists(output) then
     failwith "GENERATED_PATH_NOT_EMPTY: refusing to overwrite a test compilation unit."
 

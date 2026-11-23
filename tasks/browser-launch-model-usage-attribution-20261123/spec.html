@@ -1,0 +1,20 @@
+<h1>Persist UI-observed model selection for Jarvis agent launches</h1>
+<p><strong>Objective:</strong> Every Jarvis browser-launched executor session records the actual displayed ChatGPT mode, model and reasoning effort, attributed to the structurally supplied target agent and its canonical task (if any) at launch time.</p>
+<h2>Requirements</h2>
+<ol>
+<li>Extend the existing browser launch invocation with a structured <code>targetAgentId</code> distinct from the MCP caller (<code>Operator</code>). Do not parse agent identity or task identity from prompt text.</li>
+<li>At launch, resolve and snapshot the target agent's canonical assignment/task ID if present; permit null task for unassigned agents. Preserve the attribution snapshot across later reassignment.</li>
+<li>After the existing selection process, report the <em>displayed</em> mode/model/effort labels from the rendered UI. Never derive reported labels from picker index, candidate priority, requested settings, internal model identifiers, or hardcoded model names. Do not add a second selection-verification step: existing selection logic owns correctness.</li>
+<li>Persist a launch/session record in Jarvis's existing bookkeeping containing target agent, optional task ID, actual observed labels, submission outcome, timestamp, and durable conversation URL when available. Associate the record with the exact browser operation/session; avoid introducing a competing ledger or new MCP reporting tool. Respect current Git-backed authority and the SQLite cutover guard.</li>
+<li>Record unsuccessful, unconfirmed and unknown-outcome attempts accurately. Do not treat a submitted prompt as proven Work execution, token consumption, or credit expenditure. Missing UI observations must remain unknown, never silently substituted with requested values.</li>
+<li>Preserve existing single-Send/no-retry semantics, model fallback order, draft handling and browser tab cleanup. Do not activate the unattended scheduler, deploy or migrate storage.</li>
+</ol>
+<h2>Acceptance tests</h2>
+<ul>
+<li>Structural target identity is authoritative even when the prompt names a different agent; no attribution to the Operator caller.</li>
+<li>Assigned and unassigned launches persist correct task ID or null; reassignment after launch does not rewrite historical attribution.</li>
+<li>Displayed labels are persisted exactly as observed; reordered picker options and differing requested-versus-displayed labels do not corrupt accounting. Missing labels remain unknown.</li>
+<li>Chat Medium, Work Terra Medium and Chat Instant fallback paths produce correctly attributed records; failure/unknown submission states are distinguished.</li>
+<li>Tests verify idempotency/retry safety for persistence and no duplicate Send, and preserve existing launcher regression coverage.</li>
+</ul>
+<p>Implement the smallest coherent change; independent review before integration.</p>

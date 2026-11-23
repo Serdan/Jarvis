@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"integration-external-resolved-pending-bn050-20261123","title":"[P0][Integration] Close stale externally-published BN050 Pending without managed push proof","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"integration-external-resolved-pending-bn050-20261123","title":"[P0][Integration] Close stale externally-published BN050 Pending without managed push proof","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"c5747514b53a438f875f421c754b0501"}

@@ -7839,12 +7839,14 @@ type ReviewWorkflowTests() =
             Assert.That(observation.IntegratedTree, Is.EqualTo(tree))
             Assert.That(observation.FirstParent, Is.EqualTo(targetParent))
             Assert.That(observation.ObservedRemoteHead, Is.EqualTo(before))
-            Assert.That(summary.Submissions.Head.Status, Is.EqualTo("Pending"))
-            Assert.That(summary.Submissions.Head.PublicationMechanism, Is.Null)
+            Assert.That(summary.Submissions.Head.Status, Is.EqualTo("ResolvedExternally"))
+            Assert.That(summary.Submissions.Head.IntegratedCommit, Is.EqualTo(integrated))
+            Assert.That(summary.Submissions.Head.PublicationMechanism, Is.Null,
+                "External inclusion must not claim managed publisher proof")
             Assert.That(LedgerStore.readRemoteTarget second target |> success, Is.EqualTo(before))
             match ReviewWorkflow.completeIntegration second (Guid.NewGuid()) taskId "Reviewer"
                     submissionId integrated with
-            | Error(InvalidBinding _) | Error(OutcomeUnknown _) -> ()
+            | Error(InvalidBinding _) | Error(OutcomeUnknown _) | Error(StaleEntityVersion _) -> ()
             | other -> Assert.Fail(sprintf "External observation manufactured managed publisher proof: %A" other)
             // An observed remote may advance, but only along the already observed lineage.
             File.WriteAllText(Path.Combine(two, "after-observation.txt"), "advance")
@@ -7860,7 +7862,8 @@ type ReviewWorkflowTests() =
             Assert.That(after.ExternalObservations.Length, Is.EqualTo(2))
             Assert.That((after.ExternalObservations |> List.last).ObservedRemoteHead,
                 Is.EqualTo(advanced))
-            Assert.That(after.Submissions.Head.Status, Is.EqualTo("Pending"))
+            Assert.That(after.Submissions.Head.Status, Is.EqualTo("ResolvedExternally"))
+            Assert.That(after.Submissions.Head.IntegratedCommit, Is.EqualTo(integrated))
             // A later force rewrite that removes the previously observed head is never
             // accepted as a monotonic observation, even if the prior receipt remains.
             git one [ "push"; "--force"; "origin"; baseOid + ":" + target ] |> ignore
@@ -8038,7 +8041,8 @@ type ReviewWorkflowTests() =
                 let state = ReviewWorkflow.getIntegrationSubmissions second taskId |> success
                 Assert.That(state.ExternalObservations.Length, Is.EqualTo(1))
                 Assert.That(state.ExternalObservations.Head.ManagedPublisherProof, Is.False)
-                Assert.That(state.Latest.Value.Status, Is.EqualTo("Pending"))
+                Assert.That(state.Latest.Value.Status, Is.EqualTo("ResolvedExternally"))
+                Assert.That(state.Latest.Value.IntegratedCommit, Is.EqualTo(integrated))
                 Assert.That(state.Latest.Value.PublicationMechanism, Is.Null))
 
     [<Test>]
@@ -8097,7 +8101,8 @@ type ReviewWorkflowTests() =
                 Assert.That(state.ExternalObservations.Length, Is.EqualTo(1))
                 Assert.That(state.ExternalObservations.Head.ObservationOperationId,
                             Is.EqualTo(operationId.ToString("D")))
-                Assert.That(state.Latest.Value.Status, Is.EqualTo("Pending"))
+                Assert.That(state.Latest.Value.Status, Is.EqualTo("ResolvedExternally"))
+                Assert.That(state.Latest.Value.IntegratedCommit, Is.EqualTo(integrated))
                 Assert.That(state.Latest.Value.PublicationMechanism, Is.Null))
 
     [<Test>]
@@ -8148,7 +8153,8 @@ type ReviewWorkflowTests() =
                         | _ -> None)
                 for id in succeededIds do Assert.That(operationIds, Does.Contain(id))
                 Assert.That(operationIds.Length, Is.LessThanOrEqualTo(3))
-                Assert.That(final.Latest.Value.Status, Is.EqualTo("Pending"))
+                Assert.That(final.Latest.Value.Status, Is.EqualTo("ResolvedExternally"))
+                Assert.That(final.Latest.Value.IntegratedCommit, Is.EqualTo(integrated))
                 Assert.That(final.Latest.Value.PublicationMechanism, Is.Null)
                 Assert.That(final.ExternalObservations |> List.forall (fun item ->
                     not item.ManagedPublisherProof && item.PublisherAttribution = "Unattributed"),
@@ -8208,7 +8214,8 @@ type ReviewWorkflowTests() =
                                     Is.EqualTo("AuthenticatedUser"))
                     let final = ReviewWorkflow.getIntegrationSubmissions second taskId |> success
                     Assert.That(final.ExternalObservations.Length, Is.EqualTo(1))
-                    Assert.That(final.Latest.Value.Status, Is.EqualTo("Pending"))
+                    Assert.That(final.Latest.Value.Status, Is.EqualTo("ResolvedExternally"))
+                    Assert.That(final.Latest.Value.IntegratedCommit, Is.EqualTo(integrated))
                     Assert.That(final.Latest.Value.PublicationMechanism, Is.Null)
                 finally
                     if File.Exists configPath then File.Delete configPath)

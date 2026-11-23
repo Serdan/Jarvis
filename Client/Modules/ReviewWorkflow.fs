@@ -594,7 +594,8 @@ module ReviewWorkflow =
                         status "status" [ "Unclaimed"; "Claimed"; "Accepted"; "ChangesRequested"; "Withdrawn" ]
                         && (let mutable kind = Unchecked.defaultof<JsonElement>
                             root.TryGetProperty("kind", &kind) && kind.ValueKind = JsonValueKind.String)
-                    | "IntegrationSubmission" -> status "status" [ "Pending"; "Integrated" ]
+                    | "IntegrationSubmission" ->
+                        status "status" [ "Pending"; "Integrated"; "ResolvedExternally" ]
                     | "AttemptChallengeWait" -> status "status" [ "Waiting"; "Eligible"; "Requeued" ]
                     | "ReviewFeedbackNotice" -> status "status" [ "Accepted"; "ChangesRequested" ]
                     | "AgentCheckpoint" -> status "kind" [ "Yield"; "Completion"; "Recovery"; "Progress"; "Submission"; "Revision" ]
@@ -1265,7 +1266,8 @@ module ReviewWorkflow =
             return submission
         }
 
-    // Separate append-only observations never promote Pending to Integrated.
+    // External observations may resolve Pending, but never supply managed
+    // publisher proof or promote a submission to Integrated.
     let private externalObservationsAt binding snapshot taskId = result {
         let! paths = LedgerStore.listAt binding snapshot "tasks"
         let prefix = $"tasks/{taskId}/integration-observations/"
@@ -1338,7 +1340,15 @@ module ReviewWorkflow =
                 let! _ = required<ReviewTask> binding snapshot (taskPath taskId)
                 let! submission, _ = required<IntegrationSubmission> binding snapshot
                                         (integrationPath taskId submissionId)
-                if submission.Status <> "Pending"
+                let alreadyResolved =
+                    submission.Status = "ResolvedExternally"
+                    && submission.IntegratedCommit = integratedCommit
+                    && not (String.IsNullOrWhiteSpace submission.CompletedAtUtc)
+                    && String.IsNullOrWhiteSpace submission.PublicationPreviousHead
+                    && String.IsNullOrWhiteSpace submission.PublicationObservedHead
+                    && String.IsNullOrWhiteSpace submission.PublicationOperationId
+                    && String.IsNullOrWhiteSpace submission.PublicationMechanism
+                if (submission.Status <> "Pending" && not alreadyResolved)
                    || submission.SubmissionId <> submissionId.ToString("N")
                    || submission.TaskId <> taskId
                    || submission.IntegrationRef <> $"refs/heads/jarvis-integration/{submissionId:N}"
@@ -1363,6 +1373,10 @@ module ReviewWorkflow =
                         submission.SubmittedCommit integratedCommit
                 let! previous = externalObservationsAt binding snapshot taskId
                 let prior = previous |> List.filter (fun item -> item.SubmissionId = submission.SubmissionId)
+                if alreadyResolved
+                   && (List.isEmpty prior
+                       || (prior |> List.exists (fun item -> item.IntegratedCommit <> integratedCommit))) then
+                    return! Error(LedgerIntegrityError "Resolved submission lacks matching external publication evidence.")
                 for item in prior do
                     do! LedgerStore.verifySourceAncestry binding item.ObservedRemoteHead remoteHead
                 let record =
@@ -1381,9 +1395,9 @@ module ReviewWorkflow =
                       TargetHeadAtSubmission = submission.TargetHeadAtSubmission
                       TargetRef = submission.TargetRef; ObservedRemoteHead = remoteHead }
                 return! LegacyDirectWriterFence.transact binding action (fun current -> result {
-                    let! existing, _ = required<IntegrationSubmission> binding current
-                                            (integrationPath taskId submissionId)
-                    if existing <> submission || existing.Status <> "Pending" then
+                    let! existing, existingOid =
+                        required<IntegrationSubmission> binding current (integrationPath taskId submissionId)
+                    if existing <> submission then
                         return! Error(StaleEntityVersion "Integration changed during observation.")
                     let! now = externalObservationsAt binding current taskId
                     if now <> previous then
@@ -1392,7 +1406,14 @@ module ReviewWorkflow =
                     let! duplicate = read<ExternalPublicationObservation> binding current path
                     if duplicate.IsSome then
                         return! Error(StaleEntityVersion "Observation identity already exists.")
-                    return [ change path None record ]
+                    let submissionChanges =
+                        if existing.Status = "Pending" then
+                            [ change (integrationPath taskId submissionId) (Some existingOid)
+                                { existing with Status = "ResolvedExternally"
+                                                IntegratedCommit = integratedCommit
+                                                CompletedAtUtc = record.RecordedAtUtc } ]
+                        else []
+                    return change path None record :: submissionChanges
                 })
             }
 

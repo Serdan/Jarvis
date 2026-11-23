@@ -1033,7 +1033,7 @@ let externalGitObservationCannotPromotePendingSubmissionToWorkCompositionAccepta
         let external = ReviewWorkflow.getIntegrationSubmissions first taskId |> succeed
         Assert.That(external.ExternalObservations.Length, Is.EqualTo(1))
         Assert.That(external.ExternalObservations.Head.ManagedPublisherProof, Is.False)
-        Assert.That(external.Latest.Value.Status, Is.EqualTo("Pending"))
+        Assert.That(external.Latest.Value.Status, Is.EqualTo("ResolvedExternally"))
         Assert.That(external.Latest.Value.PublicationMechanism, Is.Null)
         let acceptanceId = Guid.NewGuid()
         match WorkCompositionAcceptanceAdapter.acceptIntegrated second owner acceptanceId

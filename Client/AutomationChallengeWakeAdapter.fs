@@ -377,3 +377,43 @@ let notifyCommitted enabled binding cmd receipt
         if host.Notify WorkWakeTrigger.DependencyCommitted then ready
         else CommittedWakeDecision.Hold "HostNotAccepting"
     | decision -> decision
+
+
+/// One client-owned registered callback for both Program and source-pinned
+/// native ingress tests. OFF returns before binding resolution or Host I/O;
+/// no callback acknowledgement changes a durable ledger write outcome.
+let deliverRegistered enabled
+                      (loadBinding: string -> Result<LedgerBinding, Client.EffectError>)
+                      (report: string -> unit)
+                      (host: Client.WorkQueueSchedulerHostLoop.WorkQueueSchedulerHostLoop.Host)
+                      (cmd: Common.ChallengeWriteCommand)
+                      (receipt: Client.OrchestrationApi.OperationResponse.Presented) =
+    if not enabled then CommittedWakeDecision.Off
+    else
+        match loadBinding cmd.ProjectName with
+        | Error _ ->
+            report "Challenge wake binding unknown; original Git commit unchanged."
+            CommittedWakeDecision.Hold "BindingUnknown"
+        | Ok binding ->
+            let outcome = notifyCommitted true binding cmd receipt host
+            match outcome with
+            | CommittedWakeDecision.Hold code ->
+                report $"Challenge wake hint held: {code}"
+            | _ -> ()
+            outcome
+
+
+/// Compiled registration used identically by Program and the isolated native
+/// SignalR ingress regression. One Host per client lifecycle; no global state.
+/// Disabled registration neither starts a worker nor reads trust bindings.
+let registerHost enabled
+                 (ports: Client.WorkQueueSchedulerHostLoop.SchedulerHostPorts)
+                 (loadBinding: string -> Result<LedgerBinding, Client.EffectError>)
+                 (report: string -> unit) =
+    let host =
+        new Client.WorkQueueSchedulerHostLoop.WorkQueueSchedulerHostLoop.Host(
+            ports, enabled = enabled)
+    let onCommitted (cmd: Common.ChallengeWriteCommand)
+                    (receipt: Client.OrchestrationApi.OperationResponse.Presented) =
+        deliverRegistered enabled loadBinding report host cmd receipt |> ignore
+    host, onCommitted

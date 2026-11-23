@@ -346,20 +346,11 @@ let private runClient args =
             challengeCoordinator
             (fun () -> Error "B1 default-off host has no authorized production head reader.")
             (fun _ -> ())
-    let challengeHost =
-        new Client.WorkQueueSchedulerHostLoop.WorkQueueSchedulerHostLoop.Host(challengeHostPorts)
-    let onChallengeCommit: Client.ChallengeWakePostCommit =
-        fun cmd receipt ->
-            // OFF must bypass LedgerBindingConfig.load (and all Git/network I/O).
-            if challengeWakeEnabled then
-                match OrchestrationApi.LedgerBindingConfig.load cmd.ProjectName rt with
-                | Error _ -> tui.Log "Challenge wake binding unknown; original Git commit unchanged."
-                | Ok binding ->
-                    match Client.AutomationChallengeWakeAdapter.notifyCommitted
-                            true binding cmd receipt challengeHost with
-                    | Client.AutomationChallengeWakeAdapter.CommittedWakeDecision.Hold code ->
-                        tui.Log $"Challenge wake hint held: {code}"
-                    | _ -> ()
+    let challengeHost, onChallengeCommit =
+        Client.AutomationChallengeWakeAdapter.registerHost
+            challengeWakeEnabled challengeHostPorts
+            (fun project -> OrchestrationApi.LedgerBindingConfig.load project rt)
+            tui.Log
     let toUiError result = result |> Result.mapError (fun error -> sprintf "%A" error)
     let toReplyError = function
         | LedgerFailureError failure when failure.Code = "StaleEntityVersion" ->

@@ -1263,6 +1263,21 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
 let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string) =
     processIncomingCommandCore rt commandJson agentId true None false None
 
+// The authenticated SignalR receive path and its isolated native regression
+// share this *same* post-journal execution boundary. The caller's original
+// operation UUID and actor label are forwarded unchanged; only a typed,
+// successful ChallengeApi write may invoke the injected wake callback.
+let executeAuthenticatedCommandWithChallengeWake
+    (rt: Runtime) (commandJson: string) (agentId: string)
+    (sourceOriginalId: string option) (manualGrantAuthorized: bool)
+    (onChallengeCommit: ChallengeWakePostCommit) : Task<AgentCommandResponse> =
+    task {
+        let! _, _, response =
+            processIncomingCommandCore rt commandJson agentId false
+                sourceOriginalId manualGrantAuthorized (Some onChallengeCommit)
+        return response
+    }
+
 // Background completion is not an agent-visible response. This is the only
 // response-alert consumption point for SignalR-delivered tool calls, including
 // pending handles, quick completions, polls and errors.
@@ -1393,11 +1408,17 @@ let executeOrPromoteWith (rt: Runtime) (commandJson: string) (agentId: string)
 let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: string)
                              (sourceOriginalId: string option) (manualGrantAuthorized: bool)
                              (onChallengeCommit: ChallengeWakePostCommit option) =
-    let run serialized actor = task {
-        let! _, _, outcome =
-            processIncomingCommandCore rt serialized actor false sourceOriginalId manualGrantAuthorized onChallengeCommit
-        return outcome
-    }
+    let run serialized actor =
+        match onChallengeCommit with
+        | Some callback ->
+            executeAuthenticatedCommandWithChallengeWake rt serialized actor
+                sourceOriginalId manualGrantAuthorized callback
+        | None ->
+            task {
+                let! _, _, outcome =
+                    processIncomingCommandCore rt serialized actor false sourceOriginalId manualGrantAuthorized None
+                return outcome
+            }
     // A prospective project cannot be bound to its actual canonical name
     // from a background PendingJob. Complete creation before returning.
     let directCreation =

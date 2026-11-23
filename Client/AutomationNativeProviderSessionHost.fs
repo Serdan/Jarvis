@@ -9,7 +9,7 @@ open Client.NativeSchedulerAccountReservation
 open Client.NativeSchedulerRosterPolicy
 open Client.AutomationNativeAccountProjectIngress
 
-// Stage A. The existing paired BrowserBridge authenticates extension transport,
+// The existing paired BrowserBridge authenticates extension transport,
 // not ChatGPT provider session/turn identity. A registered tab/window, script
 // acknowledgement, URL, disappearance or DOM stop control is never a terminal.
 type NativeHostHold =
@@ -33,6 +33,7 @@ type OriginalLaunchIntent =
       TemplateBlobOid: string
       PromptSha256: string
       ArgumentsSha256: string
+      ObservedConnectionId: string
       ObservedWindowGeneration: int
       State: string }
 
@@ -44,29 +45,14 @@ let private json value = JsonSerializer.Serialize(value, options)
 let private bad reason = Error(InvalidBinding("NativeSessionHost: " + reason))
 let private stale reason = Error(StaleEntityVersion("NativeSessionHost: " + reason))
 
-// Read only the actual paired bridge registry; never accept an extension-shaped
-// JSON record as a host capability. ListWindows does not expose its connection
-// ownership to callers, so even a unique ready window is preflight evidence only.
-let private observedWindowGeneration (bridge: BrowserBridge.Service) registration =
+// Only the paired service supplies connection identity. This is transport
+// preflight, not a provider identity or a proof that a send did/did not occur.
+let private observedWindowOwner (bridge: BrowserBridge.Service) registration =
     if isNull (box bridge) || String.IsNullOrWhiteSpace registration then
         bad "Paired browser window is missing."
     else
-        match bridge.ListWindows() with
-        | Error _ -> bad "No authenticated browser bridge connection."
-        | Ok raw ->
-            try
-                use document = JsonDocument.Parse(raw)
-                let matches =
-                    document.RootElement.GetProperty("windows").EnumerateArray()
-                    |> Seq.filter (fun w ->
-                        w.GetProperty("windowRegistration").GetString() = registration)
-                    |> Seq.toArray
-                match matches with
-                | [| window |] when window.GetProperty("availability").GetString() = "ready" ->
-                    let generation = window.GetProperty("registrationGeneration").GetInt32()
-                    if generation > 0 then Ok generation else bad "Invalid window registration generation."
-                | _ -> bad "Missing, ambiguous or unavailable exact window registration."
-            with _ -> bad "Malformed registered browser window."
+        bridge.TryGetExactWindowOwner(registration)
+        |> Result.mapError (fun reason -> InvalidBinding("NativeSessionHost: " + reason))
 
 let private intentPath (effectId: Guid) =
     $"records/native-scheduler/launch-intents/{effectId:N}.json"
@@ -93,9 +79,9 @@ let internal prepareVerifiedDisposable root (account: AccountBinding) operatorKe
             string p.ProjectId = c.ProjectId && string p.LedgerId = c.ProjectLedgerId
             && p.Epoch = c.ProjectEpoch) with
         | (true, effectId), Some project when effectId <> Guid.Empty && string effectId = c.EffectOperationId ->
-            match observedWindowGeneration bridge claim.WindowRegistration with
+            match observedWindowOwner bridge claim.WindowRegistration with
             | Error e -> Error e
-            | Ok windowGeneration ->
+            | Ok (connectionId, windowGeneration) ->
                 match NativeSchedulerAccountReservation.readVerifiedDisposable
                         root account operatorKey subject projects coverage with
                 | Error e -> bad (sprintf "Verified disposable account unavailable: %A" e)
@@ -119,16 +105,17 @@ let internal prepareVerifiedDisposable root (account: AccountBinding) operatorKe
                                     if not (BrowserArguments.fits arguments) then
                                         bad "Full serialized browser launch arguments exceed bridge budget."
                                     else
-                                        match observedWindowGeneration bridge claim.WindowRegistration with
-                                        | Ok currentGeneration when currentGeneration = windowGeneration ->
+                                        match observedWindowOwner bridge claim.WindowRegistration with
+                                        | Ok (currentOwner, currentGeneration) when currentOwner = connectionId && currentGeneration = windowGeneration ->
                                             let intent =
-                                                { SchemaVersion = 1; ProjectName = rendered.ProjectName
+                                                { SchemaVersion = 2; ProjectName = rendered.ProjectName
                                                   Claim = claim; AccountGeneration = record.Generation
                                                   CanonicalKey = record.CanonicalKey
                                                   TemplateVersion = rendered.TemplateVersion
                                                   TemplateBlobOid = rendered.TemplateBlobOid
                                                   PromptSha256 = rendered.PromptSha256
                                                   ArgumentsSha256 = NativeSchedulerRosterPolicy.sha256 arguments
+                                                  ObservedConnectionId = connectionId
                                                   ObservedWindowGeneration = windowGeneration
                                                   State = "HeldBeforeSend" }
                                             let change =
@@ -172,7 +159,12 @@ let internal readOriginalIntent (binding: LedgerBinding) (claimOperationId: Guid
                                 request.RootElement.GetProperty("claim").GetRawText(), options)
                         use args = JsonDocument.Parse(arguments)
                         let prompt = args.RootElement.GetProperty("prompt").GetString()
-                        if pinned.SchemaVersion <> 1 || pinned.State <> "HeldBeforeSend"
+                        let validConnection =
+                            match Guid.TryParseExact(pinned.ObservedConnectionId, "N") with
+                            | true, id when id <> Guid.Empty && id.ToString("N") = pinned.ObservedConnectionId -> true
+                            | _ -> false
+                        if pinned.SchemaVersion <> 2 || pinned.State <> "HeldBeforeSend"
+                           || not validConnection || pinned.ObservedWindowGeneration < 1
                            || pinned.Claim <> originalClaim || pinned.Claim.OperationId <> claimOperationId
                            || pinned.Claim.Candidate.EffectOperationId <> string effectId
                            || pinned.Claim.Candidate.ProjectId <> string binding.ProjectId
@@ -199,3 +191,12 @@ let authorizeProviderDispatch () : Result<unit, NativeHostHold list> =
 
 let releaseFromProviderTerminal () : Result<unit, NativeHostHold> =
     Error ProviderTerminalUnavailable
+
+// Program and offline tests share this exact ports factory. The existing B1
+// registration remains the sole owner of the host, callback and shutdown.
+// There is no authorized production head reader or way to enable native sends.
+let internal defaultOffHostPorts coordinator report =
+    let hold = sprintf "Native session host HOLD: %A" (productionHolds())
+    report hold
+    Client.WorkQueueSchedulerHostLoop.WorkQueueSchedulerHostLoop.productionPorts
+        coordinator (fun () -> Error hold) (fun _ -> ())

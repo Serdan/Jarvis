@@ -9,8 +9,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../Client/Client.fsproj" />
-    <Compile Include="../../Client/AutomationNativeAccountProjectIngress.fs" />
-    <Compile Include="../../Client/AutomationNativeProviderSessionHost.fs" />
     <Compile Include="HostTests.fs" />
   </ItemGroup>
   <ItemGroup>

@@ -9,8 +9,8 @@ open Client.NativeSchedulerAccountReservation
 open Client.NativeSchedulerRosterPolicy
 open Client.ReviewWorkflow
 
-// This file is NOT in Client.fsproj. Only the standalone, signed disposable
-// fixture compiles it. No public caller-supplied record grants launch authority.
+// Compiled default-off ingress; writes require the signed disposable fixture.
+// No public caller-supplied record grants production launch authority.
 type NativeIssuerStatus = Disabled of string | Enabled
 let productionStatus () =
     Disabled "Authenticated account/provider issuer absent; production ingress remains default OFF."

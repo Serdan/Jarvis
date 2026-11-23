@@ -333,8 +333,8 @@ let private runClient args =
             oauth.GetAccessTokenAsync().GetAwaiter().GetResult()
             |> operatorActorFromAccessToken
         with _ -> None
-    // B1 is a compiled, client-owned postcommit seam, NOT scheduler activation.
-    // No environment switch can enable this unfinished admission boundary.
+    // B1 and native session host share a single compiled default-off registration.
+    // No environment switch can enable the unfinished authority boundary.
     let challengeWakeEnabled = false
     let challengeWakePorts : Client.WorkQueueReactiveWake.WorkWakePorts =
         { ReadVerified = (fun () -> failwith "B1 has no approved production scheduler admission read.")
@@ -343,10 +343,7 @@ let private runClient args =
     let challengeCoordinator =
         Client.WorkQueueReactiveWake.WorkQueueReactiveWake.Coordinator(challengeWakePorts)
     let challengeHostPorts =
-        Client.WorkQueueSchedulerHostLoop.WorkQueueSchedulerHostLoop.productionPorts
-            challengeCoordinator
-            (fun () -> Error "B1 default-off host has no authorized production head reader.")
-            (fun _ -> ())
+        Client.AutomationNativeProviderSessionHost.defaultOffHostPorts challengeCoordinator tui.Log
     let challengeHost, onChallengeCommit =
         Client.AutomationChallengeWakeAdapter.registerHost
             challengeWakeEnabled challengeHostPorts

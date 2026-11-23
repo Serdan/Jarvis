@@ -162,3 +162,103 @@ source-real provider identity/terminal producer, independently accepted
 Integrator composition, and fresh independent review remain outstanding.
 
 Final host suite: **10/10 passed** (job `c89d4080cf3347218b44a7f079eda5d9`), including exact 65,536-byte accepted full envelope, minimal-only-fit rejected envelope, duplicate authenticated window registration, rewritten argument blob denial, and actual race of two separately cloned Git clients. Final W16 re-regression after atomic split: **10/10 passed** (job `3f0daa3d83ec47418ee2a1a1d5dac891`). Both final commands used `-p:BuildProjectReferences=false` with the exact previously built Release Client dependencies. All three focused suites: 49 passed; no unfiltered client tests, live provider sends, or runtime activation.
+
+
+## Stage B — accepted composition, exact transport owner, compiled default-off ports (2026-11-24)
+
+The preceding Stage A notes and results are historical; Stage B is based on
+the exact immutable remote ref
+`refs/heads/jarvis-review/integrator/9cb405cd2dfd4c349e8149a810b7d6af/r1`,
+advertising `e41f16c44b4549203ad946d1e7df46537c079063`.
+Lead's canonical resolution of challenge
+`6f79f22487ca45b69425b608b90fdcb3`, event 12843, records independent
+Reviewer 1 Accepted v3 decision 12838 and exact Stage B lease, task spec v4.
+The accepted composition contains the actual NativeProjectEffectFence.fs
+blob `255e9c6956e2e110c738e4c27e01959ea0ca6b8a`.
+Remote main was independently observed at
+`d9bea11986bd8b9ac8318c599c934c78de77c235`. A new registered isolated
+worktree was created at e41f16c; only the frozen Stage A commit
+`44d3a53dda1fb92aa8016ca07512dd51c673c758` was cherry-picked, yielding
+`85ec8be22`. The old Stage A branch remains intact. This is not a main
+publication or a claim of integration of the current delta.
+
+The additive internal `BrowserBridge.Service.TryGetExactWindowOwner`
+looks up an exact window registration (not aliases) under the same lock
+that protects the authenticated connections and registrations. It rejects
+duplicates, non-ready/closed connections and missing or out-of-range
+generations. The host compares the connection ID *and* generation at both
+preflights, and binds them into the v2 disposable immutable launch-intent
+record; the readback verifies the original request digest and schema. The
+connection ID is ephemeral transport provenance, not a provider identity.
+A same-generation reconnect cannot be treated as the same owner. No
+change to ListWindows, bridge send, pairing protocol, tab execution,
+launcher, legacy scheduler or Health.
+
+Program keeps the single B1 registration, postcommit callback and
+shutdown path. The host's compiled `defaultOffHostPorts` factory supplies
+a denied verified-head reader and reports the exact HOLD reasons. Program
+retains its hard-coded false flag and disabled coordinator. The new
+test project references the compiled Client, no longer compiling linked
+copies of the host or ingress. Signed fixture writes remain internal and
+restricted by the original disposable account verification; the production
+claim entrypoint still denies. No independent trust root, external effects
+or actual account reservations are introduced.
+
+### Remaining authority boundary (not PASS)
+
+The existing local OAuth login derives an operator actor from the returned
+token subject (Program.fs 117–134). Its existing human reply ingress
+(OrchestrationApi.fs 3052–3070) binds a Challenge reply UUID, challenge,
+condition and version; this is not an actual independently verified
+native original-reservation outcome. The project effect fence
+(NativeProjectEffectFence.fs 280–327) supplies *test-only* fake terminal
+and no-send operations; neither can furnish the production
+NativeProviderSessionTerminal operation required by the account verifier.
+No conversion from human Challenge evidence, browser connection/window
+identity, UI state, activity, or agent lifecycle to a provider terminal
+is authorized.
+
+Lead explicitly holds automatic reserve/dispatch/release; W12 task
+`automation-native-account-authority-binding-20261124` owns the
+account-side approved roster and reconciliation verifier. Its exact
+independently accepted contract and genuine original-bound outcome
+evidence are required before any project-side human reconciliation
+producer. Current source does not establish that evidence. The
+default-off host does not call a release, fabricate a terminal or accept
+generic role/approval text. Unknown remains occupied. Reviewer claim/lease
+ingress is independently held, never manufactured from Worker claims.
+Do not activate the scheduler or infer milestone completion from the
+bounded source acceptance.
+
+### Stage B regression history
+
+Initial full Release Client compile succeeded. Host job
+`bb4e3a5c64dc4dd6bc2ef42f6c7a9bd2`: 10 pass, 2 fail, both NUnit boxed
+F# Result comparison type mismatches; after typed assertions the compiled
+host suite passed 12/12 (job `0c819a00a1184d5a8dc0c9191a6e748b`).
+Predecessor W12 29/29 (job `e66a05a1742c4e65a633c6c9cdff0090`,
+intentional production RED excluded), W16 10/10 (job
+`948577f678ee4d8291066bd95a28fa0b`). B1 job
+`3f49f1bc700640869d9328134ab4e672` identified removal of the direct
+Program registration anchor (12 pass, 1 fail). The correction retains
+the existing direct registration and uses only the native HOLD ports
+factory, preserving the W17 regression source unchanged. Final tests must
+use the rebuilt exact Client after this correction.
+
+Final corrected Stage B Release results (all exit 0; exact rebuilt Client):
+
+| Suite | Passed | Job |
+| --- | ---: | --- |
+| Native session host | 12/12 | `0e39b8eba7554841937395f890d34bd4` |
+| W17 Challenge wake/B1 | 13/13 | `59e23066a48f45bc8d5161c50da83bd8` |
+| W12 provider trust | 29/29 | `771a23c70c2f4c5ea37d6ed0dbe0e34d` |
+| W16 Started ingress | 10/10 | `ba3e76d0d183477180fead652a70d222` |
+
+The first command rebuilt the real Client in Release; the three predecessor
+commands used `--no-restore -p:BuildProjectReferences=false` with that
+build. The W12 command excluded the deliberate production RED using
+`--filter FullyQualifiedName!~Production`. W17 regression source and all
+shared wire files remain unchanged. In total 64 focused tests passed.
+No unfiltered Client tests, production send, reservation, terminal
+release, deployment, restart or runtime activation were performed.
+`git diff --check` passed before freezing.

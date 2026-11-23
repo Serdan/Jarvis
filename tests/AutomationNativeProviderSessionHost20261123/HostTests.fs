@@ -357,6 +357,8 @@ let ``paired browser and verified Started CAS pins exact immutable prompt and ef
             Assert.That(pinned.TemplateVersion, Is.EqualTo(rendered.TemplateVersion))
             Assert.That(pinned.TemplateBlobOid, Is.EqualTo(rendered.TemplateBlobOid))
             Assert.That(pinned.PromptSha256, Is.EqualTo(rendered.PromptSha256))
+            let owner, _ = bridge.TryGetExactWindowOwner(claim.WindowRegistration) |> SignedFixture.success
+            Assert.That(pinned.ObservedConnectionId, Is.EqualTo(owner))
             Assert.That(pinned.ObservedWindowGeneration, Is.EqualTo(7))
             use args = JsonDocument.Parse arguments
             Assert.That(args.RootElement.GetProperty("prompt").GetString(), Is.EqualTo(rendered.Prompt))
@@ -509,3 +511,77 @@ let ``two separately cloned clients can durably claim original launch only once`
             Assert.That((readOriginalIntent f.ProjectOne winner.OperationId id).IsOk, Is.True)
             Assert.That((readOriginalIntent f.ProjectTwo loser.OperationId id).IsError, Is.True)
             Assert.That((SignedFixture.state f).Records[0].Status, Is.EqualTo("Reserved"))))
+
+
+[<Test>]
+let ``compiled default off host registers only existing B1 path and never reads or executes`` () =
+    let mutable calls = 0
+    let unexpected () =
+        calls <- calls + 1
+        failwith "Disabled host called authority port"
+    let ports : Client.WorkQueueReactiveWake.WorkWakePorts =
+        { ReadVerified = unexpected
+          Plan = fun _ -> unexpected()
+          Execute = fun _ -> unexpected() }
+    let coordinator = Client.WorkQueueReactiveWake.WorkQueueReactiveWake.Coordinator(ports)
+    let messages = ResizeArray<string>()
+    let hostPorts = defaultOffHostPorts coordinator messages.Add
+    let host, onCommitted =
+        Client.AutomationChallengeWakeAdapter.registerHost false hostPorts
+            (fun _ -> unexpected()) messages.Add
+    use host = host
+    Assert.That(typeof<OriginalLaunchIntent>.Assembly, Is.EqualTo(typeof<Client.BrowserBridge.Service>.Assembly))
+    Assert.That(messages.Count, Is.EqualTo(1))
+    Assert.That(messages[0], Does.Contain("HOLD").And.Contain("ProviderTerminalUnavailable"))
+    Assert.That(host.IsRunning, Is.False)
+    Assert.That(host.Start(), Is.False)
+    Assert.That(host.Notify Client.WorkQueueReactiveWake.WorkWakeTrigger.ManualReconcile, Is.False)
+    Assert.That(host.RunOnce [Client.WorkQueueReactiveWake.WorkWakeTrigger.ManualReconcile],
+                Is.EqualTo(Client.WorkQueueSchedulerHostLoop.SchedulerHostOutcome.Disabled))
+    onCommitted Unchecked.defaultof<_> Unchecked.defaultof<_>
+    host.StopAsync().GetAwaiter().GetResult()
+    Assert.That(calls, Is.EqualTo(0))
+    Assert.That(authorizeProviderDispatch() = Error(productionHolds()), Is.True)
+    Assert.That(releaseFromProviderTerminal() = Error ProviderTerminalUnavailable, Is.True)
+
+[<Test>]
+let ``exact authenticated owner distinguishes same generation reconnect and refuses alias or malformed registrations`` () =
+    let p = PairedBrowser.port()
+    let secret = Guid.NewGuid().ToString("N")
+    use bridge = new Client.BrowserBridge.Service(p, secret)
+    bridge.Start()
+    let lookup () = bridge.TryGetExactWindowOwner("window-disposable")
+    Assert.That(lookup().IsError, Is.True)
+    use first = (PairedBrowser.pair p secret).GetAwaiter().GetResult()
+    (PairedBrowser.register first bridge 1).GetAwaiter().GetResult()
+    let owner, generation = lookup() |> SignedFixture.success
+    Assert.That(generation, Is.EqualTo(7))
+    Assert.That(bridge.TryGetExactWindowOwner("fixture").IsError, Is.True)
+    let publish generation availability =
+        let raw = """{"version":2,"kind":"windows","windows":[{"windowRegistration":"window-disposable","alias":"fixture","availability":"AVAIL","registrationGeneration":GEN}]}"""
+                      .Replace("AVAIL", availability).Replace("GEN", generation)
+        (PairedBrowser.send first raw).GetAwaiter().GetResult()
+        Assert.That(SpinWait.SpinUntil((fun () ->
+            match bridge.ListWindows() with
+            | Ok listing ->
+                use doc = JsonDocument.Parse listing
+                let windows = doc.RootElement.GetProperty("windows")
+                windows.GetArrayLength() = 1 &&
+                windows[0].GetProperty("registrationGeneration").GetRawText() = generation &&
+                windows[0].GetProperty("availability").GetString() = availability
+            | Error _ -> false), TimeSpan.FromSeconds 5.0), Is.True)
+    publish "8" "ready"
+    Assert.That(lookup() = Ok(owner, 8), Is.True)
+    publish "999999999999" "ready"
+    Assert.That(lookup().IsError, Is.True)
+    publish "8" "unavailable"
+    Assert.That(lookup().IsError, Is.True)
+    first.Abort()
+    Assert.That(SpinWait.SpinUntil((fun () -> bridge.ListWindows().IsError), TimeSpan.FromSeconds 5.0), Is.True)
+    use second = (PairedBrowser.pair p secret).GetAwaiter().GetResult()
+    (PairedBrowser.register second bridge 1).GetAwaiter().GetResult()
+    let replacementOwner, replacementGeneration = lookup() |> SignedFixture.success
+    Assert.That(replacementGeneration, Is.EqualTo(generation))
+    Assert.That(replacementOwner, Is.Not.EqualTo(owner))
+    // Neither authenticated transport connection proves a provider terminal.
+    Assert.That(releaseFromProviderTerminal().IsError, Is.True)

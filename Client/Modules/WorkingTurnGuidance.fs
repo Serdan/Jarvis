@@ -50,24 +50,30 @@ let forSession (now: DateTimeOffset) sessionId (agent: ReviewAgent) =
 // connected device. Reconnection discards entries to account for missed pushes.
 type private CacheEntry =
     { Gate: obj
-      mutable CheckedAt: DateTimeOffset
-      mutable Value: ReviewAgent option }
+      mutable Verified: (DateTimeOffset * ReviewAgent option) option }
 
 type AgentCache(refreshInterval: TimeSpan) =
     let entries = ConcurrentDictionary<ProjectPaths.ProjectId * string, CacheEntry>()
 
-    member _.Get(now: DateTimeOffset, project: ProjectPaths.ProjectId, agentId: string, load: unit -> ReviewAgent option) =
+    member _.Get(now: DateTimeOffset, project: ProjectPaths.ProjectId, agentId: string,
+                 load: unit -> Result<ReviewAgent option, Client.EffectError>) =
         let key = project, agentId.ToUpperInvariant()
         let entry =
             entries.GetOrAdd(key, fun _ ->
-                { Gate = obj()
-                  CheckedAt = DateTimeOffset.MinValue
-                  Value = None })
+                { Gate = obj(); Verified = None })
         lock entry.Gate (fun () ->
-            if now - entry.CheckedAt >= refreshInterval || now < entry.CheckedAt then
-                entry.Value <- load()
-                entry.CheckedAt <- now
-            entry.Value)
+            match entry.Verified with
+            | Some (checkedAt, value) when now >= checkedAt && now - checkedAt < refreshInterval ->
+                Ok value
+            | _ ->
+                // A failed refresh establishes neither presence nor absence.
+                // The next call must retry rather than use stale lifecycle evidence.
+                entry.Verified <- None
+                match load() with
+                | Ok value ->
+                    entry.Verified <- Some(now, value)
+                    Ok value
+                | Error error -> Error error)
 
     member _.Invalidate(project: ProjectPaths.ProjectId, agentId: string) =
         let key = project, agentId.ToUpperInvariant()

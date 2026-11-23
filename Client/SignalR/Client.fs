@@ -226,13 +226,29 @@ let private classifyProject command =
         | Some raw -> ProjectPaths.ProjectTarget.parse raw |> Result.map Checkout
 
 
+// Trust-binding locks are held only around local config access, never
+// remote Git fetches. Retry only the typed, pre-write contention case.
+// Three short waits bound the extra synchronous lock-wait budget to 60 ms.
+let private retryBindingContention load =
+    let rec attempt retries =
+        match load() with
+        | Error(Client.LedgerFailureError issue)
+            when issue.Code = "TrustBindingContended" && retries > 0 ->
+            Thread.Sleep(10 * (4 - retries))
+            attempt (retries - 1)
+        | result -> result
+    attempt 3
+
 let private loadAgentState (rt: Runtime) (project: string) (agentId: string) =
-    match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt with
-    | Error _ -> None
+    match retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt) with
+    | Error error -> Error error
     | Ok (binding, snapshot) ->
         match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurnAt binding snapshot agentId with
-        | Ok agent -> Some agent
-        | Error _ -> None
+        | Ok agent -> Ok(Some agent)
+        // This exact required-entity read reports a missing record at the
+        // verified snapshot as StaleEntityVersion; other failures are unknown.
+        | Error(LedgerStore.StaleEntityVersion _) -> Ok None
+        | Error error -> Error(OrchestrationApi.LedgerErrors.toEffect error)
 
 let private checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.ProjectTarget option) command =
     if String.IsNullOrWhiteSpace agentId then []
@@ -247,7 +263,7 @@ let private checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.Pro
             let agent =
                 cache.Get(now, projectId, agentId, fun () ->
                     loadAgentState rt project agentId)
-            match agent |> Option.bind (WorkingTurnGuidance.instructionAt now) with
+            match agent |> Result.toOption |> Option.flatten |> Option.bind (WorkingTurnGuidance.instructionAt now) with
             | Some content ->
                 [ { Scope = "working-turn"; Path = "jarvis/working-turn"
                     Sha256 = ""; Content = content } ]
@@ -360,11 +376,11 @@ let private activatesAgent (agentId: string) command =
 
 let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                                 (target: ProjectPaths.ProjectTarget option) command =
-    if String.IsNullOrWhiteSpace agentId || not (activatesAgent agentId command) then Ok ([], None)
+    if String.IsNullOrWhiteSpace agentId || not (activatesAgent agentId command) then Ok ([], None, [])
     else
         match target with
-        | None -> Ok ([], None)
-        | Some target when not (oldSideEffectsAllowed rt target) -> Ok ([], None)
+        | None -> Ok ([], None, [])
+        | Some target when not (oldSideEffectsAllowed rt target) -> Ok ([], None, [])
         | Some target ->
             let projectId = ProjectPaths.ProjectTarget.projectId target
             let project = ProjectPaths.ProjectId.value projectId
@@ -379,29 +395,44 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
             let current =
                 cache.Get(DateTimeOffset.UtcNow, projectId, agentId, fun () ->
                     loadAgentState rt project agentId)
+            // A read of source should remain available without lifecycle
+            // authority. Report uncertainty explicitly, never invent a
+            // committed activation. Lifecycle commands must fail closed.
+            let unavailable error =
+                match LegacyWriterProtocolFence.LegacyWriterProtocolFence.classify command with
+                | LegacyWriterProtocolFence.LegacyCommandKind.HistoricalRead ->
+                    Ok ([], None,
+                        [ { Scope = "working-turn"; Path = "jarvis/activation-status"
+                            Sha256 = ""
+                            Content = $"Automatic Ready-to-Working activation could not be verified: {error}. Reread the canonical inbox before continuing assignment work." } ])
+                | _ -> Error error
             match current with
-            | Some agent when agent.State = "Ready"
+            | Error error -> unavailable error
+            | Ok(Some agent) when agent.State = "Ready"
                               && not (isNull (box agent.CurrentAssignment))
                               && not (String.IsNullOrWhiteSpace agent.CurrentAssignment.TaskId) ->
-                match OrchestrationApi.LedgerBindingConfig.load project rt with
-                | Error error -> Error(Client.ValidationError($"Cannot inspect Ready agent: {error}"))
+                match retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.load project rt) with
+                | Error error ->
+                    cache.Invalidate(projectId, agentId)
+                    unavailable error
                 | Ok binding ->
                     // A Ready cache entry cannot establish the current task
                     // lifecycle. Closure may deliberately retain Started+Ready
                     // so the owner can record a completion checkpoint.
                     match ReviewWorkflow.ReviewWorkflow.inspectAutomaticActivation binding agentId with
                     | Error error ->
-                        Error(Client.ValidationError($"Cannot inspect automatic activation eligibility: {error}"))
+                        cache.Invalidate(projectId, agentId)
+                        unavailable (Client.ValidationError($"Cannot inspect automatic activation eligibility: {error}"))
                     | Ok(Client.ReviewWorkflow.ActivationIneligible _) ->
                         cache.Invalidate(projectId, agentId)
-                        Ok ([], None)
+                        Ok ([], None, [])
                     | Ok(Client.ReviewWorkflow.ActivationEligible currentTaskId) ->
                         let result =
                             ReviewWorkflow.ReviewWorkflow.activateReadyAgent binding (Guid.NewGuid())
                                 currentTaskId agentId
                         cache.Invalidate(projectId, agentId)
                         match result with
-                        | Ok write when write.AlreadyApplied -> Ok ([], None)
+                        | Ok write when write.AlreadyApplied -> Ok ([], None, [])
                         | Ok write ->
                             // Only committed transitions emit Working metadata.
                             let committed : AgentInboxActivation =
@@ -412,12 +443,12 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                                   AfterState = Some "Working"
                                   CommittedHead = Some write.CurrentHead
                                   OperationId = Some write.Operation.OperationId }
-                            Ok (Client.LedgerStore.LedgerStore.changedAgentIds write, Some committed)
+                            Ok (Client.LedgerStore.LedgerStore.changedAgentIds write, Some committed, [])
                         | Error(Client.LedgerStore.StaleEntityVersion detail) ->
                             // Another call may have started or closed the task
                             // after eligibility was read. Reinspect canonically.
                             match ReviewWorkflow.ReviewWorkflow.inspectAutomaticActivation binding agentId with
-                            | Ok(Client.ReviewWorkflow.ActivationIneligible _) -> Ok ([], None)
+                            | Ok(Client.ReviewWorkflow.ActivationIneligible _) -> Ok ([], None, [])
                             | Ok(Client.ReviewWorkflow.ActivationEligible latestTaskId) ->
                                 Error(Client.ValidationError(
                                     $"Automatic activation conflicted with current Ready task {latestTaskId}: {detail}"))
@@ -426,7 +457,7 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                                     $"Cannot reconcile concurrent automatic activation: {error}"))
                         | Error error ->
                             Error(Client.ValidationError($"Automatic agent activation failed: {error}"))
-            | _ -> Ok ([], None)
+            | _ -> Ok ([], None, [])
 
 let private serialize<'a> (value: 'a) =
     try
@@ -1343,7 +1374,7 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                                 rt.Tui.RecordAgentSeen(AgentView.activityProject selected, localAgentId))
                         match activateReadyOnActivity rt localAgentId target command with
                         | Error error -> return Error error
-                        | Ok (changes, committedActivation) ->
+                        | Ok (changes, committedActivation, activationInstructions) ->
                             implicitChanges <- changes
                             match command, committedActivation with
                             | TaskReadCommand inbox, Some receipt when inbox.Action = "AgentInbox" ->
@@ -1365,7 +1396,7 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                                 for changed in outcome.ChangedAgentIds do
                                     cache.Invalidate(projectId, changed)
                             | _ -> ()
-                            instructions <- checkWorkingGuidance rt localAgentId target command
+                            instructions <- activationInstructions @ checkWorkingGuidance rt localAgentId target command
                             return result
                 with ex ->
                     unexpectedFailure <- true

@@ -1,0 +1,1 @@
+Immutable pin and exact HEAD/on-disk source/fixture blobs. Release CAS property 4/4; negative wrong-control and generated-path failures. Documented Client dependency boundary. No production changes.

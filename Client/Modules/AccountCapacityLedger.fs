@@ -1433,3 +1433,50 @@ module AccountCapacityLedger =
                                                                 Error(AccountIntegrityError "Native operation result lacks state digest.")))
                                         | _ ->
                                             Error(AccountIntegrityError "Native occupancy has no valid account receipt."))))))
+
+    // Read-only exact original native reservation context. The current verified
+    // account snapshot must contain the immutable receipt; the state at its
+    // first-parent origin must have been written in that same native CAS.
+    let internal readNativeReserveOrigin (b: AccountBinding) (snapshot: AccountSnapshot) opId =
+        let invalid reason = Error(AccountIntegrityError reason)
+        readReceipt b snapshot.Head opId
+        |> Result.bind (function
+            | Some receipt when receipt.Kind = "NativeReserve"
+                                && receipt.StateVersion <= snapshot.State.StateVersion ->
+                command b [ "log"; "--first-parent"; "--diff-filter=A"; "--format=%H"
+                            snapshot.Head; "--"; receiptPath opId ]
+                |> Result.bind (fun origin ->
+                    if not (validOid origin) then invalid "Native reserve receipt has no unique origin."
+                    else
+                        command b [ "rev-parse"; origin + "^" ]
+                        |> Result.bind (fun parent ->
+                            command b [ "log"; "--first-parent"; "-1"; "--format=%H"; origin
+                                        "--"; "native/scheduler-reservations-v1.json" ]
+                            |> Result.bind (fun mutation ->
+                                if mutation <> origin then
+                                    invalid "Native reserve receipt did not originate its reservation state."
+                                else
+                                    readNativeReservationDocument b origin
+                                    |> Result.bind (function
+                                        | None -> invalid "Native reserve origin lacks the reservation document."
+                                        | Some raw ->
+                                            try
+                                                use result = JsonDocument.Parse(receipt.OriginalResultJson)
+                                                if result.RootElement.GetProperty("nativeStateSha256").GetString() <> hash raw then
+                                                    invalid "Original reservation document differs from reserve receipt."
+                                                else
+                                                    readState b parent
+                                                    |> Result.bind (fun before ->
+                                                        readState b origin
+                                                        |> Result.bind (fun after ->
+                                                            let expected =
+                                                                { before with StateVersion = before.StateVersion + 1L
+                                                                              NextSequence = before.NextSequence + 1L }
+                                                            if receipt.Sequence <> before.NextSequence
+                                                               || receipt.StateVersion <> after.StateVersion
+                                                               || after <> expected then
+                                                                invalid "Original native reserve changed WQ07 state beyond its sequence increment."
+                                                            else readNativeReservationDocument b parent
+                                                                 |> Result.map (fun previous -> receipt, origin, parent, previous, raw)))
+                                            with _ -> invalid "Malformed original reserve result."))))
+            | _ -> invalid "No immutable NativeReserve operation at the verified account head.")

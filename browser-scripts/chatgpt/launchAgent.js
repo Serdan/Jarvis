@@ -2,7 +2,28 @@
 // The browser extension evaluates execute(args) in a USER_SCRIPT world.
 async function execute(args) {
   const prompt = args?.prompt;
-  const startUrl = "https://chatgpt.com/";
+  // Explicit launch destination; the ordinary home remains the default.
+  const startUrl = args?.startUrl ?? "https://chatgpt.com/";
+  const validStartUrl = (() => {
+    try {
+      const url = new URL(startUrl);
+      return url.origin === "https://chatgpt.com" &&
+        !url.search && !url.hash &&
+        (url.pathname === "/" ||
+          /^\/g\/g-p-[a-z0-9]+\/project\/?$/.test(url.pathname));
+    } catch { return false; }
+  })();
+  const projectStart = validStartUrl && new URL(startUrl).pathname !== "/";
+  const atStart = () => {
+    if (!validStartUrl) return false;
+    try {
+      const expected = new URL(startUrl);
+      const current = new URL(location.href);
+      return current.origin === expected.origin &&
+        current.pathname.replace(/\/$/, "") === expected.pathname.replace(/\/$/, "") &&
+        !current.search && !current.hash;
+    } catch { return false; }
+  };
   let sendAttempted = false;
   let sendAttemptedAt = null;
   // A non-submission does not prove that a tab is disposable: a different
@@ -10,7 +31,7 @@ async function execute(args) {
   // Only a still-home zero-turn surface can authorize failed-launch cleanup.
   const safeToDisposeCreatedTab = () => {
     try {
-      return !sendAttempted && location.href === startUrl &&
+      return !sendAttempted && atStart() &&
         document.querySelectorAll('[data-message-author-role="user"]').length === 0 &&
         document.querySelectorAll('[data-user-message-bubble]').length === 0;
     } catch {
@@ -26,7 +47,7 @@ async function execute(args) {
   // Callers must NOT place secrets in argsJson even when this check rejects it.
   // Preserve the historically ignored non-secret prior-send hint; it is
   // not evidence of a private host execution and has no send effect.
-  const permittedArgs = new Set(["prompt", "timeoutMs", "confirmedSubmittedPrompts", "selectionOnly"]);
+  const permittedArgs = new Set(["prompt", "timeoutMs", "confirmedSubmittedPrompts", "selectionOnly", "startUrl"]);
   if (!args || typeof args !== "object" || Array.isArray(args) ||
       Object.keys(args).some(key => !permittedArgs.has(key))) {
     return notSubmitted("UnsupportedPrivateBootstrapArguments");
@@ -34,7 +55,7 @@ async function execute(args) {
   if (typeof prompt !== "string" || !prompt.trim() || prompt.length > 24000) {
     return notSubmitted("InvalidPrompt");
   }
-  if (location.href !== startUrl) {
+  if (!atStart()) {
     return notSubmitted("UnexpectedStartUrl");
   }
   // Never change even the mode in an already established conversation.
@@ -93,13 +114,16 @@ async function execute(args) {
   ];
   const composerSelector = '[data-composer-input-layout] [contenteditable="true"][role="textbox"]';
   const pickerSelector = 'button[aria-label="Select ChatGPT model"]';
+  const projectChat = { getAttribute: name => name === "aria-pressed" ? "true" : null };
+  const projectWork = { getAttribute: name => name === "aria-pressed" ? "false" : null };
   const modeButton = name => {
+    if (projectStart) return name === "Chat" ? projectChat : projectWork;
     const matches = Array.from(document.querySelectorAll('button[type="button"][aria-pressed]'))
       .filter(button => button.textContent.trim() === name);
     return matches.length === 1 ? matches[0] : null;
   };
   const emptyHomeFailure = () => {
-    if (location.href !== startUrl) return notSubmitted("UnexpectedStartUrl");
+    if (!atStart()) return notSubmitted("UnexpectedStartUrl");
     if (document.querySelectorAll('[data-message-author-role="user"],[data-user-message-bubble]').length)
       return notSubmitted("ExistingConversation");
     return null;
@@ -137,6 +161,20 @@ async function execute(args) {
   let selected = null;
 
   const choose = async (target, untilAt) => {
+    if (projectStart) {
+      // Project landing pages expose a Chat composer without Chat/Work tabs.
+      // Only use the already selected Instant model; never infer a model from
+      // missing controls or silently downgrade an explicitly selected mode.
+      if (target.mode !== "Chat" || target.effort !== "none") return "ModeUnavailable";
+      const ready = await poll(() => {
+        if (emptyHomeFailure() || document.readyState !== "complete") return null;
+        const control = picker();
+        if (!control || document.querySelectorAll(composerSelector).length !== 1) return null;
+        return control.getAttribute("data-selected-reasoning-effort") === "none" &&
+          (control.textContent || "").trim() === "Instant";
+      }, untilAt);
+      return ready ? null : "ProjectInstantUnavailable";
+    }
     const home = () => emptyHomeFailure();
     const retryWait = () => delay(Math.min(100, Math.max(1, untilAt - Date.now())));
     // Chat/Work controls can appear before their React click handlers hydrate.
@@ -312,7 +350,14 @@ async function execute(args) {
   const initialTurns = document.querySelectorAll('[data-message-author-role="user"]').length;
   // Modern ChatGPT user messages use the bubble marker instead of the old role.
   const initialBubbles = document.querySelectorAll('[data-user-message-bubble]').length;
-  if (initialUrl !== startUrl || initialTurns || initialBubbles) {
+  const projectPrefix = projectStart ? new URL(startUrl).pathname.replace(/\/project\/?$/, "") : null;
+  const projectLinks = () => projectPrefix
+    ? Array.from(document.querySelectorAll('a[href]'))
+      .map(a => a.getAttribute("href") || "")
+      .filter(href => new RegExp("^" + projectPrefix + "/c/[0-9a-f-]{36}$", "i").test(href))
+    : [];
+  const initialProjectLinks = new Set(projectLinks());
+  if (!atStart() || initialTurns || initialBubbles) {
     return notSubmitted("ExistingConversation");
   }
   const normalizedPrompt = prompt.replace(/\r\n/g, "\n").replace(/\u00a0/g, " ").trim();
@@ -565,7 +610,19 @@ async function execute(args) {
     // ChatGPT can first navigate to a temporary /c/local-chatgpt:... route.
     // Only the server-issued UUID is a durable conversation URL. Closing
     // an agent tab on the optimistic route risks interrupting creation.
-    if (!/^\/c\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/?$/i.test(current.pathname)) return null;
+    const expectedPrefix = projectStart
+      ? new URL(startUrl).pathname.replace(/\/project\/?$/, "") : "";
+    const routePattern = new RegExp("^" + expectedPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+      "/c/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/?$", "i");
+    if (!routePattern.test(current.pathname)) {
+      // The project landing page can create a conversation in its sidebar
+      // without navigating. Require both a verified matching user turn and
+      // exactly one newly created, project-scoped server UUID link.
+      if (!projectStart || !evidence.matchingBubble) return null;
+      const fresh = [...new Set(projectLinks().filter(href => !initialProjectLinks.has(href)))];
+      if (fresh.length !== 1 || !routePattern.test(fresh[0])) return null;
+      return new URL(fresh[0], startUrl).href;
+    }
     current.search = "";
     current.hash = "";
     return current.href;

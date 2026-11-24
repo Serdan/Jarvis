@@ -840,3 +840,79 @@ type GeneratedComposition() =
         finally
             Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
             Directory.Delete(root, true)
+
+    // Checkpoint and recovery compete over the captured attempt version;
+    // even a valid checkpoint is not itself a fresh activity observation.
+    [<TestCase(true)>]
+    [<TestCase(false)>]
+    member _.CheckpointAndRecoveryCompeteForCapturedVersion(checkpointFirst: bool) =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-system-checkpoint-race-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let prior = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+        Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", Path.Combine(root, "config"))
+        try
+            let f = newFixture root
+            let taskId = f.Original.TaskId
+            let _, attempt = snapshot f.Second f
+            let owner = (ReviewWorkflow.getAgentInbox f.Second f.Original.AgentId |> success).Agent
+            let candidate = current f 0 |> Option.get
+            let before = {f.State with Age = Some 701}
+            f.State <- before
+            let op = Guid.NewGuid()
+            let checkpoint () =
+                ReviewWorkflow.checkpointAttempt f.Second op taskId f.Original.AgentId
+                    attempt.Version owner.Version before.Generation "race progress" "continue" "" ""
+            let now = DateTimeOffset(2026, 11, 24, 12, 0, 0, TimeSpan.Zero)
+            let observation : AgentActivitySnapshot = { ServerNowUtc = now; LastSeenAtUtc = Some(now.AddSeconds(-701.)) }
+            let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let release = TaskCompletionSource<Result<AgentActivitySnapshot,string>>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let mutable reads = 0
+            let deps : Dependencies =
+                { Enumerate = fun () -> Ok [candidate]
+                  Current = NativeHealth.current f.Runtimes[0]
+                  Activity = fun _ _ ->
+                      reads <- reads + 1
+                      if reads = 1 then Task.FromResult(Ok observation)
+                      else
+                          entered.TrySetResult(()) |> ignore
+                          release.Task
+                  Recover = NativeHealth.recover f.Runtimes[0] }
+            let check = NativeHealth.checkOnce {Enabled = true; InactivitySeconds = 600} deps
+            try
+                equal "Health reaches checkpoint race barrier" true (entered.Task.Wait(TimeSpan.FromSeconds 30.))
+                if checkpointFirst then
+                    let receipt = checkpoint() |> success
+                    let seq = receipt.Operation.Sequence
+                    let _, cp = ReviewWorkflow.getCheckpoint f.First taskId seq |> success
+                    equal "checkpoint belongs to captured generation" before.Generation cp.AssignmentGeneration
+                    let committed = (LedgerStore.fetch f.Second |> success).Commit
+                    release.SetResult(Ok observation)
+                    equal "stale recovery loses to checkpoint CAS" 0 (check.GetAwaiter().GetResult()).Recoveries
+                    equal "losing recovery leaves checkpoint head unchanged" committed (LedgerStore.fetch f.First |> success).Commit
+                    observe f
+                    // Checkpoint is durable progress, not a liveness substitute:
+                    // a fresh CAS on the still-stale activity must recover.
+                    step f 1 CheckHealth
+                    let successorHead = (LedgerStore.fetch f.First |> success).Commit
+                    let replay = checkpoint() |> success
+                    equal "checkpoint retry retains operation sequence" seq replay.Operation.Sequence
+                    equal "checkpoint retry never rewrites successor" successorHead (LedgerStore.fetch f.First |> success).Commit
+                    let _, durable = ReviewWorkflow.getCheckpoint f.First taskId seq |> success
+                    equal "checkpoint receipt survives successor" cp durable
+                else
+                    release.SetResult(Ok observation)
+                    equal "recovery wins before checkpoint" 1 (check.GetAwaiter().GetResult()).Recoveries
+                    f.State <- next CheckHealth before
+                    let committed = (LedgerStore.fetch f.First |> success).Commit
+                    equal "stale checkpoint cannot modify successor" true (checkpoint().IsError)
+                    equal "stale checkpoint leaves recovery head unchanged" committed (LedgerStore.fetch f.Second |> success).Commit
+                observe f
+                step f 1 Resume
+                step f 0 Block
+                step f 1 Resolve
+            finally
+                release.TrySetResult(Ok observation) |> ignore
+                check.GetAwaiter().GetResult() |> ignore
+        finally
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
+            Directory.Delete(root, true)

@@ -915,3 +915,43 @@ let ``current reviewer quota revocation holds review while Worker remains indepe
             let records = (ConfiguredFixture.state f).Records
             Assert.That(records.Length, Is.EqualTo(2))
             Assert.That(records |> Array.forall (fun r -> r.Status = "Reserved"), Is.True)))
+
+[<TestCase("Worker")>]
+[<TestCase("Reviewer")>]
+let ``an existing original-effect path can never be claimed as an empty slot`` kind =
+    ConfiguredFixture.withGit (fun f ->
+        let projects = [| f.ProjectOne |]
+        // This is a negative-only occupied-path fixture, not a verified
+        // no-send issuer or a valid release receipt.
+        let candidate, attempt =
+            if kind = "Worker" then
+                let c, _, claim = ConfiguredFixture.reserved f (Some template)
+                c, Choice1Of2 claim
+            else
+                let _, _, claim = reservedReviewer f
+                claim.ReviewCandidate, Choice2Of2 claim
+        let fence = NativeSchedulerAccountReservation.noSendFencePath candidate
+        let raw = """{"status":"occupied-negative-fixture"}"""
+        LedgerStore.transact f.ProjectOne
+            { OperationId = Guid.NewGuid(); Actor = "Disposable occupied-path fixture"
+              Kind = "TestOccupiedOriginalEffectPath"; RequestJson = "{}" }
+            (fun _ -> Ok [ { Path = fence; ExpectedBlobOid = None; Content = raw } ])
+        |> ConfiguredFixture.success |> ignore
+        let snapshot = LedgerStore.fetch f.ProjectTwo |> ConfiguredFixture.success
+        let bindings = [| f.ProjectTwo |]
+        let cover = ConfiguredFixture.coverage f f.AccountTwo bindings
+        PairedBrowser.withPaired (fun bridge ->
+            match attempt with
+            | Choice1Of2 claim ->
+                let changed = { claim with ExpectedProjectHead = snapshot.Commit }
+                Assert.That((prepareWorker f.AccountTwo bindings cover bridge "Disposable" 27000 changed).IsError, Is.True)
+                assertNoIntent f.ProjectTwo changed
+            | Choice2Of2 claim ->
+                let changed = { claim with ExpectedProjectHead = snapshot.Commit }
+                Assert.That((prepareReviewer f.AccountTwo bindings cover bridge "Disposable" 27000 changed).IsError, Is.True)
+                assertNoIntent f.ProjectTwo (asWorkerForNegativeTest changed)
+            let current = LedgerStore.fetch f.ProjectTwo |> ConfiguredFixture.success
+            Assert.That(current.Commit, Is.EqualTo(snapshot.Commit))
+            let actual, _ = LedgerStore.readAt f.ProjectTwo current fence |> ConfiguredFixture.success
+            Assert.That(actual, Is.EqualTo(Some raw))
+            Assert.That((ConfiguredFixture.state f).Records[0].Status, Is.EqualTo("Reserved"))))

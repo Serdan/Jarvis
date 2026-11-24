@@ -1054,9 +1054,11 @@ type GeneratedComposition() =
 
     // Competing production project claims and no-send exclusion share the
     // same original reservation and canonical fence in disposable Git clones.
-    [<TestCase(601)>]
-    [<TestCase(602)>]
-    member _.OriginalClaimAndExclusionCompeteAcrossChallenge(seed: int) =
+    [<TestCase(601, 0)>]
+    [<TestCase(602, 0)>]
+    [<TestCase(601, 1)>]
+    [<TestCase(602, 2)>]
+    member _.OriginalClaimAndExclusionCompeteAcrossChallenge(seed: int, schedule: int) =
         let root = Path.Combine(Path.GetTempPath(), "jarvis-system-exclusion-race-" + Guid.NewGuid().ToString("N"))
         Directory.CreateDirectory(root) |> ignore
         let prior = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
@@ -1071,11 +1073,26 @@ type GeneratedComposition() =
             let c = SystemPropertyAccountFixture.candidate fs[first].First fs[first].Original.TaskId
             let original = Guid.NewGuid()
             SystemPropertyAccountFixture.reserve account 0 original c |> success |> ignore
-            let claim = Task.Run(fun () -> SystemPropertyAccountFixture.claim account 0 first original c |> snd)
-            let exclusion = Task.Run(fun () -> SystemPropertyAccountFixture.tryExcludeBeforeClaim account 1 first original c)
+            // Schedule 0 races both operations. Schedules 1 and 2 force each
+            // durable winner, so either continuation is exercised on every run.
+            use firstDone = new System.Threading.ManualResetEventSlim(false)
+            let claim = Task.Run(fun () ->
+                if schedule = 2 then
+                    if not (firstDone.Wait(TimeSpan.FromSeconds 30.)) then failwith "exclusion timeout"
+                let result = SystemPropertyAccountFixture.claim account 0 first original c |> snd
+                if schedule = 1 then firstDone.Set()
+                result)
+            let exclusion = Task.Run(fun () ->
+                if schedule = 1 then
+                    if not (firstDone.Wait(TimeSpan.FromSeconds 30.)) then failwith "claim timeout"
+                let result = SystemPropertyAccountFixture.tryExcludeBeforeClaim account 1 first original c
+                if schedule = 2 then firstDone.Set()
+                result)
             Task.WaitAll [|claim :> Task; exclusion :> Task|]
             equal "exactly one original fence outcome" 1
                 ([claim.Result.IsOk; exclusion.Result.IsOk] |> List.filter id |> List.length)
+            if schedule = 1 then equal "claim-first wins" true claim.Result.IsOk
+            if schedule = 2 then equal "exclusion-first wins" true exclusion.Result.IsOk
             let records client = (SystemPropertyAccountFixture.read account client).Records
             let verify expected =
                 for client in 0..1 do

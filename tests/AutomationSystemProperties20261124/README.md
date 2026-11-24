@@ -251,3 +251,16 @@ milestone acceptance run. The legacy account component prepare script fails
 closed at this composition: expected blob fd9c9591c74ce906e15dfc191c2dbac0995b8dc3,
 actual 818bb6f8d43ab55177afe17e108e0155e6f43160. Its existing-auth rebind needs
 a separately coordinated lease; never bypass the pin.
+
+## Deterministic original-fence schedules
+
+The original claim/exclusion test retains the two concurrent races and also
+forces claim-first and exclusion-first schedules. Each forced winner must
+succeed and the loser must fail; the existing branch-specific assertions then
+exercise both occupied and no-send release continuations on every run.
+These schedules serialize the durable outcomes; they do not instrument internal
+CAS retries or establish full production provider dispatch.
+
+Focused Release job 8fd35f10c19a4db984b343ce0cad6dc7 passed 4/4 in
+1m03s, exit 0, on integrated production 3ee914c14 plus this test-only
+delta. Command: `dotnet test tests/AutomationSystemProperties20261124/AutomationSystemProperties20261124.fsproj -c Release --filter FullyQualifiedName~OriginalClaimAndExclusionCompeteAcrossChallenge`. This is not final composition acceptance.

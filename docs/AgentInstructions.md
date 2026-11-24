@@ -137,21 +137,22 @@ agent-state invalidation remain intact.
 
 ## Staged wire compatibility
 
-This source change retains the legacy `AgentCommandResponse.Instructions`
-and `InstructionDocument` wire shape while the separately gated operational
-response contract is reviewed. The new client emits only actual operational
-controls through that field. The new server renders only the recognized
-`response-alert` and `working-turn` scopes; old repository documents,
-omission/write notices and unknown scopes are not projected. The same
-repository-only filtering applies to the nested legacy original response in
-MCP job result JSON, without altering stored job data, original operation
-results/errors or mutation evidence. STOP-first alert ordering remains ahead
-of timing guidance and ordinary results.
+The operational response contract uses a closed `OperationalControls`
+union: WorkingTurnLimit (existing 25/30-minute advisory policy),
+QueuedResponseAlert, and ActivationUnverified (the corrected activation
+lookup diagnostic). A single staged wire adapter emits the equivalent
+legacy `Instructions` documents only when controls exist; new peers prefer
+the typed field, including an explicitly empty array. Legacy repository
+documents, omission/write notices and unknown scopes are discarded.
+Nested original job data is projected without legacy guidance or replaying
+previously consumed one-shot alerts; the stored terminal response and its
+result, error, operation identity and receipts are not changed.
+STOP-first ordering remains ahead of timing advisories and ordinary results.
 
 | Client | Server | Behavior |
 | --- | --- | --- |
 | New | New | No implicit repository discovery or projection; operational controls preserved. |
-| New | Old | Existing wire shape decodes unchanged; no new repository documents emitted; existing control scopes still render. |
+| New | Old | Legacy field is omitted for ordinary responses; old readers tolerate missing instructions and render projected exceptional control scopes. |
 | Old | New | Legacy documents/notices are not rendered, including nested original job guidance. The old client still performs source discovery and may reject malformed files before dispatch. |
 | Old | Old | Legacy behavior until coordinated upgrade. |
 

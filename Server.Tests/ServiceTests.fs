@@ -1541,6 +1541,71 @@ let response_json_retains_legacy_instruction_wire_compatibility () =
     Assert.That(JsonSerializer.Deserialize<AgentCommandResponse>(newWire), Is.EqualTo(newResponse))
 
 
+// Exact pre-control record shape, exercising a real legacy reader/writer.
+module LegacyWireFixture =
+    type Response =
+        { Result: string option
+          Error: AgentError option
+          Instructions: InstructionDocument list
+          AgentStateChanges: AgentStateChange list
+          InboxActivation: AgentInboxActivation option
+          PendingJob: ToolJobHandle option }
+
+[<TestCase(false)>]
+[<TestCase(true)>]
+let operational_contract_mixed_version_roundtrip_and_wire_measurement camelCase =
+    let options = JsonSerializerOptions(PropertyNameCaseInsensitive = true)
+    if camelCase then options.PropertyNamingPolicy <- JsonNamingPolicy.CamelCase
+    let ordinary : AgentCommandResponse =
+        { Result = Some """{"value":"source result"}"""; Error = None
+          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+    let controls =
+        [ OperationalControl.queuedAlert "alert-1" "STOP - safe handoff"
+          OperationalControl.WorkingTurnLimit(WorkingTurnLimitLevel.Soft, "SOFT STOP: preserve progress") ]
+    let known = [{ ProjectName = "Demo"; AgentId = "Owner" }]
+    let samples =
+        [ "ordinary", ordinary
+          "control", { ordinary with Instructions = controls }
+          "error", { ordinary with Result = None; Error = Some(NotFound "file"); AgentStateChanges = known }
+          "unknown", { ordinary with Result = None; Error = Some(ExecutionFailed "unverified"); AgentStateChanges = Unchecked.defaultof<_> } ]
+    for label, response in samples do
+        let old : LegacyWireFixture.Response =
+            { Result = response.Result; Error = response.Error
+              Instructions = OperationalControl.toLegacy response.OperationalControls
+              AgentStateChanges = response.AgentStateChanges
+              InboxActivation = response.InboxActivation; PendingJob = response.PendingJob }
+        let oldWire = JsonSerializer.SerializeToUtf8Bytes(old, options)
+        let newWire = JsonSerializer.SerializeToUtf8Bytes(response, options)
+        let oldReader = JsonSerializer.Deserialize<LegacyWireFixture.Response>(newWire, options)
+        let newReader = JsonSerializer.Deserialize<AgentCommandResponse>(oldWire, options)
+        Assert.That(oldReader.Result, Is.EqualTo(old.Result))
+        Assert.That(oldReader.Error, Is.EqualTo(old.Error))
+        Assert.That(oldReader.AgentStateChanges, Is.EqualTo(box old.AgentStateChanges))
+        Assert.That(newReader.Result, Is.EqualTo(response.Result))
+        Assert.That(newReader.Error, Is.EqualTo(response.Error))
+        Assert.That(newReader.StateChangeEvidence, Is.EqualTo(response.StateChangeEvidence))
+        Assert.That(newReader.OperationalControls, Is.EqualTo(box response.OperationalControls))
+        if old.Instructions.IsEmpty then
+            Assert.That(isNull (box oldReader.Instructions), Is.True)
+        else
+            Assert.That(oldReader.Instructions, Is.EqualTo(box old.Instructions))
+        let typedReader = JsonSerializer.Deserialize<AgentCommandResponse>(newWire, options)
+        Assert.That(typedReader.Result, Is.EqualTo(response.Result))
+        Assert.That(typedReader.Error, Is.EqualTo(response.Error))
+        Assert.That(typedReader.StateChangeEvidence, Is.EqualTo(response.StateChangeEvidence))
+        Assert.That(typedReader.OperationalControls, Is.EqualTo(box response.OperationalControls))
+        TestContext.Out.WriteLine($"wire {label} camelCase={camelCase}: legacy={oldWire.Length} typed={newWire.Length}")
+
+[<Test>]
+let operational_contract_typed_empty_precedes_legacy_and_missing_receipt_is_unknown () =
+    let json = """{"Result":"{}","Error":null,"OperationalControls":[],"Instructions":[{"Scope":"response-alert","Path":"jarvis/response-alert/stale","Sha256":"","Content":"STOP"}]}"""
+    let response = JsonSerializer.Deserialize<AgentCommandResponse>(json)
+    Assert.That(response.OperationalControls, Is.Empty)
+    Assert.That(response.StateChangeEvidence, Is.EqualTo(StateChangeEvidence.Unknown []))
+    let contradictory = json.Replace("\"OperationalControls\":", "\"AgentStateChangesStatus\":\"confirmed\",\"OperationalControls\":")
+    Assert.Throws<JsonException>(fun () -> JsonSerializer.Deserialize<AgentCommandResponse>(contradictory) |> ignore) |> ignore
+
+
 [<Test>]
 let ``MCP bridge preserves structured  ledger failure category`` () =
     let problem : Common.LedgerFailureInfo =
@@ -2211,6 +2276,40 @@ let private routeJobResult jobId status (terminal: AgentCommandResponse option) 
           Truncated = false; ToolResponse = terminal; OperationId = None }
     { Result = Some(JsonSerializer.Serialize result); Error = None
       Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+
+[<TestCase(false)>]
+[<TestCase(true)>]
+let delegated_sender_validation_preserves_consumed_alerts_on_visible_result fail =
+    task {
+        let actor = "Worker 1"
+        let jobId = "original-source-job"
+        let initialAlert = OperationalControl.queuedAlert "first" "first advisory"
+        let stop = OperationalControl.queuedAlert "stop" "STOP - yield safely"
+        let stale = OperationalControl.queuedAlert "stale" "STOP - already consumed"
+        let initial = { routePendingHealth jobId actor with Instructions = [initialAlert] }
+        let mutable polls = 0
+        let poll (query: GetJobResultCommand) =
+            Assert.That(query.JobId, Is.EqualTo(jobId))
+            Assert.That(query.ProjectName, Is.EqualTo("Wayfold"))
+            polls <- polls + 1
+            if polls = 1 then
+                Task.FromResult({ routeJobResult jobId Running None with Instructions = [stop] })
+            elif fail then
+                Task.FromResult({ routeTerminalHealth with Result = None; Error = Some(NotFound "original source unavailable") })
+            else
+                let terminal = { routeTerminalHealth with Instructions = [stale] }
+                Task.FromResult(routeJobResult jobId ToolCompleted (Some terminal))
+        let! resolved = ProjectNotificationRouting.resolveHealth "Wayfold" actor (DateTimeOffset.UtcNow.AddMinutes(1.)) initial poll
+        Assert.That(polls, Is.EqualTo(2))
+        Assert.That(resolved.OperationalControls, Is.EqualTo(box [stop; initialAlert]))
+        if fail then
+            Assert.That(resolved.Error.IsSome, Is.True)
+            Assert.That(resolved.StateChangeEvidence, Is.EqualTo(StateChangeEvidence.Unknown []))
+        else
+            Assert.That(resolved.Result, Is.EqualTo(routeTerminalHealth.Result))
+            Assert.That(resolved.StateChangeEvidence, Is.EqualTo(StateChangeEvidence.Confirmed []))
+    }
+
 
 [<Test>]
 let forwardedTransportFailureKeepsVerifiedSourceWithUnknownDestination () = task {

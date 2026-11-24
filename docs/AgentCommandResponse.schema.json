@@ -2,13 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:jarvis:agent-command-response",
   "title": "AgentCommandResponse",
-  "description": "Client-to-server Jarvis command response. Instructions is the compatibility envelope for operational controls; legacy repository documents are ignored by MCP projection. AgentStateChanges are verified ledger mutation hints for cache invalidation.",
+  "description": "Client-to-server Jarvis command response. OperationalControls is the closed typed control channel. Instructions is an optional legacy compatibility projection; repository documents are ignored. State-change status distinguishes complete, unknown and pending evidence.",
   "type": "object",
   "required": [
     "Result",
-    "Error",
-    "Instructions",
-    "AgentStateChanges"
+    "Error"
   ],
   "properties": {
     "Result": {
@@ -26,26 +24,64 @@
       "description": "Existing AgentError discriminated union representation, unchanged."
     },
     "Instructions": {
-      "type": "array",
-      "maxItems": 35,
-      "description": "Legacy wire-compatible instruction documents; new clients emit only operational controls (response-alert, working-turn), and new servers ignore repository documents and notices.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "description": "Legacy projection only. New peers prefer OperationalControls and omit Instructions when no operational controls are present; legacy documents and notices are ignored.",
       "items": {
         "$ref": "#/$defs/InstructionDocument"
       }
     },
     "AgentStateChanges": {
-      "type": "array",
-      "description": "Affected project and agent identities after confirmed canonical Working-turn/assignment transitions. This metadata is retained even when the following tool operation fails; unrelated writes produce an empty array.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "description": "Known affected project and agent identities. Null or absent legacy receipt means unknown, not confirmed empty. An uncertain outcome can include known partial mutations.",
       "items": {
         "$ref": "#/$defs/AgentStateChange"
       }
     },
     "InboxActivation": {
       "oneOf": [
-        { "$ref": "#/$defs/AgentInboxActivation" },
-        { "type": "null" }
+        {
+          "$ref": "#/$defs/AgentInboxActivation"
+        },
+        {
+          "type": "null"
+        }
       ],
       "description": "Explicit caller-visible result of self-AgentInbox activation; absent for other commands. Preserved on a failed inbox read after a confirmed transition."
+    },
+    "OperationalControls": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "description": "Closed operational control union, in STOP-first order. Absence falls back to legacy Instructions; an explicitly empty typed array has precedence.",
+      "items": {
+        "$ref": "#/$defs/OperationalControl"
+      }
+    },
+    "AgentStateChangesStatus": {
+      "enum": [
+        "confirmed",
+        "unknown",
+        "pending"
+      ],
+      "description": "New peers emit this status. Legacy absence is inferred from PendingJob, UncertainOutcome and the presence of AgentStateChanges. Status must agree with evidence."
+    },
+    "PendingJob": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ToolJobHandle"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "In-flight tool operation; poll the original job on the bound device. Pending is not a terminal mutation receipt."
     }
   },
   "additionalProperties": false,
@@ -61,26 +97,18 @@
       "properties": {
         "Scope": {
           "type": "string",
-          "enum": [
-            "workspace",
-            "project",
-            "working-turn",
-            "write-warning",
-            "instruction-warning"
-          ]
+          "description": "Recognized legacy operational scopes: response-alert and working-turn. All other scopes are ignored."
         },
         "Path": {
-          "type": "string",
-          "minLength": 9,
-          "description": "Workspace-relative source path using '/' separators. No absolute paths."
+          "type": "string"
         },
         "Sha256": {
           "type": "string",
-          "pattern": "^sha256:[0-9a-f]{64}$"
+          "description": "Empty for operational control projections."
         },
         "Content": {
           "type": "string",
-          "description": "UTF-8 Markdown or a complete-file omission notice. Automatic delivery is bounded by the client; explicit hierarchy retrieval is paginated."
+          "description": "Legacy control text or ignored repository document."
         }
       },
       "additionalProperties": false
@@ -115,15 +143,171 @@
         "OperationId"
       ],
       "properties": {
-        "ProjectName": { "type": "string", "minLength": 1 },
-        "AgentId": { "type": "string" },
-        "ActivatedByThisCall": { "type": "boolean" },
-        "BeforeState": { "type": ["string", "null"], "enum": ["Ready", null] },
-        "AfterState": { "type": ["string", "null"], "enum": ["Working", null] },
-        "CommittedHead": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
-        "OperationId": { "type": ["string", "null"] }
+        "ProjectName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "AgentId": {
+          "type": "string"
+        },
+        "ActivatedByThisCall": {
+          "type": "boolean"
+        },
+        "BeforeState": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "Ready",
+            null
+          ]
+        },
+        "AfterState": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "Working",
+            null
+          ]
+        },
+        "CommittedHead": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "OperationId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       },
       "description": "A true value must be backed by a confirmed canonical Ready-to-Working operation receipt, not inferred from the returned inbox state. False means this call did not commit an activation.",
+      "additionalProperties": false
+    },
+    "OperationalControl": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "case",
+            "level",
+            "advisory"
+          ],
+          "properties": {
+            "case": {
+              "const": "WorkingTurnLimit"
+            },
+            "level": {
+              "enum": [
+                "Soft",
+                "Hard"
+              ]
+            },
+            "advisory": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "case",
+            "alertId",
+            "text"
+          ],
+          "properties": {
+            "case": {
+              "const": "QueuedResponseAlert"
+            },
+            "alertId": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "case",
+            "detail"
+          ],
+          "properties": {
+            "case": {
+              "const": "ActivationUnverified"
+            },
+            "detail": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ToolJobHandle": {
+      "type": "object",
+      "required": [
+        "JobId",
+        "Kind",
+        "Status",
+        "ProjectName",
+        "DeviceId",
+        "AgentId",
+        "OperationId",
+        "CommandName",
+        "StartedAt"
+      ],
+      "properties": {
+        "JobId": {
+          "type": "string"
+        },
+        "Kind": {
+          "enum": [
+            "Process",
+            "ToolOperation"
+          ]
+        },
+        "Status": {
+          "type": "string"
+        },
+        "ProjectName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "DeviceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "AgentId": {
+          "type": "string"
+        },
+        "OperationId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "CommandName": {
+          "type": "string"
+        },
+        "StartedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
       "additionalProperties": false
     }
   }

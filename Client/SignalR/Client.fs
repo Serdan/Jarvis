@@ -480,46 +480,41 @@ let private serialize'<'a> (result: Result<'a, Client.EffectError>) =
             { Payload = payload; ChangedAgentIds = changedAgentIds }))
     |> ValueTask<_>
 
-// Shared with the regression suite so it exercises the actual transport guard.
-let internal toAgentResponse command instructions stateChanges inboxActivation response =
-    match response with
-    | Error error ->
-        { Result = None
-          Error = Some(EffectError.toAgentError error)
-          Instructions = instructions
-          AgentStateChanges = stateChanges
-          InboxActivation = inboxActivation
-          PendingJob = None }
-    | Ok (dispatched: DispatchedResult) ->
-        let payload = dispatched.Payload
-        let bytes = Encoding.UTF8.GetByteCount payload +
-                    Encoding.UTF8.GetByteCount(JsonSerializer.Serialize instructions) +
-                    Encoding.UTF8.GetByteCount(JsonSerializer.Serialize stateChanges) +
-                    Encoding.UTF8.GetByteCount(JsonSerializer.Serialize inboxActivation)
+// Keep the existing raw result allowances. Charge the actual serialized
+// metadata, including the temporary legacy wire projection, without escaping
+// or allocating a second copy of a potentially large result.
+let private guardResponseSize command (response: AgentCommandResponse) =
+    match response.Result, response.Error, response.PendingJob with
+    | Some payload, None, None ->
+        let metadata = { response with Result = None }
+        let bytes = Encoding.UTF8.GetByteCount payload + JsonSerializer.SerializeToUtf8Bytes(metadata).Length
         let maxBytes =
             match command with
             | ReadImageCommand _ -> (AgentProtocol.maxImageBytes * 4 / 3) + (64 * 1024)
             | ExportFileCommand _ -> (AgentProtocol.maxExportBytes * 4 / 3) + (64 * 1024)
-            // Tool responses are embedded as serialized strings inside
-            // JobResult. Keep the original media/export allowance plus safe
-            // JSON escaping overhead for this one typed polling envelope.
+            // Preserve the allowance for a serialized terminal job envelope.
             | GetJobResultCommand _ -> (AgentProtocol.maxImageBytes * 4 / 3 * 2) + (128 * 1024)
             | _ -> AgentProtocol.maxResponseBytes
-
-        if bytes <= maxBytes then
-            { Result = Some payload
-              Error = None
-              Instructions = instructions
-              AgentStateChanges = stateChanges
-              InboxActivation = inboxActivation
-              PendingJob = None }
+        if bytes <= maxBytes then response
         else
-            { Result = None
-              Error = Some(OutputTruncated $"Command response was {bytes} bytes and exceeds the safe response size of {maxBytes} bytes.")
-              Instructions = instructions
-              AgentStateChanges = stateChanges
-              InboxActivation = inboxActivation
-              PendingJob = None }
+            { response with
+                Result = None
+                Error = Some(OutputTruncated $"Command response was {bytes} bytes and exceeds the safe response size of {maxBytes} bytes.") }
+    | _ -> response
+
+// Shared with the regression suite so it exercises the actual transport guard.
+let internal toAgentResponse command instructions stateChanges inboxActivation response =
+    let result, error =
+        match response with
+        | Error error -> None, Some(EffectError.toAgentError error)
+        | Ok (dispatched: DispatchedResult) -> Some dispatched.Payload, None
+    { Result = result
+      Error = error
+      Instructions = instructions
+      AgentStateChanges = stateChanges
+      InboxActivation = inboxActivation
+      PendingJob = None }
+    |> guardResponseSize command
 
 let private unwrapProjectName (ProjectName name) = name
 let private unwrapContent (Content content) = content
@@ -1579,7 +1574,12 @@ let private withVisibleResponseAlerts (rt: Runtime) (agentId: string)
             | Ok scope -> checkResponseAlerts rt agentId (projectTarget scope)
             | Error _ -> []
         | _ -> []
-    { response with Instructions = OperationalControl.ordered (alerts @ response.OperationalControls) }
+    if alerts.IsEmpty then response
+    else
+        let visible = { response with Instructions = OperationalControl.ordered (alerts @ response.OperationalControls) }
+        match command with
+        | Some original -> guardResponseSize original visible
+        | None -> visible
 
 // Bounded, client-owned execution begins before the deadline. An HTTP
 // request and SignalR delivery may end without cancelling this operation.
@@ -1609,10 +1609,13 @@ let private shouldAutoPromote = function
 let combineCrossProjectNotification (source: CrossProjectNotificationCommand)
                                     (destination: AgentCommandResponse) =
     let knownChanges =
-        if isNull (box destination.AgentStateChanges) then
-            Unchecked.defaultof<AgentStateChange list>
-        else
-            (source.SourceStateChanges @ destination.AgentStateChanges) |> List.distinct
+        let known changes = if isNull (box changes) then [] else changes
+        match destination.StateChangeEvidence, destination.Error with
+        | _, Some(UncertainOutcome _) ->
+            (known source.SourceStateChanges @ known destination.AgentStateChanges) |> List.distinct
+        | StateChangeEvidence.Confirmed changes, _ when not (isNull (box source.SourceStateChanges)) ->
+            (source.SourceStateChanges @ changes) |> List.distinct
+        | _ -> Unchecked.defaultof<AgentStateChange list>
     { destination with
         AgentStateChanges = knownChanges
         InboxActivation =

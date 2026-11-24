@@ -553,12 +553,17 @@ module McpToolHelpers =
         // must carry its source evidence into the client-owned job, so that
         // polling eventually returns both confirmed sets of mutations.
         let changes =
-            if final.PendingJob.IsSome || isNull (box final.AgentStateChanges) then
+            let known changes = if isNull (box changes) then [] else changes
+            match prior.StateChangeEvidence, final.StateChangeEvidence, final.Error with
+            | _, StateChangeEvidence.Pending, _ -> Unchecked.defaultof<AgentStateChange list>
+            | StateChangeEvidence.Confirmed source, StateChangeEvidence.Confirmed destination, _ ->
+                (source @ destination) |> List.distinct
+            | _, _, Some(UncertainOutcome _) ->
+                (known prior.AgentStateChanges @ known final.AgentStateChanges) |> List.distinct
+            | _ ->
+                // Missing legacy receipt evidence is not a confirmed empty list.
+                // A source inbox's committed activation is retained separately.
                 Unchecked.defaultof<AgentStateChange list>
-            else
-                let source =
-                    if isNull (box prior.AgentStateChanges) then [] else prior.AgentStateChanges
-                (source @ final.AgentStateChanges) |> List.distinct
         { final with
             Instructions = OperationalControl.ordered (prior.OperationalControls @ final.OperationalControls)
             AgentStateChanges = changes
@@ -1034,7 +1039,7 @@ module McpToolHelpers =
                                             Error = Some(ExecutionFailed
                                                 "Source validation job has no bound device; cannot safely poll a different candidate.")
                                             PendingJob = None
-                                            AgentStateChanges = [] }
+                                            AgentStateChanges = Unchecked.defaultof<_> }
                                 | Some originalDevice ->
                                     // Shared typed resolver checks the job ID, project,
                                     // actor, terminal status and deadline. The callback

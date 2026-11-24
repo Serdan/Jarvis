@@ -115,6 +115,20 @@ let private planTransition binding snapshot actor original effect role roleVersi
 let internal planBeginSend binding snapshot actor original effect role roleVersion generation =
     planTransition binding snapshot actor original effect role roleVersion generation "Dispatching"
 
+// Authenticated caller must bind actor to the existing client identity. This CAS
+// proves exclusion only against participants which commit planBeginSend before
+// their first external effect. It does not fence nonparticipating send paths.
+// AlreadyApplied is an observation of the original exclusion, not new authority.
+let internal excludeHeldBeforeSend binding actor operation original effect role roleVersion generation =
+    if operation = Guid.Empty || original = Guid.Empty || effect = Guid.Empty
+       || operation = original || operation = effect || String.IsNullOrWhiteSpace actor
+       || String.IsNullOrWhiteSpace role || roleVersion < 1 || generation < 1 then
+        reject "invalid exclusion identity"
+    else
+        let request = json {| original = original; effect = effect; role = role; roleVersion = roleVersion; generation = generation |}
+        LedgerStore.transact binding (intent actor operation "ProjectCapacity.ExcludeBeforeSend" request) (fun snapshot ->
+            planTransition binding snapshot actor original effect role roleVersion generation "Excluded")
+
 #if PROJECT_CAPACITY_DISPOSABLE_TEST_ONLY
 // Fixture send and fixture no-send compete for the same held predecessor.
 let transition binding actor operation original effect role roleVersion generation target =

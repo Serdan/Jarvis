@@ -1365,7 +1365,8 @@ module AccountCapacityLedger =
                                     |> Result.bind (function
                                         | Some receipt when
                                             (receipt.Kind = "NativeReserve" || receipt.Kind = "NativeTransition"
-                                             || receipt.Kind = "NativeTerminalRelease")
+                                             || receipt.Kind = "NativeTerminalRelease"
+                                             || receipt.Kind = "NativeNoSendRelease")
                                             && message.Contains($"Request-SHA256: {receipt.RequestSha256}",
                                                                 StringComparison.Ordinal) ->
                                             command b [ "log"; "--first-parent"; "--diff-filter=A"; "--format=%H";

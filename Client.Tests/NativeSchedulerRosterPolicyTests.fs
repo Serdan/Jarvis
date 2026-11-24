@@ -1338,3 +1338,254 @@ type NativeSchedulerAccountReservationTests() =
             | other -> failwithf "Rewritten immutable review source duplicated native slot: %A" other
             Assert.That((NativeReservationFixture.snapshot f f.AccountOne f.ProjectsOne).Records.Length,
                         Is.EqualTo(1)))
+
+#if NATIVE_NO_SEND_ENVELOPE_TEST
+module ExactNoSendEnvelope =
+    open Client.NativeProjectEffectTransition
+
+    let private json value =
+        JsonSerializer.Serialize(value, JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase))
+
+    let private success value = NativeReservationFixture.success value
+    let private snapshot p = LedgerStore.fetch p |> success
+    let private head p = (snapshot p).Commit
+
+    // A: absence; B: genuine held project fence, account still Reserved;
+    // C: genuine held project fence, account records the original fence.
+    let private withOriginal scenario reviewer action =
+        NativeFixture.withGit (fun f ->
+            let limits = NativeReservationFixture.limits 1 1
+            NativeReservationFixture.establish f limits [| limits; limits |]
+            let candidate =
+                if reviewer then NativeReservationFixture.reviewer f 0
+                else NativeReservationFixture.worker f 0
+            let reservationId = Guid.NewGuid()
+            let receipt =
+                NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne
+                    (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne)
+                    reservationId candidate |> success
+            let original =
+                { ReservationOperationId = reservationId
+                  ReservationRequestSha256 = receipt.Receipt.RequestSha256
+                  Candidate = candidate; ExpectedGeneration = 1L
+                  ExpectedProjectFenceOid = ""; ExpectedProviderSessionId = "" }
+            let context =
+                NativeSchedulerAccountReservation.readOriginal f.AccountOne f.ProjectsOne
+                    (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne) original |> success
+            let project = f.ProjectsOne[0]
+            let identity: OriginalEffectIdentity =
+                { AccountId = f.AccountOne.AccountId; AccountLedgerId = f.AccountOne.LedgerId
+                  AccountEpoch = f.AccountOne.Epoch; ReservationOperationId = reservationId
+                  CanonicalKey = context.CurrentReservation.CanonicalKey; Candidate = candidate }
+            let path = NativeSchedulerAccountReservation.noSendFencePath candidate
+            let predecessor =
+                if scenario = 0 then BeforeClaim
+                else
+                    let claimId = Guid.NewGuid()
+                    let before = head project
+                    let intent =
+                        { OperationId = claimId; Actor = candidate.OwnerAgentId
+                          Kind = "NativeStartedLaunchIntentDisposable"
+                          RequestJson = json {| candidate = candidate; originalReservationOperationId = reservationId
+                                                expectedProjectHead = before |} }
+                    let raw =
+                        json {| schemaVersion = 1; projectId = candidate.ProjectId; projectLedgerId = candidate.ProjectLedgerId
+                                projectEpoch = candidate.ProjectEpoch; accountId = string identity.AccountId
+                                accountLedgerId = string identity.AccountLedgerId; accountEpoch = identity.AccountEpoch
+                                accountHead = context.AccountHead; originalReservationOperationId = string reservationId
+                                reservationCanonicalKey = identity.CanonicalKey; candidate = candidate
+                                claimOperationId = string claimId; dispatchId = candidate.DispatchId
+                                effectOperationId = candidate.EffectOperationId; sourceLeaseSha256 = candidate.SourceLeaseSha256
+                                deviceId = "fixture-device"; windowRegistration = "fixture-window"
+                                status = "HeldBeforeSend"; providerSessionId = ""; terminalOriginOid = "" |}
+                    LedgerStore.transact project intent (fun s ->
+                        checkClaim project s before identity path
+                        |> Result.map (fun () -> [ { Path = path; ExpectedBlobOid = None; Content = raw } ]))
+                    |> success |> ignore
+                    let s = snapshot project
+                    let op = LedgerStore.getOperationAt project s claimId |> success |> Option.get
+                    let origin = LedgerStore.verifiedIntegrationOperationSnapshotAt project s op |> success
+                    let _, blob = LedgerStore.readAt project origin path |> success
+                    ExactHeldFence
+                        { ClaimOperationId = claimId; ClaimRequestSha256 = op.RequestHash
+                          ClaimOrigin = origin.Commit; ClaimBlobOid = Option.get blob }
+            let original =
+                match scenario, predecessor with
+                | 2, ExactHeldFence held ->
+                    NativeSchedulerAccountReservation.transition f.AccountOne f.ProjectsOne
+                        (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne)
+                        (Guid.NewGuid()) "Disposable original fence" original "Dispatching" held.ClaimOrigin ""
+                    |> success |> ignore
+                    { original with ExpectedGeneration = 2L; ExpectedProjectFenceOid = held.ClaimOrigin }
+                | _ -> original
+            let opId = Guid.NewGuid()
+            let evidence =
+                NativeSchedulerAccountReservation.serializeNoSendEvidence
+                    { SchemaVersion = 1; State = "VerifiedNoSend"; AccountId = string identity.AccountId
+                      AccountLedgerId = string identity.AccountLedgerId; AccountEpoch = identity.AccountEpoch
+                      ReservationOrigin = context.ReservationOrigin; CanonicalKey = identity.CanonicalKey
+                      Original = original; NoSendOperationId = opId }
+            let expectedHead = head project
+            let makeRequest requestHead pred raw =
+                let witness =
+                    match pred with
+                    | BeforeClaim -> json {| kind = "BeforeClaim" |}
+                    | ExactHeldFence h ->
+                        json {| kind = "ExactHeldFence"; claimOperationId = h.ClaimOperationId
+                                claimRequestSha256 = h.ClaimRequestSha256; claimOrigin = h.ClaimOrigin
+                                claimBlobOid = h.ClaimBlobOid |}
+                sprintf """{"schemaVersion":1,"expectedProjectHead":"%s","predecessor":%s,"evidence":%s}""" requestHead witness raw
+            let intent =
+                { OperationId = opId; Actor = "Disposable exact no-send producer"
+                  Kind = "NativeVerifiedNoSend"; RequestJson = makeRequest expectedHead predecessor evidence }
+            let release releaseId locator =
+                NativeSchedulerAccountReservation.releaseNoSend f.AccountTwo f.ProjectsTwo
+                    (NativeReservationFixture.coverage f f.AccountTwo f.ProjectsTwo)
+                    releaseId "Disposable account consumer" locator
+            let deny locator =
+                let before = NativeFixture.head f.AccountTwo
+                match release (Guid.NewGuid()) locator with
+                | Error(AccountPolicyNotAuthoritative _) -> ()
+                | other -> failwithf "Unverified exclusion released occupancy: %A" other
+                Assert.That(NativeFixture.head f.AccountTwo, Is.EqualTo(before))
+            let locate origin raw =
+                { Original = original; NoSendOperationId = opId; ProjectHead = head project
+                  NoSendOrigin = origin; EvidenceBlobOid = LedgerStore.computeBlobOid project raw |> success }
+            action f project identity predecessor path expectedHead evidence intent makeRequest release deny locate)
+
+    [<TestCase(0, false)>]
+    [<TestCase(1, false)>]
+    [<TestCase(2, false)>]
+    [<TestCase(0, true)>]
+    [<TestCase(1, true)>]
+    [<TestCase(2, true)>]
+    let genuineProducerReleasesAndReusesCapacity scenario reviewer =
+        withOriginal scenario reviewer (fun f project identity predecessor path expectedHead evidence intent _ release deny locate ->
+            let committed =
+                LedgerStore.transact project intent (fun s ->
+                    planExclusion project s expectedHead identity path predecessor intent)
+                |> success
+            let s = snapshot project
+            let origin = LedgerStore.verifiedIntegrationOperationSnapshotAt project s committed.Operation |> success
+            let locator = locate origin.Commit evidence
+            deny { locator with ProjectHead = expectedHead }
+            deny { locator with NoSendOrigin = expectedHead }
+            deny { locator with EvidenceBlobOid = String.replicate 40 "a" }
+            let releaseId = Guid.NewGuid()
+            let released = release releaseId locator |> success
+            Assert.That(released.AlreadyApplied, Is.False)
+            Assert.That((NativeReservationFixture.snapshot f f.AccountOne f.ProjectsOne).Records[0].Status,
+                        Is.EqualTo("Released"))
+            let replay = release releaseId locator |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That(replay.Receipt, Is.EqualTo(released.Receipt))
+            deny locator
+            let next = if reviewer then NativeReservationFixture.reviewer f 1 else NativeReservationFixture.worker f 1
+            NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne
+                (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne)
+                (Guid.NewGuid()) next |> success |> ignore)
+
+    [<TestCase(0, "bare")>]
+    [<TestCase(0, "head")>]
+    [<TestCase(0, "raw")>]
+    [<TestCase(0, "requestEvidence")>]
+    [<TestCase(0, "extraPath")>]
+    [<TestCase(0, "staleAncestor")>]
+    [<TestCase(1, "before")>]
+    [<TestCase(1, "begun")>]
+    [<TestCase(1, "claimOrigin")>]
+    [<TestCase(1, "claimHash")>]
+    [<TestCase(1, "claimBlob")>]
+    [<TestCase(2, "before")>]
+    let rejectsReceiptShapedButInvalidExclusion scenario fault =
+        withOriginal scenario false (fun _ project identity predecessor path expectedHead evidence intent makeRequest _ deny locate ->
+            // This is deliberately NOT the accepted issuer: it models an invalid
+            // canonical operation, testing independent account-side verification.
+            let raw = if fault = "raw" then evidence + " " else evidence
+            let badPredecessor =
+                match predecessor, fault with
+                | _, "before" -> BeforeClaim
+                | ExactHeldFence h, "claimOrigin" -> ExactHeldFence { h with ClaimOrigin = String.replicate 40 "a" }
+                | ExactHeldFence h, "claimHash" -> ExactHeldFence { h with ClaimRequestSha256 = String.replicate 64 "a" }
+                | ExactHeldFence h, "claimBlob" -> ExactHeldFence { h with ClaimBlobOid = String.replicate 40 "a" }
+                | _ -> predecessor
+            if fault = "staleAncestor" then
+                LedgerStore.transact project
+                    { OperationId = Guid.NewGuid(); Actor = "Disposable unrelated advance"
+                      Kind = "FixtureAdvance"; RequestJson = "{}" }
+                    (fun _ -> Ok [ { Path = "records/fixture/advance.json"; ExpectedBlobOid = None; Content = "{}" } ])
+                |> success |> ignore
+            if fault = "begun" then
+                match predecessor with
+                | ExactHeldFence held ->
+                    LedgerStore.transact project
+                        { OperationId = Guid.NewGuid(); Actor = identity.Candidate.OwnerAgentId
+                          Kind = "NativeBeginSend"; RequestJson = "{}" }
+                        (fun s ->
+                            planBeginSend project s expectedHead identity path held
+                            |> Result.map List.singleton)
+                    |> success |> ignore
+                | _ -> failwith "Expected held fence"
+            let current = snapshot project
+            let badHead =
+                if fault = "head" then String.replicate 40 "a"
+                elif fault = "staleAncestor" then expectedHead
+                else current.Commit
+            let requestEvidence =
+                if fault = "requestEvidence" then evidence.Replace(string intent.OperationId, string (Guid.NewGuid()))
+                else evidence
+            let request = if fault = "bare" then evidence else makeRequest badHead badPredecessor requestEvidence
+            let _, prev = LedgerStore.readAt project current path |> success
+            let extra =
+                if fault = "extraPath" then
+                    [ { Path = "records/fixture/extra.json"; ExpectedBlobOid = None; Content = "{}" } ]
+                else []
+            let write =
+                LedgerStore.transact project { intent with RequestJson = request } (fun _ ->
+                    Ok ([ { Path = path; ExpectedBlobOid = prev; Content = raw }
+                          { Path = NativeSchedulerAccountReservation.noSendEvidencePath intent.OperationId
+                            ExpectedBlobOid = None; Content = raw } ] @ extra))
+                |> success
+            deny (locate write.CurrentHead raw))
+
+    [<TestCase("reservation")>]
+    [<TestCase("dispatch")>]
+    [<TestCase("effect")>]
+    let deniesReusedOriginalOperationIdentity reuse =
+        withOriginal 0 false (fun _ project identity predecessor path expectedHead evidence intent makeRequest _ deny locate ->
+            let opId =
+                match reuse with
+                | "reservation" -> identity.ReservationOperationId
+                | "dispatch" -> Guid.Parse identity.Candidate.DispatchId
+                | _ -> Guid.Parse identity.Candidate.EffectOperationId
+            let raw = evidence.Replace(string intent.OperationId, string opId)
+            let forged = { intent with OperationId = opId; RequestJson = makeRequest expectedHead predecessor raw }
+            // Match all canonical receipt/blob fields except the distinct operation identity.
+            let write =
+                LedgerStore.transact project forged (fun _ ->
+                    Ok [ { Path = path; ExpectedBlobOid = None; Content = raw }
+                         { Path = NativeSchedulerAccountReservation.noSendEvidencePath opId
+                           ExpectedBlobOid = None; Content = raw } ])
+                |> success
+            deny { (locate write.CurrentHead raw) with NoSendOperationId = opId })
+
+    [<TestCase(false)>]
+    [<TestCase(true)>]
+    let deniesChangedCurrentFenceOrEvidence changeEvidence =
+        withOriginal 0 false (fun _ project identity predecessor path expectedHead evidence intent _ _ deny locate ->
+            let committed =
+                LedgerStore.transact project intent (fun s ->
+                    planExclusion project s expectedHead identity path predecessor intent)
+                |> success
+            let originalHead = committed.CurrentHead
+            let originalBlob = LedgerStore.computeBlobOid project evidence |> success
+            let path =
+                if changeEvidence then NativeSchedulerAccountReservation.noSendEvidencePath intent.OperationId
+                else path
+            LedgerStore.transact project
+                { OperationId = Guid.NewGuid(); Actor = "Disposable changed terminal blob"
+                  Kind = "FixtureRewrite"; RequestJson = "{}" }
+                (fun _ -> Ok [ { Path = path; ExpectedBlobOid = Some originalBlob; Content = evidence + " " } ])
+            |> success |> ignore
+            deny (locate originalHead evidence))
+#endif

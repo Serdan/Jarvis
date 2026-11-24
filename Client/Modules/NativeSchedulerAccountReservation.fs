@@ -679,6 +679,193 @@ module NativeSchedulerAccountReservation =
 
     let internal serializeNoSendEvidence (evidence: NativeNoSendEvidence) = json evidence
 
+    // The canonical ledger request stores normalized JSON, not the original
+    // evidence bytes. Reconstruct the whole intent using independently read
+    // predecessor facts and the exact account evidence serializer. Never treat
+    // a matching evidence blob alone as a project exclusion.
+    type private NoSendPredecessor =
+        | BeforeClaim
+        | ExactHeldFence of claimId: Guid * requestHash: string * origin: string * blob: string
+
+    let private parseNoSendPredecessor (operation: LedgerOperation) =
+        try
+            use envelope = JsonDocument.Parse(operation.CanonicalRequestJson)
+            use request = JsonDocument.Parse(envelope.RootElement.GetProperty("request").GetString())
+            let witness = request.RootElement.GetProperty("predecessor")
+            let field name = witness.GetProperty(name: string).GetString()
+            match field "kind" with
+            | "BeforeClaim" -> Ok BeforeClaim
+            | "ExactHeldFence" when validGuid (field "claimOperationId")
+                                    && validDigest (field "claimRequestSha256")
+                                    && validOid (field "claimOrigin")
+                                    && validOid (field "claimBlobOid") ->
+                Ok(ExactHeldFence(Guid.Parse(field "claimOperationId"), field "claimRequestSha256",
+                                  field "claimOrigin", field "claimBlobOid"))
+            | _ -> bad "No-send receipt has no exact project predecessor."
+        with _ -> bad "Malformed project exclusion request."
+
+    // The project ledger already verified the operation's introducing commit
+    // against the pinned current snapshot. Read its actual single parent from
+    // the immutable commit object (not an ancestry assertion or caller value).
+    // Keep the existing Git-history safeguards; no new ledger mutation path.
+    let private noSendParent (binding: LedgerBinding) (origin: LedgerSnapshot) =
+        result {
+            do! LedgerStore.verifySourceObject binding origin.Commit
+                |> Result.mapError (fun _ -> AccountPolicyNotAuthoritative "No-send origin object is unverified.")
+            let! parent =
+                BoundedProcess.run
+                    { Executable = "git"
+                      Args = [ "cat-file"; "commit"; origin.Commit ]
+                      WorkingDirectory = binding.RepositoryPath
+                      Timeout = TimeSpan.FromSeconds 30.
+                      MaxOutputBytes = Some(64 * 1024)
+                      StandardInput = BoundedProcess.ClosedInput
+                      ExtraEnvironment = [ "GIT_NO_REPLACE_OBJECTS", "1"; "GIT_TERMINAL_PROMPT", "0" ]
+                      ConfigureStart = Some(fun start ->
+                          for key in start.Environment.Keys |> Seq.toArray do
+                              if key.StartsWith("GIT_CONFIG_", StringComparison.OrdinalIgnoreCase)
+                                 || ([ "GIT_DIR"; "GIT_COMMON_DIR"; "GIT_WORK_TREE"; "GIT_INDEX_FILE"
+                                       "GIT_OBJECT_DIRECTORY"; "GIT_ALTERNATE_OBJECT_DIRECTORIES"
+                                       "GIT_REPLACE_REF_BASE"; "GIT_GRAFT_FILE"; "GIT_SHALLOW_FILE"
+                                       "GIT_NAMESPACE"; "GIT_EXEC_PATH" ]
+                                     |> List.exists (fun name -> key.Equals(name, StringComparison.OrdinalIgnoreCase))) then
+                                  start.Environment.Remove(key) |> ignore) }
+                |> function
+                    | Ok output when not output.TimedOut && output.ExitCode = 0 && not output.StdOutTruncated ->
+                        let parents =
+                            output.StdOut.Split('\n')
+                            |> Seq.takeWhile (fun line -> line <> "")
+                            |> Seq.filter (fun line -> line.StartsWith("parent ", StringComparison.Ordinal))
+                            |> Seq.map (fun line -> line.Substring(7))
+                            |> Seq.toArray
+                        match parents with
+                        | [| parent |] when validOid parent -> Ok parent
+                        | _ -> bad "No-send origin is not a single-parent project transaction."
+                    | _ -> bad "Cannot inspect the actual no-send predecessor commit."
+            // This resolves a historical snapshot using the existing trusted
+            // ledger reader, never a caller-constructed header.
+            let! previous = LedgerStore.verifiedHistoricalSnapshot binding parent
+                            |> Result.mapError (fun _ -> AccountPolicyNotAuthoritative "No-send predecessor snapshot is unverified.")
+            if previous.Header.NextSequence <> origin.Header.NextSequence - 1L then
+                return! bad "No-send predecessor sequence differs from the operation."
+            return previous
+        }
+
+    let private heldRecordMatches (b: AccountBinding) (record: NativeReservationRecord)
+                                  (claimId: Guid) (raw: string) =
+        try
+            use document = JsonDocument.Parse(raw)
+            let root = document.RootElement
+            let field name = root.GetProperty(name: string).GetString()
+            let rec unique (element: JsonElement) =
+                match element.ValueKind with
+                | JsonValueKind.Object ->
+                    let seen = System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                    element.EnumerateObject() |> Seq.forall (fun p -> seen.Add p.Name && unique p.Value)
+                | JsonValueKind.Array -> element.EnumerateArray() |> Seq.forall unique
+                | _ -> true
+            let c = record.Candidate
+            unique root
+            && root.GetProperty("schemaVersion").GetInt32() = 1
+            && field "projectId" = c.ProjectId
+            && field "projectLedgerId" = c.ProjectLedgerId
+            && root.GetProperty("projectEpoch").GetInt32() = c.ProjectEpoch
+            && field "accountId" = string b.AccountId
+            && field "accountLedgerId" = string b.LedgerId
+            && root.GetProperty("accountEpoch").GetInt32() = b.Epoch
+            && field "originalReservationOperationId" = record.OriginalOperationId
+            && field "reservationCanonicalKey" = record.CanonicalKey
+            && JsonSerializer.Deserialize<NativeDispatchCandidate>(root.GetProperty("candidate").GetRawText(), options) = c
+            && field "claimOperationId" = string claimId
+            && field "dispatchId" = c.DispatchId
+            && field "effectOperationId" = c.EffectOperationId
+            && field "sourceLeaseSha256" = c.SourceLeaseSha256
+            && field "status" = "HeldBeforeSend"
+            && field "providerSessionId" = ""
+            && field "terminalOriginOid" = ""
+        with _ -> false
+
+    let private verifiedNoSendPredecessor (b: AccountBinding) (binding: LedgerBinding)
+                                          (parent: LedgerSnapshot) (record: NativeReservationRecord)
+                                          fencePath evidencePath operationId predecessor =
+        result {
+            match LedgerStore.readAt binding parent evidencePath with
+            | Ok(None, None) -> ()
+            | _ -> return! bad "No-send evidence already existed before the exclusion operation."
+            let reserved = record.Status = "Reserved" && record.Generation = 1L && record.ProjectFenceOid = ""
+            match predecessor with
+            | BeforeClaim ->
+                if not reserved then
+                    return! bad "Preclaim exclusion requires the original unrecorded reservation."
+                match LedgerStore.readAt binding parent fencePath with
+                | Ok(None, None) -> return None
+                | _ -> return! bad "Preclaim exclusion did not replace genuine absence."
+            | ExactHeldFence(claimId, requestHash, claimOrigin, claimBlob) ->
+                if claimId = operationId || string claimId = record.OriginalOperationId
+                   || string claimId = record.Candidate.DispatchId || string claimId = record.Candidate.EffectOperationId
+                   || not (reserved || (record.Status = "Dispatching" && record.Generation > 1L
+                                       && record.ProjectFenceOid = claimOrigin)) then
+                    return! bad "Held exclusion does not bind the original account occupancy."
+                let! claim =
+                    match LedgerStore.getOperationAt binding parent claimId with
+                    | Ok(Some op) when op.Actor = record.Candidate.OwnerAgentId
+                                       && op.RequestHash = requestHash && not (isNull op.Paths)
+                                       && Array.contains fencePath op.Paths -> Ok op
+                    | _ -> bad "No-send predecessor claim operation is missing or differs."
+                let! actualClaim =
+                    LedgerStore.verifiedIntegrationOperationSnapshotAt binding parent claim
+                    |> Result.mapError (fun _ -> AccountPolicyNotAuthoritative "No-send claim origin is unverified.")
+                if actualClaim.Commit <> claimOrigin then
+                    return! bad "No-send predecessor claim origin differs."
+                match LedgerStore.readAt binding actualClaim fencePath, LedgerStore.readAt binding parent fencePath with
+                | Ok(Some first, Some firstOid), Ok(Some previous, Some previousOid)
+                    when firstOid = claimBlob && previousOid = firstOid && first = previous
+                         && heldRecordMatches b record claimId first ->
+                    return Some claimBlob
+                | _ -> return! bad "No-send predecessor is not the original exact HeldBeforeSend fence."
+        }
+
+    let private verifyNoSendReceipt (binding: LedgerBinding) (operation: LedgerOperation)
+                                    (parent: LedgerSnapshot) predecessor fencePath evidencePath beforeOid expected =
+        try
+            // Canonical request comparison reconstructs both levels of the
+            // envelope and rejects extra, missing or ambiguous arguments.
+            let witness =
+                match predecessor with
+                | BeforeClaim -> box {| kind = "BeforeClaim" |}
+                | ExactHeldFence(id, hash, origin, blob) ->
+                    box {| kind = "ExactHeldFence"; claimOperationId = id; claimRequestSha256 = hash
+                           claimOrigin = origin; claimBlobOid = blob |}
+            use evidence = JsonDocument.Parse(expected: string)
+            let request =
+                json {| schemaVersion = 1; expectedProjectHead = parent.Commit
+                        predecessor = witness; evidence = evidence.RootElement |}
+            let operationId = Guid.Parse(operation.OperationId)
+            let verifiedIntent =
+                LedgerStore.verifyIntegrationOperationIntent binding operation
+                    { OperationId = operationId; Actor = operation.Actor
+                      Kind = "NativeVerifiedNoSend"; RequestJson = request }
+            use receipt = JsonDocument.Parse(operation.OriginalResultJson)
+            let root = receipt.RootElement
+            let changes = root.GetProperty("changes").EnumerateArray() |> Seq.toArray
+            let changeMatches path expectedBefore (change: JsonElement) =
+                let before = change.GetProperty("beforeOid")
+                change.GetProperty("path").GetString() = path
+                && change.GetProperty("contentSha256").GetString() = digest expected
+                && (match expectedBefore with
+                    | None -> before.ValueKind = JsonValueKind.Null
+                    | Some oid -> before.GetString() = oid)
+            if verifiedIntent = Ok()
+               && root.GetProperty("schemaVersion").GetInt32() = 2
+               && root.GetProperty("operationId").GetString() = operation.OperationId
+               && root.GetProperty("sequence").GetInt64() = operation.Sequence
+               && root.GetProperty("kind").GetString() = operation.Type
+               && changes.Length = 2
+               && (changes |> Array.exists (changeMatches fencePath beforeOid))
+               && (changes |> Array.exists (changeMatches evidencePath None)) then Ok()
+            else bad "No-send receipt does not bind the exact original reservation and actual exclusion."
+        with _ -> bad "Malformed project exclusion receipt."
+
     let private noSendFromVerifiedProject (b: AccountBinding) projects coverage
                                           (context: NativeOriginalReservationContext)
                                           (locator: NativeNoSendLocator) =
@@ -700,6 +887,8 @@ module NativeSchedulerAccountReservation =
                 match LedgerStore.getOperationAt binding snapshot locator.NoSendOperationId with
                 | Ok(Some op) when op.Type = "NativeVerifiedNoSend"
                                    && op.OperationId = string locator.NoSendOperationId
+                                   && not (String.IsNullOrWhiteSpace op.Actor)
+                                   && not (isNull op.Paths) && op.Paths.Length = 2
                                    && Array.contains evidencePath op.Paths
                                    && Array.contains fencePath op.Paths -> Ok op
                 | _ -> bad "Genuine original-bound project no-send operation is missing."
@@ -722,15 +911,16 @@ module NativeSchedulerAccountReservation =
                     match LedgerStore.readAt binding at path with
                     | Ok(Some raw, Some oid) when raw = expected && oid = locator.EvidenceBlobOid -> ()
                     | _ -> return! bad "Original-bound no-send fence or evidence blob is missing or changed."
-            do!
-                LedgerStore.verifyIntegrationOperationIntent binding operation
-                    { OperationId = locator.NoSendOperationId
-                      Actor = operation.Actor
-                      Kind = "NativeVerifiedNoSend"
-                      RequestJson = expected }
-                |> Result.mapError (fun _ ->
-                    AccountPolicyNotAuthoritative
-                        "No-send receipt does not bind the exact original reservation and exclusion.")
+            let! predecessor = parseNoSendPredecessor operation
+            let! parent = noSendParent binding origin
+            let! beforeOid =
+                verifiedNoSendPredecessor b binding parent record fencePath evidencePath
+                    locator.NoSendOperationId predecessor
+            do! verifyNoSendReceipt binding operation parent predecessor fencePath evidencePath beforeOid expected
+            // The historical snapshot resolver itself fetches. Reassert our
+            // original coverage after it rather than knowingly accepting an
+            // obsolete project head if that fetch observed a successor.
+            let! _, _ = projectAt projects coverage record.Candidate.ProjectId
             return ()
         }
 
@@ -739,6 +929,9 @@ module NativeSchedulerAccountReservation =
         if isNull (box locator) || isNull (box locator.Original)
            || isNull (box locator.Original.Candidate)
            || locator.NoSendOperationId = Guid.Empty || operationId = locator.NoSendOperationId
+           || locator.NoSendOperationId = locator.Original.ReservationOperationId
+           || string locator.NoSendOperationId = locator.Original.Candidate.DispatchId
+           || string locator.NoSendOperationId = locator.Original.Candidate.EffectOperationId
            || not (validOid locator.ProjectHead && validOid locator.NoSendOrigin && validOid locator.EvidenceBlobOid) then
             bad "Exact original no-send locator and verified project evidence required."
         else

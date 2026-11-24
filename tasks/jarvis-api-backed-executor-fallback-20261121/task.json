@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"jarvis-api-backed-executor-fallback-20261121","title":"[P0] Design browser-independent provider-native agent executor and hermetic test harness","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"jarvis-api-backed-executor-fallback-20261121","title":"[Deferred][Jarvis 2.0] Provider-independent launch abstraction and configurable inference profiles","version":2,"lifecycle":"Open","specVersion":2,"attemptId":null}

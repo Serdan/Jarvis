@@ -63,3 +63,15 @@ These are deployment/account tasks rather than code work:
 - set the OpenAI domain-verification token when the submission portal provides it;
 - provide publisher identity, support/privacy/terms URLs, a reviewer account, and a demo recording;
 - run the production Scan Tools/review workflow.
+
+## WSL browser sign-in
+
+When running the client in WSL, open the complete sign-in URL shown in the
+terminal in a Windows browser. Jarvis waits on its existing loopback callback;
+it does not require a Linux browser or browser-opening helper. On other desktops
+the client also opens the browser automatically and shows the link as a fallback.
+
+This requires Windows-to-WSL localhost forwarding to reach the configured
+loopback redirect address and port. If forwarding is disabled or misconfigured,
+the browser cannot reach the callback; restore localhost forwarding and retry.
+Do not expose the callback on a network interface as a workaround.

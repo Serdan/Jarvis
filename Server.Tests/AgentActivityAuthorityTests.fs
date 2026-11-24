@@ -89,7 +89,7 @@ let authenticated_client_ingress_and_registered_hub_aggregate_by_user_project_ag
         register "bob" "desktop" "bob-desktop"
 
         let completed = { Result = Some "ok"; Error = None; Instructions = []
-                          AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                          StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
         let recipient connection =
             { new IClientService with
                 member _.ReceiveMessage(_) = Task.CompletedTask

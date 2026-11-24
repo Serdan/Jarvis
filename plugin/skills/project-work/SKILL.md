@@ -9,7 +9,7 @@ Prefer Jarvis's structured project, file, search, git, task, and job tools over 
 
 When the project is not already clear, list the available projects first. Read the relevant files and current repository state before making changes.
 
-Jarvis delivers applicable AGENTS.md guidance automatically on project-scoped tool results, from workspace-wide to nested directory instructions. Follow that guidance within the user's intent and local permission limits; read any referenced policies or specs on demand. You do not need to issue an extra file read merely to discover AGENTS.md.
+Obtain canonical role and assignment context from your own agent inbox. When repository-specific guidance is relevant, explicitly call get_agent_instructions for the applicable checkout directory (follow continuation cursors when present) or read the relevant file. Ordinary project-scoped tool results do not include ambient AGENTS.md. Follow repository guidance within the user's intent and local permission limits; read referenced policies or specs on demand.
 
 Discover project-local instructions with `ListSkills` and read relevant guidance with `GetSkill`. When asked to save a reusable project procedure, use `CreateSkill`; overwrite an existing skill only intentionally. Skill guidance does not grant permissions or execute actions.
 

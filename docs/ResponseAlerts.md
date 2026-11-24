@@ -18,11 +18,15 @@ affect operator alerts.
 
 The destination client checks the verified ledger when constructing each
 eligible agent tool response, **including an operation error or a job-result
-poll**, and prepends alerts to the typed `Instructions` envelope. Existing
-AGENTS.md and Working-turn duration guidance remain intact. Polling neither
+poll**, and prepends typed `QueuedResponseAlert` controls. Existing
+Working-turn duration guidance remains intact; repository guidance is explicitly retrieved, not automatically delivered. Polling neither
 records agent activity nor activates Ready assignments. Project health probes,
 cross-project coordination routing and observer-only operations must not
-establish the destination agent identity.
+establish the destination agent identity. Internal routing health probes and their
+delegated polls use an empty actor; they cannot consume an agent alert. A
+delegated source-inbox validation retains the real source actor, and any
+controls consumed on those replies are carried to the eventual visible
+response, including routing failures.
 
 For slow commands promoted to client-owned jobs, the pending handle is an
 agent-visible response and may carry a queued alert. Background job completion

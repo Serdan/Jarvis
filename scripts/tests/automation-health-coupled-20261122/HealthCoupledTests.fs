@@ -431,7 +431,7 @@ type CoupledHealthPropertyTests() =
                 let hub2 = registeredHub users tracker store "alice" "two"
                 let completed : AgentCommandResponse =
                     { Result = Some "ok"; Error = None; Instructions = []
-                      AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                      StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
                 let recipient connection =
                     { new IClientService with
                         member _.ReceiveMessage(_) = Task.CompletedTask

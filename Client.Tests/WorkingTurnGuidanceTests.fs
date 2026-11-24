@@ -80,7 +80,7 @@ let agentStateCacheAvoidsRepeatedFetchAndInvalidatesOnTaskTransition () =
     let mutable loads = 0
     let load () =
         loads <- loads + 1
-        None
+        Ok None
     cache.Get(now, project, "Agent 3", load) |> ignore
     cache.Get(now.AddMinutes(1.), project, "Agent 3", load) |> ignore
     Assert.That(loads, Is.EqualTo(1))
@@ -105,7 +105,7 @@ let single_agent_invalidation_leaves_unrelated_caches_warm () =
     let mutable loads = 0
     let load () =
         loads <- loads + 1
-        None
+        Ok None
     cache.Get(now, first, "One", load) |> ignore
     cache.Get(now, first, "Two", load) |> ignore
     cache.Get(now, second, "One", load) |> ignore
@@ -118,4 +118,32 @@ let single_agent_invalidation_leaves_unrelated_caches_warm () =
     Assert.That(loads, Is.EqualTo(4), "Only the changed agent must reload")
     cache.InvalidateAll()
     cache.Get(now.AddSeconds(2), second, "One", load) |> ignore
+    Assert.That(loads, Is.EqualTo(5))
+
+[<Test>]
+let failed_agent_state_refresh_never_caches_absence_or_stale_state () =
+    let cache = AgentCache(TimeSpan.FromMinutes 2.)
+    let project =
+        Client.ProjectPaths.ProjectTarget.parse "Jarvis"
+        |> function Ok target -> Client.ProjectPaths.ProjectTarget.projectId target | Error error -> failwithf "%A" error
+    let error = Client.ValidationError "temporary lookup failure"
+    let mutable loads = 0
+    let load outcome () =
+        loads <- loads + 1
+        outcome
+    let ready = { agent "Ready" (started.ToString("O")) with Execution = "Stopped" }
+    let get now outcome = cache.Get(now, project, "Owner", load outcome)
+    let expected (outcome: Result<ReviewAgent option, Client.EffectError>) = Is.EqualTo(outcome)
+    Assert.That(get started (Error error), expected (Error error))
+    Assert.That(get started (Ok(Some ready)), expected (Ok(Some ready)))
+    Assert.That(get (started.AddSeconds 1.) (Error error), expected (Ok(Some ready)))
+    Assert.That(loads, Is.EqualTo(2))
+    let expired = started.AddMinutes 3.
+    Assert.That(get expired (Error error), expected (Error error))
+    Assert.That(get expired (Ok None), expected (Ok None))
+    // Verified absence is cacheable; a failed read is not.
+    Assert.That(get (expired.AddSeconds 1.) (Ok(Some ready)), expected (Ok None))
+    Assert.That(loads, Is.EqualTo(4))
+    cache.Invalidate(project, "owner")
+    Assert.That(get (expired.AddSeconds 2.) (Ok(Some ready)), expected (Ok(Some ready)))
     Assert.That(loads, Is.EqualTo(5))

@@ -344,7 +344,7 @@ module private ToolOperations =
         { Result = None
           Error = Some(ExecutionFailed message)
           Instructions = []
-          AgentStateChanges = []
+          StateChangeEvidence = StateChangeEvidence.Confirmed []
           InboxActivation = None
           PendingJob = None }
 
@@ -357,8 +357,8 @@ module private ToolOperations =
               { Message = message + " The outcome may have committed; reconcile the original operation ID before retrying."
                 OperationId = entry.Handle.OperationId })
           Instructions = []
-          // The typed UncertainOutcome marks completeness UNKNOWN, never zero.
-          AgentStateChanges = []
+          // Completeness is independently unknown, never a confirmed zero.
+          StateChangeEvidence = StateChangeEvidence.Unknown []
           InboxActivation = None
           PendingJob = None }
 
@@ -551,10 +551,7 @@ module private ToolOperations =
                                 // alerts captured by an older background path
                                 // as recurring job-result instructions.
                                 let original = entry.Completion.Task.Result
-                                let instructions =
-                                    if isNull (box original.Instructions) then [] else
-                                        original.Instructions |> List.filter (fun doc -> doc.Scope <> "response-alert")
-                                Some { original with Instructions = instructions }
+                                Some { original with Instructions = OperationalControl.withoutOneShot original.OperationalControls }
                             else None
                         Ok
                             { JobId = jobId

@@ -152,6 +152,19 @@ function harness(options = {}) {
     ? ["Instant", "Pro"] : efforts;
   let proSelections = 0;
   const picker = {
+    getClientRects() { return [1]; },
+    closest() { return null; },
+    querySelectorAll(selector) {
+      if (selector === '.sr-only') return options.projectWorkLabel
+        ? [{ textContent: options.namedWorkEffort || reasoningEffort, closest() { return null; } }] : [];
+      if (selector === '[data-model-selection-label]') {
+        if (!options.projectWorkLabel || selectedModel !== "GPT-6.1 Terra") return [];
+        const label = value => ({ innerText: value === "gpt-6.1-terra-wm" ? "GPT-6.1 Terra" : "Other",
+          getAttribute() { return value; }, getClientRects() { return [1]; }, closest() { return null; } });
+        return [label("gpt-6.1-terra-wm"), ...(options.conflictingWorkLabel ? [label("other")] : [])];
+      }
+      return [];
+    },
     querySelector(selector) {
       if (selector !== '[data-model-selection-label="gpt-6.1-terra-wm"]' ||
           !options.projectWorkLabel || selectedModel !== "GPT-6.1 Terra") return null;
@@ -352,6 +365,15 @@ function harness(options = {}) {
         getAttribute(name) { return name === "href" ? href : null; },
         click() { navigationAttempts++; throw new Error("Unbound sidebar navigation"); }
       }));
+      if (selector === 'button[aria-label="Select ChatGPT model"]') {
+        if (options.noPicker) return [];
+        if (options.hiddenDuplicatePicker) {
+          const hidden = Object.create(picker);
+          hidden.getClientRects = () => [];
+          return [activePicker, hidden];
+        }
+        return options.duplicatePicker ? [activePicker, Object.create(picker)] : [activePicker];
+      }
       if (selector === '[role="menu"]') return expanded ? [menu] : [];
       if (selector === '[data-model-selection-label]') return [];
       if (selector === '[data-composer-input-layout] [contenteditable="true"][role="textbox"]') {
@@ -1294,6 +1316,32 @@ test("slugged project entry falls back to verified Work and sends once", async (
   assert.equal(result.observedSelection.effort, "Medium");
   assert.equal(result.conversationUrl, route);
   assert.equal(h.clicks, 1);
+});
+
+for (const [name, extra] of [
+  ["competing visible model controls", { duplicatePicker: true }],
+  ["contradictory model labels", { conflictingWorkLabel: true }],
+  ["compressed effort with a conflicting named option", { namedWorkEffort: "Pro" }]
+]) {
+  test(`project Work rejects ${name} before Send`, async () => {
+    const startUrl = "https://chatgpt.com/g/g-p-abc123-jarvisagents/project";
+    const h = harness({ startUrl, noModeToggle: true, projectWorkLabel: true,
+      selectedModel: "GPT-6.1 Terra", reasoningEffort: "Medium", virtualClock: true, ...extra });
+    const result = await h.run("Do not submit", { startUrl, timeoutMs: 18000 });
+    assert.equal(result.status, "notSubmitted", JSON.stringify(result));
+    assert.equal(h.clicks, 0);
+  });
+}
+
+test("project Work ignores a hidden duplicate picker", async () => {
+  const startUrl = "https://chatgpt.com/g/g-p-abc123-jarvisagents/project";
+  const h = harness({ startUrl, noModeToggle: true, projectWorkLabel: true,
+    selectedModel: "GPT-6.1 Terra", reasoningEffort: "Medium", virtualClock: true,
+    hiddenDuplicatePicker: true });
+  const result = await h.run("Selection only", { startUrl, selectionOnly: true, timeoutMs: 18000 });
+  assert.equal(result.status, "selectionOnly", JSON.stringify(result));
+  assert.equal(result.selectedMode, "Work");
+  assert.equal(h.clicks, 0);
 });
 
 test("project Work composer with the wrong effort does not submit", async () => {

@@ -139,7 +139,7 @@ async function executeLaunch(args, observeSelection) {
   const projectWork = { getAttribute: name => name === "aria-pressed" ? "false" : null };
   const modeButton = name => {
     if (projectStart) {
-      const work = projectWorkLabel(picker()) !== null;
+      const work = projectWorkPresent(picker());
       return (name === "Work") === work ? projectChat : projectWork;
     }
     const matches = Array.from(document.querySelectorAll('button[type="button"][aria-pressed]'))
@@ -160,7 +160,12 @@ async function executeLaunch(args, observeSelection) {
     }
     return predicate();
   };
-  const picker = () => document.querySelector(pickerSelector);
+  const visible = node => Boolean(node?.getClientRects?.().length &&
+    !node.closest('[aria-hidden="true"],[inert]'));
+  const picker = () => {
+    const controls = Array.from(document.querySelectorAll(pickerSelector)).filter(visible);
+    return controls.length === 1 ? controls[0] : null;
+  };
   // Other site menus (sidebar, projects) are not model menus.
   const modelMenu = () => Array.from(document.querySelectorAll('[role="menu"]'))
     .find(menu => menu.getClientRects().length && menu.querySelector('[data-model-picker-view]')) || null;
@@ -190,13 +195,29 @@ async function executeLaunch(args, observeSelection) {
   // The closed trigger independently exposes the named effort and selected
   // attribute. It does not identify the Chat model; that must be checked in
   // the menu again at the final Send boundary.
-  const projectWorkLabel = control =>
-    renderedLabel(control?.querySelector('[data-model-selection-label="gpt-6.1-terra-wm"]'));
+  const projectWorkPresent = control =>
+    Array.from(control?.querySelectorAll('[data-model-selection-label]') || [])
+      .some(node => visible(node) &&
+        node.getAttribute("data-model-selection-label") === "gpt-6.1-terra-wm");
+  const projectWorkLabel = control => {
+    const labels = Array.from(control?.querySelectorAll('[data-model-selection-label]') || [])
+      .filter(visible);
+    return labels.length === 1 &&
+      labels[0].getAttribute("data-model-selection-label") === "gpt-6.1-terra-wm"
+      ? renderedLabel(labels[0]) : null;
+  };
+  // The Work trigger exposes the selected named effort to assistive technology.
+  // Animation layers are aria-hidden and cannot establish the selected value.
+  const projectWorkEffort = control => {
+    const labels = Array.from(control?.querySelectorAll('.sr-only') || [])
+      .filter(node => !node.closest('[aria-hidden="true"],[inert]'));
+    return labels.length === 1 ? (labels[0].textContent || "").trim() : null;
+  };
   const closedPickerProof = (control, target) => Boolean(control &&
     control.getAttribute("aria-expanded") === "false" && !modelMenu() &&
     control.getAttribute("data-selected-reasoning-effort") === target.effort &&
     (projectStart && target.mode === "Work"
-      ? projectWorkLabel(control) === target.model
+      ? projectWorkLabel(control) === target.model && projectWorkEffort(control) === target.label
       : (control.innerText || control.textContent || "").trim() === target.label));
   const unavailableRadio = item => !item || item.getAttribute("aria-disabled") === "true" ||
     item.hasAttribute("data-disabled");
@@ -238,7 +259,7 @@ async function executeLaunch(args, observeSelection) {
       confirmedObservation = { mode: null, model: confirmedModelLabel, effort: target.label };
       return null;
     }
-    if (projectStart && projectWorkLabel(picker())) return "ModeUnavailable";
+    if (projectStart && projectWorkPresent(picker())) return "ModeUnavailable";
     const home = () => emptyHomeFailure();
     const retryWait = () => delay(Math.min(100, Math.max(1, untilAt - Date.now())));
     // Chat/Work controls can appear before their React click handlers hydrate.
@@ -500,11 +521,11 @@ async function executeLaunch(args, observeSelection) {
     if (selectedMode === "Work") {
       // Work may temporarily omit its model label as React replaces the
       // composer. Reject contradictory labels, not an absent transient label.
-      const labels = Array.from(document.querySelectorAll('[data-model-selection-label]'))
+      const labels = Array.from((projectStart ? modelControl : document).querySelectorAll('[data-model-selection-label]'))
         .filter(node => node.getClientRects().length &&
           !node.closest('[aria-hidden="true"],[inert]'));
-      if (labels.length && !labels.some(node =>
-          node.getAttribute("data-model-selection-label") === "gpt-6.1-terra-wm")) {
+      if (labels.some(node =>
+          node.getAttribute("data-model-selection-label") !== "gpt-6.1-terra-wm")) {
         return { failure: incompatible(stage, "SelectedModelChanged") };
       }
     }

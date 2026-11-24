@@ -193,3 +193,29 @@ runs and final no-send extension must be recorded from terminal results.
 Job d4243864662b4ab893f44f1d0cba4657: 2/2 no-send and blocked-Health cases passed in 46s, exit 0 on the final test source copied over frozen Stage C. The final account-occupancy rerun remains separately tracked.
 
 Job dfe223cfeac54e439f176ffe9408777e: corrected existing-auth occupancy histories 2/2 passed, 3m52s, exit 0. This run used the corrected adapter and pre-Health-check revision of the new separate no-send test; no-send final revision was separately run as above. These staged results are not a full-suite run.
+
+## Project Worker quota increment
+
+ProjectWorkerQuotaIsolatedAcrossProjects seeds 501/502 use two distinct
+owners in one real disposable project and a second project. Two client clones
+race with the same captured account coverage; the losing fresh retry must be
+denied by the existing per-project Worker quota even while account capacity
+remains, while the second project can reserve. Original-bound pre-claim
+no-send release permits a replacement; replay and a different release operation
+cannot release the successor. Both clients' exact original status projections
+and quota bounds are checked after each settled step.
+
+Focused job 35a678a2b9664780ba3e5a5da77e9eea passed 2/2 in 29 s
+(exit 0), with this test overlaid on integrated source
+cb3b2f54a9f586228d5b2b210f1be6600099f932. Command:
+`dotnet test tests/AutomationSystemProperties20261124/AutomationSystemProperties20261124.fsproj -c Release --filter FullyQualifiedName~ProjectWorkerQuotaIsolatedAcrossProjects`.
+The initial race may reject a contender on stale account CAS; the subsequent
+fresh retry establishes the quota check. This is a guided, seed-varied
+increment, not a generated comprehensive history or a full-suite pass.
+It exercises existing native Scheduler account roster Worker admission only.
+It does not establish shared project-total/per-role enforcement across manual
+and Scheduler launch paths; that production seam is under Worker 21's
+automation-project-role-capacity-admission-20261124 task. After its frozen
+interface is available, adapt the independent model to mixed role/manual
+admission, unknown occupancy, restart and original-bound release and run
+against the accepted composition. No live effects.

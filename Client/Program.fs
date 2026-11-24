@@ -324,7 +324,7 @@ let private runClient args =
     let mutable registered = false
 
     let oauth =
-        OAuth.login tui.Log
+        OAuth.login tui.Log tui.ShowSignInLink
         |> Async.AwaitTask
         |> Async.RunSynchronously
 

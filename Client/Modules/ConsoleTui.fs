@@ -135,6 +135,7 @@ type LaunchTemplateUiAccess =
 
 type ConsoleTui(?activityLog: ActivityLog.Store) =
     let syncRoot = obj()
+    let mutable signInLinkVisible = false
     let activity = ResizeArray<ActivityEntry>()
     let agentSeen = Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase)
     let persistedAgentSeen = Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase)
@@ -1623,7 +1624,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                         (workDetailScroll + 1) lastDetail detail.Length)))
         draw.WriteLine(safe "Work is canonical; launch/session identifiers are evidence, not Work owners.")
 
-    let renderUnsafe () =
+    let renderFrameUnsafe () =
         let width, height =
             try
                 if Console.IsOutputRedirected then (80, 24)
@@ -1743,6 +1744,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             previousFrame <- None
             frameSize <- 0, 0
             lastRenderError <- Some ex.Message
+
+    let renderUnsafe () =
+        if not signInLinkVisible then renderFrameUnsafe()
 
     let loadLaunchTemplateUnsafe project =
         if not launchBusy && launchPending.IsNone then
@@ -2325,6 +2329,20 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     serverHost <- serverUrl
 
             renderUnsafe())
+
+    member _.ShowSignInLink(link: string option) =
+        lock syncRoot (fun () ->
+            match link with
+            | Some url ->
+                signInLinkVisible <- true
+                Console.WriteLine()
+                Console.WriteLine("Open this URL in your browser to sign in (on WSL, use your Windows browser):")
+                Console.WriteLine(url)
+                Console.WriteLine("Waiting for the local callback...")
+            | None ->
+                signInLinkVisible <- false
+                previousFrame <- None
+                renderUnsafe())
 
     member _.Log message =
         lock syncRoot (fun () ->

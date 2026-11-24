@@ -177,32 +177,55 @@ module OAuth =
             context.Response.Close()
         }
 
+    let isWslRelease isLinux (release: string) =
+        isLinux && not (isNull release) && release.Contains("microsoft", StringComparison.OrdinalIgnoreCase)
+
+    let private isWsl () =
+        if not (OperatingSystem.IsLinux()) then false
+        else
+            try isWslRelease true (File.ReadAllText("/proc/sys/kernel/osrelease"))
+            with _ -> false
+
     let private openBrowser (log: string -> unit) (uri: Uri) =
         try
             let startInfo = ProcessStartInfo(uri.AbsoluteUri)
             startInfo.UseShellExecute <- true
             Process.Start(startInfo) |> ignore
-        with ex ->
-            log $"Could not open the browser automatically: {ex.Message}"
-            log $"Open this URL to sign in: {uri.AbsoluteUri}"
+        with _ ->
+            log "Could not open the browser automatically."
 
-    let private interactiveLogin config (log: string -> unit) =
+    let presentAuthorization isWsl (showLink: string option -> unit) (launch: Uri -> unit) (authorization: Uri) =
+        showLink (Some authorization.AbsoluteUri)
+        if not isWsl then launch authorization
+
+    let callbackIsValid (expectedPath: string) (expectedState: string) (path: string) (state: string) (error: string) (code: string) =
+        String.Equals(path, expectedPath, StringComparison.Ordinal)
+        && String.Equals(state, expectedState, StringComparison.Ordinal)
+        && String.IsNullOrWhiteSpace(error)
+        && not (String.IsNullOrWhiteSpace(code))
+
+    let private interactiveLogin config (log: string -> unit) (showLink: string option -> unit) =
         task {
             let verifier, challenge = createPkce ()
             let state = randomValue 32
             let authorization = authorizationUri config state challenge
             let redirect = Uri(config.RedirectUri)
+            if not redirect.IsLoopback then
+                invalidOp "OAuth redirect URI must use a loopback host."
             let listenerPrefix = $"{redirect.Scheme}://{redirect.Host}:{redirect.Port}/"
 
             use listener = new HttpListener()
             listener.Prefixes.Add(listenerPrefix)
             listener.Start()
 
-            log "Opening browser for Jarvis sign-in..."
-            openBrowser log authorization
-
             let! context =
-                listener.GetContextAsync().WaitAsync(TimeSpan.FromMinutes(5.0))
+                task {
+                    try
+                        presentAuthorization (isWsl ()) showLink (openBrowser log) authorization
+                        return! listener.GetContextAsync().WaitAsync(TimeSpan.FromMinutes(5.0))
+                    finally
+                        showLink None
+                }
 
             let query = context.Request.QueryString
             let returnedState = query["state"]
@@ -211,10 +234,7 @@ module OAuth =
             let code = query["code"]
 
             let callbackIsValid =
-                String.Equals(context.Request.Url.AbsolutePath, redirect.AbsolutePath, StringComparison.Ordinal)
-                && String.Equals(returnedState, state, StringComparison.Ordinal)
-                && String.IsNullOrWhiteSpace(error)
-                && not (String.IsNullOrWhiteSpace(code))
+                callbackIsValid redirect.AbsolutePath state context.Request.Url.AbsolutePath returnedState error code
 
             do! sendBrowserResponse context callbackIsValid
 
@@ -305,7 +325,7 @@ module OAuth =
         finally
             if File.Exists temporary then File.Delete temporary
 
-    let login (log: string -> unit) =
+    let login (log: string -> unit) (showLink: string option -> unit) =
         task {
             let config = configuration ()
             let path = cachePath ()
@@ -325,8 +345,8 @@ module OAuth =
                             return result
                         with _ ->
                             log "Stored OAuth session could not be restored; interactive sign-in required."
-                            return! interactiveLogin config log
-                    | None -> return! interactiveLogin config log
+                            return! interactiveLogin config log showLink
+                    | None -> return! interactiveLogin config log showLink
                 }
             remember initial
             let gate = new SemaphoreSlim(1, 1)
@@ -349,11 +369,11 @@ module OAuth =
                                         remember refreshed
                                     with ex ->
                                         log $"OAuth refresh failed; signing in again: {ex.Message}"
-                                        let! authenticated = interactiveLogin config log
+                                        let! authenticated = interactiveLogin config log showLink
                                         current <- authenticated
                                         remember authenticated
                                 | None ->
-                                    let! authenticated = interactiveLogin config log
+                                    let! authenticated = interactiveLogin config log showLink
                                     current <- authenticated
                                     remember authenticated
 

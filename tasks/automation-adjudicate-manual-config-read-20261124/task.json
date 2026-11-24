@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"automation-adjudicate-manual-config-read-20261124","title":"[P0][Scheduler] Independently adjudicate manual fence configuration read finding","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"62b1f864d9ef49c89a1ca113792fa491"}
+{"schemaVersion":2,"taskId":"automation-adjudicate-manual-config-read-20261124","title":"[P0][Scheduler] Independently adjudicate manual fence configuration read finding","version":3,"lifecycle":"Cancelled","specVersion":1,"attemptId":"62b1f864d9ef49c89a1ca113792fa491"}

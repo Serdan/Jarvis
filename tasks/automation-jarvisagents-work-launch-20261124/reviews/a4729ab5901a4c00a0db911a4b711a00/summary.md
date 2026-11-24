@@ -1,0 +1,1 @@
+Origin/main-based commit. Exact JarvisAgents selection-only verified Work Terra Medium. Four targeted project tests passed, including single Send with verified Work and zero Sends for wrong effort. Full JS suite is running. Verify route binding, selection proof, and attribution compatibility before live launch.

@@ -295,3 +295,28 @@ module ClientConfig =
         | "native-health-timeout-seconds" -> Ok { stored with NativeHealthTimeoutSeconds = None }
         | "allowed-environment-variables" -> Ok { stored with AllowedEnvironmentVariables = None }
         | _ -> Error $"Unknown setting: {key}"
+
+
+    /// Device-local deny-only launch fence. This does not constitute admission.
+    type CapacityFenceMode = Disabled | NegativeOnly
+
+    let capacityFenceModeAt path : Result<CapacityFenceMode, string> =
+        try
+            let exists = File.Exists path
+            let raw = readRaw path
+            if exists && String.IsNullOrWhiteSpace raw then failwith "Existing configuration is empty."
+            if raw = "" then Ok Disabled
+            else
+                // Validate the existing schema and known settings against the same snapshot.
+                parse raw |> validate |> function
+                | Error e -> Error e
+                | Ok _ ->
+                    use json = JsonDocument.Parse(raw)
+                    match json.RootElement.TryGetProperty "capacityFenceEnabled" with
+                    | false, _ -> Ok Disabled
+                    | true, value when value.ValueKind = JsonValueKind.False -> Ok Disabled
+                    | true, value when value.ValueKind = JsonValueKind.True -> Ok NegativeOnly
+                    | _ -> Error "capacityFenceEnabled must be a boolean."
+        with ex -> Error $"Cannot read capacity fence config at {path}: {ex.Message}"
+
+    let capacityFenceMode () = capacityFenceModeAt (configPath())

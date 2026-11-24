@@ -666,40 +666,46 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
     | BrowserRunInNewTabCommand cmd ->
         fromBrowser (
             ValueTask<Result<string,EffectError>>(task {
-                match rt.Browser with
-                | None -> return Error(Client.ValidationError "BridgeDisabled")
-                | Some bridge ->
-                    match ProjectPaths.validateProjectRelativePath cmd.ScriptPath with
-                    | Error e -> return Error e
-                    | Ok _ when not (cmd.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
-                        return Error(Client.ValidationError "Browser script must be a .js file.")
-                    | Ok _ ->
-                        match ProjectPaths.resolveProjectFile cmd.ProjectName cmd.ScriptPath rt with
+                match ClientConfig.capacityFenceMode () with
+                | Ok ClientConfig.NegativeOnly ->
+                    return Error(Client.ValidationError "HOLD: capacity fence enabled; trusted admission unavailable.")
+                | Error error ->
+                    return Error(Client.ValidationError ("HOLD: capacity fence configuration unavailable: " + error))
+                | Ok ClientConfig.Disabled ->
+                    match rt.Browser with
+                    | None -> return Error(Client.ValidationError "BridgeDisabled")
+                    | Some bridge ->
+                        match ProjectPaths.validateProjectRelativePath cmd.ScriptPath with
                         | Error e -> return Error e
-                        | Ok(FilePath path) ->
-                            try
-                                if FileInfo(path).Length > int64 BrowserBridge.MaxScriptBytes then
-                                    return Error(Client.ValidationError "InputTooLarge: script exceeds 64 KiB.")
-                                else
-                                    let source = File.ReadAllText(path, UTF8Encoding(false, true))
-                                    let args = defaultArg cmd.ArgsJson "{}"
-                                    use validatedArgs = JsonDocument.Parse(args)
-                                    // Every new agent tab closes by default; an explicit false is a debugging opt-out.
-                                    let closeAfterExecution = defaultArg cmd.CloseTabAfterExecution true
-                                    let! result = BrowserBridge.runInNewTab bridge cmd.WindowRegistration cmd.Url "" (defaultArg cmd.Active false) source args (defaultArg cmd.TimeoutMs 30000) closeAfterExecution
-                                    return result
-                                           |> Result.mapError (fun (registrationId,error) ->
-                                               let detail =
-                                                   if String.IsNullOrWhiteSpace(registrationId) then error
-                                                   else error + " [tabRegistration=" + registrationId + "]"
-                                               Client.ValidationError detail)
-                            with
-                            | :? DecoderFallbackException -> return Error(Client.ValidationError "InvalidUtf8")
-                            | :? JsonException -> return Error(Client.ValidationError "InvalidArgumentsJson")
-                            | :? FileNotFoundException -> return Error(Client.NotFoundError "ScriptNotFound")
-                            | ex -> return Error(Client.ExceptionError ex)
-            })
-        )
+                        | Ok _ when not (cmd.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
+                            return Error(Client.ValidationError "Browser script must be a .js file.")
+                        | Ok _ ->
+                            match ProjectPaths.resolveProjectFile cmd.ProjectName cmd.ScriptPath rt with
+                            | Error e -> return Error e
+                            | Ok(FilePath path) ->
+                                try
+                                    if FileInfo(path).Length > int64 BrowserBridge.MaxScriptBytes then
+                                        return Error(Client.ValidationError "InputTooLarge: script exceeds 64 KiB.")
+                                    else
+                                        let source = File.ReadAllText(path, UTF8Encoding(false, true))
+                                        let args = defaultArg cmd.ArgsJson "{}"
+                                        use validatedArgs = JsonDocument.Parse(args)
+                                        // Every new agent tab closes by default; an explicit false is a debugging opt-out.
+                                        let closeAfterExecution = defaultArg cmd.CloseTabAfterExecution true
+                                        let! result = BrowserBridge.runInNewTab bridge cmd.WindowRegistration cmd.Url "" (defaultArg cmd.Active false) source args (defaultArg cmd.TimeoutMs 30000) closeAfterExecution
+                                        return result
+                                               |> Result.mapError (fun (registrationId,error) ->
+                                                   let detail =
+                                                       if String.IsNullOrWhiteSpace(registrationId) then error
+                                                       else error + " [tabRegistration=" + registrationId + "]"
+                                                   Client.ValidationError detail)
+                                with
+                                | :? DecoderFallbackException -> return Error(Client.ValidationError "InvalidUtf8")
+                                | :? JsonException -> return Error(Client.ValidationError "InvalidArgumentsJson")
+                                | :? FileNotFoundException -> return Error(Client.NotFoundError "ScriptNotFound")
+                                | ex -> return Error(Client.ExceptionError ex)
+                })
+            )
     | BrowserExecuteFileCommand cmd ->
         fromBrowser (
             ValueTask<Result<string,EffectError>>(task {

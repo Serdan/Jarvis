@@ -161,7 +161,7 @@ let forgeTerminal f client project original (c: NativeDispatchCandidate) =
 
 // Pre-claim exclusion commits through the actual project CAS and account
 // consumer. The locator comes from the immutable original reserve receipt.
-let excludeBeforeClaim f client project originalId (candidate: NativeDispatchCandidate) =
+let tryExcludeBeforeClaim f client project originalId (candidate: NativeDispatchCandidate) =
     let b = f.Accounts[client]
     let projects = f.Projects[client]
     let binding = projects[project]
@@ -193,11 +193,19 @@ let excludeBeforeClaim f client project originalId (candidate: NativeDispatchCan
             Client.NativeProjectEffectTransition.planExclusion binding snapshot head identity path
                 Client.NativeProjectEffectTransition.BeforeClaim intent
         | _ -> Error (InvalidBinding "Original account reservation changed"))
-    |> success |> ignore
-    let snapshot = LedgerStore.fetch binding |> success
-    let _, oid = LedgerStore.readAt binding snapshot path |> success
-    { Original = locator; NoSendOperationId = operation; ProjectHead = snapshot.Commit
-      NoSendOrigin = snapshot.Commit; EvidenceBlobOid = oid.Value }
+    |> Result.bind (fun _ ->
+        LedgerStore.fetch binding
+        |> Result.bind (fun snapshot ->
+            LedgerStore.readAt binding snapshot path
+            |> Result.bind (fun (_, oid) ->
+                match oid with
+                | Some evidenceOid ->
+                    Ok { Original = locator; NoSendOperationId = operation; ProjectHead = snapshot.Commit
+                         NoSendOrigin = snapshot.Commit; EvidenceBlobOid = evidenceOid }
+                | None -> Error (InvalidBinding "Committed exclusion evidence missing"))))
+
+let excludeBeforeClaim f client project originalId candidate =
+    tryExcludeBeforeClaim f client project originalId candidate |> success
 
 let releaseNoSend f client operation (locator: NativeNoSendLocator) =
     NativeSchedulerAccountReservation.releaseNoSend f.Accounts[client] f.Projects[client]

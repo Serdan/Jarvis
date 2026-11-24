@@ -1051,3 +1051,69 @@ type GeneratedComposition() =
         finally
             Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
             Directory.Delete(root, true)
+
+    // Competing production project claims and no-send exclusion share the
+    // same original reservation and canonical fence in disposable Git clones.
+    [<TestCase(601)>]
+    [<TestCase(602)>]
+    member _.OriginalClaimAndExclusionCompeteAcrossChallenge(seed: int) =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-system-exclusion-race-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let prior = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+        Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", Path.Combine(root, "config"))
+        try
+            let fs = [|newFixture (Path.Combine(root, "a")); newFixture (Path.Combine(root, "b"))|]
+            use account = SystemPropertyAccountFixture.create root [|fs |> Array.map _.First; fs |> Array.map _.Second|]
+            let first = seed % 2
+            let other = 1 - first
+            SystemPropertyAccountFixture.approve account 0 0L 1 1 |> success |> ignore
+            step fs[other] 0 Block
+            let c = SystemPropertyAccountFixture.candidate fs[first].First fs[first].Original.TaskId
+            let original = Guid.NewGuid()
+            SystemPropertyAccountFixture.reserve account 0 original c |> success |> ignore
+            let claim = Task.Run(fun () -> SystemPropertyAccountFixture.claim account 0 first original c |> snd)
+            let exclusion = Task.Run(fun () -> SystemPropertyAccountFixture.tryExcludeBeforeClaim account 1 first original c)
+            Task.WaitAll [|claim :> Task; exclusion :> Task|]
+            equal "exactly one original fence outcome" 1
+                ([claim.Result.IsOk; exclusion.Result.IsOk] |> List.filter id |> List.length)
+            let records client = (SystemPropertyAccountFixture.read account client).Records
+            let verify expected =
+                for client in 0..1 do
+                    let rs = records client
+                    equal "original reservation remains unique" 1 rs.Length
+                    equal "original reservation identity" c.DispatchId rs[0].Candidate.DispatchId
+                    equal "original occupancy state" expected rs[0].Status
+                fs |> Array.iter observe
+            verify "Reserved"
+            let blocked = SystemPropertyAccountFixture.candidate fs[other].First fs[other].Original.TaskId
+            equal "blocked challenge cannot reserve" true
+                (SystemPropertyAccountFixture.reserve account 0 (Guid.NewGuid()) blocked).IsError
+            verify "Reserved"
+            match exclusion.Result with
+            | Ok locator ->
+                let releaseId = Guid.NewGuid()
+                SystemPropertyAccountFixture.releaseNoSend account 0 releaseId locator |> success |> ignore
+                verify "Released"
+                equal "blocked challenge denies even with free capacity" true
+                    (SystemPropertyAccountFixture.reserve account 0 (Guid.NewGuid()) blocked).IsError
+                verify "Released"
+                let _, deniedClaim = SystemPropertyAccountFixture.claim account 0 first original c
+                equal "excluded original cannot later claim" true deniedClaim.IsError
+                let replay = SystemPropertyAccountFixture.releaseNoSend account 1 releaseId locator |> success
+                equal "release retry is receipt only" true replay.AlreadyApplied
+                step fs[other] 0 Resolve
+                step fs[other] 1 Resume
+                let successor = SystemPropertyAccountFixture.candidate fs[other].Second fs[other].Original.TaskId
+                SystemPropertyAccountFixture.reserve account 1 (Guid.NewGuid()) successor |> success |> ignore
+                let rs = records 0
+                equal "released original and one successor" 2 rs.Length
+                equal "successor occupied exactly once" 1 (rs |> Array.filter (fun r -> r.Status <> "Released") |> Array.length)
+            | Error _ ->
+                let _, deniedClaim = SystemPropertyAccountFixture.claim account 1 first original c
+                equal "claimed original cannot claim twice" true deniedClaim.IsError
+                equal "claimed original cannot release without terminal evidence" true
+                    (SystemPropertyAccountFixture.denyRelease account 1 original c).IsError
+                verify "Reserved"
+        finally
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
+            Directory.Delete(root, true)

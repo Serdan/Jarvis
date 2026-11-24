@@ -219,3 +219,35 @@ automation-project-role-capacity-admission-20261124 task. After its frozen
 interface is available, adapt the independent model to mixed role/manual
 admission, unknown occupancy, restart and original-bound release and run
 against the accepted composition. No live effects.
+
+## Original claim versus preclaim exclusion (2026-11-24)
+
+OriginalClaimAndExclusionCompeteAcrossChallenge seeds 601/602 race the real
+started-project claim against a real preclaim no-send project Git transaction
+for the same existing-auth account reservation. The model requires exactly one
+successful original fence, preserves the original account identity and
+occupancy, and checks the blocked sibling project. When exclusion wins it
+checks genuine no-send release, denial of blocked work with free capacity,
+receipt replay and capacity reuse after Challenge resolution; when claim wins
+it checks duplicate claim and unsupported terminal release remain denied.
+
+The two Task.Run operations permit either winner; this is a bounded scheduling
+race, not a controlled proof that both outcomes occurred, a generated long
+history, or provider-send execution. The existing project-effect component
+suite supplies controlled send/exclusion race coverage; operational host,
+trusted project-role admission and final composed acceptance remain outstanding.
+The helper refactor exposes the exclusion transaction Result for this race
+while retaining the existing successful-call wrapper.
+
+On integrated production source 0cca782ca plus this test-only delta, job
+db5359544d62416b89588dc76749b023 passed 2/2 in 30 seconds, exit 0:
+`dotnet test tests/AutomationSystemProperties20261124/AutomationSystemProperties20261124.fsproj -c Release --filter FullyQualifiedName~OriginalClaimAndExclusionCompeteAcrossChallenge`.
+After the helper refactor, job a2a06d717fa74e3ea36b08551a51c825 passed the four
+existing no-send and project Worker quota cases, exit 0, 1m25s; that staged run
+predates only the additional assertion in the new race. The complete pre-delta
+suite at exact dd211c32afa15bc9319bc959bfb485841d7b21f6 passed 17/17,
+10m14s, exit 0, job a3595fa00a77499cb4d683ec6a86d078. These are not a final
+milestone acceptance run. The legacy account component prepare script fails
+closed at this composition: expected blob fd9c9591c74ce906e15dfc191c2dbac0995b8dc3,
+actual 818bb6f8d43ab55177afe17e108e0155e6f43160. Its existing-auth rebind needs
+a separately coordinated lease; never bypass the pin.

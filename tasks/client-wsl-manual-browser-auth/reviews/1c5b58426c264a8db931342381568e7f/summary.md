@@ -1,0 +1,1 @@
+WSL skips automatic launch and presents the complete URL in the terminal after listener start; desktop retains automatic launch and manual fallback. The URL bypasses persistent activity logging. Loopback-only guard and forwarding guidance added. Release OAuthTests: 5 passed. Windows-to-WSL real-browser forwarding not tested: host kernel is Linux 7.2.14-arch1-1.

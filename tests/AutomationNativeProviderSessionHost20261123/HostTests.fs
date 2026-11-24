@@ -666,7 +666,7 @@ let ``real configured reviewer reservation has canonical frozen claim and distin
         Assert.That((renderReviewerArgumentsAt f.ProjectTwo snapshot "Disposable" 27001 claim).IsError, Is.True)
         let state =
             NativeSchedulerAccountReservation.readVerified
-            f.AccountTwo [| f.ProjectTwo |]
+                f.AccountTwo [| f.ProjectTwo |]
                 (ConfiguredFixture.coverage f f.AccountTwo [| f.ProjectTwo |])
             |> ConfiguredFixture.success |> snd
         Assert.That(state.Records.Length, Is.EqualTo(1))

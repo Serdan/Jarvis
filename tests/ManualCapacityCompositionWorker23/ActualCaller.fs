@@ -27,7 +27,7 @@ let prop (text:string) key =
     use doc = JsonDocument.Parse(text)
     doc.RootElement.GetProperty(key:string).GetString()
 
-let run (dispatch: (unit -> Task<Result<string, Client.EffectError>>) -> Task<Result<string, Client.EffectError>>) = task {
+let run mode (dispatch: (unit -> Task<Result<string, Client.EffectError>>) -> Task<Result<string, Client.EffectError>>) = task {
     let root = Path.Combine(Path.GetTempPath(), "capacity-fence-" + Guid.NewGuid().ToString("N"))
     Directory.CreateDirectory(root) |> ignore
     let prior = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
@@ -96,17 +96,27 @@ let run (dispatch: (unit -> Task<Result<string, Client.EffectError>>) -> Task<Re
             check (not pending.IsCompleted) "HOLD must emit no browser request"
         write """{"schemaVersion":1,"capacityFenceEnabled":false}"""
         printfn "stage: disabled"
+        if mode = "before" then socket.Abort()
         let launch = dispatch (fun () -> Client.SignalR.Client.receiveCommand rt command)
-        printfn "stage: frame"
-        let! frame = pending.WaitAsync(TimeSpan.FromSeconds(5.))
-        check (prop frame "kind" = "openTab") "disabled dispatch must reach browser"
-        do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"created-01","alias":"new","agentCreated":true,"availability":"ready","registrationGeneration":1}]}"""
-        do! send socket (JsonSerializer.Serialize({| version=2; kind="tabOpened"; requestId=prop frame "requestId"; connectionId=connectionId; tab={| registrationId="created-01"; availability="ready"; agentCreated=true; registrationGeneration=1 |} |}))
-        let! execute = (receive socket).WaitAsync(TimeSpan.FromSeconds(5.))
-        check (prop execute "kind" = "executeJs") "disabled dispatch executes"
-        do! send socket (JsonSerializer.Serialize({| version=2; kind="result"; requestId=prop execute "requestId"; connectionId=connectionId; registrationId="created-01"; registrationGeneration=1; status="completed"; result= {| ok=true |} |}))
-        let! outcome = launch.WaitAsync(TimeSpan.FromSeconds(5.))
-        check outcome.IsOk "disabled dispatch completes"
+        if mode = "before" then
+            let! result = launch.WaitAsync(TimeSpan.FromSeconds(5.))
+            check result.IsError "aborted bridge must fail"
+        else
+            printfn "stage: frame"
+            let! frame = pending.WaitAsync(TimeSpan.FromSeconds(5.))
+            check (prop frame "kind" = "openTab") "disabled dispatch must reach browser"
+            if mode = "after" then
+                socket.Abort()
+                let! result = launch.WaitAsync(TimeSpan.FromSeconds(5.))
+                check result.IsError "lost bridge response must fail"
+            else
+                do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"created-01","alias":"new","agentCreated":true,"availability":"ready","registrationGeneration":1}]}"""
+                do! send socket (JsonSerializer.Serialize({| version=2; kind="tabOpened"; requestId=prop frame "requestId"; connectionId=connectionId; tab={| registrationId="created-01"; availability="ready"; agentCreated=true; registrationGeneration=1 |} |}))
+                let! execute = (receive socket).WaitAsync(TimeSpan.FromSeconds(5.))
+                check (prop execute "kind" = "executeJs") "disabled dispatch executes"
+                do! send socket (JsonSerializer.Serialize({| version=2; kind="result"; requestId=prop execute "requestId"; connectionId=connectionId; registrationId="created-01"; registrationGeneration=1; status="completed"; result= {| ok=true |} |}))
+                let! outcome = launch.WaitAsync(TimeSpan.FromSeconds(5.))
+                check outcome.IsOk "disabled dispatch completes"
         ()
     finally
         Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
@@ -124,4 +134,24 @@ let actualCallerRunsOnlyAfterDisposableReservation () =
             let admitted = ManualCapacityCompositionWorker23.dispatch a fence (Guid.NewGuid()) (Guid.NewGuid()) (Guid.NewGuid()) (fun () -> pending <- Some(call()))
             if not admitted then failwith "fixture admission failed"
             pending.Value
-        run invoke |> fun t -> t.GetAwaiter().GetResult())
+        run "success" invoke |> fun t -> t.GetAwaiter().GetResult())
+
+[<NUnit.Framework.TestCase("before")>]
+[<NUnit.Framework.TestCase("after")>]
+let bridgeFailureRetainsReservation mode =
+    ProjectCapacityDisposableTests.withClones (fun a b ->
+        let fence = Guid.NewGuid()
+        Client.ProjectCapacityAdmission.initializeFixture a "fixture" (Guid.NewGuid()) 1 Map.empty |> ProjectCapacityDisposableTests.good |> ignore
+        ProjectInventoryComposedFixture.initialize a "fixture" (Guid.NewGuid()) 1 fence |> ProjectCapacityDisposableTests.good |> ignore
+        let original, effect, beginOp = Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid()
+        let invoke call =
+            let mutable pending = None
+            let admitted = ManualCapacityCompositionWorker23.dispatch a fence original effect beginOp (fun () -> pending <- Some(call()))
+            if not admitted then failwith "fixture admission failed"
+            pending.Value
+        run mode invoke |> fun t -> t.GetAwaiter().GetResult()
+        let mutable repeated = false
+        let send () = repeated <- true
+        check (not (ManualCapacityCompositionWorker23.dispatch b fence original effect beginOp send)) "replay denied"
+        check (not (ManualCapacityCompositionWorker23.dispatch b fence (Guid.NewGuid()) (Guid.NewGuid()) (Guid.NewGuid()) send)) "uncertain capacity retained"
+        check (not repeated) "no replay")

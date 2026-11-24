@@ -725,22 +725,34 @@ async function executeLaunch(args, observeSelection) {
   });
 
   if (projectStart) {
-    // A matching new rendered turn acknowledges the prompt, but not a sidebar
-    // URL. Re-prove the matching turn on the actual scoped durable route in
-    // the same poll; a previous acknowledgement cannot bind a later unrelated
-    // navigation. A legacy rendered turn can also provide exact text evidence.
+    // A matching rendered turn acknowledges Send independently of route binding.
+    // The SPA may change its URL before replacing the previous route's DOM.
+    // Require an observed scoped durable route without the matching turn, then
+    // a matching turn on that same route. Co-observation at a route transition,
+    // persistent text, and a change of marker alone do not establish freshness.
     let projectRouteAcknowledgement = null;
+    let previousSample = null;
     const bound = await until(() => {
       const current = currentPage();
-      if (!current) return null;
+      if (!current) {
+        previousSample = null;
+        return null;
+      }
+      const conversationUrl = durableRoute(current);
       const bubbles = newBubbles();
-      const matchingTurn = bubbles.some(matchesPrompt) ? "matchingUserBubble"
-        : bubbles.length === 0 && Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
-          .slice(initialTurns).some(matchesPrompt) ? "matchingLegacyUserTurn" : null;
+      const matchingBubble = bubbles.some(matchesPrompt);
+      const matchingLegacy = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+        .slice(initialTurns).some(matchesPrompt);
+      const matchingTurn = matchingBubble ? "matchingUserBubble"
+        : bubbles.length === 0 && matchingLegacy ? "matchingLegacyUserTurn" : null;
+      const freshOnRoute = conversationUrl && previousSample &&
+        previousSample.conversationUrl === conversationUrl && !previousSample.hasMatchingTurn;
+      // Track either marker for freshness even when bubble evidence takes
+      // precedence for acknowledgement. A marker change is not a new turn.
+      previousSample = { conversationUrl, hasMatchingTurn: matchingBubble || matchingLegacy };
       if (!matchingTurn) return null;
       projectRouteAcknowledgement = matchingTurn;
-      const conversationUrl = durableRoute(current);
-      return conversationUrl ? { conversationUrl, matchingTurn } : null;
+      return freshOnRoute ? { conversationUrl, matchingTurn } : null;
     });
     if (bound) return submitted(bound.conversationUrl,
       ["newUserTurn", bound.matchingTurn, "conversationRoute"]);

@@ -108,8 +108,10 @@ function harness(options = {}) {
     const submittedText = content;
     lastSubmittedText = submittedText;
     content = "";
-    userTurns++;
-    legacyRenderedText = options.legacyTextOverride ?? submittedText;
+    if (!options.deferLegacyTurn) {
+      userTurns++;
+      legacyRenderedText = options.legacyTextOverride ?? submittedText;
+    }
     if (options.projectEvents) {
       // Deterministic provider-side DOM/route events; no navigation by the launcher.
       for (const event of options.projectEvents) {
@@ -359,6 +361,10 @@ function harness(options = {}) {
           if (event.href !== undefined) site.href = event.href;
           if (event.links !== undefined) projectLinks = event.links;
           if (event.bubble !== undefined) renderedBubble = event.bubble;
+          if (event.legacy !== undefined) {
+            userTurns = event.legacy === null ? 0 : 1;
+            legacyRenderedText = event.legacy;
+          }
         }
         callback();
       });
@@ -381,6 +387,7 @@ function harness(options = {}) {
     get selectedModel() { return selectedModel; }, get reasoningEffort() { return reasoningEffort; }, get modelClicks() { return modelClicks; }, get beforeReadyInsertions() { return beforeReadyInsertions; },
     get proSelections() { return proSelections; }, get mode() { return mode; }, get content() { return content; },
     get virtualClockState() { return virtualClock && { now: virtualClock.now, delays: [...virtualClock.delays] }; },
+    get pendingProjectEventCount() { return pendingProjectEvents.length; },
     get staleSendObserved() { return staleSendObserved; }, get lastSubmittedText() { return lastSubmittedText; } };
 }
 
@@ -1189,14 +1196,17 @@ test("explicit override rejects prototype property and unsupported value without
 
 test("project entry selects Latest Medium without a Chat/Work mode toggle and sends once", async () => {
   const startUrl = "https://chatgpt.com/g/g-p-abc123/project";
-  const h = harness({ startUrl, noModeToggle: true, selectedModel: "GPT-6", reasoningEffort: "High" });
+  const route = "https://chatgpt.com/g/g-p-abc123/c/00000000-0000-0000-0000-000000000001";
+  const h = harness({ startUrl, noModeToggle: true, selectedModel: "GPT-6", reasoningEffort: "High",
+    virtualClock: true, noRoute: true, deferLegacyTurn: true,
+    projectEvents: [{ afterMs: 75, href: route }, { afterMs: 225, legacy: "Project launch" }] });
   const result = await h.run("Project launch", { startUrl, timeoutMs: 18000 });
   assert.equal(result.status, "submitted");
   assert.equal(result.selectedModel, "Latest");
   assert.equal(result.selectedEffort, "Medium");
   assert.equal(result.observedSelection.model, "Latest");
   assert.equal(result.observedSelection.mode, null);
-  assert.equal(result.conversationUrl, "https://chatgpt.com/g/g-p-abc123/c/00000000-0000-0000-0000-000000000001");
+  assert.equal(result.conversationUrl, route);
   assert.equal(h.clicks, 1);
 });
 
@@ -1474,15 +1484,18 @@ for (const [label, links, afterMs] of [
   });
 }
 
-test("project route binding: unrelated link B cannot preempt delayed actual route A", async () => {
+test("project route binding: delayed route with only the earlier matching turn is unbound", async () => {
   const { h, result } = await runProjectRoute([
     { afterMs: 75, bubble: projectPrompt, links: [projectRouteB] },
     { afterMs: 300, href: projectRouteA + "?model=secret#fragment" }
   ]);
-  assert.equal(result.status, "submitted", JSON.stringify(result));
-  assert.equal(result.conversationUrl, projectRouteA);
-  assert.deepEqual(Array.from(result.evidence), ["newUserTurn", "matchingUserBubble", "conversationRoute"]);
+  assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
+  assert.equal(result.reason, "ConversationUrlUnavailable");
+  assert.equal(result.conversationUrl, null);
+  assert.equal(result.projectRouteAcknowledgement, "matchingUserBubble");
+  assert.deepEqual(Array.from(result.evidence), ["newUserTurn", "matchingUserBubble"]);
   assert.equal(h.site.href, projectRouteA + "?model=secret#fragment");
+  assert.equal(result.timing.elapsedSinceSendMs, result.timing.budgetAtSendMs);
 });
 
 for (const [label, href] of [
@@ -1507,10 +1520,77 @@ test("project route binding: a mismatched turn and valid route do not acknowledg
   assert.equal(result.projectRouteAcknowledgement, undefined);
 });
 
-test("project route binding: a prior matching turn cannot bind a later route displaying a different turn", async () => {
+for (const [marker, evidence, extra] of [
+  ["bubble", "matchingUserBubble", {}],
+  ["legacy", "matchingLegacyUserTurn", { noLegacyTurnMarkers: false, deferLegacyTurn: true }]
+]) {
+  for (const staggered of [false, true]) {
+    test(`project route binding: ${marker} stale turn, ${staggered ? "staggered" : "atomic"} route/DOM mismatch`, async () => {
+      const { result } = await runProjectRoute([
+        { afterMs: 75, [marker]: projectPrompt },
+        { afterMs: 300, href: "https://chatgpt.com" + projectRouteB,
+          ...(!staggered ? { [marker]: "Different prompt" } : {}) },
+        ...(staggered ? [{ afterMs: 375, [marker]: "Different prompt" }] : [])
+      ], extra);
+      assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
+      assert.equal(result.reason, "ConversationUrlUnavailable");
+      assert.equal(result.conversationUrl, null);
+      assert.equal(result.projectRouteAcknowledgement, evidence);
+      assert.deepEqual(Array.from(result.evidence), ["newUserTurn", evidence]);
+      assert.equal(result.timing.elapsedSinceSendMs, result.timing.budgetAtSendMs);
+    });
+  }
+
+  test(`project route binding: ${marker} route-first fresh matching turn`, async () => {
+    const { h, result } = await runProjectRoute([
+      { afterMs: 75, href: projectRouteA + "?model=secret#fragment", links: [projectRouteB] },
+      { afterMs: 300, href: projectRouteA + "?model=other#updated", [marker]: projectPrompt }
+    ], extra);
+    assert.equal(result.status, "submitted", JSON.stringify(result));
+    assert.equal(result.conversationUrl, projectRouteA);
+    assert.deepEqual(Array.from(result.evidence), ["newUserTurn", evidence, "conversationRoute"]);
+    assert.equal(h.pendingProjectEventCount, 0);
+  });
+
+  test(`project route binding: ${marker} delayed route followed by fresh matching turn on route`, async () => {
+    const { h, result } = await runProjectRoute([
+      { afterMs: 75, [marker]: projectPrompt },
+      { afterMs: 300, href: projectRouteA },
+      { afterMs: 450, [marker]: null },
+      { afterMs: 675, [marker]: projectPrompt }
+    ], extra);
+    assert.equal(result.status, "submitted", JSON.stringify(result));
+    assert.equal(result.conversationUrl, projectRouteA);
+    assert.deepEqual(Array.from(result.evidence), ["newUserTurn", evidence, "conversationRoute"]);
+    // Success must not come from the earlier persistent matching turn.
+    assert.equal(h.pendingProjectEventCount, 0);
+  });
+
+  test(`project route binding: ${marker} simultaneous route and matching turn are unbound`, async () => {
+    const { result } = await runProjectRoute([{ afterMs: 75, href: projectRouteA, [marker]: projectPrompt }], extra);
+    assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
+    assert.equal(result.reason, "ConversationUrlUnavailable");
+    assert.equal(result.conversationUrl, null);
+    assert.equal(result.projectRouteAcknowledgement, evidence);
+  });
+}
+
+test("project route binding: switching marker alone does not prove a fresh turn", async () => {
   const { result } = await runProjectRoute([
-    { afterMs: 75, bubble: projectPrompt },
-    { afterMs: 300, bubble: "Different prompt", href: projectRouteA }
+    { afterMs: 75, legacy: projectPrompt },
+    { afterMs: 300, href: projectRouteA },
+    { afterMs: 450, legacy: null, bubble: projectPrompt }
+  ], { noLegacyTurnMarkers: false, deferLegacyTurn: true });
+  assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
+  assert.equal(result.reason, "ConversationUrlUnavailable");
+  assert.equal(result.conversationUrl, null);
+  assert.equal(result.projectRouteAcknowledgement, "matchingUserBubble");
+});
+
+test("project route binding: a different durable route starts a new evidence epoch", async () => {
+  const { result } = await runProjectRoute([
+    { afterMs: 75, href: projectRouteA },
+    { afterMs: 300, href: "https://chatgpt.com" + projectRouteB, bubble: projectPrompt }
   ]);
   assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
   assert.equal(result.reason, "ConversationUrlUnavailable");
@@ -1518,11 +1598,16 @@ test("project route binding: a prior matching turn cannot bind a later route dis
   assert.equal(result.projectRouteAcknowledgement, "matchingUserBubble");
 });
 
-test("project route binding: matching legacy rendered user turn and exact route remain supported", async () => {
-  const { result } = await runProjectRoute([{ afterMs: 150, href: projectRouteA }], { noLegacyTurnMarkers: false });
-  assert.equal(result.status, "submitted", JSON.stringify(result));
-  assert.equal(result.conversationUrl, projectRouteA);
-  assert.deepEqual(Array.from(result.evidence), ["newUserTurn", "matchingLegacyUserTurn", "conversationRoute"]);
+test("project route binding: an intervening foreign origin invalidates the previous route sample", async () => {
+  const { result } = await runProjectRoute([
+    { afterMs: 75, href: projectRouteA },
+    { afterMs: 300, href: "https://example.invalid/" },
+    { afterMs: 450, href: projectRouteA, bubble: projectPrompt }
+  ]);
+  assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
+  assert.equal(result.reason, "ConversationUrlUnavailable");
+  assert.equal(result.conversationUrl, null);
+  assert.equal(result.projectRouteAcknowledgement, "matchingUserBubble");
 });
 
 test("project route binding: mismatched legacy text cannot bind a valid route", async () => {

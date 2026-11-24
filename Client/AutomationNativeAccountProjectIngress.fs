@@ -15,6 +15,19 @@ type NativeIssuerStatus = Disabled of string | Enabled
 let productionStatus () =
     Disabled "Authenticated account/provider issuer absent; production ingress remains default OFF."
 
+// A claimed review is not a Started implementation attempt. Keep its
+// request type distinct and never derive a reviewer fence from empty task
+// and attempt fields.
+[<CLIMutable>]
+type ReviewerProjectClaim =
+    { OperationId: Guid
+      ExpectedProjectHead: string
+      AccountHead: string
+      OriginalReservationOperationId: Guid
+      ReviewCandidate: NativeDispatchCandidate
+      DeviceId: string
+      WindowRegistration: string }
+
 [<CLIMutable>]
 type StartedProjectClaim =
     { OperationId: Guid
@@ -91,6 +104,45 @@ let private recordPath (candidate: NativeDispatchCandidate) =
     + NativeSchedulerRosterPolicy.sha256 (
         candidate.ProjectLedgerId + "|" + candidate.Kind + "|"
         + candidate.TaskId + "|" + candidate.AttemptId) + ".json"
+
+// This derives an identity only; it does not verify a live claim or grant
+// account/project authority. The same-head canonical verifier must run in
+// the transaction before any reviewer fence may be created.
+let internal reviewerFencePath (claim: ReviewerProjectClaim) =
+    let canonicalUuid (format: string) (value: string) =
+        match Guid.TryParseExact(value, format) with
+        | true, id when id <> Guid.Empty && id.ToString(format) = value -> true
+        | _ -> false
+    if isNull (box claim) || isNull (box claim.ReviewCandidate) then
+        bad "Missing distinct reviewer claim"
+    else
+        let c = claim.ReviewCandidate
+        if c.Kind <> "Reviewer"
+           || not (canonicalUuid "D" c.ProjectId && canonicalUuid "D" c.ProjectLedgerId)
+           || c.ProjectEpoch < 1 || String.IsNullOrWhiteSpace c.OwnerAgentId
+           || not (canonicalUuid "N" c.ReviewId && canonicalUuid "D" c.ClaimOperationId)
+           || c.ReviewVersion < 1L || c.ReviewVersion > int64 Int32.MaxValue
+           || not (oid c.ReviewedHeadOid)
+           || String.IsNullOrWhiteSpace c.ReviewRef
+           || not (c.ReviewRef.StartsWith("refs/heads/jarvis-review/", StringComparison.Ordinal))
+           || c.AssignmentGeneration <> 0L
+           || not (String.IsNullOrEmpty c.TaskId && String.IsNullOrEmpty c.AttemptId
+                   && String.IsNullOrEmpty c.SourceRepositoryId && String.IsNullOrEmpty c.SourceBaseOid
+                   && String.IsNullOrEmpty c.SourceRef && String.IsNullOrEmpty c.SourceLeaseSha256)
+           || not (canonicalUuid "D" c.DispatchId && canonicalUuid "D" c.EffectOperationId)
+           || claim.OperationId = Guid.Empty || claim.OriginalReservationOperationId = Guid.Empty
+           || not (oid claim.ExpectedProjectHead && oid claim.AccountHead)
+           || String.IsNullOrWhiteSpace claim.DeviceId || String.IsNullOrWhiteSpace claim.WindowRegistration
+           || ([ string claim.OperationId; string claim.OriginalReservationOperationId
+                 c.DispatchId; c.EffectOperationId; c.ClaimOperationId ] |> Set.ofList |> Set.count) <> 5 then
+            bad "Invalid distinct reviewer claim identity or original UUID binding"
+        else
+            let key =
+                json {| projectId = c.ProjectId; ledgerId = c.ProjectLedgerId; epoch = c.ProjectEpoch
+                        reviewId = c.ReviewId; reviewVersion = c.ReviewVersion
+                        claimOperationId = c.ClaimOperationId |}
+            Ok ("records/native-account-reviewer-effect-v1/"
+                + NativeSchedulerRosterPolicy.sha256 key + ".json")
 
 let private readCanonical<'T> binding snapshot path : Result<('T * string * string), LedgerFailure> =
     LedgerStore.readAt binding snapshot path

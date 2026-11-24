@@ -1,5 +1,17 @@
 # Native Started account → project pre-send CAS (2026-11-23)
 
+**Historical evidence:** the original standalone/signed-fixture requirements
+below describe the prior accepted implementation, not the controlling
+2026-11-24 Scheduler architecture. Host task spec v7
+(`e5d5b5713698dec2e4bc74fad39988dfd512c7c8`) now requires use of the
+existing authenticated client/configuration/ledger boundary, without an
+additional signer or approval system. Worker 12 owns the account-side
+replacement and canonical reviewer-claim verifier. Worker 16's Stage C
+consumer checkpoint is documented in
+[the native provider session host evidence](automation-native-provider-session-host-20261123.md).
+Do not treat earlier signing-only tests as new architecture acceptance.
+Existing default-off operation and unknown-outcome occupancy remain required.
+
 ## Authority boundary
 
 Canonical task: `automation-native-account-project-ingress-terminal-20261123`, specification v2, pinned spec blob `215087bdd0d7596f2859a1b69641aa04877d23fb`. Base source `d312f1cc83685e781ce69e57ad0d4bf613bfb843` is the accepted-only native snapshot, **not** an assertion that every accepted source is on `main`.

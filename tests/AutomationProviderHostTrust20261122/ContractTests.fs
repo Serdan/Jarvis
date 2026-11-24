@@ -146,7 +146,7 @@ type ContractFixture() =
     [<TestCase("Duplicate")>]
     [<TestCase("SecondClientCASLoser")>]
     member _.``untrusted event is not a release or a new send permit`` (eventName: string) =
-        evaluateHostEvent eventName |> holds TrustedHostNotImplemented
+        evaluateHostEvent eventName |> holds VerifiedOutcomeUnavailable
 
     [<Test>]
     member _.``terminal locator with empty operation cannot authorize release`` () =
@@ -178,7 +178,7 @@ type ContractFixture() =
                                 Locator = locator; Proof = proof } with
         | Ok structural -> 
             Assert.That(structural.SessionId, Is.EqualTo("s1"))
-            authorizeRelease structural |> holds TrustedHostNotImplemented
+            authorizeRelease structural |> holds VerifiedOutcomeUnavailable
         | Error e -> Assert.Fail(sprintf "Expected structural-only terminal observation: %A" e)
 
     [<Test>]
@@ -241,7 +241,3 @@ type ContractFixture() =
                                             ProjectFenceOid = oid; ProviderSessionId = "s1" }
                           Locator = locator; Proof = proof }
         |> holds MissingObservation
-
-    [<Test; Explicit("RED: trusted Started project ingress, provider issuer and account release are absent")>]
-    member _.ProductionNativeAccountProviderTerminalRemainsUnsupported() =
-        Assert.Fail("RED: no trusted Started project ingress, real provider issuer, or connected B2 release call site exists")

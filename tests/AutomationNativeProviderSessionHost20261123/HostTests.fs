@@ -585,3 +585,231 @@ let ``exact authenticated owner distinguishes same generation reconnect and refu
     Assert.That(replacementOwner, Is.Not.EqualTo(owner))
     // Neither authenticated transport connection proves a provider terminal.
     Assert.That(releaseFromProviderTerminal().IsError, Is.True)
+
+
+// Stage C uses a real independent BranchReview claim and frozen source ref,
+// not a worker record with Kind rewritten or a fabricated account receipt.
+let private claimedReviewer f =
+    let p = f.ProjectOne
+    let agent = "Reviewer fixture"
+    ReviewWorkflow.registerAgent p (Guid.NewGuid()) agent |> SignedFixture.success |> ignore
+    Client.RoleInstructions.RoleInstructions.createRole p "Disposable fixture" (Guid.NewGuid())
+        "Reviewer" "Independent review" "Review exact frozen source independently."
+    |> SignedFixture.success |> ignore
+    Client.RoleInstructions.RoleInstructions.attachRole p "Disposable fixture" (Guid.NewGuid())
+        agent "Reviewer" 0 |> SignedFixture.success |> ignore
+    Client.RoleInstructions.RoleInstructions.setLaunchTemplate p "Disposable fixture"
+        (Guid.NewGuid()) 0 template |> SignedFixture.success |> ignore
+    let source = (LedgerStore.fetch p |> SignedFixture.success).Commit
+    let taskId = "review-fixture"
+    let reviewId = Guid.NewGuid()
+    let claimId = Guid.NewGuid()
+    let reviewRef = $"refs/heads/jarvis-review/{taskId}/{reviewId:N}/r1"
+    ReviewWorkflow.submitBranchReview p (Guid.NewGuid()) taskId
+        "Worker fixture" reviewId "" source "Disposable native reviewer"
+        "Review exact source" "" |> SignedFixture.success |> ignore
+    ReviewWorkflow.claimBranchReview p claimId taskId reviewId agent 1
+    |> SignedFixture.success |> ignore
+    let c : NativeDispatchCandidate =
+        { DispatchId = string (Guid.NewGuid()); EffectOperationId = string (Guid.NewGuid())
+          Kind = "Reviewer"; ProjectId = string p.ProjectId
+          ProjectLedgerId = string p.LedgerId; ProjectEpoch = p.Epoch
+          OwnerAgentId = agent; TaskId = ""; AttemptId = ""; AssignmentGeneration = 0L
+          SourceRepositoryId = ""; SourceBaseOid = ""; SourceRef = ""; SourceLeaseSha256 = ""
+          ReviewId = reviewId.ToString("N"); ReviewVersion = 2L
+          ReviewedHeadOid = source; ReviewRef = reviewRef; ClaimOperationId = string claimId }
+    let original = Guid.NewGuid()
+    let claim : ReviewerProjectClaim =
+        { OperationId = Guid.NewGuid()
+          ExpectedProjectHead = (LedgerStore.fetch p |> SignedFixture.success).Commit
+          AccountHead = (AccountCapacityLedger.fetch f.AccountOne |> SignedFixture.success).Head
+          OriginalReservationOperationId = original; ReviewCandidate = c
+          DeviceId = "client-device"; WindowRegistration = "window-disposable" }
+    taskId, reviewId, claim
+
+// Historical Stage B account fixture only. Replace this adapter with the
+// normal configured account path when Worker 12's accepted interface lands.
+let private reservedReviewer f =
+    SignedFixture.signed f
+    let taskId, reviewId, claim = claimedReviewer f
+    let projects = [| f.ProjectOne |]
+    NativeSchedulerAccountReservation.reserveVerifiedDisposable
+        f.Root f.AccountOne f.PublicKey f.Subject projects
+        (SignedFixture.coverage f f.AccountOne projects) claim.OriginalReservationOperationId
+        "Historical account fixture" claim.ReviewCandidate
+    |> SignedFixture.success |> ignore
+    taskId, reviewId, { claim with AccountHead = (AccountCapacityLedger.fetch f.AccountOne |> SignedFixture.success).Head }
+
+// Only the negative legacy Worker test constructs this deliberately
+// mismatched type; the real reviewer fixture remains a distinct claim.
+let private asWorkerForNegativeTest (claim: ReviewerProjectClaim) : StartedProjectClaim =
+    { OperationId = claim.OperationId; ExpectedProjectHead = claim.ExpectedProjectHead
+      AccountHead = claim.AccountHead; OriginalReservationOperationId = claim.OriginalReservationOperationId
+      Candidate = claim.ReviewCandidate; DeviceId = claim.DeviceId
+      WindowRegistration = claim.WindowRegistration }
+
+[<Test>]
+let ``real signed reviewer reservation has canonical frozen claim and distinct Worker denial`` () =
+    SignedFixture.withGit (fun f ->
+        let _, _, claim = reservedReviewer f
+        let c = claim.ReviewCandidate
+        let snapshot = LedgerStore.fetch f.ProjectTwo |> SignedFixture.success
+        Assert.That(snapshot.Commit, Is.EqualTo(claim.ExpectedProjectHead))
+        LedgerStore.fetchReviewRef f.ProjectTwo c.ReviewRef c.ReviewedHeadOid
+        |> SignedFixture.success |> ignore
+        let operation =
+            LedgerStore.getOperationAt f.ProjectTwo snapshot (Guid.Parse c.ClaimOperationId)
+            |> SignedFixture.success |> Option.get
+        Assert.That(operation.Type, Is.EqualTo("ClaimBranchReview"))
+        LedgerStore.getOperationOriginAt f.ProjectTwo snapshot operation
+        |> SignedFixture.success |> ignore
+        let rendered =
+            Client.RoleInstructions.RoleInstructions.renderLaunchPromptAt
+                f.ProjectTwo snapshot "Disposable" c.OwnerAgentId |> SignedFixture.success
+        Assert.That(rendered.Prompt, Is.EqualTo("Reviewer fixture assigned to Disposable."))
+        let instructions =
+            Client.RoleInstructions.RoleInstructions.resolveAt
+                f.ProjectTwo snapshot c.OwnerAgentId |> SignedFixture.success
+        Assert.That(instructions.SnapshotCommit, Is.EqualTo(rendered.SnapshotCommit))
+        Assert.That(instructions.RoleIds = ["Reviewer"], Is.True)
+        Assert.That(instructions.Documents.Head.Content, Is.EqualTo("Review exact frozen source independently."))
+        let launch = renderReviewerArgumentsAt f.ProjectTwo snapshot "Disposable" 27000 claim
+                     |> SignedFixture.success
+        Assert.That(launch.Rendered, Is.EqualTo(rendered))
+        Assert.That(launch.AgentConfigVersion, Is.EqualTo(instructions.AgentConfigVersion))
+        Assert.That(launch.InstructionProvenanceSha256.Length, Is.EqualTo(64))
+        Assert.That(launch.ArgumentsSha256, Is.EqualTo(NativeSchedulerRosterPolicy.sha256 launch.Arguments))
+        use args = JsonDocument.Parse launch.Arguments
+        Assert.That(args.RootElement.GetProperty("prompt").GetString(), Is.EqualTo(rendered.Prompt))
+        Assert.That(args.RootElement.GetProperty("timeoutMs").GetInt32(), Is.EqualTo(27000))
+        Assert.That(Client.BrowserArguments.fits launch.Arguments, Is.True)
+        Assert.That((renderReviewerArgumentsAt f.ProjectTwo snapshot "Disposable" 27001 claim).IsError, Is.True)
+        let state =
+            NativeSchedulerAccountReservation.readVerifiedDisposable
+                f.Root f.AccountTwo f.PublicKey f.Subject [| f.ProjectTwo |]
+                (SignedFixture.coverage f f.AccountTwo [| f.ProjectTwo |])
+            |> SignedFixture.success |> snd
+        Assert.That(state.Records.Length, Is.EqualTo(1))
+        Assert.That(state.Records[0].Candidate, Is.EqualTo(c))
+        Assert.That(state.Records[0].Status, Is.EqualTo("Reserved"))
+        PairedBrowser.withPaired (fun bridge ->
+            let wrongPool = asWorkerForNegativeTest claim
+            Assert.That((prepare f f.AccountTwo f.ProjectTwo bridge 27000 wrongPool).IsError, Is.True)
+            assertNoIntent f.ProjectTwo wrongPool))
+
+[<Test>]
+let ``released reviewer claim leaves account occupancy but cannot prove current project authority`` () =
+    SignedFixture.withGit (fun f ->
+        let taskId, reviewId, claim = reservedReviewer f
+        ReviewWorkflow.releaseBranchReview f.ProjectOne (Guid.NewGuid()) taskId reviewId
+            claim.ReviewCandidate.OwnerAgentId 2 |> SignedFixture.success |> ignore
+        let afterRelease = LedgerStore.fetch f.ProjectTwo |> SignedFixture.success
+        Assert.That(afterRelease.Commit, Is.Not.EqualTo(claim.ExpectedProjectHead))
+        Assert.That((renderReviewerArgumentsAt f.ProjectTwo afterRelease "Disposable" 27000 claim).IsError, Is.True)
+        // The account read is a valid occupancy observation, not a current
+        // review claim verifier. The eventual project CAS must revalidate.
+        let state = SignedFixture.state f
+        Assert.That(state.Records[0].Candidate, Is.EqualTo(claim.ReviewCandidate))
+        Assert.That(state.Records[0].Status, Is.EqualTo("Reserved"))
+        let changedHead = { claim with ExpectedProjectHead = afterRelease.Commit }
+        PairedBrowser.withPaired (fun bridge ->
+            let wrongPool = asWorkerForNegativeTest changedHead
+            Assert.That((prepare f f.AccountTwo f.ProjectTwo bridge 27000 wrongPool).IsError, Is.True)
+            assertNoIntent f.ProjectTwo wrongPool))
+
+[<Test>]
+let ``reviewer fence identity binds review version and original claim operation without worker fields`` () =
+    SignedFixture.withGit (fun f ->
+        let _, _, claim = claimedReviewer f
+        let c = claim.ReviewCandidate
+        let path = reviewerFencePath claim |> SignedFixture.success
+        Assert.That(path, Does.StartWith("records/native-account-reviewer-effect-v1/"))
+        let withCandidate candidate = { claim with ReviewCandidate = candidate }
+        let changedVersion = withCandidate { c with ReviewVersion = c.ReviewVersion + 1L }
+        let changedClaim = withCandidate { c with ClaimOperationId = string (Guid.NewGuid()) }
+        let changedReview = withCandidate { c with ReviewId = Guid.NewGuid().ToString("N") }
+        for different in [changedVersion; changedClaim; changedReview] do
+            Assert.That(reviewerFencePath different |> SignedFixture.success, Is.Not.EqualTo(path))
+        // Retry UUIDs do not produce another path for the same canonical claim.
+        Assert.That(reviewerFencePath { claim with OperationId = Guid.NewGuid() } |> SignedFixture.success,
+                    Is.EqualTo(path))
+        for invalid in
+            [ withCandidate { c with Kind = "Worker" }
+              withCandidate { c with TaskId = "fake-attempt" }
+              withCandidate { c with SourceLeaseSha256 = "fake-lease" }
+              withCandidate { c with ClaimOperationId = c.EffectOperationId }
+              { claim with OperationId = claim.OriginalReservationOperationId } ] do
+            Assert.That((reviewerFencePath invalid).IsError, Is.True))
+
+[<TestCase(true)>]
+[<TestCase(false)>]
+let ``reviewer journal reader binds original operation bytes and distinct fence`` includeFence =
+    SignedFixture.withGit (fun f ->
+        // Reader fixture: seed a project-only journal using the ordinary Git
+        // CAS. Deliberately no account reservation or signing. This tests
+        // historical readback, not authorization of a real reviewer send.
+        let _, _, claim = claimedReviewer f
+        let snapshot = LedgerStore.fetch f.ProjectOne |> SignedFixture.success
+        PairedBrowser.withPaired (fun bridge ->
+            let rendered = renderReviewerArgumentsAt f.ProjectOne snapshot "Disposable" 27000 claim
+                           |> SignedFixture.success
+            let owner, generation = bridge.TryGetExactWindowOwner(claim.WindowRegistration)
+                                    |> SignedFixture.success
+            let effectId = Guid.Parse claim.ReviewCandidate.EffectOperationId
+            let pinned : OriginalReviewerLaunchIntent =
+                { SchemaVersion = 1; ProjectName = "Disposable"; Claim = claim
+                  AccountGeneration = 1L; CanonicalKey = String.replicate 64 "a"
+                  TemplateVersion = rendered.Rendered.TemplateVersion
+                  TemplateBlobOid = rendered.Rendered.TemplateBlobOid
+                  PromptSha256 = rendered.Rendered.PromptSha256
+                  ArgumentsSha256 = rendered.ArgumentsSha256
+                  AgentConfigVersion = rendered.AgentConfigVersion
+                  InstructionProvenanceSha256 = rendered.InstructionProvenanceSha256
+                  ObservedConnectionId = owner; ObservedWindowGeneration = generation
+                  State = "HeldBeforeSend" }
+            let opts = JsonSerializerOptions(PropertyNamingPolicy=JsonNamingPolicy.CamelCase)
+            let raw = JsonSerializer.Serialize(pinned, opts)
+            let path = $"records/native-scheduler/launch-arguments/{effectId:N}.json"
+            let fence = reviewerFencePath claim |> SignedFixture.success
+            let write =
+                LedgerStore.transact f.ProjectOne
+                    { OperationId=claim.OperationId; Actor=claim.ReviewCandidate.OwnerAgentId
+                      Kind="NativeReviewerLaunchIntent"
+                      RequestJson=JsonSerializer.Serialize(
+                        {| claim=claim
+                           launchIntentSha256=NativeSchedulerRosterPolicy.sha256 raw
+                           argumentsSha256=rendered.ArgumentsSha256 |}, opts) }
+                    (fun current ->
+                        Assert.That(current.Commit, Is.EqualTo(claim.ExpectedProjectHead))
+                        Ok [ { Path = $"records/native-scheduler/launch-intents/{effectId:N}.json"
+                               ExpectedBlobOid=None; Content=raw }
+                             { Path=path; ExpectedBlobOid=None; Content=rendered.Arguments }
+                             if includeFence then
+                                 { Path=fence; ExpectedBlobOid=None; Content="{}" } ])
+                |> SignedFixture.success
+            Assert.That((readOriginalIntent f.ProjectTwo claim.OperationId effectId).IsError, Is.True)
+            if not includeFence then
+                Assert.That((readOriginalReviewerIntent f.ProjectTwo claim.OperationId effectId).IsError, Is.True)
+            else
+                let origin, _, read, args =
+                    readOriginalReviewerIntent f.ProjectTwo claim.OperationId effectId |> SignedFixture.success
+                Assert.That(origin, Is.EqualTo(write.CurrentHead))
+                Assert.That(read, Is.EqualTo(pinned))
+                Assert.That(args, Is.EqualTo(rendered.Arguments))
+                Assert.That((readOriginalReviewerIntent f.ProjectTwo (Guid.NewGuid()) effectId).IsError, Is.True)
+                // A newer launch template cannot change a pinned intent.
+                Client.RoleInstructions.RoleInstructions.setLaunchTemplate f.ProjectOne "Fixture" (Guid.NewGuid()) 1
+                    "{{agentId}} revised {{projectName}}" |> SignedFixture.success |> ignore
+                let _, _, _, reread =
+                    readOriginalReviewerIntent f.ProjectTwo claim.OperationId effectId |> SignedFixture.success
+                Assert.That(reread, Is.EqualTo(args))
+                LedgerStore.transact f.ProjectOne
+                    { OperationId=Guid.NewGuid(); Actor="Disposable tamper fixture"
+                      Kind="TestRewrittenReviewerArguments"; RequestJson="{}" }
+                    (fun current ->
+                        LedgerStore.readAt f.ProjectOne current path
+                        |> Result.map (fun (_, oid) ->
+                            [ { Path=path; ExpectedBlobOid=oid
+                                Content="""{"prompt":"rewritten","timeoutMs":27000}""" } ]))
+                |> SignedFixture.success |> ignore
+                Assert.That((readOriginalReviewerIntent f.ProjectTwo claim.OperationId effectId).IsError, Is.True)))

@@ -1,4 +1,13 @@
-# Native provider session host — Stage A source-only evidence
+# Native provider session host — historical Stage A/B and Stage C checkpoint
+
+**Current scope (2026-11-24):** task specification v7,
+`e5d5b5713698dec2e4bc74fad39988dfd512c7c8`, supersedes the signing and
+separate issuer requirements below. The Scheduler runs inside the existing
+authenticated client/configuration/ledger boundary. No new approval,
+signer, subject registry, or second authentication scheme is required.
+The original Stage A/B evidence remains historical, not current acceptance.
+Unknown external outcomes remain occupied; there is no automatic replay.
+No runtime activation is authorized.
 
 Task: `automation-native-provider-session-host-20261123`, specification v3
 (`14e476a9bbb62b7b211be2620b58e02bc1ddf82f`). This is a **partial
@@ -262,3 +271,51 @@ shared wire files remain unchanged. In total 64 focused tests passed.
 No unfiltered Client tests, production send, reservation, terminal
 release, deployment, restart or runtime activation were performed.
 `git diff --check` passed before freezing.
+
+## Stage C — reviewer preparation and existing-auth interface dependency
+
+The isolated worktree `automation-native-provider-session-host-stagec-worker16-20261124`
+starts from exact independent Stage B Accepted commit
+`90dff82aeb3cf5f4885468fccaf9c3ee2bb381a0`, tree
+`da4a00d5ded11adb3db280b7d95b2c439c9c067f`, immutable review ref
+`refs/heads/jarvis-review/automation-native-provider-session-host-20261123/8c3e3dc550ce4ec38ed86ec052acc816/r1`,
+decision sequence 12897. No changes to its frozen source.
+
+The separate ReviewerProjectClaim and reviewer fence path bind project,
+ledger, epoch, review ID/version and canonical claim-operation UUID;
+Worker attempt fields cannot supply this identity. The fence key is
+independent of a retry operation UUID. Reviewer rendering reads the common
+launch template and canonical role/agent layers at the same project
+snapshot, retaining a role resolution digest and the full exact argument
+bytes. A distinct OriginalReviewerLaunchIntent record and read-only
+journal reader bind the original operation, review identity, review-fence
+path, transport observation, and immutable argument/prompt hashes.
+The journal reader does not validate a current claim or grant send
+permission. Actual same-head reviewer verification and the project CAS
+are not implemented yet. The project-only journal fixture deliberately
+seeds a test transaction to exercise historical readback; it is not a
+positive test of the real reservation-to-project writer.
+
+The prior Worker adapter remains unchanged pending replacement by Worker
+12's existing-auth interface, rather than broadening the superseded
+signed-fixture path to reviewers. The proposed unused trust-host interface
+and issuer-fingerprint receipt have been removed; structural observation
+checks, real paired transport, and exact original terminal matching remain.
+This does not implement a provider outcome or an operator reconciliation.
+
+Lead challenge `e8a0900cd83744308c510119ab155601` was resolved at
+sequence 12966, authorizing the distinct W12/W16 leases (not proof of an
+implemented interface). W12 task `automation-native-account-authority-binding-20261124`,
+spec v3 `82a2103299dd2d3bf002a5fc4e9e86c92a177157`, owns the account
+side and shared same-snapshot canonical reviewer verifier. Dependency
+`72be7bf11e864787bb40a76c1366dffc`, condition
+`4ae7a9b1690833c89806e2b6ee007944`, requests actual accepted commit,
+review evidence and callable interfaces, including normal configuration
+fixtures. The consumer must use that verifier rather than a duplicate
+implementation or caller-asserted trust. Replace the legacy signed
+adapter and signing-dependent test setup with the accepted existing-auth
+path; then connect the distinct reviewer fence + launch metadata/argument
+CAS with no replay and exercise both Worker and Reviewer under real
+two-clone races. Preserve all existing runtime and provider-boundary
+leases. Do not present the intermediate tests as corrected architecture
+acceptance; fresh independent review and composed tests are required.

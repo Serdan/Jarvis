@@ -23,13 +23,13 @@ type HoldReason =
     | DisposableReceiptNotAuthority
     | ForeignProjectFence
     | InvalidTerminalProof
-    | TrustedHostNotImplemented
+    | VerifiedOutcomeUnavailable
     | EventRequiresReconciliation
     | UnknownHostEvent
 
 // The record is a structural projection of caller-supplied values, explicitly
 // NOT a capability. Its private constructor cannot stand in for an independent
-// account ledger fetch, signed roster, project operation origin or issuer.
+// account ledger fetch, configured roster or project operation origin.
 type NonAuthorizingAccountShape =
     private
         { Candidate: NativeDispatchCandidate
@@ -80,7 +80,7 @@ let private candidateShape (c: NativeDispatchCandidate) =
     && c.ReviewRef = "" && c.ReviewedHeadOid = "" && c.ClaimOperationId = ""
 
 /// Checks untrusted *shape* only. Does not fetch an account HEAD, authorize
-/// candidate ownership, verify the signed roster, or make any provider call.
+/// candidate ownership, verify configured membership, or make any provider call.
 let inspectAccount (observation: AccountObservation) : Result<NonAuthorizingAccountShape, HoldReason list> =
     if isNull (box observation) || isNull (box observation.Reservation)
        || isNull (box observation.ExpectedCandidate) then
@@ -210,7 +210,7 @@ let inspectTerminal (observation: TerminalObservation) : Result<NonAuthorizingTe
 
 /// No callback or boolean proof promotes a shape to a release capability.
 let authorizeRelease (_: NonAuthorizingTerminalShape) : Result<unit, HoldReason list> =
-    Error [ TrustedHostNotImplemented ]
+    Error [ VerifiedOutcomeUnavailable ]
 
 /// Explicit names prevent a lost ACK, tab closure, unknown provider state,
 /// revocation, late delivery or losing client from becoming terminal or resend.
@@ -218,43 +218,5 @@ let evaluateHostEvent eventName : Result<unit, HoldReason list> =
     match eventName with
     | "LostAck" | "TabClosed" | "Unknown" | "Revoked" | "LateAck"
     | "Duplicate" | "SecondClientCASLoser" ->
-        Error [ TrustedHostNotImplemented; EventRequiresReconciliation ]
-    | _ -> Error [ TrustedHostNotImplemented; UnknownHostEvent ]
-
-/// Proposed host ingress only. There is NO implementation, call site, account
-/// writer, BrowserBridge hook, provider session authenticator or grant issuer.
-/// Each eventual implementation must independently verify actual account and
-/// project Git heads plus authenticated provider-origin receipts.
-// Typed receipts for the proposed API boundary, not minted proof.
-// A real issuer must commit each effect and return source-verifiable origin;
-// no constructor in this file is an authorization capability.
-type ProjectPreSendReceipt =
-    { OriginalAccountReservationId: Guid
-      AccountGeneration: int64
-      DispatchId: Guid
-      EffectOperationId: Guid
-      ProjectClaimOperationId: Guid
-      ProjectHead: string
-      SourceRef: string
-      SourceLeaseSha256: string }
-
-type ProviderRegistrationReceipt =
-    { ProjectClaim: ProjectPreSendReceipt
-      RegistrationOperationId: Guid
-      ProviderSessionId: string
-      IssuerFingerprintSha256: string
-      ProjectHead: string }
-
-type ProviderFirstConnectReceipt =
-    { Registration: ProviderRegistrationReceipt
-      FirstConnectOperationId: Guid
-      ProviderConnectionId: string
-      ProjectHead: string }
-
-type ITrustedNativeProviderHost =
-    abstract member ReadAccountReservation: NativeDispatchCandidate -> Result<NativeReservationRecord, string>
-    abstract member ClaimStartedProjectPreSend: NativeReservationRecord -> Result<ProjectPreSendReceipt, string>
-    abstract member RegisterProviderSession: ProjectPreSendReceipt -> Result<ProviderRegistrationReceipt, string>
-    abstract member VerifyFirstConnection: ProviderRegistrationReceipt -> Result<ProviderFirstConnectReceipt, string>
-    abstract member VerifyCanonicalProviderTerminal: NativeTerminalLocator * ProviderFirstConnectReceipt -> Result<NativeTerminalProof, string>
-    abstract member ReleaseOriginalAccountReservationOnce: NativeTerminalLocator * NativeTerminalProof -> Result<unit, string>
+        Error [ VerifiedOutcomeUnavailable; EventRequiresReconciliation ]
+    | _ -> Error [ VerifiedOutcomeUnavailable; UnknownHostEvent ]

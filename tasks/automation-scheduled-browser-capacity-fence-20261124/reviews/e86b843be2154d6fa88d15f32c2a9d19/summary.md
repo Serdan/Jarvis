@@ -1,0 +1,1 @@
+Default-off deny-only fence at actual scheduled browser caller, composed on integrated manual fence 0edfc111; shared reader blob 6e943327. Release disposable capacity tests and actual callback enabled/invalid/disabled/missing checks pass. No positive admission or live effects; arbitrary scripts and old clients remain outside scope.

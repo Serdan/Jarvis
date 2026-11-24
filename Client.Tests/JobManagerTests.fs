@@ -363,7 +363,7 @@ let private completedToolResponse payload : AgentCommandResponse =
     { Result = Some payload
       Error = None
       Instructions = []
-      AgentStateChanges = [ { ProjectName = "Project1"; AgentId = "Worker 1" } ]
+      StateChangeEvidence = StateChangeEvidence.Confirmed [ { ProjectName = "Project1"; AgentId = "Worker 1" } ]
       InboxActivation = None
       PendingJob = None }
 
@@ -430,12 +430,8 @@ let completedToolPollStripsLegacyOneShotAlertsFromRawResultWithoutAlteringStored
     try
         let context = TestContext root
         let blocked = TaskCompletionSource<AgentCommandResponse>(TaskCreationOptions.RunContinuationsAsynchronously)
-        let previousStop =
-            { Scope = "response-alert"; Path = "jarvis/response-alert/previous"
-              Sha256 = ""; Content = "STOP - consumed before old background completion" }
-        let canonical =
-            { Scope = "project"; Path = "AGENTS.md"; Sha256 = ""
-              Content = "Preserve ordinary original job instructions" }
+        let previousStop = OperationalControl.queuedAlert "previous" "STOP - consumed before old background completion"
+        let canonical = OperationalControl.ActivationUnverified "Preserve original activation status"
         let original =
             { completedToolResponse """{"immutable":true}""" with
                 Instructions = [previousStop; canonical] }
@@ -799,6 +795,7 @@ let private notificationFixture (sourceChanges: AgentStateChange list)
           DecisionSequence = 0L; Evidence = ""; SessionId = "" }
     { Notification = original
       SourceStateChanges = sourceChanges
+      SourceKnownStateChanges = Unchecked.defaultof<_>
       SourceInboxActivation = sourceReceipt }
 
 let private activationFixture () : AgentInboxActivation =
@@ -832,8 +829,11 @@ let forwardedTransportRecoveryRetainsKnownSourceAndOriginalOperationId () =
     Assert.That(restored.AgentStateChanges, Is.EqualTo(source :> obj))
     Assert.That(restored.InboxActivation, Is.EqualTo(Some receipt))
 
-[<Test>]
-let forwardedNotificationJobKeepsSourceAndDestinationEvidenceThroughTerminalPolling () =
+[<TestCase(false, false)>]
+[<TestCase(true, false)>]
+[<TestCase(false, true)>]
+[<TestCase(true, true)>]
+let forwardedNotificationJobKeepsSourceAndDestinationEvidenceThroughTerminalPolling sourceIncomplete destinationIncomplete =
     let root = createTempProject ()
     let context = TestContext root
     try
@@ -843,7 +843,17 @@ let forwardedNotificationJobKeepsSourceAndDestinationEvidenceThroughTerminalPoll
                                  [ { ProjectName = "Jarvis"; AgentId = "Worker 1" } ]
                              else []
                 let receipt = if sourceChanged then Some(activationFixture()) else None
-                let envelope = notificationFixture source receipt
+                let sourceEvidence =
+                    if sourceIncomplete then StateChangeEvidence.Unknown source
+                    else StateChangeEvidence.Confirmed source
+                let complete, partial = StateChangeEvidence.split sourceEvidence
+                let forwarded = { notificationFixture complete receipt with SourceKnownStateChanges = partial }
+                let envelope =
+                    match System.Text.Json.JsonSerializer.Deserialize<AgentCommand>(
+                            System.Text.Json.JsonSerializer.Serialize(CrossProjectNotificationCommand forwarded)) with
+                    | CrossProjectNotificationCommand restored -> restored
+                    | other -> failwithf "Unexpected forwarded wire command: %A" other
+                Assert.That(envelope.SourceEvidence, Is.EqualTo(sourceEvidence))
                 let merge = Client.SignalR.Client.combineCrossProjectNotification envelope
                 let deferred =
                     TaskCompletionSource<AgentCommandResponse>(TaskCreationOptions.RunContinuationsAsynchronously)
@@ -875,18 +885,28 @@ let forwardedNotificationJobKeepsSourceAndDestinationEvidenceThroughTerminalPoll
                     { Result = if outcomeIsFailure then None else Some """{"notified":true}"""
                       Error = if outcomeIsFailure then Some(Conflict "destination failed") else None
                       Instructions = []
-                      AgentStateChanges = [ { ProjectName = "Project1"; AgentId = "Receiver" } ]
+                      StateChangeEvidence =
+                          let known = [ { ProjectName = "Project1"; AgentId = "Receiver" } ]
+                          if destinationIncomplete then StateChangeEvidence.Unknown known
+                          else StateChangeEvidence.Confirmed known
                       InboxActivation = None; PendingJob = None }
                 deferred.SetResult destination
                 let _, completion = registered
                 let terminal = completion.WaitAsync(TimeSpan.FromSeconds 4.).GetAwaiter().GetResult()
-                Assert.That(terminal.AgentStateChanges.Length, Is.EqualTo(if sourceChanged then 2 else 1))
+                let allKnown = source @ [ { ProjectName = "Project1"; AgentId = "Receiver" } ]
+                let expected =
+                    if sourceIncomplete || destinationIncomplete then StateChangeEvidence.Unknown allKnown
+                    else StateChangeEvidence.Confirmed allKnown
+                Assert.That(terminal.StateChangeEvidence, Is.EqualTo(expected))
                 Assert.That(terminal.InboxActivation, Is.EqualTo(receipt))
                 Assert.That(terminal.Error.IsSome, Is.EqualTo(outcomeIsFailure))
                 for _ in 1 .. 3 do
                     match getJobResultForProjectAsAgent jobProject (Some "Worker 1") cmd context with
                     | Ok value ->
                         Assert.That(value.ToolResponse, Is.EqualTo(Some terminal))
+                        let wire = System.Text.Json.JsonSerializer.Serialize value
+                        let restored = System.Text.Json.JsonSerializer.Deserialize<JobResult>(wire)
+                        Assert.That(restored.ToolResponse, Is.EqualTo(Some terminal))
                         Assert.That(value.Status,
                             Is.EqualTo(if outcomeIsFailure then ToolFailed "Conflict \"destination failed\""
                                        else ToolCompleted))

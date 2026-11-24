@@ -27,7 +27,7 @@ module CommandDispatchRecovery =
           Instructions = []
           // Only the forwarded source effects are confirmed. Destination
           // effects remain UNKNOWN under the typed UncertainOutcome.
-          AgentStateChanges = sourceChanges
+          StateChangeEvidence = StateChangeEvidence.Unknown sourceChanges
           InboxActivation = sourceActivation; PendingJob = None }
 
 // A command must leave SignalR's receive callback before any local work

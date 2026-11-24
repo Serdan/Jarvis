@@ -1,11 +1,13 @@
 module Client.SignalR.Client
 
 open System
+open System.Collections.Concurrent
 open System.Diagnostics
 open System.IO
 open System.Runtime.CompilerServices
 open System.Text
 open System.Text.Json
+open System.Threading
 open System.Threading.Tasks
 open Client
 open Client.SignalR
@@ -21,7 +23,163 @@ let receiveMessage (rt: Runtime) message =
 // Explicit agent labels identify the current work slot. Cache canonical
 // Working state for ordinary calls to avoid one remote git fetch per tool.
 let private workingGuidanceCaches = ConditionalWeakTable<Runtime, WorkingTurnGuidance.AgentCache>()
-let private instructionDeliveryCaches = ConditionalWeakTable<Runtime, AgentInstructions.DeliveryCache>()
+
+type private AlertProbe =
+    { Target: ProjectPaths.ProjectTarget
+      AgentId: string
+      Gate: obj
+      mutable Pending: bool
+      mutable Revision: int64
+      mutable Refreshing: bool
+      mutable LastAttempt: DateTimeOffset
+      mutable LastUsed: DateTimeOffset }
+
+// Active agents in one project share a single verified background snapshot.
+// Prevent N remote Git fetches for N agents and trust-binding contention.
+type private AlertProjectSnapshot =
+    { Gate: obj
+      mutable CheckedAt: DateTimeOffset
+      mutable Verified: (LedgerStore.LedgerBinding * LedgerStore.LedgerSnapshot) option }
+
+// A hint authorizes only a verified presence check, never the delivery of
+// cached alert contents. Canonical fenced CAS still runs at the visible reply.
+type private ResponseAlertReconciler(runtime: Runtime) =
+    let weak = WeakReference<Runtime>(runtime)
+    let probes = ConcurrentDictionary<ProjectPaths.ProjectId * string, AlertProbe>()
+    let snapshots = ConcurrentDictionary<ProjectPaths.ProjectId, AlertProjectSnapshot>()
+    let invalidateSnapshot projectId =
+        let mutable discarded = Unchecked.defaultof<AlertProjectSnapshot>
+        snapshots.TryRemove(projectId, &discarded) |> ignore
+    let period = TimeSpan.FromSeconds 15.
+    let idle = TimeSpan.FromMinutes 3.
+    let get target agentId =
+        probes.GetOrAdd((ProjectPaths.ProjectTarget.projectId target, agentId), fun _ ->
+            { Target = target; AgentId = agentId; Gate = obj(); Pending = false
+              Revision = 0L; Refreshing = false
+              LastAttempt = DateTimeOffset.MinValue; LastUsed = DateTimeOffset.UtcNow })
+    let read (entry: AlertProbe) forceFetch =
+        try
+            let mutable rt = Unchecked.defaultof<Runtime>
+            if not (weak.TryGetTarget(&rt)) then None
+            else
+                let projectId = ProjectPaths.ProjectTarget.projectId entry.Target
+                let state =
+                    snapshots.GetOrAdd(projectId, fun _ ->
+                        { Gate = obj(); CheckedAt = DateTimeOffset.MinValue; Verified = None })
+                // The project-level lock is used only on background threads.
+                // A verified snapshot is reused for each agent in this project.
+                let latest =
+                    lock state.Gate (fun () ->
+                        let now = DateTimeOffset.UtcNow
+                        if forceFetch || now - state.CheckedAt >= period then
+                            state.CheckedAt <- now
+                            state.Verified <-
+                                match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot
+                                          (ProjectPaths.ProjectId.value projectId) rt with
+                                | Ok verified -> Some verified
+                                | Error _ -> None
+                        state.Verified)
+                match latest with
+                | None -> None
+                | Some (binding, snapshot) ->
+                    match ReviewWorkflow.ReviewWorkflow.getResponseAlertsAt binding snapshot entry.AgentId with
+                    | Ok queue -> Some(not queue.Pending.IsEmpty)
+                    | Error _ -> None
+        with _ -> None
+    let rec schedule (entry: AlertProbe) forced =
+        let now = DateTimeOffset.UtcNow
+        let revision =
+            lock entry.Gate (fun () ->
+                if forced then
+                    entry.Revision <- entry.Revision + 1L
+                    entry.LastAttempt <- DateTimeOffset.MinValue
+                if not entry.Refreshing && now - entry.LastAttempt >= period then
+                    entry.Refreshing <- true
+                    entry.LastAttempt <- now
+                    Some entry.Revision
+                else None)
+        match revision with
+        | None -> ()
+        | Some version ->
+            Task.Run(fun () ->
+                let pending = read entry false
+                let superseded =
+                    lock entry.Gate (fun () ->
+                        entry.Refreshing <- false
+                        if entry.Revision <> version then
+                            entry.LastAttempt <- DateTimeOffset.MinValue
+                            true
+                        else
+                            // An unavailable ledger cannot assert queue emptiness.
+                            match pending with
+                            | Some value -> entry.Pending <- value
+                            | None -> ()
+                            false)
+                if superseded then schedule entry false) |> ignore
+    let mutable timer = Unchecked.defaultof<Timer>
+    do
+        timer <- new Timer(TimerCallback(fun _ ->
+            let mutable rt = Unchecked.defaultof<Runtime>
+            if not (weak.TryGetTarget(&rt)) then timer.Dispose()
+            else
+                let now = DateTimeOffset.UtcNow
+                for KeyValue(key, entry) in probes do
+                    let last = lock entry.Gate (fun () -> entry.LastUsed)
+                    if now - last > idle then probes.TryRemove(key) |> ignore
+                    else schedule entry false), null, period, period)
+    member _.MayHavePending(target, agentId) =
+        let entry = get target agentId
+        let result = lock entry.Gate (fun () ->
+            entry.LastUsed <- DateTimeOffset.UtcNow
+            entry.Pending)
+        schedule entry false
+        result
+    member _.AfterAttempt(target, agentId) =
+        let entry = get target agentId
+        // A failed consume remains durable and will be seen by reconciliation.
+        lock entry.Gate (fun () -> entry.Pending <- false)
+        invalidateSnapshot (ProjectPaths.ProjectTarget.projectId target)
+        schedule entry true
+    member _.Invalidate(projectId, agentId) =
+        // Invalidation never acquires the potentially slow project fetch lock.
+        invalidateSnapshot projectId
+        match probes.TryGetValue((projectId, agentId)) with
+        | true, entry -> schedule entry true
+        | _ -> ()
+    member _.InvalidateAll() =
+        snapshots.Clear()
+        for entry in probes.Values do schedule entry true
+    member _.ReconcileNow(target, agentId) : Task =
+        // Deterministic diagnostic/test hook; normal replies never await it.
+        let entry = get target agentId
+        let version = lock entry.Gate (fun () ->
+            entry.LastUsed <- DateTimeOffset.UtcNow
+            entry.Revision <- entry.Revision + 1L
+            entry.LastAttempt <- DateTimeOffset.UtcNow
+            entry.Revision)
+        Task.Run(fun () ->
+            let pending = read entry true
+            lock entry.Gate (fun () ->
+                if entry.Revision = version then
+                    match pending with
+                    | Some value -> entry.Pending <- value
+                    | None -> ()))
+
+let private responseAlertCaches = ConditionalWeakTable<Runtime, ResponseAlertReconciler>()
+let private responseAlertCache (rt: Runtime) =
+    responseAlertCaches.GetValue(rt, fun owner -> ResponseAlertReconciler(owner))
+
+let reconcileResponseAlerts (rt: Runtime) projectName agentId : Task =
+    if String.IsNullOrWhiteSpace agentId then Task.CompletedTask
+    else
+        match ProjectPaths.ProjectTarget.parse projectName with
+        | Ok selected -> (responseAlertCache rt).ReconcileNow(selected, agentId)
+        | Error _ -> Task.CompletedTask
+let responseAlertProbePending (rt: Runtime) projectName agentId =
+    match ProjectPaths.ProjectTarget.parse projectName with
+    | Ok selected -> (responseAlertCache rt).MayHavePending(selected, agentId)
+    | Error _ -> false
+
 let invalidateAgentStates (rt: Runtime) (projectName: string) (agentIds: string array) =
     // Server notifications only carry the logical project identity. Worktree
     // selectors share the canonical ledger/assignment cache by ProjectId.
@@ -33,6 +191,7 @@ let invalidateAgentStates (rt: Runtime) (projectName: string) (agentIds: string 
             let projectId = ProjectPaths.ProjectTarget.projectId target
             for agentId in agentIds |> Array.filter (String.IsNullOrWhiteSpace >> not) |> Array.distinct do
                 cache.Invalidate(projectId, agentId)
+                (responseAlertCache rt).Invalidate(projectId, agentId)
     | Error _ -> ()
 
 let invalidateAllAgentStates (rt: Runtime) =
@@ -40,6 +199,7 @@ let invalidateAllAgentStates (rt: Runtime) =
     let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
         WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
     cache.InvalidateAll()
+    (responseAlertCache rt).InvalidateAll()
 // Only commands addressing repository source are checkout selectors.
 // Message/activity project fields are literal history labels, not paths.
 type private CommandProject =
@@ -66,13 +226,29 @@ let private classifyProject command =
         | Some raw -> ProjectPaths.ProjectTarget.parse raw |> Result.map Checkout
 
 
+// Trust-binding locks are held only around local config access, never
+// remote Git fetches. Retry only the typed, pre-write contention case.
+// Three short waits bound the extra synchronous lock-wait budget to 60 ms.
+let private retryBindingContention load =
+    let rec attempt retries =
+        match load() with
+        | Error(Client.LedgerFailureError issue)
+            when issue.Code = "TrustBindingContended" && retries > 0 ->
+            Thread.Sleep(10 * (4 - retries))
+            attempt (retries - 1)
+        | result -> result
+    attempt 3
+
 let private loadAgentState (rt: Runtime) (project: string) (agentId: string) =
-    match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt with
-    | Error _ -> None
+    match retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt) with
+    | Error error -> Error error
     | Ok (binding, snapshot) ->
         match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurnAt binding snapshot agentId with
-        | Ok agent -> Some agent
-        | Error _ -> None
+        | Ok agent -> Ok(Some agent)
+        // This exact required-entity read reports a missing record at the
+        // verified snapshot as StaleEntityVersion; other failures are unknown.
+        | Error(LedgerStore.StaleEntityVersion _) -> Ok None
+        | Error error -> Error(OrchestrationApi.LedgerErrors.toEffect error)
 
 let private checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.ProjectTarget option) command =
     if String.IsNullOrWhiteSpace agentId then []
@@ -87,11 +263,9 @@ let private checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.Pro
             let agent =
                 cache.Get(now, projectId, agentId, fun () ->
                     loadAgentState rt project agentId)
-            match agent |> Option.bind (WorkingTurnGuidance.instructionAt now) with
-            | Some content ->
-                [ { Scope = "working-turn"; Path = "jarvis/working-turn"
-                    Sha256 = ""; Content = content } ]
-            | None -> []
+            agent |> Result.toOption |> Option.flatten
+            |> Option.bind (WorkingTurnGuidance.instructionAt now)
+            |> Option.bind OperationalControl.workingTurn |> Option.toList
 
 // A read can still mutate the original Agent ledger via automatic activation
 // or one-shot response-alert consumption. Verify that *side effect* separately
@@ -102,35 +276,33 @@ let private oldSideEffectsAllowed (rt: Runtime) (selected: ProjectPaths.ProjectT
         (fun name -> OrchestrationApi.LedgerBindingConfig.load name rt
                      |> Result.mapError (sprintf "%A")) project
 
-// Response alerts are distinct from cached Working-turn timing guidance.
-// A fresh canonical ledger read on each eligible response makes alerts
-// visible across devices and restarts, even if an invalidation push was lost.
-// Successful Git CAS consumption gives at-most-once best-effort delivery.
+// A client-local presence cache only decides whether to attempt delivery.
+// Never display text or write from a hint: old-writer fencing, fresh binding
+// verification, queue version, and canonical CAS remain authoritative.
 let private checkResponseAlerts (rt: Runtime) agentId (target: ProjectPaths.ProjectTarget option) =
     if String.IsNullOrWhiteSpace agentId then []
     else
         match target with
         | None -> []
-        | Some selected when not (oldSideEffectsAllowed rt selected) -> []
+        | Some selected when not ((responseAlertCache rt).MayHavePending(selected, agentId)) -> []
         | Some selected ->
-            let project = selected |> ProjectPaths.ProjectTarget.projectId |> ProjectPaths.ProjectId.value
-            // Binding resolution already fetched a verified snapshot.
-            // Avoid a second remote Git fetch for each tool reply.
-            match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt with
-            | Error _ -> []
-            | Ok (binding, snapshot) ->
-                match ReviewWorkflow.ReviewWorkflow.takeResponseAlertsAt binding snapshot agentId with
-                | Error _ -> [] // Retain pending content for a later response.
-                | Ok alerts ->
-                    alerts
-                    |> List.sortBy (fun alert ->
-                        (if alert.Message.TrimStart().StartsWith("STOP", StringComparison.OrdinalIgnoreCase)
-                         then 0 else 1), alert.QueuedAtUtc, alert.AlertId)
-                    |> List.map (fun alert ->
-                        { Scope = "response-alert"
-                          Path = $"jarvis/response-alert/{alert.AlertId}"
-                          Sha256 = ""
-                          Content = "JARVIS OPERATOR ALERT (one-shot coordination instruction):\n" + alert.Message })
+            try
+                if not (oldSideEffectsAllowed rt selected) then []
+                else
+                    let project = selected |> ProjectPaths.ProjectTarget.projectId |> ProjectPaths.ProjectId.value
+                    match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt with
+                    | Error _ -> []
+                    | Ok (binding, snapshot) ->
+                        match ReviewWorkflow.ReviewWorkflow.takeResponseAlertsAt binding snapshot agentId with
+                        | Error _ -> [] // CAS raced or failed; pending remains durable.
+                        | Ok alerts ->
+                            alerts
+                            |> List.sortBy (fun alert ->
+                                (if alert.Message.TrimStart().StartsWith("STOP", StringComparison.OrdinalIgnoreCase)
+                                 then 0 else 1), alert.QueuedAtUtc, alert.AlertId)
+                            |> List.map (fun alert -> OperationalControl.queuedAlert alert.AlertId alert.Message)
+            finally
+                (responseAlertCache rt).AfterAttempt(selected, agentId)
 
 let private mayReceiveResponseAlert = function
     // Neither a source-ledger health probe nor a cross-project notification
@@ -200,11 +372,11 @@ let private activatesAgent (agentId: string) command =
 
 let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                                 (target: ProjectPaths.ProjectTarget option) command =
-    if String.IsNullOrWhiteSpace agentId || not (activatesAgent agentId command) then Ok ([], None)
+    if String.IsNullOrWhiteSpace agentId || not (activatesAgent agentId command) then Ok ([], None, [])
     else
         match target with
-        | None -> Ok ([], None)
-        | Some target when not (oldSideEffectsAllowed rt target) -> Ok ([], None)
+        | None -> Ok ([], None, [])
+        | Some target when not (oldSideEffectsAllowed rt target) -> Ok ([], None, [])
         | Some target ->
             let projectId = ProjectPaths.ProjectTarget.projectId target
             let project = ProjectPaths.ProjectId.value projectId
@@ -219,29 +391,43 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
             let current =
                 cache.Get(DateTimeOffset.UtcNow, projectId, agentId, fun () ->
                     loadAgentState rt project agentId)
+            // A read of source should remain available without lifecycle
+            // authority. Report uncertainty explicitly, never invent a
+            // committed activation. Lifecycle commands must fail closed.
+            let unavailable error =
+                match LegacyWriterProtocolFence.LegacyWriterProtocolFence.classify command with
+                | LegacyWriterProtocolFence.LegacyCommandKind.HistoricalRead ->
+                    Ok ([], None,
+                        [ OperationalControl.ActivationUnverified
+                            $"Automatic Ready-to-Working activation could not be verified: {error}. Reread the canonical inbox before continuing assignment work." ])
+                | _ -> Error error
             match current with
-            | Some agent when agent.State = "Ready"
+            | Error error -> unavailable error
+            | Ok(Some agent) when agent.State = "Ready"
                               && not (isNull (box agent.CurrentAssignment))
                               && not (String.IsNullOrWhiteSpace agent.CurrentAssignment.TaskId) ->
-                match OrchestrationApi.LedgerBindingConfig.load project rt with
-                | Error error -> Error(Client.ValidationError($"Cannot inspect Ready agent: {error}"))
+                match retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.load project rt) with
+                | Error error ->
+                    cache.Invalidate(projectId, agentId)
+                    unavailable error
                 | Ok binding ->
                     // A Ready cache entry cannot establish the current task
                     // lifecycle. Closure may deliberately retain Started+Ready
                     // so the owner can record a completion checkpoint.
                     match ReviewWorkflow.ReviewWorkflow.inspectAutomaticActivation binding agentId with
                     | Error error ->
-                        Error(Client.ValidationError($"Cannot inspect automatic activation eligibility: {error}"))
+                        cache.Invalidate(projectId, agentId)
+                        unavailable (Client.ValidationError($"Cannot inspect automatic activation eligibility: {error}"))
                     | Ok(Client.ReviewWorkflow.ActivationIneligible _) ->
                         cache.Invalidate(projectId, agentId)
-                        Ok ([], None)
+                        Ok ([], None, [])
                     | Ok(Client.ReviewWorkflow.ActivationEligible currentTaskId) ->
                         let result =
                             ReviewWorkflow.ReviewWorkflow.activateReadyAgent binding (Guid.NewGuid())
                                 currentTaskId agentId
                         cache.Invalidate(projectId, agentId)
                         match result with
-                        | Ok write when write.AlreadyApplied -> Ok ([], None)
+                        | Ok write when write.AlreadyApplied -> Ok ([], None, [])
                         | Ok write ->
                             // Only committed transitions emit Working metadata.
                             let committed : AgentInboxActivation =
@@ -252,12 +438,12 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                                   AfterState = Some "Working"
                                   CommittedHead = Some write.CurrentHead
                                   OperationId = Some write.Operation.OperationId }
-                            Ok (Client.LedgerStore.LedgerStore.changedAgentIds write, Some committed)
+                            Ok (Client.LedgerStore.LedgerStore.changedAgentIds write, Some committed, [])
                         | Error(Client.LedgerStore.StaleEntityVersion detail) ->
                             // Another call may have started or closed the task
                             // after eligibility was read. Reinspect canonically.
                             match ReviewWorkflow.ReviewWorkflow.inspectAutomaticActivation binding agentId with
-                            | Ok(Client.ReviewWorkflow.ActivationIneligible _) -> Ok ([], None)
+                            | Ok(Client.ReviewWorkflow.ActivationIneligible _) -> Ok ([], None, [])
                             | Ok(Client.ReviewWorkflow.ActivationEligible latestTaskId) ->
                                 Error(Client.ValidationError(
                                     $"Automatic activation conflicted with current Ready task {latestTaskId}: {detail}"))
@@ -266,35 +452,7 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                                     $"Cannot reconcile concurrent automatic activation: {error}"))
                         | Error error ->
                             Error(Client.ValidationError($"Automatic agent activation failed: {error}"))
-            | _ -> Ok ([], None)
-
-// Only the Working turn identifies a stable delivery scope. Ledger calls bootstrap
-// root guidance, while normal source operations discover deeper instructions.
-let private incrementalInstructions (rt: Runtime) (agentId: string)
-                                    (target: ProjectPaths.ProjectTarget option)
-                                    provenance documents =
-    if String.IsNullOrWhiteSpace agentId then documents
-    else
-        match target with
-        | None -> documents
-        | Some target ->
-            let projectId = ProjectPaths.ProjectTarget.projectId target
-            let project = ProjectPaths.ProjectId.value projectId
-            let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
-                WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
-            let now = DateTimeOffset.UtcNow
-            let agent =
-                cache.Get(now, projectId, agentId, fun () ->
-                    loadAgentState rt project agentId)
-            match agent with
-            | Some active when active.State = "Working" ->
-                let turn = string active.StateSequence + ":" + active.WorkingTurnStartedAtUtc
-                let delivery = instructionDeliveryCaches.GetValue(rt, fun _ -> AgentInstructions.DeliveryCache())
-                delivery.Filter(target, agentId, turn, provenance, documents, fun () ->
-                    // Ledger status reads remain usable; failed instruction
-                    // resolution is surfaced as a retryable warning.
-                    AgentInstructions.rootsForTarget rt target)
-            | _ -> documents
+            | _ -> Ok ([], None, [])
 
 let private serialize<'a> (value: 'a) =
     try
@@ -322,46 +480,41 @@ let private serialize'<'a> (result: Result<'a, Client.EffectError>) =
             { Payload = payload; ChangedAgentIds = changedAgentIds }))
     |> ValueTask<_>
 
-// Shared with the regression suite so it exercises the actual transport guard.
-let internal toAgentResponse command instructions stateChanges inboxActivation response =
-    match response with
-    | Error error ->
-        { Result = None
-          Error = Some(EffectError.toAgentError error)
-          Instructions = instructions
-          AgentStateChanges = stateChanges
-          InboxActivation = inboxActivation
-          PendingJob = None }
-    | Ok (dispatched: DispatchedResult) ->
-        let payload = dispatched.Payload
-        let bytes = Encoding.UTF8.GetByteCount payload +
-                    Encoding.UTF8.GetByteCount(JsonSerializer.Serialize instructions) +
-                    Encoding.UTF8.GetByteCount(JsonSerializer.Serialize stateChanges) +
-                    Encoding.UTF8.GetByteCount(JsonSerializer.Serialize inboxActivation)
+// Keep the existing raw result allowances. Charge the actual serialized
+// metadata, including the temporary legacy wire projection, without escaping
+// or allocating a second copy of a potentially large result.
+let private guardResponseSize command (response: AgentCommandResponse) =
+    match response.Result, response.Error, response.PendingJob with
+    | Some payload, None, None ->
+        let metadata = { response with Result = None }
+        let bytes = Encoding.UTF8.GetByteCount payload + JsonSerializer.SerializeToUtf8Bytes(metadata).Length
         let maxBytes =
             match command with
             | ReadImageCommand _ -> (AgentProtocol.maxImageBytes * 4 / 3) + (64 * 1024)
             | ExportFileCommand _ -> (AgentProtocol.maxExportBytes * 4 / 3) + (64 * 1024)
-            // Tool responses are embedded as serialized strings inside
-            // JobResult. Keep the original media/export allowance plus safe
-            // JSON escaping overhead for this one typed polling envelope.
+            // Preserve the allowance for a serialized terminal job envelope.
             | GetJobResultCommand _ -> (AgentProtocol.maxImageBytes * 4 / 3 * 2) + (128 * 1024)
             | _ -> AgentProtocol.maxResponseBytes
-
-        if bytes <= maxBytes then
-            { Result = Some payload
-              Error = None
-              Instructions = instructions
-              AgentStateChanges = stateChanges
-              InboxActivation = inboxActivation
-              PendingJob = None }
+        if bytes <= maxBytes then response
         else
-            { Result = None
-              Error = Some(OutputTruncated $"Command response was {bytes} bytes and exceeds the safe response size of {maxBytes} bytes.")
-              Instructions = instructions
-              AgentStateChanges = stateChanges
-              InboxActivation = inboxActivation
-              PendingJob = None }
+            { response with
+                Result = None
+                Error = Some(OutputTruncated $"Command response was {bytes} bytes and exceeds the safe response size of {maxBytes} bytes.") }
+    | _ -> response
+
+// Shared with the regression suite so it exercises the actual transport guard.
+let internal toAgentResponse command instructions stateChanges inboxActivation response =
+    let result, error =
+        match response with
+        | Error error -> None, Some(EffectError.toAgentError error)
+        | Ok (dispatched: DispatchedResult) -> Some dispatched.Payload, None
+    { Result = result
+      Error = error
+      Instructions = instructions
+      StateChangeEvidence = StateChangeEvidence.Confirmed stateChanges
+      InboxActivation = inboxActivation
+      PendingJob = None }
+    |> guardResponseSize command
 
 let private unwrapProjectName (ProjectName name) = name
 let private unwrapContent (Content content) = content
@@ -1160,41 +1313,82 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
         return result |> Result.map (fun outcome -> outcome.Payload)
     }
 
-let private receiveCommandWithTypedInstructions (rt: Runtime)
-                                                (target: ProjectPaths.ProjectTarget option) (agentId: string) command
-                                                (sourceOriginalId: string option) (manualGrantAuthorized: bool)
-                                                (onChallengeCommit: ChallengeWakePostCommit option) =
-    task {
-        match command with
-        | GetJobResultCommand _ | ListJobsCommand _ | CancelJobCommand _ ->
-            // Cheap controls must bypass source instruction preparation and
-            // remain responsive even while source/ledger commands are blocked.
-            let! response = receiveCommandForTarget rt target None None agentId command sourceOriginalId manualGrantAuthorized onChallengeCommit
-            return response, [], AgentInstructions.RootBootstrapRequired
-        | _ ->
-            match AgentInstructions.prepareOperationWithTarget rt target command with
-            | Error error ->
-                return Error error, [], AgentInstructions.RootBootstrapRequired
-            | Ok prepared ->
-                let! response =
-                    receiveCommandForTarget rt target prepared.Source prepared.ProjectTask agentId command sourceOriginalId manualGrantAuthorized onChallengeCommit
-                let provenance =
-                    if prepared.Source.IsSome then AgentInstructions.HierarchyLoaded
-                    else AgentInstructions.RootBootstrapRequired
-                return response,
-                       prepared.Instructions
-                       @ AgentInstructions.writeWarningsForContext rt prepared.Source command response,
-                       provenance
-    }
+// Prepare the source checkout and configured-task definition once, independently
+// of explicit instruction retrieval. Authorization and execution consume the
+// same snapshot; neither may re-resolve a worktree or re-read .jarvis.json.
+type internal PreparedSourceOperation =
+    { Source: ProjectPaths.ResolvedProject option
+      ProjectTask: ProjectTaskDefinition option }
 
-let receiveCommandWithInstructions (rt: Runtime) command =
+let internal prepareSourceOperation (rt: Runtime) (target: ProjectPaths.ProjectTarget option) command =
+    let empty = Ok { Source = None; ProjectTask = None }
+    match command with
+    | TaskReadCommand _
+    | LedgerReadCommand _
+    | LedgerWriteCommand _
+    | ReviewReadCommand _
+    | ReviewWriteCommand _
+    | GetAgentInstructionsCommand _
+    | GetJobResultCommand _
+    | ListJobsCommand _
+    | CancelJobCommand _ -> empty
+    | TaskWriteCommand cmd when cmd.Action <> "ExportTaskSpec" && cmd.Action <> "ImportTaskSpec" -> empty
+    | _ ->
+        match target with
+        | None -> empty
+        | Some selected ->
+            ProjectPaths.resolveProjectContextForTarget selected rt
+            |> Result.bind (fun project ->
+                let definition =
+                    match command with
+                    | RunProjectTaskCommand cmd ->
+                        ClientShell.resolveProjectTaskIn project cmd rt |> Result.map Some
+                    | _ -> Ok None
+                definition
+                |> Result.bind (fun task ->
+                    // Preserve existing pre-authorization path checks, but do
+                    // not enumerate ancestors or examine any guidance files.
+                    let paths =
+                        match command with
+                        | ListDirectoryCommand c -> [ c.FolderPath ]
+                        | SearchFilesCommand c -> [ defaultArg c.FolderPath "" ]
+                        | SearchTextCommand c -> [ defaultArg c.FolderPath "" ]
+                        | ReadFileCommand c -> [ c.FilePath ]
+                        | ReadFilePageCommand c -> [ c.FilePath ]
+                        | ReadFilesCommand c -> c.FilePaths
+                        | ReadImageCommand c -> [ c.FilePath ]
+                        | ExportFileCommand c -> [ c.FilePath ]
+                        | ImportFileCommand c -> [ c.FilePath ]
+                        | WriteFileCommand c -> [ c.FilePath ]
+                        | PatchFileCommand c -> [ c.FilePath ]
+                        | RunCommandCommand c -> [ defaultArg c.WorkingDirectory "" ]
+                        | StartJobCommand c -> [ defaultArg c.WorkingDirectory "" ]
+                        | RunProjectTaskCommand _ ->
+                            task |> Option.map (fun configured -> defaultArg configured.WorkingDirectory "") |> Option.toList
+                        | TaskWriteCommand c -> [ c.SourceRef ]
+                        | GitCommitCommand c -> c.Paths
+                        | GetGitDiffCommand c -> [ defaultArg c.Path "" ]
+                        | GetSkillCommand c -> [ ProjectPaths.ProjectSkillPaths.primaryFile c.SkillName ]
+                        | CreateSkillCommand c -> [ ProjectPaths.ProjectSkillPaths.primaryFile c.SkillName ]
+                        | _ -> []
+                    paths
+                    |> List.filter (String.IsNullOrWhiteSpace >> not)
+                    |> List.fold (fun checkedPaths path ->
+                        checkedPaths |> Result.bind (fun () ->
+                            ProjectPaths.validateProjectRelativePath path
+                            |> Result.bind (fun valid -> ProjectPaths.resolveSourcePath project valid rt)
+                            |> Result.map ignore)) (Ok ())
+                    |> Result.map (fun () -> { Source = Some project; ProjectTask = task })))
+
+let private receivePreparedCommand (rt: Runtime)
+                                   (target: ProjectPaths.ProjectTarget option) (agentId: string) command
+                                   (sourceOriginalId: string option) (manualGrantAuthorized: bool)
+                                   (onChallengeCommit: ChallengeWakePostCommit option) =
     task {
-        match classifyProject command with
-        | Error error -> return Error error, []
-        | Ok scope ->
-            let! response, instructions, _ =
-                receiveCommandWithTypedInstructions rt (projectTarget scope) "" command None false None
-            return response |> Result.map (fun outcome -> outcome.Payload), instructions
+        match prepareSourceOperation rt target command with
+        | Error error -> return Error error
+        | Ok prepared ->
+            return! receiveCommandForTarget rt target prepared.Source prepared.ProjectTask agentId command sourceOriginalId manualGrantAuthorized onChallengeCommit
     }
 
 // Shared by SignalR receive and tests. Identity is supplied by the MCP call,
@@ -1207,7 +1401,7 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
         let mutable parsedCommand = None
         let mutable responseScope: ProjectPaths.ProjectTarget option = None
         let mutable unexpectedFailure = false
-        let mutable instructions: InstructionDocument list = []
+        let mutable instructions: OperationalControl list = []
         let mutable implicitChanges: string list = []
         let mutable inboxActivation: AgentInboxActivation option = None
         let! response =
@@ -1285,17 +1479,17 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                                 rt.Tui.RecordAgentSeen(AgentView.activityProject selected, localAgentId))
                         match activateReadyOnActivity rt localAgentId target command with
                         | Error error -> return Error error
-                        | Ok (changes, committedActivation) ->
+                        | Ok (changes, committedActivation, activationInstructions) ->
                             implicitChanges <- changes
                             match command, committedActivation with
                             | TaskReadCommand inbox, Some receipt when inbox.Action = "AgentInbox" ->
                                 inboxActivation <- Some receipt
                             | _ -> ()
-                            let! result, applicable, provenance =
+                            let! result =
                                 // Polling does not activate or record local
                                 // agent activity, but access checks still need
                                 // the initiating actor label from the transport.
-                                receiveCommandWithTypedInstructions rt target agentId command sourceOriginalId manualGrantAuthorized onChallengeCommit
+                                receivePreparedCommand rt target agentId command sourceOriginalId manualGrantAuthorized onChallengeCommit
                             // A write may alter another agent's state, or none
                             // at all. Invalidate precisely the affected local
                             // cache entries before preparing turn guidance.
@@ -1307,15 +1501,7 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                                 for changed in outcome.ChangedAgentIds do
                                     cache.Invalidate(projectId, changed)
                             | _ -> ()
-                            instructions <-
-                                match command with
-                                | GetAgentInstructionsCommand _ ->
-                                    // The explicit result includes the complete hierarchy.
-                                    // Do not double-inject automatic AGENTS.md payloads.
-                                    checkWorkingGuidance rt localAgentId target command
-                                | _ ->
-                                    incrementalInstructions rt localAgentId target provenance applicable
-                                    @ checkWorkingGuidance rt localAgentId target command
+                            instructions <- OperationalControl.ordered (activationInstructions @ checkWorkingGuidance rt localAgentId target command)
                             return result
                 with ex ->
                     unexpectedFailure <- true
@@ -1339,7 +1525,7 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
         // must not consume them: their terminal response may never be polled.
         // Those alerts are delivered when a reply is actually sent instead.
         if includeResponseAlerts then
-            instructions <- checkResponseAlerts rt agentId responseScope @ instructions
+            instructions <- OperationalControl.ordered (checkResponseAlerts rt agentId responseScope @ instructions)
         let agentResponse =
             match parsedCommand with
             | Some command -> toAgentResponse command instructions changes inboxActivation response
@@ -1350,7 +1536,8 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                 // after a ledger commit. Preserve any known activation and
                 // mark all remaining state effects as UNKNOWN.
                 { agentResponse with
-                    Error = (CommandDispatchRecovery.unexpectedResponse commandJson).Error }
+                    Error = (CommandDispatchRecovery.unexpectedResponse commandJson).Error
+                    StateChangeEvidence = StateChangeEvidence.Unknown (StateChangeEvidence.known agentResponse.StateChangeEvidence) }
             else agentResponse
         return parsedCommand, (response |> Result.map (fun outcome -> outcome.Payload)), agentResponse
     }
@@ -1388,8 +1575,12 @@ let private withVisibleResponseAlerts (rt: Runtime) (agentId: string)
             | Ok scope -> checkResponseAlerts rt agentId (projectTarget scope)
             | Error _ -> []
         | _ -> []
-    let existing = if isNull (box response.Instructions) then [] else response.Instructions
-    { response with Instructions = alerts @ existing }
+    if alerts.IsEmpty then response
+    else
+        let visible = { response with Instructions = OperationalControl.ordered (alerts @ response.OperationalControls) }
+        match command with
+        | Some original -> guardResponseSize original visible
+        | None -> visible
 
 // Bounded, client-owned execution begins before the deadline. An HTTP
 // request and SignalR delivery may end without cancelling this operation.
@@ -1418,17 +1609,13 @@ let private shouldAutoPromote = function
 /// reconstructing state evidence in a server-side cache.
 let combineCrossProjectNotification (source: CrossProjectNotificationCommand)
                                     (destination: AgentCommandResponse) =
-    let knownChanges =
-        if isNull (box destination.AgentStateChanges) then
-            Unchecked.defaultof<AgentStateChange list>
-        else
-            (source.SourceStateChanges @ destination.AgentStateChanges) |> List.distinct
     { destination with
-        AgentStateChanges = knownChanges
+        StateChangeEvidence = StateChangeEvidence.combine source.SourceEvidence destination.StateChangeEvidence
         InboxActivation =
-            match destination.InboxActivation with
-            | Some receipt -> Some receipt
-            | None ->
+            match destination.PendingJob, destination.InboxActivation with
+            | Some _, _ -> None
+            | None, Some receipt -> Some receipt
+            | None, None ->
                 source.SourceInboxActivation
                 |> Option.filter (fun receipt -> receipt.ActivatedByThisCall) }
 
@@ -1471,7 +1658,7 @@ let executeOrPromoteWith (rt: Runtime) (commandJson: string) (agentId: string)
                         { Result = None
                           Error = Some(EffectError.toAgentError error)
                           Instructions = []
-                          AgentStateChanges = []
+                          StateChangeEvidence = StateChangeEvidence.Confirmed []
                           InboxActivation = None
                           PendingJob = None }
                         |> withVisibleResponseAlerts rt agentId (Some command)
@@ -1490,7 +1677,7 @@ let executeOrPromoteWith (rt: Runtime) (commandJson: string) (agentId: string)
                               // Unknown until the original command finishes.
                               // Null on this one pending wire envelope means
                               // "not yet known", never "there were no writes".
-                              AgentStateChanges = Unchecked.defaultof<_>
+                              StateChangeEvidence = StateChangeEvidence.Pending
                               InboxActivation = None
                               PendingJob = Some handle }
                             |> withVisibleResponseAlerts rt agentId (Some command)
@@ -1621,7 +1808,7 @@ let processManualGrantApproval (rt: Runtime) (requestJson: string) =
             { Result = if approved then Some "true" else None
               Error = error
               Instructions = []
-              AgentStateChanges = []
+              StateChangeEvidence = StateChangeEvidence.Confirmed []
               InboxActivation = None
               PendingJob = None }
         try

@@ -4,9 +4,9 @@ This document describes the approved next-generation Jarvis command surface.
 
 Jarvis should not try to be a complete coding-agent runtime. Its purpose is to expose a small, safe, local bridge from the assistant to a user-selected workspace. The command surface should focus on project discovery, file access, patching, controlled execution, and git review/commit operations.
 
-## Automatic repository guidance
+## Explicit repository guidance
 
-Project-scoped operations automatically carry applicable AGENTS.md guidance from the local workspace and project ancestry. The client-to-server AgentCommandResponse envelope adds an ordered Instructions array of Scope, Path, Sha256, and Content; existing Result and Error semantics remain intact. The MCP server presents each applicable document as a distinct labeled text block before the ordinary tool result. See [AgentInstructions.md](AgentInstructions.md) and [AgentCommandResponse.schema.json](AgentCommandResponse.schema.json).
+Ordinary operations return requested results, errors and necessary operational receipts or alerts, not automatic repository documents. Read applicable repository guidance with `get_agent_instructions` and obtain dynamic role/assignment context through the self-agent inbox. The closed `OperationalControls` wire union distinguishes Working-turn soft/hard advisory limits, exceptional queued alerts, and an unverified activation diagnostic. During staged compatibility, a narrow adapter projects these controls into the legacy `Instructions` field only when present; new peers prefer typed controls and ignore legacy repository documents/notices, including nested terminal job results. `AgentStateChangesStatus` distinguishes confirmed (including an empty list), unknown (including any known partial mutations), and pending evidence independently of operation success. Missing or null legacy mutation evidence is unknown, never confirmed empty on new readers. This source behavior is gated on canonical launch-template readiness and coordinated cutover; see [AgentInstructions.md](AgentInstructions.md) and [AgentCommandResponse.schema.json](AgentCommandResponse.schema.json).
 
 ## Implicit agent activation (protocol 3.58)
 
@@ -66,7 +66,7 @@ different client's observations or agent activity may not be reflected there.
 evidence that an agent has progressed or as a global heartbeat.
 
 The observation transport is explicitly excluded from implicit Ready-to-Working
-activation, `Seen` updates, per-turn AGENTS.md delivery, and the receiver's
+activation, `Seen` updates, and the receiver's
 Working clock; both observer and target remain untouched. Unknown actors,
 missing targets, mismatched actor labels and inaccessible projects fail without
 changing the target. The regular self-`agent_inbox` has **different semantics**:
@@ -93,7 +93,7 @@ committed Git head and operation ID. A repeated read explicitly reports
 `activatedByThisCall: false`, with no invented transition. This evidence
 remains visible even when the later inbox read fails; the failure is still an
 error rather than falsely claiming the entire call had no side effects.
-The same typed `AgentStateChanges` envelope drives cache invalidation; its
+The same typed `StateChangeEvidence` drives cache invalidation; its
 public projection is advisory, never an authorization claim.
 
 The global Agents dashboard can consume the same compact projection instead
@@ -105,14 +105,32 @@ requires an explicit coordinated release authorization.
 
 A canonical Git-ledger transaction records the exact agent IDs whose assignment
 or Working-turn state changed in its immutable, replayable operation receipt.
-The client forwards those typed effects in `AgentCommandResponse.AgentStateChanges`,
+The client forwards those typed effects in `AgentCommandResponse.StateChangeEvidence`,
 independently of the ordinary command's success. In particular, a `read_file`
 call may commit Ready-to-Working activation before the file read fails.
 
-The server sends user-scoped SignalR
+Terminal source/destination composition unions and deduplicates the independently
+known affected agents. It is confirmed only if both inputs are confirmed.
+Pending replies expose only the original destination job handle; the destination
+owns the combined terminal receipt, including the source activation.
+
+For wire compatibility, `AgentStateChanges` is the complete list or (only
+under `UncertainOutcome`) the known partial list understood by the pre-control
+reader. In other unknown terminal outcomes, the legacy list is null and the
+nonempty known subset uses additive `KnownAgentStateChanges`; new peers expose
+`knownAgentStateChanges` publicly instead of a complete list. The internal
+forwarded notification uses the same separation. Legacy readers ignore status
+and the new subset field and may display confirmed empty for unknown success
+or an ordinary error. This limitation is inherent in the older contract:
+the new writer does not mislabel a known nonempty subset as complete or invent
+an error to force old behavior. Coordinated rollout is required for full visibility.
+
+For complete evidence, the server sends user-scoped SignalR
 `InvalidateAgentStates(projectName, agentIds)` only for the affected agents.
-Other agents' cached state remains valid after checkpoints, notifications,
-and unrelated task operations. Cross-project notification sender checks publish
+Unknown evidence also triggers conservative global invalidation; a known subset
+is not a bound on all changes. Other agents' cached state remains valid after
+confirmed checkpoints, notifications, and unrelated task operations.
+Cross-project notification sender checks publish
 their source-project effects independently from destination operations.
 A cross-project `notify_agent` writes the durable notification in the
 destination without counting the source sender's ID as destination activity,
@@ -390,7 +408,7 @@ type ReadFilesCommand =
 
 ### `GetAgentInstructions` (protocol 3.59)
 
-Read the complete applicable `AGENTS.md` hierarchy for a checkout-relative directory, including the workspace root, selected main/registered-worktree root, and every ancestor. Unlike automatic delivery, this explicit tool has **no per-file size, aggregate content, or document-count limit** and never uses the instruction delivery cache.
+Read the complete applicable `AGENTS.md` hierarchy for a checkout-relative directory, including the workspace root, selected main/registered-worktree root, and every ancestor. This explicit tool has **no instruction-specific per-file size, aggregate content, or document-count limit**; transport-bounded pages allow complete retrieval.
 
 The result contains an `"AGENTS.md"` mapping such as `{".": "workspace rules", "Wayfold": "project rules", "Wayfold/src": "source rules"}`. A response that cannot fit in the standard 900 KiB tool transport provides `nextCursor`. Repeat the same call with this cursor until it is absent. For a file split across pages, `chunk` identifies the path, start/end byte offsets, total size, and SHA-256; concatenate segments by path and byte offset. Continuations are stateless and rejected if the applicable hierarchy changes.
 

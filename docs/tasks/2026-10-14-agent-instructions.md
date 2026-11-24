@@ -1,5 +1,7 @@
 # Automatic Agent Instructions — implementation tasks
 
+> Historical implementation task. The 2026-11-23 context-delivery decision supersedes automatic repository instruction delivery; see [current agent context contract](../AgentInstructions.md).
+
 Source of truth: [AgentInstructions.md](../AgentInstructions.md). Implement in order, with a focused commit and relevant tests for each completed slice. No server deployment or interactive client restart without explicit approval.
 
 ## Task 1 — Static MCP server instructions

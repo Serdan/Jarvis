@@ -2652,7 +2652,7 @@ type ReviewWorkflowTests() =
                 Assert.That(delivered.IsOk, Is.True)
                 Assert.That(destinationResponse.AgentStateChanges, Is.Empty,
                             "Foreign sender must not start an agent in the destination project")
-                Assert.That(destinationResponse.Instructions |> List.exists (fun i -> i.Scope = "working-turn"),
+                Assert.That(destinationResponse.OperationalControls |> List.exists (Common.OperationalControl.isAlert >> not),
                             Is.False)
                 let after = (ReviewWorkflow.getAgentInbox destinationBinding "Owner" |> success).Agent
                 Assert.That(after.State, Is.EqualTo("Ready"))
@@ -3003,11 +3003,11 @@ type ReviewWorkflowTests() =
                 match Client.OrchestrationApi.TaskApi.read diffCmd ctx with
                 | Ok value -> Assert.That((unbox<TaskSpecDiff> value).Diff, Does.Contain("API revised"))
                 | Error error -> Assert.Fail(sprintf " diff API failed: %A" error)
-                // Source spec operations must use the checkout already
-                // resolved for AGENTS.md, including nested instructions.
+                // Source spec operations must use the checkout prepared once,
+                // independently of malformed nested guidance.
                 let sourceDirectory = Path.Combine(one, "specs")
                 Directory.CreateDirectory(sourceDirectory) |> ignore
-                File.WriteAllText(Path.Combine(sourceDirectory, "AGENTS.md"), "Task spec instructions")
+                File.WriteAllBytes(Path.Combine(sourceDirectory, "AGENTS.md"), [| 0xffuy |])
                 let sourceContext =
                     Client.ProjectPaths.resolveProjectContext "owner" ctx
                     |> function Ok value -> value | Error error -> failwithf "Cannot resolve source checkout: %A" error
@@ -3021,13 +3021,11 @@ type ReviewWorkflowTests() =
                 let exportCmd = { template "ExportTaskSpec" specTask with
                                     SourceRef = "specs/spec-api-export.html"
                                     BaseOid = pageAfter.SpecBlobOid }
-                match Client.AgentInstructions.prepareWithTarget instructionRuntime (Some target) (Common.TaskWriteCommand exportCmd) with
-                | Ok (instructions, Some preparedContext) ->
-                    Assert.That(instructions |> List.map (fun instruction -> instruction.Path),
-                                Does.Contain("owner/specs/AGENTS.md"))
+                match Client.SignalR.Client.prepareSourceOperation instructionRuntime (Some target) (Common.TaskWriteCommand exportCmd) with
+                | Ok { Source = Some preparedContext } ->
                     Assert.That(Client.ProjectPaths.ResolvedProject.sourceRoot preparedContext,
                                 Is.EqualTo(Client.ProjectPaths.ResolvedProject.sourceRoot sourceContext))
-                | other -> Assert.Fail(sprintf "Could not prepare task-spec instructions: %A" other)
+                | other -> Assert.Fail(sprintf "Could not prepare task-spec source: %A" other)
                 let exportReceipt = runPrepared exportCmd
                 Assert.That((unbox<TaskSpecExport> exportReceipt).AlreadyApplied, Is.False)
                 Assert.That((unbox<TaskSpecExport> exportReceipt).Authority,
@@ -3053,11 +3051,9 @@ type ReviewWorkflowTests() =
                         ExpectedVersion = 2; BaseOid = pageAfter.SpecBlobOid
                         TargetRef = sourceDraft.BlobOid; SourceRef = "specs/spec-api-import.html"
                         Title = "Spec API imported" }
-                match Client.AgentInstructions.prepareWithTarget instructionRuntime (Some target) (Common.TaskWriteCommand importCommand) with
-                | Ok (instructions, Some _) ->
-                    Assert.That(instructions |> List.map (fun instruction -> instruction.Path),
-                                Does.Contain("owner/specs/AGENTS.md"))
-                | other -> Assert.Fail(sprintf "Could not prepare import instructions: %A" other)
+                match Client.SignalR.Client.prepareSourceOperation instructionRuntime (Some target) (Common.TaskWriteCommand importCommand) with
+                | Ok { Source = Some _ } -> ()
+                | other -> Assert.Fail(sprintf "Could not prepare import source: %A" other)
                 runPrepared importCommand |> ignore
                 let latest =
                     Client.OrchestrationApi.TaskApi.read pageCmd ctx
@@ -3697,20 +3693,21 @@ type ReviewWorkflowTests() =
             finally
                 if File.Exists configPath then File.Delete configPath)
 
-    [<Test>]
-    member _.ImplicitActivityStartsReadyAssignmentAndPreservesWorkingClock() =
+    [<TestCase(false)>]
+    [<TestCase(true)>]
+    member _.ImplicitActivityStartsReadyAssignmentAndPreservesWorkingClock(forceContention: bool) =
         withFixture (fun one _ first second _ _ _ _ ->
             let taskId = "implicit-inbox-start"
             ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Implicit inbox"
             |> success |> ignore
             ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
             |> success |> ignore
-            // The first inbox call should deliver root guidance even though
-            // ordinary ledger reads deliberately skip source instructions.
-            File.WriteAllText(Path.Combine(Path.GetDirectoryName one, "AGENTS.md"), "workspace guidance")
-            File.WriteAllText(Path.Combine(one, "AGENTS.md"), "project guidance")
+            // The first inbox must activate and return canonical context even
+            // when repository guidance is malformed or oversized.
+            File.WriteAllBytes(Path.Combine(Path.GetDirectoryName one, "AGENTS.md"), [| 0xffuy |])
+            File.WriteAllText(Path.Combine(one, "AGENTS.md"), String('g', 1500000))
             Directory.CreateDirectory(Path.Combine(one, "src")) |> ignore
-            File.WriteAllText(Path.Combine(one, "src", "AGENTS.md"), "source guidance")
+            File.WriteAllBytes(Path.Combine(one, "src", "AGENTS.md"), [| 0xffuy |])
             File.WriteAllText(Path.Combine(one, "src", "example.fs"), "module Example")
             let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
             let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
@@ -3730,8 +3727,7 @@ type ReviewWorkflowTests() =
                     Client.SignalR.Client.processIncomingCommand rt payload "Owner"
                     |> Async.AwaitTask |> Async.RunSynchronously
                 let _, initialResult, initialResponse = invoke()
-                Assert.That(initialResponse.Instructions |> List.map (fun d -> d.Path),
-                            Is.EqualTo([ "AGENTS.md"; "owner/AGENTS.md" ] :> obj))
+                Assert.That(initialResponse.Instructions, Is.Empty)
                 Assert.That(initialResponse.AgentStateChanges |> List.map _.AgentId |> String.concat ",",
                             Is.EqualTo("Owner"), sprintf "%A" initialResponse.AgentStateChanges)
                 match initialResult with
@@ -3757,13 +3753,11 @@ type ReviewWorkflowTests() =
                     |> Async.AwaitTask |> Async.RunSynchronously
                 let _, srcResult, srcResponse = readSource()
                 Assert.That(srcResult.IsOk, Is.True)
-                Assert.That(srcResponse.Instructions |> List.map (fun d -> d.Path),
-                            Is.EqualTo([ "owner/src/AGENTS.md" ] :> obj))
+                Assert.That(srcResponse.Instructions, Is.Empty)
                 let _, _, repeatSource = readSource()
                 Assert.That(repeatSource.Instructions, Is.Empty)
-                // A warm Working-state cache must avoid GitHub for ordinary
-                // local source reads. Disable the bound remote temporarily;
-                // a forced refresh would surface as duplicate AGENTS.md.
+                // A warm Working-state cache permits ordinary local source
+                // reads during a temporary outage of the bound remote.
                 let originalRemote = git one [ "remote"; "get-url"; "origin" ]
                 let unavailable = Path.Combine(Path.GetTempPath(), "jarvis-missing-" + Guid.NewGuid().ToString("N"))
                 git one [ "remote"; "set-url"; "origin"; unavailable ] |> ignore
@@ -3771,12 +3765,16 @@ type ReviewWorkflowTests() =
                     let _, offlineResult, offlineResponse = readSource()
                     Assert.That(offlineResult.IsOk, Is.True)
                     Assert.That(offlineResponse.Instructions, Is.Empty)
+                    Client.SignalR.Client.invalidateAgentStates rt "owner" [| "Owner" |]
+                    let _, coldResult, coldResponse = readSource()
+                    Assert.That(coldResult.IsOk, Is.True)
+                    Assert.That(coldResponse.AgentStateChanges, Is.Empty)
+                    Assert.That(coldResponse.OperationalControls |> List.exists (function Common.OperationalControl.ActivationUnverified _ -> true | _ -> false), Is.True)
                 finally
                     git one [ "remote"; "set-url"; "origin"; originalRemote ] |> ignore
                 File.WriteAllText(Path.Combine(one, "src", "AGENTS.md"), "changed source guidance")
                 let _, _, updatedSource = readSource()
-                Assert.That(updatedSource.Instructions |> List.map (fun d -> d.Path),
-                            Is.EqualTo([ "owner/src/AGENTS.md" ] :> obj))
+                Assert.That(updatedSource.Instructions, Is.Empty)
                 match repeatResult with
                 | Ok _ -> ()
                 | Error error -> Assert.Fail(sprintf "Second inbox should succeed: %A" error)
@@ -3785,9 +3783,8 @@ type ReviewWorkflowTests() =
                 Assert.That(again.WorkingTurnStartedAtUtc, Is.EqualTo(agent.WorkingTurnStartedAtUtc))
 
                 // A second client changes the assignment while this client's
-                // Working-state and instruction-delivery caches are still warm.
-                // The next ordinary call must refresh the ledger state, activate
-                // Ready, and re-deliver roots for the new Working turn.
+                // Working-state cache is warm. The next ordinary call must
+                // refresh canonical state and activate Ready without guidance.
                 let _, _, currentAttempt = ReviewWorkflow.getTask second taskId |> success
                 let attempt = currentAttempt.Value
                 // This second client goes through the real TaskWrite command
@@ -3823,20 +3820,48 @@ type ReviewWorkflowTests() =
                             Is.EqualTo([ "Owner" ] :> obj))
                 let remoteReady = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
                 Assert.That(remoteReady.State, Is.EqualTo("Ready"))
-                for mutation in yieldedResponse.AgentStateChanges do
-                    Client.SignalR.Client.invalidateAgentStates rt mutation.ProjectName [| mutation.AgentId |]
+                let invalidate () =
+                    for mutation in yieldedResponse.AgentStateChanges do
+                        Client.SignalR.Client.invalidateAgentStates rt mutation.ProjectName [| mutation.AgentId |]
+                if forceContention then
+                    use held = new FileStream(configPath + ".lock", FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)
+                    invalidate ()
+                    match Client.OrchestrationApi.LedgerBindingConfig.loadWithSnapshot "owner" rt with
+                    | Error(Client.LedgerFailureError issue) ->
+                        Assert.That(issue.Code, Is.EqualTo("TrustBindingContended"))
+                    | other -> Assert.Fail(sprintf "Expected typed contention: %A" other)
+                    let _, lockedResult, lockedResponse = readSource()
+                    Assert.That(lockedResult.IsOk, Is.True)
+                    Assert.That(lockedResponse.AgentStateChanges, Is.Empty)
+                    let status = lockedResponse.OperationalControls |> List.filter (function Common.OperationalControl.ActivationUnverified _ -> true | _ -> false)
+                    Assert.That(status.Length, Is.EqualTo(1))
+                    Assert.That(Common.OperationalControl.text status.Head, Does.Contain("TrustBindingContended"))
+                    let whileLocked = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                    Assert.That(whileLocked.State, Is.EqualTo("Ready"))
+                    Assert.That(whileLocked.Version, Is.EqualTo(remoteReady.Version))
+                else invalidate ()
                 let _, resumedResult, resumedResponse = readSource()
                 Assert.That(resumedResult.IsOk, Is.True)
+                let afterFirst = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                let diagnostic =
+                    if resumedResponse.AgentStateChanges.IsEmpty then
+                        let _, nextResult, nextResponse = readSource()
+                        let afterNext = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                        sprintf "forceContention=%b; first canonical state=%s; next read=%A; next metadata=%A; next canonical state=%s" forceContention afterFirst.State nextResult nextResponse.AgentStateChanges afterNext.State
+                    else "activation metadata present"
                 Assert.That(resumedResponse.AgentStateChanges,
-                            Is.EqualTo([ ({ ProjectName = "owner"; AgentId = "Owner" } : Common.AgentStateChange) ] :> obj))
-                Assert.That(resumedResponse.Instructions |> List.map (fun d -> d.Path),
-                            Is.EqualTo([ "AGENTS.md"; "owner/AGENTS.md"; "owner/src/AGENTS.md" ] :> obj))
+                            Is.EqualTo([ ({ ProjectName = "owner"; AgentId = "Owner" } : Common.AgentStateChange) ] :> obj), diagnostic)
+                Assert.That(resumedResponse.Instructions, Is.Empty)
                 let remoteWorking = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
                 Assert.That(remoteWorking.State, Is.EqualTo("Working"))
                 Assert.That(remoteWorking.WorkingTurnStartedAtUtc,
                             Is.Not.EqualTo(agent.WorkingTurnStartedAtUtc))
                 let _, _, repeatResumed = readSource()
                 Assert.That(repeatResumed.Instructions, Is.Empty)
+                Assert.That(repeatResumed.AgentStateChanges, Is.Empty)
+                let repeated = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                Assert.That(repeated.Version, Is.EqualTo(remoteWorking.Version))
+                Assert.That(repeated.WorkingTurnStartedAtUtc, Is.EqualTo(remoteWorking.WorkingTurnStartedAtUtc))
 
                 // Reaching the inbox for a registered but unassigned agent
                 // must never fabricate an assignment or Working state.
@@ -6813,23 +6838,23 @@ type ReviewWorkflowTests() =
                         { ProjectName = "owner"; JobId = "missing-job"; AfterSequence = None }
                 ReviewWorkflow.queueResponseAlert second (Guid.NewGuid()) "Lead"
                     "Reviewer" "Please preserve test evidence" |> success |> ignore
+                (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" "Owner").GetAwaiter().GetResult()
                 let (ownerReply, io) =
                     LedgerStore.measureGitReads (fun () -> invoke "Owner" poll)
                 let _, _, other = ownerReply
-                Assert.That(io.RemoteFetches, Is.EqualTo(1),
-                            "A no-alert tool reply must reuse its verified ledger snapshot.")
-                Assert.That(other.Instructions |> List.exists (fun item ->
-                    item.Scope = "response-alert"), Is.False)
+                Assert.That(io.RemoteFetches, Is.EqualTo(0),
+                            "A verified no-alert job poll must do zero synchronous remote Git fetches.")
+                Assert.That(other.OperationalControls |> List.exists Common.OperationalControl.isAlert, Is.False)
                 Assert.That((ReviewWorkflow.getResponseAlerts first "Reviewer" |> success).Pending.Length, Is.EqualTo(1))
                 ReviewWorkflow.queueResponseAlert first (Guid.NewGuid()) "Lead"
                     "Reviewer" "STOP — commit safe changes and yield" |> success |> ignore
+                (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" "Reviewer").GetAwaiter().GetResult()
                 let _, polled, delivered = invoke "Reviewer" poll
                 Assert.That(polled.IsError, Is.True)
-                let alerts = delivered.Instructions |> List.filter (fun item ->
-                    item.Scope = "response-alert")
+                let alerts = delivered.OperationalControls |> List.filter Common.OperationalControl.isAlert
                 Assert.That(alerts.Length, Is.EqualTo(2))
-                Assert.That(alerts.Head.Content, Does.Contain("STOP"))
-                Assert.That(alerts.[1].Content, Does.Contain("preserve test evidence"))
+                Assert.That(Common.OperationalControl.text alerts.Head, Does.Contain("STOP"))
+                Assert.That(Common.OperationalControl.text alerts.[1], Does.Contain("preserve test evidence"))
                 Assert.That(delivered.AgentStateChanges, Is.Empty)
                 Assert.That(delivered.InboxActivation.IsNone, Is.True)
                 Assert.That(runtime.Tui.GetAgentLastSeen("owner", "Reviewer").IsNone, Is.True)
@@ -6841,22 +6866,108 @@ type ReviewWorkflowTests() =
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let _, readResult, after = invoke "Reviewer" ordinary
                 Assert.That(readResult.IsOk, Is.True)
-                Assert.That(after.Instructions |> List.exists (fun item ->
-                    item.Scope = "response-alert"), Is.False)
+                Assert.That(after.OperationalControls |> List.exists Common.OperationalControl.isAlert, Is.False)
                 ReviewWorkflow.queueResponseAlert first (Guid.NewGuid()) "Lead"
                     "Reviewer" "Non-stop instruction" |> success |> ignore
                 let missing : Common.AgentCommand =
                     Common.ReadFileCommand
                         { ProjectName = "owner"; FilePath = "missing-file"; StartLine = None
                           EndLine = None; IncludeLineNumbers = None }
+                (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" "Reviewer").GetAwaiter().GetResult()
                 let _, missingResult, missingReply = invoke "Reviewer" missing
                 Assert.That(missingResult.IsError, Is.True)
-                Assert.That(missingReply.Instructions |> List.exists (fun item ->
-                    item.Scope = "response-alert" && item.Content.Contains("Non-stop instruction")), Is.True)
+                Assert.That(missingReply.OperationalControls |> List.exists (fun control -> Common.OperationalControl.isAlert control && (Common.OperationalControl.text control).Contains("Non-stop instruction")), Is.True)
                 Assert.That((ReviewWorkflow.getResponseAlerts second "Reviewer" |> success).Pending, Is.Empty)
             finally
                 if File.Exists configPath then File.Delete configPath
                 if File.Exists(configPath + ".lock") then File.Delete(configPath + ".lock"))
+    [<Test>]
+    member _.ResponseAlertPresenceIsNonblockingAndRecoversClearsAndLostHints() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            try
+                let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+                let head = (LedgerStore.fetch first |> success).Commit
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" context first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl head true
+                |> success |> ignore
+                let runtime =
+                    Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+                let poll : Common.AgentCommand =
+                    Common.GetJobResultCommand
+                        { ProjectName = "owner"; JobId = "missing-job"; AfterSequence = None }
+                let invoke actor =
+                    Client.SignalR.Client.processIncomingCommand runtime
+                        (System.Text.Json.JsonSerializer.Serialize(poll)) actor
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                let refresh actor =
+                    (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" actor).GetAwaiter().GetResult()
+                let shown (reply: Common.AgentCommandResponse) =
+                    reply.OperationalControls |> List.filter Common.OperationalControl.isAlert
+
+                refresh "Owner"
+                refresh "Reviewer"
+                let (ownerPoll, count) = LedgerStore.measureGitReads (fun () -> invoke "Owner")
+                Assert.That(count.RemoteFetches, Is.EqualTo(0),
+                            "A no-alert poll cannot wait on a remote Git fetch.")
+                let _, _, ownerResponse = ownerPoll
+                Assert.That(shown ownerResponse, Is.Empty)
+
+                // A lost hint does not convert the cache into ledger authority.
+                let firstId = Guid.NewGuid()
+                ReviewWorkflow.queueResponseAlert first firstId "Lead" "Reviewer"
+                    "STOP — deliver only after a verified refresh" |> success |> ignore
+                let _, _, before = invoke "Reviewer"
+                Assert.That(shown before, Is.Empty)
+                Assert.That((ReviewWorkflow.getResponseAlerts second "Reviewer" |> success).Pending.Length,
+                            Is.EqualTo(1))
+                // SignalR invalidation triggers background reconciliation;
+                // this explicit diagnostic refresh makes the test deterministic.
+                Client.SignalR.Client.invalidateAgentStates runtime "owner" [| "Reviewer" |]
+                refresh "Reviewer"
+                Assert.That(Client.SignalR.Client.responseAlertProbePending runtime "owner" "Reviewer",
+                            Is.True, "The refresh must verify a pending alert in the client-local probe.")
+                let _, _, delivered = invoke "Reviewer"
+                Assert.That(shown delivered |> List.map Common.OperationalControl.text,
+                            Has.Some.Contains("deliver only after a verified refresh"))
+                Assert.That((ReviewWorkflow.getResponseAlerts first "Reviewer" |> success).Pending, Is.Empty)
+
+                // A queued but subsequently cleared alert must never be
+                // reconstructed from a stale positive presence observation.
+                let clearedId = Guid.NewGuid()
+                ReviewWorkflow.queueResponseAlert first clearedId "Lead" "Reviewer"
+                    "STOP — clear before reply" |> success |> ignore
+                refresh "Reviewer"
+                ReviewWorkflow.clearResponseAlert second (Guid.NewGuid()) "Lead" "Reviewer" clearedId
+                |> success |> ignore
+                // The receiver still has an earlier positive presence hint,
+                // but a clear won the canonical queue race. A fresh CAS read
+                // must never resurrect that cleared message.
+                let _, _, stalePositive = invoke "Reviewer"
+                Assert.That(shown stalePositive, Is.Empty)
+                Client.SignalR.Client.invalidateAgentStates runtime "owner" [| "Reviewer" |]
+                refresh "Reviewer"
+                let _, _, cleared = invoke "Reviewer"
+                Assert.That(shown cleared, Is.Empty)
+
+                // Periodic reconciliation does not depend on a fresh hint.
+                // Invoke the same canonical reconciler used by its 15-second timer.
+                ReviewWorkflow.queueResponseAlert second (Guid.NewGuid()) "Lead" "Reviewer"
+                    "STOP — recover after missed hint" |> success |> ignore
+                let _, _, missed = invoke "Reviewer"
+                Assert.That(shown missed, Is.Empty)
+                refresh "Reviewer"
+                let _, _, recovered = invoke "Reviewer"
+                Assert.That(shown recovered |> List.map Common.OperationalControl.text,
+                            Has.Some.Contains("recover after missed hint"))
+                Assert.That((ReviewWorkflow.getResponseAlerts first "Reviewer" |> success).Pending, Is.Empty)
+                let _, _, after = invoke "Reviewer"
+                Assert.That(shown after, Is.Empty, "Consumed STOP may not replay.")
+            finally
+                if File.Exists configPath then File.Delete configPath
+                if File.Exists(configPath + ".lock") then File.Delete(configPath + ".lock"))
+
     [<Test>]
     member _.PromotedJobAlertsOnlyConsumeAtVisibleResponsesWithoutReplayOrStranding() =
         withFixture (fun one _ first second _ _ _ _ ->
@@ -6885,9 +6996,8 @@ type ReviewWorkflowTests() =
                 let original : Common.AgentCommandResponse =
                     { Result = Some """{"terminal":true}"""; Error = None
                       Instructions =
-                        [{ Scope = "project"; Path = "owner/AGENTS.md"; Sha256 = ""
-                           Content = "Original completion instruction" }]
-                      AgentStateChanges = [{ ProjectName = "owner"; AgentId = actor }]
+                        [Common.OperationalControl.ActivationUnverified "Original activation status"]
+                      StateChangeEvidence = Common.StateChangeEvidence.Confirmed [{ ProjectName = "owner"; AgentId = actor }]
                       InboxActivation = None; PendingJob = None }
                 let startPromoted (blocked: System.Threading.Tasks.TaskCompletionSource<Common.AgentCommandResponse>) =
                     let pending =
@@ -6912,13 +7022,13 @@ type ReviewWorkflowTests() =
                     let command : Common.AgentCommand = Common.GetJobResultCommand (pollData jobId)
                     let response : Common.AgentCommandResponse =
                         { Result = Some(System.Text.Json.JsonSerializer.Serialize(stored jobId))
-                          Error = None; Instructions = []; AgentStateChanges = []
+                          Error = None; Instructions = []; StateChangeEvidence = Common.StateChangeEvidence.Confirmed []
                           InboxActivation = None; PendingJob = None }
                     Client.SignalR.Client.executeOrPromoteWith runtime (serialize command)
                         actor TimeSpan.Zero (fun _ _ -> System.Threading.Tasks.Task.FromResult response)
                     |> await
                 let alertInstructions (response: Common.AgentCommandResponse) =
-                    response.Instructions |> List.filter (fun doc -> doc.Scope = "response-alert")
+                    response.OperationalControls |> List.filter Common.OperationalControl.isAlert
                 let newBlocked () =
                     System.Threading.Tasks.TaskCompletionSource<Common.AgentCommandResponse>(
                         System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously)
@@ -6933,8 +7043,9 @@ type ReviewWorkflowTests() =
                 Assert.That((stored firstHandle.JobId).ToolResponse, Is.EqualTo(Some original))
                 Assert.That((ReviewWorkflow.getResponseAlerts second actor |> success).Pending.Length,
                             Is.EqualTo(1), "Background completion must not consume STOP.")
+                (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" actor).GetAwaiter().GetResult()
                 let firstPoll = visiblePoll firstHandle.JobId
-                Assert.That(alertInstructions firstPoll |> List.map _.Content,
+                Assert.That(alertInstructions firstPoll |> List.map Common.OperationalControl.text,
                             Has.Some.Contains("only first completed poll"))
                 Assert.That((ReviewWorkflow.getResponseAlerts first actor |> success).Pending, Is.Empty)
                 let repeatPoll = visiblePoll firstHandle.JobId
@@ -6956,13 +7067,14 @@ type ReviewWorkflowTests() =
                         { ProjectName = "owner"; AgentId = actor; Action = "GetNotificationPreferences"
                           TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
-                let unrelatedReply = { original with Instructions = []; AgentStateChanges = [] }
+                let unrelatedReply = { original with Instructions = []; StateChangeEvidence = Common.StateChangeEvidence.Confirmed [] }
+                (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" actor).GetAwaiter().GetResult()
                 let visible =
                     Client.SignalR.Client.executeOrPromoteWith runtime (serialize unrelated)
                         actor (TimeSpan.FromSeconds 3.)
                         (fun _ _ -> System.Threading.Tasks.Task.FromResult unrelatedReply)
                     |> await
-                Assert.That(alertInstructions visible |> List.map _.Content,
+                Assert.That(alertInstructions visible |> List.map Common.OperationalControl.text,
                             Has.Some.Contains("next unrelated visible tool reply"))
                 Assert.That((ReviewWorkflow.getResponseAlerts first actor |> success).Pending, Is.Empty)
                 Assert.That(alertInstructions (visiblePoll secondHandle.JobId), Is.Empty)
@@ -7005,18 +7117,17 @@ type ReviewWorkflowTests() =
                           RelativePath = null }
                 let _, result, metadata = invoke inspect
                 Assert.That(result.IsOk, Is.True)
-                Assert.That(metadata.Instructions |> List.exists (fun item ->
-                    item.Scope = "response-alert"), Is.False)
+                Assert.That(metadata.OperationalControls |> List.exists Common.OperationalControl.isAlert, Is.False)
                 Assert.That((ReviewWorkflow.getResponseAlerts first "Owner" |> success).Pending.Length, Is.EqualTo(1))
                 Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.Version, Is.EqualTo(before.Version))
 
                 let poll : Common.AgentCommand =
                     Common.GetJobResultCommand
                         { ProjectName = "owner"; JobId = "missing-job"; AfterSequence = None }
+                (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" "Owner").GetAwaiter().GetResult()
                 let _, polled, response = invoke poll
                 Assert.That(polled.IsError, Is.True)
-                Assert.That(response.Instructions |> List.exists (fun item ->
-                    item.Scope = "response-alert" && item.Content.Contains("STOP")), Is.True)
+                Assert.That(response.OperationalControls |> List.exists (fun control -> Common.OperationalControl.isAlert control && (Common.OperationalControl.text control).Contains("STOP")), Is.True)
                 Assert.That(response.AgentStateChanges, Is.Empty)
                 Assert.That(response.InboxActivation.IsNone, Is.True)
                 let after = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent

@@ -963,6 +963,10 @@ type GeneratedComposition() =
             let replay = SystemPropertyAccountFixture.releaseNoSend account 0 releaseId locator |> success
             equal "release replay has no second effect" true replay.AlreadyApplied
             verify releasedExpected
+            // A fresh operation ID is not an idempotent retry and cannot release
+            // the same original reservation twice.
+            equal "distinct release operation cannot release twice" true (SystemPropertyAccountFixture.releaseNoSend account 1 (Guid.NewGuid()) locator).IsError
+            verify releasedExpected
             let _, oldClaim = SystemPropertyAccountFixture.claim account 1 first original c
             equal "excluded original cannot claim" true oldClaim.IsError
             verify releasedExpected

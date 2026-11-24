@@ -1,5 +1,11 @@
 # Automation system properties — incremental source-bound harness
 
+## Double-release invariant (2026-11-24)
+
+After exact-operation replay, a distinct release operation must fail and leave
+both clients' observed reservation status and capacity unchanged. Focused job
+b6214a930d9d4593a67e83abd572ca46 passed 2/2 (51 s, exit 0) on published production da167f19cd100c86e8f14cc163ed2ef2028fd82c with the exact test delta overlaid; this is not final composition acceptance.
+
 ## Source and scope
 
 Private registered worktree automation-system-properties-w20, pinned production

@@ -7,9 +7,10 @@ open Client.AccountCapacityLedger
 open Client.LedgerStore
 open Client.NativeSchedulerRosterPolicy
 open Client.ReviewWorkflow
+open FsToolkit.ErrorHandling
 
-// Default-off WQ10 disposable implementation. No production account/operator
-// trust root, authenticated provider-session ingress or browser send hook exists.
+// Account-side state machine under the existing authenticated Jarvis client.
+// This is state accounting, not a provider send or activation path.
 [<CLIMutable>]
 type NativeDispatchCandidate =
     { DispatchId: string
@@ -51,17 +52,34 @@ type NativeReservationState =
       Epoch: int
       Records: NativeReservationRecord array }
 
-// Only an independently marked private disposable authority may accept this
-// synthetic completeness witness. Never expose this as production session proof.
-type NativeDisposableCoverage =
+// A head-pinned observation; every use rereads the complete configured roster.
+// This is not a provider-session completeness or terminal proof.
+type NativeAccountCoverage =
     { AccountHead: string
       ProjectHeads: NativeVerifiedProjectHead array
-      ObservedAtUtc: DateTimeOffset
-      Complete: bool }
+      ObservedAtUtc: DateTimeOffset }
+
+type NativeOriginalReservationLocator =
+    { ReservationOperationId: Guid
+      ReservationRequestSha256: string
+      Candidate: NativeDispatchCandidate
+      ExpectedGeneration: int64
+      ExpectedProjectFenceOid: string
+      ExpectedProviderSessionId: string }
+
+type NativeOriginalReservationContext =
+    { AccountHead: string
+      ReservationOrigin: string
+      ReservationParent: string
+      ReservationReceipt: AccountOperationReceipt
+      CurrentReservation: NativeReservationRecord
+      VerifiedProjectHeads: NativeVerifiedProjectHead array }
 
 type NativeTerminalLocator =
     { DispatchId: Guid
       OriginalReservationId: Guid
+      ReservationRequestSha256: string
+      ExpectedGeneration: int64
       EffectOperationId: Guid
       TerminalOperationId: Guid }
 
@@ -79,7 +97,7 @@ type NativeTerminalProof =
       ProjectTerminalOid: string
       ProviderTerminalOid: string }
 
-type INativeDisposableTerminalVerifier =
+type INativeTerminalVerifier =
     abstract member VerifyCurrentTerminal: NativeTerminalLocator -> Result<NativeTerminalProof,string>
 
 module NativeSchedulerAccountReservation =
@@ -192,31 +210,31 @@ module NativeSchedulerAccountReservation =
                     else Error(AccountIntegrityError "Native reservation identity, status or uniqueness invariant failed.")
                 with _ -> Error(AccountIntegrityError "Native reservation document cannot be parsed."))
 
-    let private verifyCurrent b root operatorKey subject projects (coverage: NativeDisposableCoverage)
+    let private verifyCurrent b projects (coverage: NativeAccountCoverage)
                               (snapshot: AccountSnapshot) =
         let policy =
-            AccountCapacityLedger.readVerifiedDisposableNativeRosterPolicy
-                root b operatorKey subject projects
+            AccountCapacityLedger.readNativeRosterPolicy b projects
         if policy.Status <> "PolicyVerified" then
-            bad ("No authenticated complete native roster: " + String.concat "; " policy.HoldReasons)
-        elif isNull (box coverage) || not coverage.Complete
+            bad ("No verified complete configured native roster: " + String.concat "; " policy.HoldReasons)
+        elif isNull (box coverage)
              || coverage.AccountHead <> snapshot.Head
              || policy.VerifiedAccountHead <> Some snapshot.Head
              || isNull coverage.ProjectHeads
+             || coverage.ProjectHeads.Length <> policy.VerifiedProjectHeads.Length
              || Set.ofArray coverage.ProjectHeads <> Set.ofArray policy.VerifiedProjectHeads
              || coverage.ObservedAtUtc > DateTimeOffset.UtcNow.AddSeconds(2.0)
              || coverage.ObservedAtUtc < DateTimeOffset.UtcNow.AddSeconds(-60.0) then
-            bad "Missing, stale, incomplete or mismatched global native session/project coverage."
+            bad "Missing, stale, incomplete or mismatched account/project head observation."
         else
             match policy.Policy with
             | Some p when p.MembershipComplete -> Ok p
-            | _ -> bad "Verified complete native operator policy is missing."
+            | _ -> bad "Verified complete native configuration is missing."
 
     // Never promote caller-shaped IDs to scheduler authority. The same verified
-    // project head used by the authenticated full-roster observation must contain
+    // project head used by the verified configured roster observation must contain
     // the actual attempt/source lease or immutable claimed review.
     let private projectAt (projects: LedgerBinding array)
-                          (coverage: NativeDisposableCoverage) projectId =
+                          (coverage: NativeAccountCoverage) projectId =
         match projects |> Array.tryFind (fun b -> string b.ProjectId = projectId),
               coverage.ProjectHeads |> Array.tryFind (fun h -> h.ProjectId = projectId) with
         | Some binding, Some witness when
@@ -259,33 +277,27 @@ module NativeSchedulerAccountReservation =
             && (r.EnumerateObject() |> Seq.length) = 4
         with _ -> false
 
-    let private candidateFromVerifiedProject projects coverage (c: NativeDispatchCandidate) =
-        projectAt projects coverage c.ProjectId
-        |> Result.bind (fun (binding, snapshot) ->
-            if c.Kind = "Worker" then
-                if not (Regex.IsMatch(c.TaskId, "^[A-Za-z0-9_-]{1,80}$")) then
-                    bad "Unsafe canonical Worker task identity."
-                else
-                    let path = $"tasks/{c.TaskId}/attempts/{c.AttemptId}.json"
-                    requiredProject<ReviewTask> binding snapshot $"tasks/{c.TaskId}/task.json"
-                    |> Result.bind (fun (task, _, _) ->
-                        requiredProject<ReviewAttempt> binding snapshot path
-                        |> Result.bind (fun (attempt, raw, _) ->
-                            if task.TaskId <> c.TaskId || task.Lifecycle <> "InProgress"
-                               || task.AttemptId <> c.AttemptId
-                               || attempt.TaskId <> c.TaskId || attempt.AttemptId <> c.AttemptId
-                               || attempt.OwnerAgentId <> c.OwnerAgentId
-                               || attempt.Phase <> "Started"
-                               || int64 attempt.AssignmentGeneration <> c.AssignmentGeneration
-                               || attempt.SourceRepositoryId <> c.SourceRepositoryId
-                               || attempt.BaseCommit <> c.SourceBaseOid
-                               || attempt.SourceRef <> c.SourceRef
-                               || String.IsNullOrWhiteSpace attempt.TargetRef
-                               || not (validOid attempt.SpecBlobOid)
-                               || c.SourceLeaseSha256 <> digest raw then
-                                bad "Worker source lease is absent, forged, stale or not issued on this project head."
-                            else Ok ()))
-            else
+    // One read-only canonical reviewer-claim verifier. The host and account
+    // reservation use the same rule against their exact verified project head.
+    // No project writer or new authentication mechanism lives here.
+    let internal verifyReviewerClaim (binding: LedgerBinding) (snapshot: LedgerSnapshot)
+                                     (c: NativeDispatchCandidate) =
+        if isNull (box binding) || isNull (box snapshot) || isNull (box snapshot.Header)
+           || isNull (box c) || c.Kind <> "Reviewer"
+           || c.ProjectId <> string binding.ProjectId
+           || c.ProjectLedgerId <> string binding.LedgerId || c.ProjectEpoch <> binding.Epoch
+           || snapshot.Header.ProjectId <> c.ProjectId
+           || snapshot.Header.LedgerId <> c.ProjectLedgerId || snapshot.Header.Epoch <> c.ProjectEpoch
+           || snapshot.Header.Status <> "active" || not (validOid snapshot.Commit)
+           || String.IsNullOrWhiteSpace c.OwnerAgentId || not (validGuidN c.ReviewId)
+           || c.ReviewVersion < 2L || c.ReviewVersion > int64 Int32.MaxValue
+           || not (validOid c.ReviewedHeadOid) || not (validGuid c.ClaimOperationId)
+           || String.IsNullOrEmpty c.ReviewRef || c.AssignmentGeneration <> 0L
+           || not (String.IsNullOrEmpty c.TaskId) || not (String.IsNullOrEmpty c.AttemptId) then
+            bad "Reviewer candidate lacks exact project, claim, source or role identity."
+        else
+            match Client.RoleInstructions.RoleInstructions.resolveAt binding snapshot c.OwnerAgentId with
+            | Ok roles when roles.RoleIds |> List.contains "Reviewer" ->
                 let bits = c.ReviewRef.Split('/')
                 if bits.Length <> 6 || bits[0] <> "refs" || bits[1] <> "heads"
                    || bits[2] <> "jarvis-review"
@@ -320,9 +332,38 @@ module NativeSchedulerAccountReservation =
                                     |> Result.mapError (fun _ ->
                                         AccountPolicyNotAuthoritative "Frozen review source/ref no longer authenticates.")
                                 | _ -> bad "Reviewer claim operation has no immutable verified origin."
-                            | _ -> bad "Reviewer claim operation is absent, stale or mismatched."))
+                            | _ -> bad "Reviewer claim operation is absent, stale or mismatched.")
+            | _ -> bad "Claimed reviewer is not a registered member of the canonical Reviewer role."
 
-    // A disposable verifier's Ok is not an issuer. The original send fence,
+    let private candidateFromVerifiedProject projects coverage (c: NativeDispatchCandidate) =
+        projectAt projects coverage c.ProjectId
+        |> Result.bind (fun (binding, snapshot) ->
+            if c.Kind = "Worker" then
+                if not (Regex.IsMatch(c.TaskId, "^[A-Za-z0-9_-]{1,80}$")) then
+                    bad "Unsafe canonical Worker task identity."
+                else
+                    let path = $"tasks/{c.TaskId}/attempts/{c.AttemptId}.json"
+                    requiredProject<ReviewTask> binding snapshot $"tasks/{c.TaskId}/task.json"
+                    |> Result.bind (fun (task, _, _) ->
+                        requiredProject<ReviewAttempt> binding snapshot path
+                        |> Result.bind (fun (attempt, raw, _) ->
+                            if task.TaskId <> c.TaskId || task.Lifecycle <> "InProgress"
+                               || task.AttemptId <> c.AttemptId
+                               || attempt.TaskId <> c.TaskId || attempt.AttemptId <> c.AttemptId
+                               || attempt.OwnerAgentId <> c.OwnerAgentId
+                               || attempt.Phase <> "Started"
+                               || int64 attempt.AssignmentGeneration <> c.AssignmentGeneration
+                               || attempt.SourceRepositoryId <> c.SourceRepositoryId
+                               || attempt.BaseCommit <> c.SourceBaseOid
+                               || attempt.SourceRef <> c.SourceRef
+                               || String.IsNullOrWhiteSpace attempt.TargetRef
+                               || not (validOid attempt.SpecBlobOid)
+                               || c.SourceLeaseSha256 <> digest raw then
+                                bad "Worker source lease is absent, forged, stale or not issued on this project head."
+                            else Ok ()))
+            else verifyReviewerClaim binding snapshot c)
+
+    // A terminal verifier's Ok is not an issuer. The original send fence,
     // terminal operation and provider-session evidence must be on the same
     // authenticated project lineage that supplied the account roster.
     let private terminalEvidenceMatches (raw: string) (record: NativeReservationRecord)
@@ -392,32 +433,120 @@ module NativeSchedulerAccountReservation =
             bad "WQ07 Held token exists; native and legacy occupancy may not coexist."
         else Ok ()
 
-    // A default-off, non-launching public entrypoint prevents a caller-provided
-    // OAuth subject, signature, or coverage boolean from becoming authority.
-    let reserve (_: AccountBinding) (_: NativeDispatchCandidate) =
-        bad "Native host/session trust root not provisioned; production reservation disabled."
-
-    let read (_: AccountBinding) =
-        bad "Native account occupancy is not authoritative without a trusted host/session root."
-
-    let internal readVerifiedDisposable root b operatorKey subject projects coverage =
+    // These are internal operations of the already authenticated client.
+    // The runtime supplies the actual configured bindings; every read and
+    // write rechecks authoritative Git state instead of trusting the caller's
+    // observation as a permission.
+    let internal readVerified b projects coverage =
         AccountCapacityLedger.fetch b
         |> Result.bind (fun snapshot ->
-            verifyCurrent b root operatorKey subject projects coverage snapshot
+            verifyCurrent b projects coverage snapshot
             |> Result.bind (fun _ -> stateAt b snapshot |> Result.map (fun native -> snapshot, native)))
 
-    let internal reserveVerifiedDisposable root (b: AccountBinding) operatorKey subject projects
-                                           coverage operationId actor candidate =
+    let private originalProjectPresent (coverage: NativeAccountCoverage) (record: NativeReservationRecord) =
+        coverage.ProjectHeads
+        |> Array.filter (fun head ->
+            head.ProjectId = record.Candidate.ProjectId
+            && head.LedgerId = record.Candidate.ProjectLedgerId
+            && head.Epoch = record.Candidate.ProjectEpoch)
+        |> Array.length = 1
+
+    let private verifiedOriginalReceipt b snapshot (record: NativeReservationRecord)
+                                        operationId requestSha256 =
+        result {
+            let! receipt, origin, parent, previous, raw =
+                AccountCapacityLedger.readNativeReserveOrigin b snapshot operationId
+            let! checkedAppend =
+                try
+                    use envelope = JsonDocument.Parse(receipt.CanonicalRequestJson)
+                    let e = envelope.RootElement
+                    use request = JsonDocument.Parse(e.GetProperty("request").GetString())
+                    let req = request.RootElement
+                    let candidate = req.GetProperty("candidate").Deserialize<NativeDispatchCandidate>(options)
+                    use outcome = JsonDocument.Parse(receipt.OriginalResultJson)
+                    let res = outcome.RootElement
+                    let original = JsonSerializer.Deserialize<NativeReservationState>(raw, options)
+                    let prior =
+                        match previous with
+                        | None -> Ok [||]
+                        | Some text ->
+                            let parsed = JsonSerializer.Deserialize<NativeReservationState>(text, options)
+                            if stateValid b parsed then Ok parsed.Records
+                            else bad "Original reservation predecessor is invalid."
+                    prior |> Result.bind (fun previousRecords ->
+                        if not (stateValid b original)
+                           || receipt.OperationId <> string operationId
+                           || receipt.RequestSha256 <> requestSha256
+                           || e.GetProperty("accountId").GetString() <> string b.AccountId
+                           || e.GetProperty("kind").GetString() <> "NativeReserve"
+                           || e.GetProperty("actor").GetString() <> receipt.Actor
+                           || req.GetProperty("coverageHead").GetString() <> parent
+                           || candidate <> record.Candidate
+                           || res.GetProperty("status").GetString() <> "Reserved"
+                           || res.GetProperty("dispatchId").GetString() <> record.Candidate.DispatchId
+                           || res.GetProperty("canonicalKey").GetString() <> record.CanonicalKey
+                           || res.GetProperty("nativeStateSha256").GetString() <> digest raw then
+                            bad "Original receipt, account/project lineage or candidate differs."
+                        else
+                            let initial =
+                                { record with Status = "Reserved"; Generation = 1L
+                                              ProjectFenceOid = ""; ProviderSessionId = ""; TerminalOperationId = "" }
+                            if original.Records <> Array.append previousRecords [| initial |] then
+                                bad "Original receipt did not create the exact initial reservation."
+                            else Ok ())
+                with _ -> bad "Malformed original native reserve payload."
+            return receipt, origin, parent
+        }
+
+    let private originalContext b snapshot state coverage (locator: NativeOriginalReservationLocator) =
+        if isNull (box locator) || isNull (box locator.Candidate)
+           || locator.ReservationOperationId = Guid.Empty || not (validDigest locator.ReservationRequestSha256)
+           || locator.ExpectedGeneration < 1L then
+            bad "Exact original reservation locator required."
+        else
+            match state.Records |> Array.tryFind (fun r ->
+                r.OriginalOperationId = string locator.ReservationOperationId) with
+            | Some record when record.Candidate = locator.Candidate
+                               && record.Generation = locator.ExpectedGeneration
+                               && record.ProjectFenceOid = locator.ExpectedProjectFenceOid
+                               && record.ProviderSessionId = locator.ExpectedProviderSessionId ->
+                if not (originalProjectPresent coverage record) then
+                    bad "Original reservation project/ledger/epoch is absent from the verified current project heads."
+                else
+                    verifiedOriginalReceipt b snapshot record locator.ReservationOperationId locator.ReservationRequestSha256
+                    |> Result.map (fun (receipt, origin, parent) ->
+                        { AccountHead = snapshot.Head
+                          ReservationOrigin = origin; ReservationParent = parent
+                          ReservationReceipt = receipt; CurrentReservation = record
+                          VerifiedProjectHeads = coverage.ProjectHeads })
+            | _ -> bad "Current reservation identity, generation, project fence or session differs."
+
+    // Exact original account evidence plus the original project tuple at a
+    // current verified head. A legitimate roster removal can make this read
+    // unavailable, but cannot erase the original reservation or free capacity.
+    let internal readOriginal b projects coverage locator =
+        readVerified b projects coverage
+        |> Result.bind (fun (snapshot, state) ->
+            originalContext b snapshot state coverage locator
+            |> Result.bind (fun context ->
+                readVerified b projects coverage
+                |> Result.bind (fun (current, currentState) ->
+                    if current.Head <> snapshot.Head || currentState <> state then
+                        bad "Account state changed during original reservation verification."
+                    else Ok context)))
+
+    let internal reserve (b: AccountBinding) projects
+                         (coverage: NativeAccountCoverage) operationId actor candidate =
         // An absent caller observation is a hold, never a null dereference.
         let observedHead = if isNull (box coverage) then "" else coverage.AccountHead
         let request = json {| candidate = candidate; coverageHead = observedHead |}
         AccountCapacityLedger.transactFiles b operationId actor "NativeReserve" request None
             (fun snapshot ->
-                verifyCurrent b root operatorKey subject projects coverage snapshot
+                verifyCurrent b projects coverage snapshot
                 |> Result.bind (fun policy ->
                     safePhase snapshot |> Result.bind (fun () ->
                         if not (candidateValid b policy candidate) then
-                            bad "Native candidate lacks exact worker source lease, reviewer claim or signed roster membership."
+                            bad "Native candidate lacks exact worker source lease, reviewer claim or configured roster membership."
                         else
                             candidateFromVerifiedProject projects coverage candidate
                             |> Result.bind (fun () ->
@@ -459,134 +588,123 @@ module NativeSchedulerAccountReservation =
                                                    canonicalKey = candidateKey; nativeStateSha256 = digest raw |},
                                            [ Path, raw ]))))))
 
-    // The only transition path is test-fixture-scoped. The caller must present
-    // the original effect ID; this is state accounting, NOT permission to send.
-    // Durable native project fence/provider verification remains a separate task.
-    let internal transitionVerifiedDisposable root (b: AccountBinding) operatorKey subject projects
-                                              coverage operationId actor dispatchId originalEffectId
-                                              expectedGeneration toStatus projectFenceOid providerSessionId =
-        let request =
-            json {| dispatchId = string dispatchId; originalEffectId = string originalEffectId
-                    expectedGeneration = expectedGeneration; toStatus = toStatus
-                    projectFenceOid = projectFenceOid; providerSessionId = providerSessionId |}
-        AccountCapacityLedger.transactFiles b operationId actor "NativeTransition" request None
-            (fun snapshot ->
-                verifyCurrent b root operatorKey subject projects coverage snapshot
-                |> Result.bind (fun _ ->
-                    safePhase snapshot |> Result.bind (fun () ->
-                        stateAt b snapshot |> Result.bind (fun state ->
-                            match state.Records |> Array.tryFind (fun r -> r.Candidate.DispatchId = string dispatchId) with
-                            | None -> bad "Native dispatch missing."
-                            | Some record when record.Candidate.EffectOperationId <> string originalEffectId
-                                               || record.Generation <> expectedGeneration ->
-                                bad "Original effect identity or reservation generation mismatch."
-                            | Some record ->
-                                let allowed =
-                                    match record.Status, toStatus with
-                                    | "Reserved", "Dispatching"
-                                    | "Dispatching", "Submitted"
-                                    | "Dispatching", "Uncertain"
-                                    | "Submitted", "Uncertain"
-                                    | "Submitted", "Active"
-                                    | "Submitted", "Unknown"
-                                    | "Uncertain", "Active"
-                                    | "Uncertain", "Unknown"
-                                    | "Active", "Unknown"
-                                    | "Unknown", "Active" -> true
-                                    | _ -> false
-                                if not allowed then bad "Native status transition is not monotonic."
-                                elif not (validOid projectFenceOid)
-                                     || (record.ProjectFenceOid <> "" && record.ProjectFenceOid <> projectFenceOid)
-                                     || (List.contains toStatus [ "Active"; "Unknown" ]
-                                         && String.IsNullOrWhiteSpace providerSessionId)
-                                     || (record.ProviderSessionId <> "" && record.ProviderSessionId <> providerSessionId) then
-                                    bad "Missing original project-send fence or trusted session identity."
-                                else
-                                    let nextRecord =
-                                        { record with Status = toStatus; Generation = record.Generation + 1L
-                                                      ProjectFenceOid = projectFenceOid
-                                                      ProviderSessionId = providerSessionId }
-                                    let records =
-                                        state.Records |> Array.map (fun r ->
-                                            if r.CanonicalKey = record.CanonicalKey then nextRecord else r)
-                                    let next = { state with Records = records }
-                                    let raw = json next
-                                    Ok(snapshot.State,
-                                       json {| status = toStatus; dispatchId = record.Candidate.DispatchId
-                                               generation = nextRecord.Generation; nativeStateSha256 = digest raw |},
-                                       [ Path, raw ])))))
+    // Internal state accounting only: the original reserve receipt, exact
+    // candidate and generation must still match, even after roster succession.
+    let internal transition (b: AccountBinding) projects coverage operationId actor
+                            (locator: NativeOriginalReservationLocator)
+                            toStatus projectFenceOid providerSessionId =
+        if isNull (box locator) then bad "Exact original reservation locator required."
+        else
+            let request = json {| original = locator; toStatus = toStatus
+                                  projectFenceOid = projectFenceOid; providerSessionId = providerSessionId |}
+            AccountCapacityLedger.transactFiles b operationId actor "NativeTransition" request None
+                (fun snapshot -> result {
+                    let! _ = verifyCurrent b projects coverage snapshot
+                    do! safePhase snapshot
+                    let! state = stateAt b snapshot
+                    let! context = originalContext b snapshot state coverage locator
+                    let record = context.CurrentReservation
+                    let allowed =
+                        match record.Status, toStatus with
+                        | "Reserved", "Dispatching"
+                        | "Dispatching", "Submitted"
+                        | "Dispatching", "Uncertain"
+                        | "Submitted", "Uncertain"
+                        | "Submitted", "Active"
+                        | "Submitted", "Unknown"
+                        | "Uncertain", "Active"
+                        | "Uncertain", "Unknown"
+                        | "Active", "Unknown"
+                        | "Unknown", "Active" -> true
+                        | _ -> false
+                    if not allowed then
+                        return! bad "Native status transition is not monotonic."
+                    if not (validOid projectFenceOid)
+                       || (record.ProjectFenceOid <> "" && record.ProjectFenceOid <> projectFenceOid)
+                       || (List.contains toStatus [ "Active"; "Unknown" ]
+                           && String.IsNullOrWhiteSpace providerSessionId)
+                       || (record.ProviderSessionId <> "" && record.ProviderSessionId <> providerSessionId) then
+                        return! bad "Missing original project-send fence or trusted session identity."
+                    let nextRecord =
+                        { record with Status = toStatus; Generation = record.Generation + 1L
+                                      ProjectFenceOid = projectFenceOid; ProviderSessionId = providerSessionId }
+                    let records =
+                        state.Records |> Array.map (fun r ->
+                            if r.CanonicalKey = record.CanonicalKey then nextRecord else r)
+                    let next = { state with Records = records }
+                    let raw = json next
+                    return snapshot.State,
+                           json {| status = toStatus; dispatchId = record.Candidate.DispatchId
+                                   generation = nextRecord.Generation; nativeStateSha256 = digest raw |},
+                           [ Path, raw ]
+                })
 
-    let internal releaseVerifiedDisposable root (b: AccountBinding) operatorKey subject projects
-                                           coverage (verifier: INativeDisposableTerminalVerifier)
-                                           operationId actor (locator: NativeTerminalLocator) =
-        // Reject invalid IDs before entering any account-head CAS transaction.
+    let internal release (b: AccountBinding) projects coverage (verifier: INativeTerminalVerifier)
+                         operationId actor (locator: NativeTerminalLocator) =
         if isNull (box locator) || locator.DispatchId = Guid.Empty
            || locator.OriginalReservationId = Guid.Empty
-           || locator.EffectOperationId = Guid.Empty
-           || locator.TerminalOperationId = Guid.Empty then
-            bad "Native terminal requires nonempty original and terminal effect UUIDs before CAS."
+           || not (validDigest locator.ReservationRequestSha256) || locator.ExpectedGeneration < 1L
+           || locator.EffectOperationId = Guid.Empty || locator.TerminalOperationId = Guid.Empty then
+            bad "Exact original and terminal UUIDs, receipt and generation required before CAS."
         else
             let request =
                 json {| dispatchId = string locator.DispatchId
                         originalReservationId = string locator.OriginalReservationId
+                        reservationRequestSha256 = locator.ReservationRequestSha256
+                        expectedGeneration = locator.ExpectedGeneration
                         effectOperationId = string locator.EffectOperationId
                         terminalOperationId = string locator.TerminalOperationId |}
             AccountCapacityLedger.transactFiles b operationId actor "NativeTerminalRelease" request None
-                (fun snapshot ->
-                    verifyCurrent b root operatorKey subject projects coverage snapshot
-                    |> Result.bind (fun _ ->
-                        safePhase snapshot
-                        |> Result.bind (fun () ->
-                            stateAt b snapshot
-                            |> Result.bind (fun state ->
-                                match state.Records |> Array.tryFind (fun r ->
-                                    r.Candidate.DispatchId = string locator.DispatchId) with
-                                | None -> bad "Original native reservation not found."
-                                | Some record when record.Status = "Released" ->
-                                    bad "Native slot already released; replay original release UUID."
-                                | Some record when record.OriginalOperationId <> string locator.OriginalReservationId
-                                                   || record.Candidate.EffectOperationId <> string locator.EffectOperationId ->
-                                    bad "Native terminal does not bind original reservation/effect."
-                                | Some _ when isNull (box verifier) ->
-                                    bad "Native terminal requires an independent verifier."
-                                | Some record ->
-                                    match verifier.VerifyCurrentTerminal locator with
-                                    | Error message -> bad ("Terminal verifier refused release: " + message)
-                                    | Ok proof when proof.DispatchId <> locator.DispatchId
-                                                    || proof.OriginalReservationId <> locator.OriginalReservationId
-                                                    || proof.EffectOperationId <> locator.EffectOperationId
-                                                    || proof.TerminalOperationId <> locator.TerminalOperationId
-                                                    || proof.ProjectId.ToString("D") <> record.Candidate.ProjectId
-                                                    || proof.ProjectLedgerId.ToString("D") <> record.Candidate.ProjectLedgerId
-                                                    || proof.ProjectEpoch <> record.Candidate.ProjectEpoch
-                                                    || proof.CanonicalKey <> record.CanonicalKey
-                                                    || not (validOid proof.ProjectHead)
-                                                    || not (validOid proof.ProjectTerminalOid)
-                                                    || not (validOid proof.ProviderTerminalOid)
-                                                    || not (validOid record.ProjectFenceOid)
-                                                    || String.IsNullOrWhiteSpace record.ProviderSessionId
-                                                    || record.ProviderSessionId <> proof.ProviderSessionId ->
-                                        bad "Foreign, stale, incomplete or mismatched project/provider terminal proof."
-                                    | Ok proof ->
-                                        terminalFromVerifiedProject projects coverage record locator proof
-                                        |> Result.bind (fun () ->
-                                            if state.Records |> Array.exists (fun r ->
-                                                r.Status = "Released"
-                                                && r.TerminalOperationId = string locator.TerminalOperationId) then
-                                                bad "Terminal operation UUID already released another reservation."
-                                            else
-                                                let nextRecord =
-                                                    { record with Status = "Released"
-                                                                  Generation = record.Generation + 1L
-                                                                  TerminalOperationId = string locator.TerminalOperationId }
-                                                let records =
-                                                    state.Records |> Array.map (fun r ->
-                                                        if r.CanonicalKey = record.CanonicalKey then nextRecord else r)
-                                                let next = { state with Records = records }
-                                                let raw = json next
-                                                Ok(snapshot.State,
-                                                   json {| status = "Released"
-                                                           dispatchId = record.Candidate.DispatchId
-                                                           generation = nextRecord.Generation
-                                                           nativeStateSha256 = digest raw |},
-                                                   [ Path, raw ]))))))
+                (fun snapshot -> result {
+                    let! _ = verifyCurrent b projects coverage snapshot
+                    do! safePhase snapshot
+                    let! state = stateAt b snapshot
+                    let! record =
+                        match state.Records |> Array.tryFind (fun r ->
+                            r.Candidate.DispatchId = string locator.DispatchId) with
+                        | Some r when r.Status <> "Released"
+                                      && r.OriginalOperationId = string locator.OriginalReservationId
+                                      && r.Candidate.EffectOperationId = string locator.EffectOperationId
+                                      && r.Generation = locator.ExpectedGeneration -> Ok r
+                        | _ -> bad "Original reservation, effect, generation or occupied status differs."
+                    if not (originalProjectPresent coverage record) then
+                        return! bad "Original reservation project/ledger/epoch is not currently verified."
+                    let! _ = verifiedOriginalReceipt b snapshot record locator.OriginalReservationId locator.ReservationRequestSha256
+                    if isNull (box verifier) then
+                        return! bad "Native terminal requires actual verified evidence."
+                    let! proof = verifier.VerifyCurrentTerminal locator
+                                 |> Result.mapError (fun message ->
+                                     AccountPolicyNotAuthoritative ("Terminal verifier refused release: " + message))
+                    if isNull (box proof) || proof.DispatchId <> locator.DispatchId
+                       || proof.OriginalReservationId <> locator.OriginalReservationId
+                       || proof.EffectOperationId <> locator.EffectOperationId
+                       || proof.TerminalOperationId <> locator.TerminalOperationId
+                       || proof.ProjectId.ToString("D") <> record.Candidate.ProjectId
+                       || proof.ProjectLedgerId.ToString("D") <> record.Candidate.ProjectLedgerId
+                       || proof.ProjectEpoch <> record.Candidate.ProjectEpoch
+                       || proof.CanonicalKey <> record.CanonicalKey
+                       || not (validOid proof.ProjectHead)
+                       || not (validOid proof.ProjectTerminalOid)
+                       || not (validOid proof.ProviderTerminalOid)
+                       || not (validOid record.ProjectFenceOid)
+                       || String.IsNullOrWhiteSpace record.ProviderSessionId
+                       || record.ProviderSessionId <> proof.ProviderSessionId then
+                        return! bad "Foreign, stale, incomplete or mismatched project/provider terminal proof."
+                    do! terminalFromVerifiedProject projects coverage record locator proof
+                    if state.Records |> Array.exists (fun r ->
+                        r.Status = "Released" && r.TerminalOperationId = string locator.TerminalOperationId) then
+                        return! bad "Terminal operation UUID already released another reservation."
+                    let nextRecord =
+                        { record with Status = "Released"
+                                      Generation = record.Generation + 1L
+                                      TerminalOperationId = string locator.TerminalOperationId }
+                    let records =
+                        state.Records |> Array.map (fun r ->
+                            if r.CanonicalKey = record.CanonicalKey then nextRecord else r)
+                    let next = { state with Records = records }
+                    let raw = json next
+                    return snapshot.State,
+                           json {| status = "Released"; dispatchId = record.Candidate.DispatchId
+                                   generation = nextRecord.Generation; nativeStateSha256 = digest raw |},
+                           [ Path, raw ]
+                })

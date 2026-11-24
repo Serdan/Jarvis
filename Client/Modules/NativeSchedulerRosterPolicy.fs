@@ -6,8 +6,8 @@ open System.Text
 open System.Text.Json
 open System.Text.RegularExpressions
 
-// Policy is deliberately not native reservation, provider-session, or launch authority.
-// It is a signed account-root statement about the *entire* approved membership.
+// Account configuration under the existing authenticated client and Git ledger.
+// Roster membership is not provider-session evidence or launch authority.
 [<CLIMutable>]
 type NativePoolLimits =
     { Worker: int
@@ -30,22 +30,19 @@ type NativeRosterPolicy =
       AccountLedgerId: string
       AccountEpoch: int
       AccountAuthoritySha256: string
-      AuthenticatedSubject: string
       Version: int64
       MembershipComplete: bool
       AccountLimits: NativePoolLimits
       Projects: NativeRosterProject array }
 
 [<CLIMutable>]
-type NativeSignedRosterApproval =
+type NativeRosterUpdate =
     { SchemaVersion: int
       OperationId: string
       Actor: string
       PreviousVersion: int64
       ExpectedAccountHead: string
-      Policy: NativeRosterPolicy
-      SignerPublicKeySha256: string
-      SignatureBase64: string }
+      Policy: NativeRosterPolicy }
 
 // Provenance observations are from individually fetched project Git heads.
 // These are NOT a globally atomic project/session occupancy snapshot.
@@ -56,7 +53,7 @@ type NativeVerifiedProjectHead =
       VerifiedHead: string }
 
 // The projection is intentionally unusable for dispatch even for genuine
-// approvals. A separate provider-session and reservation protocol is required.
+// policy reads. A separate provider-session and reservation protocol is required.
 type NativeRosterProjection =
     { Status: string
       HoldReasons: string array
@@ -83,12 +80,8 @@ module NativeSchedulerRosterPolicy =
     let sha256 (raw: string) =
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(raw))).ToLowerInvariant()
 
-    let internal keySha256 (key: byte array) =
-        if isNull key then "" else
-        Convert.ToHexString(SHA256.HashData(key)).ToLowerInvariant()
-
-    // Exact authority values stay outside Git; account and project remote URL
-    // fingerprints are included in the signed policy, never credential-bearing URLs.
+    // Exact authority values stay outside Git; remote fingerprints bind existing
+    // configured account and project identities without persisting credentials.
     let internal accountAuthoritySha256 accountId ledgerId epoch fetchUrl pushUrl =
         JsonSerializer.Serialize(
             {| accountId = accountId; ledgerId = ledgerId; epoch = epoch
@@ -118,13 +111,10 @@ module NativeSchedulerRosterPolicy =
            || not (guidIsCanonical policy.AccountLedgerId)
            || policy.AccountEpoch < 1
            || not (digest policy.AccountAuthoritySha256)
-           || String.IsNullOrWhiteSpace policy.AuthenticatedSubject
-           || policy.AuthenticatedSubject.Length > 256
-           || policy.AuthenticatedSubject <> policy.AuthenticatedSubject.Trim()
            || policy.Version < 1L || not policy.MembershipComplete
            || not (limitsValid policy.AccountLimits)
            || isNull policy.Projects || policy.Projects.Length = 0 then
-            Error "Missing or incomplete signed account root, full membership, or typed limits."
+            Error "Missing or incomplete configured account identity, full membership, or typed limits."
         elif policy.Projects |> Array.exists (fun p ->
             isNull (box p)
             || not (guidIsCanonical p.ProjectId)
@@ -147,56 +137,19 @@ module NativeSchedulerRosterPolicy =
                 Error "Duplicate project ID, ledger ID, alias or remote authority."
             else Ok ()
 
-    // A length-framed, domain-separated immutable statement, not a caller's
-    // "approved" boolean or an arbitrary actor label.
-    let internal approvalMessage (approval: NativeSignedRosterApproval) =
-        let fields =
-            [ "jarvis-native-roster-approval-v1"
-              string approval.SchemaVersion
-              approval.OperationId
-              approval.Actor
-              string approval.PreviousVersion
-              approval.ExpectedAccountHead
-              JsonSerializer.Serialize(approval.Policy, jsonOptions)
-              approval.SignerPublicKeySha256 ]
-        fields
-        |> List.map (fun value ->
-            let safe = if isNull value then "" else value
-            string (Encoding.UTF8.GetByteCount safe) + ":" + safe)
-        |> String.concat "" |> Encoding.UTF8.GetBytes
-
-    let internal verifySignedApproval (trustedOperatorKey: byte array)
-                             (approval: NativeSignedRosterApproval) =
-        let mutable opId = Guid.Empty
-        if isNull (box approval) || approval.SchemaVersion <> 1
-           || not (Guid.TryParse(approval.OperationId, &opId))
-           || opId = Guid.Empty || opId.ToString("D") <> approval.OperationId
-           || String.IsNullOrWhiteSpace approval.Actor
-           || approval.Actor <> approval.Actor.Trim()
-           || approval.Actor.Length > 160
-           || approval.PreviousVersion < 0L
-           || not (oid approval.ExpectedAccountHead)
-           || isNull (box approval.Policy)
-           || approval.Policy.Version <> approval.PreviousVersion + 1L
-           || isNull trustedOperatorKey || trustedOperatorKey.Length = 0
-           || approval.SignerPublicKeySha256 <> keySha256 trustedOperatorKey
-           || String.IsNullOrWhiteSpace approval.SignatureBase64 then
-            Error "No trusted signed, version-pinned operator policy approval."
-        else
-            match validatePolicy approval.Policy with
-            | Error reason -> Error reason
-            | Ok () ->
-                try
-                    use verifier = ECDsa.Create()
-                    let mutable consumed = 0
-                    verifier.ImportSubjectPublicKeyInfo(trustedOperatorKey.AsSpan(), &consumed)
-                    if consumed = trustedOperatorKey.Length
-                       && verifier.VerifyData(
-                            approvalMessage approval,
-                            Convert.FromBase64String approval.SignatureBase64,
-                            HashAlgorithmName.SHA256) then Ok ()
-                    else Error "Operator approval signature does not verify."
-                with _ -> Error "Invalid operator approval signature or public key."
+    // Ordinary configuration CAS intent, not a separate authorization protocol.
+    let internal validateUpdate (update: NativeRosterUpdate) =
+        if isNull (box update) || update.SchemaVersion <> 1
+           || not (guidIsCanonical update.OperationId)
+           || String.IsNullOrWhiteSpace update.Actor
+           || update.Actor <> update.Actor.Trim() || update.Actor.Length > 160
+           || update.PreviousVersion < 0L
+           || update.PreviousVersion = Int64.MaxValue
+           || not (oid update.ExpectedAccountHead)
+           || isNull (box update.Policy)
+           || update.Policy.Version <> update.PreviousVersion + 1L then
+            Error "Invalid versioned roster configuration update."
+        else validatePolicy update.Policy
 
     let internal hold reason head =
         { Status = "NotAuthoritative"

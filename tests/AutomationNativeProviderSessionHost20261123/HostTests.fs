@@ -960,18 +960,51 @@ let ``an existing original-effect path can never be claimed as an empty slot`` k
 // Composition-only regression: genuine project planner with a verified account
 // reservation, not a synthetic receipt. W12's consumer must accept the exact
 // canonical envelope emitted by W23 and preserve the original exclusion.
-[<TestCase("Worker")>]
-[<TestCase("Reviewer")>]
-let ``genuine preclaim exclusion releases the original reservation`` kind =
+[<TestCase("Worker", false)>]
+[<TestCase("Reviewer", false)>]
+[<TestCase("Worker", true)>]
+[<TestCase("Reviewer", true)>]
+let ``genuine preclaim or held exclusion releases the original reservation`` kind held =
     ConfiguredFixture.withGit (fun f ->
-        let candidate, originalId =
+        let candidate, originalId, claim =
             if kind = "Worker" then
-                let c, original, _ = ConfiguredFixture.reserved f (Some template)
-                c, original
+                let c, original, request = ConfiguredFixture.reserved f (Some template)
+                c, original, Choice1Of2 request
             else
-                let _, _, claim = reservedReviewer f
-                claim.ReviewCandidate, claim.OriginalReservationOperationId
+                let _, _, request = reservedReviewer f
+                request.ReviewCandidate, request.OriginalReservationOperationId, Choice2Of2 request
         let projects = [| f.ProjectOne |]
+        let path = NativeSchedulerAccountReservation.noSendFencePath candidate
+        let predecessor, predecessorJson =
+            if not held then
+                Client.NativeProjectEffectTransition.BeforeClaim, """{"kind":"BeforeClaim"}"""
+            else
+                let claimId =
+                    PairedBrowser.withPaired (fun bridge ->
+                        let coverage = ConfiguredFixture.coverage f f.AccountOne projects
+                        match claim with
+                        | Choice1Of2 request ->
+                            prepareWorker f.AccountOne projects coverage bridge "Disposable" 27000 request
+                            |> ConfiguredFixture.success |> ignore
+                            request.OperationId
+                        | Choice2Of2 request ->
+                            prepareReviewer f.AccountOne projects coverage bridge "Disposable" 27000 request
+                            |> ConfiguredFixture.success |> ignore
+                            request.OperationId)
+                let snapshot = LedgerStore.fetch f.ProjectOne |> ConfiguredFixture.success
+                let receipt = LedgerStore.getOperationAt f.ProjectOne snapshot claimId
+                              |> ConfiguredFixture.success |> Option.get
+                let origin = LedgerStore.verifiedIntegrationOperationSnapshotAt f.ProjectOne snapshot receipt
+                             |> ConfiguredFixture.success
+                let _, blob = LedgerStore.readAt f.ProjectOne origin path |> ConfiguredFixture.success
+                let witness : Client.NativeProjectEffectTransition.HeldFence =
+                    { ClaimOperationId = claimId; ClaimRequestSha256 = receipt.RequestHash
+                      ClaimOrigin = origin.Commit; ClaimBlobOid = blob.Value }
+                let json = JsonSerializer.Serialize(
+                    {| kind = "ExactHeldFence"; claimOperationId = string claimId
+                       claimRequestSha256 = witness.ClaimRequestSha256
+                       claimOrigin = witness.ClaimOrigin; claimBlobOid = witness.ClaimBlobOid |})
+                Client.NativeProjectEffectTransition.ExactHeldFence witness, json
         let cover = ConfiguredFixture.coverage f f.AccountOne projects
         let _, receipt = AccountCapacityLedger.readOperation f.AccountOne originalId |> ConfiguredFixture.success
         let locator : NativeOriginalReservationLocator =
@@ -993,27 +1026,45 @@ let ``genuine preclaim exclusion releases the original reservation`` kind =
               CanonicalKey = identity.CanonicalKey; Original = locator; NoSendOperationId = op }
         let raw = NativeSchedulerAccountReservation.serializeNoSendEvidence evidence
         let head = (LedgerStore.fetch f.ProjectOne |> ConfiguredFixture.success).Commit
-        let request = sprintf """{"schemaVersion":1,"expectedProjectHead":"%s","predecessor":{"kind":"BeforeClaim"},"evidence":%s}""" head raw
+        let request = sprintf """{"schemaVersion":1,"expectedProjectHead":"%s","predecessor":%s,"evidence":%s}""" head predecessorJson raw
         let intent : LedgerIntent =
             { OperationId = op; Actor = candidate.OwnerAgentId; Kind = "NativeVerifiedNoSend"; RequestJson = request }
-        let path = NativeSchedulerAccountReservation.noSendFencePath candidate
         LedgerStore.transact f.ProjectOne intent (fun snapshot ->
-            Client.NativeProjectEffectTransition.planExclusion f.ProjectOne snapshot head identity path
-                Client.NativeProjectEffectTransition.BeforeClaim intent)
+            // Verify again inside the project CAS; an old account read cannot
+            // authorize the transaction on a different snapshot.
+            match NativeSchedulerAccountReservation.readOriginal f.AccountOne projects cover locator with
+            | Ok verified when verified = original ->
+                Client.NativeProjectEffectTransition.planExclusion f.ProjectOne snapshot head identity path predecessor intent
+            | _ -> Error (InvalidBinding "Original account reservation changed"))
         |> ConfiguredFixture.success |> ignore
         let current = LedgerStore.fetch f.ProjectTwo |> ConfiguredFixture.success
         let stored, oid = LedgerStore.readAt f.ProjectTwo current path |> ConfiguredFixture.success
         Assert.That(stored, Is.EqualTo(Some raw))
         Assert.That((Client.NativeProjectEffectTransition.checkClaim f.ProjectTwo current current.Commit identity path).IsError, Is.True)
+        match predecessor with
+        | Client.NativeProjectEffectTransition.ExactHeldFence witness ->
+            Assert.That((Client.NativeProjectEffectTransition.planBeginSend f.ProjectTwo current current.Commit identity path witness).IsError, Is.True)
+        | _ -> ()
         let releaseLocator : NativeNoSendLocator =
             { Original = locator; NoSendOperationId = op; ProjectHead = current.Commit
               NoSendOrigin = current.Commit; EvidenceBlobOid = oid.Value }
         let otherProjects = [| f.ProjectTwo |]
         let newCoverage = ConfiguredFixture.coverage f f.AccountTwo otherProjects
+        let wrong = { releaseLocator with EvidenceBlobOid = String.replicate oid.Value.Length "0" }
+        Assert.That((NativeSchedulerAccountReservation.releaseNoSend f.AccountTwo otherProjects newCoverage
+                        (Guid.NewGuid()) candidate.OwnerAgentId wrong).IsError, Is.True)
+        Assert.That((ConfiguredFixture.state f).Records[0].Status, Is.EqualTo("Reserved"))
+        let releaseId = Guid.NewGuid()
         let release = NativeSchedulerAccountReservation.releaseNoSend f.AccountTwo otherProjects newCoverage
-                          (Guid.NewGuid()) candidate.OwnerAgentId releaseLocator
+                          releaseId candidate.OwnerAgentId releaseLocator
         // A genuine exclusion must release; the currently accepted W12
         // consumer verifies raw evidence instead of the full envelope.
         match release with
         | Error e -> Assert.Fail(sprintf "Genuine canonical exclusion rejected: %A" e)
-        | Ok _ -> Assert.That((ConfiguredFixture.state f).Records[0].Status, Is.EqualTo("Released")))
+        | Ok write ->
+            Assert.That(write.AlreadyApplied, Is.False)
+            let fresh = ConfiguredFixture.coverage f f.AccountOne projects
+            let replay = NativeSchedulerAccountReservation.releaseNoSend f.AccountOne projects fresh
+                            releaseId candidate.OwnerAgentId releaseLocator |> ConfiguredFixture.success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That((ConfiguredFixture.state f).Records[0].Status, Is.EqualTo("Released")))

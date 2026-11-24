@@ -1067,4 +1067,25 @@ let ``genuine preclaim or held exclusion releases the original reservation`` kin
             let replay = NativeSchedulerAccountReservation.releaseNoSend f.AccountOne projects fresh
                             releaseId candidate.OwnerAgentId releaseLocator |> ConfiguredFixture.success
             Assert.That(replay.AlreadyApplied, Is.True)
-            Assert.That((ConfiguredFixture.state f).Records[0].Status, Is.EqualTo("Released")))
+            Assert.That((ConfiguredFixture.state f).Records[0].Status, Is.EqualTo("Released"))
+            // A fresh original can consume the released kind-specific slot; the
+            // old exclusion remains irreversible even after capacity is reused.
+            let next =
+                if kind = "Worker" then ConfiguredFixture.startedWorker f candidate.OwnerAgentId
+                else
+                    let source = (LedgerStore.fetch f.ProjectOne |> ConfiguredFixture.success).Commit
+                    let reviewId = Guid.NewGuid()
+                    let claimId = Guid.NewGuid()
+                    let taskId = "review-fixture"
+                    ReviewWorkflow.submitBranchReview f.ProjectOne (Guid.NewGuid()) taskId
+                        "Worker fixture" reviewId "" source "Disposable native reviewer" "Review exact source" ""
+                    |> ConfiguredFixture.success |> ignore
+                    ReviewWorkflow.claimBranchReview f.ProjectOne claimId taskId reviewId candidate.OwnerAgentId 1
+                    |> ConfiguredFixture.success |> ignore
+                    { candidate with DispatchId = string (Guid.NewGuid()); EffectOperationId = string (Guid.NewGuid()); ReviewId = reviewId.ToString("N"); ReviewedHeadOid = source; ReviewRef = $"refs/heads/jarvis-review/{taskId}/{reviewId:N}/r1"; ClaimOperationId = string claimId }
+            let afterRelease = ConfiguredFixture.coverage f f.AccountOne projects
+            NativeSchedulerAccountReservation.reserve f.AccountOne projects afterRelease
+                (Guid.NewGuid()) "Disposable native source" next
+            |> ConfiguredFixture.success |> ignore
+            let afterReuse = LedgerStore.fetch f.ProjectTwo |> ConfiguredFixture.success
+            Assert.That((Client.NativeProjectEffectTransition.checkClaim f.ProjectTwo afterReuse afterReuse.Commit identity path).IsError, Is.True))

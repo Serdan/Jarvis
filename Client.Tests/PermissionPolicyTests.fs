@@ -555,3 +555,36 @@ let ``manual grant approval rejects malformed scope and capability`` () =
           Capabilities = [ "Implementation" ] }
     Assert.That(manualGrantConfirmation { valid with Capabilities = [ "Owner" ] }, Is.EqualTo(None))
     Assert.That(manualGrantConfirmation { valid with ResourceKind = "wildcard" }, Is.EqualTo(None))
+
+[<Test>]
+let ``launch template replacement always requires fresh operator approval`` () =
+    task {
+        let command =
+            TaskWriteCommand
+                { ProjectName = "Project1"; Action = "SetLaunchTemplate"
+                  OperationId = System.Guid.NewGuid().ToString("D"); TaskId = ""; AttemptId = ""
+                  ActorId = "Orchestrator"; OwnerId = ""; Title = ""; Html = "{{projectName}} {{agentId}}"
+                  ExpectedVersion = 0; ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
+                  AssignmentGeneration = 0; Summary = ""; NextAction = ""; Reason = ""
+                  BaseOid = ""; TargetRef = ""; SourceRef = ""; AllowDetached = false
+                  AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+        for trust in [NoTrust; PartialTrust; FullTrust] do
+            match evaluateWithTrust trust command with
+            | Error(Client.ConfirmationRequired request) ->
+                request.CommandName |> shouldEqual "SetLaunchTemplate (operator only)"
+                Assert.That(request.Args, Does.Contain("{{projectName}} {{agentId}}"))
+            | other -> Assert.Fail(sprintf "Expected explicit confirmation: %A" other)
+        AgentCommandInfo.manualGrantFamily command |> shouldEqual None
+        AgentCommandInfo.isAgentActivity command |> shouldEqual false
+        let mutable prompts = 0
+        let approve _ _ = task { prompts <- prompts + 1; return AllowExactForSession }
+        let! first = authorizeWithTrust FullTrust approve command
+        let! second = authorizeWithTrust FullTrust approve command
+        first |> shouldEqual (Ok())
+        second |> shouldEqual (Ok())
+        prompts |> shouldEqual 2
+        let! rejected = authorizeWithTrust FullTrust (fun _ _ -> task { return PermissionApproval.Deny }) command
+        match rejected with
+        | Error(Client.PermissionDenied _) -> ()
+        | other -> Assert.Fail(sprintf "Expected denial: %A" other)
+    }

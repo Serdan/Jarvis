@@ -228,7 +228,8 @@ let private runClient args =
         else
             let authCommand =
                 BrowserRunInNewTabCommand
-                    { ProjectName = action.ProjectName; WindowRegistration = action.WindowRegistration
+                    { TargetAgentId = None
+                      ProjectName = action.ProjectName; WindowRegistration = action.WindowRegistration
                       Url = action.Url; ScriptPath = action.ScriptPath
                       ArgsJson = Some action.ArgsJson; Active = Some action.Active
                       CloseTabAfterExecution = Some action.CloseTabAfterExecution
@@ -332,6 +333,25 @@ let private runClient args =
             oauth.GetAccessTokenAsync().GetAwaiter().GetResult()
             |> operatorActorFromAccessToken
         with _ -> None
+    // B1 is a compiled, client-owned postcommit seam, NOT scheduler activation.
+    // No environment switch can enable this unfinished admission boundary.
+    let challengeWakeEnabled = false
+    let challengeWakePorts : Client.WorkQueueReactiveWake.WorkWakePorts =
+        { ReadVerified = (fun () -> failwith "B1 has no approved production scheduler admission read.")
+          Plan = (fun _ -> Error "B1 scheduler admission is not authorized.")
+          Execute = (fun _ -> Client.WorkQueueReactiveWake.WorkExecutorResult.Rejected "B1 scheduler execution disabled.") }
+    let challengeCoordinator =
+        Client.WorkQueueReactiveWake.WorkQueueReactiveWake.Coordinator(challengeWakePorts)
+    let challengeHostPorts =
+        Client.WorkQueueSchedulerHostLoop.WorkQueueSchedulerHostLoop.productionPorts
+            challengeCoordinator
+            (fun () -> Error "B1 default-off host has no authorized production head reader.")
+            (fun _ -> ())
+    let challengeHost, onChallengeCommit =
+        Client.AutomationChallengeWakeAdapter.registerHost
+            challengeWakeEnabled challengeHostPorts
+            (fun project -> OrchestrationApi.LedgerBindingConfig.load project rt)
+            tui.Log
     let toUiError result = result |> Result.mapError (fun error -> sprintf "%A" error)
     let toReplyError = function
         | LedgerFailureError failure when failure.Code = "StaleEntityVersion" ->
@@ -346,6 +366,47 @@ let private runClient args =
               Reply = (fun request ->
                   OrchestrationApi.OperatorChallengeApi.reply actor request rt
                   |> Result.map ignore |> Result.mapError toReplyError) }
+        let resolveLaunchBinding projectName =
+            ProjectPaths.resolveProjectContext projectName rt
+            |> Result.bind (fun context ->
+                OrchestrationApi.LedgerBindingConfig.loadForContext context
+                |> Result.map (fun binding -> context, binding))
+        tui.SetLaunchTemplateAccess
+            { Load = (fun projectName ->
+                resolveLaunchBinding projectName
+                |> Result.bind (fun (_, binding) ->
+                    RoleInstructions.RoleInstructions.getLaunchTemplate binding
+                    |> Result.mapError OrchestrationApi.LedgerErrors.toEffect
+                    |> Result.map (fun snapshot ->
+                        { LaunchProjectName = projectName
+                          ProjectId = binding.ProjectId
+                          LedgerId = binding.LedgerId
+                          Epoch = binding.Epoch
+                          Version = snapshot.Template |> Option.map _.Version |> Option.defaultValue 0
+                          Template = snapshot.Template |> Option.map _.Template |> Option.defaultValue "" }))
+                |> toUiError)
+              Save = (fun snapshot operationId body ->
+                resolveLaunchBinding snapshot.LaunchProjectName
+                |> Result.mapError (fun error -> TemplateUncertain(sprintf "%A" error))
+                |> Result.bind (fun (context, binding) ->
+                    if binding.ProjectId <> snapshot.ProjectId || binding.LedgerId <> snapshot.LedgerId
+                       || binding.Epoch <> snapshot.Epoch then
+                        Error(TemplateUncertain "Project binding changed; restore the original trusted binding before retrying.")
+                    else
+                        let cmd: TaskWriteCommand =
+                            { ProjectName = snapshot.LaunchProjectName; Action = "SetLaunchTemplate"
+                              OperationId = operationId.ToString("D"); TaskId = ""; AttemptId = ""
+                              ActorId = "Orchestrator"; OwnerId = ""; Title = ""; Html = body
+                              ExpectedVersion = snapshot.Version; ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
+                              AssignmentGeneration = 0; Summary = ""; NextAction = ""; Reason = ""
+                              BaseOid = ""; TargetRef = ""; SourceRef = ""; AllowDetached = false
+                              AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+                        OrchestrationApi.TaskApi.writeForExpectedBinding context binding cmd rt
+                        |> Result.map ignore
+                        |> Result.mapError (function
+                            | LedgerFailureError failure when failure.Code = "StaleEntityVersion" -> TemplateStale failure.Message
+                            | LedgerFailureError failure when failure.Code = "InvalidBinding" -> TemplateRejected failure.Message
+                            | error -> TemplateUncertain(sprintf "%A" error)))) }
     | None ->
         tui.Log "Operator challenge replies unavailable: authenticated OAuth subject missing."
 
@@ -411,13 +472,13 @@ let private runClient args =
                 if manualApproval then
                     Client.receiveManualGrantApprovalAndReplyWithTiming connection rt correlationId commandJson agentId report
                 elif manualGranted then
-                    Client.receiveManualGrantedCommandAndReplyWithTiming connection rt correlationId commandJson agentId report
+                    Client.receiveAuthenticatedCommandAndReplyWithChallengeWakeTiming connection rt correlationId commandJson agentId None true report onChallengeCommit
                 else
                     match originalId with
                     | Some original ->
-                        Client.receiveSourceCommandAndReplyWithTiming connection rt correlationId commandJson agentId original report
+                        Client.receiveAuthenticatedCommandAndReplyWithChallengeWakeTiming connection rt correlationId commandJson agentId (Some original) false report onChallengeCommit
                     | None ->
-                        Client.receiveCommandAndReplyWithTiming connection rt correlationId commandJson agentId report),
+                        Client.receiveAuthenticatedCommandAndReplyWithChallengeWakeTiming connection rt correlationId commandJson agentId None false report onChallengeCommit),
             (fun error -> replyUnhandled correlationId commandJson error)) then
             Task.CompletedTask
         else
@@ -558,6 +619,8 @@ let private runClient args =
             do! dispatch.Complete().WaitAsync(TimeSpan.FromMinutes 2.0)
         with :? TimeoutException ->
             tui.Log "MCP dispatch shutdown exceeded two minutes; some command outcomes may be uncertain."
+        // Stop the explicit default-off Challenge host after draining its ingress.
+        do! challengeHost.StopAsync()
         scheduler |> Option.iter (fun service -> (service :> IDisposable).Dispose())
         browser |> Option.iter (fun bridge -> (bridge :> IDisposable).Dispose())
         do! connection.DisposeAsync()

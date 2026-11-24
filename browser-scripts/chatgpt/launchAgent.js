@@ -1,6 +1,12 @@
 // Project-owned ChatGPT UI automation. Jarvis opens and closes the tab separately.
 // The browser extension evaluates execute(args) in a USER_SCRIPT world.
 async function execute(args) {
+  let observedSelection = null;
+  const result = await executeLaunch(args, value => { observedSelection = value; });
+  return { ...result, observedSelection };
+}
+
+async function executeLaunch(args, observeSelection) {
   const prompt = args?.prompt;
   const startUrl = "https://chatgpt.com/";
   let sendAttempted = false;
@@ -257,6 +263,19 @@ async function execute(args) {
         if (target.mode === "Work" &&
             !document.querySelector('[data-model-selection-label="gpt-6.1-terra-wm"]'))
           return "ModelUnconfirmed";
+        // Capture labels from the rendered controls while the picker is open.
+        // These are observations, not another selection verification.
+        try {
+          const activeModes = [modeButton("Chat"), modeButton("Work")]
+            .filter(button => button && button.getAttribute("aria-pressed") === "true");
+          const label = node => {
+            if (!node || !node.getClientRects().length || node.closest('[aria-hidden="true"],[inert]')) return null;
+            const value = (node.innerText || "").trim();
+            return value && value.length <= 128 ? value : null;
+          };
+          observeSelection({ mode: activeModes.length === 1 ? label(activeModes[0]) : null,
+            model: label(selectedRadio), effort: label(powerLabel) });
+        } catch { observeSelection(null); }
         // Close the picker before editing. No menu click can submit a prompt.
         if (control.getAttribute("aria-expanded") === "true") control.click();
         await delay(80);

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <GenerateProgramFile>false</GenerateProgramFile>
+    <DefineConstants>$(DefineConstants);STAGE_B_DISPOSABLE_TEST_ONLY</DefineConstants>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../Client/Client.fsproj" />
+    <Compile Include="../../../Client/Modules/NativeProjectEffectFence.fs" Link="NativeProjectEffectFence.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+</Project>

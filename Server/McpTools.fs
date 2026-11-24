@@ -153,6 +153,20 @@ module private TaskCommands =
           Evidence = ""
           SessionId = "" }
 
+module IntegrationCommands =
+    let submit projectName agentId taskId submissionId sourceRef submittedCommit targetRef operationId reviewId
+               reviewNamespace reviewRef bindingApprovalOperationId =
+        // Old clients reject the distinct shared action instead of ignoring its locator.
+        let action =
+            if [ reviewNamespace; reviewRef; bindingApprovalOperationId ] |> List.forall String.IsNullOrEmpty then
+                "SubmitIntegration"
+            else "SubmitSharedAcceptedIntegration"
+        let cmd = TaskCommands.write projectName action operationId taskId agentId
+        TaskWriteCommand
+            { cmd with AttemptId = submissionId; SourceRef = sourceRef; BaseOid = submittedCommit
+                       TargetRef = targetRef; Reason = reviewId; Summary = reviewNamespace
+                       NextAction = reviewRef; Evidence = bindingApprovalOperationId }
+
 module NotificationCommands =
     // Retain the caller's original selected checkout until source ledger
     // verification succeeds. A fabricated checkout must not inherit authority
@@ -356,14 +370,14 @@ module McpToolHelpers =
           OutputSchemaJson = None }
 
     let private ledgerTaskReadMethods = [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint";  "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec";
-                                         "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"; "GetNotificationPreferences"; "GetResponseAlerts"; "GetWorkComposition" ]
+                                         "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"; "GetNotificationPreferences"; "GetResponseAlerts"; "GetWorkComposition"; "GetLaunchTemplate"; "RenderLaunchPrompt" ]
     let private ledgerTaskWriteMethods =
         [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
           "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
           "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork"
           "SetAgentState"; "CorrectAgentWorkingState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"
           "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"
-          "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"
+          "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"; "SetLaunchTemplate"
           "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec"; "MutateWorkComposition"; "AcceptWorkCompositionIntegrated" ]
 
     let private ledgerReadMethods =
@@ -1949,6 +1963,19 @@ type JarvisMcpTools =
         let cmd = TaskCommands.write projectName "RegisterAgent" operationId "" agentId
         McpToolHelpers.send client http (TaskWriteCommand cmd)
 
+    [<McpServerTool(Title = "get launch template", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read the canonical project launch template and its version/blob provenance. An absent template has version zero for initial setup.")>]
+    static member GetLaunchTemplate(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (TaskCommands.read projectName "GetLaunchTemplate" "" "")
+
+    [<McpServerTool(Title = "set launch template", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Operator-only project launch template update: requires explicit local human approval even under FullTrust. Set expectedVersion to zero only for initial creation. Include literal {{agentId}} and {{projectName}} tokens. No launch or permission grant.")>]
+    static member SetLaunchTemplate(projectName: string, agentId: string, expectedVersion: int, template: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "SetLaunchTemplate" operationId "" TaskCommands.legacyAdministrativePlaceholder
+        McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedVersion; Html = template })
+
+    [<McpServerTool(Title = "render launch prompt", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Render the configured template for one registered targetAgentId and explicit projectName from a verified ledger snapshot. Does not activate the target, authorize a launch or submit a browser message.")>]
+    static member RenderLaunchPrompt(projectName: string, agentId: string, targetAgentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (TaskCommands.read projectName "RenderLaunchPrompt" "" targetAgentId)
+
     [<McpServerTool(Title = "get role", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a versioned shared role, including content and Git ledger blob provenance.")>]
     static member GetRole(projectName: string, agentId: string, roleId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (TaskCommands.read projectName "GetRole" "" roleId)
@@ -1994,10 +2021,12 @@ type JarvisMcpTools =
     static member GetIntegrationSubmissions(projectName: string, agentId: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (TaskReadCommand { ProjectName = projectName; AgentId = ""; Action = "GetIntegrationSubmissions"; TaskId = taskId; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
-    [<McpServerTool(Title = "submit integration boundary", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Submit an Accepted immutable review snapshot for integration. reviewId is required; empty sourceRef and submittedCommit select its exact pinned SHA. Jarvis verifies the reviewed remote snapshot and publishes a create-only managed integration ref; it does not advance the target. An independently advanced target may require a new mechanically clean merge before completion. A nonempty submittedCommit must match the Accepted review; sourceRef is descriptive. submissionId is caller-stable and uncertain effects require reconciliation before any retry.")>]
-    static member SubmitIntegration(projectName: string, taskId: string, agentId: string, submissionId: string, sourceRef: string, submittedCommit: string, targetRef: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] reviewId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "SubmitIntegration" operationId taskId agentId
-        McpToolHelpers.sendWithManualGrant manualGrantCredential client http (TaskWriteCommand { cmd with AttemptId = submissionId; SourceRef = sourceRef; BaseOid = submittedCommit; TargetRef = targetRef; Reason = reviewId })
+    [<McpServerTool(Title = "submit integration boundary", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Submit an Accepted immutable review snapshot for integration. reviewId is required. For a task-bound review, empty sourceRef and submittedCommit select its exact pinned SHA. For a shared Accepted review, supply reviewNamespace=_reviews, exact immutable reviewRef, sourceRef, submittedCommit, and the authenticated Operator binding approval operation UUID. Partial shared locators are rejected. Jarvis verifies the reviewed remote snapshot and publishes a create-only managed integration ref; it does not advance the target. An independently advanced target may require a new mechanically clean merge before completion. A nonempty submittedCommit must match the Accepted review; sourceRef is descriptive. submissionId is caller-stable and uncertain effects require reconciliation before any retry.")>]
+    static member SubmitIntegration(projectName: string, taskId: string, agentId: string, submissionId: string, sourceRef: string, submittedCommit: string, targetRef: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] reviewId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, [<Optional; DefaultParameterValue("")>] reviewNamespace: string, [<Optional; DefaultParameterValue("")>] reviewRef: string, [<Optional; DefaultParameterValue("")>] bindingApprovalOperationId: string, client: ClientService, http: IHttpContextAccessor) =
+        let command =
+            IntegrationCommands.submit projectName agentId taskId submissionId sourceRef submittedCommit targetRef operationId reviewId
+                reviewNamespace reviewRef bindingApprovalOperationId
+        McpToolHelpers.sendWithManualGrant manualGrantCredential client http command
 
     [<McpServerTool(Title = "complete integration boundary", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Complete a Pending integration against its exact accepted review and source S. The authorized publisher reads current target T, checks direct S or a mechanically clean I=(T,S), performs ONE bounded ordinary non-force target push with remote readback, then records a v1 canonical completion with the original operation UUID. It neither force-pushes nor replays uncertain external effects; reconcile unknown outcomes before retry. Does not merge source branches or alter task/review lifecycle.")>]
     static member CompleteIntegration(projectName: string, taskId: string, agentId: string, submissionId: string, integratedCommit: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
@@ -2504,6 +2533,7 @@ type JarvisMcpTools =
       Description("Create a new tab in a registered browser window and run a project .js file. Closes created tabs by default; set closeTabAfterExecution=false only to retain for debugging. Never retries uncertain page effects.")>]
     static member BrowserRunInNewTab(windowRegistration: string, url: string, projectName: string, agentId: string,
                                       [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, scriptPath: string,
+                                      [<Optional; DefaultParameterValue(""); Description("Required for chatgpt/launchAgent.js: canonical target agent, distinct from the calling agent.")>] targetAgentId: string,
                                       [<Optional; DefaultParameterValue("")>] argsJson: string,
                                       [<Optional; DefaultParameterValue(false)>] active: bool,
                                       [<Optional; DefaultParameterValue(true)>] closeTabAfterExecution: bool,
@@ -2512,6 +2542,7 @@ type JarvisMcpTools =
                                       client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (BrowserRunInNewTabCommand {
+            TargetAgentId = McpToolHelpers.optionOfString targetAgentId
             WindowRegistration = windowRegistration; Url = url; ProjectName = projectName
             ScriptPath = scriptPath; ArgsJson = McpToolHelpers.optionOfString argsJson
             Active = Some active; CloseTabAfterExecution = Some closeTabAfterExecution

@@ -315,9 +315,11 @@ let private mayReceiveResponseAlert = function
     | WorkQueueReadCommand _
     | WorkQueueWriteCommand _
     | WorkPriorityCommand _ -> false
-    | TaskReadCommand cmd when cmd.Action = "GetResponseAlerts" -> false
+    | TaskReadCommand cmd when cmd.Action = "GetResponseAlerts" || cmd.Action = "GetLaunchTemplate"
+                               || cmd.Action = "RenderLaunchPrompt" -> false
     | TaskWriteCommand cmd when cmd.Action = "QueueResponseAlert"
-                                 || cmd.Action = "ClearResponseAlert" -> false
+                                 || cmd.Action = "ClearResponseAlert"
+                                 || cmd.Action = "SetLaunchTemplate" -> false
     | LedgerReadCommand cmd when cmd.Action = "Health" -> false
     | TaskWriteCommand cmd when cmd.Action = "NotifyAgent"
                                  && not (String.IsNullOrWhiteSpace cmd.SourceRef) -> false
@@ -346,7 +348,7 @@ let private activatesAgent (agentId: string) command =
               "AcknowledgeFeedback"; "AcknowledgeNotification"; "NotifyAgent"
               "SetNotificationSenderBlock"; "SetNotificationMute"
               "BindAttemptSource"; "RebindAttemptSource"; "BindReviewBase"
-              "SetAttemptSource"; "SubmitIntegration"; "CompleteIntegration" ]
+              "SetAttemptSource"; "SubmitIntegration"; "SubmitSharedAcceptedIntegration"; "CompleteIntegration" ]
     // Administrative alert inspection must never start the inspector's Ready task.
     | TaskReadCommand cmd when cmd.Action = "GetResponseAlerts" -> false
     | TaskReadCommand cmd ->
@@ -461,6 +463,9 @@ let private serialize<'a> (value: 'a) =
 type internal DispatchedResult =
     { Payload: string
       ChangedAgentIds: string list }
+
+/// Client-owned callback; only the authenticated SignalR ingress injects it.
+type ChallengeWakePostCommit = Common.ChallengeWriteCommand -> OrchestrationApi.OperationResponse.Presented -> unit
 
 let private serialize'<'a> (result: Result<'a, Client.EffectError>) =
     result
@@ -684,8 +689,40 @@ let private fromBrowser (operation: ValueTask<Result<string, EffectError>>) =
             { Payload = payload; ChangedAgentIds = [] })
     })
 
+// A launch intent is committed before any browser side effect. Its assignment
+// is read from the same ledger snapshot that creates the immutable record.
+let internal beginAttributedLaunch binding actor targetAgentId (launchId: Guid) =
+    let path = $"records/browser-launches/{launchId:N}/intent.json"
+    let intent : Client.LedgerStore.LedgerIntent =
+        { OperationId = launchId; Actor = actor; Kind = "BrowserLaunchIntent"
+          RequestJson = JsonSerializer.Serialize({| targetAgentId = targetAgentId |}) }
+    Client.LegacyDirectWriterFence.LegacyDirectWriterFence.transact binding intent (fun snapshot ->
+        match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurnAt binding snapshot targetAgentId with
+        | Error e -> Error e
+        | Ok target ->
+            let taskId =
+                if isNull (box target.CurrentAssignment) then null
+                else target.CurrentAssignment.TaskId
+            let content = JsonSerializer.Serialize(
+                {| launchId = launchId.ToString("N"); targetAgentId = targetAgentId
+                   taskId = taskId; assignmentSnapshot = snapshot.Commit
+                   timestampUtc = DateTimeOffset.UtcNow; outcome = "outcomeUnknown" |})
+            Ok [ { Path = path; ExpectedBlobOid = None; Content = content } ])
+
+let internal finishAttributedLaunch binding actor (launchId: Guid) outcomeJson =
+    let finishIdBytes = launchId.ToByteArray()
+    finishIdBytes.[0] <- finishIdBytes.[0] ^^^ 0x80uy
+    let finishId = Guid(finishIdBytes)
+    let path = $"records/browser-launches/{launchId:N}/outcome.json"
+    let intent : Client.LedgerStore.LedgerIntent =
+        { OperationId = finishId; Actor = actor; Kind = "BrowserLaunchOutcome"
+          RequestJson = outcomeJson }
+    Client.LegacyDirectWriterFence.LegacyDirectWriterFence.transact binding intent (fun _ ->
+        Ok [ { Path = path; ExpectedBlobOid = None; Content = outcomeJson } ])
+
 let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
-                     (resolved: ProjectPaths.ResolvedProject option) (agentId: string) (command: AgentCommand) =
+                     (resolved: ProjectPaths.ResolvedProject option) (agentId: string) (command: AgentCommand)
+                     (onChallengeCommit: ChallengeWakePostCommit option) =
     match command with
     | ListCommandsCommand -> rt |> ProjectBrowser.listCommands |> serialize'
     | BrowserListWindowsCommand ->
@@ -831,6 +868,9 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
                     | Error e -> return Error e
                     | Ok _ when not (cmd.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
                         return Error(Client.ValidationError "Browser script must be a .js file.")
+                    | Ok _ when Path.GetFileName(cmd.ScriptPath.Replace('\\', '/')) = "launchAgent.js"
+                                && (cmd.TargetAgentId |> Option.forall String.IsNullOrWhiteSpace) ->
+                        return Error(Client.ValidationError "targetAgentId is required for an agent launch.")
                     | Ok _ ->
                         match ProjectPaths.resolveProjectFile cmd.ProjectName cmd.ScriptPath rt with
                         | Error e -> return Error e
@@ -844,13 +884,74 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
                                     use validatedArgs = JsonDocument.Parse(args)
                                     // Every new agent tab closes by default; an explicit false is a debugging opt-out.
                                     let closeAfterExecution = defaultArg cmd.CloseTabAfterExecution true
-                                    let! result = BrowserBridge.runInNewTab bridge cmd.WindowRegistration cmd.Url "" (defaultArg cmd.Active false) source args (defaultArg cmd.TimeoutMs 30000) closeAfterExecution
-                                    return result
-                                           |> Result.mapError (fun (registrationId,error) ->
-                                               let detail =
-                                                   if String.IsNullOrWhiteSpace(registrationId) then error
-                                                   else error + " [tabRegistration=" + registrationId + "]"
-                                               Client.ValidationError detail)
+                                    let launchId = Guid.NewGuid()
+                                    let attribution =
+                                        match cmd.TargetAgentId with
+                                        | None -> Ok None
+                                        | Some targetId ->
+                                            match OrchestrationApi.LedgerBindingConfig.load cmd.ProjectName rt with
+                                            | Error e -> Error (string e)
+                                            | Ok binding ->
+                                                match beginAttributedLaunch binding agentId targetId launchId with
+                                                | Error e -> Error (string e)
+                                                | Ok _ -> Ok (Some binding)
+                                    match attribution with
+                                    | Error e -> return Error(Client.ValidationError ("LaunchAttributionNotRecorded: " + e))
+                                    | Ok binding ->
+                                        let mutable observed : JsonElement option = None
+                                        let! result =
+                                            BrowserBridge.runInNewTabWithObservation bridge cmd.WindowRegistration cmd.Url "" (defaultArg cmd.Active false) source args (defaultArg cmd.TimeoutMs 30000) closeAfterExecution (fun value -> observed <- Some value)
+                                        let getString (value: JsonElement) (name: string) =
+                                            if value.ValueKind <> JsonValueKind.Object then null
+                                            else
+                                                match value.TryGetProperty(name) with
+                                                | true, field when field.ValueKind = JsonValueKind.String -> field.GetString()
+                                                | _ -> null
+                                        let mutable registration = null
+                                        let mutable outcome = "outcomeUnknown"
+                                        match result with
+                                        | Ok raw ->
+                                            use doc = JsonDocument.Parse(raw)
+                                            registration <- getString doc.RootElement "registrationId"
+                                            outcome <- getString doc.RootElement "status"
+                                        | Error (id, reason) ->
+                                            registration <- id
+                                            if not (reason.StartsWith("OutcomeUnknown", StringComparison.Ordinal)) then
+                                                outcome <- "notSubmitted"
+                                        let labels =
+                                            match observed with
+                                            | Some value when value.ValueKind = JsonValueKind.Object ->
+                                                match value.TryGetProperty("observedSelection") with
+                                                | true, item when item.ValueKind = JsonValueKind.Object -> Some item
+                                                | _ -> None
+                                            | _ -> None
+                                        let label name = labels |> Option.map (fun value -> getString value name) |> Option.defaultValue null
+                                        let field name = observed |> Option.map (fun value -> getString value name) |> Option.defaultValue null
+                                        let conversationUrl = field "conversationUrl"
+                                        let reason =
+                                            match field "reason" with
+                                            | "SubmissionUnconfirmed" | "SendClickUncertain" | "ConversationUrlUnavailable"
+                                            | "UnexpectedUiErrorAfterSend" as value -> value
+                                            | _ -> null
+                                        let outcomeJson = JsonSerializer.Serialize(
+                                            {| launchId = launchId.ToString("N"); registrationId = registration
+                                               outcome = outcome; reason = reason; timestampUtc = DateTimeOffset.UtcNow
+                                               mode = label "mode"; model = label "model"; effort = label "effort"
+                                               conversationUrl = conversationUrl |})
+                                        let persisted =
+                                            match binding with
+                                            | None -> Ok ()
+                                            | Some value -> finishAttributedLaunch value agentId launchId outcomeJson |> Result.map ignore |> Result.mapError string
+                                        match persisted with
+                                        | Error error ->
+                                            return Error(Client.ValidationError ($"LaunchOutcomePersistenceUnknown: launchId={launchId:N}; do not retry Send; " + error))
+                                        | Ok () ->
+                                            return result
+                                                   |> Result.mapError (fun (registrationId,error) ->
+                                                       let detail =
+                                                           if String.IsNullOrWhiteSpace(registrationId) then error
+                                                           else error + " [tabRegistration=" + registrationId + "]"
+                                                       Client.ValidationError detail)
                             with
                             | :? DecoderFallbackException -> return Error(Client.ValidationError "InvalidUtf8")
                             | :? JsonException -> return Error(Client.ValidationError "InvalidArgumentsJson")
@@ -958,7 +1059,20 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
     | CrossProjectNotificationCommand _ ->
         Error(Client.ValidationError "Forwarded notification must be normalized before client dispatch.") |> serialize'
     | ChallengeReadCommand cmd -> rt |> OrchestrationApi.ChallengeApi.read cmd |> serialize'
-    | ChallengeWriteCommand cmd -> rt |> OrchestrationApi.ChallengeApi.write cmd |> serialize'
+    | ChallengeWriteCommand cmd ->
+        // Only a trusted successful post-journal receipt is eligible. No callback
+        // on failed, uncertain or already-applied original operation IDs.
+        let committed = rt |> OrchestrationApi.ChallengeApi.write cmd
+        match committed, onChallengeCommit with
+        | Ok (:? OrchestrationApi.OperationResponse.Presented as receipt), Some callback
+            when not (String.IsNullOrWhiteSpace agentId)
+                 && String.Equals(cmd.ActorId, agentId, StringComparison.Ordinal)
+                 && cmd.Action = "Resolve" && cmd.Outcome = "Satisfied"
+                 && not receipt.alreadyApplied ->
+            try callback cmd receipt
+            with _ -> rt.Tui.Log "Challenge wake hint not accepted; original Git commit remains authoritative."
+        | _ -> ()
+        committed |> serialize'
     | LedgerReadCommand cmd -> rt |> OrchestrationApi.LedgerApi.read cmd |> serialize'
     | LedgerWriteCommand cmd -> rt |> OrchestrationApi.LedgerApi.write cmd |> serialize'
     | ReviewReadCommand cmd -> rt |> OrchestrationApi.ReviewApi.read cmd |> serialize'
@@ -1064,7 +1178,8 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
 let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
                                     (resolved: ProjectPaths.ResolvedProject option)
                                     (preparedTask: ProjectTaskDefinition option) (agentId: string) (command: AgentCommand)
-                                    (sourceOriginalId: string option) (manualGrantAuthorized: bool) =
+                                    (sourceOriginalId: string option) (manualGrantAuthorized: bool)
+                                    (onChallengeCommit: ChallengeWakePostCommit option) =
     task {
         let activityId =
             match command with
@@ -1152,7 +1267,7 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
                                     | Ok invocation ->
                                         let! result =
                                             SourceEffectRouteBridge.executeDiagnostic invocation command
-                                                (fun () -> (dispatch rt target resolved agentId command).AsTask())
+                                                (fun () -> (dispatch rt target resolved agentId command onChallengeCommit).AsTask())
                                         return result |> Result.mapError Client.ValidationError |> Result.bind id
                                 | _ ->
                                     return Error(Client.ValidationError
@@ -1175,7 +1290,7 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
                                     (fun () -> ClientShell.runProjectTask cmd.ProjectName task)) rt |> serialize'
                                 return result
                             | Ok(), None ->
-                                let! result = dispatch rt target resolved agentId command
+                                let! result = dispatch rt target resolved agentId command onChallengeCommit
                                 return result
             }
 
@@ -1199,7 +1314,7 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
 
 let receiveCommand (rt: Runtime) (command: AgentCommand) =
     task {
-        let! result = receiveCommandForTarget rt None None None "" command None false
+        let! result = receiveCommandForTarget rt None None None "" command None false None
         return result |> Result.map (fun outcome -> outcome.Payload)
     }
 
@@ -1272,19 +1387,21 @@ let internal prepareSourceOperation (rt: Runtime) (target: ProjectPaths.ProjectT
 
 let private receivePreparedCommand (rt: Runtime)
                                    (target: ProjectPaths.ProjectTarget option) (agentId: string) command
-                                   (sourceOriginalId: string option) (manualGrantAuthorized: bool) =
+                                   (sourceOriginalId: string option) (manualGrantAuthorized: bool)
+                                   (onChallengeCommit: ChallengeWakePostCommit option) =
     task {
         match prepareSourceOperation rt target command with
         | Error error -> return Error error
         | Ok prepared ->
-            return! receiveCommandForTarget rt target prepared.Source prepared.ProjectTask agentId command sourceOriginalId manualGrantAuthorized
+            return! receiveCommandForTarget rt target prepared.Source prepared.ProjectTask agentId command sourceOriginalId manualGrantAuthorized onChallengeCommit
     }
 
 // Shared by SignalR receive and tests. Identity is supplied by the MCP call,
 // not inferred from provider conversation metadata.
 let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agentId: string)
                                        (includeResponseAlerts: bool)
-                                       (sourceOriginalId: string option) (manualGrantAuthorized: bool) =
+                                       (sourceOriginalId: string option) (manualGrantAuthorized: bool)
+                                       (onChallengeCommit: ChallengeWakePostCommit option) =
     task {
         let mutable parsedCommand = None
         let mutable responseScope: ProjectPaths.ProjectTarget option = None
@@ -1377,7 +1494,7 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                                 // Polling does not activate or record local
                                 // agent activity, but access checks still need
                                 // the initiating actor label from the transport.
-                                receivePreparedCommand rt target agentId command sourceOriginalId manualGrantAuthorized
+                                receivePreparedCommand rt target agentId command sourceOriginalId manualGrantAuthorized onChallengeCommit
                             // A write may alter another agent's state, or none
                             // at all. Invalidate precisely the affected local
                             // cache entries before preparing turn guidance.
@@ -1432,7 +1549,22 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
 // Preserve direct dispatch semantics for callers that receive an immediate
 // response. Promoted tool jobs execute the undecorated core in the background.
 let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string) =
-    processIncomingCommandCore rt commandJson agentId true None false
+    processIncomingCommandCore rt commandJson agentId true None false None
+
+// The authenticated SignalR receive path and its isolated native regression
+// share this *same* post-journal execution boundary. The caller's original
+// operation UUID and actor label are forwarded unchanged; only a typed,
+// successful ChallengeApi write may invoke the injected wake callback.
+let executeAuthenticatedCommandWithChallengeWake
+    (rt: Runtime) (commandJson: string) (agentId: string)
+    (sourceOriginalId: string option) (manualGrantAuthorized: bool)
+    (onChallengeCommit: ChallengeWakePostCommit) : Task<AgentCommandResponse> =
+    task {
+        let! _, _, response =
+            processIncomingCommandCore rt commandJson agentId false
+                sourceOriginalId manualGrantAuthorized (Some onChallengeCommit)
+        return response
+    }
 
 // Background completion is not an agent-visible response. This is the only
 // response-alert consumption point for SignalR-delivered tool calls, including
@@ -1561,12 +1693,19 @@ let executeOrPromoteWith (rt: Runtime) (commandJson: string) (agentId: string)
     }
 
 let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: string)
-                             (sourceOriginalId: string option) (manualGrantAuthorized: bool) =
-    let run serialized actor = task {
-        let! _, _, outcome =
-            processIncomingCommandCore rt serialized actor false sourceOriginalId manualGrantAuthorized
-        return outcome
-    }
+                             (sourceOriginalId: string option) (manualGrantAuthorized: bool)
+                             (onChallengeCommit: ChallengeWakePostCommit option) =
+    let run serialized actor =
+        match onChallengeCommit with
+        | Some callback ->
+            executeAuthenticatedCommandWithChallengeWake rt serialized actor
+                sourceOriginalId manualGrantAuthorized callback
+        | None ->
+            task {
+                let! _, _, outcome =
+                    processIncomingCommandCore rt serialized actor false sourceOriginalId manualGrantAuthorized None
+                return outcome
+            }
     // A prospective project cannot be bound to its actual canonical name
     // from a background PendingJob. Complete creation before returning.
     let directCreation =
@@ -1581,10 +1720,11 @@ let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: strin
 
 let private receiveCommandAndReplyCore (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (agentId: string)
     (sourceOriginalId: string option) (manualGrantAuthorized: bool)
-    (report: string -> float -> float -> bool -> unit) : Task =
+    (report: string -> float -> float -> bool -> unit)
+    (onChallengeCommit: ChallengeWakePostCommit option) : Task =
     task {
         let commandStarted = Stopwatch.GetTimestamp()
-        let! agentResponse = executeOrPromote rt commandJson agentId sourceOriginalId manualGrantAuthorized
+        let! agentResponse = executeOrPromote rt commandJson agentId sourceOriginalId manualGrantAuthorized onChallengeCommit
         let commandMilliseconds = Stopwatch.GetElapsedTime(commandStarted).TotalMilliseconds
         let replyStarted = Stopwatch.GetTimestamp()
         let! sendResult =
@@ -1628,7 +1768,17 @@ let private receiveCommandAndReplyCore (connection: HubConnection) (rt: Runtime)
 let receiveCommandAndReplyWithTiming (connection: HubConnection) (rt: Runtime)
     (correlationId: string) (commandJson: string) (agentId: string)
     (report: string -> float -> float -> bool -> unit) : Task =
-    receiveCommandAndReplyCore connection rt correlationId commandJson agentId None false report
+    receiveCommandAndReplyCore connection rt correlationId commandJson agentId None false report None
+
+/// Preserve the original ingress and operation UUID through promotion/reconnect.
+let receiveAuthenticatedCommandAndReplyWithChallengeWakeTiming
+    (connection: HubConnection) (rt: Runtime)
+    (correlationId: string) (commandJson: string) (agentId: string)
+    (originalOperationId: string option) (manualGranted: bool)
+    (report: string -> float -> float -> bool -> unit)
+    (onChallengeCommit: ChallengeWakePostCommit) : Task =
+    receiveCommandAndReplyCore connection rt correlationId commandJson agentId
+        originalOperationId manualGranted report (Some onChallengeCommit)
 
 let receiveCommandAndReply (connection: HubConnection) (rt: Runtime)
     (correlationId: string) (commandJson: string) (agentId: string) : Task =
@@ -1643,14 +1793,14 @@ let receiveSourceCommandAndReplyWithTiming (connection: HubConnection) (rt: Runt
     (originalOperationId: string)
     (report: string -> float -> float -> bool -> unit) : Task =
     receiveCommandAndReplyCore connection rt correlationId commandJson agentId
-        (Some originalOperationId) false report
+        (Some originalOperationId) false report None
 
 // A separate SignalR ingress exists only for the server-validated manual
 // grant. It never sends the credential to the client or bypasses other fences.
 let receiveManualGrantedCommandAndReplyWithTiming (connection: HubConnection) (rt: Runtime)
     (correlationId: string) (commandJson: string) (agentId: string)
     (report: string -> float -> float -> bool -> unit) : Task =
-    receiveCommandAndReplyCore connection rt correlationId commandJson agentId None true report
+    receiveCommandAndReplyCore connection rt correlationId commandJson agentId None true report None
 
 // The requesting model has no approval endpoint. Only the operator's local
 // permission UI can answer this server-originated SignalR request. FullTrust

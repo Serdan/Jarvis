@@ -1,0 +1,55 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="1611faec-9942-4302-baeb-fec147de55b3" name="@Serdan-Home 2026-11-22 01:39:01" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-11-22T01:39:01.9429232+01:00" queuing="2026-11-22T01:39:01.9429233+01:00" start="2026-11-22T01:38:58.6730944+01:00" finish="2026-11-22T01:39:24.1657308+01:00" />
+  <TestSettings name="default" id="dab92e78-e173-470e-8dfe-4d5d74021f87">
+    <Deployment runDeploymentRoot="_Serdan-Home_2026-11-22_01_39_01" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="c84931c6-a573-4572-9d02-314ffee31eee" testId="e2c23824-ce06-edb7-4280-5961f17b7a1a" testName="RealGitDeterministicTwoClientWorkerAndReviewerBarriers" computerName="Serdan-Home" duration="00:00:03.8949370" startTime="2026-11-22T01:39:00.9899471+01:00" endTime="2026-11-22T01:39:04.8848839+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="c84931c6-a573-4572-9d02-314ffee31eee" />
+    <UnitTestResult executionId="a65e769b-3124-4a00-bc00-4f0bc3482923" testId="430093df-60ae-3ae6-cc06-3515e1e2e154" testName="RealGitTwoCloneMultiStepAccountWorkerReviewerSourceTrace" computerName="Serdan-Home" duration="00:00:11.4179490" startTime="2026-11-22T01:39:04.8849335+01:00" endTime="2026-11-22T01:39:16.3028823+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="a65e769b-3124-4a00-bc00-4f0bc3482923" />
+    <UnitTestResult executionId="a0bd0c12-e802-455a-b836-47f80ad82a32" testId="4465140b-291b-989d-4cf1-b631f0d510e6" testName="IndependentModel384Seed24StepReplayShrinkAndMutationControls" computerName="Serdan-Home" duration="00:00:01.9205830" startTime="2026-11-22T01:38:59.0684318+01:00" endTime="2026-11-22T01:39:00.9889682+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="a0bd0c12-e802-455a-b836-47f80ad82a32" />
+    <UnitTestResult executionId="e943a623-2318-42de-b820-7d287632d701" testId="84452367-7343-e9e7-1cdc-e2a86de2d71f" testName="RealGitZeroQuotaStaleClaimsAndUncertainFetchFailClosed" computerName="Serdan-Home" duration="00:00:07.8195310" startTime="2026-11-22T01:39:16.3029263+01:00" endTime="2026-11-22T01:39:24.1224568+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="e943a623-2318-42de-b820-7d287632d701" />
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="RealGitZeroQuotaStaleClaimsAndUncertainFetchFailClosed" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-account-cas-w20-20261122/scripts/tests/scheduler-property-account-cas-20261122/bin/release/net11.0/client.tests.dll" id="84452367-7343-e9e7-1cdc-e2a86de2d71f">
+      <Execution id="e943a623-2318-42de-b820-7d287632d701" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-account-cas-w20-20261122/scripts/tests/scheduler-property-account-cas-20261122/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.NativeSchedulerRosterPolicyTests+SchedulerAccountCasProperty" name="RealGitZeroQuotaStaleClaimsAndUncertainFetchFailClosed" />
+    </UnitTest>
+    <UnitTest name="RealGitDeterministicTwoClientWorkerAndReviewerBarriers" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-account-cas-w20-20261122/scripts/tests/scheduler-property-account-cas-20261122/bin/release/net11.0/client.tests.dll" id="e2c23824-ce06-edb7-4280-5961f17b7a1a">
+      <Execution id="c84931c6-a573-4572-9d02-314ffee31eee" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-account-cas-w20-20261122/scripts/tests/scheduler-property-account-cas-20261122/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.NativeSchedulerRosterPolicyTests+SchedulerAccountCasProperty" name="RealGitDeterministicTwoClientWorkerAndReviewerBarriers" />
+    </UnitTest>
+    <UnitTest name="IndependentModel384Seed24StepReplayShrinkAndMutationControls" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-account-cas-w20-20261122/scripts/tests/scheduler-property-account-cas-20261122/bin/release/net11.0/client.tests.dll" id="4465140b-291b-989d-4cf1-b631f0d510e6">
+      <Execution id="a0bd0c12-e802-455a-b836-47f80ad82a32" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-account-cas-w20-20261122/scripts/tests/scheduler-property-account-cas-20261122/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.NativeSchedulerRosterPolicyTests+SchedulerAccountCasProperty" name="IndependentModel384Seed24StepReplayShrinkAndMutationControls" />
+    </UnitTest>
+    <UnitTest name="RealGitTwoCloneMultiStepAccountWorkerReviewerSourceTrace" storage="/home/serdan/projects/.jarvis-worktrees/scheduler-property-account-cas-w20-20261122/scripts/tests/scheduler-property-account-cas-20261122/bin/release/net11.0/client.tests.dll" id="430093df-60ae-3ae6-cc06-3515e1e2e154">
+      <Execution id="a65e769b-3124-4a00-bc00-4f0bc3482923" />
+      <TestMethod codeBase="/home/serdan/Projects/.Jarvis-worktrees/scheduler-property-account-cas-w20-20261122/scripts/tests/scheduler-property-account-cas-20261122/bin/Release/net11.0/Client.Tests.dll" adapterTypeName="executor://nunit3testexecutor/" className="Client.Tests.NativeSchedulerRosterPolicyTests+SchedulerAccountCasProperty" name="RealGitTwoCloneMultiStepAccountWorkerReviewerSourceTrace" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="e2c23824-ce06-edb7-4280-5961f17b7a1a" executionId="c84931c6-a573-4572-9d02-314ffee31eee" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="430093df-60ae-3ae6-cc06-3515e1e2e154" executionId="a65e769b-3124-4a00-bc00-4f0bc3482923" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="4465140b-291b-989d-4cf1-b631f0d510e6" executionId="a0bd0c12-e802-455a-b836-47f80ad82a32" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="84452367-7343-e9e7-1cdc-e2a86de2d71f" executionId="e943a623-2318-42de-b820-7d287632d701" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Completed">
+    <Counters total="4" executed="4" passed="4" failed="0" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>NUnit Adapter 4.6.0.0: Test execution started
+Running selected tests in /home/serdan/Projects/.Jarvis-worktrees/scheduler-property-account-cas-w20-20261122/scripts/tests/scheduler-property-account-cas-20261122/bin/Release/net11.0/Client.Tests.dll
+   NUnit3TestExecutor discovered 4 of 4 NUnit test cases using Current Discovery mode, Non-Explicit run
+MODEL: seeds=384 steps=9216 accepted=2099 rejected=6545 replayed=572 shrink=4-&gt;2
+REALGIT: 2 two-client barriers; exactly one Worker and one Reviewer account winner
+REALGIT: 2 account clones, 2 project remotes, Worker+Reviewer, replay/alias/unknown/terminal/release/unique HEAD
+REALGIT NEGATIVES: zero quotas, stale source/actor/project, account and coverage forgery, fetch fail-closed; no account HEAD change
+NUnit Adapter 4.6.0.0: Test execution complete
+</StdOut>
+    </Output>
+  </ResultSummary>
+</TestRun>

@@ -1040,6 +1040,22 @@ module LedgerStore =
                         | _ -> Error(LedgerIntegrityError
                             "An operation record changed after its originating commit.")
 
+    // Resolve an integration witness against the exact already-verified
+    // snapshot used by the caller's CAS. Do not refetch a moving ledger head
+    // for every historical decision, approval or submission witness.
+    let verifiedIntegrationOperationSnapshotAt (binding: LedgerBinding)
+                                               (snapshot: LedgerSnapshot)
+                                               (operation: LedgerOperation) = result {
+        let! origin = getOperationOriginAt binding snapshot operation
+        let! ancestor = isAncestor binding.RepositoryPath origin snapshot.Commit
+        if not ancestor then
+            return! Error(LedgerHistoryUnavailable "Integration witness is not in verified snapshot ancestry.")
+        let! header = readHeader binding origin
+        if header.NextSequence <> operation.Sequence + 1L then
+            return! Error(LedgerIntegrityError "Integration witness sequence differs from its originating snapshot.")
+        return { Commit = origin; Header = header }
+    }
+
     // RequestHash authenticates the stored bytes, not their relationship to
     // the completed integration. Bind both levels of the canonical intent
     // envelope to the exact receipt, rejecting extra or ambiguous arguments.
@@ -1093,8 +1109,8 @@ module LedgerStore =
     // of this path, not by treating a mutable Integrated status as evidence.
     // Requiring an authenticated operation origin also rejects a later file
     // rewrite and ambiguous multiple-completion histories.
-    let findCompletionOperationForPathAt (binding: LedgerBinding)
-                                         (snapshot: LedgerSnapshot) (path: string) = result {
+    let private findIntegrationOperationForPathAt (binding: LedgerBinding)
+                                         (snapshot: LedgerSnapshot) (path: string) kind = result {
         if String.IsNullOrWhiteSpace path || not (ledgerPath.IsMatch path)
            || path.Contains("..", StringComparison.Ordinal) then
             return! Error(InvalidBinding "Invalid canonical completion path.")
@@ -1111,23 +1127,32 @@ module LedgerStore =
                 | true, operationId when operationId <> Guid.Empty ->
                     let! candidate = getOperationAt binding snapshot operationId
                     match candidate with
-                    | Some operation when operation.Type = "CompleteIntegration"
+                    | Some operation when operation.Type = kind
                                           && not (isNull operation.Paths)
                                           && Array.contains path operation.Paths ->
                         let! origin = getOperationOriginAt binding snapshot operation
                         if origin <> commit || found.IsSome then
                             return! Error(LedgerIntegrityError
-                                "Integration path has multiple or displaced completion operations.")
+                                "Integration path has multiple or displaced operations of the same kind.")
                         found <- Some operation
                     | _ -> ()
                 | _ ->
                     return! Error(LedgerIntegrityError
                         "Integration path history has an invalid operation ID.")
-        match found with
-        | Some operation -> return operation
-        | None -> return! Error(InvalidBinding
-            "Managed integration lacks an original canonical completion operation.")
+        return found
     }
+
+    let findCompletionOperationForPathAt binding snapshot path =
+        findIntegrationOperationForPathAt binding snapshot path "CompleteIntegration"
+        |> Result.bind (function
+            | Some operation -> Ok operation
+            | None -> Error(InvalidBinding
+                "Managed integration lacks an original canonical completion operation."))
+
+    // Read-only origin lookup also detects a shared receipt rewritten to look
+    // like a historical task-bound submission.
+    let findIntegrationSubmissionOperationForPathAt binding snapshot path =
+        findIntegrationOperationForPathAt binding snapshot path "SubmitIntegration"
 
     let getOperationStatus (binding: LedgerBinding) (operationId: Guid) =
         if operationId = Guid.Empty then Error(InvalidBinding "Valid operation UUID required.")
@@ -1522,6 +1547,7 @@ module LedgerStore =
         if prefix <> "tasks" && prefix <> "agents" && prefix <> "notifications"
            && prefix <> "records/roles"
            && prefix <> "challenges"
+           && not (Regex.IsMatch(prefix, "^tasks/[A-Za-z0-9_-]+/lifecycle$"))
            && not (Regex.IsMatch(prefix, "^challenges/[a-f0-9]{32}/events$"))
            && not (Regex.IsMatch(prefix, "^challenge-waits/by-challenge/[a-f0-9]{32}$"))
            && not (Regex.IsMatch(prefix, "^challenge-waits/by-owner/[A-Za-z0-9_-]{1,160}$")) then
@@ -1534,6 +1560,29 @@ module LedgerStore =
                 |> Array.toList)
 
 
+    // First-parent additions witness historical issuance even when the edge is
+    // now deleted. Every caller MUST verify every returned path with
+    // verifiedWaitIndexAt at this same snapshot, including missing current
+    // blobs, malformed owner, and future-generation records.
+    // One Git log replaces the former unconditional ls-tree + log pair.
+    let listIssuedWaitIndexPathsAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) (prefix: string) =
+        if not (Regex.IsMatch(prefix, "^challenge-waits/by-challenge/[a-f0-9]{32}$")
+                || Regex.IsMatch(prefix, "^challenge-waits/by-owner/[A-Za-z0-9_-]{1,160}$")) then
+            Error(InvalidBinding "Issued wait-index listing needs one scoped owner or Challenge prefix.")
+        else
+            run binding.RepositoryPath
+                [ "log"; "--first-parent"; "--no-renames"; "--diff-filter=A"; "--format="
+                  "--name-only"; snapshot.Commit; "--"; prefix ]
+            |> Result.bind (fun history ->
+                let issued =
+                    history.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    |> Array.map _.Trim()
+                if issued |> Array.exists (fun path ->
+                    not (ledgerPath.IsMatch path)
+                    || path.Contains("..")
+                    || not (path.StartsWith(prefix + "/", StringComparison.Ordinal))) then
+                    Error(LedgerIntegrityError "Invalid historically issued Challenge reverse-index path.")
+                else Ok (issued |> Array.distinct |> Array.sort |> Array.toList))
     // Read-only full-tree evidence for default-off Agent => Work retirement.
     // Domain listAt readers omit ops, alerts, indexes and future record
     // families; discarding them here would silently lose migration evidence.
@@ -1736,8 +1785,21 @@ module LedgerStore =
     let readDashboardRecordsAt binding snapshot =
         readViewRecordsAt false true binding snapshot |> Result.map stripOids
 
+    // Preserve the original general reader for callers that need precisely
+    // the original canonical inbox record set.
     let readAgentInboxRecordsAt binding snapshot =
         readViewRecordsAt true false binding snapshot |> Result.map stripOids
+
+    // Reuse the inbox's pinned tree traversal for this ONE agent's
+    // optional instructions config; a missing config is proven absent
+    // without another Git invocation.
+    let readAgentInboxRecordsForAgentAt binding snapshot agentKey =
+        let configPath = "records/agent-instructions/" + agentKey + ".json"
+        let included path =
+            dashboardRecordPath true false path || path = configPath
+        readSelectedRecordsAt
+            [ "agents"; "tasks"; "notifications"; configPath ]
+            included binding snapshot |> Result.map stripOids
 
     // Challenge inbox projections consult only scoped materialized indexes.
     // Prefixes cannot escape the caller's encoded agent key. Missing indexes
@@ -2698,6 +2760,15 @@ module LedgerStore =
                request = canonicalRequestJson intent.RequestJson |}
 
     let private intentHash binding intent = digest (intentInput binding intent)
+
+    // Exact canonical request comparison for integration binding evidence.
+    // The operation must already have been read from a verified ledger snapshot.
+    let verifyIntegrationOperationIntent binding (operation: LedgerOperation) (expected: LedgerIntent) =
+        if operation.OperationId = expected.OperationId.ToString("D")
+           && operation.Actor = expected.Actor && operation.Type = expected.Kind
+           && operation.CanonicalRequestJson = intentInput binding expected
+           && operation.RequestHash = intentHash binding expected then Ok ()
+        else Error(InvalidBinding "Canonical integration evidence operation does not match its exact request.")
 
 
     let findApplied (binding: LedgerBinding) (intent: LedgerIntent) =

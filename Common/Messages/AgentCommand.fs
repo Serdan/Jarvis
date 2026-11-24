@@ -121,7 +121,8 @@ type BrowserOpenTabCommand =
 
 type BrowserCloseTabCommand = { TabRegistration: string }
 type BrowserRunInNewTabCommand =
-    { WindowRegistration: string
+    { TargetAgentId: string option
+      WindowRegistration: string
       Url: string
       ProjectName: string
       ScriptPath: string
@@ -1118,7 +1119,7 @@ module AgentCommandInfo =
             List.contains cmd.Action [ "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions" ] ->
             Some "SchedulingAdmin"
         | ReviewWriteCommand _ -> Some "Review"
-        | TaskWriteCommand cmd when cmd.Action = "SubmitIntegration" || cmd.Action = "CompleteIntegration" ->
+        | TaskWriteCommand cmd when List.contains cmd.Action [ "SubmitIntegration"; "SubmitSharedAcceptedIntegration"; "CompleteIntegration" ] ->
             Some "Integration"
         | _ -> None
 
@@ -1235,9 +1236,10 @@ module AgentCommandInfo =
         | ListJobsCommand _
         | GetClientActivityCommand _ -> false
         | LedgerReadCommand cmd when cmd.Action = "Health" -> false
-        | TaskReadCommand cmd when cmd.Action = "GetResponseAlerts" -> false
+        | TaskReadCommand cmd when cmd.Action = "GetResponseAlerts"
+                                || cmd.Action = "GetLaunchTemplate" || cmd.Action = "RenderLaunchPrompt" -> false
         | TaskWriteCommand cmd when cmd.Action = "QueueResponseAlert"
-                                  || cmd.Action = "ClearResponseAlert" -> false
+                                  || cmd.Action = "ClearResponseAlert" || cmd.Action = "SetLaunchTemplate" -> false
         | TaskWriteCommand cmd when cmd.Action = "NotifyAgent" &&
                                    not (String.IsNullOrWhiteSpace cmd.SourceRef) &&
                                    cmd.SourceRef <> cmd.ProjectName -> false

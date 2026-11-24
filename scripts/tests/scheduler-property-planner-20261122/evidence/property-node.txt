@@ -1,0 +1,25 @@
+sourceBase=dcac884fc061869572b12a03befc12f11c009f2f
+command=node --test scripts/tests/scheduler-property-planner-20261122/*.test.mjs
+exit=0
+stdout:
+✔ three real local bare Git authorities: Phase2 preserves heads but cannot prove native capacity (440.857656ms)
+✔ real remote missing assignment: no generation guessed and no dispatch (275.399778ms)
+✔ corrupted/truncated real canonical Git JSON has typed fail-closed error (381.690162ms)
+✔ real cross-project identity mismatch fails closed before planner or scheduler (333.024715ms)
+✔ source-pinned exact Phase1 and Phase2 production files (45.01997ms)
+✔ independent model against 320 seeded stateful 14-transition traces (1795.017603ms)
+✔ adversarial global and local evidence fail closed (3.014883ms)
+✔ missing source, stale generation, zero limits, uncertain reservation, and duplicate candidate (3.064378ms)
+✔ multi-client identical concurrent projections are proposals, not reservations (4.847591ms)
+✔ oracle negative control and typed error; minimal failing trace survives shrinking (4.35552ms)
+✔ Phase2 default-off diagnostic does not promote capacity or call browser effects (0.362565ms)
+ℹ tests 11
+ℹ suites 0
+ℹ pass 11
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1957.227367
+
+stderr:

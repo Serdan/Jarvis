@@ -75,6 +75,8 @@ type private TuiMode =
     | SettingsMode
     | SettingsEditMode
     | SettingsConfirmMode
+    | LaunchTemplateMode
+    | LaunchTemplateApprovalMode
 
 type private PendingPrompt =
     { Id: int
@@ -113,6 +115,23 @@ type SettingsUiAccess =
     { Load: unit -> Result<ClientConfigSnapshot, string>
       Save: ClientConfigSnapshot -> ClientStoredConfig -> Result<ClientConfigSnapshot, string>
       Effective: ClientEffectiveConfig }
+
+type LaunchTemplateEditSnapshot =
+    { LaunchProjectName: string
+      ProjectId: Guid
+      LedgerId: Guid
+      Epoch: int
+      Version: int
+      Template: string }
+
+type LaunchTemplateEditFailure =
+    | TemplateStale of string
+    | TemplateRejected of string
+    | TemplateUncertain of string
+
+type LaunchTemplateUiAccess =
+    { Load: string -> Result<LaunchTemplateEditSnapshot, string>
+      Save: LaunchTemplateEditSnapshot -> Guid -> string -> Result<unit, LaunchTemplateEditFailure> }
 
 type ConsoleTui(?activityLog: ActivityLog.Store) =
     let syncRoot = obj()
@@ -207,6 +226,17 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let mutable settingsEditing = ""
     let mutable settingsError: string option = None
     let mutable settingsReturnMode = ActivityMode
+    let mutable launchTemplateAccess: LaunchTemplateUiAccess option = None
+    let mutable launchProject = ""
+    let mutable launchSnapshot: LaunchTemplateEditSnapshot option = None
+    let mutable launchDraft = ""
+    let mutable launchBusy = false
+    let mutable launchNotice = ""
+    let mutable launchPending: Guid option = None
+    let mutable launchScroll = 0
+    let mutable launchNeedsReload = false
+    let mutable launchApprovalId: int option = None
+    let mutable launchApprovalScroll = 0
     let mutable connectionState = Disconnected
     let mutable serverHost = "-"
     let maxHistory = 500
@@ -238,9 +268,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
     let currentModeIs tab =
         match tab, mode with
-        | SwitchActivity, (ActivityMode | FilterMode | CopyRecentMode | PermissionMode) -> true
+        | SwitchActivity, (ActivityMode | FilterMode | CopyRecentMode | PermissionMode | LaunchTemplateApprovalMode) -> true
         | SwitchWork, (WorkMode | WorkFilterMode) -> true
-        | SwitchAgents, (AgentsMode | AgentFilterMode) -> true
+        | SwitchAgents, (AgentsMode | AgentFilterMode | LaunchTemplateMode) -> true
         | SwitchJobs, (JobsMode | JobDetailsMode | JobCancelMode | JobFilterMode) -> true
         | SwitchChallenges, (ChallengesMode | ChallengeReplyMode) -> true
         | SwitchSettings, (SettingsMode | SettingsEditMode | SettingsConfirmMode) -> true
@@ -986,6 +1016,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         writeHotkeyToken "#"; draw.Write " project, "
         writeHotkeyToken "@"; draw.Write " agent, "
         writeMnemonic 'r' "refresh"; draw.Write ", "
+        if launchTemplateAccess.IsSome then writeMnemonic 't' "launch template"; draw.Write ", "
         writeMnemonic 'p' "permissions"; draw.Write ", "
         writeHotkeyToken "Esc"; draw.Write " activity, "
         writeMnemonic 'q' "quit"; draw.WriteLine "  • mouse: click/select, double-click/details, wheel/scroll"
@@ -1476,6 +1507,51 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         settingsError |> Option.iter (fun error -> draw.WriteLine(trim (safe error) width))
         if prompts.Count > 0 then draw.WriteLine $"{prompts.Count} permission requests pending (p to review)."
 
+    let launchApprovalUnsafe () =
+        prompts
+        |> Seq.tryPick (fun p ->
+            match launchApprovalId, p.Command with
+            | Some id, TaskWriteCommand cmd when id = p.Id && cmd.Action = "SetLaunchTemplate" -> Some(p, cmd)
+            | _ -> None)
+
+    let renderLaunchApprovalUnsafe width =
+        let safe = JobView.safeLine
+        match launchApprovalUnsafe () with
+        | None -> draw.WriteLine "This permission request is no longer pending. Esc returns."
+        | Some (prompt, cmd) ->
+            draw.WriteLine(trim (safe (sprintf "Approve project launch template for %s (v%d -> v%d)" cmd.ProjectName cmd.ExpectedVersion (cmd.ExpectedVersion + 1))) width)
+            draw.WriteLine(trim (safe (sprintf "Request #%d / operation %s" prompt.Id cmd.OperationId)) width)
+            draw.WriteLine "Y approve once | D deny | F6 copy exact body | Esc back"
+            draw.WriteLine "Up/Down scroll. This changes future sessions, not existing submissions."
+            let body = if isNull cmd.Html then "(null)" else cmd.Html
+            let lines = wrappedLines width body
+            let rows = max 1 (TerminalLayout.availableRows draw.Height draw.CursorTop 2)
+            launchApprovalScroll <- min (max 0 (lines.Length - rows)) (max 0 launchApprovalScroll)
+            draw.WriteLine(sprintf "Body lines %d-%d of %d" (launchApprovalScroll + 1) (min lines.Length (launchApprovalScroll + rows)) lines.Length)
+            lines |> List.skip launchApprovalScroll |> List.truncate rows |> List.iter (safe >> draw.WriteLine)
+
+    let renderLaunchTemplateUnsafe width =
+        let safe = JobView.safeLine
+        draw.WriteLine(trim (safe ("Project launch template: " + launchProject)) width)
+        match launchSnapshot with
+        | Some snapshot ->
+            draw.WriteLine(trim (sprintf "Ledger %O / epoch %d, version %d" snapshot.LedgerId snapshot.Epoch snapshot.Version) width)
+        | None -> ()
+        draw.WriteLine "F2 save/retry | F5 reload (discard draft) | F6 copy | Esc back"
+        draw.WriteLine "Append/paste text, Enter newline, Backspace, Ctrl+U clear; Up/Down scroll."
+        if launchBusy then draw.WriteLine "Ledger operation in progress..."
+        if launchNeedsReload then draw.WriteLine "Version changed: copy draft if needed, then reload before saving."
+        launchPending |> Option.iter (fun op -> draw.WriteLine(trim (sprintf "Pending exact operation: %O" op) width))
+        if launchNotice <> "" then
+            wrappedLines width launchNotice |> List.truncate 3 |> List.iter (safe >> draw.WriteLine)
+        let lines =
+            launchDraft.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n')
+            |> Array.toList
+            |> List.collect (fun line -> if line = "" then [""] else wrappedLines width line)
+        let rows = max 1 (TerminalLayout.availableRows draw.Height draw.CursorTop 1)
+        launchScroll <- min (max 0 (lines.Length - rows)) (max 0 launchScroll)
+        lines |> List.skip launchScroll |> List.truncate rows |> List.iter (safe >> draw.WriteLine)
+
     let workRowsUnsafe () = WorkDashboardView.visibleRows workFilter workProjects
 
     let normalizeWorkSelectionUnsafe () =
@@ -1577,12 +1653,14 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     writeActivityHotkeys()
                 | PermissionMode ->
                     writePermissionHotkeys()
+                | LaunchTemplateApprovalMode -> draw.WriteLine "Explicit operator approval"
                 | FilterMode ->
                     writeFilterHotkeys()
                 | CopyRecentMode ->
                     writeCopyRecentHotkeys()
                 | AgentsMode ->
                     writeAgentHotkeys()
+                | LaunchTemplateMode -> draw.WriteLine "Operator project configuration"
                 | WorkMode -> writeWorkHotkeys()
                 | WorkFilterMode -> writeFilterHotkeys()
                 | AgentFilterMode ->
@@ -1601,10 +1679,12 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             match mode with
             | PermissionMode ->
                 renderPermissionRequestsUnsafe width
+            | LaunchTemplateApprovalMode -> renderLaunchApprovalUnsafe width
             | WorkMode | WorkFilterMode ->
                 renderWorkUnsafe width
             | AgentsMode | AgentFilterMode ->
                 renderAgentsUnsafe width
+            | LaunchTemplateMode -> renderLaunchTemplateUnsafe width
             | JobsMode | JobDetailsMode | JobCancelMode | JobFilterMode ->
                 renderJobsUnsafe width
             | ChallengesMode | ChallengeReplyMode ->
@@ -1663,6 +1743,64 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             previousFrame <- None
             frameSize <- 0, 0
             lastRenderError <- Some ex.Message
+
+    let loadLaunchTemplateUnsafe project =
+        if not launchBusy && launchPending.IsNone then
+            launchBusy <- true
+            launchProject <- project
+            launchNotice <- ""
+            launchSnapshot <- None
+            launchNeedsReload <- true
+            mode <- LaunchTemplateMode
+            let provider = launchTemplateAccess
+            Task.Run(Action(fun () ->
+                let result =
+                    try
+                        match provider with
+                        | Some access -> access.Load project
+                        | None -> Error "Operator launch-template access unavailable."
+                    with ex -> Error ex.Message
+                lock syncRoot (fun () ->
+                    launchBusy <- false
+                    match result with
+                    | Ok snapshot ->
+                        launchSnapshot <- Some snapshot
+                        launchDraft <- snapshot.Template
+                        launchScroll <- 0
+                        launchNeedsReload <- false
+                    | Error error -> launchNotice <- error
+                    renderUnsafe()))) |> ignore
+
+    let saveLaunchTemplateUnsafe () =
+        match launchTemplateAccess, launchSnapshot with
+        | Some access, Some snapshot when not launchBusy && not launchNeedsReload ->
+            let operationId = launchPending |> Option.defaultWith Guid.NewGuid
+            launchPending <- Some operationId
+            launchBusy <- true
+            launchNotice <- ""
+            let body = launchDraft
+            Task.Run(Action(fun () ->
+                let result =
+                    try access.Save snapshot operationId body
+                    with ex -> Error(TemplateUncertain ex.Message)
+                lock syncRoot (fun () ->
+                    launchBusy <- false
+                    match result with
+                    | Ok () ->
+                        launchPending <- None
+                        launchSnapshot <- None
+                        launchNeedsReload <- true
+                        launchNotice <- "Saved. Reload to inspect the new canonical version."
+                    | Error(TemplateStale error) ->
+                        launchPending <- None
+                        launchNeedsReload <- true
+                        launchNotice <- error
+                    | Error(TemplateRejected error) ->
+                        launchPending <- None
+                        launchNotice <- error
+                    | Error(TemplateUncertain error) -> launchNotice <- error + " Retry F2 with the same operation; editing is locked."
+                    renderUnsafe()))) |> ignore
+        | _ -> ()
 
     let startChallengeRefreshUnsafe () =
         if not challengeRefreshing then
@@ -1902,7 +2040,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             | _ -> ()
         | Click(x, y) ->
             // Never let a click abandon a modal edit/approval confirmation.
-            if not (List.contains mode [ SettingsEditMode; SettingsConfirmMode
+            if not (List.contains mode [ SettingsEditMode; SettingsConfirmMode; LaunchTemplateMode; LaunchTemplateApprovalMode
                                          JobCancelMode; CopyRecentMode
                                          WorkFilterMode; AgentFilterMode; JobFilterMode; FilterMode ]) then
                 mouseHits
@@ -1971,12 +2109,22 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 else
                     let index = selectedPrompt |> max 0 |> min (prompts.Count - 1)
                     let prompt = prompts[index]
-                    prompts.RemoveAt index
-                    selectedPrompt <- selectedPrompt |> min (prompts.Count - 1) |> max 0
-                    if prompts.Count = 0 then
-                        mode <- permissionReturnMode
-                    renderUnsafe()
-                    Some prompt.Completion)
+                    match prompt.Command, approval with
+                    | TaskWriteCommand cmd, (AllowOnce | AllowExactForSession | AllowExecutableForSession)
+                        when cmd.Action = "SetLaunchTemplate" && mode <> LaunchTemplateApprovalMode ->
+                        launchApprovalId <- Some prompt.Id
+                        launchApprovalScroll <- 0
+                        mode <- LaunchTemplateApprovalMode
+                        renderUnsafe()
+                        None
+                    | _ ->
+                        prompts.RemoveAt index
+                        selectedPrompt <- selectedPrompt |> min (prompts.Count - 1) |> max 0
+                        if prompts.Count = 0 then mode <- permissionReturnMode
+                        elif mode = LaunchTemplateApprovalMode then mode <- PermissionMode
+                        launchApprovalId <- None
+                        renderUnsafe()
+                        Some prompt.Completion)
 
         completion |> Option.iter (fun tcs -> tcs.TrySetResult approval |> ignore)
 
@@ -2052,6 +2200,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
     member _.SetSettingsAccess(access: SettingsUiAccess) =
         lock syncRoot (fun () -> settingsAccess <- Some access)
+
+    member _.SetLaunchTemplateAccess(access: LaunchTemplateUiAccess) =
+        lock syncRoot (fun () -> launchTemplateAccess <- Some access)
 
     member _.SetChallengeAccess(access: OperatorChallengeUiAccess) =
         lock syncRoot (fun () ->
@@ -2363,6 +2514,56 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                             challengeDetailScroll <- Int32.MaxValue
                                         | _ -> ()
                                     renderUnsafe())
+                            elif mode = LaunchTemplateApprovalMode then
+                                lock syncRoot (fun () ->
+                                    match keyInfo.Key with
+                                    | ConsoleKey.Escape ->
+                                        mode <- PermissionMode
+                                        launchApprovalId <- None
+                                    | ConsoleKey.UpArrow -> launchApprovalScroll <- max 0 (launchApprovalScroll - 1)
+                                    | ConsoleKey.DownArrow -> launchApprovalScroll <- launchApprovalScroll + 1
+                                    | ConsoleKey.F6 ->
+                                        launchApprovalUnsafe()
+                                        |> Option.iter (fun (_, cmd) -> if not (isNull cmd.Html) then Clipboard.copyText cmd.Html |> ignore)
+                                    | ConsoleKey.Y | ConsoleKey.D ->
+                                        match launchApprovalUnsafe() with
+                                        | Some(prompt, _) ->
+                                            match prompts |> Seq.tryFindIndex (fun p -> p.Id = prompt.Id) with
+                                            | Some index ->
+                                                selectedPrompt <- index
+                                                completeSelected (if keyInfo.Key = ConsoleKey.Y then AllowOnce else PermissionApproval.Deny)
+                                            | None -> ()
+                                        | None -> ()
+                                    | _ -> ()
+                                    renderUnsafe())
+                            elif mode = LaunchTemplateMode then
+                                lock syncRoot (fun () ->
+                                    let editable = not launchBusy && launchPending.IsNone && not launchNeedsReload
+                                    let append value =
+                                        let next = launchDraft + value
+                                        if System.Text.Encoding.UTF8.GetByteCount(next) <= 32768 then
+                                            launchDraft <- next
+                                            launchScroll <- Int32.MaxValue
+                                    match keyInfo.Key with
+                                    | ConsoleKey.F2 -> saveLaunchTemplateUnsafe()
+                                    | ConsoleKey.F5 when not launchBusy && launchPending.IsNone -> loadLaunchTemplateUnsafe launchProject
+                                    | ConsoleKey.F6 ->
+                                        match Clipboard.copyText launchDraft with
+                                        | Ok _ -> launchNotice <- "Draft copied."
+                                        | Error error -> launchNotice <- error
+                                    | ConsoleKey.Escape when not launchBusy && launchPending.IsNone -> mode <- AgentsMode
+                                    | ConsoleKey.UpArrow -> launchScroll <- max 0 (launchScroll - 1)
+                                    | ConsoleKey.DownArrow -> launchScroll <- launchScroll + 1
+                                    | ConsoleKey.U when editable && keyInfo.Modifiers.HasFlag ConsoleModifiers.Control ->
+                                        launchDraft <- ""; launchScroll <- 0
+                                    | ConsoleKey.Enter when editable -> append "\n"
+                                    | ConsoleKey.Backspace when editable && launchDraft.Length > 0 ->
+                                        let n = launchDraft.Length
+                                        let count = if n >= 2 && Char.IsSurrogatePair(launchDraft, n - 2) then 2 else 1
+                                        launchDraft <- launchDraft.Substring(0, n - count)
+                                    | _ when editable && not (Char.IsControl keyInfo.KeyChar) -> append (string keyInfo.KeyChar)
+                                    | _ -> ()
+                                    renderUnsafe())
                             elif mode = SettingsEditMode then
                                 lock syncRoot (fun () ->
                                     match keyInfo.Key with
@@ -2636,6 +2837,15 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                         mode <- AgentsMode
                                         normalizeAgentSelectionUnsafe()
                                         startAgentRefreshUnsafe()
+                                        renderUnsafe())
+                                | _, ConsoleKey.T when mode = AgentsMode ->
+                                    lock syncRoot (fun () ->
+                                        match selectedAgentUnsafe(), launchTemplateAccess with
+                                        | Some row, Some _ ->
+                                            launchDraft <- ""
+                                            launchScroll <- 0
+                                            loadLaunchTemplateUnsafe row.Project
+                                        | _ -> ()
                                         renderUnsafe())
                                 | ('/', _) | (_, ConsoleKey.F) when mode = AgentsMode ->
                                     lock syncRoot (fun () ->

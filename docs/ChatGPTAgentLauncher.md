@@ -89,7 +89,7 @@ Example **implemented immediate command**:
   "url": "https://chatgpt.com/",
   "projectName": "Jarvis",
   "scriptPath": "browser-scripts/chatgpt/launchAgent.js",
-  "argsJson": "{\"role\":\"worker\",\"agentId\":\"3\",\"projectName\":\"Wayfold\",\"prompt\":\"You are Worker 3. Read the latest Jarvis assignment, relevant AGENTS.md, task and spec. Follow current instructions and continue the assigned work; do not assume previous conversation state. End with the required checkpoint/Next line.\"}",
+  "argsJson": "{\"prompt\":\"You are Worker 3. Read the latest Jarvis assignment, relevant AGENTS.md, task and spec. Follow current instructions and continue the assigned work; do not assume previous conversation state. End with the required checkpoint/Next line.\"}",
   "active": false,
   "closeTabAfterExecution": true
 }
@@ -97,14 +97,14 @@ Example **implemented immediate command**:
 
 The payload is an *example*, not an instruction to hard-code a specific project, worker, prompt, role, gizmo ID, or account. The launcher accepts all agent-specific strings from arguments. One launch has one explicit message; arbitrary strings supplied as arguments must never be evaluated as JavaScript.
 
-Recommended argument contract:
+Supported argument contract (unknown keys are rejected; no secrets):
 
 | Field | Required | Meaning |
 | --- | --- | --- |
-| `prompt` | Yes | Exact bootstrap text to submit; nonempty, bounded, may contain newlines |
-| `role` / `agentId` / `projectName` | No | Caller-owned metadata for logs/correlation; **not** alternative sources of instructions |
+| `prompt` | Yes | Exact bootstrap text to submit; nonempty, at most 24,000 UTF-16 code units, may contain newlines |
+| `confirmedSubmittedPrompts` | No | Historical ignored non-secret prior-send hint; not proof of submission or authority |
 | `timeoutMs` | No | One overall UI deadline for hydration, insertion, submission confirmation and conversation URL capture (defaults to 27 s; capped at 27 s) |
-| `debug` | No | Reserved for future diagnostics; the current script always returns only sanitized structural counts on compatibility errors |
+| `selectionOnly` | No | Diagnostic mode selection without sending |
 
 Jarvis browser-workflow parameters, **not** ChatGPT script arguments, control `windowRegistration`, `active`, `closeTabAfterExecution`, and device selection. Only **scheduled** calls have delay and repeat interval. An orchestrator normally invokes the immediate workflow, rather than scheduling a zero-delay job.
 

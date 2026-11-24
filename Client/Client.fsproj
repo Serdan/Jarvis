@@ -95,8 +95,10 @@
         <Compile Include="Modules\WorkQueueCanonicalMigrationPrepare.fs"/>
         <Compile Include="Modules\WorkQueueProjectMigrationPrepare.fs"/>
         <Compile Include="Modules\WorkQueueMultiLedgerPreparedRecovery.fs"/>
+        <Compile Include="Modules\BrowserArguments.fs"/>
         <Compile Include="Modules\RoleInstructions.fs"/>
         <Compile Include="Modules\\ReviewWorkflow.fs"/>
+        <Compile Include="Modules\NativeSchedulerAccountReservation.fs"/>
         <Compile Include="Modules\WorkCompositionAcceptanceAdapter.fs"/>
         <Compile Include="Modules\WorkCompositionOperatorInputs.fs"/>
         <Compile Include="Modules\WorkCompositionQueueBinder.fs"/>
@@ -120,6 +122,7 @@
         <Compile Include="Modules\WorkQueueDurableLaunchIntent.fs"/>
         <Compile Include="Modules\WorkQueueReactiveWake.fs"/>
         <Compile Include="Modules\WorkQueueSchedulerHostLoop.fs"/>
+        <Compile Include="AutomationChallengeWakeAdapter.fs"/>
         <Compile Include="Modules\WorkQueueSchedulerHeadBinding.fs"/>
         <Compile Include="Modules\WorkQueueVerifiedDispatchAdapter.fs"/>
         <Compile Include="Modules\WorkQueueNativePrivateHostBridge.fs"/>

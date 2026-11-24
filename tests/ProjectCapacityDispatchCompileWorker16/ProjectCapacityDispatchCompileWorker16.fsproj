@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+<PropertyGroup><TargetFramework>net11.0</TargetFramework><AssemblyName>Client.Tests</AssemblyName></PropertyGroup>
+<ItemGroup><ProjectReference Include="../../Client/Client.fsproj" />
+<Compile Include="../../Client/Modules/ProjectCapacityAdmission.fs" Link="ProjectCapacityAdmission.fs" />
+<Compile Include="../../Client/Modules/ProjectCapacityDispatchTransition.fs" Link="ProjectCapacityDispatchTransition.fs" />
+</ItemGroup></Project>

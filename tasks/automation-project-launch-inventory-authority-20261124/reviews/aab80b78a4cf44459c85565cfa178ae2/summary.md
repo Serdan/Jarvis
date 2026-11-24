@@ -1,0 +1,1 @@
+Disposable state model only; no production issuer, persistence, fence, integration or cutover. dotnet fsi tests/ProjectInventoryWorker16/Tests.fsx passed. W21 same-CAS composition blocked in challenge 5bf69a0d738442f28dc8374dfc6b182e.

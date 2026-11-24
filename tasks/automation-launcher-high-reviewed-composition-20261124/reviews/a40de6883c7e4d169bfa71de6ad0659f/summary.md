@@ -1,1 +1,13 @@
+## Author submission
+
 Exact accepted base 5d0656784b3107480318b2fb842cf7b67a2f2c47. Latest High default, explicit latest-high/latest-medium, named closed trigger proof and Escape dismissal, retained final identity proof and route/multiline semantics. 148/148 offline Node tests passed, exit 0. Clean tree 02992288a79e062d137c5059b6ab477b47606e77, script SHA256 a36dc1c0e3bfc314ff39abdcd37676029dc594a9d5f7ffbbc25523311ed239fb. Checkpoint 13397. No live send/deployment or Operator checkout edits.
+
+## Independent review — Accepted
+
+Frozen ref independently resolved on origin to `c5c2666a804fd3cb37a6927e4542fe9f19c47170`. Exact parent `5d0656784b3107480318b2fb842cf7b67a2f2c47`; tree `02992288a79e062d137c5059b6ab477b47606e77`; launcher SHA-256 `a36dc1c0e3bfc314ff39abdcd37676029dc594a9d5f7ffbbc25523311ed239fb`. Reviewed against canonical spec blob `8d36eda5b9f3919bf12aa8b2e12a84b25a5601c9`.
+
+The delta stays within the three leased files. Default Chat Latest High, Work Terra Medium and Chat Latest Instant fallback order are explicit; explicit Medium and other named overrides remain strict. Closed picker proof requires exact named effort, matching attribute, closed trigger and no open model menu. Escape has a bounded trigger fallback; no contradictory label authorizes Send. Checked model identity is renewed after insertion, with final same-trigger/composer/mode/send-control identity and exact prompt readback before the sole click. Trigger replacement requires another proof. Causal route-local and multiline clipboard/readback paths are preserved. Observation describes rendered UI labels only, not provider execution. No new wire or client changes.
+
+Independent verification on clean registered worktree at frozen SHA: git diff --check exit 0; complete node --test browser-extension/tests/chatgpt-launcher.test.cjs exit 0, no timeout (job 3d37016005cd4b13aa4670f381081a2c; output clipped by capture so no independent total count asserted). Focused seven new tests passed 7/7, including Escape and fallback, inability to close, stale label before/after insertion, explicit Medium and compressed Pro. Existing suite includes same-effort drift, trigger replacement, multiline, no replay and project/sidebar route tests. No actionable defect found in scoped delta.
+
+Evidence boundary: offline source and fixture acceptance only. No live browser launches, settings changes, actual provider effort verification, deployment or modification of the Operator checkout. No causal claim about premature final responses or durable executed-script provenance. Rollout remains separately authorized.

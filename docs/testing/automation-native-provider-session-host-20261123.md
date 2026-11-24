@@ -457,3 +457,9 @@ account-fence generation, capacity reuse, wrong/replay evidence and
 two-client begin-send versus exclusion race under the actual runtime
 dispatch lease, then record fresh W16 source review. The 84 existing
 passing focused tests do not establish a genuine successful release.
+
+### Corrected account envelope composition (2026-11-24)
+
+The independently Accepted W12 correction f94bbceff4203538c7fc70add7c1d50d8bca598d (review bfb7752413cc4efa93a823c07126a0af, decision 13710, tree 04127fc8522a511e7b8be643637ed9ea0f9cda41) was cherry-picked onto disposable QA 62642b081fcc4461468ffd6edac2371a4ea53796, yielding 240463d56; W23 accepted source remains 6bb5998af609014fc0c4c69c501f028d827dead2. No constituent or W16 source ownership is transferred. Full host Release job b33095f861794740b0c3d8ad29f69040 passed 29/29, including the four formerly failing original-bound Worker/Reviewer preclaim and held-fence release cases and their same-operation replay and wrong-blob denial. A subsequent disposable fixture change at QA 11d42d621 adds distinct real Worker attempt and Reviewer claim capacity reuse after release and confirms the original exclusion still rejects claim; filtered Release job da31a44185af46d8b8674ad9c80be205 passed 4/4. An initial reuse test incorrectly reused the same canonical attempt/review and failed 4/4 (job 210a9de530414373a5c6ab9fde8925b0); distinct identities correct the fixture, not production source.
+
+W23 standalone exclusion suite passed 8/8, job f39ff704887f4cd4a95ee182db35e3dd, including two-clone preclaim and held begin-send/exclusion races. These are planner-level race tests, not proof that the actual runtime dispatch path invokes begin-send: Worker 19 owns that separate registration and remains the runtime composition dependency. The first filtered host build matched zero tests (job 9c8695671bfd4a9faa445a5a9a71e0d3); it is not counted. No live send, reservation, release, deployment or activation occurred.

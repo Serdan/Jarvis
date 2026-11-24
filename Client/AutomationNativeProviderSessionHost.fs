@@ -13,14 +13,11 @@ open Client.AutomationNativeAccountProjectIngress
 // not ChatGPT provider session/turn identity. A registered tab/window, script
 // acknowledgement, URL, disappearance or DOM stop control is never a terminal.
 type NativeHostHold =
-    | AccountAuthorityUnavailable
     | ProviderFirstConnectionUnavailable
     | ProviderTerminalUnavailable
-    | ReviewerIngressUnavailable
 
 let productionHolds () =
-    [ AccountAuthorityUnavailable; ProviderFirstConnectionUnavailable
-      ProviderTerminalUnavailable; ReviewerIngressUnavailable ]
+    [ ProviderFirstConnectionUnavailable; ProviderTerminalUnavailable ]
 
 [<CLIMutable>]
 type OriginalLaunchIntent =
@@ -115,18 +112,14 @@ let internal renderReviewerArgumentsAt (project: LedgerBinding) (snapshot: Ledge
                              Arguments = arguments
                              ArgumentsSha256 = NativeSchedulerRosterPolicy.sha256 arguments })))
 
-// This is explicitly the accepted *signed disposable* account authority. No
-// production grant, reservation, script execution or second dispatcher exists
-// here. The entire original prompt envelope is pinned in the same project CAS
-// as the Started ingress; losing/replaying it never authorizes another send.
-let internal prepareVerifiedDisposable root (account: AccountBinding) operatorKey subject
-                                       (projects: LedgerBinding array)
-                                       (coverage: NativeDisposableCoverage)
-                                       (bridge: BrowserBridge.Service)
-                                       projectName timeoutMs (claim: StartedProjectClaim) =
+// Prepare the original immutable launch envelope using the actual configured
+// account and project bindings. This is a project CAS, not a provider send.
+let internal prepareWorker (account: AccountBinding) (projects: LedgerBinding array)
+                           (coverage: NativeAccountCoverage) (bridge: BrowserBridge.Service)
+                           projectName timeoutMs (claim: StartedProjectClaim) =
     if isNull (box claim) || isNull (box claim.Candidate) || isNull projects
-       || isNull (box coverage) then bad "Missing original claim or signed coverage."
-    elif claim.Candidate.Kind <> "Worker" then bad "Reviewer requires separately verified claim/lease ingress."
+       || isNull (box coverage) then bad "Missing original claim or configured coverage."
+    elif claim.Candidate.Kind <> "Worker" then bad "Reviewer requires the distinct claim ingress."
     elif timeoutMs < 100 || timeoutMs > 27000 then bad "Invalid full launch argument timeout."
     else
         let c = claim.Candidate
@@ -137,58 +130,94 @@ let internal prepareVerifiedDisposable root (account: AccountBinding) operatorKe
             match observedWindowOwner bridge claim.WindowRegistration with
             | Error e -> Error e
             | Ok (connectionId, windowGeneration) ->
-                match NativeSchedulerAccountReservation.readVerifiedDisposable
-                        root account operatorKey subject projects coverage with
-                | Error e -> bad (sprintf "Verified disposable account unavailable: %A" e)
-                | Ok (accountSnapshot, state) ->
-                    if accountSnapshot.Head <> claim.AccountHead then stale "Original account head changed."
-                    else
-                        match state.Records |> Array.tryFind (fun r ->
-                            r.OriginalOperationId = string claim.OriginalReservationOperationId) with
-                        | Some record when record.Candidate = c && record.Status = "Reserved"
-                                           && record.Generation > 0L ->
-                            match LedgerStore.fetch project with
-                            | Error e -> Error e
-                            | Ok snapshot when snapshot.Commit <> claim.ExpectedProjectHead ->
-                                stale "Original project head changed; never rerender for a replacement attempt."
-                            | Ok snapshot ->
-                                match RoleInstructions.RoleInstructions.renderLaunchPromptAt
-                                        project snapshot projectName c.OwnerAgentId with
-                                | Error e -> Error e
-                                | Ok rendered ->
-                                    let arguments = json {| prompt = rendered.Prompt; timeoutMs = timeoutMs |}
-                                    if not (BrowserArguments.fits arguments) then
-                                        bad "Full serialized browser launch arguments exceed bridge budget."
-                                    else
-                                        match observedWindowOwner bridge claim.WindowRegistration with
-                                        | Ok (currentOwner, currentGeneration) when currentOwner = connectionId && currentGeneration = windowGeneration ->
-                                            let intent =
-                                                { SchemaVersion = 2; ProjectName = rendered.ProjectName
-                                                  Claim = claim; AccountGeneration = record.Generation
-                                                  CanonicalKey = record.CanonicalKey
-                                                  TemplateVersion = rendered.TemplateVersion
-                                                  TemplateBlobOid = rendered.TemplateBlobOid
-                                                  PromptSha256 = rendered.PromptSha256
-                                                  ArgumentsSha256 = NativeSchedulerRosterPolicy.sha256 arguments
-                                                  ObservedConnectionId = connectionId
-                                                  ObservedWindowGeneration = windowGeneration
-                                                  State = "HeldBeforeSend" }
-                                            let change =
-                                                { Path = intentPath effectId; ExpectedBlobOid = None
-                                                  Content = json intent }
-                                            // Keep the exact wire bytes separate: a valid 64 KiB envelope
-                                            // must not grow past the ledger entity bound through JSON escaping.
-                                            let argumentChange =
-                                                { Path = argumentsPath effectId; ExpectedBlobOid = None
-                                                  Content = arguments }
-                                            claimVerifiedDisposableWithLaunchIntent root account operatorKey subject
-                                                projects coverage claim change argumentChange
-                                            |> Result.bind (fun write ->
-                                                if write.AlreadyApplied then stale "Original launch intent already committed; do not replay."
-                                                else Ok write)
-                                        | _ -> stale "Browser window registration changed during preparation."
-                        | _ -> stale "Original native reservation missing, stale or foreign."
+                match verifiedReservation account projects coverage claim.AccountHead claim.OriginalReservationOperationId c with
+                | Error e -> Error e
+                | Ok record ->
+                    match LedgerStore.fetch project with
+                    | Error e -> Error e
+                    | Ok snapshot when snapshot.Commit <> claim.ExpectedProjectHead ->
+                        stale "Original project head changed; never rerender for a replacement attempt."
+                    | Ok snapshot ->
+                        match RoleInstructions.RoleInstructions.renderLaunchPromptAt
+                                project snapshot projectName c.OwnerAgentId with
+                        | Error e -> Error e
+                        | Ok rendered ->
+                            let arguments = json {| prompt = rendered.Prompt; timeoutMs = timeoutMs |}
+                            if not (BrowserArguments.fits arguments) then
+                                bad "Full serialized browser launch arguments exceed bridge budget."
+                            else
+                                match observedWindowOwner bridge claim.WindowRegistration with
+                                | Ok (currentOwner, currentGeneration) when currentOwner = connectionId && currentGeneration = windowGeneration ->
+                                    let intent =
+                                        { SchemaVersion = 2; ProjectName = rendered.ProjectName
+                                          Claim = claim; AccountGeneration = record.Generation
+                                          CanonicalKey = record.CanonicalKey
+                                          TemplateVersion = rendered.TemplateVersion
+                                          TemplateBlobOid = rendered.TemplateBlobOid
+                                          PromptSha256 = rendered.PromptSha256
+                                          ArgumentsSha256 = NativeSchedulerRosterPolicy.sha256 arguments
+                                          ObservedConnectionId = connectionId
+                                          ObservedWindowGeneration = windowGeneration
+                                          State = "HeldBeforeSend" }
+                                    let change =
+                                        { Path = intentPath effectId; ExpectedBlobOid = None
+                                          Content = json intent }
+                                    // Keep the exact wire bytes separate: a valid 64 KiB envelope
+                                    // must not grow past the ledger entity bound through JSON escaping.
+                                    let argumentChange =
+                                        { Path = argumentsPath effectId; ExpectedBlobOid = None
+                                          Content = arguments }
+                                    claimStartedWithLaunchIntent account projects coverage claim change argumentChange
+                                    |> Result.bind (fun write ->
+                                        if write.AlreadyApplied then stale "Original launch intent already committed; do not replay."
+                                        else Ok write)
+                                | _ -> stale "Browser window registration changed during preparation."
         | _ -> bad "Invalid original effect UUID or foreign project binding."
+
+// Distinct review claim; the shared account verifier and canonical review
+// validator run again inside the same project CAS as the immutable envelope.
+let internal prepareReviewer (account: AccountBinding) (projects: LedgerBinding array)
+                             (coverage: NativeAccountCoverage) (bridge: BrowserBridge.Service)
+                             projectName timeoutMs (claim: ReviewerProjectClaim) =
+    reviewerFencePath claim
+    |> Result.bind (fun _ ->
+        let c = claim.ReviewCandidate
+        if isNull projects || isNull (box coverage) then bad "Missing configured coverage."
+        else
+            match projects |> Array.tryFind (fun p ->
+                string p.ProjectId = c.ProjectId && string p.LedgerId = c.ProjectLedgerId
+                && p.Epoch = c.ProjectEpoch) with
+            | None -> bad "Foreign reviewer project binding."
+            | Some project ->
+                let effectId = Guid.Parse c.EffectOperationId
+                observedWindowOwner bridge claim.WindowRegistration
+                |> Result.bind (fun (connectionId, windowGeneration) ->
+                    verifiedReservation account projects coverage claim.AccountHead claim.OriginalReservationOperationId c
+                    |> Result.bind (fun record ->
+                        LedgerStore.fetch project
+                        |> Result.bind (fun snapshot ->
+                            renderReviewerArgumentsAt project snapshot projectName timeoutMs claim
+                            |> Result.bind (fun rendering ->
+                                match observedWindowOwner bridge claim.WindowRegistration with
+                                | Ok (owner, generation) when owner = connectionId && generation = windowGeneration ->
+                                    let rendered = rendering.Rendered
+                                    let intent =
+                                        { SchemaVersion = 1; ProjectName = rendered.ProjectName
+                                          Claim = claim; AccountGeneration = record.Generation
+                                          CanonicalKey = record.CanonicalKey
+                                          TemplateVersion = rendered.TemplateVersion; TemplateBlobOid = rendered.TemplateBlobOid
+                                          PromptSha256 = rendered.PromptSha256; ArgumentsSha256 = rendering.ArgumentsSha256
+                                          AgentConfigVersion = rendering.AgentConfigVersion
+                                          InstructionProvenanceSha256 = rendering.InstructionProvenanceSha256
+                                          ObservedConnectionId = connectionId; ObservedWindowGeneration = windowGeneration
+                                          State = "HeldBeforeSend" }
+                                    let metadata = { Path = intentPath effectId; ExpectedBlobOid = None; Content = json intent }
+                                    let arguments = { Path = argumentsPath effectId; ExpectedBlobOid = None; Content = rendering.Arguments }
+                                    claimReviewerWithLaunchIntent account projects coverage claim metadata arguments
+                                    |> Result.bind (fun write ->
+                                        if write.AlreadyApplied then stale "Original reviewer intent already committed; do not replay."
+                                        else Ok write)
+                                | _ -> stale "Browser window registration changed during reviewer preparation.")))))
 
 // Read-only reconciliation of original intent. Origin, operation and current
 // bytes are sourced from the authoritative project lineage, not the browser.
@@ -199,7 +228,7 @@ let private readOriginalJournal (binding: LedgerBinding) (claimOperationId: Guid
         LedgerStore.fetch binding
         |> Result.bind (fun snapshot ->
             match LedgerStore.getOperationAt binding snapshot claimOperationId with
-            | Ok (Some operation) when operation.Type = operationKind
+            | Ok (Some operation) when List.contains operation.Type operationKind
                                        && Array.contains (intentPath effectId) operation.Paths
                                        && Array.contains (argumentsPath effectId) operation.Paths ->
                 match LedgerStore.getOperationOriginAt binding snapshot operation,
@@ -231,7 +260,7 @@ let private matchesProject (binding: LedgerBinding) (candidate: NativeDispatchCa
     && candidate.ProjectEpoch = binding.Epoch
 
 let internal readOriginalIntent (binding: LedgerBinding) (claimOperationId: Guid) (effectId: Guid) =
-    readOriginalJournal binding claimOperationId effectId "NativeStartedLaunchIntentDisposable"
+    readOriginalJournal binding claimOperationId effectId ["NativeStartedLaunchIntent"; "NativeStartedLaunchIntentDisposable"]
     |> Result.bind (fun (operation, origin, blob, raw, arguments) ->
         try
             use envelope = JsonDocument.Parse(operation.CanonicalRequestJson)
@@ -254,7 +283,7 @@ let internal readOriginalIntent (binding: LedgerBinding) (claimOperationId: Guid
 // reads an already-journaled historical reviewer intent, even after a later
 // release/reclaim, and checks its original typed claim and exact arguments.
 let internal readOriginalReviewerIntent (binding: LedgerBinding) (claimOperationId: Guid) (effectId: Guid) =
-    readOriginalJournal binding claimOperationId effectId "NativeReviewerLaunchIntent"
+    readOriginalJournal binding claimOperationId effectId ["NativeReviewerLaunchIntent"]
     |> Result.bind (fun (operation, origin, blob, raw, arguments) ->
         try
             use envelope = JsonDocument.Parse(operation.CanonicalRequestJson)
@@ -294,7 +323,7 @@ let releaseFromProviderTerminal () : Result<unit, NativeHostHold> =
 
 // Program and offline tests share this exact ports factory. The existing B1
 // registration remains the sole owner of the host, callback and shutdown.
-// There is no authorized production head reader or way to enable native sends.
+// The actual dispatch wiring is owned separately; this remains default-off.
 let internal defaultOffHostPorts coordinator report =
     let hold = sprintf "Native session host HOLD: %A" (productionHolds())
     report hold

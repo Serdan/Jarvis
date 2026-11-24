@@ -13,17 +13,14 @@ open Client.NativeSchedulerAccountReservation
 open Client.ReviewWorkflow
 open Client.AutomationNativeAccountProjectIngress
 
-type private SignedFixture =
+type private ConfiguredFixture =
     { Root: string
       AccountOne: AccountBinding
       AccountTwo: AccountBinding
       ProjectOne: LedgerBinding
-      ProjectTwo: LedgerBinding
-      PublicKey: byte array
-      Signer: ECDsa
-      Subject: string }
+      ProjectTwo: LedgerBinding }
 
-module private SignedFixture =
+module private ConfiguredFixture =
     let git directory args =
         use proc = new Process()
         proc.StartInfo.FileName <- "git"
@@ -65,7 +62,6 @@ module private SignedFixture =
         let root = Path.Combine(Path.GetTempPath(), "native-started-" + Guid.NewGuid().ToString("N"))
         Directory.CreateDirectory(root) |> ignore
         markPrivate root
-        File.WriteAllText(Path.Combine(root, ".wq10-disposable-fixture"), "WQ10_DISPOSABLE_FIXTURE_V1")
         try
             let scope1 = Path.Combine(root, "wq10-private-client-one")
             let scope2 = Path.Combine(root, "wq10-private-client-two")
@@ -94,12 +90,9 @@ module private SignedFixture =
             LedgerStore.initialize (project projectPath) true |> success |> ignore
             let otherProject = Path.Combine(root, "project-other-client")
             git root ["clone"; projectRemote; otherProject] |> ignore
-            use signer = ECDsa.Create(ECCurve.NamedCurves.nistP256)
             let f =
                 { Root = root; AccountOne = account acc1Path; AccountTwo = account acc2Path
-                  ProjectOne = project projectPath; ProjectTwo = project otherProject
-                  Signer = signer; PublicKey = signer.ExportSubjectPublicKeyInfo()
-                  Subject = "auth0|native-started-disposable" }
+                  ProjectOne = project projectPath; ProjectTwo = project otherProject }
             action f
         finally
             try Directory.Delete(root, true) with _ -> ()
@@ -107,7 +100,7 @@ module private SignedFixture =
     let projectBindings f account =
         if account = 1 then [| f.ProjectOne |] else [| f.ProjectTwo |]
 
-    let signedVersion f version previous accountWorkerLimit projectWorkerLimit =
+    let configureVersion f version previous accountWorkerLimit projectWorkerLimit =
         let project = f.ProjectOne
         let account = f.AccountOne
         let initial = (AccountCapacityLedger.fetch account |> success).Head
@@ -123,7 +116,6 @@ module private SignedFixture =
                   NativeSchedulerRosterPolicy.accountAuthoritySha256
                       (account.AccountId.ToString("D")) (account.LedgerId.ToString("D"))
                       account.Epoch account.ApprovedFetchUrl account.ApprovedPushUrl
-              AuthenticatedSubject = f.Subject
               Version = version; MembershipComplete = true
               AccountLimits = { Worker = accountWorkerLimit; Reviewer = 1 }
               Projects =
@@ -134,37 +126,26 @@ module private SignedFixture =
                        SourceRef = NativeSchedulerRosterPolicy.ProjectSourceRef
                        RemoteAuthoritySha256 = AccountCapacityLedger.projectAuthoritySha256 authority
                        Limits = { Worker = projectWorkerLimit; Reviewer = 1 } } |] }
-        let approval =
+        let update =
             { SchemaVersion = 1
               OperationId = Guid.NewGuid().ToString("D")
-              Actor = "Disposable signed roster issuer"
+              Actor = "Configured account fixture"
               PreviousVersion = previous
               ExpectedAccountHead = initial
-              Policy = policy
-              SignerPublicKeySha256 = NativeSchedulerRosterPolicy.keySha256 f.PublicKey
-              SignatureBase64 = "" }
-        let signed =
-            { approval with
-                SignatureBase64 =
-                    Convert.ToBase64String(
-                        f.Signer.SignData(NativeSchedulerRosterPolicy.approvalMessage approval,
-                                          HashAlgorithmName.SHA256)) }
-        AccountCapacityLedger.setVerifiedDisposableNativeRosterPolicy
-            f.Root account f.PublicKey f.Subject [| project |] signed
+              Policy = policy }
+        AccountCapacityLedger.setNativeRosterPolicy account [| project |] update
         |> success |> ignore
 
-    let signed f = signedVersion f 1L 0L 1 1
+    let configure f = configureVersion f 1L 0L 1 1
 
     let coverage f account projects =
         let projection =
-            AccountCapacityLedger.readVerifiedDisposableNativeRosterPolicy
-                f.Root account f.PublicKey f.Subject projects
+            AccountCapacityLedger.readNativeRosterPolicy account projects
         Assert.That(projection.Status, Is.EqualTo("PolicyVerified"),
                     String.concat ";" projection.HoldReasons)
         { AccountHead = projection.VerifiedAccountHead.Value
           ProjectHeads = projection.VerifiedProjectHeads
-          ObservedAtUtc = DateTimeOffset.UtcNow
-          Complete = true }
+          ObservedAtUtc = DateTimeOffset.UtcNow }
 
     let private json value =
         JsonSerializer.Serialize(value, JsonSerializerOptions(PropertyNamingPolicy=JsonNamingPolicy.CamelCase))
@@ -240,11 +221,11 @@ module private SignedFixture =
         LedgerStore.fetch project |> success |> _.Commit
 
     let reserved f =
-        signed f
+        configure f
         let c = startedWorker f
         let original = Guid.NewGuid()
-        NativeSchedulerAccountReservation.reserveVerifiedDisposable
-            f.Root f.AccountOne f.PublicKey f.Subject [| f.ProjectOne |]
+        NativeSchedulerAccountReservation.reserve
+            f.AccountOne [| f.ProjectOne |]
             (coverage f f.AccountOne [| f.ProjectOne |])
             original "Disposable native source" c
         |> success |> ignore
@@ -257,14 +238,14 @@ module private SignedFixture =
 
     let ingress f account project claim =
         let projects = [| project |]
-        Client.AutomationNativeAccountProjectIngress.claimVerifiedDisposable
-            f.Root account f.PublicKey f.Subject projects
+        Client.AutomationNativeAccountProjectIngress.claimStarted
+            account projects
             (coverage f account projects) claim
 
     let state f =
         let cover = coverage f f.AccountOne [| f.ProjectOne |]
-        NativeSchedulerAccountReservation.readVerifiedDisposable
-            f.Root f.AccountOne f.PublicKey f.Subject [| f.ProjectOne |] cover
+        NativeSchedulerAccountReservation.readVerified
+            f.AccountOne [| f.ProjectOne |] cover
         |> success |> snd
 
     let reservationProof f (claim: StartedProjectClaim) =
@@ -295,30 +276,21 @@ module private SignedFixture =
 [<TestFixture>]
 type StartedNativeIngressTests() =
     [<Test>]
-    member _.ProductionIssuerIsExplicitlyDisabled() =
-        match productionStatus () with
-        | Disabled reason -> Assert.That(reason, Does.Contain("issuer"))
-        | Enabled -> Assert.Fail("Production issuer unexpectedly enabled")
-        match productionClaim Unchecked.defaultof<LedgerBinding> Unchecked.defaultof<StartedProjectClaim> with
-        | Error(InvalidBinding _) -> ()
-        | _ -> Assert.Fail("Default-OFF production path admitted an untrusted claim")
-
-    [<Test>]
-    member _.SignedDisposableStartedWorkerWinsOneRealProjectCasAndOtherCloneLoses() =
-        SignedFixture.withGit (fun f ->
-            let c, original, claim = SignedFixture.reserved f
-            let before = (LedgerStore.fetch f.ProjectOne |> SignedFixture.success).Commit
+    member _.ConfiguredStartedWorkerWinsOneRealProjectCasAndOtherCloneLoses() =
+        ConfiguredFixture.withGit (fun f ->
+            let c, original, claim = ConfiguredFixture.reserved f
+            let before = (LedgerStore.fetch f.ProjectOne |> ConfiguredFixture.success).Commit
             Assert.That(before, Is.EqualTo(claim.ExpectedProjectHead))
-            let result = SignedFixture.ingress f f.AccountOne f.ProjectOne claim
-                         |> SignedFixture.success
+            let result = ConfiguredFixture.ingress f f.AccountOne f.ProjectOne claim
+                         |> ConfiguredFixture.success
             Assert.That(result.AlreadyApplied, Is.False)
             let loser = { claim with OperationId=Guid.NewGuid() }
-            match SignedFixture.ingress f f.AccountTwo f.ProjectTwo loser with
+            match ConfiguredFixture.ingress f f.AccountTwo f.ProjectTwo loser with
             | Error _ -> ()
             | Ok _ -> Assert.Fail("Second independent clone won stale Started project CAS")
-            let after = (LedgerStore.fetch f.ProjectTwo |> SignedFixture.success).Commit
+            let after = (LedgerStore.fetch f.ProjectTwo |> ConfiguredFixture.success).Commit
             Assert.That(after, Is.Not.EqualTo(before))
-            let records = (SignedFixture.state f).Records
+            let records = (ConfiguredFixture.state f).Records
             Assert.That(records.Length, Is.EqualTo(1))
             Assert.That(records[0].OriginalOperationId, Is.EqualTo(original.ToString("D")))
             Assert.That(records[0].Status, Is.EqualTo("Reserved"),
@@ -327,7 +299,7 @@ type StartedNativeIngressTests() =
                 "records/native-account-started-effect-v1/"
                 + NativeSchedulerRosterPolicy.sha256 (
                     c.ProjectLedgerId + "|Worker|" + c.TaskId + "|" + c.AttemptId) + ".json"
-            let snapshot = LedgerStore.fetch f.ProjectOne |> SignedFixture.success
+            let snapshot = LedgerStore.fetch f.ProjectOne |> ConfiguredFixture.success
             match LedgerStore.readAt f.ProjectOne snapshot path with
             | Ok(Some raw, Some _) ->
                 Assert.That(raw, Does.Contain("HeldBeforeSend"))
@@ -336,9 +308,9 @@ type StartedNativeIngressTests() =
             | other -> failwithf "Expected original project fence: %A" other)
 
     [<Test>]
-    member _.ForgedRoleLeaseGenerationAndUUIDCannotCrossSignedAccountBoundary() =
-        SignedFixture.withGit (fun f ->
-            let _, _, claim = SignedFixture.reserved f
+    member _.ForgedRoleLeaseGenerationAndUUIDCannotCrossConfiguredAccountBoundary() =
+        ConfiguredFixture.withGit (fun f ->
+            let _, _, claim = ConfiguredFixture.reserved f
             let cases =
                 [ "foreign role", { claim with Candidate={ claim.Candidate with Kind="Reviewer" } }
                   "stale assignment", { claim with Candidate={ claim.Candidate with AssignmentGeneration=2L } }
@@ -350,12 +322,12 @@ type StartedNativeIngressTests() =
                   "stale account head", { claim with AccountHead=String.replicate 40 "a" }
                   "stale project head", { claim with ExpectedProjectHead=String.replicate 40 "b" }
                   "missing window", { claim with WindowRegistration="" } ]
-            let originalHead = (LedgerStore.fetch f.ProjectOne |> SignedFixture.success).Commit
+            let originalHead = (LedgerStore.fetch f.ProjectOne |> ConfiguredFixture.success).Commit
             for label, bad in cases do
-                match SignedFixture.ingress f f.AccountTwo f.ProjectTwo bad with
+                match ConfiguredFixture.ingress f f.AccountTwo f.ProjectTwo bad with
                 | Error _ -> ()
                 | Ok _ -> Assert.Fail(label + " changed project CAS")
-                let observed = (LedgerStore.fetch f.ProjectOne |> SignedFixture.success).Commit
+                let observed = (LedgerStore.fetch f.ProjectOne |> ConfiguredFixture.success).Commit
                 Assert.That(observed, Is.EqualTo(originalHead), label))
 
     [<Test>]
@@ -369,15 +341,14 @@ type StartedNativeIngressTests() =
 
     [<TestCase(0, 1)>]
     [<TestCase(1, 0)>]
-    member _.CurrentSignedWorkerRevocationDeniesPreSendAndPreservesReservation(accountLimit: int, projectLimit: int) =
-        SignedFixture.withGit (fun f ->
-            let _, _, claim = SignedFixture.reserved f
-            let originalAccount, originalReceipt, originalDocument = SignedFixture.reservationProof f claim
-            SignedFixture.signedVersion f 2L 1L accountLimit projectLimit
+    member _.CurrentConfiguredWorkerRevocationDeniesPreSendAndPreservesReservation(accountLimit: int, projectLimit: int) =
+        ConfiguredFixture.withGit (fun f ->
+            let _, _, claim = ConfiguredFixture.reserved f
+            let originalAccount, originalReceipt, originalDocument = ConfiguredFixture.reservationProof f claim
+            ConfiguredFixture.configureVersion f 2L 1L accountLimit projectLimit
             let projects = [| f.ProjectTwo |]
             let projection =
-                AccountCapacityLedger.readVerifiedDisposableNativeRosterPolicy
-                    f.Root f.AccountTwo f.PublicKey f.Subject projects
+                AccountCapacityLedger.readNativeRosterPolicy f.AccountTwo projects
             Assert.That(projection.Status, Is.EqualTo("PolicyVerified"))
             let currentAccount = projection.VerifiedAccountHead.Value
             let policy = projection.Policy.Value
@@ -392,41 +363,41 @@ type StartedNativeIngressTests() =
             Assert.That(projection.VerifiedProjectHeads[0].VerifiedHead, Is.EqualTo(claim.ExpectedProjectHead))
             let refreshed = { claim with AccountHead = currentAccount }
             let accountProof = currentAccount, originalReceipt, originalDocument
-            Assert.That(SignedFixture.reservationProof f refreshed = accountProof, Is.True)
-            match SignedFixture.ingress f f.AccountTwo f.ProjectTwo claim with
+            Assert.That(ConfiguredFixture.reservationProof f refreshed = accountProof, Is.True)
+            match ConfiguredFixture.ingress f f.AccountTwo f.ProjectTwo claim with
             | Error _ -> ()
             | Ok _ -> Assert.Fail("Superseded account head admitted pre-send")
-            match SignedFixture.ingress f f.AccountTwo f.ProjectTwo refreshed with
+            match ConfiguredFixture.ingress f f.AccountTwo f.ProjectTwo refreshed with
             | Error(InvalidBinding detail) ->
-                Assert.That(detail, Does.Contain("Current signed roster denies Worker pre-send"))
-            | other -> failwithf "Expected current signed Worker policy denial: %A" other
-            SignedFixture.assertNoProjectClaim f refreshed
-            Assert.That(SignedFixture.reservationProof f refreshed = accountProof, Is.True)
+                Assert.That(detail, Does.Contain("Current configured roster denies pre-send"))
+            | other -> failwithf "Expected current configured Worker policy denial: %A" other
+            ConfiguredFixture.assertNoProjectClaim f refreshed
+            Assert.That(ConfiguredFixture.reservationProof f refreshed = accountProof, Is.True)
             TestContext.WriteLine($"Account: {originalAccount} -> {currentAccount}; project: {claim.ExpectedProjectHead}"))
 
     [<Test>]
     member _.CanonicalStartedGenerationChangeDeniesOriginalCandidateAndPreservesReservation() =
-        SignedFixture.withGit (fun f ->
-            let candidate, _, claim = SignedFixture.reserved f
-            let accountProof = SignedFixture.reservationProof f claim
-            let advancedHead = SignedFixture.advanceStartedGeneration f candidate
+        ConfiguredFixture.withGit (fun f ->
+            let candidate, _, claim = ConfiguredFixture.reserved f
+            let accountProof = ConfiguredFixture.reservationProof f claim
+            let advancedHead = ConfiguredFixture.advanceStartedGeneration f candidate
             Assert.That(advancedHead, Is.Not.EqualTo(claim.ExpectedProjectHead))
             let refreshed = { claim with ExpectedProjectHead = advancedHead }
-            Assert.That(SignedFixture.reservationProof f refreshed = accountProof, Is.True)
-            match SignedFixture.ingress f f.AccountTwo f.ProjectTwo refreshed with
+            Assert.That(ConfiguredFixture.reservationProof f refreshed = accountProof, Is.True)
+            match ConfiguredFixture.ingress f f.AccountTwo f.ProjectTwo refreshed with
             | Error(StaleEntityVersion detail) ->
                 Assert.That(detail, Does.Contain("Canonical Started assignment/source lease is stale or rewritten"))
             | other -> failwithf "Expected canonical Started assignment/source lease denial: %A" other
-            SignedFixture.assertNoProjectClaim f refreshed
-            Assert.That(SignedFixture.reservationProof f refreshed = accountProof, Is.True)
+            ConfiguredFixture.assertNoProjectClaim f refreshed
+            Assert.That(ConfiguredFixture.reservationProof f refreshed = accountProof, Is.True)
             TestContext.WriteLine($"Project: {claim.ExpectedProjectHead} -> {advancedHead}; account: {claim.AccountHead}"))
 
     [<Test>]
     member _.RestartedIndependentCloneCannotRegenerateOriginalSourceOrEffectUUID() =
-        SignedFixture.withGit (fun f ->
-            let _, _, claim = SignedFixture.reserved f
-            let first = SignedFixture.ingress f f.AccountOne f.ProjectOne claim
-                        |> SignedFixture.success
+        ConfiguredFixture.withGit (fun f ->
+            let _, _, claim = ConfiguredFixture.reserved f
+            let first = ConfiguredFixture.ingress f f.AccountOne f.ProjectOne claim
+                        |> ConfiguredFixture.success
             Assert.That(first.AlreadyApplied, Is.False)
             let scope = Path.Combine(f.Root, "wq10-private-client-three")
             Directory.CreateDirectory(scope) |> ignore
@@ -435,52 +406,47 @@ type StartedNativeIngressTests() =
                     UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
             let thirdAccount = Path.Combine(scope, "account")
             let thirdProject = Path.Combine(f.Root, "third-project")
-            SignedFixture.git f.Root ["clone"; f.AccountOne.ApprovedFetchUrl; thirdAccount] |> ignore
-            SignedFixture.git f.Root ["clone"; f.ProjectOne.ApprovedFetchUrl; thirdProject] |> ignore
+            ConfiguredFixture.git f.Root ["clone"; f.AccountOne.ApprovedFetchUrl; thirdAccount] |> ignore
+            ConfiguredFixture.git f.Root ["clone"; f.ProjectOne.ApprovedFetchUrl; thirdProject] |> ignore
             let restartedAccount = { f.AccountOne with RepositoryPath=thirdAccount }
             let restartedProject = { f.ProjectOne with RepositoryPath=thirdProject }
-            let coverage = SignedFixture.coverage f restartedAccount [| restartedProject |]
+            let coverage = ConfiguredFixture.coverage f restartedAccount [| restartedProject |]
             let original =
-                claimVerifiedDisposable f.Root restartedAccount f.PublicKey f.Subject
+                claimStarted restartedAccount
                     [| restartedProject |] coverage claim
-                |> SignedFixture.success
+                |> ConfiguredFixture.success
             Assert.That(original.AlreadyApplied, Is.True,
                         "Exact immutable claim is a receipt replay, never a second send")
-            match claimVerifiedDisposable f.Root restartedAccount f.PublicKey f.Subject
-                    [| restartedProject |] (SignedFixture.coverage f restartedAccount [| restartedProject |])
+            match claimStarted restartedAccount
+                    [| restartedProject |] (ConfiguredFixture.coverage f restartedAccount [| restartedProject |])
                     { claim with OperationId=Guid.NewGuid() } with
             | Error _ -> ()
             | Ok _ -> Assert.Fail("Restarted client minted a new original operation")
-            let native = SignedFixture.state f
+            let native = ConfiguredFixture.state f
             Assert.That(native.Records.Length, Is.EqualTo(1))
             Assert.That(native.Records[0].Status, Is.EqualTo("Reserved")))
 
     [<Test>]
-    member _.NoUnsignedOrIncompleteRosterCanBePromotedByCaller() =
-        SignedFixture.withGit (fun f ->
-            let _, _, claim = SignedFixture.reserved f
-            let projectHead = (LedgerStore.fetch f.ProjectOne |> SignedFixture.success).Commit
-            let covers = SignedFixture.coverage f f.AccountOne [| f.ProjectOne |]
-            let wrongKey = Array.create<byte> f.PublicKey.Length 0uy
+    member _.NoIncompleteRosterCanBePromotedByCaller() =
+        ConfiguredFixture.withGit (fun f ->
+            let _, _, claim = ConfiguredFixture.reserved f
+            let projectHead = (LedgerStore.fetch f.ProjectOne |> ConfiguredFixture.success).Commit
+            let covers = ConfiguredFixture.coverage f f.AccountOne [| f.ProjectOne |]
             let tests =
-                [ "forged signing root", wrongKey, covers
-                  "incomplete coverage", f.PublicKey, { covers with Complete=false }
-                  "stale observation", f.PublicKey,
-                      { covers with ObservedAtUtc=DateTimeOffset.UtcNow.AddMinutes(-5.0) }
-                  "wrong account head", f.PublicKey,
-                      { covers with AccountHead=String.replicate 40 "f" } ]
-            for label, pub, coverage in tests do
-                match claimVerifiedDisposable f.Root f.AccountTwo pub f.Subject
-                        [| f.ProjectTwo |] coverage claim with
+                [ "incomplete coverage", { covers with ProjectHeads=[||] }
+                  "stale observation", { covers with ObservedAtUtc=DateTimeOffset.UtcNow.AddMinutes(-5.0) }
+                  "wrong account head", { covers with AccountHead=String.replicate 40 "f" } ]
+            for label, coverage in tests do
+                match claimStarted f.AccountTwo [| f.ProjectTwo |] coverage claim with
                 | Error _ -> ()
                 | Ok _ -> Assert.Fail(label + " produced an unauthorized Started fence")
-                Assert.That((LedgerStore.fetch f.ProjectOne |> SignedFixture.success).Commit,
+                Assert.That((LedgerStore.fetch f.ProjectOne |> ConfiguredFixture.success).Commit,
                             Is.EqualTo(projectHead), label))
 
     [<Test>]
     member _.AcceptedOldFakeStageBRefusesTheCanonicalStartedWorker() =
-        SignedFixture.withGit (fun f ->
-            let candidate, _, real = SignedFixture.reserved f
+        ConfiguredFixture.withGit (fun f ->
+            let candidate, _, real = ConfiguredFixture.reserved f
             let fakeAccount : Client.NativeProjectEffectFence.FakeAccountReservationReceipt =
                 { Marker="STAGE_B_DISPOSABLE_FAKE_ACCOUNT_RECEIPT/v1"
                   AccountLedgerId=f.AccountOne.LedgerId.ToString("D")
@@ -514,5 +480,5 @@ type StartedNativeIngressTests() =
             | Error(StaleEntityVersion detail) ->
                 Assert.That(detail, Does.Contain("Worker canonical attempt"))
             | other -> failwithf "Old fake B1 unexpectedly accepted Started: %A" other
-            Assert.That((LedgerStore.fetch f.ProjectOne |> SignedFixture.success).Commit,
+            Assert.That((LedgerStore.fetch f.ProjectOne |> ConfiguredFixture.success).Commit,
                         Is.EqualTo(real.ExpectedProjectHead)))

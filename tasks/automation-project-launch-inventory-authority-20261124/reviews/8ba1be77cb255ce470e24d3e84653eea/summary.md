@@ -1,0 +1,1 @@
+Exclusion is unavailable until original-bound no-send conditions are modeled; absent, foreign and stale attempts reject and occupancy remains held. dotnet fsi tests/ProjectInventoryWorker16/Tests.fsx and git diff --check passed. Fixture assumptions do not authenticate evidence or establish sender fencing; no production authority or cutover.

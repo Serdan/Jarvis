@@ -1,0 +1,1 @@
+Default-off isolated shared-ledger capacity seam; 5 focused tests passed and no-fixture Release build passed. Production bootstrap, trusted role verification, terminal/no-send issuance and launch path enforcement remain unsupported; fixture proof is not production authority.

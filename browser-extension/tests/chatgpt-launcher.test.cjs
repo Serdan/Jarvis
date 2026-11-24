@@ -91,7 +91,10 @@ function harness(options = {}) {
   });
   let chatMode = makeMode("Chat");
   let workMode = makeMode("Work");
+  const composerForm = {};
+  const otherForm = {};
   const editor = {
+    closest(selector) { return selector === 'form[data-composer-placement]' && options.associatedForms ? composerForm : null; },
     get innerText() { return content || (options.emptyRenderedNewline ? "\n" : ""); },
     get textContent() { return content; },
     focus() { focused = true; },
@@ -153,7 +156,7 @@ function harness(options = {}) {
   let proSelections = 0;
   const picker = {
     getClientRects() { return [1]; },
-    closest() { return null; },
+    closest(selector) { return selector === 'form' && options.associatedForms ? composerForm : null; },
     querySelectorAll(selector) {
       if (selector === '.sr-only') return options.projectWorkLabel
         ? [{ textContent: options.namedWorkEffort || reasoningEffort, closest() { return null; } }] : [];
@@ -372,10 +375,21 @@ function harness(options = {}) {
           hidden.getClientRects = () => [];
           return [activePicker, hidden];
         }
+        if (options.unrelatedPicker) {
+          const other = Object.create(picker);
+          other.closest = selector => selector === 'form' ? otherForm : null;
+          return [activePicker, other];
+        }
         return options.duplicatePicker ? [activePicker, Object.create(picker)] : [activePicker];
       }
       if (selector === '[role="menu"]') return expanded ? [menu] : [];
-      if (selector === '[data-model-selection-label]') return [];
+      if (selector === '[data-model-selection-label]') {
+        if (!options.homeLabel) return [];
+        return [{ getClientRects() { return [1]; },
+          closest(selector) { return selector === 'form' && options.associatedForms
+            ? (options.homeLabel === "unrelated" ? otherForm : composerForm) : null; },
+          getAttribute() { return "other"; } }];
+      }
       if (selector === '[data-composer-input-layout] [contenteditable="true"][role="textbox"]') {
         return options.noComposer ? [] : [activeEditor];
       }
@@ -1317,6 +1331,38 @@ test("slugged project entry falls back to verified Work and sends once", async (
   assert.equal(result.conversationUrl, route);
   assert.equal(h.clicks, 1);
 });
+
+test("project Work ignores a picker in a different form", async () => {
+  const startUrl = "https://chatgpt.com/g/g-p-abc123-jarvisagents/project";
+  const route = "https://chatgpt.com/g/g-p-abc123-jarvisagents/c/00000000-0000-0000-0000-000000000001";
+  const h = harness({ startUrl, noModeToggle: true, projectWorkLabel: true,
+    selectedModel: "GPT-6.1 Terra", reasoningEffort: "Medium", virtualClock: true,
+    associatedForms: true, unrelatedPicker: true, noRoute: true, deferLegacyTurn: true,
+    projectEvents: [{ afterMs: 75, href: route }, { afterMs: 225, legacy: "Launch" }] });
+  const result = await h.run("Launch", { startUrl, timeoutMs: 18000 });
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.equal(h.clicks, 1);
+});
+
+test("project Work rejects two pickers in the composer form", async () => {
+  const startUrl = "https://chatgpt.com/g/g-p-abc123-jarvisagents/project";
+  const h = harness({ startUrl, noModeToggle: true, projectWorkLabel: true,
+    selectedModel: "GPT-6.1 Terra", reasoningEffort: "Medium", virtualClock: true,
+    associatedForms: true, duplicatePicker: true });
+  const result = await h.run("Do not submit", { startUrl, timeoutMs: 18000 });
+  assert.equal(result.status, "notSubmitted", JSON.stringify(result));
+  assert.equal(h.clicks, 0);
+});
+
+for (const [label, expected, clicks] of [["unrelated", "submitted", 1], ["relevant", "uiIncompatible", 0]]) {
+  test(`ordinary Work handles ${label} conflicting label`, async () => {
+    const h = harness({ initialMode: "Work", selectedModel: "GPT-6.1 Terra",
+      reasoningEffort: "Medium", virtualClock: true, associatedForms: true, homeLabel: label });
+    const result = await h.run("Launch", { modelOverride: "work-terra-medium", timeoutMs: 18000 });
+    assert.equal(result.status, expected, JSON.stringify(result));
+    assert.equal(h.clicks, clicks);
+  });
+}
 
 for (const [name, extra] of [
   ["competing visible model controls", { duplicatePicker: true }],

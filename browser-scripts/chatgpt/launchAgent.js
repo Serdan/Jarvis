@@ -162,8 +162,19 @@ async function executeLaunch(args, observeSelection) {
   };
   const visible = node => Boolean(node?.getClientRects?.().length &&
     !node.closest('[aria-hidden="true"],[inert]'));
+  // The observed project composer places its editor and picker in one form.
+  // A control in a different form is unrelated; controls without a provable
+  // form association remain candidates so ambiguity still fails closed.
+  const relevantToComposer = node => {
+    const editors = Array.from(document.querySelectorAll(composerSelector));
+    if (editors.length !== 1) return true;
+    const form = editors[0].closest?.('form[data-composer-placement]');
+    const otherForm = node.closest?.('form');
+    return !form || !otherForm || form === otherForm;
+  };
   const picker = () => {
-    const controls = Array.from(document.querySelectorAll(pickerSelector)).filter(visible);
+    const controls = Array.from(document.querySelectorAll(pickerSelector))
+      .filter(node => visible(node) && relevantToComposer(node));
     return controls.length === 1 ? controls[0] : null;
   };
   // Other site menus (sidebar, projects) are not model menus.
@@ -523,7 +534,7 @@ async function executeLaunch(args, observeSelection) {
       // composer. Reject contradictory labels, not an absent transient label.
       const labels = Array.from((projectStart ? modelControl : document).querySelectorAll('[data-model-selection-label]'))
         .filter(node => node.getClientRects().length &&
-          !node.closest('[aria-hidden="true"],[inert]'));
+          !node.closest('[aria-hidden="true"],[inert]') && relevantToComposer(node));
       if (labels.some(node =>
           node.getAttribute("data-model-selection-label") !== "gpt-6.1-terra-wm")) {
         return { failure: incompatible(stage, "SelectedModelChanged") };

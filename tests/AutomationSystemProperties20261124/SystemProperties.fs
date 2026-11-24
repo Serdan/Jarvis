@@ -14,12 +14,22 @@ open Common
 open Common.SignalR
 open Client.WorkQueueSchedulerHostLoop
 open Client.WorkQueueReactiveWake
+open Client.NativeSchedulerAccountReservation
 open AutomationHealthHostedFixture
 
 // Independent abstract ownership model. The state is driven by commands and
 // preconditions, never by copying the observed canonical attempt phase.
 type Phase = Working | Waiting | CancelledWaiting | Ready
 type Model = { Phase: Phase; Generation: int; Age: int option }
+type private ReservationExpectation =
+    { Original: NativeDispatchCandidate
+      OriginalOperation: string
+      Status: string
+      Generation: int64
+      Fence: string
+      Session: string
+      Terminal: string }
+
 type Command =
     | Advance of int
     | Activity
@@ -73,7 +83,7 @@ let private observe f =
         let snap = LedgerStore.fetch binding |> success
         let t, attempt = ReviewWorkflow.getTaskAt binding snap f.Original.TaskId |> success
         let a = attempt.Value
-        let inbox = ReviewWorkflow.getAgentInboxAt binding snap "Worker" |> success
+        let inbox = ReviewWorkflow.getAgentInboxAt binding snap f.Original.AgentId |> success
         let phase =
             match f.State.Phase with
             | Working -> "Started"
@@ -83,17 +93,34 @@ let private observe f =
         equal "assignment generation" f.State.Generation a.AssignmentGeneration
         equal "immutable task id" f.Original.TaskId t.TaskId
         equal "immutable attempt" f.Original.AttemptId a.AttemptId
-        equal "owner" "Worker" a.OwnerAgentId
+        equal "owner" f.Original.AgentId a.OwnerAgentId
         equal "spec" f.Original.SpecBlobOid a.SpecBlobOid
         equal "source ref" f.Original.SourceRef a.SourceRef
+        let assignment = inbox.Agent.CurrentAssignment
         match f.State.Phase with
-        | Working -> equal "working ownership" "Working" inbox.Agent.Execution
-        | Ready ->
-            equal "ready ownership" "Ready" inbox.Agent.State
-            equal "ready stopped execution" "Stopped" inbox.Agent.Execution
+        | Working | Ready ->
+            equal "active focus exists" false (isNull (box assignment))
+            equal "active focus exact task" f.Original.TaskId assignment.TaskId
+            equal "active focus exact attempt" f.Original.AttemptId assignment.AttemptId
+            equal "no active challenge wait" 0 inbox.BlockedChallengeWaits.Length
+            equal "no blocked attempt" 0 inbox.Blocked.Length
+            if f.State.Phase = Working then
+                equal "working ownership" "Working" inbox.Agent.Execution
+                equal "no additional runnable ownership" 0 inbox.RunnableQueue.Length
+                equal "working exact attempt" (Some f.Original.AttemptId) (inbox.Working |> Option.map (fun item -> item.Attempt.AttemptId))
+            else
+                equal "ready ownership" "Ready" inbox.Agent.State
+                equal "ready stopped execution" "Stopped" inbox.Agent.Execution
+                equal "one runnable ownership" [f.Original.AttemptId] (inbox.RunnableQueue |> List.map (fun item -> item.Attempt.AttemptId))
+                equal "not simultaneously Working" true inbox.Working.IsNone
         | Waiting | CancelledWaiting ->
+            equal "blocked no active focus" true (isNull (box assignment))
             equal "blocked no runnable ownership" 0 inbox.RunnableQueue.Length
             equal "blocked not Working" false (inbox.Agent.Execution = "Working")
+            equal "one blocked ownership" [f.Original.AttemptId] (inbox.Blocked |> List.map (fun item -> item.Attempt.AttemptId))
+            let expectedWait = [f.Original.TaskId, f.Original.AttemptId, f.Original.AgentId, [f.Gate.Value.ChallengeId]]
+            equal "exact canonical indexed wait" expectedWait
+                (inbox.BlockedChallengeWaits |> List.map (fun w -> w.TaskId, w.AttemptId, w.OwnerAgentId, w.ChallengeIds))
 
 let private current (f: Fixture) client =
     NativeHealth.current f.Runtimes[client] f.Original |> success
@@ -117,7 +144,7 @@ let private step f client command =
     let expected = next command before
     let taskId = f.Original.TaskId
     let t, a = snapshot binding f
-    let owner = (ReviewWorkflow.getAgentInbox binding "Worker" |> success).Agent
+    let owner = (ReviewWorkflow.getAgentInbox binding f.Original.AgentId |> success).Agent
     let head = (LedgerStore.fetch binding |> success).Commit
     match command with
     | CheckHealth ->
@@ -145,10 +172,10 @@ let private step f client command =
     | Block when before.Phase = Working ->
         f.Previous <- current f client
         let gate =
-            ChallengeWorkflow.create binding (Guid.NewGuid()) "Worker" "system property" taskId
+            ChallengeWorkflow.create binding (Guid.NewGuid()) f.Original.AgentId "system property" taskId
                 [{ OwnerKind = ""; OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "verified dependency" }]
             |> success
-        ChallengeWorkflow.blockAttempt reader (Guid.NewGuid()) "Worker" taskId a.AttemptId
+        ChallengeWorkflow.blockAttempt reader (Guid.NewGuid()) f.Original.AgentId taskId a.AttemptId
             t.Version a.Version owner.Version before.Generation "waiting" [gate.ChallengeId]
         |> success |> ignore
         f.Gate <- Some gate
@@ -161,7 +188,7 @@ let private step f client command =
             { ProjectId = binding.ProjectId; LedgerId = binding.LedgerId; Epoch = binding.Epoch
               Commit = result.CurrentHead; OperationId = op; ChallengeId = gate.ChallengeId
               ConditionId = gate.ConditionIds.Head; TaskId = taskId; AttemptId = a.AttemptId
-              OwnerAgentId = "Worker"; BlockedGeneration = before.Generation }
+              OwnerAgentId = f.Original.AgentId; BlockedGeneration = before.Generation }
         equal "fresh committed wake" (WakeDecision.Ready(result.CurrentHead, expected.Generation)) (inspect true reader locator)
         match inspect true reader {locator with BlockedGeneration = before.Generation + 1} with
         | WakeDecision.Hold _ -> ()
@@ -170,10 +197,10 @@ let private step f client command =
     | Cancel when before.Phase = Waiting ->
         let gate = f.Gate.Value
         let op = Guid.NewGuid()
-        ChallengeWorkflow.cancel binding op "Worker" gate.ChallengeId 1 "cancelled dependency"
+        ChallengeWorkflow.cancel binding op f.Original.AgentId gate.ChallengeId 1 "cancelled dependency"
         |> success |> ignore
         let cancelledHead = (LedgerStore.fetch reader |> success).Commit
-        let replay = ChallengeWorkflow.cancel reader op "Worker" gate.ChallengeId 1 "cancelled dependency" |> success
+        let replay = ChallengeWorkflow.cancel reader op f.Original.AgentId gate.ChallengeId 1 "cancelled dependency" |> success
         equal "cancel replay" true replay.AlreadyApplied
         equal "cancel replay does not write" cancelledHead (LedgerStore.fetch binding |> success).Commit
     | Resolve when before.Phase = CancelledWaiting ->
@@ -189,11 +216,11 @@ let private step f client command =
             equal "replay cannot reissue ownership" head (LedgerStore.fetch reader |> success).Commit
         | None -> ()
     | Resume when before.Phase = Ready ->
-        ReviewWorkflow.resumeAgent binding (Guid.NewGuid()) taskId "Worker" a.Version owner.Version before.Generation
+        ReviewWorkflow.resumeAgent binding (Guid.NewGuid()) taskId f.Original.AgentId a.Version owner.Version before.Generation
         |> success |> ignore
     | Checkpoint when before.Phase = Working ->
         f.Previous <- current f client
-        let receipt = ReviewWorkflow.checkpointAttempt binding (Guid.NewGuid()) taskId "Worker" a.Version owner.Version before.Generation "progress" "continue" "" "" |> success
+        let receipt = ReviewWorkflow.checkpointAttempt binding (Guid.NewGuid()) taskId f.Original.AgentId a.Version owner.Version before.Generation "progress" "continue" "" "" |> success
         let _, cp = ReviewWorkflow.getCheckpoint reader taskId receipt.Operation.Sequence |> success
         equal "checkpoint generation" before.Generation cp.AssignmentGeneration
     | _ -> ()
@@ -232,7 +259,7 @@ let private resolveThroughHost (account: SystemPropertyAccountFixture.AccountFix
             wakes <- wakes + 1
             equal "only committed dependency wake" [WorkWakeTrigger.DependencyCommitted] triggers
             equal "real canonical automatic eligibility" (ActivationEligible f.Original.TaskId)
-                (ReviewWorkflow.inspectAutomaticActivation reader "Worker" |> success)
+                (ReviewWorkflow.inspectAutomaticActivation reader f.Original.AgentId |> success)
             WorkWakeResult.Disabled
           Report = ignore
           Delay = fun _ cancellation -> Task.Delay(System.Threading.Timeout.Infinite, cancellation) }
@@ -325,6 +352,39 @@ let private newFixture root =
     { First = a; Second = b; Runtimes = [|rtA;rtB|]; Original = original
       State = {Phase = Working; Generation = original.Generation; Age = Some 0}
       Previous = None; Gate = None; Resolved = None }
+
+// A second independently assigned agent shares the same canonical project
+// and clients. Its source branch and attempt are distinct.
+let private secondAgent (f: Fixture) =
+    let a = f.First
+    let agentId, taskId = "Worker Two", "second-system-task"
+    ReviewWorkflow.registerAgent a (Guid.NewGuid()) agentId |> success |> ignore
+    ReviewWorkflow.createTaskWithSpec a (Guid.NewGuid()) taskId "Independent task" "<h1>Independent source</h1>"
+    |> success |> ignore
+    ReviewWorkflow.assignTask a (Guid.NewGuid()) taskId (Guid.NewGuid()) agentId |> success |> ignore
+    ReviewWorkflow.resumeAgent a (Guid.NewGuid()) taskId agentId 0 0 0 |> success |> ignore
+    let baseOid = git a.RepositoryPath ["rev-parse"; "HEAD"]
+    let targetRef = "refs/heads/" + git a.RepositoryPath ["branch"; "--show-current"]
+    let sourceRef = "refs/heads/worker-two"
+    git a.RepositoryPath ["branch"; "worker-two"; baseOid] |> ignore
+    git a.RepositoryPath ["push"; "origin"; sourceRef] |> ignore
+    let _, _, attempt = ReviewWorkflow.getTask a taskId |> success
+    ReviewWorkflow.bindReviewBase a (Guid.NewGuid()) taskId agentId
+        attempt.Value.Version attempt.Value.AssignmentGeneration baseOid targetRef |> success |> ignore
+    let _, _, bound = ReviewWorkflow.getTask a taskId |> success
+    ReviewWorkflow.rebindAttemptSource a (Guid.NewGuid()) taskId agentId
+        bound.Value.Version bound.Value.AssignmentGeneration sourceRef |> success |> ignore
+    let snap = LedgerStore.fetch a |> success
+    let agent = ReviewWorkflow.getAgentWorkingTurnAt a snap agentId |> success
+    let task, active = ReviewWorkflow.getTaskAt a snap taskId |> success
+    let active = active.Value
+    let candidate =
+        { f.Original with AgentId = agentId; TaskId = taskId; AgentVersion = agent.Version
+                          GitHead = snap.Commit; TaskVersion = task.Version; AttemptId = active.AttemptId
+                          AttemptVersion = active.Version; Generation = active.AssignmentGeneration
+                          SpecBlobOid = active.SpecBlobOid; SourceRef = active.SourceRef }
+    { f with Original = candidate; State = { Phase = Working; Generation = candidate.Generation; Age = Some 0 }
+             Previous = None; Gate = None; Resolved = None }
 
 type TraceStep = int * int * Command
 
@@ -431,18 +491,42 @@ type GeneratedComposition() =
             use account = SystemPropertyAccountFixture.create root
                             [| fs |> Array.map _.First; fs |> Array.map _.Second |]
             let binding client project = if client = 0 then fs[project].First else fs[project].Second
-            let mutable expected : Map<string, string * int64 * int64> = Map.empty
+            // The oracle retains the original command's full candidate and
+            // UUID, plus separately expected lifecycle/effect state.
+            let mutable expected : Map<string, ReservationExpectation> = Map.empty
             let mutable limit = 1
+            let expectReserved (op: Guid) (candidate: NativeDispatchCandidate) =
+                let reservation = { Original = candidate; OriginalOperation = string op; Status = "Reserved"
+                                    Generation = 1L; Fence = ""; Session = ""; Terminal = "" }
+                expected <- expected.Add(candidate.DispatchId, reservation)
+            let expectMove (candidate: NativeDispatchCandidate) status generation fence session =
+                let original = expected[candidate.DispatchId]
+                expected <- expected.Add(candidate.DispatchId,
+                    { original with Status = status; Generation = generation; Fence = fence; Session = session })
             let verify () =
                 for c in 0..1 do
-                    let records = (SystemPropertyAccountFixture.read account c).Records
+                    let state = SystemPropertyAccountFixture.read account c
+                    equal "account identity" (string account.Accounts[c].AccountId) state.AccountId
+                    equal "account ledger identity" (string account.Accounts[c].LedgerId) state.LedgerId
+                    equal "account epoch" account.Accounts[c].Epoch state.Epoch
+                    let records = state.Records
                     let observed =
                         records
-                        |> Array.map (fun r -> r.Candidate.DispatchId, (r.Status, r.Generation, r.Candidate.AssignmentGeneration))
+                        |> Array.map (fun r ->
+                            r.Candidate.DispatchId,
+                            { Original = r.Candidate; OriginalOperation = r.OriginalOperationId
+                              Status = r.Status; Generation = r.Generation; Fence = r.ProjectFenceOid
+                              Session = r.ProviderSessionId; Terminal = r.TerminalOperationId })
                         |> Map.ofArray
                     equal "exact account reservation projection" expected observed
                     equal "unique reservations" records.Length observed.Count
-                    equal "capacity conserved" true (records |> Array.filter (fun r -> r.Status <> "Released") |> Array.length <= limit)
+                    equal "unique original operations" records.Length (records |> Array.map _.OriginalOperationId |> Array.distinct |> Array.length)
+                    equal "unique effect operations" records.Length (records |> Array.map (fun r -> r.Candidate.EffectOperationId) |> Array.distinct |> Array.length)
+                    equal "unique canonical keys" records.Length (records |> Array.map _.CanonicalKey |> Array.distinct |> Array.length)
+                    let occupied = records |> Array.filter (fun r -> r.Status <> "Released")
+                    equal "capacity conserved" true (occupied.Length <= limit)
+                    for _, local in occupied |> Array.groupBy (fun r -> r.Candidate.ProjectId) do
+                        equal "per-project quota conserved" true (local.Length <= 1)
                 fs |> Array.iter observe
             let run p cmd =
                 step fs[p] (random.Next 2) cmd
@@ -482,7 +566,7 @@ type GeneratedComposition() =
             let winner = winners[0]
             let loser = 1 - winner
             let original = candidates[winner]
-            expected <- expected.Add(original.DispatchId, ("Reserved", 1L, original.AssignmentGeneration))
+            expectReserved ids[winner] original
             verify ()
             let replay = SystemPropertyAccountFixture.reserveWithCoverage account loser covers[winner] ids[winner] original
             equal "exact original reservation replay" true replay.IsOk
@@ -520,7 +604,7 @@ type GeneratedComposition() =
             run loser Resume
             let op, c, admitted = reserve loser loser
             admitted |> success |> ignore
-            expected <- expected.Add(c.DispatchId, ("Reserved", 1L, c.AssignmentGeneration))
+            expectReserved op c
             verify ()
             let _, claim = SystemPropertyAccountFixture.claim account winner loser op c
             let fence = claim |> success
@@ -532,13 +616,21 @@ type GeneratedComposition() =
             let move version status session =
                 SystemPropertyAccountFixture.transition account winner dispatch effect version status fence.CurrentHead session
             move 1L "Dispatching" "" |> success |> ignore
-            expected <- expected.Add(c.DispatchId, ("Dispatching", 2L, c.AssignmentGeneration))
+            expectMove c "Dispatching" 2L fence.CurrentHead ""
             verify ()
             let staleTransition = move 1L "Uncertain" ""
             equal "stale account transition rejected" true staleTransition.IsError
             verify ()
+            let wrongEffect =
+                SystemPropertyAccountFixture.transition account loser dispatch (Guid.NewGuid()) 2L "Uncertain" fence.CurrentHead ""
+            equal "wrong original effect rejected" true wrongEffect.IsError
+            verify ()
+            let wrongFence =
+                SystemPropertyAccountFixture.transition account loser dispatch effect 2L "Uncertain" (String.replicate 40 "a") ""
+            equal "replacement project fence rejected" true wrongFence.IsError
+            verify ()
             move 2L "Uncertain" "" |> success |> ignore
-            expected <- expected.Add(c.DispatchId, ("Uncertain", 3L, c.AssignmentGeneration))
+            expectMove c "Uncertain" 3L fence.CurrentHead ""
             verify ()
             // No live provider or synthetic terminal is invoked. Uncertainty
             // must remain occupied despite duplicate/no-terminal observations.
@@ -546,10 +638,16 @@ type GeneratedComposition() =
             equal "unverified terminal cannot release" true release.IsError
             verify ()
             move 3L "Unknown" "disposable-unconfirmed-session" |> success |> ignore
-            expected <- expected.Add(c.DispatchId, ("Unknown", 4L, c.AssignmentGeneration))
+            expectMove c "Unknown" 4L fence.CurrentHead "disposable-unconfirmed-session"
             verify ()
             let forged = SystemPropertyAccountFixture.forgeTerminal account winner loser op c
             equal "positive verifier without immutable receipt cannot release" true forged.IsError
+            verify ()
+            let wrongSession = move 4L "Active" "another-session"
+            equal "replacement provider session rejected" true wrongSession.IsError
+            verify ()
+            let wrongOriginal = SystemPropertyAccountFixture.forgeTerminal account winner loser (Guid.NewGuid()) c
+            equal "wrong original reservation cannot release" true wrongOriginal.IsError
             verify ()
             let _, _, full = reserve winner winner
             equal "uncertain reservation remains occupied" true full.IsError
@@ -566,6 +664,107 @@ type GeneratedComposition() =
                 verify ()
             equal "current production provider dispatch disabled" true (Client.AutomationNativeProviderSessionHost.authorizeProviderDispatch().IsError)
             equal "current production release disabled" true (Client.AutomationNativeProviderSessionHost.releaseFromProviderTerminal().IsError)
+        finally
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
+            Directory.Delete(root, true)
+
+    [<TestCase(301)>]
+    [<TestCase(302)>]
+    member _.IndependentOwnersShareCanonicalProject(seed: int) =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-system-owners-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let prior = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+        Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", Path.Combine(root, "config"))
+        try
+            let first = newFixture root
+            let second = secondAgent first
+            let fs = [|first; second|]
+            let random = Random(seed)
+            let run owner cmd =
+                step fs[owner] (random.Next 2) cmd
+                observe fs[1-owner]
+            // Ensure a stalled sibling can recover without unblocking a
+            // challenged owner or changing its attempt/source lineage.
+            run 0 Block
+            run 1 (Advance 701)
+            run 1 CheckHealth
+            // The other owner's exact fresh task/attempt generation does
+            // not authorize claiming the recovered owner's slot.
+            let _, ready = snapshot first.First second
+            let wrongOwner = (ReviewWorkflow.getAgentInbox first.First first.Original.AgentId |> success).Agent
+            let unchanged = (LedgerStore.fetch first.First |> success).Commit
+            let wrong = ReviewWorkflow.resumeAgent first.Second (Guid.NewGuid()) second.Original.TaskId
+                            first.Original.AgentId ready.Version wrongOwner.Version second.State.Generation
+            equal "wrong owner cannot resume sibling" true wrong.IsError
+            equal "wrong owner leaves canonical head unchanged" unchanged (LedgerStore.fetch first.First |> success).Commit
+            fs |> Array.iter observe
+            run 0 CheckHealth
+            run 0 Resolve
+            run 0 ReplayResolve
+            run 1 Resume
+            run 0 Resume
+            run 1 CheckStale
+            run 0 CheckStale
+            let choices = [|Block; Resolve; Resume; Checkpoint; Advance 601; CheckHealth; Activity; CheckStale|]
+            for _ in 1..8 do
+                run (random.Next 2) choices[random.Next choices.Length]
+            // Both original ownership identities remain distinct despite
+            // all canonical mutations sharing one ledger head.
+            equal "distinct agent identities" true (first.Original.AgentId <> second.Original.AgentId)
+            equal "distinct task identities" true (first.Original.TaskId <> second.Original.TaskId)
+            equal "distinct source identities" true (first.Original.SourceRef <> second.Original.SourceRef)
+        finally
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
+            Directory.Delete(root, true)
+
+    [<Test>]
+    member _.SharedActivityStoreSeparatesProjectAndOwnerKeys() =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-system-shared-activity-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let prior = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+        Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", Path.Combine(root, "config"))
+        try
+            let first = newFixture root
+            let second = secondAgent first
+            let fs = [|first; second|]
+            use activity = new SystemPropertyActivityFixture.ActivityFixture(Path.Combine(root, "shared-activity.sqlite"))
+            let project = first.Original.ProjectName
+            let foreignProject = "Other Project"
+            let a, b = first.Original.AgentId, second.Original.AgentId
+            let now = DateTimeOffset.UtcNow
+            let old = now.AddSeconds(-701.)
+            // Opposite high-water values under each owner/project key.
+            // Neither a fresh sibling nor an unrelated stale project may
+            // suppress/authorize recovery for the wrong candidate.
+            let expected =
+                [ project, a, activity.Record(project,a,now).LastSeenAtUtc
+                  project, b, activity.Record(project,b,old).LastSeenAtUtc
+                  foreignProject, a, activity.Record(foreignProject,a,old).LastSeenAtUtc
+                  foreignProject, b, activity.Record(foreignProject,b,now).LastSeenAtUtc ]
+            for client in 0..1 do
+                for p, agent, seen in expected do
+                    let actual = activity.Read(client,p,agent).GetAwaiter().GetResult() |> success
+                    equal "shared activity preserves exact composite key" seen actual.LastSeenAtUtc
+            first.State <- {first.State with Age = Some 0}
+            second.State <- {second.State with Age = Some 701}
+            let check client =
+                let candidates = fs |> Array.choose (fun f -> current f client) |> Array.toList
+                let deps : Dependencies =
+                    { Enumerate = fun () -> Ok candidates
+                      Current = NativeHealth.current first.Runtimes[client]
+                      Activity = fun p agent -> activity.Read(client,p,agent)
+                      Recover = NativeHealth.recover first.Runtimes[client] }
+                NativeHealth.checkOnce {Enabled = true; InactivitySeconds = 600} deps
+                |> fun t -> t.GetAwaiter().GetResult()
+            equal "only actually stale owner recovered" 1 (check 1).Recoveries
+            second.State <- next CheckHealth second.State
+            fs |> Array.iter observe
+            step second 0 Resume
+            activity.Restart()
+            let head = (LedgerStore.fetch first.First |> success).Commit
+            equal "restart does not qualify persisted sibling rows" 0 (check 0).Recoveries
+            equal "unqualified restart leaves canonical head unchanged" head (LedgerStore.fetch first.Second |> success).Commit
+            fs |> Array.iter observe
         finally
             Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
             Directory.Delete(root, true)

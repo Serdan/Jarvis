@@ -800,6 +800,7 @@ type WorkingTurnLimitLevel =
 type OperationalControl =
     | WorkingTurnLimit of level: WorkingTurnLimitLevel * advisory: string
     | QueuedResponseAlert of alertId: string * text: string
+    | ActivationUnverified of detail: string
 
 module OperationalControl =
     let private alertPath = "jarvis/response-alert/"
@@ -824,6 +825,7 @@ module OperationalControl =
     let text = function
         | OperationalControl.QueuedResponseAlert(_, text) -> text
         | OperationalControl.WorkingTurnLimit(_, advisory) -> advisory
+        | OperationalControl.ActivationUnverified detail -> detail
 
     let private isStop control =
         match control with
@@ -851,7 +853,8 @@ module OperationalControl =
             match workingTurn advisory with
             | Some(OperationalControl.WorkingTurnLimit(actual, _)) -> level = actual
             | _ -> false
-        | OperationalControl.QueuedResponseAlert(_, text) -> not (String.IsNullOrWhiteSpace text)
+        | OperationalControl.QueuedResponseAlert(_, text)
+        | OperationalControl.ActivationUnverified text -> not (String.IsNullOrWhiteSpace text)
 
     let normalize controls = ordered controls |> List.filter valid
 
@@ -861,6 +864,8 @@ module OperationalControl =
             if isNull (box doc) then None
             else
                 match doc.Scope with
+                | "working-turn" when doc.Path = "jarvis/activation-status" ->
+                    Some(OperationalControl.ActivationUnverified doc.Content)
                 | "working-turn" -> workingTurn doc.Content
                 | "response-alert" when not (String.IsNullOrWhiteSpace doc.Content) ->
                     let id =
@@ -876,7 +881,9 @@ module OperationalControl =
             | OperationalControl.WorkingTurnLimit(_, advisory) ->
                 { Scope = "working-turn"; Path = "jarvis/working-turn"; Sha256 = ""; Content = advisory }
             | OperationalControl.QueuedResponseAlert(id, text) ->
-                { Scope = "response-alert"; Path = alertPath + id; Sha256 = ""; Content = text })
+                { Scope = "response-alert"; Path = alertPath + id; Sha256 = ""; Content = text }
+            | OperationalControl.ActivationUnverified detail ->
+                { Scope = "working-turn"; Path = "jarvis/activation-status"; Sha256 = ""; Content = detail })
 
 /// A canonical ledger mutation changed the assignment or Working-turn state
 /// of this agent. Advisory to other clients; never an authorization claim.
@@ -935,7 +942,7 @@ module private StateChangeEvidenceProjection =
 // remains a compatibility projection only when operational controls exist.
 // New peers prefer the closed typed field; no ambient document survives
 // decoding. Keep the receipt list untouched, including null/unknown.
-type private AgentCommandResponseWire =
+type AgentCommandResponseWire =
     { Result: string option
       Error: AgentError option
       [<JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)>]

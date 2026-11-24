@@ -1363,6 +1363,21 @@ let run_command_reason_parameter_is_optional_for_mcp_compatibility () =
     reason.HasDefaultValue |> shouldEqual true
     reason.DefaultValue |> shouldEqual ""
 
+let private legacyResponseJson (response: AgentCommandResponse) (documents: InstructionDocument list) =
+    let node = JsonSerializer.SerializeToNode(response).AsObject()
+    node.Remove("OperationalControls") |> ignore
+    node.Remove("AgentStateChangesStatus") |> ignore
+    node["Instructions"] <- JsonSerializer.SerializeToNode documents
+    node.ToJsonString()
+
+let private legacyResponse response documents =
+    JsonSerializer.Deserialize<AgentCommandResponse>(legacyResponseJson response documents)
+
+let private legacyJobPayload (job: JobResult) documents =
+    let node = JsonSerializer.SerializeToNode(job).AsObject()
+    node["ToolResponse"] <- JsonNode.Parse(legacyResponseJson job.ToolResponse.Value documents)
+    node.ToJsonString()
+
 [<Test>]
 let mcp_legacy_repository_documents_are_not_rendered () =
     let instructions =
@@ -1375,8 +1390,9 @@ let mcp_legacy_repository_documents_are_not_rendered () =
     let response =
         { Result = Some """{"result":"ok"}"""
           Error = None
-          Instructions = instructions; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
-    let result = response |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions instructions
+          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+    let decoded = legacyResponse response instructions
+    let result = decoded |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachOperationalControls decoded.OperationalControls
     Assert.That(result.IsError, Is.EqualTo(Nullable false))
     Assert.That(result.Content.Count, Is.EqualTo(1))
     let operation = result.Content[0] :?> TextContentBlock
@@ -1395,8 +1411,9 @@ let operator_alert_blocks_precede_timing_and_failed_tool_result () =
             Content = "JARVIS OPERATOR ALERT:\nPlease save test output" } ]
     let failure =
         { Result = None; Error = Some(ValidationFailed "Unrelated error")
-          Instructions = alerts; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
-    let shown = failure |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions alerts
+          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+    let decoded = legacyResponse failure alerts
+    let shown = decoded |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachOperationalControls decoded.OperationalControls
     Assert.That(shown.IsError, Is.EqualTo(Nullable true))
     Assert.That(shown.Content.Count, Is.EqualTo(4))
     Assert.That((shown.Content[0] :?> TextContentBlock).Text, Does.Contain("STOP — yield"))
@@ -1412,8 +1429,9 @@ let mcp_legacy_repository_notices_are_not_rendered () =
             Content = "Omitted repository guidance." }
           { Scope = "unknown"; Path = "unexpected"; Sha256 = ""
             Content = "Unrecognized ambient guidance." } ]
-    let response = { Result = Some """{"ok":true}"""; Error = None; Instructions = notes; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
-    let shown = response |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions notes
+    let response = { Result = Some """{"ok":true}"""; Error = None; Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+    let decoded = legacyResponse response notes
+    let shown = decoded |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachOperationalControls decoded.OperationalControls
     Assert.That(shown.IsError, Is.EqualTo(Nullable false))
     Assert.That(shown.Content.Count, Is.EqualTo(1))
     Assert.That((shown.Content[0] :?> TextContentBlock).Text, Is.EqualTo("""{"ok":true}"""))
@@ -1428,14 +1446,15 @@ let mcp_legacy_guidance_filter_preserves_errors_and_non_text_blocks () =
     let failure =
         { Result = None
           Error = Some(ValidationFailed "Unrelated error")
-          Instructions = instructions; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
-    let error = failure |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions instructions
+          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+    let decoded = legacyResponse failure instructions
+    let error = decoded |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachOperationalControls decoded.OperationalControls
     Assert.That(error.IsError, Is.EqualTo(Nullable true))
     Assert.That(error.Content.Count, Is.EqualTo(1))
     Assert.That((error.Content[0] :?> TextContentBlock).Text, Is.EqualTo("ValidationFailed: Unrelated error"))
     let image = CallToolResult()
     image.Content <- ResizeArray<ContentBlock>([ ImageContentBlock.FromBytes([| 137uy; 80uy; 78uy; 71uy |], "image/png") :> ContentBlock ])
-    let augmented = McpToolHelpers.attachInstructions instructions image
+    let augmented = McpToolHelpers.attachOperationalControls decoded.OperationalControls image
     Assert.That(augmented.Content.Count, Is.EqualTo(1))
     Assert.That(augmented.Content[0], Is.InstanceOf<ImageContentBlock>())
 
@@ -1447,10 +1466,11 @@ let mcp_server_instructions_are_static_and_concise () =
 
 [<Test>]
 let response_json_retains_legacy_instruction_wire_compatibility () =
+    let control = OperationalControl.ActivationUnverified "Activation could not be verified."
     let response =
         { Result = Some """{"ok":true}"""
           Error = None
-          Instructions = [ { Scope = "project"; Path = "Demo/AGENTS.md"; Sha256 = "sha256:" + String('f', 64); Content = "# Guidance" } ]
+          Instructions = [control]
           AgentStateChanges = [ { ProjectName = "Demo"; AgentId = "Owner" } ]
           InboxActivation = None; PendingJob = None }
     let json = JsonSerializer.Serialize(response)
@@ -1458,20 +1478,23 @@ let response_json_retains_legacy_instruction_wire_compatibility () =
     let root = document.RootElement
     Assert.That(root.GetProperty("Result").GetString(), Is.EqualTo("""{"ok":true}"""))
     let instruction = root.GetProperty("Instructions").EnumerateArray() |> Seq.head
-    Assert.That(instruction.GetProperty("Path").GetString(), Is.EqualTo("Demo/AGENTS.md"))
-    Assert.That(instruction.GetProperty("Scope").GetString(), Is.EqualTo("project"))
-    Assert.That(instruction.GetProperty("Content").GetString(), Is.EqualTo("# Guidance"))
+    Assert.That(instruction.GetProperty("Path").GetString(), Is.EqualTo("jarvis/activation-status"))
+    Assert.That(instruction.GetProperty("Scope").GetString(), Is.EqualTo("working-turn"))
+    Assert.That(instruction.GetProperty("Content").GetString(), Is.EqualTo("Activation could not be verified."))
+    Assert.That(root.GetProperty("OperationalControls").GetArrayLength(), Is.EqualTo(1))
     let mutation = root.GetProperty("AgentStateChanges").EnumerateArray() |> Seq.exactlyOne
     Assert.That(mutation.GetProperty("ProjectName").GetString(), Is.EqualTo("Demo"))
     Assert.That(mutation.GetProperty("AgentId").GetString(), Is.EqualTo("Owner"))
     let restored = JsonSerializer.Deserialize<AgentCommandResponse>(json)
     Assert.That(restored, Is.EqualTo(response))
-    let projected = restored |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions restored.Instructions
-    Assert.That(projected.Content.Count, Is.EqualTo(1))
+    let legacy = OperationalControl.toLegacy [control]
+    Assert.That(legacyResponse response legacy, Is.EqualTo(response))
     let newResponse = { response with Instructions = [] }
     let newWire = JsonSerializer.Serialize(newResponse)
     use newDocument = JsonDocument.Parse(newWire)
-    Assert.That(newDocument.RootElement.GetProperty("Instructions").GetArrayLength(), Is.Zero)
+    let mutable absent = Unchecked.defaultof<JsonElement>
+    Assert.That(newDocument.RootElement.TryGetProperty("Instructions", &absent), Is.False)
+    Assert.That(newDocument.RootElement.TryGetProperty("OperationalControls", &absent), Is.False)
     Assert.That(JsonSerializer.Deserialize<AgentCommandResponse>(newWire), Is.EqualTo(newResponse))
 
 
@@ -1866,7 +1889,7 @@ let polledToolJobsFilterLegacyRepositoryGuidanceAndPreserveMutationEvidence () =
         let original : AgentCommandResponse =
             { Result = if failed then None else Some """{"value":"terminal"}"""
               Error = if failed then Some(ValidationFailed "Original validation failure.") else None
-              Instructions = guidance
+              Instructions = []
               AgentStateChanges = [{ ProjectName = "Jarvis"; AgentId = "Worker 1" }]
               InboxActivation = Some receipt; PendingJob = None }
         let job : JobResult =
@@ -1874,20 +1897,20 @@ let polledToolJobsFilterLegacyRepositoryGuidanceAndPreserveMutationEvidence () =
               Events = []; NextSequence = 0L; Truncated = false
               ToolResponse = Some original; OperationId = Some "stable-operation-id" }
         let poll : AgentCommandResponse =
-            { Result = Some(JsonSerializer.Serialize job)
-              Error = None; Instructions = pollGuidance
+            { Result = Some(legacyJobPayload job guidance)
+              Error = None; Instructions = OperationalControl.fromLegacy pollGuidance
               AgentStateChanges = []; InboxActivation = None; PendingJob = None }
         let command = GetJobResultCommand { ProjectName = "Jarvis"; JobId = job.JobId; AfterSequence = None }
         let effective = McpToolHelpers.completedToolEvidence command poll
         // Job completion and poll-time alert delivery happen independently.
         // The poll must keep the original terminal result and mutations, but
         // never consume and discard its newly delivered STOP alert.
-        Assert.That({ effective with Instructions = guidance }, Is.EqualTo(original))
-        Assert.That(effective.Instructions = pollGuidance @ guidance, Is.True)
+        Assert.That({ effective with Instructions = [] }, Is.EqualTo(original))
+        Assert.That(effective.Instructions = OperationalControl.fromLegacy pollGuidance, Is.True)
         let displayed =
             poll |> McpToolHelpers.projectJobResultWithoutRepositoryGuidance command |> McpToolHelpers.toCallToolResult
             |> McpToolHelpers.attachStateEffects effective
-            |> McpToolHelpers.attachInstructions effective.Instructions
+            |> McpToolHelpers.attachOperationalControls effective.OperationalControls
         Assert.That(displayed.IsError, Is.EqualTo(Nullable false))
         Assert.That(displayed.Meta["jarvis/agent_state_changes"].ToJsonString(), Does.Contain("Worker 1"))
         Assert.That(displayed.Meta["jarvis/inbox_activation"].ToJsonString(), Does.Contain("activation-id"))
@@ -1901,7 +1924,9 @@ let polledToolJobsFilterLegacyRepositoryGuidanceAndPreserveMutationEvidence () =
         Assert.That(terminalJson.RootElement.GetRawText(), Does.Not.Contain("Canonical instructions from the original command"))
         let terminal = terminalJson.RootElement.GetProperty("ToolResponse")
         Assert.That(terminal.GetProperty("AgentStateChanges").GetArrayLength(), Is.EqualTo(1))
-        Assert.That(terminal.GetProperty("Instructions").GetArrayLength(), Is.Zero)
+        let mutable absent = Unchecked.defaultof<JsonElement>
+        Assert.That(terminal.TryGetProperty("Instructions", &absent), Is.False)
+        Assert.That(terminal.TryGetProperty("OperationalControls", &absent), Is.False)
         let projected = McpToolHelpers.projectJobResultWithoutRepositoryGuidance command poll
         let parsed = JsonSerializer.Deserialize<JobResult>(projected.Result.Value)
         Assert.That(parsed.ToolResponse.Value, Is.EqualTo({ original with Instructions = [] }))
@@ -1912,31 +1937,28 @@ let polledToolJobsFilterLegacyRepositoryGuidanceAndPreserveMutationEvidence () =
 [<Test>]
 let polledToolJobsKeepLegacyOperationalFieldsWithoutChangingOtherPayloads () =
     let controls =
-        [ { Scope = "working-turn"; Path = ""; Sha256 = ""; Content = "Historical turn control" }
+        [ { Scope = "working-turn"; Path = ""; Sha256 = ""; Content = "HARD STOP - historical turn control" }
           { Scope = "response-alert"; Path = "jarvis/response-alert/old"; Sha256 = ""; Content = "Historical alert" } ]
     let legacy = { Scope = "write-warning"; Path = "AGENTS.md"; Sha256 = ""; Content = "Obsolete notice" }
     let original : AgentCommandResponse =
         { Result = Some """{"Instructions":[{"Scope":"project","Content":"explicit operation content"}]}"""
-          Error = None; Instructions = legacy :: controls
+          Error = None; Instructions = OperationalControl.fromLegacy controls
           AgentStateChanges = []; InboxActivation = None; PendingJob = None }
     let job : JobResult =
         { JobId = "job"; Status = ToolCompleted; Events = []; NextSequence = 0L
           Truncated = false; ToolResponse = Some original; OperationId = None }
-    let poll = { original with Result = Some(JsonSerializer.Serialize job); Instructions = [] }
+    let poll = { original with Result = Some(legacyJobPayload job (legacy :: controls)); Instructions = [] }
     let command = GetJobResultCommand { ProjectName = "Jarvis"; JobId = job.JobId; AfterSequence = None }
     let projected = McpToolHelpers.projectJobResultWithoutRepositoryGuidance command poll
     let parsed = JsonSerializer.Deserialize<JobResult>(projected.Result.Value)
-    Assert.That(parsed, Is.EqualTo({ job with ToolResponse = Some { original with Instructions = controls } }))
-    let clean = { poll with Result = Some(JsonSerializer.Serialize parsed) }
-    Assert.That(McpToolHelpers.projectJobResultWithoutRepositoryGuidance command clean, Is.EqualTo(clean))
+    Assert.That(parsed, Is.EqualTo({ job with ToolResponse = Some { original with Instructions = OperationalControl.withoutOneShot original.OperationalControls } }))
+    Assert.That(McpToolHelpers.projectJobResultWithoutRepositoryGuidance command projected, Is.EqualTo(projected))
     let read = ReadFileCommand { ProjectName = "Jarvis"; FilePath = "AGENTS.md"; StartLine = None; EndLine = None; IncludeLineNumbers = None }
     Assert.That(McpToolHelpers.projectJobResultWithoutRepositoryGuidance read poll, Is.EqualTo(poll))
 
 [<Test>]
 let operational_contract_legacy_terminal_alert_never_reappears_in_raw_mcp_result () =
-    let alert =
-        { Scope = "response-alert"; Path = "jarvis/response-alert/stale"; Sha256 = ""
-          Content = "STOP - previously consumed" }
+    let alert = OperationalControl.queuedAlert "stale" "STOP - previously consumed"
     let original : AgentCommandResponse =
         { Result = Some "terminal"; Error = None; Instructions = [alert]
           AgentStateChanges = []; InboxActivation = None; PendingJob = None }
@@ -1964,7 +1986,7 @@ let operational_contract_missing_state_receipt_is_not_confirmed_zero () =
 let operational_contract_sender_alert_survives_destination_failure () =
     let source : AgentCommandResponse =
         { Result = Some "{}"; Error = None
-          Instructions = [{ Scope = "response-alert"; Path = "jarvis/response-alert/source"; Sha256 = ""; Content = "STOP - source" }]
+          Instructions = [OperationalControl.queuedAlert "source" "STOP - source"]
           AgentStateChanges = []; InboxActivation = None; PendingJob = None }
     let destination = { source with Result = None; Error = Some(NotFound "destination"); Instructions = [] }
     Assert.That((McpToolHelpers.mergeStateEffects source destination).Instructions, Is.EqualTo(source.Instructions :> obj))
@@ -1973,15 +1995,9 @@ let operational_contract_sender_alert_survives_destination_failure () =
 let completedPollsNeverReplayAlertsEmbeddedInAnOriginalPromotedJobResponse () =
     // A previously stored original completion may contain an alert consumed
     // before the caller ever saw the job. It cannot become a recurring alert.
-    let legacyStop =
-        { Scope = "response-alert"; Path = "jarvis/response-alert/old-stop"; Sha256 = ""
-          Content = "STOP - stale original background completion" }
-    let canonical =
-        { Scope = "project"; Path = "Jarvis/AGENTS.md"; Sha256 = ""
-          Content = "Original project instructions must survive." }
-    let newStop =
-        { Scope = "response-alert"; Path = "jarvis/response-alert/new-stop"; Sha256 = ""
-          Content = "STOP - newly consumed during this poll" }
+    let legacyStop = OperationalControl.queuedAlert "old-stop" "STOP - stale original background completion"
+    let canonical = OperationalControl.ActivationUnverified "Original activation evidence must survive."
+    let newStop = OperationalControl.queuedAlert "new-stop" "STOP - newly consumed during this poll"
     let original : AgentCommandResponse =
         { Result = Some """{"terminal":true}"""; Error = None
           Instructions = [legacyStop; canonical]
@@ -2008,9 +2024,7 @@ let completedPollsNeverReplayAlertsEmbeddedInAnOriginalPromotedJobResponse () =
 [<Test>]
 let pollResponseAlertsRemainVisibleOnPendingAndErroredJobLookups () =
     let pollCommand = GetJobResultCommand { ProjectName = "Jarvis"; JobId = "job-poll"; AfterSequence = None }
-    let alert =
-        { Scope = "response-alert"; Path = "jarvis/response-alert/new-stop"; Sha256 = ""
-          Content = "JARVIS OPERATOR ALERT:\nSTOP - yield safely" }
+    let alert = OperationalControl.queuedAlert "new-stop" "STOP - yield safely"
     let inProgress : JobResult =
         { JobId = "job-poll"; Status = Running
           Events = []; NextSequence = 0L; Truncated = false
@@ -2026,7 +2040,7 @@ let pollResponseAlertsRemainVisibleOnPendingAndErroredJobLookups () =
         let displayed =
             response |> McpToolHelpers.toCallToolResult
             |> McpToolHelpers.attachStateEffects effective
-            |> McpToolHelpers.attachInstructions effective.Instructions
+            |> McpToolHelpers.attachOperationalControls effective.OperationalControls
         Assert.That((displayed.Content[0] :?> TextContentBlock).Text,
                     Does.Contain("STOP - yield safely"))
         Assert.That(displayed.IsError, Is.EqualTo(Nullable(response.Error.IsSome)))
@@ -2219,15 +2233,17 @@ let forwardedTransportFailureKeepsVerifiedSourceWithUnknownDestination () = task
 let pendingHealthFailureRejectsFirstDeviceBeforeRoutedCrossProjectMutation () =
     task {
         let jobId = Guid.NewGuid().ToString("N")
-        let firstHealth = routePendingHealth jobId "Worker 1"
+        let firstHealth = routePendingHealth jobId ""
         let unhealthy = { routeTerminalHealth with Result = None; Error = Some(ValidationFailed "unverified ledger") }
         let respond (device: string) (command: AgentCommand) (actor: string) =
             match device, command with
-            | "first", LedgerReadCommand _ -> firstHealth
+            | "first", LedgerReadCommand _ ->
+                Assert.That(actor, Is.Empty, "Routing health probes are not agent activity.")
+                firstHealth
             | "first", GetJobResultCommand request ->
                 Assert.That(request.JobId, Is.EqualTo(jobId))
                 Assert.That(request.ProjectName, Is.EqualTo("Wayfold"))
-                Assert.That(actor, Is.EqualTo("Worker 1"))
+                Assert.That(actor, Is.Empty, "Routing health polls must not consume agent alerts.")
                 routeJobResult jobId (ToolFailed "health") (Some unhealthy)
             | "second", LedgerReadCommand _ -> routeTerminalHealth
             | "second", CrossProjectNotificationCommand _ ->
@@ -2250,15 +2266,17 @@ let pendingHealthFailureRejectsFirstDeviceBeforeRoutedCrossProjectMutation () =
 let pendingHealthCompletionUsesExactlyTheOriginalCandidateDeviceAndActor () =
     task {
         let jobId = Guid.NewGuid().ToString("N")
-        let firstHealth = routePendingHealth jobId "Worker 1"
+        let firstHealth = routePendingHealth jobId ""
         let mutable polls = 0
         let respond (device: string) (command: AgentCommand) (actor: string) =
             match device, command with
-            | "first", LedgerReadCommand _ -> firstHealth
+            | "first", LedgerReadCommand _ ->
+                Assert.That(actor, Is.Empty, "Routing health probes are not agent activity.")
+                firstHealth
             | "first", GetJobResultCommand request ->
                 polls <- polls + 1
                 Assert.That(request.JobId, Is.EqualTo(jobId))
-                Assert.That(actor, Is.EqualTo("Worker 1"))
+                Assert.That(actor, Is.Empty, "Routing health polls must not consume agent alerts.")
                 if polls = 1 then routeJobResult jobId Running None
                 else routeJobResult jobId ToolCompleted (Some routeTerminalHealth)
             | "first", CrossProjectNotificationCommand envelope ->

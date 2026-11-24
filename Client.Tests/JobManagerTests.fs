@@ -430,12 +430,8 @@ let completedToolPollStripsLegacyOneShotAlertsFromRawResultWithoutAlteringStored
     try
         let context = TestContext root
         let blocked = TaskCompletionSource<AgentCommandResponse>(TaskCreationOptions.RunContinuationsAsynchronously)
-        let previousStop =
-            { Scope = "response-alert"; Path = "jarvis/response-alert/previous"
-              Sha256 = ""; Content = "STOP - consumed before old background completion" }
-        let canonical =
-            { Scope = "project"; Path = "AGENTS.md"; Sha256 = ""
-              Content = "Preserve ordinary original job instructions" }
+        let previousStop = OperationalControl.queuedAlert "previous" "STOP - consumed before old background completion"
+        let canonical = OperationalControl.ActivationUnverified "Preserve original activation status"
         let original =
             { completedToolResponse """{"immutable":true}""" with
                 Instructions = [previousStop; canonical] }

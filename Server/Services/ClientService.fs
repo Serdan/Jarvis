@@ -45,48 +45,57 @@ module ProjectNotificationRouting =
     let resolveHealth (projectName: string) (expectedActor: string)
                       (deadline: DateTimeOffset) (initial: AgentCommandResponse)
                       (poll: GetJobResultCommand -> Task<AgentCommandResponse>) =
-        let failure detail : AgentCommandResponse =
+        let failure controls detail : AgentCommandResponse =
             { Result = None
               Error = Some(ExecutionFailed("Ledger health not verified: " + detail))
-              Instructions = []
-              AgentStateChanges = []
+              Instructions = OperationalControl.ordered controls
+              // The original sender-validation job may already have committed.
+              AgentStateChanges = Unchecked.defaultof<_>
               InboxActivation = None
               PendingJob = None }
-        let rec resolve (current: AgentCommandResponse) =
+        let rec resolve controls (current: AgentCommandResponse) =
             task {
                 match current.PendingJob with
-                | None -> return current
+                | None -> return { current with Instructions = OperationalControl.ordered controls }
                 | Some handle when handle.Kind <> JobKind.ToolOperation
                                    || handle.ProjectName <> Some projectName
                                    || handle.AgentId <> expectedActor ->
-                    return failure "pending handle does not belong to the verified project and initiating actor."
+                    return failure controls "pending handle does not belong to the verified project and initiating actor."
                 | Some handle when DateTimeOffset.UtcNow >= deadline ->
-                    return failure "pending health job did not finish before the bounded routing deadline."
+                    return failure controls "pending health job did not finish before the bounded routing deadline."
                 | Some handle ->
                     let! returned =
                         poll { ProjectName = projectName
                                JobId = handle.JobId
                                AfterSequence = None }
+                    // Internal health probes use an empty actor, so their polls
+                    // cannot consume alerts. Sender validation uses the real
+                    // actor; carry controls from those delegated replies to the
+                    // ultimate visible response, even if routing later fails.
+                    let controls = OperationalControl.ordered (controls @ returned.OperationalControls)
+                    let finish (terminal: AgentCommandResponse) =
+                        let merged = OperationalControl.ordered (controls @ OperationalControl.withoutOneShot terminal.OperationalControls)
+                        { terminal with Instructions = merged }
                     match returned.Result, returned.Error, returned.PendingJob with
                     | Some payload, None, None ->
                         try
                             let job = JsonSerializer.Deserialize<JobResult>(payload)
                             if isNull (box job) || job.JobId <> handle.JobId then
-                                return failure "poll returned a different or malformed job."
+                                return failure controls "poll returned a different or malformed job."
                             else
                                 match job.ToolResponse, job.Status with
                                 | Some terminal, ToolCompleted when terminal.PendingJob.IsNone ->
-                                    return terminal
+                                    return finish terminal
                                 | Some terminal, ToolFailed _ when terminal.PendingJob.IsNone && terminal.Error.IsSome ->
-                                    return terminal
+                                    return finish terminal
                                 | None, Running ->
-                                    return! resolve current
+                                    return! resolve controls current
                                 | _ ->
-                                    return failure "health job ended without a terminal verified result."
-                        with _ -> return failure "health job returned an invalid typed response."
-                    | _ -> return failure "health job could not be read from its original device."
+                                    return failure controls "health job ended without a terminal verified result."
+                        with _ -> return failure controls "health job returned an invalid typed response."
+                    | _ -> return failure controls "health job could not be read from its original device."
             }
-        resolve initial
+        resolve initial.OperationalControls initial
 
     let ordered (selected: ClientSessionStatus voption) (sessions: ClientSessionStatus list)
                 (explicitDevice: bool) =
@@ -460,9 +469,9 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                         let! health = this.SendCommandToUser(
                             userId,
                             ProjectNotificationRouting.healthProbe projectName,
-                            ?conversationId = conversationId, deviceId = session.DeviceId, ?agentId = agentId)
+                            ?conversationId = conversationId, deviceId = session.DeviceId)
                         let! verified =
-                            ProjectNotificationRouting.resolveHealth projectName (defaultArg agentId "")
+                            ProjectNotificationRouting.resolveHealth projectName ""
                                 (DateTimeOffset.UtcNow.AddMinutes(2.)) health
                                 (fun query ->
                                     task {
@@ -470,7 +479,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                         return! this.SendCommandToUser(
                                             userId, GetJobResultCommand query,
                                             ?conversationId = conversationId,
-                                            deviceId = session.DeviceId, ?agentId = agentId)
+                                            deviceId = session.DeviceId)
                                     })
                         let stillSameDevice =
                             match users.GetSessionByDevice(userId, session.DeviceId) with

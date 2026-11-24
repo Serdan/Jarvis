@@ -263,11 +263,9 @@ let private checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.Pro
             let agent =
                 cache.Get(now, projectId, agentId, fun () ->
                     loadAgentState rt project agentId)
-            match agent |> Result.toOption |> Option.flatten |> Option.bind (WorkingTurnGuidance.instructionAt now) with
-            | Some content ->
-                [ { Scope = "working-turn"; Path = "jarvis/working-turn"
-                    Sha256 = ""; Content = content } ]
-            | None -> []
+            agent |> Result.toOption |> Option.flatten
+            |> Option.bind (WorkingTurnGuidance.instructionAt now)
+            |> Option.bind OperationalControl.workingTurn |> Option.toList
 
 // A read can still mutate the original Agent ledger via automatic activation
 // or one-shot response-alert consumption. Verify that *side effect* separately
@@ -302,11 +300,7 @@ let private checkResponseAlerts (rt: Runtime) agentId (target: ProjectPaths.Proj
                             |> List.sortBy (fun alert ->
                                 (if alert.Message.TrimStart().StartsWith("STOP", StringComparison.OrdinalIgnoreCase)
                                  then 0 else 1), alert.QueuedAtUtc, alert.AlertId)
-                            |> List.map (fun alert ->
-                                { Scope = "response-alert"
-                                  Path = $"jarvis/response-alert/{alert.AlertId}"
-                                  Sha256 = ""
-                                  Content = "JARVIS OPERATOR ALERT (one-shot coordination instruction):\n" + alert.Message })
+                            |> List.map (fun alert -> OperationalControl.queuedAlert alert.AlertId alert.Message)
             finally
                 (responseAlertCache rt).AfterAttempt(selected, agentId)
 
@@ -402,9 +396,8 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                 match LegacyWriterProtocolFence.LegacyWriterProtocolFence.classify command with
                 | LegacyWriterProtocolFence.LegacyCommandKind.HistoricalRead ->
                     Ok ([], None,
-                        [ { Scope = "working-turn"; Path = "jarvis/activation-status"
-                            Sha256 = ""
-                            Content = $"Automatic Ready-to-Working activation could not be verified: {error}. Reread the canonical inbox before continuing assignment work." } ])
+                        [ OperationalControl.ActivationUnverified
+                            $"Automatic Ready-to-Working activation could not be verified: {error}. Reread the canonical inbox before continuing assignment work." ])
                 | _ -> Error error
             match current with
             | Error error -> unavailable error
@@ -1296,7 +1289,7 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
         let mutable parsedCommand = None
         let mutable responseScope: ProjectPaths.ProjectTarget option = None
         let mutable unexpectedFailure = false
-        let mutable instructions: InstructionDocument list = []
+        let mutable instructions: OperationalControl list = []
         let mutable implicitChanges: string list = []
         let mutable inboxActivation: AgentInboxActivation option = None
         let! response =
@@ -1396,7 +1389,7 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                                 for changed in outcome.ChangedAgentIds do
                                     cache.Invalidate(projectId, changed)
                             | _ -> ()
-                            instructions <- activationInstructions @ checkWorkingGuidance rt localAgentId target command
+                            instructions <- OperationalControl.ordered (activationInstructions @ checkWorkingGuidance rt localAgentId target command)
                             return result
                 with ex ->
                     unexpectedFailure <- true
@@ -1420,7 +1413,7 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
         // must not consume them: their terminal response may never be polled.
         // Those alerts are delivered when a reply is actually sent instead.
         if includeResponseAlerts then
-            instructions <- checkResponseAlerts rt agentId responseScope @ instructions
+            instructions <- OperationalControl.ordered (checkResponseAlerts rt agentId responseScope @ instructions)
         let agentResponse =
             match parsedCommand with
             | Some command -> toAgentResponse command instructions changes inboxActivation response
@@ -1454,8 +1447,7 @@ let private withVisibleResponseAlerts (rt: Runtime) (agentId: string)
             | Ok scope -> checkResponseAlerts rt agentId (projectTarget scope)
             | Error _ -> []
         | _ -> []
-    let existing = if isNull (box response.Instructions) then [] else response.Instructions
-    { response with Instructions = alerts @ existing }
+    { response with Instructions = OperationalControl.ordered (alerts @ response.OperationalControls) }
 
 // Bounded, client-owned execution begins before the deadline. An HTTP
 // request and SignalR delivery may end without cancelling this operation.

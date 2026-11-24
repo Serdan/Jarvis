@@ -2619,7 +2619,7 @@ type ReviewWorkflowTests() =
                 Assert.That(delivered.IsOk, Is.True)
                 Assert.That(destinationResponse.AgentStateChanges, Is.Empty,
                             "Foreign sender must not start an agent in the destination project")
-                Assert.That(destinationResponse.Instructions |> List.exists (fun i -> i.Scope = "working-turn"),
+                Assert.That(destinationResponse.OperationalControls |> List.exists (Common.OperationalControl.isAlert >> not),
                             Is.False)
                 let after = (ReviewWorkflow.getAgentInbox destinationBinding "Owner" |> success).Agent
                 Assert.That(after.State, Is.EqualTo("Ready"))
@@ -3736,7 +3736,7 @@ type ReviewWorkflowTests() =
                     let _, coldResult, coldResponse = readSource()
                     Assert.That(coldResult.IsOk, Is.True)
                     Assert.That(coldResponse.AgentStateChanges, Is.Empty)
-                    Assert.That(coldResponse.Instructions |> List.exists (fun doc -> doc.Scope = "working-turn" && doc.Path = "jarvis/activation-status"), Is.True)
+                    Assert.That(coldResponse.OperationalControls |> List.exists (function Common.OperationalControl.ActivationUnverified _ -> true | _ -> false), Is.True)
                 finally
                     git one [ "remote"; "set-url"; "origin"; originalRemote ] |> ignore
                 File.WriteAllText(Path.Combine(one, "src", "AGENTS.md"), "changed source guidance")
@@ -3800,9 +3800,9 @@ type ReviewWorkflowTests() =
                     let _, lockedResult, lockedResponse = readSource()
                     Assert.That(lockedResult.IsOk, Is.True)
                     Assert.That(lockedResponse.AgentStateChanges, Is.Empty)
-                    let status = lockedResponse.Instructions |> List.filter (fun doc -> doc.Scope = "working-turn" && doc.Path = "jarvis/activation-status")
+                    let status = lockedResponse.OperationalControls |> List.filter (function Common.OperationalControl.ActivationUnverified _ -> true | _ -> false)
                     Assert.That(status.Length, Is.EqualTo(1))
-                    Assert.That(status.Head.Content, Does.Contain("TrustBindingContended"))
+                    Assert.That(Common.OperationalControl.text status.Head, Does.Contain("TrustBindingContended"))
                     let whileLocked = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
                     Assert.That(whileLocked.State, Is.EqualTo("Ready"))
                     Assert.That(whileLocked.Version, Is.EqualTo(remoteReady.Version))
@@ -6720,19 +6720,17 @@ type ReviewWorkflowTests() =
                 let _, _, other = ownerReply
                 Assert.That(io.RemoteFetches, Is.EqualTo(0),
                             "A verified no-alert job poll must do zero synchronous remote Git fetches.")
-                Assert.That(other.Instructions |> List.exists (fun item ->
-                    item.Scope = "response-alert"), Is.False)
+                Assert.That(other.OperationalControls |> List.exists Common.OperationalControl.isAlert, Is.False)
                 Assert.That((ReviewWorkflow.getResponseAlerts first "Reviewer" |> success).Pending.Length, Is.EqualTo(1))
                 ReviewWorkflow.queueResponseAlert first (Guid.NewGuid()) "Lead"
                     "Reviewer" "STOP — commit safe changes and yield" |> success |> ignore
                 (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" "Reviewer").GetAwaiter().GetResult()
                 let _, polled, delivered = invoke "Reviewer" poll
                 Assert.That(polled.IsError, Is.True)
-                let alerts = delivered.Instructions |> List.filter (fun item ->
-                    item.Scope = "response-alert")
+                let alerts = delivered.OperationalControls |> List.filter Common.OperationalControl.isAlert
                 Assert.That(alerts.Length, Is.EqualTo(2))
-                Assert.That(alerts.Head.Content, Does.Contain("STOP"))
-                Assert.That(alerts.[1].Content, Does.Contain("preserve test evidence"))
+                Assert.That(Common.OperationalControl.text alerts.Head, Does.Contain("STOP"))
+                Assert.That(Common.OperationalControl.text alerts.[1], Does.Contain("preserve test evidence"))
                 Assert.That(delivered.AgentStateChanges, Is.Empty)
                 Assert.That(delivered.InboxActivation.IsNone, Is.True)
                 Assert.That(runtime.Tui.GetAgentLastSeen("owner", "Reviewer").IsNone, Is.True)
@@ -6744,8 +6742,7 @@ type ReviewWorkflowTests() =
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let _, readResult, after = invoke "Reviewer" ordinary
                 Assert.That(readResult.IsOk, Is.True)
-                Assert.That(after.Instructions |> List.exists (fun item ->
-                    item.Scope = "response-alert"), Is.False)
+                Assert.That(after.OperationalControls |> List.exists Common.OperationalControl.isAlert, Is.False)
                 ReviewWorkflow.queueResponseAlert first (Guid.NewGuid()) "Lead"
                     "Reviewer" "Non-stop instruction" |> success |> ignore
                 let missing : Common.AgentCommand =
@@ -6755,8 +6752,7 @@ type ReviewWorkflowTests() =
                 (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" "Reviewer").GetAwaiter().GetResult()
                 let _, missingResult, missingReply = invoke "Reviewer" missing
                 Assert.That(missingResult.IsError, Is.True)
-                Assert.That(missingReply.Instructions |> List.exists (fun item ->
-                    item.Scope = "response-alert" && item.Content.Contains("Non-stop instruction")), Is.True)
+                Assert.That(missingReply.OperationalControls |> List.exists (fun control -> Common.OperationalControl.isAlert control && (Common.OperationalControl.text control).Contains("Non-stop instruction")), Is.True)
                 Assert.That((ReviewWorkflow.getResponseAlerts second "Reviewer" |> success).Pending, Is.Empty)
             finally
                 if File.Exists configPath then File.Delete configPath
@@ -6784,7 +6780,7 @@ type ReviewWorkflowTests() =
                 let refresh actor =
                     (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" actor).GetAwaiter().GetResult()
                 let shown (reply: Common.AgentCommandResponse) =
-                    reply.Instructions |> List.filter (fun item -> item.Scope = "response-alert")
+                    reply.OperationalControls |> List.filter Common.OperationalControl.isAlert
 
                 refresh "Owner"
                 refresh "Reviewer"
@@ -6809,7 +6805,7 @@ type ReviewWorkflowTests() =
                 Assert.That(Client.SignalR.Client.responseAlertProbePending runtime "owner" "Reviewer",
                             Is.True, "The refresh must verify a pending alert in the client-local probe.")
                 let _, _, delivered = invoke "Reviewer"
-                Assert.That(shown delivered |> List.map _.Content,
+                Assert.That(shown delivered |> List.map Common.OperationalControl.text,
                             Has.Some.Contains("deliver only after a verified refresh"))
                 Assert.That((ReviewWorkflow.getResponseAlerts first "Reviewer" |> success).Pending, Is.Empty)
 
@@ -6839,7 +6835,7 @@ type ReviewWorkflowTests() =
                 Assert.That(shown missed, Is.Empty)
                 refresh "Reviewer"
                 let _, _, recovered = invoke "Reviewer"
-                Assert.That(shown recovered |> List.map _.Content,
+                Assert.That(shown recovered |> List.map Common.OperationalControl.text,
                             Has.Some.Contains("recover after missed hint"))
                 Assert.That((ReviewWorkflow.getResponseAlerts first "Reviewer" |> success).Pending, Is.Empty)
                 let _, _, after = invoke "Reviewer"
@@ -6876,8 +6872,7 @@ type ReviewWorkflowTests() =
                 let original : Common.AgentCommandResponse =
                     { Result = Some """{"terminal":true}"""; Error = None
                       Instructions =
-                        [{ Scope = "project"; Path = "owner/AGENTS.md"; Sha256 = ""
-                           Content = "Original completion instruction" }]
+                        [Common.OperationalControl.ActivationUnverified "Original activation status"]
                       AgentStateChanges = [{ ProjectName = "owner"; AgentId = actor }]
                       InboxActivation = None; PendingJob = None }
                 let startPromoted (blocked: System.Threading.Tasks.TaskCompletionSource<Common.AgentCommandResponse>) =
@@ -6909,7 +6904,7 @@ type ReviewWorkflowTests() =
                         actor TimeSpan.Zero (fun _ _ -> System.Threading.Tasks.Task.FromResult response)
                     |> await
                 let alertInstructions (response: Common.AgentCommandResponse) =
-                    response.Instructions |> List.filter (fun doc -> doc.Scope = "response-alert")
+                    response.OperationalControls |> List.filter Common.OperationalControl.isAlert
                 let newBlocked () =
                     System.Threading.Tasks.TaskCompletionSource<Common.AgentCommandResponse>(
                         System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously)
@@ -6926,7 +6921,7 @@ type ReviewWorkflowTests() =
                             Is.EqualTo(1), "Background completion must not consume STOP.")
                 (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" actor).GetAwaiter().GetResult()
                 let firstPoll = visiblePoll firstHandle.JobId
-                Assert.That(alertInstructions firstPoll |> List.map _.Content,
+                Assert.That(alertInstructions firstPoll |> List.map Common.OperationalControl.text,
                             Has.Some.Contains("only first completed poll"))
                 Assert.That((ReviewWorkflow.getResponseAlerts first actor |> success).Pending, Is.Empty)
                 let repeatPoll = visiblePoll firstHandle.JobId
@@ -6955,7 +6950,7 @@ type ReviewWorkflowTests() =
                         actor (TimeSpan.FromSeconds 3.)
                         (fun _ _ -> System.Threading.Tasks.Task.FromResult unrelatedReply)
                     |> await
-                Assert.That(alertInstructions visible |> List.map _.Content,
+                Assert.That(alertInstructions visible |> List.map Common.OperationalControl.text,
                             Has.Some.Contains("next unrelated visible tool reply"))
                 Assert.That((ReviewWorkflow.getResponseAlerts first actor |> success).Pending, Is.Empty)
                 Assert.That(alertInstructions (visiblePoll secondHandle.JobId), Is.Empty)
@@ -6998,8 +6993,7 @@ type ReviewWorkflowTests() =
                           RelativePath = null }
                 let _, result, metadata = invoke inspect
                 Assert.That(result.IsOk, Is.True)
-                Assert.That(metadata.Instructions |> List.exists (fun item ->
-                    item.Scope = "response-alert"), Is.False)
+                Assert.That(metadata.OperationalControls |> List.exists Common.OperationalControl.isAlert, Is.False)
                 Assert.That((ReviewWorkflow.getResponseAlerts first "Owner" |> success).Pending.Length, Is.EqualTo(1))
                 Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.Version, Is.EqualTo(before.Version))
 
@@ -7009,8 +7003,7 @@ type ReviewWorkflowTests() =
                 (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" "Owner").GetAwaiter().GetResult()
                 let _, polled, response = invoke poll
                 Assert.That(polled.IsError, Is.True)
-                Assert.That(response.Instructions |> List.exists (fun item ->
-                    item.Scope = "response-alert" && item.Content.Contains("STOP")), Is.True)
+                Assert.That(response.OperationalControls |> List.exists (fun control -> Common.OperationalControl.isAlert control && (Common.OperationalControl.text control).Contains("STOP")), Is.True)
                 Assert.That(response.AgentStateChanges, Is.Empty)
                 Assert.That(response.InboxActivation.IsNone, Is.True)
                 let after = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent

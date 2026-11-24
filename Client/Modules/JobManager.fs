@@ -551,10 +551,7 @@ module private ToolOperations =
                                 // alerts captured by an older background path
                                 // as recurring job-result instructions.
                                 let original = entry.Completion.Task.Result
-                                let instructions =
-                                    if isNull (box original.Instructions) then [] else
-                                        original.Instructions |> List.filter (fun doc -> doc.Scope <> "response-alert")
-                                Some { original with Instructions = instructions }
+                                Some { original with Instructions = OperationalControl.withoutOneShot original.OperationalControls }
                             else None
                         Ok
                             { JobId = jobId

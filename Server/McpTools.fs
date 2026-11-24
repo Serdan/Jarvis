@@ -296,15 +296,9 @@ module McpToolHelpers =
     let private errorResult error =
         textResult (formatError error) true
 
-    // Only these legacy scopes carry operational control. Do not interpret
-    // repository documents, notices or unknown scopes as response guidance.
-    let private operationalInstructionScope scope =
-        scope = "response-alert" || scope = "working-turn"
-
-    // A legacy terminal job's immutable original envelope can also contain
-    // repository instructions inside its requested JSON result. Filter only
-    // that field at MCP presentation; leave job storage, original result,
-    // error, operation identity, receipts and control fields untouched.
+    // Project only operational controls at the MCP presentation boundary.
+    // The immutable original result, error, operation ID and receipts stay intact.
+    // A previously consumed one-shot alert must not recur on a later poll.
     let projectJobResultWithoutRepositoryGuidance command (response: AgentCommandResponse) =
         match command, response.Result with
         | GetJobResultCommand _, Some payload ->
@@ -313,45 +307,36 @@ module McpToolHelpers =
                 | :? JsonObject as job ->
                     match job["ToolResponse"] with
                     | :? JsonObject as original ->
-                        match original["Instructions"] with
-                        | :? JsonArray as documents ->
-                            let retained = JsonArray()
-                            for item in documents do
-                                match item with
-                                | :? JsonObject as document ->
-                                    match document["Scope"] with
-                                    | :? JsonValue as scope when scope.GetValueKind() = JsonValueKind.String
-                                                                  && operationalInstructionScope (scope.GetValue<string>()) ->
-                                        retained.Add(item.DeepClone())
-                                    | _ -> ()
-                                | _ -> ()
-                            if retained.Count = documents.Count then response
-                            else
-                                original["Instructions"] <- retained
-                                { response with Result = Some(job.ToJsonString()) }
-                        | _ -> response
+                        let terminal = JsonSerializer.Deserialize<AgentCommandResponse>(original.ToJsonString())
+                        let controls = OperationalControl.withoutOneShot terminal.OperationalControls
+                        original.Remove("Instructions") |> ignore
+                        if controls.IsEmpty then
+                            original.Remove("OperationalControls") |> ignore
+                        else
+                            original["OperationalControls"] <- JsonSerializer.SerializeToNode controls
+                        let projected = job.ToJsonString()
+                        if projected = payload then response
+                        else { response with Result = Some projected }
                     | _ -> response
                 | _ -> response
             with _ -> response // Preserve the existing malformed-result handling.
         | _ -> response
 
-    let attachInstructions (documents: InstructionDocument list) (result: CallToolResult) =
-        // Migration compatibility: older clients still send repository
-        // documents and notices in Instructions. Only actual operational
-        // controls are rendered; the wire DTO stays intact for staged rollout.
-        if isNull (box documents) || documents.IsEmpty then result
-        else
+    let attachOperationalControls controls (result: CallToolResult) =
+        match OperationalControl.normalize controls with
+        | [] -> result
+        | ordered ->
             let contents = ResizeArray<ContentBlock>()
-            for document in documents do
-                if document.Scope = "response-alert" then
-                    contents.Add(textContent document.Content)
-            for document in documents do
-                if document.Scope = "working-turn" then
-                    contents.Add(textContent ("Jarvis Working turn instruction:\n" + document.Content))
-            if contents.Count > 0 then
-                for block in result.Content do
-                    contents.Add(block)
-                result.Content <- contents
+            for control in ordered do
+                let message =
+                    match control with
+                    | OperationalControl.QueuedResponseAlert(_, text) -> text
+                    | OperationalControl.WorkingTurnLimit(_, advisory) -> "Jarvis Working turn instruction:\n" + advisory
+                    | OperationalControl.ActivationUnverified detail -> detail
+                contents.Add(textContent message)
+            for block in result.Content do
+                contents.Add(block)
+            result.Content <- contents
             result
 
     let private jsonResult value =
@@ -514,24 +499,28 @@ module McpToolHelpers =
                 if isNull (box response.AgentStateChanges) then [] else response.AgentStateChanges
             let details = JsonObject()
             let metadata = if isNull result.Meta then JsonObject() else result.Meta
-            match response.Error with
-            | Some(UncertainOutcome info) ->
+            match response.StateChangeEvidence with
+            | StateChangeEvidence.Unknown _ ->
                 details["agentStateChangesStatus"] <- JsonSerializer.SerializeToNode "unknown"
                 metadata["jarvis/agent_state_changes_status"] <- JsonSerializer.SerializeToNode "unknown"
                 // Known partial evidence, if present, is explicitly NOT complete.
                 if not changes.IsEmpty then
                     details["knownAgentStateChanges"] <- JsonSerializer.SerializeToNode changes
                     metadata["jarvis/known_agent_state_changes"] <- JsonSerializer.SerializeToNode changes
-                match info.OperationId with
-                | Some id ->
-                    details["originalOperationId"] <- JsonSerializer.SerializeToNode id
-                    metadata["jarvis/recovery_operation_id"] <- JsonSerializer.SerializeToNode id
-                | None -> ()
-            | _ ->
+                match response.Error with
+                | Some(UncertainOutcome info) ->
+                    match info.OperationId with
+                    | Some id ->
+                        details["originalOperationId"] <- JsonSerializer.SerializeToNode id
+                        metadata["jarvis/recovery_operation_id"] <- JsonSerializer.SerializeToNode id
+                    | None -> ()
+                | _ -> ()
+            | StateChangeEvidence.Confirmed _ ->
                 details["agentStateChanges"] <- JsonSerializer.SerializeToNode changes
                 metadata["jarvis/agent_state_changes"] <- JsonSerializer.SerializeToNode changes
                 details["agentStateChangesStatus"] <- JsonSerializer.SerializeToNode "confirmed"
                 metadata["jarvis/agent_state_changes_status"] <- JsonSerializer.SerializeToNode "confirmed"
+            | StateChangeEvidence.Pending -> ()
             match response.InboxActivation with
             | None -> ()
             | Some activation ->
@@ -557,6 +546,7 @@ module McpToolHelpers =
                     if isNull (box prior.AgentStateChanges) then [] else prior.AgentStateChanges
                 (source @ final.AgentStateChanges) |> List.distinct
         { final with
+            Instructions = OperationalControl.ordered (prior.OperationalControls @ final.OperationalControls)
             AgentStateChanges = changes
             InboxActivation =
                 if final.PendingJob.IsSome then None
@@ -580,16 +570,9 @@ module McpToolHelpers =
                 else
                     match job.ToolResponse with
                     | Some original ->
-                        let latest =
-                            if isNull (box response.Instructions) then [] else response.Instructions
-                        let originalGuidance =
-                            // Old clients may have consumed one-shot alerts
-                            // during background completion. The immutable job
-                            // can be polled repeatedly, so never replay those
-                            // original alerts. Fresh poll-time alerts are in latest.
-                            if isNull (box original.Instructions) then [] else
-                                original.Instructions |> List.filter (fun item -> item.Scope <> "response-alert")
-                        { original with Instructions = latest @ originalGuidance }
+                        let originalControls = OperationalControl.withoutOneShot original.OperationalControls
+                        { original with
+                            Instructions = OperationalControl.ordered (response.OperationalControls @ originalControls) }
                     | None -> response
             with _ -> response
         | _ -> response
@@ -1152,7 +1135,7 @@ module McpToolHelpers =
                          | ExportFileCommand _ -> exportResult context response
                          | _ -> toCallToolResult (projectJobResultWithoutRepositoryGuidance command response))
                         |> attachStateEffects evidence
-                        |> attachInstructions evidence.Instructions
+                        |> attachOperationalControls evidence.OperationalControls
                         |> attachOperationId tracking
                         |> attachGeneratedOperationId generatedId
                         |> attachGeneratedTaskId (if response.Result.IsSome && response.Error.IsNone && response.PendingJob.IsNone then generatedTaskId else None)

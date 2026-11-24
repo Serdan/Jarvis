@@ -14,12 +14,22 @@ open Common
 open Common.SignalR
 open Client.WorkQueueSchedulerHostLoop
 open Client.WorkQueueReactiveWake
+open Client.NativeSchedulerAccountReservation
 open AutomationHealthHostedFixture
 
 // Independent abstract ownership model. The state is driven by commands and
 // preconditions, never by copying the observed canonical attempt phase.
 type Phase = Working | Waiting | CancelledWaiting | Ready
 type Model = { Phase: Phase; Generation: int; Age: int option }
+type private ReservationExpectation =
+    { Original: NativeDispatchCandidate
+      OriginalOperation: string
+      Status: string
+      Generation: int64
+      Fence: string
+      Session: string
+      Terminal: string }
+
 type Command =
     | Advance of int
     | Activity
@@ -481,18 +491,42 @@ type GeneratedComposition() =
             use account = SystemPropertyAccountFixture.create root
                             [| fs |> Array.map _.First; fs |> Array.map _.Second |]
             let binding client project = if client = 0 then fs[project].First else fs[project].Second
-            let mutable expected : Map<string, string * int64 * int64> = Map.empty
+            // The oracle retains the original command's full candidate and
+            // UUID, plus separately expected lifecycle/effect state.
+            let mutable expected : Map<string, ReservationExpectation> = Map.empty
             let mutable limit = 1
+            let expectReserved (op: Guid) (candidate: NativeDispatchCandidate) =
+                let reservation = { Original = candidate; OriginalOperation = string op; Status = "Reserved"
+                                    Generation = 1L; Fence = ""; Session = ""; Terminal = "" }
+                expected <- expected.Add(candidate.DispatchId, reservation)
+            let expectMove (candidate: NativeDispatchCandidate) status generation fence session =
+                let original = expected[candidate.DispatchId]
+                expected <- expected.Add(candidate.DispatchId,
+                    { original with Status = status; Generation = generation; Fence = fence; Session = session })
             let verify () =
                 for c in 0..1 do
-                    let records = (SystemPropertyAccountFixture.read account c).Records
+                    let state = SystemPropertyAccountFixture.read account c
+                    equal "account identity" (string account.Accounts[c].AccountId) state.AccountId
+                    equal "account ledger identity" (string account.Accounts[c].LedgerId) state.LedgerId
+                    equal "account epoch" account.Accounts[c].Epoch state.Epoch
+                    let records = state.Records
                     let observed =
                         records
-                        |> Array.map (fun r -> r.Candidate.DispatchId, (r.Status, r.Generation, r.Candidate.AssignmentGeneration))
+                        |> Array.map (fun r ->
+                            r.Candidate.DispatchId,
+                            { Original = r.Candidate; OriginalOperation = r.OriginalOperationId
+                              Status = r.Status; Generation = r.Generation; Fence = r.ProjectFenceOid
+                              Session = r.ProviderSessionId; Terminal = r.TerminalOperationId })
                         |> Map.ofArray
                     equal "exact account reservation projection" expected observed
                     equal "unique reservations" records.Length observed.Count
-                    equal "capacity conserved" true (records |> Array.filter (fun r -> r.Status <> "Released") |> Array.length <= limit)
+                    equal "unique original operations" records.Length (records |> Array.map _.OriginalOperationId |> Array.distinct |> Array.length)
+                    equal "unique effect operations" records.Length (records |> Array.map (fun r -> r.Candidate.EffectOperationId) |> Array.distinct |> Array.length)
+                    equal "unique canonical keys" records.Length (records |> Array.map _.CanonicalKey |> Array.distinct |> Array.length)
+                    let occupied = records |> Array.filter (fun r -> r.Status <> "Released")
+                    equal "capacity conserved" true (occupied.Length <= limit)
+                    for _, local in occupied |> Array.groupBy (fun r -> r.Candidate.ProjectId) do
+                        equal "per-project quota conserved" true (local.Length <= 1)
                 fs |> Array.iter observe
             let run p cmd =
                 step fs[p] (random.Next 2) cmd
@@ -532,7 +566,7 @@ type GeneratedComposition() =
             let winner = winners[0]
             let loser = 1 - winner
             let original = candidates[winner]
-            expected <- expected.Add(original.DispatchId, ("Reserved", 1L, original.AssignmentGeneration))
+            expectReserved ids[winner] original
             verify ()
             let replay = SystemPropertyAccountFixture.reserveWithCoverage account loser covers[winner] ids[winner] original
             equal "exact original reservation replay" true replay.IsOk
@@ -570,7 +604,7 @@ type GeneratedComposition() =
             run loser Resume
             let op, c, admitted = reserve loser loser
             admitted |> success |> ignore
-            expected <- expected.Add(c.DispatchId, ("Reserved", 1L, c.AssignmentGeneration))
+            expectReserved op c
             verify ()
             let _, claim = SystemPropertyAccountFixture.claim account winner loser op c
             let fence = claim |> success
@@ -582,13 +616,21 @@ type GeneratedComposition() =
             let move version status session =
                 SystemPropertyAccountFixture.transition account winner dispatch effect version status fence.CurrentHead session
             move 1L "Dispatching" "" |> success |> ignore
-            expected <- expected.Add(c.DispatchId, ("Dispatching", 2L, c.AssignmentGeneration))
+            expectMove c "Dispatching" 2L fence.CurrentHead ""
             verify ()
             let staleTransition = move 1L "Uncertain" ""
             equal "stale account transition rejected" true staleTransition.IsError
             verify ()
+            let wrongEffect =
+                SystemPropertyAccountFixture.transition account loser dispatch (Guid.NewGuid()) 2L "Uncertain" fence.CurrentHead ""
+            equal "wrong original effect rejected" true wrongEffect.IsError
+            verify ()
+            let wrongFence =
+                SystemPropertyAccountFixture.transition account loser dispatch effect 2L "Uncertain" (String.replicate 40 "a") ""
+            equal "replacement project fence rejected" true wrongFence.IsError
+            verify ()
             move 2L "Uncertain" "" |> success |> ignore
-            expected <- expected.Add(c.DispatchId, ("Uncertain", 3L, c.AssignmentGeneration))
+            expectMove c "Uncertain" 3L fence.CurrentHead ""
             verify ()
             // No live provider or synthetic terminal is invoked. Uncertainty
             // must remain occupied despite duplicate/no-terminal observations.
@@ -596,10 +638,16 @@ type GeneratedComposition() =
             equal "unverified terminal cannot release" true release.IsError
             verify ()
             move 3L "Unknown" "disposable-unconfirmed-session" |> success |> ignore
-            expected <- expected.Add(c.DispatchId, ("Unknown", 4L, c.AssignmentGeneration))
+            expectMove c "Unknown" 4L fence.CurrentHead "disposable-unconfirmed-session"
             verify ()
             let forged = SystemPropertyAccountFixture.forgeTerminal account winner loser op c
             equal "positive verifier without immutable receipt cannot release" true forged.IsError
+            verify ()
+            let wrongSession = move 4L "Active" "another-session"
+            equal "replacement provider session rejected" true wrongSession.IsError
+            verify ()
+            let wrongOriginal = SystemPropertyAccountFixture.forgeTerminal account winner loser (Guid.NewGuid()) c
+            equal "wrong original reservation cannot release" true wrongOriginal.IsError
             verify ()
             let _, _, full = reserve winner winner
             equal "uncertain reservation remains occupied" true full.IsError

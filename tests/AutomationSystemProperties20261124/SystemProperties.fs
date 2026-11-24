@@ -73,7 +73,7 @@ let private observe f =
         let snap = LedgerStore.fetch binding |> success
         let t, attempt = ReviewWorkflow.getTaskAt binding snap f.Original.TaskId |> success
         let a = attempt.Value
-        let inbox = ReviewWorkflow.getAgentInboxAt binding snap "Worker" |> success
+        let inbox = ReviewWorkflow.getAgentInboxAt binding snap f.Original.AgentId |> success
         let phase =
             match f.State.Phase with
             | Working -> "Started"
@@ -83,17 +83,34 @@ let private observe f =
         equal "assignment generation" f.State.Generation a.AssignmentGeneration
         equal "immutable task id" f.Original.TaskId t.TaskId
         equal "immutable attempt" f.Original.AttemptId a.AttemptId
-        equal "owner" "Worker" a.OwnerAgentId
+        equal "owner" f.Original.AgentId a.OwnerAgentId
         equal "spec" f.Original.SpecBlobOid a.SpecBlobOid
         equal "source ref" f.Original.SourceRef a.SourceRef
+        let assignment = inbox.Agent.CurrentAssignment
         match f.State.Phase with
-        | Working -> equal "working ownership" "Working" inbox.Agent.Execution
-        | Ready ->
-            equal "ready ownership" "Ready" inbox.Agent.State
-            equal "ready stopped execution" "Stopped" inbox.Agent.Execution
+        | Working | Ready ->
+            equal "active focus exists" false (isNull (box assignment))
+            equal "active focus exact task" f.Original.TaskId assignment.TaskId
+            equal "active focus exact attempt" f.Original.AttemptId assignment.AttemptId
+            equal "no active challenge wait" 0 inbox.BlockedChallengeWaits.Length
+            equal "no blocked attempt" 0 inbox.Blocked.Length
+            if f.State.Phase = Working then
+                equal "working ownership" "Working" inbox.Agent.Execution
+                equal "no additional runnable ownership" 0 inbox.RunnableQueue.Length
+                equal "working exact attempt" (Some f.Original.AttemptId) (inbox.Working |> Option.map (fun item -> item.Attempt.AttemptId))
+            else
+                equal "ready ownership" "Ready" inbox.Agent.State
+                equal "ready stopped execution" "Stopped" inbox.Agent.Execution
+                equal "one runnable ownership" [f.Original.AttemptId] (inbox.RunnableQueue |> List.map (fun item -> item.Attempt.AttemptId))
+                equal "not simultaneously Working" true inbox.Working.IsNone
         | Waiting | CancelledWaiting ->
+            equal "blocked no active focus" true (isNull (box assignment))
             equal "blocked no runnable ownership" 0 inbox.RunnableQueue.Length
             equal "blocked not Working" false (inbox.Agent.Execution = "Working")
+            equal "one blocked ownership" [f.Original.AttemptId] (inbox.Blocked |> List.map (fun item -> item.Attempt.AttemptId))
+            let expectedWait = [f.Original.TaskId, f.Original.AttemptId, f.Original.AgentId, [f.Gate.Value.ChallengeId]]
+            equal "exact canonical indexed wait" expectedWait
+                (inbox.BlockedChallengeWaits |> List.map (fun w -> w.TaskId, w.AttemptId, w.OwnerAgentId, w.ChallengeIds))
 
 let private current (f: Fixture) client =
     NativeHealth.current f.Runtimes[client] f.Original |> success
@@ -117,7 +134,7 @@ let private step f client command =
     let expected = next command before
     let taskId = f.Original.TaskId
     let t, a = snapshot binding f
-    let owner = (ReviewWorkflow.getAgentInbox binding "Worker" |> success).Agent
+    let owner = (ReviewWorkflow.getAgentInbox binding f.Original.AgentId |> success).Agent
     let head = (LedgerStore.fetch binding |> success).Commit
     match command with
     | CheckHealth ->
@@ -145,10 +162,10 @@ let private step f client command =
     | Block when before.Phase = Working ->
         f.Previous <- current f client
         let gate =
-            ChallengeWorkflow.create binding (Guid.NewGuid()) "Worker" "system property" taskId
+            ChallengeWorkflow.create binding (Guid.NewGuid()) f.Original.AgentId "system property" taskId
                 [{ OwnerKind = ""; OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "verified dependency" }]
             |> success
-        ChallengeWorkflow.blockAttempt reader (Guid.NewGuid()) "Worker" taskId a.AttemptId
+        ChallengeWorkflow.blockAttempt reader (Guid.NewGuid()) f.Original.AgentId taskId a.AttemptId
             t.Version a.Version owner.Version before.Generation "waiting" [gate.ChallengeId]
         |> success |> ignore
         f.Gate <- Some gate
@@ -161,7 +178,7 @@ let private step f client command =
             { ProjectId = binding.ProjectId; LedgerId = binding.LedgerId; Epoch = binding.Epoch
               Commit = result.CurrentHead; OperationId = op; ChallengeId = gate.ChallengeId
               ConditionId = gate.ConditionIds.Head; TaskId = taskId; AttemptId = a.AttemptId
-              OwnerAgentId = "Worker"; BlockedGeneration = before.Generation }
+              OwnerAgentId = f.Original.AgentId; BlockedGeneration = before.Generation }
         equal "fresh committed wake" (WakeDecision.Ready(result.CurrentHead, expected.Generation)) (inspect true reader locator)
         match inspect true reader {locator with BlockedGeneration = before.Generation + 1} with
         | WakeDecision.Hold _ -> ()
@@ -170,10 +187,10 @@ let private step f client command =
     | Cancel when before.Phase = Waiting ->
         let gate = f.Gate.Value
         let op = Guid.NewGuid()
-        ChallengeWorkflow.cancel binding op "Worker" gate.ChallengeId 1 "cancelled dependency"
+        ChallengeWorkflow.cancel binding op f.Original.AgentId gate.ChallengeId 1 "cancelled dependency"
         |> success |> ignore
         let cancelledHead = (LedgerStore.fetch reader |> success).Commit
-        let replay = ChallengeWorkflow.cancel reader op "Worker" gate.ChallengeId 1 "cancelled dependency" |> success
+        let replay = ChallengeWorkflow.cancel reader op f.Original.AgentId gate.ChallengeId 1 "cancelled dependency" |> success
         equal "cancel replay" true replay.AlreadyApplied
         equal "cancel replay does not write" cancelledHead (LedgerStore.fetch binding |> success).Commit
     | Resolve when before.Phase = CancelledWaiting ->
@@ -189,11 +206,11 @@ let private step f client command =
             equal "replay cannot reissue ownership" head (LedgerStore.fetch reader |> success).Commit
         | None -> ()
     | Resume when before.Phase = Ready ->
-        ReviewWorkflow.resumeAgent binding (Guid.NewGuid()) taskId "Worker" a.Version owner.Version before.Generation
+        ReviewWorkflow.resumeAgent binding (Guid.NewGuid()) taskId f.Original.AgentId a.Version owner.Version before.Generation
         |> success |> ignore
     | Checkpoint when before.Phase = Working ->
         f.Previous <- current f client
-        let receipt = ReviewWorkflow.checkpointAttempt binding (Guid.NewGuid()) taskId "Worker" a.Version owner.Version before.Generation "progress" "continue" "" "" |> success
+        let receipt = ReviewWorkflow.checkpointAttempt binding (Guid.NewGuid()) taskId f.Original.AgentId a.Version owner.Version before.Generation "progress" "continue" "" "" |> success
         let _, cp = ReviewWorkflow.getCheckpoint reader taskId receipt.Operation.Sequence |> success
         equal "checkpoint generation" before.Generation cp.AssignmentGeneration
     | _ -> ()
@@ -232,7 +249,7 @@ let private resolveThroughHost (account: SystemPropertyAccountFixture.AccountFix
             wakes <- wakes + 1
             equal "only committed dependency wake" [WorkWakeTrigger.DependencyCommitted] triggers
             equal "real canonical automatic eligibility" (ActivationEligible f.Original.TaskId)
-                (ReviewWorkflow.inspectAutomaticActivation reader "Worker" |> success)
+                (ReviewWorkflow.inspectAutomaticActivation reader f.Original.AgentId |> success)
             WorkWakeResult.Disabled
           Report = ignore
           Delay = fun _ cancellation -> Task.Delay(System.Threading.Timeout.Infinite, cancellation) }
@@ -325,6 +342,39 @@ let private newFixture root =
     { First = a; Second = b; Runtimes = [|rtA;rtB|]; Original = original
       State = {Phase = Working; Generation = original.Generation; Age = Some 0}
       Previous = None; Gate = None; Resolved = None }
+
+// A second independently assigned agent shares the same canonical project
+// and clients. Its source branch and attempt are distinct.
+let private secondAgent (f: Fixture) =
+    let a = f.First
+    let agentId, taskId = "Worker Two", "second-system-task"
+    ReviewWorkflow.registerAgent a (Guid.NewGuid()) agentId |> success |> ignore
+    ReviewWorkflow.createTaskWithSpec a (Guid.NewGuid()) taskId "Independent task" "<h1>Independent source</h1>"
+    |> success |> ignore
+    ReviewWorkflow.assignTask a (Guid.NewGuid()) taskId (Guid.NewGuid()) agentId |> success |> ignore
+    ReviewWorkflow.resumeAgent a (Guid.NewGuid()) taskId agentId 0 0 0 |> success |> ignore
+    let baseOid = git a.RepositoryPath ["rev-parse"; "HEAD"]
+    let targetRef = "refs/heads/" + git a.RepositoryPath ["branch"; "--show-current"]
+    let sourceRef = "refs/heads/worker-two"
+    git a.RepositoryPath ["branch"; "worker-two"; baseOid] |> ignore
+    git a.RepositoryPath ["push"; "origin"; sourceRef] |> ignore
+    let _, _, attempt = ReviewWorkflow.getTask a taskId |> success
+    ReviewWorkflow.bindReviewBase a (Guid.NewGuid()) taskId agentId
+        attempt.Value.Version attempt.Value.AssignmentGeneration baseOid targetRef |> success |> ignore
+    let _, _, bound = ReviewWorkflow.getTask a taskId |> success
+    ReviewWorkflow.rebindAttemptSource a (Guid.NewGuid()) taskId agentId
+        bound.Value.Version bound.Value.AssignmentGeneration sourceRef |> success |> ignore
+    let snap = LedgerStore.fetch a |> success
+    let agent = ReviewWorkflow.getAgentWorkingTurnAt a snap agentId |> success
+    let task, active = ReviewWorkflow.getTaskAt a snap taskId |> success
+    let active = active.Value
+    let candidate =
+        { f.Original with AgentId = agentId; TaskId = taskId; AgentVersion = agent.Version
+                          GitHead = snap.Commit; TaskVersion = task.Version; AttemptId = active.AttemptId
+                          AttemptVersion = active.Version; Generation = active.AssignmentGeneration
+                          SpecBlobOid = active.SpecBlobOid; SourceRef = active.SourceRef }
+    { f with Original = candidate; State = { Phase = Working; Generation = candidate.Generation; Age = Some 0 }
+             Previous = None; Gate = None; Resolved = None }
 
 type TraceStep = int * int * Command
 
@@ -566,6 +616,55 @@ type GeneratedComposition() =
                 verify ()
             equal "current production provider dispatch disabled" true (Client.AutomationNativeProviderSessionHost.authorizeProviderDispatch().IsError)
             equal "current production release disabled" true (Client.AutomationNativeProviderSessionHost.releaseFromProviderTerminal().IsError)
+        finally
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
+            Directory.Delete(root, true)
+
+    [<TestCase(301)>]
+    [<TestCase(302)>]
+    member _.IndependentOwnersShareCanonicalProject(seed: int) =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-system-owners-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let prior = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+        Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", Path.Combine(root, "config"))
+        try
+            let first = newFixture root
+            let second = secondAgent first
+            let fs = [|first; second|]
+            let random = Random(seed)
+            let run owner cmd =
+                step fs[owner] (random.Next 2) cmd
+                observe fs[1-owner]
+            // Ensure a stalled sibling can recover without unblocking a
+            // challenged owner or changing its attempt/source lineage.
+            run 0 Block
+            run 1 (Advance 701)
+            run 1 CheckHealth
+            // The other owner's exact fresh task/attempt generation does
+            // not authorize claiming the recovered owner's slot.
+            let _, ready = snapshot first.First second
+            let wrongOwner = (ReviewWorkflow.getAgentInbox first.First first.Original.AgentId |> success).Agent
+            let unchanged = (LedgerStore.fetch first.First |> success).Commit
+            let wrong = ReviewWorkflow.resumeAgent first.Second (Guid.NewGuid()) second.Original.TaskId
+                            first.Original.AgentId ready.Version wrongOwner.Version second.State.Generation
+            equal "wrong owner cannot resume sibling" true wrong.IsError
+            equal "wrong owner leaves canonical head unchanged" unchanged (LedgerStore.fetch first.First |> success).Commit
+            fs |> Array.iter observe
+            run 0 CheckHealth
+            run 0 Resolve
+            run 0 ReplayResolve
+            run 1 Resume
+            run 0 Resume
+            run 1 CheckStale
+            run 0 CheckStale
+            let choices = [|Block; Resolve; Resume; Checkpoint; Advance 601; CheckHealth; Activity; CheckStale|]
+            for _ in 1..8 do
+                run (random.Next 2) choices[random.Next choices.Length]
+            // Both original ownership identities remain distinct despite
+            // all canonical mutations sharing one ledger head.
+            equal "distinct agent identities" true (first.Original.AgentId <> second.Original.AgentId)
+            equal "distinct task identities" true (first.Original.TaskId <> second.Original.TaskId)
+            equal "distinct source identities" true (first.Original.SourceRef <> second.Original.SourceRef)
         finally
             Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
             Directory.Delete(root, true)

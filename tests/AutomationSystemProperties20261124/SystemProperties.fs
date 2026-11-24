@@ -18,7 +18,7 @@ open AutomationHealthHostedFixture
 
 // Independent abstract ownership model. The state is driven by commands and
 // preconditions, never by copying the observed canonical attempt phase.
-type Phase = Working | Waiting | Ready
+type Phase = Working | Waiting | CancelledWaiting | Ready
 type Model = { Phase: Phase; Generation: int; Age: int option }
 type Command =
     | Advance of int
@@ -31,6 +31,7 @@ type Command =
     | Resume
     | Checkpoint
     | ReplayResolve
+    | Cancel
 
 let next command state =
     match command, state.Phase with
@@ -41,6 +42,7 @@ let next command state =
         { state with Phase = Ready; Generation = state.Generation + 1 }
     | Block, Working -> { state with Phase = Waiting }
     | Resolve, Waiting -> { state with Phase = Ready; Generation = state.Generation + 1 }
+    | Cancel, Waiting -> { state with Phase = CancelledWaiting }
     | Resume, Ready -> { state with Phase = Working }
     | _ -> state
 
@@ -75,7 +77,7 @@ let private observe f =
         let phase =
             match f.State.Phase with
             | Working -> "Started"
-            | Waiting -> "Blocked"
+            | Waiting | CancelledWaiting -> "Blocked"
             | Ready -> "Queued"
         equal "attempt phase" phase a.Phase
         equal "assignment generation" f.State.Generation a.AssignmentGeneration
@@ -89,7 +91,7 @@ let private observe f =
         | Ready ->
             equal "ready ownership" "Ready" inbox.Agent.State
             equal "ready stopped execution" "Stopped" inbox.Agent.Execution
-        | Waiting ->
+        | Waiting | CancelledWaiting ->
             equal "blocked no runnable ownership" 0 inbox.RunnableQueue.Length
             equal "blocked not Working" false (inbox.Agent.Execution = "Working")
 
@@ -165,6 +167,20 @@ let private step f client command =
         | WakeDecision.Hold _ -> ()
         | other -> raise (PropertyViolation("forged wake lineage", sprintf "%A" other))
         f.Resolved <- Some(gate, op, locator)
+    | Cancel when before.Phase = Waiting ->
+        let gate = f.Gate.Value
+        let op = Guid.NewGuid()
+        ChallengeWorkflow.cancel binding op "Worker" gate.ChallengeId 1 "cancelled dependency"
+        |> success |> ignore
+        let cancelledHead = (LedgerStore.fetch reader |> success).Commit
+        let replay = ChallengeWorkflow.cancel reader op "Worker" gate.ChallengeId 1 "cancelled dependency" |> success
+        equal "cancel replay" true replay.AlreadyApplied
+        equal "cancel replay does not write" cancelledHead (LedgerStore.fetch binding |> success).Commit
+    | Resolve when before.Phase = CancelledWaiting ->
+        let gate = f.Gate.Value
+        let result = ChallengeWorkflow.resolve reader (Guid.NewGuid()) "Lead" gate.ChallengeId gate.ConditionIds.Head 2 "late evidence" ""
+        equal "cancelled dependency cannot satisfy" true result.IsError
+        equal "cancelled dependency cannot wake" head (LedgerStore.fetch binding |> success).Commit
     | ReplayResolve ->
         match f.Resolved with
         | Some(gate, op, _) ->
@@ -370,12 +386,17 @@ type GeneratedComposition() =
     member _.MixedHealthChallengeWake(seed: int) =
         let random = Random(seed)
         let prefix = [Block; Advance 601; CheckStale; CheckHealth; Resolve; ReplayResolve; Resume; CheckStale; CheckHealth; Resume; Checkpoint; CheckStale; ResetActivity; CheckHealth]
-        let choices = [|Advance 599; Advance 1; Advance 601; Activity; ResetActivity; CheckHealth; CheckStale; Block; Resolve; Resume; Checkpoint; ReplayResolve|]
+        let choices = [|Advance 599; Advance 1; Advance 601; Activity; ResetActivity; CheckHealth; CheckStale; Block; Resolve; Resume; Checkpoint; ReplayResolve; Cancel|]
         let commands =
             [ for command in prefix do
                 for project in 0..1 do yield project, random.Next(2), command
               for _ in 1..configuredBudget "JARVIS_SYSTEM_EXTRA_STEPS" 16 256 do
-                  yield random.Next(2), random.Next(2), choices[random.Next(choices.Length)] ]
+                  yield random.Next(2), random.Next(2), choices[random.Next(choices.Length)]
+              // Ensure at least one cancellation path is reached without
+              // sacrificing exploration of recoverable states earlier.
+              for project in 0..1 do
+                  for command in [Resume; Block; Cancel; Resolve; Advance 701; CheckHealth; Resume] do
+                      yield project, random.Next(2), command ]
         match runTrace commands with
         | Ok () -> ()
         | Error(label,detail,prefix) ->
@@ -545,6 +566,78 @@ type GeneratedComposition() =
                 verify ()
             equal "current production provider dispatch disabled" true (Client.AutomationNativeProviderSessionHost.authorizeProviderDispatch().IsError)
             equal "current production release disabled" true (Client.AutomationNativeProviderSessionHost.releaseFromProviderTerminal().IsError)
+        finally
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
+            Directory.Delete(root, true)
+
+    // Explicit schedule at the final activity/recovery boundary. Both
+    // contenders have captured the same Working generation; the first
+    // durable transition must exclude the stale second command.
+    [<TestCase(true)>]
+    [<TestCase(false)>]
+    member _.ChallengeAndHealthCompeteForCapturedGeneration(blockFirst: bool) =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-system-race-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let prior = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+        Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", Path.Combine(root, "config"))
+        try
+            let f = newFixture root
+            let taskId = f.Original.TaskId
+            let gate = ChallengeWorkflow.create f.Second (Guid.NewGuid()) "Worker" "race" taskId
+                           [{ OwnerKind = ""; OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "race dependency" }]
+                       |> success
+            let t, a = snapshot f.Second f
+            let owner = (ReviewWorkflow.getAgentInbox f.Second "Worker" |> success).Agent
+            let candidate = current f 0 |> Option.get
+            let before = {f.State with Age = Some 701}
+            f.State <- before
+            let now = DateTimeOffset(2026, 11, 24, 12, 0, 0, TimeSpan.Zero)
+            let observation : AgentActivitySnapshot = { ServerNowUtc = now; LastSeenAtUtc = Some(now.AddSeconds(-701.)) }
+            let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let release = TaskCompletionSource<Result<AgentActivitySnapshot,string>>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let mutable reads = 0
+            let deps : Dependencies =
+                { Enumerate = fun () -> Ok [candidate]
+                  Current = NativeHealth.current f.Runtimes[0]
+                  Activity = fun _ _ ->
+                      reads <- reads + 1
+                      if reads = 1 then Task.FromResult(Ok observation)
+                      else
+                          entered.TrySetResult(()) |> ignore
+                          release.Task
+                  Recover = NativeHealth.recover f.Runtimes[0] }
+            let check = NativeHealth.checkOnce { Enabled = true; InactivitySeconds = 600 } deps
+            let block () =
+                ChallengeWorkflow.blockAttempt f.Second (Guid.NewGuid()) "Worker" taskId a.AttemptId
+                    t.Version a.Version owner.Version before.Generation "race" [gate.ChallengeId]
+            try
+                equal "Health reaches final activity barrier" true (entered.Task.Wait(TimeSpan.FromSeconds 30.))
+                if blockFirst then
+                    block() |> success |> ignore
+                    f.Gate <- Some gate
+                    f.State <- next Block before
+                    observe f
+                    let committed = (LedgerStore.fetch f.Second |> success).Commit
+                    release.SetResult(Ok observation)
+                    equal "stale recovery loses to durable block" 0 (check.GetAwaiter().GetResult()).Recoveries
+                    equal "losing recovery does not write" committed (LedgerStore.fetch f.Second |> success).Commit
+                    observe f
+                    step f 1 Resolve
+                else
+                    release.SetResult(Ok observation)
+                    equal "fresh recovery wins" 1 (check.GetAwaiter().GetResult()).Recoveries
+                    f.State <- next CheckHealth before
+                    observe f
+                    let committed = (LedgerStore.fetch f.First |> success).Commit
+                    equal "stale block loses to recovery" true (block().IsError)
+                    equal "losing block does not write" committed (LedgerStore.fetch f.First |> success).Commit
+                    observe f
+                    step f 1 Resume
+                    step f 0 Block
+                    step f 1 Resolve
+            finally
+                release.TrySetResult(Ok observation) |> ignore
+                check.GetAwaiter().GetResult() |> ignore
         finally
             Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
             Directory.Delete(root, true)

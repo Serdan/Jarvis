@@ -111,3 +111,15 @@ merely to inflate test counts. Every semantic change must update its affected
 model/generator/oracle in the same or explicitly coordinated dependent change
 before release acceptance; review checks actual semantic parity. Nonsemantic
 changes may record why no model change is required.
+
+## Verified incremental evidence update (2026-11-24)
+
+- Job cc3d385894804265add3741671a08ecf: 6/6 passed, 5m41s, exit 0, prior committed harness.
+- Job 0cadff77d2ce4996bb9db2991d927ecc: 8/8 passed, 7m06s, exit 0, including the cancellation extension and both captured-generation Health/Challenge CAS schedules. TRX system-properties-cancel-race-full.trx.
+- Job 385770cb29ce497787106fcc7b207646: both CAS schedules passed, 7s, exit 0 (intermediate before final cancellation prefix).
+- Job aa47366f73574bce81e86f5bb118db2e: deliberate stale-candidate mutant RED 1/1, exit 1; seed 101, invariant `stale recovery denied expected 0, actual 1`, bounded shrink trace retained in job output.
+- Job 774294a82a0e448fa54477ed07bdbd14: lost committed wake mutant RED 2/2, exit 1; seeds 211/212, invariant `committed wake reaches real host`, expected Reconciled Disabled, actual Dormant.
+
+The cancellation extension exercises terminal cancellation, exact operation replay without another commit, rejection of late resolution, and no wake or Health recovery from the cancelled dependency. The CAS schedules capture the same original Working generation and pause Health at its final activity read; committing the challenge block first excludes stale recovery, and committing recovery first excludes the stale block. Both schedules check the losing operation leaves the canonical head unchanged and then exercise a fresh authorized continuation. These are real isolated Git transitions with controlled interleaving, not evidence of live provider dispatch.
+
+At 12:16 UTC the local origin/main was 5d0656784 (only browser prompt parsing differs from pinned production base); the existing-auth account correction ea25c1584102fc8796ee15f04219836fb6b8d75c remained a frozen independent review, not accepted main. Do not silently compose unreviewed production branches into this test lease or equate the above passing increment with milestone completion.

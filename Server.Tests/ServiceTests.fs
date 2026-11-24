@@ -76,10 +76,11 @@ let invalidation_routes_only_exact_changed_agents_even_on_command_failure () =
         { Result = None
           Error = Some(NotFound "A source file was missing after activation")
           Instructions = []
-          AgentStateChanges =
-              [ { ProjectName = "Wayfold"; AgentId = "Owner" }
-                { ProjectName = "Wayfold"; AgentId = "Owner" }
-                { ProjectName = "Jarvis"; AgentId = "Reviewer" } ]
+          StateChangeEvidence =
+              StateChangeEvidence.Confirmed
+                  [ { ProjectName = "Wayfold"; AgentId = "Owner" }
+                    { ProjectName = "Wayfold"; AgentId = "Owner" }
+                    { ProjectName = "Jarvis"; AgentId = "Reviewer" } ]
           InboxActivation = None; PendingJob = None }
     let groups = AgentStateInvalidationRouting.affectedByProject failedRead.AgentStateChanges
     Assert.That(groups.Length, Is.EqualTo(2))
@@ -88,7 +89,7 @@ let invalidation_routes_only_exact_changed_agents_even_on_command_failure () =
     Assert.That(groups |> List.find (fun (project, _) -> project = "Jarvis") |> snd,
                 Is.EqualTo([| "Reviewer" |] :> obj))
     let checkpoint : AgentCommandResponse =
-        { failedRead with Result = Some "{}"; Error = None; AgentStateChanges = [] }
+        { failedRead with Result = Some "{}"; Error = None; StateChangeEvidence = StateChangeEvidence.Confirmed [] }
     Assert.That(AgentStateInvalidationRouting.affectedByProject checkpoint.AgentStateChanges, Is.Empty)
 
 [<Test>]
@@ -394,7 +395,7 @@ let ``response tracker completes registered response`` () =
         let expected =
             { Result = Some "ok"
               Error = None
-              Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+              Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
 
         tracker.Complete(correlationId, "alice", "conn-1", 1L, expected) |> shouldEqual true
         let! actual = pending
@@ -407,7 +408,7 @@ let ``response tracker rejects other users connections and generations`` () =
     task {
         let tracker = ClientResponseTracker()
         let correlationId, pending = tracker.Register("alice", "connection-a", 3L, TimeSpan.FromSeconds 5L)
-        let response = { Result = Some "accepted"; Error = None; Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+        let response = { Result = Some "accepted"; Error = None; Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
 
         tracker.Complete(correlationId, "bob", "connection-a", 3L, response) |> shouldEqual false
         tracker.Complete(correlationId, "alice", "connection-b", 3L, response) |> shouldEqual false
@@ -779,7 +780,7 @@ let ``MCP bridge returns successful JSON as text without a mismatched output sch
     let response =
         { Result = Some """{"value":42,"items":[1,2]}"""
           Error = None
-          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+          Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
 
     let result = McpToolHelpers.toCallToolResult response
 
@@ -802,7 +803,7 @@ let mcp_self_inbox_exposes_committed_activation_on_success_and_read_error () =
             { Result = if readFailed then None else Some """{"Agent":{"State":"Working"}}"""
               Error = if readFailed then Some(NotFound "Inbox read failed after activation") else None
               Instructions = []
-              AgentStateChanges = [ { ProjectName = "Jarvis"; AgentId = "Owner" } ]
+              StateChangeEvidence = StateChangeEvidence.Confirmed [ { ProjectName = "Jarvis"; AgentId = "Owner" } ]
               InboxActivation = Some receipt; PendingJob = None }
         let roundtrip =
             JsonSerializer.Deserialize<AgentCommandResponse>(JsonSerializer.Serialize(response))
@@ -840,7 +841,7 @@ let mcp_self_inbox_exposes_committed_activation_on_success_and_read_error () =
           CommittedHead = None; OperationId = None }
     let repeated =
         { Result = Some """{"Agent":{"State":"Working"}}"""
-          Error = None; Instructions = []; AgentStateChanges = []
+          Error = None; Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []
           InboxActivation = Some noChange; PendingJob = None }
     let repeated =
         repeated |> McpToolHelpers.toCallToolResult
@@ -864,7 +865,7 @@ let mcp_project_tool_responses_always_expose_canonical_state_change_evidence () 
             { Result = if failed then None else Some """{"result":"ok"}"""
               Error = if failed then Some(NotFound "Source file absent") else None
               Instructions = []
-              AgentStateChanges = []
+              StateChangeEvidence = StateChangeEvidence.Confirmed []
               InboxActivation = None; PendingJob = None }
         let tool =
             response |> McpToolHelpers.toCallToolResult
@@ -884,7 +885,7 @@ let mcp_project_tool_responses_always_expose_canonical_state_change_evidence () 
         { Result = None
           Error = Some(NotFound "Read failed after prior mutation")
           Instructions = []
-          AgentStateChanges = [ { ProjectName = "Wayfold"; AgentId = "Worker 1" } ]
+          StateChangeEvidence = StateChangeEvidence.Confirmed [ { ProjectName = "Wayfold"; AgentId = "Worker 1" } ]
           InboxActivation = None; PendingJob = None }
     let result =
         affected |> McpToolHelpers.toCallToolResult
@@ -908,7 +909,7 @@ let uncertain_mutation_response_does_not_claim_authoritative_empty_state_changes
                 { Message = "The local command ended after an unknown execution point."
                   OperationId = Some operationId })
           Instructions = []
-          AgentStateChanges = []
+          StateChangeEvidence = StateChangeEvidence.Unknown []
           InboxActivation = None; PendingJob = None }
     let restored =
         JsonSerializer.Deserialize<AgentCommandResponse>(JsonSerializer.Serialize response)
@@ -928,7 +929,7 @@ let uncertain_mutation_response_does_not_claim_authoritative_empty_state_changes
     let mutable omitted = Unchecked.defaultof<JsonElement>
     Assert.That(body.RootElement.TryGetProperty("agentStateChanges", &omitted), Is.False)
     Assert.That((exposed.Content[0] :?> TextContentBlock).Text, Does.Contain(operationId))
-    let known = { restored with AgentStateChanges = [ { ProjectName = "Jarvis"; AgentId = "Worker 5" } ] }
+    let known = { restored with StateChangeEvidence = StateChangeEvidence.Unknown [ { ProjectName = "Jarvis"; AgentId = "Worker 5" } ] }
     let partial =
         known |> McpToolHelpers.toCallToolResult
         |> McpToolHelpers.attachStateEffects known
@@ -939,7 +940,7 @@ let uncertain_mutation_response_does_not_claim_authoritative_empty_state_changes
     let rejected =
         { restored with
             Error = Some(ExecutionFailed "Dispatch capacity exhausted: command not executed.")
-            AgentStateChanges = [] }
+            StateChangeEvidence = StateChangeEvidence.Confirmed [] }
     let confirmed =
         rejected |> McpToolHelpers.toCallToolResult
         |> McpToolHelpers.attachStateEffects rejected
@@ -958,14 +959,15 @@ let cross_project_notify_merges_preflight_and_destination_state_changes () =
           CommittedHead = Some(String('a', 40)); OperationId = Some(Guid.NewGuid().ToString("D")) }
     let preflight : AgentCommandResponse =
         { Result = Some "{}"; Error = None; Instructions = []
-          AgentStateChanges = [ { ProjectName = "Wayfold"; AgentId = "Worker 1" } ]
+          StateChangeEvidence = StateChangeEvidence.Confirmed [ { ProjectName = "Wayfold"; AgentId = "Worker 1" } ]
           InboxActivation = Some sourceActivation; PendingJob = None }
     let destination : AgentCommandResponse =
         { Result = None; Error = Some(NotFound "Destination write failed")
           Instructions = []
-          AgentStateChanges =
-            [ { ProjectName = "Jarvis"; AgentId = "Reviewer 1" }
-              { ProjectName = "Wayfold"; AgentId = "Worker 1" } ]
+          StateChangeEvidence =
+              StateChangeEvidence.Confirmed
+                  [ { ProjectName = "Jarvis"; AgentId = "Reviewer 1" }
+                    { ProjectName = "Wayfold"; AgentId = "Worker 1" } ]
           InboxActivation = None; PendingJob = None }
     let merged = McpToolHelpers.mergeStateEffects preflight destination
     Assert.That(merged.AgentStateChanges.Length, Is.EqualTo(2))
@@ -977,6 +979,32 @@ let cross_project_notify_merges_preflight_and_destination_state_changes () =
     use json = JsonDocument.Parse((tool.Content[1] :?> TextContentBlock).Text)
     Assert.That(json.RootElement.GetProperty("agentStateChanges").GetArrayLength(), Is.EqualTo(2))
     Assert.That(json.RootElement.GetProperty("agentInboxActivation").GetProperty("ActivatedByThisCall").GetBoolean(), Is.True)
+
+[<Test>]
+let partial_state_evidence_survives_successful_cross_project_merge_in_both_directions () =
+    let known = [{ ProjectName = "Demo"; AgentId = "Owner" }]
+    let complete : AgentCommandResponse =
+        { Result = Some "{}"; Error = None; Instructions = []
+          StateChangeEvidence = StateChangeEvidence.Confirmed known; InboxActivation = None; PendingJob = None }
+    let legacy = JsonSerializer.Deserialize<AgentCommandResponse>("""{"Result":"{}","Error":null}""")
+    for prior, destination in [complete, legacy; legacy, complete] do
+        let merged = McpToolHelpers.mergeStateEffects prior destination
+        Assert.That(merged.Error.IsNone, Is.True)
+        Assert.That(merged.StateChangeEvidence, Is.EqualTo(StateChangeEvidence.Unknown known))
+        let restored = JsonSerializer.Deserialize<AgentCommandResponse>(JsonSerializer.Serialize merged)
+        Assert.That(restored.StateChangeEvidence, Is.EqualTo(StateChangeEvidence.Unknown known))
+        let visible = merged |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachStateEffects merged
+        Assert.That(visible.Meta.ContainsKey("jarvis/agent_state_changes"), Is.False)
+        Assert.That(visible.Meta["jarvis/known_agent_state_changes"].ToJsonString(), Does.Contain("Owner"))
+
+[<Test>]
+let explicit_unknown_success_preserves_known_subset_independent_of_error () =
+    let wire = """{"Result":"{}","Error":null,"AgentStateChanges":null,"AgentStateChangesStatus":"unknown","KnownAgentStateChanges":[{"ProjectName":"Demo","AgentId":"Owner"}]}"""
+    let restored = JsonSerializer.Deserialize<AgentCommandResponse>(wire)
+    Assert.That(restored.Error.IsNone, Is.True)
+    Assert.That(restored.StateChangeEvidence,
+                Is.EqualTo(StateChangeEvidence.Unknown [{ ProjectName = "Demo"; AgentId = "Owner" }]))
+
 
 [<Test>]
 let ``MCP bridge preserves typed confirmation error details`` () =
@@ -994,7 +1022,7 @@ let ``MCP bridge preserves typed confirmation error details`` () =
     let response =
         { Result = None
           Error = Some(ConfirmationRequired confirmation)
-          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+          Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
 
     let result = McpToolHelpers.toCallToolResult response
 
@@ -1018,7 +1046,7 @@ let ``MCP bridge preserves stable AgentError kinds`` () =
         let result =
             { Result = None
               Error = Some error
-              Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+              Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
             |> McpToolHelpers.toCallToolResult
 
         result.IsError |> shouldEqual (Nullable true)
@@ -1433,7 +1461,7 @@ let mcp_legacy_repository_documents_are_not_rendered () =
     let response =
         { Result = Some """{"result":"ok"}"""
           Error = None
-          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+          Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
     let decoded = legacyResponse response instructions
     let result = decoded |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachOperationalControls decoded.OperationalControls
     Assert.That(result.IsError, Is.EqualTo(Nullable false))
@@ -1454,7 +1482,7 @@ let operator_alert_blocks_precede_timing_and_failed_tool_result () =
             Content = "JARVIS OPERATOR ALERT:\nPlease save test output" } ]
     let failure =
         { Result = None; Error = Some(ValidationFailed "Unrelated error")
-          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+          Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
     let decoded = legacyResponse failure alerts
     let shown = decoded |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachOperationalControls decoded.OperationalControls
     Assert.That(shown.IsError, Is.EqualTo(Nullable true))
@@ -1472,7 +1500,7 @@ let mcp_legacy_repository_notices_are_not_rendered () =
             Content = "Omitted repository guidance." }
           { Scope = "unknown"; Path = "unexpected"; Sha256 = ""
             Content = "Unrecognized ambient guidance." } ]
-    let response = { Result = Some """{"ok":true}"""; Error = None; Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+    let response = { Result = Some """{"ok":true}"""; Error = None; Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
     let decoded = legacyResponse response notes
     let shown = decoded |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachOperationalControls decoded.OperationalControls
     Assert.That(shown.IsError, Is.EqualTo(Nullable false))
@@ -1489,7 +1517,7 @@ let mcp_legacy_guidance_filter_preserves_errors_and_non_text_blocks () =
     let failure =
         { Result = None
           Error = Some(ValidationFailed "Unrelated error")
-          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+          Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
     let decoded = legacyResponse failure instructions
     let error = decoded |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachOperationalControls decoded.OperationalControls
     Assert.That(error.IsError, Is.EqualTo(Nullable true))
@@ -1514,7 +1542,7 @@ let response_json_retains_legacy_instruction_wire_compatibility () =
         { Result = Some """{"ok":true}"""
           Error = None
           Instructions = [control]
-          AgentStateChanges = [ { ProjectName = "Demo"; AgentId = "Owner" } ]
+          StateChangeEvidence = StateChangeEvidence.Confirmed [ { ProjectName = "Demo"; AgentId = "Owner" } ]
           InboxActivation = None; PendingJob = None }
     let json = JsonSerializer.Serialize(response)
     use document = JsonDocument.Parse(json)
@@ -1553,12 +1581,98 @@ module LegacyWireFixture =
 
 [<TestCase(false)>]
 [<TestCase(true)>]
+let partial_state_evidence_legacy_projection_never_advertises_incomplete_nonempty_list camelCase =
+    let options = JsonSerializerOptions(PropertyNameCaseInsensitive = true)
+    if camelCase then options.PropertyNamingPolicy <- JsonNamingPolicy.CamelCase
+    let known = [{ ProjectName = "Demo"; AgentId = "Owner" }]
+    let activation =
+        { ProjectName = "Demo"; AgentId = "Owner"; ActivatedByThisCall = true
+          BeforeState = Some "Ready"; AfterState = Some "Working"
+          CommittedHead = Some(String('a', 40)); OperationId = Some "original" }
+    let uncertain = UncertainOutcome { Message = "Unknown destination"; OperationId = Some "destination-op" }
+    for error in [None; Some(NotFound "file"); Some uncertain] do
+        let response : AgentCommandResponse =
+            { Result = if error.IsNone then Some "{}" else None
+              Error = error; Instructions = []
+              StateChangeEvidence = StateChangeEvidence.Unknown known
+              InboxActivation = Some activation; PendingJob = None }
+        let wire = JsonSerializer.Serialize(response, options)
+        let legacy = JsonSerializer.Deserialize<LegacyWireFixture.Response>(wire, options)
+        let restored = JsonSerializer.Deserialize<AgentCommandResponse>(wire, options)
+        Assert.That(restored, Is.EqualTo(response))
+        Assert.That(legacy.Result, Is.EqualTo(response.Result))
+        Assert.That(legacy.Error, Is.EqualTo(error))
+        Assert.That(legacy.InboxActivation, Is.EqualTo(Some activation))
+        // Pre-control rendering ignores completeness status and treats a null
+        // list as empty. Only its UncertainOutcome branch recognizes partial
+        // evidence. It must never receive a false complete nonempty subset.
+        match error with
+        | Some(UncertainOutcome _) ->
+            Assert.That(legacy.AgentStateChanges, Is.EqualTo(known :> obj))
+            let oldWire = JsonSerializer.Serialize(legacy, options)
+            Assert.That(JsonSerializer.Deserialize<AgentCommandResponse>(oldWire, options).StateChangeEvidence,
+                        Is.EqualTo(StateChangeEvidence.Unknown known))
+        | _ ->
+            Assert.That(isNull (box legacy.AgentStateChanges), Is.True)
+            let oldWire = JsonSerializer.Serialize(legacy, options)
+            Assert.That(JsonSerializer.Deserialize<AgentCommandResponse>(oldWire, options).StateChangeEvidence,
+                        Is.EqualTo(StateChangeEvidence.Unknown []),
+                        "An older forwarding hop cannot preserve the new partial subset.")
+
+[<Test>]
+let partial_state_evidence_composition_unions_deduplicates_and_preserves_outcome () =
+    let sourceKnown = [{ ProjectName = "Demo"; AgentId = "Owner" }]
+    let destinationKnown = sourceKnown @ [{ ProjectName = "Other"; AgentId = "Receiver" }]
+    let receipt =
+        { ProjectName = "Demo"; AgentId = "Owner"; ActivatedByThisCall = true
+          BeforeState = Some "Ready"; AfterState = Some "Working"
+          CommittedHead = Some(String('a', 40)); OperationId = Some "source-op" }
+    let uncertain = UncertainOutcome { Message = "Unknown destination"; OperationId = Some "destination-op" }
+    for sourceIncomplete in [false; true] do
+        for destinationIncomplete in [false; true] do
+            for error in [None; Some(NotFound "destination"); Some uncertain] do
+                let destinationIncomplete = destinationIncomplete || error = Some uncertain
+                let source : AgentCommandResponse =
+                    { Result = Some "{}"; Error = None; Instructions = []
+                      StateChangeEvidence =
+                          if sourceIncomplete then StateChangeEvidence.Unknown sourceKnown
+                          else StateChangeEvidence.Confirmed sourceKnown
+                      InboxActivation = Some receipt; PendingJob = None }
+                let destination : AgentCommandResponse =
+                    { Result = if error.IsNone then Some """{"sent":true}""" else None
+                      Error = error; Instructions = []
+                      StateChangeEvidence =
+                          if destinationIncomplete then StateChangeEvidence.Unknown destinationKnown
+                          else StateChangeEvidence.Confirmed destinationKnown
+                      InboxActivation = None; PendingJob = None }
+                let merged = McpToolHelpers.mergeStateEffects source destination
+                let expected =
+                    if sourceIncomplete || destinationIncomplete then StateChangeEvidence.Unknown destinationKnown
+                    else StateChangeEvidence.Confirmed destinationKnown
+                Assert.That(merged.StateChangeEvidence, Is.EqualTo(expected))
+                Assert.That(merged.Result, Is.EqualTo(destination.Result))
+                Assert.That(merged.Error, Is.EqualTo(error))
+                Assert.That(merged.InboxActivation, Is.EqualTo(Some receipt))
+                Assert.That(merged.PendingJob.IsNone, Is.True)
+                let restored = JsonSerializer.Deserialize<AgentCommandResponse>(JsonSerializer.Serialize merged)
+                Assert.That(restored, Is.EqualTo(merged))
+                let visible = McpToolHelpers.attachStateEffects restored (McpToolHelpers.toCallToolResult restored)
+                let expectedField =
+                    if sourceIncomplete || destinationIncomplete then "jarvis/known_agent_state_changes"
+                    else "jarvis/agent_state_changes"
+                Assert.That(visible.Meta[expectedField].AsArray().Count, Is.EqualTo(2))
+                Assert.That(visible.IsError, Is.EqualTo(Nullable(error.IsSome)))
+                Assert.That(visible.Meta.ContainsKey("jarvis/recovery_operation_id"), Is.EqualTo((error = Some uncertain)))
+
+
+[<TestCase(false)>]
+[<TestCase(true)>]
 let operational_contract_mixed_version_roundtrip_and_wire_measurement camelCase =
     let options = JsonSerializerOptions(PropertyNameCaseInsensitive = true)
     if camelCase then options.PropertyNamingPolicy <- JsonNamingPolicy.CamelCase
     let ordinary : AgentCommandResponse =
         { Result = Some """{"value":"source result"}"""; Error = None
-          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+          Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
     let controls =
         [ OperationalControl.queuedAlert "alert-1" "STOP - safe handoff"
           OperationalControl.WorkingTurnLimit(WorkingTurnLimitLevel.Soft, "SOFT STOP: preserve progress") ]
@@ -1566,8 +1680,8 @@ let operational_contract_mixed_version_roundtrip_and_wire_measurement camelCase 
     let samples =
         [ "ordinary", ordinary
           "control", { ordinary with Instructions = controls }
-          "error", { ordinary with Result = None; Error = Some(NotFound "file"); AgentStateChanges = known }
-          "unknown", { ordinary with Result = None; Error = Some(ExecutionFailed "unverified"); AgentStateChanges = Unchecked.defaultof<_> } ]
+          "error", { ordinary with Result = None; Error = Some(NotFound "file"); StateChangeEvidence = StateChangeEvidence.Confirmed known }
+          "unknown", { ordinary with Result = None; Error = Some(ExecutionFailed "unverified"); StateChangeEvidence = StateChangeEvidence.Unknown [] } ]
     for label, response in samples do
         let old : LegacyWireFixture.Response =
             { Result = response.Result; Error = response.Error
@@ -1616,7 +1730,7 @@ let ``MCP bridge preserves structured  ledger failure category`` () =
     let response =
         { Result = None
           Error = Some(Common.AgentError.LedgerFailure problem)
-          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+          Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
     let tool = McpToolHelpers.toCallToolResult response
     tool.IsError |> shouldEqual (Nullable true)
     let content = tool.Content[0] :?> TextContentBlock
@@ -1632,7 +1746,7 @@ let ``typed  ledger failures survive response JSON roundtrip`` () =
               Some(Common.AgentError.LedgerFailure
                   { Code = "OutcomeUnknown"; Message = "Unconfirmed push"
                     OperationId = Some operationId; VerifiedLedgerHead = None })
-          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+          Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
     let payload = JsonSerializer.Serialize(source)
     let destination = JsonSerializer.Deserialize<Common.AgentCommandResponse>(payload)
     match destination.Error with
@@ -1719,7 +1833,7 @@ let cross_project_probe_errors_are_classified_without_leaking_client_error_text 
           ExecutionFailed error, "ledger health execution failed or timed out" ]
     for issue, expected in failures do
         let reply : AgentCommandResponse =
-            { Result = None; Error = Some issue; Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+            { Result = None; Error = Some issue; Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
         let classification = ProjectNotificationRouting.probeFailure reply
         Assert.That(classification, Is.EqualTo(expected))
         Assert.That(classification, Does.Not.Contain(error))
@@ -1804,7 +1918,7 @@ let client_request_abort_cancels_outstanding_device_correlation_without_faulting
         let expected =
             { Result = Some "later-success"
               Error = None
-              Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+              Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
         let mutable dispatchCount = 0
         let dispatched =
             TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously)
@@ -1855,7 +1969,7 @@ let client_request_abort_cancels_outstanding_device_correlation_without_faulting
                 with :? OperationCanceledException -> return true
             }
         Assert.That(canceled, Is.True)
-        let response = { Result = Some "unexpected"; Error = None; Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+        let response = { Result = Some "unexpected"; Error = None; Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
         Assert.That(tracker.Complete(correlationId, user, connection, registered.Generation, response), Is.False)
         match users.GetSession(user) with
         | ValueSome session ->
@@ -1926,7 +2040,7 @@ let post_commit_uncertain_client_reply_remains_unknown_across_server_dispatch_an
                               Error = Some(UncertainOutcome
                                   { Message = "Command terminated after possible commit."
                                     OperationId = Some operationId })
-                              AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                              StateChangeEvidence = StateChangeEvidence.Unknown []; InboxActivation = None; PendingJob = None }
                         tracker.Complete(correlationId, user, connection,
                                          registered.Generation, uncertain) |> ignore
                     } :> Task
@@ -1998,7 +2112,7 @@ let polledToolJobsFilterLegacyRepositoryGuidanceAndPreserveMutationEvidence () =
             { Result = if failed then None else Some """{"value":"terminal"}"""
               Error = if failed then Some(ValidationFailed "Original validation failure.") else None
               Instructions = []
-              AgentStateChanges = [{ ProjectName = "Jarvis"; AgentId = "Worker 1" }]
+              StateChangeEvidence = StateChangeEvidence.Confirmed [{ ProjectName = "Jarvis"; AgentId = "Worker 1" }]
               InboxActivation = Some receipt; PendingJob = None }
         let job : JobResult =
             { JobId = "tool-job-1"; Status = if failed then ToolFailed "failed" else ToolCompleted
@@ -2007,7 +2121,7 @@ let polledToolJobsFilterLegacyRepositoryGuidanceAndPreserveMutationEvidence () =
         let poll : AgentCommandResponse =
             { Result = Some(legacyJobPayload job guidance)
               Error = None; Instructions = OperationalControl.fromLegacy pollGuidance
-              AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+              StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
         let command = GetJobResultCommand { ProjectName = "Jarvis"; JobId = job.JobId; AfterSequence = None }
         let effective = McpToolHelpers.completedToolEvidence command poll
         // Job completion and poll-time alert delivery happen independently.
@@ -2051,7 +2165,7 @@ let polledToolJobsKeepLegacyOperationalFieldsWithoutChangingOtherPayloads () =
     let original : AgentCommandResponse =
         { Result = Some """{"Instructions":[{"Scope":"project","Content":"explicit operation content"}]}"""
           Error = None; Instructions = OperationalControl.fromLegacy controls
-          AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+          StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
     let job : JobResult =
         { JobId = "job"; Status = ToolCompleted; Events = []; NextSequence = 0L
           Truncated = false; ToolResponse = Some original; OperationId = None }
@@ -2069,7 +2183,7 @@ let operational_contract_legacy_terminal_alert_never_reappears_in_raw_mcp_result
     let alert = OperationalControl.queuedAlert "stale" "STOP - previously consumed"
     let original : AgentCommandResponse =
         { Result = Some "terminal"; Error = None; Instructions = [alert]
-          AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+          StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
     let job : JobResult =
         { JobId = "job"; Status = ToolCompleted; Events = []; NextSequence = 0L
           Truncated = false; ToolResponse = Some original; OperationId = Some "original-id" }
@@ -2084,7 +2198,7 @@ let operational_contract_legacy_terminal_alert_never_reappears_in_raw_mcp_result
 let operational_contract_missing_state_receipt_is_not_confirmed_zero () =
     let reply : AgentCommandResponse =
         { Result = Some "ok"; Error = None; Instructions = []
-          AgentStateChanges = Unchecked.defaultof<_>; InboxActivation = None; PendingJob = None }
+          StateChangeEvidence = StateChangeEvidence.Unknown []; InboxActivation = None; PendingJob = None }
     Assert.That(AgentStateEvidence.isUnknown reply, Is.True)
     let rendered = reply |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachStateEffects reply
     Assert.That(rendered.Meta["jarvis/agent_state_changes_status"].GetValue<string>(), Is.EqualTo("unknown"))
@@ -2095,7 +2209,7 @@ let operational_contract_sender_alert_survives_destination_failure () =
     let source : AgentCommandResponse =
         { Result = Some "{}"; Error = None
           Instructions = [OperationalControl.queuedAlert "source" "STOP - source"]
-          AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+          StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
     let destination = { source with Result = None; Error = Some(NotFound "destination"); Instructions = [] }
     Assert.That((McpToolHelpers.mergeStateEffects source destination).Instructions, Is.EqualTo(source.Instructions :> obj))
 
@@ -2109,7 +2223,7 @@ let completedPollsNeverReplayAlertsEmbeddedInAnOriginalPromotedJobResponse () =
     let original : AgentCommandResponse =
         { Result = Some """{"terminal":true}"""; Error = None
           Instructions = [legacyStop; canonical]
-          AgentStateChanges = [{ ProjectName = "Jarvis"; AgentId = "Worker 1" }]
+          StateChangeEvidence = StateChangeEvidence.Confirmed [{ ProjectName = "Jarvis"; AgentId = "Worker 1" }]
           InboxActivation = None; PendingJob = None }
     let job : JobResult =
         { JobId = "promoted-job"; Status = ToolCompleted; Events = []
@@ -2118,7 +2232,7 @@ let completedPollsNeverReplayAlertsEmbeddedInAnOriginalPromotedJobResponse () =
     let command = GetJobResultCommand { ProjectName = "Jarvis"; JobId = job.JobId; AfterSequence = None }
     let poll : AgentCommandResponse =
         { Result = Some(JsonSerializer.Serialize job); Error = None
-          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+          Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
     for _ in 1..2 do
         let evidence = McpToolHelpers.completedToolEvidence command poll
         Assert.That(evidence.Instructions, Is.EqualTo([canonical] :> obj),
@@ -2139,7 +2253,7 @@ let pollResponseAlertsRemainVisibleOnPendingAndErroredJobLookups () =
           ToolResponse = None; OperationId = None }
     let pendingPoll : AgentCommandResponse =
         { Result = Some(JsonSerializer.Serialize inProgress); Error = None
-          Instructions = [alert]; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+          Instructions = [alert]; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
     let failedPoll : AgentCommandResponse =
         { pendingPoll with Result = None; Error = Some(NotFound "job not found") }
     for response in [pendingPoll; failedPoll] do
@@ -2163,7 +2277,7 @@ let pendingToolJobNeverAdvertisesAFalseEmptyMutationList () =
           StartedAt = DateTimeOffset.UtcNow }
     let pending : AgentCommandResponse =
         { Result = Some(JsonSerializer.Serialize handle); Error = None
-          Instructions = []; AgentStateChanges = Unchecked.defaultof<_>
+          Instructions = []; StateChangeEvidence = StateChangeEvidence.Pending
           InboxActivation = None; PendingJob = Some handle }
     use wire = JsonDocument.Parse(JsonSerializer.Serialize pending)
     Assert.That(wire.RootElement.GetProperty("AgentStateChanges").ValueKind,
@@ -2246,6 +2360,7 @@ let private routedNotificationFixtureWithReceipt (sourceReceipt: AgentInboxActiv
             CrossProjectNotificationCommand
                 { Notification = notification
                   SourceStateChanges = [ { ProjectName = "Jarvis"; AgentId = actor } ]
+                  SourceKnownStateChanges = Unchecked.defaultof<_>
                   SourceInboxActivation = sourceReceipt }
         let! response =
             service.SendCommandToProject(userId, "Wayfold", cmd,
@@ -2258,7 +2373,7 @@ let private routedNotificationFixture reply =
 
 let private routeTerminalHealth : AgentCommandResponse =
     { Result = Some """{"VerifiedLedger":true}"""; Error = None
-      Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+      Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
 
 let private routePendingHealth jobId actor : AgentCommandResponse =
     let handle : ToolJobHandle =
@@ -2267,7 +2382,7 @@ let private routePendingHealth jobId actor : AgentCommandResponse =
           OperationId = None; CommandName = "LedgerRead"
           StartedAt = DateTimeOffset.UtcNow }
     { Result = Some(JsonSerializer.Serialize handle); Error = None
-      Instructions = []; AgentStateChanges = Unchecked.defaultof<_>
+      Instructions = []; StateChangeEvidence = StateChangeEvidence.Pending
       InboxActivation = None; PendingJob = Some handle }
 
 let private routeJobResult jobId status (terminal: AgentCommandResponse option) : AgentCommandResponse =
@@ -2275,7 +2390,7 @@ let private routeJobResult jobId status (terminal: AgentCommandResponse option) 
         { JobId = jobId; Status = status; Events = []; NextSequence = 0L
           Truncated = false; ToolResponse = terminal; OperationId = None }
     { Result = Some(JsonSerializer.Serialize result); Error = None
-      Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+      Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
 
 [<TestCase(false)>]
 [<TestCase(true)>]
@@ -2346,7 +2461,7 @@ let forwardedTransportFailureKeepsVerifiedSourceWithUnknownDestination () = task
         Assert.That(info.Message, Does.Contain("destination response lost"))
     | other -> Assert.Fail($"Expected uncertain destination dispatch: {other}")
     let sender : AgentCommandResponse =
-        { routeTerminalHealth with AgentStateChanges = source
+        { routeTerminalHealth with StateChangeEvidence = StateChangeEvidence.Confirmed source
                                    InboxActivation = Some receipt }
     let merged = McpToolHelpers.mergeStateEffects sender destination
     Assert.That(AgentStateEvidence.isUnknown merged, Is.True)
@@ -2479,8 +2594,9 @@ let mergingSourceWithPendingDestinationPreservesUnknownChangesAndOriginalJobHand
     for sourceChanged in [false; true] do
         let source : AgentCommandResponse =
             { Result = Some "{}"; Error = None; Instructions = []
-              AgentStateChanges =
-                if sourceChanged then [ { ProjectName = "Jarvis"; AgentId = "Worker 1" } ] else []
+              StateChangeEvidence =
+                  StateChangeEvidence.Confirmed
+                      (if sourceChanged then [ { ProjectName = "Jarvis"; AgentId = "Worker 1" } ] else [])
               InboxActivation =
                 if sourceChanged then
                     Some { ProjectName = "Jarvis"; AgentId = "Worker 1"
@@ -2526,7 +2642,7 @@ let browser_dom_mcp_tools_route_only_when_all_required_oauth_scopes_are_present 
                 lock dispatched (fun () -> dispatched.Add(command))
                 tracker.Complete(correlationId, userId, connectionId, registration.Generation,
                     { Result = Some """{"status":"ok"}"""
-                      Error = None; Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }) |> ignore
+                      Error = None; Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }) |> ignore
                 Task.CompletedTask
             member _.InvalidateAgentStates(_, _) = Task.CompletedTask
             member _.RecordAgentActivity(_, _, _) = Task.CompletedTask
@@ -2638,7 +2754,7 @@ let attributed_tool_dispatch_survives_missing_sqlite_and_notifies_only_user_devi
     let mutable deliveredCommands = 0
     let received = System.Collections.Concurrent.ConcurrentQueue<string * string * string * DateTimeOffset>()
     let expected = { Result = Some "ok"; Error = None; Instructions = []
-                     AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                     StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
     let recipient connection =
         { new Common.SignalR.IClientService with
             member _.ReceiveMessage(_) = Task.CompletedTask
@@ -2731,7 +2847,7 @@ let stalled_cross_device_activity_hints_drop_without_unbounded_tasks_or_blocking
         TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
     let accepted =
         { Result = Some "ok"; Error = None; Instructions = []
-          AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+          StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
     let recipient connection =
         { new IClientService with
             member _.ReceiveMessage(_) = Task.CompletedTask
@@ -2848,7 +2964,7 @@ let source_uuid_signalr_dispatch_preserves_caller_identity_and_legacy_receiver (
         let mutable legacyDispatches = 0
         let expected : AgentCommandResponse =
             { Result = Some "ok"; Error = None; Instructions = []
-              AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+              StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
         let reply correlation =
             tracker.Complete(correlation, user, connection, registration.Generation, expected)
             |> ignore
@@ -2982,7 +3098,7 @@ let wq06_authenticated_mcp_post_forwards_only_oauth_derived_actor_and_original_u
         let reply correlation =
             tracker.Complete(correlation, user, connection, registration.Generation,
                 { Result = Some """{"status":"fixture-response"}"""
-                  Error = None; Instructions = []; AgentStateChanges = []
+                  Error = None; Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []
                   InboxActivation = None; PendingJob = None })
             |> ignore
             Task.CompletedTask

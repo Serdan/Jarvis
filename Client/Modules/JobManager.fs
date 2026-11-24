@@ -344,7 +344,7 @@ module private ToolOperations =
         { Result = None
           Error = Some(ExecutionFailed message)
           Instructions = []
-          AgentStateChanges = []
+          StateChangeEvidence = StateChangeEvidence.Confirmed []
           InboxActivation = None
           PendingJob = None }
 
@@ -357,8 +357,8 @@ module private ToolOperations =
               { Message = message + " The outcome may have committed; reconcile the original operation ID before retrying."
                 OperationId = entry.Handle.OperationId })
           Instructions = []
-          // The typed UncertainOutcome marks completeness UNKNOWN, never zero.
-          AgentStateChanges = []
+          // Completeness is independently unknown, never a confirmed zero.
+          StateChangeEvidence = StateChangeEvidence.Unknown []
           InboxActivation = None
           PendingJob = None }
 

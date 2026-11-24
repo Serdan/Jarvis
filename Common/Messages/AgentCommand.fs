@@ -948,25 +948,80 @@ type StateChangeEvidence =
     | Confirmed of AgentStateChange list
     | Unknown of knownChanges: AgentStateChange list
 
-module private StateChangeEvidenceProjection =
-    let ofParts error changes pending =
-        let known = if isNull (box changes) then [] else changes
-        if Option.isSome pending then StateChangeEvidence.Pending
-        else
-            match error with
-            | Some(UncertainOutcome _) -> StateChangeEvidence.Unknown known
-            | _ when isNull (box changes) -> StateChangeEvidence.Unknown known
-            | _ -> StateChangeEvidence.Confirmed known
+[<RequireQualifiedAccess>]
+module StateChangeEvidence =
+    let known = function
+        | StateChangeEvidence.Confirmed changes
+        | StateChangeEvidence.Unknown changes -> changes
+        | StateChangeEvidence.Pending -> []
+
+    let combine prior destination =
+        match prior, destination with
+        | _, StateChangeEvidence.Pending -> StateChangeEvidence.Pending
+        | StateChangeEvidence.Confirmed source, StateChangeEvidence.Confirmed target ->
+            StateChangeEvidence.Confirmed (List.distinct (source @ target))
+        | _ ->
+            StateChangeEvidence.Unknown (List.distinct (known prior @ known destination))
 
     let status = function
         | StateChangeEvidence.Pending -> "pending"
         | StateChangeEvidence.Confirmed _ -> "confirmed"
         | StateChangeEvidence.Unknown _ -> "unknown"
 
-// A single adapter for mixed-version client/server transport. The old field
-// remains a compatibility projection only when operational controls exist.
-// New peers prefer the closed typed field; no ambient document survives
-// decoding. Keep the receipt list untouched, including null/unknown.
+    let private absent : AgentStateChange list = Unchecked.defaultof<_>
+
+    /// Compatibility projection for forwarding, where there is no error field
+    /// to tell a legacy reader that a nonempty receipt is incomplete.
+    let split = function
+        | StateChangeEvidence.Confirmed changes -> changes, absent
+        | StateChangeEvidence.Unknown changes -> absent, changes
+        | StateChangeEvidence.Pending -> absent, absent
+
+    let fromForwarded complete partial =
+        if isNull (box complete) then
+            StateChangeEvidence.Unknown (if isNull (box partial) then [] else partial)
+        elif isNull (box partial) then StateChangeEvidence.Confirmed complete
+        else StateChangeEvidence.Unknown (List.distinct (complete @ partial))
+
+module private StateChangeEvidenceProjection =
+    let private isUncertain = function
+        | Some(UncertainOutcome _) -> true
+        | _ -> false
+
+    let read error legacy partial pending status =
+        let hasLegacy = not (isNull (box legacy))
+        let hasPartial = not (isNull (box partial))
+        let invalid () = raise (JsonException("Command response state-change status contradicts its evidence."))
+        let known =
+            if hasPartial && hasLegacy && List.distinct legacy <> List.distinct partial then invalid ()
+            elif hasPartial then partial
+            elif hasLegacy then legacy
+            else []
+        match status, pending with
+        | ("pending" | null | ""), Some _ when not hasPartial -> StateChangeEvidence.Pending
+        | _, Some _ -> invalid ()
+        | "pending", None -> invalid ()
+        | "confirmed", None when hasLegacy && not hasPartial && not (isUncertain error) ->
+            StateChangeEvidence.Confirmed legacy
+        | "confirmed", None -> invalid ()
+        | "unknown", None -> StateChangeEvidence.Unknown known
+        | (null | ""), None ->
+            if hasPartial || not hasLegacy || isUncertain error then StateChangeEvidence.Unknown known
+            else StateChangeEvidence.Confirmed legacy
+        | _ -> invalid ()
+
+    let write error evidence =
+        match evidence with
+        | StateChangeEvidence.Unknown changes when isUncertain error ->
+            // Old readers understand partial lists only under UncertainOutcome.
+            changes, Unchecked.defaultof<AgentStateChange list>
+        | StateChangeEvidence.Unknown [] ->
+            // Avoid adding an unnecessary field to an empty unknown receipt.
+            Unchecked.defaultof<_>, Unchecked.defaultof<_>
+        | _ -> StateChangeEvidence.split evidence
+
+// Single mixed-version transport adapter. New peers use explicit evidence
+// completeness; the legacy list never presents a known subset as complete.
 type AgentCommandResponseWire =
     { Result: string option
       Error: AgentError option
@@ -976,6 +1031,8 @@ type AgentCommandResponseWire =
       OperationalControls: OperationalControl list
       AgentStateChanges: AgentStateChange list
       AgentStateChangesStatus: string
+      [<JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)>]
+      KnownAgentStateChanges: AgentStateChange list
       InboxActivation: AgentInboxActivation option
       PendingJob: ToolJobHandle option }
 
@@ -983,16 +1040,20 @@ type AgentCommandResponseWire =
 type AgentCommandResponse =
     { Result: string option
       Error: AgentError option
-      // Source-compatible field name for existing empty-response constructors.
-      // Its type is closed; only the wire adapter knows the legacy document DTO.
       Instructions: OperationalControl list
-      AgentStateChanges: AgentStateChange list
+      StateChangeEvidence: StateChangeEvidence
       InboxActivation: AgentInboxActivation option
       PendingJob: ToolJobHandle option }
 
     member this.OperationalControls = OperationalControl.normalize this.Instructions
-    member this.StateChangeEvidence =
-        StateChangeEvidenceProjection.ofParts this.Error this.AgentStateChanges this.PendingJob
+    /// Compatibility accessor for existing invalidation and receipt consumers.
+    /// Use StateChangeEvidence to determine completeness; a nonempty list may
+    /// be only the independently known subset.
+    member this.AgentStateChanges =
+        match this.StateChangeEvidence with
+        | StateChangeEvidence.Pending
+        | StateChangeEvidence.Unknown [] -> Unchecked.defaultof<AgentStateChange list>
+        | evidence -> StateChangeEvidence.known evidence
 
 and AgentCommandResponseConverter() =
     inherit JsonConverter<AgentCommandResponse>()
@@ -1003,23 +1064,22 @@ and AgentCommandResponseConverter() =
         let controls =
             if isNull (box wire.OperationalControls) then OperationalControl.fromLegacy wire.Instructions
             else OperationalControl.normalize wire.OperationalControls
-        let changes = wire.AgentStateChanges
-        let inferred = StateChangeEvidenceProjection.ofParts wire.Error changes wire.PendingJob
-        if not (String.IsNullOrEmpty wire.AgentStateChangesStatus)
-           && wire.AgentStateChangesStatus <> StateChangeEvidenceProjection.status inferred then
-            raise (JsonException("Command response state-change status contradicts its evidence."))
+        let evidence = StateChangeEvidenceProjection.read wire.Error wire.AgentStateChanges
+                           wire.KnownAgentStateChanges wire.PendingJob wire.AgentStateChangesStatus
         { Result = wire.Result; Error = wire.Error; Instructions = controls
-          AgentStateChanges = changes; InboxActivation = wire.InboxActivation
+          StateChangeEvidence = evidence; InboxActivation = wire.InboxActivation
           PendingJob = wire.PendingJob }
 
     override _.Write(writer: Utf8JsonWriter, response: AgentCommandResponse, options: JsonSerializerOptions) =
         let controls = response.OperationalControls
+        let legacy, partial = StateChangeEvidenceProjection.write response.Error response.StateChangeEvidence
         let wire: AgentCommandResponseWire =
             { Result = response.Result; Error = response.Error
               Instructions = if controls.IsEmpty then Unchecked.defaultof<_> else OperationalControl.toLegacy controls
               OperationalControls = if controls.IsEmpty then Unchecked.defaultof<_> else controls
-              AgentStateChanges = response.AgentStateChanges
-              AgentStateChangesStatus = StateChangeEvidenceProjection.status response.StateChangeEvidence
+              AgentStateChanges = legacy
+              AgentStateChangesStatus = StateChangeEvidence.status response.StateChangeEvidence
+              KnownAgentStateChanges = partial
               InboxActivation = response.InboxActivation; PendingJob = response.PendingJob }
         JsonSerializer.Serialize(writer, wire, options)
 
@@ -1030,7 +1090,12 @@ and AgentCommandResponseConverter() =
 type CrossProjectNotificationCommand =
     { Notification: TaskWriteCommand
       SourceStateChanges: AgentStateChange list
+      [<JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)>]
+      SourceKnownStateChanges: AgentStateChange list
       SourceInboxActivation: AgentInboxActivation option }
+    [<JsonIgnore>]
+    member this.SourceEvidence =
+        StateChangeEvidence.fromForwarded this.SourceStateChanges this.SourceKnownStateChanges
 
 /// Process output and complete, immutable tool response share a lookup API.
 /// ToolResponse contains the ORIGINAL response, not reconstructed polling metadata.
@@ -1152,7 +1217,7 @@ module AgentCommandInfo =
     /// write later has an uncertain outcome.
     let confirmedSourceEvidence = function
         | CrossProjectNotificationCommand envelope ->
-            (if isNull (box envelope.SourceStateChanges) then [] else envelope.SourceStateChanges),
+            (StateChangeEvidence.known envelope.SourceEvidence),
             (envelope.SourceInboxActivation
              |> Option.filter (fun receipt -> receipt.ActivatedByThisCall))
         | _ -> [], None

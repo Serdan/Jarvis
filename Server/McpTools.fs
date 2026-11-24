@@ -514,8 +514,7 @@ module McpToolHelpers =
     let attachStateEffects (response: AgentCommandResponse) (result: CallToolResult) =
         if response.PendingJob.IsSome then result
         else
-            let changes =
-                if isNull (box response.AgentStateChanges) then [] else response.AgentStateChanges
+            let changes = StateChangeEvidence.known response.StateChangeEvidence
             let details = JsonObject()
             let metadata = if isNull result.Meta then JsonObject() else result.Meta
             match response.StateChangeEvidence with
@@ -554,24 +553,11 @@ module McpToolHelpers =
     /// state (notably a cross-project notification sender validation). Never
     /// lose the preliminary mutation from the caller-visible result.
     let mergeStateEffects (prior: AgentCommandResponse) (final: AgentCommandResponse) =
-        // Unknown final effects are NOT an empty list. A promoted destination
-        // must carry its source evidence into the client-owned job, so that
-        // polling eventually returns both confirmed sets of mutations.
-        let changes =
-            let known changes = if isNull (box changes) then [] else changes
-            match prior.StateChangeEvidence, final.StateChangeEvidence, final.Error with
-            | _, StateChangeEvidence.Pending, _ -> Unchecked.defaultof<AgentStateChange list>
-            | StateChangeEvidence.Confirmed source, StateChangeEvidence.Confirmed destination, _ ->
-                (source @ destination) |> List.distinct
-            | _, _, Some(UncertainOutcome _) ->
-                (known prior.AgentStateChanges @ known final.AgentStateChanges) |> List.distinct
-            | _ ->
-                // Missing legacy receipt evidence is not a confirmed empty list.
-                // A source inbox's committed activation is retained separately.
-                Unchecked.defaultof<AgentStateChange list>
+        // The destination job owns pending effects; terminal results retain
+        // the union of independently known effects, even on success.
         { final with
             Instructions = OperationalControl.ordered (prior.OperationalControls @ final.OperationalControls)
-            AgentStateChanges = changes
+            StateChangeEvidence = StateChangeEvidence.combine prior.StateChangeEvidence final.StateChangeEvidence
             InboxActivation =
                 if final.PendingJob.IsSome then None
                 else
@@ -994,7 +980,7 @@ module McpToolHelpers =
                                         factory.CreateLogger("Jarvis.AgentStateInvalidation")
                                             .LogWarning(ex, "Could not invalidate caches after an uncertain command.")
                             for project, agentIds in
-                                AgentStateInvalidationRouting.affectedByProject response.AgentStateChanges do
+                                AgentStateInvalidationRouting.affectedByProject (StateChangeEvidence.known response.StateChangeEvidence) do
                                 try
                                     do! client.InvalidateAgentStatesForUser(userId, project, agentIds)
                                 with ex ->
@@ -1044,7 +1030,7 @@ module McpToolHelpers =
                                             Error = Some(ExecutionFailed
                                                 "Source validation job has no bound device; cannot safely poll a different candidate.")
                                             PendingJob = None
-                                            AgentStateChanges = Unchecked.defaultof<_> }
+                                            StateChangeEvidence = StateChangeEvidence.Unknown [] }
                                 | Some originalDevice ->
                                     // Shared typed resolver checks the job ID, project,
                                     // actor, terminal status and deadline. The callback
@@ -1097,10 +1083,12 @@ module McpToolHelpers =
                                         // Preserve source activation while forwarding
                                         // only the verified canonical sender identity.
                                         // No server-owned task store or retry writes.
+                                        let sourceComplete, sourcePartial = StateChangeEvidence.split sender.StateChangeEvidence
                                         let forwarded =
                                             CrossProjectNotificationCommand
                                                 { Notification = canonical
-                                                  SourceStateChanges = sender.AgentStateChanges
+                                                  SourceStateChanges = sourceComplete
+                                                  SourceKnownStateChanges = sourcePartial
                                                   SourceInboxActivation = sender.InboxActivation }
                                         let! destination = client.SendCommandToProject(
                                             userId, notification.ProjectName, forwarded,

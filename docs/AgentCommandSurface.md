@@ -6,7 +6,7 @@ Jarvis should not try to be a complete coding-agent runtime. Its purpose is to e
 
 ## Explicit repository guidance
 
-Ordinary operations return requested results, errors and necessary operational receipts or alerts, not automatic repository documents. Read applicable repository guidance with `get_agent_instructions` and obtain dynamic role/assignment context through the self-agent inbox. The closed `OperationalControls` wire union distinguishes Working-turn soft/hard advisory limits, exceptional queued alerts, and an unverified activation diagnostic. During staged compatibility, a narrow adapter projects these controls into the legacy `Instructions` field only when present; new peers prefer typed controls and ignore legacy repository documents/notices, including nested terminal job results. `AgentStateChangesStatus` distinguishes confirmed (including an empty list), unknown (including any known partial mutations), and pending evidence. Missing or null legacy mutation evidence is unknown, never confirmed empty. This source behavior is gated on canonical launch-template readiness and coordinated cutover; see [AgentInstructions.md](AgentInstructions.md) and [AgentCommandResponse.schema.json](AgentCommandResponse.schema.json).
+Ordinary operations return requested results, errors and necessary operational receipts or alerts, not automatic repository documents. Read applicable repository guidance with `get_agent_instructions` and obtain dynamic role/assignment context through the self-agent inbox. The closed `OperationalControls` wire union distinguishes Working-turn soft/hard advisory limits, exceptional queued alerts, and an unverified activation diagnostic. During staged compatibility, a narrow adapter projects these controls into the legacy `Instructions` field only when present; new peers prefer typed controls and ignore legacy repository documents/notices, including nested terminal job results. `AgentStateChangesStatus` distinguishes confirmed (including an empty list), unknown (including any known partial mutations), and pending evidence independently of operation success. Missing or null legacy mutation evidence is unknown, never confirmed empty on new readers. This source behavior is gated on canonical launch-template readiness and coordinated cutover; see [AgentInstructions.md](AgentInstructions.md) and [AgentCommandResponse.schema.json](AgentCommandResponse.schema.json).
 
 ## Implicit agent activation (protocol 3.58)
 
@@ -93,7 +93,7 @@ committed Git head and operation ID. A repeated read explicitly reports
 `activatedByThisCall: false`, with no invented transition. This evidence
 remains visible even when the later inbox read fails; the failure is still an
 error rather than falsely claiming the entire call had no side effects.
-The same typed `AgentStateChanges` envelope drives cache invalidation; its
+The same typed `StateChangeEvidence` drives cache invalidation; its
 public projection is advisory, never an authorization claim.
 
 The global Agents dashboard can consume the same compact projection instead
@@ -105,14 +105,32 @@ requires an explicit coordinated release authorization.
 
 A canonical Git-ledger transaction records the exact agent IDs whose assignment
 or Working-turn state changed in its immutable, replayable operation receipt.
-The client forwards those typed effects in `AgentCommandResponse.AgentStateChanges`,
+The client forwards those typed effects in `AgentCommandResponse.StateChangeEvidence`,
 independently of the ordinary command's success. In particular, a `read_file`
 call may commit Ready-to-Working activation before the file read fails.
 
-The server sends user-scoped SignalR
+Terminal source/destination composition unions and deduplicates the independently
+known affected agents. It is confirmed only if both inputs are confirmed.
+Pending replies expose only the original destination job handle; the destination
+owns the combined terminal receipt, including the source activation.
+
+For wire compatibility, `AgentStateChanges` is the complete list or (only
+under `UncertainOutcome`) the known partial list understood by the pre-control
+reader. In other unknown terminal outcomes, the legacy list is null and the
+nonempty known subset uses additive `KnownAgentStateChanges`; new peers expose
+`knownAgentStateChanges` publicly instead of a complete list. The internal
+forwarded notification uses the same separation. Legacy readers ignore status
+and the new subset field and may display confirmed empty for unknown success
+or an ordinary error. This limitation is inherent in the older contract:
+the new writer does not mislabel a known nonempty subset as complete or invent
+an error to force old behavior. Coordinated rollout is required for full visibility.
+
+For complete evidence, the server sends user-scoped SignalR
 `InvalidateAgentStates(projectName, agentIds)` only for the affected agents.
-Other agents' cached state remains valid after checkpoints, notifications,
-and unrelated task operations. Cross-project notification sender checks publish
+Unknown evidence also triggers conservative global invalidation; a known subset
+is not a bound on all changes. Other agents' cached state remains valid after
+confirmed checkpoints, notifications, and unrelated task operations.
+Cross-project notification sender checks publish
 their source-project effects independently from destination operations.
 A cross-project `notify_agent` writes the durable notification in the
 destination without counting the source sender's ID as destination activity,

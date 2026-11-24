@@ -198,7 +198,7 @@ let ``manual grant has exact two-device same-name project authority and a positi
     let health id : AgentCommandResponse =
         { Result = Some (sprintf """{"projectId":"%s"}""" id)
           Error = None; PendingJob = None; Instructions = []
-          AgentStateChanges = []; InboxActivation = None }
+          StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None }
     let idA = ManualGrantPolicy.verifiedHealthProjectId (health projectId)
     let idB = ManualGrantPolicy.verifiedHealthProjectId (health projectB)
     Assert.That(idA, Is.EqualTo(Some projectId))
@@ -262,7 +262,7 @@ let ``existing grants require verified ledger identity before issuing bearer`` (
     Assert.That(store.VerifierCount, Is.Zero)
     let missing : AgentCommandResponse =
         { Result = Some "{}"; Error = None; PendingJob = None
-          Instructions = []; AgentStateChanges = []; InboxActivation = None }
+          Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None }
     Assert.That(ManualGrantPolicy.verifiedHealthProjectId missing, Is.EqualTo(None))
     Assert.That(ManualGrantPolicy.verifiedHealthProjectId
                     { missing with Result = Some (sprintf """{"projectId":"%s"}""" projectId)

@@ -6997,7 +6997,7 @@ type ReviewWorkflowTests() =
                     { Result = Some """{"terminal":true}"""; Error = None
                       Instructions =
                         [Common.OperationalControl.ActivationUnverified "Original activation status"]
-                      AgentStateChanges = [{ ProjectName = "owner"; AgentId = actor }]
+                      StateChangeEvidence = Common.StateChangeEvidence.Confirmed [{ ProjectName = "owner"; AgentId = actor }]
                       InboxActivation = None; PendingJob = None }
                 let startPromoted (blocked: System.Threading.Tasks.TaskCompletionSource<Common.AgentCommandResponse>) =
                     let pending =
@@ -7022,7 +7022,7 @@ type ReviewWorkflowTests() =
                     let command : Common.AgentCommand = Common.GetJobResultCommand (pollData jobId)
                     let response : Common.AgentCommandResponse =
                         { Result = Some(System.Text.Json.JsonSerializer.Serialize(stored jobId))
-                          Error = None; Instructions = []; AgentStateChanges = []
+                          Error = None; Instructions = []; StateChangeEvidence = Common.StateChangeEvidence.Confirmed []
                           InboxActivation = None; PendingJob = None }
                     Client.SignalR.Client.executeOrPromoteWith runtime (serialize command)
                         actor TimeSpan.Zero (fun _ _ -> System.Threading.Tasks.Task.FromResult response)
@@ -7067,7 +7067,7 @@ type ReviewWorkflowTests() =
                         { ProjectName = "owner"; AgentId = actor; Action = "GetNotificationPreferences"
                           TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
-                let unrelatedReply = { original with Instructions = []; AgentStateChanges = [] }
+                let unrelatedReply = { original with Instructions = []; StateChangeEvidence = Common.StateChangeEvidence.Confirmed [] }
                 (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" actor).GetAwaiter().GetResult()
                 let visible =
                     Client.SignalR.Client.executeOrPromoteWith runtime (serialize unrelated)

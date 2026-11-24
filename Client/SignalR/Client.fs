@@ -511,7 +511,7 @@ let internal toAgentResponse command instructions stateChanges inboxActivation r
     { Result = result
       Error = error
       Instructions = instructions
-      AgentStateChanges = stateChanges
+      StateChangeEvidence = StateChangeEvidence.Confirmed stateChanges
       InboxActivation = inboxActivation
       PendingJob = None }
     |> guardResponseSize command
@@ -1536,7 +1536,8 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                 // after a ledger commit. Preserve any known activation and
                 // mark all remaining state effects as UNKNOWN.
                 { agentResponse with
-                    Error = (CommandDispatchRecovery.unexpectedResponse commandJson).Error }
+                    Error = (CommandDispatchRecovery.unexpectedResponse commandJson).Error
+                    StateChangeEvidence = StateChangeEvidence.Unknown (StateChangeEvidence.known agentResponse.StateChangeEvidence) }
             else agentResponse
         return parsedCommand, (response |> Result.map (fun outcome -> outcome.Payload)), agentResponse
     }
@@ -1608,20 +1609,13 @@ let private shouldAutoPromote = function
 /// reconstructing state evidence in a server-side cache.
 let combineCrossProjectNotification (source: CrossProjectNotificationCommand)
                                     (destination: AgentCommandResponse) =
-    let knownChanges =
-        let known changes = if isNull (box changes) then [] else changes
-        match destination.StateChangeEvidence, destination.Error with
-        | _, Some(UncertainOutcome _) ->
-            (known source.SourceStateChanges @ known destination.AgentStateChanges) |> List.distinct
-        | StateChangeEvidence.Confirmed changes, _ when not (isNull (box source.SourceStateChanges)) ->
-            (source.SourceStateChanges @ changes) |> List.distinct
-        | _ -> Unchecked.defaultof<AgentStateChange list>
     { destination with
-        AgentStateChanges = knownChanges
+        StateChangeEvidence = StateChangeEvidence.combine source.SourceEvidence destination.StateChangeEvidence
         InboxActivation =
-            match destination.InboxActivation with
-            | Some receipt -> Some receipt
-            | None ->
+            match destination.PendingJob, destination.InboxActivation with
+            | Some _, _ -> None
+            | None, Some receipt -> Some receipt
+            | None, None ->
                 source.SourceInboxActivation
                 |> Option.filter (fun receipt -> receipt.ActivatedByThisCall) }
 
@@ -1664,7 +1658,7 @@ let executeOrPromoteWith (rt: Runtime) (commandJson: string) (agentId: string)
                         { Result = None
                           Error = Some(EffectError.toAgentError error)
                           Instructions = []
-                          AgentStateChanges = []
+                          StateChangeEvidence = StateChangeEvidence.Confirmed []
                           InboxActivation = None
                           PendingJob = None }
                         |> withVisibleResponseAlerts rt agentId (Some command)
@@ -1683,7 +1677,7 @@ let executeOrPromoteWith (rt: Runtime) (commandJson: string) (agentId: string)
                               // Unknown until the original command finishes.
                               // Null on this one pending wire envelope means
                               // "not yet known", never "there were no writes".
-                              AgentStateChanges = Unchecked.defaultof<_>
+                              StateChangeEvidence = StateChangeEvidence.Pending
                               InboxActivation = None
                               PendingJob = Some handle }
                             |> withVisibleResponseAlerts rt agentId (Some command)
@@ -1814,7 +1808,7 @@ let processManualGrantApproval (rt: Runtime) (requestJson: string) =
             { Result = if approved then Some "true" else None
               Error = error
               Instructions = []
-              AgentStateChanges = []
+              StateChangeEvidence = StateChangeEvidence.Confirmed []
               InboxActivation = None
               PendingJob = None }
         try

@@ -50,7 +50,7 @@ module ProjectNotificationRouting =
               Error = Some(ExecutionFailed("Ledger health not verified: " + detail))
               Instructions = OperationalControl.ordered controls
               // The original sender-validation job may already have committed.
-              AgentStateChanges = Unchecked.defaultof<_>
+              StateChangeEvidence = StateChangeEvidence.Unknown []
               InboxActivation = None
               PendingJob = None }
         let rec resolve controls (current: AgentCommandResponse) =
@@ -291,12 +291,12 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                         ValidationFailed "deviceId must be a nonempty device ID of at most 256 characters."
                     else
                         NotFound $"Jarvis device '{requested}' is not registered for the authenticated user. Use ListDevices to find available devices."
-                return { Result = None; Error = Some error; Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                return { Result = None; Error = Some error; Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
             | ValueNone ->
                 return
                     { Result = None
                       Error = Some(NotFound "No Jarvis client has registered for the authenticated user.")
-                      Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                      Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
             | ValueSome session ->
                 match session.State, session.ConnectionId with
                 | Disconnected, _ ->
@@ -308,7 +308,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                 ExecutionFailed
                                     $"Jarvis device {session.DeviceName} is disconnected (generation {session.Generation}, protocol {session.ProtocolVersion}, last seen {session.LastSeenAt:O}). Reason: {reason}"
                             )
-                          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                          Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
                 | Registered, None ->
                     return
                         { Result = None
@@ -317,7 +317,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                 ExecutionFailed
                                     $"Jarvis device {session.DeviceName} generation {session.Generation} is registered without an active connection."
                             )
-                          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                          Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
                 | Registered, Some connectionId ->
                     let commandName = AgentCommandInfo.protocolName command
 
@@ -329,7 +329,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                     ExecutionFailed
                                         $"Jarvis device {session.DeviceName} does not advertise support for {commandName}. Client {session.ClientVersion} uses protocol {session.ProtocolVersion}; the server uses protocol {AgentProtocol.version}. Update Jarvis to a compatible version and reconnect."
                                 )
-                              Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                              Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
                     else
                         let correlationId, trackingTask = tracker.Register(userId, connectionId, session.Generation, this.ResponseTimeout command)
                         let client = ctx.Clients.Client(connectionId)
@@ -406,7 +406,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                                     { Message = $"{reason} Protocol {session.ProtocolVersion}, client {session.ClientVersion}, last seen {session.LastSeenAt:O}."
                                                       OperationId = AgentCommandInfo.recoveryOperationId command }
                                             )
-                                          Instructions = []; AgentStateChanges = sourceChanges
+                                          Instructions = []; StateChangeEvidence = StateChangeEvidence.Unknown sourceChanges
                                           InboxActivation = sourceActivation; PendingJob = None }
                         with ex ->
                                 match replyStartedAt with
@@ -433,7 +433,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                             Some(UncertainOutcome
                                                 { Message = reason
                                                   OperationId = AgentCommandInfo.recoveryOperationId command })
-                                          Instructions = []; AgentStateChanges = sourceChanges
+                                          Instructions = []; StateChangeEvidence = StateChangeEvidence.Unknown sourceChanges
                                           InboxActivation = sourceActivation; PendingJob = None }
         }
 
@@ -464,7 +464,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                         return { Result = None
                                  Error = Some(NotFound(ProjectNotificationRouting.failureMessage projectName commandName
                                       requireCurrentProtocol deviceId.IsSome ordered (List.rev probeFailures)))
-                                 Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                                 Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
                     | session :: rest ->
                         let! health = this.SendCommandToUser(
                             userId,

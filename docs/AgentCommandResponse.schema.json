@@ -38,7 +38,7 @@
         "array",
         "null"
       ],
-      "description": "Known affected project and agent identities. Null or absent legacy receipt means unknown, not confirmed empty. An uncertain outcome can include known partial mutations.",
+      "description": "Complete affected identities when confirmed. The legacy list may contain a partial subset only under UncertainOutcome, which old readers already recognize. Otherwise an unknown receipt has a null legacy list, not a complete empty set.",
       "items": {
         "$ref": "#/$defs/AgentStateChange"
       }
@@ -70,7 +70,14 @@
         "unknown",
         "pending"
       ],
-      "description": "New peers emit this status. Legacy absence is inferred from PendingJob, UncertainOutcome and the presence of AgentStateChanges. Status must agree with evidence."
+      "description": "New peers emit explicit completeness independently of operation success or error. Missing legacy status is inferred conservatively from PendingJob, UncertainOutcome and the available receipt fields."
+    },
+    "KnownAgentStateChanges": {
+      "type": "array",
+      "description": "Independently known subset when status is unknown without UncertainOutcome. Omitted for complete or pending receipts and empty unknown subsets. Never a complete list.",
+      "items": {
+        "$ref": "#/$defs/AgentStateChange"
+      }
     },
     "PendingJob": {
       "oneOf": [

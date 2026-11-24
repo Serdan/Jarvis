@@ -954,6 +954,84 @@ type NativeSchedulerAccountReservationTests() =
                 (Guid.NewGuid()) reusable |> NativeReservationFixture.success |> ignore)
 
     [<Test>]
+    member _.NoSendRequiresCanonicalExclusionAndNeverTreatsUnknownAsAbsence() =
+        NativeFixture.withGit (fun f ->
+            let limits = NativeReservationFixture.limits 1 1
+            NativeReservationFixture.establish f limits [| limits; limits |]
+            let candidate = NativeReservationFixture.worker f 0
+            let reservationId = Guid.NewGuid()
+            let receipt =
+                NativeReservationFixture.reserve f f.AccountOne f.ProjectsOne
+                    (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne)
+                    reservationId candidate
+                |> NativeReservationFixture.success
+            let original =
+                { ReservationOperationId = reservationId
+                  ReservationRequestSha256 = receipt.Receipt.RequestSha256
+                  Candidate = candidate; ExpectedGeneration = 1L
+                  ExpectedProjectFenceOid = ""; ExpectedProviderSessionId = "" }
+            let project = f.ProjectsOne[0]
+            let context =
+                NativeSchedulerAccountReservation.readOriginal f.AccountOne f.ProjectsOne
+                    (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne) original
+                |> NativeReservationFixture.success
+            let operationId = Guid.NewGuid()
+            let evidence =
+                { SchemaVersion = 1; State = "VerifiedNoSend"
+                  AccountId = string f.AccountOne.AccountId
+                  AccountLedgerId = string f.AccountOne.LedgerId; AccountEpoch = f.AccountOne.Epoch
+                  ReservationOrigin = context.ReservationOrigin
+                  CanonicalKey = context.CurrentReservation.CanonicalKey
+                  Original = original; NoSendOperationId = operationId }
+                |> NativeSchedulerAccountReservation.serializeNoSendEvidence
+            let blob = LedgerStore.computeBlobOid project evidence |> NativeReservationFixture.success
+            let head () = (LedgerStore.fetch project |> NativeReservationFixture.success).Commit
+            let initialHead = head ()
+            let locator =
+                { Original = original; NoSendOperationId = operationId
+                  ProjectHead = initialHead; NoSendOrigin = initialHead; EvidenceBlobOid = blob }
+            let deny (l: NativeNoSendLocator) =
+                let before = NativeFixture.head f.AccountTwo
+                match NativeSchedulerAccountReservation.releaseNoSend f.AccountTwo f.ProjectsTwo
+                        (NativeReservationFixture.coverage f f.AccountTwo f.ProjectsTwo)
+                        (Guid.NewGuid()) "Disposable denial fixture" l with
+                | Error(AccountPolicyNotAuthoritative _) -> ()
+                | other -> failwithf "Unverified no-send release was not denied: %A" other
+                Assert.That(NativeFixture.head f.AccountTwo, Is.EqualTo(before))
+            deny locator
+            deny { locator with Original = { original with ExpectedGeneration = 2L } }
+            deny { locator with Original = { original with ReservationRequestSha256 = String.replicate 64 "c" } }
+            deny { locator with Original = { original with Candidate = { candidate with EffectOperationId = string (Guid.NewGuid()) } } }
+            // Negative fixture deliberately writes only a receipt-shaped blob,
+            // without the canonical fence mutation. Not a genuine issuer.
+            let path = NativeSchedulerAccountReservation.noSendEvidencePath operationId
+            LedgerStore.transact project
+                { OperationId = operationId; Actor = "Disposable incomplete no-send fixture"
+                  Kind = "NativeVerifiedNoSend"; RequestJson = evidence }
+                (fun _ -> Ok [ { Path = path; ExpectedBlobOid = None; Content = evidence } ])
+            |> NativeReservationFixture.success |> ignore
+            let current = head ()
+            deny { locator with ProjectHead = current; NoSendOrigin = current }
+            let advance (l: NativeOriginalReservationLocator) status =
+                NativeSchedulerAccountReservation.transition f.AccountOne f.ProjectsOne
+                    (NativeReservationFixture.coverage f f.AccountOne f.ProjectsOne)
+                    (Guid.NewGuid()) "Disposable status fixture" l status current ""
+                |> NativeReservationFixture.success |> ignore
+            advance original "Dispatching"
+            let dispatching = { original with ExpectedGeneration = 2L; ExpectedProjectFenceOid = current }
+            advance dispatching "Uncertain"
+            deny { locator with ProjectHead = current; NoSendOrigin = current
+                                Original = { dispatching with ExpectedGeneration = 3L } }
+            let occupied = (NativeReservationFixture.snapshot f f.AccountTwo f.ProjectsTwo).Records[0]
+            Assert.That(occupied.Status, Is.EqualTo("Uncertain"))
+            let competing = NativeReservationFixture.worker f 1
+            match NativeReservationFixture.reserve f f.AccountTwo f.ProjectsTwo
+                    (NativeReservationFixture.coverage f f.AccountTwo f.ProjectsTwo)
+                    (Guid.NewGuid()) competing with
+            | Error(AccountCapacityFull(1,1)) -> ()
+            | other -> failwithf "Uncertain no-send evidence freed capacity: %A" other)
+
+    [<Test>]
     member _.OriginalProjectLineageSurvivesRosterSuccessionButRemovalHoldsSlot() =
         NativeFixture.withGit (fun f ->
             let limits = NativeReservationFixture.limits 1 1

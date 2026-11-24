@@ -97,6 +97,28 @@ type NativeTerminalProof =
       ProjectTerminalOid: string
       ProviderTerminalOid: string }
 
+// Written by the genuine project-side pre-send cancellation CAS. Both the
+// canonical fence and immutable evidence path must contain these exact bytes.
+// A verifier-shaped assertion, a missing journal or a fake Stage B marker
+// is not a substitute for this operation.
+type NativeNoSendEvidence =
+    { SchemaVersion: int
+      State: string
+      AccountId: string
+      AccountLedgerId: string
+      AccountEpoch: int
+      ReservationOrigin: string
+      CanonicalKey: string
+      Original: NativeOriginalReservationLocator
+      NoSendOperationId: Guid }
+
+type NativeNoSendLocator =
+    { Original: NativeOriginalReservationLocator
+      NoSendOperationId: Guid
+      ProjectHead: string
+      NoSendOrigin: string
+      EvidenceBlobOid: string }
+
 type INativeTerminalVerifier =
     abstract member VerifyCurrentTerminal: NativeTerminalLocator -> Result<NativeTerminalProof,string>
 
@@ -635,6 +657,121 @@ module NativeSchedulerAccountReservation =
                     let raw = json next
                     return snapshot.State,
                            json {| status = toStatus; dispatchId = record.Candidate.DispatchId
+                                   generation = nextRecord.Generation; nativeStateSha256 = digest raw |},
+                           [ Path, raw ]
+                })
+
+    // The same fence identity must be used by both send authorization and
+    // cancellation. Never derive a reviewer fence from empty worker fields.
+    let internal noSendFencePath (c: NativeDispatchCandidate) =
+        if c.Kind = "Worker" then
+            "records/native-account-started-effect-v1/"
+            + digest (c.ProjectLedgerId + "|" + c.Kind + "|" + c.TaskId + "|" + c.AttemptId) + ".json"
+        else
+            let identity =
+                json {| projectId = c.ProjectId; ledgerId = c.ProjectLedgerId; epoch = c.ProjectEpoch
+                        reviewId = c.ReviewId; reviewVersion = c.ReviewVersion
+                        claimOperationId = c.ClaimOperationId |}
+            "records/native-account-reviewer-effect-v1/" + digest identity + ".json"
+
+    let internal noSendEvidencePath (operationId: Guid) =
+        $"records/native-scheduler/no-send/{operationId:N}.json"
+
+    let internal serializeNoSendEvidence (evidence: NativeNoSendEvidence) = json evidence
+
+    let private noSendFromVerifiedProject (b: AccountBinding) projects coverage
+                                          (context: NativeOriginalReservationContext)
+                                          (locator: NativeNoSendLocator) =
+        let record = context.CurrentReservation
+        result {
+            let! binding, snapshot = projectAt projects coverage record.Candidate.ProjectId
+            if snapshot.Commit <> locator.ProjectHead then
+                return! bad "No-send evidence is not on the current verified project head."
+            let evidencePath = noSendEvidencePath locator.NoSendOperationId
+            let fencePath = noSendFencePath record.Candidate
+            let expected =
+                { SchemaVersion = 1; State = "VerifiedNoSend"
+                  AccountId = string b.AccountId; AccountLedgerId = string b.LedgerId
+                  AccountEpoch = b.Epoch; ReservationOrigin = context.ReservationOrigin
+                  CanonicalKey = record.CanonicalKey; Original = locator.Original
+                  NoSendOperationId = locator.NoSendOperationId }
+                |> serializeNoSendEvidence
+            let! operation =
+                match LedgerStore.getOperationAt binding snapshot locator.NoSendOperationId with
+                | Ok(Some op) when op.Type = "NativeVerifiedNoSend"
+                                   && op.OperationId = string locator.NoSendOperationId
+                                   && Array.contains evidencePath op.Paths
+                                   && Array.contains fencePath op.Paths -> Ok op
+                | _ -> bad "Genuine original-bound project no-send operation is missing."
+            let! origin =
+                LedgerStore.verifiedIntegrationOperationSnapshotAt binding snapshot operation
+                |> Result.mapError (fun _ -> AccountPolicyNotAuthoritative "No-send operation origin is unverified.")
+            if origin.Commit <> locator.NoSendOrigin then
+                return! bad "No-send operation origin differs."
+            if record.ProjectFenceOid <> "" then
+                if record.ProjectFenceOid = origin.Commit then
+                    return! bad "No-send must follow the original project fence."
+                match LedgerStore.verifySourceAncestry binding record.ProjectFenceOid origin.Commit with
+                | Error _ -> return! bad "No-send is outside the original fence lineage."
+                | Ok () -> ()
+            // Require the very same terminal fence and immutable evidence blob
+            // at the operation origin AND the current verified head. This
+            // catches a removed/replaced tombstone, even when the receipt remains.
+            for at in [ origin; snapshot ] do
+                for path in [ fencePath; evidencePath ] do
+                    match LedgerStore.readAt binding at path with
+                    | Ok(Some raw, Some oid) when raw = expected && oid = locator.EvidenceBlobOid -> ()
+                    | _ -> return! bad "Original-bound no-send fence or evidence blob is missing or changed."
+            let matchesIntent =
+                try
+                    use document = JsonDocument.Parse(operation.CanonicalRequestJson)
+                    let envelope = document.RootElement
+                    envelope.GetProperty("projectId").GetString() = record.Candidate.ProjectId
+                    && envelope.GetProperty("kind").GetString() = "NativeVerifiedNoSend"
+                    && envelope.GetProperty("operationId").GetString() = string locator.NoSendOperationId
+                    && envelope.GetProperty("actor").GetString() = operation.Actor
+                    && envelope.GetProperty("request").GetString() = expected
+                with _ -> false
+            if not matchesIntent then
+                return! bad "No-send receipt does not bind the exact original reservation and exclusion."
+            return ()
+        }
+
+    let internal releaseNoSend (b: AccountBinding) projects coverage operationId actor
+                               (locator: NativeNoSendLocator) =
+        if isNull (box locator) || isNull (box locator.Original)
+           || isNull (box locator.Original.Candidate)
+           || locator.NoSendOperationId = Guid.Empty || operationId = locator.NoSendOperationId
+           || not (validOid locator.ProjectHead && validOid locator.NoSendOrigin && validOid locator.EvidenceBlobOid) then
+            bad "Exact original no-send locator and verified project evidence required."
+        else
+            let request = json locator
+            AccountCapacityLedger.transactFiles b operationId actor "NativeNoSendRelease" request None
+                (fun snapshot -> result {
+                    let! _ = verifyCurrent b projects coverage snapshot
+                    do! safePhase snapshot
+                    let! state = stateAt b snapshot
+                    let! context = originalContext b snapshot state coverage locator.Original
+                    let record = context.CurrentReservation
+                    // Unknown/submitted/active/uncertain is never absence.
+                    if record.ProviderSessionId <> "" || record.TerminalOperationId <> ""
+                       || not ((record.Status = "Reserved" && record.Generation = 1L && record.ProjectFenceOid = "")
+                               || (record.Status = "Dispatching" && validOid record.ProjectFenceOid)) then
+                        return! bad "No-send release requires original pre-send occupancy with no provider session."
+                    do! noSendFromVerifiedProject b projects coverage context locator
+                    if state.Records |> Array.exists (fun r ->
+                        r.Status = "Released" && r.TerminalOperationId = string locator.NoSendOperationId) then
+                        return! bad "No-send operation already released another reservation."
+                    let nextRecord =
+                        { record with Status = "Released"; Generation = record.Generation + 1L
+                                      TerminalOperationId = string locator.NoSendOperationId }
+                    let records =
+                        state.Records |> Array.map (fun r ->
+                            if r.CanonicalKey = record.CanonicalKey then nextRecord else r)
+                    let next = { state with Records = records }
+                    let raw = json next
+                    return snapshot.State,
+                           json {| status = "Released"; dispatchId = record.Candidate.DispatchId
                                    generation = nextRecord.Generation; nativeStateSha256 = digest raw |},
                            [ Path, raw ]
                 })

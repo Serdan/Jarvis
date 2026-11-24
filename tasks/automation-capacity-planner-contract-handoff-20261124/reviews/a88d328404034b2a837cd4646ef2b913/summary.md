@@ -1,1 +1,7 @@
-Review incremental diff against accepted seam e3430a0806c77078344b23d17095971a5fe2edde; existing main does not contain the complete frozen seam. Disposable Release tests passed 7/7. No production wiring or activation.
+## Verdict: Accepted
+
+Reviewed frozen source `abef95dc790ce6f95c51968e8cfb37203c431887` against accepted base `e3430a0806c77078344b23d17095971a5fe2edde` and the canonical task specification. Verified base is an ancestor and inspected the entire incremental diff, capacity admission invariants, LedgerStore transaction retry/replay behavior, and disposable tests. No blocking defects found in the scoped composition seam. Existing main does not contain the complete frozen seam.
+
+`planReservation` reads capacity using the supplied transaction snapshot and returns changes for the caller to combine with inventory changes; existing `reserve` retains its transaction intent and invokes the same logic. LedgerStore reruns the callback on a fresh tip after contention. The added tests cover stale/unknown inventory, atomic combined changes, and a forced concurrent fence change; existing tests cover competing total and role reservations and send/exclusion. On an isolated detached checkout of the frozen SHA, the disposable suite passed 7/7 after restore and build.
+
+Scope and evidence limits: this is a low-level composition interface and disposable fixture, not a production admission boundary or an acceptance of W16/W19 integrations. The actual caller must validate complete canonical inventory and authority on each callback, bind all relevant inputs into the intent, and treat receipt replay as no authority to send; the handoff explicitly states these obligations. No deployment, integration, or live occupancy completeness was reviewed or authorized.

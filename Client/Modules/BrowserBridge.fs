@@ -795,9 +795,10 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
                     return Error(registrationId, "OutcomeUnknown: created tab identity or provenance was missing")
                 else
                     // A detached ChatGPT execution continues when its launch
-                    // tab closes. For close-after-execution, a missed activation is
-                    // preferable to leaking tabs, including on uncertain outcomes.
-                    // Explicit debug retention keeps the old fresh-home guard.
+                    // tab closes. Close-after-execution reclaims generic uncertain
+                    // outcomes; the narrow acknowledged project-route exception
+                    // below retains evidence instead. Debug retention keeps the
+                    // old fresh-home guard.
                     let closeDefinitive () = task {
                         match! bridge.CloseTab(registrationId, ownerConnectionId = ownerConnectionId,
                                                expectedRegistrationGeneration = createdGeneration,
@@ -940,7 +941,45 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
                                     | _ -> ""
                                 let detail = "OutcomeUnknown:" + stage + ":" + reason +
                                              (if timing = "" then "" else ";" + timing)
-                                if closeAfterExecution then
+                                // A matching project turn may be acknowledged while
+                                // the durable URL remains unbound. Do not derive
+                                // this disposition from generic evidence arrays or
+                                // caller arguments alone. Require the typed result,
+                                // explicit null URL and the exact bound project entry.
+                                let acknowledgedProjectRouteUnknown =
+                                    let matchingAcknowledgement =
+                                        match payload.TryGetProperty("projectRouteAcknowledgement") with
+                                        | true, field when field.ValueKind = JsonValueKind.String ->
+                                            match field.GetString() with
+                                            | "matchingUserBubble" | "matchingLegacyUserTurn" -> true
+                                            | _ -> false
+                                        | _ -> false
+                                    let missingConversationUrl =
+                                        match payload.TryGetProperty("conversationUrl") with
+                                        | true, field -> field.ValueKind = JsonValueKind.Null
+                                        | _ -> false
+                                    let projectEntryPath (raw: string) =
+                                        match Uri.TryCreate(raw, UriKind.Absolute) with
+                                        | true, entry when entry.Scheme = Uri.UriSchemeHttps &&
+                                                           entry.Host = "chatgpt.com" && entry.IsDefaultPort &&
+                                                           entry.UserInfo = "" && entry.Query = "" && entry.Fragment = "" &&
+                                                           Text.RegularExpressions.Regex.IsMatch(entry.AbsolutePath, @"^/g/g-p-[a-z0-9]+/project/?\z") ->
+                                            Some(entry.AbsolutePath.TrimEnd('/'))
+                                        | _ -> None
+                                    if stage <> "conversationRoute" || reason <> "ConversationUrlUnavailable" ||
+                                       not matchingAcknowledgement || not missingConversationUrl then false
+                                    else
+                                        match projectEntryPath url with
+                                        | None -> false
+                                        | Some boundPath ->
+                                            use args = JsonDocument.Parse(argsJson)
+                                            match args.RootElement.TryGetProperty("startUrl") with
+                                            | true, start when start.ValueKind = JsonValueKind.String ->
+                                                projectEntryPath (start.GetString()) = Some boundPath
+                                            | _ -> false
+                                if closeAfterExecution && acknowledgedProjectRouteUnknown then
+                                    return Error(registrationId, detail + ";cleanup=retained")
+                                elif closeAfterExecution then
                                     match! closeDefinitive() with
                                     | Ok cleanup -> return Error(registrationId, detail + ";cleanup=" + cleanup)
                                     | Error failure -> return Error(registrationId, detail + ";" + failure)

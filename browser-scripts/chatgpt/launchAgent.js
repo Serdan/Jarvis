@@ -8,7 +8,28 @@ async function execute(args) {
 
 async function executeLaunch(args, observeSelection) {
   const prompt = args?.prompt;
-  const startUrl = "https://chatgpt.com/";
+  // Explicit launch destination; the ordinary home remains the default.
+  const startUrl = args?.startUrl ?? "https://chatgpt.com/";
+  const validStartUrl = (() => {
+    try {
+      const url = new URL(startUrl);
+      return url.origin === "https://chatgpt.com" &&
+        !url.search && !url.hash &&
+        (url.pathname === "/" ||
+          /^\/g\/g-p-[a-z0-9]+\/project\/?$/.test(url.pathname));
+    } catch { return false; }
+  })();
+  const projectStart = validStartUrl && new URL(startUrl).pathname !== "/";
+  const atStart = () => {
+    if (!validStartUrl) return false;
+    try {
+      const expected = new URL(startUrl);
+      const current = new URL(location.href);
+      return current.origin === expected.origin &&
+        current.pathname.replace(/\/$/, "") === expected.pathname.replace(/\/$/, "") &&
+        !current.search && !current.hash;
+    } catch { return false; }
+  };
   let sendAttempted = false;
   let sendAttemptedAt = null;
   // A non-submission does not prove that a tab is disposable: a different
@@ -16,7 +37,7 @@ async function executeLaunch(args, observeSelection) {
   // Only a still-home zero-turn surface can authorize failed-launch cleanup.
   const safeToDisposeCreatedTab = () => {
     try {
-      return !sendAttempted && location.href === startUrl &&
+      return !sendAttempted && atStart() &&
         document.querySelectorAll('[data-message-author-role="user"]').length === 0 &&
         document.querySelectorAll('[data-user-message-bubble]').length === 0;
     } catch {
@@ -32,7 +53,7 @@ async function executeLaunch(args, observeSelection) {
   // Callers must NOT place secrets in argsJson even when this check rejects it.
   // Preserve the historically ignored non-secret prior-send hint; it is
   // not evidence of a private host execution and has no send effect.
-  const permittedArgs = new Set(["prompt", "timeoutMs", "confirmedSubmittedPrompts", "selectionOnly"]);
+  const permittedArgs = new Set(["prompt", "timeoutMs", "confirmedSubmittedPrompts", "selectionOnly", "startUrl", "modelOverride"]);
   if (!args || typeof args !== "object" || Array.isArray(args) ||
       Object.keys(args).some(key => !permittedArgs.has(key))) {
     return notSubmitted("UnsupportedPrivateBootstrapArguments");
@@ -40,7 +61,7 @@ async function executeLaunch(args, observeSelection) {
   if (typeof prompt !== "string" || !prompt.trim() || prompt.length > 24000) {
     return notSubmitted("InvalidPrompt");
   }
-  if (location.href !== startUrl) {
+  if (!atStart()) {
     return notSubmitted("UnexpectedStartUrl");
   }
   // Never change even the mode in an already established conversation.
@@ -90,22 +111,38 @@ async function executeLaunch(args, observeSelection) {
   });
   try {
   // Re-evaluate on every fresh launch; never cache usage availability.
-  // Strict fallback order: Chat GPT-6 Medium, Work GPT-6.1 Terra Medium, Chat GPT-6 Instant.
+  // Strict fallback order: Chat Latest Medium, Work GPT-6.1 Terra Medium, Chat Latest Instant.
   // Advance only when the current selection cannot be confirmed before Send.
-  const preferences = [
-    { mode: "Chat", model: "GPT-6", effort: "medium", level: 1, label: "Medium" },
+  const defaultPreferences = [
+    { mode: "Chat", model: "Latest", effort: "medium", level: 1, label: "Medium" },
     { mode: "Work", model: "GPT-6.1 Terra", effort: "medium", level: 1, label: "Medium" },
-    { mode: "Chat", model: "GPT-6", effort: "none", level: 0, label: "Instant" }
+    { mode: "Chat", model: "Latest", effort: "none", level: 0, label: "Instant" }
   ];
+  // Latest is a selectable alias, not a hard-coded version. Do not infer
+  // the alias's backing model from this account's current version.
+  const modelOverrides = new Map([
+    ["gpt-5.6-instant", [{ mode: "Chat", model: "GPT-5.6", alternateModels: ["GPT-5.6 Sol"], effort: "none", level: 0, label: "Instant" }]],
+    ["work-terra-medium", [defaultPreferences[1]]]
+  ]);
+  if (args.modelOverride !== undefined && !modelOverrides.has(args.modelOverride)) {
+    return notSubmitted("UnsupportedModelOverride");
+  }
+  const preferences = args.modelOverride === undefined
+    ? defaultPreferences : modelOverrides.get(args.modelOverride);
+  // Only the default sequence permits pre-Send Work -> Chat Instant fallback.
+  const sendFallback = preferences.find(target => target.mode === "Chat" && target.effort === "none");
   const composerSelector = '[data-composer-input-layout] [contenteditable="true"][role="textbox"]';
   const pickerSelector = 'button[aria-label="Select ChatGPT model"]';
+  const projectChat = { getAttribute: name => name === "aria-pressed" ? "true" : null };
+  const projectWork = { getAttribute: name => name === "aria-pressed" ? "false" : null };
   const modeButton = name => {
+    if (projectStart) return name === "Chat" ? projectChat : projectWork;
     const matches = Array.from(document.querySelectorAll('button[type="button"][aria-pressed]'))
       .filter(button => button.textContent.trim() === name);
     return matches.length === 1 ? matches[0] : null;
   };
   const emptyHomeFailure = () => {
-    if (location.href !== startUrl) return notSubmitted("UnexpectedStartUrl");
+    if (!atStart()) return notSubmitted("UnexpectedStartUrl");
     if (document.querySelectorAll('[data-message-author-role="user"],[data-user-message-bubble]').length)
       return notSubmitted("ExistingConversation");
     return null;
@@ -123,8 +160,28 @@ async function executeLaunch(args, observeSelection) {
   const modelMenu = () => Array.from(document.querySelectorAll('[role="menu"]'))
     .find(menu => menu.getClientRects().length && menu.querySelector('[data-model-picker-view]')) || null;
   const menuView = () => modelMenu()?.querySelector('[data-model-picker-view]')?.getAttribute('data-model-picker-view');
-  const radio = model => Array.from(modelMenu()?.querySelectorAll('[role="menuitemradio"]') || [])
-    .find(item => (item.innerText || item.textContent || "").trim() === model) || null;
+  const radioText = item => (item?.innerText || item?.textContent || "").trim();
+  const radio = model => {
+    const matches = Array.from(modelMenu()?.querySelectorAll('[role="menuitemradio"]') || [])
+      .filter(item => radioText(item) === model);
+    return matches.length === 1 ? matches[0] : null;
+  };
+  const modelRadio = target => {
+    for (const name of [target.model, ...(target.alternateModels || [])]) {
+      const item = radio(name);
+      if (item) return item;
+    }
+    return null;
+  };
+  // Observation is intentionally narrower than selector confirmation: do not
+  // report a hidden label or infer a version from the checked Latest alias.
+  const renderedLabel = node => {
+    try {
+      if (!node?.getClientRects?.().length || node.closest('[aria-hidden="true"],[inert]')) return null;
+      const value = (node.innerText || "").trim();
+      return value && value.length <= 128 ? value : null;
+    } catch { return null; }
+  };
   const unavailableRadio = item => !item || item.getAttribute("aria-disabled") === "true" ||
     item.hasAttribute("data-disabled");
   const activeMenuControl = selector => Array.from(modelMenu()?.querySelectorAll(selector) || [])
@@ -141,13 +198,24 @@ async function executeLaunch(args, observeSelection) {
   // is uncertain until confirmed and must never be replayed.
   const preSendDeadline = deadline - acknowledgementReserveMs;
   let selected = null;
+  let confirmedModelLabel = null;
+  let confirmedObservation = null;
+  let confirmedPicker = null;
 
-  const choose = async (target, untilAt) => {
+  const choose = async (target, untilAt, finalCheck = false) => {
+    // Selection is provisional until selectionOnly completes or Send is
+    // attempted on the re-verified surface. Never publish a failed repair.
+    confirmedModelLabel = null;
+    confirmedObservation = null;
+    confirmedPicker = null;
+    // Project landing pages expose the Chat model picker, but no mode switch.
+    // Use the same checked-radio and effort verification as ordinary Chat.
+    if (projectStart && target.mode !== "Chat") return "ModeUnavailable";
     const home = () => emptyHomeFailure();
     const retryWait = () => delay(Math.min(100, Math.max(1, untilAt - Date.now())));
     // Chat/Work controls can appear before their React click handlers hydrate.
     let lastModeClick = -Infinity;
-    const modeReady = await poll(() => {
+    const modeReady = projectStart || await poll(() => {
       if (home()) return null;
       const chat = modeButton("Chat");
       const work = modeButton("Work");
@@ -157,7 +225,7 @@ async function executeLaunch(args, observeSelection) {
       if (chatOn === workOn) return null;
       if (target.mode === "Chat" ? chatOn : workOn) return true;
       const wanted = target.mode === "Chat" ? chat : work;
-      if (document.readyState === "complete" &&
+      if (!finalCheck && document.readyState === "complete" &&
           document.querySelectorAll(composerSelector).length === 1 &&
           !wanted.disabled && Date.now() - lastModeClick >= 220) {
         lastModeClick = Date.now();
@@ -180,38 +248,56 @@ async function executeLaunch(args, observeSelection) {
       return null;
     }, untilAt);
 
-    if (!await openPicker()) return "ModelPickerUnavailable";
-    let model = radio(target.model);
-    if (!model && menuView() === "simple") {
+    const enterAdvanced = async () => {
+      if (home()) return false;
+      if (menuView() === "advanced") return true;
+      if (menuView() !== "simple") return false;
       const toggle = activeMenuControl('[data-model-picker-view-toggle]');
-      if (toggle) toggle.click();
-      await poll(() => menuView() === "advanced", untilAt);
-      model = radio(target.model);
+      if (!toggle) return false;
+      toggle.click();
+      return Boolean(await poll(() => !home() && menuView() === "advanced", untilAt));
+    };
+    const checked = item => !unavailableRadio(item) && item.getAttribute("aria-checked") === "true";
+    const hidden = item => Boolean(item?.closest('[aria-hidden="true"],[inert]'));
+
+    if (!await openPicker()) return "ModelPickerUnavailable";
+    let model = modelRadio(target);
+    if (!model && menuView() === "simple") {
+      if (!await enterAdvanced()) return "ModelListUnavailable";
+      model = modelRadio(target);
     }
     if (unavailableRadio(model)) return "ModelUnavailable";
-    if (model.getAttribute("aria-checked") !== "true") {
-      if (menuView() !== "advanced") {
-        const toggle = activeMenuControl('[data-model-picker-view-toggle]');
-        if (!toggle) return "ModelListUnavailable";
-        toggle.click();
-        if (!await poll(() => menuView() === "advanced", untilAt)) return "ModelListUnavailable";
-      }
-      model = radio(target.model);
-      if (unavailableRadio(model) || model.closest('[aria-hidden="true"],[inert]'))
-        return "ModelUnavailable";
+    if (!checked(model)) {
+      if (!await enterAdvanced()) return "ModelListUnavailable";
+      model = modelRadio(target);
+      if (unavailableRadio(model) || hidden(model)) return "ModelUnavailable";
       if (home()) return "HomeChanged";
+      const clickedLabel = radioText(model);
       model.click();
       await retryWait();
       if (!await openPicker()) return "ModelSelectionUnconfirmed";
-      if (!await poll(() => radio(target.model)?.getAttribute("aria-checked") === "true", untilAt))
+      if (!await poll(() => checked(radio(clickedLabel)), untilAt))
         return "ModelSelectionUnconfirmed";
+      model = radio(clickedLabel);
     }
+    if (!checked(model)) return "ModelSelectionUnconfirmed";
+    const checkedModelLabel = radioText(model);
 
-    // The model list and reasoning slider are separate, mutually exclusive
-    // views. Re-selecting the already checked radio returns to the slider.
+    // The simple view can retain hidden model radios. Their checked state
+    // verifies selection, but their hidden text is not a rendered observation.
+    // Observe the same checked label in the advanced view when necessary.
+    if (hidden(model)) {
+      if (!await enterAdvanced()) return "ModelListUnavailable";
+      model = radio(checkedModelLabel);
+      if (!checked(model) || hidden(model)) return "ModelSelectionUnconfirmed";
+    }
+    const modelObservation = renderedLabel(model);
+
+    // Return to the effort slider by re-selecting only the visible, already
+    // checked radio. Verify that exact model again in the simple view.
     if (menuView() !== "simple") {
-      const selectedRadio = radio(target.model);
-      if (!selectedRadio || selectedRadio.closest('[aria-hidden="true"],[inert]'))
+      const selectedRadio = radio(checkedModelLabel);
+      if (!checked(selectedRadio) || hidden(selectedRadio) || home())
         return "EffortPickerUnavailable";
       selectedRadio.click();
       await retryWait();
@@ -231,8 +317,8 @@ async function executeLaunch(args, observeSelection) {
         await retryWait();
         continue;
       }
-      const selectedRadio = radio(target.model);
-      if (unavailableRadio(selectedRadio) || selectedRadio.getAttribute("aria-checked") !== "true")
+      const selectedRadio = radio(checkedModelLabel);
+      if (!checked(selectedRadio))
         return "ModelChanged";
       const effort = control.getAttribute("data-selected-reasoning-effort");
       const power = activeMenuControl('[data-model-picker-power-slider]');
@@ -263,26 +349,34 @@ async function executeLaunch(args, observeSelection) {
         if (target.mode === "Work" &&
             !document.querySelector('[data-model-selection-label="gpt-6.1-terra-wm"]'))
           return "ModelUnconfirmed";
-        // Capture labels from the rendered controls while the picker is open.
-        // These are observations, not another selection verification.
-        try {
-          const activeModes = [modeButton("Chat"), modeButton("Work")]
-            .filter(button => button && button.getAttribute("aria-pressed") === "true");
-          const label = node => {
-            if (!node || !node.getClientRects().length || node.closest('[aria-hidden="true"],[inert]')) return null;
-            const value = (node.innerText || "").trim();
-            return value && value.length <= 128 ? value : null;
-          };
-          observeSelection({ mode: activeModes.length === 1 ? label(activeModes[0]) : null,
-            model: label(selectedRadio), effort: label(powerLabel) });
-        } catch { observeSelection(null); }
-        // Close the picker before editing. No menu click can submit a prompt.
+        const activeModes = projectStart ? [] : [modeButton("Chat"), modeButton("Work")]
+          .filter(button => button?.getAttribute("aria-pressed") === "true");
+        const observation = {
+          mode: activeModes.length === 1 ? renderedLabel(activeModes[0]) : null,
+          model: modelObservation,
+          effort: renderedLabel(powerLabel)
+        };
+        // Close the picker before editing or sending. No menu click can
+        // submit a prompt. At the final boundary avoid an extra settling
+        // delay after the checked-radio proof; wait only for closure if needed.
         if (control.getAttribute("aria-expanded") === "true") control.click();
-        await delay(80);
+        if (finalCheck) {
+          // Closure may replace the trigger. Keep the checked trigger's
+          // identity below so the caller must re-prove on a replacement.
+          const closed = () => !home() &&
+            picker()?.getAttribute("aria-expanded") === "false" && !modelMenu();
+          if (!closed() && !await poll(closed, Math.min(untilAt, Date.now() + 250)))
+            return "SelectionChanged";
+        } else {
+          await delay(80);
+        }
         if (home() || !modeButton(target.mode) ||
             modeButton(target.mode)?.getAttribute("aria-pressed") !== "true" ||
             picker()?.getAttribute("data-selected-reasoning-effort") !== target.effort)
           return "SelectionChanged";
+        confirmedModelLabel = checkedModelLabel;
+        confirmedObservation = observation;
+        confirmedPicker = control;
         return null;
       }
       if (lastValue === step) stalls++;
@@ -318,20 +412,22 @@ async function executeLaunch(args, observeSelection) {
     // recurring schedule. The next invocation will re-evaluate from #1.
     return { ...notSubmitted("PreferredConfigurationsUnavailable"), attempts };
   }
-  const selectedMode = selected.mode;
-  const selectedModel = selected.model;
-  const selectedEffort = selected.effort;
+  let selectedMode = selected.mode;
+  let selectedModel = confirmedModelLabel;
+  let selectedEffort = selected.effort;
   if (args.selectionOnly === true) {
+    observeSelection(confirmedObservation);
     return { status: "selectionOnly", selectedMode, selectedModel,
       selectedEffort: selected.label, attempts };
   }
 
-  const sendSelector = 'button[type="submit"][aria-label="Send"]:not(:disabled)';
+  const sendSelector = 'button[type="submit"][aria-label="Send"]:not(:disabled):not([aria-disabled="true"])';
   const initialUrl = location.href;
   const initialTurns = document.querySelectorAll('[data-message-author-role="user"]').length;
   // Modern ChatGPT user messages use the bubble marker instead of the old role.
   const initialBubbles = document.querySelectorAll('[data-user-message-bubble]').length;
-  if (initialUrl !== startUrl || initialTurns || initialBubbles) {
+  const projectPrefix = projectStart ? new URL(startUrl).pathname.replace(/\/project\/?$/, "") : null;
+  if (!atStart() || initialTurns || initialBubbles) {
     return notSubmitted("ExistingConversation");
   }
   const normalizedPrompt = prompt.replace(/\r\n/g, "\n").replace(/\u00a0/g, " ").trim();
@@ -344,7 +440,10 @@ async function executeLaunch(args, observeSelection) {
   let rebinds = 0;
   let rewrites = 0;
   let effortRepairs = 0;
+  let finalChecks = 0;
   let lastInsertError = null;
+  let sendDisabledSince = null;
+  let sendFallbackAttempted = false;
   const readEditor = () => (activeComposer.innerText || "")
     .replace(/\r\n/g, "\n").replace(/\u00a0/g, " ");
 
@@ -380,7 +479,7 @@ async function executeLaunch(args, observeSelection) {
     }
     const editors = document.querySelectorAll(composerSelector);
     if (editors.length !== 1) return { transient: "ComposerChanged" };
-    return { chat, work, composer: editors[0] };
+    return { chat, work, modelControl, composer: editors[0] };
   };
 
   // Rebind after any React replacement, then clear+insert in the new editor.
@@ -411,12 +510,16 @@ async function executeLaunch(args, observeSelection) {
         // successful picker selection, including after typing the prompt.
         // Repair only before Send. Keep the exact unsent draft and prove it
         // again; a changed editor is rebound and rewritten by the normal loop.
-        if (++effortRepairs > 2)
-          return incompatible(stage, "SelectedEffortUnstable");
-        const cutoff = Math.min(preSendDeadline, Date.now() + 2500);
-        const failure = await choose(selected, cutoff);
-        if (failure && effortRepairs >= 2)
-          return incompatible(stage, "SelectedEffortRecoveryFailed");
+        let failure;
+        do {
+          if (++effortRepairs > 2)
+            return incompatible(stage, "SelectedEffortUnstable");
+          const cutoff = Math.min(preSendDeadline, Date.now() + 2500);
+          failure = await choose(selected, cutoff);
+          // Never proceed using a stale confirmation after a failed repair.
+        } while (failure && effortRepairs < 2 && Date.now() < preSendDeadline);
+        if (failure) return incompatible(stage, "SelectedEffortRecoveryFailed");
+        selectedModel = confirmedModelLabel;
         lastTransient = current.transient;
         continue;
       }
@@ -441,6 +544,37 @@ async function executeLaunch(args, observeSelection) {
           inserted = false;
         } else {
           const send = document.querySelector(sendSelector);
+          if (!send && selectedMode === "Work" && !sendFallbackAttempted && sendFallback) {
+            // The picker may still offer Work after its quota is exhausted.
+            // Wait for the normal composer hydration, then fall back before
+            // any Send attempt. Never retry after clicking Send.
+            sendDisabledSince ??= Date.now();
+            if (Date.now() - sendDisabledSince >= 1500 &&
+                preSendDeadline - Date.now() >= 3500) {
+              sendFallbackAttempted = true;
+              attempts.push({ mode: selectedMode, model: selectedModel,
+                effort: selected.label, reason: "SendUnavailable" });
+              const fallback = sendFallback;
+              const failure = await choose(fallback, preSendDeadline - 1000);
+              if (failure) {
+                attempts.push({ mode: fallback.mode, model: fallback.model,
+                  effort: fallback.label, reason: failure });
+                return { ...notSubmitted("PreferredConfigurationsUnavailable"), attempts };
+              }
+              selected = fallback;
+              selectedMode = fallback.mode;
+              selectedModel = confirmedModelLabel;
+              selectedEffort = fallback.effort;
+              activeComposer = null;
+              activeModes = null;
+              inserted = false;
+              lastTransient = null;
+              sendDisabledSince = null;
+              continue;
+            }
+          } else if (send) {
+            sendDisabledSince = null;
+          }
           if (send) {
             const verified = surface("submitControl");
             if (verified.failure) return verified.failure;
@@ -450,17 +584,54 @@ async function executeLaunch(args, observeSelection) {
                 verified.composer === activeComposer &&
                 readEditor() === insertedPrompt &&
                 document.querySelector(sendSelector) === send) {
-              if (Date.now() >= preSendDeadline) {
-                return { ...notSubmitted("LaunchDeadlineExceeded"), stage: "submitControl" };
+              // Chat has no grounded closed-picker model identity signal.
+              // Reopen and re-prove (or repair) the selected configuration
+              // only when the exact draft and enabled Send are ready. This
+              // is a bounded pre-Send check, not a model polling loop.
+              if (++finalChecks > 3)
+                return incompatible("submitControl", "SelectedModelUnstable");
+              const cutoff = Math.min(preSendDeadline, Date.now() + 2500);
+              const failure = await choose(selected, cutoff, true);
+              const homeFailure = emptyHomeFailure();
+              if (homeFailure) return homeFailure;
+              if (failure)
+                return incompatible("submitControl", "FinalSelectionUnconfirmed");
+              const final = surface("submitControl");
+              if (final.failure) return final.failure;
+              if (!final.transient &&
+                  final.chat === activeModes.chat &&
+                  final.work === activeModes.work &&
+                  final.modelControl === confirmedPicker &&
+                  final.composer === activeComposer &&
+                  readEditor() === insertedPrompt &&
+                  document.querySelector(sendSelector) === send &&
+                  confirmedPicker.getAttribute("aria-expanded") === "false" &&
+                  !modelMenu()) {
+                if (Date.now() >= preSendDeadline) {
+                  return { ...notSubmitted("LaunchDeadlineExceeded"), stage: "submitControl" };
+                }
+                // Report only the last checked UI model, never Latest's
+                // inferred backing version or an earlier provisional choice.
+                selectedModel = confirmedModelLabel;
+                observeSelection(confirmedObservation);
+                try {
+                  sendAttempted = true;
+                  sendAttemptedAt = Date.now();
+                  send.click();
+                } catch {
+                  return unknownAfterSend("sendClick", "SendClickUncertain");
+                }
+                break;
               }
-              try {
-                sendAttempted = true;
-                sendAttemptedAt = Date.now();
-                send.click();
-              } catch {
-                return unknownAfterSend("sendClick", "SendClickUncertain");
+              // Picker activity can replace controls or disturb the draft.
+              // An unchanged editor with the exact draft does not need a
+              // destructive rewrite just because the controls re-rendered.
+              // Either way, the next Send candidate needs fresh model proof.
+              if (!final.transient && final.composer === activeComposer &&
+                  readEditor() === insertedPrompt) {
+                activeModes = { chat: final.chat, work: final.work };
+                continue;
               }
-              break;
             }
             activeComposer = null;
             activeModes = null;
@@ -522,15 +693,87 @@ async function executeLaunch(args, observeSelection) {
     await delay(Math.min(75, Math.max(1, preSendDeadline - Date.now())));
   }
 
+  // Only the browser's current route can identify the conversation. Project
+  // sidebar links are shared mutable state and have no causal binding to Send.
+  const expectedOrigin = new URL(startUrl).origin;
+  const currentPage = () => {
+    const current = new URL(location.href);
+    return current.origin === expectedOrigin ? current : null;
+  };
+  const durableRoute = current => {
+    if (!current) return null;
+    const prefix = (projectPrefix || "") + "/c/";
+    const routePath = projectStart ? current.pathname : current.pathname.toLowerCase();
+    if (!routePath.startsWith(prefix) ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/?$/i
+          .test(routePath.slice(prefix.length))) return null;
+    current.username = "";
+    current.password = "";
+    current.search = "";
+    current.hash = "";
+    return current.href;
+  };
+  const matchesPrompt = turn => (turn.innerText || "")
+    .replace(/\r\n/g, "\n").replace(/\u00a0/g, " ").trim() === normalizedPrompt;
+  const newBubbles = () => Array.from(document.querySelectorAll('[data-user-message-bubble]'))
+    .slice(initialBubbles);
+  const submitted = (conversationUrl, evidence) => ({
+    status: "submitted",
+    selectedMode, selectedModel, selectedEffort: selected.label,
+    attempts, conversationUrl, evidence,
+    submittedAtUtc: new Date().toISOString()
+  });
+
+  if (projectStart) {
+    // A matching rendered turn acknowledges Send independently of route binding.
+    // The SPA may change its URL before replacing the previous route's DOM.
+    // Require an observed scoped durable route without the matching turn, then
+    // a matching turn on that same route. Co-observation at a route transition,
+    // persistent text, and a change of marker alone do not establish freshness.
+    let projectRouteAcknowledgement = null;
+    let previousSample = null;
+    const bound = await until(() => {
+      const current = currentPage();
+      if (!current) {
+        previousSample = null;
+        return null;
+      }
+      const conversationUrl = durableRoute(current);
+      const bubbles = newBubbles();
+      const matchingBubble = bubbles.some(matchesPrompt);
+      const matchingLegacy = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+        .slice(initialTurns).some(matchesPrompt);
+      const matchingTurn = matchingBubble ? "matchingUserBubble"
+        : bubbles.length === 0 && matchingLegacy ? "matchingLegacyUserTurn" : null;
+      const freshOnRoute = conversationUrl && previousSample &&
+        previousSample.conversationUrl === conversationUrl && !previousSample.hasMatchingTurn;
+      // Track either marker for freshness even when bubble evidence takes
+      // precedence for acknowledgement. A marker change is not a new turn.
+      previousSample = { conversationUrl, hasMatchingTurn: matchingBubble || matchingLegacy };
+      if (!matchingTurn) return null;
+      projectRouteAcknowledgement = matchingTurn;
+      return freshOnRoute ? { conversationUrl, matchingTurn } : null;
+    });
+    if (bound) return submitted(bound.conversationUrl,
+      ["newUserTurn", bound.matchingTurn, "conversationRoute"]);
+    if (!projectRouteAcknowledgement)
+      return unknownAfterSend("acknowledgement", "SubmissionUnconfirmed");
+    // Typed, bounded acknowledgement for the bridge's narrow retention
+    // policy. This is not submission success and supplies no conversation ID.
+    return {
+      ...unknownAfterSend("conversationRoute", "ConversationUrlUnavailable"),
+      conversationUrl: null,
+      projectRouteAcknowledgement,
+      evidence: ["newUserTurn", projectRouteAcknowledgement]
+    };
+  }
+
+  // Preserve ordinary home/legacy acknowledgement behavior.
   const evidence = await until(() => {
     const legacyTurn = document.querySelectorAll('[data-message-author-role="user"]').length > initialTurns;
-    // Match the actual newly rendered user bubble, not a sidebar title or
-    // arbitrary page text. Never include prompt content in diagnostics.
-    const matchingBubble = Array.from(document.querySelectorAll('[data-user-message-bubble]'))
-      .slice(initialBubbles)
-      .some(bubble => (bubble.innerText || "").replace(/\r\n/g, "\n").replace(/\u00a0/g, " ").trim() === normalizedPrompt);
+    const matchingBubble = newBubbles().some(matchesPrompt);
     const newUserTurn = legacyTurn || matchingBubble;
-    const routeChanged = location.href !== initialUrl && location.origin === new URL(startUrl).origin;
+    const routeChanged = location.href !== initialUrl && location.origin === expectedOrigin;
     const composerCleared = readEditor().trim().length === 0;
     // Some builds only expose route transition plus cleared composer and a
     // generation control. A matching user bubble is stronger evidence even if
@@ -543,32 +786,14 @@ async function executeLaunch(args, observeSelection) {
   });
   if (!evidence) return unknownAfterSend("acknowledgement", "SubmissionUnconfirmed");
 
-  // The user turn may render before SPA navigation. Wait for the actual URL,
-  // never invent an identifier or resubmit the prompt.
-  const conversationUrl = await until(() => {
-    if (location.origin !== new URL(startUrl).origin) return null;
-    const current = new URL(location.href);
-    // ChatGPT can first navigate to a temporary /c/local-chatgpt:... route.
-    // Only the server-issued UUID is a durable conversation URL. Closing
-    // an agent tab on the optimistic route risks interrupting creation.
-    if (!/^\/c\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/?$/i.test(current.pathname)) return null;
-    current.search = "";
-    current.hash = "";
-    return current.href;
-  });
+  // A temporary /c/local-chatgpt:... route is not a server-issued UUID.
+  const conversationUrl = await until(() => durableRoute(currentPage()));
   if (!conversationUrl) return unknownAfterSend("conversationRoute", "ConversationUrlUnavailable");
-  return {
-    status: "submitted",
-    selectedMode, selectedModel, selectedEffort: selected.label,
-    attempts,
-    conversationUrl,
-    evidence: [
-      ...(evidence.newUserTurn ? ["newUserTurn"] : []),
-      ...(evidence.matchingBubble ? ["matchingUserBubble"] : []),
-      "conversationRoute"
-    ],
-    submittedAtUtc: new Date().toISOString()
-  };
+  return submitted(conversationUrl, [
+    ...(evidence.newUserTurn ? ["newUserTurn"] : []),
+    ...(evidence.matchingBubble ? ["matchingUserBubble"] : []),
+    "conversationRoute"
+  ]);
   } catch {
     // Unexpected DOM exceptions are still provider compatibility failures if
     // we have not attempted Send; after Send, the outcome is unknowable.

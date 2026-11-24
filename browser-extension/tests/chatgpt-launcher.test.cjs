@@ -12,7 +12,13 @@ function harness(options = {}) {
   let userTurns = options.initialUserTurns || 0;
   let lastSubmittedText = null;
   let renderedBubble = null;
+  let legacyRenderedText = null;
+  let projectLinks = [...(options.initialProjectLinks || [])];
+  const pendingProjectEvents = [];
+  let navigationAttempts = 0;
   let clicks = 0;
+  let modelAtSend = null;
+  let draftPickerOpens = 0;
   let focused = false;
   let visibility = options.visibilityState || "visible";
   let editorSelected = false;
@@ -20,7 +26,7 @@ function harness(options = {}) {
   let mode = options.initialMode || "Chat";
   let chatClicks = 0;
   let modelClicks = 0;
-  let selectedModel = options.selectedModel || "GPT-6";
+  let selectedModel = options.selectedModel || "Latest";
   let reasoningEffort = options.reasoningEffort || "High";
   let staleSendChecks = 0;
   let staleSendObserved = 0;
@@ -36,13 +42,17 @@ function harness(options = {}) {
     if (ms === 0) queueMicrotask(callback);
     else setTimeout(callback, ms);
   };
+  const scheduleImmediateEffect = (callback, ms = 0) => {
+    if (options.virtualClock && ms === 0) queueMicrotask(callback);
+    else setTimeout(callback, ms);
+  };
   if (options.addUserTurnBeforeModeMs) {
     setTimeout(() => { userTurns++; }, options.addUserTurnBeforeModeMs);
   }
   const makeMode = name => ({
     textContent: name,
-    get innerText() { return options.observableLabels ? name : undefined; },
-    getClientRects() { return options.observableLabels ? [1] : []; },
+    get innerText() { return options.observableLabels === false ? undefined : name; },
+    getClientRects() { return options.observableLabels === false ? [] : [1]; },
     closest() { return null; },
     getAttribute(attribute) {
       return attribute === "aria-pressed" ? String(mode === name) : null;
@@ -57,7 +67,11 @@ function harness(options = {}) {
           setTimeout(() => { site.href = "https://chatgpt.com/c/unexpected-during-selection"; }, options.routeAfterFirstChatClickMs);
         }
         if (!options.modeSwitchFails && chatClicks > (options.ignoreFirstChatClicks || 0)) {
-          setTimeout(() => { mode = "Chat"; }, options.modeDelayMs || 0);
+          scheduleImmediateEffect(() => {
+            mode = "Chat";
+            if (options.chatInstantAndProOnly && !["Instant", "Pro"].includes(reasoningEffort))
+              reasoningEffort = "Instant";
+          }, options.modeDelayMs || 0);
         }
         if (options.replaceModesDuringModeSwitchMs) {
           setTimeout(() => {
@@ -65,7 +79,7 @@ function harness(options = {}) {
             workMode = makeMode("Work");
           }, options.replaceModesDuringModeSwitchMs);
         }
-      } else { setTimeout(() => {
+      } else { scheduleImmediateEffect(() => {
         mode = "Work";
         if (reasoningEffort === "Pro") reasoningEffort = "Medium";
       }, options.modeDelayMs || 0); }
@@ -81,16 +95,29 @@ function harness(options = {}) {
   let activeEditor = editor;
   const send = { click() {
     clicks++;
+    modelAtSend = selectedModel;
     if (options.sendClickThrows) throw new Error("send click outcome could not be observed");
     if (options.noAcknowledgement) return;
     if (options.optimisticLocalRoute) {
       site.href = "https://chatgpt.com/c/local-chatgpt%3Aclient-only-placeholder";
     }
-    if (!options.noRoute) setTimeout(() => { site.href = "https://chatgpt.com/c/00000000-0000-0000-0000-000000000001"; }, options.routeDelayMs || 0);
+    if (!options.noRoute) scheduleImmediateEffect(() => {
+      const prefix = options.startUrl?.endsWith("/project") ? options.startUrl.slice(0, -"/project".length) : "https://chatgpt.com";
+      site.href = prefix + "/c/00000000-0000-0000-0000-000000000001";
+    }, options.routeDelayMs || 0);
     const submittedText = content;
     lastSubmittedText = submittedText;
     content = "";
-    userTurns++;
+    if (!options.deferLegacyTurn) {
+      userTurns++;
+      legacyRenderedText = options.legacyTextOverride ?? submittedText;
+    }
+    if (options.projectEvents) {
+      // Deterministic provider-side DOM/route events; no navigation by the launcher.
+      for (const event of options.projectEvents) {
+        pendingProjectEvents.push({ ...event, at: virtualClock.now + event.afterMs });
+      }
+    }
     if (options.renderUserBubble) {
       setTimeout(() => {
         renderedBubble = options.bubbleTextOverride ?? submittedText;
@@ -115,22 +142,45 @@ function harness(options = {}) {
       return options.forceEffortMismatchWhileDraft && content
         ? "high" : reasoningEffort === "Pro" ? "medium" : values[efforts.indexOf(reasoningEffort)];
     },
-    click() { expanded = !expanded; }
+    click() {
+      expanded = !expanded;
+      if (expanded && content) draftPickerOpens++;
+      if (!expanded && content && draftPickerOpens === 1 &&
+          options.replaceComposerOnFinalPickerClose) {
+        activeEditor = Object.create(editor);
+        selectedModel = "GPT-6";
+      }
+      if (!expanded && content && (options.replacePickerOnEveryDraftClose ||
+          (draftPickerOpens === 1 && options.replacePickerOnFinalClose))) {
+        activePicker = Object.create(picker);
+        selectedModel = "GPT-6";
+      }
+    }
   };
+  let activePicker = picker;
   const radio = name => ({
     textContent: name,
-    get innerText() { return options.observableLabels ? (this.labelObserved ? (options.displayedModelLabel ?? name) : name) : undefined; },
-    getClientRects() { this.labelObserved = true; return options.observableLabels ? [1] : []; },
-    getAttribute(attr) { return attr === "aria-checked" ? String(selectedModel === name) : null; },
-    hasAttribute() { return false; }, closest() { return null; },
-    click() { modelClicks++; selectedModel = name; view = "simple"; expanded = false; }
+    get innerText() { return options.observableLabels === false ? undefined : (this.labelObserved ? (options.displayedModelLabel ?? name) : name); },
+    getClientRects() { this.labelObserved = true; return options.observableLabels === false ? [] : [1]; },
+    getAttribute(attr) {
+      if (attr === "aria-disabled" && options.disabledModels?.includes(name)) return "true";
+      return attr === "aria-checked" ? String(selectedModel === name) : null;
+    },
+    hasAttribute() { return false; },
+    closest() { return options.hiddenModelRadiosInSimple && view === "simple" ? {} : null; },
+    click() {
+      if (this.closest()) throw new Error("Hidden model radio was clicked");
+      modelClicks++; selectedModel = name; view = "simple"; expanded = false;
+      if (content && options.unstableModelWhileDraft)
+        queueMicrotask(() => { selectedModel = "GPT-6"; });
+    }
   });
   const toggle = { closest() { return null; }, click() { view = "advanced"; } };
   const knob = { getAttribute(name) { return String(name === "aria-valuemax" ? (options.maxEffortStep ?? activeEfforts().length - 1) : activeEfforts().indexOf(reasoningEffort)); } };
   const power = { closest() { return null; }, querySelector(sel) { return sel === '[role="slider"]' ? knob : null; } };
   const powerLabel = {
-    get innerText() { return options.observableLabels ? reasoningEffort : undefined; },
-    getClientRects() { return options.observableLabels ? [1] : []; },
+    get innerText() { return options.observableLabels === false ? undefined : reasoningEffort; },
+    getClientRects() { return options.observableLabels === false ? [] : [1]; },
     closest() { return null; },
     get textContent() { return reasoningEffort; },
     getAttribute(name) { return name === "data-power-disabled" ? "false" : null; }
@@ -151,7 +201,8 @@ function harness(options = {}) {
     querySelector(sel) { return sel === '[data-model-picker-view]' ? { getAttribute() { return view; } } : null; },
     querySelectorAll(sel) {
       if (sel === '[role="menuitemradio"]') {
-        const items = (view === "simple" ? [selectedModel] : ["GPT-6", "GPT-6.1 Terra"]).map(radio);
+        const choices = options.modelChoices || ["Latest", "GPT-6.2", "GPT-6", "GPT-5.6 Sol", "GPT-6.1 Terra"];
+        const items = (view === "simple" && !options.hiddenModelRadiosInSimple ? [selectedModel] : choices).map(radio);
         if (mode === "Chat" && options.chatInstantAndProOnly && !options.omitEffortOption)
           items.push(disabledMedium);
         return items;
@@ -223,17 +274,19 @@ function harness(options = {}) {
         postInsert(options.hideTabAfterInsertMs, () => { visibility = "hidden"; });
         postInsert(options.resetEffortAfterInsertMs,
           () => { reasoningEffort = options.resetEffortTo || "Medium"; });
+        postInsert(options.changeModelAfterInsertMs,
+          () => { selectedModel = "GPT-6"; });
         postInsert(options.addTurnAfterInsertMs, () => { userTurns++; });
         postInsert(options.routeAfterInsertMs, () => { site.href = "https://chatgpt.com/c/new-route"; });
       }
       return true;
     },
     querySelector(selector) {
-      if (selector === 'button[aria-label="Select ChatGPT model"]') return options.noPicker ? null : picker;
+      if (selector === 'button[aria-label="Select ChatGPT model"]') return options.noPicker ? null : activePicker;
       if (selector === '[data-model-selection-label="gpt-6.1-terra-wm"]') return selectedModel === "GPT-6.1 Terra" ? {} : null;
       if (selector.includes('contenteditable="true"')) return options.noComposer ? null : activeEditor;
       if (selector.includes('aria-label="Send"')) {
-        if (options.noSend) return null;
+        if (options.noSend || (options.workSendDisabled && mode === "Work")) return null;
         if (options.sendAvailableAfterMs !== undefined &&
             (options.virtualClock ? virtualClock.now : Date.now() - launchStartedAt) <
               options.sendAvailableAfterMs) return null;
@@ -253,6 +306,10 @@ function harness(options = {}) {
       return null;
     },
     querySelectorAll(selector) {
+      if (selector === 'a[href]') return projectLinks.map(href => ({
+        getAttribute(name) { return name === "href" ? href : null; },
+        click() { navigationAttempts++; throw new Error("Unbound sidebar navigation"); }
+      }));
       if (selector === '[role="menu"]') return expanded ? [menu] : [];
       if (selector === '[data-model-selection-label]') return [];
       if (selector === '[data-composer-input-layout] [contenteditable="true"][role="textbox"]') {
@@ -279,7 +336,7 @@ function harness(options = {}) {
         injectedTurn = true;
       }
       return selector.includes('data-message-author-role="user"') && !options.noLegacyTurnMarkers
-        ? Array(userTurns).fill({}) : [];
+        ? Array(userTurns).fill({ innerText: legacyRenderedText ?? "" }) : [];
     }
   };
   if (options.documentHydrationDelayMs) {
@@ -296,18 +353,41 @@ function harness(options = {}) {
     ? (callback, ms) => {
       virtualClock.delays.push(ms);
       virtualClock.now += ms;
-      queueMicrotask(callback);
+      queueMicrotask(() => {
+        for (let i = 0; i < pendingProjectEvents.length;) {
+          const event = pendingProjectEvents[i];
+          if (event.at > virtualClock.now) { i++; continue; }
+          pendingProjectEvents.splice(i, 1);
+          if (event.href !== undefined) site.href = event.href;
+          if (event.links !== undefined) projectLinks = event.links;
+          if (event.bubble !== undefined) renderedBubble = event.bubble;
+          if (event.legacy !== undefined) {
+            userTurns = event.legacy === null ? 0 : 1;
+            legacyRenderedText = event.legacy;
+          }
+        }
+        callback();
+      });
     }
     : setTimeout;
-  const ctx = vm.createContext({ document, window, location: site, setTimeout: schedule, Date: clockDate, URL, KeyboardEvent: class { constructor(type, init) { Object.assign(this, init); } } });
+  const location = {
+    get href() { return site.href; },
+    get origin() { return new URL(site.href).origin; },
+    set href(_) { navigationAttempts++; throw new Error("Launcher must not navigate"); },
+    assign() { navigationAttempts++; throw new Error("Launcher must not navigate"); },
+    replace() { navigationAttempts++; throw new Error("Launcher must not navigate"); }
+  };
+  const ctx = vm.createContext({ document, window, location, setTimeout: schedule, Date: clockDate, URL, KeyboardEvent: class { constructor(type, init) { Object.assign(this, init); } } });
   const run = async (prompt = "Start fresh\nRead Jarvis assignment", extra = {}) =>
     await vm.runInContext(source + "\nexecute(" + JSON.stringify({
       prompt, timeoutMs: (options.timeoutMs || 350) + 5000, ...extra
     }) + ")", ctx);
-  return { run, site, get clicks() { return clicks; }, get insertions() { return insertions; }, get chatClicks() { return chatClicks; },
+  return { run, site, get navigationAttempts() { return navigationAttempts; }, get clicks() { return clicks; }, get insertions() { return insertions; }, get chatClicks() { return chatClicks; },
+    get modelAtSend() { return modelAtSend; }, get draftPickerOpens() { return draftPickerOpens; },
     get selectedModel() { return selectedModel; }, get reasoningEffort() { return reasoningEffort; }, get modelClicks() { return modelClicks; }, get beforeReadyInsertions() { return beforeReadyInsertions; },
     get proSelections() { return proSelections; }, get mode() { return mode; }, get content() { return content; },
     get virtualClockState() { return virtualClock && { now: virtualClock.now, delays: [...virtualClock.delays] }; },
+    get pendingProjectEventCount() { return pendingProjectEvents.length; },
     get staleSendObserved() { return staleSendObserved; }, get lastSubmittedText() { return lastSubmittedText; } };
 }
 
@@ -857,14 +937,14 @@ test("route change after insertion always prevents a Send", async () => {
 
 test("ignored pre-hydration Chat click retries on the same untouched new-chat home", async () => {
   const h = harness({ initialMode: "Work", ignoreFirstChatClicks: 1, timeoutMs: 1100,
-    selectedModel: "GPT-6", reasoningEffort: "High" });
+    selectedModel: "Latest", reasoningEffort: "High" });
   const result = await h.run("Hydration recovery");
   assert.equal(result.status, "submitted");
   assert.equal(h.chatClicks >= 2, true);
   assert.equal(h.mode, "Chat");
   assert.equal(h.clicks, 1);
   assert.equal(h.lastSubmittedText, "Hydration recovery");
-  assert.equal(h.selectedModel, "GPT-6");
+  assert.equal(h.selectedModel, "Latest");
   assert.equal(h.reasoningEffort, "Medium");
   assert.equal(h.modelClicks, 0);
 });
@@ -922,7 +1002,8 @@ test("ambiguous Chat buttons do not authorize a mode click or Send", async () =>
 });
 
 for (const { selectedModel, reasoningEffort } of [
-  { selectedModel: "GPT-6", reasoningEffort: "Instant" },
+  { selectedModel: "Latest", reasoningEffort: "Instant" },
+  { selectedModel: "GPT-6.2", reasoningEffort: "Medium" },
   { selectedModel: "GPT-6", reasoningEffort: "Extra High" },
   { selectedModel: "GPT-5.6 Sol", reasoningEffort: "Medium" },
   { selectedModel: "Pro", reasoningEffort: "High" }
@@ -933,13 +1014,13 @@ for (const { selectedModel, reasoningEffort } of [
     assert.equal(result.status, "submitted");
     assert.equal(h.chatClicks, 0);
     assert.equal(h.clicks, 1);
-    assert.equal(h.selectedModel, "GPT-6");
+    assert.equal(h.selectedModel, "Latest");
     assert.equal(h.reasoningEffort, "Medium");
   });
 }
 
 test("Work mode with a restored draft always sends only the intended prompt", async () => {
-  const h = harness({ initialMode: "Work", selectedModel: "GPT-6",
+  const h = harness({ initialMode: "Work", selectedModel: "Latest",
     reasoningEffort: "High", existingDraft: "Saved unrelated draft", timeoutMs: 1400 });
   const result = await h.run("Exact intended new task");
   assert.equal(result.status, "submitted");
@@ -1008,12 +1089,12 @@ test("when Chat Medium and Work Terra Medium cannot be selected, fall back to Ch
   const result = await h.run("Exactly one fallback", { selectionOnly: true });
   assert.equal(result.status, "selectionOnly");
   assert.equal(result.selectedMode, "Chat");
-  assert.equal(result.selectedModel, "GPT-6");
+  assert.equal(result.selectedModel, "Latest");
   assert.equal(result.selectedEffort, "Instant");
   assert.deepEqual(Array.from(result.attempts, item => ({
     mode: item.mode, model: item.model, effort: item.effort, reason: item.reason
   })), [
-    { mode: "Chat", model: "GPT-6", effort: "Medium", reason: "EffortUnavailable" },
+    { mode: "Chat", model: "Latest", effort: "Medium", reason: "EffortUnavailable" },
     { mode: "Work", model: "GPT-6.1 Terra", effort: "Medium", reason: "EffortUnavailable" }
   ]);
   assert.equal(h.clicks, 0);
@@ -1063,9 +1144,266 @@ test("missing visible effort label cannot authorize a send from an attribute alo
   assert.equal(h.clicks, 0);
 });
 
+test("Latest is selected instead of explicit GPT-6.2 and the checked alias is observed without inventing a version", async () => {
+  const h = harness({ selectedModel: "GPT-6.2", reasoningEffort: "Medium", virtualClock: true });
+  const result = await h.run("Selection only", { selectionOnly: true, timeoutMs: 18000 });
+  assert.equal(result.status, "selectionOnly");
+  assert.equal(h.selectedModel, "Latest");
+  assert.equal(result.selectedModel, "Latest");
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: "Chat", model: "Latest", effort: "Medium" });
+  assert.equal(h.clicks, 0);
+});
+
+test("explicit 5.6 Instant override uses the rendered Sol label on the current account", async () => {
+  const h = harness({ selectedModel: "Latest", reasoningEffort: "High", virtualClock: true });
+  const result = await h.run("Selection only", { modelOverride: "gpt-5.6-instant", selectionOnly: true, timeoutMs: 18000 });
+  assert.equal(result.status, "selectionOnly");
+  assert.equal(h.selectedModel, "GPT-5.6 Sol");
+  assert.equal(result.selectedModel, "GPT-5.6 Sol");
+  assert.equal(result.observedSelection.model, "GPT-5.6 Sol");
+  assert.equal(result.selectedEffort, "Instant");
+  assert.equal(h.clicks, 0);
+});
+
+test("legacy explicit 5.6 label is supported without reporting Sol", async () => {
+  const h = harness({ modelChoices: ["Latest", "GPT-5.6"], virtualClock: true });
+  const result = await h.run("Selection only", { modelOverride: "gpt-5.6-instant", selectionOnly: true, timeoutMs: 18000 });
+  assert.equal(result.status, "selectionOnly");
+  assert.equal(result.selectedModel, "GPT-5.6");
+  assert.equal(result.observedSelection.model, "GPT-5.6");
+  assert.equal(h.clicks, 0);
+});
+
+test("explicit Work override cannot silently fall back when its Send is disabled", async () => {
+  const h = harness({ selectedModel: "Latest", reasoningEffort: "Medium", workSendDisabled: true, virtualClock: true });
+  const result = await h.run("Must not send", { modelOverride: "work-terra-medium", timeoutMs: 18000 });
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.reason, "SendUnavailable");
+  assert.equal(h.mode, "Work");
+  assert.equal(h.clicks, 0);
+});
+
+test("explicit override rejects prototype property and unsupported value without selecting or sending", async () => {
+  for (const modelOverride of ["constructor", "__proto__", "toString", "unknown"]) {
+    const h = harness({ virtualClock: true });
+    const result = await h.run("Must not send", { modelOverride, timeoutMs: 18000 });
+    assert.equal(result.status, "notSubmitted");
+    assert.equal(result.reason, "UnsupportedModelOverride");
+    assert.equal(h.modelClicks, 0);
+    assert.equal(h.clicks, 0);
+  }
+});
+
+test("project entry selects Latest Medium without a Chat/Work mode toggle and sends once", async () => {
+  const startUrl = "https://chatgpt.com/g/g-p-abc123/project";
+  const route = "https://chatgpt.com/g/g-p-abc123/c/00000000-0000-0000-0000-000000000001";
+  const h = harness({ startUrl, noModeToggle: true, selectedModel: "GPT-6", reasoningEffort: "High",
+    virtualClock: true, noRoute: true, deferLegacyTurn: true,
+    projectEvents: [{ afterMs: 75, href: route }, { afterMs: 225, legacy: "Project launch" }] });
+  const result = await h.run("Project launch", { startUrl, timeoutMs: 18000 });
+  assert.equal(result.status, "submitted");
+  assert.equal(result.selectedModel, "Latest");
+  assert.equal(result.selectedEffort, "Medium");
+  assert.equal(result.observedSelection.model, "Latest");
+  assert.equal(result.observedSelection.mode, null);
+  assert.equal(result.conversationUrl, route);
+  assert.equal(h.clicks, 1);
+});
+
+test("when Latest and Work are unavailable no explicit model or Send is silently chosen", async () => {
+  const h = harness({ modelChoices: ["GPT-6.2", "GPT-6"], selectedModel: "GPT-6.2", virtualClock: true });
+  const result = await h.run("Must not send", { timeoutMs: 18000 });
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "PreferredConfigurationsUnavailable");
+  assert.equal(h.selectedModel, "GPT-6.2");
+  assert.equal(h.clicks, 0);
+});
+
+test("observations are unknown if the picker label cannot be rendered, not inferred from the preference", async () => {
+  const h = harness({ observableLabels: false, virtualClock: true });
+  const result = await h.run("Selection only", { selectionOnly: true, timeoutMs: 18000 });
+  assert.equal(result.status, "selectionOnly");
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: null, model: null, effort: null });
+  assert.equal(h.clicks, 0);
+});
+
+test("default disabled Work Send falls back to confirmed Latest Instant before the one Send", async () => {
+  const h = harness({ chatInstantAndProOnly: true, reasoningEffort: "Instant", workSendDisabled: true, virtualClock: true });
+  const result = await h.run("One fallback send", { timeoutMs: 27000 });
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.equal(result.selectedMode, "Chat");
+  assert.equal(result.selectedModel, "Latest");
+  assert.equal(result.selectedEffort, "Instant");
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: "Chat", model: "Latest", effort: "Instant" });
+  assert.equal(h.clicks, 1);
+});
+
+test("disabled Latest uses only the explicit Work fallback and reports its checked model", async () => {
+  const h = harness({ disabledModels: ["Latest"], selectedModel: "GPT-6.2", reasoningEffort: "Medium", virtualClock: true });
+  const result = await h.run("Selection only", { selectionOnly: true, timeoutMs: 18000 });
+  assert.equal(result.status, "selectionOnly");
+  assert.equal(result.selectedMode, "Work");
+  assert.equal(result.selectedModel, "GPT-6.1 Terra");
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: "Work", model: "GPT-6.1 Terra", effort: "Medium" });
+  assert.equal(result.attempts[0].reason, "ModelUnavailable");
+  assert.equal(h.clicks, 0);
+});
+
+test("unavailable explicit 5.6 override does not fall back to Latest", async () => {
+  const h = harness({ modelChoices: ["Latest", "GPT-6.2"], virtualClock: true });
+  const result = await h.run("Must not send", { modelOverride: "gpt-5.6-instant", timeoutMs: 18000 });
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "PreferredConfigurationsUnavailable");
+  assert.equal(result.observedSelection, null);
+  assert.equal(h.modelClicks, 0);
+  assert.equal(h.clicks, 0);
+});
+
+test("project entry rejects explicit Work without switching or sending", async () => {
+  const startUrl = "https://chatgpt.com/g/g-p-abc123/project";
+  const h = harness({ startUrl, noModeToggle: true, virtualClock: true });
+  const result = await h.run("Must not send", { startUrl, modelOverride: "work-terra-medium", timeoutMs: 18000 });
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.attempts[0].reason, "ModeUnavailable");
+  assert.equal(result.observedSelection, null);
+  assert.equal(h.modelClicks, 0);
+  assert.equal(h.clicks, 0);
+});
+
+for (const selectedModel of ["Latest", "GPT-6.2"]) {
+  test(`hidden simple-view model radios: confirm visible checked Latest from ${selectedModel}`, async () => {
+    const h = harness({ selectedModel, hiddenModelRadiosInSimple: true,
+      reasoningEffort: "High", virtualClock: true });
+    const result = await h.run("Selection only", { selectionOnly: true, timeoutMs: 18000 });
+    assert.equal(result.status, "selectionOnly", JSON.stringify(result));
+    assert.equal(h.selectedModel, "Latest");
+    assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)),
+      { mode: "Chat", model: "Latest", effort: "Medium" });
+    assert.equal(h.clicks, 0);
+  });
+}
+
+for (const [name, modelOverride, model, effort] of [
+  ["Latest default", undefined, "Latest", "Medium"],
+  ["strict 5.6 override", "gpt-5.6-instant", "GPT-5.6 Sol", "Instant"]
+]) {
+  for (const drift of [false, true]) {
+    test(`final model identity: ${name}, ${drift ? "same-effort drift" : "stable"}`, async () => {
+      const h = harness({ selectedModel: model, reasoningEffort: effort, virtualClock: true,
+        changeModelAfterInsertMs: drift ? 0 : undefined });
+      const result = await h.run("One exact prompt", {
+        ...(modelOverride ? { modelOverride } : {}), timeoutMs: 18000
+      });
+      assert.equal(result.status, "submitted", JSON.stringify(result));
+      assert.equal(h.modelAtSend, model);
+      assert.equal(result.selectedModel, model);
+      assert.equal(result.observedSelection.model, model);
+      assert.equal(h.reasoningEffort, effort);
+      assert.equal(h.lastSubmittedText, "One exact prompt");
+      assert.equal(h.clicks, 1);
+    });
+  }
+
+  test(`final model identity: ${name}, unstable selection fails before Send`, async () => {
+    const h = harness({ selectedModel: model, reasoningEffort: effort, virtualClock: true,
+      changeModelAfterInsertMs: 0, unstableModelWhileDraft: true });
+    const result = await h.run("Do not send", {
+      ...(modelOverride ? { modelOverride } : {}), timeoutMs: 27000
+    });
+    assert.equal(result.status, "uiIncompatible", JSON.stringify(result));
+    assert.equal(result.observedSelection, null);
+    assert.equal(result.selectedModel, undefined);
+    assert.equal(h.clicks, 0);
+    assert.ok(h.virtualClockState.now <= 19000);
+  });
+}
+
+test("final model identity is re-proved when closing the picker replaces the composer", async () => {
+  const h = harness({ selectedModel: "Latest", reasoningEffort: "Medium",
+    virtualClock: true, replaceComposerOnFinalPickerClose: true });
+  const result = await h.run("One exact prompt", { timeoutMs: 18000 });
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.equal(h.modelAtSend, "Latest");
+  assert.equal(result.observedSelection.model, "Latest");
+  assert.ok(h.draftPickerOpens >= 2);
+  assert.equal(h.lastSubmittedText, "One exact prompt");
+  assert.equal(h.clicks, 1);
+});
+
+test("final model identity: hidden simple radios are observed only in advanced view before Send", async () => {
+  const h = harness({ selectedModel: "Latest", reasoningEffort: "Medium",
+    hiddenModelRadiosInSimple: true, virtualClock: true, changeModelAfterInsertMs: 0 });
+  const result = await h.run("One exact prompt", { timeoutMs: 18000 });
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.equal(result.observedSelection.model, "Latest");
+  assert.equal(h.modelAtSend, "Latest");
+  assert.equal(h.clicks, 1);
+});
+
+test("final model identity: selection-only never inserts or clicks Send", async () => {
+  const h = harness({ virtualClock: true, changeModelAfterInsertMs: 0 });
+  const result = await h.run("Selection only", { selectionOnly: true, timeoutMs: 18000 });
+  assert.equal(result.status, "selectionOnly");
+  assert.equal(result.observedSelection.model, "Latest");
+  assert.equal(h.insertions, 0);
+  assert.equal(h.clicks, 0);
+});
+
+test("final model identity is re-proved when the picker control itself is replaced", async () => {
+  const h = harness({ selectedModel: "Latest", reasoningEffort: "Medium",
+    virtualClock: true, replacePickerOnFinalClose: true });
+  const result = await h.run("One exact prompt", { timeoutMs: 18000 });
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.equal(result.observedSelection.model, "Latest");
+  assert.equal(h.modelAtSend, "Latest");
+  assert.equal(h.insertions, 1);
+  assert.equal(h.clicks, 1);
+});
+
+test("final model identity: repeated picker replacement cannot authorize Send or stale attribution", async () => {
+  const h = harness({ selectedModel: "Latest", reasoningEffort: "Medium",
+    virtualClock: true, replacePickerOnEveryDraftClose: true });
+  const result = await h.run("Do not send", { timeoutMs: 27000 });
+  assert.equal(result.status, "uiIncompatible", JSON.stringify(result));
+  assert.equal(result.reason, "SelectedModelUnstable");
+  assert.equal(result.observedSelection, null);
+  assert.equal(h.clicks, 0);
+  assert.ok(h.draftPickerOpens <= 6);
+});
+
+test("final model identity: Work Terra override sends exactly once on confirmed selection", async () => {
+  const h = harness({ selectedModel: "GPT-6.1 Terra", initialMode: "Work",
+    reasoningEffort: "Medium", virtualClock: true });
+  const result = await h.run("One exact prompt", { modelOverride: "work-terra-medium", timeoutMs: 18000 });
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.equal(result.observedSelection.model, "GPT-6.1 Terra");
+  assert.equal(result.selectedMode, "Work");
+  assert.equal(h.modelAtSend, "GPT-6.1 Terra");
+  assert.equal(h.clicks, 1);
+});
+
+test("final model identity: unavailable rendered labels stay unknown on submission", async () => {
+  const h = harness({ virtualClock: true, observableLabels: false, changeModelAfterInsertMs: 0 });
+  const result = await h.run("One exact prompt", { timeoutMs: 18000 });
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)),
+    { mode: null, model: null, effort: null });
+  assert.equal(h.modelAtSend, "Latest");
+  assert.equal(h.clicks, 1);
+});
+
+test("final model identity: uncertain click retains only the freshly checked observation and never replays", async () => {
+  const h = harness({ virtualClock: true, changeModelAfterInsertMs: 0, sendClickThrows: true });
+  const result = await h.run("One exact prompt", { timeoutMs: 18000 });
+  assert.equal(result.status, "outcomeUnknown");
+  assert.equal(result.reason, "SendClickUncertain");
+  assert.equal(result.observedSelection.model, "Latest");
+  assert.equal(h.modelAtSend, "Latest");
+  assert.equal(h.clicks, 1);
+});
 
 test("unobservable rendered selection remains unknown and does not duplicate Send", async () => {
-  const h = harness();
+  const h = harness({ observableLabels: false });
   const result = await h.run();
   assert.equal(result.status, "submitted");
   assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: null, model: null, effort: null });
@@ -1076,7 +1414,7 @@ test("unobservable rendered selection remains unknown and does not duplicate Sen
 test("records visible selection labels from rendered controls", async () => {
   const h = harness({ observableLabels: true });
   const result = await h.run();
-  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: "Chat", model: "GPT-6", effort: "Medium" });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: "Chat", model: "Latest", effort: "Medium" });
   assert.equal(h.clicks, 1);
 });
 
@@ -1091,7 +1429,7 @@ test("observes Work fallback labels from the rendered selection", async () => {
 test("observes Chat Instant fallback labels from the rendered selection", async () => {
   const h = harness({ observableLabels: true, maxEffortStep: 0, reasoningEffort: "Instant", timeoutMs: 18000 });
   const result = await h.run("No submission", { selectionOnly: true });
-  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: "Chat", model: "GPT-6", effort: "Instant" });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: "Chat", model: "Latest", effort: "Instant" });
   assert.equal(h.clicks, 0);
 });
 
@@ -1101,4 +1439,182 @@ test("reports rendered model text even when it differs from the requested model"
   const result = await h.run();
   assert.equal(result.observedSelection.model, "Displayed model label");
   assert.equal(h.clicks, 1);
+});
+
+const projectRouteStart = "https://chatgpt.com/g/g-p-abc123/project";
+const projectRouteA = "https://chatgpt.com/g/g-p-abc123/c/00000000-0000-0000-0000-000000000001";
+const projectRouteB = "/g/g-p-abc123/c/00000000-0000-0000-0000-000000000002";
+const projectRouteC = "/g/g-p-abc123/c/00000000-0000-0000-0000-000000000003";
+const projectPrompt = "Exact project prompt";
+async function runProjectRoute(events, extra = {}) {
+  const h = harness({ startUrl: projectRouteStart, noModeToggle: true,
+    virtualClock: true, noLegacyTurnMarkers: true, noRoute: true,
+    selectedModel: "Latest", reasoningEffort: "Medium", projectEvents: events, ...extra });
+  const result = await h.run(projectPrompt, { startUrl: projectRouteStart, timeoutMs: 18000 });
+  assert.equal(h.clicks, 1);
+  assert.equal(h.navigationAttempts, 0);
+  assert.equal(h.lastSubmittedText, projectPrompt);
+  assert.equal(result.observedSelection.model, "Latest");
+  return { h, result };
+}
+
+for (const [label, links, afterMs] of [
+  ["zero links", [], 150],
+  ["single unrelated fresh link", [projectRouteB], 150],
+  ["multiple fresh links", [projectRouteB, projectRouteC], 150],
+  ["duplicate unrelated link", [projectRouteB, projectRouteB], 150],
+  ["late unrelated link", [projectRouteB], 8000],
+  ["malformed fresh link", ["/g/g-p-abc123/c/000000000000000000000000000000000000"], 150],
+  ["existing sidebar link", [projectRouteB], 150]
+]) {
+  test("project route binding: matching bubble without durable navigation, " + label, async () => {
+    const { h, result } = await runProjectRoute([
+      { afterMs: 75, bubble: projectPrompt },
+      { afterMs, links }
+    ], label === "existing sidebar link" ? { initialProjectLinks: links } : {});
+    assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
+    assert.equal(result.reason, "ConversationUrlUnavailable");
+    assert.equal(result.stage, "conversationRoute");
+    assert.equal(result.conversationUrl, null);
+    assert.equal(result.projectRouteAcknowledgement, "matchingUserBubble");
+    assert.deepEqual(Array.from(result.evidence), ["newUserTurn", "matchingUserBubble"]);
+    assert.equal(h.site.href, projectRouteStart);
+    assert.equal(result.timing.elapsedSinceSendMs, result.timing.budgetAtSendMs);
+    assert.equal(JSON.stringify(result).includes(projectPrompt), false);
+  });
+}
+
+test("project route binding: delayed route with only the earlier matching turn is unbound", async () => {
+  const { h, result } = await runProjectRoute([
+    { afterMs: 75, bubble: projectPrompt, links: [projectRouteB] },
+    { afterMs: 300, href: projectRouteA + "?model=secret#fragment" }
+  ]);
+  assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
+  assert.equal(result.reason, "ConversationUrlUnavailable");
+  assert.equal(result.conversationUrl, null);
+  assert.equal(result.projectRouteAcknowledgement, "matchingUserBubble");
+  assert.deepEqual(Array.from(result.evidence), ["newUserTurn", "matchingUserBubble"]);
+  assert.equal(h.site.href, projectRouteA + "?model=secret#fragment");
+  assert.equal(result.timing.elapsedSinceSendMs, result.timing.budgetAtSendMs);
+});
+
+for (const [label, href] of [
+  ["temporary", "https://chatgpt.com/g/g-p-abc123/c/local-chatgpt%3Atemp"],
+  ["malformed", "https://chatgpt.com/g/g-p-abc123/c/000000000000000000000000000000000000"],
+  ["wrong project", "https://chatgpt.com/g/g-p-other/c/00000000-0000-0000-0000-000000000001"],
+  ["ordinary home conversation", "https://chatgpt.com/c/00000000-0000-0000-0000-000000000001"]
+]) {
+  test("project route binding: " + label + " route does not bind even with matching turn", async () => {
+    const { result } = await runProjectRoute([{ afterMs: 75, bubble: projectPrompt, href, links: [projectRouteB] }]);
+    assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
+    assert.equal(result.reason, "ConversationUrlUnavailable");
+    assert.equal(result.conversationUrl, null);
+    assert.equal(result.projectRouteAcknowledgement, "matchingUserBubble");
+  });
+}
+
+test("project route binding: a mismatched turn and valid route do not acknowledge", async () => {
+  const { result } = await runProjectRoute([{ afterMs: 75, bubble: "Different prompt", href: projectRouteA, links: [projectRouteB] }]);
+  assert.equal(result.status, "outcomeUnknown");
+  assert.equal(result.reason, "SubmissionUnconfirmed");
+  assert.equal(result.projectRouteAcknowledgement, undefined);
+});
+
+for (const [marker, evidence, extra] of [
+  ["bubble", "matchingUserBubble", {}],
+  ["legacy", "matchingLegacyUserTurn", { noLegacyTurnMarkers: false, deferLegacyTurn: true }]
+]) {
+  for (const staggered of [false, true]) {
+    test(`project route binding: ${marker} stale turn, ${staggered ? "staggered" : "atomic"} route/DOM mismatch`, async () => {
+      const { result } = await runProjectRoute([
+        { afterMs: 75, [marker]: projectPrompt },
+        { afterMs: 300, href: "https://chatgpt.com" + projectRouteB,
+          ...(!staggered ? { [marker]: "Different prompt" } : {}) },
+        ...(staggered ? [{ afterMs: 375, [marker]: "Different prompt" }] : [])
+      ], extra);
+      assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
+      assert.equal(result.reason, "ConversationUrlUnavailable");
+      assert.equal(result.conversationUrl, null);
+      assert.equal(result.projectRouteAcknowledgement, evidence);
+      assert.deepEqual(Array.from(result.evidence), ["newUserTurn", evidence]);
+      assert.equal(result.timing.elapsedSinceSendMs, result.timing.budgetAtSendMs);
+    });
+  }
+
+  test(`project route binding: ${marker} route-first fresh matching turn`, async () => {
+    const { h, result } = await runProjectRoute([
+      { afterMs: 75, href: projectRouteA + "?model=secret#fragment", links: [projectRouteB] },
+      { afterMs: 300, href: projectRouteA + "?model=other#updated", [marker]: projectPrompt }
+    ], extra);
+    assert.equal(result.status, "submitted", JSON.stringify(result));
+    assert.equal(result.conversationUrl, projectRouteA);
+    assert.deepEqual(Array.from(result.evidence), ["newUserTurn", evidence, "conversationRoute"]);
+    assert.equal(h.pendingProjectEventCount, 0);
+  });
+
+  test(`project route binding: ${marker} delayed route followed by fresh matching turn on route`, async () => {
+    const { h, result } = await runProjectRoute([
+      { afterMs: 75, [marker]: projectPrompt },
+      { afterMs: 300, href: projectRouteA },
+      { afterMs: 450, [marker]: null },
+      { afterMs: 675, [marker]: projectPrompt }
+    ], extra);
+    assert.equal(result.status, "submitted", JSON.stringify(result));
+    assert.equal(result.conversationUrl, projectRouteA);
+    assert.deepEqual(Array.from(result.evidence), ["newUserTurn", evidence, "conversationRoute"]);
+    // Success must not come from the earlier persistent matching turn.
+    assert.equal(h.pendingProjectEventCount, 0);
+  });
+
+  test(`project route binding: ${marker} simultaneous route and matching turn are unbound`, async () => {
+    const { result } = await runProjectRoute([{ afterMs: 75, href: projectRouteA, [marker]: projectPrompt }], extra);
+    assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
+    assert.equal(result.reason, "ConversationUrlUnavailable");
+    assert.equal(result.conversationUrl, null);
+    assert.equal(result.projectRouteAcknowledgement, evidence);
+  });
+}
+
+test("project route binding: switching marker alone does not prove a fresh turn", async () => {
+  const { result } = await runProjectRoute([
+    { afterMs: 75, legacy: projectPrompt },
+    { afterMs: 300, href: projectRouteA },
+    { afterMs: 450, legacy: null, bubble: projectPrompt }
+  ], { noLegacyTurnMarkers: false, deferLegacyTurn: true });
+  assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
+  assert.equal(result.reason, "ConversationUrlUnavailable");
+  assert.equal(result.conversationUrl, null);
+  assert.equal(result.projectRouteAcknowledgement, "matchingUserBubble");
+});
+
+test("project route binding: a different durable route starts a new evidence epoch", async () => {
+  const { result } = await runProjectRoute([
+    { afterMs: 75, href: projectRouteA },
+    { afterMs: 300, href: "https://chatgpt.com" + projectRouteB, bubble: projectPrompt }
+  ]);
+  assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
+  assert.equal(result.reason, "ConversationUrlUnavailable");
+  assert.equal(result.conversationUrl, null);
+  assert.equal(result.projectRouteAcknowledgement, "matchingUserBubble");
+});
+
+test("project route binding: an intervening foreign origin invalidates the previous route sample", async () => {
+  const { result } = await runProjectRoute([
+    { afterMs: 75, href: projectRouteA },
+    { afterMs: 300, href: "https://example.invalid/" },
+    { afterMs: 450, href: projectRouteA, bubble: projectPrompt }
+  ]);
+  assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
+  assert.equal(result.reason, "ConversationUrlUnavailable");
+  assert.equal(result.conversationUrl, null);
+  assert.equal(result.projectRouteAcknowledgement, "matchingUserBubble");
+});
+
+test("project route binding: mismatched legacy text cannot bind a valid route", async () => {
+  const { result } = await runProjectRoute([{ afterMs: 150, href: projectRouteA }], {
+    noLegacyTurnMarkers: false, legacyTextOverride: "Different prompt"
+  });
+  assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
+  assert.equal(result.reason, "SubmissionUnconfirmed");
+  assert.equal(result.projectRouteAcknowledgement, undefined);
 });

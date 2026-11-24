@@ -319,3 +319,85 @@ CAS with no replay and exercise both Worker and Reviewer under real
 two-clone races. Preserve all existing runtime and provider-boundary
 leases. Do not present the intermediate tests as corrected architecture
 acceptance; fresh independent review and composed tests are required.
+
+### Stage C — existing-auth Worker and Reviewer consumer connected
+
+The preceding Stage C preparation subsection is historical. Per pinned
+specification v8 (00639e2f72766240c6b4838e0373416ab925233c), W16 was
+authorized to compose and test against frozen W12 candidate
+4a400be780d8e0b91cbd6ff6913fffff455b675b (tree
+1b93f8f5df2b6a2ef4072f6b5df2e98532ffeef8) without awaiting its acceptance.
+It is **not** accepted: review b38c6c3596d448e299773c8912a6d113
+ChangesRequested, decision 13310. No ownership of W12 code was imported
+into the W16 feature branch.
+
+W16's consumer uses readNativeRosterPolicy, readOperation and readOriginal
+with actual configured account/project bindings, verified coverage, exact
+original receipt hash and candidate, generation one and absent prior
+project fence/provider session. It checks current per-kind positive limits,
+then repeats original account verification inside the same project CAS as
+the canonical Worker Started/source lease or W12 verifyReviewerClaim
+validation. No second signing identity, authority callback, or production
+deny solely for absent Scheduler-specific approval remains. Both kinds use
+the W12 noSendFencePath and require the path to be unambiguously absent.
+The distinct Reviewer claim and launch journal remain bound to the exact
+immutable claimed review ref/head/version/operation and canonical role
+resolution. Both kinds validate the paired window connection/generation
+and exact wire payload; neither replays an existing original effect.
+The Worker journal reader accepts the historical disposable operation kind
+as read-only provenance. Terminal observations remain non-authoritative.
+
+The source/test delta is frozen at W16 commit
+3464199d85e8b756918fb0f34e2ae5819878ecd7 (tree
+ea5fc594d618a276d9172a9a91401162a2506ad4) on the registered Stage C
+worktree. Disposable QA worktree native-stagec-compose-w16 combines it
+with the two W12 producer commits fad737653905ad2b255adaef116c65bf2ef512db,
+4a400be780d8e0b91cbd6ff6913fffff455b675b and the exact accepted shared
+integration merge 9e66a2cbeefb0493d6662c7a075713e0f3b58378 (first-parent
+patch required by LedgerStore.verifiedIntegrationOperationSnapshotAt).
+The final source/test composition is e90158701dbfd1dcf809e755d10508efb7ff81e6,
+tree f3635565d67a2e9e539bd98ecbc65f51d32ef66b.
+It is a local QA composition only; no main publication.
+
+The positive host fixture uses actual normal configured account
+reservations, independent Git clones and existing authenticated paired
+bridge, including concurrent Worker and distinct Reviewer project CAS.
+Negative cases exercise stale/released/reclaimed/foreign claims,
+role removal, source/ref mutation, reviewer quota revocation separately
+from Worker quota, duplicate original claim, missing window, changed head,
+wire limit and immutable readback. Occupied-path cases are negative-only:
+arbitrary existing path data cannot be mistaken for absence or grant a
+release. They are not a valid no-send issuer or proof.
+
+Release Client rebuilt in job 26e4121a454b4cd9867f4ea2c8ef219f, exit 0,
+23/23 host tests passed. Subsequent ingress/trust/B1 jobs use the same
+rebuilt Client, with unchanged production source in the final QA tree:
+
+| Suite | Passed | Job | Exit |
+| --- | ---: | --- | ---: |
+| Host before final occupied-path test additions | 23/23 | 26e4121a454b4cd9867f4ea2c8ef219f | 0 |
+| Native Started ingress | 9/9 | 68536e8b9aae432aaf3efc06f83d6461 | 0 |
+| Provider trust | 29/29 | 96762eb88aeb4cb9ab3f4d52d83c8db0 | 0 |
+| Challenge wake/B1 (unchanged) | 13/13 | f4c4dc0ff3d94615ac9eb1467359c024 | 0 |
+
+The genuine no-send writer and begin-send exclusion are Worker 23's
+exclusive lease automation-native-project-no-send-issuer-20261124.
+Candidate 51c0708cad4fa9364c1980f636a0f35ea6dbd360, review
+a858ed49b090430e986472c57e6e70b6, ChangesRequested 13352 is not an
+accepted dependency. W16 challenge 8d344cda39104e879c35d897486d93f2
+(condition ef0c4ec5fdcc7bae59d41cb5bf4c8038) requests exact accepted
+typed contract from W23; W12 dependency 72be7bf11e864787bb40a76c1366dffc
+remains pending. W12's earlier issuer request 683f139d4af343da91dfe286d26508b5
+was blocked by its owner W16 because the actual issuer was leased to W23;
+W12 should reconcile ownership rather than require a competing writer.
+
+Final acceptance needs independently Accepted exact W12/W23 heads,
+the genuine original-bound no-send producer/consumer composition and
+tests, then fresh independent W16 review. Actual callsite wiring belongs
+to automation-native-runtime-authority-dispatch-20261124, not this lease.
+Default-off registration, shared Program/Client.fsproj, BrowserBridge,
+Health, legacy B1 and launch/wire files are unchanged in W16 source.
+No provider send, actual reservation or release, runtime activation,
+deployment, restart, main publication, or operational E2E is claimed.
+
+Final host suite with both occupied-path tests: job 0cb49220c2a84af6aa6f4ab66c98a6cd, exit 0, 25/25 passed, zero skipped. Total 76/76 focused tests on the final production source and final QA test tree. This is bounded candidate verification, not independent acceptance of either pending producer.

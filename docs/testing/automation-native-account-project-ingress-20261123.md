@@ -1,5 +1,7 @@
 # Native Started account → project pre-send CAS (2026-11-23)
 
+> Historical Stage A/B evidence follows. The 2026-11-24 Operator correction supersedes the separate signing/approval requirements and the old productionClaim denial. See the Stage C update at the end and the native provider session host testing record for current scope and evidence.
+
 **Historical evidence:** the original standalone/signed-fixture requirements
 below describe the prior accepted implementation, not the controlling
 2026-11-24 Scheduler architecture. Host task spec v7
@@ -66,3 +68,38 @@ The signed successor tests retain membership and reservation while setting accou
 The generation test advances the real disposable Started attempt, refreshes project head and coverage, and preserves the candidate and account receipt. It expects the assignment/source-lease denial, no claim or fence, and unchanged reservation. Compound-guard bypass control job `0e522709293d401cb03077e43537470e` exited 1: 1 executed, 1 failed, 0 skipped, because the altered source admitted the claim. It restored the source SHA-256 `2170479cc84c675fd0d6925044235b9325782c4e84fdb97c8fc24c6aaeb003a0`. This control tests the compound guard, not each comparator independently. Terminal issuer, production wiring, and B2 remain on HOLD.
 
 Final restored-source Release job `02ddbadf622840c3a0e375a714916438` exited 0, 10 discovered/executed, 10 passed, 0 skipped; TRX SHA-256 `2b09b77a20afaac43a2185f4d7004a8d9ce300bfbf1372dbbd11d71723fc7f5b`. Generation mutant TRX SHA-256 `e08d386b8f2fa38b3316eaef076f875984ce33ae22a72208c46d0ea47e6b90ab`. Tested ingress SHA-256 `2170479cc84c675fd0d6925044235b9325782c4e84fdb97c8fc24c6aaeb003a0`; test fixture SHA-256 `333671fcadc31e6bf9e7be9ef9786920196fd6f3e52caf2dc1e7b7a9733ec762`. Prior reviewed source is `931b7dc93abb76fb3c5fc2f80208b974466e597e`, parent accepted base `d312f1cc83685e781ce69e57ad0d4bf613bfb843`; relevant accepted dependency blobs: roster `99483f6764dd99b98db328d9c367ee573f24e28a`, reservation `fd9c9591c74ce906e15dfc191c2dbac0995b8dc3`, old fence `255e9c6956e2e110c738e4c27e01959ea0ca6b8a`, account ledger `8f4f3978ce599d0a3c5a411952aa621ee8f24430`, project ledger `602035282ec9021b5a0173cba3c18bdadf0920e4`.
+
+## Stage C — existing client authentication (source-only, 2026-11-24)
+
+The controlling architecture is task automation-native-provider-session-host-20261123,
+spec v8, blob 00639e2f72766240c6b4838e0373416ab925233c. The historical
+signed-disposable tests above are not requirements for the current path.
+The existing authenticated account/project bindings and canonical Git
+ledger operations are the sole authority context.
+
+The Worker and distinct Reviewer ingress share verifiedReservation and
+one project CAS. The receipt hash is read from the actual original account
+operation and checked by W12 readOriginal (original candidate, receipt
+lineage, generation one, no project fence/session or terminal). The current
+verified roster must still include the exact project ledger/epoch and
+positive limit for the actual kind. Inside the same expected-head project
+CAS, the Worker validates canonical Started task/attempt/source lease;
+the Reviewer invokes W12's verifyReviewerClaim against that exact
+snapshot. An existing fence path, including cancellation, is never an
+empty slot. The key comes from W12 noSendFencePath. The original
+launch-intent and argument bytes are committed atomically with the fence.
+
+The revised standalone ingress suite uses normal configured account
+policy rather than fixture signing. Exact final Client source compiled in
+job 26e4121a454b4cd9867f4ea2c8ef219f; the ingress suite re-used that build
+in Release job 68536e8b9aae432aaf3efc06f83d6461: exit 0, 9/9 pass,
+zero skipped. The removed obsolete signing-only production-denial
+assertion is not a regression of actual authentication. The old fake
+Stage B path remains a historical negative control, never a real issuer.
+
+Evidence is against the explicitly authorized frozen W12 candidate
+4a400be780d8e0b91cbd6ff6913fffff455b675b, not an independently accepted
+producer. W23 owns the genuine project exclusion CAS; this ingress
+does not manufacture that proof or call a provider. Final review,
+composed real no-send validation, and publication remain gated by
+independently accepted W12/W23 constituent heads. No live effects.

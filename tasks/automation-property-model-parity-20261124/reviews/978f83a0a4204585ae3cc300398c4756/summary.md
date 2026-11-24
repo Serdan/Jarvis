@@ -1,0 +1,1 @@
+Real disposable account/project ledgers, two owners, fresh quota denial and other-project admission; no-send release and replay. Focused 2/2 on integrated cb3b2f54 plus exact test delta. Does not cover future shared manual/Scheduler project-total and role mechanism.

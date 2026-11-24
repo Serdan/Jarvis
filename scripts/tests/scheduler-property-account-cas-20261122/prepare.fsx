@@ -6,7 +6,7 @@ open System.Diagnostics
 // Writes exclusively inside this scripts/tests/... lease. Never changes source.
 let here = __SOURCE_DIRECTORY__
 let root = Path.GetFullPath(Path.Combine(here, "..", "..", ".."))
-let pin = "5607baf9913f4976add13c984e0182906d4fe8c7"
+let pin = "3f84149a29950830d5bb217fa341611d95bfe958"
 let source = "Client/Modules/NativeSchedulerAccountReservation.fs"
 let fixture = Path.Combine(root, "Client.Tests", "NativeSchedulerRosterPolicyTests.fs")
 let property = Path.Combine(here, "Property.fs")
@@ -40,8 +40,10 @@ let control =
     if fsi.CommandLineArgs.Length > 1 then fsi.CommandLineArgs[1]
     else expected
 
+if expected <> actual then
+    failwithf "SOURCE_PIN_MISMATCH expected=%s actual=%s" expected actual
 if control <> actual then
-    failwithf "SOURCE_PIN_MISMATCH expected=%s actual=%s" control actual
+    failwithf "SOURCE_PIN_MISMATCH control=%s actual=%s" control actual
 
 // Immutable reviewed pin and exact source/fixture blob identity attest tested bytes.
 // Ancestry alone rejects valid accepted-only cherry-pick compositions.
@@ -59,18 +61,12 @@ if File.Exists(output) then
     failwith "GENERATED_PATH_NOT_EMPTY: refusing to overwrite a test compilation unit."
 
 let original = File.ReadAllText(fixture)
-if not (original.Contains("let success = NativeFixture.success")
-        && original.Contains("let limits = NativeFixture.limits")) then
-    failwith "FROZEN_FIXTURE_LAYOUT_MISMATCH: expected function aliases absent."
+if not (original.Contains("let success value = NativeFixture.success value")
+        && original.Contains("let limits w r = NativeFixture.limits w r")) then
+    failwith "FROZEN_FIXTURE_LAYOUT_MISMATCH: expected initialized function wrappers absent."
 
-// In a single-file standalone assembly the original alias-field initializers
-// are not automatically run. Eta-expansion changes only the generated copy,
-// preserving the same calls while avoiding uninitialized FSharpFunc fields.
-let standalone =
-    original.Replace("let success = NativeFixture.success",
-                     "let success value = NativeFixture.success value")
-            .Replace("let limits = NativeFixture.limits",
-                     "let limits w r = NativeFixture.limits w r")
+// Current integrated fixture already eta-expands the aliases.
+let standalone = original
 let body = File.ReadAllText(property)
 let nativeDifferential = File.ReadAllText(differential)
 File.WriteAllText(output, standalone + body + Environment.NewLine + nativeDifferential)

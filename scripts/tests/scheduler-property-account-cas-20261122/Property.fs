@@ -280,10 +280,17 @@ type SchedulerAccountCasProperty() =
             let fence =
                 (LedgerStore.fetch f.ProjectsOne[0] |> NativeReservationFixture.success).Commit
             let advance expected status session =
-                NativeSchedulerAccountReservation.transitionVerifiedDisposable
-                    f.Root account f.PublicKey f.Subject f.ProjectsOne (fresh())
-                    (Guid.NewGuid()) "Property fixture" (Guid.Parse worker1.DispatchId)
-                    (Guid.Parse worker1.EffectOperationId) expected status fence session
+                let entry = (NativeReservationFixture.snapshot f account f.ProjectsOne).Records
+                            |> Array.find (fun r -> r.Candidate.DispatchId = worker1.DispatchId)
+                let original =
+                    { ReservationOperationId = operation
+                      ReservationRequestSha256 = first.Receipt.RequestSha256
+                      Candidate = worker1; ExpectedGeneration = expected
+                      ExpectedProjectFenceOid = entry.ProjectFenceOid
+                      ExpectedProviderSessionId = entry.ProviderSessionId }
+                NativeSchedulerAccountReservation.transition
+                    account f.ProjectsOne (fresh())
+                    (Guid.NewGuid()) "Property fixture" original status fence session
                 |> NativeReservationFixture.success |> ignore
             advance 1L "Dispatching" ""
             advance 2L "Uncertain" ""
@@ -298,16 +305,18 @@ type SchedulerAccountCasProperty() =
             let locator =
                 { DispatchId = Guid.Parse worker1.DispatchId
                   OriginalReservationId = operation
+                  ReservationRequestSha256 = first.Receipt.RequestSha256
+                  ExpectedGeneration = entry.Generation
                   EffectOperationId = Guid.Parse worker1.EffectOperationId
                   TerminalOperationId = Guid.NewGuid() }
             let proof = NativeReservationFixture.terminalProof f worker1 entry locator
                             fence "provider-property-session"
             let verifier =
-                { new INativeDisposableTerminalVerifier with
+                { new INativeTerminalVerifier with
                     member _.VerifyCurrentTerminal _ = Ok proof }
             let release l =
-                NativeSchedulerAccountReservation.releaseVerifiedDisposable
-                    f.Root account f.PublicKey f.Subject f.ProjectsOne (fresh())
+                NativeSchedulerAccountReservation.release
+                    account f.ProjectsOne (fresh())
                     verifier (Guid.NewGuid()) "Property terminal" l
             let beforeForeign = NativeFixture.head account
             requirePolicy "foreign reservation terminal"
@@ -403,7 +412,7 @@ type SchedulerAccountCasProperty() =
             rejectPolicy "Reviewer version overflow" { reviewer with ReviewVersion = 4294967298L }
             let validCoverage = fresh()
             requirePolicy "incomplete account/project coverage"
-                (attempt worker {validCoverage with Complete = false})
+                (attempt worker {validCoverage with ProjectHeads = [| validCoverage.ProjectHeads[0] |]})
             requirePolicy "forged account head"
                 (attempt worker {validCoverage with AccountHead = f.InitialSourceHead})
             requirePolicy "stale global coverage"

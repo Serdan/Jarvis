@@ -47,6 +47,8 @@ module private NativeCasDifferential =
           Transition(firstWorker, "Unknown")
           ForgedRelease(firstWorker, "head")
           ForgedRelease(firstWorker, "terminal-origin")
+          ForgedRelease(firstWorker, "receipt")
+          ForgedRelease(firstWorker, "generation")
           ForgedRelease(firstWorker, "fence")
           ForgedRelease(firstWorker, "missing-operation")
           Release firstWorker
@@ -147,7 +149,7 @@ module private NativeCasDifferential =
             let sessions = [| for i in 0..3 -> sprintf "provider-differential-%d-%d" seed i |]
             let originalTerminal = System.Collections.Generic.Dictionary<int,NativeTerminalLocator * NativeTerminalProof>()
             let receipts = System.Collections.Generic.Dictionary<Guid,AccountOperationReceipt>()
-            let reservationCoverage = System.Collections.Generic.Dictionary<int,NativeDisposableCoverage>()
+            let reservationCoverage = System.Collections.Generic.Dictionary<int,NativeAccountCoverage>()
             let mutable model: Map<int,Entry> = Map.empty
             let initial = AccountCapacityLedger.fetch f.AccountOne |> NativeFixture.success
             let mutable expectedSeq = initial.State.NextSequence
@@ -178,6 +180,8 @@ module private NativeCasDifferential =
                     fences[i]
                 let locator i terminalId =
                     { DispatchId=dispatch i; OriginalReservationId=reservationIds[i]
+                      ReservationRequestSha256=receipts[reservationIds[i]].RequestSha256
+                      ExpectedGeneration=model[i].Generation
                       EffectOperationId=effect i; TerminalOperationId=terminalId }
                 let terminal i terminalId badFence =
                     let record =
@@ -190,10 +194,10 @@ module private NativeCasDifferential =
                     loc,proof
                 let releaseWith op (loc: NativeTerminalLocator) (proof: NativeTerminalProof) =
                     let verifier =
-                        { new INativeDisposableTerminalVerifier with
+                        { new INativeTerminalVerifier with
                             member _.VerifyCurrentTerminal _ = Ok proof }
-                    NativeSchedulerAccountReservation.releaseVerifiedDisposable
-                        f.Root account f.PublicKey f.Subject projects (fresh())
+                    NativeSchedulerAccountReservation.release
+                        account projects (fresh())
                         verifier op "Seeded native differential" loc
                 let operationId,result =
                     match action with
@@ -209,10 +213,15 @@ module private NativeCasDifferential =
                     | Transition(i,status) ->
                         let current = model[i]
                         let session = if status = "Unknown" then sessions[i] else ""
-                        guid, NativeSchedulerAccountReservation.transitionVerifiedDisposable
-                            f.Root account f.PublicKey f.Subject projects (fresh())
-                            guid "Seeded native differential" (dispatch i) (effect i)
-                            current.Generation status (fence i) session
+                        let original =
+                            { ReservationOperationId = reservationIds[i]
+                              ReservationRequestSha256 = receipts[reservationIds[i]].RequestSha256
+                              Candidate = candidate i; ExpectedGeneration = current.Generation
+                              ExpectedProjectFenceOid = if current.Status = "Reserved" then "" else fence i
+                              ExpectedProviderSessionId = if current.Status = "Unknown" then sessions[i] else "" }
+                        guid, NativeSchedulerAccountReservation.transition
+                            account projects (fresh())
+                            guid "Seeded native differential" original status (fence i) session
                     | ForgedRelease(i,mutation) ->
                         let trialId = deterministicGuid seed (2000+index)
                         let loc,proof = terminal i trialId (mutation = "fence")
@@ -220,6 +229,8 @@ module private NativeCasDifferential =
                             match mutation with
                             | "head" -> loc,{proof with ProjectHead=String.replicate 40 "0"}
                             | "terminal-origin" -> loc,{proof with ProjectTerminalOid=String.replicate 40 "0"}
+                            | "receipt" -> {loc with ReservationRequestSha256=String.replicate 64 "0"},proof
+                            | "generation" -> {loc with ExpectedGeneration=loc.ExpectedGeneration-1L},proof
                             | "terminal-blob" -> loc,{proof with ProviderTerminalOid=String.replicate 40 "0"}
                             | "fence" -> loc,proof
                             | "missing-operation" ->

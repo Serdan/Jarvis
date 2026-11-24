@@ -1,0 +1,1 @@
+Project/ledger/epoch-bound revisioned policy, conditional idempotent CAS update and same-snapshot role read; isolated from production registration. Release focused disposable-ledger tests: 3 passed. Integration with inventory/admission and planner remains separate; policy alone cannot permit admission.

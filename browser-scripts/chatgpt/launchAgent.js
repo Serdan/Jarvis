@@ -672,7 +672,19 @@ async function executeLaunch(args, observeSelection) {
             return { ...notSubmitted("LaunchDeadlineExceeded"), stage: "composer" };
           }
           activeComposer.focus();
-          const didInsert = document.execCommand("insertText", false, prompt);
+          // Multiline plain text must go through the editor's paste parser.
+          // Chromium insertText may construct blocks whose rendered newlines
+          // differ from the intended ProseMirror document.
+          let didInsert;
+          if (prompt.includes("\n") && typeof DataTransfer === "function" &&
+              typeof ClipboardEvent === "function") {
+            const clipboardData = new DataTransfer();
+            clipboardData.setData("text/plain", prompt);
+            activeComposer.dispatchEvent(new ClipboardEvent("paste", {
+              bubbles: true, cancelable: true, clipboardData
+            }));
+            didInsert = true; // Exact readEditor proof below, not event cancellation.
+          } else didInsert = document.execCommand("insertText", false, prompt);
           if (!didInsert || readEditor() !== insertedPrompt) {
             // An editor can be visible before its input handlers finish
             // hydrating. Retry only on the verified pre-Send home, clearing

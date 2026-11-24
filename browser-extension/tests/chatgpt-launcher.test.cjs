@@ -35,6 +35,8 @@ function harness(options = {}) {
   let afterClearEffectsScheduled = false;
   let afterInsertEffectsScheduled = false;
   let insertions = 0;
+  let pasteAttempts = 0;
+  let textInsertAttempts = 0;
   let beforeReadyInsertions = 0;
   const launchStartedAt = Date.now();
   const postInsert = (ms, callback) => {
@@ -90,7 +92,18 @@ function harness(options = {}) {
   const editor = {
     get innerText() { return content || (options.emptyRenderedNewline ? "\n" : ""); },
     get textContent() { return content; },
-    focus() { focused = true; }
+    focus() { focused = true; },
+    dispatchEvent(event) {
+      assert.equal(this, activeEditor);
+      assert.equal(event.type, "paste");
+      assert.equal(event.bubbles, true);
+      assert.equal(event.cancelable, true);
+      assert.deepEqual(event.clipboardData.types, ["text/plain"]);
+      pasteAttempts++;
+      // A canceled paste is normal: ProseMirror handles it itself.
+      if (!options.ignorePaste) applyInsert(event.clipboardData.getData("text/plain"));
+      return false;
+    }
   };
   let activeEditor = editor;
   const send = { click() {
@@ -214,6 +227,32 @@ function harness(options = {}) {
       return [];
     }
   };
+  const applyInsert = value => {
+      if (options.throwOnInsert) throw new Error("ProseMirror changed unexpectedly");
+      if (options.requireClearMicrotask && !editorDeleteFlushed) return false;
+      if (document.readyState !== "complete") beforeReadyInsertions++;
+      insertions++;
+      if (insertions <= (options.rejectInsertCount || 0)) return false;
+      content = options.insertWrong ? "wrong" : value;
+      if (!afterInsertEffectsScheduled) {
+        afterInsertEffectsScheduled = true;
+        postInsert(options.replaceComposerAfterInsertMs, () => { activeEditor = Object.create(editor); });
+        postInsert(options.replaceModesAfterInsertMs, () => {
+          chatMode = makeMode("Chat");
+          workMode = makeMode("Work");
+        });
+        postInsert(options.restoreDraftAfterInsertMs, () => { content = "Competing tab restored an unsent draft"; });
+        postInsert(options.switchToWorkAfterInsertMs, () => { mode = "Work"; });
+        postInsert(options.hideTabAfterInsertMs, () => { visibility = "hidden"; });
+        postInsert(options.resetEffortAfterInsertMs,
+          () => { reasoningEffort = options.resetEffortTo || "Medium"; });
+        postInsert(options.changeModelAfterInsertMs,
+          () => { selectedModel = "GPT-6"; });
+        postInsert(options.addTurnAfterInsertMs, () => { userTurns++; });
+        postInsert(options.routeAfterInsertMs, () => { site.href = "https://chatgpt.com/c/new-route"; });
+      }
+      return true;
+  };
   const document = {
     get visibilityState() { return visibility; },
     readyState: options.documentHydrationDelayMs ? "loading" : "complete",
@@ -257,29 +296,9 @@ function harness(options = {}) {
         return true;
       }
       if (command !== "insertText") return false;
-      if (options.requireClearMicrotask && !editorDeleteFlushed) return false;
-      if (document.readyState !== "complete") beforeReadyInsertions++;
-      insertions++;
-      if (insertions <= (options.rejectInsertCount || 0)) return false;
-      content = options.insertWrong ? "wrong" : value;
-      if (!afterInsertEffectsScheduled) {
-        afterInsertEffectsScheduled = true;
-        postInsert(options.replaceComposerAfterInsertMs, () => { activeEditor = Object.create(editor); });
-        postInsert(options.replaceModesAfterInsertMs, () => {
-          chatMode = makeMode("Chat");
-          workMode = makeMode("Work");
-        });
-        postInsert(options.restoreDraftAfterInsertMs, () => { content = "Competing tab restored an unsent draft"; });
-        postInsert(options.switchToWorkAfterInsertMs, () => { mode = "Work"; });
-        postInsert(options.hideTabAfterInsertMs, () => { visibility = "hidden"; });
-        postInsert(options.resetEffortAfterInsertMs,
-          () => { reasoningEffort = options.resetEffortTo || "Medium"; });
-        postInsert(options.changeModelAfterInsertMs,
-          () => { selectedModel = "GPT-6"; });
-        postInsert(options.addTurnAfterInsertMs, () => { userTurns++; });
-        postInsert(options.routeAfterInsertMs, () => { site.href = "https://chatgpt.com/c/new-route"; });
-      }
-      return true;
+      textInsertAttempts++;
+      // Chromium's native insertText can produce different block boundaries.
+      return applyInsert(options.nativeMultilineMismatch ? value.replace(/\n/g, "\n\n") : value);
     },
     querySelector(selector) {
       if (selector === 'button[aria-label="Select ChatGPT model"]') return options.noPicker ? null : activePicker;
@@ -377,12 +396,21 @@ function harness(options = {}) {
     assign() { navigationAttempts++; throw new Error("Launcher must not navigate"); },
     replace() { navigationAttempts++; throw new Error("Launcher must not navigate"); }
   };
-  const ctx = vm.createContext({ document, window, location, setTimeout: schedule, Date: clockDate, URL, KeyboardEvent: class { constructor(type, init) { Object.assign(this, init); } } });
+  class DataTransfer {
+    constructor() { this.data = new Map(); }
+    get types() { return [...this.data.keys()]; }
+    setData(type, value) { this.data.set(type, value); }
+    getData(type) { return this.data.get(type) || ""; }
+  }
+  class ClipboardEvent {
+    constructor(type, init) { Object.assign(this, init, { type }); }
+  }
+  const ctx = vm.createContext({ DataTransfer, ClipboardEvent, document, window, location, setTimeout: schedule, Date: clockDate, URL, KeyboardEvent: class { constructor(type, init) { Object.assign(this, init); } } });
   const run = async (prompt = "Start fresh\nRead Jarvis assignment", extra = {}) =>
     await vm.runInContext(source + "\nexecute(" + JSON.stringify({
       prompt, timeoutMs: (options.timeoutMs || 350) + 5000, ...extra
     }) + ")", ctx);
-  return { run, site, get navigationAttempts() { return navigationAttempts; }, get clicks() { return clicks; }, get insertions() { return insertions; }, get chatClicks() { return chatClicks; },
+  return { run, site, get navigationAttempts() { return navigationAttempts; }, get clicks() { return clicks; }, get insertions() { return insertions; }, get pasteAttempts() { return pasteAttempts; }, get textInsertAttempts() { return textInsertAttempts; }, get chatClicks() { return chatClicks; },
     get modelAtSend() { return modelAtSend; }, get draftPickerOpens() { return draftPickerOpens; },
     get selectedModel() { return selectedModel; }, get reasoningEffort() { return reasoningEffort; }, get modelClicks() { return modelClicks; }, get beforeReadyInsertions() { return beforeReadyInsertions; },
     get proSelections() { return proSelections; }, get mode() { return mode; }, get content() { return content; },
@@ -408,12 +436,26 @@ test("visibility lost after insertion cannot authorize duplicate Send", async ()
 });
 
 test("inserts multiline prompt through editor and submits once", async () => {
-  const h = harness();
-  const result = await h.run();
+  const h = harness({ nativeMultilineMismatch: true });
+  const prompt = "Start fresh\n\nRead Jarvis assignment\n  Preserve indentation";
+  const result = await h.run(prompt);
   assert.equal(result.status, "submitted");
   assert.equal(result.conversationUrl, h.site.href);
   assert.equal(h.clicks, 1);
+  assert.equal(h.lastSubmittedText, prompt);
+  assert.equal(h.pasteAttempts, 1);
+  assert.equal(h.textInsertAttempts, 0);
   assert.deepEqual(Array.from(result.evidence), ["newUserTurn", "conversationRoute"]);
+});
+
+test("ignored multiline paste cannot authorize Send even when enabled", async () => {
+  const h = harness({ ignorePaste: true, sendAlwaysEnabled: true, virtualClock: true });
+  const result = await h.run();
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.reason, "TextInsertionFailed");
+  assert.equal(h.clicks, 0);
+  assert.ok(h.pasteAttempts > 0);
+  assert.equal(h.textInsertAttempts, 0);
 });
 
 test("replaces arbitrary restored draft with exact intended bootstrap once", async () => {
@@ -422,6 +464,8 @@ test("replaces arbitrary restored draft with exact intended bootstrap once", asy
   assert.equal(result.status, "submitted");
   assert.equal(result.safeToDisposeCreatedTab, undefined);
   assert.equal(h.lastSubmittedText, "Worker 2 bootstrap");
+  assert.equal(h.textInsertAttempts, 1);
+  assert.equal(h.pasteAttempts, 0);
   assert.equal(h.clicks, 1);
   assert.equal(JSON.stringify(result).includes("Personal unsent text"), false);
 });
@@ -555,6 +599,8 @@ test("after clicking, missing acknowledgement is uncertain and never resent", as
   assert.equal(result.status, "outcomeUnknown");
   assert.equal(result.safeToDisposeCreatedTab, undefined);
   assert.equal(result.reason, "SubmissionUnconfirmed");
+  assert.equal(h.pasteAttempts, 1);
+  assert.equal(h.textInsertAttempts, 0);
   assert.equal(result.stage, "acknowledgement");
   assert.equal(result.timing.budgetAtSendMs >= 3000, true);
   assert.equal(result.timing.elapsedSinceSendMs > 0, true);

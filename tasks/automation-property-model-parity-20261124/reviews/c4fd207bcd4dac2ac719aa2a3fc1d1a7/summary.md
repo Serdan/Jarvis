@@ -1,0 +1,1 @@
+Distinct same-revision policy writers race on two disposable real Git clones; assert one successor, full winner state on both clones, and idempotent replay. Release job 8dd814264d2647f6bf3fa87771ac99f0 passed 10/10. Incremental policy-only evidence, not composed milestone acceptance.

@@ -9,6 +9,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../Client/Client.fsproj" />
+    <Compile Include="../../Client/Modules/NativeProjectEffectTransition.fs" />
     <Compile Include="HostTests.fs" />
   </ItemGroup>
   <ItemGroup>

@@ -955,3 +955,65 @@ let ``an existing original-effect path can never be claimed as an empty slot`` k
             let actual, _ = LedgerStore.readAt f.ProjectTwo current fence |> ConfiguredFixture.success
             Assert.That(actual, Is.EqualTo(Some raw))
             Assert.That((ConfiguredFixture.state f).Records[0].Status, Is.EqualTo("Reserved"))))
+
+ 
+// Composition-only regression: genuine project planner with a verified account
+// reservation, not a synthetic receipt. W12's consumer must accept the exact
+// canonical envelope emitted by W23 and preserve the original exclusion.
+[<TestCase("Worker")>]
+[<TestCase("Reviewer")>]
+let ``genuine preclaim exclusion releases the original reservation`` kind =
+    ConfiguredFixture.withGit (fun f ->
+        let candidate, originalId =
+            if kind = "Worker" then
+                let c, original, _ = ConfiguredFixture.reserved f (Some template)
+                c, original
+            else
+                let _, _, claim = reservedReviewer f
+                claim.ReviewCandidate, claim.OriginalReservationOperationId
+        let projects = [| f.ProjectOne |]
+        let cover = ConfiguredFixture.coverage f f.AccountOne projects
+        let _, receipt = AccountCapacityLedger.readOperation f.AccountOne originalId |> ConfiguredFixture.success
+        let locator : NativeOriginalReservationLocator =
+            { ReservationOperationId = originalId
+              ReservationRequestSha256 = receipt.Value.RequestSha256
+              Candidate = candidate; ExpectedGeneration = 1L
+              ExpectedProjectFenceOid = ""; ExpectedProviderSessionId = "" }
+        let original = NativeSchedulerAccountReservation.readOriginal f.AccountOne projects cover locator
+                       |> ConfiguredFixture.success
+        let identity : Client.NativeProjectEffectTransition.OriginalEffectIdentity =
+            { AccountId = f.AccountOne.AccountId; AccountLedgerId = f.AccountOne.LedgerId
+              AccountEpoch = f.AccountOne.Epoch; ReservationOperationId = originalId
+              CanonicalKey = original.CurrentReservation.CanonicalKey; Candidate = candidate }
+        let op = Guid.NewGuid()
+        let evidence : NativeNoSendEvidence =
+            { SchemaVersion = 1; State = "VerifiedNoSend"
+              AccountId = string identity.AccountId; AccountLedgerId = string identity.AccountLedgerId
+              AccountEpoch = identity.AccountEpoch; ReservationOrigin = original.ReservationOrigin
+              CanonicalKey = identity.CanonicalKey; Original = locator; NoSendOperationId = op }
+        let raw = NativeSchedulerAccountReservation.serializeNoSendEvidence evidence
+        let head = (LedgerStore.fetch f.ProjectOne |> ConfiguredFixture.success).Commit
+        let request = sprintf """{"schemaVersion":1,"expectedProjectHead":"%s","predecessor":{"kind":"BeforeClaim"},"evidence":%s}""" head raw
+        let intent : LedgerIntent =
+            { OperationId = op; Actor = candidate.OwnerAgentId; Kind = "NativeVerifiedNoSend"; RequestJson = request }
+        let path = NativeSchedulerAccountReservation.noSendFencePath candidate
+        LedgerStore.transact f.ProjectOne intent (fun snapshot ->
+            Client.NativeProjectEffectTransition.planExclusion f.ProjectOne snapshot head identity path
+                Client.NativeProjectEffectTransition.BeforeClaim intent)
+        |> ConfiguredFixture.success |> ignore
+        let current = LedgerStore.fetch f.ProjectTwo |> ConfiguredFixture.success
+        let stored, oid = LedgerStore.readAt f.ProjectTwo current path |> ConfiguredFixture.success
+        Assert.That(stored, Is.EqualTo(Some raw))
+        Assert.That((Client.NativeProjectEffectTransition.checkClaim f.ProjectTwo current current.Commit identity path).IsError, Is.True)
+        let releaseLocator : NativeNoSendLocator =
+            { Original = locator; NoSendOperationId = op; ProjectHead = current.Commit
+              NoSendOrigin = current.Commit; EvidenceBlobOid = oid.Value }
+        let otherProjects = [| f.ProjectTwo |]
+        let newCoverage = ConfiguredFixture.coverage f f.AccountTwo otherProjects
+        let release = NativeSchedulerAccountReservation.releaseNoSend f.AccountTwo otherProjects newCoverage
+                          (Guid.NewGuid()) candidate.OwnerAgentId releaseLocator
+        // A genuine exclusion must release; the currently accepted W12
+        // consumer verifies raw evidence instead of the full envelope.
+        match release with
+        | Error e -> Assert.Fail(sprintf "Genuine canonical exclusion rejected: %A" e)
+        | Ok _ -> Assert.That((ConfiguredFixture.state f).Records[0].Status, Is.EqualTo("Released")))

@@ -1,0 +1,1 @@
+Lead reconciled to HOLD-only. Identity-bound snapshot inspection explicitly lists missing producers and never grants admission. Parent abef95dc accepted. Release test running; evidence to follow in checkpoint.

@@ -1019,9 +1019,12 @@ type NativeSchedulerAccountReservationTests() =
             // evidence remains byte-exact in the blob, not in the envelope.
             use envelope = JsonDocument.Parse(operation.CanonicalRequestJson)
             Assert.That(envelope.RootElement.GetProperty("request").GetString(), Is.Not.EqualTo(evidence))
-            Assert.That(LedgerStore.verifyIntegrationOperationIntent project operation intent, Is.EqualTo(Ok ()))
+            LedgerStore.verifyIntegrationOperationIntent project operation intent
+            |> NativeReservationFixture.success
             let wrongIntent = { intent with RequestJson = "{}" }
-            Assert.That(LedgerStore.verifyIntegrationOperationIntent project operation wrongIntent, Is.Not.EqualTo(Ok ()))
+            match LedgerStore.verifyIntegrationOperationIntent project operation wrongIntent with
+            | Error(InvalidBinding _) -> ()
+            | other -> failwithf "Wrong no-send intent was not denied: %A" other
             let current = snapshot.Commit
             deny { locator with ProjectHead = current; NoSendOrigin = current }
             let advance (l: NativeOriginalReservationLocator) status =

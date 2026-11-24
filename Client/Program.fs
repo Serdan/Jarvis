@@ -133,6 +133,96 @@ let private operatorActorFromAccessToken (token: string) =
                 |> fun hash -> Some("operator:" + hash.ToLowerInvariant())
     with _ -> None
 
+let executeScheduledAction (readFence: unit -> Result<ClientConfig.CapacityFenceMode, string>) (rt: Runtime) (tui: ConsoleTui) (browser: BrowserBridge.Service option) (action: BrowserSchedules.ScheduledAction) = task {
+    let permission = rt :> PermissionIO
+    let prompt (cmd: AgentCommand) request = permission.PromptPermission cmd request
+    if action.ActionKind = "RunCommand" then
+        let cmd : RunCommandCommand =
+            { ProjectName = action.ProjectName
+              Executable = action.Executable
+              Args = action.CommandArgs
+              Reason = Some("Scheduled execution " + action.Id)
+              WorkingDirectory = if String.IsNullOrWhiteSpace(action.WorkingDirectory) then None
+                                 else Some action.WorkingDirectory
+              TimeoutSeconds = Some action.TimeoutSeconds
+              MaxOutputBytes = Some action.MaxOutputBytes }
+        // Preserve normal run_command permission prompts, TUI activity,
+        // source-path checks and audit rather than executing an untracked process.
+        let! commandResult = Client.receiveCommand rt (RunCommandCommand cmd)
+        match commandResult with
+        | Error error -> return Error("", sprintf "%A" error)
+        | Ok responseJson ->
+            try
+                let result = JsonSerializer.Deserialize<RunCommandResult>(responseJson)
+                let summary = JsonSerializer.Serialize(
+                    {| exitCode = result.ExitCode; timedOut = result.TimedOut
+                       truncated = result.Truncated |})
+                if result.ExitCode = 0 && not result.TimedOut then
+                    return Ok summary
+                else return Error(summary, "CommandFailed")
+            with :? JsonException ->
+                // Process may have executed; no automatic replay.
+                return Error("", "OutcomeUnknown: malformed run_command response")
+    elif (match readFence() with
+          | Ok ClientConfig.Disabled -> false
+          | Ok ClientConfig.NegativeOnly | Error _ -> true) then
+        // No authoritative shared admission is wired here. Never send while
+        // the local deny-only fence is enabled or its setting is unreadable.
+        return Error("", "CapacityFenceHold: scheduled browser launch denied")
+    else
+        let authCommand =
+            BrowserRunInNewTabCommand
+                { TargetAgentId = None
+                  ProjectName = action.ProjectName; WindowRegistration = action.WindowRegistration
+                  Url = action.Url; ScriptPath = action.ScriptPath
+                  ArgsJson = Some action.ArgsJson; Active = Some action.Active
+                  CloseTabAfterExecution = Some action.CloseTabAfterExecution
+                  TimeoutMs = Some 30000 }
+        let! allowed = PermissionPolicy.authorizeWithTrust permission.TrustLevel prompt authCommand
+        match allowed with
+        | Error error -> return Error("", "AuthorizationDenied: " + sprintf "%A" error)
+        | Ok() ->
+            let script =
+                match ProjectPaths.validateProjectRelativePath action.ScriptPath with
+                | Error e -> Error(sprintf "%A" e)
+                | Ok _ when not (action.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
+                    Error "InvalidScriptPath"
+                | Ok _ ->
+                    match ProjectPaths.resolveProjectFile action.ProjectName action.ScriptPath rt with
+                    | Error e -> Error(sprintf "%A" e)
+                    | Ok(FilePath path) ->
+                        try
+                            if FileInfo(path).Length > int64 BrowserBridge.MaxScriptBytes then Error "InputTooLarge"
+                            else Ok(File.ReadAllText(path, UTF8Encoding(false, true)))
+                        with e -> Error("ScriptUnavailable:" + e.GetType().Name)
+            match script, browser with
+            | Error e, _ -> return Error("", e)
+            | _, None -> return Error("", "BridgeDisabled")
+            | Ok source, Some bridge ->
+                let mutable connected = false
+                let mutable tries = 0
+                while not connected && tries < 60 do
+                    connected <- bridge.ListWindows().IsOk
+                    if not connected then
+                        tries <- tries + 1
+                        do! Task.Delay(500)
+                if not connected then return Error("", "ExtensionDisconnected")
+                elif (match readFence() with
+                      | Ok ClientConfig.Disabled -> false
+                      | Ok ClientConfig.NegativeOnly | Error _ -> true) then
+                    return Error("", "CapacityFenceHold: scheduled browser launch denied")
+                else
+                    let! result = BrowserBridge.runInNewTab bridge action.WindowRegistration
+                                        action.Url action.Alias action.Active source action.ArgsJson
+                                        30000 action.CloseTabAfterExecution
+                    match result with
+                    | Error (registrationId, reason) ->
+                        if reason.StartsWith("UiIncompatible:", StringComparison.Ordinal) then
+                            tui.Log $"Browser schedule '{action.Id}' suspended: {reason}; inspect tab {registrationId} and update provider script."
+                        return Error(registrationId, reason)
+                    | Ok json -> return Ok json
+}
+
 let private runClient args =
     let activityStore, activityStoreError =
         try
@@ -195,85 +285,7 @@ let private runClient args =
 
     // One persistent execution scheduler for CLI and browser actions.
     // The browser bridge is optional; CLI scheduling works without an extension.
-    let executeScheduledAction (action: BrowserSchedules.ScheduledAction) = task {
-        let permission = rt :> PermissionIO
-        let prompt (cmd: AgentCommand) request = permission.PromptPermission cmd request
-        if action.ActionKind = "RunCommand" then
-            let cmd : RunCommandCommand =
-                { ProjectName = action.ProjectName
-                  Executable = action.Executable
-                  Args = action.CommandArgs
-                  Reason = Some("Scheduled execution " + action.Id)
-                  WorkingDirectory = if String.IsNullOrWhiteSpace(action.WorkingDirectory) then None
-                                     else Some action.WorkingDirectory
-                  TimeoutSeconds = Some action.TimeoutSeconds
-                  MaxOutputBytes = Some action.MaxOutputBytes }
-            // Preserve normal run_command permission prompts, TUI activity,
-            // source-path checks and audit rather than executing an untracked process.
-            let! commandResult = Client.receiveCommand rt (RunCommandCommand cmd)
-            match commandResult with
-            | Error error -> return Error("", sprintf "%A" error)
-            | Ok responseJson ->
-                try
-                    let result = JsonSerializer.Deserialize<RunCommandResult>(responseJson)
-                    let summary = JsonSerializer.Serialize(
-                        {| exitCode = result.ExitCode; timedOut = result.TimedOut
-                           truncated = result.Truncated |})
-                    if result.ExitCode = 0 && not result.TimedOut then
-                        return Ok summary
-                    else return Error(summary, "CommandFailed")
-                with :? JsonException ->
-                    // Process may have executed; no automatic replay.
-                    return Error("", "OutcomeUnknown: malformed run_command response")
-        else
-            let authCommand =
-                BrowserRunInNewTabCommand
-                    { TargetAgentId = None
-                      ProjectName = action.ProjectName; WindowRegistration = action.WindowRegistration
-                      Url = action.Url; ScriptPath = action.ScriptPath
-                      ArgsJson = Some action.ArgsJson; Active = Some action.Active
-                      CloseTabAfterExecution = Some action.CloseTabAfterExecution
-                      TimeoutMs = Some 30000 }
-            let! allowed = PermissionPolicy.authorizeWithTrust permission.TrustLevel prompt authCommand
-            match allowed with
-            | Error error -> return Error("", "AuthorizationDenied: " + sprintf "%A" error)
-            | Ok() ->
-                let script =
-                    match ProjectPaths.validateProjectRelativePath action.ScriptPath with
-                    | Error e -> Error(sprintf "%A" e)
-                    | Ok _ when not (action.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
-                        Error "InvalidScriptPath"
-                    | Ok _ ->
-                        match ProjectPaths.resolveProjectFile action.ProjectName action.ScriptPath rt with
-                        | Error e -> Error(sprintf "%A" e)
-                        | Ok(FilePath path) ->
-                            try
-                                if FileInfo(path).Length > int64 BrowserBridge.MaxScriptBytes then Error "InputTooLarge"
-                                else Ok(File.ReadAllText(path, UTF8Encoding(false, true)))
-                            with e -> Error("ScriptUnavailable:" + e.GetType().Name)
-                match script, browser with
-                | Error e, _ -> return Error("", e)
-                | _, None -> return Error("", "BridgeDisabled")
-                | Ok source, Some bridge ->
-                    let mutable connected = false
-                    let mutable tries = 0
-                    while not connected && tries < 60 do
-                        connected <- bridge.ListWindows().IsOk
-                        if not connected then
-                            tries <- tries + 1
-                            do! Task.Delay(500)
-                    if not connected then return Error("", "ExtensionDisconnected")
-                    else
-                        let! result = BrowserBridge.runInNewTab bridge action.WindowRegistration
-                                            action.Url action.Alias action.Active source action.ArgsJson
-                                            30000 action.CloseTabAfterExecution
-                        match result with
-                        | Error (registrationId, reason) ->
-                            if reason.StartsWith("UiIncompatible:", StringComparison.Ordinal) then
-                                tui.Log $"Browser schedule '{action.Id}' suspended: {reason}; inspect tab {registrationId} and update provider script."
-                            return Error(registrationId, reason)
-                        | Ok json -> return Ok json
-    }
+    let executeScheduledAction = executeScheduledAction ClientConfig.capacityFenceMode rt tui browser
     // The runtime owns at most one local scheduler per private state file.
     // A second JarvisClient can still connect, but never becomes a competing
     // schedule writer/executor. Idle launches also require a *fresh* authenticated

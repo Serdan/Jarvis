@@ -1,0 +1,1 @@
+Prior accepted 872139fa. Added focused deterministic checkpoint-first/recovery-first schedules against actual isolated Client/Server; job 841cb21308494e8cb0e32028776c7623 exit 0, 2/2 (8s). Existing-auth production producers not yet published on main; no activation or final composition claim.

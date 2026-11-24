@@ -71,6 +71,25 @@ let initializeFixture (binding: LedgerBinding) actor operation total roles =
 
 #endif
 
+// Composable planner: invoke only inside the inventory owner's LedgerStore.transact
+// callback, using the same snapshot and a transaction intent binding all inputs.
+// Re-run inventory validation and this function on every callback invocation.
+// A successful replay bypasses the callback and is not permission to send.
+let internal planReservation binding snapshot actor operation effect role roleVersion generation =
+    if effect = Guid.Empty || String.IsNullOrWhiteSpace role || roleVersion < 1 || generation < 1 then reject "invalid identity"
+    else
+        read binding snapshot
+        |> Result.bind (fun (state, oid) ->
+            let occupied = state.Entries |> List.filter (fun e -> e.Status <> "Excluded")
+            if state.Entries |> List.exists (fun e -> e.Effect = effect) then reject "effect already exists"
+            elif occupied.Length >= state.Total then reject "total capacity exhausted"
+            elif state.Roles |> Map.tryFind role |> Option.exists (fun limit ->
+                (occupied |> List.filter (fun e -> e.Role = role) |> List.length) >= limit)
+            then reject "role capacity exhausted"
+            else
+                let entry = { Effect = effect; ReservationOperation = operation; Role = role; Owner = actor; RoleVersion = roleVersion; Generation = generation; Status = "Held" }
+                Ok(change (Some oid) { state with Entries = entry :: state.Entries }))
+
 // The actor/role must be verified against canonical authority by the future host.
 // This lower-level planner alone is not a complete admission boundary.
 let internal reserve binding actor operation effect role roleVersion generation =
@@ -78,17 +97,7 @@ let internal reserve binding actor operation effect role roleVersion generation 
     if effect = Guid.Empty || String.IsNullOrWhiteSpace role || roleVersion < 1 || generation < 1 then reject "invalid identity"
     else
         LedgerStore.transact binding (intent actor operation "FixtureCapacity.Reserve" request) (fun snapshot ->
-            read binding snapshot
-            |> Result.bind (fun (state, oid) ->
-                let occupied = state.Entries |> List.filter (fun e -> e.Status <> "Excluded")
-                if state.Entries |> List.exists (fun e -> e.Effect = effect) then reject "effect already exists"
-                elif occupied.Length >= state.Total then reject "total capacity exhausted"
-                elif state.Roles |> Map.tryFind role |> Option.exists (fun limit ->
-                    (occupied |> List.filter (fun e -> e.Role = role) |> List.length) >= limit)
-                then reject "role capacity exhausted"
-                else
-                    let entry = { Effect = effect; ReservationOperation = operation; Role = role; Owner = actor; RoleVersion = roleVersion; Generation = generation; Status = "Held" }
-                    Ok(change (Some oid) { state with Entries = entry :: state.Entries })))
+            planReservation binding snapshot actor operation effect role roleVersion generation)
 
 #if PROJECT_CAPACITY_DISPOSABLE_TEST_ONLY
 // Fixture send and fixture no-send compete for the same held predecessor.

@@ -6,6 +6,9 @@ open System.Diagnostics
 open System.IO
 open System.Threading
 open System.Threading.Tasks
+open Microsoft.Data.Sqlite
+open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Logging.Abstractions
 
 type private PendingActivity =
     { Version: int64
@@ -34,13 +37,13 @@ type private StoreWork =
 /// per bounded authority key; a single posted diagnostic may take a turn
 /// between activity writes, without a general-purpose diagnostic queue.
 /// The underlying database is deliberately neither deleted nor migrated here.
-type OptionalFeedbackStore(databasePath: string, ?timeout: TimeSpan, ?maxDiskBytes: int64) as this =
+type OptionalFeedbackStore(databasePath: string, ?timeout: TimeSpan, ?maxDiskBytes: int64, ?logger: ILogger) as this =
+    let logger = defaultArg logger NullLogger.Instance
     let deadline = defaultArg timeout (TimeSpan.FromMilliseconds 200.)
     do if deadline <= TimeSpan.Zero then invalidArg "timeout" "Must be positive."
-    // Hard high-water: no new diagnostic operation starts once the main DB
-    // plus WAL/SHM/rollback sidecars consume 32 MiB. SQLite itself is limited
-    // to 16 MiB of database pages; WAL is periodically checkpointed.
-    // Legacy oversized files are left byte-for-byte untouched and unavailable.
+    // Soft pressure sheds expendable posts; hard pressure rejects new writes.
+    // Reads and bounded maintenance have independent admission. Recovery must
+    // cross the lower watermark before posts resume.
     let diskBudget = defaultArg maxDiskBytes (32L * 1024L * 1024L)
     do if diskBudget < 256L * 1024L then invalidArg "maxDiskBytes" "Must be at least 256 KiB."
     let databaseBudget = min (16L * 1024L * 1024L) (diskBudget / 2L)
@@ -49,8 +52,146 @@ type OptionalFeedbackStore(databasePath: string, ?timeout: TimeSpan, ?maxDiskByt
     let diagnosticBytes () =
         [| databasePath; databasePath + "-wal"; databasePath + "-shm"; databasePath + "-journal" |]
         |> Array.sumBy fileBytes
-    let database =
+    let softMain, softDisk = databaseBudget * 4L / 5L, diskBudget * 4L / 5L
+    let recoverMain, recoverDisk = databaseBudget * 13L / 20L, diskBudget * 13L / 20L
+    let newDatabase () =
         lazy (new FeedbackStore(databasePath, runPruneTimer = false, maxDatabaseBytes = databaseBudget))
+    let mutable database = newDatabase()
+    let getDatabase () =
+        try database.Value
+        with _ ->
+            // Lazy caches initialization errors; a transient quota/lock must
+            // not poison the write store for the rest of this process.
+            database <- newDatabase()
+            reraise()
+    let readDatabase = lazy (new FeedbackStore(databasePath, readOnly = true, runPruneTimer = false))
+    // These fields are accessed only by the existing physical worker.
+    let mutable pressure = false
+    let mutable lastRoutinePrune = DateTimeOffset.MinValue
+    let mutable lastMaintenanceFault = ""
+    let mutable storageStatus = "NotObserved"
+    let markPressure () =
+        pressure <- true
+        if Volatile.Read(&storageStatus) <> "MaintenanceRequired" then
+            Volatile.Write(&storageStatus, "Pressure")
+    let measure () =
+        let main, total = fileBytes databasePath, diagnosticBytes()
+        if main >= softMain || total >= softDisk then markPressure()
+        main, total
+    let releasePressure main total =
+        if main < recoverMain && total < recoverDisk then pressure <- false
+    let freeSpace () =
+        let directory = Path.GetDirectoryName(Path.GetFullPath(databasePath))
+        DriveInfo.GetDrives()
+        |> Array.filter (fun drive ->
+            let root = drive.RootDirectory.FullName
+            String.Equals(directory, root.TrimEnd(Path.DirectorySeparatorChar), StringComparison.Ordinal)
+            || directory.StartsWith(root.TrimEnd(Path.DirectorySeparatorChar) + string Path.DirectorySeparatorChar, StringComparison.Ordinal))
+        |> Array.sortByDescending (fun drive -> drive.RootDirectory.FullName.Length)
+        |> Array.tryHead
+        |> Option.map (fun drive -> drive.AvailableFreeSpace)
+    let quotaMessage = "TelemetryQuotaExceeded: diagnostic disk budget reached; optional retention maintenance required."
+    let maintenanceRequired reason = invalidOp ("TelemetryMaintenanceRequired: " + reason)
+    let maintain () =
+        let main, total = measure()
+        if not (File.Exists databasePath) then
+            if total > 0L then maintenanceRequired "database absent with existing sidecars; operator inspection required."
+            else releasePressure main total
+        elif not pressure then
+            let now = DateTimeOffset.UtcNow
+            if now - lastRoutinePrune >= TimeSpan.FromHours 1. then
+                getDatabase().PruneTelemetry(now)
+                lastRoutinePrune <- now
+        else
+            // Never create a replacement DB or manually delete a SQLite sidecar.
+            // Limit legacy compaction to one configured disk budget, with
+            // explicit temporary free-space admission and a progress deadline.
+            if main > diskBudget || total - diskBudget > diskBudget then
+                maintenanceRequired $"legacy footprint exceeds bounded reclamation envelope (main={main}, aggregate={total} bytes); operator archival required."
+            match freeSpace() with
+            | Some available when available >= min total diskBudget + diskBudget / 4L -> ()
+            | _ -> maintenanceRequired "insufficient verified free space for safe checkpoint and retention."
+            let builder = SqliteConnectionStringBuilder()
+            builder.DataSource <- databasePath
+            builder.Mode <- SqliteOpenMode.ReadWrite
+            builder.Cache <- SqliteCacheMode.Private
+            builder.Pooling <- false
+            builder.DefaultTimeout <- 1
+            use connection = new SqliteConnection(builder.ToString())
+            connection.Open()
+            let started = Stopwatch.GetTimestamp()
+            SQLitePCL.raw.sqlite3_progress_handler(
+                connection.Handle, 1000,
+                SQLitePCL.delegate_progress(fun _ ->
+                    if Stopwatch.GetElapsedTime(started) > TimeSpan.FromSeconds 2. then 1 else 0), null)
+            let scalar sql =
+                use command = connection.CreateCommand()
+                command.CommandText <- sql
+                Convert.ToInt64(command.ExecuteScalar())
+            let exec sql =
+                use command = connection.CreateCommand()
+                command.CommandText <- sql
+                command.ExecuteNonQuery()
+            let checkpoint () =
+                use command = connection.CreateCommand()
+                command.CommandText <- "PRAGMA wal_checkpoint(TRUNCATE);"
+                use reader = command.ExecuteReader()
+                if not (reader.Read()) || reader.GetInt32(0) <> 0 then
+                    maintenanceRequired "WAL checkpoint blocked by another SQLite connection; retry after it releases."
+            // Confirm the expected schema before maintenance. Only two
+            // expendable tables may be pruned; protected feedback and activity
+            // rows (and operation links retained by feedback) are untouched.
+            if scalar "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('operations','connection_events','feedback');" <> 3L then
+                maintenanceRequired "diagnostic schema is unavailable; operator inspection required."
+            checkpoint()
+            let currentMain, currentTotal = measure()
+            releasePressure currentMain currentTotal
+            if not pressure then ()
+            else
+                if currentMain > diskBudget || (currentTotal >= diskBudget && currentTotal - currentMain > diskBudget / 4L) then
+                    maintenanceRequired "database or sidecars remain above bounded maintenance headroom after checkpoint."
+                let pageSize = scalar "PRAGMA page_size;"
+                let pageCount = scalar "PRAGMA page_count;"
+                scalar $"PRAGMA max_page_count = {max pageCount (databaseBudget / pageSize)};" |> ignore
+                exec "PRAGMA foreign_keys = ON;" |> ignore
+                scalar "PRAGMA wal_autocheckpoint = 64;" |> ignore
+                // One pass is bounded; the recurring worker can continue over
+                // subsequent passes. Oldest optional rows go first even if
+                // the normal 30-day horizon has not been reached.
+                use transaction = connection.BeginTransaction()
+                let delete sql =
+                    use command = connection.CreateCommand()
+                    command.Transaction <- transaction
+                    command.CommandText <- sql
+                    command.ExecuteNonQuery()
+                let deletedEvents =
+                    delete "DELETE FROM connection_events WHERE rowid IN (SELECT rowid FROM connection_events ORDER BY created_at, rowid LIMIT 128);"
+                let deletedOperations =
+                    delete "DELETE FROM operations WHERE rowid IN (SELECT o.rowid FROM operations o WHERE NOT EXISTS (SELECT 1 FROM feedback f WHERE f.operation_id=o.id) ORDER BY o.created_at, o.rowid LIMIT 128);"
+                transaction.Commit()
+                checkpoint()
+                let usedBytes = (scalar "PRAGMA page_count;" - scalar "PRAGMA freelist_count;") * pageSize
+                let beforeCompact, _ = measure()
+                if pressure && beforeCompact >= recoverMain && usedBytes < recoverMain then
+                    // VACUUM is transactional, but SQLite may need roughly two
+                    // database sizes of temporary space. Keep an extra budget
+                    // free and never attempt compaction without this evidence.
+                    match freeSpace() with
+                    | Some available when available >= 2L * beforeCompact + diskBudget ->
+                        exec "VACUUM;" |> ignore
+                        checkpoint()
+                    | _ -> maintenanceRequired "insufficient verified free disk space for safe compaction."
+                let afterMain, afterTotal = measure()
+                releasePressure afterMain afterTotal
+                if pressure && deletedEvents + deletedOperations = 0 then
+                    let feedbackBytes =
+                        try
+                            scalar "SELECT COALESCE(SUM(pgsize),0) FROM dbstat WHERE name IN (SELECT name FROM sqlite_master WHERE tbl_name='feedback');"
+                            |> string
+                        with :? SqliteException -> "unavailable (dbstat)"
+                    maintenanceRequired $"no eligible telemetry remains; main={afterMain} bytes, aggregate={afterTotal} bytes, allocated live pages={usedBytes} bytes, feedback pages and indexes={feedbackBytes} bytes. Protected feedback/activity or schema require an operator archival decision."
+                elif pressure then
+                    maintenanceRequired $"bounded retention pass incomplete; main={afterMain} bytes, aggregate={afterTotal} bytes; retry maintenance."
     let unavailable = "TelemetryUnavailable: optional server SQLite is disabled, busy, or unresponsive."
     // A persisted row cannot prove complete observation: writes can be dropped,
     // including just before a server restart. Only a successful write during
@@ -79,20 +220,45 @@ type OptionalFeedbackStore(databasePath: string, ?timeout: TimeSpan, ?maxDiskByt
              String.IsNullOrWhiteSpace agent)
         && user.Length <= 512 && project.Length <= 256 && agent.Length <= 128
     let timedOut = "TelemetryUnavailable: SQLite timed out; diagnostic outcome unknown."
-    let execute (operation: FeedbackStore -> 'T) : Result<'T, string> =
-        try
-            // Neither filesystem inspection nor lazy SQLite initialization runs
-            // on an ingress thread. Every physical operation shares these quotas.
-            if fileBytes databasePath >= databaseBudget ||
-               diagnosticBytes() >= diskBudget then
-                invalidOp "TelemetryQuotaExceeded: diagnostic disk budget reached."
-            Ok(operation database.Value)
+    let executePhysical (operation: unit -> 'T) : Result<'T, string> =
+        try Ok(operation())
         with
         | :? TimeoutException -> Error timedOut
+        | :? SqliteException as ex when ex.SqliteErrorCode = 13 ->
+            markPressure()
+            Error quotaMessage
+        | :? SqliteException as ex ->
+            Error($"TelemetryUnavailable: SQLite error {ex.SqliteErrorCode}/{ex.SqliteExtendedErrorCode}.")
         | :? InvalidOperationException as ex when
-            ex.Message.StartsWith("TelemetryQuotaExceeded:", StringComparison.Ordinal) ->
+            ex.Message.StartsWith("TelemetryQuotaExceeded:", StringComparison.Ordinal) ||
+            ex.Message.StartsWith("TelemetryMaintenanceRequired:", StringComparison.Ordinal) ->
             Error ex.Message
         | ex -> Error("TelemetryUnavailable: " + ex.GetType().Name)
+    let execute (operation: FeedbackStore -> 'T) =
+        executePhysical (fun () ->
+            let main, total = measure()
+            if main >= databaseBudget || total >= diskBudget then invalidOp quotaMessage
+            operation (getDatabase()))
+    let executePost operation =
+        executePhysical (fun () ->
+            measure() |> ignore
+            if pressure then invalidOp quotaMessage
+            operation (getDatabase()))
+    let executeMaintenance () =
+        let result = executePhysical maintain
+        match result with
+        | Ok () ->
+            lastMaintenanceFault <- ""
+            Volatile.Write(&storageStatus, if pressure then "Pressure" else "Healthy")
+        | Error reason ->
+            Volatile.Write(&storageStatus, "MaintenanceRequired")
+            // Details are server-local, not exposed to another user's MCP
+            // request. Do not log row contents or raw SQLite error messages.
+            if reason <> lastMaintenanceFault then
+                lastMaintenanceFault <- reason
+                try logger.LogWarning("Optional diagnostic maintenance: {Reason}", reason)
+                with _ -> ()
+        result
 
     // A shared worker must not inherit the first request's AsyncLocals for
     // later observations. Diagnostics may legitimately need their own request
@@ -178,10 +344,10 @@ type OptionalFeedbackStore(databasePath: string, ?timeout: TimeSpan, ?maxDiskByt
     // underlying FeedbackStore timer is disabled for this wrapper.
     let pruneTimer =
         new Timer(TimerCallback(fun _ ->
-            this.TryPost(fun db -> db.PruneTelemetry(DateTimeOffset.UtcNow))),
-            null, TimeSpan.FromHours 1.0, TimeSpan.FromHours 1.0)
+            this.PostMaintenance()),
+            null, TimeSpan.FromMinutes 1.0, TimeSpan.FromMinutes 1.0)
 
-    member _.TryExecute<'T>(operation: FeedbackStore -> 'T) : Task<Result<'T, string>> =
+    member private _.TryExecuteCore<'T>(operation: unit -> Result<'T, string>) : Task<Result<'T, string>> =
         task {
             let completion = TaskCompletionSource<Result<'T, string>>(TaskCreationOptions.RunContinuationsAsynchronously)
             let admitted =
@@ -189,7 +355,7 @@ type OptionalFeedbackStore(databasePath: string, ?timeout: TimeSpan, ?maxDiskByt
                     if disposed || String.IsNullOrWhiteSpace databasePath || active.IsSome then false
                     else
                         startLocked (diagnosticWork (fun () ->
-                            let result = execute operation
+                            let result = operation()
                             fun () -> completion.TrySetResult(result) |> ignore))
                         true)
             if not admitted then return Error unavailable
@@ -198,22 +364,60 @@ type OptionalFeedbackStore(databasePath: string, ?timeout: TimeSpan, ?maxDiskByt
                 with :? TimeoutException -> return Error timedOut
         }
 
+    member this.TryExecute<'T>(operation: FeedbackStore -> 'T) =
+        this.TryExecuteCore(fun () -> execute operation)
+
+    /// Existing history is opened read-only, independently of write quota
+    /// and schema initialization. A missing or corrupt DB remains unavailable.
+    member this.TryRead<'T>(operation: FeedbackStore -> 'T) =
+        this.TryExecuteCore(fun () -> executePhysical(fun () ->
+            // Size inspection is not a prerequisite for reading history.
+            try measure() |> ignore with _ -> ()
+            operation readDatabase.Value))
+
+    /// Explicit single-flight maintenance for deterministic callers/tests.
+    /// The timer uses the same physical operation; never release a timed-out slot.
+    member this.TryMaintain() =
+        this.TryExecuteCore executeMaintenance
+
+    /// No SQLite access or tenant-specific data on this status read.
+    member _.StorageStatus = Volatile.Read(&storageStatus)
+
     /// Best-effort diagnostics retain immediate, nonwaiting admission. While
     /// activity owns the worker, reserve at most one posted operation for its
     /// next turn. Further posts (and posts during diagnostics) are dropped as
     /// before. An expired reservation is not executed later.
-    member _.TryPost(operation: FeedbackStore -> unit) =
+    member private _.PostWork(operation: unit -> unit) =
         lock activityGate (fun () ->
             if not disposed && not (String.IsNullOrWhiteSpace databasePath) then
                 let admittedAt = Stopwatch.GetTimestamp()
                 let work () = diagnosticWork (fun () ->
                     if Stopwatch.GetElapsedTime(admittedAt) <= deadline then
-                        execute operation |> ignore
+                        operation()
                     ignore)
                 match active, pendingPost with
                 | None, _ -> startLocked (work())
                 | Some Activity, None -> pendingPost <- Some(work())
                 | _ -> ())
+
+    member this.TryPost(operation: FeedbackStore -> unit) =
+        this.PostWork(fun () -> executePost operation |> ignore)
+
+    /// Retention is not an expendable request post. Reserve the existing
+    /// single pending diagnostic slot even during another diagnostic; replace
+    /// an expendable reservation if needed. No additional queue or worker and
+    /// no request deadline that could discard scheduled recovery under load.
+    member _.PostMaintenance() =
+        lock activityGate (fun () ->
+            if not disposed && not (String.IsNullOrWhiteSpace databasePath) then
+                let work =
+                    { Kind = Diagnostic
+                      Execute = fun () ->
+                          executeMaintenance() |> ignore
+                          ignore }
+                match active with
+                | None -> startLocked work
+                | Some _ -> pendingPost <- Some work)
 
     /// Invalidate synchronously, before dispatch, even if storage is unavailable.
     /// The returned task is only a bounded best-effort wait, never proof. A

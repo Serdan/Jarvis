@@ -146,3 +146,44 @@ The second bounded increment 872139fa260e4c1c1f1dfea06514f3212f31ee40 was indepe
 Job 841cb21308494e8cb0e32028776c7623 completed exit 0; 2/2 focused cases passed, 8 s test duration, TRX system-properties-checkpoint-race.trx. Command: `dotnet test tests/AutomationSystemProperties20261124/AutomationSystemProperties20261124.fsproj -c Release --filter FullyQualifiedName~CheckpointAndRecoveryCompeteForCapturedVersion --logger "trx;LogFileName=system-properties-checkpoint-race.trx" --results-directory /tmp/jarvis-w20-system-properties`. Actual Client and Server references rebuilt on pinned base. This is staged evidence, not a fresh full-suite or final composition pass.
 
 Upstream main verified via ls-remote at 45825a2aee0699fc110134bafc153be789eb1c36; initial test increment integrated, producer semantics still unchanged from the original pinned source. Existing-auth account source ea25c1584102fc8796ee15f04219836fb6b8d75c (review bd902f0af91443a7b9b68e1037f49c51 Accepted) and original-bound no-send source 6bb5998af609014fc0c4c69c501f028d827dead2 (review 6c12d587232b4b13a416ab2dac1f70f5 Accepted) are not published on main. W12 account attempt Blocked, W23 no-send issuer Finished, W16 host and W19 runtime Started. Do not merge their independent production source into the test-only lease or claim final composition. Next rebind AccountFixture after the accepted coordinated producer/consumer composition is available: normal `setNativeRosterPolicy/readNativeRosterPolicy`, `readVerified/reserve/transition/readOriginal/releaseNoSend/release` (internal existing-auth seams accessible via the existing Client.Tests friend assembly). Reuse the expected original-candidate and occupancy oracle, replace signing entirely, use real project effect exclusion/terminal issuer and provider boundary, then rebind host wake to actual planner/dispatch. Component account source pin and driver must be coordinated with their owner; preserve exact historical evidence, never bypass the pin. No additional test investment in obsolete signing.
+
+## Frozen Stage C existing-auth incremental adaptation
+
+This test-only increment depends on the unaccepted frozen Stage C composition
+19378518c5469b1dda8eeaa9b2cd9e3f7d2f8c82, which contains accepted W12
+f94bbceff4203538c7fc70add7c1d50d8bca598d and W23
+6bb5998af609014fc0c4c69c501f028d827dead2 as ancestors. It cannot compile
+against the older pinned production base until that dependency is composed.
+It is not evidence that Stage C has been accepted or published.
+
+AccountFixture now uses existing authenticated native roster, reservation,
+project claim and original-bound transition APIs instead of disposable signing.
+The preserved independent account oracle compares original candidate/operation,
+generation, fence, session, state, per-project and account occupancy across two
+real disposable clones and mixed Health/Challenge histories. Wrong original,
+effect, fence, session and forged terminal are negative controls. Test-owned
+fixture reads the original immutable reserve receipt; no fabricated account
+authority or actual provider sends are used.
+
+NoSendReleasePreservesChallengeAndCapacity seeds 401/402 exercise original
+reservation, real preclaim exclusion transaction, rejection of forged evidence,
+account release and idempotent replay, denial of the old claim after release,
+blocked work denial with available capacity, stale Health check while blocked,
+challenge resolution and subsequent capacity reuse. Compare actual account
+snapshots with a separate expected status map after each settled stage.
+NativeProjectEffectTransition.fs is linked into the test assembly as in the
+frozen HostTests project: this exercises the real planner code and Git CAS,
+not a production-wired issuer. The fixed guided histories are incremental,
+not a substitute for generated send-versus-exclusion interleavings, shrinking,
+provider/host dispatch, or final exact published composition execution.
+
+Job 4ecd01890fef4589902d76c52736552c: 2/2 no-send cases passed, 41s,
+before the additional stale Health check. Job c5118e7706da4213bfad2464001e21a8
+failed both existing-account cases at a test fixture null dereference for the
+intentional wrong original. This was a fixture bug: preserve the real original
+receipt while supplying the incorrect original UUID to the consumer. Corrected
+runs and final no-send extension must be recorded from terminal results.
+
+Job d4243864662b4ab893f44f1d0cba4657: 2/2 no-send and blocked-Health cases passed in 46s, exit 0 on the final test source copied over frozen Stage C. The final account-occupancy rerun remains separately tracked.
+
+Job dfe223cfeac54e439f176ffe9408777e: corrected existing-auth occupancy histories 2/2 passed, 3m52s, exit 0. This run used the corrected adapter and pre-Health-check revision of the new separate no-send test; no-send final revision was separately run as above. These staged results are not a full-suite run.

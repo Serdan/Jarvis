@@ -7,6 +7,7 @@
     <IsPackable>false</IsPackable>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="../../Client/Modules/NativeProjectEffectTransition.fs" Link="NativeProjectEffectTransition.fs" />
     <Compile Include="../AutomationHealthHosted20261123/GitFixture.fs" Link="GitFixture.fs" />
     <Compile Include="AccountFixture.fs" />
     <Compile Include="ActivityFixture.fs" />

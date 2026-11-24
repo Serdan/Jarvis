@@ -155,9 +155,43 @@ Feedback must never be linked to another user.
 
 ## Retention
 
-No automatic deletion in the first implementation.
+The optional server SQLite store is not a canonical command receipt or project ledger.
+Routine age-based retention removes up to 128 expired operation rows and 128
+connection events at startup/hourly (30-day horizon); linked feedback survives
+normal operation expiry. Explicit feedback and attributed activity rows are
+never deleted by quota maintenance.
 
-The schema includes timestamps so retention can be added later without migration difficulty. The database should be backed up with the rest of server state.
+The default limits remain 16 MiB of SQLite database pages and 32 MiB combined
+main DB, WAL, SHM and rollback journal files. The constructor's smaller
+test/host-supplied budget also reduces the main page ceiling to at most half
+the aggregate limit. These are write-admission limits, not a filesystem quota:
+an already admitted SQLite transaction can temporarily grow its sidecars.
+
+- At 80% of either limit, new expendable operation/connection posts are shed.
+  Explicit feedback/activity writes remain subject to the hard limits and
+  activity proof still fails closed on missed or late writes.
+- At the hard limits, new write admission fails with `TelemetryQuotaExceeded`.
+  Existing history and feedback reads use read-only SQLite without initializing
+  a missing database. The authenticated connection diagnostic response always
+  includes process-local device state, with `historyUnavailable` populated if
+  persisted events cannot be read.
+- Each minute, the existing single physical worker can attempt one bounded
+  pressure pass. It checkpoints WAL, deletes at most 128 oldest connection
+  events and 128 oldest unlinked operations, then checkpoints again. When
+  live pages fit below the recovery watermark, transactional VACUUM can reclaim
+  physical pages. Admission checks filesystem free space and refuses a legacy
+  main file over one aggregate budget or a total over twice that budget.
+  The SQLite busy timeout is one second and a two-second VM progress budget
+  bounds SQL work; an uninterruptible I/O stall retains the single worker.
+  Expendable writes resume below both 65% watermarks.
+- `storageStatus` reports coarse pressure/maintenance state; server-local
+  warnings record precise aggregate/live-page and protected feedback footprint
+  where SQLite dbstat is available. A blocked checkpoint or incomplete pass
+  retries on a later maintenance turn. Protected-only saturation, corrupt or
+  unsupported legacy files, or inadequate free space require an operator
+  decision. Do not delete SQLite sidecars or feedback to clear the error.
+
+For recovery, see [diagnostic quota recovery](diagnostic-quota-recovery.md).
 
 ## Tasks
 

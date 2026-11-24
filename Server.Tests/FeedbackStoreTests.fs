@@ -8,6 +8,8 @@ open System.Text.Json.Nodes
 open System.Text.Json
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Http
+open Microsoft.Extensions.DependencyInjection
+open Microsoft.Extensions.Options
 open NUnit.Framework
 open FsUnitTyped
 open Server
@@ -555,3 +557,48 @@ let failedAgentActivityPersistencePoisonsVerificationUntilSuccessfulRepair () =
                     Is.EqualTo(Some(first.AddMinutes(4.))))
     finally
         Directory.Delete(directory, true)
+
+
+[<Test>]
+let ``connection diagnostics retain current authenticated device state when optional history is unavailable`` () = task {
+    let users = UserService()
+    let register user id =
+        let registration : Common.SignalR.ClientRegistration =
+            { DeviceId = id; DeviceName = id; ProtocolVersion = Common.AgentProtocol.version
+              ClientVersion = "test"; SupportedCommands = [ "ListProjects" ] }
+        users.TransportConnected(user, id + "-connection")
+        users.Register(user, registration, id + "-connection") |> ignore
+    register "alice" "alice-device"
+    register "bob" "bob-device"
+    let directory = Path.Combine(Path.GetTempPath(), "jarvis-diagnostics-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(directory) |> ignore
+    try
+        let corruptPath = Path.Combine(directory, "corrupt.db")
+        File.WriteAllBytes(corruptPath, Array.create 1024 1uy)
+        for path in [ ""; Path.Combine(directory, "absent.db"); corruptPath ] do
+            use host = new OptionalFeedbackStore(path, timeout = TimeSpan.FromSeconds 2.)
+            let accessor = authenticatedAccessor "alice"
+            let! response = McpToolHelpers.getConnectionDiagnostics host users accessor (Nullable 10)
+            Assert.That(response.IsError, Is.EqualTo(Nullable false))
+            let body = (response.Content[0] :?> ModelContextProtocol.Protocol.TextContentBlock).Text
+            use json = JsonDocument.Parse(body)
+            Assert.That(json.RootElement.GetProperty("devices").GetArrayLength(), Is.EqualTo(1))
+            let device = json.RootElement.GetProperty("devices").[0]
+            Assert.That(device.GetProperty("deviceId").GetString(), Is.EqualTo("alice-device"))
+            Assert.That(json.RootElement.GetProperty("events").GetArrayLength(), Is.Zero)
+            Assert.That(json.RootElement.GetProperty("historyUnavailable").GetString(), Is.Not.Empty)
+            Assert.That(body, Does.Not.Contain("bob-device"))
+            let! invalid = McpToolHelpers.getConnectionDiagnostics host users accessor (Nullable 101)
+            Assert.That(invalid.IsError, Is.EqualTo(Nullable true))
+            let options =
+                { Auth0Domain = "example.auth0.com"; Audience = "https://example.invalid"
+                  OpenAIAppsChallenge = ""; EnableOperatorConversations = false }
+            use services = ServiceCollection().AddSingleton<IOptions<JarvisOptions>>(Options.Create(options)).BuildServiceProvider()
+            let anonymous = HttpContextAccessor()
+            anonymous.HttpContext <- DefaultHttpContext(RequestServices = services)
+            let! unauthenticated = McpToolHelpers.getConnectionDiagnostics host users anonymous (Nullable 10)
+            Assert.That(unauthenticated.IsError, Is.EqualTo(Nullable true))
+        Assert.That(File.Exists(Path.Combine(directory, "absent.db")), Is.False)
+    finally
+        Directory.Delete(directory, true)
+}

@@ -240,3 +240,195 @@ VALUES('2020-01-01T00:00:00.0000000+00:00','alice','Disconnect','expired-{i}');
             Assert.That(rowCount "connection_events", Is.EqualTo(remaining))
     finally
         Directory.Delete(directory, true)
+
+
+let private footprint path =
+    [| path; path + "-wal"; path + "-shm"; path + "-journal" |]
+    |> Array.sumBy (fun file -> if File.Exists file then FileInfo(file).Length else 0L)
+
+let private insertLargeEvents path count =
+    use connection = new SqliteConnection($"Data Source={path};Pooling=False")
+    connection.Open()
+    use transaction = connection.BeginTransaction()
+    use insert = connection.CreateCommand()
+    insert.Transaction <- transaction
+    insert.CommandText <-
+        """INSERT INTO connection_events(created_at,user_id,event_type,connection_id,error_message)
+           VALUES($created,'alice','Disconnect',$id,$message);"""
+    let created = insert.Parameters.Add("$created", SqliteType.Text)
+    let id = insert.Parameters.Add("$id", SqliteType.Text)
+    insert.Parameters.AddWithValue("$message", String('x', 4000)) |> ignore
+    for i in 1 .. count do
+        created.Value <- DateTimeOffset.UtcNow.AddMinutes(float (i - count - 1)).ToString("O")
+        id.Value <- string i
+        insert.ExecuteNonQuery() |> ignore
+    transaction.Commit()
+    use checkpoint = connection.CreateCommand()
+    checkpoint.CommandText <- "PRAGMA wal_checkpoint(TRUNCATE);"
+    use reader = checkpoint.ExecuteReader()
+    Assert.That(reader.Read(), Is.True)
+    Assert.That(reader.GetInt32(0), Is.Zero)
+
+[<Test>]
+let saturatedMainFileAllowsHistoryAndReclaimsAfterRestartWithoutDeletingProtectedRows () = task {
+    let directory = tempDirectory()
+    let path = Path.Combine(directory, "saturated.db")
+    let budget = 1024L * 1024L
+    try
+        let feedbackId =
+            use seed = new FeedbackStore(path, runPruneTimer = false)
+            let operation = seed.BeginOperation("alice", "ListProjects", None, "1", None, None)
+            let input =
+                { ProjectName = None; ToolName = None; Category = "Other"; Severity = "Info"
+                  Summary = "protected report"; Details = Some "preserve"; Workaround = None; OperationId = None }
+            let feedback = seed.AddFeedback("alice", input, Some operation.Id)
+            seed.RecordAttributedAgentActivity("alice", "Jarvis", "Worker", DateTimeOffset.UtcNow)
+            feedback.Id
+        insertLargeEvents path 160
+        Assert.That(FileInfo(path).Length, Is.GreaterThan(budget / 2L))
+        Assert.That(FileInfo(path).Length, Is.LessThan(budget))
+        // First process hits the hard limit, but history is still readable.
+        do
+            use first = new OptionalFeedbackStore(path, maxDiskBytes = budget, timeout = TimeSpan.FromSeconds 5.)
+            let rejected = first.TryExecute(fun db -> db.BeginOperation("alice", "ListProjects", None, "1", None, None)).GetAwaiter().GetResult()
+            Assert.That(rejected.IsError, Is.True)
+            let history = first.TryRead(fun db -> db.ListConnectionEvents("alice", 10)).GetAwaiter().GetResult()
+            match history with
+            | Ok events -> Assert.That(events.Length, Is.EqualTo(10))
+            | Error reason -> Assert.Fail(reason)
+        // Restart retains the on-disk saturated state and can reclaim it.
+        use restarted = new OptionalFeedbackStore(path, maxDiskBytes = budget, timeout = TimeSpan.FromSeconds 5.)
+        // Scheduled recovery must reserve the single diagnostic slot even
+        // when another diagnostic occupies the worker, rather than starve.
+        use entered = new ManualResetEventSlim(false)
+        use release = new ManualResetEventSlim(false)
+        let busy = restarted.TryRead(fun _ ->
+            entered.Set()
+            release.Wait(TimeSpan.FromSeconds 5.) |> ignore)
+        try
+            Assert.That(entered.Wait(TimeSpan.FromSeconds 3.), Is.True)
+            restarted.PostMaintenance()
+        finally
+            release.Set()
+        let! busyResult = busy
+        Assert.That(busyResult.IsOk, Is.True)
+        let watch = Stopwatch.StartNew()
+        while restarted.StorageStatus <> "Healthy" && watch.Elapsed < TimeSpan.FromSeconds 5. do
+            do! Task.Delay(10)
+        Assert.That(restarted.StorageStatus, Is.EqualTo("Healthy"))
+        Assert.That(FileInfo(path).Length, Is.LessThan(budget / 2L * 13L / 20L))
+        Assert.That(footprint path, Is.LessThan(budget * 13L / 20L))
+        let! retained = restarted.TryRead(fun db ->
+            db.GetFeedback("alice", feedbackId), db.ListConnectionEvents("alice", 100))
+        match retained with
+        | Ok (Some feedback, events) ->
+            Assert.That(feedback.Summary, Is.EqualTo("protected report"))
+            Assert.That(feedback.OperationId, Is.Not.Empty)
+            Assert.That(events.Length, Is.EqualTo(32))
+        | _ -> Assert.Fail(string retained)
+        let! write = restarted.TryExecute(fun db -> db.BeginOperation("alice", "ListProjects", None, "1", None, None))
+        Assert.That(write.IsOk, Is.True, string write)
+        let! activity = restarted.TryRead(fun db -> db.GetAttributedAgentActivity("alice", "Jarvis", "Worker"))
+        match activity with
+        | Ok (Some _) -> ()
+        | _ -> Assert.Fail(string activity)
+    finally
+        Directory.Delete(directory, true)
+}
+
+[<Test>]
+let protectedOnlySaturationReportsMaintenanceRequiredAndLeavesFeedbackReadable () = task {
+    let directory = tempDirectory()
+    let path = Path.Combine(directory, "protected.db")
+    let budget = 1024L * 1024L
+    try
+        let ids =
+            use seed = new FeedbackStore(path, runPruneTimer = false)
+            [| for i in 1 .. 85 do
+                let input =
+                    { ProjectName = None; ToolName = None; Category = "Other"; Severity = "Info"
+                      Summary = string i; Details = Some(String('p', 8192)); Workaround = None; OperationId = None }
+                yield (seed.AddFeedback("alice", input, None)).Id |]
+        use host = new OptionalFeedbackStore(path, maxDiskBytes = budget, timeout = TimeSpan.FromSeconds 5.)
+        let! outcome = host.TryMaintain()
+        match outcome with
+        | Error reason ->
+            Assert.That(reason, Does.Contain("no eligible telemetry remains"))
+            Assert.That(reason, Does.Contain("feedback pages and indexes="))
+            Assert.That(host.StorageStatus, Is.EqualTo("MaintenanceRequired"))
+        | Ok () -> Assert.Fail("Protected data must not be purged to make room.")
+        let! reports = host.TryRead(fun db -> ids |> Array.map (fun id -> db.GetFeedback("alice", id)))
+        match reports with
+        | Ok entries -> Assert.That(entries |> Array.forall Option.isSome, Is.True)
+        | Error reason -> Assert.Fail(reason)
+    finally
+        Directory.Delete(directory, true)
+}
+
+[<Test>]
+let realWalSaturationShedsPostsAndRecoversAfterReaderReleases () = task {
+    let directory = tempDirectory()
+    let path = Path.Combine(directory, "wal-pressure.db")
+    let budget = 1024L * 1024L
+    try
+        use seed = new FeedbackStore(path, runPruneTimer = false)
+        use readerConnection = new SqliteConnection($"Data Source={path};Pooling=False")
+        readerConnection.Open()
+        use readTransaction = readerConnection.BeginTransaction(deferred = true)
+        use readCommand = readerConnection.CreateCommand()
+        readCommand.Transaction <- readTransaction
+        readCommand.CommandText <- "SELECT COUNT(*) FROM connection_events;"
+        readCommand.ExecuteScalar() |> ignore
+        use writer = new SqliteConnection($"Data Source={path};Pooling=False")
+        writer.Open()
+        use insert = writer.CreateCommand()
+        insert.CommandText <- """INSERT INTO connection_events(created_at,user_id,event_type,connection_id,error_message)
+                                 VALUES('2026-11-20T00:00:00.0000000+00:00','alice','Disconnect','x',hex(randomblob(2000)));"""
+        // A real pinned WAL, not synthetic bytes. Repeated committed writes
+        // inflate the WAL while the main file remains small.
+        let mutable writes = 0
+        while footprint path < budget && writes < 300 do
+            insert.ExecuteNonQuery() |> ignore
+            writes <- writes + 1
+        Assert.That(footprint path, Is.GreaterThanOrEqualTo(budget))
+        Assert.That(FileInfo(path).Length, Is.LessThan(budget / 2L))
+        // A crash image: with no concurrent writer, copy the stable main/WAL
+        // pair, not SHM (a restarted process reconstructs its WAL index).
+        // This intentionally simulates uncheckpointed committed WAL after
+        // process loss without touching any non-test database.
+        let crashPath = Path.Combine(directory, "crash-image.db")
+        File.Copy(path, crashPath)
+        File.Copy(path + "-wal", crashPath + "-wal")
+        use crashRestart = new OptionalFeedbackStore(crashPath, maxDiskBytes = budget, timeout = TimeSpan.FromSeconds 5.)
+        let! crashHistory = crashRestart.TryRead(fun db -> db.ListConnectionEvents("alice", 100))
+        match crashHistory with
+        | Ok events -> Assert.That(events.Length, Is.EqualTo(min writes 100))
+        | Error reason -> Assert.Fail(reason)
+        let! crashRecovered = crashRestart.TryMaintain()
+        Assert.That(crashRecovered.IsOk, Is.True, string crashRecovered)
+        Assert.That(footprint crashPath, Is.LessThan(budget * 13L / 20L))
+        use host = new OptionalFeedbackStore(path, maxDiskBytes = budget, timeout = TimeSpan.FromSeconds 5.)
+        let! history = host.TryRead(fun db -> db.ListConnectionEvents("alice", 10))
+        Assert.That(history.IsOk, Is.True, string history)
+        use executed = new ManualResetEventSlim(false)
+        host.TryPost(fun _ -> executed.Set())
+        // Wait for the posted worker to release its physical slot.
+        let watch = Stopwatch.StartNew()
+        let mutable idle = false
+        while not idle && watch.Elapsed < TimeSpan.FromSeconds 3. do
+            let! available = host.TryRead(fun db -> db.ListConnectionEvents("alice", 1))
+            idle <- available.IsOk
+            if not idle then do! Task.Delay(10)
+        Assert.That(idle, Is.True)
+        Assert.That(executed.IsSet, Is.False)
+        let! blocked = host.TryMaintain()
+        Assert.That(blocked.IsError, Is.True)
+        readTransaction.Rollback()
+        let! resumed = host.TryMaintain()
+        Assert.That(resumed.IsOk, Is.True, string resumed)
+        Assert.That(footprint path, Is.LessThan(budget * 13L / 20L))
+        let! write = host.TryExecute(fun db -> db.BeginOperation("alice", "ListProjects", None, "1", None, None))
+        Assert.That(write.IsOk, Is.True, string write)
+    finally
+        Directory.Delete(directory, true)
+}

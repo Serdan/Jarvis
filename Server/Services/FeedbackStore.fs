@@ -103,7 +103,8 @@ module FeedbackValidation =
     let isClosed value = value = "Resolved" || value = "WontFix"
 
 type FeedbackStore(databasePath: string, ?telemetryRetention: TimeSpan, ?runPruneTimer: bool,
-                   ?maxDatabaseBytes: int64) =
+                   ?maxDatabaseBytes: int64, ?readOnly: bool) =
+    let readOnly = defaultArg readOnly false
     let telemetryRetention = defaultArg telemetryRetention (TimeSpan.FromDays 30.0)
     do if telemetryRetention <= TimeSpan.Zero then invalidArg "telemetryRetention" "Must be positive"
     // This disposable diagnostics database cannot grow new SQLite pages indefinitely.
@@ -113,7 +114,7 @@ type FeedbackStore(databasePath: string, ?telemetryRetention: TimeSpan, ?runPrun
     let connectionString =
         let builder = SqliteConnectionStringBuilder()
         builder.DataSource <- databasePath
-        builder.Mode <- SqliteOpenMode.ReadWriteCreate
+        builder.Mode <- if readOnly then SqliteOpenMode.ReadOnly else SqliteOpenMode.ReadWriteCreate
         builder.Cache <- SqliteCacheMode.Shared
         // Best-effort diagnostics must never hold a SQLite lock indefinitely.
         builder.DefaultTimeout <- 1
@@ -135,28 +136,30 @@ type FeedbackStore(databasePath: string, ?telemetryRetention: TimeSpan, ?runPrun
 
     let openConnection () =
         let connection = new SqliteConnection(connectionString)
-        connection.Open()
-
-        use size = connection.CreateCommand()
-        size.CommandText <- "PRAGMA page_size;"
-        let pageSize = Convert.ToInt64(size.ExecuteScalar())
-        use pageLimit = connection.CreateCommand()
-        pageLimit.CommandText <- $"PRAGMA max_page_count = {max 1L (maxDatabaseBytes / pageSize)};"
-        pageLimit.ExecuteScalar() |> ignore
-        // Checkpoints keep WAL space small normally. A blocked checkpoint can
-        // outlive this limit, so OptionalFeedbackStore also checks sidecar sizes.
-        use checkpoint = connection.CreateCommand()
-        checkpoint.CommandText <- "PRAGMA wal_autocheckpoint = 64;"
-        checkpoint.ExecuteScalar() |> ignore
-        use journalLimit = connection.CreateCommand()
-        journalLimit.CommandText <- "PRAGMA journal_size_limit = 1048576;"
-        journalLimit.ExecuteScalar() |> ignore
-
-        use foreignKeys = connection.CreateCommand()
-        foreignKeys.CommandText <- "PRAGMA foreign_keys = ON;"
-        foreignKeys.ExecuteNonQuery() |> ignore
-
-        connection
+        try
+            connection.Open()
+            if not readOnly then
+                use size = connection.CreateCommand()
+                size.CommandText <- "PRAGMA page_size;"
+                let pageSize = Convert.ToInt64(size.ExecuteScalar())
+                use pageLimit = connection.CreateCommand()
+                pageLimit.CommandText <- $"PRAGMA max_page_count = {max 1L (maxDatabaseBytes / pageSize)};"
+                pageLimit.ExecuteScalar() |> ignore
+                // Checkpoints keep WAL space small normally. A blocked checkpoint can
+                // outlive this limit, so OptionalFeedbackStore also checks sidecar sizes.
+                use checkpoint = connection.CreateCommand()
+                checkpoint.CommandText <- "PRAGMA wal_autocheckpoint = 64;"
+                checkpoint.ExecuteScalar() |> ignore
+                use journalLimit = connection.CreateCommand()
+                journalLimit.CommandText <- "PRAGMA journal_size_limit = 1048576;"
+                journalLimit.ExecuteScalar() |> ignore
+                use foreignKeys = connection.CreateCommand()
+                foreignKeys.CommandText <- "PRAGMA foreign_keys = ON;"
+                foreignKeys.ExecuteNonQuery() |> ignore
+            connection
+        with _ ->
+            connection.Dispose()
+            reraise()
 
     let addParameter (command: SqliteCommand) name value =
         command.Parameters.AddWithValue(name, value) |> ignore
@@ -281,10 +284,11 @@ CREATE TABLE IF NOT EXISTS attributed_agent_activity (
             command.ExecuteNonQuery() |> ignore
         transaction.Commit()
 
-    do initialize()
-    do pruneTelemetry DateTimeOffset.UtcNow
+    do if not readOnly then
+           initialize()
+           pruneTelemetry DateTimeOffset.UtcNow
     let pruneTimer =
-        if defaultArg runPruneTimer true then
+        if not readOnly && defaultArg runPruneTimer true then
             Some(new Timer(TimerCallback(fun _ ->
                 try pruneTelemetry DateTimeOffset.UtcNow
                 with _ -> ()), null, TimeSpan.FromHours 1.0, TimeSpan.FromHours 1.0))

@@ -1546,6 +1546,7 @@ module LedgerStore =
     let listAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) (prefix: string) =
         if prefix <> "tasks" && prefix <> "agents" && prefix <> "notifications"
            && prefix <> "records/roles"
+           && not (Regex.IsMatch(prefix, "^records/integration-attributions/[A-Za-z0-9_-]{1,80}$"))
            && prefix <> "challenges"
            && not (Regex.IsMatch(prefix, "^tasks/[A-Za-z0-9_-]+/lifecycle$"))
            && not (Regex.IsMatch(prefix, "^challenges/[a-f0-9]{32}/events$"))
@@ -2582,6 +2583,42 @@ module LedgerStore =
                 | Ok true -> Ok ()
                 | Ok false -> Error(InvalidBinding "Source commit does not descend from the expected base.")
                 | Error error -> Error error
+
+
+    // Full raw tree delta, including mode changes and deletions. No pathspecs,
+    // rename inference, text conversion or caller-supplied object lookups.
+    // Only exact changed tree entries can establish constituent inclusion.
+    let reviewedTreeDelta (binding: LedgerBinding) baseCommit commit = result {
+        do! verifySourceAncestry binding baseCommit commit
+        do! ensureUnmodifiedGitHistory binding.RepositoryPath
+        let! tree = run binding.RepositoryPath [ "rev-parse"; "--verify"; commit + "^{tree}" ]
+        if not (validSourceCommitOid tree) then
+            return! Error(LedgerIntegrityError "Invalid reviewed source tree.")
+        let! raw =
+            gitRaw binding.RepositoryPath
+                [ "diff"; "--raw"; "--no-abbrev"; "--no-renames"; "--no-ext-diff"
+                  "--no-textconv"; "--ignore-submodules=none"; "-z"; baseCommit; commit; "--" ]
+            |> requireSuccess "inspect reviewed tree delta"
+        if String.IsNullOrEmpty raw then return tree, Map.empty
+        else
+            let parts = raw.Split('\u0000')
+            if parts.Length % 2 <> 1 || parts[parts.Length - 1] <> "" then
+                return! Error(LedgerIntegrityError "Incomplete raw reviewed tree delta.")
+            let mutable entries = Map.empty
+            for i in 0 .. 2 .. parts.Length - 3 do
+                let fields = parts[i].Split(' ')
+                let path = parts[i+1]
+                if fields.Length <> 5
+                   || not (Regex.IsMatch(fields[0], "^:[0-7]{6}$"))
+                   || not (Regex.IsMatch(fields[1], "^[0-7]{6}$"))
+                   || not (oidPattern.IsMatch fields[2] && oidPattern.IsMatch fields[3])
+                   || not (List.contains fields[4] [ "A"; "D"; "M"; "T" ])
+                   || String.IsNullOrEmpty path || path.Contains('\uFFFD')
+                   || Map.containsKey path entries then
+                    return! Error(LedgerIntegrityError "Malformed or ambiguous reviewed tree delta.")
+                entries <- Map.add path (fields[1] + ":" + fields[3]) entries
+            return tree, entries
+    }
 
     // A reviewed source remains immutable when the target advances. Only a
     // conflict-free Git merge of the exact reviewed source and target lineage

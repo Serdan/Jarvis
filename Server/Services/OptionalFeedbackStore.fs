@@ -2,19 +2,37 @@ namespace Server.Services
 
 open System
 open System.Collections.Generic
+open System.Diagnostics
 open System.IO
 open System.Threading
 open System.Threading.Tasks
 
+type private PendingActivity =
+    { Version: int64
+      ObservedAtUtc: DateTimeOffset
+      Completion: TaskCompletionSource<unit> }
+
 type private ActivityCoverage =
     { mutable Version: int64
-      mutable ConfirmedAtUtc: DateTimeOffset option }
+      mutable HighWaterUtc: DateTimeOffset
+      mutable ConfirmedAtUtc: DateTimeOffset option
+      mutable Pending: PendingActivity option }
+
+type private StoreWorkKind = Activity | Diagnostic
+
+// Execute performs physical work off the gate, returning its publication action.
+// Publication and the next reservation are serialized with ingress revocation.
+type private StoreWork =
+    { Kind: StoreWorkKind
+      Execute: unit -> (unit -> unit) }
 
 /// Optional, single-flight access to the disposable server diagnostics database.
 ///
 /// No filesystem or SQLite work occurs in the constructor or on an authenticated
 /// request/SignalR routing thread. A stuck database consumes at most one worker;
-/// later diagnostics fail immediately instead of piling up blocking SQLite calls.
+/// later diagnostic reads fail immediately. Activity has one coalescing slot
+/// per bounded authority key; a single posted diagnostic may take a turn
+/// between activity writes, without a general-purpose diagnostic queue.
 /// The underlying database is deliberately neither deleted nor migrated here.
 type OptionalFeedbackStore(databasePath: string, ?timeout: TimeSpan, ?maxDiskBytes: int64) as this =
     let deadline = defaultArg timeout (TimeSpan.FromMilliseconds 200.)
@@ -33,16 +51,24 @@ type OptionalFeedbackStore(databasePath: string, ?timeout: TimeSpan, ?maxDiskByt
         |> Array.sumBy fileBytes
     let database =
         lazy (new FeedbackStore(databasePath, runPruneTimer = false, maxDatabaseBytes = databaseBudget))
-    let mutable inFlight = 0
     let unavailable = "TelemetryUnavailable: optional server SQLite is disabled, busy, or unresponsive."
     // A persisted row cannot prove complete observation: writes can be dropped,
     // including just before a server restart. Only a successful write during
     // this process establishes coverage, revoked at each newer agent ingress.
     // The finite proof cache fails closed at capacity; it never blocks dispatch.
     let activityGate = obj()
-    let activityCoverage = Dictionary<struct (string * string * string), ActivityCoverage>()
+    let mutable activityCoverage = Dictionary<struct (string * string * string), ActivityCoverage>()
+    let mutable readyKeys = Queue<struct (string * string * string)>()
+    let mutable active: StoreWorkKind option = None
+    let mutable pendingPost: StoreWork option = None
+    let mutable disposed = false
     let maxActivityKeys = 16384
     let mutable activityCoverageExhausted = false
+    // Abandon exhausted slots in constant time under the ingress gate. Their
+    // bounded waits expire independently; GC can reclaim the abandoned graph.
+    let discardActivityLocked () =
+        activityCoverage <- Dictionary<_, _>()
+        readyKeys <- Queue<_>()
     let canonicalProject (project: string) =
         if isNull project then ""
         else
@@ -52,6 +78,102 @@ type OptionalFeedbackStore(databasePath: string, ?timeout: TimeSpan, ?maxDiskByt
         not (String.IsNullOrWhiteSpace user || String.IsNullOrWhiteSpace project ||
              String.IsNullOrWhiteSpace agent)
         && user.Length <= 512 && project.Length <= 256 && agent.Length <= 128
+    let timedOut = "TelemetryUnavailable: SQLite timed out; diagnostic outcome unknown."
+    let execute (operation: FeedbackStore -> 'T) : Result<'T, string> =
+        try
+            // Neither filesystem inspection nor lazy SQLite initialization runs
+            // on an ingress thread. Every physical operation shares these quotas.
+            if fileBytes databasePath >= databaseBudget ||
+               diagnosticBytes() >= diskBudget then
+                invalidOp "TelemetryQuotaExceeded: diagnostic disk budget reached."
+            Ok(operation database.Value)
+        with
+        | :? TimeoutException -> Error timedOut
+        | :? InvalidOperationException as ex when
+            ex.Message.StartsWith("TelemetryQuotaExceeded:", StringComparison.Ordinal) ->
+            Error ex.Message
+        | ex -> Error("TelemetryUnavailable: " + ex.GetType().Name)
+
+    // A shared worker must not inherit the first request's AsyncLocals for
+    // later observations. Diagnostics may legitimately need their own request
+    // context (e.g. feedback authorization via IHttpContextAccessor), so only
+    // an admitted diagnostic captures and restores its individual context.
+    let diagnosticWork (work: unit -> (unit -> unit)) =
+        let context = ExecutionContext.Capture()
+        { Kind = Diagnostic
+          Execute = fun () ->
+            if isNull context then work()
+            else
+                let mutable publish = ignore
+                ExecutionContext.Run(context, ContextCallback(fun _ -> publish <- work()), null)
+                publish }
+
+    let activityWork key observation =
+        // Time spent awaiting admission is not an attempted SQLite write.
+        // Once dispatched, even physical success after the deadline is uncertain
+        // and cannot publish proof. No retry of this version is scheduled.
+        let dispatchedAt = Stopwatch.GetTimestamp()
+        let struct (user, project, agent) = key
+        { Kind = Activity
+          Execute = fun () ->
+            let outcome = execute (fun db ->
+                db.RecordAttributedAgentActivity(user, project, agent, observation.ObservedAtUtc))
+            fun () ->
+                match outcome, activityCoverage.TryGetValue(key) with
+                | Ok (), (true, coverage)
+                    when not activityCoverageExhausted && not disposed &&
+                         coverage.Version = observation.Version &&
+                         Stopwatch.GetElapsedTime(dispatchedAt) <= deadline ->
+                    coverage.ConfirmedAtUtc <- Some observation.ObservedAtUtc
+                | _ -> ()
+                observation.Completion.TrySetResult(()) |> ignore }
+
+    // Only the worker (or the idle-to-active transition) consumes ready keys.
+    // Each key is enqueued once while Pending is populated; replacing a pending
+    // observation keeps its place. A running key may have one further slot.
+    let reserveNextLocked () =
+        let next =
+            if disposed then None
+            else
+                match pendingPost with
+                | Some post ->
+                    pendingPost <- None
+                    Some post
+                | None when activityCoverageExhausted ->
+                    discardActivityLocked()
+                    None
+                | None when readyKeys.Count > 0 ->
+                    let key = readyKeys.Dequeue()
+                    let coverage = activityCoverage[key]
+                    let observation = coverage.Pending.Value
+                    coverage.Pending <- None
+                    Some(activityWork key observation)
+                | None -> None
+        active <- next |> Option.map (fun work -> work.Kind)
+        next
+
+    let runWorker first =
+        let mutable next = Some first
+        while next.IsSome do
+            // A deadline never releases the physical slot. Only this worker,
+            // after SQLite returns, may publish and reserve the next operation.
+            let publish = next.Value.Execute()
+            next <- lock activityGate (fun () ->
+                publish()
+                reserveNextLocked())
+
+    let startLocked work =
+        active <- Some work.Kind
+        try
+            let schedule () = Task.Run(Action(fun () -> runWorker work)) |> ignore
+            if ExecutionContext.IsFlowSuppressed() then schedule()
+            else
+                use _flow = ExecutionContext.SuppressFlow()
+                schedule()
+        with _ ->
+            active <- None
+            reraise()
+
     // Periodic retention must follow the same single-flight budget; the
     // underlying FeedbackStore timer is disabled for this wrapper.
     let pruneTimer =
@@ -61,88 +183,91 @@ type OptionalFeedbackStore(databasePath: string, ?timeout: TimeSpan, ?maxDiskByt
 
     member _.TryExecute<'T>(operation: FeedbackStore -> 'T) : Task<Result<'T, string>> =
         task {
-            if String.IsNullOrWhiteSpace databasePath then
-                return Error unavailable
-            elif Interlocked.CompareExchange(&inFlight, 1, 0) <> 0 then
-                return Error unavailable
+            let completion = TaskCompletionSource<Result<'T, string>>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let admitted =
+                lock activityGate (fun () ->
+                    if disposed || String.IsNullOrWhiteSpace databasePath || active.IsSome then false
+                    else
+                        startLocked (diagnosticWork (fun () ->
+                            let result = execute operation
+                            fun () -> completion.TrySetResult(result) |> ignore))
+                        true)
+            if not admitted then return Error unavailable
             else
-                // Task.Run is essential: even initializing a corrupt/locked database
-                // must never execute on the caller's request/dispatch thread.
-                let background =
-                    try
-                        Task.Run(Func<'T>(fun () ->
-                            try
-                                // Stat and SQLite both execute off the MCP request
-                                // path; over-budget existing DBs are not opened.
-                                if fileBytes databasePath >= databaseBudget ||
-                                   diagnosticBytes() >= diskBudget then
-                                    invalidOp "TelemetryQuotaExceeded: diagnostic disk budget reached."
-                                operation database.Value
-                            finally Interlocked.Exchange(&inFlight, 0) |> ignore))
-                    with _ ->
-                        Interlocked.Exchange(&inFlight, 0) |> ignore
-                        reraise()
-                try
-                    let! result = background.WaitAsync(deadline)
-                    return Ok result
-                with
-                | :? TimeoutException ->
-                    // The worker may still finish. Never start another SQLite
-                    // operation until it returns, and do not claim a write failed.
-                    return Error "TelemetryUnavailable: SQLite timed out; diagnostic outcome unknown."
-                | :? InvalidOperationException as ex when
-                    ex.Message.StartsWith("TelemetryQuotaExceeded:", StringComparison.Ordinal) ->
-                    return Error ex.Message
-                | ex ->
-                    return Error("TelemetryUnavailable: " + ex.GetType().Name)
+                try return! completion.Task.WaitAsync(deadline)
+                with :? TimeoutException -> return Error timedOut
         }
 
-    /// Fire-and-forget best-effort diagnostics. No database activity or wait on
-    /// this calling thread; overload, startup failure and storage loss drop data.
-    member this.TryPost(operation: FeedbackStore -> unit) =
-        this.TryExecute(operation) |> ignore
+    /// Best-effort diagnostics retain immediate, nonwaiting admission. While
+    /// activity owns the worker, reserve at most one posted operation for its
+    /// next turn. Further posts (and posts during diagnostics) are dropped as
+    /// before. An expired reservation is not executed later.
+    member _.TryPost(operation: FeedbackStore -> unit) =
+        lock activityGate (fun () ->
+            if not disposed && not (String.IsNullOrWhiteSpace databasePath) then
+                let admittedAt = Stopwatch.GetTimestamp()
+                let work () = diagnosticWork (fun () ->
+                    if Stopwatch.GetElapsedTime(admittedAt) <= deadline then
+                        execute operation |> ignore
+                    ignore)
+                match active, pendingPost with
+                | None, _ -> startLocked (work())
+                | Some Activity, None -> pendingPost <- Some(work())
+                | _ -> ())
 
-    /// The in-process gate is invalidated SYNCHRONOUSLY before dispatch.
-    /// Rejected, failed or timed-out SQLite writes leave the key unverified.
-    /// An older write completing late cannot certify a newer agent call.
-    member this.RecordAgentActivity(userId: string, projectName: string,
-                                    agentId: string, observedAtUtc: DateTimeOffset) : Task =
+    /// Invalidate synchronously, before dispatch, even if storage is unavailable.
+    /// The returned task is only a bounded best-effort wait, never proof. A
+    /// superseded pending waiter is completed immediately; at most one waiter
+    /// per key and one running waiter are retained. A caller's bounded wait
+    /// is independent of queue/dispatch time and does not certify or cancel
+    /// the observation. The dispatched write has its own deadline: a physical
+    /// completion past that deadline can never certify that version.
+    member _.RecordAgentActivity(userId: string, projectName: string,
+                                 agentId: string, observedAtUtc: DateTimeOffset) : Task =
         let project = canonicalProject projectName
         if not (validActivityKey userId project agentId) then Task.CompletedTask
         else
             let key = struct (userId, project, agentId)
-            let version =
+            let completion =
                 lock activityGate (fun () ->
-                    if activityCoverageExhausted then None
+                    if activityCoverageExhausted || disposed then None
                     else
-                        match activityCoverage.TryGetValue(key) with
-                        | true, coverage ->
-                            coverage.Version <- coverage.Version + 1L
-                            coverage.ConfirmedAtUtc <- None
-                            Some coverage.Version
-                        | _ when activityCoverage.Count < maxActivityKeys ->
-                            activityCoverage[key] <- { Version = 1L; ConfirmedAtUtc = None }
-                            Some 1L
-                        | _ ->
-                            activityCoverageExhausted <- true
-                            None)
-            match version with
+                        let coverage =
+                            match activityCoverage.TryGetValue(key) with
+                            | true, known when known.Version < Int64.MaxValue ->
+                                known.Version <- known.Version + 1L
+                                known.HighWaterUtc <- max known.HighWaterUtc observedAtUtc
+                                known.ConfirmedAtUtc <- None
+                                Some known
+                            | false, _ when activityCoverage.Count < maxActivityKeys ->
+                                let fresh =
+                                    { Version = 1L; HighWaterUtc = observedAtUtc
+                                      ConfirmedAtUtc = None; Pending = None }
+                                activityCoverage.Add(key, fresh)
+                                Some fresh
+                            | _ ->
+                                activityCoverageExhausted <- true
+                                None
+                        match coverage with
+                        | Some known when not (String.IsNullOrWhiteSpace databasePath) ->
+                            let waiter = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+                            let observation =
+                                { Version = known.Version; ObservedAtUtc = known.HighWaterUtc
+                                  Completion = waiter }
+                            match known.Pending with
+                            | Some previous -> previous.Completion.TrySetResult(()) |> ignore
+                            | None -> readyKeys.Enqueue(key)
+                            known.Pending <- Some observation
+                            if active.IsNone then
+                                reserveNextLocked() |> Option.iter startLocked
+                            Some waiter.Task
+                        | _ -> None)
+            match completion with
             | None -> Task.CompletedTask
-            | Some currentVersion ->
+            | Some waiter ->
                 task {
-                    try
-                        let! result =
-                            this.TryExecute(fun db ->
-                                db.RecordAttributedAgentActivity(userId, project, agentId, observedAtUtc))
-                        match result with
-                        | Ok () ->
-                            lock activityGate (fun () ->
-                                match activityCoverage.TryGetValue(key) with
-                                | true, coverage when coverage.Version = currentVersion ->
-                                    coverage.ConfirmedAtUtc <- Some observedAtUtc
-                                | _ -> ())
-                        | Error _ -> () // Fail closed, including quota and uncertain timeouts.
-                    with _ -> () // Telemetry must never change command semantics.
+                    try do! waiter.WaitAsync(deadline)
+                    with :? TimeoutException -> ()
                 } :> Task
 
     /// A fresh, authenticated Hub read. A row from a previous server process
@@ -188,5 +313,10 @@ type OptionalFeedbackStore(databasePath: string, ?timeout: TimeSpan, ?maxDiskByt
     interface IDisposable with
         member _.Dispose() =
             pruneTimer.Dispose()
+            lock activityGate (fun () ->
+                disposed <- true
+                activityCoverageExhausted <- true
+                pendingPost <- None
+                discardActivityLocked())
             if database.IsValueCreated then
                 (database.Value :> IDisposable).Dispose()

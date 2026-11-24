@@ -318,3 +318,204 @@ let actual_sqlite_writer_lock_poisoned_activity_requires_new_success () = task {
     finally
         Directory.Delete(directory, true)
 }
+
+[<Test>]
+let bounded_fifo_latest_activity_survives_audit_and_preserves_monotonic_timestamp () = task {
+    let directory, path = scratch ()
+    use entered = new ManualResetEventSlim(false)
+    use release = new ManualResetEventSlim(false)
+    try
+        use store = new OptionalFeedbackStore(path, timeout = TimeSpan.FromSeconds 2.)
+        let first = DateTimeOffset.UtcNow.AddMinutes(-5.)
+        do! store.RecordAgentActivity("alice", "Jarvis", "Worker", first)
+        let! _, _ = store.GetVerifiedAgentActivity("alice", "Jarvis", "Worker")
+        let holding = store.TryExecute(fun _ ->
+            entered.Set()
+            if not (release.Wait(TimeSpan.FromSeconds 8.)) then failwith "audit barrier")
+        Assert.That(entered.Wait(TimeSpan.FromSeconds 3.), Is.True)
+        let latest = first.AddMinutes(3.)
+        let oldWaiter = store.RecordAgentActivity("alice", "Jarvis", "Worker", latest)
+        // Clock reversal while queued must not discard the larger observed timestamp.
+        let latestWaiter = store.RecordAgentActivity("alice", "Jarvis::branch", "Worker", latest.AddSeconds(-1.))
+        let distinct = [| for i in 1..32 -> store.RecordAgentActivity("alice", "Jarvis", string i, latest) |]
+        do! oldWaiter.WaitAsync(TimeSpan.FromSeconds 1.)
+        do! expectUnavailable (store.GetVerifiedAgentActivity("alice", "Jarvis", "Worker"))
+        release.Set()
+        let! _ = holding
+        do! latestWaiter.WaitAsync(TimeSpan.FromSeconds 3.)
+        do! Task.WhenAll(distinct).WaitAsync(TimeSpan.FromSeconds 3.)
+        let! seen, _ = awaitVerified store "alice" "Jarvis" "Worker"
+        Assert.That(seen, Is.EqualTo(latest))
+        for i in 1..32 do
+            let! recorded, _ = awaitVerified store "alice" "Jarvis" (string i)
+            Assert.That(recorded, Is.EqualTo(latest))
+    finally
+        release.Set()
+        Directory.Delete(directory, true)
+}
+
+[<Test>]
+let pending_activity_has_bounded_waiters_and_key_overflow_fails_closed () = task {
+    let directory, path = scratch ()
+    use entered = new ManualResetEventSlim(false)
+    use release = new ManualResetEventSlim(false)
+    try
+        use store = new OptionalFeedbackStore(path, timeout = TimeSpan.FromMilliseconds 150.)
+        let first = DateTimeOffset.UtcNow.AddMinutes(-1.)
+        do! store.RecordAgentActivity("alice", "Jarvis", "Existing", first)
+        let! _, _ = store.GetVerifiedAgentActivity("alice", "Jarvis", "Existing")
+        let holding = store.TryExecute(fun _ ->
+            entered.Set()
+            if not (release.Wait(TimeSpan.FromSeconds 8.)) then failwith "audit barrier")
+        Assert.That(entered.Wait(TimeSpan.FromSeconds 3.), Is.True)
+        let now = DateTimeOffset.UtcNow
+        let flood = [| for i in 1..20000 -> store.RecordAgentActivity("alice", "Jarvis", "Existing", now) |]
+        // Superseded tasks cannot accumulate unbounded waiting behind a hung worker.
+        do! Task.WhenAll(flood).WaitAsync(TimeSpan.FromSeconds 2.)
+        let distinct = [| for i in 1..16384 -> store.RecordAgentActivity("alice", "Jarvis", string i, now) |]
+        do! Task.WhenAll(distinct).WaitAsync(TimeSpan.FromSeconds 2.)
+        do! expectUnavailable (store.GetVerifiedAgentActivity("alice", "Jarvis", "Existing"))
+        release.Set()
+        let! _ = holding
+        // Exhaustion poisons the complete proof domain, including already verified keys.
+        do! store.RecordAgentActivity("alice", "Jarvis", "Existing", now)
+        do! expectUnavailable (store.GetVerifiedAgentActivity("alice", "Jarvis", "Existing"))
+    finally
+        release.Set()
+        Directory.Delete(directory, true)
+}
+
+[<Test>]
+let posted_audit_gets_a_bounded_turn_between_pending_activity_keys () = task {
+    let directory, path = scratch ()
+    use auditEntered = new ManualResetEventSlim(false)
+    use auditRelease = new ManualResetEventSlim(false)
+    try
+        use store = new OptionalFeedbackStore(path, timeout = TimeSpan.FromSeconds 2.)
+        let first = DateTimeOffset.UtcNow.AddMinutes(-1.)
+        do! store.RecordAgentActivity("alice", "Jarvis", "First", first)
+        let! _, _ = store.GetVerifiedAgentActivity("alice", "Jarvis", "First")
+        let now = DateTimeOffset.UtcNow
+        let ambient = AsyncLocal<string>()
+        ambient.Value <- "awaited-diagnostic"
+        let! ownContext = store.TryExecute(fun _ -> ambient.Value)
+        Assert.That(ownContext, Is.EqualTo(Ok "awaited-diagnostic" : Result<string,string>))
+        let mutable auditContext = ""
+        let mutable sawQueuedKey = false
+        let mutable duplicateRan = false
+        let mutable pending = [||] : Task array
+        let mutable active = Task.CompletedTask
+        do!
+            task {
+                use writer = new SqliteConnection("Data Source=" + path + ";Cache=Shared")
+                writer.Open()
+                use transaction = writer.BeginTransaction()
+                use sql = writer.CreateCommand()
+                sql.Transaction <- transaction
+                sql.CommandText <- "UPDATE attributed_agent_activity SET last_seen_at=last_seen_at;"
+                sql.ExecuteNonQuery() |> ignore
+                ambient.Value <- "activity-ingress"
+                active <- store.RecordAgentActivity("alice", "Jarvis", "First", now)
+                pending <- [| for i in 1..16 -> store.RecordAgentActivity("alice", "Jarvis", string i, now) |]
+                ambient.Value <- "posted-audit"
+                store.TryPost(fun db ->
+                    auditContext <- ambient.Value
+                    sawQueuedKey <- db.GetAttributedAgentActivity("alice", "Jarvis", "1").IsSome
+                    db.BeginOperation("alice", "agent_inbox", Some "Jarvis", "test", None, None) |> ignore
+                    auditEntered.Set()
+                    if not (auditRelease.Wait(TimeSpan.FromSeconds 5.)) then failwith "audit barrier")
+                // At most one posted diagnostic is retained while the activity worker owns the gate.
+                store.TryPost(fun _ -> duplicateRan <- true)
+                transaction.Rollback()
+            }
+        Assert.That(auditEntered.Wait(TimeSpan.FromSeconds 3.), Is.True, "Accepted audit must run without waiting for all activity keys.")
+        Assert.That(sawQueuedKey, Is.False, "Audit gets a turn before the next queued activity.")
+        Assert.That(auditContext, Is.EqualTo("posted-audit"), "Queued diagnostics must not inherit another request's context.")
+        Assert.That(duplicateRan, Is.False)
+        auditRelease.Set()
+        do! active
+        do! Task.WhenAll pending
+        for i in 1..16 do
+            let! seen, _ = awaitVerified store "alice" "Jarvis" (string i)
+            Assert.That(seen, Is.EqualTo(now))
+        Assert.That(duplicateRan, Is.False)
+    finally
+        auditRelease.Set()
+        Directory.Delete(directory, true)
+}
+
+[<Test>]
+let durable_read_racing_new_ingress_cannot_publish_revoked_generation () = task {
+    let directory, path = scratch ()
+    try
+        use store = new OptionalFeedbackStore(path, timeout = TimeSpan.FromSeconds 2.)
+        let old = DateTimeOffset.UtcNow.AddMinutes(-2.)
+        do! store.RecordAgentActivity("alice", "Jarvis", "Worker", old)
+        let! _, _ = store.GetVerifiedAgentActivity("alice", "Jarvis", "Worker")
+        let blockedRead (revoke: bool) = task {
+            use writer = new SqliteConnection("Data Source=" + path + ";Cache=Shared")
+            writer.Open()
+            use transaction = writer.BeginTransaction()
+            use sql = writer.CreateCommand()
+            sql.Transaction <- transaction
+            // A shared-cache schema write lock blocks actual SQLite reads,
+            // including openConnection's PRAGMAs, until rollback. The proof
+            // read has already captured the verified generation and reserved
+            // the diagnostic worker when GetVerifiedAgentActivity returns.
+            sql.CommandText <- "CREATE TABLE read_barrier (id INTEGER);"
+            sql.ExecuteNonQuery() |> ignore
+            let reading = store.GetVerifiedAgentActivity("alice", "Jarvis", "Worker")
+            do! Task.Delay(20)
+            Assert.That(reading.IsCompleted, Is.False, "Read must still own the physical slot")
+            let newer = old.AddMinutes(1.)
+            let writing =
+                if revoke then store.RecordAgentActivity("alice", "Jarvis", "Worker", newer)
+                else Task.CompletedTask
+            transaction.Rollback()
+            if revoke then
+                do! expectUnavailable reading
+                do! writing
+                let! observed, _ = awaitVerified store "alice" "Jarvis" "Worker"
+                Assert.That(observed, Is.EqualTo(newer))
+            else
+                let! observed, _ = reading
+                Assert.That(observed, Is.EqualTo(old), "Control read succeeds through the same real lock without revocation")
+        }
+        do! blockedRead false
+        do! blockedRead true
+    finally
+        Directory.Delete(directory, true)
+}
+
+[<Test>]
+let new_generation_queued_during_uncertain_activity_write_requalifies_only_after_its_own_write () = task {
+    let directory, path = scratch ()
+    try
+        use store = new OptionalFeedbackStore(path, timeout = TimeSpan.FromMilliseconds 150.)
+        let old = DateTimeOffset.UtcNow.AddMinutes(-2.)
+        do! store.RecordAgentActivity("alice", "Jarvis", "Worker", old)
+        let! _, _ = store.GetVerifiedAgentActivity("alice", "Jarvis", "Worker")
+        let newer = old.AddMinutes(1.)
+        let latest = newer.AddSeconds(1.)
+        let mutable pending = Task.CompletedTask
+        do!
+            task {
+                use writer = new SqliteConnection("Data Source=" + path + ";Cache=Shared")
+                writer.Open()
+                use transaction = writer.BeginTransaction()
+                use sql = writer.CreateCommand()
+                sql.Transaction <- transaction
+                sql.CommandText <- "UPDATE attributed_agent_activity SET last_seen_at=last_seen_at;"
+                sql.ExecuteNonQuery() |> ignore
+                do! store.RecordAgentActivity("alice", "Jarvis", "Worker", newer)
+                do! expectUnavailable (store.GetVerifiedAgentActivity("alice", "Jarvis", "Worker"))
+                pending <- store.RecordAgentActivity("alice", "Jarvis", "Worker", latest)
+                do! expectUnavailable (store.GetVerifiedAgentActivity("alice", "Jarvis", "Worker"))
+                transaction.Rollback()
+            }
+        do! pending
+        let! observed, _ = awaitVerified store "alice" "Jarvis" "Worker"
+        Assert.That(observed, Is.EqualTo(latest))
+    finally
+        Directory.Delete(directory, true)
+}

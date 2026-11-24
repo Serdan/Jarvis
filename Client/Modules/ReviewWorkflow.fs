@@ -360,11 +360,32 @@ type IntegrationSubmission =
       // reviews must carry their original approval and submission locators.
       SharedBinding: SharedIntegrationBinding option }
 
+
+[<CLIMutable>]
+type AggregateInclusionRecord =
+    { TaskId: string
+      SubmissionId: string
+      ProjectId: string
+      LedgerId: string
+      Epoch: int
+      OperationId: string
+      ReviewerId: string
+      AggregateTaskId: string
+      AggregateSubmissionId: string
+      AggregateCommit: string
+      AggregateTree: string
+      PublishedCommit: string
+      ObservedTargetHead: string
+      ConstituentCommit: string
+      TargetRef: string
+      Evidence: Common.AggregateInclusionEvidence }
+
 [<CLIMutable>]
 type IntegrationSummary =
     { SnapshotCommit: string
       Latest: IntegrationSubmission option
-      Submissions: IntegrationSubmission list }
+      Submissions: IntegrationSubmission list
+      AggregateInclusions: AggregateInclusionRecord list }
 
 [<CLIMutable>]
 type AgentCheckpoint =
@@ -609,7 +630,15 @@ module ReviewWorkflow =
                         status "status" [ "Unclaimed"; "Claimed"; "Accepted"; "ChangesRequested"; "Withdrawn" ]
                         && (let mutable kind = Unchecked.defaultof<JsonElement>
                             root.TryGetProperty("kind", &kind) && kind.ValueKind = JsonValueKind.String)
-                    | "IntegrationSubmission" -> status "status" [ "Pending"; "Integrated" ]
+                    | "IntegrationSubmission" ->
+                         status "status" [ "Pending"; "Integrated" ]
+                         || (status "status" [ "IncludedInAggregate" ]
+                             && not historicalEvidenceShape && not historicalPublicationShape
+                             && ([ "integratedCommit"; "completedAtUtc"; "publicationPreviousHead"
+                                   "publicationObservedHead"; "publicationOperationId"; "publicationMechanism" ]
+                                 |> List.forall (fun name ->
+                                     let mutable field = Unchecked.defaultof<JsonElement>
+                                     root.TryGetProperty(name, &field) && field.ValueKind = JsonValueKind.Null)))
                     | "AttemptChallengeWait" -> status "status" [ "Waiting"; "Eligible"; "Requeued" ]
                     | "ReviewFeedbackNotice" -> status "status" [ "Accepted"; "ChangesRequested" ]
                     | "AgentCheckpoint" -> status "kind" [ "Yield"; "Completion"; "Recovery"; "Progress"; "Submission"; "Revision" ]
@@ -655,6 +684,9 @@ module ReviewWorkflow =
 
     let private integrationPath taskId (submissionId: Guid) =
         $"tasks/{taskId}/integrations/" + submissionId.ToString("N") + ".json"
+
+    let private attributionPath taskId (submissionId: Guid) =
+        $"records/integration-attributions/{taskId}/{submissionId:N}.json"
 
     let private notificationPath (notificationId: Guid) =
         "notifications/" + notificationId.ToString("N") + ".json"
@@ -1471,17 +1503,6 @@ module ReviewWorkflow =
             return submission
         }
 
-    let getIntegrationSubmissions binding taskId =
-        if not (validTaskId taskId) then Error(InvalidBinding "Invalid task ID.")
-        else result {
-            let! snapshot = LedgerStore.fetch binding
-            let! _ = required<ReviewTask> binding snapshot (taskPath taskId)
-            let! submissions = integrationSubmissionsAt binding snapshot taskId
-            return { SnapshotCommit = snapshot.Commit
-                     Latest = submissions |> List.tryLast
-                     Submissions = submissions }
-        }
-
     // Use the existing authenticated local Operator Challenge reply as the
     // durable approval. The evidence is a versioned exact identity, not a
     // human-readable similarity match or a new generic ledger write.
@@ -1924,8 +1945,13 @@ module ReviewWorkflow =
                 let! snapshot = LedgerStore.fetch binding
                 let path = integrationPath taskId submissionId
                 let! currentRecord, currentOid = required<IntegrationSubmission> binding snapshot path
+                if currentRecord.Status = "IncludedInAggregate" then
+                    return! Error(StaleEntityVersion "Integration submission is already attributed to an aggregate.")
                 if currentRecord.Status <> "Pending" then
                     return! Error(StaleEntityVersion "Integration submission is already completed.")
+                let! attribution, _ = LedgerStore.readAt binding snapshot (attributionPath taskId submissionId)
+                if attribution.IsSome then
+                    return! Error(LedgerIntegrityError "Pending submission conflicts with an aggregate attribution.")
                 let! shared = verifySharedIntegrationAt binding snapshot taskId submissionId currentRecord
                 // Legacy branch-only entries keep the original read-only
                 // receipt semantics. New managed entries must NEVER accept an
@@ -1964,8 +1990,13 @@ module ReviewWorkflow =
                 return! LegacyDirectWriterFence.transact binding action (fun current -> result {
                     let! _ = required<ReviewAgent> binding current (agentPath actorId)
                     let! existing, oid = required<IntegrationSubmission> binding current path
+                    if existing.Status = "IncludedInAggregate" then
+                        return! Error(StaleEntityVersion "Integration submission is already attributed to an aggregate.")
                     if existing.Status <> "Pending" then
                         return! Error(StaleEntityVersion "Integration submission is already completed.")
+                    let! attribution, _ = LedgerStore.readAt binding current (attributionPath taskId submissionId)
+                    if attribution.IsSome then
+                        return! Error(LedgerIntegrityError "Pending submission conflicts with an aggregate attribution.")
                     if oid <> currentOid then
                         return! Error(StaleEntityVersion "Integration receipt changed during publication.")
                     if shared.IsSome then
@@ -1985,6 +2016,389 @@ module ReviewWorkflow =
                                                     publication |> Option.map (fun p -> p.Mechanism) |> Option.defaultValue null } ]
                 })
             }
+
+
+    let aggregateInclusionEvidenceText (evidence: Common.AggregateInclusionEvidence) =
+        json evidence
+
+    // No permissive fallback or implicit default fields in the typed evidence
+    // envelope. The original reviewer supplies the exact canonical locator.
+    let private parseAggregateEvidence (body: string) =
+        let invalid () = Error(InvalidBinding "Invalid exact aggregate inclusion evidence.")
+        try
+            let exactObject (element: JsonElement) (names: string list) =
+                element.ValueKind = JsonValueKind.Object
+                && (element.EnumerateObject() |> Seq.map (fun p -> p.Name) |> Seq.sort |> Seq.toList)
+                    = List.sort names
+            let review (element: JsonElement) =
+                exactObject element [ "taskId"; "reviewId"; "decisionOperationId" ]
+            // The canonical ledger entity is capped at 64 KiB; oversized
+            // evidence cannot fit that envelope and need not be parsed.
+            use doc =
+                if isNull body || Encoding.UTF8.GetByteCount body > 64 * 1024 then
+                    raise (ArgumentException "Invalid aggregate evidence size.")
+                JsonDocument.Parse(body)
+            let root = doc.RootElement
+            if not (exactObject root [ "aggregateSubmissionId"; "aggregateCompletionOperationId"
+                                       "aggregateReview"; "constituentReview"; "aggregateTree"; "corrections" ])
+               || not (review (root.GetProperty("aggregateReview")))
+               || not (review (root.GetProperty("constituentReview"))) then invalid ()
+            else
+                let corrections = root.GetProperty("corrections")
+                if corrections.ValueKind <> JsonValueKind.Array
+                   || not (corrections.EnumerateArray() |> Seq.forall (fun e ->
+                       exactObject e [ "path"; "review" ] && review (e.GetProperty("review")))) then invalid ()
+                else
+                    let evidence = JsonSerializer.Deserialize<Common.AggregateInclusionEvidence>(body, options)
+                    if isNull (box evidence) || isNull evidence.Corrections then invalid ()
+                    else Ok evidence
+        with _ -> invalid ()
+
+    let private verifyIndependentDecisionAt binding snapshot (proof: Common.AggregateReviewEvidence) = result {
+        if not (validTaskId proof.TaskId) || proof.ReviewId = Guid.Empty
+           || proof.DecisionOperationId = Guid.Empty then
+            return! Error(InvalidBinding "Invalid exact review evidence locator.")
+        let id = proof.ReviewId.ToString("N")
+        let path = branchReviewPath proof.TaskId id
+        let! review, _ = required<BranchReview> binding snapshot path
+        let! decision, original = operationOrigin binding snapshot proof.DecisionOperationId
+        let! accepted, _ = required<BranchReview> binding original path
+        if review.TaskId <> proof.TaskId || review.ReviewId <> id
+           || review.Status <> "Accepted" || review.SourceVersion < 1
+           || review.DecisionSequence <= review.CreatedSequence
+           || review.ReviewRef <> reviewRef proof.TaskId id review.SourceVersion
+           || not (validAgent review.OwnerAgentId && validAgent review.ReviewerId)
+           || review.OwnerAgentId = review.ReviewerId
+           || not (validBranch review.TaskRef && validBranch review.TargetRef)
+           || not (operationWrote decision path)
+           || decision.Sequence <> review.DecisionSequence
+           || not (sameAcceptedReview accepted review)
+           || accepted.Version < 3 || accepted.Acknowledged then
+            return! Error(InvalidBinding "Review does not match its original independent Accepted decision.")
+        do! LedgerStore.verifyIntegrationOperationIntent binding decision
+                (intent proof.DecisionOperationId review.ReviewerId "DecideBranchReview"
+                    {| taskId = proof.TaskId; reviewId = id; reviewerId = review.ReviewerId
+                       expectedVersion = accepted.Version - 1; status = "Accepted" |})
+        do! LedgerStore.fetchReviewRef binding review.ReviewRef review.ReviewedHeadOid
+        do! LedgerStore.verifySourceAncestry binding review.BaseCommit review.ReviewedHeadOid
+        return review
+    }
+
+    // Task-bound managed receipts must have their original exact Submit
+    // operation; shared/unbound or rewritten locators cannot be attributed.
+    let private verifyOriginalTaskBoundSubmission binding snapshot taskId (id: Guid)
+                     (record: IntegrationSubmission) (review: BranchReview) = result {
+        if not (realIntegrationTaskId taskId) || sharedReceipt record
+           || record.TaskId <> taskId || record.SubmissionId <> id.ToString("N")
+           || review.TaskId <> taskId || record.ReviewId <> review.ReviewId
+           || record.ReviewRef <> review.ReviewRef
+           || record.ReviewVersion <> review.SourceVersion
+           || record.ReviewedHeadOid <> review.ReviewedHeadOid
+           || record.SubmittedCommit <> review.ReviewedHeadOid
+           || record.SourceRef <> review.TaskRef || record.TargetRef <> review.TargetRef
+           || record.IntegrationRef <> $"refs/heads/jarvis-integration/{id:N}"
+           || not (LedgerStore.validSourceCommitOid record.TargetHeadAtSubmission)
+           || record.CreatedSequence <= review.DecisionSequence then
+            return! Error(InvalidBinding "Aggregate inclusion requires an exact task-bound managed submission.")
+        let path = integrationPath taskId id
+        let! maybeOperation = LedgerStore.findIntegrationSubmissionOperationForPathAt binding snapshot path
+        let! operation =
+            match maybeOperation with
+            | Some op when op.Sequence = record.CreatedSequence && op.Actor = record.ActorId -> Ok op
+            | _ -> Error(InvalidBinding "Missing original task-bound integration submission operation.")
+        let! operationId = exactGuid "D" operation.OperationId
+        let! original = LedgerStore.verifiedIntegrationOperationSnapshotAt binding snapshot operation
+        let! pending = getIntegrationSubmissionAt binding original taskId id
+        let! originalReview, _ =
+            required<BranchReview> binding original (branchReviewPath taskId review.ReviewId)
+        if pending <> asPending record || not (sameAcceptedReview originalReview review) then
+            return! Error(InvalidBinding "Submission differs from its original immutable Pending record or Accepted review.")
+        let! payload = operationPayload operation
+        try
+            let sourceRef = stringMember payload "sourceRef"
+            let submittedCommit = stringMember payload "submittedCommit"
+            if (not (String.IsNullOrWhiteSpace sourceRef) && sourceRef <> record.SourceRef)
+               || (not (String.IsNullOrWhiteSpace submittedCommit) && submittedCommit <> record.SubmittedCommit) then
+                return! Error(InvalidBinding "Original submission request differs from pinned source.")
+            do! LedgerStore.verifyIntegrationOperationIntent binding operation
+                    (intent operationId record.ActorId "SubmitIntegration"
+                        {| taskId = taskId; submissionId = id; sourceRef = sourceRef
+                           submittedCommit = submittedCommit; reviewId = record.ReviewId
+                           targetRef = record.TargetRef |})
+        with
+        | :? InvalidOperationException | :? System.Collections.Generic.KeyNotFoundException ->
+            return! Error(InvalidBinding "Malformed original task-bound integration request.")
+        do! LedgerStore.fetchIntegrationRef binding record.IntegrationRef record.SubmittedCommit
+        return ()
+    }
+
+    // Read-only publication verifier shared with composition acceptance.
+    let internal requireManagedCompletionAt (binding: LedgerBinding) (snapshot: LedgerSnapshot)
+                                           taskId (submissionId: Guid) (submission: IntegrationSubmission) = result {
+        let path = $"tasks/{taskId}/integrations/{submissionId:N}.json"
+        let! completion = LedgerStore.findCompletionOperationForPathAt binding snapshot path
+        if completion.Sequence <= submission.CreatedSequence
+           || String.IsNullOrWhiteSpace completion.Actor then
+            return! Error(InvalidBinding
+                "Composition integration lacks a valid canonical completion sequence and actor.")
+        let! originalHead = LedgerStore.getOperationOriginAt binding snapshot completion
+        let! originalSnapshot = LedgerStore.verifiedHistoricalSnapshot binding originalHead
+        let! originalReceipt =
+            getIntegrationSubmissionAt binding originalSnapshot taskId submissionId
+        if originalReceipt <> submission then
+            return! Error(InvalidBinding
+                "Composition integration receipt differs from its original immutable completion.")
+        do! LedgerStore.verifyCompletionOperationRequest binding completion
+                taskId submissionId originalReceipt.IntegratedCommit
+        do! LedgerStore.fetchReviewRef binding submission.ReviewRef submission.SubmittedCommit
+        do! LedgerStore.fetchIntegrationRef binding submission.IntegrationRef submission.SubmittedCommit
+
+        let legacyDirect =
+            originalReceipt.IntegratedCommit = originalReceipt.SubmittedCommit
+            && String.IsNullOrWhiteSpace originalReceipt.PublicationOperationId
+            && String.IsNullOrWhiteSpace originalReceipt.PublicationMechanism
+            && String.IsNullOrWhiteSpace originalReceipt.PublicationPreviousHead
+            && String.IsNullOrWhiteSpace originalReceipt.PublicationObservedHead
+        if legacyDirect then
+            // A blank original v1 receipt is not evidence of pre-v1 origin:
+            // generic canonical transactions can manufacture it *today*.
+            // No independently verified pre-v1 rollout anchor or historical
+            // operation allowlist is available. Fail closed for managed
+            // composition acceptance. Legacy branch-only integration records
+            // remain covered by ReviewWorkflow's separate compatibility path.
+            return! Error(InvalidBinding
+                "Managed legacy direct completion has no trusted pre-v1 origin proof.")
+        else
+            let! _ =
+                match Guid.TryParseExact(submission.PublicationOperationId, "D") with
+                | true, id when id <> Guid.Empty
+                                && submission.PublicationMechanism = "VerifiedNonForceGitPush/v1"
+                                && completion.OperationId = id.ToString("D") -> Ok id
+                | _ -> Error(InvalidBinding
+                    "Managed integration has no original verified non-force publisher receipt.")
+            if not (LedgerStore.validSourceCommitOid submission.PublicationPreviousHead)
+               || not (LedgerStore.validSourceCommitOid submission.PublicationObservedHead)
+               || submission.PublicationPreviousHead = submission.IntegratedCommit then
+                return! Error(InvalidBinding "Invalid original integration publication heads.")
+            if submission.IntegratedCommit = submission.SubmittedCommit then
+                let! remoteHead = LedgerStore.readRemoteTarget binding submission.TargetRef
+                do! LedgerStore.verifySourceAncestry binding
+                        submission.TargetHeadAtSubmission submission.PublicationPreviousHead
+                do! LedgerStore.verifySourceAncestry binding
+                        submission.PublicationPreviousHead submission.IntegratedCommit
+                do! LedgerStore.verifySourceAncestry binding
+                        submission.IntegratedCommit submission.PublicationObservedHead
+                do! LedgerStore.verifySourceAncestry binding
+                        submission.PublicationObservedHead remoteHead
+            else
+                do! LedgerStore.verifyPublishedMechanicalIntegration binding
+                        submission.TargetRef submission.TargetHeadAtSubmission
+                        submission.SubmittedCommit submission.IntegratedCommit
+                        submission.PublicationPreviousHead submission.PublicationObservedHead
+            // Under the Operator-approved trusted-writer model, the original
+            // authorized CompleteIntegration workflow is our publisher. Its
+            // immutable canonical operation/request, v1 receipt, independent
+            // reviewed source and actual Git facts were checked above. This
+            // read-only verifier never publishes or replays an uncertain effect.
+            //
+            // A privileged actor that can arbitrarily write the canonical
+            // ledger AND target ref could fabricate matching history; no
+            // in-process receipt proves execution against that actor. The
+            // separate audit fixture documents that OUT-OF-MODEL capability.
+            return ()
+    }
+
+
+
+    // Source inclusion is a distinct disposition, never a new publication or
+    // operational acceptance receipt. The original aggregate reviewer is the
+    // independent attesting actor. Old readers reject the non-Pending and
+    // non-Integrated status; they cannot dispatch it or release a graph edge.
+    let recordAggregateInclusion binding operationId taskId actorId (submissionId: Guid) evidenceJson =
+        if not (realIntegrationTaskId taskId) || not (validAgent actorId)
+           || submissionId = Guid.Empty then
+            Error(InvalidBinding "Invalid aggregate inclusion identity.")
+        else result {
+            let! evidence = parseAggregateEvidence evidenceJson
+            let aggregateProof = evidence.AggregateReview
+            let constituentProof = evidence.ConstituentReview
+            if isNull (box aggregateProof) || isNull (box constituentProof)
+               || not (realIntegrationTaskId aggregateProof.TaskId)
+               || constituentProof.TaskId <> taskId
+               || evidence.AggregateSubmissionId = Guid.Empty
+               || evidence.AggregateCompletionOperationId = Guid.Empty
+               || (aggregateProof.TaskId = taskId && evidence.AggregateSubmissionId = submissionId)
+               || not (LedgerStore.validSourceCommitOid evidence.AggregateTree) then
+                return! Error(InvalidBinding "Aggregate and constituent must be distinct exact task-bound evidence.")
+            let action = intent operationId actorId "RecordAggregateInclusion"
+                            {| taskId = taskId; submissionId = submissionId; evidence = evidenceJson |}
+            return! LegacyDirectWriterFence.transact binding action (fun snapshot -> result {
+                let! _ = required<ReviewAgent> binding snapshot (agentPath actorId)
+                let! task, _ = required<ReviewTask> binding snapshot (taskPath taskId)
+                let! aggregateTask, _ = required<ReviewTask> binding snapshot (taskPath aggregateProof.TaskId)
+                if task.TaskId <> taskId || aggregateTask.TaskId <> aggregateProof.TaskId
+                   || task.Lifecycle = "Cancelled" || aggregateTask.Lifecycle = "Cancelled" then
+                    return! Error(InvalidBinding "Aggregate inclusion requires existing non-cancelled canonical tasks.")
+                let path = integrationPath taskId submissionId
+                let! pending, oid = required<IntegrationSubmission> binding snapshot path
+                if pending.Status <> "Pending" || pending <> asPending pending then
+                    return! Error(StaleEntityVersion "Constituent must still be the original Pending submission.")
+                let receiptPath = attributionPath taskId submissionId
+                let! prior, _ = LedgerStore.readAt binding snapshot receiptPath
+                if prior.IsSome then
+                    return! Error(StaleEntityVersion "Constituent inclusion is already recorded.")
+                let! aggregate =
+                    getIntegrationSubmissionAt binding snapshot aggregateProof.TaskId evidence.AggregateSubmissionId
+                if aggregate.Status <> "Integrated"
+                   || aggregate.PublicationOperationId <> evidence.AggregateCompletionOperationId.ToString("D")
+                   || aggregate.TargetRef <> pending.TargetRef
+                   || aggregate.SubmittedCommit = pending.SubmittedCommit then
+                    return! Error(InvalidBinding "Aggregate is not a distinct published managed source on the same target.")
+                let! aggregateReview = verifyIndependentDecisionAt binding snapshot aggregateProof
+                let! constituentReview = verifyIndependentDecisionAt binding snapshot constituentProof
+                if actorId <> aggregateReview.ReviewerId || actorId = constituentReview.OwnerAgentId
+                   || constituentReview.DecisionSequence >= aggregateReview.DecisionSequence
+                   || pending.CreatedSequence >= aggregateReview.DecisionSequence then
+                    return! Error(InvalidBinding "Inclusion must be explicitly attested by the independent aggregate reviewer.")
+                do! verifyOriginalTaskBoundSubmission binding snapshot taskId submissionId pending constituentReview
+                do! verifyOriginalTaskBoundSubmission binding snapshot aggregateProof.TaskId
+                        evidence.AggregateSubmissionId aggregate aggregateReview
+                do! requireManagedCompletionAt binding snapshot aggregateProof.TaskId evidence.AggregateSubmissionId aggregate
+                do! LedgerStore.verifySourceAncestry binding pending.SubmittedCommit aggregate.SubmittedCommit
+                let! _, sourceDelta =
+                    LedgerStore.reviewedTreeDelta binding constituentReview.BaseCommit pending.SubmittedCommit
+                let! finalTree, aggregateDelta =
+                    LedgerStore.reviewedTreeDelta binding constituentReview.BaseCommit aggregate.SubmittedCommit
+                if sourceDelta.IsEmpty || finalTree <> evidence.AggregateTree then
+                    return! Error(InvalidBinding "Missing constituent delta or incorrect independently reviewed final tree.")
+                let! _, publishedDelta =
+                    LedgerStore.reviewedTreeDelta binding constituentReview.BaseCommit aggregate.IntegratedCommit
+                let! remoteHead = LedgerStore.readRemoteTarget binding aggregate.TargetRef
+                do! LedgerStore.verifySourceAncestry binding aggregate.PublicationObservedHead remoteHead
+                let! _, currentDelta =
+                    LedgerStore.reviewedTreeDelta binding constituentReview.BaseCommit remoteHead
+                let mutable corrections = Map.empty
+                let mutable correctionDeltas = Map.empty
+                for correction in evidence.Corrections do
+                    if isNull (box correction) || isNull (box correction.Review)
+                       || String.IsNullOrEmpty correction.Path
+                       || not (Map.containsKey correction.Path sourceDelta)
+                       || Map.containsKey correction.Path corrections then
+                        return! Error(InvalidBinding "Ambiguous or unrelated reviewed path correction.")
+                    let key = correction.Review.TaskId, correction.Review.ReviewId, correction.Review.DecisionOperationId
+                    let! delta =
+                        match Map.tryFind key correctionDeltas with
+                        | Some delta -> Ok delta
+                        | None -> result {
+                            let! reviewed = verifyIndependentDecisionAt binding snapshot correction.Review
+                            if reviewed.TargetRef <> aggregate.TargetRef
+                               || reviewed.DecisionSequence <= constituentReview.DecisionSequence
+                               || reviewed.DecisionSequence >= aggregateReview.DecisionSequence
+                               || reviewed.ReviewedHeadOid = aggregate.SubmittedCommit then
+                                return! Error(InvalidBinding "Path correction is not a distinct later Accepted review.")
+                            do! LedgerStore.verifySourceAncestry binding reviewed.ReviewedHeadOid aggregate.SubmittedCommit
+                            let! _, delta = LedgerStore.reviewedTreeDelta binding reviewed.BaseCommit reviewed.ReviewedHeadOid
+                            return delta
+                        }
+                    correctionDeltas <- Map.add key delta correctionDeltas
+                    match Map.tryFind correction.Path delta with
+                    | Some value -> corrections <- Map.add correction.Path value corrections
+                    | None -> return! Error(InvalidBinding "Correction review did not change its asserted path.")
+                for KeyValue(path, original) in sourceDelta do
+                    let final = Map.tryFind path aggregateDelta
+                    let expected =
+                        match Map.tryFind path corrections with
+                        | Some corrected when corrected <> original -> Some corrected
+                        | Some _ -> None
+                        | None -> Some original
+                    if final.IsNone || final <> expected
+                       || Map.tryFind path publishedDelta <> final
+                       || Map.tryFind path currentDelta <> final then
+                        return! Error(InvalidBinding "Constituent path was reverted, omitted, changed without exact Accepted correction, or is no longer on target.")
+                let attribution: AggregateInclusionRecord =
+                    { TaskId = taskId; SubmissionId = submissionId.ToString("N")
+                      ProjectId = binding.ProjectId.ToString("D"); LedgerId = binding.LedgerId.ToString("D")
+                      Epoch = binding.Epoch; OperationId = operationId.ToString("D"); ReviewerId = actorId
+                      AggregateTaskId = aggregateProof.TaskId
+                      AggregateSubmissionId = evidence.AggregateSubmissionId.ToString("N")
+                      AggregateCommit = aggregate.SubmittedCommit; AggregateTree = finalTree
+                      PublishedCommit = aggregate.IntegratedCommit; ObservedTargetHead = remoteHead
+                      ConstituentCommit = pending.SubmittedCommit; TargetRef = pending.TargetRef
+                      Evidence = evidence }
+                return [ change path (Some oid) { pending with Status = "IncludedInAggregate" }
+                         change receiptPath None attribution ]
+            })
+        }
+
+
+    // A historical disposition is not a current operational acceptance. Verify
+    // the exact immutable attribution operation and original record, without
+    // reconstructing an effect or claiming that all later target edits retain it.
+    let getAggregateInclusionAt binding snapshot taskId submissionId = result {
+        let! submission = getIntegrationSubmissionAt binding snapshot taskId submissionId
+        let path = attributionPath taskId submissionId
+        let! entry = read<AggregateInclusionRecord> binding snapshot path
+        match submission.Status, entry with
+        | "IncludedInAggregate", Some (record, _) ->
+            let! operationId = exactGuid "D" record.OperationId
+            let! operation, original = operationOrigin binding snapshot operationId
+            let! originalRecord, _ = required<AggregateInclusionRecord> binding original path
+            let! originalSubmission = getIntegrationSubmissionAt binding original taskId submissionId
+            let! payload = operationPayload operation
+            try
+                let evidenceJson = stringMember payload "evidence"
+                let! evidence = parseAggregateEvidence evidenceJson
+                if isNull (box evidence.AggregateReview) || isNull (box evidence.ConstituentReview)
+                   || originalRecord <> record || originalSubmission <> submission
+                   || not (operationWrote operation path)
+                   || not (operationWrote operation (integrationPath taskId submissionId))
+                   || record.TaskId <> taskId || record.SubmissionId <> submissionId.ToString("N")
+                   || record.ProjectId <> binding.ProjectId.ToString("D")
+                   || record.LedgerId <> binding.LedgerId.ToString("D") || record.Epoch <> binding.Epoch
+                   || record.ConstituentCommit <> submission.SubmittedCommit
+                   || record.TargetRef <> submission.TargetRef || record.Evidence <> evidence
+                   || record.AggregateTaskId <> evidence.AggregateReview.TaskId
+                   || record.AggregateSubmissionId <> evidence.AggregateSubmissionId.ToString("N")
+                   || record.AggregateTree <> evidence.AggregateTree
+                   || asPending submission <> { submission with Status = "Pending" } then
+                    return! Error(LedgerIntegrityError "Aggregate attribution differs from its immutable disposition.")
+                do! LedgerStore.verifyIntegrationOperationIntent binding operation
+                        (intent operationId record.ReviewerId "RecordAggregateInclusion"
+                            {| taskId = taskId; submissionId = submissionId; evidence = evidenceJson |})
+                return Some record
+            with
+            | :? InvalidOperationException | :? System.Collections.Generic.KeyNotFoundException ->
+                return! Error(LedgerIntegrityError "Malformed aggregate inclusion operation.")
+        | "IncludedInAggregate", None ->
+            return! Error(LedgerIntegrityError "Included constituent is missing its canonical attribution.")
+        | _, Some _ ->
+            return! Error(LedgerIntegrityError "Attribution exists without its included constituent disposition.")
+        | _, None -> return None
+    }
+
+    let getIntegrationSubmissions binding taskId =
+        if not (validTaskId taskId) then Error(InvalidBinding "Invalid task ID.")
+        else result {
+            let! snapshot = LedgerStore.fetch binding
+            let! _ = required<ReviewTask> binding snapshot (taskPath taskId)
+            let! submissions = integrationSubmissionsAt binding snapshot taskId
+            let included = submissions |> List.filter (fun submission -> submission.Status = "IncludedInAggregate")
+            let! paths = LedgerStore.listAt binding snapshot $"records/integration-attributions/{taskId}"
+            let expectedPaths =
+                included |> List.map (fun item -> attributionPath taskId (Guid.ParseExact(item.SubmissionId, "N")))
+                |> Set.ofList
+            if Set.ofList paths <> expectedPaths then
+                return! Error(LedgerIntegrityError "Canonical integration dispositions and attribution paths differ.")
+            let mutable attributions = []
+            for submission in included do
+                let! id = exactGuid "N" submission.SubmissionId
+                let! attribution = getAggregateInclusionAt binding snapshot taskId id
+                attributions <- (attribution |> Option.toList) @ attributions
+            return { SnapshotCommit = snapshot.Commit
+                     Latest = submissions |> List.tryLast
+                     Submissions = submissions
+                     AggregateInclusions = List.rev attributions }
+        }
 
     let private emptyNotificationPreferences agentId =
         { AgentId = agentId; Version = 0; MuteAll = false

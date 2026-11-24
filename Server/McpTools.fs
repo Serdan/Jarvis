@@ -167,6 +167,11 @@ module IntegrationCommands =
                        TargetRef = targetRef; Reason = reviewId; Summary = reviewNamespace
                        NextAction = reviewRef; Evidence = bindingApprovalOperationId }
 
+    let recordAggregateInclusion projectName agentId taskId submissionId operationId (evidence: AggregateInclusionEvidence) =
+        let cmd = TaskCommands.write projectName "RecordAggregateInclusion" operationId taskId agentId
+        let evidenceJson = JsonSerializer.Serialize(evidence, JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase))
+        TaskWriteCommand { cmd with AttemptId = submissionId; Evidence = evidenceJson }
+
 module NotificationCommands =
     // Retain the caller's original selected checkout until source ledger
     // verification succeeds. A fabricated checkout must not inherit authority
@@ -372,7 +377,7 @@ module McpToolHelpers =
     let private ledgerTaskReadMethods = [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint";  "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec";
                                          "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"; "GetNotificationPreferences"; "GetResponseAlerts"; "GetWorkComposition"; "GetLaunchTemplate"; "RenderLaunchPrompt" ]
     let private ledgerTaskWriteMethods =
-        [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
+        [ "SubmitIntegration"; "CompleteIntegration"; "RecordAggregateInclusion"; "NotifyAgent"; "AcknowledgeNotification"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
           "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
           "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork"
           "SetAgentState"; "CorrectAgentWorkingState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"
@@ -2022,7 +2027,7 @@ type JarvisMcpTools =
         let cmd = TaskCommands.write projectName "SetAgentInstructions" operationId "" TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.sendWithManualGrant manualGrantCredential client http (TaskWriteCommand { cmd with OwnerId = targetAgentId; ExpectedVersion = expectedVersion; Html = instructions })
 
-    [<McpServerTool(Title = "integration submissions", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read every recorded exact-commit integration submission and the latest submitted boundary for a task, including pending and integrated evidence. Does not merge or infer that a review verdict implies integration.")>]
+    [<McpServerTool(Title = "integration submissions", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read every recorded exact-commit integration submission and the latest submitted boundary for a task, including pending, integrated and historical aggregate inclusion evidence. Does not merge or infer that a review verdict implies integration.")>]
     static member GetIntegrationSubmissions(projectName: string, agentId: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (TaskReadCommand { ProjectName = projectName; AgentId = ""; Action = "GetIntegrationSubmissions"; TaskId = taskId; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
@@ -2037,6 +2042,11 @@ type JarvisMcpTools =
     static member CompleteIntegration(projectName: string, taskId: string, agentId: string, submissionId: string, integratedCommit: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "CompleteIntegration" operationId taskId agentId
         McpToolHelpers.sendWithManualGrant manualGrantCredential client http (TaskWriteCommand { cmd with AttemptId = submissionId; BaseOid = integratedCommit })
+
+    [<McpServerTool(Title = "record aggregate source inclusion", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("The original independent aggregate reviewer explicitly attests a Pending task-bound constituent's source inclusion in an already published, independently Accepted aggregate. Supply exact review decision operation UUIDs, aggregate submission and v1 completion UUID, final reviewed tree, and any independently Accepted later path corrections. Records a separate historical IncludedInAggregate disposition; never publishes source, changes the aggregate receipt, accepts work, or releases dependencies. Reuse the exact operation UUID and evidence on retry.")>]
+    static member RecordAggregateInclusion(projectName: string, taskId: string, agentId: string, submissionId: string, evidence: AggregateInclusionEvidence, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =
+        let command = IntegrationCommands.recordAggregateInclusion projectName agentId taskId submissionId operationId evidence
+        McpToolHelpers.sendWithManualGrant manualGrantCredential client http command
 
     [<McpServerTool(Title = "get notification preferences", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read this registered agent's durable recipient-owned notification mute and sender blocks without changing them. The empty source project denotes this same project.")>]
     static member GetNotificationPreferences(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

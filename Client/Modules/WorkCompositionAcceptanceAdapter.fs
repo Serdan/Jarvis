@@ -75,81 +75,6 @@ module WorkCompositionAcceptanceAdapter =
     // CompleteIntegration transaction, irrespective of whether I equals S.
     // A mutable I-to-S downgrade (or cleared publisher fields) can never turn
     // a modern completion into an unauthenticated historical direct receipt.
-    let private requireManagedCompletionAt (binding: LedgerBinding) (snapshot: LedgerSnapshot)
-                                           taskId (submissionId: Guid) (submission: IntegrationSubmission) = result {
-        let path = $"tasks/{taskId}/integrations/{submissionId:N}.json"
-        let! completion = LedgerStore.findCompletionOperationForPathAt binding snapshot path
-        if completion.Sequence <= submission.CreatedSequence
-           || String.IsNullOrWhiteSpace completion.Actor then
-            return! Error(InvalidBinding
-                "Composition integration lacks a valid canonical completion sequence and actor.")
-        let! originalHead = LedgerStore.getOperationOriginAt binding snapshot completion
-        let! originalSnapshot = LedgerStore.verifiedHistoricalSnapshot binding originalHead
-        let! originalReceipt =
-            ReviewWorkflow.getIntegrationSubmissionAt binding originalSnapshot taskId submissionId
-        if originalReceipt <> submission then
-            return! Error(InvalidBinding
-                "Composition integration receipt differs from its original immutable completion.")
-        do! LedgerStore.verifyCompletionOperationRequest binding completion
-                taskId submissionId originalReceipt.IntegratedCommit
-        do! LedgerStore.fetchReviewRef binding submission.ReviewRef submission.SubmittedCommit
-        do! LedgerStore.fetchIntegrationRef binding submission.IntegrationRef submission.SubmittedCommit
-
-        let legacyDirect =
-            originalReceipt.IntegratedCommit = originalReceipt.SubmittedCommit
-            && String.IsNullOrWhiteSpace originalReceipt.PublicationOperationId
-            && String.IsNullOrWhiteSpace originalReceipt.PublicationMechanism
-            && String.IsNullOrWhiteSpace originalReceipt.PublicationPreviousHead
-            && String.IsNullOrWhiteSpace originalReceipt.PublicationObservedHead
-        if legacyDirect then
-            // A blank original v1 receipt is not evidence of pre-v1 origin:
-            // generic canonical transactions can manufacture it *today*.
-            // No independently verified pre-v1 rollout anchor or historical
-            // operation allowlist is available. Fail closed for managed
-            // composition acceptance. Legacy branch-only integration records
-            // remain covered by ReviewWorkflow's separate compatibility path.
-            return! Error(InvalidBinding
-                "Managed legacy direct completion has no trusted pre-v1 origin proof.")
-        else
-            let! _ =
-                match Guid.TryParseExact(submission.PublicationOperationId, "D") with
-                | true, id when id <> Guid.Empty
-                                && submission.PublicationMechanism = "VerifiedNonForceGitPush/v1"
-                                && completion.OperationId = id.ToString("D") -> Ok id
-                | _ -> Error(InvalidBinding
-                    "Managed integration has no original verified non-force publisher receipt.")
-            if not (LedgerStore.validSourceCommitOid submission.PublicationPreviousHead)
-               || not (LedgerStore.validSourceCommitOid submission.PublicationObservedHead)
-               || submission.PublicationPreviousHead = submission.IntegratedCommit then
-                return! Error(InvalidBinding "Invalid original integration publication heads.")
-            if submission.IntegratedCommit = submission.SubmittedCommit then
-                let! remoteHead = LedgerStore.readRemoteTarget binding submission.TargetRef
-                do! LedgerStore.verifySourceAncestry binding
-                        submission.TargetHeadAtSubmission submission.PublicationPreviousHead
-                do! LedgerStore.verifySourceAncestry binding
-                        submission.PublicationPreviousHead submission.IntegratedCommit
-                do! LedgerStore.verifySourceAncestry binding
-                        submission.IntegratedCommit submission.PublicationObservedHead
-                do! LedgerStore.verifySourceAncestry binding
-                        submission.PublicationObservedHead remoteHead
-            else
-                do! LedgerStore.verifyPublishedMechanicalIntegration binding
-                        submission.TargetRef submission.TargetHeadAtSubmission
-                        submission.SubmittedCommit submission.IntegratedCommit
-                        submission.PublicationPreviousHead submission.PublicationObservedHead
-            // Under the Operator-approved trusted-writer model, the original
-            // authorized CompleteIntegration workflow is our publisher. Its
-            // immutable canonical operation/request, v1 receipt, independent
-            // reviewed source and actual Git facts were checked above. This
-            // read-only verifier never publishes or replays an uncertain effect.
-            //
-            // A privileged actor that can arbitrarily write the canonical
-            // ledger AND target ref could fabricate matching history; no
-            // in-process receipt proves execution against that actor. The
-            // separate audit fixture documents that OUT-OF-MODEL capability.
-            return ()
-    }
-
     let internal checkAt (binding: LedgerBinding) (snapshot: LedgerSnapshot)
                         (graph: WorkCompositionGraph) (unitId: string) (receipt: string) =
         result {
@@ -194,7 +119,7 @@ module WorkCompositionAcceptanceAdapter =
             if not valid then
                 return! Error(InvalidBinding
                     "Composition acceptance requires an independent review of this exact spec and an integrated canonical source receipt.")
-            do! requireManagedCompletionAt binding snapshot taskId submissionId submission
+            do! ReviewWorkflow.requireManagedCompletionAt binding snapshot taskId submissionId submission
             return ()
         }
 

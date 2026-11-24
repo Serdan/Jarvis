@@ -1053,6 +1053,52 @@ module PendingIntentJournal =
             | _ -> false
         | _ -> false
 
+    // Inclusion has two canonical entity changes, not a v1 publication receipt.
+    // Preserve uncertain intents unless both exact effects and the request match.
+    let private aggregateInclusionReceiptMatches (record: PendingIntent) (operation: LedgerStore.LedgerOperation)
+                                                (own: JsonElement) (envelope: JsonElement) (remote: JsonElement) =
+        match commandProperty own "OperationId", commandProperty own "AttemptId",
+              commandProperty own "TaskId", commandProperty own "ActorId" with
+        | Some ownId, Some submission, Some taskId, Some actor ->
+            match Guid.TryParse ownId, Guid.TryParse submission with
+            | (true, id), (true, submissionId) when id <> Guid.Empty && submissionId <> Guid.Empty ->
+                let path = $"tasks/{taskId}/integrations/{submissionId:N}.json"
+                let attribution = $"records/integration-attributions/{taskId}/{submissionId:N}.json"
+                use receipt = JsonDocument.Parse(operation.OriginalResultJson)
+                let result = receipt.RootElement
+                let effects = result.GetProperty("entityResults")
+                let changes = result.GetProperty("changes")
+                let matchingEffect index expectedPath =
+                    match commandProperty effects.[index] "contentSha256", commandProperty changes.[index] "contentSha256" with
+                    | Some effectHash, Some changeHash ->
+                        effectHash.Length = 64 && (effectHash |> Seq.forall Uri.IsHexDigit)
+                        && effectHash = changeHash
+                        && commandProperty effects.[index] "path" = Some expectedPath
+                        && commandProperty changes.[index] "path" = Some expectedPath
+                        && commandProperty effects.[index] "taskId" = Some taskId
+                    | _ -> false
+                operation.SchemaVersion = 2
+                && taskId <> "_reviews" && not (String.IsNullOrWhiteSpace taskId)
+                && record.OperationId = id.ToString("D")
+                && operation.OperationId = record.OperationId && operation.Actor = actor
+                && (envelope.EnumerateObject() |> Seq.length) = 6
+                && envelope.GetProperty("schemaVersion").GetInt32() = 2
+                && commandProperty envelope "projectId" = Some record.ProjectId
+                && commandProperty envelope "operationId" = Some record.OperationId
+                && commandProperty envelope "actor" = Some actor
+                && commandProperty envelope "kind" = Some operation.Type
+                && (remote.EnumerateObject() |> Seq.length) = 3
+                && operation.Path = path && operation.Paths = [| path; attribution |]
+                && result.GetProperty("schemaVersion").GetInt32() = 2
+                && commandProperty result "operationId" = Some record.OperationId
+                && commandProperty result "kind" = Some operation.Type
+                && result.GetProperty("sequence").GetInt64() = operation.Sequence
+                && effects.GetArrayLength() = 2 && changes.GetArrayLength() = 2
+                && matchingEffect 0 path && matchingEffect 1 attribution
+                && commandProperty effects.[0] "status" = Some "IncludedInAggregate"
+            | _ -> false
+        | _ -> false
+
     let private identityMatches (record: PendingIntent) (operation: LedgerStore.LedgerOperation) =
         try
             use local = JsonDocument.Parse(record.CommandJson)
@@ -1095,6 +1141,9 @@ module PendingIntentJournal =
                 | "TaskWrite", "CompleteIntegration"
                     when integrationReceiptMatches record operation own full.RootElement remote 3 "Integrated" None ->
                     common @ [ "AttemptId", "submissionId"; "BaseOid", "integratedCommit" ]
+                | "TaskWrite", "RecordAggregateInclusion"
+                    when aggregateInclusionReceiptMatches record operation own full.RootElement remote ->
+                    common @ [ "AttemptId", "submissionId"; "Evidence", "evidence" ]
                 | "TaskWrite", "CreateTask" ->
                     common @ [ "Title", "title"; "Html", "specSha256" ]
                 | "TaskWrite", "ReviseTaskSpec" ->
@@ -2636,6 +2685,11 @@ module TaskApi =
                                 |> Result.bind (fun submissionId ->
                                     ReviewWorkflow.ReviewWorkflow.completeIntegration binding operationId
                                         cmd.TaskId cmd.ActorId submissionId cmd.BaseOid |> mapError)
+                            | "RecordAggregateInclusion" ->
+                                guid "submissionId" cmd.AttemptId
+                                |> Result.bind (fun submissionId ->
+                                    ReviewWorkflow.ReviewWorkflow.recordAggregateInclusion binding operationId
+                                        cmd.TaskId cmd.ActorId submissionId cmd.Evidence |> mapError)
                             | "QueueResponseAlert" ->
                                 withAdministrativeActor (fun actor ->
                                     ReviewWorkflow.ReviewWorkflow.queueResponseAlert binding operationId

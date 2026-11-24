@@ -295,3 +295,39 @@ module ClientConfig =
         | "native-health-timeout-seconds" -> Ok { stored with NativeHealthTimeoutSeconds = None }
         | "allowed-environment-variables" -> Ok { stored with AllowedEnvironmentVariables = None }
         | _ -> Error $"Unknown setting: {key}"
+
+
+    /// Device-local deny-only launch fence. This does not constitute admission.
+    type CapacityFenceMode = Disabled | NegativeOnly
+
+    let capacityFenceModeAt (path: string) : Result<CapacityFenceMode, string> =
+        try
+            // File.Exists suppresses access and I/O errors; treating those as
+            // absence would accidentally disable the fence. Inspect and read
+            // once, defaulting only for genuinely missing files/directories.
+            let raw =
+                try
+                    let attributes = File.GetAttributes path
+                    if attributes.HasFlag(FileAttributes.ReparsePoint) then
+                        invalidOp "Config path must not be a symbolic link."
+                    use reader = new StreamReader(path, UTF8Encoding(false, true), true)
+                    Some(reader.ReadToEnd())
+                with
+                | :? FileNotFoundException | :? DirectoryNotFoundException -> None
+            match raw with
+            | None -> Ok Disabled
+            | Some raw when String.IsNullOrWhiteSpace raw -> Error "Existing configuration is empty."
+            | Some raw ->
+                // Validate the existing schema and known settings against the same snapshot.
+                parse raw |> validate |> function
+                | Error e -> Error e
+                | Ok _ ->
+                    use json = JsonDocument.Parse(raw)
+                    match json.RootElement.TryGetProperty "capacityFenceEnabled" with
+                    | false, _ -> Ok Disabled
+                    | true, value when value.ValueKind = JsonValueKind.False -> Ok Disabled
+                    | true, value when value.ValueKind = JsonValueKind.True -> Ok NegativeOnly
+                    | _ -> Error "capacityFenceEnabled must be a boolean."
+        with ex -> Error $"Cannot read capacity fence config at {path}: {ex.Message}"
+
+    let capacityFenceMode () = capacityFenceModeAt (configPath())

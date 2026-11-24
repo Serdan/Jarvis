@@ -531,13 +531,41 @@ let private fromBrowser (operation: ValueTask<Result<string, EffectError>>) =
             { Payload = payload; ChangedAgentIds = [] })
     })
 
+// An attributed launch uses one bounded, strictly decoded UTF-8 snapshot.
+// Strip exactly one UTF-8 BOM, preserve line endings and Unicode as decoded.
+let internal readAttributedLaunchSource (path: string) =
+    use stream = File.OpenRead(path)
+    let buffer = Array.zeroCreate<byte> (BrowserBridge.MaxScriptBytes + 1)
+    let mutable count = 0
+    let mutable reading = true
+    while reading && count < buffer.Length do
+        let n = stream.Read(buffer, count, buffer.Length - count)
+        if n = 0 then reading <- false
+        else count <- count + n
+    if count > BrowserBridge.MaxScriptBytes then
+        raise (InvalidDataException("InputTooLarge: script exceeds 64 KiB."))
+    let offset =
+        if count >= 3 && buffer.[0] = 0xEFuy && buffer.[1] = 0xBBuy && buffer.[2] = 0xBFuy then 3
+        else 0
+    let source = UTF8Encoding(false, true).GetString(buffer, offset, count - offset)
+    if String.IsNullOrWhiteSpace source then
+        raise (InvalidDataException("Empty attributed launch script."))
+    source
+
 // A launch intent is committed before any browser side effect. Its assignment
 // is read from the same ledger snapshot that creates the immutable record.
-let internal beginAttributedLaunch binding actor targetAgentId (launchId: Guid) =
+// The digest is of the actual decoded source string, not the file bytes.
+let internal beginAttributedLaunch binding actor targetAgentId (launchId: Guid) scriptPath (source: string) =
+    let executedSourceSha256 =
+        UTF8Encoding(false, true).GetBytes(source)
+        |> System.Security.Cryptography.SHA256.HashData
+        |> Convert.ToHexString
+        |> fun value -> value.ToLowerInvariant()
     let path = $"records/browser-launches/{launchId:N}/intent.json"
     let intent : Client.LedgerStore.LedgerIntent =
         { OperationId = launchId; Actor = actor; Kind = "BrowserLaunchIntent"
-          RequestJson = JsonSerializer.Serialize({| targetAgentId = targetAgentId |}) }
+          RequestJson = JsonSerializer.Serialize({| targetAgentId = targetAgentId; scriptPath = scriptPath
+                                                    executedSourceSha256 = executedSourceSha256 |}) }
     Client.LegacyDirectWriterFence.LegacyDirectWriterFence.transact binding intent (fun snapshot ->
         match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurnAt binding snapshot targetAgentId with
         | Error e -> Error e
@@ -548,6 +576,7 @@ let internal beginAttributedLaunch binding actor targetAgentId (launchId: Guid) 
             let content = JsonSerializer.Serialize(
                 {| launchId = launchId.ToString("N"); targetAgentId = targetAgentId
                    taskId = taskId; assignmentSnapshot = snapshot.Commit
+                   scriptPath = scriptPath; executedSourceSha256 = executedSourceSha256
                    timestampUtc = DateTimeOffset.UtcNow; outcome = "outcomeUnknown" |})
             Ok [ { Path = path; ExpectedBlobOid = None; Content = content } ])
 
@@ -721,7 +750,10 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
                                 if FileInfo(path).Length > int64 BrowserBridge.MaxScriptBytes then
                                     return Error(Client.ValidationError "InputTooLarge: script exceeds 64 KiB.")
                                 else
-                                    let source = File.ReadAllText(path, UTF8Encoding(false, true))
+                                    let source =
+                                        match cmd.TargetAgentId with
+                                        | Some _ -> readAttributedLaunchSource path
+                                        | None -> File.ReadAllText(path, UTF8Encoding(false, true))
                                     let args = defaultArg cmd.ArgsJson "{}"
                                     use validatedArgs = JsonDocument.Parse(args)
                                     // Every new agent tab closes by default; an explicit false is a debugging opt-out.
@@ -734,8 +766,10 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
                                             match OrchestrationApi.LedgerBindingConfig.load cmd.ProjectName rt with
                                             | Error e -> Error (string e)
                                             | Ok binding ->
-                                                match beginAttributedLaunch binding agentId targetId launchId with
+                                                match beginAttributedLaunch binding agentId targetId launchId cmd.ScriptPath source with
                                                 | Error e -> Error (string e)
+                                                | Ok receipt when receipt.AlreadyApplied ->
+                                                    Error "Launch intent already recorded; do not retry Send."
                                                 | Ok _ -> Ok (Some binding)
                                     match attribution with
                                     | Error e -> return Error(Client.ValidationError ("LaunchAttributionNotRecorded: " + e))
@@ -795,6 +829,7 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
                                                            else error + " [tabRegistration=" + registrationId + "]"
                                                        Client.ValidationError detail)
                             with
+                            | :? InvalidDataException as e -> return Error(Client.ValidationError e.Message)
                             | :? DecoderFallbackException -> return Error(Client.ValidationError "InvalidUtf8")
                             | :? JsonException -> return Error(Client.ValidationError "InvalidArgumentsJson")
                             | :? FileNotFoundException -> return Error(Client.NotFoundError "ScriptNotFound")

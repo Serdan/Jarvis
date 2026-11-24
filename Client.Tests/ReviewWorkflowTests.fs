@@ -91,10 +91,34 @@ type ReviewWorkflowTests() =
 
     [<Test>]
     member _.BrowserLaunchAttributionPersistsSnapshotAndIdempotentOutcome() =
-        withFixture (fun _ _ first second _ _ _ initTask ->
+        withFixture (fun one _ first second _ _ _ initTask ->
             initTask "attribution-task"
             let launch = Guid.NewGuid()
-            Client.SignalR.Client.beginAttributedLaunch first "Operator" "Owner" launch |> success |> ignore
+            let scriptPath = "scripts/launchAgent.js"
+            let source = "// 界😀\r\nlaunch();\n"
+            let localPath = Path.Combine(one, scriptPath)
+            Directory.CreateDirectory(Path.GetDirectoryName(localPath)) |> ignore
+            let bytes = System.Text.Encoding.UTF8.GetBytes(source)
+            let readSource = Client.SignalR.Client.readAttributedLaunchSource
+            File.WriteAllBytes(localPath, Array.append [| 0xEFuy; 0xBBuy; 0xBFuy |] bytes)
+            let snapshotSource = readSource localPath
+            Assert.That(snapshotSource, Is.EqualTo(source))
+            File.WriteAllBytes(localPath, bytes)
+            Assert.That(readSource localPath, Is.EqualTo(snapshotSource))
+            File.WriteAllBytes(localPath, [| 0xEFuy; 0xBBuy; 0xBFuy; 0xC3uy; 0x28uy |])
+            Assert.Throws<System.Text.DecoderFallbackException>(fun () -> readSource localPath |> ignore) |> ignore
+            File.WriteAllBytes(localPath, [| 0xFFuy; 0xFEuy; 0x61uy; 0x00uy |])
+            Assert.Throws<System.Text.DecoderFallbackException>(fun () -> readSource localPath |> ignore) |> ignore
+            File.WriteAllBytes(localPath, [||])
+            Assert.Throws<InvalidDataException>(fun () -> readSource localPath |> ignore) |> ignore
+            File.Delete(localPath)
+            Assert.Throws<FileNotFoundException>(fun () -> readSource localPath |> ignore) |> ignore
+            let expectedDigest =
+                System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(source))
+                |> Convert.ToHexString |> fun value -> value.ToLowerInvariant()
+            let beginLaunch target id path text =
+                Client.SignalR.Client.beginAttributedLaunch first "Operator" target id path text
+            beginLaunch "Owner" launch scriptPath snapshotSource |> success |> ignore
             let read path =
                 let snapshot = LedgerStore.fetch second |> success
                 let content, _ = LedgerStore.readAt second snapshot path |> success
@@ -102,6 +126,21 @@ type ReviewWorkflowTests() =
             use intent = read $"records/browser-launches/{launch:N}/intent.json"
             Assert.That(intent.RootElement.GetProperty("targetAgentId").GetString(), Is.EqualTo("Owner"))
             Assert.That(intent.RootElement.GetProperty("taskId").GetString(), Is.EqualTo("attribution-task"))
+            Assert.That(intent.RootElement.GetProperty("scriptPath").GetString(), Is.EqualTo(scriptPath))
+            Assert.That(intent.RootElement.GetProperty("executedSourceSha256").GetString(), Is.EqualTo(expectedDigest))
+            let _, operation = LedgerStore.getOperationStatus first launch |> success
+            Assert.That(operation.Value.CanonicalRequestJson, Does.Contain(expectedDigest))
+            Assert.That(operation.Value.CanonicalRequestJson, Does.Not.Contain("launch();"))
+            let duplicate = beginLaunch "Owner" launch scriptPath source |> success
+            Assert.That(duplicate.AlreadyApplied, Is.True)
+            for path, text in [ scriptPath, source.Replace("\r\n", "\n"); "other/launchAgent.js", source ] do
+                match beginLaunch "Owner" launch path text with
+                | Error OperationIdReused -> ()
+                | other -> Assert.Fail(sprintf "Changed launch input must fail: %A" other)
+            let different = Guid.NewGuid()
+            beginLaunch "Owner" different scriptPath (source + "// changed") |> success |> ignore
+            use differentIntent = read $"records/browser-launches/{different:N}/intent.json"
+            Assert.That(differentIntent.RootElement.GetProperty("executedSourceSha256").GetString(), Is.Not.EqualTo(expectedDigest))
             let outcome = """{"outcome":"submitted","model":"observed","mode":"Chat","effort":null}"""
             Client.SignalR.Client.finishAttributedLaunch first "Operator" launch outcome |> success |> ignore
             let retry = Client.SignalR.Client.finishAttributedLaunch first "Operator" launch outcome |> success
@@ -109,18 +148,104 @@ type ReviewWorkflowTests() =
             use saved = read $"records/browser-launches/{launch:N}/outcome.json"
             Assert.That(saved.RootElement.GetProperty("model").GetString(), Is.EqualTo("observed"))
             let unassigned = Guid.NewGuid()
-            Client.SignalR.Client.beginAttributedLaunch first "Operator" "Reviewer" unassigned |> success |> ignore
+            beginLaunch "Reviewer" unassigned scriptPath source |> success |> ignore
             use empty = read $"records/browser-launches/{unassigned:N}/intent.json"
             Assert.That(empty.RootElement.GetProperty("taskId").ValueKind, Is.EqualTo(System.Text.Json.JsonValueKind.Null))
             ReviewWorkflow.createTask first (Guid.NewGuid()) "later-task" "later-task" |> success |> ignore
             ReviewWorkflow.assignTask first (Guid.NewGuid()) "later-task" (Guid.NewGuid()) "Reviewer" |> success |> ignore
-            let retryStart = Client.SignalR.Client.beginAttributedLaunch first "Operator" "Reviewer" unassigned |> success
+            let retryStart = beginLaunch "Reviewer" unassigned scriptPath source |> success
             Assert.That(retryStart.AlreadyApplied, Is.True)
             use unchanged = read $"records/browser-launches/{unassigned:N}/intent.json"
             Assert.That(unchanged.RootElement.GetProperty("taskId").ValueKind, Is.EqualTo(System.Text.Json.JsonValueKind.Null))
+            Assert.That(unchanged.RootElement.GetProperty("executedSourceSha256").GetString(), Is.EqualTo(expectedDigest))
+            let historical = Guid.NewGuid()
+            let historicalPath = $"records/browser-launches/{historical:N}/intent.json"
+            let historicalJson = """{"targetAgentId":"Owner","outcome":"outcomeUnknown"}"""
+            let historicalIntent : LedgerIntent =
+                { OperationId = historical; Actor = "Operator"; Kind = "BrowserLaunchIntent"
+                  RequestJson = """{"targetAgentId":"Owner"}""" }
+            Client.LegacyDirectWriterFence.LegacyDirectWriterFence.transact first historicalIntent (fun _ ->
+                Ok [ { Path = historicalPath; ExpectedBlobOid = None; Content = historicalJson } ])
+            |> success |> ignore
+            match beginLaunch "Owner" historical scriptPath source with
+            | Error OperationIdReused -> ()
+            | other -> Assert.Fail(sprintf "Historical intent must not be rewritten: %A" other)
+            use old = read historicalPath
+            Assert.That(old.RootElement.TryGetProperty("executedSourceSha256") |> fst, Is.False)
             match Client.SignalR.Client.finishAttributedLaunch first "Operator" launch "{\"outcome\":\"other\"}" with
             | Error OperationIdReused -> ()
             | other -> Assert.Fail(sprintf "Changed retry must fail: %A" other))
+
+    [<Test>]
+    member _.BrowserLaunchAttributionDispatchUsesStrictSourceBeforeIntentAndPreservesGenericContract() =
+        withFixture (fun one _ first second _ _ _ initTask ->
+            initTask "dispatch-task"
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            try
+                let head = (LedgerStore.fetch first |> success).Commit
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" context first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl head true
+                |> success |> ignore
+                let runtime = Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.FullTrust)
+                // Never start the bridge or register a window. Its blank-window
+                // preflight deterministically denies all browser effects.
+                use bridge = new Client.BrowserBridge.Service(12345, "disposable-test")
+                runtime.Browser <- Some bridge
+                let scriptPath = "test.js"
+                let localPath = Path.Combine(one, scriptPath)
+                let invoke target =
+                    let command =
+                        Common.BrowserRunInNewTabCommand
+                            { TargetAgentId = target; WindowRegistration = ""; Url = "https://example.test/"
+                              ProjectName = "owner"; ScriptPath = scriptPath; ArgsJson = None
+                              Active = None; CloseTabAfterExecution = None; TimeoutMs = None }
+                    let _, result, _ =
+                        Client.SignalR.Client.processIncomingCommand runtime
+                            (System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(command)) "Owner"
+                        |> Async.AwaitTask |> Async.RunSynchronously
+                    result
+                let current () = LedgerStore.fetch second |> success
+                let launchFiles () =
+                    let snapshot = current()
+                    git second.RepositoryPath [ "ls-tree"; "-r"; "--name-only"; snapshot.Commit; "--"; "records/browser-launches" ]
+                let expectError expected target =
+                    let result = invoke target
+                    Assert.That(result.IsError, Is.True, sprintf "%A" result)
+                    Assert.That(sprintf "%A" result, Does.Contain(expected))
+                expectError "NotFoundError" (Some "Reviewer")
+                File.WriteAllBytes(localPath, [| 0xEFuy; 0xBBuy; 0xBFuy; 0xC3uy; 0x28uy |])
+                expectError "InvalidUtf8" (Some "Reviewer")
+                File.WriteAllBytes(localPath, [||])
+                expectError "Empty attributed launch script" (Some "Reviewer")
+                Assert.That(launchFiles(), Is.Empty)
+                let source = "// 界😀\r\n"
+                let bytes = System.Text.Encoding.UTF8.GetBytes(source)
+                File.WriteAllBytes(localPath, Array.append [| 0xEFuy; 0xBBuy; 0xBFuy |] bytes)
+                expectError "WindowNotRegistered" None
+                Assert.That(launchFiles(), Is.Empty)
+                expectError "WindowNotRegistered" (Some "Reviewer")
+                let files = launchFiles().Split('\n')
+                Assert.That(files.Length, Is.EqualTo(2))
+                let intentPath = files |> Array.find (fun path -> path.EndsWith("/intent.json"))
+                let outcomePath = files |> Array.find (fun path -> path.EndsWith("/outcome.json"))
+                let read path =
+                    let content, _ = LedgerStore.readAt second (current()) path |> success
+                    System.Text.Json.JsonDocument.Parse(content.Value)
+                use intent = read intentPath
+                use outcome = read outcomePath
+                let field (doc: System.Text.Json.JsonDocument) name = doc.RootElement.GetProperty(name: string).GetString()
+                let digest =
+                    System.Security.Cryptography.SHA256.HashData(bytes) |> Convert.ToHexString
+                    |> fun value -> value.ToLowerInvariant()
+                Assert.That(field intent "executedSourceSha256", Is.EqualTo(digest))
+                Assert.That(field intent "scriptPath", Is.EqualTo(scriptPath))
+                Assert.That(field intent "launchId", Is.EqualTo(field outcome "launchId"))
+                Assert.That(field intent "outcome", Is.EqualTo("outcomeUnknown"))
+                Assert.That(field outcome "outcome", Is.EqualTo("notSubmitted"))
+            finally
+                if File.Exists configPath then File.Delete configPath)
 
     [<Test>]
     member _.AdministrativeActorIsRecordedInReceiptAssignmentAndClosureEvent() =

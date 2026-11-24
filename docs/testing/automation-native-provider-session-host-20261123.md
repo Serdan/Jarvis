@@ -401,3 +401,59 @@ No provider send, actual reservation or release, runtime activation,
 deployment, restart, main publication, or operational E2E is claimed.
 
 Final host suite with both occupied-path tests: job 0cb49220c2a84af6aa6f4ab66c98a6cd, exit 0, 25/25 passed, zero skipped. Total 76/76 focused tests on the final production source and final QA test tree. This is bounded candidate verification, not independent acceptance of either pending producer.
+
+### Stage C accepted-constituent composition — confirmed cross-component HOLD
+
+On 2026-11-24, composed the independently accepted W12 account source
+ea25c1584102fc8796ee15f04219836fb6b8d75c (review bd902f0af91443a7b9b68e1037f49c51,
+decision 13465) and W23 project exclusion source
+6bb5998af609014fc0c4c69c501f028d827dead2 (review 6c12d587232b4b13a416ab2dac1f70f5,
+decision 13497). Applied their exact deltas only in the disposable
+native-stagec-compose-w16 worktree; W16 feature source retains exclusive
+ownership and neither accepted constituent was modified. Existing focused
+Release verification on that composition:
+
+| Suite | Passed | Job | Exit |
+| --- | ---: | --- | ---: |
+| Host | 25/25 | 8d8e1e51de9445dbb1e0b674c10fed15 | 0 |
+| Started ingress | 9/9 | bbcdde19ace441c88005912a3ed84bfe | 0 |
+| Provider trust | 29/29 | 3842d77f45744f529f1c49313f7336ba | 0 |
+| Challenge wake/B1 | 13/13 | c0854bbd2460472d93c068b5c449076a | 0 |
+| W23 project exclusion | 8/8 | 68f068b02c4145589d37794de44c0adb | 0 |
+
+New composition-only genuine release regressions are frozen at
+62642b081fcc4461468ffd6edac2371a4ea53796, tree
+bfcc515615877e3682889159dd1b84f32bea72b8, branch
+qa/native-stagec-compose-w16-20261124. They use normal configured account
+reservations and two independent disposable Git clients, recheck the account
+receipt inside project CAS, and exercise both Worker and Reviewer before
+claim and after genuine paired-bridge host preparation (HeldBeforeSend,
+account still Reserved generation 1). Actual W23 planExclusion commits
+the original-bound tombstone, both claims and any held begin-send are denied,
+wrong evidence blob release is denied and occupancy remains Reserved. All
+four expected valid release cases then fail at W12's receipt verification:
+AccountPolicyNotAuthoritative, "No-send receipt does not bind the exact
+original reservation and exclusion." Release job
+109e80c994f0452da590b3c2a86e7111 exit 1, 4 failed, 0 passed; an earlier
+preclaim-only regression 7604a20c4c1446479961736389fe5fa9 also reproduced
+both failures. The positive replay assertion has not executed.
+
+Root cause: accepted W12 NativeSchedulerAccountReservation.fs passes the
+raw serialized nested NativeNoSendEvidence as the expected RequestJson
+to verifyIntegrationOperationIntent; accepted W23 hashes the full v1 envelope
+(schemaVersion, expectedProjectHead, predecessor, evidence). The authentic
+project receipt cannot satisfy the raw-only verifier. Lead challenge
+5c15097ca14346a0b9444bcfc2daf61f, condition
+27332b5108b0eb5f23ccf8483d982550, requests exclusive account lease correction
+and independently accepted exact SHA; also requests reconciliation of
+runtime registration and checkClaim/planBeginSend ownership. Neither
+accepted historical source verdict is changed. No synthetic receipt,
+release bypass, shared fsproj/Program change, production send, deployment,
+or main integration was attempted.
+
+Continuation: compose the exact corrected W12 accepted delta into the
+frozen QA branch and rerun the four red cases to green; extend to recorded
+account-fence generation, capacity reuse, wrong/replay evidence and
+two-client begin-send versus exclusion race under the actual runtime
+dispatch lease, then record fresh W16 source review. The 84 existing
+passing focused tests do not establish a genuine successful release.

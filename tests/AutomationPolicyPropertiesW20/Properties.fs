@@ -1,6 +1,7 @@
 module AutomationPolicyPropertiesW20
 
 open System
+open System.Threading.Tasks
 open NUnit.Framework
 open Client.LedgerStore
 open Client.ProjectCapacityPolicy
@@ -41,3 +42,27 @@ let policyHistories seed =
             Assert.That((current.Roles = roles), Is.True, context)
             Assert.That(readForRole reader snapshot (revision + 1) "Worker" |> Result.isError, Is.True, context)
             Assert.That(readForRole reader snapshot revision "Unknown" |> Result.isError, Is.True, context))
+
+// Competing requests share a predecessor but carry different values and identities.
+// The oracle allows either winner, but never both, and verifies the durable value.
+[<Test>]
+let concurrentPolicyWritersHaveOneSuccessor () =
+    withClones (fun a b ->
+        let opA, opB = Guid.NewGuid(), Guid.NewGuid()
+        let rolesA = Map.ofList [ "Worker", 1 ]
+        let rolesB = Map.ofList [ "Worker", 2 ]
+        let first = Task.Run(fun () -> update a "operator" opA 0 2 rolesA)
+        let second = Task.Run(fun () -> update b "operator" opB 0 3 rolesB)
+        Task.WaitAll [| first :> Task; second :> Task |]
+        Assert.That([first.Result; second.Result] |> List.filter Result.isOk |> List.length, Is.EqualTo(1))
+        let winnerOp, winnerTotal, winnerRoles =
+            if Result.isOk first.Result then opA, 2, rolesA else opB, 3, rolesB
+        for reader in [a; b] do
+            let snapshot = LedgerStore.fetch reader |> good
+            let policy = readForRole reader snapshot 1 "Worker" |> good |> fst
+            Assert.That(policy.Revision, Is.EqualTo(1))
+            Assert.That(policy.Total, Is.EqualTo(winnerTotal))
+            Assert.That(policy.Roles = winnerRoles, Is.True)
+            let retry = update reader "operator" winnerOp 0 winnerTotal winnerRoles |> good
+            Assert.That(retry.AlreadyApplied, Is.True)
+        )

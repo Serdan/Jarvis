@@ -99,21 +99,31 @@ let internal reserve binding actor operation effect role roleVersion generation 
         LedgerStore.transact binding (intent actor operation "FixtureCapacity.Reserve" request) (fun snapshot ->
             planReservation binding snapshot actor operation effect role roleVersion generation)
 
+// Pure planning against the caller's transaction snapshot. This does not establish
+// production authority or permission to send; replay bypasses this callback.
+// A composing CAS adapter must treat LedgerWrite.AlreadyApplied=true as replay,
+// never as permission to send. A new commit alone is not production authority.
+let private planTransition binding snapshot actor original effect role roleVersion generation target =
+    read binding snapshot
+    |> Result.bind (fun (state, oid) ->
+        match state.Entries |> List.tryFind (fun e -> e.Effect = effect) with
+        | Some e when e.ReservationOperation = original && e.Role = role && e.Owner = actor && e.RoleVersion = roleVersion && e.Generation = generation && e.Status = "Held" ->
+            let entries = state.Entries |> List.map (fun x -> if x.Effect = effect then { x with Status = target } else x)
+            Ok(change (Some oid) { state with Entries = entries })
+        | _ -> reject "original held identity missing or changed")
+
+let internal planBeginSend binding snapshot actor original effect role roleVersion generation =
+    planTransition binding snapshot actor original effect role roleVersion generation "Dispatching"
+
 #if PROJECT_CAPACITY_DISPOSABLE_TEST_ONLY
 // Fixture send and fixture no-send compete for the same held predecessor.
-// No caller-provided boolean or receipt is accepted as evidence.
 let transition binding actor operation original effect role roleVersion generation target =
     let request = json {| original = original; effect = effect; role = role; roleVersion = roleVersion; generation = generation; target = target |}
     if not (List.contains target ["Dispatching"; "Excluded"]) then reject "unsupported transition"
     else
         LedgerStore.transact binding (intent actor operation ("FixtureCapacity." + target) request) (fun snapshot ->
-            read binding snapshot
-            |> Result.bind (fun (state, oid) ->
-                match state.Entries |> List.tryFind (fun e -> e.Effect = effect) with
-                | Some e when e.ReservationOperation = original && e.Role = role && e.Owner = actor && e.RoleVersion = roleVersion && e.Generation = generation && e.Status = "Held" ->
-                    let entries = state.Entries |> List.map (fun x -> if x.Effect = effect then { x with Status = target } else x)
-                    Ok(change (Some oid) { state with Entries = entries })
-                | _ -> reject "original held identity missing or changed"))
+            if target = "Dispatching" then planBeginSend binding snapshot actor original effect role roleVersion generation
+            else planTransition binding snapshot actor original effect role roleVersion generation target)
 
 let beginSend binding actor operation original effect role roleVersion generation =
     transition binding actor operation original effect role roleVersion generation "Dispatching"

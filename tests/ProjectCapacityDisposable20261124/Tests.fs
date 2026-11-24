@@ -169,3 +169,32 @@ let unknownInventoryFailsClosedAndCombinedReserveCommits () =
         let snapshot = LedgerStore.fetch b |> good
         let raw, _ = LedgerStore.readAt b snapshot path |> good
         Assert.That(raw, Is.EqualTo(Some "claimed")))
+
+
+[<Test>]
+let extractedPlannerValidatesIdentityAndReplayIsNotNewCommit () =
+    withClones (fun a b ->
+        let original, effect, sendOp = Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid()
+        let plan snapshot actor orig eff role version generation =
+            planBeginSend a snapshot actor orig eff role version generation
+        let unknown = LedgerStore.fetch a |> good
+        Assert.That(plan unknown "worker" original effect "Worker" 2 3 |> Result.isError, Is.True)
+        initializeFixture a "fixture" (Guid.NewGuid()) 1 Map.empty |> good |> ignore
+        reserve a "worker" original effect "Worker" 2 3 |> good |> ignore
+        let held = LedgerStore.fetch a |> good
+        let bad =
+            [ plan held "other" original effect "Worker" 2 3
+              plan held "worker" (Guid.NewGuid()) effect "Worker" 2 3
+              plan held "worker" original (Guid.NewGuid()) "Worker" 2 3
+              plan held "worker" original effect "Reviewer" 2 3
+              plan held "worker" original effect "Worker" 1 3
+              plan held "worker" original effect "Worker" 2 4 ]
+        Assert.That(bad |> List.forall Result.isError, Is.True)
+        Assert.That(plan held "worker" original effect "Worker" 2 3 |> Result.isOk, Is.True)
+        let first = beginSend a "worker" sendOp original effect "Worker" 2 3 |> good
+        Assert.That(first.AlreadyApplied, Is.False)
+        let replay = beginSend b "worker" sendOp original effect "Worker" 2 3 |> good
+        Assert.That(replay.AlreadyApplied, Is.True)
+        let sent = LedgerStore.fetch a |> good
+        Assert.That(plan sent "worker" original effect "Worker" 2 3 |> Result.isError, Is.True)
+        Assert.That(beginSend b "worker" (Guid.NewGuid()) original effect "Worker" 2 3 |> Result.isError, Is.True))

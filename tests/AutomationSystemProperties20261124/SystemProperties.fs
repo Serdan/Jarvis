@@ -717,6 +717,58 @@ type GeneratedComposition() =
             Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
             Directory.Delete(root, true)
 
+    [<Test>]
+    member _.SharedActivityStoreSeparatesProjectAndOwnerKeys() =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-system-shared-activity-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let prior = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+        Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", Path.Combine(root, "config"))
+        try
+            let first = newFixture root
+            let second = secondAgent first
+            let fs = [|first; second|]
+            use activity = new SystemPropertyActivityFixture.ActivityFixture(Path.Combine(root, "shared-activity.sqlite"))
+            let project = first.Original.ProjectName
+            let foreignProject = "Other Project"
+            let a, b = first.Original.AgentId, second.Original.AgentId
+            let now = DateTimeOffset.UtcNow
+            let old = now.AddSeconds(-701.)
+            // Opposite high-water values under each owner/project key.
+            // Neither a fresh sibling nor an unrelated stale project may
+            // suppress/authorize recovery for the wrong candidate.
+            let expected =
+                [ project, a, activity.Record(project,a,now).LastSeenAtUtc
+                  project, b, activity.Record(project,b,old).LastSeenAtUtc
+                  foreignProject, a, activity.Record(foreignProject,a,old).LastSeenAtUtc
+                  foreignProject, b, activity.Record(foreignProject,b,now).LastSeenAtUtc ]
+            for client in 0..1 do
+                for p, agent, seen in expected do
+                    let actual = activity.Read(client,p,agent).GetAwaiter().GetResult() |> success
+                    equal "shared activity preserves exact composite key" seen actual.LastSeenAtUtc
+            first.State <- {first.State with Age = Some 0}
+            second.State <- {second.State with Age = Some 701}
+            let check client =
+                let candidates = fs |> Array.choose (fun f -> current f client) |> Array.toList
+                let deps : Dependencies =
+                    { Enumerate = fun () -> Ok candidates
+                      Current = NativeHealth.current first.Runtimes[client]
+                      Activity = fun p agent -> activity.Read(client,p,agent)
+                      Recover = NativeHealth.recover first.Runtimes[client] }
+                NativeHealth.checkOnce {Enabled = true; InactivitySeconds = 600} deps
+                |> fun t -> t.GetAwaiter().GetResult()
+            equal "only actually stale owner recovered" 1 (check 1).Recoveries
+            second.State <- next CheckHealth second.State
+            fs |> Array.iter observe
+            step second 0 Resume
+            activity.Restart()
+            let head = (LedgerStore.fetch first.First |> success).Commit
+            equal "restart does not qualify persisted sibling rows" 0 (check 0).Recoveries
+            equal "unqualified restart leaves canonical head unchanged" head (LedgerStore.fetch first.Second |> success).Commit
+            fs |> Array.iter observe
+        finally
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
+            Directory.Delete(root, true)
+
     // Explicit schedule at the final activity/recovery boundary. Both
     // contenders have captured the same Working generation; the first
     // durable transition must exclude the stale second command.

@@ -1,0 +1,1 @@
+Base 3f84149a; source 818bb6f8, fixture 6206e852. Combined Release six passed; subsequent final native differential two passed, 27 steps x 3 seeds. Wrong blob rejected; comparator mutant detected. Script shell denied locally; direct equivalent commands documented. Component-level scope only.

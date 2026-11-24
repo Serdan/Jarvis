@@ -1,0 +1,1 @@
+Base f94902a contains accepted abef95dc. Exposes internal planBeginSend using validated reader and existing exact held identity checks. Fixture send uses planner; exclusion and initialization remain test-gated. CAS consumers must reject AlreadyApplied as permission to send. Release Client build passed (one existing warning); focused disposable tests passed 8/8.

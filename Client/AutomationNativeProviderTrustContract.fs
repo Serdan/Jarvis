@@ -185,6 +185,8 @@ let inspectTerminal (observation: TerminalObservation) : Result<NonAuthorizingTe
         let r, l, p = observation.Reservation, observation.Locator, observation.Proof
         if l.DispatchId = Guid.Empty || l.OriginalReservationId = Guid.Empty
            || l.EffectOperationId = Guid.Empty || l.TerminalOperationId = Guid.Empty
+           || not (digest l.ReservationRequestSha256)
+           || l.ExpectedGeneration <> r.Generation || r.Generation < 1L
            || r.Status <> "Active"
            || r.Candidate.DispatchId <> string l.DispatchId
            || r.OriginalOperationId <> string l.OriginalReservationId

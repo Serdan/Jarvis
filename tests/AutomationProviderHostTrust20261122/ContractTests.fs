@@ -150,8 +150,9 @@ type ContractFixture() =
 
     [<Test>]
     member _.``terminal locator with empty operation cannot authorize release`` () =
-        let locator =
+        let locator : NativeTerminalLocator =
             { DispatchId = guid dispatch; OriginalReservationId = guid original
+              ReservationRequestSha256 = digest; ExpectedGeneration = reserved.Generation
               EffectOperationId = guid effect; TerminalOperationId = Guid.Empty }
         let proof =
             { DispatchId = locator.DispatchId; OriginalReservationId = locator.OriginalReservationId
@@ -165,8 +166,9 @@ type ContractFixture() =
 
     [<Test>]
     member _.``matching typed terminal shape remains non-authoritative without verified canonical origin`` () =
-        let locator =
+        let locator : NativeTerminalLocator =
             { DispatchId = guid dispatch; OriginalReservationId = guid original
+              ReservationRequestSha256 = digest; ExpectedGeneration = reserved.Generation
               EffectOperationId = guid effect; TerminalOperationId = guid terminal }
         let proof =
             { DispatchId = locator.DispatchId; OriginalReservationId = locator.OriginalReservationId
@@ -183,8 +185,9 @@ type ContractFixture() =
 
     [<Test>]
     member _.``forged provider session is rejected before non-authoritative projection`` () =
-        let locator =
+        let locator : NativeTerminalLocator =
             { DispatchId = guid dispatch; OriginalReservationId = guid original
+              ReservationRequestSha256 = digest; ExpectedGeneration = reserved.Generation
               EffectOperationId = guid effect; TerminalOperationId = guid terminal }
         let proof =
             { DispatchId = locator.DispatchId; OriginalReservationId = locator.OriginalReservationId
@@ -226,8 +229,9 @@ type ContractFixture() =
 
     [<Test>]
     member _.MalformedActiveTerminalMissingCandidateReturnsTypedHold() =
-        let locator =
+        let locator : NativeTerminalLocator =
             { DispatchId = guid dispatch; OriginalReservationId = guid original
+              ReservationRequestSha256 = digest; ExpectedGeneration = reserved.Generation
               EffectOperationId = guid effect; TerminalOperationId = guid terminal }
         let proof =
             { DispatchId = locator.DispatchId; OriginalReservationId = locator.OriginalReservationId

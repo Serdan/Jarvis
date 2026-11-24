@@ -1005,12 +1005,24 @@ type NativeSchedulerAccountReservationTests() =
             // Negative fixture deliberately writes only a receipt-shaped blob,
             // without the canonical fence mutation. Not a genuine issuer.
             let path = NativeSchedulerAccountReservation.noSendEvidencePath operationId
-            LedgerStore.transact project
+            let intent =
                 { OperationId = operationId; Actor = "Disposable incomplete no-send fixture"
                   Kind = "NativeVerifiedNoSend"; RequestJson = evidence }
+            LedgerStore.transact project intent
                 (fun _ -> Ok [ { Path = path; ExpectedBlobOid = None; Content = evidence } ])
             |> NativeReservationFixture.success |> ignore
-            let current = head ()
+            let snapshot = LedgerStore.fetch project |> NativeReservationFixture.success
+            let operation =
+                LedgerStore.getOperationAt project snapshot operationId
+                |> NativeReservationFixture.success |> Option.get
+            // Normal ledger writes canonicalize the nested request; the raw
+            // evidence remains byte-exact in the blob, not in the envelope.
+            use envelope = JsonDocument.Parse(operation.CanonicalRequestJson)
+            Assert.That(envelope.RootElement.GetProperty("request").GetString(), Is.Not.EqualTo(evidence))
+            Assert.That(LedgerStore.verifyIntegrationOperationIntent project operation intent, Is.EqualTo(Ok ()))
+            let wrongIntent = { intent with RequestJson = "{}" }
+            Assert.That(LedgerStore.verifyIntegrationOperationIntent project operation wrongIntent, Is.Not.EqualTo(Ok ()))
+            let current = snapshot.Commit
             deny { locator with ProjectHead = current; NoSendOrigin = current }
             let advance (l: NativeOriginalReservationLocator) status =
                 NativeSchedulerAccountReservation.transition f.AccountOne f.ProjectsOne

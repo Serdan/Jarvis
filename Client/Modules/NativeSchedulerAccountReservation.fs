@@ -722,18 +722,15 @@ module NativeSchedulerAccountReservation =
                     match LedgerStore.readAt binding at path with
                     | Ok(Some raw, Some oid) when raw = expected && oid = locator.EvidenceBlobOid -> ()
                     | _ -> return! bad "Original-bound no-send fence or evidence blob is missing or changed."
-            let matchesIntent =
-                try
-                    use document = JsonDocument.Parse(operation.CanonicalRequestJson)
-                    let envelope = document.RootElement
-                    envelope.GetProperty("projectId").GetString() = record.Candidate.ProjectId
-                    && envelope.GetProperty("kind").GetString() = "NativeVerifiedNoSend"
-                    && envelope.GetProperty("operationId").GetString() = string locator.NoSendOperationId
-                    && envelope.GetProperty("actor").GetString() = operation.Actor
-                    && envelope.GetProperty("request").GetString() = expected
-                with _ -> false
-            if not matchesIntent then
-                return! bad "No-send receipt does not bind the exact original reservation and exclusion."
+            do!
+                LedgerStore.verifyIntegrationOperationIntent binding operation
+                    { OperationId = locator.NoSendOperationId
+                      Actor = operation.Actor
+                      Kind = "NativeVerifiedNoSend"
+                      RequestJson = expected }
+                |> Result.mapError (fun _ ->
+                    AccountPolicyNotAuthoritative
+                        "No-send receipt does not bind the exact original reservation and exclusion.")
             return ()
         }
 

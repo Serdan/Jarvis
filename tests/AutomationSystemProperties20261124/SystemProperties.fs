@@ -916,3 +916,68 @@ type GeneratedComposition() =
         finally
             Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
             Directory.Delete(root, true)
+
+    // Each seed chooses which project owns the original reservation and which
+    // client executes each transition. The other project's challenge remains
+    // an independent eligibility gate even after capacity is released.
+    [<TestCase(401)>]
+    [<TestCase(402)>]
+    member _.NoSendReleasePreservesChallengeAndCapacity(seed: int) =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-system-nosend-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let prior = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+        Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", Path.Combine(root, "config"))
+        try
+            let random = Random(seed)
+            let fs = [| newFixture (Path.Combine(root, "project-a")); newFixture (Path.Combine(root, "project-b")) |]
+            use account = SystemPropertyAccountFixture.create root [| fs |> Array.map _.First; fs |> Array.map _.Second |]
+            let first = random.Next 2
+            let other = 1 - first
+            let binding client project = if client = 0 then fs[project].First else fs[project].Second
+            let candidate client project = SystemPropertyAccountFixture.candidate (binding client project) fs[project].Original.TaskId
+            let verify expected =
+                for client in 0..1 do
+                    let records = (SystemPropertyAccountFixture.read account client).Records
+                    equal "no-send exact account state" expected (records |> Array.map (fun r -> r.Candidate.DispatchId, r.Status) |> Map.ofArray)
+                    equal "no-send unique reservations" expected.Count records.Length
+                    equal "no-send capacity conserved" true ((records |> Array.filter (fun r -> r.Status <> "Released") |> Array.length) <= 1)
+                fs |> Array.iter observe
+            SystemPropertyAccountFixture.approve account 0 0L 1 1 |> success |> ignore
+            step fs[other] 0 Block
+            verify Map.empty
+            let original = Guid.NewGuid()
+            let c = candidate 0 first
+            SystemPropertyAccountFixture.reserve account 0 original c |> success |> ignore
+            let expected = Map.ofList [c.DispatchId, "Reserved"]
+            verify expected
+            let locator = SystemPropertyAccountFixture.excludeBeforeClaim account 0 first original c
+            verify expected
+            let wrong = { locator with EvidenceBlobOid = String.replicate locator.EvidenceBlobOid.Length "0" }
+            equal "forged exclusion cannot release" true (SystemPropertyAccountFixture.releaseNoSend account 1 (Guid.NewGuid()) wrong).IsError
+            verify expected
+            let releaseId = Guid.NewGuid()
+            let released = SystemPropertyAccountFixture.releaseNoSend account 1 releaseId locator |> success
+            equal "first exclusion release is fresh" false released.AlreadyApplied
+            let releasedExpected = Map.ofList [c.DispatchId, "Released"]
+            verify releasedExpected
+            let replay = SystemPropertyAccountFixture.releaseNoSend account 0 releaseId locator |> success
+            equal "release replay has no second effect" true replay.AlreadyApplied
+            verify releasedExpected
+            let _, oldClaim = SystemPropertyAccountFixture.claim account 1 first original c
+            equal "excluded original cannot claim" true oldClaim.IsError
+            verify releasedExpected
+            let blockedCandidate = candidate 0 other
+            equal "free capacity cannot dispatch blocked work" true
+                (SystemPropertyAccountFixture.reserve account 0 (Guid.NewGuid()) blockedCandidate).IsError
+            verify releasedExpected
+            step fs[other] 0 (Advance 601)
+            step fs[other] 1 CheckStale
+            verify releasedExpected
+            step fs[other] 1 Resolve
+            step fs[other] 0 Resume
+            let next = candidate 1 other
+            SystemPropertyAccountFixture.reserve account 1 (Guid.NewGuid()) next |> success |> ignore
+            verify (releasedExpected.Add(next.DispatchId, "Reserved"))
+        finally
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
+            Directory.Delete(root, true)

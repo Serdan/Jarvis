@@ -111,16 +111,18 @@ async function executeLaunch(args, observeSelection) {
   });
   try {
   // Re-evaluate on every fresh launch; never cache usage availability.
-  // Strict fallback order: Chat Latest Medium, Work GPT-6.1 Terra Medium, Chat Latest Instant.
+  // Strict fallback order: Chat Latest High, Work GPT-6.1 Terra Medium, Chat Latest Instant.
   // Advance only when the current selection cannot be confirmed before Send.
   const defaultPreferences = [
-    { mode: "Chat", model: "Latest", effort: "medium", level: 1, label: "Medium" },
+    { mode: "Chat", model: "Latest", effort: "high", level: 2, label: "High" },
     { mode: "Work", model: "GPT-6.1 Terra", effort: "medium", level: 1, label: "Medium" },
     { mode: "Chat", model: "Latest", effort: "none", level: 0, label: "Instant" }
   ];
   // Latest is a selectable alias, not a hard-coded version. Do not infer
   // the alias's backing model from this account's current version.
   const modelOverrides = new Map([
+    ["latest-high", [defaultPreferences[0]]],
+    ["latest-medium", [{ mode: "Chat", model: "Latest", effort: "medium", level: 1, label: "Medium" }]],
     ["gpt-5.6-instant", [{ mode: "Chat", model: "GPT-5.6", alternateModels: ["GPT-5.6 Sol"], effort: "none", level: 0, label: "Instant" }]],
     ["work-terra-medium", [defaultPreferences[1]]]
   ]);
@@ -182,6 +184,13 @@ async function executeLaunch(args, observeSelection) {
       return value && value.length <= 128 ? value : null;
     } catch { return null; }
   };
+  // The closed trigger independently exposes the named effort and selected
+  // attribute. It does not identify the Chat model; that must be checked in
+  // the menu again at the final Send boundary.
+  const closedPickerProof = (control, target) => Boolean(control &&
+    control.getAttribute("aria-expanded") === "false" && !modelMenu() &&
+    control.getAttribute("data-selected-reasoning-effort") === target.effort &&
+    (control.innerText || control.textContent || "").trim() === target.label);
   const unavailableRadio = item => !item || item.getAttribute("aria-disabled") === "true" ||
     item.hasAttribute("data-disabled");
   const activeMenuControl = selector => Array.from(modelMenu()?.querySelectorAll(selector) || [])
@@ -356,23 +365,27 @@ async function executeLaunch(args, observeSelection) {
           model: modelObservation,
           effort: renderedLabel(powerLabel)
         };
-        // Close the picker before editing or sending. No menu click can
-        // submit a prompt. At the final boundary avoid an extra settling
-        // delay after the checked-radio proof; wait only for closure if needed.
-        if (control.getAttribute("aria-expanded") === "true") control.click();
-        if (finalCheck) {
-          // Closure may replace the trigger. Keep the checked trigger's
-          // identity below so the caller must re-prove on a replacement.
-          const closed = () => !home() &&
-            picker()?.getAttribute("aria-expanded") === "false" && !modelMenu();
+        // Escape follows the actual reasoning-menu dismissal path. A
+        // trigger click is only a fallback when Escape did not close it.
+        if (control.getAttribute("aria-expanded") === "true") {
+          keyboard.dispatchEvent(new KeyboardEvent("keydown", {
+            key: "Escape", code: "Escape", bubbles: true, cancelable: true
+          }));
+        }
+        const closed = () => !home() && closedPickerProof(picker(), target);
+        const closureCutoff = Math.min(untilAt, Date.now() + 250);
+        if (!closed() && !await poll(closed, closureCutoff)) {
+          const stillOpen = picker();
+          if (!home() && stillOpen === control &&
+              stillOpen.getAttribute("aria-expanded") === "true") stillOpen.click();
           if (!closed() && !await poll(closed, Math.min(untilAt, Date.now() + 250)))
             return "SelectionChanged";
-        } else {
-          await delay(80);
         }
-        if (home() || !modeButton(target.mode) ||
-            modeButton(target.mode)?.getAttribute("aria-pressed") !== "true" ||
-            picker()?.getAttribute("data-selected-reasoning-effort") !== target.effort)
+        if (!finalCheck) await delay(80);
+        // A replacement trigger may have the same effort, but the caller
+        // must re-prove model identity on that replacement before Send.
+        if (home() || modeButton(target.mode)?.getAttribute("aria-pressed") !== "true" ||
+            !closedPickerProof(picker(), target))
           return "SelectionChanged";
         confirmedModelLabel = checkedModelLabel;
         confirmedObservation = observation;
@@ -414,7 +427,6 @@ async function executeLaunch(args, observeSelection) {
   }
   let selectedMode = selected.mode;
   let selectedModel = confirmedModelLabel;
-  let selectedEffort = selected.effort;
   if (args.selectionOnly === true) {
     observeSelection(confirmedObservation);
     return { status: "selectionOnly", selectedMode, selectedModel,
@@ -463,7 +475,7 @@ async function executeLaunch(args, observeSelection) {
     }
     const modelControl = picker();
     if (!modelControl) return { transient: "ModelControlChanged" };
-    if (modelControl.getAttribute("data-selected-reasoning-effort") !== selectedEffort) {
+    if (!closedPickerProof(modelControl, selected)) {
       return { transient: "SelectedEffortChanged" };
     }
     if (selectedMode === "Work") {
@@ -564,7 +576,6 @@ async function executeLaunch(args, observeSelection) {
               selected = fallback;
               selectedMode = fallback.mode;
               selectedModel = confirmedModelLabel;
-              selectedEffort = fallback.effort;
               activeComposer = null;
               activeModes = null;
               inserted = false;
@@ -605,8 +616,7 @@ async function executeLaunch(args, observeSelection) {
                   final.composer === activeComposer &&
                   readEditor() === insertedPrompt &&
                   document.querySelector(sendSelector) === send &&
-                  confirmedPicker.getAttribute("aria-expanded") === "false" &&
-                  !modelMenu()) {
+                  closedPickerProof(confirmedPicker, selected)) {
                 if (Date.now() >= preSendDeadline) {
                   return { ...notSubmitted("LaunchDeadlineExceeded"), stage: "submitControl" };
                 }

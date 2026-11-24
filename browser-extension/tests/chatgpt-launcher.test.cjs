@@ -18,6 +18,8 @@ function harness(options = {}) {
   let navigationAttempts = 0;
   let clicks = 0;
   let modelAtSend = null;
+  let effortAtSend = null;
+  let escapeAttempts = 0;
   let draftPickerOpens = 0;
   let focused = false;
   let visibility = options.visibilityState || "visible";
@@ -109,6 +111,7 @@ function harness(options = {}) {
   const send = { click() {
     clicks++;
     modelAtSend = selectedModel;
+    effortAtSend = reasoningEffort;
     if (options.sendClickThrows) throw new Error("send click outcome could not be observed");
     if (options.noAcknowledgement) return;
     if (options.optimisticLocalRoute) {
@@ -149,27 +152,33 @@ function harness(options = {}) {
     ? ["Instant", "Pro"] : efforts;
   let proSelections = 0;
   const picker = {
+    get innerText() { return (content && options.closedTriggerLabelWhileDraft) || options.closedTriggerLabel || reasoningEffort; },
+    get textContent() { return this.innerText; },
     getAttribute(name) {
       if (name === "aria-expanded") return String(expanded);
       if (name !== "data-selected-reasoning-effort") return null;
       return options.forceEffortMismatchWhileDraft && content
-        ? "high" : reasoningEffort === "Pro" ? "medium" : values[efforts.indexOf(reasoningEffort)];
+        ? "medium" : reasoningEffort === "Pro" ? "medium" : values[efforts.indexOf(reasoningEffort)];
     },
     click() {
-      expanded = !expanded;
-      if (expanded && content) draftPickerOpens++;
-      if (!expanded && content && draftPickerOpens === 1 &&
-          options.replaceComposerOnFinalPickerClose) {
-        activeEditor = Object.create(editor);
-        selectedModel = "GPT-6";
-      }
-      if (!expanded && content && (options.replacePickerOnEveryDraftClose ||
-          (draftPickerOpens === 1 && options.replacePickerOnFinalClose))) {
-        activePicker = Object.create(picker);
-        selectedModel = "GPT-6";
-      }
+      if (expanded && options.triggerCannotClose) return;
+      togglePicker();
     }
   };
+  function togglePicker() {
+    expanded = !expanded;
+    if (expanded && content) draftPickerOpens++;
+    if (!expanded && content && draftPickerOpens === 1 &&
+        options.replaceComposerOnFinalPickerClose) {
+      activeEditor = Object.create(editor);
+      selectedModel = "GPT-6";
+    }
+    if (!expanded && content && (options.replacePickerOnEveryDraftClose ||
+        (draftPickerOpens === 1 && options.replacePickerOnFinalClose))) {
+      activePicker = Object.create(picker);
+      selectedModel = "GPT-6";
+    }
+  }
   let activePicker = picker;
   const radio = name => ({
     textContent: name,
@@ -204,6 +213,11 @@ function harness(options = {}) {
     hasAttribute(name) { return name === "data-disabled"; }
   };
   const keyboard = { closest() { return null; }, focus() {}, dispatchEvent(event) {
+    if (event.key === "Escape") {
+      escapeAttempts++;
+      if (!options.escapeCannotClose && expanded) togglePicker();
+      return;
+    }
     const available = activeEfforts();
     const n = Math.max(0, Math.min(available.length - 1, available.indexOf(reasoningEffort) + (event.key === "ArrowRight" ? 1 : -1)));
     reasoningEffort = available[n];
@@ -411,7 +425,7 @@ function harness(options = {}) {
       prompt, timeoutMs: (options.timeoutMs || 350) + 5000, ...extra
     }) + ")", ctx);
   return { run, site, get navigationAttempts() { return navigationAttempts; }, get clicks() { return clicks; }, get insertions() { return insertions; }, get pasteAttempts() { return pasteAttempts; }, get textInsertAttempts() { return textInsertAttempts; }, get chatClicks() { return chatClicks; },
-    get modelAtSend() { return modelAtSend; }, get draftPickerOpens() { return draftPickerOpens; },
+    get modelAtSend() { return modelAtSend; }, get effortAtSend() { return effortAtSend; }, get escapeAttempts() { return escapeAttempts; }, get draftPickerOpens() { return draftPickerOpens; },
     get selectedModel() { return selectedModel; }, get reasoningEffort() { return reasoningEffort; }, get modelClicks() { return modelClicks; }, get beforeReadyInsertions() { return beforeReadyInsertions; },
     get proSelections() { return proSelections; }, get mode() { return mode; }, get content() { return content; },
     get virtualClockState() { return virtualClock && { now: virtualClock.now, delays: [...virtualClock.delays] }; },
@@ -423,7 +437,7 @@ test("hidden launch is not rejected merely for lacking visibility", async () => 
   const h = harness({ visibilityState: "hidden" });
   const result = await h.run("Background launch is a requirement");
   assert.equal(result.status, "submitted");
-  assert.equal(result.selectedEffort, "Medium");
+  assert.equal(result.selectedEffort, "High");
   assert.equal(h.clicks, 1);
 });
 
@@ -431,7 +445,7 @@ test("visibility lost after insertion cannot authorize duplicate Send", async ()
   const h = harness({ hideTabAfterInsertMs: 0, timeoutMs: 1100 });
   const result = await h.run("Do not duplicate this message");
   assert.equal(result.status, "submitted");
-  assert.equal(result.selectedEffort, "Medium");
+  assert.equal(result.selectedEffort, "High");
   assert.equal(h.clicks, 1);
 });
 
@@ -818,7 +832,7 @@ test("effort resetting after prompt insertion is repaired before the sole Send",
   const h = harness({ resetEffortAfterInsertMs: 0, resetEffortTo: "Instant", timeoutMs: 2600 });
   const result = await h.run("Exact unique task prompt");
   assert.equal(result.status, "submitted");
-  assert.equal(h.reasoningEffort, "Medium");
+  assert.equal(h.reasoningEffort, "High");
   assert.equal(h.lastSubmittedText, "Exact unique task prompt");
   assert.equal(h.clicks, 1);
 });
@@ -991,7 +1005,7 @@ test("ignored pre-hydration Chat click retries on the same untouched new-chat ho
   assert.equal(h.clicks, 1);
   assert.equal(h.lastSubmittedText, "Hydration recovery");
   assert.equal(h.selectedModel, "Latest");
-  assert.equal(h.reasoningEffort, "Medium");
+  assert.equal(h.reasoningEffort, "High");
   assert.equal(h.modelClicks, 0);
 });
 
@@ -1061,7 +1075,7 @@ for (const { selectedModel, reasoningEffort } of [
     assert.equal(h.chatClicks, 0);
     assert.equal(h.clicks, 1);
     assert.equal(h.selectedModel, "Latest");
-    assert.equal(h.reasoningEffort, "Medium");
+    assert.equal(h.reasoningEffort, "High");
   });
 }
 
@@ -1117,7 +1131,7 @@ test("absent model picker fails closed without sending", async () => {
   assert.equal(h.clicks, 0);
 });
 
-test("disabled Chat Medium falls back to Work Terra without selecting Pro", async () => {
+test("disabled Chat High falls back to Work Terra without selecting Pro", async () => {
   const h = harness({ chatInstantAndProOnly: true, reasoningEffort: "Instant", timeoutMs: 12000 });
   const result = await h.run("Never send", { selectionOnly: true });
   assert.equal(result.status, "selectionOnly");
@@ -1130,7 +1144,7 @@ test("disabled Chat Medium falls back to Work Terra without selecting Pro", asyn
 });
 
 
-test("when Chat Medium and Work Terra Medium cannot be selected, fall back to Chat Instant", async () => {
+test("when Chat High and Work Terra Medium cannot be selected, fall back to Chat Instant", async () => {
   const h = harness({ maxEffortStep: 0, reasoningEffort: "Instant", timeoutMs: 18000 });
   const result = await h.run("Exactly one fallback", { selectionOnly: true });
   assert.equal(result.status, "selectionOnly");
@@ -1140,7 +1154,7 @@ test("when Chat Medium and Work Terra Medium cannot be selected, fall back to Ch
   assert.deepEqual(Array.from(result.attempts, item => ({
     mode: item.mode, model: item.model, effort: item.effort, reason: item.reason
   })), [
-    { mode: "Chat", model: "Latest", effort: "Medium", reason: "EffortUnavailable" },
+    { mode: "Chat", model: "Latest", effort: "High", reason: "EffortUnavailable" },
     { mode: "Work", model: "GPT-6.1 Terra", effort: "Medium", reason: "EffortUnavailable" }
   ]);
   assert.equal(h.clicks, 0);
@@ -1170,7 +1184,7 @@ test("waits for delayed post-Send user bubble and durable UUID without replay", 
   assert.equal(h.clicks, 1);
 });
 
-test("Pro with a medium attribute cannot pass as Medium even without an effort option", async () => {
+test("Pro with a medium attribute cannot pass as High even without an effort option", async () => {
   const h = harness({ chatInstantAndProOnly: true, omitEffortOption: true,
     reasoningEffort: "Pro", timeoutMs: 12000 });
   const result = await h.run("No paid message for a selection check", { selectionOnly: true });
@@ -1196,7 +1210,7 @@ test("Latest is selected instead of explicit GPT-6.2 and the checked alias is ob
   assert.equal(result.status, "selectionOnly");
   assert.equal(h.selectedModel, "Latest");
   assert.equal(result.selectedModel, "Latest");
-  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: "Chat", model: "Latest", effort: "Medium" });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: "Chat", model: "Latest", effort: "High" });
   assert.equal(h.clicks, 0);
 });
 
@@ -1240,7 +1254,7 @@ test("explicit override rejects prototype property and unsupported value without
   }
 });
 
-test("project entry selects Latest Medium without a Chat/Work mode toggle and sends once", async () => {
+test("project entry selects Latest High without a Chat/Work mode toggle and sends once", async () => {
   const startUrl = "https://chatgpt.com/g/g-p-abc123/project";
   const route = "https://chatgpt.com/g/g-p-abc123/c/00000000-0000-0000-0000-000000000001";
   const h = harness({ startUrl, noModeToggle: true, selectedModel: "GPT-6", reasoningEffort: "High",
@@ -1249,7 +1263,7 @@ test("project entry selects Latest Medium without a Chat/Work mode toggle and se
   const result = await h.run("Project launch", { startUrl, timeoutMs: 18000 });
   assert.equal(result.status, "submitted");
   assert.equal(result.selectedModel, "Latest");
-  assert.equal(result.selectedEffort, "Medium");
+  assert.equal(result.selectedEffort, "High");
   assert.equal(result.observedSelection.model, "Latest");
   assert.equal(result.observedSelection.mode, null);
   assert.equal(result.conversationUrl, route);
@@ -1324,13 +1338,13 @@ for (const selectedModel of ["Latest", "GPT-6.2"]) {
     assert.equal(result.status, "selectionOnly", JSON.stringify(result));
     assert.equal(h.selectedModel, "Latest");
     assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)),
-      { mode: "Chat", model: "Latest", effort: "Medium" });
+      { mode: "Chat", model: "Latest", effort: "High" });
     assert.equal(h.clicks, 0);
   });
 }
 
 for (const [name, modelOverride, model, effort] of [
-  ["Latest default", undefined, "Latest", "Medium"],
+  ["Latest default", undefined, "Latest", "High"],
   ["strict 5.6 override", "gpt-5.6-instant", "GPT-5.6 Sol", "Instant"]
 ]) {
   for (const drift of [false, true]) {
@@ -1460,7 +1474,7 @@ test("unobservable rendered selection remains unknown and does not duplicate Sen
 test("records visible selection labels from rendered controls", async () => {
   const h = harness({ observableLabels: true });
   const result = await h.run();
-  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: "Chat", model: "Latest", effort: "Medium" });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.observedSelection)), { mode: "Chat", model: "Latest", effort: "High" });
   assert.equal(h.clicks, 1);
 });
 
@@ -1663,4 +1677,66 @@ test("project route binding: mismatched legacy text cannot bind a valid route", 
   assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
   assert.equal(result.reason, "SubmissionUnconfirmed");
   assert.equal(result.projectRouteAcknowledgement, undefined);
+});
+
+test("default High uses Escape to close picker when trigger cannot dismiss it", async () => {
+  const h = harness({ reasoningEffort: "Medium", triggerCannotClose: true, virtualClock: true });
+  const result = await h.run("One exact prompt", { timeoutMs: 18000 });
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.equal(h.effortAtSend, "High");
+  assert.equal(h.clicks, 1);
+  assert.ok(h.escapeAttempts >= 2);
+  assert.equal(result.observedSelection.effort, "High");
+});
+
+test("explicit Latest Medium overrides High and retains exact selection proof", async () => {
+  const h = harness({ reasoningEffort: "High", virtualClock: true });
+  const result = await h.run("One exact prompt", { modelOverride: "latest-medium", timeoutMs: 18000 });
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.equal(h.effortAtSend, "Medium");
+  assert.equal(h.clicks, 1);
+  assert.equal(result.observedSelection.effort, "Medium");
+});
+
+test("closed picker contradicting selected effort attribute cannot authorize Send", async () => {
+  const h = harness({ closedTriggerLabel: "Stale", virtualClock: true });
+  const result = await h.run("Never send", { timeoutMs: 18000 });
+  assert.equal(result.status, "notSubmitted", JSON.stringify(result));
+  assert.equal(result.observedSelection, null);
+  assert.equal(h.clicks, 0);
+});
+
+test("picker that cannot close never authorizes Send", async () => {
+  const h = harness({ triggerCannotClose: true, escapeCannotClose: true, virtualClock: true });
+  const result = await h.run("Never send", { timeoutMs: 18000 });
+  assert.equal(result.status, "notSubmitted", JSON.stringify(result));
+  assert.equal(result.observedSelection, null);
+  assert.equal(h.clicks, 0);
+});
+
+test("Escape unsupported: closed trigger fallback is still proved before one Send", async () => {
+  const h = harness({ escapeCannotClose: true, virtualClock: true });
+  const result = await h.run("One exact prompt", { timeoutMs: 18000 });
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.equal(h.effortAtSend, "High");
+  assert.equal(h.clicks, 1);
+  assert.ok(h.escapeAttempts >= 2);
+});
+
+test("contradictory closed trigger appearing after insertion cannot authorize Send", async () => {
+  const h = harness({ closedTriggerLabelWhileDraft: "Medium", virtualClock: true });
+  const result = await h.run("Never send", { timeoutMs: 18000 });
+  assert.equal(result.status, "uiIncompatible", JSON.stringify(result));
+  assert.equal(result.observedSelection, null);
+  assert.equal(h.insertions, 1);
+  assert.equal(h.clicks, 0);
+});
+
+test("explicit Latest Medium rejects compressed Pro despite the medium attribute", async () => {
+  const h = harness({ chatInstantAndProOnly: true, omitEffortOption: true,
+    reasoningEffort: "Pro", virtualClock: true });
+  const result = await h.run("Never send", { modelOverride: "latest-medium", timeoutMs: 18000 });
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.attempts[0].reason, "EffortUnavailable");
+  assert.equal(h.clicks, 0);
 });

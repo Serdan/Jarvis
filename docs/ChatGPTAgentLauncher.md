@@ -105,14 +105,18 @@ Supported argument contract (unknown keys are rejected; no secrets):
 | `confirmedSubmittedPrompts` | No | Historical ignored non-secret prior-send hint; not proof of submission or authority |
 | `timeoutMs` | No | One overall UI deadline for hydration, insertion, submission confirmation and conversation URL capture (defaults to 27 s; capped at 27 s) |
 | `selectionOnly` | No | Diagnostic mode selection without sending |
+| `startUrl` | No | Exact fresh ChatGPT home or project landing URL, default `https://chatgpt.com/` |
+| `modelOverride` | No | Exact preference: `latest-high`, `latest-medium`, `gpt-5.6-instant`, or `work-terra-medium`; no fallback for explicit overrides |
 
 Jarvis browser-workflow parameters, **not** ChatGPT script arguments, control `windowRegistration`, `active`, `closeTabAfterExecution`, and device selection. Only **scheduled** calls have delay and repeat interval. An orchestrator normally invokes the immediate workflow, rather than scheduling a zero-delay job.
 
-**Fixed ChatGPT entry point:** `https://chatgpt.com/`. The ChatGPT-specific launcher does not accept alternate origins, Project URLs, GPT URLs, or existing conversation URLs. The generic bridge remains URL-agnostic, but callers of this script always supply the fixed URL. The script rejects an unexpected starting URL before typing. Model selection, project navigation and alternate entry points require a separate explicit feature if desired.
+**ChatGPT entry point:** `https://chatgpt.com/` or an explicit scoped project landing URL `https://chatgpt.com/g/g-p-<project-id>/project`. The script rejects an unexpected starting URL before editing. Alternate origins, query/fragment-bearing entry URLs and existing conversations are not supported. Project landings expose Chat, not Work.
 
 ### Model and thinking effort
 
-Prefer the account's already configured UI defaults when the caller does not specify them. If supplied, a future explicit `model` or `thinkingEffort` option must be implemented as actual UI interaction + verification, not by forging backend parameters or assuming a saved setting. The initial launcher may omit this feature. Unsupported requested settings fail clearly instead of falling back silently.
+The default preference order is Chat Latest High, Work GPT-6.1 Terra Medium, then Chat Latest Instant. Explicit overrides select only the named preference (including Latest Medium). Each invocation rechecks the live picker rather than assuming saved settings or inferring the backing version behind Latest. The checked model radio and named effort must agree with the selected controls; dismiss the picker through Escape where supported, otherwise use the trigger, and require the closed trigger's exact effort text, matching effort attribute and absence of an open model menu. After insertion, re-prove the model and effort at the single Send boundary; a replaced trigger requires renewed proof. Exact prompt readback and unchanged composer/mode/Send controls are also required. A failed or contradictory proof never authorizes Send.
+
+The `observedSelection` payload contains only rendered mode/model/effort labels from the confirmed UI, or null for unobservable labels; it does not prove which model or inference effort the provider actually executed. Offline fixture verification is not evidence of deployment or live provider behavior.
 
 ## 5. ChatGPT UI automation contract
 
@@ -122,7 +126,7 @@ Prefer the account's already configured UI defaults when the caller does not spe
 - Await a ready registration/document; the extension rechecks current origin and identity before execution. A subsequent explicit `TabUnavailable:loading` from the extension's **pre-injection check** is safe to retry within the 30-second readiness budget. Never retry an uncertain or post-injection failure.
 - The script must wait for React/ProseMirror hydration and composer availability with a bounded deadline; merely finding a DOM node before hydration is insufficient.
 - ChatGPT bootstrap launches are **background** tabs (`active=false`, `closeTabAfterExecution=true`) in the same registered window. Never require visibility or focus: only one tab can be foreground at a time. A 2026-11-21 investigation found background synthetic Send clicks can leave the original prompt and enabled control unchanged. An isolated browser extension correction now uses per-target Chromium DevTools focus emulation so the renderer can process background UI actions **without activating its tab**. This requires Chrome's required (not optional) broad `debugger` permission, so no extension upgrade/deployment is authorized before a user-visible permission decision and independent source review. It fails before executing the launcher if debugger attachment or page visibility proof fails, never retries a possibly submitted effect, and detaches after execution. No live end-to-end background submission has been verified with the upgraded extension yet.
-- Model preference: Chat GPT-6 **High** first, Work GPT-6.2 Sol **Medium** second, then Chat Instant fallback. Each launch rechecks the live picker; selection failure never authorizes Send.
+- Model preference: Chat Latest **High** first, Work GPT-6.1 Terra **Medium** second, then Chat Latest Instant fallback. Each launch rechecks the live picker; selection failure never authorizes Send.
 - Reject ChatGPT login, challenge, error, suspended account, wrong project/GPT, permission prompts, or otherwise blocked UI states when detectable. Report actionable categories; do not attempt to bypass a challenge.
 
 ### 5.2 Chat/Work home-mode selection
@@ -407,7 +411,7 @@ No new task database, browser automation engine, direct HTTP ChatGPT integration
 
 - Native ChatGPT API integration or synthesis of private network payloads.
 - Parsing `usage` frames to enforce account budget, credit or model-rate limits.
-- Automated selection of models/thinking effort until robust UI selectors are tested.
+- Provider-authenticated proof of the actual inference model and effort (distinct from UI selection).
 - Agent-side concurrency leases / strict singleton enforcement.
 - Automatic cleanup of uncertain in-flight tabs without a proven safe policy.
 - Automated detection of *agent task completion* from ChatGPT UI.

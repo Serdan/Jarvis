@@ -13,7 +13,7 @@ trap 'rm -f "$GENERATED"' EXIT HUP INT TERM
 DOTNET_CLI_TELEMETRY_OPTOUT=1 dotnet restore "$HERE/PropertyHarness.fsproj" --ignore-failed-sources
 DOTNET_CLI_TELEMETRY_OPTOUT=1 dotnet test "$HERE/PropertyHarness.fsproj" \
   --configuration Release --no-restore \
-  --filter "FullyQualifiedName~SchedulerAccountCasProperty" \
+  --filter "FullyQualifiedName~SchedulerAccountCasProperty|FullyQualifiedName~SchedulerAccountCasNativeDifferential" \
   --logger "trx;LogFileName=scheduler-account-cas-property.trx" \
-  --results-directory "$HERE/evidence" \
+  --results-directory "$HERE/TestResults" \
   --logger "console;verbosity=normal"

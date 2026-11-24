@@ -182,11 +182,104 @@ let internal planBeginSend binding snapshot expectedHead identity path held =
 let internal noSendEvidencePath (operationId: Guid) =
     $"records/native-scheduler/no-send/{operationId:N}.json"
 
+// The account locator describes account occupancy, not the actual project
+// predecessor. The operation intent binds both independently. The evidence
+// object remains the exact account-consumer blob; only the enclosing request
+// adds the local head/predecessor. A preclaim request can never be rebound to
+// a held claim by refreshing its caller arguments or by a CAS retry.
+type private ExclusionRequest =
+    { ExpectedProjectHead: string
+      Predecessor: ExclusionPredecessor
+      EvidenceJson: string }
+
+let private exactFields (element: JsonElement) (names: string list) =
+    element.ValueKind = JsonValueKind.Object
+    && (element.EnumerateObject() |> Seq.map (fun p -> p.Name) |> Seq.sort |> Seq.toList)
+       = List.sort names
+
+let rec private uniqueProperties (element: JsonElement) =
+    match element.ValueKind with
+    | JsonValueKind.Object ->
+        let properties = element.EnumerateObject() |> Seq.toArray
+        (properties |> Array.map (fun p -> p.Name) |> Array.distinct |> Array.length) = properties.Length
+        && (properties |> Array.forall (fun p -> uniqueProperties p.Value))
+    | JsonValueKind.Array -> element.EnumerateArray() |> Seq.forall uniqueProperties
+    | _ -> true
+
+let private parseExclusionRequest (identity: OriginalEffectIdentity) (intent: LedgerIntent) =
+    try
+        use document = JsonDocument.Parse(intent.RequestJson)
+        let root = document.RootElement
+        if not (exactFields root ["schemaVersion"; "expectedProjectHead"; "predecessor"; "evidence"])
+           || not (uniqueProperties root)
+           || root.GetProperty("schemaVersion").GetInt32() <> 1 then
+            bad "Malformed or ambiguous project exclusion request."
+        else
+            let head = field root "expectedProjectHead"
+            let witness = root.GetProperty("predecessor")
+            let predecessor =
+                match field witness "kind" with
+                | "BeforeClaim" when exactFields witness ["kind"] -> Some BeforeClaim
+                | "ExactHeldFence" when
+                    exactFields witness ["kind"; "claimOperationId"; "claimRequestSha256"; "claimOrigin"; "claimBlobOid"]
+                    && uuid (field witness "claimOperationId") ->
+                    Some (ExactHeldFence
+                        { ClaimOperationId = Guid.ParseExact(field witness "claimOperationId", "D")
+                          ClaimRequestSha256 = field witness "claimRequestSha256"
+                          ClaimOrigin = field witness "claimOrigin"
+                          ClaimBlobOid = field witness "claimBlobOid" })
+                | _ -> None
+            let evidence = root.GetProperty("evidence")
+            let original = evidence.GetProperty("original")
+            let candidate =
+                JsonSerializer.Deserialize<NativeDispatchCandidate>(
+                    original.GetProperty("candidate").GetRawText(), options)
+            let accountFence = field original "expectedProjectFenceOid"
+            let generation = original.GetProperty("expectedGeneration").GetInt64()
+            let accountLocatorMatches =
+                match predecessor with
+                | Some BeforeClaim -> accountFence = "" && generation = 1L
+                | Some (ExactHeldFence held) ->
+                    (accountFence = "" && generation = 1L)
+                    || (oid accountFence && accountFence = held.ClaimOrigin && generation > 1L)
+                | None -> false
+            if not (oid head)
+               || not (exactFields evidence ["schemaVersion"; "state"; "accountId"; "accountLedgerId"; "accountEpoch";
+                                              "reservationOrigin"; "canonicalKey"; "original"; "noSendOperationId"])
+               || not (exactFields original ["reservationOperationId"; "reservationRequestSha256"; "candidate";
+                                              "expectedGeneration"; "expectedProjectFenceOid"; "expectedProviderSessionId"])
+               || evidence.GetProperty("schemaVersion").GetInt32() <> 1
+               || field evidence "state" <> "VerifiedNoSend"
+               || field evidence "accountId" <> string identity.AccountId
+               || field evidence "accountLedgerId" <> string identity.AccountLedgerId
+               || evidence.GetProperty("accountEpoch").GetInt32() <> identity.AccountEpoch
+               || not (oid (field evidence "reservationOrigin"))
+               || field evidence "canonicalKey" <> identity.CanonicalKey
+               || field evidence "noSendOperationId" <> string intent.OperationId
+               || field original "reservationOperationId" <> string identity.ReservationOperationId
+               || not (digest (field original "reservationRequestSha256"))
+               || candidate <> identity.Candidate
+               || field original "expectedProviderSessionId" <> ""
+               || not accountLocatorMatches then
+                bad "Exclusion evidence does not bind the original operation, identity and project predecessor."
+            else
+                match predecessor with
+                | Some p -> Ok { ExpectedProjectHead = head; Predecessor = p; EvidenceJson = evidence.GetRawText() }
+                | None -> bad "Missing project predecessor."
+    with
+    | :? JsonException
+    | :? InvalidOperationException
+    | :? Collections.Generic.KeyNotFoundException
+    | :? FormatException
+    | :? ArgumentException ->
+        bad "Malformed project exclusion request."
+
 // Atomic exclusion changes only the canonical fence and the immutable evidence
-// path. The supplied intent is the typed consumer's serialized evidence, not
-// an authority token; the authenticated caller must verify all account-side
-// original context before invoking this plan. Use this very intent in the
-// enclosing LedgerStore.transact (its request hash binds the evidence bytes).
+// path. The request envelope is hashed by LedgerStore; the raw nested account
+// evidence remains byte-for-byte the consumer's account locator. The caller's
+// expected head and predecessor are assertions, never a substitute for the
+// immutable request. Authentication of the account receipt remains the
+// responsibility of the existing authenticated caller, on every CAS retry.
 let internal planExclusion binding snapshot expectedHead identity path predecessor
                            (intent: LedgerIntent) =
     checkIdentity binding snapshot expectedHead identity path
@@ -200,20 +293,25 @@ let internal planExclusion binding snapshot expectedHead identity path predecess
            || String.IsNullOrWhiteSpace intent.RequestJson then
             bad "Missing distinct no-send operation or evidence."
         else
-            let evidencePath = noSendEvidencePath intent.OperationId
-            let before =
-                match predecessor with
-                | BeforeClaim ->
-                    readMissing binding snapshot path |> Result.map (fun () -> None)
-                | ExactHeldFence held ->
-                    if not (isNull (box held)) && held.ClaimOperationId = intent.OperationId then
-                        bad "No-send operation must differ from claim."
-                    else
-                        readHeld binding snapshot expectedHead identity path held
-                        |> Result.map (fun _ -> Some held.ClaimBlobOid)
-            before
-            |> Result.bind (fun previous ->
-                readMissing binding snapshot evidencePath
-                |> Result.map (fun () ->
-                    [ { Path = path; ExpectedBlobOid = previous; Content = intent.RequestJson }
-                      { Path = evidencePath; ExpectedBlobOid = None; Content = intent.RequestJson } ])))
+            parseExclusionRequest identity intent
+            |> Result.bind (fun request ->
+                if request.ExpectedProjectHead <> expectedHead || request.Predecessor <> predecessor then
+                    stale "Exclusion request head or predecessor differs from the asserted plan."
+                else
+                    let evidencePath = noSendEvidencePath intent.OperationId
+                    let before =
+                        match request.Predecessor with
+                        | BeforeClaim ->
+                            readMissing binding snapshot path |> Result.map (fun () -> None)
+                        | ExactHeldFence held ->
+                            if held.ClaimOperationId = intent.OperationId then
+                                bad "No-send operation must differ from claim."
+                            else
+                                readHeld binding snapshot request.ExpectedProjectHead identity path held
+                                |> Result.map (fun _ -> Some held.ClaimBlobOid)
+                    before
+                    |> Result.bind (fun previous ->
+                        readMissing binding snapshot evidencePath
+                        |> Result.map (fun () ->
+                            [ { Path = path; ExpectedBlobOid = previous; Content = request.EvidenceJson }
+                              { Path = evidencePath; ExpectedBlobOid = None; Content = request.EvidenceJson } ]))))

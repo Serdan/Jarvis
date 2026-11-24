@@ -118,18 +118,27 @@ let private witness b i claimId =
 // The evidence fixture matches the observed consumer draft's field shape.
 // It is not an account proof; account receipt verification and authorized
 // runtime composition deliberately remain outside this isolated test project.
-let private exclusionIntent (i: OriginalEffectIdentity) fenceOrigin op =
+let private exclusionIntent (i: OriginalEffectIdentity) head predecessor fenceOrigin op =
+    let predecessorJson =
+        match predecessor with
+        | BeforeClaim -> box {| kind = "BeforeClaim" |}
+        | ExactHeldFence held ->
+            box {| kind = "ExactHeldFence"; claimOperationId = held.ClaimOperationId
+                   claimRequestSha256 = held.ClaimRequestSha256; claimOrigin = held.ClaimOrigin
+                   claimBlobOid = held.ClaimBlobOid |}
+    let evidence =
+        {| schemaVersion = 1; state = "VerifiedNoSend"; accountId = string i.AccountId
+           accountLedgerId = string i.AccountLedgerId; accountEpoch = i.AccountEpoch
+           reservationOrigin = String.replicate 40 "f"; canonicalKey = i.CanonicalKey
+           original =
+               {| reservationOperationId = i.ReservationOperationId
+                  reservationRequestSha256 = String.replicate 64 "a"; candidate = i.Candidate
+                  expectedGeneration = if fenceOrigin = "" then 1L else 2L
+                  expectedProjectFenceOid = fenceOrigin; expectedProviderSessionId = "" |}
+           noSendOperationId = op |}
     { OperationId = op; Actor = "Fixture"; Kind = "NativeVerifiedNoSend"
-      RequestJson =
-        json {| schemaVersion = 1; state = "VerifiedNoSend"; accountId = string i.AccountId
-                accountLedgerId = string i.AccountLedgerId; accountEpoch = i.AccountEpoch
-                reservationOrigin = String.replicate 40 "f"; canonicalKey = i.CanonicalKey
-                original =
-                    {| reservationOperationId = i.ReservationOperationId
-                       reservationRequestSha256 = String.replicate 64 "a"; candidate = i.Candidate
-                       expectedGeneration = if fenceOrigin = "" then 1L else 2L
-                       expectedProjectFenceOid = fenceOrigin; expectedProviderSessionId = "" |}
-                noSendOperationId = op |} }
+      RequestJson = json {| schemaVersion = 1; expectedProjectHead = head
+                            predecessor = predecessorJson; evidence = evidence |} }
 
 let private exclude b head i predecessor intent =
     LedgerStore.transact b intent (fun s -> planExclusion b s head i (path i) predecessor intent)
@@ -149,7 +158,27 @@ let private assertEvidence b i (intent: LedgerIntent) =
     let origin = LedgerStore.verifiedIntegrationOperationSnapshotAt b s op |> success
     LedgerStore.verifyIntegrationOperationIntent b op intent |> success
     let expected = LedgerStore.readAt b origin (path i) |> success
-    Assert.That(fst expected, Is.EqualTo(Some intent.RequestJson))
+    use request = JsonDocument.Parse(intent.RequestJson)
+    let evidence = request.RootElement.GetProperty("evidence").GetRawText()
+    let predecessor = request.RootElement.GetProperty("predecessor")
+    let head = request.RootElement.GetProperty("expectedProjectHead").GetString()
+    Assert.That(git b.RepositoryPath ["rev-parse"; origin.Commit + "^"], Is.EqualTo(head))
+    use receipt = JsonDocument.Parse(op.OriginalResultJson)
+    let changes = receipt.RootElement.GetProperty("changes").EnumerateArray() |> Seq.toArray
+    Assert.That(changes.Length, Is.EqualTo(2))
+    let fenceChange = changes |> Array.find (fun c -> c.GetProperty("path").GetString() = path i)
+    let evidenceChange = changes |> Array.find (fun c -> c.GetProperty("path").GetString() = noSendEvidencePath intent.OperationId)
+    let beforeOid = fenceChange.GetProperty("beforeOid")
+    match predecessor.GetProperty("kind").GetString() with
+    | "BeforeClaim" -> Assert.That(beforeOid.ValueKind, Is.EqualTo(JsonValueKind.Null))
+    | "ExactHeldFence" ->
+        Assert.That(beforeOid.GetString(), Is.EqualTo(predecessor.GetProperty("claimBlobOid").GetString()))
+    | other -> failwithf "Unexpected predecessor: %s" other
+    Assert.That(evidenceChange.GetProperty("beforeOid").ValueKind, Is.EqualTo(JsonValueKind.Null))
+    let evidenceHash = NativeSchedulerRosterPolicy.sha256 evidence
+    for change in changes do
+        Assert.That(change.GetProperty("contentSha256").GetString(), Is.EqualTo(evidenceHash))
+    Assert.That(fst expected, Is.EqualTo(Some evidence))
     Assert.That(snd expected |> Option.isSome, Is.True)
     for at in [origin; s] do
         for p in [path i; noSendEvidencePath intent.OperationId] do
@@ -160,7 +189,7 @@ let ``preclaim exclusion holds permanently and replay is receipt only`` () =
     withProject (fun one two ->
         let i = original one
         let head = current one
-        let op = exclusionIntent i "" (Guid.NewGuid())
+        let op = exclusionIntent i head BeforeClaim "" (Guid.NewGuid())
         let committed = exclude one head i BeforeClaim op |> success
         Assert.That(committed.AlreadyApplied, Is.False)
         assertEvidence two i op
@@ -174,7 +203,7 @@ let ``preclaim exclusion holds permanently and replay is receipt only`` () =
         match exclude two newHead i BeforeClaim modified with
         | Error OperationIdReused -> ()
         | x -> failwithf "Changed request must not replay: %A" x
-        exclude two newHead i BeforeClaim (exclusionIntent i "" (Guid.NewGuid())) |> rejected
+        exclude two newHead i BeforeClaim (exclusionIntent i newHead BeforeClaim "" (Guid.NewGuid())) |> rejected
         assertEvidence two i op
         let successor = original two
         Assert.That(path successor, Is.Not.EqualTo(path i))
@@ -191,17 +220,22 @@ let ``exact held fence can be excluded but never subsequently begun`` () =
         claim one head i (claimIntent i head claimId) |> success |> ignore
         let held = witness two i claimId
         let heldHead = current two
-        let op = exclusionIntent i held.ClaimOrigin (Guid.NewGuid())
+        let op = exclusionIntent i heldHead (ExactHeldFence held) held.ClaimOrigin (Guid.NewGuid())
         exclude two heldHead i BeforeClaim op |> rejected
-        exclude two heldHead i (ExactHeldFence {held with ClaimOrigin = head}) op |> rejected
-        exclude two heldHead i (ExactHeldFence {held with ClaimBlobOid = String.replicate 40 "a"}) op |> rejected
-        exclude two heldHead i (ExactHeldFence {held with ClaimOperationId = Guid.NewGuid()}) op |> rejected
-        exclude two heldHead i (ExactHeldFence {held with ClaimRequestSha256 = String.replicate 64 "e"}) op |> rejected
-        exclude two heldHead {i with Candidate = {i.Candidate with AssignmentGeneration = 2L}} (ExactHeldFence held) op |> rejected
-        let wrong = {i with Candidate = {i.Candidate with EffectOperationId = string(Guid.NewGuid())}}
-        exclude two heldHead wrong (ExactHeldFence held) op |> rejected
-        exclude two heldHead {i with ReservationOperationId = Guid.NewGuid()} (ExactHeldFence held) op |> rejected
-        exclude two heldHead {i with AccountEpoch = 2} (ExactHeldFence held) op |> rejected
+        // Keep assertions and serialized request consistent here: these
+        // negatives must exercise the actual held-record/claim verification.
+        let denyHeld badIdentity badFence =
+            let predecessor = ExactHeldFence badFence
+            let intent = exclusionIntent badIdentity heldHead predecessor "" (Guid.NewGuid())
+            exclude two heldHead badIdentity predecessor intent |> rejected
+        denyHeld i {held with ClaimOrigin = head}
+        denyHeld i {held with ClaimBlobOid = String.replicate 40 "a"}
+        denyHeld i {held with ClaimOperationId = Guid.NewGuid()}
+        denyHeld i {held with ClaimRequestSha256 = String.replicate 64 "e"}
+        denyHeld {i with Candidate = {i.Candidate with AssignmentGeneration = 2L}} held
+        denyHeld {i with Candidate = {i.Candidate with EffectOperationId = string(Guid.NewGuid())}} held
+        denyHeld {i with ReservationOperationId = Guid.NewGuid()} held
+        denyHeld {i with AccountEpoch = 2} held
         exclude two heldHead i (ExactHeldFence held) op |> success |> ignore
         assertEvidence one i op
         let send = sendIntent i held (Guid.NewGuid())
@@ -226,7 +260,7 @@ let ``begin send consumes held state and replay never grants send twice`` () =
         let replay = beginSend one heldHead i held send |> success
         Assert.That(replay.AlreadyApplied, Is.True)
         let latest = current one
-        exclude one latest i (ExactHeldFence held) (exclusionIntent i held.ClaimOrigin (Guid.NewGuid())) |> rejected
+        exclude one latest i (ExactHeldFence held) (exclusionIntent i latest (ExactHeldFence held) held.ClaimOrigin (Guid.NewGuid())) |> rejected
         beginSend one latest i held (sendIntent i held (Guid.NewGuid())) |> rejected
         let s = LedgerStore.fetch one |> success
         let raw, _ = LedgerStore.readAt one s (path i) |> success
@@ -239,7 +273,7 @@ let ``actual two clone preclaim race permits only one writer`` () =
         let i = original one
         let head = current one
         let claimOp = claimIntent i head (Guid.NewGuid())
-        let exclusion = exclusionIntent i "" (Guid.NewGuid())
+        let exclusion = exclusionIntent i head BeforeClaim "" (Guid.NewGuid())
         use barrier = new Barrier(2)
         let waitOnce (once: int ref) result =
             if Result.isOk result && Interlocked.Increment(&once.contents) = 1 then
@@ -262,8 +296,11 @@ let ``actual two clone preclaim race permits only one writer`` () =
             claim one (current one) i (claimIntent i (current one) (Guid.NewGuid())) |> rejected
         else
             let held = witness one i claimOp.OperationId
-            exclude two (current two) i (ExactHeldFence held) exclusion |> success |> ignore
-            assertEvidence one i exclusion)
+            let freshHead = current two
+            exclude two freshHead i (ExactHeldFence held) exclusion |> rejected
+            let fresh = exclusionIntent i freshHead (ExactHeldFence held) "" (Guid.NewGuid())
+            exclude two freshHead i (ExactHeldFence held) fresh |> success |> ignore
+            assertEvidence one i fresh)
 
 [<Test>]
 let ``actual two clone held race excludes or begins but cannot do both`` () =
@@ -275,7 +312,7 @@ let ``actual two clone held race excludes or begins but cannot do both`` () =
         let held = witness two i claimId
         let heldHead = current two
         let send = sendIntent i held (Guid.NewGuid())
-        let exclusion = exclusionIntent i held.ClaimOrigin (Guid.NewGuid())
+        let exclusion = exclusionIntent i heldHead (ExactHeldFence held) held.ClaimOrigin (Guid.NewGuid())
         use barrier = new Barrier(2)
         let sync (calls: int ref) result =
             if Result.isOk result && Interlocked.Increment(&calls.contents) = 1 then
@@ -294,7 +331,9 @@ let ``actual two clone held race excludes or begins but cannot do both`` () =
             assertEvidence one i exclusion
             beginSend one (current one) i held send |> rejected
         else
-            exclude two (current two) i (ExactHeldFence held) exclusion |> rejected)
+            let latest = current two
+            let fresh = exclusionIntent i latest (ExactHeldFence held) held.ClaimOrigin (Guid.NewGuid())
+            exclude two latest i (ExactHeldFence held) fresh |> rejected)
 
 [<Test>]
 let ``wrong canonical key and unknown fence fail closed`` () =
@@ -303,7 +342,7 @@ let ``wrong canonical key and unknown fence fail closed`` () =
         let head = current one
         let snapshot = LedgerStore.fetch one |> success
         let wrongPath = "records/native-account-started-effect-v1/" + String.replicate 64 "a" + ".json"
-        let exclusion = exclusionIntent i "" (Guid.NewGuid())
+        let exclusion = exclusionIntent i head BeforeClaim "" (Guid.NewGuid())
         checkClaim one snapshot head i wrongPath |> rejected
         planExclusion one snapshot head i wrongPath BeforeClaim exclusion |> rejected
         checkClaim one snapshot head {i with Candidate = {i.Candidate with ProjectEpoch = i.Candidate.ProjectEpoch + 1}} (path i) |> rejected
@@ -320,10 +359,58 @@ let ``wrong canonical key and unknown fence fail closed`` () =
                    Content = (Option.get raw).Replace("HeldBeforeSend", "Unknown") }]))
         |> success |> ignore
         let latest = current one
-        exclude one latest i (ExactHeldFence held) exclusion |> rejected
+        let fresh = exclusionIntent i latest (ExactHeldFence held) held.ClaimOrigin (Guid.NewGuid())
+        exclude one latest i (ExactHeldFence held) fresh |> rejected
         beginSend one latest i held (sendIntent i held (Guid.NewGuid())) |> rejected
         claim one latest i (claimIntent i latest (Guid.NewGuid())) |> rejected
         let s = LedgerStore.fetch one |> success
         let raw, _ = LedgerStore.readAt one s (path i) |> success
         use doc = JsonDocument.Parse(Option.get raw)
         Assert.That(doc.RootElement.GetProperty("status").GetString(), Is.EqualTo("Unknown")))
+
+[<Test>]
+let ``claim before account recording requires a freshly bound held request`` () =
+    withProject (fun one two ->
+        let i = original one
+        let head = current one
+        let preclaim = exclusionIntent i head BeforeClaim "" (Guid.NewGuid())
+        let claimId = Guid.NewGuid()
+        claim one head i (claimIntent i head claimId) |> success |> ignore
+        let held = witness two i claimId
+        let latest = current two
+        exclude two latest i (ExactHeldFence held) preclaim |> rejected
+        let fresh = exclusionIntent i latest (ExactHeldFence held) "" (Guid.NewGuid())
+        // Account still Reserved, generation 1; the local predecessor is held.
+        let wrongAccount = exclusionIntent i latest (ExactHeldFence held) head (Guid.NewGuid())
+        exclude two latest i (ExactHeldFence held) wrongAccount |> rejected
+        let stale = exclusionIntent i head (ExactHeldFence held) "" (Guid.NewGuid())
+        exclude two latest i (ExactHeldFence held) stale |> rejected
+        let wrongIdentity = exclusionIntent {i with AccountId = Guid.NewGuid()} latest (ExactHeldFence held) "" (Guid.NewGuid())
+        exclude two latest i (ExactHeldFence held) wrongIdentity |> rejected
+        let wrongOperation = {fresh with OperationId = Guid.NewGuid()}
+        exclude two latest i (ExactHeldFence held) wrongOperation |> rejected
+        exclude two latest i (ExactHeldFence held) fresh |> success |> ignore
+        assertEvidence one i fresh
+        let receipt = exclude one latest i (ExactHeldFence held) fresh |> success
+        Assert.That(receipt.AlreadyApplied, Is.True)
+        beginSend one (current one) i held (sendIntent i held (Guid.NewGuid())) |> rejected)
+
+[<Test>]
+let ``preclaim excludes only a compatible unique account evidence request`` () =
+    withProject (fun one two ->
+        let i = original one
+        let head = current one
+        let fresh = exclusionIntent i head BeforeClaim "" (Guid.NewGuid())
+        let withRecordedFence = exclusionIntent i head BeforeClaim head (Guid.NewGuid())
+        exclude one head i BeforeClaim withRecordedFence |> rejected
+        let wrongGeneration = {fresh with RequestJson = fresh.RequestJson.Replace("\"expectedGeneration\":1", "\"expectedGeneration\":2")}
+        Assert.That(wrongGeneration.RequestJson, Is.Not.EqualTo(fresh.RequestJson))
+        exclude one head i BeforeClaim wrongGeneration |> rejected
+        let wrongCandidate = exclusionIntent {i with Candidate = {i.Candidate with EffectOperationId = string(Guid.NewGuid())}} head BeforeClaim "" (Guid.NewGuid())
+        exclude one head i BeforeClaim wrongCandidate |> rejected
+        let duplicate = {fresh with RequestJson = fresh.RequestJson.Replace("\"state\":\"VerifiedNoSend\"", "\"state\":\"Other\",\"state\":\"VerifiedNoSend\"")}
+        Assert.That(duplicate.RequestJson, Is.Not.EqualTo(fresh.RequestJson))
+        exclude one head i BeforeClaim duplicate |> rejected
+        Assert.That(current two, Is.EqualTo(head))
+        exclude one head i BeforeClaim fresh |> success |> ignore
+        assertEvidence two i fresh)

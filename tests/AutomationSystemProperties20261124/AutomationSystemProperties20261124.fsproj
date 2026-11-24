@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <AssemblyName>Client.Tests</AssemblyName>
+    <GenerateProgramFile>false</GenerateProgramFile>
+    <IsTestProject>true</IsTestProject>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../AutomationHealthHosted20261123/GitFixture.fs" Link="GitFixture.fs" />
+    <Compile Include="AccountFixture.fs" />
+    <Compile Include="ActivityFixture.fs" />
+    <Compile Include="SystemProperties.fs" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="NUnit" Version="4.3.2" />
+    <PackageReference Include="NUnit3TestAdapter" Version="4.6.0" />
+    <ProjectReference Include="../../Client/Client.fsproj" />
+    <ProjectReference Include="../../Server/Server.fsproj" />
+  </ItemGroup>
+</Project>

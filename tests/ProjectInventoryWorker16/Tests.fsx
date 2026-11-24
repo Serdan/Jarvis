@@ -20,7 +20,8 @@ transition { identity with Epoch = 2 } effect Excluded held |> rejected
 let sent = transition identity effect Dispatching held |> ok
 transition identity effect Excluded sent |> rejected
 if occupied sent <> 1 then failwith "uncertain send must remain occupied"
-let excluded = transition identity effect Excluded held |> ok
-transition identity effect Dispatching excluded |> rejected
-if occupied excluded <> 0 then failwith "excluded fixture effect must release"
+// No no-send condition exists in the model, so even a matching held effect cannot release.
+transition identity effect Excluded held |> rejected
+if occupied held <> 1 then failwith "unproven exclusion must retain occupancy"
+if occupied sent <> 1 then failwith "dispatch must retain occupancy"
 printfn "Inventory fixture model checks passed"

@@ -31,7 +31,9 @@ let reserve expected effect state =
 
 let transition expected effect target state =
     if state.Identity <> expected || state.Coverage <> FixtureBaseline then Error "coverage unknown"
-    elif target <> Dispatching && target <> Excluded then Error "invalid target"
+    // No original-bound no-send condition is modeled yet. Never release occupancy.
+    // A fixture baseline is not evidence that this effect was never dispatched.
+    elif target <> Dispatching then Error "exclusion requires modeled no-send evidence"
     else
         match state.Entries.TryFind effect.Id with
         | Some (original, Held) when original = effect ->

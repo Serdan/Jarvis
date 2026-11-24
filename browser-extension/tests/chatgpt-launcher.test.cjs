@@ -152,6 +152,15 @@ function harness(options = {}) {
     ? ["Instant", "Pro"] : efforts;
   let proSelections = 0;
   const picker = {
+    querySelector(selector) {
+      if (selector !== '[data-model-selection-label="gpt-6.1-terra-wm"]' ||
+          !options.projectWorkLabel || selectedModel !== "GPT-6.1 Terra") return null;
+      return {
+        innerText: "GPT-6.1 Terra",
+        getClientRects() { return [1]; },
+        closest() { return null; }
+      };
+    },
     get innerText() { return (content && options.closedTriggerLabelWhileDraft) || options.closedTriggerLabel || reasoningEffort; },
     get textContent() { return this.innerText; },
     getAttribute(name) {
@@ -1268,6 +1277,32 @@ test("project entry selects Latest High without a Chat/Work mode toggle and send
   assert.equal(result.observedSelection.mode, null);
   assert.equal(result.conversationUrl, route);
   assert.equal(h.clicks, 1);
+});
+
+test("slugged project entry falls back to verified Work and sends once", async () => {
+  const startUrl = "https://chatgpt.com/g/g-p-abc123-jarvisagents/project";
+  const route = "https://chatgpt.com/g/g-p-abc123-jarvisagents/c/00000000-0000-0000-0000-000000000001";
+  const h = harness({ startUrl, noModeToggle: true, projectWorkLabel: true,
+    selectedModel: "GPT-6.1 Terra", reasoningEffort: "Medium", virtualClock: true,
+    noRoute: true, deferLegacyTurn: true,
+    projectEvents: [{ afterMs: 75, href: route }, { afterMs: 225, legacy: "Project Work launch" }] });
+  const result = await h.run("Project Work launch", { startUrl, timeoutMs: 18000 });
+  assert.equal(result.status, "submitted", JSON.stringify(result));
+  assert.equal(result.attempts[0].reason, "ModeUnavailable");
+  assert.equal(result.selectedMode, "Work");
+  assert.equal(result.observedSelection.model, "GPT-6.1 Terra");
+  assert.equal(result.observedSelection.effort, "Medium");
+  assert.equal(result.conversationUrl, route);
+  assert.equal(h.clicks, 1);
+});
+
+test("project Work composer with the wrong effort does not submit", async () => {
+  const startUrl = "https://chatgpt.com/g/g-p-abc123-jarvisagents/project";
+  const h = harness({ startUrl, noModeToggle: true, projectWorkLabel: true,
+    selectedModel: "GPT-6.1 Terra", reasoningEffort: "High", virtualClock: true });
+  const result = await h.run("Do not submit", { startUrl, timeoutMs: 18000 });
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(h.clicks, 0);
 });
 
 test("when Latest and Work are unavailable no explicit model or Send is silently chosen", async () => {

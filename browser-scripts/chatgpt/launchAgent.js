@@ -16,7 +16,7 @@ async function executeLaunch(args, observeSelection) {
       return url.origin === "https://chatgpt.com" &&
         !url.search && !url.hash &&
         (url.pathname === "/" ||
-          /^\/g\/g-p-[a-z0-9]+\/project\/?$/.test(url.pathname));
+          /^\/g\/g-p-[a-z0-9]+(?:-[a-z0-9]+)*\/project\/?$/.test(url.pathname));
     } catch { return false; }
   })();
   const projectStart = validStartUrl && new URL(startUrl).pathname !== "/";
@@ -138,7 +138,10 @@ async function executeLaunch(args, observeSelection) {
   const projectChat = { getAttribute: name => name === "aria-pressed" ? "true" : null };
   const projectWork = { getAttribute: name => name === "aria-pressed" ? "false" : null };
   const modeButton = name => {
-    if (projectStart) return name === "Chat" ? projectChat : projectWork;
+    if (projectStart) {
+      const work = projectWorkLabel(picker()) !== null;
+      return (name === "Work") === work ? projectChat : projectWork;
+    }
     const matches = Array.from(document.querySelectorAll('button[type="button"][aria-pressed]'))
       .filter(button => button.textContent.trim() === name);
     return matches.length === 1 ? matches[0] : null;
@@ -187,10 +190,14 @@ async function executeLaunch(args, observeSelection) {
   // The closed trigger independently exposes the named effort and selected
   // attribute. It does not identify the Chat model; that must be checked in
   // the menu again at the final Send boundary.
+  const projectWorkLabel = control =>
+    renderedLabel(control?.querySelector('[data-model-selection-label="gpt-6.1-terra-wm"]'));
   const closedPickerProof = (control, target) => Boolean(control &&
     control.getAttribute("aria-expanded") === "false" && !modelMenu() &&
     control.getAttribute("data-selected-reasoning-effort") === target.effort &&
-    (control.innerText || control.textContent || "").trim() === target.label);
+    (projectStart && target.mode === "Work"
+      ? projectWorkLabel(control) === target.model
+      : (control.innerText || control.textContent || "").trim() === target.label));
   const unavailableRadio = item => !item || item.getAttribute("aria-disabled") === "true" ||
     item.hasAttribute("data-disabled");
   const activeMenuControl = selector => Array.from(modelMenu()?.querySelectorAll(selector) || [])
@@ -219,7 +226,19 @@ async function executeLaunch(args, observeSelection) {
     confirmedPicker = null;
     // Project landing pages expose the Chat model picker, but no mode switch.
     // Use the same checked-radio and effort verification as ordinary Chat.
-    if (projectStart && target.mode !== "Chat") return "ModeUnavailable";
+    if (projectStart && target.mode === "Work") {
+      const control = await poll(() => {
+        const current = picker();
+        return !emptyHomeFailure() && document.readyState === "complete" &&
+          closedPickerProof(current, target) ? current : null;
+      }, untilAt);
+      if (!control) return "ModeUnavailable";
+      confirmedPicker = control;
+      confirmedModelLabel = projectWorkLabel(control);
+      confirmedObservation = { mode: null, model: confirmedModelLabel, effort: target.label };
+      return null;
+    }
+    if (projectStart && projectWorkLabel(picker())) return "ModeUnavailable";
     const home = () => emptyHomeFailure();
     const retryWait = () => delay(Math.min(100, Math.max(1, untilAt - Date.now())));
     // Chat/Work controls can appear before their React click handlers hydrate.

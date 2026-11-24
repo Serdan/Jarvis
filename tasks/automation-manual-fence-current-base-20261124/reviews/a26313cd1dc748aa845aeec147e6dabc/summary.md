@@ -1,0 +1,1 @@
+Base bda9dccef27af163b14937d88506889f168c7f19; Release capacity fence actual caller test passed. Deny-only, no claims of deletion/race protection, other senders or positive admission. Old uncertain request remains distinct and must not authorize integration.

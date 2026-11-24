@@ -1,0 +1,1 @@
+Documentation-only preparatory increment: identifies actual manual/native/scheduled gaps, conservative cutover and CAS requirements, and no production authority. Source implementation and end-to-end coverage remain outstanding.

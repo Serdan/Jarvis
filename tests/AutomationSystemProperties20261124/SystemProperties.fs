@@ -985,3 +985,69 @@ type GeneratedComposition() =
         finally
             Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
             Directory.Delete(root, true)
+
+    // Existing native roster per-project Worker quota, not the forthcoming
+    // shared manual/Scheduler project-total admission mechanism.
+    [<TestCase(501)>]
+    [<TestCase(502)>]
+    member _.ProjectWorkerQuotaIsolatedAcrossProjects(seed: int) =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-system-project-quota-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let prior = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+        Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", Path.Combine(root, "config"))
+        try
+            let first = newFixture (Path.Combine(root, "a"))
+            let sibling = secondAgent first
+            let other = newFixture (Path.Combine(root, "b"))
+            let fs = [| first; sibling; other |]
+            use account = SystemPropertyAccountFixture.create root [| [|first.First; other.First|]; [|first.Second; other.Second|] |]
+            SystemPropertyAccountFixture.approve account 0 0L 2 1 |> success |> ignore
+            let candidate client (f: Fixture) =
+                SystemPropertyAccountFixture.candidate (if client = 0 then f.First else f.Second) f.Original.TaskId
+            let candidates = [|candidate 0 first; candidate 1 sibling|]
+            let ids = [|Guid.NewGuid(); Guid.NewGuid()|]
+            let proof = [|SystemPropertyAccountFixture.coverage account 0; SystemPropertyAccountFixture.coverage account 1|]
+            let operations =
+                [| for i in 0..1 ->
+                    Task.Run(fun () -> SystemPropertyAccountFixture.reserveWithCoverage account i proof[i] ids[i] candidates[i]) |]
+            Task.WhenAll(operations).GetAwaiter().GetResult() |> ignore
+            let winners = [| for i in 0..1 do if operations[i].Result.IsOk then yield i |]
+            equal "one same-project Worker reservation" 1 winners.Length
+            let winner = winners[0]
+            let loser = 1 - winner
+            let mutable expected = Map.ofList [candidates[winner].DispatchId, "Reserved"]
+            let verify () =
+                for client in 0..1 do
+                    let records = (SystemPropertyAccountFixture.read account client).Records
+                    equal "exact quota history" expected (records |> Array.map (fun r -> r.Candidate.DispatchId, r.Status) |> Map.ofArray)
+                    equal "no duplicate reservation" expected.Count records.Length
+                    let occupied = records |> Array.filter (fun r -> r.Status <> "Released")
+                    equal "account Worker limit" true (occupied.Length <= 2)
+                    for _, group in occupied |> Array.groupBy (fun r -> r.Candidate.ProjectId) do
+                        equal "project Worker limit" true (group.Length <= 1)
+                fs |> Array.iter observe
+            verify ()
+            let retry = SystemPropertyAccountFixture.reserve account loser (Guid.NewGuid()) (candidate loser fs[loser])
+            equal "fresh same-project candidate denied with account room" true retry.IsError
+            verify ()
+            let otherCandidate = candidate (seed % 2) other
+            SystemPropertyAccountFixture.reserve account (seed % 2) (Guid.NewGuid()) otherCandidate |> success |> ignore
+            expected <- expected.Add(otherCandidate.DispatchId, "Reserved")
+            verify ()
+            let locator = SystemPropertyAccountFixture.excludeBeforeClaim account winner 0 ids[winner] candidates[winner]
+            let releaseId = Guid.NewGuid()
+            SystemPropertyAccountFixture.releaseNoSend account loser releaseId locator |> success |> ignore
+            expected <- expected.Add(candidates[winner].DispatchId, "Released")
+            verify ()
+            let replacement = candidate loser fs[loser]
+            SystemPropertyAccountFixture.reserve account loser (Guid.NewGuid()) replacement |> success |> ignore
+            expected <- expected.Add(replacement.DispatchId, "Reserved")
+            verify ()
+            let replay = SystemPropertyAccountFixture.releaseNoSend account winner releaseId locator |> success
+            equal "old release replay cannot release successor" true replay.AlreadyApplied
+            equal "new release operation cannot release original twice" true
+                (SystemPropertyAccountFixture.releaseNoSend account loser (Guid.NewGuid()) locator).IsError
+            verify ()
+        finally
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
+            Directory.Delete(root, true)

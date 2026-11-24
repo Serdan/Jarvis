@@ -146,12 +146,13 @@ type ContractFixture() =
     [<TestCase("Duplicate")>]
     [<TestCase("SecondClientCASLoser")>]
     member _.``untrusted event is not a release or a new send permit`` (eventName: string) =
-        evaluateHostEvent eventName |> holds TrustedHostNotImplemented
+        evaluateHostEvent eventName |> holds VerifiedOutcomeUnavailable
 
     [<Test>]
     member _.``terminal locator with empty operation cannot authorize release`` () =
-        let locator =
+        let locator : NativeTerminalLocator =
             { DispatchId = guid dispatch; OriginalReservationId = guid original
+              ReservationRequestSha256 = digest; ExpectedGeneration = reserved.Generation
               EffectOperationId = guid effect; TerminalOperationId = Guid.Empty }
         let proof =
             { DispatchId = locator.DispatchId; OriginalReservationId = locator.OriginalReservationId
@@ -165,8 +166,9 @@ type ContractFixture() =
 
     [<Test>]
     member _.``matching typed terminal shape remains non-authoritative without verified canonical origin`` () =
-        let locator =
+        let locator : NativeTerminalLocator =
             { DispatchId = guid dispatch; OriginalReservationId = guid original
+              ReservationRequestSha256 = digest; ExpectedGeneration = reserved.Generation
               EffectOperationId = guid effect; TerminalOperationId = guid terminal }
         let proof =
             { DispatchId = locator.DispatchId; OriginalReservationId = locator.OriginalReservationId
@@ -178,13 +180,14 @@ type ContractFixture() =
                                 Locator = locator; Proof = proof } with
         | Ok structural -> 
             Assert.That(structural.SessionId, Is.EqualTo("s1"))
-            authorizeRelease structural |> holds TrustedHostNotImplemented
+            authorizeRelease structural |> holds VerifiedOutcomeUnavailable
         | Error e -> Assert.Fail(sprintf "Expected structural-only terminal observation: %A" e)
 
     [<Test>]
     member _.``forged provider session is rejected before non-authoritative projection`` () =
-        let locator =
+        let locator : NativeTerminalLocator =
             { DispatchId = guid dispatch; OriginalReservationId = guid original
+              ReservationRequestSha256 = digest; ExpectedGeneration = reserved.Generation
               EffectOperationId = guid effect; TerminalOperationId = guid terminal }
         let proof =
             { DispatchId = locator.DispatchId; OriginalReservationId = locator.OriginalReservationId
@@ -226,8 +229,9 @@ type ContractFixture() =
 
     [<Test>]
     member _.MalformedActiveTerminalMissingCandidateReturnsTypedHold() =
-        let locator =
+        let locator : NativeTerminalLocator =
             { DispatchId = guid dispatch; OriginalReservationId = guid original
+              ReservationRequestSha256 = digest; ExpectedGeneration = reserved.Generation
               EffectOperationId = guid effect; TerminalOperationId = guid terminal }
         let proof =
             { DispatchId = locator.DispatchId; OriginalReservationId = locator.OriginalReservationId
@@ -241,7 +245,3 @@ type ContractFixture() =
                                             ProjectFenceOid = oid; ProviderSessionId = "s1" }
                           Locator = locator; Proof = proof }
         |> holds MissingObservation
-
-    [<Test; Explicit("RED: trusted Started project ingress, provider issuer and account release are absent")>]
-    member _.ProductionNativeAccountProviderTerminalRemainsUnsupported() =
-        Assert.Fail("RED: no trusted Started project ingress, real provider issuer, or connected B2 release call site exists")

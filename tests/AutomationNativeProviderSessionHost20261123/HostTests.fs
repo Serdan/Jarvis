@@ -107,7 +107,7 @@ module private ConfiguredFixture =
     let projectBindings f account =
         if account = 1 then [| f.ProjectOne |] else [| f.ProjectTwo |]
 
-    let configureVersion f version previous accountWorkerLimit projectWorkerLimit =
+    let configureLimits f version previous accountWorkerLimit projectWorkerLimit accountReviewerLimit projectReviewerLimit =
         let project = f.ProjectOne
         let account = f.AccountOne
         let initial = (AccountCapacityLedger.fetch account |> success).Head
@@ -124,7 +124,7 @@ module private ConfiguredFixture =
                       (account.AccountId.ToString("D")) (account.LedgerId.ToString("D"))
                       account.Epoch account.ApprovedFetchUrl account.ApprovedPushUrl
               Version = version; MembershipComplete = true
-              AccountLimits = { Worker = accountWorkerLimit; Reviewer = 1 }
+              AccountLimits = { Worker = accountWorkerLimit; Reviewer = accountReviewerLimit }
               Projects =
                   [| { ProjectId = project.ProjectId.ToString("D")
                        Alias = "Disposable project"
@@ -132,7 +132,7 @@ module private ConfiguredFixture =
                        Epoch = project.Epoch
                        SourceRef = NativeSchedulerRosterPolicy.ProjectSourceRef
                        RemoteAuthoritySha256 = AccountCapacityLedger.projectAuthoritySha256 authority
-                       Limits = { Worker = projectWorkerLimit; Reviewer = 1 } } |] }
+                       Limits = { Worker = projectWorkerLimit; Reviewer = projectReviewerLimit } } |] }
         let update =
             { SchemaVersion = 1
               OperationId = Guid.NewGuid().ToString("D")
@@ -142,6 +142,9 @@ module private ConfiguredFixture =
               Policy = policy }
         AccountCapacityLedger.setNativeRosterPolicy account [| project |] update
         |> success |> ignore
+
+    let configureVersion f version previous accountWorkerLimit projectWorkerLimit =
+        configureLimits f version previous accountWorkerLimit projectWorkerLimit 1 1
 
     let configure f = configureVersion f 1L 0L 1 1
 
@@ -825,3 +828,90 @@ let ``real configured reviewer reservation prepares and journals once under pair
             Assert.That((readOriginalReviewerIntent f.ProjectOne loser.OperationId effectId).IsError, Is.True)
             Assert.That((prepare f.AccountOne f.ProjectOne winner).IsError, Is.True)
             Assert.That((ConfiguredFixture.state f).Records[0].Status, Is.EqualTo("Reserved"))))
+
+[<Test>]
+let ``reclaimed review cannot reuse original reserved claim even for same agent`` () =
+    ConfiguredFixture.withGit (fun f ->
+        let taskId, reviewId, claim = reservedReviewer f
+        let agent = claim.ReviewCandidate.OwnerAgentId
+        ReviewWorkflow.releaseBranchReview f.ProjectOne (Guid.NewGuid()) taskId reviewId agent 2
+        |> ConfiguredFixture.success |> ignore
+        let replacement = Guid.NewGuid()
+        ReviewWorkflow.claimBranchReview f.ProjectOne replacement taskId reviewId agent 3
+        |> ConfiguredFixture.success |> ignore
+        let snapshot = LedgerStore.fetch f.ProjectTwo |> ConfiguredFixture.success
+        let old = { claim with ExpectedProjectHead = snapshot.Commit }
+        let newer =
+            { old with ReviewCandidate =
+                        { old.ReviewCandidate with ReviewVersion = 4L; ClaimOperationId = string replacement } }
+        PairedBrowser.withPaired (fun bridge ->
+            let cover = ConfiguredFixture.coverage f f.AccountTwo [| f.ProjectTwo |]
+            for candidate in [old; newer] do
+                Assert.That((prepareReviewer f.AccountTwo [| f.ProjectTwo |] cover bridge "Disposable" 27000 candidate).IsError, Is.True)
+                assertNoIntent f.ProjectTwo (asWorkerForNegativeTest candidate)
+            Assert.That((ConfiguredFixture.state f).Records[0].Status, Is.EqualTo("Reserved"))))
+
+[<Test>]
+let ``reviewer reservation cannot be repurposed for another owner source or claim`` () =
+    ConfiguredFixture.withGit (fun f ->
+        let _, _, claim = reservedReviewer f
+        let c = claim.ReviewCandidate
+        let mutated =
+            [ { c with OwnerAgentId = "Other reviewer" }
+              { c with ReviewedHeadOid = String.replicate 40 "a" }
+              { c with ReviewRef = c.ReviewRef + "-foreign" }
+              { c with ReviewVersion = c.ReviewVersion + 1L }
+              { c with ClaimOperationId = string (Guid.NewGuid()) } ]
+        PairedBrowser.withPaired (fun bridge ->
+            let cover = ConfiguredFixture.coverage f f.AccountTwo [| f.ProjectTwo |]
+            for candidate in mutated do
+                let altered = { claim with ReviewCandidate = candidate }
+                Assert.That((prepareReviewer f.AccountTwo [| f.ProjectTwo |] cover bridge "Disposable" 27000 altered).IsError, Is.True)
+                assertNoIntent f.ProjectTwo (asWorkerForNegativeTest altered)
+            Assert.That((ConfiguredFixture.state f).Records[0].Candidate, Is.EqualTo(c))))
+
+[<Test>]
+let ``removing Reviewer role invalidates the same canonical claim`` () =
+    ConfiguredFixture.withGit (fun f ->
+        let _, _, claim = reservedReviewer f
+        Client.RoleInstructions.RoleInstructions.detachRole f.ProjectOne "Disposable fixture"
+            (Guid.NewGuid()) claim.ReviewCandidate.OwnerAgentId "Reviewer" 1
+        |> ConfiguredFixture.success |> ignore
+        let snapshot = LedgerStore.fetch f.ProjectTwo |> ConfiguredFixture.success
+        let updated = { claim with ExpectedProjectHead = snapshot.Commit }
+        PairedBrowser.withPaired (fun bridge ->
+            let cover = ConfiguredFixture.coverage f f.AccountTwo [| f.ProjectTwo |]
+            Assert.That((prepareReviewer f.AccountTwo [| f.ProjectTwo |] cover bridge "Disposable" 27000 updated).IsError, Is.True)
+            assertNoIntent f.ProjectTwo (asWorkerForNegativeTest updated)
+            Assert.That((ConfiguredFixture.state f).Records[0].Status, Is.EqualTo("Reserved"))))
+
+[<TestCase(0,1)>]
+[<TestCase(1,0)>]
+let ``current reviewer quota revocation holds review while Worker remains independently eligible`` accountReviewerLimit projectReviewerLimit =
+    ConfiguredFixture.withGit (fun f ->
+        let _, _, review = reservedReviewer f
+        ConfiguredFixture.configureLimits f 2L 1L 1 1 accountReviewerLimit projectReviewerLimit
+        let agent = "Worker fixture"
+        ReviewWorkflow.registerAgent f.ProjectOne (Guid.NewGuid()) agent |> ConfiguredFixture.success |> ignore
+        let worker = ConfiguredFixture.startedWorker f agent
+        let original = Guid.NewGuid()
+        let projects = [| f.ProjectOne |]
+        NativeSchedulerAccountReservation.reserve f.AccountOne projects
+            (ConfiguredFixture.coverage f f.AccountOne projects) original "Configured fixture" worker
+        |> ConfiguredFixture.success |> ignore
+        let cover = ConfiguredFixture.coverage f f.AccountOne projects
+        let head = (LedgerStore.fetch f.ProjectOne |> ConfiguredFixture.success).Commit
+        let review = { review with AccountHead = cover.AccountHead; ExpectedProjectHead = head }
+        let claim : StartedProjectClaim =
+            { OperationId = Guid.NewGuid(); ExpectedProjectHead = head; AccountHead = cover.AccountHead
+              OriginalReservationOperationId = original; Candidate = worker; DeviceId = review.DeviceId
+              WindowRegistration = review.WindowRegistration }
+        PairedBrowser.withPaired (fun bridge ->
+            Assert.That((prepareReviewer f.AccountOne projects cover bridge "Disposable" 27000 review).IsError, Is.True)
+            assertNoIntent f.ProjectOne (asWorkerForNegativeTest review)
+            let write = prepareWorker f.AccountOne projects cover bridge "Disposable" 27000 claim
+                        |> ConfiguredFixture.success
+            Assert.That(write.AlreadyApplied, Is.False)
+            let records = (ConfiguredFixture.state f).Records
+            Assert.That(records.Length, Is.EqualTo(2))
+            Assert.That(records |> Array.forall (fun r -> r.Status = "Reserved"), Is.True)))

@@ -266,8 +266,7 @@ let private claimCore (account: AccountBinding) (projects: LedgerBinding array)
                             |> Result.bind (fun original ->
                                 LedgerStore.readAt project snapshot path
                                 |> Result.bind (function
-                                    | Some _, _ -> stale "Original claim already has a project fence or cancellation"
-                                    | None, _ ->
+                                    | None, None ->
                                         let effect =
                                             { SchemaVersion = 1; ProjectId = c.ProjectId
                                               ProjectLedgerId = c.ProjectLedgerId; ProjectEpoch = c.ProjectEpoch
@@ -282,7 +281,8 @@ let private claimCore (account: AccountBinding) (projects: LedgerBinding array)
                                               DeviceId = deviceId; WindowRegistration = windowRegistration
                                               Status = "HeldBeforeSend"; ProviderSessionId = ""; TerminalOriginOid = "" }
                                         Ok ([ { Path = path; ExpectedBlobOid = None; Content = json effect } ]
-                                            @ (launchIntent |> Option.map (fun (metadata, arguments) -> [metadata; arguments]) |> Option.defaultValue [])))))))
+                                            @ (launchIntent |> Option.map (fun (metadata, arguments) -> [metadata; arguments]) |> Option.defaultValue []))
+                                    | _ -> stale "Original claim already has a project fence or cancellation")))))
 
 let private claimStartedCore account projects coverage (claim: StartedProjectClaim)
                              (launchIntent: (LedgerFileChange * LedgerFileChange) option) =

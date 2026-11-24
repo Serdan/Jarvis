@@ -1,0 +1,1 @@
+Two deterministic 18-step histories compare accepted policy revision, values, stale writes and request-bound replay across disposable clones against an independent small model. Release filtered run passed 2/2, 6s test duration. Based on integrated 3f84149a; does not prove occupancy, runtime admission or milestone composition.

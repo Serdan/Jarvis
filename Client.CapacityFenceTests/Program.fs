@@ -33,6 +33,7 @@ let run () = task {
     let prior = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
     Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", root)
     try
+        printfn "stage: config"
         let config = ClientConfig.configPath()
         Directory.CreateDirectory(Path.GetDirectoryName(config)) |> ignore
         let write (text:string) = File.WriteAllText(config,text)
@@ -49,6 +50,7 @@ let run () = task {
             write raw
             check ((ClientConfig.capacityFenceModeAt config).IsError) "invalid config must fail closed"
 
+        printfn "stage: bridge"
         let project = Path.Combine(root,"Project1")
         Directory.CreateDirectory(project) |> ignore
         File.WriteAllText(Path.Combine(project,"launch.js"), "async function execute(args) { return args; }")
@@ -61,10 +63,12 @@ let run () = task {
         use socket = new ClientWebSocket()
         socket.Options.SetRequestHeader("Origin","chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         do! socket.ConnectAsync(Uri("ws://127.0.0.1:" + string port + "/"),CancellationToken.None)
+        printfn "stage: challenge"
         let! challenge = (receive socket).WaitAsync(TimeSpan.FromSeconds(5.))
         use hmac = new HMACSHA256(Encoding.UTF8.GetBytes("test-secret"))
         let proof = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(prop challenge "nonce"))).ToLowerInvariant()
         do! send socket (JsonSerializer.Serialize({| version=2; kind="authenticate"; proof=proof |}))
+        printfn "stage: ready"
         let! ready = (receive socket).WaitAsync(TimeSpan.FromSeconds(5.))
         let connectionId = prop ready "connectionId"
         do! send socket """{"version":2,"kind":"windows","windows":[{"windowRegistration":"window-01","alias":"agents","availability":"ready","registrationGeneration":1}]}"""
@@ -73,10 +77,13 @@ let run () = task {
             if bridge.ListWindows() |> Result.exists (fun s -> s.Contains("window-01")) then registered <- true
             elif not registered then do! Task.Delay(25)
         check registered "window registration"
-        let rt = Runtime(root, ConsoleTui.ConsoleTui(), PartialTrust)
+        printfn "stage: runtime"
+        let rt = Runtime(root, ConsoleTui.ConsoleTui(), FullTrust)
         rt.Browser <- Some bridge
         let command = BrowserRunInNewTabCommand { WindowRegistration="agents"; Url="https://example.test/"; ProjectName="Project1"; ScriptPath="launch.js"; ArgsJson=None; Active=None; CloseTabAfterExecution=Some false; TimeoutMs=Some 1000 }
+        printfn "stage: pending"
         let pending = receive socket
+        printfn "stage: hold"
         for raw in [ """{"schemaVersion":1,"capacityFenceEnabled":true}"""; """{"schemaVersion":1,"capacityFenceEnabled":"bad"}""" ] do
             write raw
             let! result = Client.SignalR.Client.receiveCommand rt command
@@ -84,7 +91,9 @@ let run () = task {
             do! Task.Delay(100)
             check (not pending.IsCompleted) "HOLD must emit no browser request"
         write """{"schemaVersion":1,"capacityFenceEnabled":false}"""
+        printfn "stage: disabled"
         let launch = Client.SignalR.Client.receiveCommand rt command
+        printfn "stage: frame"
         let! frame = pending.WaitAsync(TimeSpan.FromSeconds(5.))
         check (prop frame "kind" = "openTab") "disabled dispatch must reach browser"
         do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"created-01","alias":"new","agentCreated":true,"availability":"ready","registrationGeneration":1}]}"""

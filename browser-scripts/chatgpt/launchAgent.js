@@ -112,7 +112,7 @@ async function executeLaunch(args, observeSelection) {
   try {
   // Re-evaluate on every fresh launch; never cache usage availability.
   // Strict fallback order: Chat Latest High, Work GPT-6.1 Terra Medium, Chat Latest Instant.
-  // Advance only when the current selection cannot be confirmed before Send.
+  // Work requires an explicit quota signal on this launch’s Chat model or High effort.
   const defaultPreferences = [
     { mode: "Chat", model: "Latest", effort: "high", level: 2, label: "High" },
     { mode: "Work", model: "GPT-6.1 Terra", effort: "medium", level: 1, label: "Medium" },
@@ -124,7 +124,7 @@ async function executeLaunch(args, observeSelection) {
     ["latest-high", [defaultPreferences[0]]],
     ["latest-medium", [{ mode: "Chat", model: "Latest", effort: "medium", level: 1, label: "Medium" }]],
     ["gpt-5.6-instant", [{ mode: "Chat", model: "GPT-5.6", alternateModels: ["GPT-5.6 Sol"], effort: "none", level: 0, label: "Instant" }]],
-    ["work-terra-medium", [defaultPreferences[1]]]
+    ["work-terra-medium", defaultPreferences.slice(0, 2)]
   ]);
   if (args.modelOverride !== undefined && !modelOverrides.has(args.modelOverride)) {
     return notSubmitted("UnsupportedModelOverride");
@@ -137,13 +137,21 @@ async function executeLaunch(args, observeSelection) {
   const pickerSelector = 'button[aria-label="Select ChatGPT model"]';
   const projectChat = { getAttribute: name => name === "aria-pressed" ? "true" : null };
   const projectWork = { getAttribute: name => name === "aria-pressed" ? "false" : null };
+  const modeButtons = () => {
+    const groups = Array.from(document.querySelectorAll('[role="group"][aria-label="Composer mode"]'))
+      .filter(visible);
+    if (groups.length > 1) return [];
+    return Array.from((groups[0] || document).querySelectorAll('button[type="button"][aria-pressed]'))
+      .filter(button => ["Chat", "Work"].includes(button.textContent.trim()));
+  };
   const modeButton = name => {
-    if (projectStart) {
+    const buttons = modeButtons();
+    if (projectStart && !buttons.length &&
+        !document.querySelectorAll('[role="group"][aria-label="Composer mode"]').length) {
       const work = projectWorkPresent(picker());
       return (name === "Work") === work ? projectChat : projectWork;
     }
-    const matches = Array.from(document.querySelectorAll('button[type="button"][aria-pressed]'))
-      .filter(button => button.textContent.trim() === name);
+    const matches = buttons.filter(button => button.textContent.trim() === name);
     return matches.length === 1 ? matches[0] : null;
   };
   const emptyHomeFailure = () => {
@@ -178,8 +186,14 @@ async function executeLaunch(args, observeSelection) {
     return controls.length === 1 ? controls[0] : null;
   };
   // Other site menus (sidebar, projects) are not model menus.
-  const modelMenu = () => Array.from(document.querySelectorAll('[role="menu"]'))
-    .find(menu => menu.getClientRects().length && menu.querySelector('[data-model-picker-view]')) || null;
+  const modelMenu = () => {
+    const control = picker();
+    const ownedId = control?.getAttribute("aria-controls");
+    const menus = Array.from(document.querySelectorAll('[role="menu"]')).filter(menu =>
+      (!ownedId || menu.id === ownedId) && menu.getClientRects().length &&
+      menu.querySelector('[data-model-picker-view]'));
+    return menus.length === 1 ? menus[0] : null;
+  };
   const menuView = () => modelMenu()?.querySelector('[data-model-picker-view]')?.getAttribute('data-model-picker-view');
   const radioText = item => (item?.innerText || item?.textContent || "").trim();
   const radio = model => {
@@ -232,6 +246,16 @@ async function executeLaunch(args, observeSelection) {
       : (control.innerText || control.textContent || "").trim() === target.label));
   const unavailableRadio = item => !item || item.getAttribute("aria-disabled") === "true" ||
     item.hasAttribute("data-disabled");
+  // The menu always contains a hidden “Usage limit reached” description.
+  // It is evidence only when the unavailable target itself references it.
+  const quotaLimited = item => {
+    if (!item || !unavailableRadio(item)) return false;
+    const descriptions = [item.getAttribute("aria-description")];
+    for (const id of (item.getAttribute("aria-describedby") || "").split(/\s+/).filter(Boolean)) {
+      descriptions.push(document.getElementById(id)?.textContent);
+    }
+    return descriptions.some(value => /^usage limit reached[.!]?$/i.test(value?.trim() || ""));
+  };
   const activeMenuControl = selector => Array.from(modelMenu()?.querySelectorAll(selector) || [])
     .find(item => !item.closest('[aria-hidden="true"],[inert]')) || null;
   const attempts = [];
@@ -256,26 +280,11 @@ async function executeLaunch(args, observeSelection) {
     confirmedModelLabel = null;
     confirmedObservation = null;
     confirmedPicker = null;
-    // Project landing pages expose the Chat model picker, but no mode switch.
-    // Use the same checked-radio and effort verification as ordinary Chat.
-    if (projectStart && target.mode === "Work") {
-      const control = await poll(() => {
-        const current = picker();
-        return !emptyHomeFailure() && document.readyState === "complete" &&
-          closedPickerProof(current, target) ? current : null;
-      }, untilAt);
-      if (!control) return "ModeUnavailable";
-      confirmedPicker = control;
-      confirmedModelLabel = projectWorkLabel(control);
-      confirmedObservation = { mode: null, model: confirmedModelLabel, effort: target.label };
-      return null;
-    }
-    if (projectStart && projectWorkPresent(picker())) return "ModeUnavailable";
     const home = () => emptyHomeFailure();
     const retryWait = () => delay(Math.min(100, Math.max(1, untilAt - Date.now())));
     // Chat/Work controls can appear before their React click handlers hydrate.
     let lastModeClick = -Infinity;
-    const modeReady = projectStart || await poll(() => {
+    const modeReady = await poll(() => {
       if (home()) return null;
       const chat = modeButton("Chat");
       const work = modeButton("Work");
@@ -287,13 +296,22 @@ async function executeLaunch(args, observeSelection) {
       const wanted = target.mode === "Chat" ? chat : work;
       if (!finalCheck && document.readyState === "complete" &&
           document.querySelectorAll(composerSelector).length === 1 &&
-          !wanted.disabled && Date.now() - lastModeClick >= 220) {
+          typeof wanted.click === "function" && !wanted.disabled && Date.now() - lastModeClick >= 220) {
         lastModeClick = Date.now();
         if (!home()) wanted.click();
       }
       return null;
     }, untilAt);
     if (!modeReady) return "ModeUnavailable";
+    if (projectStart && target.mode === "Work") {
+      const control = picker();
+      if (!home() && closedPickerProof(control, target)) {
+        confirmedPicker = control;
+        confirmedModelLabel = projectWorkLabel(control);
+        confirmedObservation = { mode: renderedLabel(modeButton("Work")), model: confirmedModelLabel, effort: target.label };
+        return null;
+      }
+    }
 
     let lastPickerClick = -Infinity;
     const openPicker = () => poll(() => {
@@ -326,7 +344,7 @@ async function executeLaunch(args, observeSelection) {
       if (!await enterAdvanced()) return "ModelListUnavailable";
       model = modelRadio(target);
     }
-    if (unavailableRadio(model)) return "ModelUnavailable";
+    if (unavailableRadio(model)) return quotaLimited(model) ? "ReasoningQuotaExhausted" : "ModelUnavailable";
     if (!checked(model)) {
       if (!await enterAdvanced()) return "ModelListUnavailable";
       model = modelRadio(target);
@@ -386,7 +404,8 @@ async function executeLaunch(args, observeSelection) {
       // Quota filtering compresses the slider: position 1 can be Pro while
       // the trigger still reports "medium". Check the named option and label.
       const effortOption = radio(target.label);
-      if (effortOption && unavailableRadio(effortOption)) return "EffortUnavailable";
+      if (effortOption && unavailableRadio(effortOption))
+        return quotaLimited(effortOption) ? "ReasoningQuotaExhausted" : "EffortUnavailable";
       const knob = power?.querySelector('[role="slider"]');
       const position = knob?.getAttribute("aria-valuenow");
       const maximum = knob?.getAttribute("aria-valuemax");
@@ -400,6 +419,13 @@ async function executeLaunch(args, observeSelection) {
         await retryWait();
         continue;
       }
+      // In the quota-compressed picker, High can be absent entirely.
+      // A small slider alone is not a quota signal. Require the provider’s
+      // quota description on the disabled reasoning tier as well.
+      if (target.mode === "Chat" && target.effort === "high" &&
+          !effortOption && maxStep < target.level &&
+          ["Instant", "Pro"].includes(visibleEffort) && quotaLimited(radio("Medium")))
+        return "ReasoningQuotaExhausted";
       if (powerLabel.getAttribute("data-power-disabled") === "true" ||
           power?.querySelector('[data-locked="true"]') || target.level > maxStep)
         return "EffortUnavailable";
@@ -409,7 +435,7 @@ async function executeLaunch(args, observeSelection) {
         if (target.mode === "Work" &&
             !document.querySelector('[data-model-selection-label="gpt-6.1-terra-wm"]'))
           return "ModelUnconfirmed";
-        const activeModes = projectStart ? [] : [modeButton("Chat"), modeButton("Work")]
+        const activeModes = [modeButton("Chat"), modeButton("Work")]
           .filter(button => button?.getAttribute("aria-pressed") === "true");
         const observation = {
           mode: activeModes.length === 1 ? renderedLabel(activeModes[0]) : null,
@@ -468,6 +494,15 @@ async function executeLaunch(args, observeSelection) {
     const failure = await choose(target, cutoff);
     if (!failure) { selected = target; break; }
     attempts.push({ mode: target.mode, model: target.model, effort: target.label, reason: failure });
+    if (target.mode === "Work" && failure === "SelectionChanged") break;
+    if (target.mode === "Chat" && target.effort === "high") {
+      if (failure !== "ReasoningQuotaExhausted") break;
+      // Dismiss the Chat menu before switching modes. Never click through it.
+      const menu = modelMenu();
+      menu?.dispatchEvent?.(new KeyboardEvent("keydown", {
+        key: "Escape", code: "Escape", bubbles: true, cancelable: true
+      }));
+    }
   }
   if (!selected) {
     const homeFailure = emptyHomeFailure();

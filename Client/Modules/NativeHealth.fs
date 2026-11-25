@@ -262,7 +262,10 @@ module NativeHealth =
                                             let agentFiles =
                                                 paths |> List.filter (fun path ->
                                                     path.StartsWith("agents/", StringComparison.Ordinal)
-                                                    && path.EndsWith(".json", StringComparison.Ordinal))
+                                                    && path.EndsWith(".json", StringComparison.Ordinal)
+                                                    // Challenge subscription sidecars are not registered agent records.
+                                                    // Match the canonical suffix before applying the roster bound.
+                                                    && not (path.EndsWith(".challenge-subscription.json", StringComparison.Ordinal)))
                                             if agentFiles.Length > 512 then
                                                 failure <- Some ("Registered agent enumeration exceeds bound for " + name)
                                             else

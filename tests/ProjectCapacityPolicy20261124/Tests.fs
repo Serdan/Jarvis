@@ -148,6 +148,7 @@ let malformedPolicyFailsClosed () =
                      valid.Replace(string a.ProjectId, string (Guid.NewGuid())) ] do
             install a path raw
             Assert.That(read a 1 "Worker" |> Result.isError, Is.True, raw)
+            Assert.That(readCurrentOptional a (LedgerStore.fetch a |> good) |> Result.isError, Is.True, raw)
             Assert.That(set a 1 None Map.empty |> Result.isError, Is.True, raw))
 
 [<Test>]
@@ -157,3 +158,44 @@ let corruptCanonicalRoleFailsEvenWithNoCaps () =
         Assert.That(read a 0 "Worker" |> Result.isError, Is.True)
         Assert.That(set a 0 None (Map.ofList ["Worker", 1]) |> Result.isError, Is.True)
         set a 0 (Some 3) (roles ()) |> fun result -> Assert.That(Result.isError result, Is.True))
+
+[<Test>]
+let currentReaderUsesOnlyPinnedSnapshot () =
+    withRoles (fun a b ->
+        let absent = LedgerStore.fetch a |> good
+        let initial, initialOid = readCurrentOptional a absent |> good
+        Assert.That(initial.Revision, Is.Zero)
+        Assert.That(initial.Total = None && Map.isEmpty initial.Roles && initialOid = None, Is.True)
+        set b 0 (Some 3) (roles ()) |> good |> ignore
+        let configured = LedgerStore.fetch a |> good
+        set b 1 None Map.empty |> good |> ignore
+        let disabled = LedgerStore.fetch a |> good
+        let (old, oldOid), metrics = LedgerStore.measureGitReads (fun () -> readCurrentOptional a configured |> good)
+        Assert.That(metrics.RemoteFetches, Is.Zero)
+        Assert.That(old.Revision, Is.EqualTo(1))
+        Assert.That(old.Total = Some 3 && old.Roles = roles () && Option.isSome oldOid, Is.True)
+        Assert.That(readCurrentOptional a configured |> good, Is.EqualTo(readOptionalForRole a configured 1 "Worker" |> good))
+        let latest, latestOid = readCurrentOptional a disabled |> good
+        Assert.That(latest.Revision, Is.EqualTo(2))
+        Assert.That(latest.Total = None && Map.isEmpty latest.Roles && Option.isSome latestOid, Is.True)
+        Assert.That(latestOid <> oldOid, Is.True)
+        Assert.That(readCurrentOptional a absent |> good, Is.EqualTo((initial, initialOid)))
+        Assert.That(readCurrentOptional a { configured with Commit = String('0', 40) } |> Result.isError, Is.True)
+        Assert.That(readCurrentOptional { a with LedgerId = Guid.NewGuid() } configured |> Result.isError, Is.True)
+        install a "records/roles/Worker.json" (roleRaw "Reviewer")
+        // Disabled policy has no configured role identities to validate.
+        Assert.That(readCurrentOptional a (LedgerStore.fetch a |> good) |> Result.isOk, Is.True)
+        Assert.That(readOptionalForRole a (LedgerStore.fetch a |> good) 2 "Worker" |> Result.isError, Is.True))
+
+[<Test>]
+let currentReaderPreservesLegacyAndRejectsCorruptConfiguredRole () =
+    withRoles (fun a _ ->
+        update a "operator" (Guid.NewGuid()) 0 3 (roles ()) |> good |> ignore
+        let pinned = LedgerStore.fetch a |> good
+        let policy, oid = readCurrentOptional a pinned |> good
+        Assert.That(policy.Schema, Is.EqualTo(1))
+        Assert.That(policy.Revision, Is.EqualTo(1))
+        Assert.That(policy.Total = Some 3 && policy.Roles = roles () && Option.isSome oid, Is.True)
+        install a "records/roles/Worker.json" (roleRaw "Reviewer")
+        Assert.That(readCurrentOptional a (LedgerStore.fetch a |> good) |> Result.isError, Is.True)
+        Assert.That(readCurrentOptional a pinned |> good, Is.EqualTo((policy, oid))))

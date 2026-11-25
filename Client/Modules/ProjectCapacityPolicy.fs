@@ -117,23 +117,31 @@ let private parsePolicy (binding: LedgerBinding) (raw: string) =
             else Ok p
     with _ -> reject "malformed policy"
 
-let private readPolicy (binding: LedgerBinding) snapshot expectedRevision =
-    if expectedRevision < 0 || not (validSnapshot binding snapshot) then
-        reject "invalid expected revision or snapshot binding"
+// Read the current policy at the caller's already verified snapshot. No fetch
+// or expected revision is needed; only genuine record absence is disabled.
+let readCurrentOptional (binding: LedgerBinding) snapshot =
+    if not (validSnapshot binding snapshot) then
+        reject "invalid snapshot binding"
     else
         LedgerStore.readAt binding snapshot path
         |> Result.bind (function
-            | None, None when expectedRevision = 0 ->
+            | None, None ->
                 Ok ({ Schema = 2; Project = binding.ProjectId; Ledger = binding.LedgerId
                       Epoch = binding.Epoch; Revision = 0; Total = None; Roles = Map.empty }, None)
             | Some raw, Some oid ->
                 parsePolicy binding raw
                 |> Result.bind (fun p ->
-                    if p.Revision <> expectedRevision then reject "stale policy revision"
-                    else
-                        requireRoles binding snapshot p.Roles
-                        |> Result.map (fun () -> p, Some oid))
-            | _ -> reject "missing or inconsistent policy revision")
+                    requireRoles binding snapshot p.Roles
+                    |> Result.map (fun () -> p, Some oid))
+            | _ -> reject "inconsistent policy record")
+
+let private readPolicy binding snapshot expectedRevision =
+    if expectedRevision < 0 then reject "invalid expected revision"
+    else
+        readCurrentOptional binding snapshot
+        |> Result.bind (fun (policy, oid) ->
+            if policy.Revision <> expectedRevision then reject "stale policy revision"
+            else Ok (policy, oid))
 
 // Exact expected revision, including zero for absence, is mandatory. The
 // caller must use the same authenticated snapshot on every CAS attempt.

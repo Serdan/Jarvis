@@ -226,3 +226,228 @@ let ``canonical transient excess drains naturally without cancellation`` () =
         yieldNaturally "manual-two" "Manual2"
         Assert.That(run ports binding, Is.EqualTo(Submitted "submitted"))
         Assert.That(sends, Is.EqualTo(1)))
+
+open System.Net
+open System.Net.Sockets
+open System.Net.WebSockets
+open System.Security.Cryptography
+open System.Text
+open System.Text.Json
+open System.Threading
+open Client
+open Client.OrchestrationApi
+
+let private route (project: string) : BrowserSchedules.ScheduledAction =
+    { Id = "ready-resume"; DueAtUtc = DateTimeOffset.UtcNow; Url = "https://chatgpt.com/g/g-p-fixture/project"
+      ProjectName = project; ScriptPath = "browser-scripts/chatgpt/launchAgent.js"; Alias = "agents"
+      ArgsJson = """{"resumeReady":true}"""; Active = false; WindowRegistration = "agents"
+      CloseTabAfterExecution = false; RepeatEverySeconds = 60; Status = "running"
+      RegistrationId = ""; ConversationUrl = ""; Cleanup = ""; AttemptId = "attempt"; RevisionId = "revision"
+      Error = ""; UpdatedAtUtc = DateTimeOffset.UtcNow; ActionKind = "BrowserScript"; TriggerKind = "Every"
+      Executable = ""; CommandArgs = []; WorkingDirectory = ""; TimeoutSeconds = 30; MaxOutputBytes = 100
+      IdleAgentId = ""; IdleSeconds = 0; LastActivityAtUtc = DateTimeOffset.MinValue
+      StartedAtUtc = DateTimeOffset.UtcNow; Disabled = false; LastResult = "" }
+
+[<Test>]
+let onlyExplicitRecurringRoute () =
+    let a = route "Fixture"
+    Assert.That(BrowserSchedules.isReadyResume a, Is.True)
+    Assert.That(validateRoute a, Is.EqualTo(Ok () : Result<unit,string>))
+    for invalid in [
+        { a with TriggerKind = "Once"; RepeatEverySeconds = 0 }
+        { a with ArgsJson = """{"resumeReady":true,"prompt":"injected"}""" }
+        { a with Url = "https://chatgpt.com/c/conversation" }
+        { a with Url = "https://example.test/" }
+        { a with ProjectName = "Fixture::other" }
+        { a with WindowRegistration = "" } ] do
+        Assert.That((validateRoute invalid).IsError, Is.True)
+    Assert.That(BrowserSchedules.isReadyResume { a with ArgsJson = "{}" }, Is.False)
+    Assert.That(BrowserSchedules.isReadyResume { a with ScriptPath = "other.js" }, Is.False)
+
+[<Test>]
+let canonicalOptionalPolicyChanges () =
+    fixture (fun binding assign ->
+        assign "Manual" "manual-task"
+        assign "Worker" "ready-task"
+        ReviewWorkflow.activateReadyAgent binding (Guid.NewGuid()) "manual-task" "Manual" |> good |> ignore
+        let mutable sends = 0
+        let ports =
+            { ReadLimits = readCurrentLimits
+              CanSend = fun _ -> Task.FromResult(Ok true)
+              Send = fun _ -> sends <- sends + 1; Task.FromResult(Ok "submitted") }
+        ProjectCapacityPolicy.updateOptional binding "fixture" (Guid.NewGuid()) 0 (Some 1) Map.empty
+        |> good |> ignore
+        Assert.That(run ports binding, Is.EqualTo(NoEligibleReady))
+        ProjectCapacityPolicy.updateOptional binding "fixture" (Guid.NewGuid()) 1 None Map.empty
+        |> good |> ignore
+        Assert.That(run ports binding, Is.EqualTo(Submitted "submitted"))
+        Assert.That(sends, Is.EqualTo(1)))
+
+[<Test>]
+let lateStopAfterIntent () =
+    fixture (fun binding assign ->
+        assign "Worker" "ready-task"
+        let mutable checks = 0
+        let mutable sends = 0
+        let ports =
+            { ReadLimits = readCurrentLimits
+              CanSend = fun ready ->
+                  checks <- checks + 1
+                  if checks = 2 then
+                      ReviewWorkflow.queueResponseAlert binding (Guid.NewGuid()) "fixture" "Worker" "STOP now"
+                      |> good |> ignore
+                  let latest = LedgerStore.fetch binding |> good
+                  Task.FromResult(stillReadyAt binding latest ready |> Result.mapError (sprintf "%A"))
+              Send = fun _ -> sends <- sends + 1; Task.FromResult(Ok "unexpected") }
+        Assert.That(run ports binding, Is.EqualTo(Held "Scheduled launch stopped before Send."))
+        Assert.That(checks, Is.EqualTo(2))
+        Assert.That(sends, Is.Zero)
+        Assert.That((ReviewWorkflow.getResponseAlerts binding "Worker" |> good).Pending.Length, Is.EqualTo(1)))
+
+let private waitUntil (check: unit -> bool) =
+    let deadline = DateTime.UtcNow.AddSeconds(15.)
+    while not (check()) && DateTime.UtcNow < deadline do Thread.Sleep(25)
+    Assert.That(check(), Is.True, "Timed out waiting for fixture state.")
+
+let private scheduleState (service: BrowserSchedules.Service) id =
+    use doc = JsonDocument.Parse(service.Get(id) |> good)
+    let p name = doc.RootElement.GetProperty(name: string).GetString()
+    p "status", p "attemptId", p "error"
+
+[<Test>]
+let interruptedClaimIsNotReplayed () =
+    let folder = Path.Combine(Path.GetTempPath(), "jarvis-ready-journal-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(folder) |> ignore
+    try
+        let path = Path.Combine(folder, "schedules.json")
+        let original = route "Fixture"
+        File.WriteAllText(path, JsonSerializer.Serialize({| schemaVersion = 3; actions = [original] |}))
+        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+            File.SetUnixFileMode(path, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+        let mutable nowTicks = DateTimeOffset.UtcNow.Ticks
+        let clock () = DateTimeOffset(Interlocked.Read(&nowTicks), TimeSpan.Zero)
+        let mutable calls = 0
+        use service = new BrowserSchedules.Service(path, (fun _ ->
+            Interlocked.Increment(&calls) |> ignore
+            Task.FromResult(Ok """{"status":"completed"}""")), now=clock, pollMs=25)
+        let status, attempt, error = scheduleState service original.Id
+        Assert.That(status, Is.EqualTo("suspended"))
+        Assert.That(attempt, Is.EqualTo(original.AttemptId))
+        Assert.That(error, Does.StartWith("ResumePublicationUncertain:"))
+        let schedule id project script args =
+            service.Schedule(id, 5, original.Url, project, script, "", args, false,
+                windowRegistration="agents", repeatEverySeconds=60)
+        Assert.That((schedule original.Id "Fixture" original.ScriptPath original.ArgsJson).IsError, Is.True)
+        schedule "alternate" "Fixture" original.ScriptPath original.ArgsJson |> good |> ignore
+        schedule "generic" "Fixture" "other.js" "{}" |> good |> ignore
+        Interlocked.Add(&nowTicks, TimeSpan.FromSeconds(6.).Ticks) |> ignore
+        service.Start()
+        waitUntil (fun () ->
+            let status, attempt, _ = scheduleState service "generic"
+            status = "pending" && not (String.IsNullOrWhiteSpace attempt))
+        Assert.That(Volatile.Read(&calls), Is.EqualTo(1))
+        let _, otherAttempt, _ = scheduleState service "alternate"
+        Assert.That(otherAttempt, Is.Empty)
+    finally
+        Directory.Delete(folder, true)
+
+let private socketSend (socket: ClientWebSocket) (value: string) = task {
+    let bytes = Encoding.UTF8.GetBytes value
+    do! socket.SendAsync(ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None)
+}
+
+let private socketReceive (socket: ClientWebSocket) = task {
+    let bytes = Array.zeroCreate<byte> 8192
+    let! result = socket.ReceiveAsync(ArraySegment<byte>(bytes), CancellationToken.None)
+    Assert.That(result.EndOfMessage, Is.True)
+    return Encoding.UTF8.GetString(bytes, 0, result.Count)
+}
+
+let private prop (raw: string) (key: string) =
+    use doc = JsonDocument.Parse raw
+    doc.RootElement.GetProperty(key).GetString()
+
+[<Test; NonParallelizable>]
+let actualScheduledCallerWithFakeBrowser () =
+    fixture (fun binding assign ->
+        let root = Path.GetDirectoryName(binding.RepositoryPath)
+        let prior = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+        Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", Path.Combine(root, "config"))
+        try
+            let a = route "local"
+            let script = Path.Combine(binding.RepositoryPath, a.ScriptPath)
+            Directory.CreateDirectory(Path.GetDirectoryName script) |> ignore
+            File.WriteAllText(script, "async function execute(args) { return args; }")
+            assign "Manual" "manual-task"
+            ReviewWorkflow.activateReadyAgent binding (Guid.NewGuid()) "manual-task" "Manual" |> good |> ignore
+            assign "Worker" "ready-task"
+            ProjectCapacityPolicy.updateOptional binding "fixture" (Guid.NewGuid()) 0 (Some 1) Map.empty
+            |> good |> ignore
+            let rt = Runtime(root, ConsoleTui.ConsoleTui(), Client.FullTrust)
+            let head = (LedgerStore.fetch binding |> good).Commit
+            LedgerBindingConfig.bindExisting "local" rt binding.ProjectId binding.LedgerId binding.Epoch
+                binding.RemoteName binding.ApprovedFetchUrl binding.ApprovedPushUrl head true |> good |> ignore
+            (task {
+                use listener = new TcpListener(IPAddress.Loopback, 0)
+                listener.Start()
+                let port = (listener.LocalEndpoint :?> IPEndPoint).Port
+                listener.Stop()
+                use bridge = new BrowserBridge.Service(port, "test-secret")
+                bridge.Start()
+                rt.Browser <- Some bridge
+                use socket = new ClientWebSocket()
+                socket.Options.SetRequestHeader("Origin", "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                do! socket.ConnectAsync(Uri("ws://127.0.0.1:" + string port + "/"), CancellationToken.None)
+                let! challenge = (socketReceive socket).WaitAsync(TimeSpan.FromSeconds(5.))
+                use hmac = new HMACSHA256(Encoding.UTF8.GetBytes("test-secret"))
+                let proof = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(prop challenge "nonce"))).ToLowerInvariant()
+                do! socketSend socket (JsonSerializer.Serialize({| version=2; kind="authenticate"; proof=proof |}))
+                let! ready = (socketReceive socket).WaitAsync(TimeSpan.FromSeconds(5.))
+                let connection = prop ready "connectionId"
+                do! socketSend socket """{"version":2,"kind":"windows","windows":[{"windowRegistration":"window-01","alias":"agents","availability":"ready","registrationGeneration":1}]}"""
+                waitUntil (fun () -> bridge.ListWindows() |> Result.exists (fun s -> s.Contains("window-01")))
+                let mutable nowTicks = DateTimeOffset.UtcNow.Ticks
+                let clock () = DateTimeOffset(Interlocked.Read(&nowTicks), TimeSpan.Zero)
+                let advance (seconds: float) = Interlocked.Add(&nowTicks, TimeSpan.FromSeconds(seconds).Ticks) |> ignore
+                let actor () = Some "operator:fixture"
+                use service = new BrowserSchedules.Service(Path.Combine(root, "schedules.json"),
+                    Program.executeReadySchedule actor rt (Some bridge), now=clock, pollMs=25)
+                rt.BrowserScheduler <- Some service
+                service.Schedule(a.Id, 5, a.Url, a.ProjectName, a.ScriptPath, a.Alias, a.ArgsJson, a.Active,
+                    windowRegistration=a.WindowRegistration, closeAfter=false, repeatEverySeconds=60) |> good |> ignore
+                let waitOccurrence old =
+                    waitUntil (fun () ->
+                        let status, attempt, _ = scheduleState service a.Id
+                        status = "pending" && attempt <> old && not (String.IsNullOrWhiteSpace attempt))
+                    let _, attempt, _ = scheduleState service a.Id
+                    attempt
+                service.Start()
+                let pending = socketReceive socket
+                advance 6.
+                let capped = waitOccurrence ""
+                Assert.That(pending.IsCompleted, Is.False, "Enabled cap must produce no browser effect.")
+                ProjectCapacityPolicy.updateOptional binding "fixture" (Guid.NewGuid()) 1 None Map.empty
+                |> good |> ignore
+                advance 60.
+                let! frame = pending.WaitAsync(TimeSpan.FromSeconds(15.))
+                Assert.That(prop frame "kind", Is.EqualTo("openTab"))
+                do! socketSend socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"created-01","alias":"new","agentCreated":true,"availability":"ready","registrationGeneration":1}]}"""
+                do! socketSend socket (JsonSerializer.Serialize({| version=2; kind="tabOpened"; requestId=prop frame "requestId"; connectionId=connection; tab={| registrationId="created-01"; availability="ready"; agentCreated=true; registrationGeneration=1 |} |}))
+                let! execute = (socketReceive socket).WaitAsync(TimeSpan.FromSeconds(5.))
+                Assert.That(prop execute "kind", Is.EqualTo("executeJs"))
+                use request = JsonDocument.Parse execute
+                let args = request.RootElement.GetProperty("args")
+                Assert.That(args.GetProperty("prompt").GetString(), Is.EqualTo("Agent Worker, project local. Call inbox."))
+                Assert.That(args.GetProperty("startUrl").GetString(), Is.EqualTo(a.Url))
+                Assert.That(args.EnumerateObject() |> Seq.length, Is.EqualTo(2))
+                do! socketSend socket (JsonSerializer.Serialize({| version=2; kind="result"; requestId=prop execute "requestId"; connectionId=connection; registrationId="created-01"; registrationGeneration=1; status="completed"; result={| status="outcomeUnknown"; stage="acknowledgement"; reason="SubmissionUnconfirmed" |} |}))
+                let launched = waitOccurrence capped
+                let _, _, error = scheduleState service a.Id
+                Assert.That(error, Does.Contain("OutcomeUnknown"))
+                let noReplay = socketReceive socket
+                advance 60.
+                waitOccurrence launched |> ignore
+                Assert.That(noReplay.IsCompleted, Is.False, "Original Ready episode must never replay after unknown send.")
+            }).GetAwaiter().GetResult()
+        finally
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior))

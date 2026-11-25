@@ -110,7 +110,9 @@ let readRosterAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) (limits: Li
     LedgerStore.listAt binding snapshot "agents"
     |> Result.bind (fun paths ->
         let paths = paths |> List.filter (fun path ->
-            path.StartsWith("agents/", StringComparison.Ordinal) && path.EndsWith(".json", StringComparison.Ordinal))
+            path.StartsWith("agents/", StringComparison.Ordinal)
+            && path.EndsWith(".json", StringComparison.Ordinal)
+            && not (path.EndsWith(".challenge-subscription.json", StringComparison.Ordinal)))
         let read path =
             readAgentId binding snapshot path
             |> Result.bind (fun id -> ReviewWorkflow.getAgentWorkingTurnAt binding snapshot id)
@@ -147,6 +149,58 @@ type Prepared =
       OperationId: Guid }
 
 type ReadLimits = LedgerBinding -> LedgerSnapshot -> Result<Limits, LedgerFailure>
+
+/// A missing canonical policy is disabled, while malformed/unavailable policy
+/// is never silently interpreted as absence.
+let readCurrentLimits : ReadLimits =
+    fun binding snapshot ->
+        ProjectCapacityPolicy.readCurrentOptional binding snapshot
+        |> Result.map (fun (policy, _) -> { Total = policy.Total; Roles = policy.Roles })
+
+/// Recheck the exact Ready episode and non-consuming STOP queue at the
+/// latest verified snapshot immediately before the browser effect.
+let stillReadyAt binding snapshot (ready: Ready) =
+    ReviewWorkflow.getAgentWorkingTurnAt binding snapshot ready.AgentId
+    |> Result.bind (readReady binding snapshot)
+    |> Result.map (fun current -> current = Some ready)
+
+/// The configured recurring schedule is the explicit default-off route.
+/// Require a main project selector and the provider's supported empty start
+/// surface; never pass arbitrary route metadata into the launcher.
+let validateRoute (action: BrowserSchedules.ScheduledAction) =
+    if not (BrowserSchedules.isReadyResume action) ||
+       action.TriggerKind <> "Every" || action.RepeatEverySeconds <= 0 ||
+       String.IsNullOrWhiteSpace(action.ProjectName) ||
+       action.ProjectName.Contains("::", StringComparison.Ordinal) ||
+       String.IsNullOrWhiteSpace(action.WindowRegistration) then
+        Error "InvalidReadyResumeRoute"
+    else
+        try
+            use doc = JsonDocument.Parse(action.ArgsJson)
+            let fields = doc.RootElement.EnumerateObject() |> Seq.toList
+            let validUrl =
+                match Uri.TryCreate(action.Url, UriKind.Absolute) with
+                | true, uri ->
+                    uri.Scheme = "https" && uri.Host = "chatgpt.com" &&
+                    uri.IsDefaultPort && uri.UserInfo = "" && uri.Query = "" && uri.Fragment = "" &&
+                    (uri.AbsolutePath = "/" ||
+                     System.Text.RegularExpressions.Regex.IsMatch(
+                         uri.AbsolutePath, @"^/g/g-p-[a-z0-9]+(?:-[a-z0-9]+)*/project/?$"))
+                | _ -> false
+            if fields.Length <> 1 || not validUrl then Error "InvalidReadyResumeRoute"
+            else Ok ()
+        with _ -> Error "InvalidReadyResumeRoute"
+
+/// Only pass the two documented launcher arguments. The host-only switch is
+/// never exposed to the browser script. The configured project destination
+/// must be sent explicitly because launchAgent.js defaults to the home page.
+let browserArguments (startUrl: string) (prepared: Prepared) =
+    let args = JsonSerializer.Serialize(
+        {| prompt = prepared.Rendered.Prompt; startUrl = startUrl |},
+        JsonSerializerOptions(Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping))
+    if BrowserArguments.fits args then Ok args
+    else Error "Rendered launch exceeds argument budget."
+
 
 /// Read current policy, roster and renderer at one pinned head. A prior intent
 /// is never launch permission, regardless of its outcome or missing browser receipt.

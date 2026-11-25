@@ -3398,18 +3398,10 @@ module ReviewWorkflow =
                            || not (String.IsNullOrEmpty attempt.SourceRepositoryId) then
                             return! Error(StaleEntityVersion "Source already pinned or attempt not Working.")
                         let! identity = LedgerStore.sourceRepositoryIdentity binding
-                        let! observation = LedgerStore.inspectSourceWorktree binding sourceRef
-                        if observation.State = "SourceUnavailable" then
-                            return! Error(SourceUnavailable "Working source branch does not exist.")
-                        if observation.State = "StaleDetachedCheckout" then
-                            return! Error(SourceUnavailable "Detached checkout HEAD differs from the pinned source branch head.")
-                        if observation.SelectedWorktreeDetached && not allowDetached then
-                            return! Error(SourceUnavailable "Detached checkout requires explicit allowDetached.")
-                        if observation.SelectedWorktreeDirty && not allowUncommitted then
-                            return! Error(SourceUnavailable "Uncommitted checkout requires explicit allowUncommitted.")
-                        do! LedgerStore.verifySourceCommit binding sourceRef observation.SourceHead
+                        let! sourceHead = LedgerStore.initialSourceCheckout binding sourceRef allowDetached allowUncommitted
+                        do! LedgerStore.verifySourceCommit binding sourceRef sourceHead
                         do! LedgerStore.verifySourceObject binding baseOid
-                        do! LedgerStore.verifySourceAncestry binding baseOid observation.SourceHead
+                        do! LedgerStore.verifySourceAncestry binding baseOid sourceHead
                         let! remoteTargetHead = LedgerStore.readRemoteTarget binding targetRef
                         do! LedgerStore.verifySourceAncestry binding baseOid remoteTargetHead
                         return [ change (attemptPath taskId attempt.AttemptId) (Some attemptOid)

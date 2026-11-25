@@ -1976,6 +1976,162 @@ type ReviewWorkflowTests() =
             Assert.That(assigned.Lifecycle, Is.EqualTo("InProgress"))
             Assert.That(attempt.Value.OwnerAgentId, Is.EqualTo("Owner")))
 
+    [<TestCase(false, false, false, true)>]
+    [<TestCase(true, false, false, true)>]
+    [<TestCase(false, true, false, false)>]
+    [<TestCase(true, true, false, false)>]
+    [<TestCase(false, true, true, true)>]
+    [<TestCase(true, true, true, true)>]
+    member _.InitialBindingUsesActualLinkedCheckout(primaryDirty: bool, sourceDirty: bool, allowDirty: bool, accepted: bool) =
+        withFixture (fun one _ first second baseOid targetRef _ _ ->
+            let taskId = "actual-linked-source"
+            let branch = "feature/actual-linked"
+            let sourceRef = "refs/heads/" + branch
+            let path = Path.Combine(Path.GetDirectoryName(one), "actual linked")
+            git one [ "worktree"; "add"; "-b"; branch; path; baseOid ] |> ignore
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId taskId |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1 |> success |> ignore
+            if primaryDirty then File.WriteAllText(Path.Combine(one, "source.txt"), "unrelated dirty primary")
+            if sourceDirty then
+                // An untracked file must be detected even when status defaults
+                // to hiding untracked paths.
+                git path [ "config"; "status.showUntrackedFiles"; "no" ] |> ignore
+                File.WriteAllText(Path.Combine(path, "untracked.txt"), "dirty actual source")
+            let before, _, attempt = ReviewWorkflow.getTask second taskId |> success
+            let bind = ReviewWorkflow.bindAttemptSource first (Guid.NewGuid()) taskId "Owner" 2 1
+                            sourceRef baseOid targetRef false allowDirty
+            if accepted then
+                bind |> success |> ignore
+                let _, _, after = ReviewWorkflow.getTask second taskId |> success
+                Assert.That(after.Value.SourceRef, Is.EqualTo(sourceRef))
+                Assert.That(after.Value.BaseCommit, Is.EqualTo(baseOid))
+            else
+                match bind with
+                | Error(SourceUnavailable _) -> ()
+                | other -> Assert.Fail(sprintf "Actual dirty checkout must reject: %A" other)
+                let after, _, unchanged = ReviewWorkflow.getTask second taskId |> success
+                Assert.That(after, Is.EqualTo(before))
+                Assert.That(unchanged, Is.EqualTo(attempt)))
+
+    [<TestCase("detached-primary", true)>]
+    [<TestCase("no-checkout", false)>]
+    [<TestCase("missing-ref", false)>]
+    [<TestCase("duplicate", false)>]
+    [<TestCase("prunable", false)>]
+    [<TestCase("wrong-repository", false)>]
+    [<TestCase("wrong-symbolic-ref", false)>]
+    [<TestCase("invalid-head", false)>]
+    [<TestCase("status-failure", false)>]
+    [<TestCase("wrong-root", false)>]
+    member _.InitialBindingRequiresUnambiguousActualSource(scenario: string, accepted: bool) =
+        withFixture (fun one two first second baseOid targetRef newCommit _ ->
+            let taskId = "registered-source-identity"
+            let branch = "feature/actual-identity"
+            let sourceRef = "refs/heads/" + branch
+            let path = Path.Combine(Path.GetDirectoryName(one), "actual-identity")
+            let extra = Path.Combine(Path.GetDirectoryName(one), "duplicate-identity")
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId taskId |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1 |> success |> ignore
+            if scenario <> "missing-ref" then
+                git one [ "branch"; branch; baseOid ] |> ignore
+            if scenario <> "missing-ref" && scenario <> "no-checkout" then
+                git one [ "worktree"; "add"; path; branch ] |> ignore
+            match scenario with
+            | "detached-primary" ->
+                let newer = newCommit "Unrelated primary" "newer"
+                git one [ "checkout"; "--detach"; newer ] |> ignore
+                File.WriteAllText(Path.Combine(one, "source.txt"), "unrelated dirty detached")
+            | "duplicate" -> git one [ "worktree"; "add"; "--force"; extra; branch ] |> ignore
+            | "prunable" -> Directory.Delete(path, true)
+            | "wrong-repository" ->
+                Directory.Delete(path, true)
+                git two [ "worktree"; "add"; "--detach"; path; baseOid ] |> ignore
+            | "wrong-symbolic-ref" ->
+                // The registered checkout must not be inferred from another
+                // attached branch, even when it has the same commit.
+                git path [ "checkout"; "-b"; "feature/not-the-source" ] |> ignore
+            | "invalid-head" ->
+                let headPath = git path [ "rev-parse"; "--path-format=absolute"; "--git-path"; "HEAD" ]
+                File.WriteAllText(headPath, "not-a-valid-head\n")
+            | "status-failure" ->
+                let indexPath = git path [ "rev-parse"; "--path-format=absolute"; "--git-path"; "index" ]
+                File.WriteAllText(indexPath, "not-a-valid-index\n")
+            | "wrong-root" ->
+                let primaryGit = git one [ "rev-parse"; "--absolute-git-dir" ]
+                File.WriteAllText(Path.Combine(path, ".git"), "gitdir: " + primaryGit + "\n")
+            | _ -> ()
+            let before, _, attempt = ReviewWorkflow.getTask second taskId |> success
+            let bind = ReviewWorkflow.bindAttemptSource first (Guid.NewGuid()) taskId "Owner" 2 1
+                            sourceRef baseOid targetRef (not accepted) (not accepted)
+            if accepted then
+                bind |> success |> ignore
+            else
+                match bind with
+                | Error(SourceUnavailable _) -> ()
+                | other -> Assert.Fail(sprintf "Unsafe source must fail closed even with dirty consent: %A" other)
+                let after, _, unchanged = ReviewWorkflow.getTask second taskId |> success
+                Assert.That(after, Is.EqualTo(before))
+                Assert.That(unchanged, Is.EqualTo(attempt)))
+
+    [<TestCase(false, false, true)>]
+    [<TestCase(true, false, false)>]
+    [<TestCase(true, true, true)>]
+    member _.InitialBindingDetachedFallbackChecksActualDirtyState(dirty: bool, allowDirty: bool, accepted: bool) =
+        withFixture (fun one _ first second baseOid targetRef _ _ ->
+            let taskId = "actual-detached-source"
+            let branch = "feature/actual-detached"
+            let path = Path.Combine(Path.GetDirectoryName(one), "actual-detached")
+            git one [ "branch"; branch; baseOid ] |> ignore
+            git one [ "worktree"; "add"; "--detach"; path; baseOid ] |> ignore
+            let selected = { first with RepositoryPath = path }
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId taskId |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1 |> success |> ignore
+            if dirty then File.WriteAllText(Path.Combine(path, "untracked.txt"), "dirty detached")
+            let before, _, attempt = ReviewWorkflow.getTask second taskId |> success
+            let bind = ReviewWorkflow.bindAttemptSource selected (Guid.NewGuid()) taskId "Owner" 2 1
+                            ("refs/heads/" + branch) baseOid targetRef true allowDirty
+            if accepted then bind |> success |> ignore
+            else
+                match bind with
+                | Error(SourceUnavailable _) -> ()
+                | other -> Assert.Fail(sprintf "Dirty detached source must fail closed: %A" other)
+                let after, _, unchanged = ReviewWorkflow.getTask second taskId |> success
+                Assert.That(after, Is.EqualTo(before))
+                Assert.That(unchanged, Is.EqualTo(attempt)))
+
+    [<Test>]
+    member _.InitialBindingSameRootPreservesActorCasEndpointAndAncestryFences() =
+        withFixture (fun one _ first second baseOid targetRef newCommit _ ->
+            let taskId = "same-root-source"
+            let branch = "feature/same-root-source"
+            let sourceRef = "refs/heads/" + branch
+            let nonAncestor = newCommit "Future unrelated base" "future"
+            git one [ "checkout"; "-b"; branch; baseOid ] |> ignore
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId taskId |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1 |> success |> ignore
+            let before, _, attempt = ReviewWorkflow.getTask second taskId |> success
+            let bind binding owner version generation baseCommit =
+                ReviewWorkflow.bindAttemptSource binding (Guid.NewGuid()) taskId owner version generation
+                    sourceRef baseCommit targetRef false false
+            expectStale (bind first "Reviewer" 2 1 baseOid)
+            expectStale (bind first "Owner" 1 1 baseOid)
+            expectStale (bind first "Owner" 2 2 baseOid)
+            let altered = { first with ApprovedPushUrl = Path.Combine(Path.GetDirectoryName(one), "unapproved.git") }
+            match bind altered "Owner" 2 1 baseOid with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Endpoint drift must reject: %A" other)
+            match bind first "Owner" 2 1 nonAncestor with
+            | Error _ -> ()
+            | other -> Assert.Fail(sprintf "Nonancestor baseline must reject: %A" other)
+            let after, _, unchanged = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(after, Is.EqualTo(before))
+            Assert.That(unchanged, Is.EqualTo(attempt))
+            bind first "Owner" 2 1 baseOid |> success |> ignore)
+
     [<Test>]
     member _.DetachedSourceCheckoutRequiresExplicitApproval() =
         withFixture (fun one _ first _ baseOid targetRef newCommit _ ->

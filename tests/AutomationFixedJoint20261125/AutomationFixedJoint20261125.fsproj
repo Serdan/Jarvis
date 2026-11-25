@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <AssemblyName>Client.Tests</AssemblyName>
+    <IsPackable>false</IsPackable>
+    <GenerateProgramFile>false</GenerateProgramFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../Client/Client.fsproj" />
+    <ProjectReference Include="../../Server/Server.fsproj" />
+    <Compile Include="../AutomationHealthHosted20261123/GitFixture.fs" Link="GitFixture.fs" />
+    <Compile Include="BrowserFixture.fs" />
+    <Compile Include="JointTests.fs" />
+    <Content Include="../../browser-scripts/chatgpt/launchAgent.js" Link="launchAgent.js" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="NUnit" Version="4.3.2" />
+    <PackageReference Include="NUnit3TestAdapter" Version="4.6.0" />
+  </ItemGroup>
+</Project>

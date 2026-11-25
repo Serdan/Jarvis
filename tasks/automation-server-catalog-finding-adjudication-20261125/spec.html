@@ -1,0 +1,41 @@
+<article>
+<h1>Independent adjudication of Server catalog and OAuth test-contract findings</h1>
+<p><strong>Purpose:</strong> Decide whether Worker 23's read-only audit findings justify a bounded corrective task. This is findings adjudication, not source review, implementation, or deployment approval.</p>
+<h2>Independence requirement</h2>
+<p>You must be independent of Worker 23 (the finding author), the original author(s) of the affected source/tests, and anyone who proposed the corrective design. Verify source/test authorship from the pinned history. If you discover a conflict, do not adjudicate; checkpoint the conflict and request a different adjudicator.</p>
+<h2>Exact evidence boundary</h2>
+<ul>
+<li>Audit source: <code>2be5afb056fc31b0f5f5c7410afaed225b0216bf</code></li>
+<li>Audit tree: <code>cb2bfb9ea4b3aa70997d933e0207e5dccc83cd84</code></li>
+<li>Original Server qualification job: <code>7b12a0a4cffe476e9f16c90619efeb7b</code>, exit 1, 582/586 assertions.</li>
+<li>Finding author: Worker 23, task <code>automation-final-red-server-catalog-audit-20261125</code>.</li>
+<li>Do not use later or dirty source as a substitute for the pinned baseline. Preserve the original RED as authoritative.</li>
+</ul>
+<h2>Findings to adjudicate independently</h2>
+<ol>
+<li><code>McpAuthenticationTests.fs</code> optional operationId assertion reports 69 vs 71 raw operationId-bearing tools. Audit claims <code>SetLaunchTemplate</code> is optional while <code>RecordAggregateInclusion</code> is required, making the correct optional count 70 with a separate required assertion for the latter.</li>
+<li><code>ServiceTests.fs</code> client-backed MCP facade count reports 165 vs 166. Audit attributes the extra facade to <code>RecordAggregateInclusion</code>.</li>
+<li>The <code>orchestrationTools</code> set omits <code>RecordAggregateInclusion</code>, despite its registration in the existing TaskWrite facade catalog.</li>
+<li>The OAuth alias map omits <code>RecordAggregateInclusion</code>, causing it to be classified as an unexpected server-local tool. Audit claims it maps to existing TaskWrite and Integration manual-grant semantics, with <code>git:write</code> scope.</li>
+</ol>
+<h2>Required adjudication</h2>
+<p>Inspect the original task/spec, applicable architecture, exact source and history. Do not accept the audit summary or proposed correction without independently checking the evidence. For each finding, decide exactly one of Accept, Narrow, Defer or Reject. Record:</p>
+<ul>
+<li>Demonstrated validity and assumptions.</li>
+<li>Relevance to the established task and threat model.</li>
+<li>Concrete impact and the conditions under which it occurs.</li>
+<li>Proportionality, cost and maintenance consequences.</li>
+<li>Simpler alternatives in the existing system.</li>
+<li>The precise authorized correction, or why no change is warranted.</li>
+</ul>
+<p>Keep the proposed solution separate from the accepted defect. If accepted or narrowed, specify whether the smallest justified correction is limited to <code>Server.Tests/McpAuthenticationTests.fs</code> and <code>Server.Tests/ServiceTests.fs</code>, and restate all required negative controls. If deferred or rejected, explain why. One adjudication only; do not recursively adjudicate this decision.</p>
+<h2>Negative controls and prohibitions</h2>
+<ul>
+<li>Read-only only: no source edits, test reruns, new branches, commits, review publication, or live effects.</li>
+<li>No production changes, AgentCommand union changes, MCP registration changes, OAuth scope/permission changes, or authentication changes.</li>
+<li>Do not weaken assertions, hide tools from enumeration, or turn the original RED into PASS.</li>
+<li>Do not authorize deployment, restart, migration, Scheduler activation, or cutover.</li>
+<li>If a correction is accepted/narrowed, preserve seven required selector IDs; keep the other 70 writes optional with default empty operationId; keep <code>RecordAggregateInclusion</code> operationId required and stable, Integration manual-grant family, <code>git:write</code> scope, ReadOnly=false, Destructive=false, OpenWorld=false.</li>
+</ul>
+<p>Record exact source references, authorship independence, reasoning and final disposition in a durable checkpoint, then complete the adjudication assignment.</p>
+</article>

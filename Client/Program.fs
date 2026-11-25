@@ -9,6 +9,7 @@ open System.Security.Cryptography
 open System.Threading
 open System.Threading.Tasks
 open Client
+open Client.LedgerStore
 open Client.ConsoleTui
 open Client.SignalR
 open Common
@@ -230,6 +231,37 @@ let executeScheduledAction (readFence: unit -> Result<ClientConfig.CapacityFence
 // Ordinary canonical Ready resume shares the existing persistent schedule
 // and authenticated bridge. No provider inventory, account baseline, new
 // credential or capacity reservation is introduced.
+let private readyResumeHash (value: string) =
+    Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes value)).ToLowerInvariant()
+
+let private resumeBindingHash (binding: LedgerBinding) =
+    JsonSerializer.Serialize(binding) |> readyResumeHash
+
+// Reconciliation is inspection of the exact original operation only. A
+// matching receipt isolates the original episode in canonical history;
+// it never confers Send permission, even if the browser was never entered.
+let reconcileReadySchedule (authenticatedActor: unit -> string option) (rt: Runtime)
+                           (action: BrowserSchedules.ScheduledAction) (selection: BrowserSchedules.ResumeSelection) = task {
+    match authenticatedActor() with
+    | Some actor when actor = selection.Actor ->
+        let permission = rt :> PermissionIO
+        match PermissionPolicy.evaluateWithTrust permission.TrustLevel (scheduledBrowserCommand action) with
+        | Error _ -> return false
+        | Ok () ->
+            match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot action.ProjectName rt with
+            | Ok(binding, _) when resumeBindingHash binding = selection.BindingSha256 ->
+                let intent : LedgerIntent =
+                    { OperationId = selection.OperationId; Actor = selection.Actor
+                      Kind = "ScheduledReadyResumeIntent"; RequestJson = selection.RequestJson }
+                match LedgerStore.findApplied binding intent with
+                | Ok(Some receipt) ->
+                    return receipt.Operation.Type = intent.Kind &&
+                           receipt.Operation.Path = $"records/scheduled-ready-resume/{intent.OperationId:N}/intent.json"
+                | _ -> return false
+            | _ -> return false
+    | _ -> return false
+}
+
 let executeReadySchedule (authenticatedActor: unit -> string option) (rt: Runtime)
                          (browser: BrowserBridge.Service option) (action: BrowserSchedules.ScheduledAction) = task {
     let permission = rt :> PermissionIO
@@ -249,8 +281,7 @@ let executeReadySchedule (authenticatedActor: unit -> string option) (rt: Runtim
                     match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot action.ProjectName rt with
                     | Error error -> return Error("", sprintf "%A" error)
                     | Ok(binding, _) ->
-                        let hash (value: string) =
-                            Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes value)).ToLowerInvariant()
+                        let hash = readyResumeHash
                         let routeHash =
                             JsonSerializer.Serialize(
                                 {| id = action.Id; revisionId = action.RevisionId; project = action.ProjectName; url = action.Url; script = action.ScriptPath
@@ -267,7 +298,10 @@ let executeReadySchedule (authenticatedActor: unit -> string option) (rt: Runtim
                                     match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot action.ProjectName rt with
                                     | Error error -> return Error(sprintf "%A" error)
                                     | Ok(current, snapshot) when current = binding ->
-                                        return ScheduledReadyResume.stillReadyAt current snapshot ready
+                                        return ScheduledReadyResume.readCurrentLimits current snapshot
+                                               |> Result.bind (fun limits ->
+                                                   ScheduledReadyResume.readRosterAt current snapshot limits
+                                                   |> Result.map (ScheduledReadyResume.candidates limits >> List.contains ready))
                                                |> Result.mapError (sprintf "%A")
                                     | Ok _ -> return Error "Project ledger binding changed."
                         }
@@ -293,9 +327,16 @@ let executeReadySchedule (authenticatedActor: unit -> string option) (rt: Runtim
                             { ReadLimits = ScheduledReadyResume.readCurrentLimits
                               CanSend = preflight
                               Send = send }
+                        let sourceHash = hash source
+                        let track stage prepared =
+                            let intent = ScheduledReadyResume.intentFor actor action.ScriptPath sourceHash routeHash prepared
+                            let selection : BrowserSchedules.ResumeSelection =
+                                { Stage = stage; BindingSha256 = resumeBindingHash binding
+                                  OperationId = intent.OperationId; Actor = actor; RequestJson = intent.RequestJson }
+                            scheduler.RecordResumeStage(action, selection)
                         let! outcome =
-                            ScheduledReadyResume.executeOnce ports binding actor action.ProjectName
-                                action.ScriptPath (hash source) routeHash
+                            ScheduledReadyResume.executeOnceTracked track ports binding actor action.ProjectName
+                                action.ScriptPath sourceHash routeHash
                         match outcome with
                         | ScheduledReadyResume.NoEligibleReady -> return Ok """{"status":"noEligibleReady"}"""
                         | ScheduledReadyResume.Held reason -> return Error("", reason)
@@ -392,6 +433,7 @@ let private runClient args =
                     let canonical = if checkout < 0 then project else project.Substring(0, checkout)
                     tui.GetAgentLastSeen(canonical, agent)),
                 verifyIdleActivity=(fun project agent -> verifyIdleActivity project agent),
+                reconcileResume=(fun action selection -> reconcileReadySchedule readyResumeActor rt action selection),
                 onFault=tui.Log))
         with :? IOException as error ->
             tui.Log ("Execution scheduling inactive on this client: " + error.Message)

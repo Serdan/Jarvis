@@ -302,7 +302,58 @@ let lateStopAfterIntent () =
         Assert.That(run ports binding, Is.EqualTo(Held "Scheduled launch stopped before Send."))
         Assert.That(checks, Is.EqualTo(2))
         Assert.That(sends, Is.Zero)
-        Assert.That((ReviewWorkflow.getResponseAlerts binding "Worker" |> good).Pending.Length, Is.EqualTo(1)))
+        let alert = (ReviewWorkflow.getResponseAlerts binding "Worker" |> good).Pending.Head
+        Assert.That(run ports binding, Is.EqualTo(NoEligibleReady))
+        Assert.That(sends, Is.Zero)
+        ReviewWorkflow.clearResponseAlert binding (Guid.NewGuid()) "fixture" "Worker" (Guid.Parse alert.AlertId)
+        |> good |> ignore
+        Assert.That(run ports binding, Is.EqualTo(Submitted "unexpected"))
+        Assert.That(run ports binding, Is.EqualTo(NoEligibleReady))
+        Assert.That(sends, Is.EqualTo(1)))
+
+[<TestCase(false)>]
+[<TestCase(true)>]
+let lateDenialThenConcurrentHealthyPolls isError =
+    fixture (fun binding assign ->
+        assign "Worker" "ready-task"
+        let mutable checks = 0
+        let mutable sends = 0
+        let ports =
+            { ReadLimits = readCurrentLimits
+              CanSend = fun _ ->
+                  checks <- checks + 1
+                  Task.FromResult(if checks = 2 then
+                                      if isError then Error "temporary preflight failure" else Ok false
+                                  else Ok true)
+              Send = fun _ -> Interlocked.Increment(&sends) |> ignore; Task.FromResult(Ok "submitted") }
+        let before = LedgerStore.fetch binding |> good
+        let first = (prepareAt readCurrentLimits binding before "Fixture" |> good).Value
+        Assert.That(run ports binding, Is.EqualTo(Held (if isError then "temporary preflight failure" else "Scheduled launch stopped before Send.")))
+        Assert.That(sends, Is.Zero)
+        let after = LedgerStore.fetch binding |> good
+        let second = (prepareAt readCurrentLimits binding after "Fixture" |> good).Value
+        Assert.That(second.Ready, Is.EqualTo(first.Ready))
+        Assert.That(second.OperationId, Is.Not.EqualTo(first.OperationId))
+        Assert.That((LedgerStore.getOperationAt binding after first.OperationId |> good).IsSome, Is.True)
+        let healthy = { ports with CanSend = fun _ -> Task.FromResult(Ok true) }
+        use barrier = new Barrier(2)
+        let compete () =
+            Task.Run(fun () ->
+                let mutable firstCheck = true
+                let preflight _ =
+                    if firstCheck then
+                        firstCheck <- false
+                        if not (barrier.SignalAndWait(TimeSpan.FromSeconds(15.))) then failwith "race barrier timed out"
+                    Task.FromResult(Ok true)
+                let concurrent = { healthy with CanSend = preflight }
+                run concurrent binding)
+        let a = compete()
+        let b = compete()
+        Task.WaitAll([| a :> Task; b :> Task |])
+        Assert.That(run healthy binding, Is.EqualTo(NoEligibleReady))
+        Assert.That(sends, Is.EqualTo(1))
+        let final = LedgerStore.fetch binding |> good
+        Assert.That((LedgerStore.getOperationAt binding final second.OperationId |> good).IsSome, Is.True))
 
 let private waitUntil (check: unit -> bool) =
     let deadline = DateTime.UtcNow.AddSeconds(15.)
@@ -451,3 +502,212 @@ let actualScheduledCallerWithFakeBrowser () =
             }).GetAwaiter().GetResult()
         finally
             Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior))
+
+
+[<TestCase("PreSelection")>]
+[<TestCase("SelectedNoReceipt")>]
+[<TestCase("PublicationUnknown")>]
+[<TestCase("SelectedWithReceipt")>]
+[<TestCase("Published")>]
+[<TestCase("EnteringSend")>]
+[<NonParallelizable>]
+let restartAtDurableResumeBoundary boundary =
+    fixture (fun initialBinding assign ->
+        let root = Path.GetDirectoryName(initialBinding.RepositoryPath)
+        let prior = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+        Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", Path.Combine(root, "config"))
+        try
+            assign "Worker" "original-task"
+            let rt = Runtime(root, ConsoleTui.ConsoleTui(), Client.FullTrust)
+            let head = (LedgerStore.fetch initialBinding |> good).Commit
+            LedgerBindingConfig.bindExisting "local" rt initialBinding.ProjectId initialBinding.LedgerId initialBinding.Epoch
+                initialBinding.RemoteName initialBinding.ApprovedFetchUrl initialBinding.ApprovedPushUrl head true |> good |> ignore
+            let binding, _ = LedgerBindingConfig.loadWithSnapshot "local" rt |> good
+            let bindingHash =
+                Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(binding)))).ToLowerInvariant()
+            let actor () = Some "operator:fixture"
+            let hook = Path.Combine(binding.ApprovedPushUrl, "hooks", "pre-receive")
+            let uncertainWithoutReceipt = boundary = "SelectedNoReceipt" || boundary = "PublicationUnknown"
+            if boundary = "PublicationUnknown" then
+                File.WriteAllText(hook, "#!/bin/sh\nexit 1\n")
+                if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                    File.SetUnixFileMode(hook, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+            let path = Path.Combine(root, "restart-schedules.json")
+            let a = route "local"
+            let mutable nowTicks = DateTimeOffset.UtcNow.Ticks
+            let clock () = DateTimeOffset(Interlocked.Read(&nowTicks), TimeSpan.Zero)
+            let advance (seconds: float) = Interlocked.Add(&nowTicks, TimeSpan.FromSeconds(seconds).Ticks) |> ignore
+            use interrupted = new ManualResetEventSlim(false)
+            use release = new ManualResetEventSlim(false)
+            use oldExited = new ManualResetEventSlim(false)
+            let mutable firstRun = true
+            let mutable service : BrowserSchedules.Service option = None
+            let mutable original : Prepared option = None
+            let sent = System.Collections.Concurrent.ConcurrentQueue<string>()
+            let pause () =
+                interrupted.Set()
+                if not (release.Wait(TimeSpan.FromSeconds(30.))) then failwith "Interrupted fixture was not released."
+                raise (OperationCanceledException("Simulated process interruption"))
+            let execute (action: BrowserSchedules.ScheduledAction) = task {
+                let wasFirst = firstRun
+                try
+                    if wasFirst && boundary = "PreSelection" then pause()
+                    let track stage prepared =
+                        let intent = intentFor (actor().Value) action.ScriptPath "fixture-source" "fixture-route" prepared
+                        let selection : BrowserSchedules.ResumeSelection =
+                            { Stage = stage; BindingSha256 = bindingHash; OperationId = intent.OperationId
+                              Actor = intent.Actor; RequestJson = intent.RequestJson }
+                        if wasFirst then
+                            original <- Some prepared
+                            if boundary = "SelectedWithReceipt" && stage = "Published" then pause()
+                        let written = service.Value.RecordResumeStage(action, selection)
+                        if wasFirst && ((boundary = "SelectedNoReceipt" && stage = "Selected") ||
+                                        (boundary = "Published" && stage = "Published")) then pause()
+                        written
+                    let ports =
+                        { ReadLimits = readCurrentLimits
+                          CanSend = fun _ -> Task.FromResult(Ok true)
+                          Send = fun prepared -> task {
+                              sent.Enqueue(prepared.Ready.AgentId)
+                              if wasFirst && boundary = "EnteringSend" then pause()
+                              return Ok "submitted" } }
+                    let! result = executeOnceTracked track ports binding (actor().Value) "local" action.ScriptPath "fixture-source" "fixture-route"
+                    match result with
+                    | Submitted _ | NoEligibleReady -> return Ok """{"status":"completed"}"""
+                    | Held reason | OutcomeUnknown reason -> return Error("", reason)
+                    | PublicationUncertain(id, reason) -> return Error("", $"ResumePublicationUncertain:{id:D}:{reason}")
+                finally
+                    if wasFirst then oldExited.Set()
+            }
+            let makeService () =
+                new BrowserSchedules.Service(path, execute, now=clock, pollMs=25,
+                    reconcileResume=Program.reconcileReadySchedule actor rt)
+            let first = makeService()
+            service <- Some first
+            try
+                first.Schedule(a.Id, 5, a.Url, a.ProjectName, a.ScriptPath, a.Alias, a.ArgsJson, a.Active,
+                    windowRegistration=a.WindowRegistration, closeAfter=false, repeatEverySeconds=60) |> good |> ignore
+                first.Start()
+                advance 6.
+                if boundary = "PublicationUnknown" then
+                    waitUntil (fun () ->
+                        let status, _, _ = scheduleState first a.Id
+                        status = "suspended")
+                else
+                    Assert.That(interrupted.Wait(TimeSpan.FromSeconds(20.)), Is.True, "Expected durable interruption boundary.")
+                let status, oldAttempt, evidence = scheduleState first a.Id
+                Assert.That(status, Is.EqualTo(if boundary = "PublicationUnknown" then "suspended" else "running"))
+                Assert.That(evidence, Does.StartWith(if boundary = "PublicationUnknown" then "ResumePublicationUncertain:" else "ResumeStage:"))
+                let priorOperation = original |> Option.map _.OperationId
+                let snapshot = LedgerStore.fetch binding |> good
+                match priorOperation with
+                | Some id ->
+                    Assert.That((LedgerStore.getOperationAt binding snapshot id |> good).IsSome,
+                        Is.EqualTo(not uncertainWithoutReceipt))
+                | None -> Assert.That(boundary, Is.EqualTo("PreSelection"))
+                (first :> IDisposable).Dispose()
+                firstRun <- false
+                release.Set()
+                Assert.That(oldExited.Wait(TimeSpan.FromSeconds(5.)), Is.True)
+                if boundary = "PublicationUnknown" then File.Delete(hook)
+                if boundary <> "PreSelection" then assign "Other" "other-task"
+                use restored = makeService()
+                service <- Some restored
+                let restoredStatus, restoredAttempt, _ = scheduleState restored a.Id
+                Assert.That(restoredAttempt, Is.EqualTo(oldAttempt))
+                Assert.That(restoredStatus, Is.EqualTo(if boundary = "PreSelection" then "pending" else "suspended"))
+                restored.Start()
+                if uncertainWithoutReceipt then
+                    advance 120.
+                    Thread.Sleep(600)
+                    let state, attempt, _ = scheduleState restored a.Id
+                    Assert.That(state, Is.EqualTo("suspended"))
+                    Assert.That(attempt, Is.EqualTo(oldAttempt))
+                    Assert.That(sent.ToArray(), Is.Empty)
+                    let after = LedgerStore.fetch binding |> good
+                    Assert.That((LedgerStore.getOperationAt binding after priorOperation.Value |> good).IsNone, Is.True)
+                else
+                    waitUntil (fun () ->
+                        let status, attempt, _ = scheduleState restored a.Id
+                        status = "pending" && attempt = oldAttempt)
+                    advance 61.
+                    waitUntil (fun () ->
+                        let status, attempt, _ = scheduleState restored a.Id
+                        status = "pending" && attempt <> oldAttempt)
+                    let expected =
+                        if boundary = "PreSelection" then [|"Worker"|]
+                        elif boundary = "EnteringSend" then [|"Worker"; "Other"|]
+                        else [|"Other"|]
+                    Assert.That(sent.ToArray(), Is.EqualTo(expected :> obj))
+                    let _, resumedAttempt, _ = scheduleState restored a.Id
+                    advance 60.
+                    waitUntil (fun () ->
+                        let status, attempt, _ = scheduleState restored a.Id
+                        status = "pending" && attempt <> resumedAttempt)
+                    Assert.That(sent.ToArray(), Is.EqualTo(expected :> obj))
+                    match priorOperation with
+                    | Some id ->
+                        let after = LedgerStore.fetch binding |> good
+                        Assert.That(LedgerStore.getOperationAt binding after id |> good,
+                            Is.EqualTo(LedgerStore.getOperationAt binding snapshot id |> good))
+                    | None -> ()
+            finally
+                release.Set()
+                if not oldExited.IsSet then
+                    (first :> IDisposable).Dispose()
+                    oldExited.Wait(TimeSpan.FromSeconds(5.)) |> ignore
+        finally
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior))
+
+
+[<Test>]
+let failedTerminalProofNeverAuthorizesRetry () =
+    fixture (fun binding assign ->
+        assign "Worker" "ready-task"
+        let hook = Path.Combine(binding.ApprovedPushUrl, "hooks", "pre-receive")
+        let mutable checks = 0
+        let mutable sends = 0
+        let ports =
+            { ReadLimits = readCurrentLimits
+              CanSend = fun _ ->
+                  checks <- checks + 1
+                  if checks = 2 then
+                      File.WriteAllText(hook, "#!/bin/sh\nexit 1\n")
+                      if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                          File.SetUnixFileMode(hook, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+                      Task.FromResult(Ok false)
+                  else Task.FromResult(Ok true)
+              Send = fun _ -> sends <- sends + 1; Task.FromResult(Ok "unexpected") }
+        match run ports binding with
+        | OutcomeUnknown reason -> Assert.That(reason, Does.Contain("Non-invocation proof not confirmed"))
+        | other -> Assert.Fail(sprintf "Expected uncertain proof, got %A" other)
+        File.Delete(hook)
+        let healthy = { ports with CanSend = fun _ -> Task.FromResult(Ok true) }
+        Assert.That(run healthy binding, Is.EqualTo(NoEligibleReady))
+        Assert.That(sends, Is.Zero))
+
+[<Test>]
+let legacyIntentRemainsFencedWithoutPositiveProof () =
+    fixture (fun binding assign ->
+        assign "Worker" "ready-task"
+        let snapshot = LedgerStore.fetch binding |> good
+        let prepared = (prepareAt readCurrentLimits binding snapshot "Fixture" |> good).Value
+        let legacyRequest =
+            JsonSerializer.Serialize(
+                {| ready = prepared.Ready; scriptPath = "launchAgent.js"; sourceSha256 = "script-sha"
+                   routeSha256 = "route-sha"; promptSha256 = prepared.Rendered.PromptSha256
+                   templateVersion = prepared.Rendered.TemplateVersion
+                   templateBlobOid = prepared.Rendered.TemplateBlobOid |})
+        let intent : LedgerIntent =
+            { OperationId = prepared.OperationId; Actor = "fixture"
+              Kind = "ScheduledReadyResumeIntent"; RequestJson = legacyRequest }
+        LedgerStore.transact binding intent (fun _ ->
+            Ok [{ Path = $"records/scheduled-ready-resume/{prepared.OperationId:N}/intent.json"
+                  ExpectedBlobOid = None; Content = legacyRequest }]) |> good |> ignore
+        let mutable sends = 0
+        let ports =
+            { ReadLimits = readCurrentLimits
+              CanSend = fun _ -> Task.FromResult(Ok true)
+              Send = fun _ -> sends <- sends + 1; Task.FromResult(Ok "unexpected") }
+        Assert.That(run ports binding, Is.EqualTo(NoEligibleReady))
+        Assert.That(sends, Is.Zero))

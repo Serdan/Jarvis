@@ -64,6 +64,52 @@ let private isUncertainResume (action: ScheduledAction) =
     not (String.IsNullOrEmpty action.Error) &&
     action.Error.StartsWith("ResumePublicationUncertain:", StringComparison.Ordinal)
 
+// The occurrence's Error field carries private durable stage evidence while
+// running/suspended. No public schedule record shape or other caller changes.
+// Legacy running records without the explicit PreSelection marker are ambiguous.
+[<CLIMutable>]
+type ResumeSelection =
+    { Stage: string
+      BindingSha256: string
+      OperationId: Guid
+      Actor: string
+      RequestJson: string }
+
+let private preSelection = "ResumeStage:PreSelection"
+let private stagePrefix = "ResumeStage:"
+let private uncertainPrefix = "ResumePublicationUncertain:"
+
+let tryResumeSelection (action: ScheduledAction) =
+    try
+        let raw = action.Error
+        let prefix =
+            if raw.StartsWith(stagePrefix, StringComparison.Ordinal) then stagePrefix
+            elif raw.StartsWith(uncertainPrefix, StringComparison.Ordinal) then uncertainPrefix
+            else ""
+        if prefix = "" then None
+        else
+            let selection = JsonSerializer.Deserialize<ResumeSelection>(raw.Substring(prefix.Length))
+            if isNull (box selection) || selection.OperationId = Guid.Empty ||
+               String.IsNullOrWhiteSpace(selection.Actor) || String.IsNullOrWhiteSpace(selection.RequestJson) ||
+               String.IsNullOrWhiteSpace(selection.BindingSha256) ||
+               not (List.contains selection.Stage ["Selected"; "Published"; "EnteringSend"]) then None
+            else Some selection
+    with _ -> None
+
+let private suspendResume action =
+    match tryResumeSelection action with
+    | Some selection -> uncertainPrefix + JsonSerializer.Serialize(selection)
+    | None -> uncertainPrefix + " interrupted ambiguous resume; reconcile original intent."
+
+let private nextOccurrence (now: DateTimeOffset) (action: ScheduledAction) =
+    let seconds = float action.RepeatEverySeconds
+    let elapsed = max 0.0 (now - action.DueAtUtc).TotalSeconds
+    action.DueAtUtc.AddSeconds((floor(elapsed / seconds) + 1.0) * seconds)
+
+let private finishInterrupted now action error =
+    { action with Status = (if action.Disabled then "canceled" else "pending")
+                  DueAtUtc = nextOccurrence now action; Error = error; UpdatedAtUtc = now }
+
 let private sameResumeProject (left: ScheduledAction) (right: ScheduledAction) =
     isReadyResume left && isReadyResume right &&
     String.Equals(left.ProjectName, right.ProjectName, StringComparison.OrdinalIgnoreCase)
@@ -142,7 +188,7 @@ let private describe (a: ScheduledAction) =
        error = a.Error
        updatedAtUtc = a.UpdatedAtUtc |}
 
-type Service(path: string, execute: ScheduledAction -> Task<Result<string,string * string>>, ?now: unit -> DateTimeOffset, ?pollMs: int, ?agentLastSeen: string -> string -> DateTimeOffset option, ?verifyIdleActivity: string -> string -> Task<Result<DateTimeOffset option,string>>, ?onFault: string -> unit) =
+type Service(path: string, execute: ScheduledAction -> Task<Result<string,string * string>>, ?now: unit -> DateTimeOffset, ?pollMs: int, ?agentLastSeen: string -> string -> DateTimeOffset option, ?verifyIdleActivity: string -> string -> Task<Result<DateTimeOffset option,string>>, ?onFault: string -> unit, ?reconcileResume: ScheduledAction -> ResumeSelection -> Task<bool>) =
     let gate = obj()
     // A process-wide exclusive lifetime lease, acquired BEFORE loading state.
     // A second JarvisClient cannot read stale pending and race a claim. The
@@ -169,6 +215,8 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
     let verify = defaultArg verifyIdleActivity (fun _ _ ->
         Task.FromResult(Error "ActivityVerificationUnavailable: authenticated server snapshot is required."))
     let reportFault = defaultArg onFault ignore
+    let reconcile = defaultArg reconcileResume (fun _ _ -> Task.FromResult false)
+    let nextResumeCheck = Dictionary<string, DateTimeOffset>(StringComparer.Ordinal)
     let isIdle (a: ScheduledAction) = a.TriggerKind = "AfterAgentIdle"
     let mutable actions: ScheduledAction list = []
     let mutable started = false
@@ -246,11 +294,15 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                 elif rawResult.Length > 200 then rawResult.Substring(0, 200)
                                 else rawResult
                             else ""
-                        if isReadyResume a && error.StartsWith("ResumePublicationUncertain:", StringComparison.Ordinal) then
-                            // Keep unresolved intent evidence even if cancellation
-                            // raced the active occurrence.
-                            { a with Status = "suspended"; RegistrationId = registrationId
-                                     Error = error; LastResult = resultSummary; UpdatedAtUtc = now }
+                        if isReadyResume a && error.StartsWith(uncertainPrefix, StringComparison.Ordinal) then
+                            // Keep the exact original identity even if cancellation
+                            // raced the active occurrence; never replace it with a
+                            // truncated generic exception or an absent receipt.
+                            if a.Error = preSelection then
+                                finishInterrupted now a "Interrupted before selection; original occurrence retired."
+                            else
+                                { a with Status = "suspended"; RegistrationId = registrationId
+                                         Error = suspendResume a; LastResult = resultSummary; UpdatedAtUtc = now }
                         elif a.Disabled then
                             { a with Status = "canceled"; Error = error; LastResult = resultSummary; UpdatedAtUtc = now }
                         elif effectiveStatus = "suspended" then
@@ -321,12 +373,10 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                         // Historical failure details are evidence, not permission.
                         if action.Status = "running" then
                             if isReadyResume action then
-                                // No durable receipt for the canonical launch intent
-                                // has been reconciled. Never infer no publication
-                                // from a missing receipt after a client crash.
-                                { action with Status = "suspended"
-                                              Error = "ResumePublicationUncertain: interrupted claimed resume; reconcile original intent."
-                                              UpdatedAtUtc = clock() }
+                                if action.Error = preSelection && action.RepeatEverySeconds > 0 then
+                                    finishInterrupted (clock()) action "Interrupted before selection; original occurrence retired."
+                                else
+                                    { action with Status = "suspended"; Error = suspendResume action; UpdatedAtUtc = clock() }
                             elif isIdle action then
                                 let now = clock()
                                 let stale = action.StartedAtUtc.AddMinutes(30.)
@@ -570,6 +620,32 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                 a.Id = action.Id && a.RevisionId = action.RevisionId
                 && a.AttemptId = action.AttemptId && a.Status = "running" && not a.Disabled)))
 
+    /// Persist the exact original selection before publication and the
+    /// subsequent boundaries before entering Send. Stage changes belong to
+    /// one exact active occurrence; no stale callback can advance it.
+    member _.RecordResumeStage(action: ScheduledAction, selection: ResumeSelection) =
+        lock gate (fun () ->
+            match actions |> List.tryFind (fun a ->
+                not disposed && not cancellation.IsCancellationRequested &&
+                a.Id = action.Id && a.RevisionId = action.RevisionId &&
+                a.AttemptId = action.AttemptId && a.Status = "running" && isReadyResume a) with
+            | None -> false
+            | Some current ->
+                let valid =
+                    match selection.Stage, tryResumeSelection current with
+                    | "Selected", None -> current.Error = preSelection && not current.Disabled
+                    | "Published", Some prior ->
+                        prior.Stage = "Selected" && { prior with Stage = selection.Stage } = selection
+                    | "EnteringSend", Some prior ->
+                        not current.Disabled && prior.Stage = "Published" && { prior with Stage = selection.Stage } = selection
+                    | _ -> false
+                if not valid then false
+                else
+                    let marker = stagePrefix + JsonSerializer.Serialize(selection)
+                    setActions (actions |> List.map (fun a ->
+                        if a = current then { a with Error = marker; UpdatedAtUtc = clock() } else a))
+                    true)
+
     member _.Start() =
         lock gate (fun () ->
             if started then invalidOp "Execution scheduler already started."
@@ -580,6 +656,37 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
             let runLoop () = task {
                 try
                     while not cancellation.IsCancellationRequested do
+                        // Reconcile one exact suspended occurrence against the
+                        // authenticated canonical ledger, outside the store lock.
+                        // Missing or mismatched receipt never clears the hold.
+                        let recovery =
+                            lock gate (fun () ->
+                                let now = DateTimeOffset.UtcNow
+                                actions
+                                |> List.tryPick (fun a ->
+                                    if not (isUncertainResume a) ||
+                                       (match nextResumeCheck.TryGetValue a.Id with
+                                        | true, next when now < next -> true
+                                        | _ -> false) then None
+                                    else tryResumeSelection a |> Option.map (fun selection -> a, selection))
+                                |> Option.map (fun (a, selection) ->
+                                    nextResumeCheck[a.Id] <- now.Add(waitingPoll)
+                                    a, selection))
+                        match recovery with
+                        | Some (entry, selection) ->
+                            let! isolated = task {
+                                try return! reconcile entry selection
+                                with _ -> return false
+                            }
+                            if isolated then
+                                lock gate (fun () ->
+                                    if not disposed && actions |> List.contains entry then
+                                        setActions (actions |> List.map (fun a ->
+                                            if a = entry then
+                                                finishInterrupted (clock()) a
+                                                    ("Original intent isolated by verified receipt: " + selection.OperationId.ToString("D"))
+                                            else a)))
+                        | None -> ()
                         // Local notifications may postpone a deadline, but are
                         // not proof that an idle agent has stopped sending tools.
                         // Never hold the state lock across server verification.
@@ -702,6 +809,7 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                                     { currentEntry with Status = "running"
                                                                         AttemptId = Guid.NewGuid().ToString("N")
                                                                         StartedAtUtc = now
+                                                                        Error = (if isReadyResume currentEntry then preSelection else currentEntry.Error)
                                                                         UpdatedAtUtc = now }
                                                 // An fsync-backed claim is committed while
                                                 // holding this process's lifetime ownership lease.

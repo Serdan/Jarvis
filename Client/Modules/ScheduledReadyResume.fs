@@ -142,11 +142,64 @@ let operationId (binding: LedgerBinding) (ready: Ready) =
     bytes[8] <- (bytes[8] &&& 0x3Fuy) ||| 0x80uy
     Guid bytes
 
+// The v1 episode ID remains the first intent. Each later ID is derived only
+// from a positive, immutable pre-Send terminal proof of the preceding intent.
+let private derivedId (domain: string) (prior: Guid) =
+    let bytes = SHA256.HashData(Encoding.UTF8.GetBytes(domain + ":" + prior.ToString("N")))[..15]
+    bytes[7] <- (bytes[7] &&& 0x0Fuy) ||| 0x50uy
+    bytes[8] <- (bytes[8] &&& 0x3Fuy) ||| 0x80uy
+    Guid bytes
+
+let private proofId = derivedId "ScheduledReadyResume:NotInvoked:v1"
+let private nextId = derivedId "ScheduledReadyResume:NextAttempt:v1"
+let private intentPath (id: Guid) = $"records/scheduled-ready-resume/{id:N}/intent.json"
+let private proofPath (id: Guid) = $"records/scheduled-ready-resume/{id:N}/not-invoked.json"
+
+let private proofContent (intent: LedgerOperation) =
+    JsonSerializer.Serialize(
+        {| intentOperationId = intent.OperationId; intentRequestHash = intent.RequestHash
+           intentSequence = intent.Sequence; stage = "DefinitelyNotInvokedBeforeSend" |})
+
+let private proofIntent (id: Guid) (original: LedgerOperation) : LedgerIntent =
+    { OperationId = proofId id
+      Actor = original.Actor
+      Kind = "ScheduledReadyResumeNotInvoked"
+      RequestJson = proofContent original }
+
+/// An absent proof does not grant permission. The next candidate is derived
+/// from a verified immutable proof tied to the exact preceding receipt.
+let private nextOperationAt binding snapshot ready =
+    let rec walk id =
+        LedgerStore.getOperationAt binding snapshot id
+        |> Result.bind (function
+            | None -> Ok(Some id)
+            | Some intent when intent.Type = "ScheduledReadyResumeIntent"
+                               && intent.Path = intentPath id ->
+                LedgerStore.getOperationAt binding snapshot (proofId id)
+                |> Result.bind (function
+                    | None -> Ok None
+                    | Some proof when proof.Type = "ScheduledReadyResumeNotInvoked"
+                                      && proof.Actor = intent.Actor
+                                      && proof.Sequence > intent.Sequence
+                                      && proof.Path = proofPath id ->
+                        // Reuse the ledger's exact request verifier (also used
+                        // by integration) against this already pinned receipt.
+                        LedgerStore.verifyIntegrationOperationIntent binding proof (proofIntent id intent)
+                        |> Result.bind (fun () ->
+                            LedgerStore.readAt binding snapshot (proofPath id)
+                            |> Result.bind (function
+                                | Some content, Some _ when content = proofContent intent -> walk (nextId id)
+                                | _ -> bad "Invalid non-invocation proof."))
+                    | Some _ -> bad "Mismatched non-invocation receipt.")
+            | Some _ -> bad "Mismatched resume intent receipt.")
+    walk (operationId binding ready)
+
 type Prepared =
     { Ready: Ready
       Rendered: RoleInstructions.RenderedLaunchPrompt
       Arguments: string
-      OperationId: Guid }
+      OperationId: Guid
+      Owner: Guid }
 
 type ReadLimits = LedgerBinding -> LedgerSnapshot -> Result<Limits, LedgerFailure>
 
@@ -202,8 +255,8 @@ let browserArguments (startUrl: string) (prepared: Prepared) =
     else Error "Rendered launch exceeds argument budget."
 
 
-/// Read current policy, roster and renderer at one pinned head. A prior intent
-/// is never launch permission, regardless of its outcome or missing browser receipt.
+/// Read current policy, roster and renderer at one pinned head. Only an exact
+/// positive non-invocation proof permits a fresh attempt of an existing episode.
 let prepareAt (readLimits: ReadLimits) (binding: LedgerBinding) snapshot projectName =
     readLimits binding snapshot
     |> Result.bind (fun limits ->
@@ -214,55 +267,86 @@ let prepareAt (readLimits: ReadLimits) (binding: LedgerBinding) snapshot project
                 let rec choose = function
                     | [] -> Ok None
                     | ready :: remaining ->
-                        let id = operationId binding ready
-                        LedgerStore.getOperationAt binding snapshot id
+                        nextOperationAt binding snapshot ready
                         |> Result.bind (function
-                            | Some _ -> choose remaining
-                            | None ->
+                            | None -> choose remaining
+                            | Some id ->
                                 RoleInstructions.renderLaunchPromptAt binding snapshot projectName ready.AgentId
                                 |> Result.bind (fun rendered ->
                                     let args = BrowserArguments.serializeMinimalLaunchPrompt rendered.Prompt
                                     if not (BrowserArguments.fits args) then bad "Rendered launch exceeds argument budget."
-                                    else Ok(Some { Ready = ready; Rendered = rendered; Arguments = args; OperationId = id })))
+                                    else Ok(Some { Ready = ready; Rendered = rendered; Arguments = args; OperationId = id; Owner = Guid.NewGuid() })))
                 choose (candidates limits roster)))
 
 // Only a fresh, successful publication can grant one send. Recheck current
 // eligibility and limits inside the transaction; do not require unchanged
 // unrelated Git head or reserve capacity for in-flight submissions.
-let commitIntent (readLimits: ReadLimits) (binding: LedgerBinding) actor scriptPath sourceSha256
-                 routeSha256 (prepared: Prepared) =
-    let intent : LedgerIntent =
+let intentFor actor scriptPath sourceSha256 routeSha256 (prepared: Prepared) : LedgerIntent =
         { OperationId = prepared.OperationId
           Actor = actor
           Kind = "ScheduledReadyResumeIntent"
           RequestJson =
             JsonSerializer.Serialize(
-                {| ready = prepared.Ready; scriptPath = scriptPath; sourceSha256 = sourceSha256
+                {| ready = prepared.Ready; owner = prepared.Owner; scriptPath = scriptPath; sourceSha256 = sourceSha256
                    routeSha256 = routeSha256; promptSha256 = prepared.Rendered.PromptSha256
                    templateVersion = prepared.Rendered.TemplateVersion
                    templateBlobOid = prepared.Rendered.TemplateBlobOid |}) }
-    if prepared.OperationId <> operationId binding prepared.Ready then bad "Mismatched launch operation identity."
+let commitIntent (readLimits: ReadLimits) (binding: LedgerBinding) actor scriptPath sourceSha256
+                 routeSha256 (prepared: Prepared) =
+    let intent = intentFor actor scriptPath sourceSha256 routeSha256 prepared
+    // Some integrity/transport failures can occur during confirmation rather
+    // than before publication. Once any plan succeeds, conservatively retain
+    // the exact original intent unless the ledger positively confirms its result.
+    let mutable publicationPossible = false
+    let plan snapshot =
+        nextOperationAt binding snapshot prepared.Ready
+        |> Result.bind (fun next ->
+            if next <> Some prepared.OperationId then
+                Error(StaleEntityVersion "Resume attempt no longer authorized.")
+            else
+                readLimits binding snapshot
+                |> Result.bind (fun limits ->
+                    readRosterAt binding snapshot limits
+                    |> Result.bind (fun roster ->
+                        if not (List.contains prepared.Ready (candidates limits roster)) then
+                            Error(StaleEntityVersion "Ready episode no longer eligible or capacity reached.")
+                        else
+                            RoleInstructions.renderLaunchPromptAt binding snapshot prepared.Rendered.ProjectName prepared.Ready.AgentId
+                            |> Result.bind (fun current ->
+                                if current.PromptSha256 <> prepared.Rendered.PromptSha256
+                                   || current.TemplateBlobOid <> prepared.Rendered.TemplateBlobOid
+                                   || BrowserArguments.serializeMinimalLaunchPrompt current.Prompt <> prepared.Arguments then
+                                    Error(StaleEntityVersion "Launch template changed.")
+                                else
+                                    publicationPossible <- true
+                                    Ok [{ Path = intentPath prepared.OperationId
+                                          ExpectedBlobOid = None; Content = intent.RequestJson }]))))
+    match Client.LegacyDirectWriterFence.LegacyDirectWriterFence.transact binding intent plan with
+    | Ok receipt when receipt.AlreadyApplied ->
+        Error(StaleEntityVersion "Original launch intent exists; never replay Send.")
+    | Error OperationIdReused -> Error OperationIdReused
+    | Error(LedgerFailure.OutcomeUnknown reason) -> Error(LedgerFailure.OutcomeUnknown reason)
+    | Error issue when publicationPossible ->
+        Error(LedgerFailure.OutcomeUnknown(sprintf "Original publication not positively resolved: %A" issue))
+    | result -> result
+
+// Private: only the continuation holding a fresh successful intent receipt,
+// before entering Send, may issue this proof. No recovery path calls it.
+let private proveNotInvoked binding actor (prepared: Prepared) (receipt: LedgerWrite) =
+    let original = receipt.Operation
+    let intent = proofIntent prepared.OperationId original
+    let content = intent.RequestJson
+    if receipt.AlreadyApplied || original.Actor <> actor ||
+       original.OperationId <> prepared.OperationId.ToString("D") ||
+       original.Type <> "ScheduledReadyResumeIntent" then
+        bad "Non-invocation requires fresh original intent ownership."
     else
         Client.LegacyDirectWriterFence.LegacyDirectWriterFence.transact binding intent (fun snapshot ->
-            readLimits binding snapshot
-            |> Result.bind (fun limits ->
-                readRosterAt binding snapshot limits
-                |> Result.bind (fun roster ->
-                    if not (List.contains prepared.Ready (candidates limits roster)) then
-                        Error(StaleEntityVersion "Ready episode no longer eligible or capacity reached.")
-                    else
-                        RoleInstructions.renderLaunchPromptAt binding snapshot prepared.Rendered.ProjectName prepared.Ready.AgentId
-                        |> Result.bind (fun current ->
-                            if current.PromptSha256 <> prepared.Rendered.PromptSha256
-                               || current.TemplateBlobOid <> prepared.Rendered.TemplateBlobOid
-                               || BrowserArguments.serializeMinimalLaunchPrompt current.Prompt <> prepared.Arguments then
-                                Error(StaleEntityVersion "Launch template changed.")
-                            else
-                                Ok [{ Path = $"records/scheduled-ready-resume/{prepared.OperationId:N}/intent.json"
-                                      ExpectedBlobOid = None; Content = intent.RequestJson }]))))
-        |> Result.bind (fun receipt ->
-            if receipt.AlreadyApplied then Error(StaleEntityVersion "Original launch intent exists; never replay Send.")
-            else Ok receipt)
+            LedgerStore.getOperationAt binding snapshot prepared.OperationId
+            |> Result.bind (function
+                | Some current when current = original ->
+                    Ok [{ Path = proofPath prepared.OperationId; ExpectedBlobOid = None; Content = content }]
+                | _ -> bad "Original resume intent changed."))
 
 
 /// Distinguish a held occurrence from an irreversible unknown send. The
@@ -286,7 +370,9 @@ type ExecutionPorts =
 /// PublicationUncertain with the exact operation ID, never retry from an
 /// absent receipt. An unknown browser result also never grants replay.
 /// This is a composition seam, not a registered timer or enable switch.
-let executeOnce (ports: ExecutionPorts) binding actor projectName scriptPath sourceSha256 routeSha256 =
+// The host persists selection before the canonical publication and records
+// the subsequent effect boundaries in its exact occurrence journal.
+let executeOnceTracked (track: string -> Prepared -> bool) (ports: ExecutionPorts) binding actor projectName scriptPath sourceSha256 routeSha256 =
     task {
         match LedgerStore.fetch binding |> Result.bind (fun snapshot ->
             prepareAt ports.ReadLimits binding snapshot projectName) with
@@ -297,22 +383,36 @@ let executeOnce (ports: ExecutionPorts) binding actor projectName scriptPath sou
             match allowed with
             | Error reason -> return Held reason
             | Ok false -> return Held "Scheduled launch stopped."
+            | Ok true when not (track "Selected" prepared) ->
+                return Held "Schedule claim lost before publication."
             | Ok true ->
                 match commitIntent ports.ReadLimits binding actor scriptPath sourceSha256 routeSha256 prepared with
                 | Error(LedgerFailure.OutcomeUnknown reason) ->
                     return PublicationUncertain(prepared.OperationId, reason)
                 | Error issue -> return Held(sprintf "%A" issue)
-                | Ok _ ->
-                    let! current = ports.CanSend prepared.Ready
-                    match current with
-                    | Error reason -> return Held reason
-                    | Ok false -> return Held "Scheduled launch stopped before Send."
-                    | Ok true ->
-                        try
-                            let! sent = ports.Send prepared
-                            match sent with
-                            | Ok value -> return Submitted value
-                            | Error reason -> return OutcomeUnknown reason
-                        with error ->
-                            return OutcomeUnknown(error.GetType().Name)
+                | Ok receipt ->
+                    let hold reason =
+                        match proveNotInvoked binding actor prepared receipt with
+                        | Ok _ -> Held reason
+                        | Error issue -> OutcomeUnknown(sprintf "Non-invocation proof not confirmed: %A" issue)
+                    if not (track "Published" prepared) then
+                        return hold "Schedule claim lost before Send."
+                    else
+                        let! current = ports.CanSend prepared.Ready
+                        match current with
+                        | Error reason -> return hold reason
+                        | Ok false -> return hold "Scheduled launch stopped before Send."
+                        | Ok true when not (track "EnteringSend" prepared) ->
+                            return hold "Schedule claim lost before Send."
+                        | Ok true ->
+                          try
+                              let! sent = ports.Send prepared
+                              match sent with
+                              | Ok value -> return Submitted value
+                              | Error reason -> return OutcomeUnknown reason
+                          with error ->
+                              return OutcomeUnknown(error.GetType().Name)
     }
+
+let executeOnce ports binding actor projectName scriptPath sourceSha256 routeSha256 =
+    executeOnceTracked (fun _ _ -> true) ports binding actor projectName scriptPath sourceSha256 routeSha256

@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"automation-client-property-hang-timeout-diagnostic-20261125","title":"[P1] Add opt-in bounded hang timeout for slow Client property diagnostics","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"automation-client-property-hang-timeout-diagnostic-20261125","title":"[P1] Add opt-in bounded hang timeout for slow Client property diagnostics","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"c8d3e1f25a794d109c6b2e4f8a1b3c06"}

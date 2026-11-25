@@ -75,7 +75,7 @@ type private TuiMode =
     | SettingsMode
     | SettingsEditMode
     | SettingsConfirmMode
-    | LaunchTemplateMode
+    | ProjectEditorMode
     | LaunchTemplateApprovalMode
 
 type private PendingPrompt =
@@ -132,6 +132,80 @@ type LaunchTemplateEditFailure =
 type LaunchTemplateUiAccess =
     { Load: string -> Result<LaunchTemplateEditSnapshot, string>
       Save: LaunchTemplateEditSnapshot -> Guid -> string -> Result<unit, LaunchTemplateEditFailure> }
+
+type CapacityPolicyDraft =
+    { Total: int option
+      Roles: Map<string, int> }
+
+module CapacityPolicyDraft =
+    let format (draft: CapacityPolicyDraft) =
+        let total = draft.Total |> Option.map string |> Option.defaultValue "off"
+        [ yield "total=" + total
+          for KeyValue(role, cap) in draft.Roles do
+              yield sprintf "role %s=%d" role cap ]
+        |> String.concat "\n"
+
+    let parse (body: string) =
+        let positive (raw: string) =
+            match Int32.TryParse(raw, Globalization.NumberStyles.None, Globalization.CultureInfo.InvariantCulture) with
+            | true, n when n > 0 && (raw |> Seq.forall Char.IsAsciiDigit) -> Ok n
+            | _ -> Error "Caps must be positive integers (or off for total)."
+        let roleId (role: string) =
+            role.Length > 0 && role.Length <= 80 &&
+            (role |> Seq.forall (fun c -> Char.IsAsciiLetterOrDigit c || c = '_' || c = '-'))
+        let folder state (line: string) =
+            state |> Result.bind (fun (total, roles) ->
+                let parts = line.Trim().Split('=')
+                if parts.Length <> 2 then Error "Use total=off or total=N, and role RoleId=N."
+                else
+                    let key, value = parts[0].Trim(), parts[1].Trim()
+                    if key = "total" then
+                        if Option.isSome total then Error "Duplicate total cap."
+                        elif value = "off" then Ok(Some None, roles)
+                        else positive value |> Result.map (fun n -> Some(Some n), roles)
+                    elif key.StartsWith("role ", StringComparison.Ordinal) then
+                        let role = key.Substring(5)
+                        if not (roleId role) then Error "Invalid canonical role ID."
+                        elif Map.containsKey role roles then Error "Duplicate role cap."
+                        else positive value |> Result.map (fun n -> total, Map.add role n roles)
+                    else Error "Unknown policy field.")
+        if isNull body then Error "An explicit total=off or total=N is required."
+        else
+            body.Replace("\r\n", "\n").Split('\n')
+            |> Array.filter (String.IsNullOrWhiteSpace >> not)
+            |> Array.fold folder (Ok(None, Map.empty))
+            |> Result.bind (function
+                | Some total, roles -> Ok { Total = total; Roles = roles }
+                | None, _ -> Error "An explicit total=off or total=N is required.")
+
+type CapacityPolicyEditFailure =
+    | CapacityStale of string
+    | CapacityRejected of string
+    | CapacityUncertain of string
+
+type CapacityPolicyEditSnapshot =
+    { CapacityProjectName: string
+      ProjectId: Guid
+      LedgerId: Guid
+      Epoch: int
+      Revision: int
+      Draft: CapacityPolicyDraft
+      // Captures the exact authenticated actor and full verified binding.
+      Save: Guid -> CapacityPolicyDraft -> Result<unit, CapacityPolicyEditFailure> }
+
+type CapacityPolicyUiAccess =
+    { Load: string -> Result<CapacityPolicyEditSnapshot, string> }
+
+type private ProjectEditorKind = LaunchTemplateEditor | CapacityPolicyEditor
+
+// Both project editors share one pending-operation lock and navigation path.
+type private ProjectEditorSnapshot =
+    { ProjectId: Guid
+      LedgerId: Guid
+      Epoch: int
+      Revision: int
+      Body: string
+      Prepare: string -> Result<Guid -> Result<unit, LaunchTemplateEditFailure>, string> }
 
 type ConsoleTui(?activityLog: ActivityLog.Store) =
     let syncRoot = obj()
@@ -229,11 +303,13 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let mutable settingsReturnMode = ActivityMode
     let mutable launchTemplateAccess: LaunchTemplateUiAccess option = None
     let mutable launchProject = ""
-    let mutable launchSnapshot: LaunchTemplateEditSnapshot option = None
+    let mutable capacityPolicyAccess: CapacityPolicyUiAccess option = None
+    let mutable projectEditorKind = LaunchTemplateEditor
+    let mutable launchSnapshot: ProjectEditorSnapshot option = None
     let mutable launchDraft = ""
     let mutable launchBusy = false
     let mutable launchNotice = ""
-    let mutable launchPending: Guid option = None
+    let mutable launchPending: (Guid * (Guid -> Result<unit, LaunchTemplateEditFailure>)) option = None
     let mutable launchScroll = 0
     let mutable launchNeedsReload = false
     let mutable launchApprovalId: int option = None
@@ -271,7 +347,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         match tab, mode with
         | SwitchActivity, (ActivityMode | FilterMode | CopyRecentMode | PermissionMode | LaunchTemplateApprovalMode) -> true
         | SwitchWork, (WorkMode | WorkFilterMode) -> true
-        | SwitchAgents, (AgentsMode | AgentFilterMode | LaunchTemplateMode) -> true
+        | SwitchAgents, (AgentsMode | AgentFilterMode | ProjectEditorMode) -> true
         | SwitchJobs, (JobsMode | JobDetailsMode | JobCancelMode | JobFilterMode) -> true
         | SwitchChallenges, (ChallengesMode | ChallengeReplyMode) -> true
         | SwitchSettings, (SettingsMode | SettingsEditMode | SettingsConfirmMode) -> true
@@ -1018,6 +1094,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         writeHotkeyToken "@"; draw.Write " agent, "
         writeMnemonic 'r' "refresh"; draw.Write ", "
         if launchTemplateAccess.IsSome then writeMnemonic 't' "launch template"; draw.Write ", "
+        if capacityPolicyAccess.IsSome then writeMnemonic 'k' "capacity policy"; draw.Write ", "
         writeMnemonic 'p' "permissions"; draw.Write ", "
         writeHotkeyToken "Esc"; draw.Write " activity, "
         writeMnemonic 'q' "quit"; draw.WriteLine "  • mouse: click/select, double-click/details, wheel/scroll"
@@ -1531,18 +1608,27 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             draw.WriteLine(sprintf "Body lines %d-%d of %d" (launchApprovalScroll + 1) (min lines.Length (launchApprovalScroll + rows)) lines.Length)
             lines |> List.skip launchApprovalScroll |> List.truncate rows |> List.iter (safe >> draw.WriteLine)
 
-    let renderLaunchTemplateUnsafe width =
+    let renderProjectEditorUnsafe width =
         let safe = JobView.safeLine
-        draw.WriteLine(trim (safe ("Project launch template: " + launchProject)) width)
+        let label = if projectEditorKind = CapacityPolicyEditor then "Project scheduler capacity policy: " else "Project launch template: "
+        draw.WriteLine(trim (safe (label + launchProject)) width)
         match launchSnapshot with
         | Some snapshot ->
-            draw.WriteLine(trim (sprintf "Ledger %O / epoch %d, version %d" snapshot.LedgerId snapshot.Epoch snapshot.Version) width)
+            if projectEditorKind = CapacityPolicyEditor then
+                draw.WriteLine(trim (sprintf "Project %O" snapshot.ProjectId) width)
+                draw.WriteLine(trim (sprintf "Ledger %O / epoch %d, revision %d" snapshot.LedgerId snapshot.Epoch snapshot.Revision) width)
+            else
+                draw.WriteLine(trim (sprintf "Ledger %O / epoch %d, version %d" snapshot.LedgerId snapshot.Epoch snapshot.Revision) width)
         | None -> ()
         draw.WriteLine "F2 save/retry | F5 reload (discard draft) | F6 copy | Esc back"
-        draw.WriteLine "Append/paste text, Enter newline, Backspace, Ctrl+U clear; Up/Down scroll."
+        if projectEditorKind = CapacityPolicyEditor then
+            draw.WriteLine "total=off or total=N; role RoleId=N (one per line); omit role to disable."
+            draw.WriteLine "Scheduler only; manual launches bypass limits. Ctrl+U clear, Enter newline."
+        else draw.WriteLine "Append/paste text, Enter newline, Backspace, Ctrl+U clear; Up/Down scroll."
         if launchBusy then draw.WriteLine "Ledger operation in progress..."
-        if launchNeedsReload then draw.WriteLine "Version changed: copy draft if needed, then reload before saving."
-        launchPending |> Option.iter (fun op -> draw.WriteLine(trim (sprintf "Pending exact operation: %O" op) width))
+        if launchNeedsReload then
+            draw.WriteLine "Draft not verified current: copy if needed, then reload before saving."
+        launchPending |> Option.iter (fun (op, _) -> draw.WriteLine(trim (sprintf "Pending exact operation: %O" op) width))
         if launchNotice <> "" then
             wrappedLines width launchNotice |> List.truncate 3 |> List.iter (safe >> draw.WriteLine)
         let lines =
@@ -1661,7 +1747,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     writeCopyRecentHotkeys()
                 | AgentsMode ->
                     writeAgentHotkeys()
-                | LaunchTemplateMode -> draw.WriteLine "Operator project configuration"
+                | ProjectEditorMode -> draw.WriteLine "Operator project configuration"
                 | WorkMode -> writeWorkHotkeys()
                 | WorkFilterMode -> writeFilterHotkeys()
                 | AgentFilterMode ->
@@ -1685,7 +1771,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 renderWorkUnsafe width
             | AgentsMode | AgentFilterMode ->
                 renderAgentsUnsafe width
-            | LaunchTemplateMode -> renderLaunchTemplateUnsafe width
+            | ProjectEditorMode -> renderProjectEditorUnsafe width
             | JobsMode | JobDetailsMode | JobCancelMode | JobFilterMode ->
                 renderJobsUnsafe width
             | ChallengesMode | ChallengeReplyMode ->
@@ -1748,62 +1834,123 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let renderUnsafe () =
         if not signInLinkVisible then renderFrameUnsafe()
 
-    let loadLaunchTemplateUnsafe project =
-        if not launchBusy && launchPending.IsNone then
+    let loadProjectEditorUnsafe kind project =
+        if launchBusy || launchPending.IsSome then
+            mode <- ProjectEditorMode
+        else
             launchBusy <- true
+            if kind <> projectEditorKind || project <> launchProject then
+                launchDraft <- ""
+                launchScroll <- 0
+            projectEditorKind <- kind
             launchProject <- project
             launchNotice <- ""
             launchSnapshot <- None
             launchNeedsReload <- true
-            mode <- LaunchTemplateMode
-            let provider = launchTemplateAccess
+            mode <- ProjectEditorMode
+            let launchProvider, capacityProvider = launchTemplateAccess, capacityPolicyAccess
             Task.Run(Action(fun () ->
                 let result =
                     try
-                        match provider with
-                        | Some access -> access.Load project
-                        | None -> Error "Operator launch-template access unavailable."
+                        match kind, launchProvider, capacityProvider with
+                        | LaunchTemplateEditor, Some access, _ ->
+                            access.Load project |> Result.map (fun snapshot ->
+                                { ProjectId = snapshot.ProjectId; LedgerId = snapshot.LedgerId; Epoch = snapshot.Epoch; Revision = snapshot.Version
+                                  Body = snapshot.Template
+                                  Prepare = fun body -> Ok(fun operation -> access.Save snapshot operation body) })
+                        | CapacityPolicyEditor, _, Some access ->
+                            access.Load project |> Result.map (fun snapshot ->
+                                { ProjectId = snapshot.ProjectId; LedgerId = snapshot.LedgerId; Epoch = snapshot.Epoch; Revision = snapshot.Revision
+                                  Body = CapacityPolicyDraft.format snapshot.Draft
+                                  Prepare = fun body ->
+                                      CapacityPolicyDraft.parse body |> Result.map (fun draft operation ->
+                                          snapshot.Save operation draft |> Result.mapError (function
+                                              | CapacityStale error -> TemplateStale error
+                                              | CapacityRejected error -> TemplateRejected error
+                                              | CapacityUncertain error -> TemplateUncertain error)) })
+                        | _ -> Error "Operator project editor access unavailable."
                     with ex -> Error ex.Message
                 lock syncRoot (fun () ->
                     launchBusy <- false
                     match result with
                     | Ok snapshot ->
                         launchSnapshot <- Some snapshot
-                        launchDraft <- snapshot.Template
+                        launchDraft <- snapshot.Body
                         launchScroll <- 0
                         launchNeedsReload <- false
                     | Error error -> launchNotice <- error
                     renderUnsafe()))) |> ignore
 
-    let saveLaunchTemplateUnsafe () =
-        match launchTemplateAccess, launchSnapshot with
-        | Some access, Some snapshot when not launchBusy && not launchNeedsReload ->
-            let operationId = launchPending |> Option.defaultWith Guid.NewGuid
-            launchPending <- Some operationId
-            launchBusy <- true
-            launchNotice <- ""
-            let body = launchDraft
-            Task.Run(Action(fun () ->
-                let result =
-                    try access.Save snapshot operationId body
-                    with ex -> Error(TemplateUncertain ex.Message)
-                lock syncRoot (fun () ->
-                    launchBusy <- false
-                    match result with
-                    | Ok () ->
-                        launchPending <- None
-                        launchSnapshot <- None
-                        launchNeedsReload <- true
-                        launchNotice <- "Saved. Reload to inspect the new canonical version."
-                    | Error(TemplateStale error) ->
-                        launchPending <- None
-                        launchNeedsReload <- true
-                        launchNotice <- error
-                    | Error(TemplateRejected error) ->
-                        launchPending <- None
-                        launchNotice <- error
-                    | Error(TemplateUncertain error) -> launchNotice <- error + " Retry F2 with the same operation; editing is locked."
-                    renderUnsafe()))) |> ignore
+    let saveProjectEditorUnsafe () =
+        match launchSnapshot with
+        | Some snapshot when not launchBusy && not launchNeedsReload ->
+            let prepared =
+                match launchPending with
+                | Some exact -> Ok exact
+                | None -> snapshot.Prepare launchDraft |> Result.map (fun save -> Guid.NewGuid(), save)
+            match prepared with
+            | Error error -> launchNotice <- error
+            | Ok(operationId, save) ->
+                launchPending <- Some(operationId, save)
+                launchBusy <- true
+                launchNotice <- ""
+                Task.Run(Action(fun () ->
+                    let result =
+                        try save operationId
+                        with ex -> Error(TemplateUncertain ex.Message)
+                    lock syncRoot (fun () ->
+                        launchBusy <- false
+                        match result with
+                        | Ok () ->
+                            launchPending <- None
+                            launchSnapshot <- None
+                            launchNeedsReload <- true
+                            launchNotice <- "Saved. Reload to inspect the new canonical version."
+                        | Error(TemplateStale error) ->
+                            launchPending <- None
+                            launchNeedsReload <- true
+                            launchNotice <- error
+                        | Error(TemplateRejected error) ->
+                            launchPending <- None
+                            launchNotice <- error
+                        | Error(TemplateUncertain error) -> launchNotice <- error + " Retry F2 with the same operation; editing is locked."
+                        renderUnsafe()))) |> ignore
+        | _ -> ()
+
+    let openSelectedCapacityPolicyUnsafe () =
+        match selectedAgentUnsafe(), capacityPolicyAccess with
+        | Some row, Some _ -> loadProjectEditorUnsafe CapacityPolicyEditor row.Project
+        | _ -> ()
+
+    let handleProjectEditorKeyUnsafe (keyInfo: ConsoleKeyInfo) =
+        let editable = not launchBusy && launchPending.IsNone && not launchNeedsReload
+        let append value =
+            let next = launchDraft + value
+            // Capacity records can exceed the launch-template body limit. Keep
+            // a bounded editor but allow round-tripping a maximum-size policy.
+            let limit = if projectEditorKind = CapacityPolicyEditor then 128 * 1024 else 32768
+            if System.Text.Encoding.UTF8.GetByteCount(next) <= limit then
+                launchDraft <- next
+                launchScroll <- Int32.MaxValue
+            else launchNotice <- "Draft size limit reached."
+        match keyInfo.Key with
+        | ConsoleKey.F2 -> saveProjectEditorUnsafe()
+        | ConsoleKey.F5 when not launchBusy && launchPending.IsNone -> loadProjectEditorUnsafe projectEditorKind launchProject
+        | ConsoleKey.F6 ->
+            match Clipboard.copyText launchDraft with
+            | Ok _ -> launchNotice <- "Draft copied."
+            | Error error -> launchNotice <- error
+        | ConsoleKey.Escape when not launchBusy && launchPending.IsNone -> mode <- AgentsMode
+        | ConsoleKey.UpArrow -> launchScroll <- max 0 (launchScroll - 1)
+        | ConsoleKey.DownArrow -> launchScroll <- launchScroll + 1
+        | ConsoleKey.U when editable && keyInfo.Modifiers.HasFlag ConsoleModifiers.Control ->
+            launchDraft <- ""; launchScroll <- 0
+        | ConsoleKey.Enter when editable -> append "\n"
+        | ConsoleKey.Backspace when editable && launchDraft.Length > 0 ->
+            let n = launchDraft.Length
+            let count = if n >= 2 && Char.IsSurrogatePair(launchDraft, n - 2) then 2 else 1
+            launchDraft <- launchDraft.Substring(0, n - count)
+        | _ when editable && not (Char.IsControl keyInfo.KeyChar) -> append (string keyInfo.KeyChar)
         | _ -> ()
 
     let startChallengeRefreshUnsafe () =
@@ -2044,7 +2191,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             | _ -> ()
         | Click(x, y) ->
             // Never let a click abandon a modal edit/approval confirmation.
-            if not (List.contains mode [ SettingsEditMode; SettingsConfirmMode; LaunchTemplateMode; LaunchTemplateApprovalMode
+            if not (List.contains mode [ SettingsEditMode; SettingsConfirmMode; ProjectEditorMode; LaunchTemplateApprovalMode
                                          JobCancelMode; CopyRecentMode
                                          WorkFilterMode; AgentFilterMode; JobFilterMode; FilterMode ]) then
                 mouseHits
@@ -2207,6 +2354,32 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
     member _.SetLaunchTemplateAccess(access: LaunchTemplateUiAccess) =
         lock syncRoot (fun () -> launchTemplateAccess <- Some access)
+
+    member _.SetCapacityPolicyAccess(access: CapacityPolicyUiAccess) =
+        lock syncRoot (fun () -> capacityPolicyAccess <- Some access)
+
+    // Fixture drives the same modal load/key/save path as the selected Agents row.
+    // No live Console.ReadKey or authenticated runtime binding is required.
+    member internal _.DispatchCapacityPolicyKeyForFixture(snapshot: AgentView.Snapshot, keyInfo: ConsoleKeyInfo) =
+        lock syncRoot (fun () ->
+            agentSnapshot <- Some snapshot
+            mode <- AgentsMode
+            normalizeAgentSelectionUnsafe()
+            if keyInfo.Key = ConsoleKey.K then openSelectedCapacityPolicyUnsafe())
+
+    member internal _.OpenCapacityPolicyForFixture(project: string) =
+        lock syncRoot (fun () -> loadProjectEditorUnsafe CapacityPolicyEditor project)
+
+    member internal _.OpenLaunchTemplateForFixture(project: string) =
+        lock syncRoot (fun () -> loadProjectEditorUnsafe LaunchTemplateEditor project)
+
+    member internal _.DispatchProjectEditorKeyForFixture(keyInfo: ConsoleKeyInfo) =
+        lock syncRoot (fun () ->
+            if mode = ProjectEditorMode then handleProjectEditorKeyUnsafe keyInfo)
+
+    member internal _.InspectProjectEditorForFixture() =
+        lock syncRoot (fun () ->
+            string mode, launchBusy, (launchPending |> Option.map fst), launchDraft, launchNotice, launchNeedsReload)
 
     member _.SetChallengeAccess(access: OperatorChallengeUiAccess) =
         lock syncRoot (fun () ->
@@ -2554,33 +2727,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                         | None -> ()
                                     | _ -> ()
                                     renderUnsafe())
-                            elif mode = LaunchTemplateMode then
+                            elif mode = ProjectEditorMode then
                                 lock syncRoot (fun () ->
-                                    let editable = not launchBusy && launchPending.IsNone && not launchNeedsReload
-                                    let append value =
-                                        let next = launchDraft + value
-                                        if System.Text.Encoding.UTF8.GetByteCount(next) <= 32768 then
-                                            launchDraft <- next
-                                            launchScroll <- Int32.MaxValue
-                                    match keyInfo.Key with
-                                    | ConsoleKey.F2 -> saveLaunchTemplateUnsafe()
-                                    | ConsoleKey.F5 when not launchBusy && launchPending.IsNone -> loadLaunchTemplateUnsafe launchProject
-                                    | ConsoleKey.F6 ->
-                                        match Clipboard.copyText launchDraft with
-                                        | Ok _ -> launchNotice <- "Draft copied."
-                                        | Error error -> launchNotice <- error
-                                    | ConsoleKey.Escape when not launchBusy && launchPending.IsNone -> mode <- AgentsMode
-                                    | ConsoleKey.UpArrow -> launchScroll <- max 0 (launchScroll - 1)
-                                    | ConsoleKey.DownArrow -> launchScroll <- launchScroll + 1
-                                    | ConsoleKey.U when editable && keyInfo.Modifiers.HasFlag ConsoleModifiers.Control ->
-                                        launchDraft <- ""; launchScroll <- 0
-                                    | ConsoleKey.Enter when editable -> append "\n"
-                                    | ConsoleKey.Backspace when editable && launchDraft.Length > 0 ->
-                                        let n = launchDraft.Length
-                                        let count = if n >= 2 && Char.IsSurrogatePair(launchDraft, n - 2) then 2 else 1
-                                        launchDraft <- launchDraft.Substring(0, n - count)
-                                    | _ when editable && not (Char.IsControl keyInfo.KeyChar) -> append (string keyInfo.KeyChar)
-                                    | _ -> ()
+                                    handleProjectEditorKeyUnsafe keyInfo
                                     renderUnsafe())
                             elif mode = SettingsEditMode then
                                 lock syncRoot (fun () ->
@@ -2860,10 +3009,12 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     lock syncRoot (fun () ->
                                         match selectedAgentUnsafe(), launchTemplateAccess with
                                         | Some row, Some _ ->
-                                            launchDraft <- ""
-                                            launchScroll <- 0
-                                            loadLaunchTemplateUnsafe row.Project
+                                            loadProjectEditorUnsafe LaunchTemplateEditor row.Project
                                         | _ -> ()
+                                        renderUnsafe())
+                                | _, ConsoleKey.K when mode = AgentsMode ->
+                                    lock syncRoot (fun () ->
+                                        openSelectedCapacityPolicyUnsafe()
                                         renderUnsafe())
                                 | ('/', _) | (_, ConsoleKey.F) when mode = AgentsMode ->
                                     lock syncRoot (fun () ->

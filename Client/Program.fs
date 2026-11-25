@@ -134,6 +134,18 @@ let private operatorActorFromAccessToken (token: string) =
                 |> fun hash -> Some("operator:" + hash.ToLowerInvariant())
     with _ -> None
 
+// Register only after the existing local authenticated Operator login. Each
+// load/save reacquires that identity and the approved project binding.
+let internal registerCapacityPolicyAccess (tui: ConsoleTui) (rt: Runtime) authenticatedOperator authenticate =
+    match authenticatedOperator with
+    | None -> ()
+    | Some _ ->
+        tui.SetCapacityPolicyAccess(
+            Client.ProjectCapacityOperator.create authenticate
+                (fun project ->
+                    OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt
+                    |> Result.mapError (sprintf "%A")))
+
 let private readScheduledScript (rt: Runtime) (action: BrowserSchedules.ScheduledAction) =
     match ProjectPaths.validateProjectRelativePath action.ScriptPath with
     | Error e -> Error(sprintf "%A" e)
@@ -500,6 +512,11 @@ let private runClient args =
         // Every other failed/uncertain write retains the exact retry operation ID.
         // Only a definitive CAS stale response can authorize a new intent.
         | error -> OtherOperatorReplyFailure(sprintf "%A" error)
+    registerCapacityPolicyAccess tui rt authenticatedOperator (fun () ->
+        try
+            oauth.GetAccessTokenAsync().GetAwaiter().GetResult()
+            |> operatorActorFromAccessToken
+        with _ -> None)
     match authenticatedOperator with
     | Some actor ->
         tui.SetChallengeAccess

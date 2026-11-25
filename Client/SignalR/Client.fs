@@ -1447,6 +1447,15 @@ let executeOrPromoteWith (rt: Runtime) (commandJson: string) (agentId: string)
                 (combineCrossProjectNotification envelope)
             | _ -> command, commandJson, id
         match command with
+        | Some (TaskWriteCommand request) when request.Action = "YieldAgent" ->
+            // A yield ends the executor's turn. Keep its existing journaled
+            // transaction on this call and acknowledge only its terminal success.
+            let! outcome = runCommand normalizedJson agentId
+            let reply =
+                match outcome.Result, outcome.Error, outcome.PendingJob with
+                | Some _, None, None -> { outcome with Result = Some(JsonSerializer.Serialize("OK")) }
+                | _ -> outcome
+            return withVisibleResponseAlerts rt agentId command reply
         | Some command when shouldAutoPromote command ->
             match classifyProject command with
             | Ok scope ->

@@ -264,3 +264,54 @@ CAS retries or establish full production provider dispatch.
 Focused Release job 8fd35f10c19a4db984b343ce0cad6dc7 passed 4/4 in
 1m03s, exit 0, on integrated production 3ee914c14 plus this test-only
 delta. Command: `dotnet test tests/AutomationSystemProperties20261124/AutomationSystemProperties20261124.fsproj -c Release --filter FullyQualifiedName~OriginalClaimAndExclusionCompeteAcrossChallenge`. This is not final composition acceptance.
+
+
+## Cold-client durable original uncertainty (2026-11-25)
+
+On integrated source 3b423ebbbbb9066d86d19955c37f37c154ceee8c, seeds 701/702
+drive the real existing-auth reserve, claim and Dispatching/Uncertain/Unknown
+transitions, then reconstruct account and project bindings in a third client
+with fresh Git clones of the same disposable remote endpoints. Check the
+complete original candidate, original operation, status/generation, fence,
+session, lack of terminal, record count and unique original identities
+against the independently expected values in all three client views.
+The exact old reservation request replays receipt-only; duplicate claim and
+unsupported or forged terminal release cannot advance the account head.
+Blocked work remains ineligible; real Challenge resolution and resume permit
+the other project to reserve without changing the original Unknown record.
+
+This is cold canonical Git reconstruction, not process or provider-host
+restart, real provider observation, operational dispatch, or final milestone
+acceptance. It uses the existing account reservation component, not an
+assertion that project Working-count caps count reservation occupancy.
+Focused Release job e42d13da9ffc457e8177df4da85d924a passed 2/2, exit 0,
+40 s test duration, TRX cold-original-unknown.trx. Command:
+`dotnet test tests/AutomationSystemProperties20261124/AutomationSystemProperties20261124.fsproj -c Release --no-restore --filter FullyQualifiedName~ColdClientPreservesOriginalUnknownAcrossChallenge --logger "trx;LogFileName=cold-original-unknown.trx" --results-directory /tmp/jarvis-w20-system-cold-20261125`.
+The first build 0a3e5e0b4fec44e5919924b72aa50aed failed at test-only module
+qualification and index syntax; corrected in the passing source. No live
+effects, deployment or production changes.
+
+Current component parity: accepted W13 account CAS rebind
+20d88efd44601ddb5ebd7d391305e15f96280a7a is an ancestor of this base.
+The actual HEAD and working-tree blob hashes match its current-source
+attestation (818bb6f8d43ab55177afe17e108e0155e6f43160 for the reservation module,
+6206e852903ca9b69ef314fbed5e2092a305e25e for its fixture). Historical RED
+source-pin evidence above is retained, not waived. The rebind has its own
+prior passing evidence in CURRENT-SOURCE.md; this increment did not rerun
+the full component suite.
+
+Controlling 25 November Operator correction: new project and per-role
+caps are optional, disabled by default, and Scheduler-only; manual launch
+bypasses them, including unavailable cap data. Once Working, manually
+launched agents count. Temporary overshoot from in-flight sends or changed
+limits is allowed. The legacy account/component occupancy assertions above
+are not the oracle for this new policy; do not add inventory/baseline/drain
+or manual fencing requirements. Keep original-bound no-replay, Challenge and
+STOP safety independent. At this increment W14 Working-count check
+60509fee0c055c836a6258f24d2e88f6bf7b26a6 and W19 scheduled resume
+94247cbb22f7991fb7a7d6e04bf6d8555ea69902 have independent Accepted reviews
+but are not part of the pinned base; current optional reader
+484dc92e579a60eb76ed94918dbdad24429b3c08 is still under review. Rebind the
+policy history and add real canonical Working/Ready/manual and Scheduler
+admission histories against their accepted composed API, not old occupancy
+infrastructure or an invented test-only production authority.

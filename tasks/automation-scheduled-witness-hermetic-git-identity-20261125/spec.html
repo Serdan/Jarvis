@@ -1,0 +1,21 @@
+<article>
+<h1>Make the standalone scheduled reconciliation witness hermetic</h1>
+<p><strong>Authorized scope:</strong> a test-only correction at exact final qualification source <code>2be5afb056fc31b0f5f5c7410afaed225b0216bf</code> (tree <code>cb2bfb9ea4b3aa70997d933e0207e5dccc83cd84</code>). Do not use or modify the dirty primary checkout.</p>
+<h2>Evidence and defect</h2>
+<p>Worker 21's completed read-only audit confirms the correct-path job <code>4608245c7b134d708d029de3d81fc0b1</code> exited 1 because both cases failed before behavior at <code>Tests.fs:44</code>, <code>LedgerStore.initialize</code>, during <code>git commit-tree</code> with “Author identity unknown”. The stack never reached BrowserSchedules.Service, bridge, actor, or behavior assertions. The final isolated invocation moved HOME/XDG/TMP to scratch but did not supply Git identity/config. The previously accepted 2/2 run inherited host Git configuration, so its README invocation was not hermetic. Production Git plumbing is not defective.</p>
+<h2>Lease and implementation</h2>
+<ul>
+<li><code>tests/AutomationScheduledReconcileWitness20261125/Tests.fs</code></li>
+<li><code>tests/AutomationScheduledReconcileWitness20261125/README.md</code></li>
+</ul>
+<p>Create a clean registered worktree and branch <code>refs/heads/fix/automation-scheduled-witness-hermetic-git-identity-w21-20261125</code> from the exact base above; bind the attempt source to <code>refs/heads/main</code>. Make the test fixture own its Git identity: snapshot every inherited <code>GIT_*</code> environment variable, remove them, set a private <code>GIT_CONFIG_GLOBAL</code> beneath the fixture scratch root, set <code>GIT_CONFIG_NOSYSTEM=1</code>, and install fake <code>GIT_AUTHOR_NAME/EMAIL</code> and <code>GIT_COMMITTER_NAME/EMAIL</code>. Restore all prior <code>GIT_*</code> values in a <code>finally</code> path. Preserve the existing nonparallel fixture guarantee; do not assume that private HOME alone neutralizes Git's environment/config precedence. Update README with the actual hermetic invocation/contract.</p>
+<h2>Acceptance</h2>
+<ul>
+<li>Only the two leased test files change. No production Git plumbing, shared Client code, global Git configuration, credentials, or real identity.</li>
+<li>Run the focused scheduled witness in a clean isolated environment with hostile/inherited Git overrides removed; both tests pass (2/2). Record exact command, result count, TRX path and SHA-256.</li>
+<li>Prove the fixture restores the caller's original Git environment even on failure; ensure no process-global environment leaks to other tests.</li>
+<li>Do not deploy, integrate, merge, or run the full combined qualification. Do not touch the dirty primary checkout.</li>
+<li>Publish the exact source snapshot for independent review. Integrator handles integration only after an Accepted review.</li>
+</ul>
+<p>When finished, checkpoint exact source, diff paths, environment-isolation behavior and focused test evidence, then complete the assignment.</p>
+</article>

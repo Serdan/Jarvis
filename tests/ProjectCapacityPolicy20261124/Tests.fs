@@ -199,3 +199,33 @@ let currentReaderPreservesLegacyAndRejectsCorruptConfiguredRole () =
         install a "records/roles/Worker.json" (roleRaw "Reviewer")
         Assert.That(readCurrentOptional a (LedgerStore.fetch a |> good) |> Result.isError, Is.True)
         Assert.That(readCurrentOptional a pinned |> good, Is.EqualTo((policy, oid))))
+
+[<Test>]
+let explicitAutomationIsVersionedAndCapacityOnlyWritesPreserveIt () =
+    withRoles (fun a b ->
+        let readCurrent binding =
+            readCurrentOptional binding (LedgerStore.fetch binding |> good) |> good |> fst
+        Assert.That((readCurrent a).AutomationEnabled, Is.False)
+        set a 0 (Some 3) (roles ()) |> good |> ignore
+        Assert.That((readCurrent b).AutomationEnabled, Is.False, "Legacy configured caps are not opt-in.")
+        let enabled = Guid.NewGuid()
+        updateAutomation b "operator" enabled 1 true (Some 3) (roles ()) |> good |> ignore
+        let current = readCurrent a
+        Assert.That(current.AutomationEnabled, Is.True)
+        Assert.That(current.Revision, Is.EqualTo(2))
+        Assert.That((updateAutomation a "operator" enabled 1 true (Some 3) (roles ()) |> good).AlreadyApplied, Is.True)
+        Assert.That(updateAutomation a "operator" (Guid.NewGuid()) 1 false None Map.empty |> Result.isError, Is.True)
+        set a 2 None Map.empty |> good |> ignore
+        Assert.That((readCurrent b).AutomationEnabled, Is.True)
+        updateAutomation b "operator" (Guid.NewGuid()) 3 false None Map.empty |> good |> ignore
+        Assert.That((readCurrent a).AutomationEnabled, Is.False)
+        Assert.That((readCurrent a).Revision, Is.EqualTo(4)))
+
+[<Test>]
+let malformedAutomationFieldFailsClosed () =
+    withRoles (fun a _ ->
+        let policy value =
+            sprintf "{\"Schema\":3,\"Project\":\"%O\",\"Ledger\":\"%O\",\"Epoch\":%d,\"Revision\":1,\"Total\":null,\"Roles\":{},\"AutomationEnabled\":%s}" a.ProjectId a.LedgerId a.Epoch value
+        for raw in [policy "null"; policy "1"; policy "\"true\""; policy "true,\"AutomationEnabled\":false"] do
+            install a path raw
+            Assert.That(readCurrentOptional a (LedgerStore.fetch a |> good) |> Result.isError, Is.True, raw))

@@ -119,3 +119,35 @@ let ineligibleSubscribedAgentDoesNotRecover () =
         Assert.That(summary.Recoveries, Is.Zero)
         Assert.That(summary.Errors, Is.Empty)
         Assert.That((snapshot second).Commit, Is.EqualTo(before.Commit)))
+
+[<Test>]
+let registeredAutomationHealthPortsRequireFreshProjectOptIn () =
+    withFixture (fun first second rt original ->
+        let gated =
+            { deps rt with
+                Enumerate = fun () -> NativeHealth.enumerateAutomation rt
+                Current = NativeHealth.currentAutomation rt
+                Recover = NativeHealth.recoverAutomation rt }
+        let check ports = NativeHealth.checkOnce (settings ()) ports |> fun job -> job.GetAwaiter().GetResult()
+        Assert.That(NativeHealth.enumerateAutomation rt |> success, Is.Empty)
+        Assert.That(check gated |> _.Recoveries, Is.Zero)
+        ProjectCapacityPolicy.updateAutomation first "fixture" (Guid.NewGuid()) 0 true None Map.empty |> success |> ignore
+        let candidate = NativeHealth.enumerateAutomation rt |> success |> List.exactlyOne
+        Assert.That(candidate.AgentId, Is.EqualTo(original.AgentId))
+        let mutable reads = 0
+        let race =
+            { gated with Activity = fun project agent ->
+                reads <- reads + 1
+                if reads = 2 then
+                    ProjectCapacityPolicy.updateAutomation second "fixture" (Guid.NewGuid()) 1 false None Map.empty |> success |> ignore
+                gated.Activity project agent }
+        let held = check race
+        Assert.That(held.Recoveries, Is.Zero)
+        Assert.That(reads, Is.EqualTo(2))
+        Assert.That(NativeHealth.currentAutomation rt candidate |> success, Is.EqualTo(None))
+        let _, receipt = LedgerStore.getOperationStatus first (NativeHealth.recoveryOperationId candidate) |> success
+        Assert.That(receipt.IsNone, Is.True)
+        ProjectCapacityPolicy.updateAutomation first "fixture" (Guid.NewGuid()) 2 true None Map.empty |> success |> ignore
+        Assert.That(check gated |> _.Recoveries, Is.EqualTo(1))
+        let _, receipt = LedgerStore.getOperationStatus second (NativeHealth.recoveryOperationId candidate) |> success
+        Assert.That(receipt.IsSome, Is.True))

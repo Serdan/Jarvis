@@ -43,10 +43,10 @@ let create
                                 else
                                     // Do not pre-check current revision: the original UUID's
                                     // receipt must be reconciled before stale-revision handling.
-                                    ProjectCapacityPolicy.updateOptional binding owner operation policy.Revision draft.Total draft.Roles
+                                    ProjectCapacityPolicy.updateAutomation binding owner operation policy.Revision draft.AutomationEnabled draft.Total draft.Roles
                                     |> Result.map ignore
                                     |> Result.mapError classify)
                     { CapacityProjectName = project; ProjectId = binding.ProjectId
                       LedgerId = binding.LedgerId; Epoch = binding.Epoch
-                      Revision = policy.Revision; Draft = { Total = policy.Total; Roles = policy.Roles }
+                      Revision = policy.Revision; Draft = { AutomationEnabled = policy.AutomationEnabled; Total = policy.Total; Roles = policy.Roles }
                       Save = save })) }

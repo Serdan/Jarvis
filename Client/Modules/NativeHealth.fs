@@ -226,7 +226,12 @@ module NativeHealth =
 
     // Only locally approved, Git-bound projects are scanned. Unbound ordinary
     // directories are never promoted into health authority by discovery.
-    let enumerate (rt: Runtime) =
+    let private automationEnabled binding snapshot =
+        ProjectCapacityPolicy.readCurrentOptional binding snapshot
+        |> Result.map (fun (policy, _) -> policy.AutomationEnabled)
+        |> Result.mapError (sprintf "%A")
+
+    let private enumerateWithPolicy readEnabled (rt: Runtime) =
         match ProjectBrowser.listGitProjects rt with
         | Error reason -> Error (sprintf "%A" reason)
         | Ok projects ->
@@ -256,33 +261,41 @@ module NativeHealth =
                                             failure <- Some ("Conflicting approved aliases for " + identity)
                                     | false, _ ->
                                         seen.Add(identity, binding)
-                                        match LedgerStore.listAt binding snapshot "agents" with
-                                        | Error reason -> failure <- Some (sprintf "%A" reason)
-                                        | Ok paths ->
-                                            let agentFiles =
-                                                paths |> List.filter (fun path ->
-                                                    path.StartsWith("agents/", StringComparison.Ordinal)
-                                                    && path.EndsWith(".json", StringComparison.Ordinal)
-                                                    // Challenge subscription sidecars are not registered agent records.
-                                                    // Match the canonical suffix before applying the roster bound.
-                                                    && not (path.EndsWith(".challenge-subscription.json", StringComparison.Ordinal)))
-                                            if agentFiles.Length > 512 then
-                                                failure <- Some ("Registered agent enumeration exceeds bound for " + name)
-                                            else
-                                                for path in agentFiles do
-                                                    if failure.IsNone then
-                                                        match agentIdFromRecord binding snapshot path with
-                                                        | Error reason -> failure <- Some reason
-                                                        | Ok id ->
-                                                            match candidateAt name binding snapshot id with
-                                                            | Error reason -> failure <- Some reason
-                                                            | Ok None -> ()
-                                                            | Ok (Some candidate) -> candidates.Add candidate
+                                        match readEnabled binding snapshot with
+                                        | Error reason -> failure <- Some reason
+                                        | Ok false -> ()
+                                        | Ok true ->
+                                          match LedgerStore.listAt binding snapshot "agents" with
+                                          | Error reason -> failure <- Some (sprintf "%A" reason)
+                                          | Ok paths ->
+                                              let agentFiles =
+                                                  paths |> List.filter (fun path ->
+                                                      path.StartsWith("agents/", StringComparison.Ordinal)
+                                                      && path.EndsWith(".json", StringComparison.Ordinal)
+                                                      // Challenge subscription sidecars are not registered agent records.
+                                                      // Match the canonical suffix before applying the roster bound.
+                                                      && not (path.EndsWith(".challenge-subscription.json", StringComparison.Ordinal)))
+                                              if agentFiles.Length > 512 then
+                                                  failure <- Some ("Registered agent enumeration exceeds bound for " + name)
+                                              else
+                                                  for path in agentFiles do
+                                                      if failure.IsNone then
+                                                          match agentIdFromRecord binding snapshot path with
+                                                          | Error reason -> failure <- Some reason
+                                                          | Ok id ->
+                                                              match candidateAt name binding snapshot id with
+                                                              | Error reason -> failure <- Some reason
+                                                              | Ok None -> ()
+                                                              | Ok (Some candidate) -> candidates.Add candidate
                 match failure with
                 | Some reason -> Error reason
                 | None -> Ok (candidates |> Seq.toList)
 
-    let current (rt: Runtime) (before: Candidate) =
+    // Explicit legacy fixture seam; the registered host uses the gated ports below.
+    let enumerate rt = enumerateWithPolicy (fun _ _ -> Ok true) rt
+    let enumerateAutomation rt = enumerateWithPolicy automationEnabled rt
+
+    let private currentWithPolicy readEnabled (rt: Runtime) (before: Candidate) =
         match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot before.ProjectName rt with
         | Error issue -> Error (sprintf "%A" issue)
         | Ok (binding, snapshot) ->
@@ -291,7 +304,14 @@ module NativeHealth =
                || binding.ApprovedFetchUrl <> before.ApprovedFetchUrl
                || binding.ApprovedPushUrl <> before.ApprovedPushUrl then
                 Error "Canonical approved project binding changed."
-            else candidateAt before.ProjectName binding snapshot before.AgentId
+            else
+                readEnabled binding snapshot
+                |> Result.bind (fun enabled ->
+                    if enabled then candidateAt before.ProjectName binding snapshot before.AgentId
+                    else Ok None)
+
+    let current rt before = currentWithPolicy (fun _ _ -> Ok true) rt before
+    let currentAutomation rt before = currentWithPolicy automationEnabled rt before
 
     // Uses the existing task-write pending-intent journal and Git CAS recovery
     // mutation. This code never creates a browser/session/workflow execution.
@@ -335,6 +355,17 @@ module NativeHealth =
 
     let recover (rt: Runtime) (candidate: Candidate) (operationId: Guid) =
         recoverWithWrite (fun command _ -> OrchestrationApi.TaskApi.write command rt) rt candidate operationId
+
+    // Re-read the exact approved project and the switch after the final activity
+    // observation, immediately before issuing a new recovery write. A policy
+    // change after this read cannot revoke an already-issued mutation.
+    // Original uncertain-write reconciliation remains in recoverWithWrite.
+    let recoverAutomation rt candidate operationId =
+        match currentAutomation rt candidate with
+        | Ok(Some latest) when sameCandidate candidate latest ->
+            recover rt latest operationId
+        | Ok _ -> Error "Project Automation disabled or recovery candidate changed."
+        | Error reason -> Error reason
 
     type Service(settings: unit -> Result<Settings, string>,
                  dependencies: Dependencies,

@@ -475,9 +475,14 @@ let actualScheduledCallerWithFakeBrowser () =
                 service.Start()
                 let pending = socketReceive socket
                 advance 6.
-                let capped = waitOccurrence ""
+                let absentSwitch = waitOccurrence ""
+                Assert.That(pending.IsCompleted, Is.False, "Legacy capacity policy must not enable Automation.")
+                ProjectCapacityPolicy.updateAutomation binding "fixture" (Guid.NewGuid()) 1 true (Some 1) Map.empty
+                |> good |> ignore
+                advance 60.
+                let capped = waitOccurrence absentSwitch
                 Assert.That(pending.IsCompleted, Is.False, "Enabled cap must produce no browser effect.")
-                ProjectCapacityPolicy.updateOptional binding "fixture" (Guid.NewGuid()) 1 None Map.empty
+                ProjectCapacityPolicy.updateAutomation binding "fixture" (Guid.NewGuid()) 2 true None Map.empty
                 |> good |> ignore
                 advance 60.
                 let! frame = pending.WaitAsync(TimeSpan.FromSeconds(15.))
@@ -711,3 +716,30 @@ let legacyIntentRemainsFencedWithoutPositiveProof () =
               Send = fun _ -> sends <- sends + 1; Task.FromResult(Ok "unexpected") }
         Assert.That(run ports binding, Is.EqualTo(NoEligibleReady))
         Assert.That(sends, Is.Zero))
+
+[<Test>]
+let automationSwitchIsIndependentAcrossVerifiedProjects () =
+    fixture (fun a assignA ->
+        fixture (fun b assignB ->
+            assignA "Worker" "a-task"
+            assignB "Worker" "b-task"
+            let mutable sends = 0
+            let ports =
+                { ReadLimits = readAutomationLimits
+                  CanSend = fun _ -> Task.FromResult(Ok true)
+                  Send = fun _ -> sends <- sends + 1; Task.FromResult(Ok "submitted") }
+            let held = function Held _ -> true | _ -> false
+            Assert.That(run ports a |> held, Is.True)
+            Assert.That(run ports b |> held, Is.True)
+            ProjectCapacityPolicy.updateAutomation a "fixture" (Guid.NewGuid()) 0 true None Map.empty |> good |> ignore
+            Assert.That(run ports a, Is.EqualTo(Submitted "submitted"))
+            Assert.That(run ports b |> held, Is.True)
+            Assert.That(sends, Is.EqualTo(1))
+            let snapshot = LedgerStore.fetch a |> good
+            Assert.That(readAutomationLimits b snapshot |> Result.isError, Is.True)
+            Assert.That(readAutomationLimits a { snapshot with Commit = String('0', 40) } |> Result.isError, Is.True)
+            // Restarted caller must read persisted policy, not a process-global opt-in.
+            Assert.That(readAutomationLimits a (LedgerStore.fetch a |> good) |> Result.isOk, Is.True)
+            ProjectCapacityPolicy.updateAutomation a "fixture" (Guid.NewGuid()) 1 false None Map.empty |> good |> ignore
+            Assert.That(run ports a |> held, Is.True)
+            Assert.That(sends, Is.EqualTo(1))))

@@ -210,6 +210,15 @@ let readCurrentLimits : ReadLimits =
         ProjectCapacityPolicy.readCurrentOptional binding snapshot
         |> Result.map (fun (policy, _) -> { Total = policy.Total; Roles = policy.Roles })
 
+/// Only the production autonomous route uses this reader. Absence, legacy
+/// capacity settings, or malformed/foreign policy never authorize automation.
+let readAutomationLimits : ReadLimits =
+    fun binding snapshot ->
+        ProjectCapacityPolicy.readCurrentOptional binding snapshot
+        |> Result.bind (fun (policy, _) ->
+            if policy.AutomationEnabled then Ok { Total = policy.Total; Roles = policy.Roles }
+            else bad "Project Automation is disabled.")
+
 /// Recheck the exact Ready episode and non-consuming STOP queue at the
 /// latest verified snapshot immediately before the browser effect.
 let stillReadyAt binding snapshot (ready: Ready) =

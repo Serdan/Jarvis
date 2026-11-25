@@ -134,13 +134,15 @@ type LaunchTemplateUiAccess =
       Save: LaunchTemplateEditSnapshot -> Guid -> string -> Result<unit, LaunchTemplateEditFailure> }
 
 type CapacityPolicyDraft =
-    { Total: int option
+    { AutomationEnabled: bool
+      Total: int option
       Roles: Map<string, int> }
 
 module CapacityPolicyDraft =
     let format (draft: CapacityPolicyDraft) =
         let total = draft.Total |> Option.map string |> Option.defaultValue "off"
-        [ yield "total=" + total
+        [ yield "automation=" + (if draft.AutomationEnabled then "on" else "off")
+          yield "total=" + total
           for KeyValue(role, cap) in draft.Roles do
               yield sprintf "role %s=%d" role cap ]
         |> String.concat "\n"
@@ -154,29 +156,35 @@ module CapacityPolicyDraft =
             role.Length > 0 && role.Length <= 80 &&
             (role |> Seq.forall (fun c -> Char.IsAsciiLetterOrDigit c || c = '_' || c = '-'))
         let folder state (line: string) =
-            state |> Result.bind (fun (total, roles) ->
+            state |> Result.bind (fun (enabled, total, roles) ->
                 let parts = line.Trim().Split('=')
-                if parts.Length <> 2 then Error "Use total=off or total=N, and role RoleId=N."
+                if parts.Length <> 2 then Error "Use automation=on/off, total=off or total=N, and role RoleId=N."
                 else
                     let key, value = parts[0].Trim(), parts[1].Trim()
-                    if key = "total" then
+                    if key = "automation" then
+                        if Option.isSome enabled then Error "Duplicate Automation switch."
+                        elif value = "on" then Ok(Some true, total, roles)
+                        elif value = "off" then Ok(Some false, total, roles)
+                        else Error "Automation must be on or off."
+                    elif key = "total" then
                         if Option.isSome total then Error "Duplicate total cap."
-                        elif value = "off" then Ok(Some None, roles)
-                        else positive value |> Result.map (fun n -> Some(Some n), roles)
+                        elif value = "off" then Ok(enabled, Some None, roles)
+                        else positive value |> Result.map (fun n -> enabled, Some(Some n), roles)
                     elif key.StartsWith("role ", StringComparison.Ordinal) then
                         let role = key.Substring(5)
                         if not (roleId role) then Error "Invalid canonical role ID."
                         elif Map.containsKey role roles then Error "Duplicate role cap."
-                        else positive value |> Result.map (fun n -> total, Map.add role n roles)
+                        else positive value |> Result.map (fun n -> enabled, total, Map.add role n roles)
                     else Error "Unknown policy field.")
-        if isNull body then Error "An explicit total=off or total=N is required."
+        if isNull body then Error "An explicit Automation switch and total cap are required."
         else
             body.Replace("\r\n", "\n").Split('\n')
             |> Array.filter (String.IsNullOrWhiteSpace >> not)
-            |> Array.fold folder (Ok(None, Map.empty))
+            |> Array.fold folder (Ok(None, None, Map.empty))
             |> Result.bind (function
-                | Some total, roles -> Ok { Total = total; Roles = roles }
-                | None, _ -> Error "An explicit total=off or total=N is required.")
+                | Some enabled, Some total, roles -> Ok { AutomationEnabled = enabled; Total = total; Roles = roles }
+                | None, _, _ -> Error "An explicit automation=on or automation=off is required."
+                | _, None, _ -> Error "An explicit total=off or total=N is required.")
 
 type CapacityPolicyEditFailure =
     | CapacityStale of string
@@ -1094,7 +1102,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         writeHotkeyToken "@"; draw.Write " agent, "
         writeMnemonic 'r' "refresh"; draw.Write ", "
         if launchTemplateAccess.IsSome then writeMnemonic 't' "launch template"; draw.Write ", "
-        if capacityPolicyAccess.IsSome then writeMnemonic 'k' "capacity policy"; draw.Write ", "
+        if capacityPolicyAccess.IsSome then writeMnemonic 'k' "k Automation"; draw.Write ", "
         writeMnemonic 'p' "permissions"; draw.Write ", "
         writeHotkeyToken "Esc"; draw.Write " activity, "
         writeMnemonic 'q' "quit"; draw.WriteLine "  • mouse: click/select, double-click/details, wheel/scroll"
@@ -1610,20 +1618,23 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
     let renderProjectEditorUnsafe width =
         let safe = JobView.safeLine
-        let label = if projectEditorKind = CapacityPolicyEditor then "Project scheduler capacity policy: " else "Project launch template: "
+        let label = if projectEditorKind = CapacityPolicyEditor then "Project Automation: " else "Project launch template: "
         draw.WriteLine(trim (safe (label + launchProject)) width)
         match launchSnapshot with
         | Some snapshot ->
             if projectEditorKind = CapacityPolicyEditor then
                 draw.WriteLine(trim (sprintf "Project %O" snapshot.ProjectId) width)
                 draw.WriteLine(trim (sprintf "Ledger %O / epoch %d, revision %d" snapshot.LedgerId snapshot.Epoch snapshot.Revision) width)
+                match CapacityPolicyDraft.parse snapshot.Body with
+                | Ok saved -> draw.WriteLine(if saved.AutomationEnabled then "Saved Automation: ON" else "Saved Automation: OFF")
+                | Error _ -> draw.WriteLine "Saved Automation: UNKNOWN"
             else
                 draw.WriteLine(trim (sprintf "Ledger %O / epoch %d, version %d" snapshot.LedgerId snapshot.Epoch snapshot.Revision) width)
         | None -> ()
         draw.WriteLine "F2 save/retry | F5 reload (discard draft) | F6 copy | Esc back"
         if projectEditorKind = CapacityPolicyEditor then
-            draw.WriteLine "total=off or total=N; role RoleId=N (one per line); omit role to disable."
-            draw.WriteLine "Scheduler only; manual launches bypass limits. Ctrl+U clear, Enter newline."
+            draw.WriteLine "automation=on/off; total=off or total=N; role RoleId=N; omit role to uncap."
+            draw.WriteLine "Automatic launch/recovery only; manual actions bypass. Ctrl+U clear, Enter newline."
         else draw.WriteLine "Append/paste text, Enter newline, Backspace, Ctrl+U clear; Up/Down scroll."
         if launchBusy then draw.WriteLine "Ledger operation in progress..."
         if launchNeedsReload then

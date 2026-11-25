@@ -138,6 +138,7 @@
         <Compile Include="AutomationNativeProviderSessionHost.fs"/>
         <Compile Include="Modules\BrowserSchedules.fs"/>
         <Compile Include="Runtime.fs"/>
+        <Compile Include="Modules\ProjectCapacityPolicy.fs"/>
         <Compile Include="Modules\NativeHealth.fs"/>
         <Compile Include="Modules\WorkQueueDashboardHost.fs"/>
         <Compile Include="Modules\AgentInstructions.fs"/>
@@ -146,7 +147,6 @@
         <Compile Include="SignalR\CommandDispatch.fs"/>
         <Compile Include="SignalR\HubConnection.fs"/>
         <Compile Include="SignalR\Client.fs"/>
-        <Compile Include="Modules\ProjectCapacityPolicy.fs"/>
         <Compile Include="Modules\ProjectCapacityOperator.fs"/>
         <Compile Include="Modules\ScheduledReadyResume.fs"/>
         <Compile Include="Program.fs"/>

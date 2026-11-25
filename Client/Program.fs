@@ -310,7 +310,7 @@ let executeReadySchedule (authenticatedActor: unit -> string option) (rt: Runtim
                                     match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot action.ProjectName rt with
                                     | Error error -> return Error(sprintf "%A" error)
                                     | Ok(current, snapshot) when current = binding ->
-                                        return ScheduledReadyResume.readCurrentLimits current snapshot
+                                        return ScheduledReadyResume.readAutomationLimits current snapshot
                                                |> Result.bind (fun limits ->
                                                    ScheduledReadyResume.readRosterAt current snapshot limits
                                                    |> Result.map (ScheduledReadyResume.candidates limits >> List.contains ready))
@@ -336,7 +336,7 @@ let executeReadySchedule (authenticatedActor: unit -> string option) (rt: Runtim
                                         return Error reason
                         }
                         let ports : ScheduledReadyResume.ExecutionPorts =
-                            { ReadLimits = ScheduledReadyResume.readCurrentLimits
+                            { ReadLimits = ScheduledReadyResume.readAutomationLimits
                               CanSend = preflight
                               Send = send }
                         let sourceHash = hash source
@@ -698,8 +698,8 @@ let private runClient args =
     // Native Health is ordinary client application code, not a browser schedule
     // or an MCP worker. The default-off switch is reloaded on each check.
     let nativeHealthDependencies : Client.NativeHealth.Dependencies =
-        { Enumerate = (fun () -> Client.NativeHealth.NativeHealth.enumerate rt)
-          Current = Client.NativeHealth.NativeHealth.current rt
+        { Enumerate = (fun () -> Client.NativeHealth.NativeHealth.enumerateAutomation rt)
+          Current = Client.NativeHealth.NativeHealth.currentAutomation rt
           Activity = (fun project agent -> task {
               if not registered || connection.State <> HubConnectionState.Connected then
                   return Error "Authenticated server connection unavailable."
@@ -711,7 +711,7 @@ let private runClient args =
                   with ex ->
                       return Error ("Authenticated server activity failed: " + ex.GetType().Name)
           })
-          Recover = Client.NativeHealth.NativeHealth.recover rt }
+          Recover = Client.NativeHealth.NativeHealth.recoverAutomation rt }
     let nativeHealth =
         new Client.NativeHealth.NativeHealth.Service(
             (fun () ->

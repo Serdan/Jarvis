@@ -23,7 +23,8 @@ type OptionalPolicy =
       Epoch: int
       Revision: int
       Total: int option
-      Roles: Map<string, int> }
+      Roles: Map<string, int>
+      AutomationEnabled: bool }
 
 let private path = "records/project-capacity-policy/policy.json"
 let private reject message = Error(InvalidBinding ("Project capacity policy: " + message))
@@ -88,10 +89,12 @@ let private parsePolicy (binding: LedgerBinding) (raw: string) =
     try
         use doc = JsonDocument.Parse raw
         let root = doc.RootElement
-        if not (fieldsExactly ["Schema"; "Project"; "Ledger"; "Epoch"; "Revision"; "Total"; "Roles"] root) then
+        let schema = root.GetProperty("Schema").GetInt32()
+        let fields = ["Schema"; "Project"; "Ledger"; "Epoch"; "Revision"; "Total"; "Roles"]
+        let expected = if schema = 3 then "AutomationEnabled" :: fields else fields
+        if not (fieldsExactly expected root) then
             reject "missing, duplicate, or unknown policy fields"
         else
-            let schema = root.GetProperty("Schema").GetInt32()
             let totalElement = root.GetProperty("Total")
             let total =
                 if totalElement.ValueKind = JsonValueKind.Null then None
@@ -108,8 +111,9 @@ let private parsePolicy (binding: LedgerBinding) (raw: string) =
                   Epoch = root.GetProperty("Epoch").GetInt32()
                   Revision = root.GetProperty("Revision").GetInt32()
                   Total = total
-                  Roles = roles }
-            if (schema <> 1 && schema <> 2)
+                  Roles = roles
+                  AutomationEnabled = schema = 3 && root.GetProperty("AutomationEnabled").GetBoolean() }
+            if (schema <> 1 && schema <> 2 && schema <> 3)
                || (schema = 1 && (Option.isNone total || Map.isEmpty roles))
                || p.Project <> binding.ProjectId || p.Ledger <> binding.LedgerId || p.Epoch <> binding.Epoch
                || p.Revision <= 0 || roles.Count <> roleFields.Length || not (validCaps total roles)
@@ -127,7 +131,8 @@ let readCurrentOptional (binding: LedgerBinding) snapshot =
         |> Result.bind (function
             | None, None ->
                 Ok ({ Schema = 2; Project = binding.ProjectId; Ledger = binding.LedgerId
-                      Epoch = binding.Epoch; Revision = 0; Total = None; Roles = Map.empty }, None)
+                      Epoch = binding.Epoch; Revision = 0; Total = None; Roles = Map.empty
+                      AutomationEnabled = false }, None)
             | Some raw, Some oid ->
                 parsePolicy binding raw
                 |> Result.bind (fun p ->
@@ -165,7 +170,7 @@ let readForRole binding snapshot expectedRevision role =
         | 1, Some total, Some blob -> Ok(legacy p total, blob)
         | _ -> reject "schema-1 configured policy required")
 
-let private updateCore schema (binding: LedgerBinding) actor operation expectedRevision total roles =
+let private updateCore schema automationEnabled (binding: LedgerBinding) actor operation expectedRevision total roles =
     if expectedRevision < 0 || expectedRevision = Int32.MaxValue || not (validBinding binding) then
         reject "invalid update revision or binding"
     elif not (validCaps total roles) then
@@ -175,19 +180,28 @@ let private updateCore schema (binding: LedgerBinding) actor operation expectedR
     else
         let next : OptionalPolicy =
             { Schema = schema; Project = binding.ProjectId; Ledger = binding.LedgerId
-              Epoch = binding.Epoch; Revision = expectedRevision + 1; Total = total; Roles = roles }
+              Epoch = binding.Epoch; Revision = expectedRevision + 1; Total = total; Roles = roles
+              AutomationEnabled = automationEnabled }
+        let optionalTotal = match total with Some n -> Nullable n | None -> Nullable()
+        let automationRecord enabled =
+            {| Schema = 3; Project = next.Project; Ledger = next.Ledger
+               Epoch = next.Epoch; Revision = next.Revision; Total = optionalTotal
+               Roles = next.Roles; AutomationEnabled = enabled |}
         let content, request =
             if schema = 1 then
                 // Preserve the original schema-1 request encoding for replay.
                 let record = legacy next (Option.get total)
                 JsonSerializer.Serialize record,
                 JsonSerializer.Serialize {| expectedRevision = expectedRevision; policy = record |}
+            elif schema = 3 then
+                let record = automationRecord automationEnabled
+                JsonSerializer.Serialize record,
+                JsonSerializer.Serialize {| expectedRevision = expectedRevision; policy = record |}
             else
                 let record =
                     {| Schema = next.Schema; Project = next.Project; Ledger = next.Ledger
                        Epoch = next.Epoch; Revision = next.Revision
-                       Total = (match total with Some n -> Nullable n | None -> Nullable())
-                       Roles = next.Roles |}
+                       Total = optionalTotal; Roles = next.Roles |}
                 JsonSerializer.Serialize record,
                 JsonSerializer.Serialize {| expectedRevision = expectedRevision; policy = record |}
         let intent = { OperationId = operation; Actor = actor; Kind = "ProjectCapacityPolicy.Update"; RequestJson = request }
@@ -199,11 +213,21 @@ let private updateCore schema (binding: LedgerBinding) actor operation expectedR
                 else
                     requireRoles binding snapshot roles
                     |> Result.map (fun () ->
-                        [{ Path = path; ExpectedBlobOid = oid; Content = content }])))
+                        // A capacity-only writer cannot implicitly enable or disable Automation.
+                        // Preserve the legacy request encoding for exact operation replay.
+                        let updated =
+                            if schema = 2 && previous.Schema = 3 then
+                                JsonSerializer.Serialize(automationRecord previous.AutomationEnabled)
+                            else content
+                        [{ Path = path; ExpectedBlobOid = oid; Content = updated }])))
 
 // Explicitly replacing with disabled caps advances the revision; never delete.
 let updateOptional binding actor operation expectedRevision total roles =
-    updateCore 2 binding actor operation expectedRevision total roles
+    updateCore 2 false binding actor operation expectedRevision total roles
+
+// One revision and one CAS for the selected project's switch and capacity settings.
+let updateAutomation binding actor operation expectedRevision enabled total roles =
+    updateCore 3 enabled binding actor operation expectedRevision total roles
 
 let update binding actor operation expectedRevision total roles =
-    updateCore 1 binding actor operation expectedRevision (Some total) roles
+    updateCore 1 false binding actor operation expectedRevision (Some total) roles

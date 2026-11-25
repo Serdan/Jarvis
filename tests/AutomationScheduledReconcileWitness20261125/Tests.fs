@@ -138,8 +138,10 @@ let private prop (raw: string) (key: string) =
     use doc = JsonDocument.Parse raw
     doc.RootElement.GetProperty(key).GetString()
 
-[<TestCase(false); TestCase(true); NonParallelizable>]
-let hostedOriginalNoSendOrDisconnect lateNoSend =
+[<TestCase("disconnect"); TestCase("auth"); TestCase("switch"); NonParallelizable>]
+let hostedOriginalNoSendOrDisconnect scenario =
+    let lateNoSend = scenario <> "disconnect"
+    let switchOff = scenario = "switch"
     let inherited = gitEnvironment ()
     if lateNoSend then
         let failure =
@@ -159,6 +161,7 @@ let hostedOriginalNoSendOrDisconnect lateNoSend =
             Directory.CreateDirectory(Path.GetDirectoryName script) |> ignore
             File.Copy(Path.Combine(AppContext.BaseDirectory, "launchAgent.js"), script)
             assign "Worker" "ready-task"
+            ProjectCapacityPolicy.updateAutomation binding "fixture" (Guid.NewGuid()) 0 true None Map.empty |> good |> ignore
             let rt = Runtime(root, ConsoleTui.ConsoleTui(), Client.FullTrust)
             let head = (LedgerStore.fetch binding |> good).Commit
             LedgerBindingConfig.bindExisting "local" rt binding.ProjectId binding.LedgerId binding.Epoch
@@ -200,7 +203,10 @@ let hostedOriginalNoSendOrDisconnect lateNoSend =
                     if lateNoSend && n = 3 then
                         let original = readOccurrence()
                         firstSelection <- Some(original, (BrowserSchedules.tryResumeSelection original).Value)
-                        None
+                        if switchOff then
+                            ProjectCapacityPolicy.updateAutomation binding "fixture" (Guid.NewGuid()) 1 false None Map.empty |> good |> ignore
+                            Some "operator:fixture"
+                        else None
                     else Some "operator:fixture"
                 use service = new BrowserSchedules.Service(journal,
                     Program.executeReadySchedule actor rt (Some bridge), now=clock, pollMs=25, reconcileResume=Program.reconcileReadySchedule actor rt)
@@ -222,7 +228,13 @@ let hostedOriginalNoSendOrDisconnect lateNoSend =
                     previous <- waitOccurrence ""
                     Assert.That(pending.IsCompleted, Is.False)
                     let _, _, error = scheduleState service a.Id
-                    Assert.That(error, Does.Contain("stopped before Send"))
+                    Assert.That(error, Does.Contain(if switchOff then "Automation is disabled" else "stopped before Send"))
+                    if switchOff then
+                        let original, selection = firstSelection.Value
+                        let reconciled = Program.reconcileReadySchedule (fun () -> Some "operator:fixture") rt original selection
+                        let! confirmed = reconciled
+                        Assert.That(confirmed, Is.True, "Switch off must not inhibit original-intent reconciliation.")
+                        ProjectCapacityPolicy.updateAutomation binding "fixture" (Guid.NewGuid()) 2 true None Map.empty |> good |> ignore
                     let current = LedgerStore.fetch binding |> good
                     let retry = (prepareAt readCurrentLimits binding current "local" |> good).Value
                     Assert.That(retry.Ready, Is.EqualTo(first.Ready))

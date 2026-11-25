@@ -61,7 +61,7 @@ let resolve binding project =
 let openAt binding =
     (create (fun () -> Some "operator:fixture") (resolve binding)).Load "Fixture" |> good
 
-let draft total roles : CapacityPolicyDraft = { Total=total; Roles=Map.ofList roles }
+let draft total roles : CapacityPolicyDraft = { AutomationEnabled=false; Total=total; Roles=Map.ofList roles }
 let off () = draft None []
 
 [<Test>]
@@ -72,7 +72,7 @@ let independentDimensionsAndExplicitRemoval () =
         Assert.That(initial.Draft=off (), Is.True)
         Assert.That(initial.ProjectId, Is.EqualTo(a.ProjectId))
         Assert.That(initial.LedgerId, Is.EqualTo(a.LedgerId))
-        let changes = [ draft (Some 3) []; draft None ["Worker",2]; draft (Some 5) ["Worker",2;"Reviewer",1]
+        let changes = [ { draft (Some 3) [] with AutomationEnabled=true }; draft None ["Worker",2]; draft (Some 5) ["Worker",2;"Reviewer",1]
                         draft (Some 2) ["Reviewer",3]; off () ]
         changes |> List.iteri (fun i next ->
             let loaded = openAt a
@@ -133,11 +133,11 @@ let authenticationBindingAndDeniedResolutionNeverWrite () =
 
 [<Test>]
 let textParserRejectsAmbiguityAndRoundTrips () =
-    for configuration in [off ();draft (Some 2) [];draft None ["Worker",3];draft (Some 7) ["Worker",3;"Reviewer",2]] do
+    for configuration in [off (); { draft (Some 2) [] with AutomationEnabled=true };draft None ["Worker",3];draft (Some 7) ["Worker",3;"Reviewer",2]] do
         Assert.That(CapacityPolicyDraft.parse (CapacityPolicyDraft.format configuration) = Ok configuration, Is.True)
-    for text in ["";"role Worker=1";"total=0";"total=-1";"total=2147483648";"total=off\ntotal=off"
+    for text in ["";"total=off";"automation=yes\ntotal=off";"automation=on\nautomation=off\ntotal=off";"automation=on"] @ (["role Worker=1";"total=0";"total=-1";"total=2147483648";"total=off\ntotal=off"
                  "total=off\nrole Worker=0";"total=off\nrole Worker=2\nrole Worker=3"
-                 "total=off\nrole ../Worker=2";"total=off\nfoo=2";"total=off=2"] do
+                 "total=off\nrole ../Worker=2";"total=off\nfoo=2";"total=off=2"] |> List.map (fun text -> "automation=off\n" + text)) do
         Assert.That(CapacityPolicyDraft.parse text |> Result.isError, Is.True, text)
 
 let key k = ConsoleKeyInfo('\000',k,false,false,false)
@@ -166,8 +166,10 @@ let actualModalPreservesExactUnknownReceiptIntent () =
         tui.OpenCapacityPolicyForFixture("Fixture")
         awaitEditor tui
         let _,_,_,body,_,_ = tui.InspectProjectEditorForFixture()
-        Assert.That(body, Is.EqualTo("total=off"))
+        Assert.That(body, Is.EqualTo("automation=off\ntotal=off"))
         tui.DispatchProjectEditorKeyForFixture(ctrlU ())
+        for c in "automation=on" do tui.DispatchProjectEditorKeyForFixture(typeChar c)
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.Enter)
         for c in "total=2" do tui.DispatchProjectEditorKeyForFixture(typeChar c)
         tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.Enter)
         for c in "role Worker=1" do tui.DispatchProjectEditorKeyForFixture(typeChar c)
@@ -204,19 +206,21 @@ let staleModalRequiresRefreshBeforeSaving () =
         awaitEditor tui
         (openAt b).Save (Guid.NewGuid()) (draft (Some 3) ["Reviewer",1]) |> good
         tui.DispatchProjectEditorKeyForFixture(ctrlU ())
+        for c in "automation=on" do tui.DispatchProjectEditorKeyForFixture(typeChar c)
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.Enter)
         for c in "total=2" do tui.DispatchProjectEditorKeyForFixture(typeChar c)
         tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.F2)
         awaitEditor tui
         let _,_,pending,body,notice,reload = tui.InspectProjectEditorForFixture()
         Assert.That(pending.IsNone && reload, Is.True, notice)
-        Assert.That(body, Is.EqualTo("total=2"))
+        Assert.That(body, Is.EqualTo("automation=on\ntotal=2"))
         tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.F2)
         Assert.That((openAt b).Revision, Is.EqualTo(1))
         tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.F5)
         awaitEditor tui
         let _,_,_,body,_,reload = tui.InspectProjectEditorForFixture()
         Assert.That(reload, Is.False)
-        Assert.That(body, Is.EqualTo("total=3\nrole Reviewer=1")))
+        Assert.That(body, Is.EqualTo("automation=off\ntotal=3\nrole Reviewer=1")))
 
 [<Test; NonParallelizable>]
 let sharedEditorPreservesLaunchTemplateBodySemantics () =
@@ -292,8 +296,10 @@ let productionRegistrationUsesSelectedProjectAndApprovedBinding () =
             awaitEditor tui
             let _,_,_,initial,_,needsReload = tui.InspectProjectEditorForFixture()
             Assert.That(needsReload, Is.False)
-            Assert.That(initial, Is.EqualTo("total=off"))
+            Assert.That(initial, Is.EqualTo("automation=off\ntotal=off"))
             tui.DispatchProjectEditorKeyForFixture(ctrlU ())
+            for c in "automation=on" do tui.DispatchProjectEditorKeyForFixture(typeChar c)
+            tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.Enter)
             for c in "total=4" do tui.DispatchProjectEditorKeyForFixture(typeChar c)
             tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.Enter)
             for c in "role Worker=2" do tui.DispatchProjectEditorKeyForFixture(typeChar c)
@@ -310,11 +316,11 @@ let productionRegistrationUsesSelectedProjectAndApprovedBinding () =
             Assert.That(finished.IsNone && refresh, Is.True)
             let saved = openAt b
             Assert.That(saved.Revision, Is.EqualTo(1))
-            Assert.That(saved.Draft = draft (Some 4) ["Worker",2], Is.True)
+            Assert.That(saved.Draft = { draft (Some 4) ["Worker",2] with AutomationEnabled=true }, Is.True)
             tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.F5)
             awaitEditor tui
             let _,_,_,body,_,reload = tui.InspectProjectEditorForFixture()
             Assert.That(reload, Is.False)
-            Assert.That(body, Is.EqualTo("total=4\nrole Worker=2"))
+            Assert.That(body, Is.EqualTo("automation=on\ntotal=4\nrole Worker=2"))
         finally
             Environment.SetEnvironmentVariable("XDG_CONFIG_HOME",prior))

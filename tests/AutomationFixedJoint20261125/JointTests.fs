@@ -203,6 +203,11 @@ let authenticatedHealthAndChallengeWakeReachRecurringScheduler () =
                     RoleInstructions.attachRole second "fixture" (Guid.NewGuid()) id "Worker" 0 |> success |> ignore
 
                 do! withScheduler root launchRt "Fixture" first.RepositoryPath (fun noEffect send refuseManual -> task {
+                    noEffect() |> ignore
+                    startManual()
+                    do! refuseManual "Manual" "Worker"
+                    stopManual()
+                    ProjectCapacityPolicy.updateAutomation second "fixture" (Guid.NewGuid()) 0 true None Map.empty |> success |> ignore
                     // Absent caps allow an actual recurring scheduled resume of
                     // precisely the recovered episode.
                     let readyBefore () =
@@ -248,15 +253,15 @@ let authenticatedHealthAndChallengeWakeReachRecurringScheduler () =
                     Assert.That((agent "Worker").State, Is.EqualTo("Ready"))
 
                     startManual()
-                    changePolicy 0 (Some 1) Map.empty
+                    changePolicy 1 (Some 1) Map.empty
                     noEffect() |> ignore
                     // Real manual command bypasses the cap; fake extension
                     // refuses the open, so no live effect or Ready consumption.
                     do! refuseManual "Manual" "Worker"
                     Assert.That((agent "Manual").Execution, Is.EqualTo("Working"))
-                    changePolicy 1 None (Map.ofList ["Worker", 1])
+                    changePolicy 2 None (Map.ofList ["Worker", 1])
                     noEffect() |> ignore
-                    changePolicy 2 (Some 2) (Map.ofList ["Worker", 1])
+                    changePolicy 3 (Some 2) (Map.ofList ["Worker", 1])
                     noEffect() |> ignore
                     stopManual()
 
@@ -274,7 +279,7 @@ let authenticatedHealthAndChallengeWakeReachRecurringScheduler () =
                     Assert.That(challengeResult, Is.EqualTo("completed: "))
                     ReviewWorkflow.activateReadyAgent second (Guid.NewGuid()) taskId "Worker" |> success |> ignore
                     // Independent ordinary Ready work, with explicitly disabled caps.
-                    changePolicy 3 None Map.empty
+                    changePolicy 4 None Map.empty
                     register "Ordinary"
                     ReviewWorkflow.createTask second (Guid.NewGuid()) "ordinary-task" "Ordinary" |> success |> ignore
                     ReviewWorkflow.assignTask second (Guid.NewGuid()) "ordinary-task" (Guid.NewGuid()) "Ordinary" |> success |> ignore

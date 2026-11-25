@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <AssemblyName>ProjectCapacityExclusionCompileWorker21</AssemblyName>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../Client/Client.fsproj" />
+    <Compile Include="../../Client/Modules/ProjectCapacityAdmission.fs" Link="ProjectCapacityAdmission.fs" />
+    <Compile Include="../../Client/Modules/ProjectCapacityDispatchTransition.fs" Link="ProjectCapacityDispatchTransition.fs" />
+    <Compile Include="../../Client/Modules/ProjectCapacityExclusionTransition.fs" Link="ProjectCapacityExclusionTransition.fs" />
+  </ItemGroup>
+</Project>

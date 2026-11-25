@@ -180,8 +180,8 @@ module LedgerBindingConfig =
     // Remote Git I/O and ancestry verification MUST run without the process-shared
     // binding lock. The second short lock is a compare-and-swap against the
     // exact stored trust anchor read before the fetch.
-    let internal loadAtRootWithSnapshotUsing
-        (fetch: LedgerStore.LedgerBinding -> Result<LedgerStore.LedgerSnapshot, LedgerStore.LedgerFailure>) root =
+    let private loadAtRootWithSnapshotChoosing
+        (fetch: string -> LedgerStore.LedgerBinding -> Result<LedgerStore.LedgerSnapshot, LedgerStore.LedgerFailure>) root =
         let path = pathForRoot root
         if not (File.Exists path) then
             Error(Client.ValidationError $" ledger disabled for this checkout. Approved binding required at {path}. No V1 fallback.")
@@ -196,7 +196,7 @@ module LedgerBindingConfig =
                 match initial with
                 | Error error -> Error error
                 | Ok (stored, binding) ->
-                    match fetch binding |> Result.mapError LedgerErrors.toEffect with
+                    match fetch stored.HighestTrustedHead binding |> Result.mapError LedgerErrors.toEffect with
                     | Error error -> Error error
                     | Ok snapshot ->
                         match LedgerStore.LedgerStore.verifyTrustedHead binding
@@ -231,6 +231,9 @@ module LedgerBindingConfig =
                                 Error(Client.ValidationError "Trusted ledger head advanced concurrently; retry the request.")
             load 2
 
+    let internal loadAtRootWithSnapshotUsing fetch root =
+        loadAtRootWithSnapshotChoosing (fun _ binding -> fetch binding) root
+
     let private loadAtRootWithSnapshot root =
         loadAtRootWithSnapshotUsing LedgerStore.LedgerStore.fetch root
 
@@ -242,6 +245,23 @@ module LedgerBindingConfig =
     let loadWithSnapshot projectName rt =
         ProjectPaths.resolveProjectRoot projectName rt
         |> Result.bind (fun (FolderPath root) -> loadAtRootWithSnapshot root)
+
+    // Reuse only a remotely confirmed transaction head from this request. The
+    // normal trust-anchor CAS still runs. If another reader already advanced the
+    // anchor beyond that head, fetch afresh rather than returning an older view.
+    let internal loadWithConfirmedWrite projectName rt originalBinding write =
+        ProjectPaths.resolveProjectRoot projectName rt
+        |> Result.bind (fun (FolderPath root) ->
+            loadAtRootWithSnapshotChoosing (fun anchor binding ->
+                if binding <> originalBinding then
+                    Error(LedgerStore.InvalidBinding "Ledger binding changed after automatic activation.")
+                else
+                    match LedgerStore.LedgerStore.snapshotOfConfirmedWrite binding write with
+                    | Error error -> Error error
+                    | Ok snapshot ->
+                        match LedgerStore.LedgerStore.verifyTrustedHead binding anchor snapshot.Commit with
+                        | Ok () -> Ok snapshot
+                        | Error _ -> LedgerStore.LedgerStore.fetch binding) root)
 
     // A source operation already resolved its checkout when loading AGENTS.md.
     // Reuse that physical root, but perform exactly the same pinned trust-anchor
@@ -2512,7 +2532,13 @@ module TaskApi =
         | true, id when id <> Guid.Empty -> Ok id
         | _ -> Error(Client.ValidationError $"Invalid {label}: a caller-stable UUID is required.")
 
-    let read (cmd: TaskReadCommand) rt =
+    let internal readInboxAt (cmd: TaskReadCommand) binding snapshot =
+        ReviewWorkflow.ReviewWorkflow.getAgentInboxAt binding snapshot cmd.AgentId
+        |> Result.bind (fun inbox ->
+            ChallengeWorkflow.ChallengeWorkflow.enrichInboxAt binding snapshot cmd.AgentId inbox)
+        |> mapError |> Result.map box
+
+    let private readOther (cmd: TaskReadCommand) rt =
         LedgerBindingConfig.load cmd.ProjectName rt
         |> Result.bind (fun binding ->
             match cmd.Action with
@@ -2552,13 +2578,6 @@ module TaskApi =
             | "GetCompositionOverview" ->
                 WorkCompositionGitLedger.WorkCompositionGitLedger.loadOverviewPage binding cmd.TaskId cmd.PageSize cmd.Cursor
                 |> mapError |> Result.map box
-            | "AgentInbox" ->
-                LedgerStore.LedgerStore.fetch binding
-                |> Result.bind (fun snapshot ->
-                    ReviewWorkflow.ReviewWorkflow.getAgentInboxAt binding snapshot cmd.AgentId
-                    |> Result.bind (fun inbox ->
-                        ChallengeWorkflow.ChallengeWorkflow.enrichInboxAt binding snapshot cmd.AgentId inbox))
-                |> mapError |> Result.map box
             | "GetAssignment" ->
                 ReviewWorkflow.ReviewWorkflow.getAssignment binding cmd.TaskId cmd.AssignmentGeneration
                 |> mapError |> Result.map box
@@ -2572,6 +2591,12 @@ module TaskApi =
                 ReviewWorkflow.ReviewWorkflow.inspectAttemptSource binding cmd.TaskId
                 |> mapError |> Result.map box
             | _ -> Error(Client.ValidationError "Unsupported  task read operation."))
+
+    let read (cmd: TaskReadCommand) rt =
+        if cmd.Action = "AgentInbox" then
+            LedgerBindingConfig.loadWithSnapshot cmd.ProjectName rt
+            |> Result.bind (fun (binding, snapshot) -> readInboxAt cmd binding snapshot)
+        else readOther cmd rt
 
     // Administrative operation provenance is user-scoped, not inferred from
     // provider-specific conversation metadata. Historical receipts preserve

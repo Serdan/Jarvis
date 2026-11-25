@@ -849,6 +849,13 @@ module LedgerStore =
     let fetch (binding: LedgerBinding) : Result<LedgerSnapshot, LedgerFailure> =
         fetchWithRetries 8 binding
 
+    // A successful transaction's CurrentHead is the exact remotely confirmed
+    // snapshot, not the locally proposed commit. Reconstruct its header without
+    // another network read; callers still verify the persisted trust anchor.
+    let internal snapshotOfConfirmedWrite binding (write: LedgerWrite) =
+        readHeader binding write.CurrentHead
+        |> Result.map (fun header -> { Commit = write.CurrentHead; Header = header })
+
     let verifyTrustedHead (binding: LedgerBinding) (expectedHead: string) (observedHead: string) =
         if String.IsNullOrWhiteSpace expectedHead
            || not (oidPattern.IsMatch expectedHead)

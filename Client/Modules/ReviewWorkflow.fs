@@ -3739,9 +3739,8 @@ module ReviewWorkflow =
     /// assignment may have Execution=Stopped and therefore derived State=Ready
     /// even after its task is explicitly Closed. That is a completion candidate,
     /// not permission to restart the task.
-    let inspectAutomaticActivation binding agentId =
+    let internal inspectAutomaticActivationAt binding snapshot agentId =
         result {
-            let! snapshot = LedgerStore.fetch binding
             let! agent = getAgentWorkingTurnAt binding snapshot agentId
             match box agent.CurrentAssignment with
             | null -> return ActivationIneligible "Agent has no current assignment."
@@ -3766,6 +3765,10 @@ module ReviewWorkflow =
                         return ActivationIneligible $"Task {task.TaskId} has no current attempt."
         }
 
+
+    let inspectAutomaticActivation binding agentId =
+        LedgerStore.fetch binding
+        |> Result.bind (fun snapshot -> inspectAutomaticActivationAt binding snapshot agentId)
 
     // Resolve agent association from the canonical ledger even after a client
     // restart. This is identity for activity tracking, not evidence of Working.

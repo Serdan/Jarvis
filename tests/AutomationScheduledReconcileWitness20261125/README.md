@@ -33,13 +33,32 @@ loaded and asserted on the executeJs frame. No actual provider invocation.
   stages (23/23 in checkpoint 15738); this fixture adds hosted positive and
   changed-effect/transport evidence, not another restart model.
 
-Run from an isolated checkout:
+Run from a clean isolated checkout. Both cases are nonparallel because the
+fixture temporarily owns the process Git environment. It snapshots and clears
+all inherited GIT_* variables, disables system Git configuration, points global
+Git configuration at a private scratch path, and supplies fake author and
+committer identities. It restores the original environment in a finally path,
+including after a deliberate fixture failure exercised by the late-no-send case.
+The fixture does not read or modify host Git configuration or use real identity.
+
+For a hermetic focused run, set private HOME, XDG_CONFIG_HOME and TMPDIR
+and use an existing package cache if needed. Deliberately hostile fake Git
+overrides below must not reach the fixture Git commands; the tests assert
+restoration of the caller's environment after success and failure.
 
 ```sh
-dotnet test tests/AutomationScheduledReconcileWitness20261125/AutomationScheduledReconcileWitness20261125.fsproj -c Release -m:1 --logger 'trx;LogFileName=w21-scheduled-reconcile-final-v2.trx'
+scratch=$(mktemp -d)
+mkdir -p "$scratch/home" "$scratch/config" "$scratch/tmp"
+env HOME="$scratch/home" XDG_CONFIG_HOME="$scratch/config" TMPDIR="$scratch/tmp" \
+  NUGET_PACKAGES="${NUGET_PACKAGES:-$HOME/.nuget/packages}" \
+  GIT_DIR="$scratch/nonexistent.git" GIT_CONFIG_COUNT=1 \
+  GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=hostile-fixture \
+  GIT_AUTHOR_NAME=hostile-fixture GIT_AUTHOR_EMAIL=hostile@example.test \
+  GIT_COMMITTER_NAME=hostile-fixture GIT_COMMITTER_EMAIL=hostile@example.test \
+  dotnet test tests/AutomationScheduledReconcileWitness20261125/AutomationScheduledReconcileWitness20261125.fsproj -c Release -m:1 --logger 'trx;LogFileName=w21-scheduled-reconcile-hermetic.trx'
 ```
 
-Final job `4b915a90524142579dcbc3c403e52fb2`, exit 0, 2/2 passed,
+Historical pre-hermetic job `4b915a90524142579dcbc3c403e52fb2`, exit 0, 2/2 passed,
 0 failed, 0 skipped. The dependencies were built from the pinned source
 in job `9d99002c152d41a5b652db84ece2d027`; final fixture-only run added
 `--no-restore -p:BuildProjectReferences=false`. TRX at

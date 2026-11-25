@@ -26,29 +26,62 @@ let private git directory args =
     if proc.ExitCode <> 0 then failwith error
     output.Trim()
 
+let private gitEnvironment () =
+    Environment.GetEnvironmentVariables()
+    |> Seq.cast<System.Collections.DictionaryEntry>
+    |> Seq.choose (fun entry ->
+        let name = entry.Key :?> string
+        if name.StartsWith("GIT_", StringComparison.OrdinalIgnoreCase) then
+            Some (name, entry.Value :?> string)
+        else None)
+    |> Map.ofSeq
+
+let private clearGitEnvironment () =
+    for KeyValue(name, _) in gitEnvironment () do
+        Environment.SetEnvironmentVariable(name, null)
+
+let private withFixtureGitEnvironment root action =
+    let inherited = gitEnvironment ()
+    try
+        clearGitEnvironment ()
+        for name, value in
+            [ "GIT_CONFIG_GLOBAL", Path.Combine(root, "gitconfig")
+              "GIT_CONFIG_NOSYSTEM", "1"
+              "GIT_AUTHOR_NAME", "Fixture"
+              "GIT_AUTHOR_EMAIL", "fixture@example.test"
+              "GIT_COMMITTER_NAME", "Fixture"
+              "GIT_COMMITTER_EMAIL", "fixture@example.test" ] do
+            Environment.SetEnvironmentVariable(name, value)
+        action ()
+    finally
+        clearGitEnvironment ()
+        for KeyValue(name, value) in inherited do
+            Environment.SetEnvironmentVariable(name, value)
+
 let private fixture action =
     let root = Path.Combine(Path.GetTempPath(), "jarvis-ready-resume-" + Guid.NewGuid().ToString("N"))
     Directory.CreateDirectory root |> ignore
     try
-        let bare = Path.Combine(root, "remote.git")
-        let local = Path.Combine(root, "local")
-        git root ["init"; "--bare"; "--initial-branch=main"; bare] |> ignore
-        git root ["clone"; bare; local] |> ignore
-        File.WriteAllText(Path.Combine(local, "source.txt"), "fixture")
-        git local ["add"; "source.txt"] |> ignore
-        git local ["-c"; "user.name=Fixture"; "-c"; "user.email=fixture@example.test"; "commit"; "-m"; "fixture"] |> ignore
-        git local ["push"; "-u"; "origin"; "HEAD"] |> ignore
-        let binding =
-            { RepositoryPath = local; RemoteName = "origin"; ApprovedFetchUrl = bare; ApprovedPushUrl = bare
-              ProjectId = Guid.NewGuid(); LedgerId = Guid.NewGuid(); Epoch = 1 }
-        LedgerStore.initialize binding true |> good |> ignore
-        let assign agent task =
-            ReviewWorkflow.registerAgent binding (Guid.NewGuid()) agent |> good |> ignore
-            ReviewWorkflow.createTask binding (Guid.NewGuid()) task task |> good |> ignore
-            ReviewWorkflow.assignTask binding (Guid.NewGuid()) task (Guid.NewGuid()) agent |> good |> ignore
-        RoleInstructions.setLaunchTemplate binding "fixture" (Guid.NewGuid()) 0 "Agent {{agentId}}, project {{projectName}}. Call inbox."
-        |> good |> ignore
-        action binding assign
+        withFixtureGitEnvironment root (fun () ->
+            let bare = Path.Combine(root, "remote.git")
+            let local = Path.Combine(root, "local")
+            git root ["init"; "--bare"; "--initial-branch=main"; bare] |> ignore
+            git root ["clone"; bare; local] |> ignore
+            File.WriteAllText(Path.Combine(local, "source.txt"), "fixture")
+            git local ["add"; "source.txt"] |> ignore
+            git local ["-c"; "user.name=Fixture"; "-c"; "user.email=fixture@example.test"; "commit"; "-m"; "fixture"] |> ignore
+            git local ["push"; "-u"; "origin"; "HEAD"] |> ignore
+            let binding =
+                { RepositoryPath = local; RemoteName = "origin"; ApprovedFetchUrl = bare; ApprovedPushUrl = bare
+                  ProjectId = Guid.NewGuid(); LedgerId = Guid.NewGuid(); Epoch = 1 }
+            LedgerStore.initialize binding true |> good |> ignore
+            let assign agent task =
+                ReviewWorkflow.registerAgent binding (Guid.NewGuid()) agent |> good |> ignore
+                ReviewWorkflow.createTask binding (Guid.NewGuid()) task task |> good |> ignore
+                ReviewWorkflow.assignTask binding (Guid.NewGuid()) task (Guid.NewGuid()) agent |> good |> ignore
+            RoleInstructions.setLaunchTemplate binding "fixture" (Guid.NewGuid()) 0 "Agent {{agentId}}, project {{projectName}}. Call inbox."
+            |> good |> ignore
+            action binding assign)
     finally
         Directory.Delete(root, true)
 
@@ -107,6 +140,15 @@ let private prop (raw: string) (key: string) =
 
 [<TestCase(false); TestCase(true); NonParallelizable>]
 let hostedOriginalNoSendOrDisconnect lateNoSend =
+    let inherited = gitEnvironment ()
+    if lateNoSend then
+        let failure =
+            Assert.Throws<InvalidOperationException>(TestDelegate(fun () ->
+                fixture (fun _ _ ->
+                    Assert.That(Environment.GetEnvironmentVariable("GIT_AUTHOR_EMAIL"), Is.EqualTo("fixture@example.test"))
+                    raise (InvalidOperationException("intentional fixture failure")))))
+        Assert.That(failure.Message, Is.EqualTo("intentional fixture failure"))
+        Assert.That(gitEnvironment () = inherited, Is.True, "Git environment must be restored after fixture failure.")
     fixture (fun binding assign ->
         let root = Path.GetDirectoryName(binding.RepositoryPath)
         let prior = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
@@ -303,5 +345,6 @@ let hostedOriginalNoSendOrDisconnect lateNoSend =
             }).GetAwaiter().GetResult()
         finally
             Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior))
+    Assert.That(gitEnvironment () = inherited, Is.True, "Git environment must be restored after fixture success.")
 
 

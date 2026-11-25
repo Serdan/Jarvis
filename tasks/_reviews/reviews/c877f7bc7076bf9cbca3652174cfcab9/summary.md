@@ -1,0 +1,1 @@
+Retry bounded sharing violations during initial pre-journal task/review checks and verified/configuration loads. Preserve single-attempt dashboard grouping and revalidate both directory and lock symlinks on retries. Retain short critical sections, existing Git/CAS boundaries and typed errors. Includes launch-template entry-point regression.

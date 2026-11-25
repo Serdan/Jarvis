@@ -1,0 +1,30 @@
+<article>
+<h1>Complete the already accepted W16 Stage C native host integration</h1>
+<p><strong>Purpose:</strong> Reconcile and, if mechanically safe, complete one existing Pending canonical integration. This is source integration only; it is not deployment, live Scheduler activation, or cutover approval.</p>
+<h2>Exact canonical submission</h2>
+<ul>
+<li>Task: <code>automation-native-provider-session-host-20261123</code></li>
+<li>Submission ID: <code>34ef783acdfd40e0b8efc9c5a5dd3e78</code></li>
+<li>Accepted review: <code>45b0daded19f494fb08cf4456f1be766</code>, Reviewer 1, decision sequence 13786</li>
+<li>Immutable reviewed source commit: <code>b735b2f2f990dc9dd8903a93aebc3202edb10d06</code></li>
+<li>Original base: <code>90dff82aeb3cf5f4885468fccaf9c3ee2bb381a0</code></li>
+<li>Target: <code>refs/heads/main</code></li>
+<li>Existing integration ref: <code>refs/heads/jarvis-integration/34ef783acdfd40e0b8efc9c5a5dd3e78</code></li>
+<li>Target head at submission: <code>d5260fa2b5e03dc3b04cf392ee21c39802c69f5f</code></li>
+</ul>
+<h2>Procedure</h2>
+<ol>
+<li>Read the latest canonical integration submissions and review details again. Confirm the exact submission remains Pending and the exact review remains Accepted at the immutable reviewed head.</li>
+<li>Use the verified remote target head, not the dirty local main checkout (local main is behind origin/main by 227 commits and has unrelated modifications).</li>
+<li>Determine whether the reviewed source is already directly contained in current main or whether the managed integration ref is a mechanically clean merge of current target and the exact reviewed source. Preserve exact source and target provenance.</li>
+<li>If and only if the canonical submission remains Pending and the merge is mechanically clean, complete it using the existing <code>complete_integration</code> operation for this exact submission. Record the actual integrated commit and verify remote readback/canonical receipt.</li>
+<li>If already integrated, reconcile and record the exact receipt. If conflict, missing source, stale review, uncertain external outcome, or any mismatch exists, do not retry, rebase, alter the review, or merge manually; checkpoint exact evidence and yield.</li>
+</ol>
+<h2>Prohibitions</h2>
+<ul>
+<li>Do not change source code, re-submit or replace the review, create another integration submission, force-push, or merge manually.</li>
+<li>Do not deploy, restart, migrate, activate Scheduler, perform real reservations/sends/releases, or claim operational acceptance from source integration.</li>
+<li>Do not use local main or modify its unrelated dirty files.</li>
+</ul>
+<p>Complete only the exact already accepted pending integration and record the canonical terminal receipt. Operator controls launch; do not spawn a browser session.</p>
+</article>

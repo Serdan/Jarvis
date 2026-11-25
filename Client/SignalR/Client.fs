@@ -885,114 +885,110 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
     | BrowserRunInNewTabCommand cmd ->
         fromBrowser (
             ValueTask<Result<string,EffectError>>(task {
-                match ClientConfig.capacityFenceMode () with
-                | Ok ClientConfig.NegativeOnly ->
-                    return Error(Client.ValidationError "HOLD: capacity fence enabled; trusted admission unavailable.")
-                | Error error ->
-                    return Error(Client.ValidationError ("HOLD: capacity fence configuration unavailable: " + error))
-                | Ok ClientConfig.Disabled ->
-                    match rt.Browser with
-                    | None -> return Error(Client.ValidationError "BridgeDisabled")
-                    | Some bridge ->
-                        match ProjectPaths.validateProjectRelativePath cmd.ScriptPath with
+                // Capacity limits apply only to Scheduler launches. Keep manual
+                // browser dispatch independent of capacity policy and its availability.
+                match rt.Browser with
+                | None -> return Error(Client.ValidationError "BridgeDisabled")
+                | Some bridge ->
+                    match ProjectPaths.validateProjectRelativePath cmd.ScriptPath with
+                    | Error e -> return Error e
+                    | Ok _ when not (cmd.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
+                        return Error(Client.ValidationError "Browser script must be a .js file.")
+                    | Ok _ when Path.GetFileName(cmd.ScriptPath.Replace('\\', '/')) = "launchAgent.js"
+                                && (cmd.TargetAgentId |> Option.forall String.IsNullOrWhiteSpace) ->
+                        return Error(Client.ValidationError "targetAgentId is required for an agent launch.")
+                    | Ok _ ->
+                        match ProjectPaths.resolveProjectFile cmd.ProjectName cmd.ScriptPath rt with
                         | Error e -> return Error e
-                        | Ok _ when not (cmd.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
-                            return Error(Client.ValidationError "Browser script must be a .js file.")
-                        | Ok _ when Path.GetFileName(cmd.ScriptPath.Replace('\\', '/')) = "launchAgent.js"
-                                    && (cmd.TargetAgentId |> Option.forall String.IsNullOrWhiteSpace) ->
-                            return Error(Client.ValidationError "targetAgentId is required for an agent launch.")
-                        | Ok _ ->
-                            match ProjectPaths.resolveProjectFile cmd.ProjectName cmd.ScriptPath rt with
-                            | Error e -> return Error e
-                            | Ok(FilePath path) ->
-                                try
-                                    if FileInfo(path).Length > int64 BrowserBridge.MaxScriptBytes then
-                                        return Error(Client.ValidationError "InputTooLarge: script exceeds 64 KiB.")
-                                    else
-                                        let source =
-                                            match cmd.TargetAgentId with
-                                            | Some _ -> readAttributedLaunchSource path
-                                            | None -> File.ReadAllText(path, UTF8Encoding(false, true))
-                                        let args = defaultArg cmd.ArgsJson "{}"
-                                        use validatedArgs = JsonDocument.Parse(args)
-                                        // Every new agent tab closes by default; an explicit false is a debugging opt-out.
-                                        let closeAfterExecution = defaultArg cmd.CloseTabAfterExecution true
-                                        let launchId = Guid.NewGuid()
-                                        let attribution =
-                                            match cmd.TargetAgentId with
-                                            | None -> Ok None
-                                            | Some targetId ->
-                                                match OrchestrationApi.LedgerBindingConfig.load cmd.ProjectName rt with
+                        | Ok(FilePath path) ->
+                            try
+                                if FileInfo(path).Length > int64 BrowserBridge.MaxScriptBytes then
+                                    return Error(Client.ValidationError "InputTooLarge: script exceeds 64 KiB.")
+                                else
+                                    let source =
+                                        match cmd.TargetAgentId with
+                                        | Some _ -> readAttributedLaunchSource path
+                                        | None -> File.ReadAllText(path, UTF8Encoding(false, true))
+                                    let args = defaultArg cmd.ArgsJson "{}"
+                                    use validatedArgs = JsonDocument.Parse(args)
+                                    // Every new agent tab closes by default; an explicit false is a debugging opt-out.
+                                    let closeAfterExecution = defaultArg cmd.CloseTabAfterExecution true
+                                    let launchId = Guid.NewGuid()
+                                    let attribution =
+                                        match cmd.TargetAgentId with
+                                        | None -> Ok None
+                                        | Some targetId ->
+                                            match OrchestrationApi.LedgerBindingConfig.load cmd.ProjectName rt with
+                                            | Error e -> Error (string e)
+                                            | Ok binding ->
+                                                match beginAttributedLaunch binding agentId targetId launchId cmd.ScriptPath source with
                                                 | Error e -> Error (string e)
-                                                | Ok binding ->
-                                                    match beginAttributedLaunch binding agentId targetId launchId cmd.ScriptPath source with
-                                                    | Error e -> Error (string e)
-                                                    | Ok receipt when receipt.AlreadyApplied ->
-                                                        Error "Launch intent already recorded; do not retry Send."
-                                                    | Ok _ -> Ok (Some binding)
-                                        match attribution with
-                                        | Error e -> return Error(Client.ValidationError ("LaunchAttributionNotRecorded: " + e))
-                                        | Ok binding ->
-                                            let mutable observed : JsonElement option = None
-                                            let! result =
-                                                BrowserBridge.runInNewTabWithObservation bridge cmd.WindowRegistration cmd.Url "" (defaultArg cmd.Active false) source args (defaultArg cmd.TimeoutMs 30000) closeAfterExecution (fun value -> observed <- Some value)
-                                            let getString (value: JsonElement) (name: string) =
-                                                if value.ValueKind <> JsonValueKind.Object then null
-                                                else
-                                                    match value.TryGetProperty(name) with
-                                                    | true, field when field.ValueKind = JsonValueKind.String -> field.GetString()
-                                                    | _ -> null
-                                            let mutable registration = null
-                                            let mutable outcome = "outcomeUnknown"
-                                            match result with
-                                            | Ok raw ->
-                                                use doc = JsonDocument.Parse(raw)
-                                                registration <- getString doc.RootElement "registrationId"
-                                                outcome <- getString doc.RootElement "status"
-                                            | Error (id, reason) ->
-                                                registration <- id
-                                                if not (reason.StartsWith("OutcomeUnknown", StringComparison.Ordinal)) then
-                                                    outcome <- "notSubmitted"
-                                            let labels =
-                                                match observed with
-                                                | Some value when value.ValueKind = JsonValueKind.Object ->
-                                                    match value.TryGetProperty("observedSelection") with
-                                                    | true, item when item.ValueKind = JsonValueKind.Object -> Some item
-                                                    | _ -> None
-                                                | _ -> None
-                                            let label name = labels |> Option.map (fun value -> getString value name) |> Option.defaultValue null
-                                            let field name = observed |> Option.map (fun value -> getString value name) |> Option.defaultValue null
-                                            let conversationUrl = field "conversationUrl"
-                                            let reason =
-                                                match field "reason" with
-                                                | "SubmissionUnconfirmed" | "SendClickUncertain" | "ConversationUrlUnavailable"
-                                                | "UnexpectedUiErrorAfterSend" as value -> value
+                                                | Ok receipt when receipt.AlreadyApplied ->
+                                                    Error "Launch intent already recorded; do not retry Send."
+                                                | Ok _ -> Ok (Some binding)
+                                    match attribution with
+                                    | Error e -> return Error(Client.ValidationError ("LaunchAttributionNotRecorded: " + e))
+                                    | Ok binding ->
+                                        let mutable observed : JsonElement option = None
+                                        let! result =
+                                            BrowserBridge.runInNewTabWithObservation bridge cmd.WindowRegistration cmd.Url "" (defaultArg cmd.Active false) source args (defaultArg cmd.TimeoutMs 30000) closeAfterExecution (fun value -> observed <- Some value)
+                                        let getString (value: JsonElement) (name: string) =
+                                            if value.ValueKind <> JsonValueKind.Object then null
+                                            else
+                                                match value.TryGetProperty(name) with
+                                                | true, field when field.ValueKind = JsonValueKind.String -> field.GetString()
                                                 | _ -> null
-                                            let outcomeJson = JsonSerializer.Serialize(
-                                                {| launchId = launchId.ToString("N"); registrationId = registration
-                                                   outcome = outcome; reason = reason; timestampUtc = DateTimeOffset.UtcNow
-                                                   mode = label "mode"; model = label "model"; effort = label "effort"
-                                                   conversationUrl = conversationUrl |})
-                                            let persisted =
-                                                match binding with
-                                                | None -> Ok ()
-                                                | Some value -> finishAttributedLaunch value agentId launchId outcomeJson |> Result.map ignore |> Result.mapError string
-                                            match persisted with
-                                            | Error error ->
-                                                return Error(Client.ValidationError ($"LaunchOutcomePersistenceUnknown: launchId={launchId:N}; do not retry Send; " + error))
-                                            | Ok () ->
-                                                return result
-                                                       |> Result.mapError (fun (registrationId,error) ->
-                                                           let detail =
-                                                               if String.IsNullOrWhiteSpace(registrationId) then error
-                                                               else error + " [tabRegistration=" + registrationId + "]"
-                                                           Client.ValidationError detail)
-                                with
-                                | :? InvalidDataException as e -> return Error(Client.ValidationError e.Message)
-                                | :? DecoderFallbackException -> return Error(Client.ValidationError "InvalidUtf8")
-                                | :? JsonException -> return Error(Client.ValidationError "InvalidArgumentsJson")
-                                | :? FileNotFoundException -> return Error(Client.NotFoundError "ScriptNotFound")
-                                | ex -> return Error(Client.ExceptionError ex)
+                                        let mutable registration = null
+                                        let mutable outcome = "outcomeUnknown"
+                                        match result with
+                                        | Ok raw ->
+                                            use doc = JsonDocument.Parse(raw)
+                                            registration <- getString doc.RootElement "registrationId"
+                                            outcome <- getString doc.RootElement "status"
+                                        | Error (id, reason) ->
+                                            registration <- id
+                                            if not (reason.StartsWith("OutcomeUnknown", StringComparison.Ordinal)) then
+                                                outcome <- "notSubmitted"
+                                        let labels =
+                                            match observed with
+                                            | Some value when value.ValueKind = JsonValueKind.Object ->
+                                                match value.TryGetProperty("observedSelection") with
+                                                | true, item when item.ValueKind = JsonValueKind.Object -> Some item
+                                                | _ -> None
+                                            | _ -> None
+                                        let label name = labels |> Option.map (fun value -> getString value name) |> Option.defaultValue null
+                                        let field name = observed |> Option.map (fun value -> getString value name) |> Option.defaultValue null
+                                        let conversationUrl = field "conversationUrl"
+                                        let reason =
+                                            match field "reason" with
+                                            | "SubmissionUnconfirmed" | "SendClickUncertain" | "ConversationUrlUnavailable"
+                                            | "UnexpectedUiErrorAfterSend" as value -> value
+                                            | _ -> null
+                                        let outcomeJson = JsonSerializer.Serialize(
+                                            {| launchId = launchId.ToString("N"); registrationId = registration
+                                               outcome = outcome; reason = reason; timestampUtc = DateTimeOffset.UtcNow
+                                               mode = label "mode"; model = label "model"; effort = label "effort"
+                                               conversationUrl = conversationUrl |})
+                                        let persisted =
+                                            match binding with
+                                            | None -> Ok ()
+                                            | Some value -> finishAttributedLaunch value agentId launchId outcomeJson |> Result.map ignore |> Result.mapError string
+                                        match persisted with
+                                        | Error error ->
+                                            return Error(Client.ValidationError ($"LaunchOutcomePersistenceUnknown: launchId={launchId:N}; do not retry Send; " + error))
+                                        | Ok () ->
+                                            return result
+                                                   |> Result.mapError (fun (registrationId,error) ->
+                                                       let detail =
+                                                           if String.IsNullOrWhiteSpace(registrationId) then error
+                                                           else error + " [tabRegistration=" + registrationId + "]"
+                                                       Client.ValidationError detail)
+                            with
+                            | :? InvalidDataException as e -> return Error(Client.ValidationError e.Message)
+                            | :? DecoderFallbackException -> return Error(Client.ValidationError "InvalidUtf8")
+                            | :? JsonException -> return Error(Client.ValidationError "InvalidArgumentsJson")
+                            | :? FileNotFoundException -> return Error(Client.NotFoundError "ScriptNotFound")
+                            | ex -> return Error(Client.ExceptionError ex)
                 })
             )
     | BrowserExecuteFileCommand cmd ->

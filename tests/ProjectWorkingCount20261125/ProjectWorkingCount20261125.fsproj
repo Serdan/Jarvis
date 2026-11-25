@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net11.0</TargetFramework><AssemblyName>Client.Tests</AssemblyName><GenerateProgramFile>false</GenerateProgramFile><DefineConstants>$(DefineConstants);PROJECT_CAPACITY_DISPOSABLE_TEST_ONLY</DefineConstants><IsPackable>false</IsPackable></PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../Client/Client.fsproj" />
+    <Compile Include="../../Client/Modules/ProjectCapacityAdmission.fs" Link="ProjectCapacityAdmission.fs" />
+    <Compile Include="../../Client/Modules/ProjectWorkingCount.fs" Link="ProjectWorkingCount.fs" />
+    <Compile Include="../ProjectCapacityDisposable20261124/Tests.fs" Link="Fixtures.fs" />
+    <Compile Include="Tests.fs" />
+  </ItemGroup>
+  <ItemGroup><PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" /><PackageReference Include="NUnit" Version="4.3.2" /><PackageReference Include="NUnit3TestAdapter" Version="4.6.0" /></ItemGroup>
+</Project>

@@ -176,6 +176,155 @@ type ReviewWorkflowTests() =
             | Error OperationIdReused -> ()
             | other -> Assert.Fail(sprintf "Changed retry must fail: %A" other))
 
+    // This uses the real manual command caller and a disposable authenticated
+    // browser-bridge peer. The peer observes openTab and refuses it; no tab
+    // is opened, script executed, or live service contacted.
+    [<TestCase(1, 1, 1)>]
+    [<TestCase(2, 1, 1)>]
+    [<TestCase(1, 2, 1)>]
+    [<TestCase(2, 1, 3)>]
+    [<TestCase(1, 0, 0)>]
+    [<NonParallelizable>]
+    member _.ManualBrowserDispatchIgnoresSchedulerCapacity(workingCount: int, totalCap: int, roleCap: int) =
+        let configRoot = Path.Combine(Path.GetTempPath(), "jarvis-manual-cap-config-" + Guid.NewGuid().ToString("N"))
+        let previousXdg = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+        try
+            // A deterministic regression for the obsolete device-local fence:
+            // never read or change the operator's actual config.
+            if OperatingSystem.IsLinux() then
+                Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", configRoot)
+                let path = Client.ClientConfig.configPath()
+                Assert.That(path, Is.EqualTo(Path.Combine(configRoot, "Jarvis", "config.json")))
+                Directory.CreateDirectory(Path.GetDirectoryName(path)) |> ignore
+                let raw =
+                    if totalCap = 0 then """{"schemaVersion":1,"capacityFenceEnabled":null}"""
+                    else """{"schemaVersion":1,"capacityFenceEnabled":true}"""
+                File.WriteAllText(path, raw)
+                Assert.That(Client.ClientConfig.capacityFenceModeAt(path).IsOk, Is.EqualTo(totalCap <> 0))
+
+            withFixture (fun one _ first second _ _ _ initTask ->
+                initTask "manual-cap-task"
+                let role = "Worker"
+                Client.RoleInstructions.RoleInstructions.createRole first "AuthenticatedUser" (Guid.NewGuid()) role "Worker" "Fixture"
+                |> success |> ignore
+                let attach id =
+                    Client.RoleInstructions.RoleInstructions.attachRole first "AuthenticatedUser" (Guid.NewGuid()) id role 0
+                    |> success |> ignore
+                attach "Owner"
+                attach "Reviewer"
+                let active =
+                    [ yield "Owner"
+                      for i in 2..workingCount do
+                          let id = sprintf "Crowd%d" i
+                          ReviewWorkflow.registerAgent first (Guid.NewGuid()) id |> success |> ignore
+                          attach id
+                          let current = ReviewWorkflow.getAgentWorkingTurn first id |> success
+                          ReviewWorkflow.startTasklessWork first (Guid.NewGuid()) id current.Version "Fixture occupancy"
+                          |> success |> ignore
+                          yield id ]
+                // Write the same canonical policy record format as the isolated
+                // project capacity producer. Absence is deliberately also tested.
+                let policyPath = "records/project-capacity-policy/policy.json"
+                if totalCap > 0 then
+                    let raw = System.Text.Json.JsonSerializer.Serialize(
+                        {| Schema = 1; Project = first.ProjectId; Ledger = first.LedgerId
+                           Epoch = first.Epoch; Revision = 1; Total = totalCap; Roles = Map.ofList [role, roleCap] |})
+                    let intent : LedgerIntent =
+                        { OperationId = Guid.NewGuid(); Actor = "AuthenticatedUser"; Kind = "FixtureCapacityPolicy"; RequestJson = raw }
+                    LedgerStore.transact first intent (fun _ ->
+                        Ok [{ Path = policyPath; ExpectedBlobOid = None; Content = raw }])
+                    |> success |> ignore
+                let snapshot = LedgerStore.fetch first |> success
+                for id in active do
+                    Assert.That((ReviewWorkflow.getAgentWorkingTurnAt first snapshot id |> success).Execution, Is.EqualTo("Working"))
+                Assert.That((ReviewWorkflow.getAgentWorkingTurnAt first snapshot "Reviewer" |> success).Execution, Is.Not.EqualTo("Working"))
+                let policy, _ = LedgerStore.readAt first snapshot policyPath |> success
+                Assert.That(policy.IsSome, Is.EqualTo(totalCap > 0))
+                let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+                let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+                try
+                    Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                        "owner" context first.ProjectId first.LedgerId first.Epoch
+                        first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl snapshot.Commit true
+                    |> success |> ignore
+                    let runtime = Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.FullTrust)
+                    File.WriteAllText(Path.Combine(one, "launchAgent.js"), "// disposable fixture")
+                    let run = task {
+                        let port =
+                            use listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0)
+                            listener.Start()
+                            (listener.LocalEndpoint :?> System.Net.IPEndPoint).Port
+                        let secret = "disposable-manual-cap-test"
+                        use bridge = new Client.BrowserBridge.Service(port, secret)
+                        bridge.Start()
+                        runtime.Browser <- Some bridge
+                        use socket = new System.Net.WebSockets.ClientWebSocket()
+                        socket.Options.SetRequestHeader("Origin", "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                        use deadline = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(30.))
+                        let send raw =
+                            let bytes = System.Text.Encoding.UTF8.GetBytes(raw: string)
+                            socket.SendAsync(ArraySegment<byte>(bytes), System.Net.WebSockets.WebSocketMessageType.Text, true, deadline.Token)
+                        let receive () = task {
+                            let bytes = Array.zeroCreate<byte> 8192
+                            use stream = new MemoryStream()
+                            let mutable doneFrame = false
+                            while not doneFrame do
+                                let! part = socket.ReceiveAsync(ArraySegment<byte>(bytes), deadline.Token)
+                                if part.MessageType = System.Net.WebSockets.WebSocketMessageType.Close then
+                                    failwith "Disposable peer closed"
+                                stream.Write(bytes, 0, part.Count)
+                                doneFrame <- part.EndOfMessage
+                            return System.Text.Encoding.UTF8.GetString(stream.ToArray()) }
+                        let field raw name =
+                            use doc = System.Text.Json.JsonDocument.Parse(raw: string)
+                            doc.RootElement.GetProperty(name: string).GetString()
+                        let json value = System.Text.Json.JsonSerializer.Serialize(value)
+                        do! socket.ConnectAsync(Uri(sprintf "ws://127.0.0.1:%d/" port), deadline.Token)
+                        let! challenge = receive()
+                        use hmac = new System.Security.Cryptography.HMACSHA256(System.Text.Encoding.UTF8.GetBytes(secret))
+                        let proof = hmac.ComputeHash(System.Text.Encoding.UTF8.GetBytes(field challenge "nonce")) |> Convert.ToHexString |> fun x -> x.ToLowerInvariant()
+                        do! send (json {| version = 2; kind = "authenticate"; proof = proof |})
+                        let! ready = receive()
+                        Assert.That(field ready "kind", Is.EqualTo("ready"))
+                        let connectionId = field ready "connectionId"
+                        do! send """{"version":2,"kind":"windows","windows":[{"windowRegistration":"window-agents","alias":"agents","availability":"ready","registrationGeneration":1}]}"""
+                        let mutable registered = false
+                        for _ in 1..100 do
+                            if not registered then
+                                registered <- bridge.ListWindows() |> Result.exists (fun x -> x.Contains("window-agents"))
+                                if not registered then do! System.Threading.Tasks.Task.Delay(25, deadline.Token)
+                        Assert.That(registered, Is.True)
+                        let command =
+                            Common.BrowserRunInNewTabCommand
+                                { TargetAgentId = Some "Reviewer"; WindowRegistration = "agents"; Url = "https://example.test/"
+                                  ProjectName = "owner"; ScriptPath = "launchAgent.js"; ArgsJson = None
+                                  Active = None; CloseTabAfterExecution = None; TimeoutMs = Some 5000 }
+                        let dispatch =
+                            Client.SignalR.Client.processIncomingCommand runtime
+                                (System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(command)) "Owner"
+                        let pendingFrame = receive()
+                        let! firstFinished = System.Threading.Tasks.Task.WhenAny(dispatch :> System.Threading.Tasks.Task, pendingFrame :> System.Threading.Tasks.Task)
+                        if obj.ReferenceEquals(firstFinished, dispatch) then
+                            let! _, result, _ = dispatch
+                            failwithf "Manual dispatch stopped before reaching browser: %A" result
+                        let! frame = pendingFrame
+                        Assert.That(field frame "kind", Is.EqualTo("openTab"))
+                        Assert.That(field frame "url", Is.EqualTo("https://example.test/"))
+                        do! send (json {| version = 2; kind = "error"; connectionId = connectionId
+                                          requestId = field frame "requestId"; error = "FixtureRefusedOpen" |})
+                        let! _, result, _ = dispatch.WaitAsync(deadline.Token)
+                        Assert.That(sprintf "%A" result, Does.Contain("FixtureRefusedOpen"))
+                    }
+                    run.GetAwaiter().GetResult()
+                    let after = LedgerStore.fetch second |> success
+                    let paths = git second.RepositoryPath ["ls-tree"; "-r"; "--name-only"; after.Commit; "--"; "records/browser-launches"]
+                    Assert.That(paths.Split('\n').Length, Is.EqualTo(2))
+                finally
+                    if File.Exists(configPath) then File.Delete(configPath))
+        finally
+            if OperatingSystem.IsLinux() then Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", previousXdg)
+            if Directory.Exists(configRoot) then Directory.Delete(configRoot, true)
+
     [<Test>]
     member _.BrowserLaunchAttributionDispatchUsesStrictSourceBeforeIntentAndPreservesGenericContract() =
         withFixture (fun one _ first second _ _ _ initTask ->

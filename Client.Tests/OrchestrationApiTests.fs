@@ -310,9 +310,7 @@ let trustBindingSharingContentionReturnsTypedErrorWithoutBlockingDashboard () =
         Directory.Delete(root, true)
 
 
-[<TestCase(true)>]
-[<TestCase(false)>]
-let verifiedTrustBindingLoadRetriesTransientAcquisitionOnly (releaseDuringRetry: bool) =
+let private withTrustBindingForContention test =
     let root, project = GitCommandTests.createTempProject ()
     let path = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot project
     try
@@ -325,7 +323,25 @@ let verifiedTrustBindingLoadRetriesTransientAcquisitionOnly (releaseDuringRetry:
               ApprovedPushUrl = "local-test"; HighestTrustedHead = String.replicate 40 "a" }
         let original = System.Text.Json.JsonSerializer.Serialize(record)
         File.WriteAllText(path, original)
-        use held = new FileStream(path + ".lock", FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)
+        test root project (path + ".lock")
+        Assert.That(File.ReadAllText(path), Is.EqualTo(original))
+    finally
+        if File.Exists(path) then File.Delete(path)
+        if File.Exists(path + ".lock") then File.Delete(path + ".lock")
+        Directory.Delete(root, true)
+
+let private releaseContendedTrustBindingAfterDelay (held: FileStream) test =
+    let release = System.Threading.Tasks.Task.Run(fun () ->
+        System.Threading.Thread.Sleep(60)
+        held.Dispose())
+    try test ()
+    finally release.GetAwaiter().GetResult()
+
+[<TestCase(true)>]
+[<TestCase(false)>]
+let verifiedTrustBindingLoadRetriesTransientAcquisitionOnly (releaseDuringRetry: bool) =
+    withTrustBindingForContention (fun _ project lockPath ->
+        use held = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)
         let mutable fetches = 0
         let load () =
             Client.OrchestrationApi.LedgerBindingConfig.loadAtRootWithSnapshotUsing
@@ -334,17 +350,12 @@ let verifiedTrustBindingLoadRetriesTransientAcquisitionOnly (releaseDuringRetry:
                     Error(LedgerStore.TrustBindingContended "sentinel from fetch"))
                 project
         if releaseDuringRetry then
-            let release = System.Threading.Tasks.Task.Run(fun () ->
-                System.Threading.Thread.Sleep(60)
-                held.Dispose())
-            try
+            releaseContendedTrustBindingAfterDelay held (fun () ->
                 match load () with
                 | Error(Client.LedgerFailureError issue) ->
                     Assert.That(issue.Message, Does.Contain("sentinel from fetch"))
                 | other -> Assert.Fail(sprintf "Expected the fetch's error after acquisition: %A" other)
-                Assert.That(fetches, Is.EqualTo(1))
-            finally
-                release.GetAwaiter().GetResult()
+                Assert.That(fetches, Is.EqualTo(1)))
         else
             let watch = System.Diagnostics.Stopwatch.StartNew()
             match load () with
@@ -354,12 +365,28 @@ let verifiedTrustBindingLoadRetriesTransientAcquisitionOnly (releaseDuringRetry:
             | other -> Assert.Fail(sprintf "Expected the lock's error before fetch: %A" other)
             Assert.That(fetches, Is.Zero)
             Assert.That(watch.ElapsedMilliseconds, Is.GreaterThanOrEqualTo(150L))
-            Assert.That(watch.ElapsedMilliseconds, Is.LessThan(2000L))
-        Assert.That(File.ReadAllText(path), Is.EqualTo(original))
-    finally
-        if File.Exists(path) then File.Delete(path)
-        if File.Exists(path + ".lock") then File.Delete(path + ".lock")
-        Directory.Delete(root, true)
+            Assert.That(watch.ElapsedMilliseconds, Is.LessThan(2000L)))
+
+[<Test>]
+let launchTemplateWriteRetriesBeforeJournaling () =
+    withTrustBindingForContention (fun root _ lockPath ->
+        let context = GitCommandTests.TestContext root
+        GitCommandTests.initRepo context
+        let command : TaskWriteCommand =
+            { ProjectName = "Project1"; Action = "SetLaunchTemplate"
+              OperationId = "invalid-uuid"; TaskId = ""; AttemptId = ""
+              ActorId = "Operator"; OwnerId = ""; Title = ""; Html = ""
+              ExpectedVersion = 2; ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
+              AssignmentGeneration = 0; Summary = ""; NextAction = ""; Reason = ""
+              BaseOid = ""; TargetRef = ""; SourceRef = ""; AllowDetached = false
+              AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+        use held = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)
+        releaseContendedTrustBindingAfterDelay held (fun () ->
+            // UUID validation follows lock acquisition and precedes any Git or journal operation.
+            match Client.OrchestrationApi.TaskApi.write command context with
+            | Error(Client.ValidationError message) ->
+                Assert.That(message, Does.Contain("operationId"))
+            | other -> Assert.Fail(sprintf "Expected operation ID validation after acquisition: %A" other)))
 
 [<Test>]
 let trustBindingErrorClassifierRecognizesSharingOnlyNotOtherIoOrSecurityFailures () =

@@ -84,36 +84,35 @@ module LedgerBindingConfig =
         try
             let dir = Path.GetDirectoryName path
             Directory.CreateDirectory(dir) |> ignore
-            if DirectoryInfo(dir).Attributes.HasFlag(FileAttributes.ReparsePoint) then
-                Error(Client.ValidationError " binding directory must not be a symlink.")
-            else
-                let lockPath = path + ".lock"
-                let rec acquire delays =
-                    if File.Exists(lockPath) && File.GetAttributes(lockPath).HasFlag(FileAttributes.ReparsePoint) then
-                        Error(Client.ValidationError " binding lock must not be a symlink.")
-                    else
-                        try
-                            Ok (new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite,
-                                               FileShare.None, 4096, FileOptions.None))
-                        with
-                        | :? IOException as ex when isTransientSharingViolation ex ->
-                            match delays with
-                            | delay :: remaining ->
-                                System.Threading.Thread.Sleep(delay: int)
-                                acquire remaining
-                            | [] ->
-                                Error(LedgerErrors.toEffect (LedgerStore.TrustBindingContended ex.Message))
-                        | :? UnauthorizedAccessException as ex ->
-                            Error(Client.PermissionDenied $"Cannot access trust-binding lock: {ex.Message}")
-                        | :? IOException as ex ->
-                            Error(Client.ValidationError $"Cannot open trust-binding lock: {ex.Message}")
-                match acquire retryDelaysMs with
-                | Error error -> Error error
-                | Ok stream ->
-                    use held = stream
-                    if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
-                        File.SetUnixFileMode(lockPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
-                    operation ()
+            let lockPath = path + ".lock"
+            let rec acquire delays =
+                if DirectoryInfo(dir).Attributes.HasFlag(FileAttributes.ReparsePoint) then
+                    Error(Client.ValidationError " binding directory must not be a symlink.")
+                elif File.Exists(lockPath) && File.GetAttributes(lockPath).HasFlag(FileAttributes.ReparsePoint) then
+                    Error(Client.ValidationError " binding lock must not be a symlink.")
+                else
+                    try
+                        Ok (new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite,
+                                           FileShare.None, 4096, FileOptions.None))
+                    with
+                    | :? IOException as ex when isTransientSharingViolation ex ->
+                        match delays with
+                        | delay :: remaining ->
+                            System.Threading.Thread.Sleep(delay: int)
+                            acquire remaining
+                        | [] ->
+                            Error(LedgerErrors.toEffect (LedgerStore.TrustBindingContended ex.Message))
+                    | :? UnauthorizedAccessException as ex ->
+                        Error(Client.PermissionDenied $"Cannot access trust-binding lock: {ex.Message}")
+                    | :? IOException as ex ->
+                        Error(Client.ValidationError $"Cannot open trust-binding lock: {ex.Message}")
+            match acquire retryDelaysMs with
+            | Error error -> Error error
+            | Ok stream ->
+                use held = stream
+                if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                    File.SetUnixFileMode(lockPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                operation ()
         with
         | :? UnauthorizedAccessException as ex ->
             Error(Client.PermissionDenied $"Cannot access trust binding: {ex.Message}")
@@ -258,21 +257,27 @@ module LedgerBindingConfig =
     // Inspect locally approved, validated binding identity before network I/O.
     // Dashboard refreshes use it to group aliases of one canonical ledger;
     // this read neither fetches a head nor updates the trust anchor.
-    let private inspectLocalAtRoot root =
+    let private inspectLocalAtRoot retryDelaysMs root =
         let path = pathForRoot root
-        withConfigLock [] path (fun () ->
+        withConfigLock retryDelaysMs path (fun () ->
             readStored path
             |> Result.bind (fun stored ->
                 validStored root stored
                 |> Result.map (fun binding -> binding, stored.HighestTrustedHead)))
 
-    let inspectLocalForContext (context: ProjectPaths.ResolvedProject) =
-        let (FolderPath root) = ProjectPaths.ResolvedProject.sourceRoot context
-        inspectLocalAtRoot root
+    let private inspectLocalUsing retryDelaysMs projectName rt =
+        ProjectPaths.resolveProjectRoot projectName rt
+        |> Result.bind (fun (FolderPath root) -> inspectLocalAtRoot retryDelaysMs root)
 
     let inspectLocal projectName rt =
-        ProjectPaths.resolveProjectRoot projectName rt
-        |> Result.bind (fun (FolderPath root) -> inspectLocalAtRoot root)
+        inspectLocalUsing [] projectName rt
+
+    let inspectLocalForWrite projectName rt =
+        inspectLocalUsing configLockRetryDelaysMs projectName rt
+
+    let inspectLocalForWriteContext (context: ProjectPaths.ResolvedProject) =
+        let (FolderPath root) = ProjectPaths.ResolvedProject.sourceRoot context
+        inspectLocalAtRoot configLockRetryDelaysMs root
 
     // Setup is always an explicit approved action, never a side effect of a read.
     // The expected head is a separately supplied trust anchor, not inferred
@@ -2402,7 +2407,7 @@ module ReviewApi =
         |> Result.bind (fun operationId ->
             // A local, explicitly approved binding is sufficient to journal
             // the original command before the first remote fetch.
-            LedgerBindingConfig.inspectLocal cmd.ProjectName rt
+            LedgerBindingConfig.inspectLocalForWrite cmd.ProjectName rt
             |> Result.bind (fun (binding, _) ->
                 let id () = parseId "requestId" cmd.RequestId
                 let result =
@@ -2629,8 +2634,8 @@ module TaskApi =
     let private writeUsingContext (context: ProjectPaths.ResolvedProject option) (expectedBinding: LedgerStore.LedgerBinding option) (cmd: TaskWriteCommand) rt =
         let inspectLocal () =
             match context with
-            | Some resolved -> LedgerBindingConfig.inspectLocalForContext resolved
-            | None -> LedgerBindingConfig.inspectLocal cmd.ProjectName rt
+            | Some resolved -> LedgerBindingConfig.inspectLocalForWriteContext resolved
+            | None -> LedgerBindingConfig.inspectLocalForWrite cmd.ProjectName rt
         let verifyRemote () =
             match context with
             | Some resolved -> LedgerBindingConfig.loadForContext resolved

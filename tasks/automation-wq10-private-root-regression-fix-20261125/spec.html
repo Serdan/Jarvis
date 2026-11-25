@@ -1,0 +1,22 @@
+<article>
+<h1>Restore the lost private-root fixture regression guards</h1>
+<p><strong>Authorized scope:</strong> a narrowly evidenced test-only correction at the exact final qualification source <code>2be5afb056fc31b0f5f5c7410afaed225b0216bf</code> (tree <code>cb2bfb9ea4b3aa70997d933e0207e5dccc83cd84</code>). Do not use or modify the dirty primary checkout.</p>
+<h2>Evidence and defect</h2>
+<p>Worker 20's completed read-only audit found that commit <code>175b6fb709906a941c2f4f31b226d0487b0a652b</code> added explicit Unix 0700 private-root creation/assertions and group/world-writable rejection controls to exactly these three test files, but merge <code>16ce68173926d76fde23875c2ca1040452c492d4</code> selected the first-parent versions and silently dropped those changes. The final source's three blobs equal the pre-fix versions. Existing retained W27 evidence: pre-fix under umask 0002, one failure; post-fix, 38/38 passed. The private parent scratch directory does not prove the child root's mode.</p>
+<h2>Lease and implementation</h2>
+<ul>
+<li><code>Client.Tests/WorkQueueCanonicalMigrationPrepareTests.fs</code></li>
+<li><code>Client.Tests/WorkQueueMultiLedgerPreparedRecoveryTests.fs</code></li>
+<li><code>Client.Tests/WorkQueueProjectMigrationPrepareTests.fs</code></li>
+</ul>
+<p>Create a clean registered worktree and branch <code>refs/heads/fix/automation-wq10-private-root-regression-w20-20261125</code> from the exact base above; bind the attempt source to <code>refs/heads/main</code>. Restore the exact three reviewed blobs from <code>175b6fb709906a941c2f4f31b226d0487b0a652b</code> (or a semantically identical minimal patch if exact restoration conflicts with current APIs). Preserve both group/world-writable rejection controls, explicit 0700 mode, and canonical-head non-mutation assertions.</p>
+<h2>Acceptance</h2>
+<ul>
+<li>Only the three leased files change; no production code, project files, shared helpers, or unrelated WQ10 paths.</li>
+<li>Run the focused fixture suite under <code>umask 0002</code>; record exact command, discovered/executed counts, TRX path and SHA-256. Expect the previously retained 38/38 post-fix result.</li>
+<li>Demonstrate that both negative controls still reject unsafe roots and leave canonical heads unchanged.</li>
+<li>Do not run the full Client suite or combined qualification. Do not deploy, integrate, merge, or touch the dirty main checkout.</li>
+<li>Publish the exact source snapshot for independent review. Integrator handles integration only after an Accepted review.</li>
+</ul>
+<p>When finished, record a durable checkpoint with the exact source commit, diff paths, test evidence and any deviation from the reviewed blobs, then complete the assignment.</p>
+</article>

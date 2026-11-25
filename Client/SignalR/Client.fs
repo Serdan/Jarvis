@@ -239,18 +239,22 @@ let private retryBindingContention load =
         | result -> result
     attempt 3
 
-let private loadAgentState (rt: Runtime) (project: string) (agentId: string) =
-    match retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt) with
-    | Error error -> Error error
-    | Ok (binding, snapshot) ->
-        match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurnAt binding snapshot agentId with
-        | Ok agent -> Ok(Some agent)
-        // This exact required-entity read reports a missing record at the
-        // verified snapshot as StaleEntityVersion; other failures are unknown.
-        | Error(LedgerStore.StaleEntityVersion _) -> Ok None
-        | Error error -> Error(OrchestrationApi.LedgerErrors.toEffect error)
+type private InboxSnapshot =
+    Result<LedgerStore.LedgerBinding * LedgerStore.LedgerSnapshot, EffectError>
 
-let private checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.ProjectTarget option) command =
+let private agentStateAt agentId (binding, snapshot) =
+    match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurnAt binding snapshot agentId with
+    | Ok agent -> Ok(Some agent)
+    // Only the exact missing-entity error proves absence.
+    | Error(LedgerStore.StaleEntityVersion _) -> Ok None
+    | Error error -> Error(OrchestrationApi.LedgerErrors.toEffect error)
+
+let private loadAgentState (rt: Runtime) (project: string) (agentId: string) =
+    retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt)
+    |> Result.bind (agentStateAt agentId)
+
+let private checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.ProjectTarget option)
+                                 (inboxSnapshot: InboxSnapshot option) command =
     if String.IsNullOrWhiteSpace agentId then []
     else
         match target with
@@ -262,7 +266,9 @@ let private checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.Pro
             let cache = workingGuidanceCaches.GetValue(rt, fun _ -> WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
             let agent =
                 cache.Get(now, projectId, agentId, fun () ->
-                    loadAgentState rt project agentId)
+                    match inboxSnapshot with
+                    | Some verified -> verified |> Result.bind (agentStateAt agentId)
+                    | None -> loadAgentState rt project agentId)
             agent |> Result.toOption |> Option.flatten
             |> Option.bind (WorkingTurnGuidance.instructionAt now)
             |> Option.bind OperationalControl.workingTurn |> Option.toList
@@ -371,7 +377,8 @@ let private activatesAgent (agentId: string) command =
     | _ -> true
 
 let private activateReadyOnActivity (rt: Runtime) (agentId: string)
-                                (target: ProjectPaths.ProjectTarget option) command =
+                                (target: ProjectPaths.ProjectTarget option)
+                                (inboxSnapshot: InboxSnapshot option ref) command =
     if String.IsNullOrWhiteSpace agentId || not (activatesAgent agentId command) then Ok ([], None, [])
     else
         match target with
@@ -386,11 +393,17 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
             // Keep the 2-minute fallback for changes outside Jarvis and missed
             // notifications. Do not fetch from GitHub for every ordinary source call.
             match command with
-            | TaskReadCommand cmd when cmd.Action = "AgentInbox" -> cache.Invalidate(projectId, agentId)
+            | TaskReadCommand cmd when cmd.Action = "AgentInbox" ->
+                cache.Invalidate(projectId, agentId)
+                inboxSnapshot.Value <-
+                    Some(retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt))
             | _ -> ()
             let current =
-                cache.Get(DateTimeOffset.UtcNow, projectId, agentId, fun () ->
-                    loadAgentState rt project agentId)
+                match inboxSnapshot.Value with
+                | Some verified -> verified |> Result.bind (agentStateAt agentId)
+                | None ->
+                    cache.Get(DateTimeOffset.UtcNow, projectId, agentId, fun () ->
+                        loadAgentState rt project agentId)
             // A read of source should remain available without lifecycle
             // authority. Report uncertainty explicitly, never invent a
             // committed activation. Lifecycle commands must fail closed.
@@ -406,7 +419,11 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
             | Ok(Some agent) when agent.State = "Ready"
                               && not (isNull (box agent.CurrentAssignment))
                               && not (String.IsNullOrWhiteSpace agent.CurrentAssignment.TaskId) ->
-                match retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.load project rt) with
+                let bindingResult =
+                    match inboxSnapshot.Value with
+                    | Some verified -> verified |> Result.map fst
+                    | None -> retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.load project rt)
+                match bindingResult with
                 | Error error ->
                     cache.Invalidate(projectId, agentId)
                     unavailable error
@@ -414,7 +431,12 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                     // A Ready cache entry cannot establish the current task
                     // lifecycle. Closure may deliberately retain Started+Ready
                     // so the owner can record a completion checkpoint.
-                    match ReviewWorkflow.ReviewWorkflow.inspectAutomaticActivation binding agentId with
+                    let eligibility =
+                        match inboxSnapshot.Value with
+                        | Some(Ok(_, snapshot)) ->
+                            ReviewWorkflow.ReviewWorkflow.inspectAutomaticActivationAt binding snapshot agentId
+                        | _ -> ReviewWorkflow.ReviewWorkflow.inspectAutomaticActivation binding agentId
+                    match eligibility with
                     | Error error ->
                         cache.Invalidate(projectId, agentId)
                         unavailable (Client.ValidationError($"Cannot inspect automatic activation eligibility: {error}"))
@@ -427,22 +449,36 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                                 currentTaskId agentId
                         cache.Invalidate(projectId, agentId)
                         match result with
-                        | Ok write when write.AlreadyApplied -> Ok ([], None, [])
                         | Ok write ->
-                            // Only committed transitions emit Working metadata.
-                            let committed : AgentInboxActivation =
-                                { ProjectName = project
-                                  AgentId = agentId
-                                  ActivatedByThisCall = true
-                                  BeforeState = Some "Ready"
-                                  AfterState = Some "Working"
-                                  CommittedHead = Some write.CurrentHead
-                                  OperationId = Some write.Operation.OperationId }
-                            Ok (Client.LedgerStore.LedgerStore.changedAgentIds write, Some committed, [])
+                            if inboxSnapshot.Value.IsSome then
+                                inboxSnapshot.Value <-
+                                    Some(retryBindingContention (fun () ->
+                                        OrchestrationApi.LedgerBindingConfig.loadWithConfirmedWrite project rt binding write))
+                            if write.AlreadyApplied then Ok ([], None, [])
+                            else
+                                // Only committed transitions emit Working metadata.
+                                let committed : AgentInboxActivation =
+                                    { ProjectName = project
+                                      AgentId = agentId
+                                      ActivatedByThisCall = true
+                                      BeforeState = Some "Ready"
+                                      AfterState = Some "Working"
+                                      CommittedHead = Some write.CurrentHead
+                                      OperationId = Some write.Operation.OperationId }
+                                Ok (Client.LedgerStore.LedgerStore.changedAgentIds write, Some committed, [])
                         | Error(Client.LedgerStore.StaleEntityVersion detail) ->
                             // Another call may have started or closed the task
                             // after eligibility was read. Reinspect canonically.
-                            match ReviewWorkflow.ReviewWorkflow.inspectAutomaticActivation binding agentId with
+                            let latest =
+                                if inboxSnapshot.Value.IsSome then
+                                    let verified = retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt)
+                                    inboxSnapshot.Value <- Some verified
+                                    match verified with
+                                    | Ok(latestBinding, snapshot) when latestBinding = binding ->
+                                        ReviewWorkflow.ReviewWorkflow.inspectAutomaticActivationAt binding snapshot agentId
+                                    | _ -> Error(LedgerStore.InvalidBinding "Cannot verify concurrent activation snapshot.")
+                                else ReviewWorkflow.ReviewWorkflow.inspectAutomaticActivation binding agentId
+                            match latest with
                             | Ok(Client.ReviewWorkflow.ActivationIneligible _) -> Ok ([], None, [])
                             | Ok(Client.ReviewWorkflow.ActivationEligible latestTaskId) ->
                                 Error(Client.ValidationError(
@@ -746,7 +782,8 @@ let internal finishAttributedLaunch binding actor (launchId: Guid) outcomeJson =
 
 let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
                      (resolved: ProjectPaths.ResolvedProject option) (agentId: string) (command: AgentCommand)
-                     (onChallengeCommit: ChallengeWakePostCommit option) =
+                     (onChallengeCommit: ChallengeWakePostCommit option)
+                     (inboxSnapshot: InboxSnapshot option) =
     match command with
     | ListCommandsCommand -> rt |> ProjectBrowser.listCommands |> serialize'
     | BrowserListWindowsCommand ->
@@ -1079,6 +1116,10 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
         rt |> OrchestrationApi.WorkQueueApi.write cmd |> serialize'
     | WorkPriorityCommand cmd ->
         rt |> OrchestrationApi.WorkQueueApi.setPriority cmd |> serialize'
+    | TaskReadCommand cmd when cmd.Action = "AgentInbox" && inboxSnapshot.IsSome ->
+        inboxSnapshot.Value
+        |> Result.bind (fun (binding, snapshot) -> OrchestrationApi.TaskApi.readInboxAt cmd binding snapshot)
+        |> serialize'
     | TaskReadCommand cmd -> rt |> OrchestrationApi.TaskApi.read cmd |> serialize'
     | ObserveAgentCommand cmd ->
         rt |> OrchestrationApi.AgentObservationApi.observe cmd
@@ -1211,7 +1252,8 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
                                     (resolved: ProjectPaths.ResolvedProject option)
                                     (preparedTask: ProjectTaskDefinition option) (agentId: string) (command: AgentCommand)
                                     (sourceOriginalId: string option) (manualGrantAuthorized: bool)
-                                    (onChallengeCommit: ChallengeWakePostCommit option) =
+                                    (onChallengeCommit: ChallengeWakePostCommit option)
+                                    (inboxSnapshot: InboxSnapshot option) =
     task {
         let activityId =
             match command with
@@ -1299,7 +1341,7 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
                                     | Ok invocation ->
                                         let! result =
                                             SourceEffectRouteBridge.executeDiagnostic invocation command
-                                                (fun () -> (dispatch rt target resolved agentId command onChallengeCommit).AsTask())
+                                                (fun () -> (dispatch rt target resolved agentId command onChallengeCommit inboxSnapshot).AsTask())
                                         return result |> Result.mapError Client.ValidationError |> Result.bind id
                                 | _ ->
                                     return Error(Client.ValidationError
@@ -1322,7 +1364,7 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
                                     (fun () -> ClientShell.runProjectTask cmd.ProjectName task)) rt |> serialize'
                                 return result
                             | Ok(), None ->
-                                let! result = dispatch rt target resolved agentId command onChallengeCommit
+                                let! result = dispatch rt target resolved agentId command onChallengeCommit inboxSnapshot
                                 return result
             }
 
@@ -1346,7 +1388,7 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
 
 let receiveCommand (rt: Runtime) (command: AgentCommand) =
     task {
-        let! result = receiveCommandForTarget rt None None None "" command None false None
+        let! result = receiveCommandForTarget rt None None None "" command None false None None
         return result |> Result.map (fun outcome -> outcome.Payload)
     }
 
@@ -1420,12 +1462,13 @@ let internal prepareSourceOperation (rt: Runtime) (target: ProjectPaths.ProjectT
 let private receivePreparedCommand (rt: Runtime)
                                    (target: ProjectPaths.ProjectTarget option) (agentId: string) command
                                    (sourceOriginalId: string option) (manualGrantAuthorized: bool)
-                                   (onChallengeCommit: ChallengeWakePostCommit option) =
+                                   (onChallengeCommit: ChallengeWakePostCommit option)
+                                   (inboxSnapshot: InboxSnapshot option) =
     task {
         match prepareSourceOperation rt target command with
         | Error error -> return Error error
         | Ok prepared ->
-            return! receiveCommandForTarget rt target prepared.Source prepared.ProjectTask agentId command sourceOriginalId manualGrantAuthorized onChallengeCommit
+            return! receiveCommandForTarget rt target prepared.Source prepared.ProjectTask agentId command sourceOriginalId manualGrantAuthorized onChallengeCommit inboxSnapshot
     }
 
 // Shared by SignalR receive and tests. Identity is supplied by the MCP call,
@@ -1514,7 +1557,9 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                         if not (String.IsNullOrWhiteSpace localAgentId) then
                             target |> Option.iter (fun selected ->
                                 rt.Tui.RecordAgentSeen(AgentView.activityProject selected, localAgentId))
-                        match activateReadyOnActivity rt localAgentId target command with
+                        // Request-local only: never use this observation to serve another inbox.
+                        let inboxSnapshot: InboxSnapshot option ref = ref None
+                        match activateReadyOnActivity rt localAgentId target inboxSnapshot command with
                         | Error error -> return Error error
                         | Ok (changes, committedActivation, activationInstructions) ->
                             implicitChanges <- changes
@@ -1526,7 +1571,7 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                                 // Polling does not activate or record local
                                 // agent activity, but access checks still need
                                 // the initiating actor label from the transport.
-                                receivePreparedCommand rt target agentId command sourceOriginalId manualGrantAuthorized onChallengeCommit
+                                receivePreparedCommand rt target agentId command sourceOriginalId manualGrantAuthorized onChallengeCommit inboxSnapshot.Value
                             // A write may alter another agent's state, or none
                             // at all. Invalidate precisely the affected local
                             // cache entries before preparing turn guidance.
@@ -1538,7 +1583,7 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                                 for changed in outcome.ChangedAgentIds do
                                     cache.Invalidate(projectId, changed)
                             | _ -> ()
-                            instructions <- OperationalControl.ordered (activationInstructions @ checkWorkingGuidance rt localAgentId target command)
+                            instructions <- OperationalControl.ordered (activationInstructions @ checkWorkingGuidance rt localAgentId target inboxSnapshot.Value command)
                             return result
                 with ex ->
                     unexpectedFailure <- true

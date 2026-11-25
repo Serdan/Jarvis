@@ -4310,6 +4310,96 @@ type ReviewWorkflowTests() =
                 if File.Exists configPath then File.Delete configPath)
 
     [<Test>]
+    member _.SelfInboxReusesVerifiedSnapshotAndConfirmedActivationHead() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let taskId = "inbox-fetch-budget"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Inbox fetch budget" |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" |> success |> ignore
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            try
+                let head = (LedgerStore.fetch first |> success).Commit
+                let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" ctx first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl head true
+                |> success |> ignore
+                let runtime () =
+                    Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+                let command : Common.AgentCommand =
+                    Common.TaskReadCommand
+                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"
+                          TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
+                          Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
+                let payload = System.Text.Json.JsonSerializer.Serialize(command)
+                // Use the authenticated execution boundary, excluding independent
+                // visible-response alert delivery. Delay each physical fetch by
+                // 100ms to expose the network contribution reproducibly.
+                let invoke rt =
+                    Client.SignalR.Client.executeAuthenticatedCommandWithChallengeWake
+                        rt payload "Owner" None false (fun _ _ -> ())
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                let measure label rt =
+                    let sw = Stopwatch.StartNew()
+                    let response, io =
+                        LedgerStore.measureGitReads (fun () ->
+                            LedgerStore.withGitTransportFaults (fun _ args ->
+                                match args with
+                                | "fetch" :: _ -> System.Threading.Thread.Sleep(100); None
+                                | _ -> None) (fun () -> invoke rt))
+                    sw.Stop()
+                    TestContext.Progress.WriteLine(
+                        sprintf "%s: fetches=%d elapsedMs=%d" label io.RemoteFetches sw.ElapsedMilliseconds)
+                    response, io
+                let rt = runtime()
+                let ready, readyIo = measure "Ready inbox" rt
+                let working, workingIo = measure "Working inbox" rt
+                Assert.That(ready.Error.IsNone, Is.True, sprintf "%A" ready.Error)
+                Assert.That(working.Error.IsNone, Is.True, sprintf "%A" working.Error)
+                Assert.That(readyIo.RemoteFetches, Is.EqualTo(3),
+                            "Ready requires one verified read, transaction prepublication and confirmation.")
+                Assert.That(workingIo.RemoteFetches, Is.EqualTo(1),
+                            "Working inbox must share one verified read with guidance and projection.")
+                let receipt = ready.InboxActivation.Value
+                Assert.That(receipt.ActivatedByThisCall, Is.True)
+                Assert.That(working.InboxActivation.Value.ActivatedByThisCall, Is.False)
+                let assertWorking (expectedHead: string) (response: Common.AgentCommandResponse) =
+                    Assert.That(response.Error.IsNone, Is.True, sprintf "%A" response.Error)
+                    use doc = System.Text.Json.JsonDocument.Parse(response.Result.Value)
+                    let root = doc.RootElement
+                    Assert.That(root.GetProperty("SnapshotCommit").GetString(), Is.EqualTo(expectedHead))
+                    Assert.That(root.GetProperty("Agent").GetProperty("Execution").GetString(), Is.EqualTo("Working"))
+                    root.GetProperty("Agent").GetProperty("Version").GetInt32()
+                let committed = receipt.CommittedHead.Value
+                let version = assertWorking committed ready
+                Assert.That(assertWorking committed working, Is.EqualTo(version))
+                let stored = System.Text.Json.JsonSerializer.Deserialize<Client.OrchestrationApi.LedgerTrustBinding>(
+                    File.ReadAllText configPath)
+                Assert.That(stored.HighestTrustedHead, Is.EqualTo(committed))
+                let canonical = ReviewWorkflow.getAgentInbox second "Owner" |> success
+                Assert.That(canonical.Agent.Version, Is.EqualTo(version))
+                Assert.That(canonical.Focused.Value.Attempt.Phase, Is.EqualTo("Started"))
+
+                // Race two actual inbox requests on a freshly Ready slot.
+                ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner"
+                    canonical.Focused.Value.Attempt.Version canonical.Agent.Version
+                    canonical.Focused.Value.Attempt.AssignmentGeneration "Yield for concurrency" "Resume"
+                |> success |> ignore
+                let calls =
+                    [| for _ in 1..2 ->
+                        System.Threading.Tasks.Task.Run(fun () -> invoke (runtime())) |]
+                System.Threading.Tasks.Task.WaitAll(calls |> Array.map (fun t -> t :> System.Threading.Tasks.Task))
+                let responses = calls |> Array.map (fun t -> t.Result)
+                let winners = responses |> Array.filter (fun r -> r.InboxActivation.Value.ActivatedByThisCall)
+                Assert.That(winners.Length, Is.EqualTo(1))
+                let raceHead = winners[0].InboxActivation.Value.CommittedHead.Value
+                let versions = responses |> Array.map (assertWorking raceHead)
+                Assert.That(versions[0], Is.EqualTo(versions[1]))
+                let after = ReviewWorkflow.getAgentInbox second "Owner" |> success
+                Assert.That(after.Agent.Version, Is.EqualTo(versions[0]))
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
     member _.ImplicitReadyActivationHasOneWinnerAcrossConcurrentCalls() =
         withFixture (fun _ _ first second _ _ _ _ ->
             let taskId = "implicit-concurrent"

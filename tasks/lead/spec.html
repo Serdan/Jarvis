@@ -1,60 +1,54 @@
 <article>
-<h1>Automation milestone — current execution frontier</h1>
-<p><strong>Objective:</strong> deliver Health, Challenges and the ordinary unattended Scheduler together, independently reviewed and integrated, then separately authorized for deployment, joint operational verification and cutover. Manager remains retired; Lead prepares canonical Ready assignments, and Operator launches agents. Do not spawn browser sessions.</p>
-
+<h1>Lead — Automation milestone current execution plan</h1>
+<h2>Objective and authority</h2>
+<p>Deliver the single Jarvis Automation milestone with all three required features: <strong>Health</strong> (deterministic cross-device liveness and safe recovery), <strong>Challenges</strong> (durable operator interaction, dependency holds and canonical wake/requeue), and <strong>Scheduler</strong> (capacity-aware once-only dispatch and verified terminal release). Report each feature separately. The milestone is not complete until all three have working, independently reviewed, incorporated and deployed behavior, an authorized end-to-end joint test, and explicit Operator cutover.</p>
+<p>Telos is a separate Servitor project. Do not make Telos/Work/SQLite migration or the larger Work graph a Jarvis prerequisite. Manager is retired and Parked; Lead must not reactivate it or launch browser sessions. Keep eligible assignments canonical and Ready; the Operator launches them explicitly. Lead owns actionability, dependencies and this plan. Lead does not implement worker tasks, review its own work, or integrate/merge. Integrator handles accepted source and canonical integration receipts.</p>
+<h2>Authoritative architecture and safety</h2>
+<ul>
+<li>Health follows the explicit 2026-11-21 Operator override: in-process deterministic Health; authenticated server SQLite is authoritative for per-agent qualifying tool-call timestamps; canonical task/attempt/agent ownership and recovery remain in the existing project Git ledger with ordinary optimistic CAS. Default threshold 600 seconds. Missing, invalid or untrusted SQLite evidence means skip recovery, never infer inactivity. Browser-tab closure does not terminate backend execution. No browser liveness sampling, browser Health agents/schedules, leader election, new execution-ID/auth subsystem, or master/slave clients.</li>
+<li>Existing Git-backed project/account ledgers remain authoritative for coordination and Scheduler. No silent activation, parallel old/new writers, deployment, restart, storage migration, unattended Scheduler activation, or cutover without independent review and explicit Operator approval.</li>
+<li>Never retry an uncertain external effect from absence of a ledger receipt/ref alone. Reconcile using the original operation UUID, source/ref, serving client/build and terminal process/transport evidence. Preserve provenance and unknown occupancy.</li>
+<li>A review verdict is not integration; an integration receipt is not deployment or operational acceptance. No unsupported combined .NET11 Release PASS, no invented evidence, no force-push, no unreviewed integration or merge.</li>
+<li>Before converting a review/audit finding into corrective work, acceptance criteria, a blocking dependency or a spec change, obtain one bounded adjudication independent of source author, finding reviewer and corrective-design proposer. Decide Accept/Narrow/Defer/Reject per finding; do not recursively adjudicate.</li>
+</ul>
+<h2>Verified current state</h2>
+<p>The local main checkout is 227 commits behind origin/main and dirty (deploy skill, launcher script, proptest skill and review worktrees). Do not use or modify that checkout for current source decisions; use registered worktrees and exact verified remote refs.</p>
+<ul>
+<li><strong>Health:</strong> accepted activity-admission review <code>1e3e2721ae3a4130ad4c96a59fcebdf6</code>; hosted two-client CAS integration <code>d9bea11986bd8b9ac8318c599c934c78de77c235</code>; roster-sidecar integration <code>b04150</code>. The broader accepted Automation composition <code>d63c49dacda93e246c3b38fe3854ea7a0b2f2135</code> is integrated, but exact containment of every Health constituent has not been proven here. Source integration is not deployment or joint operational acceptance.</li>
+<li><strong>Challenges:</strong> production wake B1 review <code>f539c0a8bd2c4c07936d1962427a7e8f</code> is Accepted; the broader Automation composition <code>d63c49</code> is integrated. There is no standalone B1 integration submission, so do not claim complete containment or end-to-end feature acceptance until exact source and reverse-index/wake/requeue regression evidence are reconciled.</li>
+<li><strong>Scheduler:</strong> project-role capacity admission integrated at <code>0cca782cae187a1101f46bf99a786c441da1d65a</code>; same-CAS capacity-planner handoff integrated at <code>3ee914</code>. The W12 account no-send consumer is Accepted (review <code>bfb7752413cc4efa93a823c07126a0af</code>) but its integration submission <code>a0f5e98c3e5649949dfe84968b94d5f1</code> is Pending. W16 Stage C host is Accepted (review <code>45b0daded19f494fb08cf4456f1be766</code>) but submission <code>34ef783acdfd40e0b8efc9c5a5dd3e78</code> is Pending. W12 must integrate before W16.</li>
+<li><strong>Runtime and production authority remain blocked:</strong> runtime dispatch challenge <code>6fbd14250db4430987f1b30e4215e5ab</code> still lacks the independently accepted executable planner/materialization contract and original-bound terminal/no-send or authorized reconciliation evidence. Planner publication challenge <code>efb3143d66ac4939916c2a41d36ef124</code> is Blocked because original review publication attempts are uncertain; no retry is authorized. Project baseline challenge <code>06716045c7a647a99857906a1694234b</code>, inventory composition challenge <code>5f8cfc67dfb24993aad94c15870b96dc</code>, and manual ingress challenge <code>8696aa43809b4c5f8b99a7c10eca9c37</code> remain Blocked: complete manual/native/scheduled/old-client sender fencing, trusted generation-bound historical occupancy, and original-bound terminal/no-send authority are not established.</li>
+<li><strong>Server qualification:</strong> exact audit baseline <code>2be5afb056fc31b0f5f5c7410afaed225b0216bf</code>, original RED 582/586. Worker 23's read-only audit found four stale Server test contracts, not production permission/routing drift. The proposed two-file correction is not authorized until independent adjudication is complete.</li>
+</ul>
 <h2>Current GO / HOLD</h2>
-<ul>
-<li><strong>GO:</strong> three isolated, evidence-backed test/harness corrections are authorized below. Their scopes are test-only; independent review and Integrator-owned integration remain mandatory.</li>
-<li><strong>HOLD:</strong> deployment, restart, migration, live Scheduler activation, joint operational verification and cutover. The prior combined-qualification approval was consumed. Obtain fresh Operator authorization before any serial requalification of the corrected exact final source, and separate explicit authorization before production actions.</li>
-<li>Keep original-Git STOP and publisher hold. Preserve backups, existing authentication, the dirty primary checkout, and all uncertain-effect identities. Never replay an external effect from an absent/uncertain receipt.</li>
-</ul>
-
-<h2>Authoritative source and safety boundary</h2>
-<p>Last independently verified remote main: <code>2be5afb056fc31b0f5f5c7410afaed225b0216bf</code>, tree <code>cb2bfb9ea4b3aa70997d933e0207e5dccc83cd84</code>. The frozen qualification worktree was clean. The primary main checkout is dirty and remains untouched. Existing Git-backed project/account ledgers remain authoritative. The WQ-02 Work ledger is not initialized; <code>list_work</code> returned <code>InvalidBinding</code> (“WQ-02 ledger is not initialized; no migration is permitted”). Do not initialize or migrate it.</p>
-
-<h2>Final combined qualification — RED remains authoritative</h2>
-<table>
-<tr><th>Job</th><th>Terminal evidence</th><th>Disposition</th></tr>
-<tr><td>Client <code>a651dba0736642b5b01fa400ae6e95da</code></td><td>Exit 1; 338 Passed, 1 NotExecuted; no completed assertion-failed row and total discovery count unknown. 75-second inactivity abort while the mixed real-Git property was active; no dump retained.</td><td>Harness budget mismatch is evidenced; no application deadlock is proven.</td></tr>
-<tr><td>Server <code>7b12a0a4cffe476e9f16c90619efeb7b</code></td><td>Exit 1; 582/586. Four command-catalog/OAuth metadata assertions differ.</td><td>Worker 23's read-only root-cause audit remains in progress; no source changes authorized yet.</td></tr>
-<tr><td>Fixed <code>530f470adfb64aebbb8cbde69bb7c401</code></td><td>Exit 0; 4/4.</td><td>Scoped pass only.</td></tr>
-<tr><td>Manual <code>a426f586c46245dc9849cba68a8e2a11</code></td><td>Exit 0; 2/2.</td><td>Scoped pass only.</td></tr>
-<tr><td>Scheduled <code>4608245c7b134d708d029de3d81fc0b1</code></td><td>Exit 1; 0/2. Both cases failed in fixture setup at <code>git commit-tree</code> with “Author identity unknown”, before behavior assertions.</td><td>Test-only hermetic identity defect; not a production behavior failure.</td></tr>
-<tr><td>Policy <code>e566efd067bf4fc2a63a6300e1526060</code></td><td>Exit 0; 4/4.</td><td>Scoped pass only.</td></tr>
-<tr><td>Holistic <code>dcd62b16b3034ec1b13bc57c898861b5</code></td><td>Exit 0; 25/25.</td><td>Scoped pass only.</td></tr>
-</table>
-<p>The original combined RED is immutable. Do not turn scoped passes into an overall PASS. No Windows/macOS execution, actual OS-process restart, full OAuth renewal or real external-provider proof has been established.</p>
-
-<h2>Reconciled read-only audits</h2>
-<h3>Worker 20 — Client inactivity and WQ10 fixture drift</h3>
-<ul>
-<li>At exact final source, the mixed property has 4 seeds × 56 generated commands with real Git clones and full snapshot/index/lifecycle oracles. The wrapper hardcodes VSTest <code>--blame-hang-timeout 75s</code>; outer timeout is separately bounded (default 240s, max 900s). The same property source passed a retained focused run in 3m38.4166940; earlier retained runs were about 3m34–4m15. No dump exists, so exact aborted process state is unknown.</li>
-<li>Commit <code>175b6fb709906a941c2f4f31b226d0487b0a652b</code> added private Unix 0700 fixture roots and group/world-writable rejection controls to three WQ10 test files. Merge <code>16ce68173926d76fde23875c2ca1040452c492d4</code> selected first-parent versions and dropped those guards. Retained W27 evidence: pre-fix under umask 0002, one failure; post-fix, 38/38 passed.</li>
-<li>Audit task <code>automation-final-red-client-timeout-audit-20261125</code> is closed after reconciliation. No source edit or rerun was made during the audit.</li>
-</ul>
-
-<h3>Worker 21 — scheduled fixture identity</h3>
-<ul>
-<li>The final scheduled witness's two failures occurred before BrowserSchedules behavior, because isolated HOME/XDG/TMP did not also neutralize inherited <code>GIT_*</code> variables or provide fake Git author/committer identity. The accepted earlier 2/2 run passed only because it inherited host Git configuration. The existing Client hermetic runner is specific to Client.Tests and is not included by this standalone witness project.</li>
-<li>Recommended correction is test-only: snapshot/clear inherited <code>GIT_*</code>, use private <code>GIT_CONFIG_GLOBAL</code> and <code>GIT_CONFIG_NOSYSTEM=1</code>, set fake author/committer identity, and restore the caller environment in <code>finally</code>. Do not change production Git plumbing.</li>
-<li>Audit task <code>automation-final-red-scheduled-fixture-audit-20261125</code> is closed after reconciliation. No source edit or rerun was made during the audit.</li>
-</ul>
-
-<h2>Authorized bounded correction frontier</h2>
-<p>All three tasks are assigned in canonical state and queued for explicit Operator launch. Lead has not launched sessions. No full-suite or combined qualification may overlap these tasks.</p>
-<ul>
-<li><strong>Worker 20:</strong> <code>automation-wq10-private-root-regression-fix-20261125</code>, attempt <code>a6b45b806e2f4c7d9d657bb8c3e1b0a2</code>, sequence 15953. Lease: only the three WQ10 fixture files; restore reviewed 0700 and negative-control behavior from <code>175b6fb709906a941c2f4f31b226d0487b0a652b</code>; focused 38/38 under umask 0002. No production changes or full suite.</li>
-<li><strong>Worker 21:</strong> <code>automation-scheduled-witness-hermetic-git-identity-20261125</code>, attempt <code>b5c2d7e13f844a698c204a9f2d6e1b03</code>, sequence 15955. Lease: standalone witness <code>Tests.fs</code> and <code>README.md</code> only; test-owned fake Git identity/private config with guaranteed environment restoration; focused 2/2. No production changes.</li>
-<li><strong>Worker 19:</strong> <code>automation-client-property-hang-timeout-diagnostic-20261125</code>, attempt <code>c8d3e1f25a794d109c6b2e4f8a1b3c06</code>, sequence 15957. Lease: <code>scripts/test-client-hermetic.fsx</code> only unless Lead approves a parser-test expansion. Add opt-in <code>--hang-timeout-seconds</code>; default remains 75s, explicit 360s only for the filtered diagnostic with outer 600s, reject duplicate/invalid values, preserve process-tree cleanup and exit semantics. Parser/cleanup checks only; do not run the expensive property or combined qualification.</li>
-</ul>
-<p>Each task must publish exact source for independent review. Integrator alone performs integration after Accepted review. No worker may merge or deploy.</p>
-
-<h2>Pending P0 audit and next actions</h2>
+<p><strong>GO:</strong> bounded default-off implementation and test work under exact source leases; independent evidence gathering; completion of already Accepted canonical integrations in dependency order; one-shot independent adjudication of the Server audit; source-only preparation that preserves all negative controls.</p>
+<p><strong>HOLD:</strong> production positive admission, real browser/scheduled dispatch, sends/releases, Scheduler activation, deployment, restart, migration, cutover, and any combined release claim not backed by a fresh source-exact serial witness. Do not infer that fixtures, accepted reviews, integrated commits or missing activity establish live authority.</p>
+<h2>Current assignments and dependencies</h2>
 <ol>
-<li>Worker 23 owns <code>automation-final-red-server-catalog-audit-20261125</code>, attempt <code>e8dd5ae0450647b59037042283c94a01</code>, sequence 15923. Exact failing assertions: optional operation IDs 69 vs 71; per-command deviceId 165 vs 166; AgentCommand/MCP catalog set mismatch; unexpected server-local <code>RecordAggregateInclusion</code> OAuth metadata. Reconcile exact set differences, permissions and origin commits. The attempt remains Started; no source change is authorized until the audit's terminal evidence is read once.</li>
-<li>After the three bounded corrections are complete, obtain independent reviews and Integrator-owned merges. Verify exact integrated source, focused test receipts and no unrelated paths. Preserve the original RED and its job/TRX evidence.</li>
-<li>Only after all corrections are independently accepted and integrated, request fresh Operator authorization for one serial combined Release qualification of the exact final source. If it passes, separately request deployment/joint operational verification/cutover authorization.</li>
+<li><strong>Integrator — W12 first:</strong> task <code>integrate-automation-native-account-no-send-envelope-20261125</code>, attempt <code>7e1c3a5b-9d2f-4b6a-8c1e-3f5d7a9b2c40</code>, Ready. Reconcile the exact Pending W12 submission and complete it only if the immutable Accepted review and mechanically clean current-target integration are verified. No manual merge or retry of uncertain effects.</li>
+<li><strong>Integrator — W16 second:</strong> task <code>integrate-automation-native-provider-session-host-20261125</code>, attempt <code>6d4f1a2b-7c8e-4f9a-b3d5-1e6f8a2c4d70</code>, Blocked until W12 has an Integrated receipt. It was deliberately held to prevent out-of-order integration.</li>
+<li><strong>Adjudicator 1:</strong> task <code>automation-server-catalog-finding-adjudication-20261125</code>, attempt <code>5c3f2a1b-8d5e-4c6f-9a7b-2e1d5c8f3a60</code>, Ready. One read-only, independent Accept/Narrow/Defer/Reject decision on Worker 23's four Server test-contract findings. No edits or test reruns.</li>
+<li><strong>Worker 23:</strong> read-only Server audit is Finished. Proposed correction task <code>automation-server-catalog-stale-test-contract-fix-20261125</code> is held pending the adjudication; an explicit STOP response alert was queued. No source edits until an Accepted/Narrowed adjudication or explicit human Operator override.</li>
+<li><strong>Worker 20 / Worker 21:</strong> their bounded fixture/witness tasks remain assigned but their sessions yielded while asynchronous inbox/worktree/checkpoint operations were pending. Do not poll or duplicate those operations. Worker 21 notification <code>b1c9842c31f1467d8f5f212bef4c10ba</code> remains unacknowledged until the exact terminal results are retrieved by that worker and reconciled. Preserve the original RED and main-checkout cleanliness boundary.</li>
+<li><strong>Worker 19:</strong> native runtime and frozen-interface tasks remain blocked on planner and terminal/reconciliation evidence. The client-property diagnostic is queued; do not treat queued work as started.</li>
+<li><strong>Worker 16:</strong> project baseline and inventory authority tasks remain Blocked; the accepted standalone host source is Finished but its integration is Pending. Do not treat disposable same-CAS fixtures as complete production inventory or occupancy authority.</li>
+<li><strong>Worker 12:</strong> account authority binding remains Started in canonical state, although the agent is Ready/stale. The accepted no-send consumer integration is separately assigned to Integrator; runtime begin-send wiring remains distinct W19 work.</li>
+<li><strong>Worker 14 / Worker 27:</strong> source/producer and review-publication recovery work has outstanding review/uncertain-publication dependencies. Preserve original operation IDs and exact source; do not retry a publication because its ref is absent.</li>
 </ol>
-
-<p>Preserve unresolved publisher identities <code>2c484cca-b313-4df9-a6e1-6e3a16114f34</code>, <code>ebb91d9c-a444-4e04-bd02-4a74a95594c1</code>, and <code>209c5c26-6901-4070-ad21-9e79a5fb9709</code>; never replay from an absent receipt. Inbox at this reconciliation had Challenge subscription enabled, no assigned/triage challenges, no pending notifications/reviews, and no Operator action required.</p>
+<h2>Next Lead priorities</h2>
+<ol>
+<li>Keep the W12 integration as the first runnable Scheduler action. After its exact Integrated receipt, recheck current main and requeue W16 Stage C integration; only then reconsider the runtime composition dependency.</li>
+<li>Let Adjudicator 1 produce the single bounded Server findings decision. If Accept/Narrow, unblock Worker 23's exact two-file test-only task; if Defer/Reject, record that disposition and close or retain the task accordingly.</li>
+<li>Reconcile the Worker 21 notification only when terminal evidence is available in that worker's client. Keep it pending until the requested action is actually handled.</li>
+<li>Advance the sender-fence and baseline chain through the existing owners and non-overlapping source leases: W14 policy/producer, W23 manual ingress, W19 scheduled ingress, W21 same-CAS admission, W16 inventory/baseline, W12 account consumer. Identify the next concrete producer, reader, test or source-owner task from exact source evidence; do not create placeholder work.</li>
+<li>Preserve the W23 planner-publication and W16 baseline-publication holds until original job results, serving build and terminal process/transport evidence establish a safe reconciliation route. No speculative retries.</li>
+<li>Reconcile Challenge source containment and reverse-index/wake/requeue tests, then perform the authorized Health/Challenges/Scheduler joint test only after source integration and independent review are complete. Request Operator cutover explicitly; do not infer it.</li>
+</ol>
+<h2>Operating rules</h2>
+<ul>
+<li>Lead remains subscribed to Challenge triage; inspect owned, triage, recent-outcome and blocked-wait sections on each inbox read. Acknowledge only individually handled or deliberately obsolete notifications by exact ID. Keep unresolved decisions pending.</li>
+<li>Reviewers claim independently from the shared queue; never route or fan out reviews to named reviewers. Integrator alone completes accepted source integrations.</li>
+<li>Manager is retired. Do not spawn browser sessions; Operator launches explicitly. Keep independent Ready tasks concurrently runnable when source leases and prerequisites genuinely permit.</li>
+<li>Write this task as the single current snapshot. Preserve durable history in ledger revisions, checkpoints and reviews, not copied turn narratives. Yield at the end of each Working turn with the exact next action and dependencies.</li>
+</ul>
 </article>

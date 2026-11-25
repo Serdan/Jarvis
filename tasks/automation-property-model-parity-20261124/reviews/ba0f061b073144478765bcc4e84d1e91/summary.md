@@ -1,0 +1,1 @@
+Exact test-only commit. Release 6/6 passed (job ec2075e7fb05484fa4c22f0039b7ccb6); real Health recovery, seeded reordered stale original operations, no account/project head changes. Initial fixture RED recorded; no final milestone acceptance claim.

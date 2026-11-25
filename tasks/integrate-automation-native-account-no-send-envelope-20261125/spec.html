@@ -1,0 +1,31 @@
+<article>
+<h1>Complete the accepted W12 canonical no-send envelope integration</h1>
+<p><strong>Purpose:</strong> Reconcile and complete one existing Pending canonical integration, which is a prerequisite to the W16 Stage C host integration. Source integration only; no live Scheduler activation or cutover.</p>
+<h2>Exact canonical submission</h2>
+<ul>
+<li>Task: <code>automation-native-account-no-send-envelope-20261124</code></li>
+<li>Submission ID: <code>a0f5e98c3e5649949dfe84968b94d5f1</code></li>
+<li>Accepted review: <code>bfb7752413cc4efa93a823c07126a0af</code>, Reviewer 1, decision sequence 13710</li>
+<li>Immutable reviewed source commit: <code>f94bbceff4203538c7fc70add7c1d50d8bca598d</code></li>
+<li>Review base: <code>9e66a2cbeefb0493d6662c7a075713e0f3b58378</code></li>
+<li>Target: <code>refs/heads/main</code></li>
+<li>Existing integration ref: <code>refs/heads/jarvis-integration/a0f5e98c3e5649949dfe84968b94d5f1</code></li>
+<li>Target head at submission: <code>d5260fa2b5e03dc3b04cf392ee21c39802c69f5f</code></li>
+</ul>
+<h2>Procedure</h2>
+<ol>
+<li>Re-read canonical integration submissions and review details. Confirm this exact submission remains Pending and its exact immutable review remains Accepted.</li>
+<li>Use the verified remote target head, never the dirty local main checkout (local main is behind origin/main by 227 commits and has unrelated modifications).</li>
+<li>Check whether the exact reviewed source is already contained in current main or the managed integration ref is a mechanically clean merge of current target and this exact source.</li>
+<li>If and only if the submission remains Pending and the merge is mechanically clean, complete this exact submission with <code>complete_integration</code>, then verify remote readback and the canonical Integrated receipt.</li>
+<li>If already integrated, reconcile the exact receipt. If conflict, missing source, stale review, uncertain external outcome, or mismatch exists, do not retry, rebase, alter the review, or merge manually; checkpoint exact evidence and yield.</li>
+</ol>
+<h2>Dependency order and prohibitions</h2>
+<p>This W12 no-send envelope consumer must integrate before W16 Stage C host submission <code>34ef783acdfd40e0b8efc9c5a5dd3e78</code>. That W16 task is canonically Blocked until this exact W12 submission has an Integrated receipt. Do not process W16 first.</p>
+<ul>
+<li>No source edits, review replacement, new submission, force-push, or manual merge.</li>
+<li>No deployment, restart, migration, Scheduler activation, actual reservation/send/release, or cutover.</li>
+<li>Do not use local main or modify unrelated dirty files.</li>
+</ul>
+<p>Complete only this accepted pending integration and record its exact canonical terminal receipt. Operator controls launch; do not spawn a browser session.</p>
+</article>

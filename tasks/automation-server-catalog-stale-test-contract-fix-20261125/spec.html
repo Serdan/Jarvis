@@ -1,0 +1,38 @@
+<article>
+<h1>Correct stale Server catalog and OAuth metadata test contracts</h1>
+<p><strong>Authorization basis:</strong> Lead reviewed the completed read-only exact-source audit from Worker 23. The original Server qualification RED is preserved. The audit establishes that all four failing assertions are stale test contracts, not production permission or routing drift. This task authorizes only the bounded test-only correction below.</p>
+<h2>Exact source baseline</h2>
+<ul>
+<li>Base commit: <code>2be5afb056fc31b0f5f5c7410afaed225b0216bf</code></li>
+<li>Base tree: <code>cb2bfb9ea4b3aa70997d933e0207e5dccc83cd84</code></li>
+<li>Target: <code>refs/heads/main</code></li>
+<li>Worker branch: <code>refs/heads/fix/automation-server-catalog-stale-test-contracts-w23-20261125</code></li>
+</ul>
+<h2>Exclusive file lease</h2>
+<p>Modify only these two files:</p>
+<ul>
+<li><code>Server.Tests/McpAuthenticationTests.fs</code></li>
+<li><code>Server.Tests/ServiceTests.fs</code></li>
+</ul>
+<p>No production files, generated contracts, AgentCommand union, MCP registration, permission maps, OAuth scopes, or authentication behavior may change. Do not alter any other test file without first stopping and obtaining a revised lease.</p>
+<h2>Required corrections</h2>
+<ol>
+<li>In <code>McpAuthenticationTests.fs</code>, replace the stale optional-operationId count of 69 with a semantic assertion for 70 optional writes. <code>SetLaunchTemplate</code> is an optional TaskWrite facade. <code>RecordAggregateInclusion</code> is required and must be excluded from that optional count; assert its stable operationId is required separately. Preserve the seven selector IDs that are required.</li>
+<li>In <code>ServiceTests.fs</code>, include <code>RecordAggregateInclusion</code> in the existing <code>orchestrationTools</code> set and in the TaskWrite OAuth alias map. Update the client-backed MCP facade count from 165 to 166 only after explicitly accounting for this facade.</li>
+<li>Preserve the existing test that verifies <code>RecordAggregateInclusion</code> requires evidence and operationId and maps to the TaskWrite action.</li>
+</ol>
+<h2>Evidence and negative controls</h2>
+<ul>
+<li><code>RecordAggregateInclusion</code> is already registered in <code>ledgerTaskWriteMethods</code> and derives its public capability from existing TaskWrite; it is not a new AgentCommand union case.</li>
+<li>Its existing contract remains GitWrite, ReadOnly=false, Destructive=false, Idempotent=true, OpenWorld=false; it uses the Integration manual-grant family and <code>git:write</code> scope.</li>
+<li>Preserve seven required selector IDs.</li>
+<li>Keep the other 70 writes optional with default empty operationId.</li>
+<li>Keep <code>RecordAggregateInclusion</code> operationId required and stable; do not add it to server-local tool names.</li>
+<li>Do not add a new wire command, union case, OAuth scope, or permission.</li>
+<li>Do not weaken assertions, hide tools from enumeration, or force counts to pass without verifying the actual sets.</li>
+</ul>
+<h2>Verification</h2>
+<p>Inspect the exact pinned source and relevant history before editing. Run only the focused tests that exercise these two files; do not run the full suite or combined qualification. Preserve the original RED and all existing job/TRX evidence. Report exact commands, results, source commit and changed paths.</p>
+<h2>Review and integration boundary</h2>
+<p>Publish the exact resulting source for independent review. Do not merge, integrate, deploy, restart, migrate, change authentication, or activate Scheduler. Integrator alone may integrate after an Accepted independent review. If the exact baseline, file lease, or negative controls cannot be maintained, stop and checkpoint with evidence rather than broadening scope.</p>
+</article>

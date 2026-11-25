@@ -407,3 +407,72 @@ accepted composition is required; this scoped source/test evidence neither
 authorizes deployment nor establishes real provider or live automation.
 
 Final focused normal Release job 405a8600aa944db8a5fd63a8cc2b3bdc: 2/2 passed, 55 s, exit 0 on the executable test blob above (subsequent clarification comment only). Command: `dotnet test tests/AutomationSystemProperties20261124/AutomationSystemProperties20261124.fsproj -c Release --no-restore -p:BuildProjectReferences=false --filter FullyQualifiedName~WorkingCountTracksHealthChallengeAndManualTurns --logger 'trx;LogFileName=scheduled-intent-composition.trx' --results-directory /tmp/jarvis-w20-scheduled-20261125`. No final full-suite or live claim.
+
+## Accepted production composition and roster/editor parity (2026-11-25)
+
+The exact accepted production base is
+7a9ffa965b13f95a071cb125edbaa24cbe76f320 (published origin/main when
+the run began). It includes the accepted W20 scheduled Ready model, W21
+Health roster correction and W23 authenticated capacity editor. The assigned
+test branch was advanced by fast-forward only; no production changes or
+live effects.
+
+Mixed seeds 801/802 now additionally toggle canonical Challenge subscriptions
+for assigned agents and the taskless Reviewer. At each settled step the
+independent phase/generation model predicts the complete actual NativeHealth
+enumeration on both disposable clients; it checks exact owner/generation
+sets and no duplicates, excluding taskless Working turns from Health while
+retaining them in Scheduler Working counts. The actual Challenge-enriched
+inbox is compared with the independent subscription set. Policy changes use
+the registered production ProjectCapacityOperator.create Load/Save interface
+with fixture identity and disposable binding resolver, checking old revision
+and draft before save; canonical head and actual scheduled admission checks
+remain intact. This is the production editor access boundary, not a claim
+to exercise a real OAuth login, TUI keystrokes, or the recurring browser
+host in these generated histories; the accepted component tests cover
+registration and modal dispatch with disposable inputs. The initial
+extension job ed3b46ddace14591bdb1c1ece7429a95 was RED 2/2 because the test
+incorrectly read the unenriched ReviewWorkflow inbox (which deliberately
+defaults the subscription field to false). Reading the production
+ChallengeWorkflow.enrichInboxAt projection fixes the fixture, not production.
+Corrected focused job a2c3254488f74aaca410b982431d8dda passed 2/2 (1m20s,
+exit 0) using already-built exact Release Client/Server; TRX
+final-roster-editor-enriched.trx.
+
+The companion optional-policy property model was rebound to the actual
+compiled Client in tests/AutomationPolicyPropertiesW20 (4/4 pass after
+three old mandatory-policy cases failed); its own README records the source,
+seeds and replay evidence. This does not change legacy reservation semantics.
+Fresh exact-base affected component passes (all exit 0):
+- Health roster: 8e99fffe719441bf90e9daa8fcaf1046, 9/9, 50s.
+- Capacity operator: fe0d8d73cffd4d95bdcbc20c3639c6f3, 8/8, 24s.
+- Coupled Health: 9463d89fe29b4792981d0c5a51bc7b71, 15/15, 54s.
+- Native account CAS differential: 0b24bc67190649419b48db9f4ab812b6,
+  6/6, 2m11s. Actual prepare.fsx pin validated source
+  818bb6f8d43ab55177afe17e108e0155e6f43160 and fixture
+  6206e852903ca9b69ef314fbed5e2092a305e25e (job
+  2c104e0588bb498c9ad4aa244a32d738).
+- Actual scheduled Ready host/caller: e7b5d2d57151431193b8b0359091552c,
+  23/23, 27s.
+
+All TRX files are in /tmp/jarvis-w20-final-7a9ffa965. Standard
+dotnet test <project> -c Release -p:BuildProjectReferences=false on
+exact already-built references; the full holistic exact-base job
+c13961e59c2b4e73bb06a95d4c42d06e and affected Client.Tests filter job
+8abf476c1caf47e3aaea9d96213e189f are pending terminal verification as of
+this evidence entry, not green by assumption. Focused mixed delta command:
+dotnet test tests/AutomationSystemProperties20261124/AutomationSystemProperties20261124.fsproj -c Release -p:BuildProjectReferences=false --filter FullyQualifiedName~WorkingCountTracksHealthChallengeAndManualTurns
+
+Coverage boundaries: the generated system suite combines actual Health,
+Challenge, scheduled admission/intent CAS and real isolated Git ledgers.
+The older linked ProjectWorkingCount and NativeProjectEffectTransition
+comparisons are still explicitly not compiled operational host seams;
+the scheduled Ready caller is real, with fake preflight/external send.
+The provider-session evidence and historical account reservation/exclusion
+cases are separate from the ordinary Scheduler-only Working-count gate.
+No generated end-to-end real OAuth/browser effect, exhaustive fairness proof,
+or arbitrary concurrent histories are claimed. Keep review and final
+publication distinct; subsequent semantic changes require model parity,
+and live activation requires the Operator's separate authority.
+
+Final-delta negative control: job `b6e755d19299448bba66ecba802928db` (Release, `JARVIS_SYSTEM_IGNORE_WORKING_CAP=1`, same compiled delta and focused filter) failed both seeds as intended, exit 1, 18 s; expected `NoEligibleReady`, actual `OutcomeUnknown "fixture unknown receipt"`. TRX `final-working-cap-mutant.trx` in the same evidence directory. This is evidence that the assertions detect omitted working-cap enforcement, not a production test failure.

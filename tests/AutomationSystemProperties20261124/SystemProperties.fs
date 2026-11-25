@@ -1264,6 +1264,7 @@ type GeneratedComposition() =
             Client.RoleInstructions.RoleInstructions.attachRole a "Operator" (Guid.NewGuid()) manual "Reviewer" 0 |> success |> ignore
 
             let mutable manualWorking = false
+            let mutable subscribed : Set<string> = Set.empty
             let mutable revision = 0
             let mutable total : int option = None
             let mutable roles : Map<string,int> = Map.empty
@@ -1290,6 +1291,19 @@ type GeneratedComposition() =
                 equal "two client views of same policy/count head" headA.Commit headB.Commit
                 let manualState = ReviewWorkflow.getAgentWorkingTurnAt b headB manual |> success
                 equal "manual turn state" manualWorking (manualState.State = "Working")
+                // Subscription sidecars must not turn valid Health roster observations into errors.
+                let expectedRoster =
+                    [first; sibling] |> List.choose (fun f ->
+                        if f.State.Phase = Working then Some(f.Original.AgentId, f.State.Generation) else None) |> Set.ofList
+                for rt in first.Runtimes do
+                    let roster = NativeHealth.enumerate rt |> success
+                    equal "Health roster has exact Working assignment generations" expectedRoster
+                        (roster |> List.map (fun c -> c.AgentId,c.Generation) |> Set.ofList)
+                    equal "Health roster has no duplicate owners" expectedRoster.Count roster.Length
+                for owner in [first.Original.AgentId; sibling.Original.AgentId; manual] do
+                    let inbox = ReviewWorkflow.getAgentInboxAt b headB owner |> success
+                    let inbox = ChallengeWorkflow.enrichInboxAt b headB owner inbox |> success
+                    equal "canonical challenge subscription" (Set.contains owner subscribed) inbox.ChallengeSubscribed
                 checkAt a headA total roles workers reviewers
                 checkAt b headB total roles workers reviewers
                 match oldHead with
@@ -1299,11 +1313,23 @@ type GeneratedComposition() =
                 oldHead <- Some (headB,total,roles,workers,reviewers)
             let set client cap roleCaps =
                 let binding = if client = 0 then a else b
-                Client.ProjectCapacityPolicy.updateOptional binding "Operator" (Guid.NewGuid()) revision cap roleCaps
-                |> success |> ignore
+                let resolve project =
+                    if project <> "Fixture" then Error "fixture project denied"
+                    else LedgerStore.fetch binding |> Result.map (fun head -> binding,head) |> Result.mapError (sprintf "%A")
+                let editor = Client.ProjectCapacityOperator.create (fun () -> Some "Operator") resolve
+                let loaded = editor.Load "Fixture" |> success
+                equal "editor revision" revision loaded.Revision
+                equal "editor previous total" total loaded.Draft.Total
+                equal "editor previous roles" roles loaded.Draft.Roles
+                loaded.Save (Guid.NewGuid()) { Total = cap; Roles = roleCaps } |> success
                 revision <- revision + 1
                 total <- cap
                 roles <- roleCaps
+                verify ()
+            let subscribe client owner enabled =
+                let binding = if client = 0 then a else b
+                ChallengeWorkflow.setSubscription binding (Guid.NewGuid()) owner enabled |> success |> ignore
+                subscribed <- if enabled then Set.add owner subscribed else Set.remove owner subscribed
                 verify ()
             let turn client working =
                 let binding = if client = 0 then a else b
@@ -1394,6 +1420,8 @@ type GeneratedComposition() =
                 verify ()
             let workerCap n = Map.ofList ["Worker",n]
             verify ()
+            subscribe 0 first.Original.AgentId true
+            subscribe 1 manual true
             poll 0 true true
             set 0 (Some 2) (workerCap 1)
             // Manual taskless start is allowed even above total capacity.
@@ -1404,6 +1432,7 @@ type GeneratedComposition() =
             change first 0 CheckHealth
             poll 1 true true
             change sibling 1 Block
+            subscribe 0 sibling.Original.AgentId true
             set 1 None (workerCap 1)
             poll 0 false true
             poll 0 true false
@@ -1415,12 +1444,16 @@ type GeneratedComposition() =
             change sibling 1 Resume
             change first 1 Resume
             turn 0 false
+            subscribe 1 first.Original.AgentId false
             set 0 None Map.empty
             let rng = Random(seed)
             let commands = [|Activity; Advance 601; CheckHealth; CheckStale; Block; Resolve; Resume; Checkpoint|]
             for _ in 1..8 do
                 let client = rng.Next(2)
-                match rng.Next(5) with
+                match rng.Next(6) with
+                | 5 ->
+                    let owner = [|first.Original.AgentId; sibling.Original.AgentId; manual|][rng.Next(3)]
+                    subscribe client owner (not (Set.contains owner subscribed))
                 | 4 -> poll client (rng.Next(2) = 0) (rng.Next(2) = 0)
                 | 0 -> set client (if rng.Next(2) = 0 then None else Some(rng.Next(1,5))) (if rng.Next(2) = 0 then Map.empty else workerCap (rng.Next(1,3)))
                 | 1 -> turn client (not manualWorking)

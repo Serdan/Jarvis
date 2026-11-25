@@ -476,6 +476,48 @@ let quickToolOperationReturnsOriginalResponseWithoutJobPromotion () =
     Assert.That(isToolOperationJob handle.JobId, Is.False,
                 "A quick call is discarded rather than cluttering list_jobs.")
 
+[<TestCase(false)>]
+[<TestCase(true)>]
+let yieldReturnsTerminalAcknowledgmentWithoutPromotion (failed: bool) =
+    let root = createTempProject ()
+    try
+        let runtime = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+        let workId = Guid.NewGuid().ToString("D")
+        let command : AgentCommand =
+            TaskWriteCommand
+                { ProjectName = "Project1"; Action = "YieldAgent"; OperationId = workId
+                  TaskId = "test-yield"; AttemptId = ""; ActorId = "Worker 1"; OwnerId = ""
+                  Title = ""; Html = ""; ExpectedVersion = 2; ExpectedAgentVersion = 3
+                  ExpectedTaskVersion = 0; AssignmentGeneration = 1; Summary = "Checkpoint"
+                  NextAction = "Continue"; Reason = ""; BaseOid = ""; TargetRef = ""; SourceRef = ""
+                  AllowDetached = false; AllowUncommitted = false; DecisionSequence = 0L
+                  Evidence = ""; SessionId = "" }
+        let completion = TaskCompletionSource<AgentCommandResponse>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let serialized = System.Text.Json.JsonSerializer.Serialize<AgentCommand>(command)
+        let original = completedToolResponse """{"ledgerReceipt":true}"""
+        let terminal =
+            if failed then { original with Result = None; Error = Some(ValidationFailed "Stale assignment") }
+            else original
+        let mutable calls = 0
+        let pending =
+            Client.SignalR.Client.executeOrPromoteWith runtime serialized "Worker 1" TimeSpan.Zero
+                (fun request actor ->
+                    Assert.That(request, Is.EqualTo(serialized))
+                    Assert.That(actor, Is.EqualTo("Worker 1"))
+                    calls <- calls + 1
+                    completion.Task)
+        Assert.That(pending.IsCompleted, Is.False,
+                    "Even beyond the promotion threshold, yield must keep the original call open.")
+        completion.SetResult terminal
+        let reply = pending.WaitAsync(TimeSpan.FromSeconds(4.)).GetAwaiter().GetResult()
+        Assert.That(calls, Is.EqualTo(1))
+        Assert.That(reply.PendingJob.IsNone, Is.True)
+        Assert.That(reply.Error, Is.EqualTo(terminal.Error))
+        let expected = if failed then None else Some(System.Text.Json.JsonSerializer.Serialize("OK"))
+        Assert.That(reply, Is.EqualTo({ terminal with Result = expected }))
+    finally
+        Directory.Delete(root, true)
+
 [<Test>]
 let boundedSignalRIngressDoesNotHeadOfLineBlockCheapRequests () =
     let errors = System.Collections.Concurrent.ConcurrentQueue<exn>()

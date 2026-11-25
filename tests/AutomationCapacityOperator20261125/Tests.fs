@@ -135,8 +135,8 @@ let authenticationBindingAndDeniedResolutionNeverWrite () =
 let textParserRejectsAmbiguityAndRoundTrips () =
     for configuration in [off (); { draft (Some 2) [] with AutomationEnabled=true };draft None ["Worker",3];draft (Some 7) ["Worker",3;"Reviewer",2]] do
         Assert.That(CapacityPolicyDraft.parse (CapacityPolicyDraft.format configuration) = Ok configuration, Is.True)
-    for text in ["";"total=off";"automation=yes\ntotal=off";"automation=on\nautomation=off\ntotal=off";"automation=on"] @ (["role Worker=1";"total=0";"total=-1";"total=2147483648";"total=off\ntotal=off"
-                 "total=off\nrole Worker=0";"total=off\nrole Worker=2\nrole Worker=3"
+    for text in ["";"total=off";"automation=yes\ntotal=off";"automation=on\nautomation=off\ntotal=off";"automation=on"] @ (["role Worker=1";"total=0";"total=-1";"total=2147483648";"total=off\ntotal=off";
+                 "total=off\nrole Worker=0";"total=off\nrole Worker=2\nrole Worker=3";
                  "total=off\nrole ../Worker=2";"total=off\nfoo=2";"total=off=2"] |> List.map (fun text -> "automation=off\n" + text)) do
         Assert.That(CapacityPolicyDraft.parse text |> Result.isError, Is.True, text)
 

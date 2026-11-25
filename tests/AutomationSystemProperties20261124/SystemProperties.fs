@@ -1238,3 +1238,111 @@ type GeneratedComposition() =
         finally
             Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
             Directory.Delete(root, true)
+
+
+    // The accepted policy reader and Working-count component are linked from
+    // their real source until the scheduled caller registers them in Client.
+    // The independent oracle counts only model Working phases and taskless
+    // manual turns, not reservations or a maximum historical census.
+    [<TestCase(801)>]
+    [<TestCase(802)>]
+    member _.WorkingCountTracksHealthChallengeAndManualTurns(seed: int) =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-system-working-count-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let prior = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+        Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", Path.Combine(root, "config"))
+        try
+            let first = newFixture (Path.Combine(root, "a"))
+            let sibling = secondAgent first
+            let a,b = first.First, first.Second
+            let manual = "Manual reviewer"
+            for role in ["Worker"; "Reviewer"] do
+                Client.RoleInstructions.RoleInstructions.createRole a "Operator" (Guid.NewGuid()) role "fixture" "fixture" |> success |> ignore
+            ReviewWorkflow.registerAgent a (Guid.NewGuid()) manual |> success |> ignore
+            for owner in [first.Original.AgentId; sibling.Original.AgentId] do
+                Client.RoleInstructions.RoleInstructions.attachRole a "Operator" (Guid.NewGuid()) owner "Worker" 0 |> success |> ignore
+            Client.RoleInstructions.RoleInstructions.attachRole a "Operator" (Guid.NewGuid()) manual "Reviewer" 0 |> success |> ignore
+
+            let mutable manualWorking = false
+            let mutable revision = 0
+            let mutable total : int option = None
+            let mutable roles : Map<string,int> = Map.empty
+            let mutable oldHead : (LedgerSnapshot * int option * Map<string,int> * int * int) option = None
+            let expected target cap roleCaps workers reviewers =
+                let matching = if target = "Worker" then workers elif target = "Reviewer" then reviewers else 0
+                (cap |> Option.exists (fun n -> workers + reviewers >= n))
+                || (roleCaps |> Map.tryFind target |> Option.exists (fun n -> matching >= n))
+            let checkAt binding head cap roleCaps workers reviewers =
+                let policy,_ = Client.ProjectCapacityPolicy.readCurrentOptional binding head |> success
+                equal "pinned total policy" cap policy.Total
+                equal "pinned role policy" roleCaps policy.Roles
+                for target in ["Worker"; "Reviewer"; "Lead"] do
+                    equal ("canonical Working-count hold for " + target)
+                        (expected target cap roleCaps workers reviewers)
+                        (Client.ProjectWorkingCount.isHeldAt binding head target policy.Total policy.Roles |> success)
+            let verify () =
+                observe first
+                observe sibling
+                let workers = [first; sibling] |> List.filter (fun f -> f.State.Phase = Working) |> List.length
+                let reviewers = if manualWorking then 1 else 0
+                let headA = LedgerStore.fetch a |> success
+                let headB = LedgerStore.fetch b |> success
+                equal "two client views of same policy/count head" headA.Commit headB.Commit
+                let manualState = ReviewWorkflow.getAgentWorkingTurnAt b headB manual |> success
+                equal "manual turn state" manualWorking (manualState.State = "Working")
+                checkAt a headA total roles workers reviewers
+                checkAt b headB total roles workers reviewers
+                match oldHead with
+                | Some (old,cap,roleCaps,oldWorkers,oldReviewers) ->
+                    checkAt b old cap roleCaps oldWorkers oldReviewers
+                | None -> ()
+                oldHead <- Some (headB,total,roles,workers,reviewers)
+            let set client cap roleCaps =
+                let binding = if client = 0 then a else b
+                Client.ProjectCapacityPolicy.updateOptional binding "Operator" (Guid.NewGuid()) revision cap roleCaps
+                |> success |> ignore
+                revision <- revision + 1
+                total <- cap
+                roles <- roleCaps
+                verify ()
+            let turn client working =
+                let binding = if client = 0 then a else b
+                let snapshot = LedgerStore.fetch binding |> success
+                let current = ReviewWorkflow.getAgentWorkingTurnAt binding snapshot manual |> success
+                if working <> manualWorking then
+                    if working then
+                        ReviewWorkflow.startTasklessWork binding (Guid.NewGuid()) manual current.Version "manual fixture start" |> success |> ignore
+                    else
+                        ReviewWorkflow.yieldTasklessWork binding (Guid.NewGuid()) manual current.Version "manual fixture end" |> success |> ignore
+                    manualWorking <- working
+                verify ()
+            let change f client command =
+                step f client command
+                verify ()
+            let workerCap n = Map.ofList ["Worker",n]
+            verify ()
+            set 0 (Some 2) (workerCap 1)
+            // Manual taskless start is allowed even above total capacity.
+            // This is real canonical activation, not the browser RPC test.
+            turn 1 true
+            change first 0 Activity
+            change first 1 (Advance 601)
+            change first 0 CheckHealth
+            change sibling 1 Block
+            set 1 None (workerCap 1)
+            change sibling 0 Resolve
+            change sibling 1 Resume
+            change first 1 Resume
+            turn 0 false
+            set 0 None Map.empty
+            let rng = Random(seed)
+            let commands = [|Activity; Advance 601; CheckHealth; CheckStale; Block; Resolve; Resume; Checkpoint|]
+            for _ in 1..8 do
+                let client = rng.Next(2)
+                match rng.Next(4) with
+                | 0 -> set client (if rng.Next(2) = 0 then None else Some(rng.Next(1,5))) (if rng.Next(2) = 0 then Map.empty else workerCap (rng.Next(1,3)))
+                | 1 -> turn client (not manualWorking)
+                | _ -> change (if rng.Next(2) = 0 then first else sibling) client commands[rng.Next(commands.Length)]
+        finally
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
+            Directory.Delete(root, true)

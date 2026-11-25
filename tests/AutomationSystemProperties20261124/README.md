@@ -333,3 +333,28 @@ including all four existing original claim/exclusion schedules. Command:
 Actual Client/Server references on base 3b423ebbbbb9066d86d19955c37f37c154ceee8c;
 this remains incremental test evidence, not final composed Scheduler or live
 provider acceptance.
+
+## Generated canonical Working-count histories (2026-11-25)
+
+Seeds 801/802 combine two assigned Worker agents and a taskless manual Reviewer
+in a real disposable project with two independent Git clones. A guided prefix
+exercises enabled total and role caps, manual Working overshoot, Health recovery,
+Challenge blocking, dependency resolution, resume and natural drain; an eight-step
+seeded suffix mixes activity/recovery/block/resume, policy revision changes and
+manual turns. An independent model counts Working phases only and compares all
+three target roles, exact optional policy, both clones and the preceding pinned
+historical snapshot after each step. No reservation occupancy or strict cap
+conservation is asserted. On published main f3298b4000612d4a001ba593750cbbefea219277
+plus the previous reviewed cold-recovery delta, exact local merge parent
+ e513f1a61fe3f47a88cd9ef6e42c153dca985140, the accepted policy/count source modules
+are linked as in the W14 isolated tests because they are not registered in the
+Client project yet. Manual taskless start is canonical state mutation, not a
+browser launch test. This is component composition, not final operational
+Scheduler dispatch evidence. Initial build f01ce25b931b4cd4a8d3aeb811a64910
+failed solely on nested RoleInstructions qualification; corrected focused job
+7c9339202dcc4c16b5fd976795a9a322 passed 2/2, exit 0, 49 s, using unchanged
+already-built actual Client/Server references. Command:
+`dotnet test tests/AutomationSystemProperties20261124/AutomationSystemProperties20261124.fsproj -c Release --no-restore -p:BuildProjectReferences=false --filter FullyQualifiedName~WorkingCountTracksHealthChallengeAndManualTurns --logger 'trx;LogFileName=working-count-composition.trx' --results-directory /tmp/jarvis-w20-system-cold-20261125`.
+Remove linked module duplicates when production registration is published and
+exercise the actual ordinary scheduled caller with fake browser only at its
+external boundary. No live effects.

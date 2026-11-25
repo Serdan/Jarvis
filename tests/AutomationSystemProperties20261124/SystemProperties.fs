@@ -1134,3 +1134,75 @@ type GeneratedComposition() =
         finally
             Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
             Directory.Delete(root, true)
+
+
+    // A new client with fresh Git clones must reconstruct original uncertainty
+    // from durable authority. No provider observation or local occupancy
+    // cache is permitted to convert uncertainty into a second send or release.
+    [<TestCase(701)>]
+    [<TestCase(702)>]
+    member _.ColdClientPreservesOriginalUnknownAcrossChallenge(seed: int) =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-system-cold-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let prior = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+        Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", Path.Combine(root, "config"))
+        try
+            let fs = [|newFixture (Path.Combine(root, "a")); newFixture (Path.Combine(root, "b"))|]
+            use account = SystemPropertyAccountFixture.create root [|fs |> Array.map _.First; fs |> Array.map _.Second|]
+            let first = seed % 2
+            let other = 1 - first
+            SystemPropertyAccountFixture.approve account 0 0L 2 1 |> success |> ignore
+            step fs[other] 1 Block
+            let c = SystemPropertyAccountFixture.candidate fs[first].First fs[first].Original.TaskId
+            let original = Guid.NewGuid()
+            let captured = SystemPropertyAccountFixture.coverage account 0
+            SystemPropertyAccountFixture.reserveWithCoverage account 0 captured original c |> success |> ignore
+            let fence = SystemPropertyAccountFixture.claim account 1 first original c |> snd |> success
+            let dispatch, effect = Guid.Parse c.DispatchId, Guid.Parse c.EffectOperationId
+            let session = "unconfirmed-cold-session"
+            SystemPropertyAccountFixture.transition account 0 dispatch effect 1L "Dispatching" fence.CurrentHead "" |> success |> ignore
+            SystemPropertyAccountFixture.transition account 1 dispatch effect 2L "Uncertain" fence.CurrentHead "" |> success |> ignore
+            SystemPropertyAccountFixture.transition account 0 dispatch effect 3L "Unknown" fence.CurrentHead session |> success |> ignore
+            use cold = SystemPropertyAccountFixture.coldClone account 1
+            let verify expectedCount =
+                for f, client in [account,0; account,1; cold,0] do
+                    let rs = (SystemPropertyAccountFixture.read f client).Records
+                    equal "cold exact record count" expectedCount rs.Length
+                    let originalRecord = rs |> Array.find (fun r -> r.Candidate.DispatchId = c.DispatchId)
+                    equal "cold original candidate" c originalRecord.Candidate
+                    equal "cold original operation" (string original) originalRecord.OriginalOperationId
+                    equal "cold original status" "Unknown" originalRecord.Status
+                    equal "cold generation" 4L originalRecord.Generation
+                    equal "cold original fence" fence.CurrentHead originalRecord.ProjectFenceOid
+                    equal "cold original session" session originalRecord.ProviderSessionId
+                    equal "cold no invented terminal" "" originalRecord.TerminalOperationId
+                    equal "cold unique original identities" rs.Length (rs |> Array.map _.OriginalOperationId |> Array.distinct |> Array.length)
+                fs |> Array.iter observe
+            verify 1
+            let head () = (SystemPropertyAccountFixture.coverage cold 0).AccountHead
+            let unchanged = head ()
+            // The exact old request may be acknowledged again, but cannot
+            // mutate the original Unknown record or create another reservation.
+            let retry = SystemPropertyAccountFixture.reserveWithCoverage cold 0 captured original c
+            equal "cold original receipt replay" true retry.IsOk
+            equal "cold retry leaves account head unchanged" unchanged (head ())
+            let _, duplicate = SystemPropertyAccountFixture.claim cold 0 first original c
+            equal "cold original cannot claim twice" true duplicate.IsError
+            equal "cold missing terminal cannot release" true (SystemPropertyAccountFixture.denyRelease cold 0 original c).IsError
+            equal "cold forged terminal cannot release" true (SystemPropertyAccountFixture.forgeTerminal cold 0 first original c).IsError
+            equal "cold rejected actions leave account head unchanged" unchanged (head ())
+            verify 1
+            let blocked = SystemPropertyAccountFixture.candidate cold.Projects.[0].[other] fs[other].Original.TaskId
+            equal "cold blocked challenge remains ineligible" true
+                (SystemPropertyAccountFixture.reserve cold 0 (Guid.NewGuid()) blocked).IsError
+            equal "cold blocked reservation leaves account head unchanged" unchanged (head ())
+            step fs[other] 0 Resolve
+            step fs[other] 1 Resume
+            let next = SystemPropertyAccountFixture.candidate cold.Projects.[0].[other] fs[other].Original.TaskId
+            SystemPropertyAccountFixture.reserve cold 0 (Guid.NewGuid()) next |> success |> ignore
+            verify 2
+            let successor = (SystemPropertyAccountFixture.read account 0).Records |> Array.find (fun r -> r.Candidate.DispatchId = next.DispatchId)
+            equal "cold eligible other work admitted exactly once" "Reserved" successor.Status
+        finally
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior)
+            Directory.Delete(root, true)

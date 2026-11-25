@@ -210,3 +210,23 @@ let excludeBeforeClaim f client project originalId candidate =
 let releaseNoSend f client operation (locator: NativeNoSendLocator) =
     NativeSchedulerAccountReservation.releaseNoSend f.Accounts[client] f.Projects[client]
         (coverage f client) operation "Disposable system property" locator
+
+
+// A cold client obtains only the same configured identities/endpoints and
+// fresh Git clones. It does not copy either prior client's local ledger refs,
+// observations, checkout metadata, or in-memory reservation state.
+let coldClone f client =
+    let scope = Path.Combine(f.Root, "wq10-private-cold-" + Guid.NewGuid().ToString("N"))
+    privateDirectory scope
+    let clone remote name =
+        let local = Path.Combine(scope, name)
+        git scope ["clone"; remote; local] |> ignore
+        git local ["config"; "user.name"; "Cold system property"] |> ignore
+        git local ["config"; "user.email"; "cold-system@example.test"] |> ignore
+        local
+    let oldAccount = f.Accounts[client]
+    let account = { oldAccount with RepositoryPath = clone oldAccount.ApprovedFetchUrl "account" }
+    let projects =
+        f.Projects[client] |> Array.mapi (fun i old ->
+            { old with RepositoryPath = clone old.ApprovedFetchUrl (sprintf "project-%d" i) })
+    { Root = f.Root; Accounts = [|account|]; Projects = [|projects|] }

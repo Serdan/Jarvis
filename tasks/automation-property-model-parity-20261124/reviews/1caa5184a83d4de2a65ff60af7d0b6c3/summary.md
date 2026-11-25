@@ -1,0 +1,1 @@
+2/2 Release passed job 7c9339202dcc4c16b5fd976795a9a322. Source links accepted reader/count because runtime registration is pending; exact canonical model across manual taskless turns, recovery, challenge wait/wake and policy changes. Prior cold recovery commit ba0f061b is separately in review. Not operational caller acceptance.

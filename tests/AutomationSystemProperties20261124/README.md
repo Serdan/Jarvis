@@ -315,3 +315,21 @@ but are not part of the pinned base; current optional reader
 policy history and add real canonical Working/Ready/manual and Scheduler
 admission histories against their accepted composed API, not old occupancy
 infrastructure or an invented test-only production authority.
+
+## Cold reconstruction through Health recovery (2026-11-25)
+
+Seeds 701/702 now perform actual Health recovery and resume while the original
+account dispatch remains Unknown. The model checks both assignment generation
+and preserved original account identity before and after recovery. A seeded
+permutation of stale transition, original claim, preclaim exclusion and missing
+terminal requests must fail without advancing either durable ledger head.
+The preclaim exclusion fixture now returns the actual original-locator rejection
+as an error rather than throwing an unexpected fixture exception. Initial RED
+job 65dae0f4b1014720804eaac9c9cf4c6b failed both cases at that fixture exception
+(the production locator correctly denied the stale identity). Corrected Release
+job ec2075e7fb05484fa4c22f0039b7ccb6 passed 6/6, exit 0, test duration 2m20s,
+including all four existing original claim/exclusion schedules. Command:
+`dotnet test tests/AutomationSystemProperties20261124/AutomationSystemProperties20261124.fsproj -c Release --no-restore --filter 'FullyQualifiedName~ColdClientPreservesOriginalUnknownAcrossChallenge|FullyQualifiedName~OriginalClaimAndExclusionCompeteAcrossChallenge' --logger 'trx;LogFileName=cold-recovery-and-exclusion.trx' --results-directory /tmp/jarvis-w20-system-cold-20261125`.
+Actual Client/Server references on base 3b423ebbbbb9066d86d19955c37f37c154ceee8c;
+this remains incremental test evidence, not final composed Scheduler or live
+provider acceptance.

@@ -170,39 +170,41 @@ let tryExcludeBeforeClaim f client project originalId (candidate: NativeDispatch
     let locator : NativeOriginalReservationLocator =
         { ReservationOperationId = originalId; ReservationRequestSha256 = receipt.Value.RequestSha256
           Candidate = candidate; ExpectedGeneration = 1L; ExpectedProjectFenceOid = ""; ExpectedProviderSessionId = "" }
-    let context = NativeSchedulerAccountReservation.readOriginal b projects proof locator |> success
-    let identity : Client.NativeProjectEffectTransition.OriginalEffectIdentity =
-        { AccountId = b.AccountId; AccountLedgerId = b.LedgerId; AccountEpoch = b.Epoch
-          ReservationOperationId = originalId; CanonicalKey = context.CurrentReservation.CanonicalKey
-          Candidate = candidate }
-    let operation = Guid.NewGuid()
-    let evidence : NativeNoSendEvidence =
-        { SchemaVersion = 1; State = "VerifiedNoSend"; AccountId = string b.AccountId
-          AccountLedgerId = string b.LedgerId; AccountEpoch = b.Epoch
-          ReservationOrigin = context.ReservationOrigin; CanonicalKey = identity.CanonicalKey
-          Original = locator; NoSendOperationId = operation }
-    let raw = NativeSchedulerAccountReservation.serializeNoSendEvidence evidence
-    let head = (LedgerStore.fetch binding |> success).Commit
-    let request = sprintf """{"schemaVersion":1,"expectedProjectHead":"%s","predecessor":{"kind":"BeforeClaim"},"evidence":%s}""" head raw
-    let intent : LedgerIntent =
-        { OperationId = operation; Actor = candidate.OwnerAgentId; Kind = "NativeVerifiedNoSend"; RequestJson = request }
-    let path = NativeSchedulerAccountReservation.noSendFencePath candidate
-    LedgerStore.transact binding intent (fun snapshot ->
-        match NativeSchedulerAccountReservation.readOriginal b projects proof locator with
-        | Ok verified when verified = context ->
-            Client.NativeProjectEffectTransition.planExclusion binding snapshot head identity path
-                Client.NativeProjectEffectTransition.BeforeClaim intent
-        | _ -> Error (InvalidBinding "Original account reservation changed"))
-    |> Result.bind (fun _ ->
-        LedgerStore.fetch binding
-        |> Result.bind (fun snapshot ->
-            LedgerStore.readAt binding snapshot path
-            |> Result.bind (fun (_, oid) ->
-                match oid with
-                | Some evidenceOid ->
-                    Ok { Original = locator; NoSendOperationId = operation; ProjectHead = snapshot.Commit
-                         NoSendOrigin = snapshot.Commit; EvidenceBlobOid = evidenceOid }
-                | None -> Error (InvalidBinding "Committed exclusion evidence missing"))))
+    match NativeSchedulerAccountReservation.readOriginal b projects proof locator with
+    | Error e -> Error (InvalidBinding (sprintf "Original account reservation rejected: %A" e))
+    | Ok context ->
+        let identity : Client.NativeProjectEffectTransition.OriginalEffectIdentity =
+            { AccountId = b.AccountId; AccountLedgerId = b.LedgerId; AccountEpoch = b.Epoch
+              ReservationOperationId = originalId; CanonicalKey = context.CurrentReservation.CanonicalKey
+              Candidate = candidate }
+        let operation = Guid.NewGuid()
+        let evidence : NativeNoSendEvidence =
+            { SchemaVersion = 1; State = "VerifiedNoSend"; AccountId = string b.AccountId
+              AccountLedgerId = string b.LedgerId; AccountEpoch = b.Epoch
+              ReservationOrigin = context.ReservationOrigin; CanonicalKey = identity.CanonicalKey
+              Original = locator; NoSendOperationId = operation }
+        let raw = NativeSchedulerAccountReservation.serializeNoSendEvidence evidence
+        let head = (LedgerStore.fetch binding |> success).Commit
+        let request = sprintf """{"schemaVersion":1,"expectedProjectHead":"%s","predecessor":{"kind":"BeforeClaim"},"evidence":%s}""" head raw
+        let intent : LedgerIntent =
+            { OperationId = operation; Actor = candidate.OwnerAgentId; Kind = "NativeVerifiedNoSend"; RequestJson = request }
+        let path = NativeSchedulerAccountReservation.noSendFencePath candidate
+        LedgerStore.transact binding intent (fun snapshot ->
+            match NativeSchedulerAccountReservation.readOriginal b projects proof locator with
+            | Ok verified when verified = context ->
+                Client.NativeProjectEffectTransition.planExclusion binding snapshot head identity path
+                    Client.NativeProjectEffectTransition.BeforeClaim intent
+            | _ -> Error (InvalidBinding "Original account reservation changed"))
+        |> Result.bind (fun _ ->
+            LedgerStore.fetch binding
+            |> Result.bind (fun snapshot ->
+                LedgerStore.readAt binding snapshot path
+                |> Result.bind (fun (_, oid) ->
+                    match oid with
+                    | Some evidenceOid ->
+                        Ok { Original = locator; NoSendOperationId = operation; ProjectHead = snapshot.Commit
+                             NoSendOrigin = snapshot.Commit; EvidenceBlobOid = evidenceOid }
+                    | None -> Error (InvalidBinding "Committed exclusion evidence missing"))))
 
 let excludeBeforeClaim f client project originalId candidate =
     tryExcludeBeforeClaim f client project originalId candidate |> success

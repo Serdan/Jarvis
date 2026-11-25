@@ -1192,6 +1192,38 @@ type GeneratedComposition() =
             equal "cold forged terminal cannot release" true (SystemPropertyAccountFixture.forgeTerminal cold 0 first original c).IsError
             equal "cold rejected actions leave account head unchanged" unchanged (head ())
             verify 1
+
+            // A real Health recovery changes assignment lineage while the
+            // original provider outcome remains Unknown. It must not imply
+            // terminal evidence or permit a stale original action.
+            step fs[first] 0 Activity
+            step fs[first] 1 (Advance 601)
+            step fs[first] 0 CheckHealth
+            verify 1
+            equal "Health recovery cannot release original uncertainty" unchanged (head ())
+            step fs[first] 1 Resume
+            step fs[first] 0 CheckStale
+            verify 1
+
+            let rejected = [|
+                "stale original account transition", (fun () ->
+                    (SystemPropertyAccountFixture.transition cold 0 dispatch effect 3L "Unknown" fence.CurrentHead session).IsError)
+                "old claim after Health recovery", (fun () ->
+                    (SystemPropertyAccountFixture.claim cold 0 first original c |> snd).IsError)
+                "claimed original cannot be excluded before claim", (fun () ->
+                    (SystemPropertyAccountFixture.tryExcludeBeforeClaim cold 0 first original c).IsError)
+                "missing original terminal after recovery", (fun () ->
+                    (SystemPropertyAccountFixture.denyRelease cold 0 original c).IsError)
+            |]
+            let rng = Random(seed)
+            let projectHead () = (LedgerStore.fetch cold.Projects.[0].[first] |> success).Commit
+            let recoveredHead = projectHead ()
+            for label, attempt in rejected |> Array.map (fun item -> rng.Next(), item) |> Array.sortBy fst |> Array.map snd do
+                equal label true (attempt ())
+                equal "reordered stale action leaves account head unchanged" unchanged (head ())
+                equal "reordered stale action leaves recovered project head unchanged" recoveredHead (projectHead ())
+                verify 1
+
             let blocked = SystemPropertyAccountFixture.candidate cold.Projects.[0].[other] fs[other].Original.TaskId
             equal "cold blocked challenge remains ineligible" true
                 (SystemPropertyAccountFixture.reserve cold 0 (Guid.NewGuid()) blocked).IsError

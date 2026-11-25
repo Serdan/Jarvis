@@ -55,8 +55,9 @@ let hosted_negative_matrix_requires_real_coverage () =
             |> JwtSecurityTokenHandler().WriteToken
 
         // Always use the genuine production registrations and mapped endpoints.
-        // Recreating this DI container is the offline hosted-process restart seam:
-        // it retains disk SQLite but cannot retain OptionalFeedbackStore's proof cache.
+        // Recreating this host/DI container retains disk SQLite but replaces
+        // OptionalFeedbackStore's proof cache. Both hosts run in the same OS
+        // process; an actual subprocess restart is not exercised by this fixture.
         let newHost () =
             let builder = WebApplication.CreateBuilder()
             builder.WebHost.UseUrls("http://127.0.0.1:0") |> ignore
@@ -155,6 +156,36 @@ let hosted_negative_matrix_requires_real_coverage () =
                 Assert.That(message, Is.EqualTo("NotFound: Jarvis device 'test-missing-device' is not registered for the authenticated user. Use ListDevices to find available devices."))
             }
 
+        let qualify (host: WebApplication) address (hub: HubConnection) =
+            task {
+                let store = host.Services.GetRequiredService<Server.Services.OptionalFeedbackStore>()
+                // Hub Connect posts a diagnostic write to the same single-flight
+                // store. Wait for that flight to drain before the one MCP call.
+                use proofDeadline = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds 2.)
+                let mutable ready = false
+                while not ready && not proofDeadline.IsCancellationRequested do
+                    let! status = store.TryExecute(fun _ -> ())
+                    match status with
+                    | Ok () -> ready <- true
+                    | Error _ -> do! Task.Delay(25)
+                Assert.That(ready, Is.True, "SQLite did not finish the registered connection diagnostics.")
+                do! qualifyingIngress address
+                let mutable confirmed : AgentActivitySnapshot option = None
+                let mutable lastProofError = ""
+                let mutable attempts = 0
+                while confirmed.IsNone && attempts < 40 do
+                    attempts <- attempts + 1
+                    try
+                        let! actual = hub.InvokeAsync<AgentActivitySnapshot>("GetAgentActivity", "Fixture", "Worker")
+                        confirmed <- Some actual
+                    with :? HubException as ex ->
+                        lastProofError <- ex.Message
+                        do! Task.Delay(50)
+                Assert.That(confirmed.IsSome, Is.True, "Qualified MCP ingress must reach verified hosted SQLite: " + lastProofError)
+                Assert.That(confirmed.Value.LastSeenAtUtc.IsSome, Is.True)
+                return confirmed.Value
+            }
+
         // The only positive timestamps originate in actual registered hub reads.
         // Optional clock projection below is an explicit test-only negative/edge
         // control: it preserves the server-authoritative SQLite LastSeenAtUtc,
@@ -191,31 +222,7 @@ let hosted_negative_matrix_requires_real_coverage () =
                     do! register alice "alice-new-negative"
                     // The isolation assertion deliberately follows the genuine
                     // qualifying ingress and presence of Alice's persisted row.
-                    let store = firstHost.Services.GetRequiredService<Server.Services.OptionalFeedbackStore>()
-                    // Hub Connect posts a diagnostic write to the same single-flight
-                    // store. Wait for that flight to drain before the one MCP call.
-                    use proofDeadline = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds 2.)
-                    let mutable ready = false
-                    while not ready && not proofDeadline.IsCancellationRequested do
-                        let! status = store.TryExecute(fun _ -> ())
-                        match status with
-                        | Ok () -> ready <- true
-                        | Error _ -> do! Task.Delay(25)
-                    Assert.That(ready, Is.True, "SQLite did not finish the registered connection diagnostics.")
-                    do! qualifyingIngress address
-                    let mutable confirmed : AgentActivitySnapshot option = None
-                    let mutable lastProofError = ""
-                    let mutable attempts = 0
-                    while confirmed.IsNone && attempts < 40 do
-                        attempts <- attempts + 1
-                        try
-                            let! actual = alice.InvokeAsync<AgentActivitySnapshot>("GetAgentActivity", "Fixture", "Worker")
-                            confirmed <- Some actual
-                        with :? HubException as ex ->
-                            lastProofError <- ex.Message
-                            do! Task.Delay(50)
-                    Assert.That(confirmed.IsSome, Is.True, "Qualified MCP ingress must reach verified hosted SQLite: " + lastProofError)
-                    Assert.That(confirmed.Value.LastSeenAtUtc.IsSome, Is.True)
+                    let! confirmed = qualify firstHost address alice
                     do! register bob "bob-after-alice-ingress"
                     do! unavailable bob "Bob must not observe Alice's persisted row after qualifying ingress."
 
@@ -245,7 +252,7 @@ let hosted_negative_matrix_requires_real_coverage () =
                     let reversedActivity (project: string) (agent: string) =
                         task {
                             let! real = alice.InvokeAsync<AgentActivitySnapshot>("GetAgentActivity", project, agent)
-                            Assert.That(real.LastSeenAtUtc, Is.EqualTo(confirmed.Value.LastSeenAtUtc))
+                            Assert.That(real.LastSeenAtUtc, Is.EqualTo(confirmed.LastSeenAtUtc))
                             readCount <- readCount + 1
                             let age = if readCount = 1 then TimeSpan.FromSeconds 601. else TimeSpan.FromSeconds 600.
                             return Ok { real with ServerNowUtc = real.LastSeenAtUtc.Value.Add(age) }
@@ -335,6 +342,64 @@ let hosted_negative_matrix_requires_real_coverage () =
                 try
                     do! register aliceAgain "alice-after-host-restart"
                     do! unavailable aliceAgain "Persisted SQLite row alone cannot verify post-restart Health inactivity."
+                    let first, second, rt, secondRt, candidate = fixture "fresh-host-requalification"
+                    let baseline = (LedgerStore.fetch first |> success).Commit
+                    let deps = dependencies candidate rt (hubActivity aliceAgain None)
+                    let operationId = NativeHealth.recoveryOperationId candidate
+                    let accelerated = { Enabled = true; InactivitySeconds = 1 }
+                    let! absent = NativeHealth.checkOnce accelerated deps
+                    Assert.That(absent.Holds, Is.EqualTo(1))
+                    Assert.That(absent.Recoveries, Is.Zero)
+                    Assert.That(absent.Errors, Has.Some.Contains("Activity unavailable"))
+                    Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(baseline))
+                    let _, absentReceipt = LedgerStore.getOperationStatus second operationId |> success
+                    Assert.That(absentReceipt.IsNone, Is.True)
+
+                    // Retained row is a negative control only. No direct SQL write
+                    // or projected server time participates in this positive proof.
+                    use previous = sql.CreateCommand()
+                    previous.CommandText <- "SELECT last_seen_at FROM attributed_agent_activity WHERE user_id='alice' AND project_name='Fixture' AND agent_id='Worker'"
+                    let previousSeen = DateTimeOffset.Parse(string (previous.ExecuteScalar()))
+                    let beforeIngress = DateTimeOffset.UtcNow
+                    let! fresh = qualify restarted address aliceAgain
+                    Assert.That(fresh.LastSeenAtUtc.Value, Is.GreaterThan(previousSeen))
+                    Assert.That(fresh.LastSeenAtUtc.Value, Is.GreaterThanOrEqualTo(beforeIngress))
+                    Assert.That(fresh.ServerNowUtc, Is.GreaterThanOrEqualTo(fresh.LastSeenAtUtc.Value))
+                    let! recent = NativeHealth.checkOnce settings deps
+                    Assert.That(recent.Holds, Is.EqualTo(1))
+                    Assert.That(recent.Errors, Is.Empty)
+                    Assert.That(recent.Recoveries, Is.Zero)
+                    Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(baseline))
+
+                    // Real elapsed time at a test-only one-second timeout; not a
+                    // claim of 600 seconds' live inactivity. Both Health reads
+                    // use the actual newly registered Hub and actual Git CAS.
+                    do! Task.Delay(1250)
+                    let! recovered = NativeHealth.checkOnce accelerated deps
+                    Assert.That(recovered.Recoveries, Is.EqualTo(1), sprintf "%A" recovered)
+                    Assert.That(recovered.Errors, Is.Empty)
+                    let _, receipt = LedgerStore.getOperationStatus second operationId |> success
+                    Assert.That(receipt.IsSome, Is.True)
+                    Assert.That(receipt.Value.Type, Is.EqualTo("RecoverAgentAssignment"))
+                    let _, _, afterAttempt = ReviewWorkflow.getTask second candidate.TaskId |> success
+                    Assert.That(afterAttempt.Value.AssignmentGeneration, Is.EqualTo(candidate.Generation + 1))
+                    Assert.That(afterAttempt.Value.AttemptId, Is.EqualTo(candidate.AttemptId))
+                    Assert.That(afterAttempt.Value.SpecBlobOid, Is.EqualTo(candidate.SpecBlobOid))
+                    Assert.That(afterAttempt.Value.SourceRef, Is.EqualTo(candidate.SourceRef))
+                    match NativeHealth.current secondRt candidate with
+                    | Ok None -> ()
+                    | other -> Assert.Fail(sprintf "Recovered candidate remains actionable: %A" other)
+                    let recoveredHead = (LedgerStore.fetch second |> success).Commit
+                    let staleId = Guid.NewGuid()
+                    match ReviewWorkflow.recoverAgentAssignmentWithTaskVersionAs second
+                            "AuthenticatedUser" staleId candidate.TaskId candidate.AgentId
+                            candidate.TaskVersion candidate.AttemptVersion candidate.AgentVersion
+                            candidate.Generation "Stale post-requalification competitor" with
+                    | Error(StaleEntityVersion _) -> ()
+                    | outcome -> Assert.Fail(sprintf "Stale competing CAS must lose: %A" outcome)
+                    let _, staleReceipt = LedgerStore.getOperationStatus second staleId |> success
+                    Assert.That(staleReceipt.IsNone, Is.True)
+                    Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(recoveredHead))
                 finally
                     aliceAgain.DisposeAsync().AsTask().GetAwaiter().GetResult()
             finally

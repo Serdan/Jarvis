@@ -146,6 +146,7 @@
         <Compile Include="SignalR\CommandDispatch.fs"/>
         <Compile Include="SignalR\HubConnection.fs"/>
         <Compile Include="SignalR\Client.fs"/>
+        <Compile Include="Modules\ProjectCapacityPolicy.fs"/>
         <Compile Include="Modules\ScheduledReadyResume.fs"/>
         <Compile Include="Program.fs"/>
     </ItemGroup>

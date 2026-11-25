@@ -46,6 +46,28 @@ type ScheduledAction =
       Disabled: bool
       LastResult: string }
 
+// The opt-in is host metadata, not a browser script argument. Other scripts
+// and legacy browser schedules retain their ordinary execution semantics.
+let isReadyResume (action: ScheduledAction) =
+    if action.ActionKind <> "BrowserScript" ||
+       action.ScriptPath <> "browser-scripts/chatgpt/launchAgent.js" then false
+    else
+        try
+            use doc = JsonDocument.Parse(action.ArgsJson)
+            match doc.RootElement.TryGetProperty("resumeReady") with
+            | true, marker -> marker.ValueKind = JsonValueKind.True
+            | _ -> false
+        with _ -> false
+
+let private isUncertainResume (action: ScheduledAction) =
+    isReadyResume action && action.Status = "suspended" &&
+    not (String.IsNullOrEmpty action.Error) &&
+    action.Error.StartsWith("ResumePublicationUncertain:", StringComparison.Ordinal)
+
+let private sameResumeProject (left: ScheduledAction) (right: ScheduledAction) =
+    isReadyResume left && isReadyResume right &&
+    String.Equals(left.ProjectName, right.ProjectName, StringComparison.OrdinalIgnoreCase)
+
 // A claim must survive sudden power loss before any external side effect.
 // On Unix, the containing directory must be synced after the atomic rename.
 // On Windows, use MOVEFILE_WRITE_THROUGH with replace semantics.
@@ -174,17 +196,17 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
             if File.Exists(temp) then File.Delete(temp)
 
     let setActions items =
-        let active = items |> List.filter (fun item -> item.Status = "pending" || item.Status = "running" || item.Status = "waitingActivity")
+        let active = items |> List.filter (fun item -> item.Status = "pending" || item.Status = "running" || item.Status = "waitingActivity" || isUncertainResume item)
         let history =
             items
-            |> List.filter (fun item -> item.Status <> "pending" && item.Status <> "running" && item.Status <> "waitingActivity")
+            |> List.filter (fun item -> item.Status <> "pending" && item.Status <> "running" && item.Status <> "waitingActivity" && not (isUncertainResume item))
             |> List.sortByDescending (fun item -> item.UpdatedAtUtc)
             |> List.truncate 100
         let bounded = active @ history
         persist bounded
         actions <- bounded
 
-    let update id attemptId status (rawResult: string) error =
+    let update id attemptId status (rawResult: string) (error: string) =
         // Accept legacy registration-only results and structured browser workflow results.
         let registrationId, conversationUrl, cleanup, effectiveStatus =
             try
@@ -224,7 +246,12 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                 elif rawResult.Length > 200 then rawResult.Substring(0, 200)
                                 else rawResult
                             else ""
-                        if a.Disabled then
+                        if isReadyResume a && error.StartsWith("ResumePublicationUncertain:", StringComparison.Ordinal) then
+                            // Keep unresolved intent evidence even if cancellation
+                            // raced the active occurrence.
+                            { a with Status = "suspended"; RegistrationId = registrationId
+                                     Error = error; LastResult = resultSummary; UpdatedAtUtc = now }
+                        elif a.Disabled then
                             { a with Status = "canceled"; Error = error; LastResult = resultSummary; UpdatedAtUtc = now }
                         elif effectiveStatus = "suspended" then
                             // A provider UI contract failure needs inspection, not another
@@ -293,7 +320,14 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                         // An inactive schedule cannot authorize its own reactivation.
                         // Historical failure details are evidence, not permission.
                         if action.Status = "running" then
-                            if isIdle action then
+                            if isReadyResume action then
+                                // No durable receipt for the canonical launch intent
+                                // has been reconciled. Never infer no publication
+                                // from a missing receipt after a client crash.
+                                { action with Status = "suspended"
+                                              Error = "ResumePublicationUncertain: interrupted claimed resume; reconcile original intent."
+                                              UpdatedAtUtc = clock() }
+                            elif isIdle action then
                                 let now = clock()
                                 let stale = action.StartedAtUtc.AddMinutes(30.)
                                 { action with Status = "pending"
@@ -368,6 +402,8 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                     lock gate (fun () ->
                         if actions |> List.exists (fun x -> x.Id = id && x.Status = "running") then
                             Error "ScheduleRunning: cannot replace an executing action."
+                        elif actions |> List.exists (fun x -> x.Id = id && isUncertainResume x) then
+                            Error "ResumePublicationUncertain: reconcile the original intent before replacing this schedule."
                         elif (actions |> List.filter (fun x ->
                                 (x.Status = "pending" || x.Status = "waitingActivity") && x.Id <> id)
                                 |> List.length) >= 100 then
@@ -467,6 +503,8 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                 lock gate (fun () ->
                     if actions |> List.exists (fun a -> a.Id = cmd.ScheduleId && a.Status = "running") then
                         Error "ScheduleRunning: cannot replace an executing action."
+                    elif actions |> List.exists (fun a -> a.Id = cmd.ScheduleId && isUncertainResume a) then
+                        Error "ResumePublicationUncertain: reconcile the original intent before replacing this schedule."
                     elif (actions |> List.filter (fun a ->
                             a.Id <> cmd.ScheduleId && (a.Status = "pending" || a.Status = "waitingActivity"))
                             |> List.length) >= 100 then
@@ -523,6 +561,15 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
             | Some action -> Ok(JsonSerializer.Serialize(describe action))
             | None -> Error "ScheduleNotFound")
 
+    // Revalidate the exact durable occurrence after async preflight and
+    // immediately before Send. Cancellation cannot authorize a replacement.
+    member _.IsCurrentClaim(action: ScheduledAction) =
+        lock gate (fun () ->
+            not disposed && not cancellation.IsCancellationRequested &&
+            (actions |> List.exists (fun a ->
+                a.Id = action.Id && a.RevisionId = action.RevisionId
+                && a.AttemptId = action.AttemptId && a.Status = "running" && not a.Disabled)))
+
     member _.Start() =
         lock gate (fun () ->
             if started then invalidOp "Execution scheduler already started."
@@ -576,13 +623,19 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                     isIdle entry && (running |> List.exists (fun a ->
                                         isIdle a && a.ProjectName = entry.ProjectName
                                         && a.IdleAgentId = entry.IdleAgentId))
+                                let resumeHeld entry =
+                                    isReadyResume entry &&
+                                    (actions |> List.exists (fun a ->
+                                        a.Id <> entry.Id && sameResumeProject a entry
+                                        && (a.Status = "running" || isUncertainResume a)))
                                 let due =
                                     if running.Length >= 8 then None
                                     else
                                         actions
                                         |> List.filter (fun a ->
                                             a.Status = "pending" && not a.Disabled
-                                            && a.DueAtUtc <= current && not (alreadyRunningManager a))
+                                            && a.DueAtUtc <= current && not (alreadyRunningManager a)
+                                            && not (resumeHeld a))
                                         |> List.sortBy (fun a -> a.DueAtUtc)
                                         |> List.tryHead
                                 match due with
@@ -635,6 +688,10 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                             let eligible () =
                                                 currentEntry.Status = "pending" && currentEntry.DueAtUtc <= now
                                                 && (actions |> List.filter (fun a -> a.Status = "running") |> List.length) < 8
+                                                && (not (isReadyResume currentEntry) ||
+                                                    not (actions |> List.exists (fun a ->
+                                                        a.Id <> currentEntry.Id && sameResumeProject a currentEntry
+                                                        && (a.Status = "running" || isUncertainResume a))))
                                                 && (not (isIdle currentEntry) ||
                                                     not (actions |> List.exists (fun a ->
                                                         isIdle a && a.Status = "running"
@@ -710,7 +767,11 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                     | Ok value -> update entry.Id entry.AttemptId "completed" value ""
                                     | Error (value, reason) ->
                                         let status =
-                                            if reason.StartsWith("UiIncompatible:", StringComparison.Ordinal) then
+                                            if isReadyResume entry &&
+                                               reason.StartsWith("ResumePublicationUncertain:", StringComparison.Ordinal) then "suspended"
+                                            elif isReadyResume entry &&
+                                                 reason.StartsWith("UiIncompatible:", StringComparison.Ordinal) then "suspended"
+                                            elif reason.StartsWith("UiIncompatible:", StringComparison.Ordinal) then
                                                 // Retry at the next interval; never replay this attempt.
                                                 if entry.RepeatEverySeconds > 0 then "failed" else "suspended"
                                             elif reason.Contains("OutcomeUnknown", StringComparison.OrdinalIgnoreCase) then "outcomeUnknown"
@@ -718,8 +779,12 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                         update entry.Id entry.AttemptId status value
                                             (if reason.Length > 250 then reason.Substring(0, 250) else reason)
                                 with ex ->
-                                    update entry.Id entry.AttemptId "outcomeUnknown" ""
-                                        ("Unexpected error: " + ex.GetType().Name)
+                                    if isReadyResume entry then
+                                        update entry.Id entry.AttemptId "suspended" ""
+                                            ("ResumePublicationUncertain: unexpected error: " + ex.GetType().Name)
+                                    else
+                                        update entry.Id entry.AttemptId "outcomeUnknown" ""
+                                            ("Unexpected error: " + ex.GetType().Name)
                             }
                             Task.Run(Func<Task>(fun () -> run () :> Task)) |> ignore
                         do! Task.Delay(interval, cancellation.Token)

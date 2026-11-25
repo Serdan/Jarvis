@@ -133,6 +133,29 @@ let private operatorActorFromAccessToken (token: string) =
                 |> fun hash -> Some("operator:" + hash.ToLowerInvariant())
     with _ -> None
 
+let private readScheduledScript (rt: Runtime) (action: BrowserSchedules.ScheduledAction) =
+    match ProjectPaths.validateProjectRelativePath action.ScriptPath with
+    | Error e -> Error(sprintf "%A" e)
+    | Ok _ when not (action.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
+        Error "InvalidScriptPath"
+    | Ok _ ->
+        match ProjectPaths.resolveProjectFile action.ProjectName action.ScriptPath rt with
+        | Error e -> Error(sprintf "%A" e)
+        | Ok(FilePath path) ->
+            try
+                if FileInfo(path).Length > int64 BrowserBridge.MaxScriptBytes then Error "InputTooLarge"
+                else Ok(File.ReadAllText(path, UTF8Encoding(false, true)))
+            with e -> Error("ScriptUnavailable:" + e.GetType().Name)
+
+let private scheduledBrowserCommand (action: BrowserSchedules.ScheduledAction) =
+    BrowserRunInNewTabCommand
+        { TargetAgentId = None
+          ProjectName = action.ProjectName; WindowRegistration = action.WindowRegistration
+          Url = action.Url; ScriptPath = action.ScriptPath
+          ArgsJson = Some action.ArgsJson; Active = Some action.Active
+          CloseTabAfterExecution = Some action.CloseTabAfterExecution
+          TimeoutMs = Some 30000 }
+
 let executeScheduledAction (readFence: unit -> Result<ClientConfig.CapacityFenceMode, string>) (rt: Runtime) (tui: ConsoleTui) (browser: BrowserBridge.Service option) (action: BrowserSchedules.ScheduledAction) = task {
     let permission = rt :> PermissionIO
     let prompt (cmd: AgentCommand) request = permission.PromptPermission cmd request
@@ -170,31 +193,12 @@ let executeScheduledAction (readFence: unit -> Result<ClientConfig.CapacityFence
         // the local deny-only fence is enabled or its setting is unreadable.
         return Error("", "CapacityFenceHold: scheduled browser launch denied")
     else
-        let authCommand =
-            BrowserRunInNewTabCommand
-                { TargetAgentId = None
-                  ProjectName = action.ProjectName; WindowRegistration = action.WindowRegistration
-                  Url = action.Url; ScriptPath = action.ScriptPath
-                  ArgsJson = Some action.ArgsJson; Active = Some action.Active
-                  CloseTabAfterExecution = Some action.CloseTabAfterExecution
-                  TimeoutMs = Some 30000 }
+        let authCommand = scheduledBrowserCommand action
         let! allowed = PermissionPolicy.authorizeWithTrust permission.TrustLevel prompt authCommand
         match allowed with
         | Error error -> return Error("", "AuthorizationDenied: " + sprintf "%A" error)
         | Ok() ->
-            let script =
-                match ProjectPaths.validateProjectRelativePath action.ScriptPath with
-                | Error e -> Error(sprintf "%A" e)
-                | Ok _ when not (action.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
-                    Error "InvalidScriptPath"
-                | Ok _ ->
-                    match ProjectPaths.resolveProjectFile action.ProjectName action.ScriptPath rt with
-                    | Error e -> Error(sprintf "%A" e)
-                    | Ok(FilePath path) ->
-                        try
-                            if FileInfo(path).Length > int64 BrowserBridge.MaxScriptBytes then Error "InputTooLarge"
-                            else Ok(File.ReadAllText(path, UTF8Encoding(false, true)))
-                        with e -> Error("ScriptUnavailable:" + e.GetType().Name)
+            let script = readScheduledScript rt action
             match script, browser with
             | Error e, _ -> return Error("", e)
             | _, None -> return Error("", "BridgeDisabled")
@@ -221,6 +225,89 @@ let executeScheduledAction (readFence: unit -> Result<ClientConfig.CapacityFence
                             tui.Log $"Browser schedule '{action.Id}' suspended: {reason}; inspect tab {registrationId} and update provider script."
                         return Error(registrationId, reason)
                     | Ok json -> return Ok json
+}
+
+// Ordinary canonical Ready resume shares the existing persistent schedule
+// and authenticated bridge. No provider inventory, account baseline, new
+// credential or capacity reservation is introduced.
+let executeReadySchedule (authenticatedActor: unit -> string option) (rt: Runtime)
+                         (browser: BrowserBridge.Service option) (action: BrowserSchedules.ScheduledAction) = task {
+    let permission = rt :> PermissionIO
+    let authorize () =
+        PermissionPolicy.evaluateWithTrust permission.TrustLevel (scheduledBrowserCommand action)
+        |> Result.mapError (fun error -> "AuthorizationDenied: " + sprintf "%A" error)
+    match ScheduledReadyResume.validateRoute action with
+    | Error reason -> return Error("", reason)
+    | Ok () ->
+        match authenticatedActor(), rt.BrowserScheduler, browser with
+        | Some actor, Some scheduler, Some bridge when scheduler.IsCurrentClaim action ->
+            match authorize(), readScheduledScript rt action with
+            | Error reason, _ | _, Error reason -> return Error("", reason)
+            | Ok (), Ok source ->
+                if bridge.ListWindows().IsError then return Error("", "ExtensionDisconnected")
+                else
+                    match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot action.ProjectName rt with
+                    | Error error -> return Error("", sprintf "%A" error)
+                    | Ok(binding, _) ->
+                        let hash (value: string) =
+                            Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes value)).ToLowerInvariant()
+                        let routeHash =
+                            JsonSerializer.Serialize(
+                                {| id = action.Id; revisionId = action.RevisionId; project = action.ProjectName; url = action.Url; script = action.ScriptPath
+                                   window = action.WindowRegistration; alias = action.Alias; active = action.Active; close = action.CloseTabAfterExecution |})
+                            |> hash
+                        let mutable registrationId = ""
+                        let preflight ready = task {
+                            if authenticatedActor() <> Some actor || not (scheduler.IsCurrentClaim action) then
+                                return Ok false
+                            else
+                                match authorize() with
+                                | Error reason -> return Error reason
+                                | Ok () ->
+                                    match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot action.ProjectName rt with
+                                    | Error error -> return Error(sprintf "%A" error)
+                                    | Ok(current, snapshot) when current = binding ->
+                                        return ScheduledReadyResume.stillReadyAt current snapshot ready
+                                               |> Result.mapError (sprintf "%A")
+                                    | Ok _ -> return Error "Project ledger binding changed."
+                        }
+                        let send prepared = task {
+                            // Check the exact authenticated occurrence again after
+                            // the ledger read, immediately before entering the bridge.
+                            if authenticatedActor() <> Some actor || not (scheduler.IsCurrentClaim action) then
+                                return Error "Schedule stopped before browser invocation."
+                            else
+                                match ScheduledReadyResume.browserArguments action.Url prepared with
+                                | Error reason -> return Error reason
+                                | Ok args ->
+                                    let! result = BrowserBridge.runInNewTab bridge action.WindowRegistration
+                                                    action.Url action.Alias action.Active source args
+                                                    30000 action.CloseTabAfterExecution
+                                    match result with
+                                    | Ok value -> return Ok value
+                                    | Error(id, reason) ->
+                                        registrationId <- id
+                                        return Error reason
+                        }
+                        let ports : ScheduledReadyResume.ExecutionPorts =
+                            { ReadLimits = ScheduledReadyResume.readCurrentLimits
+                              CanSend = preflight
+                              Send = send }
+                        let! outcome =
+                            ScheduledReadyResume.executeOnce ports binding actor action.ProjectName
+                                action.ScriptPath (hash source) routeHash
+                        match outcome with
+                        | ScheduledReadyResume.NoEligibleReady -> return Ok """{"status":"noEligibleReady"}"""
+                        | ScheduledReadyResume.Held reason -> return Error("", reason)
+                        | ScheduledReadyResume.Submitted value -> return Ok value
+                        | ScheduledReadyResume.PublicationUncertain(operation, reason) ->
+                            return Error("", $"ResumePublicationUncertain:{operation:D}:{reason}")
+                        | ScheduledReadyResume.OutcomeUnknown reason ->
+                            let detail =
+                                if reason.StartsWith("UiIncompatible:", StringComparison.Ordinal) then reason
+                                else "OutcomeUnknown:" + reason
+                            return Error(registrationId, detail)
+        | _ -> return Error("", "Authenticated active resume schedule unavailable.")
 }
 
 let private runClient args =
@@ -285,7 +372,12 @@ let private runClient args =
 
     // One persistent execution scheduler for CLI and browser actions.
     // The browser bridge is optional; CLI scheduling works without an extension.
-    let executeScheduledAction = executeScheduledAction ClientConfig.capacityFenceMode rt tui browser
+    let mutable registered = false
+    let mutable readyResumeActor : unit -> string option = fun () -> None
+    let executeScheduledAction action =
+        if BrowserSchedules.isReadyResume action then
+            executeReadySchedule readyResumeActor rt browser action
+        else executeScheduledAction ClientConfig.capacityFenceMode rt tui browser action
     // The runtime owns at most one local scheduler per private state file.
     // A second JarvisClient can still connect, but never becomes a competing
     // schedule writer/executor. Idle launches also require a *fresh* authenticated
@@ -332,8 +424,6 @@ let private runClient args =
     let importSizeDescription =
         if maxImportBytes = 0L then "unlimited" else $"{maxImportBytes} bytes"
     tui.Log $"Maximum import size: {importSizeDescription}"
-
-    let mutable registered = false
 
     let oauth =
         OAuth.login tui.Log tui.ShowSignInLink
@@ -429,6 +519,10 @@ let private runClient args =
                         Func<Task<string>>(fun () -> oauth.GetAccessTokenAsync()))
             )
             .Build()
+
+    readyResumeActor <- (fun () ->
+        if registered && connection.State = HubConnectionState.Connected then authenticatedOperator
+        else None)
 
     connection.KeepAliveInterval <- TimeSpan.FromSeconds 10.0
     connection.ServerTimeout <- TimeSpan.FromSeconds 60.0

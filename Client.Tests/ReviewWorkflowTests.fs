@@ -6056,10 +6056,9 @@ type ReviewWorkflowTests() =
                 match job.Result with
                 | Ok _ -> ()
                 | Error(Client.LedgerFailureError info) when info.Code = "TrustBindingContended" ->
-                    // Readers launched while the external lock is held now
-                    // fail promptly with typed, recoverable contention rather
-                    // than synchronously spinning for two seconds. Retry after
-                    // release must reverify the latest approved trust anchor.
+                    // A reader that exhausts its contention budget may fail
+                    // with typed contention. A new load after release must
+                    // reverify the latest approved trust anchor.
                     match Client.OrchestrationApi.LedgerBindingConfig.load "owner" ctx with
                     | Ok _ -> ()
                     | other -> Assert.Fail(sprintf "Contended load did not recover: %A" other)

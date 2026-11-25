@@ -310,6 +310,57 @@ let trustBindingSharingContentionReturnsTypedErrorWithoutBlockingDashboard () =
         Directory.Delete(root, true)
 
 
+[<TestCase(true)>]
+[<TestCase(false)>]
+let verifiedTrustBindingLoadRetriesTransientAcquisitionOnly (releaseDuringRetry: bool) =
+    let root, project = GitCommandTests.createTempProject ()
+    let path = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot project
+    try
+        Directory.CreateDirectory(Path.GetDirectoryName(path)) |> ignore
+        let record : Client.OrchestrationApi.LedgerTrustBinding =
+            { SchemaVersion = 1; Enabled = true; ProjectRoot = Path.GetFullPath(project)
+              ProjectId = Guid.NewGuid().ToString("D")
+              LedgerId = Guid.NewGuid().ToString("D"); Epoch = 1
+              RemoteName = "origin"; ApprovedFetchUrl = "local-test"
+              ApprovedPushUrl = "local-test"; HighestTrustedHead = String.replicate 40 "a" }
+        let original = System.Text.Json.JsonSerializer.Serialize(record)
+        File.WriteAllText(path, original)
+        use held = new FileStream(path + ".lock", FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)
+        let mutable fetches = 0
+        let load () =
+            Client.OrchestrationApi.LedgerBindingConfig.loadAtRootWithSnapshotUsing
+                (fun _ ->
+                    fetches <- fetches + 1
+                    Error(LedgerStore.TrustBindingContended "sentinel from fetch"))
+                project
+        if releaseDuringRetry then
+            let release = System.Threading.Tasks.Task.Run(fun () ->
+                System.Threading.Thread.Sleep(60)
+                held.Dispose())
+            try
+                match load () with
+                | Error(Client.LedgerFailureError issue) ->
+                    Assert.That(issue.Message, Does.Contain("sentinel from fetch"))
+                | other -> Assert.Fail(sprintf "Expected the fetch's error after acquisition: %A" other)
+                Assert.That(fetches, Is.EqualTo(1))
+            finally
+                release.GetAwaiter().GetResult()
+        else
+            let watch = System.Diagnostics.Stopwatch.StartNew()
+            match load () with
+            | Error(Client.LedgerFailureError issue) ->
+                Assert.That(issue.Code, Is.EqualTo("TrustBindingContended"))
+                Assert.That(issue.Message, Does.Not.Contain("sentinel from fetch"))
+            | other -> Assert.Fail(sprintf "Expected the lock's error before fetch: %A" other)
+            Assert.That(fetches, Is.Zero)
+            Assert.That(watch.ElapsedMilliseconds, Is.GreaterThanOrEqualTo(150L))
+            Assert.That(watch.ElapsedMilliseconds, Is.LessThan(2000L))
+        Assert.That(File.ReadAllText(path), Is.EqualTo(original))
+    finally
+        if File.Exists(path) then File.Delete(path)
+        if File.Exists(path + ".lock") then File.Delete(path + ".lock")
+        Directory.Delete(root, true)
+
 [<Test>]
 let trustBindingErrorClassifierRecognizesSharingOnlyNotOtherIoOrSecurityFailures () =
     let classified = Client.OrchestrationApi.LedgerBindingConfig.isTransientSharingViolation

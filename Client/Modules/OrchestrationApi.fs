@@ -76,7 +76,11 @@ module LedgerBindingConfig =
             | 11 | 32 | 33 | 35 -> true // Linux EAGAIN, Windows sharing/lock, macOS EAGAIN
             | _ -> false
 
-    let private withConfigLock (path: string) operation =
+    // Verified loads and administrative updates tolerate short-lived contention.
+    // Dashboard grouping still uses a single attempt to minimize refresh latency.
+    let private configLockRetryDelaysMs = [ 10; 20; 40; 80; 80 ]
+
+    let private withConfigLock retryDelaysMs (path: string) operation =
         try
             let dir = Path.GetDirectoryName path
             Directory.CreateDirectory(dir) |> ignore
@@ -84,29 +88,32 @@ module LedgerBindingConfig =
                 Error(Client.ValidationError " binding directory must not be a symlink.")
             else
                 let lockPath = path + ".lock"
-                if File.Exists(lockPath) && File.GetAttributes(lockPath).HasFlag(FileAttributes.ReparsePoint) then
-                    Error(Client.ValidationError " binding lock must not be a symlink.")
-                else
-                    // One nonblocking attempt. The caller's next dashboard refresh
-                    // retries transient contention; remote fetches never run here.
-                    let acquired =
+                let rec acquire delays =
+                    if File.Exists(lockPath) && File.GetAttributes(lockPath).HasFlag(FileAttributes.ReparsePoint) then
+                        Error(Client.ValidationError " binding lock must not be a symlink.")
+                    else
                         try
                             Ok (new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite,
                                                FileShare.None, 4096, FileOptions.None))
                         with
                         | :? IOException as ex when isTransientSharingViolation ex ->
-                            Error(LedgerErrors.toEffect (LedgerStore.TrustBindingContended ex.Message))
+                            match delays with
+                            | delay :: remaining ->
+                                System.Threading.Thread.Sleep(delay: int)
+                                acquire remaining
+                            | [] ->
+                                Error(LedgerErrors.toEffect (LedgerStore.TrustBindingContended ex.Message))
                         | :? UnauthorizedAccessException as ex ->
                             Error(Client.PermissionDenied $"Cannot access trust-binding lock: {ex.Message}")
                         | :? IOException as ex ->
                             Error(Client.ValidationError $"Cannot open trust-binding lock: {ex.Message}")
-                    match acquired with
-                    | Error error -> Error error
-                    | Ok stream ->
-                        use held = stream
-                        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
-                            File.SetUnixFileMode(lockPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
-                        operation ()
+                match acquire retryDelaysMs with
+                | Error error -> Error error
+                | Ok stream ->
+                    use held = stream
+                    if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                        File.SetUnixFileMode(lockPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                    operation ()
         with
         | :? UnauthorizedAccessException as ex ->
             Error(Client.PermissionDenied $"Cannot access trust binding: {ex.Message}")
@@ -182,7 +189,7 @@ module LedgerBindingConfig =
         else
             let rec load remaining =
                 let initial =
-                    withConfigLock path (fun () ->
+                    withConfigLock configLockRetryDelaysMs path (fun () ->
                         readStored path
                         |> Result.bind (fun stored ->
                             validStored root stored
@@ -199,7 +206,7 @@ module LedgerBindingConfig =
                         | Error error -> Error error
                         | Ok () ->
                             let committed =
-                                withConfigLock path (fun () ->
+                                withConfigLock configLockRetryDelaysMs path (fun () ->
                                     readStored path
                                     |> Result.bind (fun current ->
                                         validStored root current
@@ -253,7 +260,7 @@ module LedgerBindingConfig =
     // this read neither fetches a head nor updates the trust anchor.
     let private inspectLocalAtRoot root =
         let path = pathForRoot root
-        withConfigLock path (fun () ->
+        withConfigLock [] path (fun () ->
             readStored path
             |> Result.bind (fun stored ->
                 validStored root stored
@@ -306,7 +313,7 @@ module LedgerBindingConfig =
                                   RemoteName = remoteName; ApprovedFetchUrl = approvedFetchUrl
                                   ApprovedPushUrl = approvedPushUrl
                                   HighestTrustedHead = snapshot.Commit }
-                            withConfigLock path (fun () ->
+                            withConfigLock configLockRetryDelaysMs path (fun () ->
                                 if File.Exists path then
                                     Error(Client.ValidationError " binding was concurrently created; refusing overwrite.")
                                 else
@@ -373,7 +380,7 @@ module LedgerBindingConfig =
                 | Ok(FolderPath root) ->
                     let path = pathForRoot root
                     let initial =
-                        withConfigLock path (fun () ->
+                        withConfigLock configLockRetryDelaysMs path (fun () ->
                             readStored path
                             |> Result.bind (fun stored ->
                                 validStored root stored
@@ -401,7 +408,7 @@ module LedgerBindingConfig =
                                     expectedTrustedHead snapshot.Commit
                                 |> Result.mapError LedgerErrors.toEffect
                                 |> Result.bind (fun () ->
-                                    withConfigLock path (fun () ->
+                                    withConfigLock configLockRetryDelaysMs path (fun () ->
                                         readStored path
                                         |> Result.bind (fun current ->
                                             validStored root current

@@ -1,0 +1,18 @@
+<article>
+<h1>Add an opt-in bounded hang timeout for the slow real-Git property diagnostic</h1>
+<p><strong>Authorized scope:</strong> a narrowly bounded harness-only correction at exact final qualification source <code>2be5afb056fc31b0f5f5c7410afaed225b0216bf</code> (tree <code>cb2bfb9ea4b3aa70997d933e0207e5dccc83cd84</code>). Do not use or modify the dirty primary checkout.</p>
+<h2>Evidence and rationale</h2>
+<p>Worker 20's completed read-only audit found that the final Client run <code>a651dba0736642b5b01fa400ae6e95da</code> exited 1 after 338 passed and one NotExecuted result, with no assertion-failed row and no completed total. The runner's blame report says 75 seconds of inactivity while <code>GeneratedTwoCloneDependencyTracesMatchTaskWaitGenerationAndIndexModel</code> was active. No dump exists, so do not claim a deadlock or infer the exact aborted process state. The wrapper hardcodes <code>--blame-hang-timeout 75s</code> at lines 112-115; the outer timeout is independently bounded (default 240s, maximum 900s). The exact same property source passed in a retained focused run in 3m38.4166940, and earlier retained runs were approximately 3m34-4m15. The mixed property performs 4 seeds × 56 generated commands with real Git clones and full snapshot/index/lifecycle oracles. This demonstrates a harness inactivity-budget mismatch, not a proven application regression.</p>
+<h2>Lease and implementation</h2>
+<ul><li><code>scripts/test-client-hermetic.fsx</code></li></ul>
+<p>Create a clean registered worktree and branch <code>refs/heads/fix/client-hermetic-diagnostic-hang-timeout-w19-20261125</code> from the exact base above; bind the attempt source to <code>refs/heads/main</code>. Add a wrapper-level <code>--hang-timeout-seconds</code> option that controls only VSTest's <code>--blame-hang-timeout</code>. Preserve the current 75-second default exactly. Validate a positive value strictly less than the existing outer timeout; keep the outer timeout's current bounds, process-tree kill, output-drain, cleanup and exit semantics. Reject duplicate/competing forwarded <code>--blame-hang-timeout</code> forms rather than silently passing two values. Document the wrapper option and its explicit opt-in nature.</p>
+<h2>Acceptance</h2>
+<ul>
+<li>Only the leased runner file changes unless a tiny existing parser-test file is essential; obtain Lead approval before expanding the lease.</li>
+<li>Verify default remains 75 seconds; explicit 360 seconds is accepted when the outer timeout is 600; invalid, zero, out-of-range and duplicate forwarded timeout inputs fail before starting dotnet test.</li>
+<li>Verify existing outer timeout still kills/reaps the process tree, returns nonzero, drains output within its existing bound, and cleans scratch data.</li>
+<li>Do not change the property test, seeds, generated command count, oracle, test selection, or global/default timeouts. Do not run the 360-second filtered property or the combined qualification yet.</li>
+<li>Do not deploy, integrate, merge, or touch the dirty primary checkout. Publish the exact source snapshot for independent review; Integrator handles integration only after an Accepted review.</li>
+</ul>
+<p>After independent review and integration, Lead will seek fresh Operator authorization before any serial requalification. Until then, retain the original RED and do not rerun the expensive property or combined suite. Checkpoint exact source, parser/cleanup evidence and diff paths, then complete the assignment.</p>
+</article>

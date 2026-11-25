@@ -1917,6 +1917,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                         renderUnsafe()))) |> ignore
         | _ -> ()
 
+    let openSelectedCapacityPolicyUnsafe () =
+        match selectedAgentUnsafe(), capacityPolicyAccess with
+        | Some row, Some _ -> loadProjectEditorUnsafe CapacityPolicyEditor row.Project
+        | _ -> ()
+
     let handleProjectEditorKeyUnsafe (keyInfo: ConsoleKeyInfo) =
         let editable = not launchBusy && launchPending.IsNone && not launchNeedsReload
         let append value =
@@ -2355,6 +2360,13 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
     // Fixture drives the same modal load/key/save path as the selected Agents row.
     // No live Console.ReadKey or authenticated runtime binding is required.
+    member internal _.DispatchCapacityPolicyKeyForFixture(snapshot: AgentView.Snapshot, keyInfo: ConsoleKeyInfo) =
+        lock syncRoot (fun () ->
+            agentSnapshot <- Some snapshot
+            mode <- AgentsMode
+            normalizeAgentSelectionUnsafe()
+            if keyInfo.Key = ConsoleKey.K then openSelectedCapacityPolicyUnsafe())
+
     member internal _.OpenCapacityPolicyForFixture(project: string) =
         lock syncRoot (fun () -> loadProjectEditorUnsafe CapacityPolicyEditor project)
 
@@ -3002,10 +3014,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                         renderUnsafe())
                                 | _, ConsoleKey.K when mode = AgentsMode ->
                                     lock syncRoot (fun () ->
-                                        match selectedAgentUnsafe(), capacityPolicyAccess with
-                                        | Some row, Some _ ->
-                                            loadProjectEditorUnsafe CapacityPolicyEditor row.Project
-                                        | _ -> ()
+                                        openSelectedCapacityPolicyUnsafe()
                                         renderUnsafe())
                                 | ('/', _) | (_, ConsoleKey.F) when mode = AgentsMode ->
                                     lock syncRoot (fun () ->

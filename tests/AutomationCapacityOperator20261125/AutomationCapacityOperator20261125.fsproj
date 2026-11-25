@@ -7,8 +7,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../Client/Client.fsproj" />
-    <Compile Include="../../Client/Modules/ProjectCapacityPolicy.fs" Link="ProjectCapacityPolicy.fs" />
-    <Compile Include="../../Client/Modules/ProjectCapacityOperator.fs" Link="ProjectCapacityOperator.fs" />
     <Compile Include="Tests.fs" />
   </ItemGroup>
   <ItemGroup>

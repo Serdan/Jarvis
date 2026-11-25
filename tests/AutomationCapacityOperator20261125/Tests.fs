@@ -251,3 +251,70 @@ let sharedEditorPreservesLaunchTemplateBodySemantics () =
     let _,_,_,reloaded,_,needsReload = tui.InspectProjectEditorForFixture()
     Assert.That(needsReload, Is.False)
     Assert.That(reloaded, Is.EqualTo(body))
+
+
+// Exercise the compiled Program registration and real approved-binding resolver,
+// through the same selected Agents row/key path used by the terminal. Only the
+// already-authenticated identity is a fixture input; no real account is used.
+[<Test; NonParallelizable>]
+let productionRegistrationUsesSelectedProjectAndApprovedBinding () =
+    withClones (fun a b ->
+        let root = Path.GetDirectoryName(a.RepositoryPath)
+        let prior = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+        Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", Path.Combine(root,"config"))
+        try
+            let row project : Client.AgentView.AgentRow =
+                { Key = project + "::Worker"; Agent = "Worker"; Project = project
+                  ProjectLabel = project; ProjectAliases = [project]; State = "Ready"
+                  StateEnteredAt = None; StateReason = None; Focus = None; RoleIds = ["Worker"]
+                  Activity = None; ReviewContext = None; PendingNotifications = 0
+                  LatestNotification = None; ActivityKeys = [] }
+            let snapshot project : Client.AgentView.Snapshot =
+                { Agents = [row project]; Projects = []; Issues = []; RefreshedAt = DateTimeOffset.UtcNow }
+            let project = Path.GetFileName(a.RepositoryPath)
+            let tui = ConsoleTui()
+            let rt = Client.Runtime(root, tui, Client.FullTrust)
+            let mutable actor = Some "operator:fixture"
+            Program.registerCapacityPolicyAccess tui rt None (fun () -> actor)
+            tui.DispatchCapacityPolicyKeyForFixture(snapshot project, key ConsoleKey.K)
+            let mode,_,_,_,_,_ = tui.InspectProjectEditorForFixture()
+            Assert.That(mode, Is.EqualTo("AgentsMode"))
+            let head = (LedgerStore.fetch a |> good).Commit
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting project rt a.ProjectId a.LedgerId a.Epoch
+                a.RemoteName a.ApprovedFetchUrl a.ApprovedPushUrl head true |> good |> ignore
+            Program.registerCapacityPolicyAccess tui rt actor (fun () -> actor)
+            tui.DispatchCapacityPolicyKeyForFixture(snapshot "unbound", key ConsoleKey.K)
+            awaitEditor tui
+            let _,_,_,_,_,denied = tui.InspectProjectEditorForFixture()
+            Assert.That(denied, Is.True)
+            Assert.That((openAt b).Revision, Is.Zero)
+            tui.DispatchCapacityPolicyKeyForFixture(snapshot project, key ConsoleKey.K)
+            awaitEditor tui
+            let _,_,_,initial,_,needsReload = tui.InspectProjectEditorForFixture()
+            Assert.That(needsReload, Is.False)
+            Assert.That(initial, Is.EqualTo("total=off"))
+            tui.DispatchProjectEditorKeyForFixture(ctrlU ())
+            for c in "total=4" do tui.DispatchProjectEditorKeyForFixture(typeChar c)
+            tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.Enter)
+            for c in "role Worker=2" do tui.DispatchProjectEditorKeyForFixture(typeChar c)
+            actor <- Some "operator:different"
+            tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.F2)
+            awaitEditor tui
+            let _,_,pending,_,_,_ = tui.InspectProjectEditorForFixture()
+            Assert.That(pending.IsSome, Is.True)
+            Assert.That((openAt b).Revision, Is.Zero)
+            actor <- Some "operator:fixture"
+            tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.F2)
+            awaitEditor tui
+            let _,_,finished,_,_,refresh = tui.InspectProjectEditorForFixture()
+            Assert.That(finished.IsNone && refresh, Is.True)
+            let saved = openAt b
+            Assert.That(saved.Revision, Is.EqualTo(1))
+            Assert.That(saved.Draft = draft (Some 4) ["Worker",2], Is.True)
+            tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.F5)
+            awaitEditor tui
+            let _,_,_,body,_,reload = tui.InspectProjectEditorForFixture()
+            Assert.That(reload, Is.False)
+            Assert.That(body, Is.EqualTo("total=4\nrole Worker=2"))
+        finally
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME",prior))

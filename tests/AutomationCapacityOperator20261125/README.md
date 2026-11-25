@@ -1,65 +1,56 @@
-# Capacity policy operator preparation
+# Capacity policy operator surface
 
-Scope: task automation-capacity-policy-operator-surface-20261125, spec blob
-335e69a1be92a38e7e928c1130509988dfa1042f. Base
-40d27e7bf33cd38479e50e72b385dbb67e865d65. No live policy or activation.
+Task automation-capacity-policy-operator-surface-20261125, spec blob
+335e69a1be92a38e7e928c1130509988dfa1042f. Composition base
+ece3c2a23dc2ec0ecd7c24855410d25675fe0ba1; accepted preparatory source
+180f9d429763742058d531b7a837e1411fb87595 (review
+8ec72d7f9c764bd9a4dd70f51ed6b721). Lead custody transfer 15583.
+No live policy changes, deployment or activation.
 
-The base contains readCurrentOptional/updateOptional in
-Client/Modules/ProjectCapacityPolicy.fs but no production references to either
-function; the policy module is not included in Client.fsproj. The existing
-Agents view uses selectedAgentUnsafe().Project and the authenticated
-SetLaunchTemplateAccess registration in Program.fs. The capacity editor
-reuses that selection and modal, with an independent typed draft.
+## Operator usage
 
-## Shared-path custody handoff (NOT applied here)
+After the existing local client login, open the Agents view with A, select
+an agent in the intended project, and press K. The editor displays the
+canonical project/ledger identity, epoch, and policy revision. Use one
+total line and optional canonical role lines, for example:
 
-After Lead explicitly transfers Client/Program.fs and Client/Client.fsproj
-following W19's integration, rebase/compose against verified current main.
-Check whether W19 already registered ProjectCapacityPolicy; if not, insert its
-Compile entry after LedgerStore. Include Modules/ProjectCapacityOperator.fs
-after both ProjectCapacityPolicy and ConsoleTui, before Program. Do not duplicate
-the policy module, replace its implementation or touch scheduled runtime.
-
-Inside the existing Program.fs authenticatedOperator / Some actor branch,
-register the following access (using the same local OAuth client and
-operatorActorFromAccessToken helper, with a current token on each operation):
-
-```fsharp
-let authenticateCapacityOperator () =
-    try
-        oauth.GetAccessTokenAsync().GetAwaiter().GetResult()
-        |> operatorActorFromAccessToken
-    with _ -> None
-tui.SetCapacityPolicyAccess(
-    Client.ProjectCapacityOperator.create authenticateCapacityOperator
-        (fun project ->
-            OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt
-            |> Result.mapError (sprintf "%A")))
+```
+total=4
+role Worker=2
+role Reviewer=1
 ```
 
-No registration in the unauthenticated branch. loadWithSnapshot resolves the
-approved project root, verifies its pinned trust binding and remote ancestry,
-and returns the authoritative snapshot. The adapter captures the complete
-binding and current actor/revision, rechecks them at save, and invokes the
-existing exact revision CAS. Do not preflight away a possible receipt by
-checking current policy revision before calling updateOptional with the
-original operation UUID. The shared editor holds the original UUID and exact
-save closure while an outcome is uncertain; it cannot edit/reload/switch
-project until that in-process intent is resolved. This is not a claim of
-cross-process recovery or production activation.
+Use total=off to disable the independent total limit; omit a role line to
+remove its limit. F2 saves; F5 reloads. A stale revision requires a reload
+before another save. An unknown receipt retains the exact UUID and draft
+for F2 reconciliation; the pending operation cannot be replaced or closed
+in-process. This does not provide cross-process recovery. These limits
+apply to Scheduler resume decisions; manual launches remain available and
+Working agents count toward scheduler occupancy.
 
-Once both modules are registered, remove their linked source entries from the
-isolated test project (the Client project reference supplies them). Re-run the
-dedicated Release suite and applicable existing Client tests. Verify actual
-Program registration plus Agents/K entry and approved binding, without writing
-a live ledger. A disposable runtime integration proof is still required;
-these tests exercise the actual modal key dispatcher with injected access and
-actual policy operations on disposable Git clones, not the production
-authenticated Program route. No changes to manual launch admission or
-scheduler counting behavior.
+## Composition and proof
+
+The already-registered ProjectCapacityPolicy module is reused, with no
+new policy schema, approval, credential, or runtime scheduling path.
+Program.registerCapacityPolicyAccess registers only following existing
+authenticated local login. Every load/save reacquires the current local
+OAuth subject and resolves the selected project's approved binding and
+verified snapshot via LedgerBindingConfig.loadWithSnapshot. The editor
+captures the complete binding and actor/revision and rechecks them before
+calling the existing exact revision CAS. It does not pre-check the policy
+revision in place of original-UUID receipt reconciliation.
+
+The dedicated tests reference the actual compiled Client assembly rather
+than linked copies. They exercise independent dimensions, removal,
+canonical roles, competing and stale revisions, identity/binding mismatch,
+denied/unauthenticated access, parser validation, shared modal behavior,
+and an intentionally withheld receipt on a disposable Git remote. The
+production registration fixture calls the same Program registration and
+selected Agents/K dispatch with a disposable approved project binding and
+fixture identity (the real OAuth login is not executed). No live account
+or production ledger is required.
 
 Run:
-
 ```sh
 dotnet test tests/AutomationCapacityOperator20261125/AutomationCapacityOperator20261125.fsproj -c Release
 ```

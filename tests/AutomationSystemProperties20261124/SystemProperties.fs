@@ -1240,10 +1240,10 @@ type GeneratedComposition() =
             Directory.Delete(root, true)
 
 
-    // The accepted policy reader and Working-count component are linked from
-    // their real source until the scheduled caller registers them in Client.
-    // The independent oracle counts only model Working phases and taskless
-    // manual turns, not reservations or a maximum historical census.
+    // The policy reader and scheduled resume are actual Client modules.
+    // The earlier standalone Working-count component is still linked for
+    // comparison. The independent oracle counts only model Working phases
+    // and taskless manual turns, not reservations or a historical census.
     [<TestCase(801)>]
     [<TestCase(802)>]
     member _.WorkingCountTracksHealthChallengeAndManualTurns(seed: int) =
@@ -1319,8 +1319,82 @@ type GeneratedComposition() =
             let change f client command =
                 step f client command
                 verify ()
+            // Actual scheduled admission is now registered in Client. Keep
+            // the external browser boundary fake, but use real intent CAS.
+            Client.RoleInstructions.RoleInstructions.setLaunchTemplate a "Operator" (Guid.NewGuid()) 0
+                "Agent {{agentId}}, project {{projectName}}. Call inbox." |> success |> ignore
+            let mutable consumed : Set<string * int> = Set.empty
+            let mutable intents : Set<Guid> = Set.empty
+            let poll client allowedBefore allowedAfter =
+                let binding,reader = if client = 0 then a,b else b,a
+                let before = (LedgerStore.fetch binding |> success).Commit
+                let workers = [first; sibling] |> List.filter (fun f -> f.State.Phase = Working) |> List.length
+                let reviewers = if manualWorking then 1 else 0
+                let eligible =
+                    [first; sibling]
+                    |> List.filter (fun f ->
+                        f.State.Phase = Ready
+                        && not (expected "Worker" total roles workers reviewers)
+                        && not (Set.contains (f.Original.AgentId,f.State.Generation) consumed))
+                let mutable sent : (string * int) list = []
+                let mutable selected : Client.ScheduledReadyResume.Prepared option = None
+                let mutable checks = 0
+                let readLimits =
+                    if Environment.GetEnvironmentVariable("JARVIS_SYSTEM_IGNORE_WORKING_CAP") = "1" then
+                        fun _ _ -> Ok Client.ScheduledReadyResume.disabled
+                    else Client.ScheduledReadyResume.readCurrentLimits
+                let ports : Client.ScheduledReadyResume.ExecutionPorts =
+                    { ReadLimits = readLimits
+                      CanSend = fun _ ->
+                          checks <- checks + 1
+                          Task.FromResult(Ok (if checks = 1 then allowedBefore else allowedAfter))
+                      Send = fun prepared ->
+                          sent <- (prepared.Ready.AgentId,prepared.Ready.Generation) :: sent
+                          Task.FromResult(Error "fixture unknown receipt") }
+                let track stage prepared =
+                    if stage = "Selected" then selected <- Some prepared
+                    true
+                let outcome =
+                    Client.ScheduledReadyResume.executeOnceTracked track ports binding "Operator" "fixture"
+                        "launchAgent.js" "script-sha" "route-sha"
+                    |> fun t -> t.GetAwaiter().GetResult()
+                let verifyIntent () =
+                    let prepared = selected.Value
+                    let key = prepared.Ready.AgentId,prepared.Ready.Generation
+                    equal "exact independently eligible episode" true
+                        (eligible |> List.exists (fun f -> (f.Original.AgentId,f.State.Generation) = key))
+                    equal "fresh intent operation identity" false (Set.contains prepared.OperationId intents)
+                    let head = LedgerStore.fetch reader |> success
+                    equal "durable intent changed canonical head" true (before <> head.Commit)
+                    let receipt = LedgerStore.getOperationAt reader head prepared.OperationId |> success
+                    equal "exact original intent kind" (Some "ScheduledReadyResumeIntent") (receipt |> Option.map _.Type)
+                    intents <- Set.add prepared.OperationId intents
+                    key
+                match eligible,allowedBefore,allowedAfter with
+                | [],_,_ ->
+                    equal "no eligible scheduled episode" Client.ScheduledReadyResume.NoEligibleReady outcome
+                    equal "no eligible send" [] sent
+                    equal "no eligible intent commit" before (LedgerStore.fetch reader |> success).Commit
+                | _,false,_ ->
+                    equal "STOP before intent" (Client.ScheduledReadyResume.Held "Scheduled launch stopped.") outcome
+                    equal "STOP no send" [] sent
+                    equal "STOP no intent commit" before (LedgerStore.fetch reader |> success).Commit
+                | _,true,false ->
+                    equal "STOP after intent" (Client.ScheduledReadyResume.Held "Scheduled launch stopped before Send.") outcome
+                    equal "positive non-invocation no send" [] sent
+                    verifyIntent () |> ignore
+                    // A positively excluded attempt leaves the same Ready
+                    // episode eligible for a subsequent distinct intent.
+                | _,true,true ->
+                    equal "unknown external result" (Client.ScheduledReadyResume.OutcomeUnknown "fixture unknown receipt") outcome
+                    equal "single external invocation" 1 sent.Length
+                    let key = verifyIntent ()
+                    equal "effect belongs to selected episode" key sent.Head
+                    consumed <- Set.add key consumed
+                verify ()
             let workerCap n = Map.ofList ["Worker",n]
             verify ()
+            poll 0 true true
             set 0 (Some 2) (workerCap 1)
             // Manual taskless start is allowed even above total capacity.
             // This is real canonical activation, not the browser RPC test.
@@ -1328,9 +1402,16 @@ type GeneratedComposition() =
             change first 0 Activity
             change first 1 (Advance 601)
             change first 0 CheckHealth
+            poll 1 true true
             change sibling 1 Block
             set 1 None (workerCap 1)
+            poll 0 false true
+            poll 0 true false
+            poll 1 true true
+            poll 0 true true
             change sibling 0 Resolve
+            poll 0 true true
+            poll 1 true true
             change sibling 1 Resume
             change first 1 Resume
             turn 0 false
@@ -1339,7 +1420,8 @@ type GeneratedComposition() =
             let commands = [|Activity; Advance 601; CheckHealth; CheckStale; Block; Resolve; Resume; Checkpoint|]
             for _ in 1..8 do
                 let client = rng.Next(2)
-                match rng.Next(4) with
+                match rng.Next(5) with
+                | 4 -> poll client (rng.Next(2) = 0) (rng.Next(2) = 0)
                 | 0 -> set client (if rng.Next(2) = 0 then None else Some(rng.Next(1,5))) (if rng.Next(2) = 0 then Map.empty else workerCap (rng.Next(1,3)))
                 | 1 -> turn client (not manualWorking)
                 | _ -> change (if rng.Next(2) = 0 then first else sibling) client commands[rng.Next(commands.Length)]

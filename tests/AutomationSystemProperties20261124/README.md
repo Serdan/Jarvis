@@ -358,3 +358,52 @@ already-built actual Client/Server references. Command:
 Remove linked module duplicates when production registration is published and
 exercise the actual ordinary scheduled caller with fake browser only at its
 external boundary. No live effects.
+
+## Scheduled Ready resume in generated mixed histories (2026-11-25)
+
+Published production base ece3c2a23dc2ec0ecd7c24855410d25675fe0ba1
+registers the actual ProjectCapacityPolicy and ScheduledReadyResume modules
+in Client; the test now references those directly rather than linking a second
+policy implementation. The earlier Working-count component remains linked for
+historical/independent component comparison. Seeds 801/802 now call the
+actual executeOnceTracked seam with the real policy reader, actual canonical
+roster/Ready selection and Git intent CAS. Only the preflight and browser
+effect ports are controlled here. The independently expected eligible set
+uses model phase/generation and current Working counts, including the manual
+taskless turn. The model records consumed Ready episodes only on an unknown
+external effect and checks exact intent receipt kind and unique operation
+identity on the other clone. STOP before publication leaves the head intact;
+positive STOP after publication permits a fresh attempt in the same Ready
+episode, whereas unknown external effect cannot replay across clients or
+policy changes. Challenge resolution and Health recovery supply fresh episodes.
+The guided prefix exercises the cap hold, unknown/no-replay and both STOP
+boundaries; randomized suffix mixes them with policy/Health/Challenge/manual
+commands. This is not the recurring Program/BrowserBridge host itself; the
+separate current-source component suite covers that caller with fake extension
+transport and six durable restart boundaries.
+
+Source-exact staged results:
+- Initial mixed scheduler extension (test blob 556c4b27b387be2b2cb2f135953440f7ddc84281):
+  job f7fa76e708b74910b3d491bddf162ac1, 2/2 passed, 54 s, exit 0;
+  actual Client/Server rebuilt Release at the published base.
+- ScheduledReadyResume20261125 component job 8728277c837748b6ab4c8904f5648ee8:
+  23/23 passed, 28 s, exit 0, same production binaries; command
+  dotnet test tests/ScheduledReadyResume20261125/ScheduledReadyResume20261125.fsproj -c Release -p:BuildProjectReferences=false.
+- Negative control JARVIS_SYSTEM_IGNORE_WORKING_CAP=1 replaces real policy
+  reads at the scheduled admission seam with disabled caps; job
+  066f2cf4291c4d61ab40954a6f3ade59, both seeds RED, exit 1, 14 s:
+  no eligible scheduled episode expected NoEligibleReady, actual
+  OutcomeUnknown "fixture unknown receipt". This proves the independent
+  Working-count admission oracle rejects omission of configured caps.
+  The final executable test blob before comment-only clarification was
+  bc4cf9d9b81a57c1b8a1daed51a6727fbbf9aee5; project blob
+  b259e1eb2e917d7ef95bc079c77114655a6d3510.
+  Test-only mutant must not be enabled for ordinary runs.
+
+Remaining exact composition gate: Health roster sidecar correction and
+operator capacity editor integration are independently owned. Do not merge
+unreviewed production changes into this lease. A fresh final run after
+accepted composition is required; this scoped source/test evidence neither
+authorizes deployment nor establishes real provider or live automation.
+
+Final focused normal Release job 405a8600aa944db8a5fd63a8cc2b3bdc: 2/2 passed, 55 s, exit 0 on the executable test blob above (subsequent clarification comment only). Command: `dotnet test tests/AutomationSystemProperties20261124/AutomationSystemProperties20261124.fsproj -c Release --no-restore -p:BuildProjectReferences=false --filter FullyQualifiedName~WorkingCountTracksHealthChallengeAndManualTurns --logger 'trx;LogFileName=scheduled-intent-composition.trx' --results-directory /tmp/jarvis-w20-scheduled-20261125`. No final full-suite or live claim.

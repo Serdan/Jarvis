@@ -9,7 +9,6 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../Client/Modules/ProjectCapacityAdmission.fs" Link="ProjectCapacityAdmission.fs" />
-    <Compile Include="../../Client/Modules/ProjectCapacityPolicy.fs" Link="ProjectCapacityPolicy.fs" />
     <Compile Include="../../Client/Modules/ProjectWorkingCount.fs" Link="ProjectWorkingCount.fs" />
     <Compile Include="../../Client/Modules/NativeProjectEffectTransition.fs" Link="NativeProjectEffectTransition.fs" />
     <Compile Include="../AutomationHealthHosted20261123/GitFixture.fs" Link="GitFixture.fs" />

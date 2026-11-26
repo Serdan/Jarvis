@@ -404,17 +404,38 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                 | None ->
                     cache.Get(DateTimeOffset.UtcNow, projectId, agentId, fun () ->
                         loadAgentState rt project agentId)
+            let scheduledLaunch =
+                match command with
+                | TaskReadCommand cmd when cmd.Action = "AgentInbox" &&
+                                           not (String.IsNullOrWhiteSpace cmd.LaunchId) -> Some cmd.LaunchId
+                | _ -> None
+            let mutable exactScheduledActivation: (Guid * ScheduledReadyResume.Ready) option = None
+            let current =
+                match scheduledLaunch, inboxSnapshot.Value, current with
+                | Some launchId, Some(Ok(binding, snapshot)), Ok(Some agent) ->
+                    match ScheduledReadyResume.confirmedActivationAt binding snapshot agentId launchId with
+                    | Ok activation ->
+                        exactScheduledActivation <- activation
+                        Ok(Some agent)
+                    | Error issue ->
+                        Error(Client.ValidationError(sprintf "ScheduledLaunchActivationRejected: %A" issue))
+                | Some _, _, Error error -> Error error
+                | Some _, _, _ ->
+                    Error(Client.ValidationError "Scheduled launch activation requires the exact verified inbox snapshot.")
+                | None, _, _ -> current
             // A read of source should remain available without lifecycle
             // authority. Report uncertainty explicitly, never invent a
             // committed activation. Lifecycle commands must fail closed.
             let unavailable error =
-                match LegacyWriterProtocolFence.LegacyWriterProtocolFence.classify command with
-                | LegacyWriterProtocolFence.LegacyCommandKind.HistoricalRead ->
+                match scheduledLaunch, LegacyWriterProtocolFence.LegacyWriterProtocolFence.classify command with
+                | Some _, _ -> Error error
+                | None, LegacyWriterProtocolFence.LegacyCommandKind.HistoricalRead ->
                     Ok ([], None,
                         [ OperationalControl.ActivationUnverified
                             $"Automatic Ready-to-Working activation could not be verified: {error}. Reread the canonical inbox before continuing assignment work." ])
                 | _ -> Error error
             match current with
+            | Error error when scheduledLaunch.IsSome -> Error error
             | Error error -> unavailable error
             | Ok(Some agent) when agent.State = "Ready"
                               && not (isNull (box agent.CurrentAssignment))
@@ -441,12 +462,24 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                         cache.Invalidate(projectId, agentId)
                         unavailable (Client.ValidationError($"Cannot inspect automatic activation eligibility: {error}"))
                     | Ok(Client.ReviewWorkflow.ActivationIneligible _) ->
-                        cache.Invalidate(projectId, agentId)
-                        Ok ([], None, [])
+                        if scheduledLaunch.IsSome then
+                            cache.Invalidate(projectId, agentId)
+                            Error(Client.ValidationError "Scheduled launch is no longer eligible for activation.")
+                        else
+                            cache.Invalidate(projectId, agentId)
+                            Ok ([], None, [])
                     | Ok(Client.ReviewWorkflow.ActivationEligible currentTaskId) ->
                         let result =
-                            ReviewWorkflow.ReviewWorkflow.activateReadyAgent binding (Guid.NewGuid())
-                                currentTaskId agentId
+                            match exactScheduledActivation with
+                            | Some(operationId, ready) when ready.TaskId = currentTaskId ->
+                                ReviewWorkflow.ReviewWorkflow.activateReadyAgentExact binding operationId
+                                    currentTaskId agentId agent.Version ready.Generation
+                            | Some _ ->
+                                Error(LedgerStore.StaleEntityVersion "Scheduled launch assignment changed before activation.")
+                            | None when scheduledLaunch.IsSome ->
+                                Error(LedgerStore.StaleEntityVersion "Scheduled launch does not own this Ready episode.")
+                            | None ->
+                                ReviewWorkflow.ReviewWorkflow.activateReadyAgent binding (Guid.NewGuid()) currentTaskId agentId
                         cache.Invalidate(projectId, agentId)
                         match result with
                         | Ok write ->
@@ -454,18 +487,29 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                                 inboxSnapshot.Value <-
                                     Some(retryBindingContention (fun () ->
                                         OrchestrationApi.LedgerBindingConfig.loadWithConfirmedWrite project rt binding write))
-                            if write.AlreadyApplied then Ok ([], None, [])
-                            else
-                                // Only committed transitions emit Working metadata.
-                                let committed : AgentInboxActivation =
-                                    { ProjectName = project
-                                      AgentId = agentId
-                                      ActivatedByThisCall = true
-                                      BeforeState = Some "Ready"
-                                      AfterState = Some "Working"
-                                      CommittedHead = Some write.CurrentHead
-                                      OperationId = Some write.Operation.OperationId }
-                                Ok (Client.LedgerStore.LedgerStore.changedAgentIds write, Some committed, [])
+                            let verified =
+                                match scheduledLaunch, inboxSnapshot.Value with
+                                | Some launchId, Some(Ok(currentBinding, snapshot)) when currentBinding = binding ->
+                                    match ScheduledReadyResume.confirmedActivationAt binding snapshot agentId launchId with
+                                    | Ok None -> Ok ()
+                                    | _ -> Error(Client.ValidationError "Scheduled launch no longer owns the confirmed Working episode.")
+                                | Some _, _ -> Error(Client.ValidationError "Cannot verify scheduled activation receipt.")
+                                | None, _ -> Ok ()
+                            verified |> Result.map (fun () ->
+                                if write.AlreadyApplied then ([], None, [])
+                                else
+                                    // Only committed transitions emit Working metadata.
+                                    let committed : AgentInboxActivation =
+                                        { ProjectName = project
+                                          AgentId = agentId
+                                          ActivatedByThisCall = true
+                                          BeforeState = Some "Ready"
+                                          AfterState = Some "Working"
+                                          CommittedHead = Some write.CurrentHead
+                                          OperationId = Some write.Operation.OperationId }
+                                    (Client.LedgerStore.LedgerStore.changedAgentIds write, Some committed, []))
+                        | Error(Client.LedgerStore.StaleEntityVersion detail) when scheduledLaunch.IsSome ->
+                            Error(Client.ValidationError("ScheduledLaunchActivationRejected: " + detail))
                         | Error(Client.LedgerStore.StaleEntityVersion detail) ->
                             // Another call may have started or closed the task
                             // after eligibility was read. Reinspect canonically.
@@ -1505,6 +1549,11 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                     // any activity attribution, or the canonical read.
                     let project =
                         match command with
+                        | TaskReadCommand inbox when inbox.Action = "AgentInbox"
+                            && not (String.IsNullOrWhiteSpace inbox.LaunchId)
+                            && (String.IsNullOrWhiteSpace agentId || inbox.AgentId <> agentId) ->
+                            Error(Client.ValidationError "Scheduled launch check-in requires the initiating agent identity.")
+
                         | ObserveAgentCommand observation
                             when String.IsNullOrWhiteSpace agentId
                                  || not (String.Equals(observation.ObserverAgentId, agentId, StringComparison.Ordinal)) ->
@@ -1537,6 +1586,24 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                                              |> Result.mapError (sprintf "%A")) command
                             |> Result.map (fun () -> scope)
                             |> Result.mapError Client.ValidationError)
+                    // Correlate the explicit launch before activity or automatic activation.
+                    // A late/invalid launch cannot activate the replacement's Ready episode.
+                    let project =
+                        project |> Result.bind (fun scope ->
+                            match command with
+                            | TaskReadCommand inbox when inbox.Action = "AgentInbox" &&
+                                                         not (String.IsNullOrWhiteSpace inbox.LaunchId) ->
+                                match OrchestrationApi.LedgerBindingConfig.load inbox.ProjectName rt with
+                                | Error error -> Error error
+                                | Ok binding ->
+                                    match ScheduledReadyResume.recordCheckin binding agentId inbox.LaunchId DateTimeOffset.UtcNow with
+                                    | Error error ->
+                                        Error(Client.ValidationError(sprintf "ScheduledLaunchCheckinRejected: %A" error))
+                                    | Ok(ScheduledReadyResume.CheckinLate reason) ->
+                                        Error(Client.ValidationError("ScheduledLaunchCheckinLate: " + reason))
+                                    | Ok(ScheduledReadyResume.CheckinConfirmed _)
+                                    | Ok(ScheduledReadyResume.CheckinDuplicate _) -> Ok scope
+                            | _ -> Ok scope)
                     match project with
                     | Error error -> return Error error
                     | Ok scope ->

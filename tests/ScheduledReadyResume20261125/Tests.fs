@@ -84,6 +84,131 @@ let private run ports binding =
     executeOnce ports binding "fixture" "Fixture" "launchAgent.js" "script-sha" "route-sha"
     |> fun task -> task.GetAwaiter().GetResult()
 
+let private held = function HeldCandidates [_] -> true | _ -> false
+
+let private captureLaunch binding =
+    let mutable captured = None
+    let ports =
+        { ReadLimits = readCurrentLimits
+          CanSend = fun _ -> Task.FromResult(Ok true)
+          Send = fun prepared -> captured <- Some prepared; Task.FromResult(Ok "submitted") }
+    Assert.That(run ports binding, Is.EqualTo(Submitted "submitted"))
+    captured.Value, ports
+
+[<TestCase(299, false)>]
+[<TestCase(300, true)>]
+[<TestCase(301, true)>]
+let deadlineRequiresVerifiedEvidence seconds expired =
+    fixture (fun binding assign ->
+        assign "Worker" "ready-task"
+        let launch, ports = captureLaunch binding
+        let id = launch.OperationId.ToString("D")
+        let sent = launch.SendBoundaryAtUtc.Value
+        let now = sent.AddSeconds(float seconds)
+        let deadline = sent.AddMinutes(5.)
+        let evidence = { LastSeenAtUtc = sent.AddSeconds(-1.); ServerNowAtUtc = now }
+        match reconcileAt binding id now None |> good with
+        | LaunchActivityEvidenceUnavailable _ when expired -> ()
+        | LaunchAwaitingCheckin at when not expired -> Assert.That(at, Is.EqualTo(deadline))
+        | other -> Assert.Fail(sprintf "Unexpected absent-evidence result: %A" other)
+        Assert.That(run ports binding |> held, Is.True)
+        match reconcileAt binding id now (Some evidence) |> good with
+        | LaunchReplacementAuthorized at when expired -> Assert.That(at, Is.EqualTo(now))
+        | LaunchAwaitingCheckin at when not expired -> Assert.That(at, Is.EqualTo(deadline))
+        | other -> Assert.Fail(sprintf "Unexpected verified-evidence result: %A" other)
+        if expired then
+            let replacement, replacementPorts = captureLaunch binding
+            Assert.That(replacement.Ready, Is.EqualTo(launch.Ready))
+            Assert.That(replacement.OperationId, Is.Not.EqualTo(launch.OperationId))
+            match recordCheckin binding "Worker" id now |> good with
+            | CheckinLate _ -> ()
+            | other -> Assert.Fail(sprintf "Superseded check-in accepted: %A" other)
+            Assert.That(run replacementPorts binding |> held, Is.True)
+        else Assert.That(run ports binding |> held, Is.True))
+
+[<Test>]
+let exactCheckinPreventsReplacement () =
+    fixture (fun binding assign ->
+        assign "Worker" "ready-task"
+        let launch, ports = captureLaunch binding
+        let id = launch.OperationId.ToString("D")
+        let sent = launch.SendBoundaryAtUtc.Value
+        Assert.That(recordCheckin binding "Wrong" id (sent.AddSeconds(1.)) |> Result.isError, Is.True)
+        Assert.That(recordCheckin binding "Worker" (Guid.NewGuid().ToString("D")) (sent.AddSeconds(1.)) |> Result.isError, Is.True)
+        let at = sent.AddSeconds(299.)
+        Assert.That(recordCheckin binding "Worker" id at |> good, Is.EqualTo(CheckinConfirmed at))
+        Assert.That(recordCheckin binding "Worker" id (at.AddSeconds(2.)) |> good, Is.EqualTo(CheckinDuplicate at))
+        let now = sent.AddSeconds(301.)
+        let evidence = { LastSeenAtUtc = sent.AddSeconds(-1.); ServerNowAtUtc = now }
+        Assert.That(reconcileAt binding id now (Some evidence) |> good, Is.EqualTo(LaunchStarted at))
+        Assert.That(run ports binding |> held, Is.True))
+
+[<Test>]
+let unrelatedActivityCannotAuthorizeReplacement () =
+    fixture (fun binding assign ->
+        assign "Worker" "ready-task"
+        let launch, ports = captureLaunch binding
+        let sent = launch.SendBoundaryAtUtc.Value
+        let now = sent.AddSeconds(301.)
+        let evidence = { LastSeenAtUtc = sent.AddSeconds(1.); ServerNowAtUtc = now }
+        match reconcileAt binding (launch.OperationId.ToString("D")) now (Some evidence) |> good with
+        | LaunchActivityEvidenceUnavailable _ -> ()
+        | other -> Assert.Fail(sprintf "Unattributed activity authorized replacement: %A" other)
+        Assert.That(run ports binding |> held, Is.True))
+
+[<Test>]
+let operatorResolutionRequiresOriginalOwnerAndExactAssignment () =
+    fixture (fun binding assign ->
+        assign "Worker" "ready-task"
+        let launch, ports = captureLaunch binding
+        let id = launch.OperationId.ToString("D")
+        let at = launch.SendBoundaryAtUtc.Value.AddSeconds(301.)
+        let resolve actor ready rationale ended = resolveOperator binding actor id ready rationale ended at
+        Assert.That(resolve "fixture" launch.Ready "verified" false |> Result.isError, Is.True)
+        Assert.That(resolve "foreign" launch.Ready "verified" true |> Result.isError, Is.True)
+        Assert.That(resolve "fixture" { launch.Ready with Generation = launch.Ready.Generation + 1 } "verified" true |> Result.isError, Is.True)
+        Assert.That(resolve "fixture" launch.Ready "" true |> Result.isError, Is.True)
+        Assert.That(resolve "fixture" launch.Ready "verified ended" true |> good, Is.EqualTo(OperatorResolutionRecorded at))
+        Assert.That(resolve "fixture" launch.Ready "verified ended" true |> good, Is.EqualTo(OperatorResolutionAlreadyRecorded at))
+        let replacement, replacementPorts = captureLaunch binding
+        Assert.That(replacement.Ready, Is.EqualTo(launch.Ready))
+        Assert.That(replacement.OperationId, Is.Not.EqualTo(launch.OperationId))
+        Assert.That(run replacementPorts binding |> held, Is.True)
+        match recordCheckin binding "Worker" id at |> good with
+        | CheckinLate _ -> ()
+        | other -> Assert.Fail(sprintf "Old launch check-in not fenced: %A" other))
+
+[<Test>]
+let heldLaunchDoesNotBlockOtherReadyAgent () =
+    fixture (fun binding assign ->
+        assign "Worker A" "ready-a"
+        let first, _ = captureLaunch binding
+        assign "Worker B" "ready-b"
+        let second, ports = captureLaunch binding
+        Assert.That(second.Ready.AgentId, Is.Not.EqualTo(first.Ready.AgentId))
+        match run ports binding with
+        | HeldCandidates launches ->
+            Assert.That(launches |> List.map _.LaunchId |> Set.ofList,
+                        Is.EqualTo(Set.ofList [first.OperationId; second.OperationId] :> obj))
+        | other -> Assert.Fail(sprintf "Expected two separately reported holds: %A" other))
+
+[<Test>]
+let expiryAndCheckinRaceNeverAuthorizeTwoOutcomes () =
+    fixture (fun binding assign ->
+        assign "Worker" "ready-task"
+        let launch, _ = captureLaunch binding
+        let id = launch.OperationId.ToString("D")
+        let sent = launch.SendBoundaryAtUtc.Value
+        let expiry = sent.AddSeconds(300.)
+        let evidence = { LastSeenAtUtc = sent.AddSeconds(-1.); ServerNowAtUtc = expiry }
+        let checkin = Task.Run(fun () -> recordCheckin binding "Worker" id (sent.AddSeconds(299.)))
+        let timeout = Task.Run(fun () -> reconcileAt binding id expiry (Some evidence))
+        Task.WaitAll([| checkin :> Task; timeout :> Task |])
+        let snapshot = LedgerStore.fetch binding |> good
+        let state = (inspectLaunchAt binding snapshot launch.OperationId |> good).Value
+        Assert.That(state.CheckinAtUtc.IsSome <> state.NoCheckinAtUtc.IsSome, Is.True,
+                    "Exactly one terminal proof must survive competing transitions."))
+
 [<Test>]
 let ``actual canonical Ready resumes once and unknown browser send cannot replay`` () =
     fixture (fun binding assign ->
@@ -94,10 +219,11 @@ let ``actual canonical Ready resumes once and unknown browser send cannot replay
               CanSend = fun _ -> Task.FromResult(Ok true)
               Send = fun prepared ->
                   sends <- sends + 1
-                  Assert.That(prepared.Rendered.Prompt, Is.EqualTo("Agent Worker, project Fixture. Call inbox."))
+                  Assert.That(prepared.Rendered.Prompt, Does.StartWith("Agent Worker, project Fixture. Call inbox."))
+                  Assert.That(prepared.Rendered.Prompt, Does.Contain(prepared.OperationId.ToString("D")))
                   Task.FromResult(Error(SendOutcomeUnknown "unknown browser receipt")) }
         Assert.That(run ports binding, Is.EqualTo(OutcomeUnknown "unknown browser receipt"))
-        Assert.That(run ports binding, Is.EqualTo(NoEligibleReady))
+        Assert.That(run ports binding |> held, Is.True)
         Assert.That(sends, Is.EqualTo(1)))
 
 [<Test>]
@@ -191,7 +317,7 @@ let ``canonical role-only caps include manually Working agents`` () =
                   selected <- prepared.Ready.AgentId :: selected
                   Task.FromResult(Ok "submitted") }
         Assert.That(run ports binding, Is.EqualTo(Submitted "submitted"))
-        Assert.That(run ports binding, Is.EqualTo(NoEligibleReady))
+        Assert.That(run ports binding |> held, Is.True)
         Assert.That(selected, Is.EqualTo(["Reviewer"] :> obj)))
 
 [<Test>]
@@ -222,7 +348,7 @@ let ``actual challenge wait blocks launch and resolution makes the new generatio
             challenge.ConditionIds.Head 1 "Passed" "" |> good |> ignore
         Assert.That(run ports binding, Is.EqualTo(Submitted "submitted"))
         Assert.That(generations, Is.EqualTo([2] :> obj))
-        Assert.That(run ports binding, Is.EqualTo(NoEligibleReady)))
+        Assert.That(run ports binding |> held, Is.True))
 
 [<Test>]
 let ``canonical transient excess drains naturally without cancellation`` () =
@@ -265,18 +391,19 @@ let private route (project: string) : BrowserSchedules.ScheduledAction =
     { Id = "ready-resume"; DueAtUtc = DateTimeOffset.UtcNow; Url = "https://chatgpt.com/g/g-p-fixture/project"
       ProjectName = project; ScriptPath = "browser-scripts/chatgpt/launchAgent.js"; Alias = "agents"
       ArgsJson = """{"resumeReady":true}"""; Active = false; WindowRegistration = "agents"
-      CloseTabAfterExecution = false; RepeatEverySeconds = 60; Status = "running"
+      CloseTabAfterExecution = true; RepeatEverySeconds = 60; Status = "running"
       RegistrationId = ""; ConversationUrl = ""; Cleanup = ""; AttemptId = "attempt"; RevisionId = "revision"
       Error = ""; UpdatedAtUtc = DateTimeOffset.UtcNow; ActionKind = "BrowserScript"; TriggerKind = "Every"
       Executable = ""; CommandArgs = []; WorkingDirectory = ""; TimeoutSeconds = 30; MaxOutputBytes = 100
       IdleAgentId = ""; IdleSeconds = 0; LastActivityAtUtc = DateTimeOffset.MinValue
-      StartedAtUtc = DateTimeOffset.UtcNow; Disabled = false; LastResult = "" }
+      StartedAtUtc = DateTimeOffset.UtcNow; Disabled = false; CheckinWakeAtUtc = DateTimeOffset.MinValue; LastResult = "" }
 
 [<Test>]
 let onlyExplicitRecurringRoute () =
     let a = route "Fixture"
     Assert.That(BrowserSchedules.isReadyResume a, Is.True)
     Assert.That(validateRoute a, Is.EqualTo(Ok () : Result<unit,string>))
+    Assert.That(validateRoute { a with CloseTabAfterExecution = false }, Is.EqualTo(Ok () : Result<unit,string>))
     for invalid in [
         { a with TriggerKind = "Once"; RepeatEverySeconds = 0 }
         { a with ArgsJson = """{"resumeReady":true,"prompt":"injected"}""" }
@@ -332,7 +459,7 @@ let lateStopAfterIntent () =
         ReviewWorkflow.clearResponseAlert binding (Guid.NewGuid()) "fixture" "Worker" (Guid.Parse alert.AlertId)
         |> good |> ignore
         Assert.That(run ports binding, Is.EqualTo(Submitted "unexpected"))
-        Assert.That(run ports binding, Is.EqualTo(NoEligibleReady))
+        Assert.That(run ports binding |> held, Is.True)
         Assert.That(sends, Is.EqualTo(1)))
 
 [<TestCase(false)>]
@@ -374,7 +501,7 @@ let lateDenialThenConcurrentHealthyPolls isError =
         let a = compete()
         let b = compete()
         Task.WaitAll([| a :> Task; b :> Task |])
-        Assert.That(run healthy binding, Is.EqualTo(NoEligibleReady))
+        Assert.That(run healthy binding |> held, Is.True)
         Assert.That(sends, Is.EqualTo(1))
         let final = LedgerStore.fetch binding |> good
         Assert.That((LedgerStore.getOperationAt binding final second.OperationId |> good).IsSome, Is.True))
@@ -388,6 +515,59 @@ let private scheduleState (service: BrowserSchedules.Service) id =
     use doc = JsonDocument.Parse(service.Get(id) |> good)
     let p name = doc.RootElement.GetProperty(name: string).GetString()
     p "status", p "attemptId", p "error"
+
+[<Test>]
+let durableDeadlineWakeSurvivesRestartWithoutChangingCadence () =
+    let folder = Path.Combine(Path.GetTempPath(), "jarvis-checkin-wake-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(folder) |> ignore
+    try
+        let path = Path.Combine(folder, "schedules.json")
+        let origin = DateTimeOffset.UtcNow
+        let mutable nowTicks = origin.Ticks
+        let clock () = DateTimeOffset(Interlocked.Read(&nowTicks), TimeSpan.Zero)
+        let setTime at = Interlocked.Exchange(&nowTicks, (at: DateTimeOffset).Ticks) |> ignore
+        let wake = origin.AddSeconds(300.)
+        let cadence = origin.AddSeconds(3601.)
+        let action = route "Fixture"
+        let mutable calls = 0
+        let mutable firstService: BrowserSchedules.Service option = None
+        let execute claimed =
+            Interlocked.Increment(&calls) |> ignore
+            Assert.That(firstService.Value.RecordCheckinWake(claimed, Some wake, true), Is.True)
+            Task.FromResult(Ok """{"status":"completed"}""")
+        let waitFinished (service: BrowserSchedules.Service) old =
+            waitUntil(fun () ->
+                let status, attempt, _ = scheduleState service action.Id
+                status = "pending" && attempt <> old && not (String.IsNullOrWhiteSpace attempt))
+        let dueAndWake (service: BrowserSchedules.Service) =
+            use doc = JsonDocument.Parse(service.Get(action.Id) |> good)
+            doc.RootElement.GetProperty("dueAtUtc").GetDateTimeOffset(),
+            doc.RootElement.GetProperty("checkinWakeAtUtc").GetDateTimeOffset()
+        do
+            use service = new BrowserSchedules.Service(path, execute, now=clock, pollMs=25)
+            firstService <- Some service
+            service.Schedule(action.Id, 1, action.Url, action.ProjectName, action.ScriptPath, action.Alias, action.ArgsJson, action.Active,
+                windowRegistration=action.WindowRegistration, closeAfter=true, repeatEverySeconds=3600) |> good |> ignore
+            service.Start()
+            setTime (origin.AddSeconds(1.))
+            waitFinished service ""
+            Assert.That(dueAndWake service, Is.EqualTo((cadence, wake)))
+        use restarted = new BrowserSchedules.Service(path, (fun _ ->
+            Interlocked.Increment(&calls) |> ignore
+            Task.FromResult(Ok """{"status":"completed"}""")), now=clock, pollMs=25)
+        let _, previous, _ = scheduleState restarted action.Id
+        restarted.Start()
+        setTime (wake.AddSeconds(-1.))
+        Thread.Sleep(100)
+        Assert.That(Volatile.Read(&calls), Is.EqualTo(1))
+        setTime wake
+        waitFinished restarted previous
+        Assert.That(Volatile.Read(&calls), Is.EqualTo(2))
+        Assert.That(dueAndWake restarted, Is.EqualTo((cadence, DateTimeOffset.MinValue)))
+        setTime (wake.AddSeconds(1.))
+        Thread.Sleep(100)
+        Assert.That(Volatile.Read(&calls), Is.EqualTo(2))
+    finally Directory.Delete(folder, true)
 
 [<Test>]
 let interruptedClaimIsNotReplayed () =
@@ -490,7 +670,7 @@ let actualScheduledCallerWithFakeBrowser () =
                     Program.executeRegisteredSchedule (fun () -> Ok ClientConfig.Disabled) actorProvider rt (ConsoleTui.ConsoleTui()) (Some bridge), now=clock, pollMs=25)
                 rt.BrowserScheduler <- Some service
                 service.Schedule(a.Id, 5, a.Url, a.ProjectName, a.ScriptPath, a.Alias, a.ArgsJson, a.Active,
-                    windowRegistration=a.WindowRegistration, closeAfter=false, repeatEverySeconds=60) |> good |> ignore
+                    windowRegistration=a.WindowRegistration, closeAfter=true, repeatEverySeconds=60) |> good |> ignore
                 let waitOccurrence old =
                     waitUntil (fun () ->
                         let status, attempt, _ = scheduleState service a.Id
@@ -533,10 +713,15 @@ let actualScheduledCallerWithFakeBrowser () =
                 Assert.That(prop execute "kind", Is.EqualTo("executeJs"))
                 use request = JsonDocument.Parse execute
                 let args = request.RootElement.GetProperty("args")
-                Assert.That(args.GetProperty("prompt").GetString(), Is.EqualTo("Agent Worker, project local. Call inbox."))
+                Assert.That(args.GetProperty("prompt").GetString(), Does.StartWith("Agent Worker, project local. Call inbox."))
+                Assert.That(args.GetProperty("prompt").GetString(), Does.Contain("launchId"))
                 Assert.That(args.GetProperty("startUrl").GetString(), Is.EqualTo(a.Url))
                 Assert.That(args.EnumerateObject() |> Seq.length, Is.EqualTo(2))
                 do! socketSend socket (JsonSerializer.Serialize({| version=2; kind="result"; requestId=prop execute "requestId"; connectionId=connection; registrationId="created-01"; registrationGeneration=1; status="completed"; result={| status="outcomeUnknown"; stage="acknowledgement"; reason="SubmissionUnconfirmed" |} |}))
+                let! close = (socketReceive socket).WaitAsync(TimeSpan.FromSeconds(5.))
+                Assert.That(prop close "kind", Is.EqualTo("closeTab"))
+                Assert.That(prop close "registrationId", Is.EqualTo("created-01"))
+                do! socketSend socket (JsonSerializer.Serialize({| version=2; kind="tabClosed"; requestId=prop close "requestId"; connectionId=connection; registrationId="created-01"; registrationGeneration=1 |}))
                 let launched = waitOccurrence unregistered
                 let _, _, error = scheduleState service a.Id
                 Assert.That(error, Does.Contain("OutcomeUnknown"))
@@ -845,7 +1030,7 @@ let failedTerminalProofNeverAuthorizesRetry () =
         | other -> Assert.Fail(sprintf "Expected uncertain proof, got %A" other)
         File.Delete(hook)
         let healthy = { ports with CanSend = fun _ -> Task.FromResult(Ok true) }
-        Assert.That(run healthy binding, Is.EqualTo(NoEligibleReady))
+        Assert.That(run healthy binding |> held, Is.True)
         Assert.That(sends, Is.Zero))
 
 [<Test>]
@@ -871,7 +1056,7 @@ let legacyIntentRemainsFencedWithoutPositiveProof () =
             { ReadLimits = readCurrentLimits
               CanSend = fun _ -> Task.FromResult(Ok true)
               Send = fun _ -> sends <- sends + 1; Task.FromResult(Ok "unexpected") }
-        Assert.That(run ports binding, Is.EqualTo(NoEligibleReady))
+        Assert.That(run ports binding |> held, Is.True)
         Assert.That(sends, Is.Zero))
 
 [<Test>]

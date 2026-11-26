@@ -99,12 +99,12 @@ let private route (project: string) : BrowserSchedules.ScheduledAction =
     { Id = "ready-resume"; DueAtUtc = DateTimeOffset.UtcNow; Url = "https://chatgpt.com/g/g-p-fixture/project"
       ProjectName = project; ScriptPath = "browser-scripts/chatgpt/launchAgent.js"; Alias = "agents"
       ArgsJson = """{"resumeReady":true}"""; Active = false; WindowRegistration = "agents"
-      CloseTabAfterExecution = false; RepeatEverySeconds = 60; Status = "running"
+      CloseTabAfterExecution = true; RepeatEverySeconds = 60; Status = "running"
       RegistrationId = ""; ConversationUrl = ""; Cleanup = ""; AttemptId = "attempt"; RevisionId = "revision"
       Error = ""; UpdatedAtUtc = DateTimeOffset.UtcNow; ActionKind = "BrowserScript"; TriggerKind = "Every"
       Executable = ""; CommandArgs = []; WorkingDirectory = ""; TimeoutSeconds = 30; MaxOutputBytes = 100
       IdleAgentId = ""; IdleSeconds = 0; LastActivityAtUtc = DateTimeOffset.MinValue
-      StartedAtUtc = DateTimeOffset.UtcNow; Disabled = false; LastResult = "" }
+      StartedAtUtc = DateTimeOffset.UtcNow; Disabled = false; CheckinWakeAtUtc = DateTimeOffset.MinValue; LastResult = "" }
 
 let private waitUntil (check: unit -> bool) =
     let deadline = DateTime.UtcNow.AddSeconds(15.)
@@ -212,7 +212,7 @@ let hostedOriginalNoSendOrDisconnect scenario =
                     Program.executeReadySchedule actor rt (Some bridge), now=clock, pollMs=25, reconcileResume=Program.reconcileReadySchedule actor rt)
                 rt.BrowserScheduler <- Some service
                 service.Schedule(a.Id, 5, a.Url, a.ProjectName, a.ScriptPath, a.Alias, a.ArgsJson, a.Active,
-                    windowRegistration=a.WindowRegistration, closeAfter=false, repeatEverySeconds=60) |> good |> ignore
+                    windowRegistration=a.WindowRegistration, closeAfter=true, repeatEverySeconds=60) |> good |> ignore
                 let waitOccurrence old =
                     waitUntil (fun () ->
                         let status, attempt, _ = scheduleState service a.Id
@@ -250,7 +250,8 @@ let hostedOriginalNoSendOrDisconnect scenario =
                 use request = JsonDocument.Parse execute
                 Assert.That(request.RootElement.GetProperty("source").GetString(), Is.EqualTo(File.ReadAllText(script)))
                 let args = request.RootElement.GetProperty("args")
-                Assert.That(args.GetProperty("prompt").GetString(), Is.EqualTo("Agent Worker, project local. Call inbox."))
+                Assert.That(args.GetProperty("prompt").GetString(), Does.StartWith("Agent Worker, project local. Call inbox."))
+                Assert.That(args.GetProperty("prompt").GetString(), Does.Contain(expected.OperationId.ToString("D")))
                 Assert.That(args.GetProperty("startUrl").GetString(), Is.EqualTo(a.Url))
                 Assert.That(args.EnumerateObject() |> Seq.length, Is.EqualTo(2))
                 let receiptPath (id: Guid) = $"records/scheduled-ready-resume/{id:N}/intent.json"
@@ -312,6 +313,10 @@ let hostedOriginalNoSendOrDisconnect scenario =
                 Assert.That(foreignActor, Is.False)
                 if lateNoSend then
                     do! socketSend socket (JsonSerializer.Serialize({| version=2; kind="result"; requestId=prop execute "requestId"; connectionId=connection; registrationId="created-01"; registrationGeneration=1; status="completed"; result={| status="submitted"; stage="acknowledgement" |} |}))
+                    let! close = (socketReceive socket).WaitAsync(TimeSpan.FromSeconds(5.))
+                    Assert.That(prop close "kind", Is.EqualTo("closeTab"))
+                    Assert.That(prop close "registrationId", Is.EqualTo("created-01"))
+                    do! socketSend socket (JsonSerializer.Serialize({| version=2; kind="tabClosed"; requestId=prop close "requestId"; connectionId=connection; registrationId="created-01"; registrationGeneration=1 |}))
                 else
                     socket.Abort()
                 let launched = waitOccurrence previous
@@ -342,12 +347,12 @@ let hostedOriginalNoSendOrDisconnect scenario =
                     waitUntil (fun () -> bridge.ListWindows() |> Result.exists (fun s -> s.Contains("window-02")))
                 let nextFrame = socketReceive (if lateNoSend then socket else replacement)
                 service.Schedule(a.Id, 5, "https://chatgpt.com/g/g-p-other/project", a.ProjectName, a.ScriptPath, a.Alias, a.ArgsJson, a.Active,
-                    windowRegistration=a.WindowRegistration, closeAfter=false, repeatEverySeconds=60) |> good |> ignore
+                    windowRegistration=a.WindowRegistration, closeAfter=true, repeatEverySeconds=60) |> good |> ignore
                 advance 6.
                 waitOccurrence launched |> ignore
                 Assert.That(nextFrame.IsCompleted, Is.False, "Changed route/source must not replay an already invoked episode.")
                 let _, _, changedError = scheduleState service a.Id
-                Assert.That(changedError, Is.EqualTo("completed: "))
+                Assert.That(changedError, Does.StartWith("heldLaunches:"))
                 Assert.That(receiptAt first.OperationId, Is.EqualTo(initialReceipt))
                 Assert.That(receiptAt expected.OperationId, Is.EqualTo(sendReceipt))
                 let latest = LedgerStore.fetch binding |> good

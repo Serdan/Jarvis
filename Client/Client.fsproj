@@ -146,9 +146,9 @@
         <Compile Include="Modules\SelfUpdate.fs"/>
         <Compile Include="SignalR\CommandDispatch.fs"/>
         <Compile Include="SignalR\HubConnection.fs"/>
+        <Compile Include="Modules\ScheduledReadyResume.fs"/>
         <Compile Include="SignalR\Client.fs"/>
         <Compile Include="Modules\ProjectCapacityOperator.fs"/>
-        <Compile Include="Modules\ScheduledReadyResume.fs"/>
         <Compile Include="Program.fs"/>
     </ItemGroup>
 

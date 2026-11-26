@@ -122,7 +122,7 @@ module private TaskCommands =
 
     let read projectName action agentId taskId =
         TaskReadCommand
-            { ProjectName = projectName; AgentId = agentId; Action = action
+            { ProjectName = projectName; LaunchId = null; AgentId = agentId; Action = action
               TaskId = taskId; AssignmentGeneration = 0; CheckpointSequence = 0L
               Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
               RelativePath = null }
@@ -1061,7 +1061,7 @@ module McpToolHelpers =
                                 let! sender = client.SendCommandToProject(
                                     userId, notification.SourceRef,
                                     TaskReadCommand
-                                        { ProjectName = notification.SourceRef
+                                        { ProjectName = notification.SourceRef; LaunchId = null
                                           Action = "AgentInbox"; AgentId = notification.ActorId
                                           TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                                           Cursor = ""; PageSize = 0; BeforeOid = null
@@ -1931,7 +1931,7 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "get work composition", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read work unit specifications and derived status from one verified Git snapshot. unitId selects one; otherwise use bounded pagination. A changed head invalidates the cursor.")>]
     static member GetWorkComposition(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] unitId: string, [<Optional; DefaultParameterValue("")>] cursor: string, [<Optional; DefaultParameterValue(0)>] pageSize: int, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http
-            (TaskReadCommand { ProjectName = projectName; AgentId = agentId; Action = "GetCompositionOverview"
+            (TaskReadCommand { ProjectName = projectName; LaunchId = null; AgentId = agentId; Action = "GetCompositionOverview"
                                TaskId = unitId; AssignmentGeneration = 0; CheckpointSequence = 0L
                                Cursor = cursor; PageSize = pageSize; BeforeOid = null; AfterOid = null; RelativePath = null })
 
@@ -2028,7 +2028,7 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "integration submissions", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read every recorded exact-commit integration submission and the latest submitted boundary for a task, including pending, integrated and historical aggregate inclusion evidence. Does not merge or infer that a review verdict implies integration.")>]
     static member GetIntegrationSubmissions(projectName: string, agentId: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        McpToolHelpers.send client http (TaskReadCommand { ProjectName = projectName; AgentId = ""; Action = "GetIntegrationSubmissions"; TaskId = taskId; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
+        McpToolHelpers.send client http (TaskReadCommand { ProjectName = projectName; LaunchId = null; AgentId = ""; Action = "GetIntegrationSubmissions"; TaskId = taskId; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
     [<McpServerTool(Title = "submit integration boundary", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Submit an Accepted immutable review snapshot for integration. reviewId is required. For a task-bound review, empty sourceRef and submittedCommit select its exact pinned SHA. For a shared Accepted review, supply reviewNamespace=_reviews, exact immutable reviewRef, sourceRef, submittedCommit, and the authenticated Operator binding approval operation UUID. Partial shared locators are rejected. Jarvis verifies the reviewed remote snapshot and publishes a create-only managed integration ref; it does not advance the target. An independently advanced target may require a new mechanically clean merge before completion. A nonempty submittedCommit must match the Accepted review; sourceRef is descriptive. submissionId is caller-stable and uncertain effects require reconciliation before any retry.")>]
     static member SubmitIntegration(projectName: string, taskId: string, agentId: string, submissionId: string, sourceRef: string, submittedCommit: string, targetRef: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] reviewId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, [<Optional; DefaultParameterValue("")>] reviewNamespace: string, [<Optional; DefaultParameterValue("")>] reviewRef: string, [<Optional; DefaultParameterValue("")>] bindingApprovalOperationId: string, client: ClientService, http: IHttpContextAccessor) =
@@ -2051,7 +2051,7 @@ type JarvisMcpTools =
     static member GetNotificationPreferences(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http
             (TaskReadCommand
-                { ProjectName = projectName; AgentId = agentId; Action = "GetNotificationPreferences"
+                { ProjectName = projectName; LaunchId = null; AgentId = agentId; Action = "GetNotificationPreferences"
                   TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                   Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
@@ -2103,7 +2103,7 @@ type JarvisMcpTools =
     static member GetAssignment(projectName: string, agentId: string, taskId: string, assignmentGeneration: int, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http
             (TaskReadCommand
-                { ProjectName = projectName; AgentId = ""; Action = "GetAssignment"
+                { ProjectName = projectName; LaunchId = null; AgentId = ""; Action = "GetAssignment"
                   TaskId = taskId; AssignmentGeneration = assignmentGeneration; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
     [<McpServerTool(Title = "reissue assignment", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Update instructions or canonical HTML for an unstarted Ready assignment. Optionally adopt a separately revised canonical spec by supplying expectedCurrentSpecBlobOid and expectedTaskVersion instead of newSpecHtml. Those inputs are mutually exclusive; Working assignments cannot be updated. Immutable issuance history is preserved.")>]
@@ -2132,7 +2132,7 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "get checkpoint", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read an immutable attempt checkpoint by its ledger sequence from a verified canonical snapshot.")>]
     static member GetCheckpoint(projectName: string, agentId: string, taskId: string, checkpointSequence: int64, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (TaskReadCommand
-            { ProjectName = projectName; AgentId = ""; Action = "GetCheckpoint"
+            { ProjectName = projectName; LaunchId = null; AgentId = ""; Action = "GetCheckpoint"
               TaskId = taskId; AssignmentGeneration = 0; CheckpointSequence = checkpointSequence; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
     [<McpServerTool(Title = "set attempt source", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Set the source branch for a current Working or Ready attempt. For initial binding supply both baseOid and targetRef; a later source-branch change omits both. Initial binding verifies Git ancestry and optional allowDetached/allowUncommitted; rebinding preserves pinned baseline and independent review snapshots.")>]
@@ -2161,7 +2161,7 @@ type JarvisMcpTools =
     static member InspectAttemptSource(projectName: string, agentId: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http
             (TaskReadCommand
-                { ProjectName = projectName; AgentId = ""; Action = "InspectAttemptSource"
+                { ProjectName = projectName; LaunchId = null; AgentId = ""; Action = "InspectAttemptSource"
                   TaskId = taskId; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
     [<McpServerTool(Title = "acknowledge review decision", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Acknowledge a specific review verdict by its decision sequence without interrupting the agent's implementation slot.")>]
@@ -2271,13 +2271,13 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "Task lifecycle history", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read immutable administrative transitions and their previous/new task, attempt and owner metadata.")>]
     static member TaskLifecycleHistory(projectName: string, agentId: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (TaskReadCommand
-            { ProjectName = projectName; AgentId = ""; Action = "LifecycleHistory"; TaskId = taskId
+            { ProjectName = projectName; LaunchId = null; AgentId = ""; Action = "LifecycleHistory"; TaskId = taskId
               AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
     [<McpServerTool(Title = "Read a bounded canonical task specification page", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a bounded canonical task specification page. Requires an existing bound orphan Git ledger.")>]
     static member GetTaskSpecPage(projectName: string, agentId: string, taskId: string, pageBytes: int, cursor: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (TaskReadCommand
-            { ProjectName = projectName; AgentId = ""; Action = "GetSpecPage"; TaskId = taskId
+            { ProjectName = projectName; LaunchId = null; AgentId = ""; Action = "GetSpecPage"; TaskId = taskId
               AssignmentGeneration = 0; CheckpointSequence = 0L
               Cursor = cursor
               PageSize = pageBytes
@@ -2288,7 +2288,7 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "Compare two pinned canonical task specification blob OIDs", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Compare two pinned canonical task specification blob OIDs. Requires an existing bound orphan Git ledger.")>]
     static member DiffTaskSpec(projectName: string, agentId: string, taskId: string, beforeBlobOid: string, afterBlobOid: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (TaskReadCommand
-            { ProjectName = projectName; AgentId = ""; Action = "DiffTaskSpec"; TaskId = taskId
+            { ProjectName = projectName; LaunchId = null; AgentId = ""; Action = "DiffTaskSpec"; TaskId = taskId
               AssignmentGeneration = 0; CheckpointSequence = 0L
               Cursor = ""
               PageSize = 0

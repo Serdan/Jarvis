@@ -77,6 +77,7 @@ type private TuiMode =
     | SettingsConfirmMode
     | ProjectEditorMode
     | LaunchTemplateApprovalMode
+    | LaunchResolutionMode
 
 type private PendingPrompt =
     { Id: int
@@ -204,6 +205,16 @@ type CapacityPolicyEditSnapshot =
 type CapacityPolicyUiAccess =
     { Load: string -> Result<CapacityPolicyEditSnapshot, string> }
 
+type LaunchResolutionSnapshot =
+    { LaunchId: string
+      AgentId: string
+      TaskId: string
+      AttemptId: string
+      AssignmentGeneration: int
+      StateSequence: int64
+      Reason: string
+      Resolve: string -> Result<unit, string> }
+
 type private ProjectEditorKind = LaunchTemplateEditor | CapacityPolicyEditor
 
 // Both project editors share one pending-operation lock and navigation path.
@@ -312,6 +323,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let mutable launchTemplateAccess: LaunchTemplateUiAccess option = None
     let mutable launchProject = ""
     let mutable capacityPolicyAccess: CapacityPolicyUiAccess option = None
+    let mutable launchResolutionAccess: (string -> string -> Result<LaunchResolutionSnapshot, string>) option = None
+    let mutable launchResolution: LaunchResolutionSnapshot option = None
+    let mutable launchResolutionRationale = ""
+    let mutable launchResolutionNotice = ""
+    let mutable launchResolutionBusy = false
     let mutable projectEditorKind = LaunchTemplateEditor
     let mutable launchSnapshot: ProjectEditorSnapshot option = None
     let mutable launchDraft = ""
@@ -1103,6 +1119,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         writeMnemonic 'r' "refresh"; draw.Write ", "
         if launchTemplateAccess.IsSome then writeMnemonic 't' "launch template"; draw.Write ", "
         if capacityPolicyAccess.IsSome then writeMnemonic 'k' "k Automation"; draw.Write ", "
+        if launchResolutionAccess.IsSome then writeMnemonic 'l' "launch recovery"; draw.Write ", "
         writeMnemonic 'p' "permissions"; draw.Write ", "
         writeHotkeyToken "Esc"; draw.Write " activity, "
         writeMnemonic 'q' "quit"; draw.WriteLine "  • mouse: click/select, double-click/details, wheel/scroll"
@@ -1759,6 +1776,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 | AgentsMode ->
                     writeAgentHotkeys()
                 | ProjectEditorMode -> draw.WriteLine "Operator project configuration"
+                | LaunchResolutionMode -> draw.WriteLine "Explicit operator launch recovery"
                 | WorkMode -> writeWorkHotkeys()
                 | WorkFilterMode -> writeFilterHotkeys()
                 | AgentFilterMode ->
@@ -1783,6 +1801,20 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             | AgentsMode | AgentFilterMode ->
                 renderAgentsUnsafe width
             | ProjectEditorMode -> renderProjectEditorUnsafe width
+            | LaunchResolutionMode ->
+                match launchResolution with
+                | Some target ->
+                    draw.WriteLine (trim ("Agent: " + target.AgentId + "  Task: " + target.TaskId) width)
+                    draw.WriteLine (trim ("Original launch: " + target.LaunchId) width)
+                    draw.WriteLine (trim ("Attempt: " + target.AttemptId) width)
+                    draw.WriteLine $"Assignment generation: {target.AssignmentGeneration}, Ready sequence: {target.StateSequence}"
+                    draw.WriteLine (trim target.Reason width)
+                    draw.WriteLine "Enter confirms the old execution ended and authorizes ONE replacement."
+                    draw.WriteLine "Do not confirm if the old execution could still be active."
+                    draw.WriteLine (trim ("Rationale: " + launchResolutionRationale) width)
+                | None -> ()
+                draw.WriteLine (trim launchResolutionNotice width)
+                draw.WriteLine "Esc: return"
             | JobsMode | JobDetailsMode | JobCancelMode | JobFilterMode ->
                 renderJobsUnsafe width
             | ChallengesMode | ChallengeReplyMode ->
@@ -1931,6 +1963,48 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let openSelectedCapacityPolicyUnsafe () =
         match selectedAgentUnsafe(), capacityPolicyAccess with
         | Some row, Some _ -> loadProjectEditorUnsafe CapacityPolicyEditor row.Project
+        | _ -> ()
+
+    let openLaunchResolutionUnsafe () =
+        match selectedAgentUnsafe(), launchResolutionAccess with
+        | Some row, Some load ->
+            mode <- LaunchResolutionMode
+            launchResolution <- None
+            launchResolutionRationale <- ""
+            launchResolutionNotice <- "Loading exact held launch..."
+            launchResolutionBusy <- true
+            let project, agent = row.Project, row.Agent
+            Task.Run(fun () ->
+                let result =
+                    try load project agent
+                    with ex -> Error ex.Message
+                lock syncRoot (fun () ->
+                    launchResolutionBusy <- false
+                    match result with
+                    | Ok target -> launchResolution <- Some target; launchResolutionNotice <- ""
+                    | Error reason -> launchResolutionNotice <- reason
+                    renderUnsafe())) |> ignore
+        | _ -> ()
+
+    let submitLaunchResolutionUnsafe () =
+        match launchResolution with
+        | Some target when not launchResolutionBusy && not (String.IsNullOrWhiteSpace launchResolutionRationale) ->
+            launchResolutionBusy <- true
+            let rationale = launchResolutionRationale.Trim()
+            launchResolutionNotice <- "Recording explicit resolution..."
+            Task.Run(fun () ->
+                let result =
+                    try target.Resolve rationale
+                    with ex -> Error ex.Message
+                lock syncRoot (fun () ->
+                    launchResolutionBusy <- false
+                    match result with
+                    | Ok () ->
+                        launchResolution <- None
+                        launchResolutionNotice <- "Resolution recorded. Scheduler must still recheck eligibility."
+                    | Error reason ->
+                        launchResolutionNotice <- reason
+                    renderUnsafe())) |> ignore
         | _ -> ()
 
     let handleProjectEditorKeyUnsafe (keyInfo: ConsoleKeyInfo) =
@@ -2202,7 +2276,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             | _ -> ()
         | Click(x, y) ->
             // Never let a click abandon a modal edit/approval confirmation.
-            if not (List.contains mode [ SettingsEditMode; SettingsConfirmMode; ProjectEditorMode; LaunchTemplateApprovalMode
+            if not (List.contains mode [ SettingsEditMode; SettingsConfirmMode; ProjectEditorMode; LaunchTemplateApprovalMode; LaunchResolutionMode
                                          JobCancelMode; CopyRecentMode
                                          WorkFilterMode; AgentFilterMode; JobFilterMode; FilterMode ]) then
                 mouseHits
@@ -2368,6 +2442,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
     member _.SetCapacityPolicyAccess(access: CapacityPolicyUiAccess) =
         lock syncRoot (fun () -> capacityPolicyAccess <- Some access)
+
+    member _.SetLaunchResolutionAccess(access: string -> string -> Result<LaunchResolutionSnapshot, string>) =
+        lock syncRoot (fun () -> launchResolutionAccess <- Some access)
 
     // Fixture drives the same modal load/key/save path as the selected Agents row.
     // No live Console.ReadKey or authenticated runtime binding is required.
@@ -2696,6 +2773,19 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                         true
                                     else false)
                             if workHandled then ()
+                            elif mode = LaunchResolutionMode then
+                                lock syncRoot (fun () ->
+                                    if not launchResolutionBusy then
+                                        match keyInfo.Key with
+                                        | ConsoleKey.Escape -> mode <- AgentsMode
+                                        | ConsoleKey.Enter -> submitLaunchResolutionUnsafe()
+                                        | ConsoleKey.Backspace when launchResolutionRationale.Length > 0 ->
+                                            launchResolutionRationale <- launchResolutionRationale.Substring(0, launchResolutionRationale.Length - 1)
+                                        | _ when launchResolution.IsSome && not (Char.IsControl keyInfo.KeyChar) &&
+                                                 System.Text.Encoding.UTF8.GetByteCount(launchResolutionRationale + string keyInfo.KeyChar) <= 4096 ->
+                                            launchResolutionRationale <- launchResolutionRationale + string keyInfo.KeyChar
+                                        | _ -> ()
+                                    renderUnsafe())
                             elif mode = ChallengeReplyMode then
                                 lock syncRoot (fun () ->
                                     if not challengeSubmitting then
@@ -3026,6 +3116,10 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                 | _, ConsoleKey.K when mode = AgentsMode ->
                                     lock syncRoot (fun () ->
                                         openSelectedCapacityPolicyUnsafe()
+                                        renderUnsafe())
+                                | _, ConsoleKey.L when mode = AgentsMode ->
+                                    lock syncRoot (fun () ->
+                                        openLaunchResolutionUnsafe()
                                         renderUnsafe())
                                 | ('/', _) | (_, ConsoleKey.F) when mode = AgentsMode ->
                                     lock syncRoot (fun () ->

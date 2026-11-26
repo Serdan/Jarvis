@@ -3155,6 +3155,14 @@ module ReviewWorkflow =
     let activateReadyAgent binding operationId taskId agentId =
         resumeAgentCore binding operationId taskId agentId 0 0 0 "" false
 
+    // Scheduled check-in has already established an exact Ready episode at a
+    // verified snapshot. Fence the ensuing activation against any intervening
+    // assignment/state transition; the caller provides a launch-derived ID.
+    let activateReadyAgentExact binding operationId taskId agentId agentVersion generation =
+        if agentVersion <= 0 || generation <= 0 then
+            Error(InvalidBinding "Scheduled activation requires exact agent version and assignment generation.")
+        else resumeAgentCore binding operationId taskId agentId 0 agentVersion generation "" false
+
     let resumeAgent binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation =
         resumeAgentWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation ""
 

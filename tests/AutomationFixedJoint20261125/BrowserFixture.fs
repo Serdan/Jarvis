@@ -20,12 +20,12 @@ let private route (project: string) : BrowserSchedules.ScheduledAction =
     { Id = "ready-resume"; DueAtUtc = DateTimeOffset.UtcNow; Url = "https://chatgpt.com/g/g-p-fixture/project"
       ProjectName = project; ScriptPath = "browser-scripts/chatgpt/launchAgent.js"; Alias = "agents"
       ArgsJson = """{"resumeReady":true}"""; Active = false; WindowRegistration = "agents"
-      CloseTabAfterExecution = false; RepeatEverySeconds = 60; Status = "running"
+      CloseTabAfterExecution = true; RepeatEverySeconds = 60; Status = "running"
       RegistrationId = ""; ConversationUrl = ""; Cleanup = ""; AttemptId = "attempt"; RevisionId = "revision"
       Error = ""; UpdatedAtUtc = DateTimeOffset.UtcNow; ActionKind = "BrowserScript"; TriggerKind = "Every"
       Executable = ""; CommandArgs = []; WorkingDirectory = ""; TimeoutSeconds = 30; MaxOutputBytes = 100
       IdleAgentId = ""; IdleSeconds = 0; LastActivityAtUtc = DateTimeOffset.MinValue
-      StartedAtUtc = DateTimeOffset.UtcNow; Disabled = false; LastResult = "" }
+      StartedAtUtc = DateTimeOffset.UtcNow; Disabled = false; CheckinWakeAtUtc = DateTimeOffset.MinValue; LastResult = "" }
 
 
 let private waitUntil (check: unit -> bool) =
@@ -96,7 +96,7 @@ let withScheduler (root: string) (rt: Runtime) (project: string) (repository: st
         Program.executeReadySchedule actor rt (Some bridge), now=clock, pollMs=25)
     rt.BrowserScheduler <- Some service
     service.Schedule(a.Id, 5, a.Url, a.ProjectName, a.ScriptPath, a.Alias, a.ArgsJson, a.Active,
-        windowRegistration=a.WindowRegistration, closeAfter=false, repeatEverySeconds=60) |> good |> ignore
+        windowRegistration=a.WindowRegistration, closeAfter=true, repeatEverySeconds=60) |> good |> ignore
     let mutable occurrence = ""
     let mutable seconds = 6.
     let mutable pending = socketReceive socket
@@ -126,10 +126,15 @@ let withScheduler (root: string) (rt: Runtime) (project: string) (repository: st
         use request = JsonDocument.Parse execute
         Assert.That(request.RootElement.GetProperty("source").GetString(), Is.EqualTo(File.ReadAllText(script)))
         let args = request.RootElement.GetProperty("args")
-        Assert.That(args.GetProperty("prompt").GetString(), Is.EqualTo(expectedPrompt))
+        Assert.That(args.GetProperty("prompt").GetString(), Does.StartWith(expectedPrompt))
+        Assert.That(args.GetProperty("prompt").GetString(), Does.Contain("launchId"))
         Assert.That(args.GetProperty("startUrl").GetString(), Is.EqualTo(a.Url))
         Assert.That(args.EnumerateObject() |> Seq.length, Is.EqualTo(2))
         do! socketSend socket (JsonSerializer.Serialize({| version=2; kind="result"; requestId=prop execute "requestId"; connectionId=connection; registrationId=tab; registrationGeneration=1; status="completed"; result={| status=status; stage="acknowledgement"; reason="SubmissionUnconfirmed" |} |}))
+        let! close = (socketReceive socket).WaitAsync(TimeSpan.FromSeconds(5.))
+        Assert.That(prop close "kind", Is.EqualTo("closeTab"))
+        Assert.That(prop close "registrationId", Is.EqualTo(tab))
+        do! socketSend socket (JsonSerializer.Serialize({| version=2; kind="tabClosed"; requestId=prop close "requestId"; connectionId=connection; registrationId=tab; registrationGeneration=1 |}))
         let error = finish()
         pending <- socketReceive socket
         return error

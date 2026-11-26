@@ -3091,7 +3091,7 @@ type ReviewWorkflowTests() =
                 Assert.That(queued.RunnableQueue.Length, Is.EqualTo(1))
                 Assert.That(queued.RunnableQueue.Head.Attempt.SpecBlobOid.Length, Is.EqualTo(40))
                 let generationLookup : Common.TaskReadCommand =
-                    { ProjectName = "owner"; AgentId = ""; Action = "GetAssignment"
+                    { ProjectName = "owner"; LaunchId = null; AgentId = ""; Action = "GetAssignment"
                       TaskId = taskId; AssignmentGeneration = 1; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let snapshotAssignment =
                     Client.OrchestrationApi.TaskApi.read generationLookup ctx
@@ -3230,7 +3230,7 @@ type ReviewWorkflowTests() =
                 run { template "CancelOpenTask" adminTask with
                           ExpectedTaskVersion = 1; Reason = "Explicit cancellation" } |> ignore
                 let adminHistory : Common.TaskReadCommand =
-                    { ProjectName = "owner"; Action = "LifecycleHistory"; TaskId = adminTask
+                    { ProjectName = "owner"; LaunchId = null; Action = "LifecycleHistory"; TaskId = adminTask
                       AgentId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 match Client.OrchestrationApi.TaskApi.read adminHistory ctx with
                 | Ok value ->
@@ -3248,7 +3248,7 @@ type ReviewWorkflowTests() =
                 run { template "CreateTask" specTask with
                           Title = "Spec API"; Html = "<h1>API revision one</h1>\\n" } |> ignore
                 let pageCmd : Common.TaskReadCommand =
-                    { ProjectName = "owner"; Action = "GetSpecPage"; TaskId = specTask
+                    { ProjectName = "owner"; LaunchId = null; Action = "GetSpecPage"; TaskId = specTask
                       AgentId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                       Cursor = ""; PageSize = 128; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let pageBefore =
@@ -3993,7 +3993,7 @@ type ReviewWorkflowTests() =
                 |> success |> ignore
                 let rt = Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
                 let cmdData : Common.TaskReadCommand =
-                    { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"
+                    { ProjectName = "owner"; LaunchId = null; AgentId = "Owner"; Action = "AgentInbox"
                       TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                       Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let payload = System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(Common.TaskReadCommand cmdData)

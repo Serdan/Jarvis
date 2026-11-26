@@ -776,12 +776,14 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
         let mutable registrationId = ""
         let mutable ownerConnectionId = ""
         let mutable createdGeneration = 0
-        let closeOwnedTab () = task {
-            if String.IsNullOrWhiteSpace registrationId || String.IsNullOrWhiteSpace ownerConnectionId || createdGeneration <= 0 then
+        let mutable verifiedAgentCreated = false
+        let closeOwnedTab requireFreshHomeNoTurns = task {
+            if not verifiedAgentCreated || String.IsNullOrWhiteSpace registrationId || String.IsNullOrWhiteSpace ownerConnectionId || createdGeneration <= 0 then
                 return Error "cleanup=retained; cleanupReason=ownershipUnverified"
             else
                 match! bridge.CloseTab(registrationId, ownerConnectionId = ownerConnectionId,
-                                       expectedRegistrationGeneration = createdGeneration) with
+                                       expectedRegistrationGeneration = createdGeneration,
+                                       requireFreshHomeNoTurns = requireFreshHomeNoTurns) with
                 | Ok _ -> return Ok "closed"
                 | Error e ->
                     let safe = if e.Length > 100 then e.Substring(0, 100) else e
@@ -807,12 +809,14 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
                 if String.IsNullOrWhiteSpace(registrationId) || String.IsNullOrWhiteSpace ownerConnectionId || createdGeneration < 1 || not agentCreated then
                     return Error(registrationId, "OutcomeUnknown: created tab identity or provenance was missing")
                 else
-                    // A detached ChatGPT execution continues when its launch
-                    // tab closes. Close-after-execution reclaims generic uncertain
-                    // outcomes; the narrow acknowledged project-route exception
-                    // below retains evidence instead. Debug retention keeps the
-                    // old fresh-home guard.
-                    let closeDefinitive () = closeOwnedTab()
+                    verifiedAgentCreated <- true
+                    // A detached ChatGPT execution continues when its launch tab
+                    // closes. Explicit close-after-execution applies to the exact
+                    // verified Jarvis-owned registration even after a user turn;
+                    // it does not change send certainty or authorize replay.
+                    // Pre-send cleanup uses the stronger fresh-home/no-turn guard.
+                    let closeDefinitive () = closeOwnedTab false
+                    let closeGuarded () = closeOwnedTab true
                     // Readiness advertised by the extension is not atomic with
                     // Chrome's live tab status. A page can start another load
                     // between ListTabs and the extension's execute preflight.
@@ -822,9 +826,10 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
                     let cleanupNotReady () = task {
                         if not closeAfterExecution then
                             return Error(registrationId, "TabNotReady; cleanup=retained; registrationId=" + registrationId)
-                        else match! closeDefinitive() with
-                        | Ok cleanup -> return Error(registrationId, "TabNotReady; cleanup=" + cleanup)
-                        | Error failure -> return Error(registrationId, "TabNotReady; " + failure)
+                        else
+                            match! closeGuarded() with
+                            | Ok cleanup -> return Error(registrationId, "TabNotReady; cleanup=" + cleanup)
+                            | Error failure -> return Error(registrationId, "TabNotReady; " + failure)
                     }
                     let mutable ready = false
                     let mutable ownershipChanged = false
@@ -999,7 +1004,7 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
                                        cleanup = cleanup |}))
         with e ->
             if closeAfterExecution then
-                match! closeOwnedTab() with
+                match! closeOwnedTab false with
                 | Ok cleanup -> return Error(registrationId, "OutcomeUnknown: " + e.GetType().Name + ";cleanup=" + cleanup)
                 | Error cleanup -> return Error(registrationId, "OutcomeUnknown: " + e.GetType().Name + ";" + cleanup)
             else
@@ -1014,7 +1019,7 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
 /// tabs.create is called. Other transport/open errors may have lost their reply
 /// after a tab was created and must remain OutcomeUnknown.
 let isConfirmedNoSendFailure (registrationId: string) (reason: string) =
-    let starts prefix = reason.StartsWith(prefix, StringComparison.Ordinal)
+    let starts (prefix: string) = reason.StartsWith(prefix, StringComparison.Ordinal)
     if String.IsNullOrEmpty registrationId then
         // This exact response is emitted by the extension's capacity preflight
         // before tabs.create. Do not generalize to other open/transport errors.

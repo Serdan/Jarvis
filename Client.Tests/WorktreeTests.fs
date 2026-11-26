@@ -342,7 +342,7 @@ let ``promoted inspection and removal exclude themselves but count active target
         try
             let inbox =
                 TaskReadCommand
-                    { ProjectName = "Project1"; AgentId = "Worker 3"; Action = "AgentInbox"
+                    { ProjectName = "Project1"; LaunchId = null; AgentId = "Worker 3"; Action = "AgentInbox"
                       TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                       Cursor = ""; PageSize = 0; BeforeOid = ""; AfterOid = ""; RelativePath = "" }
             remember inbox (runHeld coordination (fun () -> response "{}")) |> ignore

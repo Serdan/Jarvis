@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net11.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <GenerateProgramFile>false</GenerateProgramFile>
+    <JarvisClientProject Condition="'$(JarvisClientProject)' == ''">$(MSBuildThisFileDirectory)../../../Client/Client.fsproj</JarvisClientProject>
+    <JarvisServerProject Condition="'$(JarvisServerProject)' == ''">$(MSBuildThisFileDirectory)../../../Server/Server.fsproj</JarvisServerProject>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="$(JarvisClientProject)" />
+    <ProjectReference Include="$(JarvisServerProject)" />
+  </ItemGroup>
+</Project>

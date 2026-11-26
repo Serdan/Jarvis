@@ -398,12 +398,17 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                 inboxSnapshot.Value <-
                     Some(retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt))
             | _ -> ()
+            // Only the loader for this request can supply a fresh snapshot.
+            // A cached Ready agent is a hint, not a verified eligibility read.
+            let mutable activationSnapshot = inboxSnapshot.Value
             let current =
-                match inboxSnapshot.Value with
+                match activationSnapshot with
                 | Some verified -> verified |> Result.bind (agentStateAt agentId)
                 | None ->
                     cache.Get(DateTimeOffset.UtcNow, projectId, agentId, fun () ->
-                        loadAgentState rt project agentId)
+                        let verified = retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt)
+                        activationSnapshot <- Some verified
+                        verified |> Result.bind (agentStateAt agentId))
             // A read of source should remain available without lifecycle
             // authority. Report uncertainty explicitly, never invent a
             // committed activation. Lifecycle commands must fail closed.
@@ -419,23 +424,20 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
             | Ok(Some agent) when agent.State = "Ready"
                               && not (isNull (box agent.CurrentAssignment))
                               && not (String.IsNullOrWhiteSpace agent.CurrentAssignment.TaskId) ->
-                let bindingResult =
-                    match inboxSnapshot.Value with
-                    | Some verified -> verified |> Result.map fst
-                    | None -> retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.load project rt)
-                match bindingResult with
+                let verified =
+                    match activationSnapshot with
+                    | Some verified -> verified
+                    | None -> retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt)
+                match verified with
                 | Error error ->
                     cache.Invalidate(projectId, agentId)
                     unavailable error
-                | Ok binding ->
+                | Ok (binding, snapshot) ->
                     // A Ready cache entry cannot establish the current task
                     // lifecycle. Closure may deliberately retain Started+Ready
                     // so the owner can record a completion checkpoint.
                     let eligibility =
-                        match inboxSnapshot.Value with
-                        | Some(Ok(_, snapshot)) ->
-                            ReviewWorkflow.ReviewWorkflow.inspectAutomaticActivationAt binding snapshot agentId
-                        | _ -> ReviewWorkflow.ReviewWorkflow.inspectAutomaticActivation binding agentId
+                        ReviewWorkflow.ReviewWorkflow.inspectAutomaticActivationAt binding snapshot agentId
                     match eligibility with
                     | Error error ->
                         cache.Invalidate(projectId, agentId)

@@ -894,6 +894,58 @@ module LedgerStore =
             if matchOid.Success then Ok(Some matchOid.Groups[1].Value)
             else Error(LedgerIntegrityError "Unexpected ledger object type.")
 
+    // Compare exact immutable tree entries in a single Git invocation. Keep
+    // the per-path implementation for unusual or large requests, including
+    // overlapping paths (ls-tree may suppress a selected descendant).
+    let private validateChangeVersions repo head (changes: LedgerFileChange list) =
+        let validate lookup =
+            changes
+            |> List.tryPick (fun change ->
+                match lookup change.Path with
+                | Error error -> Some error
+                | Ok current when current <> change.ExpectedBlobOid ->
+                    Some(StaleEntityVersion $"Ledger entity changed: {change.Path}")
+                | _ -> None)
+        let paths = changes |> List.map (fun change -> change.Path)
+        let individually () = validate (blobAt repo head)
+        let canBatch =
+            paths.Length > 1 && paths.Length <= 64
+            && (paths |> List.sumBy (fun path -> path.Length + 1)) <= 16000
+            && (paths |> List.forall (fun path -> Regex.IsMatch(path, @"\A[A-Za-z0-9_./-]+\z")))
+            && not (paths |> List.exists (fun path ->
+                paths |> List.exists (fun other ->
+                    other.StartsWith(path + "/", StringComparison.Ordinal))))
+        if not canBatch then individually ()
+        else
+            match gitRaw repo ([ "ls-tree"; "-z"; head; "--" ] @ paths) with
+            | Error error -> Some error
+            | Ok listing when listing.ExitCode <> 0 ->
+                Some(LedgerHistoryUnavailable listing.Stderr)
+            | Ok listing ->
+                let entries =
+                    System.Collections.Generic.Dictionary<string, Result<string option, LedgerFailure>>(StringComparer.Ordinal)
+                let requested = System.Collections.Generic.HashSet<string>(paths, StringComparer.Ordinal)
+                let mutable unambiguous = true
+                for entry in listing.Stdout.Split('\000', StringSplitOptions.RemoveEmptyEntries) do
+                    let separator = entry.IndexOf('\t')
+                    if separator < 0 then unambiguous <- false
+                    else
+                        let path = entry.Substring(separator + 1)
+                        if not (requested.Contains path) || entries.ContainsKey path then
+                            unambiguous <- false
+                        else
+                            let value =
+                                let m = Regex.Match(entry.Substring(0, separator), "^100644 blob ([0-9a-f]{40}(?:[0-9a-f]{24})?)$")
+                                if m.Success then Ok(Some m.Groups[1].Value)
+                                else Error(LedgerIntegrityError "Unexpected ledger object type.")
+                            entries.Add(path, value)
+                if not unambiguous then individually ()
+                else
+                    validate (fun path ->
+                        match entries.TryGetValue path with
+                        | true, value -> value
+                        | _ -> Ok None)
+
     // Compute a prospective canonical spec blob OID without changing the
     // checkout or writing an object. The transaction writes/validates it later.
     let computeBlobOid (binding: LedgerBinding) (content: string) =
@@ -2871,13 +2923,7 @@ module LedgerStore =
                                 Error(InvalidBinding "Invalid or duplicate entity paths in ledger transaction.")
                             else
                                 let validationFailure =
-                                    changes
-                                    |> List.tryPick (fun change ->
-                                        match blobAt repo head change.Path with
-                                        | Error error -> Some error
-                                        | Ok current when current <> change.ExpectedBlobOid ->
-                                            Some(StaleEntityVersion $"Ledger entity changed: {change.Path}")
-                                        | _ -> None)
+                                    validateChangeVersions repo head changes
                                 match validationFailure with
                                 | Some error -> Error error
                                 | None ->

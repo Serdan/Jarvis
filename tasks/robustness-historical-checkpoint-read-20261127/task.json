@@ -1,0 +1,1 @@
+{"schemaVersion":2,"taskId":"robustness-historical-checkpoint-read-20261127","title":"[P1][Reliability] Keep immutable checkpoints readable after attempt closure or replacement","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}

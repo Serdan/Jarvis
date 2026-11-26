@@ -125,3 +125,25 @@ The MCP harness emits machine-readable reports and fails closed on missing tool 
 The delayed transport fixture must be a local disposable bare remote with a file handshake around `git-upload-pack`; wait for proof that the remote child is blocked before starting the pinned read. Cancel a second real fetch and assert no retry, no staging-ref residue and no silent state advance; then perform and record a distinct recovery fetch. The delay and handshake are correctness controls, not absolute timing gates. This is POSIX-only unless a separate Windows run is explicitly arranged.
 
 No live remote, production data, deployment, activation, scheduler changes, main checkout edits, or full combined test run is part of this task. Do not change permission, freshness, fencing, CAS, cancellation, idempotency, or uncertainty semantics to improve a timing number.
+
+### Supplementary whole-fixture Trace2 evidence (ledger lane)
+
+The frozen focused Release baseline at 9dc95184896118c96f34493da28ce40bf5b3d8d6 (job e6bf10c519ff475bbea42b855cd43e9b) and ledger candidate ca4823ad1f198416ef2f96588f9e47b5ea87647a (job dc2bef72288448ef9c924619f7a39737) both passed 28/28 common fixtures. The candidate-only TransactionChecksMultipleExactVersionsInOneTreeRead test is excluded from the aggregate comparison. Runner provenance: isolated measurement branch perf/git-call-measure-20261126, commit c91cdd427 (see docs/testing/git-call-equivalence-contract-20261126.md on that branch), run_trace.py SHA-256 901adaa1f40eae5464cf74b1f60568bff2b0d79a26997ab2de476ef95bd10b69. Private HOME and NUnit global Git config enable Trace2 despite test environment sanitization. The observed counts include fixture setup and teardown, not individual MCP calls.
+
+| Metric | Baseline | Ledger candidate |
+|---|---:|---:|
+| Git starts (all) | 4,635 | 4,624 |
+| Root Git starts | 3,450 | 3,439 |
+| Nested Git starts | 1,185 | 1,185 |
+| Root fetches | 207 | 207 |
+| File transport child starts | 317 | 317 |
+| Runner wall time including build | 86.427 s | 79.734 s |
+| Reported test duration | 29 s | 28 s |
+
+Evidence retained in /tmp/jarvis-perf1-traced-baseline-home-full-9dc95184 and /tmp/jarvis-perf1-traced-ledger-candidate-common-ca4823ad (summary.json, results.trx, git.trace2.jsonl). Candidate Trace2 SHA-256 f90ab18febb4576d740cfc6b6d8153185b897dff278d0c86943cb656b1fadc71; candidate TRX SHA-256 d189840d3bd10af2b2acda9bd693756a95370af35c57efb93f5d4d6809ba6807. Baseline Trace2 SHA-256 001f3a081dab2b5c3c05d5892adef818394fd4a498f3b08f55301e162876f8c9; baseline TRX SHA-256 f81a6c03fe42967db00bfead73859dbf6b2bd1747ebc863ffe32a84e7b142b14. These are observed aggregate counts and passing existing assertions, not a complete semantic digest gate or proof of an operation-level speedup. Attribution requires a matched parent/control and operation-scoped evidence; the direct MCP harness remains a separate gate.
+
+### Direct MCP baseline terminal evidence
+
+Harness source 94d8e2ab40a340baa2457f6bc94cce162be03716, product source 9dc95184896118c96f34493da28ce40bf5b3d8d6, job c425b73a751246c9a166a802586d3f61, exit 0, report `/tmp/jarvis-perf1-direct-9dc95184-94d8e2ab.json` (SHA-256 `65013d0b734868786153bfb4a94bac9d5777845972e4ada231f6cb02dd69de5a`), fixture `/tmp/jarvis-git-call-optimization-7c22cea063be4159b38b0b2f7341226d`. Command: `dotnet run --project scripts/perf/git-call-optimization-20261126/GitCallOptimization.Harness.fsproj -c Release -p:JarvisClientProject=$BASELINE_WORKTREE/Client/Client.fsproj -p:JarvisServerProject=$BASELINE_WORKTREE/Server/Server.fsproj -- --source-root "$BASELINE_WORKTREE" --out /tmp/jarvis-perf1-direct-9dc95184-94d8e2ab.json` with BASELINE_WORKTREE the frozen baseline checkout.
+
+Observed Git starts/fetches: list-worktrees 36/2, get-worktree 5/0, cold and each of 30 warm worktree file reads 1/0, post-HEAD and post-worktree-add reads 1/0, get-task 32/2, register-agent 94/5, get-operation-status 34/2, identical retry 62/4, changed-input operation-ID reuse 62/4 (expected OperationIdReused), unauthorized registration 0/0. These single-run observations establish a direct baseline, not comparative equivalence. Control and candidate must use the same harness and be compared before claiming an improvement.

@@ -741,7 +741,7 @@ module OrdinaryDispatchGitTests =
             if not missing then Assert.That(JsonSerializer.Deserialize<string>(first.Result.Value), Is.EqualTo("base"))
             Assert.That(first.Instructions, Is.Empty)
             Assert.That(warm.Instructions, Is.Empty)
-            Assert.That(first.AgentStateChanges |> List.map (fun change -> change.AgentId), Is.EqualTo([ "Owner" ]))
+            Assert.That(first.AgentStateChanges |> List.map (fun change -> change.AgentId), Is.EqualTo(box [ "Owner" ]))
             Assert.That(warm.AgentStateChanges, Is.Empty)
             Assert.That(first.InboxActivation.IsNone, Is.True)
             Assert.That(warm.InboxActivation.IsNone, Is.True)

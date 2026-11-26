@@ -169,75 +169,110 @@ let private scheduledBrowserCommand (action: BrowserSchedules.ScheduledAction) =
           CloseTabAfterExecution = Some action.CloseTabAfterExecution
           TimeoutMs = Some 30000 }
 
-let executeScheduledAction (readFence: unit -> Result<ClientConfig.CapacityFenceMode, string>) (rt: Runtime) (tui: ConsoleTui) (browser: BrowserBridge.Service option) (action: BrowserSchedules.ScheduledAction) = task {
-    let permission = rt :> PermissionIO
-    let prompt (cmd: AgentCommand) request = permission.PromptPermission cmd request
-    if action.ActionKind = "RunCommand" then
-        let cmd : RunCommandCommand =
-            { ProjectName = action.ProjectName
-              Executable = action.Executable
-              Args = action.CommandArgs
-              Reason = Some("Scheduled execution " + action.Id)
-              WorkingDirectory = if String.IsNullOrWhiteSpace(action.WorkingDirectory) then None
-                                 else Some action.WorkingDirectory
-              TimeoutSeconds = Some action.TimeoutSeconds
-              MaxOutputBytes = Some action.MaxOutputBytes }
-        // Preserve normal run_command permission prompts, TUI activity,
-        // source-path checks and audit rather than executing an untracked process.
-        let! commandResult = Client.receiveCommand rt (RunCommandCommand cmd)
-        match commandResult with
-        | Error error -> return Error("", sprintf "%A" error)
-        | Ok responseJson ->
-            try
-                let result = JsonSerializer.Deserialize<RunCommandResult>(responseJson)
-                let summary = JsonSerializer.Serialize(
-                    {| exitCode = result.ExitCode; timedOut = result.TimedOut
-                       truncated = result.Truncated |})
-                if result.ExitCode = 0 && not result.TimedOut then
-                    return Ok summary
-                else return Error(summary, "CommandFailed")
-            with :? JsonException ->
-                // Process may have executed; no automatic replay.
-                return Error("", "OutcomeUnknown: malformed run_command response")
-    elif (match readFence() with
-          | Ok ClientConfig.Disabled -> false
-          | Ok ClientConfig.NegativeOnly | Error _ -> true) then
-        // No authoritative shared admission is wired here. Never send while
-        // the local deny-only fence is enabled or its setting is unreadable.
-        return Error("", "CapacityFenceHold: scheduled browser launch denied")
+// Resolve the source checkout first, but read policy from the canonical main
+// project. Worktree selectors must never create an independent opt-in.
+let private recurringLaunchPolicy (rt: Runtime) (action: BrowserSchedules.ScheduledAction) =
+    let knownLauncher =
+        if String.IsNullOrWhiteSpace action.ScriptPath then false
+        else
+            let normalized =
+                action.ScriptPath.Split([| Path.DirectorySeparatorChar; Path.AltDirectorySeparatorChar |], StringSplitOptions.RemoveEmptyEntries)
+                |> Array.filter ((<>) ".")
+                |> String.concat "/"
+            let comparison = if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal
+            String.Equals(normalized, "browser-scripts/chatgpt/launchAgent.js", comparison)
+    if action.ActionKind <> "BrowserScript" || action.TriggerKind <> "Every" || not knownLauncher then
+        Ok None
     else
-        let authCommand = scheduledBrowserCommand action
-        let! allowed = PermissionPolicy.authorizeWithTrust permission.TrustLevel prompt authCommand
-        match allowed with
-        | Error error -> return Error("", "AuthorizationDenied: " + sprintf "%A" error)
-        | Ok() ->
-            let script = readScheduledScript rt action
-            match script, browser with
-            | Error e, _ -> return Error("", e)
-            | _, None -> return Error("", "BridgeDisabled")
-            | Ok source, Some bridge ->
-                let mutable connected = false
-                let mutable tries = 0
-                while not connected && tries < 60 do
-                    connected <- bridge.ListWindows().IsOk
-                    if not connected then
-                        tries <- tries + 1
-                        do! Task.Delay(500)
-                if not connected then return Error("", "ExtensionDisconnected")
-                elif (match readFence() with
-                      | Ok ClientConfig.Disabled -> false
-                      | Ok ClientConfig.NegativeOnly | Error _ -> true) then
-                    return Error("", "CapacityFenceHold: scheduled browser launch denied")
-                else
-                    let! result = BrowserBridge.runInNewTab bridge action.WindowRegistration
-                                        action.Url action.Alias action.Active source action.ArgsJson
-                                        30000 action.CloseTabAfterExecution
-                    match result with
-                    | Error (registrationId, reason) ->
-                        if reason.StartsWith("UiIncompatible:", StringComparison.Ordinal) then
-                            tui.Log $"Browser schedule '{action.Id}' suspended: {reason}; inspect tab {registrationId} and update provider script."
-                        return Error(registrationId, reason)
-                    | Ok json -> return Ok json
+        ProjectPaths.resolveProjectContext action.ProjectName rt
+        |> Result.mapError (sprintf "%A")
+        |> Result.bind (fun resolved ->
+            let project = resolved |> ProjectPaths.ResolvedProject.target |> ProjectPaths.ProjectTarget.projectName
+            OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt
+            |> Result.mapError (sprintf "%A")
+            |> Result.bind (fun (binding, snapshot) ->
+                ScheduledReadyResume.readAutomationLimits binding snapshot
+                |> Result.mapError (sprintf "%A")
+                |> Result.map (fun _ -> Some(binding, ProjectPaths.ResolvedProject.sourceRoot resolved))))
+        |> Result.mapError (fun reason -> "AutomationHold: " + reason)
+
+let executeScheduledAction (readFence: unit -> Result<ClientConfig.CapacityFenceMode, string>) (rt: Runtime) (tui: ConsoleTui) (browser: BrowserBridge.Service option) (action: BrowserSchedules.ScheduledAction) = task {
+    match recurringLaunchPolicy rt action with
+    | Error reason -> return Error("", reason)
+    | Ok initialBinding ->
+        let permission = rt :> PermissionIO
+        let prompt (cmd: AgentCommand) request = permission.PromptPermission cmd request
+        if action.ActionKind = "RunCommand" then
+            let cmd : RunCommandCommand =
+                { ProjectName = action.ProjectName
+                  Executable = action.Executable
+                  Args = action.CommandArgs
+                  Reason = Some("Scheduled execution " + action.Id)
+                  WorkingDirectory = if String.IsNullOrWhiteSpace(action.WorkingDirectory) then None
+                                     else Some action.WorkingDirectory
+                  TimeoutSeconds = Some action.TimeoutSeconds
+                  MaxOutputBytes = Some action.MaxOutputBytes }
+            // Preserve normal run_command permission prompts, TUI activity,
+            // source-path checks and audit rather than executing an untracked process.
+            let! commandResult = Client.receiveCommand rt (RunCommandCommand cmd)
+            match commandResult with
+            | Error error -> return Error("", sprintf "%A" error)
+            | Ok responseJson ->
+                try
+                    let result = JsonSerializer.Deserialize<RunCommandResult>(responseJson)
+                    let summary = JsonSerializer.Serialize(
+                        {| exitCode = result.ExitCode; timedOut = result.TimedOut
+                           truncated = result.Truncated |})
+                    if result.ExitCode = 0 && not result.TimedOut then
+                        return Ok summary
+                    else return Error(summary, "CommandFailed")
+                with :? JsonException ->
+                    // Process may have executed; no automatic replay.
+                    return Error("", "OutcomeUnknown: malformed run_command response")
+        elif (match readFence() with
+              | Ok ClientConfig.Disabled -> false
+              | Ok ClientConfig.NegativeOnly | Error _ -> true) then
+            // No authoritative shared admission is wired here. Never send while
+            // the local deny-only fence is enabled or its setting is unreadable.
+            return Error("", "CapacityFenceHold: scheduled browser launch denied")
+        else
+            let authCommand = scheduledBrowserCommand action
+            let! allowed = PermissionPolicy.authorizeWithTrust permission.TrustLevel prompt authCommand
+            match allowed with
+            | Error error -> return Error("", "AuthorizationDenied: " + sprintf "%A" error)
+            | Ok() ->
+                let script = readScheduledScript rt action
+                match script, browser with
+                | Error e, _ -> return Error("", e)
+                | _, None -> return Error("", "BridgeDisabled")
+                | Ok source, Some bridge ->
+                    let mutable connected = false
+                    let mutable tries = 0
+                    while not connected && tries < 60 do
+                        connected <- bridge.ListWindows().IsOk
+                        if not connected then
+                            tries <- tries + 1
+                            do! Task.Delay(500)
+                    if not connected then return Error("", "ExtensionDisconnected")
+                    elif (match readFence() with
+                          | Ok ClientConfig.Disabled -> false
+                          | Ok ClientConfig.NegativeOnly | Error _ -> true) then
+                        return Error("", "CapacityFenceHold: scheduled browser launch denied")
+                    else
+                        match recurringLaunchPolicy rt action with
+                        | Error reason -> return Error("", reason)
+                        | Ok current when current <> initialBinding ->
+                            return Error("", "AutomationHold: project binding changed before send.")
+                        | Ok _ ->
+                            let! result = BrowserBridge.runInNewTab bridge action.WindowRegistration
+                                                action.Url action.Alias action.Active source action.ArgsJson
+                                                30000 action.CloseTabAfterExecution
+                            match result with
+                            | Error (registrationId, reason) ->
+                                if reason.StartsWith("UiIncompatible:", StringComparison.Ordinal) then
+                                    tui.Log $"Browser schedule '{action.Id}' suspended: {reason}; inspect tab {registrationId} and update provider script."
+                                return Error(registrationId, reason)
+                            | Ok json -> return Ok json
 }
 
 // Ordinary canonical Ready resume shares the existing persistent schedule
@@ -363,6 +398,12 @@ let executeReadySchedule (authenticatedActor: unit -> string option) (rt: Runtim
         | _ -> return Error("", "Authenticated active resume schedule unavailable.")
 }
 
+// Shared production dispatch entry point, also used by disposable scheduler tests.
+let executeRegisteredSchedule readFence authenticatedActor rt tui browser action =
+    if BrowserSchedules.isReadyResume action then
+        executeReadySchedule authenticatedActor rt browser action
+    else executeScheduledAction readFence rt tui browser action
+
 let private runClient args =
     let activityStore, activityStoreError =
         try
@@ -427,10 +468,7 @@ let private runClient args =
     // The browser bridge is optional; CLI scheduling works without an extension.
     let mutable registered = false
     let mutable readyResumeActor : unit -> string option = fun () -> None
-    let executeScheduledAction action =
-        if BrowserSchedules.isReadyResume action then
-            executeReadySchedule readyResumeActor rt browser action
-        else executeScheduledAction ClientConfig.capacityFenceMode rt tui browser action
+    let executeScheduledAction = executeRegisteredSchedule ClientConfig.capacityFenceMode readyResumeActor rt tui browser
     // The runtime owns at most one local scheduler per private state file.
     // A second JarvisClient can still connect, but never becomes a competing
     // schedule writer/executor. Idle launches also require a *fresh* authenticated

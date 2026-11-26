@@ -26,28 +26,32 @@ let private git directory args =
     if proc.ExitCode <> 0 then failwith error
     output.Trim()
 
+let private fixtureIn root name =
+    let bare = Path.Combine(root, name + ".git")
+    let local = Path.Combine(root, name)
+    git root ["init"; "--bare"; "--initial-branch=main"; bare] |> ignore
+    git root ["clone"; bare; local] |> ignore
+    File.WriteAllText(Path.Combine(local, "source.txt"), "fixture")
+    git local ["add"; "source.txt"] |> ignore
+    git local ["-c"; "user.name=Fixture"; "-c"; "user.email=fixture@example.test"; "commit"; "-m"; "fixture"] |> ignore
+    git local ["push"; "-u"; "origin"; "HEAD"] |> ignore
+    let binding =
+        { RepositoryPath = local; RemoteName = "origin"; ApprovedFetchUrl = bare; ApprovedPushUrl = bare
+          ProjectId = Guid.NewGuid(); LedgerId = Guid.NewGuid(); Epoch = 1 }
+    LedgerStore.initialize binding true |> good |> ignore
+    let assign agent task =
+        ReviewWorkflow.registerAgent binding (Guid.NewGuid()) agent |> good |> ignore
+        ReviewWorkflow.createTask binding (Guid.NewGuid()) task task |> good |> ignore
+        ReviewWorkflow.assignTask binding (Guid.NewGuid()) task (Guid.NewGuid()) agent |> good |> ignore
+    RoleInstructions.setLaunchTemplate binding "fixture" (Guid.NewGuid()) 0 "Agent {{agentId}}, project {{projectName}}. Call inbox."
+    |> good |> ignore
+    binding, assign
+
 let private fixture action =
     let root = Path.Combine(Path.GetTempPath(), "jarvis-ready-resume-" + Guid.NewGuid().ToString("N"))
     Directory.CreateDirectory root |> ignore
     try
-        let bare = Path.Combine(root, "remote.git")
-        let local = Path.Combine(root, "local")
-        git root ["init"; "--bare"; "--initial-branch=main"; bare] |> ignore
-        git root ["clone"; bare; local] |> ignore
-        File.WriteAllText(Path.Combine(local, "source.txt"), "fixture")
-        git local ["add"; "source.txt"] |> ignore
-        git local ["-c"; "user.name=Fixture"; "-c"; "user.email=fixture@example.test"; "commit"; "-m"; "fixture"] |> ignore
-        git local ["push"; "-u"; "origin"; "HEAD"] |> ignore
-        let binding =
-            { RepositoryPath = local; RemoteName = "origin"; ApprovedFetchUrl = bare; ApprovedPushUrl = bare
-              ProjectId = Guid.NewGuid(); LedgerId = Guid.NewGuid(); Epoch = 1 }
-        LedgerStore.initialize binding true |> good |> ignore
-        let assign agent task =
-            ReviewWorkflow.registerAgent binding (Guid.NewGuid()) agent |> good |> ignore
-            ReviewWorkflow.createTask binding (Guid.NewGuid()) task task |> good |> ignore
-            ReviewWorkflow.assignTask binding (Guid.NewGuid()) task (Guid.NewGuid()) agent |> good |> ignore
-        RoleInstructions.setLaunchTemplate binding "fixture" (Guid.NewGuid()) 0 "Agent {{agentId}}, project {{projectName}}. Call inbox."
-        |> good |> ignore
+        let binding, assign = fixtureIn root "local"
         action binding assign
     finally
         Directory.Delete(root, true)
@@ -462,7 +466,7 @@ let actualScheduledCallerWithFakeBrowser () =
                 let advance (seconds: float) = Interlocked.Add(&nowTicks, TimeSpan.FromSeconds(seconds).Ticks) |> ignore
                 let actor () = Some "operator:fixture"
                 use service = new BrowserSchedules.Service(Path.Combine(root, "schedules.json"),
-                    Program.executeReadySchedule actor rt (Some bridge), now=clock, pollMs=25)
+                    Program.executeRegisteredSchedule (fun () -> Ok ClientConfig.Disabled) actor rt (ConsoleTui.ConsoleTui()) (Some bridge), now=clock, pollMs=25)
                 rt.BrowserScheduler <- Some service
                 service.Schedule(a.Id, 5, a.Url, a.ProjectName, a.ScriptPath, a.Alias, a.ArgsJson, a.Active,
                     windowRegistration=a.WindowRegistration, closeAfter=false, repeatEverySeconds=60) |> good |> ignore
@@ -508,6 +512,123 @@ let actualScheduledCallerWithFakeBrowser () =
         finally
             Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior))
 
+
+[<Test; NonParallelizable>]
+let recurringLegacyLauncherUsesCanonicalProjectOptIn () =
+    fixture (fun a _ ->
+        let root = Path.GetDirectoryName(a.RepositoryPath)
+        let b, _ = fixtureIn root "other"
+        let prior = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+        Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", Path.Combine(root, "config"))
+        try
+            let checkout = Path.Combine(root, "legacy-checkout")
+            git a.RepositoryPath ["worktree"; "add"; "-b"; "legacy-checkout"; checkout] |> ignore
+            let launcher = (route "local").ScriptPath
+            let writeScript folder script =
+                let path = Path.Combine(folder, script)
+                Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
+                File.WriteAllText(path, "async function execute(args) { return args; }")
+            writeScript checkout launcher
+            writeScript b.RepositoryPath launcher
+            writeScript b.RepositoryPath "other.js"
+            let tui = ConsoleTui.ConsoleTui()
+            let rt = Runtime(root, tui, Client.FullTrust)
+            for name, binding in ["local", a; "other", b] do
+                let head = (LedgerStore.fetch binding |> good).Commit
+                LedgerBindingConfig.bindExisting name rt binding.ProjectId binding.LedgerId binding.Epoch
+                    binding.RemoteName binding.ApprovedFetchUrl binding.ApprovedPushUrl head true |> good |> ignore
+            ProjectCapacityPolicy.updateAutomation b "fixture" (Guid.NewGuid()) 0 false None Map.empty |> good |> ignore
+            (task {
+                use listener = new TcpListener(IPAddress.Loopback, 0)
+                listener.Start()
+                let port = (listener.LocalEndpoint :?> IPEndPoint).Port
+                listener.Stop()
+                use bridge = new BrowserBridge.Service(port, "test-secret")
+                bridge.Start()
+                rt.Browser <- Some bridge
+                use socket = new ClientWebSocket()
+                socket.Options.SetRequestHeader("Origin", "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                do! socket.ConnectAsync(Uri("ws://127.0.0.1:" + string port + "/"), CancellationToken.None)
+                let! challenge = (socketReceive socket).WaitAsync(TimeSpan.FromSeconds(5.))
+                use hmac = new HMACSHA256(Encoding.UTF8.GetBytes("test-secret"))
+                let proof = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(prop challenge "nonce"))).ToLowerInvariant()
+                do! socketSend socket (JsonSerializer.Serialize({| version=2; kind="authenticate"; proof=proof |}))
+                let! ready = (socketReceive socket).WaitAsync(TimeSpan.FromSeconds(5.))
+                let connection = prop ready "connectionId"
+                do! socketSend socket """{"version":2,"kind":"windows","windows":[{"windowRegistration":"window-01","alias":"agents","availability":"ready","registrationGeneration":1}]}"""
+                waitUntil (fun () -> bridge.ListWindows() |> Result.exists (fun s -> s.Contains("window-01")))
+                let mutable nowTicks = DateTimeOffset.UtcNow.Ticks
+                let clock () = DateTimeOffset(Interlocked.Read(&nowTicks), TimeSpan.Zero)
+                let advance (seconds: float) = Interlocked.Add(&nowTicks, TimeSpan.FromSeconds(seconds).Ticks) |> ignore
+                let mutable raceReads = 0
+                let mutable raceArmed = 0
+                let readFence () =
+                    if Volatile.Read(&raceArmed) = 1 && Interlocked.Increment(&raceReads) = 2 then
+                        ProjectCapacityPolicy.updateAutomation a "fixture" (Guid.NewGuid()) 1 false None Map.empty |> good |> ignore
+                        Volatile.Write(&raceArmed, 0)
+                    Ok ClientConfig.Disabled
+                let actor () = Some "operator:fixture"
+                use service = new BrowserSchedules.Service(Path.Combine(root, "legacy-schedules.json"),
+                    Program.executeRegisteredSchedule readFence actor rt tui (Some bridge), now=clock, pollMs=25)
+                rt.BrowserScheduler <- Some service
+                let schedule id project script =
+                    let route = route project
+                    service.Schedule(id, 5, route.Url, project, script, route.Alias, "{}", false,
+                        windowRegistration=route.WindowRegistration, closeAfter=false, repeatEverySeconds=60) |> good |> ignore
+                let waitOccurrence id old =
+                    waitUntil (fun () ->
+                        let status, attempt, _ = scheduleState service id
+                        status = "pending" && attempt <> old && not (String.IsNullOrWhiteSpace attempt))
+                    let _, attempt, error = scheduleState service id
+                    attempt, error
+                let hold id old =
+                    let attempt, error = waitOccurrence id old
+                    Assert.That(error, Does.StartWith("AutomationHold:"))
+                    attempt
+                let finish (pending: Task<string>) registration = task {
+                    let! frame = pending.WaitAsync(TimeSpan.FromSeconds(15.))
+                    Assert.That(prop frame "kind", Is.EqualTo("openTab"))
+                    do! socketSend socket (JsonSerializer.Serialize({| version=2; kind="registrations"; tabs=[| {| registrationId=registration; alias="new"; agentCreated=true; availability="ready"; registrationGeneration=1 |} |] |}))
+                    do! socketSend socket (JsonSerializer.Serialize({| version=2; kind="tabOpened"; requestId=prop frame "requestId"; connectionId=connection; tab={| registrationId=registration; availability="ready"; agentCreated=true; registrationGeneration=1 |} |}))
+                    let! execute = (socketReceive socket).WaitAsync(TimeSpan.FromSeconds(5.))
+                    Assert.That(prop execute "kind", Is.EqualTo("executeJs"))
+                    do! socketSend socket (JsonSerializer.Serialize({| version=2; kind="result"; requestId=prop execute "requestId"; connectionId=connection; registrationId=registration; registrationGeneration=1; status="completed"; result={| ok=true |} |}))
+                }
+                schedule "legacy-a" "local::legacy-checkout" launcher
+                service.Start()
+                let pending = socketReceive socket
+                advance 6.
+                let absent = hold "legacy-a" ""
+                Assert.That(pending.IsCompleted, Is.False, "Absent switch must not send.")
+                ProjectCapacityPolicy.updateAutomation a "fixture" (Guid.NewGuid()) 0 true None Map.empty |> good |> ignore
+                schedule "legacy-b" "other" launcher
+                advance 6.
+                hold "legacy-b" "" |> ignore
+                Assert.That(pending.IsCompleted, Is.False, "Other project remains off when A is enabled.")
+                service.Cancel("legacy-b") |> good |> ignore
+                schedule "unrelated" "other" "other.js"
+                advance 6.
+                do! finish pending "created-unrelated"
+                let _, error = waitOccurrence "unrelated" ""
+                Assert.That(error, Is.Empty, "Unrelated scheduled script must still execute while Automation is off.")
+                service.Cancel("unrelated") |> good |> ignore
+                let pending = socketReceive socket
+                Volatile.Write(&raceArmed, 1)
+                advance 60.
+                let raced = hold "legacy-a" absent
+                Assert.That(Volatile.Read(&raceReads), Is.EqualTo(2))
+                Assert.That(pending.IsCompleted, Is.False, "Disable observed at final boundary must not send.")
+                advance 60.
+                let off = hold "legacy-a" raced
+                Assert.That(pending.IsCompleted, Is.False, "Explicitly off recurrence must not send.")
+                ProjectCapacityPolicy.updateAutomation a "fixture" (Guid.NewGuid()) 2 true None Map.empty |> good |> ignore
+                advance 60.
+                do! finish pending "created-legacy"
+                let _, error = waitOccurrence "legacy-a" off
+                Assert.That(error, Is.Empty, "Re-enable must allow next occurrence using canonical main policy for worktree.")
+            }).GetAwaiter().GetResult()
+        finally
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior))
 
 [<TestCase("PreSelection")>]
 [<TestCase("SelectedNoReceipt")>]

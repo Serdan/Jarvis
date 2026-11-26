@@ -36,6 +36,10 @@ At the start of every pass:
    actual canonical `state` and `execution` are separate: a Ready assignment normally
    has state Ready but execution Stopped; a taskless reviewer available for the
    shared queue normally has state NeedsWork but execution Stopped. Record
+   `unassignedDisposition` for every agent exactly as `observe_agent` returns it.
+   After `yield_taskless_work`, a reviewer is Parked/Stopped with disposition
+   `TasklessYield`; an explicit Operator Park is Parked/Stopped with disposition
+   `Parked` and must never be auto-resumed.
    canonical stateEnteredAtUtc from observe_agent: a Ready state entered
    before observed launch activity does not prove a later yield. Never
    infer agent activity from a noncanonical local last-seen timestamp; put
@@ -52,11 +56,16 @@ At the start of every pass:
    the inbox's `snapshotCommit` to equal `task_overview`'s `SnapshotCommit`. For an
    unclaimed-review reservation, confirm the same `taskId`/`reviewId`/`version`
    remains unclaimed; for a claim-resume reservation, confirm the same claim
-   remains owned by that reviewer. Never claim, transfer or route a review for
+   remains owned by that reviewer. If canonical state is Parked, only
+   `unassignedDisposition: TasklessYield` is resumable; `Parked` is an explicit
+   Operator STOP. A changed review version or owner blocks the launch. Never
+   claim, transfer or route a review for
    them. Then call the planner's atomic `begin` operation on that exact launch
    ID. This rechecks the live runtime stop switch and durably marks
    `dispatching` before any browser effect. A second `begin` is rejected, even
    after restart.
+   The Manager must never call `start_taskless_work` for a Reviewer or use a
+   Reviewer ID as the caller; only the launched Reviewer self-starts.
    If a worker is no longer Ready, a reviewer is no longer eligible, a challenge
    blocks it, the request changed, or evidence is stale, record the reservation
    as blocked before `begin`; do not launch. A blocked pre-dispatch record is
@@ -66,10 +75,21 @@ At the start of every pass:
    `https://chatgpt.com/`, and a short role-specific prompt:
    - Worker: "You are Worker N in <project>. Call Jarvis agent_inbox,
      continue your assigned work, then complete or yield before ending."
-   - Reviewer: "You are Reviewer N in <project>. Read Jarvis reviewer_inbox,
-     claim eligible frozen work, and act only after your claim succeeds. If
-     another reviewer wins a claim race, refresh the inbox and try the next
-     eligible item. Complete or yield according to the canonical instructions."
+   - Reviewer: "You are Reviewer N in <project>. First call your own Jarvis
+     agent_inbox and use its exact Agent.Version. For an unassigned
+     NeedsWork/Stopped agent or Parked/Stopped with
+     unassignedDisposition=TasklessYield, call start_taskless_work as yourself
+     with that version, a concise activity, and a caller-stable UUID operationId
+     before reviewer_inbox. Parked with unassignedDisposition=Parked is an
+     explicit Operator STOP; do not start. On uncertain/lost acknowledgement,
+     call get_operation_status with that exact operationId before any retry; retry only the exact same operationId and payload when the original receipt says it is safe, never use a new
+     ID. If your inbox activates a Ready assignment into Working, do not start
+     taskless work; continue that assignment and resume only a claim you already
+     own. If already Working without an assignment, stop without claiming; the
+     existing session owns this slot. A definitive start rejection means do not
+     review, claim or decide. Then call reviewer_inbox as yourself, resume your
+     own runnable claim before claiming unclaimed work, and act only after claim
+     succeeds. Complete or yield according to canonical instructions."
    Do not include stale task details in launch prompts. Never use Codex
    through Jarvis.
 7. Mark each reservation with the actual launcher outcome:

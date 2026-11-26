@@ -42,8 +42,10 @@ function setUnclaimedReviews(c, s, reviews) {
 function agent(agentId, kind, state, overrides = {}) {
   return {
     agentId, kind, state, execution: state === "Working" ? "Working" : "Stopped",
-    slotAvailable: state === "Free" || state === "NeedsWork", verified: true,
+    slotAvailable: ["Free", "NeedsWork", "Parked"].includes(state), verified: true,
     hasReadyAssignment: state === "Ready",
+    unassignedDisposition: state === "Parked" ? "Parked" :
+      (state === "Free" || state === "NeedsWork") ? "NeedsWork" : null,
     // Canonical state transition time from observe_agent, not a client-local cache.
     stateEnteredAtUtc: "2026-11-14T02:00:00Z",
     assignmentKey: kind === "worker" && state === "Ready" ? "task/gen1/" + agentId : null,
@@ -383,7 +385,7 @@ test("a claim that appears while an earlier reviewer send is unresolved is not r
   transferred.capturedAtUtc = "2026-11-15T02:01:00Z";
   setReviewerInboxes(c, transferred, {
     "Reviewer 1": [],
-    "Reviewer 2": [review({ status: "Claimed", reviewerId: "Reviewer 2" })]
+    "Reviewer 2": [review({ version: 2, status: "Claimed", reviewerId: "Reviewer 2" })]
   });
   const next = decide(c, transferred, j, transferred.capturedAtUtc);
   assert.deepEqual(next.reservations, []);
@@ -404,6 +406,7 @@ test("unclaimed demand selects an idle eligible reviewer, not an assigned or blo
   assigned.state = "Ready";
   assigned.hasReadyAssignment = true;
   assigned.slotAvailable = false;
+  assigned.unassignedDisposition = null;
   const blocked = s.agents.find(x => x.agentId === "Reviewer 2");
   blocked.waitingOnChallenge = true;
 
@@ -424,6 +427,7 @@ test("a reviewer resumes only its own claimed review, including with a standing 
   reviewer.state = "Ready";
   reviewer.hasReadyAssignment = true;
   reviewer.slotAvailable = false;
+  reviewer.unassignedDisposition = null;
 
   const r = decide(c, s, journal(), NOW);
   assert.deepEqual(r.reservations.map(x => x.agentId), ["Reviewer 1"]);
@@ -466,6 +470,7 @@ test("a standing task alone never makes a Reviewer eligible for generic ready di
     reviewer.state = "Ready";
     reviewer.hasReadyAssignment = true;
     reviewer.slotAvailable = false;
+    reviewer.unassignedDisposition = null;
   }
   assert.deepEqual(decide(c, s, journal(), NOW).reservations, []);
 });
@@ -666,4 +671,214 @@ test("unclassified active or uncertain project agents fail closed", () => {
   const s = snapshot();
   s.agents.push(agent("Inactive helper", "other", "Parked"));
   assert.equal(decide(config(), s, journal(), NOW).reservations.length, 4);
+});
+
+test("taskless reviewer reservation survives inbox-only activity and resumes the exact claim after yield", () => {
+  const c = config();
+  c.budgets.worker = 0;
+  c.budgets.reviewer = 1;
+  const j = journal();
+  const initial = snapshot();
+  setUnclaimedReviews(c, initial, [REVIEW_A]);
+  const first = decide(c, initial, j, NOW);
+  assert.deepEqual(first.reservations.map(x => x.agentId), ["Reviewer 1"]);
+  j.records[0].status = "uncertain";
+
+  const inboxOnly = snapshot();
+  inboxOnly.capturedAtUtc = "2026-11-15T02:01:00Z";
+  const inboxReader = inboxOnly.agents.find(x => x.agentId === "Reviewer 1");
+  inboxReader.lastAttributedActivityAtUtc = "2026-11-15T02:00:30Z";
+  inboxReader.activityEvidence = "ExplicitAttributedToolCall";
+  setUnclaimedReviews(c, inboxOnly, [REVIEW_A]);
+  const inboxRead = decide(c, inboxOnly, j, inboxOnly.capturedAtUtc);
+  assert.deepEqual(inboxRead.reservations, []);
+  assert.equal(j.records[0].status, "uncertain");
+  assert.equal(inboxRead.counts.reviewer, 1);
+
+  const started = snapshot();
+  started.capturedAtUtc = "2026-11-15T02:02:00Z";
+  const startedReviewer = started.agents.find(x => x.agentId === "Reviewer 1");
+  startedReviewer.state = "Working";
+  startedReviewer.execution = "Working";
+  startedReviewer.slotAvailable = false;
+  startedReviewer.unassignedDisposition = null;
+  startedReviewer.lastAttributedActivityAtUtc = "2026-11-15T02:01:30Z";
+  startedReviewer.activityEvidence = "ExplicitAttributedToolCall";
+  setReviewerInboxes(c, started, {
+    "Reviewer 1": [review({ version: 2, status: "Claimed", reviewerId: "Reviewer 1" })],
+    "Reviewer 2": []
+  });
+  assert.deepEqual(decide(c, started, j, started.capturedAtUtc).reservations, []);
+  assert.equal(j.records[0].status, "observed");
+
+  const yielded = snapshot();
+  yielded.capturedAtUtc = "2026-11-15T02:03:00Z";
+  const yieldedReviewer = yielded.agents.find(x => x.agentId === "Reviewer 1");
+  yieldedReviewer.state = "Parked";
+  yieldedReviewer.execution = "Stopped";
+  yieldedReviewer.slotAvailable = true;
+  yieldedReviewer.hasReadyAssignment = false;
+  yieldedReviewer.unassignedDisposition = "TasklessYield";
+  yieldedReviewer.stateEnteredAtUtc = "2026-11-15T02:02:30Z";
+  yieldedReviewer.lastAttributedActivityAtUtc = "2026-11-15T02:02:15Z";
+  yieldedReviewer.activityEvidence = "ExplicitAttributedToolCall";
+  setReviewerInboxes(c, yielded, {
+    "Reviewer 1": [review({ version: 2, status: "Claimed", reviewerId: "Reviewer 1" })],
+    "Reviewer 2": []
+  });
+  const resumed = decide(c, yielded, j, yielded.capturedAtUtc);
+  assert.deepEqual(resumed.reservations.map(x => x.agentId), ["Reviewer 1"]);
+  assert.equal(resumed.reservations[0].reason, "ClaimedReviewResume");
+  assert.equal(resumed.reservations[0].review.reviewId, REVIEW_A.reviewId);
+  assert.equal(resumed.reservations[0].review.version, 2);
+  assert.equal(j.records[0].status, "observed");
+  assert.equal(j.records[1].status, "reserved");
+  assert.equal(j.records.filter(record =>
+    ["reserved", "dispatching", "submitted", "uncertain"].includes(record.status)).length, 1);
+  assert.deepEqual(decide(c, yielded, j, yielded.capturedAtUtc).reservations, []);
+
+  const resumeInboxOnly = snapshot();
+  resumeInboxOnly.capturedAtUtc = "2026-11-15T02:04:00Z";
+  const resumedInboxReader = resumeInboxOnly.agents.find(x => x.agentId === "Reviewer 1");
+  resumedInboxReader.state = "Parked";
+  resumedInboxReader.execution = "Stopped";
+  resumedInboxReader.slotAvailable = true;
+  resumedInboxReader.unassignedDisposition = "TasklessYield";
+  resumedInboxReader.stateEnteredAtUtc = yieldedReviewer.stateEnteredAtUtc;
+  resumedInboxReader.lastAttributedActivityAtUtc = "2026-11-15T02:03:30Z";
+  resumedInboxReader.activityEvidence = "ExplicitAttributedToolCall";
+  setReviewerInboxes(c, resumeInboxOnly, {
+    "Reviewer 1": [review({ version: 2, status: "Claimed", reviewerId: "Reviewer 1" })],
+    "Reviewer 2": []
+  });
+  assert.deepEqual(decide(c, resumeInboxOnly, j, resumeInboxOnly.capturedAtUtc).reservations, []);
+  assert.equal(j.records[1].status, "reserved");
+
+  const resumedWorking = snapshot();
+  resumedWorking.capturedAtUtc = "2026-11-15T02:05:00Z";
+  const resumedReviewer = resumedWorking.agents.find(x => x.agentId === "Reviewer 1");
+  resumedReviewer.state = "Working";
+  resumedReviewer.execution = "Working";
+  resumedReviewer.slotAvailable = false;
+  resumedReviewer.unassignedDisposition = null;
+  resumedReviewer.lastAttributedActivityAtUtc = "2026-11-15T02:04:30Z";
+  resumedReviewer.activityEvidence = "ExplicitAttributedToolCall";
+  setReviewerInboxes(c, resumedWorking, {
+    "Reviewer 1": [review({ version: 2, status: "Claimed", reviewerId: "Reviewer 1" })],
+    "Reviewer 2": []
+  });
+  assert.deepEqual(decide(c, resumedWorking, j, resumedWorking.capturedAtUtc).reservations, []);
+  assert.equal(j.records[1].status, "observed");
+});
+
+test("reviewer dispatch eligibility follows durable disposition across claimed and unclaimed demand", () => {
+  const dispositions = ["NeedsWork", "Parked", "TasklessYield"];
+  const modes = ["unclaimed", "claimed"];
+  for (const disposition of dispositions) {
+    for (const mode of modes) {
+      for (const waitingOnChallenge of [false, true]) {
+        const c = config();
+        c.budgets.worker = 0;
+        c.budgets.reviewer = 2;
+        const s = snapshot();
+        const reviewer = s.agents.find(x => x.agentId === "Reviewer 1");
+        reviewer.state = disposition === "NeedsWork" ? "NeedsWork" : "Parked";
+        reviewer.execution = "Stopped";
+        reviewer.slotAvailable = true;
+        reviewer.hasReadyAssignment = false;
+        reviewer.unassignedDisposition = disposition;
+        reviewer.waitingOnChallenge = waitingOnChallenge;
+        if (mode === "claimed") {
+          setReviewerInboxes(c, s, {
+            "Reviewer 1": [review({ status: "Claimed", reviewerId: "Reviewer 1" })],
+            "Reviewer 2": []
+          });
+        } else {
+          setUnclaimedReviews(c, s, [REVIEW_A]);
+        }
+        const result = decide(c, s, journal(), NOW);
+        const expected = disposition !== "Parked" && !waitingOnChallenge;
+        assert.equal(result.reservations.some(x => x.agentId === "Reviewer 1"), expected,
+          `${mode}/${disposition}/challenge=${waitingOnChallenge}`);
+        if (disposition === "Parked" && !waitingOnChallenge) {
+          assert.equal(result.suppressed.find(x => x.agentId === "Reviewer 1").reason,
+            "OperatorParked");
+        }
+        const reviewKeys = result.reservations.filter(x => x.kind === "reviewer")
+          .map(x => `${x.review.taskId}/${x.review.reviewId}`);
+        assert.equal(new Set(reviewKeys).size, reviewKeys.length);
+      }
+    }
+  }
+});
+
+
+test("completed taskless review releases its old claim and reuses the yielded reviewer for new demand", () => {
+  const c = config();
+  c.budgets.worker = 0;
+  c.budgets.reviewer = 1;
+  const j = journal();
+
+  const initial = snapshot();
+  setUnclaimedReviews(c, initial, [REVIEW_A]);
+  const first = decide(c, initial, j, NOW);
+  assert.equal(first.reservations[0].reason, "UnclaimedFrozenReview");
+  assert.equal(first.reservations[0].review.reviewId, REVIEW_A.reviewId);
+  j.records[0].status = "uncertain";
+
+  const working = snapshot();
+  working.capturedAtUtc = "2026-11-15T02:02:00Z";
+  const active = working.agents.find(x => x.agentId === "Reviewer 1");
+  active.state = "Working";
+  active.execution = "Working";
+  active.slotAvailable = false;
+  active.unassignedDisposition = null;
+  active.lastAttributedActivityAtUtc = "2026-11-15T02:01:30Z";
+  active.activityEvidence = "ExplicitAttributedToolCall";
+  setReviewerInboxes(c, working, {
+    "Reviewer 1": [review({ version: 2, status: "Claimed", reviewerId: "Reviewer 1" })],
+    "Reviewer 2": []
+  });
+  assert.deepEqual(decide(c, working, j, working.capturedAtUtc).reservations, []);
+  assert.equal(j.records[0].status, "observed");
+
+  const yielded = snapshot();
+  yielded.capturedAtUtc = "2026-11-15T02:03:00Z";
+  const reviewer = yielded.agents.find(x => x.agentId === "Reviewer 1");
+  reviewer.state = "Parked";
+  reviewer.execution = "Stopped";
+  reviewer.slotAvailable = true;
+  reviewer.hasReadyAssignment = false;
+  reviewer.unassignedDisposition = "TasklessYield";
+  reviewer.stateEnteredAtUtc = "2026-11-15T02:02:30Z";
+  reviewer.lastAttributedActivityAtUtc = "2026-11-15T02:02:15Z";
+  reviewer.activityEvidence = "ExplicitAttributedToolCall";
+  setUnclaimedReviews(c, yielded, [REVIEW_B]);
+
+  const reused = decide(c, yielded, j, yielded.capturedAtUtc);
+  assert.deepEqual(reused.reservations.map(x => x.agentId), ["Reviewer 1"]);
+  assert.equal(reused.reservations[0].reason, "UnclaimedFrozenReview");
+  assert.equal(reused.reservations[0].review.reviewId, REVIEW_B.reviewId);
+  assert.equal(j.records[0].status, "observed");
+  assert.equal(j.records[1].status, "reserved");
+  assert.equal(j.records[1].review.reviewId, REVIEW_B.reviewId);
+  assert.equal(j.records.some(record =>
+    ["reserved", "dispatching", "submitted", "uncertain"].includes(record.status) &&
+    record.review?.reviewId === REVIEW_A.reviewId), false);
+});
+
+test("Manager reviewer launch prompt self-starts before inbox and preserves Operator STOP", () => {
+  const role = fs.readFileSync(new URL("../../config/manager/Manager.role.md", import.meta.url), "utf8");
+  const start = role.indexOf("- Reviewer:");
+  const end = role.indexOf("Do not include stale task details", start);
+  assert.ok(start >= 0 && end > start, "reviewer launch prompt is present");
+  const prompt = role.slice(start, end);
+  assert.ok(prompt.indexOf("agent_inbox") < prompt.indexOf("start_taskless_work"));
+  assert.ok(prompt.indexOf("start_taskless_work") < prompt.indexOf("reviewer_inbox"));
+  assert.match(prompt, /start_taskless_work as yourself/);
+  assert.match(prompt, /caller-stable UUID operationId/);
+  assert.match(prompt, /get_operation_status with that exact operationId before any retry/);
+  assert.match(prompt, /Parked with unassignedDisposition=Parked is an\s+explicit Operator STOP/);
+  assert.match(prompt, /A definitive start rejection means do not\s+review, claim or decide/);
+  assert.match(role, /The Manager must never call .+start_taskless_work.+for a Reviewer/);
 });

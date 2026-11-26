@@ -464,7 +464,8 @@ function buildChallengeProjection(project, taskById, agentById, holds) {
         owner.execution === "Stopped" && owner.currentAssignment === null &&
         owner.unassignedDisposition === "NeedsWork";
       const isParkedOwner = owner.state === "Parked" ||
-        owner.unassignedDisposition === "Parked";
+        owner.unassignedDisposition === "Parked" ||
+        owner.unassignedDisposition === "TasklessYield";
       const isBusyOwner = owner.state === "Working" ||
         owner.execution === "Working" || owner.currentAssignment !== null;
       const validRequeueProvenance = isRecord(requeueProvenance) &&
@@ -604,7 +605,7 @@ function attemptBaseHolds(project, task, attempt, context) {
     });
   } else if (owner.verified !== true) {
     addHold(holds, "attempt", "OwnerStateUnverified", identity, { ownerAgentId: owner.agentId });
-  } else if (owner.state === "Parked" || owner.unassignedDisposition === "Parked") {
+  } else if (owner.state === "Parked" || owner.unassignedDisposition === "Parked" || owner.unassignedDisposition === "TasklessYield") {
     addHold(holds, "attempt", "OwnerParked", identity, { ownerAgentId: owner.agentId });
   } else if (context.sessions.some(session =>
     session.agentId === owner.agentId && session.status === "Unknown")) {

@@ -1815,7 +1815,7 @@ module ChallengeWorkflow =
                         return! Error(StaleEntityVersion "Only Blocked challenge-linked attempts can be requeued.")
                     if not (isNull (box agent.CurrentAssignment)) || agent.Execution <> "Stopped"
                        || agent.UnassignedDisposition <> "NeedsWork" then
-                        return! Error(AgentBusy "Cannot requeue while owner is assigned, Working, or explicitly Parked.")
+                        return! Error(AgentBusy "Cannot requeue while owner is assigned, Working, Parked, or in a TasklessYield boundary; the owner must be NeedsWork.")
                     let waitingPath = waitPath task attemptId
                     let! wait, waitOid = canonical<AttemptChallengeWait> binding snapshot waitingPath
                     if wait.TaskId <> task || wait.AttemptId <> attemptId ||

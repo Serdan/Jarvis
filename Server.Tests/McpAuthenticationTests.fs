@@ -178,7 +178,8 @@ let write_tools_expose_optional_operation_ids () =
     let methods = typeof<Server.JarvisMcpTools>.GetMethods()
     let writeMethods =
         methods
-        |> Array.filter (fun methodInfo -> methodInfo.Name <> "Feedback")
+        |> Array.filter (fun methodInfo ->
+            methodInfo.Name <> "Feedback" && methodInfo.Name <> "RecordAggregateInclusion")
         |> Array.choose (fun methodInfo ->
             match methodInfo.GetParameters() |> Array.tryFind (fun p -> p.Name = "operationId") with
             | Some id when not (List.contains methodInfo.Name
@@ -188,7 +189,12 @@ let write_tools_expose_optional_operation_ids () =
                 Some (methodInfo.Name, id)
             | _ -> None)
     // Preserve challenge-domain, taskless, notification, composition and default-off Work writes.
-    Assert.That(writeMethods.Length, Is.EqualTo(69), String.concat ", " (writeMethods |> Array.map fst))
+    Assert.That(writeMethods.Length, Is.EqualTo(70), String.concat ", " (writeMethods |> Array.map fst))
+    let aggregateOperationId =
+        typeof<Server.JarvisMcpTools>.GetMethod("RecordAggregateInclusion").GetParameters()
+        |> Array.find (fun parameter -> parameter.Name = "operationId")
+    Assert.That(aggregateOperationId.IsOptional, Is.False,
+                "Aggregate inclusion requires its caller-stable operationId.")
     for newTool in [ "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork"
                      "ConnectWork"; "ClaimNextWork"; "CheckpointWork"; "CompleteWork"
                      "SetWorkPriority" ] do

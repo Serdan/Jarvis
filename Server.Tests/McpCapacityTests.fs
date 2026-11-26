@@ -104,6 +104,64 @@ let private responseJson (body: string) =
             |> fun line -> line.Substring(5).Trim()
     JsonDocument.Parse(json)
 
+// The same ordinary authenticated principal reaches the generic MCP handler,
+// but must never be treated as an authenticated provider-launch principal.
+[<Test>]
+let provider_routes_fail_closed_without_authenticated_launch_context () =
+    task {
+        ProbeState.reset()
+        ProbeState.gate.TrySetResult(()) |> ignore
+        let! instance, endpoint = startServer ()
+        use app = instance
+        use http = new HttpClient()
+        http.Timeout <- TimeSpan.FromSeconds(10.0)
+        use! listing = postMcp http endpoint """{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"""
+        let! listedBody = listing.Content.ReadAsStringAsync()
+        use document = responseJson listedBody
+        let name =
+            document.RootElement.GetProperty("result").GetProperty("tools").EnumerateArray()
+            |> Seq.find (fun item -> item.GetProperty("name").GetString().Contains("hold", StringComparison.OrdinalIgnoreCase))
+            |> fun item -> item.GetProperty("name").GetString()
+        let directCall =
+            sprintf """{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":{"callId":17,"projectName":"other-project","agentId":"Lead","role":"Worker","profile":"worker"}}}""" name
+        let payloads =
+            [ initialize 3
+              """{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}"""
+              sprintf """{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"%s","arguments":{"callId":16}}}""" name
+              directCall ]
+        for path in [ "/mcp/provider"; "/mcp/provider/"; "/mcp/provider/Worker"; "/MCP/PROVIDER/project/Lead/wrong-profile" ] do
+            for payload in payloads do
+                use request = new HttpRequestMessage(HttpMethod.Post, endpoint + path)
+                request.Headers.TryAddWithoutValidation("Accept", "application/json, text/event-stream") |> ignore
+                request.Headers.TryAddWithoutValidation("X-Jarvis-Agent", "Worker 6") |> ignore
+                request.Content <- new StringContent(payload, Encoding.UTF8, "application/json")
+                use! response = http.SendAsync(request)
+                Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.Forbidden), path)
+            for method in [ HttpMethod.Get; HttpMethod.Delete ] do
+                use request = new HttpRequestMessage(method, endpoint + path)
+                use! response = http.SendAsync(request)
+                Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.Forbidden), path)
+        Assert.That(ProbeState.entered.Count, Is.Zero, "No provider route may enter an actual tool handler")
+        // A random role-shaped alternate endpoint is not a generic MCP alias.
+        for path in [ "/mcp/Worker"; "/mcp/roles/Worker"; "/other/mcp" ] do
+            use request = new HttpRequestMessage(HttpMethod.Post, endpoint + path)
+            request.Headers.TryAddWithoutValidation("Accept", "application/json, text/event-stream") |> ignore
+            request.Content <- new StringContent(directCall, Encoding.UTF8, "application/json")
+            use! alternate = http.SendAsync(request)
+            Assert.That(alternate.StatusCode, Is.EqualTo(HttpStatusCode.NotFound), path)
+        Assert.That(ProbeState.entered.Count, Is.Zero)
+        for path in [ "/mcp"; "/mcp/"; "/mcp/provider"; "/mcp/provider/Worker"; "/mcp/roles/Worker" ] do
+            match McpEndpoint.tryProviderCallableCeiling (PathString(path)) with
+            | Error _ -> ()
+            | Ok _ -> Assert.Fail($"No provider ceiling can be issued for {path}")
+        // Preserve the actual generic manual route. This is intentionally NOT
+        // evidence of a scoped ceiling: the same bearer principal can use it.
+        use! ordinary = postMcp http endpoint (sprintf """{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"%s","arguments":{"callId":18}}}""" name)
+        let! body = ordinary.Content.ReadAsStringAsync()
+        Assert.That(ordinary.StatusCode, Is.EqualTo(HttpStatusCode.OK), body)
+        Assert.That(ProbeState.entered.ToArray() = [|18|], Is.True)
+    }
+
 [<Test>]
 let authenticated_mcp_http_accepts_more_than_240_rapid_requests_without_synthetic_429 () =
     task {

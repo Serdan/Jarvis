@@ -3,7 +3,9 @@
     <TargetFramework>net11.0</TargetFramework>
     <LangVersion>latest</LangVersion>
     <IsPackable>false</IsPackable>
-    <GenerateProgramFile>false</GenerateProgramFile>
+    <!-- Keep the SDK entry point after the F# test module so startup
+         initialization is not emitted into an entry point NUnit never calls. -->
+    <GenerateProgramFile>true</GenerateProgramFile>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../Client/Client.fsproj" />

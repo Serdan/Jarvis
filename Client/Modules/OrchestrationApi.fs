@@ -1467,6 +1467,90 @@ module PendingIntentJournal =
             sameTask && (equivalentCreate || supersededLifecycle)
         with _ -> false
 
+    // A CompleteIntegration may have an external target effect before its
+    // ledger receipt. Absence of the old UUID, or even a newer target alone,
+    // is NOT permission to discard it. First publish a distinct successor
+    // through the normal managed publisher; only its canonical immutable
+    // receipt and incompatible Git ancestry can retire the old intent.
+    let private relatedIntegrationProofMatches binding (snapshot: LedgerStore.LedgerSnapshot)
+                                               (original: PendingIntent)
+                                               (related: LedgerStore.LedgerOperation) =
+        try
+            use saved = JsonDocument.Parse(original.CommandJson)
+            let own = saved.RootElement
+            let field (name: string) =
+                let value = own.GetProperty(name)
+                if value.ValueKind <> JsonValueKind.String then invalidOp "Expected saved string."
+                value.GetString()
+            let uniqueFields =
+                let fields = own.EnumerateObject() |> Seq.map (fun p -> p.Name.ToUpperInvariant()) |> Seq.toArray
+                fields.Length = (fields |> Array.distinct |> Array.length)
+            let taskId, actor, oldCommit = field "TaskId", field "ActorId", field "BaseOid"
+            let originalId = Guid.Parse(field "OperationId")
+            let submissionId = Guid.Parse(field "AttemptId")
+            // Only a proven negative ancestry check is evidence. Missing Git
+            // objects, transport failures and invalid graphs are not.
+            let notAncestor earlier later =
+                match LedgerStore.LedgerStore.verifySourceAncestry binding earlier later with
+                | Error(LedgerStore.InvalidBinding "Source commit does not descend from the expected base.") -> true
+                | _ -> false
+            let ok = Result.isOk
+            if not uniqueFields || normalizeCommandType original.CommandType <> "TaskWrite"
+               || field "Action" <> "CompleteIntegration" || related.Type <> "CompleteIntegration"
+               || originalId = Guid.Empty || original.OperationId <> originalId.ToString("D")
+               || submissionId = Guid.Empty || taskId = "_reviews"
+               || String.IsNullOrWhiteSpace taskId || String.IsNullOrWhiteSpace actor
+               || related.Actor <> actor || related.OperationId = original.OperationId
+               || not (LedgerStore.LedgerStore.validSourceCommitOid oldCommit) then false
+            else
+                match ReviewWorkflow.ReviewWorkflow.getIntegrationSubmissionAt binding snapshot taskId submissionId with
+                | Ok submission when submission.Status = "Integrated"
+                                     && submission.IntegrationRef = $"refs/heads/jarvis-integration/{submissionId:N}"
+                                     && submission.PublicationOperationId = related.OperationId
+                                     && submission.PublicationMechanism = "VerifiedNonForceGitPush/v1"
+                                     && submission.ReviewedHeadOid = submission.SubmittedCommit
+                                     && oldCommit <> submission.IntegratedCommit
+                                     && oldCommit <> submission.SubmittedCommit ->
+                    match ReviewWorkflow.ReviewWorkflow.getIntegrationReviewAt binding snapshot taskId submissionId submission with
+                    | Ok review when review.Status = "Accepted"
+                                     && review.ReviewId = submission.ReviewId
+                                     && review.ReviewRef = submission.ReviewRef
+                                     && review.SourceVersion = submission.ReviewVersion
+                                     && review.ReviewedHeadOid = submission.SubmittedCommit
+                                     && review.TaskRef = submission.SourceRef
+                                     && review.TargetRef = submission.TargetRef
+                                     && submission.CreatedSequence > review.DecisionSequence
+                                     && not (String.IsNullOrWhiteSpace review.ReviewerId)
+                                     && not (String.IsNullOrWhiteSpace review.OwnerAgentId)
+                                     && review.ReviewerId <> review.OwnerAgentId ->
+                        // Reuse the canonical completion proof (original
+                        // receipt at its origin, exact request and verified
+                        // non-force publication), not an operator assertion.
+                        ok (LedgerStore.LedgerStore.verifyCompletionOperationRequest binding related
+                                taskId submissionId submission.IntegratedCommit)
+                        && ok (ReviewWorkflow.ReviewWorkflow.requireManagedCompletionAt binding snapshot
+                                taskId submissionId submission)
+                        && ok (LedgerStore.LedgerStore.verifyMechanicalIntegrationMerge binding
+                                submission.TargetHeadAtSubmission submission.SubmittedCommit oldCommit)
+                        // The old merge cannot have been a previous successful
+                        // non-force update in the successor's lineage, nor can
+                        // a delayed ordinary push advance the successor to it.
+                        && notAncestor oldCommit submission.IntegratedCommit
+                        && notAncestor submission.IntegratedCommit oldCommit
+                        && (match LedgerStore.LedgerStore.readRemoteTarget binding submission.TargetRef with
+                            | Ok current ->
+                                ok (LedgerStore.LedgerStore.verifySourceAncestry binding submission.IntegratedCommit current)
+                                && notAncestor oldCommit current
+                            | Error _ -> false)
+                        // The operator's verified ledger pin remains required
+                        // throughout the additional remote evidence reads.
+                        && (match LedgerStore.LedgerStore.fetch binding with
+                            | Ok current -> current.Commit = snapshot.Commit
+                            | Error _ -> false)
+                    | _ -> false
+                | _ -> false
+        with _ -> false
+
     // Operator-controlled, durable local supersession. This does not mutate
     // the remote ledger. The related UUID is required to be a verified Applied
     // receipt with an exact supplied hash and subject-specific equivalence.
@@ -1546,7 +1630,8 @@ module PendingIntentJournal =
                                                     |> Result.bind (function
                                                         | Some related when
                                                             String.Equals(related.RequestHash, relatedRequestHash, StringComparison.OrdinalIgnoreCase)
-                                                            && relatedProofMatches original related ->
+                                                            && (relatedProofMatches original related
+                                                                || relatedIntegrationProofMatches binding snapshot original related) ->
                                                             LedgerStore.LedgerStore.getOperationOriginAt binding snapshot related
                                                             |> Result.mapError LedgerErrors.toEffect
                                                             |> Result.bind (fun origin ->

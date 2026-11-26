@@ -5635,6 +5635,165 @@ type ReviewWorkflowTests() =
             Assert.That(inspected.Disposition, Is.EqualTo(Some "Superseded"))
             Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head)))
 
+    [<TestCase(false, false)>]
+    [<TestCase(true, false)>]
+    [<TestCase(false, true)>]
+    member _.ObsoleteManagedCompletionRequiresDistinctVerifiedSuccessor(priorPublication: bool, targetIncludesOld: bool) =
+        withFixture (fun one two first second _ _ newCommit _ ->
+            let mainBranch = git one [ "branch"; "--show-current" ]
+            let target = "refs/heads/" + mainBranch
+            let taskId = "obsolete-integration-recovery"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId taskId |> success |> ignore
+            git one [ "checkout"; "-b"; "feature/obsolete-integration-recovery" ] |> ignore
+            let source = newCommit "Reviewed source" "reviewed"
+            let reviewId = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
+                reviewId "refs/heads/feature/obsolete-integration-recovery" source "Snapshot" "" target
+            |> success |> ignore
+            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId reviewId "Reviewer" 1
+            |> success |> ignore
+            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId reviewId "Reviewer" 2 Accept
+            |> success |> ignore
+            let submission = Guid.NewGuid()
+            ReviewWorkflow.submitIntegration first (Guid.NewGuid()) taskId "Owner"
+                submission "" "" (reviewId.ToString("N")) target |> success |> ignore
+            git one [ "checkout"; "--detach"; mainBranch ] |> ignore
+            git one [ "merge"; "--no-ff"; "--no-edit"; source ] |> ignore
+            let obsolete = git one [ "rev-parse"; "HEAD" ]
+            let originalId = Guid.NewGuid()
+            let savedJson = System.Text.Json.JsonSerializer.Serialize(
+                {| Action = "CompleteIntegration"; TaskId = taskId
+                   ActorId = "Reviewer"; OperationId = originalId.ToString("D")
+                   AttemptId = submission.ToString("D"); BaseOid = obsolete |})
+            let persist () =
+                Client.OrchestrationApi.PendingIntentJournal.persist first originalId "TaskWrite" savedJson
+            persist () |> success
+            let original =
+                Client.OrchestrationApi.PendingIntentJournal.findAtRoot one originalId |> success |> Option.get
+            if priorPublication then
+                // Simulate an old external update without a ledger receipt.
+                // This is a disposable Git remote, never the live target.
+                git one [ "push"; "origin"; obsolete + ":" + target ] |> ignore
+                git two [ "pull"; "--ff-only"; "origin"; mainBranch ] |> ignore
+            File.WriteAllText(Path.Combine(two, "advance.txt"), "Independent target advance")
+            git two [ "add"; "advance.txt" ] |> ignore
+            git two [ "commit"; "-m"; "Advance target" ] |> ignore
+            let advanced = git two [ "rev-parse"; "HEAD" ]
+            git two [ "push"; "origin"; mainBranch ] |> ignore
+            git one [ "fetch"; "origin"; target ] |> ignore
+            git one [ "checkout"; "--detach"; "FETCH_HEAD" ] |> ignore
+            let successor =
+                if priorPublication then
+                    // Source already included; construct an exact mechanical
+                    // merge in the fixture to demonstrate ambiguous prior effect.
+                    let tree = git one [ "merge-tree"; "--write-tree"; "--no-messages"; advanced; source ]
+                    git one [ "commit-tree"; tree; "-p"; advanced; "-p"; source; "-m"; "Successor" ]
+                else
+                    git one [ "merge"; "--no-ff"; "--no-edit"; source ] |> ignore
+                    git one [ "rev-parse"; "HEAD" ]
+            Assert.That(successor, Is.Not.EqualTo(obsolete))
+            let successorId = Guid.NewGuid()
+            let reason = "Retire obsolete merge only after exact successor publication."
+            let supersede head hash =
+                Client.OrchestrationApi.PendingIntentJournal.supersede first originalId
+                    original.CommandSha256 head "operator:test" reason successorId hash
+            let assertRejected value =
+                match value with
+                | Error(Client.ValidationError _) -> ()
+                | other -> Assert.Fail(sprintf "Expected recovery rejection: %A" other)
+            let before = (LedgerStore.fetch first |> success).Commit
+            assertRejected (supersede before (String.replicate 64 "a"))
+            Assert.That(LedgerStore.readRemoteTarget first target |> success, Is.EqualTo(advanced))
+            let applied =
+                ReviewWorkflow.completeIntegration first successorId taskId "Reviewer" submission successor
+                |> success
+            let head = (LedgerStore.fetch first |> success).Commit
+            assertRejected (supersede before applied.Operation.RequestHash)
+            assertRejected (supersede head (String.replicate 64 "a"))
+            // The exact receipt cannot retire a different actor, subject, or
+            // candidate (including the successor itself).
+            for actor, subject, candidate in
+                [ "Owner", submission, obsolete
+                  "Reviewer", Guid.NewGuid(), obsolete
+                  "Reviewer", submission, successor
+                  "Reviewer", submission, source ] do
+                let id = Guid.NewGuid()
+                let mismatched =
+                    System.Text.Json.JsonSerializer.Serialize(
+                        {| Action = "CompleteIntegration"; TaskId = taskId
+                           ActorId = actor; OperationId = id.ToString("D")
+                           AttemptId = subject.ToString("D"); BaseOid = candidate |})
+                Client.OrchestrationApi.PendingIntentJournal.persist first id "TaskWrite" mismatched |> success
+                let stored =
+                    Client.OrchestrationApi.PendingIntentJournal.findAtRoot one id |> success |> Option.get
+                assertRejected (
+                    Client.OrchestrationApi.PendingIntentJournal.supersede first id
+                        stored.CommandSha256 head "operator:test" reason successorId applied.Operation.RequestHash)
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one id |> success).IsSome, Is.True)
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one originalId |> success).IsSome, Is.True)
+            if priorPublication then
+                assertRejected (supersede head applied.Operation.RequestHash)
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one originalId |> success).IsSome, Is.True)
+                Assert.That(LedgerStore.readRemoteTarget first target |> success, Is.EqualTo(successor))
+            elif targetIncludesOld then
+                // A third party includes the old merge in a later target
+                // descendant while recovery is reading publication evidence.
+                let tree = git one [ "merge-tree"; "--write-tree"; "--no-messages"; successor; obsolete ]
+                let advancedWithOld = git one [ "commit-tree"; tree; "-p"; successor; "-p"; obsolete; "-m"; "Include old" ]
+                let mutable injected = false
+                let raced () =
+                    LedgerStore.withGitTransportFaults
+                        (fun _ args ->
+                            match args with
+                            | [ "ls-remote"; "--refs"; _; reference ] when reference = target && not injected ->
+                                injected <- true
+                                git one [ "push"; "origin"; advancedWithOld + ":" + target ] |> ignore
+                                None
+                            | _ -> None)
+                        (fun () -> supersede head applied.Operation.RequestHash)
+                assertRejected (raced ())
+                Assert.That(injected, Is.True)
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one originalId |> success).IsSome, Is.True)
+            else
+                let mutable ledgerAdvanced = false
+                let raced () =
+                    LedgerStore.withGitTransportFaults
+                        (fun _ args ->
+                            match args with
+                            | [ "ls-remote"; "--refs"; _; reference ] when reference = target && not ledgerAdvanced ->
+                                ledgerAdvanced <- true
+                                ReviewWorkflow.createTask second (Guid.NewGuid()) "recovery-ledger-race" "Race"
+                                |> success |> ignore
+                                None
+                            | _ -> None)
+                        (fun () -> supersede head applied.Operation.RequestHash)
+                assertRejected (raced ())
+                Assert.That(ledgerAdvanced, Is.True)
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one originalId |> success).IsSome, Is.True)
+                let freshHead = (LedgerStore.fetch first |> success).Commit
+                Assert.That(freshHead, Is.Not.EqualTo(head))
+                // Archive rename can succeed before directory fsync. The old
+                // pending bytes survive; the tombstone rejects re-execution.
+                if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                    let interrupted =
+                        Client.OrchestrationApi.PendingIntentJournal.withDirectorySyncFault
+                            (fun path ->
+                                if Path.GetFileName path = "archive" then
+                                    raise (IOException("Simulated archive fsync failure.")))
+                            (fun () -> supersede freshHead applied.Operation.RequestHash)
+                    assertRejected interrupted
+                    Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one originalId |> success).IsSome, Is.True)
+                    assertRejected (persist ())
+                let archived = supersede freshHead applied.Operation.RequestHash |> success
+                Assert.That(archived.archive.Original.CommandJson, Is.EqualTo(savedJson))
+                Assert.That(archived.archive.RelatedOperationId, Is.EqualTo(successorId.ToString("D")))
+                Assert.That((supersede freshHead applied.Operation.RequestHash |> success).alreadySuperseded, Is.True)
+                assertRejected (persist ())
+                Assert.That(LedgerStore.readRemoteTarget first target |> success, Is.EqualTo(successor))
+                Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(freshHead))
+            if priorPublication || targetIncludesOld then
+                Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head)))
+
     [<Test>]
     member _.OperatorRetryUsesExactSavedTaskCommandAndCurrentLedgerWriter() =
         withFixture (fun one _ first _ _ _ _ _ ->

@@ -30,6 +30,7 @@ type private JobRecord =
       mutable OutputTruncated: bool
       mutable NextSequence: int64
       mutable CancellationRequested: bool
+      mutable ExitObserved: bool
       mutable Status: JobStatus
       mutable CompletedAt: DateTimeOffset option }
 
@@ -48,7 +49,9 @@ module private Core =
 
     let private pruneCompletedJobs () =
         jobs.Values
-        |> Seq.filter (fun job -> job.Status <> Running)
+        // Cancel acknowledges the kill request, not observed process exit.
+        // Keep the exit callback alive until its checkout lease can end.
+        |> Seq.filter (fun job -> lock job.SyncRoot (fun () -> job.Status <> Running && job.ExitObserved))
         |> Seq.sortByDescending (fun job -> job.StartedAt)
         |> Seq.indexed
         |> Seq.choose (fun (index, job) ->
@@ -112,12 +115,14 @@ module private Core =
                 job.OutputBytes <- job.OutputBytes + addedBytes
                 job.OutputTruncated <- job.OutputTruncated || addedBytes < valueBytes)
 
-    let private startProcess projectName workingDirectory executable args reason maxOutputBytes : Client.Result<StartJobResult> =
+    let private startProcessAdmitted projectName workingDirectory executable args reason maxOutputBytes jobId (admission: IDisposable) : Client.Result<StartJobResult> =
+        let mutable started = false
         try
             match validateExecutable executable with
-            | Error error -> Error error
+            | Error error ->
+                admission.Dispose()
+                Error error
             | Ok executable ->
-                let jobId = Guid.NewGuid().ToString("N")
                 let proc = new Process()
 
                 proc.StartInfo.FileName <- executable
@@ -146,6 +151,7 @@ module private Core =
                       OutputTruncated = false
                       NextSequence = 0L
                       CancellationRequested = false
+                      ExitObserved = false
                       Status = Running
                       CompletedAt = None }
 
@@ -165,11 +171,14 @@ module private Core =
                         else
                             try job.Status <- Completed proc.ExitCode
                             with _ -> job.Status <- FailedToStart "Process exited before an exit code was available."
-                        job.CompletedAt <- Some DateTimeOffset.UtcNow)
+                        job.CompletedAt <- Some DateTimeOffset.UtcNow
+                        job.ExitObserved <- true)
+                    admission.Dispose()
                     pruneCompletedJobs())
 
                 if not (jobs.TryAdd(jobId, job)) then
                     proc.Dispose()
+                    admission.Dispose()
                     Error(Client.ContextError "Failed to register job.")
                 else
                     try
@@ -177,18 +186,35 @@ module private Core =
                             let mutable removed = Unchecked.defaultof<JobRecord>
                             jobs.TryRemove(jobId, &removed) |> ignore
                             proc.Dispose()
+                            admission.Dispose()
                             Error(Client.ContextError "Failed to start job.")
                         else
+                            started <- true
                             proc.BeginOutputReadLine()
                             proc.BeginErrorReadLine()
                             Ok { JobId = jobId; StartedAt = job.StartedAt }
                     with ex ->
                         let mutable removed = Unchecked.defaultof<JobRecord>
                         jobs.TryRemove(jobId, &removed) |> ignore
-                        proc.Dispose()
+                        if started then
+                            // Keep the resource claim until the actual exit callback,
+                            // even if output setup or cancellation fails.
+                            try if not proc.HasExited then proc.Kill(entireProcessTree = true)
+                            with _ -> ()
+                        else
+                            proc.Dispose()
+                            admission.Dispose()
                         Error(ExceptionError ex)
         with ex ->
+            if not started then admission.Dispose()
             Error(ExceptionError ex)
+
+    let private startProcess projectName sourceRoot workingDirectory executable args reason maxOutputBytes =
+        let jobId = Guid.NewGuid().ToString("N")
+        match WorktreeActivity.admit jobId (WorktreeActivity.Paths [ sourceRoot; workingDirectory ]) with
+        | Error error -> Error error
+        | Ok admission ->
+            startProcessAdmitted projectName workingDirectory executable args reason maxOutputBytes jobId admission
 
     let startJobForContext (context: ProjectPaths.ResolvedProject) (cmd: StartJobCommand) =
         effect {
@@ -199,7 +225,8 @@ module private Core =
                 let canonical =
                     context |> ProjectPaths.ResolvedProject.target |> ProjectPaths.ProjectTarget.projectId
                 let! (FolderPath workingDirectory) = resolveWorkingDirectory context cmd.WorkingDirectory
-                let! result = fun _ -> startProcess canonical workingDirectory cmd.Executable cmd.Args cmd.Reason maxOutputBytes
+                let (FolderPath sourceRoot) = ProjectPaths.ResolvedProject.sourceRoot context
+                let! result = fun _ -> startProcess canonical sourceRoot workingDirectory cmd.Executable cmd.Args cmd.Reason maxOutputBytes
                 return result
         }
 
@@ -287,6 +314,7 @@ type private ToolOperationRecord =
       CommandHash: string
       OperationKey: string option
       Completion: TaskCompletionSource<AgentCommandResponse>
+      Admission: IDisposable
       PreserveEvidence: AgentCommandResponse -> AgentCommandResponse
       mutable Status: JobStatus
       mutable StartedExecution: bool
@@ -371,6 +399,7 @@ module private ToolOperations =
                     | Some error -> ToolFailed(sprintf "%A" error)
                     | None -> ToolCompleted
                 entry.CompletedAt <- Some DateTimeOffset.UtcNow
+                entry.Admission.Dispose()
                 entry.Completion.TrySetResult(response) |> ignore
             // Cancellation of a queued job may already have released its slot.
             if entry.Counted then
@@ -396,6 +425,7 @@ module private ToolOperations =
                         if shouldExecute then
                             let! response =
                                 task {
+                                    use _context = WorktreeActivity.enter entry.Handle.JobId
                                     try return! execute ()
                                     with ex ->
                                         return entry.PreserveEvidence (
@@ -420,7 +450,7 @@ module private ToolOperations =
             } :> Task))
         |> ignore
 
-    let start canonical projectName actor commandName operationId commandHash execute preserveEvidence =
+    let start canonical projectName actor commandName operationId commandHash scope execute preserveEvidence =
         lock gate (fun () ->
             prune DateTimeOffset.UtcNow
             let identity = canonical |> Option.map ProjectPaths.ProjectId.value |> Option.defaultValue "@unscoped"
@@ -450,36 +480,41 @@ module private ToolOperations =
                     "The client has reached its bounded tool-operation capacity (32 running/queued). Retry after an existing job finishes.")
             | None ->
                 let id = Guid.NewGuid().ToString("N")
-                let handle =
-                    { JobId = id
-                      Kind = JobKind.ToolOperation
-                      Status = "Running"
-                      ProjectName = projectName
-                      DeviceId = None
-                      AgentId = actor
-                      OperationId = operationId
-                      CommandName = commandName
-                      StartedAt = DateTimeOffset.UtcNow }
-                let entry =
-                    { Handle = handle
-                      CanonicalProject = canonical
-                      CommandHash = commandHash
-                      OperationKey = key
-                      Completion = TaskCompletionSource<AgentCommandResponse>(TaskCreationOptions.RunContinuationsAsynchronously)
-                      PreserveEvidence = preserveEvidence
-                      Status = Running
-                      StartedExecution = false
-                      Counted = true
-                      Exposed = false
-                      CompletedAt = None }
-                if not (records.TryAdd(id, entry)) then
-                    Error(Client.ContextError "Unable to register client-owned tool operation.")
-                else
-                    inFlight <- inFlight + 1
-                    key |> Option.iter (fun value ->
-                        byOperation[value] <- struct (id, commandHash, handle.StartedAt))
-                    schedule entry execute
-                    Ok(handle, entry.Completion.Task))
+                match WorktreeActivity.admit id scope with
+                | Error error -> Error error
+                | Ok admission ->
+                    let handle =
+                        { JobId = id
+                          Kind = JobKind.ToolOperation
+                          Status = "Running"
+                          ProjectName = projectName
+                          DeviceId = None
+                          AgentId = actor
+                          OperationId = operationId
+                          CommandName = commandName
+                          StartedAt = DateTimeOffset.UtcNow }
+                    let entry =
+                        { Handle = handle
+                          CanonicalProject = canonical
+                          CommandHash = commandHash
+                          OperationKey = key
+                          Completion = TaskCompletionSource<AgentCommandResponse>(TaskCreationOptions.RunContinuationsAsynchronously)
+                          Admission = admission
+                          PreserveEvidence = preserveEvidence
+                          Status = Running
+                          StartedExecution = false
+                          Counted = true
+                          Exposed = false
+                          CompletedAt = None }
+                    if not (records.TryAdd(id, entry)) then
+                        admission.Dispose()
+                        Error(Client.ContextError "Unable to register client-owned tool operation.")
+                    else
+                        inFlight <- inFlight + 1
+                        key |> Option.iter (fun value ->
+                            byOperation[value] <- struct (id, commandHash, handle.StartedAt))
+                        schedule entry execute
+                        Ok(handle, entry.Completion.Task))
 
     let promote jobId =
         lock gate (fun () ->
@@ -582,6 +617,7 @@ module private ToolOperations =
                     | Ok () ->
                         entry.Status <- Canceled
                         entry.CompletedAt <- Some DateTimeOffset.UtcNow
+                        entry.Admission.Dispose()
                         if entry.Counted then
                             entry.Counted <- false
                             inFlight <- inFlight - 1
@@ -591,10 +627,13 @@ module private ToolOperations =
                 Some response)
 
 let startToolOperation canonical projectName actor commandName operationId commandHash execute =
-    ToolOperations.start canonical projectName actor commandName operationId commandHash execute id
+    ToolOperations.start canonical projectName actor commandName operationId commandHash (WorktreeActivity.Unknown canonical) execute id
 
 let startToolOperationWithCancelEvidence canonical projectName actor commandName operationId commandHash execute preserveEvidence =
-    ToolOperations.start canonical projectName actor commandName operationId commandHash execute preserveEvidence
+    ToolOperations.start canonical projectName actor commandName operationId commandHash (WorktreeActivity.Unknown canonical) execute preserveEvidence
+
+let internal startToolOperationWithScopeAndCancelEvidence canonical projectName actor commandName operationId commandHash scope execute preserveEvidence =
+    ToolOperations.start canonical projectName actor commandName operationId commandHash scope execute preserveEvidence
 
 let promoteToolOperation jobId = ToolOperations.promote jobId
 let forgetQuickToolOperation jobId = ToolOperations.forgetQuick jobId

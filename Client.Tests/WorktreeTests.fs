@@ -222,3 +222,162 @@ let ``active job in a selected worktree blocks safe removal`` () =
                 | Error e -> Assert.Fail($"Inspection failed: {e}")
             finally
                 Client.JobManager.cancelJob { ProjectName = "Project1::running-job"; JobId = id } context |> shouldEqual (Ok()))
+
+
+[<Test>]
+let ``unrelated worktree process does not block removal`` () =
+    if OperatingSystem.IsWindows() then Assert.Ignore("Uses the POSIX sleep executable.")
+    else
+        withRepo (fun _ _ context ->
+            let make name =
+                createWorktree
+                    { ProjectName = "Project1"; Name = name; Branch = "feature/" + name; BaseRef = "HEAD" } context
+                |> function Ok item -> item | Error e -> failwithf "%A" e
+            let target = make "remove-me"
+            let other = make "keep-me"
+            let id =
+                Client.JobManager.startJob
+                    { ProjectName = "Project1::keep-me"; Executable = "sleep"; Args = [ "30" ]
+                      Reason = None; WorkingDirectory = None; MaxOutputBytes = Some 1024 } context
+                |> function Ok started -> started.JobId | Error e -> failwithf "%A" e
+            try
+                match inspectRemoval { ProjectName = "Project1"; WorktreePath = target.Path; TargetRef = None } context with
+                | Ok inspection ->
+                    inspection.RunningJobCount |> shouldEqual 0
+                    inspection.CanRemove |> shouldEqual true
+                | Error e -> Assert.Fail($"Inspection failed: {e}")
+                match removeWorktree { ProjectName = "Project1"; WorktreePath = target.Path; TargetRef = None } context with
+                | Ok _ -> Directory.Exists other.Path |> shouldEqual true
+                | Error e -> Assert.Fail($"Removal failed: {e}")
+            finally
+                Client.JobManager.cancelJob { ProjectName = "Project1"; JobId = id } context |> shouldEqual (Ok()))
+
+[<Test>]
+let ``removal reservation fences concurrent admission and unresolved provenance`` () =
+    withRepo (fun root _ context ->
+        let selected = ProjectPaths.ProjectTarget.parse "Project1" |> function Ok x -> x | Error e -> failwithf "%A" e
+        let target: WorktreeActivity.RemovalTarget =
+            { Project = ProjectPaths.ProjectTarget.projectId selected
+              Path = Path.Combine(root, "target")
+              ResolveCheckout = fun _ -> Error(ValidationError "unresolved") }
+        let admit scope =
+            WorktreeActivity.admit (Guid.NewGuid().ToString("N")) scope
+        do
+            use unknown =
+                admit (WorktreeActivity.Checkout selected)
+                |> function Ok x -> x | Error e -> failwithf "%A" e
+            WorktreeActivity.count target |> shouldEqual 1
+            match WorktreeActivity.reserveRemoval target with
+            | Error 1 -> ()
+            | _ -> Assert.Fail("Unresolved resource must block reservation.")
+        use reservation =
+            WorktreeActivity.reserveRemoval target
+            |> function Ok x -> x | Error n -> failwithf "Blocked by %d" n
+        let rejected scope =
+            match admit scope with
+            | Error _ -> ()
+            | Ok x -> x.Dispose(); Assert.Fail("Conflicting admission succeeded.")
+        rejected (WorktreeActivity.Paths [ Path.Combine(target.Path, "child") ])
+        rejected (WorktreeActivity.Paths [ root ])
+        rejected (WorktreeActivity.Unknown (Some target.Project))
+        rejected (WorktreeActivity.Checkout selected)
+        use unrelated =
+            admit (WorktreeActivity.Paths [ target.Path + "-sibling" ])
+            |> function Ok x -> x | Error e -> failwithf "%A" e
+        use coordination =
+            admit WorktreeActivity.NoCheckout
+            |> function Ok x -> x | Error e -> failwithf "%A" e
+        ())
+
+[<Test>]
+let ``promoted inspection and removal exclude themselves but count active target operations`` () =
+    withRepo (fun root _ context ->
+        let runtime = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+        let make name =
+            createWorktree
+                { ProjectName = "Project1"; Name = name; Branch = "feature/" + name; BaseRef = "HEAD" } context
+            |> function Ok item -> item | Error e -> failwithf "%A" e
+        let target = make "promoted-target"
+        let other = make "promoted-other"
+        let response payload: AgentCommandResponse =
+            { Result = Some payload; Error = None; Instructions = []
+              StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
+        let serialize command = System.Text.Json.JsonSerializer.Serialize<AgentCommand>(command)
+        let start command run =
+            let reply =
+                Client.SignalR.Client.executeOrPromoteWith runtime (serialize command) "Worker 3" TimeSpan.Zero
+                    (fun _ _ -> run())
+                |> _.GetAwaiter().GetResult()
+            match reply.PendingJob with
+            | Some handle -> handle
+            | None -> failwithf "Expected pending operation: %A" reply
+        let finish (handle: ToolJobHandle) =
+            let mutable terminal = None
+            let observed =
+                System.Threading.SpinWait.SpinUntil((fun () ->
+                    match Client.JobManager.getJobResult
+                        { ProjectName = "Project1"; JobId = handle.JobId; AfterSequence = None } context with
+                    | Ok result when result.ToolResponse.IsSome ->
+                        terminal <- result.ToolResponse
+                        true
+                    | _ -> false), TimeSpan.FromSeconds(10.))
+            if not observed then failwithf "No terminal result for %s" handle.JobId
+            terminal.Value
+        let hold () = System.Threading.Tasks.TaskCompletionSource<unit>(System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously)
+        let runHeld (gate: System.Threading.Tasks.TaskCompletionSource<unit>) action () =
+            task {
+                do! gate.Task
+                return action()
+            }
+        let coordination = hold()
+        let sibling = hold()
+        let targetOperation = hold()
+        let inspectGate = hold()
+        let removeGate = hold()
+        let mutable jobs = []
+        let remember command run =
+            let handle = start command run
+            jobs <- handle :: jobs
+            handle
+        try
+            let inbox =
+                TaskReadCommand
+                    { ProjectName = "Project1"; AgentId = "Worker 3"; Action = "AgentInbox"
+                      TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
+                      Cursor = ""; PageSize = 0; BeforeOid = ""; AfterOid = ""; RelativePath = "" }
+            remember inbox (runHeld coordination (fun () -> response "{}")) |> ignore
+            remember (GetGitStatusCommand { ProjectName = "Project1::promoted-other" })
+                (runHeld sibling (fun () -> response "{}")) |> ignore
+            let targetJob =
+                remember (GetGitStatusCommand { ProjectName = "Project1::promoted-target" })
+                    (runHeld targetOperation (fun () -> response "{}"))
+            let query: InspectWorktreeRemovalCommand =
+                { ProjectName = "Project1"; WorktreePath = target.Path; TargetRef = None }
+            let inspection =
+                remember (InspectWorktreeRemovalCommand query)
+                    (runHeld inspectGate (fun () ->
+                        match inspectRemoval query context with
+                        | Ok check ->
+                            check.CanRemove |> shouldEqual false
+                            check.RunningJobCount |> shouldEqual 1
+                            response "ok"
+                        | Error e -> failwithf "%A" e))
+            inspectGate.SetResult()
+            (finish inspection).Error |> shouldEqual None
+            targetOperation.SetResult()
+            (finish targetJob).Error |> shouldEqual None
+            let remove: RemoveWorktreeCommand =
+                { ProjectName = "Project1"; WorktreePath = target.Path; TargetRef = None }
+            let removal =
+                remember (RemoveWorktreeCommand remove)
+                    (runHeld removeGate (fun () ->
+                        match removeWorktree remove context with
+                        | Ok removed -> removed.Path |> shouldEqual target.Path; response "ok"
+                        | Error e -> failwithf "%A" e))
+            removeGate.SetResult()
+            (finish removal).Error |> shouldEqual None
+            Directory.Exists target.Path |> shouldEqual false
+            Directory.Exists other.Path |> shouldEqual true
+        finally
+            for gate in [ coordination; sibling; targetOperation; inspectGate; removeGate ] do gate.TrySetResult() |> ignore
+            for handle in jobs do finish handle |> ignore)

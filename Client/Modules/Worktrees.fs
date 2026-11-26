@@ -22,14 +22,19 @@ type WorktreeInfo =
       IsClean: bool option }
 
 let private git projectName args =
-    ClientShell.runCommand
-        { ProjectName = projectName
-          Executable = "git"
-          Args = args
-          Reason = None
-          WorkingDirectory = None
-          TimeoutSeconds = Some 20
-          MaxOutputBytes = Some(256 * 1024) }
+    effect {
+        // Repository-wide management commands must not execute from an
+        // incidental selected linked checkout.
+        let! selected = ProjectPaths.ProjectTarget.parse projectName |> Effect.ofResult
+        return! ClientShell.runCommand
+            { ProjectName = ProjectPaths.ProjectTarget.projectName selected
+              Executable = "git"
+              Args = args
+              Reason = None
+              WorkingDirectory = None
+              TimeoutSeconds = Some 20
+              MaxOutputBytes = Some(256 * 1024) }
+    }
 
 /// Decode Git's porcelain format. A blank line separates records.
 let parsePorcelain (mainPath: string) (output: string) : Result<WorktreeInfo list, string> =
@@ -68,9 +73,10 @@ let parsePorcelain (mainPath: string) (output: string) : Result<WorktreeInfo lis
         | _, Error e -> Error e) (Ok [])
     |> Result.map List.rev
 
-let listWorktrees (cmd: ListWorktreesCommand) =
+// Internal registration discovery does not inspect unrelated checkout files.
+let private listRegistrations projectName =
     effect {
-        let! result = git cmd.ProjectName [ "worktree"; "list"; "--porcelain" ]
+        let! result = git projectName [ "worktree"; "list"; "--porcelain" ]
         if result.ExitCode <> 0 || result.TimedOut || result.Truncated then
             return! Client.ValidationError($"Cannot inspect Git worktrees: {result.StdErr}") |> Effect.ofError
         else
@@ -84,25 +90,29 @@ let listWorktrees (cmd: ListWorktreesCommand) =
                 | None -> Client.ValidationError "Git did not return a main worktree." |> Effect.ofError
                 | Some mainPath ->
                     match parsePorcelain mainPath result.StdOut with
-                    | Ok items ->
-                        fun rt ->
-                            items
-                            |> List.map (fun item ->
-                                if not (Directory.Exists item.Path) then item
-                                else
-                                    match git cmd.ProjectName [ "-C"; item.Path; "status"; "--porcelain" ] rt with
-                                    | Ok status when status.ExitCode = 0 && not status.TimedOut && not status.Truncated ->
-                                        { item with IsClean = Some(String.IsNullOrWhiteSpace status.StdOut) }
-                                    | _ -> item)
-                            |> Ok
+                    | Ok items -> fun _ -> Ok items
                     | Error message -> Client.ValidationError message |> Effect.ofError
     }
 
-let getWorktree (cmd: GetWorktreeCommand) =
+let private statusFor projectName (entry: WorktreeInfo) rt =
+    if not (Directory.Exists entry.Path) then entry
+    else
+        match git projectName [ "-C"; entry.Path; "status"; "--porcelain" ] rt with
+        | Ok status when status.ExitCode = 0 && not status.TimedOut && not status.Truncated ->
+            { entry with IsClean = Some(String.IsNullOrWhiteSpace status.StdOut) }
+        | _ -> entry
+
+let listWorktrees (cmd: ListWorktreesCommand) =
     effect {
-        let! entries = listWorktrees { ProjectName = cmd.ProjectName }
+        let! entries = listRegistrations cmd.ProjectName
+        return! fun rt -> entries |> List.map (fun entry -> statusFor cmd.ProjectName entry rt) |> Ok
+    }
+
+let private getRegistration projectName worktreePath =
+    effect {
+        let! entries = listRegistrations projectName
         let target =
-            try Some(Path.GetFullPath(cmd.WorktreePath).TrimEnd(Path.DirectorySeparatorChar))
+            try Some(Path.GetFullPath(worktreePath: string).TrimEnd(Path.DirectorySeparatorChar))
             with _ -> None
         let comparison =
             if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal
@@ -110,6 +120,12 @@ let getWorktree (cmd: GetWorktreeCommand) =
             match target |> Option.bind (fun path -> entries |> List.tryFind (fun entry -> String.Equals(entry.Path, path, comparison))) with
             | Some entry -> fun _ -> Ok entry
             | None -> Client.NotFoundError "Worktree is not registered with this project." |> Effect.ofError
+    }
+
+let getWorktree (cmd: GetWorktreeCommand) =
+    effect {
+        let! entry = getRegistration cmd.ProjectName cmd.WorktreePath
+        return! fun rt -> Ok(statusFor cmd.ProjectName entry rt)
     }
 
 let private safeName name =
@@ -131,7 +147,7 @@ let createWorktree (cmd: CreateWorktreeCommand) =
         elif not (safeRef cmd.Branch && safeRef cmd.BaseRef) then
             return! Client.ValidationError "Invalid branch or base ref." |> Effect.ofError
         else
-            let! entries = listWorktrees { ProjectName = cmd.ProjectName }
+            let! entries = listRegistrations cmd.ProjectName
             let main = entries |> List.find (fun item -> item.IsMain) |> fun item -> DirectoryInfo(item.Path)
             let parent = Path.Combine(main.Parent.FullName, "." + main.Name + "-worktrees")
             let path = Path.Combine(parent, cmd.Name)
@@ -154,30 +170,41 @@ type WorktreeRemovalInspection =
       CanRemove: bool
       Reasons: string list }
 
-let inspectRemoval (cmd: InspectWorktreeRemovalCommand) =
+let private removalTarget projectName (entry: WorktreeInfo) =
     effect {
-        let! entry = getWorktree { ProjectName = cmd.ProjectName; WorktreePath = cmd.WorktreePath }
+        let! selected = ProjectPaths.ProjectTarget.parse projectName |> Effect.ofResult
+        return! fun rt ->
+            Ok
+                ({ Project = ProjectPaths.ProjectTarget.projectId selected
+                   Path = entry.Path
+                   ResolveCheckout = fun target ->
+                       ProjectPaths.resolveProjectContextForTarget target rt
+                       |> Result.map (fun project ->
+                           let (FolderPath root) = ProjectPaths.ResolvedProject.sourceRoot project
+                           root) } : WorktreeActivity.RemovalTarget)
+    }
+
+let private inspectEntry (cmd: InspectWorktreeRemovalCommand) (entry: WorktreeInfo) resource =
+    effect {
         let! target =
             match cmd.TargetRef with
             | Some r when safeRef r -> fun _ -> Ok r
             | Some _ -> Client.ValidationError "Invalid integration target ref." |> Effect.ofError
             | None ->
                 effect {
-                    let! entries = listWorktrees { ProjectName = cmd.ProjectName }
-                    let main = entries |> List.find (fun item -> item.IsMain)
-                    let! branch = git cmd.ProjectName [ "-C"; main.Path; "branch"; "--show-current" ]
-                    return branch.StdOut.Trim()
+                    let! branch = git cmd.ProjectName [ "-C"; entry.MainPath; "branch"; "--show-current" ]
+                    return
+                        if branch.ExitCode = 0 && not branch.TimedOut && not branch.Truncated then branch.StdOut.Trim()
+                        else ""
                 }
         let! status = git cmd.ProjectName [ "-C"; entry.Path; "status"; "--porcelain" ]
         let! integrated = git cmd.ProjectName [ "merge-base"; "--is-ancestor"; entry.Head; target ]
-        let! allJobs = JobManager.listJobs { ProjectName = None; IncludeCompleted = false }
-        let canonical = ProjectPaths.ProjectTarget.identity cmd.ProjectName
-        let jobs =
-            allJobs.Jobs |> List.filter (fun job ->
-                match canonical, ProjectPaths.ProjectTarget.identity job.ProjectName with
-                | Ok expected, Ok actual -> expected = actual
-                | _ -> false)
-        let isClean = status.ExitCode = 0 && not status.TimedOut && not status.Truncated && String.IsNullOrWhiteSpace status.StdOut
+        let jobs = WorktreeActivity.count resource
+        let clean =
+            if status.ExitCode = 0 && not status.TimedOut && not status.Truncated then
+                Some(String.IsNullOrWhiteSpace status.StdOut)
+            else None
+        let isClean = clean = Some true
         let isIntegrated = not (String.IsNullOrWhiteSpace target) && integrated.ExitCode = 0 && not integrated.TimedOut
         let reasons =
             [ if entry.IsMain then "Main worktree"
@@ -185,24 +212,40 @@ let inspectRemoval (cmd: InspectWorktreeRemovalCommand) =
               if entry.IsPrunable then "Worktree registration is prunable"
               if not isClean then "Worktree has changes or cannot be inspected"
               if not isIntegrated then "HEAD is not verified integrated into target"
-              if not jobs.IsEmpty then "Jarvis project has active jobs" ]
+              if jobs <> 0 then "Jarvis has active jobs using this worktree or with unresolved resource provenance" ]
         return
-            { Worktree = entry
+            { Worktree = { entry with IsClean = clean }
               TargetRef = target
               IsClean = isClean
               IsIntegrated = isIntegrated
-              RunningJobCount = jobs.Length
+              RunningJobCount = jobs
               CanRemove = reasons.IsEmpty
               Reasons = reasons }
     }
 
-let removeWorktree (cmd: RemoveWorktreeCommand) =
+let inspectRemoval (cmd: InspectWorktreeRemovalCommand) =
+    fun rt ->
+        match WorktreeActivity.admitDirect (WorktreeActivity.Paths [ cmd.WorktreePath ]) with
+        | Error error -> Error error
+        | Ok admission ->
+            use _admission = admission
+            (effect {
+                let! entry = getRegistration cmd.ProjectName cmd.WorktreePath
+                let! resource = removalTarget cmd.ProjectName entry
+                return! inspectEntry cmd entry resource
+            }) rt
+
+let private removeReserved (cmd: RemoveWorktreeCommand) resource =
     effect {
+        // Registration and all Git preconditions must be read again while
+        // holding the exclusive removal reservation.
+        let! entry = getRegistration cmd.ProjectName cmd.WorktreePath
         let! inspection =
-            inspectRemoval
+            inspectEntry
                 { ProjectName = cmd.ProjectName
                   WorktreePath = cmd.WorktreePath
                   TargetRef = cmd.TargetRef }
+                entry resource
         if not inspection.CanRemove then
             return! Client.ValidationError(String.concat "; " inspection.Reasons) |> Effect.ofError
         else
@@ -211,10 +254,31 @@ let removeWorktree (cmd: RemoveWorktreeCommand) =
                 return! Client.ValidationError($"Worktree removal failed: {removal.StdErr}") |> Effect.ofError
             else
                 let parent = Directory.GetParent(inspection.Worktree.Path)
-                let! entries = listWorktrees { ProjectName = cmd.ProjectName }
-                let main = entries |> List.find (fun item -> item.IsMain) |> fun item -> DirectoryInfo(item.Path)
+                let main = DirectoryInfo(inspection.Worktree.MainPath)
                 let expected = Path.Combine(main.Parent.FullName, "." + main.Name + "-worktrees")
-                if parent <> null && parent.FullName = expected && Directory.Exists(expected) && Array.isEmpty (Directory.GetFileSystemEntries(expected)) then
-                    Directory.Delete(expected)
+                let () =
+                    if parent <> null && parent.FullName = expected && Directory.Exists(expected) && Array.isEmpty (Directory.GetFileSystemEntries(expected)) then
+                        Directory.Delete(expected)
                 return inspection.Worktree
     }
+
+let removeWorktree (cmd: RemoveWorktreeCommand) =
+    fun rt ->
+        match WorktreeActivity.admitDirect (WorktreeActivity.Paths [ cmd.WorktreePath ]) with
+        | Error error -> Error error
+        | Ok admission ->
+            use _admission = admission
+            let resource =
+                (effect {
+                    let! entry = getRegistration cmd.ProjectName cmd.WorktreePath
+                    return! removalTarget cmd.ProjectName entry
+                }) rt
+            match resource with
+            | Error error -> Error error
+            | Ok resource ->
+                match WorktreeActivity.reserveRemoval resource with
+                | Error count ->
+                    Error(Client.ValidationError($"Jarvis has {count} active job(s) using this worktree or with unresolved resource provenance."))
+                | Ok reservation ->
+                    use _reservation = reservation
+                    removeReserved cmd resource rt

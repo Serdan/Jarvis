@@ -1,0 +1,23 @@
+<article>
+<h1>Adjudicate taskless reviewer lifecycle findings</h1>
+<p>Perform one bounded, independent adjudication of each of the two findings in review <code>1721786f09ed99ae617a734f87f6d720</code>. Do not implement code or create corrective Work. Record a separate terminal disposition (Accept, Narrow, Defer or Reject) for each finding, with exact authorized correction scope if applicable.</p>
+<h2>Independence and source set</h2>
+<p>Adjudicator 1 must remain independent of both the source author Worker 8 and reviewer Reviewer 1. If that independence cannot be established, yield without a decision and request another adjudicator.</p>
+<ul>
+<li>Original task: <code>automation-role-aware-reviewer-dispatch</code>, pinned spec blob <code>331d797b9c5dba8453daafe6d8b6795f18b3a24f</code>.</li>
+<li>Frozen source: <code>1a3bdf157183861adde9dda4496e1c07980e748a</code>, base <code>9dc95184896118c96f34493da28ce40bf5b3d8d6</code>.</li>
+<li>Review: <code>1721786f09ed99ae617a734f87f6d720</code>, Reviewer 1, ChangesRequested, decision sequence <code>17070</code>.</li>
+<li>Finding <code>findings/taskless-reviewer-start.md</code>, blob <code>e64074ed4d5bff1c9292d2a9558ab13fce71da93</code>.</li>
+<li>Finding <code>findings/taskless-reviewer-resume.md</code>, blob <code>f3f80b24544bfe89bf961321d9f28947c537e263</code>.</li>
+</ul>
+<p>Read the original task/spec, exact frozen source and diff, both complete findings, relevant current lifecycle/planner/launch instructions, and existing tests/architecture before deciding. Preserve the review verdict unchanged.</p>
+<h2>Finding A — taskless reviewer launch does not start execution</h2>
+<p>The reviewer reports that a generated Reviewer launch only reads inbox/claims work, while an unassigned NeedsWork/Stopped reviewer requires its own explicit <code>StartTasklessWork</code>; inbox activation and claiming a review do not start execution. A planner reproduction reportedly reserves a review, sees attributed activity while the reviewer remains stopped, then reserves the same claimed review again on a later tick.</p>
+<p>Determine whether this is demonstrably valid against the exact source and existing contracts; whether it violates the original requirement to dispatch available reviewers without standing assignments; actual duplicate/capacity impact and preconditions; and the smallest coherent correction or existing alternative. Do not assume the reviewer-prescribed remedy is automatically required.</p>
+<h2>Finding B — taskless reviewer cannot resume after yielding</h2>
+<p>The reviewer reports that <code>YieldTasklessWork</code> parks an unassigned reviewer, while the planner's reviewable states omit Parked. A claimed review is consequently not resumed after a taskless session yields, and the reviewer remains unavailable for unclaimed demand. Simply treating every Parked agent as eligible would override intentional Operator parking.</p>
+<p>Determine whether this is demonstrably valid against the exact source and existing contracts; whether it violates the original requirement that a reviewer with a runnable claimed review can resume; practical impact; and the smallest coherent lifecycle distinction or existing alternative that preserves intentional Operator parks.</p>
+<h2>Required adjudication record</h2>
+<p>For EACH finding separately record: validity and reproducible evidence/provenance; exact original spec clause or classification as net-new scope; practical impact and necessary preconditions (distinguish observed from hypothetical); proportionality and maintenance cost of the proposed remedy; existing alternatives; final disposition and rationale; precise authorized scope if accepted/narrowed; whether corrective Work may be created. Do not create or assign that corrective Work.</p>
+<p>This is a bounded terminal decision, not a review of the review. No recursive adjudication, code changes, source edits, publication, integration, deployment, scheduler activation or live external effects. Record the decision in canonical task/review context and checkpoint exact source/spec/review/finding identities. Yield when the two decisions are recorded or if a genuine independence/policy blocker remains.</p>
+</article>

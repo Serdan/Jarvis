@@ -144,7 +144,7 @@ let operationId (binding: LedgerBinding) (ready: Ready) =
     Guid bytes
 
 // The v1 episode ID remains the first intent. Each later ID is derived only
-// from a positive, immutable pre-Send terminal proof of the preceding intent.
+// from positive immutable no-send proof or explicit verified termination of the preceding intent.
 let private derivedId (domain: string) (prior: Guid) =
     let bytes = SHA256.HashData(Encoding.UTF8.GetBytes(domain + ":" + prior.ToString("N")))[..15]
     bytes[7] <- (bytes[7] &&& 0x0Fuy) ||| 0x50uy
@@ -451,7 +451,7 @@ let inspectLaunchAt binding snapshot id =
                                     |> Result.bind (fun resolution ->
                                         if checkin.IsSome && (noCheckin.IsSome || notInvoked.IsSome || resolution.IsSome) then
                                             bad "Conflicting terminal evidence for scheduled launch."
-                                        elif noCheckin.IsSome && (notInvoked.IsSome || resolution.IsSome) then
+                                        elif noCheckin.IsSome && notInvoked.IsSome then
                                             bad "Conflicting replacement authorizations for scheduled launch."
                                         elif notInvoked.IsSome && resolution.IsSome then
                                             bad "Conflicting replacement authorizations for scheduled launch."
@@ -473,6 +473,61 @@ let inspectLaunchAt binding snapshot id =
                                                       use doc = JsonDocument.Parse(operationRequest op)
                                                       doc.RootElement.GetProperty("resolvedAtUtc").GetDateTimeOffset()) })))))))
         | Some _ -> bad "Mismatched scheduled-resume intent receipt.")
+
+// Negative actor activity is diagnostic, never execution-termination proof.
+// An unresolved predecessor continues to own the fence even if an older
+// software version recorded a no-check-in receipt.
+let rec private currentLaunchAt binding snapshot (ready: Ready) id =
+    inspectLaunchAt binding snapshot id
+    |> Result.bind (function
+        | None -> Ok(id, None)
+        | Some inspection when inspection.Ready <> ready ->
+            bad "A scheduled launch receipt does not match the exact Ready episode."
+        | Some inspection when inspection.NotInvoked || inspection.OperatorResolved ->
+            currentLaunchAt binding snapshot ready (nextId id)
+        | Some inspection -> Ok(id, Some inspection))
+
+let private requireCurrentLaunchAt binding snapshot ready id =
+    currentLaunchAt binding snapshot ready (operationId binding ready)
+    |> Result.bind (function
+        | currentId, Some _ when currentId = id -> Ok ()
+        | _ -> bad "This launch is not the current unresolved launch; its predecessor or replacement is fenced.")
+
+/// An ordinary actor label is not sufficient to bypass an unresolved
+/// scheduled launch. Derive the exact episode independently of STOP/capacity:
+/// those affect scheduling eligibility, not ownership of an existing intent.
+/// A confirmed first check-in is still fenced until its exact activation.
+let guardUncorrelatedIngressAt binding snapshot agentId =
+    match ReviewWorkflow.getAgentWorkingTurnAt binding snapshot agentId with
+    | Error(StaleEntityVersion _) -> Ok () // no registered agent
+    | Error issue -> Error issue
+    | Ok agent when agent.State <> "Ready" -> Ok ()
+    | Ok agent ->
+        let assignment = agent.CurrentAssignment
+        ReviewWorkflow.getTaskAt binding snapshot assignment.TaskId
+        |> Result.bind (fun (_, attempt) ->
+            match attempt with
+            | Some current when current.AttemptId = assignment.AttemptId &&
+                                current.OwnerAgentId = agentId ->
+                let ready =
+                    { AgentId = agentId; StateSequence = agent.StateSequence
+                      TaskId = assignment.TaskId; AttemptId = current.AttemptId
+                      Generation = current.AssignmentGeneration; Priority = current.Priority
+                      IssuedSequence = current.IssuedSequence }
+                currentLaunchAt binding snapshot ready (operationId binding ready)
+                |> Result.bind (function
+                    | _, None -> Ok ()
+                    | id, Some _ ->
+                        bad ($"Launch {id:D} owns this Ready episode. Ordinary actor-only ingress is held until exact check-in/activation, verified no-send, or explicit operator-confirmed termination."))
+            | _ -> bad "Cannot establish the exact Ready assignment for launch admission.")
+
+let private checkinStateAt binding snapshot id =
+    inspectLaunchAt binding snapshot id
+    |> Result.bind (function
+        | Some state when not state.NotInvoked && not state.OperatorResolved && state.NoCheckinAtUtc.IsNone ->
+            requireCurrentLaunchAt binding snapshot state.Ready id
+            |> Result.map (fun () -> Some state)
+        | state -> Ok state)
 
 type ActivityEvidence =
     { LastSeenAtUtc: DateTimeOffset
@@ -549,7 +604,9 @@ let confirmedActivationAt binding snapshot agentId (launchId: string) =
                                    inspection.CheckinAtUtc.IsSome ->
                 stillReadyAt binding snapshot inspection.Ready
                 |> Result.bind (fun ready ->
-                    if ready then Ok(Some(activationId id, inspection.Ready))
+                    if ready then
+                        requireCurrentLaunchAt binding snapshot inspection.Ready id
+                        |> Result.map (fun () -> Some(activationId id, inspection.Ready))
                     else exactWorkingActivationAt binding snapshot id inspection.Ready
                          |> Result.bind (fun working ->
                             if working then Ok None
@@ -557,14 +614,14 @@ let confirmedActivationAt binding snapshot agentId (launchId: string) =
             | _ -> bad "No confirmed check-in for this launch and agent.")
 
 /// An absent proof does not grant permission. The next candidate is derived
-/// only from a verified non-invocation, no-check-in, or explicit operator proof.
+/// only from verified non-invocation or explicit operator-confirmed termination.
 let private recordCheckinOnce binding agentId (launchId: string) (checkedAt: DateTimeOffset) =
     match Guid.TryParseExact(launchId, "D") with
     | false, _ -> bad "Scheduled launch check-in requires the exact launchId returned by the scheduler."
     | true, id ->
         LedgerStore.fetch binding
         |> Result.bind (fun snapshot ->
-            inspectLaunchAt binding snapshot id
+            checkinStateAt binding snapshot id
             |> Result.bind (function
                 | None -> bad "The scheduled launch intent does not exist."
                 | Some inspection when inspection.Ready.AgentId <> agentId ->
@@ -594,7 +651,7 @@ let private recordCheckinOnce binding agentId (launchId: string) (checkedAt: Dat
                                     when currentSentAt = sentAt && currentDeadline = deadline ->
                                     let checkin = checkinIntent id original boundaryOperation agentId checkedAt
                                     Client.LegacyDirectWriterFence.LegacyDirectWriterFence.transact binding checkin (fun current ->
-                                            inspectLaunchAt binding current id
+                                            checkinStateAt binding current id
                                             |> Result.bind (function
                                                 | Some currentState when currentState.Ready <> inspection.Ready ->
                                                     bad "The Ready assignment changed before check-in; the launch is fenced."
@@ -782,8 +839,8 @@ let resolveOperator binding actor (launchId: string) expectedReady rationale exe
                         bad "Operator resolution rejected: the supplied agent/task/attempt/generation does not match the original launch."
                     | Some inspection when inspection.CheckinAtUtc.IsSome ->
                         bad "Operator resolution rejected: the exact launch has already checked in."
-                    | Some inspection when inspection.NotInvoked || inspection.NoCheckinAtUtc.IsSome ->
-                        bad "Operator resolution rejected: the launch already has an automatic terminal proof."
+                    | Some inspection when inspection.NotInvoked ->
+                        bad "Operator resolution rejected: the launch already has a verified no-send proof."
                     | Some inspection ->
                         LedgerStore.getOperationAt binding snapshot id
                         |> Result.bind (function
@@ -806,7 +863,6 @@ let resolveOperator binding actor (launchId: string) expectedReady rationale exe
                                                     bad "The Ready assignment changed before operator resolution."
                                                 | Some currentState when currentState.CheckinAtUtc.IsSome ||
                                                                          currentState.NotInvoked ||
-                                                                         currentState.NoCheckinAtUtc.IsSome ||
                                                                          currentState.OperatorResolved ->
                                                     bad "The launch was already checked in or resolved before operator resolution."
                                                 | Some _ ->
@@ -832,10 +888,10 @@ let reconcileAt binding (launchId: string) now activity =
                     Ok(LaunchStarted inspection.CheckinAtUtc.Value)
                 | Some inspection when inspection.NotInvoked ->
                     Ok(LaunchReplacementAuthorized now)
-                | Some inspection when inspection.NoCheckinAtUtc.IsSome ->
-                    Ok(LaunchReplacementAuthorized inspection.NoCheckinAtUtc.Value)
                 | Some inspection when inspection.OperatorResolvedAtUtc.IsSome ->
                     Ok(LaunchReplacementAuthorized inspection.OperatorResolvedAtUtc.Value)
+                | Some inspection when inspection.NoCheckinAtUtc.IsSome ->
+                    Ok(LaunchOperatorResolutionRequired "Deadline elapsed without correlated check-in. Actor activity cannot establish execution termination; explicit verified operator resolution is required.")
                 | Some inspection ->
                     match inspection.SendBoundaryAtUtc, inspection.CheckinDeadlineAtUtc with
                     | None, _ when inspection.ProtocolVersion >= 1 ->
@@ -856,8 +912,9 @@ let reconcileAt binding (launchId: string) now activity =
                         | Some evidence ->
                             recordNoCheckinProof binding launchId evidence
                             |> Result.map (function
-                                | NoCheckinProven at
-                                | NoCheckinAlreadyProven at -> LaunchReplacementAuthorized at
+                                | NoCheckinProven _
+                                | NoCheckinAlreadyProven _ ->
+                                    LaunchOperatorResolutionRequired "Deadline elapsed without correlated check-in. Actor activity cannot establish execution termination; explicit verified operator resolution is required."
                                 | LaunchAlreadyCheckedIn at -> LaunchStarted at
                                 | NoCheckinDeadlineNotReached next -> LaunchAwaitingCheckin next
                                 | NoCheckinActivityEvidenceUnavailable reason -> LaunchActivityEvidenceUnavailable reason
@@ -868,17 +925,8 @@ let reconcileAt binding (launchId: string) now activity =
                             "The launch has an incomplete or inconsistent send-boundary record; operator resolution is required."))))
 
 let private nextOperationAt binding snapshot ready =
-    let rec walk id =
-        inspectLaunchAt binding snapshot id
-        |> Result.bind (function
-            | None -> Ok(Some id)
-            | Some inspection when inspection.Ready <> ready ->
-                bad "A scheduled launch receipt does not match the exact Ready episode."
-            | Some inspection when inspection.CheckinAtUtc.IsSome -> Ok None
-            | Some inspection when inspection.NotInvoked || inspection.NoCheckinAtUtc.IsSome || inspection.OperatorResolved ->
-                walk (nextId id)
-            | Some _ -> Ok None)
-    walk (operationId binding ready)
+    currentLaunchAt binding snapshot ready (operationId binding ready)
+    |> Result.map (function id, None -> Some id | _, Some _ -> None)
 
 type Prepared =
     { Ready: Ready
@@ -976,9 +1024,7 @@ let rec private heldLaunchAt binding snapshot (ready: Ready) lastKnownOutcome id
         | None -> Ok None
         | Some inspection when inspection.Ready <> ready ->
             bad "A scheduled launch receipt does not match the exact Ready episode."
-        | Some inspection when inspection.NotInvoked
-                              || inspection.NoCheckinAtUtc.IsSome
-                              || inspection.OperatorResolved ->
+        | Some inspection when inspection.NotInvoked || inspection.OperatorResolved ->
             heldLaunchAt binding snapshot ready lastKnownOutcome (nextId id)
         | Some inspection ->
             let status, reason =
@@ -989,7 +1035,7 @@ let rec private heldLaunchAt binding snapshot (ready: Ready) lastKnownOutcome id
                     "awaitingCheckin", "Send boundary recorded at " + sentAt.ToString("O") + "; waiting for authenticated launch check-in until " + deadline.ToString("O") + "."
                 | None, Some sentAt, Some deadline ->
                     "operatorResolutionRequired", "No attributed check-in by " + deadline.ToString("O") +
-                    "; authoritative activity evidence is required before replacement. Send boundary: " + sentAt.ToString("O") + "."
+                    "; actor activity cannot establish termination. Verify that the old execution ended and record operator resolution before replacement. Send boundary: " + sentAt.ToString("O") + "."
                 | None, None, _ when inspection.ProtocolVersion >= 1 ->
                     "sendBoundaryRecoveryRequired", "Intent exists without a send boundary; reconcile a durable no-send proof before replacement."
                 | _ ->
@@ -1002,6 +1048,7 @@ let rec private heldLaunchAt binding snapshot (ready: Ready) lastKnownOutcome id
                   LaunchId = id
                   LastKnownOutcome =
                       if inspection.CheckinAtUtc.IsSome then "AuthenticatedCheckin"
+                      elif inspection.NoCheckinAtUtc.IsSome then "DeadlineElapsedNoCorrelatedCheckin"
                       elif inspection.SendBoundaryAtUtc.IsSome then "SendBoundaryRecorded"
                       elif inspection.ProtocolVersion >= 1 then "NoSendBoundaryRecorded"
                       elif String.IsNullOrWhiteSpace lastKnownOutcome then "Unknown"

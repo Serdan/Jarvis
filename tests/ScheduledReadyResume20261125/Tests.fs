@@ -113,10 +113,18 @@ let deadlineRequiresVerifiedEvidence seconds expired =
         | other -> Assert.Fail(sprintf "Unexpected absent-evidence result: %A" other)
         Assert.That(run ports binding |> held, Is.True)
         match reconcileAt binding id now (Some evidence) |> good with
-        | LaunchReplacementAuthorized at when expired -> Assert.That(at, Is.EqualTo(now))
+        | LaunchOperatorResolutionRequired _ when expired -> ()
         | LaunchAwaitingCheckin at when not expired -> Assert.That(at, Is.EqualTo(deadline))
         | other -> Assert.Fail(sprintf "Unexpected verified-evidence result: %A" other)
         if expired then
+            Assert.That(run ports binding |> held, Is.True, "Negative actor activity cannot authorize a second execution.")
+            let state = (inspectLaunchAt binding (LedgerStore.fetch binding |> good) launch.OperationId |> good).Value
+            Assert.That(state.NoCheckinAtUtc.IsSome, Is.True, "Deadline evidence remains durable diagnostic evidence.")
+            match reconcileAt binding id now (Some evidence) |> good with
+            | LaunchOperatorResolutionRequired _ -> ()
+            | other -> Assert.Fail(sprintf "Restart/reconciliation released the held launch: %A" other)
+            Assert.That(resolveOperator binding "fixture" id launch.Ready "verified old execution ended" true now |> good,
+                        Is.EqualTo(OperatorResolutionRecorded now))
             let replacement, replacementPorts = captureLaunch binding
             Assert.That(replacement.Ready, Is.EqualTo(launch.Ready))
             Assert.That(replacement.OperationId, Is.Not.EqualTo(launch.OperationId))
@@ -125,6 +133,105 @@ let deadlineRequiresVerifiedEvidence seconds expired =
             | other -> Assert.Fail(sprintf "Superseded check-in accepted: %A" other)
             Assert.That(run replacementPorts binding |> held, Is.True)
         else Assert.That(run ports binding |> held, Is.True))
+
+// Exercise the same registered post-journal execution core as SignalR,
+// not just the scheduler's recordCheckin helper. All bindings and activity
+// are disposable; a fresh runtime simulates client restart.
+[<Test; NonParallelizable>]
+let registeredIngressHoldsAmbiguousLaunchUntilVerifiedTermination () =
+    fixture (fun binding assign ->
+        let root = Path.GetDirectoryName(binding.RepositoryPath)
+        let previous = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+        Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", Path.Combine(root, "config"))
+        try
+            assign "Worker" "ready-task"
+            let launch, ports = captureLaunch binding
+            let id = launch.OperationId.ToString("D")
+            let now = launch.SendBoundaryAtUtc.Value.AddMinutes(5.)
+            let evidence = { LastSeenAtUtc = launch.SendBoundaryAtUtc.Value.AddSeconds(-1.); ServerNowAtUtc = now }
+            let tui = Client.ConsoleTui.ConsoleTui()
+            let runtime = Client.Runtime(root, tui, Client.FullTrust)
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting "local" runtime binding.ProjectId binding.LedgerId
+                binding.Epoch binding.RemoteName binding.ApprovedFetchUrl binding.ApprovedPushUrl
+                (LedgerStore.fetch binding |> good).Commit true |> good |> ignore
+            let read actor action launchId : Common.AgentCommand =
+                Common.TaskReadCommand
+                    { ProjectName = "local"; AgentId = actor; LaunchId = launchId; Action = action
+                      TaskId = "ready-task"; AssignmentGeneration = 0; CheckpointSequence = 0L
+                      Cursor = ""; PageSize = 0; BeforeOid = ""; AfterOid = ""; RelativePath = "" }
+            let execute rt actor command =
+                let wire = System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(command)
+                Client.SignalR.Client.executeAuthenticatedCommandWithChallengeWake rt wire actor None false
+                    (fun _ _ -> ())
+                |> fun pending -> pending.GetAwaiter().GetResult()
+            let state () = LedgerStore.fetch binding |> good
+            let reject (rt: Client.Runtime) actor command =
+                let head = (state()).Commit
+                let seen = rt.Tui.GetAgentLastSeen("local", actor)
+                let response = execute rt actor command
+                Assert.That(response.Error.IsSome, Is.True, sprintf "Expected registered ingress rejection: %A" response)
+                Assert.That(sprintf "%A" response.Error, Does.Contain("ScheduledLaunch"))
+                Assert.That((state()).Commit, Is.EqualTo(head), "Rejected ingress changed canonical state")
+                Assert.That(rt.Tui.GetAgentLastSeen("local", actor), Is.EqualTo(seen :> obj), "Rejected ingress advanced client-admitted activity")
+                Assert.That(response.AgentStateChanges, Is.Empty)
+            reject runtime "Worker" (read "Worker" "AgentInbox" "")
+            reject runtime "Worker" (read "Worker" "AgentInbox" (Guid.NewGuid().ToString("D")))
+            reject runtime "Worker" (read "Worker" "GetTask" "")
+            match reconcileAt binding id now (Some evidence) |> good with
+            | LaunchOperatorResolutionRequired _ -> ()
+            | other -> Assert.Fail(sprintf "Unexpected expiry result: %A" other)
+            Assert.That(run ports binding |> held, Is.True)
+            let restarted = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.FullTrust)
+            reject restarted "Worker" (read "Worker" "AgentInbox" id)
+            reject restarted "Worker" (read "Worker" "AgentInbox" "")
+            reject restarted "Worker" (read "Worker" "GetTask" "")
+            let retry : Common.AgentCommand =
+                Common.RetryPendingIntentCommand
+                    { ProjectName = "local"; OperatorId = "Worker"; OperationId = Guid.NewGuid().ToString("D")
+                      ExpectedCommandSha256 = String.replicate 64 "0"; ExpectedVerifiedHead = (state()).Commit }
+            reject restarted "Worker" retry
+            // A conflicting manual launch must not acquire a new durable intent.
+            let beforeManual = (state()).Commit
+            Assert.That(Client.SignalR.Client.beginAttributedLaunch binding "fixture" "Worker" (Guid.NewGuid()) "launchAgent.js" "fixture" |> Result.isError, Is.True)
+            Assert.That((state()).Commit, Is.EqualTo(beforeManual))
+            // Promotion uses the same execution core and cannot bypass admission.
+            let promotedCommand = read "Worker" "GetTask" ""
+            let runCore wire actor = task {
+                return! Client.SignalR.Client.executeAuthenticatedCommandWithChallengeWake restarted wire actor None false (fun _ _ -> ())
+            }
+            let promoted =
+                Client.SignalR.Client.executeOrPromoteWith restarted
+                    (System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(promotedCommand))
+                    "Worker" (TimeSpan.FromSeconds(30.)) runCore
+                |> fun pending -> pending.GetAwaiter().GetResult()
+            Assert.That(promoted.PendingJob.IsNone, Is.True, "Bounded fixture must observe the terminal promoted response")
+            Assert.That(sprintf "%A" promoted.Error, Does.Contain("ScheduledLaunchIngressRejected"))
+            Assert.That((state()).Commit, Is.EqualTo(beforeManual))
+            Assert.That(restarted.Tui.GetAgentLastSeen("local", "Worker").IsNone, Is.True)
+            Assert.That(resolveOperator binding "fixture" id launch.Ready "verified termination of A" true now |> good,
+                        Is.EqualTo(OperatorResolutionRecorded now))
+            let replacement, _ = captureLaunch binding
+            let replacementId = replacement.OperationId.ToString("D")
+            // Explicit old A is rejected both before and after exact B
+            // activation. Before B, omitted ID cannot win the Ready episode.
+            reject restarted "Worker" (read "Worker" "AgentInbox" id)
+            reject restarted "Worker" (read "Worker" "AgentInbox" "")
+            reject restarted "Worker" (read "Worker" "GetTask" "")
+            let activated = execute restarted "Worker" (read "Worker" "AgentInbox" replacementId)
+            Assert.That(activated.Error.IsNone, Is.True, sprintf "%A" activated.Error)
+            Assert.That(activated.InboxActivation.Value.ActivatedByThisCall, Is.True)
+            Assert.That((ReviewWorkflow.getAgentWorkingTurnAt binding (state()) "Worker" |> good).State, Is.EqualTo("Working"))
+            reject restarted "Worker" (read "Worker" "AgentInbox" id)
+            let ordinary = execute restarted "Worker" (read "Worker" "AgentInbox" "")
+            Assert.That(ordinary.Error.IsNone, Is.True, sprintf "%A" ordinary.Error)
+            Assert.That(ordinary.InboxActivation.Value.ActivatedByThisCall, Is.False)
+            // No conflict: manual first ingress continues to work.
+            assign "Manual" "manual-task"
+            let manual = execute restarted "Manual" (read "Manual" "AgentInbox" "")
+            Assert.That(manual.Error.IsNone, Is.True, sprintf "%A" manual.Error)
+            Assert.That(manual.InboxActivation.Value.ActivatedByThisCall, Is.True)
+        finally
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", previous))
 
 [<Test>]
 let exactCheckinPreventsReplacement () =

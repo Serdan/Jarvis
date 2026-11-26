@@ -395,8 +395,9 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
             match command with
             | TaskReadCommand cmd when cmd.Action = "AgentInbox" ->
                 cache.Invalidate(projectId, agentId)
-                inboxSnapshot.Value <-
-                    Some(retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt))
+                if inboxSnapshot.Value.IsNone then
+                    inboxSnapshot.Value <-
+                        Some(retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt))
             | _ -> ()
             let current =
                 match inboxSnapshot.Value with
@@ -472,14 +473,23 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                         let result =
                             match exactScheduledActivation with
                             | Some(operationId, ready) when ready.TaskId = currentTaskId ->
-                                ReviewWorkflow.ReviewWorkflow.activateReadyAgentExact binding operationId
+                                ReviewWorkflow.ReviewWorkflow.activateReadyAgentGuarded binding operationId
                                     currentTaskId agentId agent.Version ready.Generation
+                                    (fun current ->
+                                        match scheduledLaunch with
+                                        | Some launchId ->
+                                            ScheduledReadyResume.confirmedActivationAt binding current agentId launchId
+                                            |> Result.bind (function
+                                                | Some(id, exact) when id = operationId && exact = ready -> Ok ()
+                                                | _ -> Error(LedgerStore.StaleEntityVersion "Scheduled activation lost its exact launch fence."))
+                                        | None -> Error(LedgerStore.StaleEntityVersion "Scheduled activation has no launch identity."))
                             | Some _ ->
                                 Error(LedgerStore.StaleEntityVersion "Scheduled launch assignment changed before activation.")
                             | None when scheduledLaunch.IsSome ->
                                 Error(LedgerStore.StaleEntityVersion "Scheduled launch does not own this Ready episode.")
                             | None ->
-                                ReviewWorkflow.ReviewWorkflow.activateReadyAgent binding (Guid.NewGuid()) currentTaskId agentId
+                                ReviewWorkflow.ReviewWorkflow.activateReadyAgentGuarded binding (Guid.NewGuid()) currentTaskId agentId 0 0
+                                    (fun current -> ScheduledReadyResume.guardUncorrelatedIngressAt binding current agentId)
                         cache.Invalidate(projectId, agentId)
                         match result with
                         | Ok write ->
@@ -800,7 +810,10 @@ let internal beginAttributedLaunch binding actor targetAgentId (launchId: Guid) 
           RequestJson = JsonSerializer.Serialize({| targetAgentId = targetAgentId; scriptPath = scriptPath
                                                     executedSourceSha256 = executedSourceSha256 |}) }
     Client.LegacyDirectWriterFence.LegacyDirectWriterFence.transact binding intent (fun snapshot ->
-        match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurnAt binding snapshot targetAgentId with
+        let admitted =
+            ScheduledReadyResume.guardUncorrelatedIngressAt binding snapshot targetAgentId
+            |> Result.bind (fun () -> ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurnAt binding snapshot targetAgentId)
+        match admitted with
         | Error e -> Error e
         | Ok target ->
             let taskId =
@@ -1515,6 +1528,22 @@ let private receivePreparedCommand (rt: Runtime)
             return! receiveCommandForTarget rt target prepared.Source prepared.ProjectTask agentId command sourceOriginalId manualGrantAuthorized onChallengeCommit inboxSnapshot
     }
 
+// The agent label authenticates the user/actor route, not a particular
+// inference execution. Refuse actor-only ingress while an unresolved launch
+// owns the Ready episode. This gate is shared by direct and promoted execution.
+let private admitOrdinaryLaunchIngress (rt: Runtime) agentId target =
+    match target with
+    | Some selected when not (String.IsNullOrWhiteSpace agentId) ->
+        let project = selected |> ProjectPaths.ProjectTarget.projectId |> ProjectPaths.ProjectId.value
+        retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.loadOptionalWithSnapshot project rt)
+        |> Result.bind (function
+            | None -> Ok None
+            | Some(binding, snapshot) ->
+                ScheduledReadyResume.guardUncorrelatedIngressAt binding snapshot agentId
+                |> Result.map (fun () -> Some(Ok(binding, snapshot)))
+                |> Result.mapError (fun issue -> Client.ValidationError(sprintf "ScheduledLaunchIngressRejected: %A" issue)))
+    | _ -> Ok None
+
 // Shared by SignalR receive and tests. Identity is supplied by the MCP call,
 // not inferred from provider conversation metadata.
 let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agentId: string)
@@ -1586,6 +1615,7 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                                              |> Result.mapError (sprintf "%A")) command
                             |> Result.map (fun () -> scope)
                             |> Result.mapError Client.ValidationError)
+                    let inboxSnapshot: InboxSnapshot option ref = ref None
                     // Correlate the explicit launch before activity or automatic activation.
                     // A late/invalid launch cannot activate the replacement's Ready episode.
                     let project =
@@ -1603,7 +1633,12 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                                         Error(Client.ValidationError("ScheduledLaunchCheckinLate: " + reason))
                                     | Ok(ScheduledReadyResume.CheckinConfirmed _)
                                     | Ok(ScheduledReadyResume.CheckinDuplicate _) -> Ok scope
-                            | _ -> Ok scope)
+                            | CreateProjectCommand _ -> Ok scope // no existing target ledger
+                            | _ ->
+                                admitOrdinaryLaunchIngress rt agentId (projectTarget scope)
+                                |> Result.map (fun verified ->
+                                    inboxSnapshot.Value <- verified
+                                    scope))
                     match project with
                     | Error error -> return Error error
                     | Ok scope ->
@@ -1621,24 +1656,32 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                             | GetJobResultCommand _ | ListJobsCommand _ | CancelJobCommand _ -> ""
                             | _ when isLocalAgentActivity command -> agentId
                             | _ -> ""
-                        if not (String.IsNullOrWhiteSpace localAgentId) then
-                            target |> Option.iter (fun selected ->
-                                rt.Tui.RecordAgentSeen(AgentView.activityProject selected, localAgentId))
-                        // Request-local only: never use this observation to serve another inbox.
-                        let inboxSnapshot: InboxSnapshot option ref = ref None
+                        // The exact activation CAS may still reject an ordinary
+                        // request if a scheduled intent won since admission.
                         match activateReadyOnActivity rt localAgentId target inboxSnapshot command with
-                        | Error error -> return Error error
+                        | Error error ->
+                            responseScope <- None
+                            return Error error
                         | Ok (changes, committedActivation, activationInstructions) ->
+                            if not (String.IsNullOrWhiteSpace localAgentId) then
+                                target |> Option.iter (fun selected ->
+                                    rt.Tui.RecordAgentSeen(AgentView.activityProject selected, localAgentId))
                             implicitChanges <- changes
                             match command, committedActivation with
                             | TaskReadCommand inbox, Some receipt when inbox.Action = "AgentInbox" ->
                                 inboxActivation <- Some receipt
                             | _ -> ()
+                            // Only self-inbox may reuse this pre-dispatch
+                            // observation as its authoritative response snapshot.
+                            let responseInboxSnapshot =
+                                match command with
+                                | TaskReadCommand request when request.Action = "AgentInbox" -> inboxSnapshot.Value
+                                | _ -> None
                             let! result =
                                 // Polling does not activate or record local
                                 // agent activity, but access checks still need
                                 // the initiating actor label from the transport.
-                                receivePreparedCommand rt target agentId command sourceOriginalId manualGrantAuthorized onChallengeCommit inboxSnapshot.Value
+                                receivePreparedCommand rt target agentId command sourceOriginalId manualGrantAuthorized onChallengeCommit responseInboxSnapshot
                             // A write may alter another agent's state, or none
                             // at all. Invalidate precisely the affected local
                             // cache entries before preparing turn guidance.
@@ -1650,7 +1693,7 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                                 for changed in outcome.ChangedAgentIds do
                                     cache.Invalidate(projectId, changed)
                             | _ -> ()
-                            instructions <- OperationalControl.ordered (activationInstructions @ checkWorkingGuidance rt localAgentId target inboxSnapshot.Value command)
+                            instructions <- OperationalControl.ordered (activationInstructions @ checkWorkingGuidance rt localAgentId target responseInboxSnapshot command)
                             return result
                 with ex ->
                     unexpectedFailure <- true
@@ -1717,10 +1760,20 @@ let executeAuthenticatedCommandWithChallengeWake
 let private withVisibleResponseAlerts (rt: Runtime) (agentId: string)
                                       (command: AgentCommand option)
                                       (response: AgentCommandResponse) =
+    let launchRejected =
+        match response.Error with
+        | Some(ValidationFailed message) when message.StartsWith("ScheduledLaunch", StringComparison.Ordinal) -> true
+        | _ -> false
     let alerts =
         match command with
-        | Some original when mayReceiveResponseAlert original ->
+        | Some original when mayReceiveResponseAlert original && not launchRejected ->
             match classifyProject original with
+            | Ok scope when response.PendingJob.IsSome ->
+                // A pending handle may precede admission. Do not allow its
+                // delivery path to mutate the held actor's response queue.
+                match admitOrdinaryLaunchIngress rt agentId (projectTarget scope) with
+                | Ok _ -> checkResponseAlerts rt agentId (projectTarget scope)
+                | Error _ -> []
             | Ok scope -> checkResponseAlerts rt agentId (projectTarget scope)
             | Error _ -> []
         | _ -> []

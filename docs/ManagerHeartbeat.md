@@ -82,11 +82,16 @@ config and journal together through ordinary client restarts.
 
 The Manager gets canonical task_overview and copies its SnapshotCommit to
 snapshot.ledgerHead, observes **all** configured agents using observe_agent,
-and calls reviewer_inbox with every configured reviewer ID. Set each
-reviewerInboxes entry's reviewerId to the requested ID and copy the response's
-snapshotCommit and reviews unchanged. Every snapshotCommit must equal the
-task_overview SnapshotCommit; if any differs, discard and recapture the
-snapshot. The inbox reviews are the eligibility source: unclaimed reviews may
+and calls reviewer_inbox for every configured reviewer. Pass the Manager's own
+ID as `agentId` (the caller) and the configured reviewer ID as `reviewerId` (the
+inbox subject). Never put the subject reviewer ID in `agentId`: reviewer inbox
+reads are attributed activity, so doing so would fabricate reviewer activity
+and could falsely mark an in-flight launch as observed, releasing its
+deduplication reservation. Set each reviewerInboxes entry's reviewerId to the
+requested subject and copy the response's snapshotCommit and reviews unchanged.
+Every snapshotCommit must equal the task_overview SnapshotCommit; if any differs,
+discard and recapture the snapshot. The inbox reviews are the eligibility
+source: unclaimed reviews may
 appear in several inboxes, while a claimed review appears only in its owner's
 inbox. Do not substitute a global unclaimed-review count. Also inspect task
 readiness, priorities, blockers, durable challenges and relevant client
@@ -232,9 +237,11 @@ other Working agents count against the 5/3 budget. Unclassified live or
 uncertain agents prevent all launches. Duplicate timer ticks reserve nothing
 twice.
 
-For each reservation, re-observe the agent, re-read task_overview and read
-its reviewer_inbox immediately before dispatch. Require the inbox
-snapshotCommit to equal task_overview's SnapshotCommit. For an unclaimed
+For each reservation, re-observe the agent and re-read task_overview
+immediately before dispatch. For a reviewer reservation, read
+reviewer_inbox with the Manager's own `agentId` and the reserved reviewer as
+`reviewerId`; never attribute this subject read to the reviewer. Require the
+inbox snapshotCommit to equal task_overview's SnapshotCommit. For an unclaimed
 reservation, confirm the same taskId/reviewId/version remains unclaimed; for a
 claim resume, confirm the same claim remains owned by that reviewer. Never
 claim or transfer a review for the reviewer. If eligibility changed, mark the

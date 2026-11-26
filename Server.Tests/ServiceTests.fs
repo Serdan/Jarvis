@@ -583,6 +583,16 @@ let ``public orchestration tool metadata describes canonical branch reviews`` ()
     Assert.That(reviewDescription "ClaimReview", Does.Contain("Git branch"))
     Assert.That(reviewDescription "DecideReview", Does.Contain("Markdown"))
     Assert.That(reviewDescription "SubmitReview", Does.Contain("No assignment"))
+    let inboxParameters = typeof<JarvisMcpTools>.GetMethod("ReviewerInbox").GetParameters()
+    let caller = inboxParameters |> Array.find (fun parameter -> parameter.Name = "agentId")
+    let subject = inboxParameters |> Array.find (fun parameter -> parameter.Name = "reviewerId")
+    Assert.That(caller.IsOptional, Is.False, "agentId remains the calling agent")
+    Assert.That(subject.IsOptional, Is.True, "reviewerId selects another inbox without impersonation")
+    Assert.That(subject.DefaultValue, Is.EqualTo(""), "legacy own-inbox calls default to agentId")
+    Assert.That(reviewDescription "ReviewerInbox", Does.Contain("agentId identifies the calling agent"))
+    Assert.That(reviewDescription "ReviewerInbox", Does.Contain("reviewerId selects the inbox subject"))
+    Assert.That(McpToolHelpers.reviewerInboxSubject "Manager" "Reviewer 1", Is.EqualTo("Reviewer 1"))
+    Assert.That(McpToolHelpers.reviewerInboxSubject "Reviewer 1" "", Is.EqualTo("Reviewer 1"))
 
 [<Test>]
 let ``public SubmitReview accepts arbitrary commit and optional context without worker phase`` () =

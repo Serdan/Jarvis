@@ -15,7 +15,10 @@ At the start of every pass:
    or assume an earlier ChatGPT session is authoritative.
 2. Read canonical `task_overview`; copy its `SnapshotCommit` to
    `snapshot.ledgerHead`. Call `reviewer_inbox` for every configured reviewer
-   ID, set `reviewerId` to the requested ID, and copy each response's
+   using your own Manager `agentId` (the caller) and set `reviewerId` to the
+   requested reviewer (the inbox subject). Never impersonate a reviewer by
+   putting their ID in `agentId`: inbox reads are attributed activity and could
+   falsely release an in-flight launch reservation. Copy each response's
    `snapshotCommit` and `reviews` into `snapshot.reviewerInboxes`. Every
    `snapshotCommit` must equal the `task_overview` `SnapshotCommit`; if any
    differs, discard and recapture the snapshot. Do not substitute an aggregate
@@ -43,8 +46,10 @@ At the start of every pass:
    intended launches *before* any browser side effect. Do not create a launch
    outside its returned reservations or reinterpret its budget/suppression rules.
 6. For each reserved agent, re-observe its canonical state, re-read
-   `task_overview` and read its `reviewer_inbox`. Require the inbox's
-   `snapshotCommit` to equal `task_overview`'s `SnapshotCommit`. For an
+   `task_overview` immediately before dispatch. For a reviewer reservation,
+   read `reviewer_inbox` with your Manager `agentId` and the reserved reviewer
+   as `reviewerId`; never attribute the subject read to the reviewer. Require
+   the inbox's `snapshotCommit` to equal `task_overview`'s `SnapshotCommit`. For an
    unclaimed-review reservation, confirm the same `taskId`/`reviewId`/`version`
    remains unclaimed; for a claim-resume reservation, confirm the same claim
    remains owned by that reviewer. Never claim, transfer or route a review for

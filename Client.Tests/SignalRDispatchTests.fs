@@ -644,3 +644,831 @@ module DispatchProbeTests =
                    p99Ms = percentile 0.99
                    maxMs = values |> Array.max |}))
     }
+
+
+// Independent disposable fixture for the ordinary (non-inbox) authenticated
+// dispatch path. Measure only the actual command, not setup or observations.
+module OrdinaryDispatchGitTests =
+    open System
+    open System.Diagnostics
+    open System.IO
+    open System.Text.Json
+    open Client.LedgerStore
+    open Client.AccountCapacityLedger
+    open Client.WorkQueueGitLedger
+    open Client.ReviewWorkflow
+    open Common
+    open NUnit.Framework
+
+    let private success = function
+        | Ok value -> value
+        | Error error -> failwithf "Unexpected fixture result: %A" error
+
+    let private git directory args =
+        use proc = new Process()
+        proc.StartInfo.FileName <- "git"
+        proc.StartInfo.WorkingDirectory <- directory
+        proc.StartInfo.RedirectStandardOutput <- true
+        proc.StartInfo.RedirectStandardError <- true
+        args |> List.iter proc.StartInfo.ArgumentList.Add
+        if not (proc.Start()) then failwith "Could not start fixture Git."
+        let stdout = proc.StandardOutput.ReadToEndAsync()
+        let stderr = proc.StandardError.ReadToEndAsync()
+        if not (proc.WaitForExit(10000)) then
+            proc.Kill(true)
+            failwith "Fixture Git timed out."
+        if proc.ExitCode <> 0 then failwithf "Fixture Git failed: %s" (stderr.GetAwaiter().GetResult())
+        stdout.GetAwaiter().GetResult().Trim()
+
+    [<TestCase(false)>]
+    [<TestCase(true)>]
+    let OrdinarySourceDispatchActivationGitBudget(missing: bool) =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-dispatch-git-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let remote = Path.Combine(root, "remote.git")
+        let checkout = Path.Combine(root, "project")
+        let config = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot checkout
+        try
+            git root [ "init"; "--bare"; "--initial-branch=main"; remote ] |> ignore
+            git root [ "clone"; remote; checkout ] |> ignore
+            git checkout [ "config"; "user.name"; "Dispatch Test" ] |> ignore
+            git checkout [ "config"; "user.email"; "dispatch@example.invalid" ] |> ignore
+            File.WriteAllText(Path.Combine(checkout, "source.txt"), "base")
+            git checkout [ "add"; "source.txt" ] |> ignore
+            git checkout [ "commit"; "-m"; "base" ] |> ignore
+            git checkout [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
+            let binding: LedgerBinding =
+                { RepositoryPath = checkout; RemoteName = "origin"
+                  ApprovedFetchUrl = remote; ApprovedPushUrl = remote
+                  ProjectId = Guid.NewGuid(); LedgerId = Guid.NewGuid(); Epoch = 1 }
+            LedgerStore.initialize binding true |> success |> ignore
+            ReviewWorkflow.registerAgent binding (Guid.NewGuid()) "Owner" |> success |> ignore
+            ReviewWorkflow.createTask binding (Guid.NewGuid()) "dispatch-task" "Dispatch" |> success |> ignore
+            ReviewWorkflow.assignTask binding (Guid.NewGuid()) "dispatch-task" (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let before = LedgerStore.fetch binding |> success
+            let rt = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting "project" rt
+                binding.ProjectId binding.LedgerId binding.Epoch binding.RemoteName
+                binding.ApprovedFetchUrl binding.ApprovedPushUrl before.Commit true
+            |> success |> ignore
+            let command =
+                ReadFileCommand
+                    { ProjectName = "project"
+                      FilePath = if missing then "missing.txt" else "source.txt"
+                      StartLine = None; EndLine = None; IncludeLineNumbers = None }
+            let payload = JsonSerializer.Serialize(command)
+            let invoke () =
+                Client.SignalR.Client.executeAuthenticatedCommandWithChallengeWake
+                    rt payload "Owner" None false (fun _ _ -> ())
+                |> Async.AwaitTask |> Async.RunSynchronously
+            let measure label =
+                let sw = Stopwatch.StartNew()
+                let response, io =
+                    LedgerStore.measureGitReads (fun () ->
+                        LedgerStore.withGitTransportFaults (fun _ args ->
+                            match args with
+                            | "fetch" :: _ -> System.Threading.Thread.Sleep(50); None
+                            | _ -> None) invoke)
+                sw.Stop()
+                TestContext.Progress.WriteLine(
+                    sprintf "ordinary dispatch %s missing=%b: git=%d fetches=%d elapsedMs=%d"
+                        label missing io.ProcessStarts io.RemoteFetches sw.ElapsedMilliseconds)
+                response, io
+            let first, firstIo = measure "cold Ready"
+            let afterFirst = LedgerStore.fetch binding |> success
+            let warm, warmIo = measure "warm Working"
+            // The pinned main baseline used 104 Git process starts and six
+            // remote fetches for the cold Ready call. The confirmed activation
+            // snapshot should replace the post-activation refetch; the warm
+            // Working read remains a zero-Git negative control.
+            Assert.That(firstIo.ProcessStarts, Is.LessThan(104), "Cold dispatch must remove redundant Git work from the pinned baseline.")
+            Assert.That(firstIo.RemoteFetches, Is.EqualTo(3), "Cold dispatch should retain only the eligibility, transaction and confirmation fetches.")
+            Assert.That(warmIo.ProcessStarts, Is.EqualTo(0))
+            Assert.That(warmIo.RemoteFetches, Is.EqualTo(0))
+            Assert.That(first.Error.IsSome, Is.EqualTo(missing), sprintf "%A" first.Error)
+            Assert.That(warm.Error, Is.EqualTo(first.Error))
+            Assert.That(warm.Result, Is.EqualTo(first.Result))
+            if not missing then Assert.That(JsonSerializer.Deserialize<string>(first.Result.Value), Is.EqualTo("base"))
+            Assert.That(first.Instructions, Is.Empty)
+            Assert.That(warm.Instructions, Is.Empty)
+            Assert.That(first.AgentStateChanges |> List.map (fun change -> change.AgentId), Is.EqualTo(box [ "Owner" ]))
+            Assert.That(warm.AgentStateChanges, Is.Empty)
+            Assert.That(first.InboxActivation.IsNone, Is.True)
+            Assert.That(warm.InboxActivation.IsNone, Is.True)
+            let canonical = ReviewWorkflow.getAgentInbox binding "Owner" |> success
+            Assert.That(canonical.Agent.State, Is.EqualTo("Working"))
+            Assert.That(canonical.Focused.Value.Attempt.Phase, Is.EqualTo("Started"))
+            let afterWarm = LedgerStore.fetch binding |> success
+            Assert.That(afterFirst.Commit, Is.Not.EqualTo(before.Commit))
+            Assert.That(afterWarm.Commit, Is.EqualTo(afterFirst.Commit), "Warm Working dispatch must not create a new durable ledger head.")
+            Assert.That(git checkout [ "status"; "--porcelain" ], Is.Empty)
+        finally
+            if File.Exists config then File.Delete config
+            if File.Exists(config + ".lock") then File.Delete(config + ".lock")
+            Directory.Delete(root, true)
+
+
+    [<Test; NonParallelizable>]
+    let WorkingDispatchSkipsLegacyFenceGitWhenAlreadyWorking () =
+        let oldHost =
+            Environment.GetEnvironmentVariable(
+                Client.LegacyWriterProtocolFence.LegacyWriterProtocolFence.HostBindingEnvironment)
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-dispatch-fence-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let hostPath = Path.Combine(root, "host-fence.json")
+        let projectCheckout = Path.Combine(root, "project")
+        let accountCheckout = Path.Combine(root, "account")
+        let config = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot projectCheckout
+        try
+            let repository name checkout =
+                let remote = Path.Combine(root, name + ".git")
+                git root [ "init"; "--bare"; "--initial-branch=main"; remote ] |> ignore
+                git root [ "clone"; remote; checkout ] |> ignore
+                git checkout [ "config"; "user.name"; "Dispatch Fence Test" ] |> ignore
+                git checkout [ "config"; "user.email"; "dispatch-fence@example.invalid" ] |> ignore
+                File.WriteAllText(Path.Combine(checkout, "source.txt"), "base")
+                git checkout [ "add"; "source.txt" ] |> ignore
+                git checkout [ "commit"; "-m"; "base" ] |> ignore
+                git checkout [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
+                remote
+
+            let projectRemote = repository "project" projectCheckout
+            let accountRemote = repository "account" accountCheckout
+            let binding: LedgerBinding =
+                { RepositoryPath = projectCheckout; RemoteName = "origin"
+                  ApprovedFetchUrl = projectRemote; ApprovedPushUrl = projectRemote
+                  ProjectId = Guid.NewGuid(); LedgerId = Guid.NewGuid(); Epoch = 1 }
+            let accountBinding: AccountBinding =
+                { RepositoryPath = accountCheckout; RemoteName = "origin"
+                  ApprovedFetchUrl = accountRemote; ApprovedPushUrl = accountRemote
+                  AccountId = Guid.NewGuid(); LedgerId = Guid.NewGuid(); Epoch = 1 }
+            AccountCapacityLedger.initialize accountBinding 3 |> success |> ignore
+            LedgerStore.initialize binding true |> success |> ignore
+            WorkQueueGitLedger.initialize binding "project" (Guid.NewGuid())
+                (Map.ofList [ "Owner", set [ "source" ]; "BlockedOwner", set [ "source" ] ])
+            |> success |> ignore
+            for agentId, taskId, title in
+                [ "Owner", "dispatch-task", "Dispatch"
+                  "BlockedOwner", "blocked-task", "Blocked dispatch" ] do
+                ReviewWorkflow.registerAgent binding (Guid.NewGuid()) agentId |> success |> ignore
+                ReviewWorkflow.createTask binding (Guid.NewGuid()) taskId title |> success |> ignore
+                ReviewWorkflow.assignTask binding (Guid.NewGuid()) taskId (Guid.NewGuid()) agentId
+                |> success |> ignore
+
+            let before = LedgerStore.fetch binding |> success
+            let rt = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting "project" rt
+                binding.ProjectId binding.LedgerId binding.Epoch binding.RemoteName
+                binding.ApprovedFetchUrl binding.ApprovedPushUrl before.Commit true
+            |> success |> ignore
+
+            let writeHost expectedAccountHead expectedProjectHead =
+                let document =
+                    {| schemaVersion = 1
+                       protocolVersion = Client.LegacyWriterProtocolFence.LegacyWriterProtocolFence.ProtocolVersion
+                       projectName = "project"
+                       projectRepositoryPath = binding.RepositoryPath
+                       projectRemoteName = binding.RemoteName
+                       projectApprovedFetchUrl = binding.ApprovedFetchUrl
+                       projectApprovedPushUrl = binding.ApprovedPushUrl
+                       projectId = binding.ProjectId.ToString("D")
+                       projectLedgerId = binding.LedgerId.ToString("D")
+                       projectEpoch = binding.Epoch
+                       accountRepositoryPath = accountBinding.RepositoryPath
+                       accountRemoteName = accountBinding.RemoteName
+                       accountApprovedFetchUrl = accountBinding.ApprovedFetchUrl
+                       accountApprovedPushUrl = accountBinding.ApprovedPushUrl
+                       accountId = accountBinding.AccountId.ToString("D")
+                       accountLedgerId = accountBinding.LedgerId.ToString("D")
+                       accountEpoch = accountBinding.Epoch
+                       expectedAccountHead = expectedAccountHead
+                       expectedProjectHead = expectedProjectHead |}
+                File.WriteAllText(hostPath, JsonSerializer.Serialize document)
+                if not (OperatingSystem.IsWindows()) then
+                    File.SetUnixFileMode(hostPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                Environment.SetEnvironmentVariable(
+                    Client.LegacyWriterProtocolFence.LegacyWriterProtocolFence.HostBindingEnvironment,
+                    hostPath)
+
+            let account = AccountCapacityLedger.fetch accountBinding |> success
+            writeHost account.Head before.Commit
+            let command =
+                ReadFileCommand
+                    { ProjectName = "project"; FilePath = "source.txt"
+                      StartLine = None; EndLine = None; IncludeLineNumbers = None }
+            let payload = JsonSerializer.Serialize command
+            let invoke agentId =
+                Client.SignalR.Client.executeAuthenticatedCommandWithChallengeWake
+                    rt payload agentId None false (fun _ _ -> ())
+                |> Async.AwaitTask |> Async.RunSynchronously
+            let measure agentId =
+                LedgerStore.measureGitReads (fun () ->
+                    LedgerStore.withGitTransportFaults (fun _ args ->
+                        match args with
+                        | "fetch" :: _ -> System.Threading.Thread.Sleep(10); None
+                        | _ -> None) (fun () -> invoke agentId))
+
+            let first, firstIo = measure "Owner"
+            Assert.That(first.Error.IsSome, Is.False, sprintf "%A" first.Error)
+            Assert.That(firstIo.RemoteFetches, Is.GreaterThan(3),
+                "A Ready agent must still consult the configured legacy fence before activation.")
+            let activated = ReviewWorkflow.getAgentInbox binding "Owner" |> success
+            Assert.That(activated.Agent.State, Is.EqualTo("Working"))
+
+            let warm, warmIo = measure "Owner"
+            Assert.That(warm.Error, Is.EqualTo(first.Error))
+            Assert.That(warm.Result, Is.EqualTo(first.Result))
+            Assert.That(warmIo.ProcessStarts, Is.EqualTo(0),
+                "An already-Working agent has no implicit lifecycle write for the migration fence to protect.")
+            Assert.That(warmIo.RemoteFetches, Is.EqualTo(0))
+
+            // A second Ready agent remains protected: once the account epoch is
+            // no longer LegacyActive, the same ordinary read must not activate it.
+            let accountBeforeFreeze = AccountCapacityLedger.fetch accountBinding |> success
+            git accountCheckout [ "checkout"; "-B"; "freeze-fixture"; accountBeforeFreeze.Head ] |> ignore
+            let statePath = Path.Combine(accountCheckout, "state.json")
+            let frozen =
+                { accountBeforeFreeze.State with
+                    MigrationPhase = "Frozen"
+                    StateVersion = accountBeforeFreeze.State.StateVersion + 1L
+                    NextSequence = accountBeforeFreeze.State.NextSequence + 1L }
+            File.WriteAllText(statePath, JsonSerializer.Serialize frozen)
+            git accountCheckout [ "add"; "state.json" ] |> ignore
+            git accountCheckout [ "commit"; "-m"; "fixture frozen migration phase" ] |> ignore
+            git accountCheckout [ "push"; "origin"; "HEAD:" + AccountCapacityLedger.AccountRef ] |> ignore
+            let frozenAccount = AccountCapacityLedger.fetch accountBinding |> success
+            let currentProject = LedgerStore.fetch binding |> success
+            writeHost frozenAccount.Head currentProject.Commit
+            let beforeBlockedRead = LedgerStore.fetch binding |> success
+            let blocked, blockedIo = measure "BlockedOwner"
+            Assert.That(blocked.Error.IsSome, Is.False, sprintf "%A" blocked.Error)
+            Assert.That(blocked.Result.IsSome, Is.True)
+            Assert.That(blockedIo.RemoteFetches, Is.GreaterThan(0),
+                "A Ready agent still requires a fresh fence check before implicit activation.")
+            let stillReady = ReviewWorkflow.getAgentInbox binding "BlockedOwner" |> success
+            Assert.That(stillReady.Agent.State, Is.EqualTo("Ready"))
+            let afterBlockedRead = LedgerStore.fetch binding |> success
+            Assert.That(afterBlockedRead.Commit, Is.EqualTo(beforeBlockedRead.Commit),
+                "A fenced read must not create a lifecycle transition.")
+        finally
+            Environment.SetEnvironmentVariable(
+                Client.LegacyWriterProtocolFence.LegacyWriterProtocolFence.HostBindingEnvironment,
+                oldHost)
+            if File.Exists config then File.Delete config
+            if File.Exists(config + ".lock") then File.Delete(config + ".lock")
+            Directory.Delete(root, true)
+
+
+    [<Test; NonParallelizable>]
+    let OrdinaryLocalHierarchyDispatchActivationGitBudget () =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-instruction-dispatch-git-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let remote = Path.Combine(root, "remote.git")
+        let checkout = Path.Combine(root, "project")
+        let config = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot checkout
+        try
+            git root [ "init"; "--bare"; "--initial-branch=main"; remote ] |> ignore
+            git root [ "clone"; remote; checkout ] |> ignore
+            git checkout [ "config"; "user.name"; "Dispatch Instructions Test" ] |> ignore
+            git checkout [ "config"; "user.email"; "dispatch-instructions@example.invalid" ] |> ignore
+            File.WriteAllText(Path.Combine(checkout, "AGENTS.md"), "dispatch guidance")
+            git checkout [ "add"; "AGENTS.md" ] |> ignore
+            git checkout [ "commit"; "-m"; "add dispatch guidance" ] |> ignore
+            git checkout [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
+            let binding: LedgerBinding =
+                { RepositoryPath = checkout; RemoteName = "origin"
+                  ApprovedFetchUrl = remote; ApprovedPushUrl = remote
+                  ProjectId = Guid.NewGuid(); LedgerId = Guid.NewGuid(); Epoch = 1 }
+            LedgerStore.initialize binding true |> success |> ignore
+            ReviewWorkflow.registerAgent binding (Guid.NewGuid()) "Owner" |> success |> ignore
+            ReviewWorkflow.createTask binding (Guid.NewGuid()) "dispatch-task" "Dispatch" |> success |> ignore
+            ReviewWorkflow.assignTask binding (Guid.NewGuid()) "dispatch-task" (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.registerAgent binding (Guid.NewGuid()) "DetailsOwner" |> success |> ignore
+            ReviewWorkflow.createTask binding (Guid.NewGuid()) "details-task" "Details" |> success |> ignore
+            ReviewWorkflow.assignTask binding (Guid.NewGuid()) "details-task" (Guid.NewGuid()) "DetailsOwner"
+            |> success |> ignore
+            let before = LedgerStore.fetch binding |> success
+            let rt = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting "project" rt
+                binding.ProjectId binding.LedgerId binding.Epoch binding.RemoteName
+                binding.ApprovedFetchUrl binding.ApprovedPushUrl before.Commit true
+            |> success |> ignore
+            let command =
+                GetAgentInstructionsCommand
+                    { ProjectName = "project"; AgentId = ""; Directory = ""; Cursor = None }
+            let payload = JsonSerializer.Serialize command
+            let invoke () =
+                Client.SignalR.Client.executeAuthenticatedCommandWithChallengeWake
+                    rt payload "Owner" None false (fun _ _ -> ())
+                |> Async.AwaitTask |> Async.RunSynchronously
+            let detailsCommand = GetProjectDetailsCommand { ProjectName = "project" }
+            let detailsPayload = JsonSerializer.Serialize detailsCommand
+            let invokeDetails () =
+                Client.SignalR.Client.executeAuthenticatedCommandWithChallengeWake
+                    rt detailsPayload "DetailsOwner" None false (fun _ _ -> ())
+                |> Async.AwaitTask |> Async.RunSynchronously
+            let measure label invoke =
+                let sw = Stopwatch.StartNew()
+                let response, io =
+                    LedgerStore.measureGitReads (fun () ->
+                        LedgerStore.withGitTransportFaults (fun _ args ->
+                            match args with
+                            | "fetch" :: _ -> System.Threading.Thread.Sleep(50); None
+                            | _ -> None) invoke)
+                sw.Stop()
+                TestContext.Progress.WriteLine(
+                    sprintf "local-only instruction dispatch %s: git=%d fetches=%d elapsedMs=%d"
+                        label io.ProcessStarts io.RemoteFetches sw.ElapsedMilliseconds)
+                response, io
+            let first, firstIo = measure "cold Ready" invoke
+            let afterFirst = LedgerStore.fetch binding |> success
+            let warm, warmIo = measure "warm Working" invoke
+            Assert.That(firstIo.ProcessStarts, Is.LessThan(104))
+            Assert.That(firstIo.RemoteFetches, Is.EqualTo(3),
+                "Local-only instruction dispatch should reuse the confirmed activation snapshot for turn guidance.")
+            Assert.That(warmIo.ProcessStarts, Is.EqualTo(0))
+            Assert.That(warmIo.RemoteFetches, Is.EqualTo(0))
+            Assert.That(first.Error.IsSome, Is.False, sprintf "%A" first.Error)
+            Assert.That(warm.Error, Is.EqualTo(first.Error))
+            Assert.That(warm.Result, Is.EqualTo(first.Result))
+            Assert.That(box first.Instructions, Is.EqualTo(box warm.Instructions))
+            Assert.That(first.AgentStateChanges |> List.map (fun change -> change.AgentId), Is.EqualTo(box [ "Owner" ]))
+            Assert.That(warm.AgentStateChanges, Is.Empty)
+            Assert.That(first.InboxActivation.IsNone, Is.True)
+            Assert.That(warm.InboxActivation.IsNone, Is.True)
+            use page = JsonDocument.Parse(first.Result.Value)
+            Assert.That(
+                page.RootElement.GetProperty("AGENTS.md").GetProperty("project").GetString(),
+                Is.EqualTo("dispatch guidance"))
+            let canonical = ReviewWorkflow.getAgentInbox binding "Owner" |> success
+            Assert.That(canonical.Agent.State, Is.EqualTo("Working"))
+            Assert.That(canonical.Focused.Value.Attempt.Phase, Is.EqualTo("Started"))
+            let afterWarm = LedgerStore.fetch binding |> success
+            Assert.That(afterFirst.Commit, Is.Not.EqualTo(before.Commit))
+            Assert.That(afterWarm.Commit, Is.EqualTo(afterFirst.Commit),
+                "Warm instruction dispatch must not create a new durable ledger head.")
+            let details, detailsIo = measure "cold Ready project details" invokeDetails
+            let afterDetails = LedgerStore.fetch binding |> success
+            let detailsWarm, detailsWarmIo = measure "warm Working project details" invokeDetails
+            Assert.That(detailsIo.ProcessStarts, Is.LessThan(104))
+            Assert.That(detailsIo.RemoteFetches, Is.EqualTo(3),
+                "Project details dispatch should reuse the confirmed activation snapshot for turn guidance.")
+            Assert.That(detailsWarmIo.ProcessStarts, Is.EqualTo(0))
+            Assert.That(detailsWarmIo.RemoteFetches, Is.EqualTo(0))
+            Assert.That(details.Error.IsSome, Is.False, sprintf "%A" details.Error)
+            Assert.That(detailsWarm.Error, Is.EqualTo(details.Error))
+            Assert.That(detailsWarm.Result, Is.EqualTo(details.Result))
+            Assert.That(box details.Instructions, Is.EqualTo(box detailsWarm.Instructions))
+            Assert.That(details.AgentStateChanges |> List.map (fun change -> change.AgentId), Is.EqualTo(box [ "DetailsOwner" ]))
+            Assert.That(detailsWarm.AgentStateChanges, Is.Empty)
+            Assert.That(details.InboxActivation.IsNone, Is.True)
+            Assert.That(detailsWarm.InboxActivation.IsNone, Is.True)
+            Assert.That(details.Result.Value, Is.EqualTo("[]"))
+            let detailsCanonical = ReviewWorkflow.getAgentInbox binding "DetailsOwner" |> success
+            Assert.That(detailsCanonical.Agent.State, Is.EqualTo("Working"))
+            let afterDetailsWarm = LedgerStore.fetch binding |> success
+            Assert.That(afterDetails.Commit, Is.Not.EqualTo(afterWarm.Commit))
+            Assert.That(afterDetailsWarm.Commit, Is.EqualTo(afterDetails.Commit))
+        finally
+            if File.Exists config then File.Delete config
+            if File.Exists(config + ".lock") then File.Delete(config + ".lock")
+            Directory.Delete(root, true)
+
+
+    [<Test>]
+    let ReadyClosedTaskReadReusesActivationSnapshotForGuidance () =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-dispatch-closed-task-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let remote = Path.Combine(root, "remote.git")
+        let checkout = Path.Combine(root, "project")
+        let config = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot checkout
+        try
+            git root [ "init"; "--bare"; "--initial-branch=main"; remote ] |> ignore
+            git root [ "clone"; remote; checkout ] |> ignore
+            git checkout [ "config"; "user.name"; "Dispatch Closed Task Test" ] |> ignore
+            git checkout [ "config"; "user.email"; "dispatch-closed@example.invalid" ] |> ignore
+            File.WriteAllText(Path.Combine(checkout, "source.txt"), "base")
+            git checkout [ "add"; "source.txt" ] |> ignore
+            git checkout [ "commit"; "-m"; "base" ] |> ignore
+            git checkout [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
+            let binding: LedgerBinding =
+                { RepositoryPath = checkout; RemoteName = "origin"
+                  ApprovedFetchUrl = remote; ApprovedPushUrl = remote
+                  ProjectId = Guid.NewGuid(); LedgerId = Guid.NewGuid(); Epoch = 1 }
+            LedgerStore.initialize binding true |> success |> ignore
+            ReviewWorkflow.registerAgent binding (Guid.NewGuid()) "ClosedOwner" |> success |> ignore
+            ReviewWorkflow.createTask binding (Guid.NewGuid()) "closed-task" "Closed task" |> success |> ignore
+            ReviewWorkflow.assignTask binding (Guid.NewGuid()) "closed-task" (Guid.NewGuid()) "ClosedOwner"
+            |> success |> ignore
+            let _, task, _ = ReviewWorkflow.getTask binding "closed-task" |> success
+            ReviewWorkflow.closeTaskAs binding "Lead" (Guid.NewGuid()) "closed-task" task.Version
+            |> success |> ignore
+            let before = LedgerStore.fetch binding |> success
+            let rt = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting "project" rt
+                binding.ProjectId binding.LedgerId binding.Epoch binding.RemoteName
+                binding.ApprovedFetchUrl binding.ApprovedPushUrl before.Commit true
+            |> success |> ignore
+            let command =
+                ReadFileCommand
+                    { ProjectName = "project"; FilePath = "source.txt"
+                      StartLine = None; EndLine = None; IncludeLineNumbers = None }
+            let payload = JsonSerializer.Serialize command
+            let invoke () =
+                Client.SignalR.Client.executeAuthenticatedCommandWithChallengeWake
+                    rt payload "ClosedOwner" None false (fun _ _ -> ())
+                |> Async.AwaitTask |> Async.RunSynchronously
+            let sw = Stopwatch.StartNew()
+            let response, io =
+                LedgerStore.measureGitReads (fun () ->
+                    LedgerStore.withGitTransportFaults (fun _ args ->
+                        match args with
+                        | "fetch" :: _ -> System.Threading.Thread.Sleep(50); None
+                        | _ -> None) invoke)
+            sw.Stop()
+            TestContext.Progress.WriteLine(
+                sprintf "ordinary dispatch cold Ready closed task: git=%d fetches=%d elapsedMs=%d"
+                    io.ProcessStarts io.RemoteFetches sw.ElapsedMilliseconds)
+            Assert.That(io.RemoteFetches, Is.EqualTo(1),
+                "A cold closed-task read needs one canonical fetch; eligibility and guidance must reuse that snapshot without a write or another fetch.")
+            Assert.That(response.Error.IsSome, Is.False, sprintf "%A" response.Error)
+            Assert.That(JsonSerializer.Deserialize<string>(response.Result.Value), Is.EqualTo("base"))
+            Assert.That(response.Instructions, Is.Empty)
+            Assert.That(response.AgentStateChanges, Is.Empty)
+            Assert.That(response.InboxActivation.IsNone, Is.True)
+            let closedInbox = ReviewWorkflow.getAgentInbox binding "ClosedOwner" |> success
+            Assert.That(closedInbox.Agent.State, Is.EqualTo("Ready"))
+            Assert.That(closedInbox.Focused.Value.Attempt.Phase, Is.EqualTo("Queued"))
+            let _, closedTask, _ = ReviewWorkflow.getTask binding "closed-task" |> success
+            Assert.That(closedTask.Lifecycle, Is.EqualTo("Closed"))
+            let after = LedgerStore.fetch binding |> success
+            Assert.That(after.Commit, Is.EqualTo(before.Commit),
+                "A read for a closed task must not create a lifecycle transition.")
+            Assert.That(git checkout [ "status"; "--porcelain" ], Is.Empty)
+        finally
+            if File.Exists config then File.Delete config
+            if File.Exists(config + ".lock") then File.Delete(config + ".lock")
+            Directory.Delete(root, true)
+
+
+    [<Test>]
+    let RequestSnapshotGenerationGuardsWorkingGuidanceReuse () =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-dispatch-snapshot-generation-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let remote = Path.Combine(root, "remote.git")
+        let checkout = Path.Combine(root, "project")
+        let config = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot checkout
+        try
+            git root [ "init"; "--bare"; "--initial-branch=main"; remote ] |> ignore
+            git root [ "clone"; remote; checkout ] |> ignore
+            git checkout [ "config"; "user.name"; "Dispatch Snapshot Test" ] |> ignore
+            git checkout [ "config"; "user.email"; "dispatch-snapshot@example.invalid" ] |> ignore
+            File.WriteAllText(Path.Combine(checkout, "source.txt"), "base")
+            git checkout [ "add"; "source.txt" ] |> ignore
+            git checkout [ "commit"; "-m"; "base" ] |> ignore
+            git checkout [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
+            let binding: LedgerBinding =
+                { RepositoryPath = checkout; RemoteName = "origin"
+                  ApprovedFetchUrl = remote; ApprovedPushUrl = remote
+                  ProjectId = Guid.NewGuid(); LedgerId = Guid.NewGuid(); Epoch = 1 }
+            LedgerStore.initialize binding true |> success |> ignore
+            ReviewWorkflow.registerAgent binding (Guid.NewGuid()) "Owner" |> success |> ignore
+            let before = LedgerStore.fetch binding |> success
+            let rt = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting "project" rt
+                binding.ProjectId binding.LedgerId binding.Epoch binding.RemoteName
+                binding.ApprovedFetchUrl binding.ApprovedPushUrl before.Commit true
+            |> success |> ignore
+            let target = Client.ProjectPaths.ProjectTarget.parse "project" |> success
+            let projectId = Client.ProjectPaths.ProjectTarget.projectId target
+            let command =
+                ReadFileCommand
+                    { ProjectName = "project"; FilePath = "source.txt"
+                      StartLine = None; EndLine = None; IncludeLineNumbers = None }
+            let requestGeneration =
+                Client.SignalR.Client.captureWorkingGuidanceGeneration rt target "Owner"
+            let requestLedgerSnapshot = LedgerStore.fetch binding |> success
+            let requestSnapshot =
+                Client.SignalR.Client.createRequestSnapshot target "Owner" requestGeneration DateTimeOffset.UtcNow (Ok(binding, requestLedgerSnapshot))
+            let guidance, warmIo =
+                LedgerStore.measureGitReads (fun () ->
+                    Client.SignalR.Client.checkWorkingGuidance rt "Owner" (Some target) (Some requestSnapshot) command)
+            Assert.That(warmIo.RemoteFetches, Is.EqualTo(0),
+                "A current request snapshot should supply guidance without another remote fetch.")
+            Assert.That(guidance, Is.Empty)
+
+            // An invalidation for another agent must not discard this snapshot.
+            let unrelatedSnapshot =
+                Client.SignalR.Client.createRequestSnapshot target "Owner" requestGeneration DateTimeOffset.UtcNow (Ok(binding, requestLedgerSnapshot))
+            Client.SignalR.Client.invalidateAgentStates rt "project" [| "Other" |]
+            let mutable usedUnrelatedSnapshot = false
+            let mutable unrelatedFallback = false
+            let unrelated =
+                Client.SignalR.Client.withCurrentRequestSnapshot rt projectId "Owner" (Some unrelatedSnapshot)
+                    (fun _ -> usedUnrelatedSnapshot <- true; Ok "snapshot")
+                    (fun () -> unrelatedFallback <- true; Ok "fallback")
+            Assert.That(unrelated, Is.EqualTo(Ok "snapshot" : Result<string, Client.EffectError>))
+            Assert.That(usedUnrelatedSnapshot, Is.True)
+            Assert.That(unrelatedFallback, Is.False)
+
+            // Invalidation during use must discard the result and take the fresh path.
+            let mutable postUseFallback = false
+            let duringUse =
+                Client.SignalR.Client.withCurrentRequestSnapshot rt projectId "Owner" (Some unrelatedSnapshot)
+                    (fun _ ->
+                        Client.SignalR.Client.invalidateAgentStates rt "project" [| "Owner" |]
+                        Ok "stale")
+                    (fun () -> postUseFallback <- true; Ok "fresh")
+            Assert.That(duringUse, Is.EqualTo(Ok "fresh" : Result<string, Client.EffectError>))
+            Assert.That(postUseFallback, Is.True)
+
+            let _, invalidatedIo =
+                LedgerStore.measureGitReads (fun () ->
+                    Client.SignalR.Client.checkWorkingGuidance rt "Owner" (Some target) (Some unrelatedSnapshot) command)
+            Assert.That(invalidatedIo.RemoteFetches, Is.EqualTo(1),
+                "A same-agent push must force a fresh canonical read instead of reusing the stale request snapshot.")
+
+            // A reconnect invalidates every agent generation.
+            let globalGeneration =
+                Client.SignalR.Client.captureWorkingGuidanceGeneration rt target "Owner"
+            let globalLedgerSnapshot = LedgerStore.fetch binding |> success
+            let globalSnapshot =
+                Client.SignalR.Client.createRequestSnapshot target "Owner" globalGeneration DateTimeOffset.UtcNow (Ok(binding, globalLedgerSnapshot))
+            Client.SignalR.Client.invalidateAllAgentStates rt
+            let mutable globalFallback = false
+            let globalResult =
+                Client.SignalR.Client.withCurrentRequestSnapshot rt projectId "Owner" (Some globalSnapshot)
+                    (fun _ -> Ok "stale")
+                    (fun () -> globalFallback <- true; Ok "fresh")
+            Assert.That(globalResult, Is.EqualTo(Ok "fresh" : Result<string, Client.EffectError>))
+            Assert.That(globalFallback, Is.True)
+
+            let after = LedgerStore.fetch binding |> success
+            Assert.That(after.Commit, Is.EqualTo(before.Commit),
+                "Cache generation changes must not mutate durable ledger state.")
+        finally
+            if File.Exists config then File.Delete config
+            if File.Exists(config + ".lock") then File.Delete(config + ".lock")
+            Directory.Delete(root, true)
+
+    [<Test>]
+    let RequestSnapshotObservationAgeGuardsWorkingGuidanceReuse () =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-dispatch-snapshot-age-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let remote = Path.Combine(root, "remote.git")
+        let checkout = Path.Combine(root, "project")
+        let config = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot checkout
+        try
+            git root [ "init"; "--bare"; "--initial-branch=main"; remote ] |> ignore
+            git root [ "clone"; remote; checkout ] |> ignore
+            git checkout [ "config"; "user.name"; "Dispatch Age Test" ] |> ignore
+            git checkout [ "config"; "user.email"; "dispatch-age@example.invalid" ] |> ignore
+            File.WriteAllText(Path.Combine(checkout, "source.txt"), "base")
+            git checkout [ "add"; "source.txt" ] |> ignore
+            git checkout [ "commit"; "-m"; "base" ] |> ignore
+            git checkout [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
+            let binding: LedgerBinding =
+                { RepositoryPath = checkout; RemoteName = "origin"
+                  ApprovedFetchUrl = remote; ApprovedPushUrl = remote
+                  ProjectId = Guid.NewGuid(); LedgerId = Guid.NewGuid(); Epoch = 1 }
+            LedgerStore.initialize binding true |> success |> ignore
+            ReviewWorkflow.registerAgent binding (Guid.NewGuid()) "Owner" |> success |> ignore
+            ReviewWorkflow.createTask binding (Guid.NewGuid()) "dispatch-age-task" "Dispatch age" |> success |> ignore
+            ReviewWorkflow.assignTask binding (Guid.NewGuid()) "dispatch-age-task" (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.activateReadyAgent binding (Guid.NewGuid()) "dispatch-age-task" "Owner"
+            |> success |> ignore
+            let verified = LedgerStore.fetch binding |> success
+            let agent = ReviewWorkflow.getAgentWorkingTurnAt binding verified "Owner" |> success
+            // Synthetic clock: t0 is 29 minutes into the observed Working turn.
+            // There is no two-minute sleep and no mutation of ledger timestamps.
+            let t0 = DateTimeOffset.Parse(agent.WorkingTurnStartedAtUtc).AddMinutes(29.)
+            let target = Client.ProjectPaths.ProjectTarget.parse "project" |> success
+            // The on-disk binding is shared; each runtime has its own cache.
+            let bindingRt = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting "project" bindingRt
+                binding.ProjectId binding.LedgerId binding.Epoch binding.RemoteName
+                binding.ApprovedFetchUrl binding.ApprovedPushUrl verified.Commit true
+            |> success |> ignore
+            let createRuntime () =
+                let rt = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+                let generation = Client.SignalR.Client.captureWorkingGuidanceGeneration rt target "Owner"
+                let snapshot = Client.SignalR.Client.createRequestSnapshot target "Owner" generation t0 (Ok(binding, verified))
+                rt, snapshot
+            let seededRt, seededSnapshot = createRuntime()
+            let emptyRt, emptySnapshot = createRuntime()
+            let failedRt, failedSnapshot = createRuntime()
+            let check rt snapshot now =
+                LedgerStore.measureGitReads (fun () ->
+                    Client.SignalR.Client.checkWorkingGuidanceAt now rt "Owner" (Some target) snapshot)
+            let immediate, immediateIo = check failedRt (Some failedSnapshot) t0
+            Assert.That(immediateIo.RemoteFetches, Is.Zero)
+            Assert.That(sprintf "%A" immediate, Does.Contain("SOFT STOP"))
+            let beforeExpiry, reuseIo = check seededRt (Some seededSnapshot) (t0.AddSeconds 119.)
+            Assert.That(reuseIo.RemoteFetches, Is.Zero)
+            Assert.That(sprintf "%A" beforeExpiry, Does.Contain("HARD STOP"))
+
+            // External writer changes canonical state without sending this runtime
+            // a push invalidation. Generation equality must not extend the TTL.
+            ReviewWorkflow.yieldAgent binding (Guid.NewGuid()) "dispatch-age-task" "Owner" 0 0 0
+                "External yield" "Resume" |> success |> ignore
+            let current = LedgerStore.fetch binding |> success
+            Assert.That(current.Commit, Is.Not.EqualTo(verified.Commit))
+            let expiry = t0.AddSeconds 120.
+            let seeded, seededIo = check seededRt (Some seededSnapshot) expiry
+            Assert.That(seededIo.RemoteFetches, Is.EqualTo(1),
+                "A cache seeded at t0+119s must expire at the original t0+120s.")
+            Assert.That(seeded, Is.Empty)
+            let direct, directIo = check emptyRt (Some emptySnapshot) expiry
+            Assert.That(directIo.RemoteFetches, Is.EqualTo(1),
+                "Even an empty cache must reject a generation-current snapshot at age 120s.")
+            Assert.That(direct, Is.Empty)
+
+            let mutable faulted = 0
+            let failed, _ =
+                LedgerStore.withGitTransportFaults (fun _ args ->
+                    match args with
+                    | "fetch" :: _ ->
+                        faulted <- faulted + 1
+                        Some { FaultExitCode = 128; FaultStderr = "Could not resolve host: fixture.invalid"; FaultTimedOut = false }
+                    | _ -> None)
+                    (fun () -> check failedRt (Some failedSnapshot) expiry)
+            Assert.That(faulted, Is.GreaterThan(0), "Expired guidance must try the authoritative read.")
+            Assert.That(failed, Is.Empty, "A failed refresh must not produce stale Working guidance.")
+            let retried, retryIo = check failedRt (Some failedSnapshot) expiry
+            Assert.That(retryIo.RemoteFetches, Is.EqualTo(1), "Failure must leave the next call retryable.")
+            Assert.That(retried, Is.Empty)
+            let warm, warmIo = check failedRt None (expiry.AddSeconds 1.)
+            Assert.That(warmIo.RemoteFetches, Is.Zero)
+            Assert.That(warm, Is.Empty)
+            Assert.That((LedgerStore.fetch binding |> success).Commit, Is.EqualTo(current.Commit),
+                "Guidance checks must not mutate durable lifecycle state.")
+        finally
+            if File.Exists config then File.Delete config
+            if File.Exists(config + ".lock") then File.Delete(config + ".lock")
+            Directory.Delete(root, true)
+
+// This module is replayed verbatim on the baseline for a nonblank executor
+// instruction read. It uses only public dispatch/ledger fixture APIs.
+module RepresentativeInstructionDispatchTests =
+    open System
+    open System.Diagnostics
+    open System.IO
+    open System.Text.Json
+    open System.Text.Json.Nodes
+    open Client.LedgerStore
+    open Client.ReviewWorkflow
+    open Client.RoleInstructions
+    open Common
+    open NUnit.Framework
+
+    let private success = function
+        | Ok value -> value
+        | Error error -> failwithf "Unexpected fixture result: %A" error
+
+    let private git directory args =
+        use proc = new Process()
+        proc.StartInfo.FileName <- "git"
+        proc.StartInfo.WorkingDirectory <- directory
+        proc.StartInfo.RedirectStandardOutput <- true
+        proc.StartInfo.RedirectStandardError <- true
+        args |> List.iter proc.StartInfo.ArgumentList.Add
+        if not (proc.Start()) then failwith "Could not start fixture Git."
+        let stdout = proc.StandardOutput.ReadToEndAsync()
+        let stderr = proc.StandardError.ReadToEndAsync()
+        if not (proc.WaitForExit(10000)) then
+            proc.Kill(true)
+            failwith "Fixture Git timed out."
+        if proc.ExitCode <> 0 then failwithf "Fixture Git failed: %s" (stderr.GetAwaiter().GetResult())
+        stdout.GetAwaiter().GetResult().Trim()
+
+    [<Test; NonParallelizable>]
+    let FullExplicitInstructionDispatchSuccessAndTransientFailure () =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-full-instruction-dispatch-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let remote = Path.Combine(root, "remote.git")
+        let checkout = Path.Combine(root, "project")
+        let config = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot checkout
+        try
+            git root [ "init"; "--bare"; "--initial-branch=main"; remote ] |> ignore
+            git root [ "clone"; remote; checkout ] |> ignore
+            git checkout [ "config"; "user.name"; "Full Dispatch Instructions Test" ] |> ignore
+            git checkout [ "config"; "user.email"; "full-dispatch@example.invalid" ] |> ignore
+            File.WriteAllText(Path.Combine(root, "AGENTS.md"), "workspace guidance")
+            File.WriteAllText(Path.Combine(checkout, "AGENTS.md"), "project guidance")
+            git checkout [ "add"; "AGENTS.md" ] |> ignore
+            git checkout [ "commit"; "-m"; "add dispatch guidance" ] |> ignore
+            git checkout [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
+            let binding: LedgerBinding =
+                { RepositoryPath = checkout; RemoteName = "origin"
+                  ApprovedFetchUrl = remote; ApprovedPushUrl = remote
+                  ProjectId = Guid.NewGuid(); LedgerId = Guid.NewGuid(); Epoch = 1 }
+            LedgerStore.initialize binding true |> success |> ignore
+            ReviewWorkflow.registerAgent binding (Guid.NewGuid()) "Owner" |> success |> ignore
+            RoleInstructions.createRole binding "AuthenticatedUser" (Guid.NewGuid()) "Worker"
+                "Implement task" "Role instructions for Owner." |> success |> ignore
+            RoleInstructions.attachRole binding "AuthenticatedUser" (Guid.NewGuid()) "Owner" "Worker" 0
+            |> success |> ignore
+            RoleInstructions.setAgentInstructions binding "AuthenticatedUser" (Guid.NewGuid()) "Owner" 1
+                "Individual instructions for Owner." |> success |> ignore
+            ReviewWorkflow.createTask binding (Guid.NewGuid()) "dispatch-task" "Dispatch" |> success |> ignore
+            ReviewWorkflow.assignTask binding (Guid.NewGuid()) "dispatch-task" (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let before = LedgerStore.fetch binding |> success
+            let rt = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting "project" rt
+                binding.ProjectId binding.LedgerId binding.Epoch binding.RemoteName
+                binding.ApprovedFetchUrl binding.ApprovedPushUrl before.Commit true
+            |> success |> ignore
+            let command =
+                GetAgentInstructionsCommand
+                    { ProjectName = "project"; AgentId = "Owner"; Directory = ""; Cursor = None }
+            let payload = JsonSerializer.Serialize command
+            let invoke () =
+                Client.SignalR.Client.executeAuthenticatedCommandWithChallengeWake
+                    rt payload "Owner" None false (fun _ _ -> ())
+                |> Async.AwaitTask |> Async.RunSynchronously
+            let measure label failRoleLookup =
+                let mutable failedFetches = 0
+                let sw = Stopwatch.StartNew()
+                let response, io =
+                    LedgerStore.measureGitReads (fun () ->
+                        LedgerStore.withGitTransportFaults (fun _ args ->
+                            match args with
+                            | "fetch" :: _ when failRoleLookup ->
+                                failedFetches <- failedFetches + 1
+                                Some { FaultExitCode = 128; FaultStderr = "Could not resolve host: fixture.invalid"; FaultTimedOut = false }
+                            | "fetch" :: _ -> System.Threading.Thread.Sleep(50); None
+                            | _ -> None) invoke)
+                sw.Stop()
+                TestContext.Progress.WriteLine(
+                    sprintf "full explicit instruction dispatch %s: git=%d fetches=%d faultedFetches=%d elapsedMs=%d"
+                        label io.ProcessStarts io.RemoteFetches failedFetches sw.ElapsedMilliseconds)
+                Assert.That(response.Error.IsSome, Is.False, sprintf "%A" response.Error)
+                response, io, failedFetches
+            let cold, coldIo, _ = measure "cold Ready" false
+            let afterCold = LedgerStore.fetch binding |> success
+            let warm, warmIo, _ = measure "warm Working" false
+            Assert.That(coldIo.RemoteFetches, Is.GreaterThan(0))
+            Assert.That(warmIo.RemoteFetches, Is.GreaterThan(0), "Role resolution is deliberately still authoritative on warm reads.")
+            Assert.That(cold.AgentStateChanges |> List.map (fun change -> change.AgentId), Is.EqualTo(box [ "Owner" ]))
+            Assert.That(warm.AgentStateChanges, Is.Empty)
+            Assert.That(cold.InboxActivation.IsNone, Is.True)
+            Assert.That(warm.InboxActivation.IsNone, Is.True)
+            Assert.That(cold.Instructions, Is.Empty)
+            Assert.That(warm.Instructions, Is.Empty)
+            Assert.That(cold.Result, Is.EqualTo(warm.Result))
+            Assert.That(afterCold.Commit, Is.Not.EqualTo(before.Commit))
+            let canonical = ReviewWorkflow.getAgentInbox binding "Owner" |> success
+            Assert.That(canonical.Agent.State, Is.EqualTo("Working"))
+            Assert.That(canonical.Focused.Value.Attempt.Phase, Is.EqualTo("Started"))
+            let expected = RoleInstructions.resolve binding "Owner" |> success
+            Assert.That(expected.SnapshotCommit, Is.EqualTo(afterCold.Commit))
+            Assert.That(expected.Documents |> List.map (fun layer -> layer.Scope), Is.EqualTo(box [ "role"; "agent" ]))
+            Assert.That(expected.Documents |> List.map (fun layer -> layer.Content),
+                Is.EqualTo(box [ "Role instructions for Owner."; "Individual instructions for Owner." ]))
+            use coldPage = JsonDocument.Parse(cold.Result.Value)
+            let local = coldPage.RootElement.GetProperty("AGENTS.md")
+            Assert.That(local.GetProperty(".").GetString(), Is.EqualTo("workspace guidance"))
+            Assert.That(local.GetProperty("project").GetString(), Is.EqualTo("project guidance"))
+            let actualLayers = JsonNode.Parse(coldPage.RootElement.GetProperty("instructionLayers").GetRawText())
+            Assert.That(JsonNode.DeepEquals(actualLayers, JsonSerializer.SerializeToNode expected), Is.True,
+                "All role/agent content, precedence, versions, source paths, blob and digest provenance must match canonical resolution.")
+            // Print comparable content separately from fixture-generated ledger/object IDs.
+            let normalized = actualLayers.DeepClone().AsObject()
+            normalized.Remove("SnapshotCommit") |> ignore
+            for doc in normalized["Documents"].AsArray() do
+                doc.AsObject().Remove("BlobOid") |> ignore
+            TestContext.Progress.WriteLine("full explicit normalized layers: " + normalized.ToJsonString())
+            // A healthy warm activation cache isolates the role lookup failure.
+            // No pre-dispatch activation error or lifecycle mutation is allowed.
+            let failed, _, faulted = measure "warm role unavailable" true
+            Assert.That(faulted, Is.GreaterThan(0))
+            Assert.That(failed.AgentStateChanges, Is.Empty)
+            Assert.That(failed.Instructions, Is.Empty, "Role lookup failure must not be mistaken for activation uncertainty.")
+            Assert.That(failed.InboxActivation.IsNone, Is.True)
+            use failedPage = JsonDocument.Parse(failed.Result.Value)
+            Assert.That(JsonNode.DeepEquals(
+                JsonNode.Parse(failedPage.RootElement.GetProperty("AGENTS.md").GetRawText()),
+                JsonNode.Parse(local.GetRawText())), Is.True)
+            let warning = failedPage.RootElement.GetProperty("instructionLayers")
+            Assert.That(warning.GetProperty("status").GetString(), Is.EqualTo("unavailable"))
+            Assert.That(warning.GetProperty("complete").GetBoolean(), Is.False)
+            Assert.That(warning.GetProperty("code").GetString(), Is.EqualTo("RemoteUnavailable"))
+            Assert.That(warning.GetProperty("message").GetString(), Does.Contain("NOT loaded"))
+            TestContext.Progress.WriteLine("full explicit role outage marker: " + warning.GetRawText())
+            let retry, retryIo, _ = measure "warm retry" false
+            Assert.That(retryIo.RemoteFetches, Is.GreaterThan(0))
+            Assert.That(retry.Result, Is.EqualTo(cold.Result))
+            Assert.That(retry.Instructions, Is.Empty)
+            Assert.That(retry.AgentStateChanges, Is.Empty)
+            Assert.That(retry.InboxActivation.IsNone, Is.True)
+            Assert.That((LedgerStore.fetch binding |> success).Commit, Is.EqualTo(afterCold.Commit),
+                "Only cold activation may change the durable head.")
+            Assert.That(git checkout [ "status"; "--porcelain" ], Is.Empty)
+        finally
+            if File.Exists config then File.Delete config
+            if File.Exists(config + ".lock") then File.Delete(config + ".lock")
+            Directory.Delete(root, true)

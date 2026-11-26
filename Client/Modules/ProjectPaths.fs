@@ -1,9 +1,11 @@
 module Client.ProjectPaths
 
 open System
+open System.Collections.Concurrent
 open System.IO
 open System.Diagnostics
 open System.Runtime.InteropServices
+open System.Threading
 open System.Threading.Tasks
 open Client
 open Client.Effect
@@ -109,25 +111,247 @@ let resolveWorkspacePath (parts: string seq) : IO<'rt, string> =
         | false -> return! Client.PermissionDenied "Path is outside workspace root." |> Effect.ofError
     }
 
+type private WorktreeCacheInvalidation() =
+    let mutable invalidated = 0
+
+    member _.Invalidate() = Interlocked.Exchange(&invalidated, 1) |> ignore
+    member _.IsInvalidated = Volatile.Read(&invalidated) <> 0
+
+type private WorktreeCacheEntry =
+    { Paths: string array
+      Watcher: FileSystemWatcher
+      Invalidation: WorktreeCacheInvalidation
+      Generation: int64 }
+
+type private WorktreeListing =
+    { Paths: string array
+      WasCacheHit: bool
+      Generation: int64 }
+
 // Reuse the bounded subprocess executor; this must finish even if Git exits
-// but a descendant retains its stdout/stderr file descriptors.
-module WorktreeGit =
-    let list (executable: string) (mainRoot: string) (timeout: TimeSpan) : Client.Result<string> =
-        BoundedProcess.run
-            { Executable = executable
-              Args = [ "worktree"; "list"; "--porcelain" ]
-              WorkingDirectory = mainRoot
-              Timeout = timeout
-              MaxOutputBytes = Some(1024 * 1024)
-              StandardInput = BoundedProcess.InheritInput
-              ExtraEnvironment = []
-              ConfigureStart = None }
-        |> Result.bind (fun result ->
-            if result.TimedOut then
-                Error(ValidationError "Git worktree discovery timed out.")
-            elif result.ExitCode <> 0 || result.StdOutTruncated || result.StdErrTruncated then
-                Error(ValidationError "Cannot inspect worktree registration.")
-            else Ok result.StdOut)
+// but a descendant retains its stdout/stderr file descriptors. Cache only the
+// registered paths consumed by ProjectPaths: HEAD, branch, dirty and detached
+// state are deliberately not cached or used as source/ref identity.
+module private WorktreeGit =
+    let private pathComparison =
+        if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal
+
+    let private pathComparer =
+        if OperatingSystem.IsWindows() then StringComparer.OrdinalIgnoreCase else StringComparer.Ordinal
+
+    let private cache = ConcurrentDictionary<string, WorktreeCacheEntry>(pathComparer)
+    let private gates = ConcurrentDictionary<string, obj>(pathComparer)
+    let mutable private nextGeneration = 0L
+
+    let private cacheKey (mainRoot: string) =
+        Path.TrimEndingDirectorySeparator(Path.GetFullPath mainRoot)
+
+    // A project may itself be a linked worktree. Resolve its common Git dir
+    // without spawning another Git process so the registration watcher is
+    // attached to the repository-wide worktrees directory in either layout.
+    let private tryCommonGitDirectory (mainRoot: string) =
+        try
+            let dotGit = Path.Combine(mainRoot, ".git")
+            if Directory.Exists dotGit then
+                let attributes = File.GetAttributes dotGit
+                if attributes.HasFlag FileAttributes.ReparsePoint then None
+                else Some(Path.GetFullPath dotGit)
+            elif File.Exists dotGit then
+                let attributes = File.GetAttributes dotGit
+                if attributes.HasFlag FileAttributes.ReparsePoint then None
+                else
+                    let contents = File.ReadAllText dotGit |> fun value -> value.Trim()
+                    if contents.StartsWith("gitdir: ", StringComparison.Ordinal) then
+                        let rawGitDirectory = contents.Substring("gitdir: ".Length)
+                        let gitDirectory =
+                            if Path.IsPathRooted rawGitDirectory then rawGitDirectory
+                            else Path.Combine(mainRoot, rawGitDirectory)
+                        let gitDirectory = Path.GetFullPath gitDirectory
+                        let commonDirectoryFile = Path.Combine(gitDirectory, "commondir")
+                        if File.Exists commonDirectoryFile then
+                            let rawCommonDirectory = File.ReadAllText commonDirectoryFile |> fun value -> value.Trim()
+                            let commonDirectory =
+                                if Path.IsPathRooted rawCommonDirectory then rawCommonDirectory
+                                else Path.Combine(gitDirectory, rawCommonDirectory)
+                            Some(Path.GetFullPath commonDirectory)
+                        else Some gitDirectory
+                    else None
+            else None
+        with _ -> None
+
+    let private tryCreateWatcher (mainRoot: string) =
+        try
+            match tryCommonGitDirectory mainRoot with
+            | None -> None
+            | Some commonGitDirectory ->
+                let registryDirectory = Path.Combine(commonGitDirectory, "worktrees")
+                if not (Directory.Exists registryDirectory) then None
+                else
+                    let attributes = File.GetAttributes registryDirectory
+                    if attributes.HasFlag FileAttributes.ReparsePoint then None
+                    else
+                        let invalidation = WorktreeCacheInvalidation()
+                        let watcher = new FileSystemWatcher(registryDirectory)
+                        try
+                            watcher.IncludeSubdirectories <- true
+                            watcher.NotifyFilter <-
+                                NotifyFilters.FileName ||| NotifyFilters.DirectoryName ||| NotifyFilters.LastWrite
+                            watcher.InternalBufferSize <- 32 * 1024
+
+                            let isRegistrationPath (path: string) =
+                                try
+                                    let fullPath = Path.GetFullPath path
+                                    let name = Path.GetFileName fullPath
+                                    let parent = Path.GetDirectoryName fullPath
+                                    let isDirectChild =
+                                        not (String.IsNullOrEmpty parent)
+                                        && String.Equals(
+                                            Path.TrimEndingDirectorySeparator parent,
+                                            Path.TrimEndingDirectorySeparator registryDirectory,
+                                            pathComparison
+                                        )
+                                    isDirectChild
+                                    || String.Equals(name, "gitdir", StringComparison.Ordinal)
+                                    || String.Equals(name, "commondir", StringComparison.Ordinal)
+                                with _ -> true
+
+                            let isMetadataPointer (path: string) =
+                                let name = Path.GetFileName path
+                                String.Equals(name, "gitdir", StringComparison.Ordinal)
+                                || String.Equals(name, "commondir", StringComparison.Ordinal)
+
+                            // HEAD/index/locked changes do not alter path membership. In
+                            // particular, commits and detach operations must not turn
+                            // ordinary path resolution back into a Git subprocess.
+                            watcher.Changed.Add(fun event ->
+                                if isMetadataPointer event.FullPath then invalidation.Invalidate())
+                            watcher.Created.Add(fun event ->
+                                if isRegistrationPath event.FullPath then invalidation.Invalidate())
+                            watcher.Deleted.Add(fun event ->
+                                if isRegistrationPath event.FullPath then invalidation.Invalidate())
+                            watcher.Renamed.Add(fun event ->
+                                if isRegistrationPath event.FullPath || isRegistrationPath event.OldFullPath then
+                                    invalidation.Invalidate())
+                            watcher.Error.Add(fun _ -> invalidation.Invalidate())
+                            watcher.EnableRaisingEvents <- true
+                            Some(watcher, invalidation)
+                        with _ ->
+                            try watcher.Dispose() with _ -> ()
+                            None
+        with _ -> None
+
+    let private disposeWatcher (watcher: FileSystemWatcher) =
+        try watcher.Dispose() with _ -> ()
+
+    let private removeCache key =
+        let mutable removed = Unchecked.defaultof<WorktreeCacheEntry>
+        if cache.TryRemove(key, &removed) then disposeWatcher removed.Watcher
+
+    let private tryCached key =
+        match cache.TryGetValue key with
+        | true entry when not entry.Invalidation.IsInvalidated ->
+            Some
+                { Paths = entry.Paths
+                  WasCacheHit = true
+                  Generation = entry.Generation }
+        | _ -> None
+
+    let private parsePaths (output: string) : Client.Result<string array> =
+        try
+            let paths =
+                output.Split('\000', StringSplitOptions.RemoveEmptyEntries)
+                |> Array.choose (fun field ->
+                    if field.StartsWith("worktree ", StringComparison.Ordinal) then
+                        let path = field.Substring("worktree ".Length)
+                        if String.IsNullOrWhiteSpace path || not (Path.IsPathFullyQualified path) then
+                            raise (InvalidDataException "Git returned an invalid worktree path.")
+                        Some(Path.GetFullPath path)
+                    else None)
+            Ok paths
+        with ex -> Error(ExceptionError ex)
+
+    let private discover executable mainRoot timeout key =
+        let rec run attempt =
+            let watcher = tryCreateWatcher mainRoot
+            let result =
+                BoundedProcess.run
+                    { Executable = executable
+                      Args = [ "worktree"; "list"; "--porcelain"; "-z" ]
+                      WorkingDirectory = mainRoot
+                      Timeout = timeout
+                      MaxOutputBytes = Some(1024 * 1024)
+                      StandardInput = BoundedProcess.InheritInput
+                      ExtraEnvironment = []
+                      ConfigureStart = None }
+                |> Result.bind (fun outcome ->
+                    if outcome.TimedOut then
+                        Error(ValidationError "Git worktree discovery timed out.")
+                    elif outcome.ExitCode <> 0 || outcome.StdOutTruncated || outcome.StdErrTruncated then
+                        Error(ValidationError "Cannot inspect worktree registration.")
+                    else parsePaths outcome.StdOut)
+
+            match result with
+            | Error error ->
+                watcher |> Option.iter (fun (instance, _) -> disposeWatcher instance)
+                Error error
+            | Ok paths ->
+                match watcher with
+                | Some(instance, invalidation) when invalidation.IsInvalidated ->
+                    disposeWatcher instance
+                    if attempt = 0 then run 1
+                    else Error(ValidationError "Git worktree registration changed during discovery.")
+                | Some(instance, invalidation) ->
+                    let generation = Interlocked.Increment(&nextGeneration)
+                    let entry =
+                        { Paths = paths
+                          Watcher = instance
+                          Invalidation = invalidation
+                          Generation = generation }
+                    cache[key] <- entry
+                    if invalidation.IsInvalidated then
+                        removeCache key
+                        if attempt = 0 then run 1
+                        else Error(ValidationError "Git worktree registration changed during discovery.")
+                    else
+                        Ok { Paths = paths; WasCacheHit = false; Generation = generation }
+                | None -> Ok { Paths = paths; WasCacheHit = false; Generation = 0L }
+
+        run 0
+
+    let list (executable: string) (mainRoot: string) (timeout: TimeSpan) : Client.Result<WorktreeListing> =
+        try
+            let key = cacheKey mainRoot
+            match tryCached key with
+            | Some listing -> Ok listing
+            | None ->
+                let gate = gates.GetOrAdd(key, fun _ -> obj())
+                lock gate (fun () ->
+                    match tryCached key with
+                    | Some listing -> Ok listing
+                    | None ->
+                        removeCache key
+                        discover executable mainRoot timeout key)
+        with ex -> Error(ExceptionError ex)
+
+    let isCurrent (mainRoot: string) (listing: WorktreeListing) =
+        if listing.Generation = 0L then true
+        else
+            try
+                let key = cacheKey mainRoot
+                match cache.TryGetValue key with
+                | true entry ->
+                    entry.Generation = listing.Generation && not entry.Invalidation.IsInvalidated
+                | _ -> false
+            with _ -> false
+
+    let invalidate (mainRoot: string) (listing: WorktreeListing) =
+        if listing.Generation <> 0L then
+            try
+                let key = cacheKey mainRoot
+                match cache.TryGetValue key with
+                | true entry when entry.Generation = listing.Generation -> entry.Invalidation.Invalidate()
+                | _ -> ()
+            with _ -> ()
 
 let private resolveRegisteredWorktree (mainRoot: string) (selector: string) : Client.Result<string> =
     if String.IsNullOrWhiteSpace selector
@@ -136,18 +360,17 @@ let private resolveRegisteredWorktree (mainRoot: string) (selector: string) : Cl
        || selector.Contains("..", StringComparison.Ordinal) then
         Error(Client.ValidationError "Invalid worktree selector.")
     else
-        match WorktreeGit.list "git" mainRoot (TimeSpan.FromSeconds 10.) with
-        | Error error -> Error error
-        | Ok output ->
+        let resolve (listing: WorktreeListing) =
             try
                 let comparison = if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal
                 let matches =
-                    output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                    |> Array.choose (fun line ->
-                        if line.StartsWith("worktree ", StringComparison.Ordinal) then
-                            let path = Path.GetFullPath(line.Substring("worktree ".Length).TrimEnd('\r'))
-                            if String.Equals(Path.GetFileName(Path.TrimEndingDirectorySeparator(path)), selector, comparison) then Some path else None
-                        else None)
+                    listing.Paths
+                    |> Array.filter (fun path ->
+                        String.Equals(
+                            Path.GetFileName(Path.TrimEndingDirectorySeparator(path)),
+                            selector,
+                            comparison
+                        ))
                 match matches with
                 | [| path |] when Directory.Exists(path) ->
                     let rec containsLink (dir: DirectoryInfo) =
@@ -156,10 +379,30 @@ let private resolveRegisteredWorktree (mainRoot: string) (selector: string) : Cl
                         else containsLink dir.Parent
                     if containsLink (DirectoryInfo(path)) then
                         Error(Client.PermissionDenied "Worktree path contains a symbolic link.")
+                    elif not (WorktreeGit.isCurrent mainRoot listing) then
+                        Error(Client.ValidationError "Git worktree registration changed during resolution.")
                     else Ok path
                 | [||] -> Error(Client.NotFoundError "Unknown Git-registered worktree selector.")
                 | _ -> Error(Client.ValidationError "Ambiguous worktree selector.")
             with ex -> Error(Client.ExceptionError ex)
+
+        match WorktreeGit.list "git" mainRoot (TimeSpan.FromSeconds 10.) with
+        | Error error -> Error error
+        | Ok listing ->
+            match resolve listing with
+            | Ok path -> Ok path
+            | Error error when listing.WasCacheHit || not (WorktreeGit.isCurrent mainRoot listing) ->
+                // A cache hit is only a hint. Re-discover when the selector is
+                // absent/ambiguous or its registered path no longer validates;
+                // a failed refresh never falls back to stale cached paths.
+                WorktreeGit.invalidate mainRoot listing
+                match WorktreeGit.list "git" mainRoot (TimeSpan.FromSeconds 10.) with
+                | Error refreshError -> Error refreshError
+                | Ok refreshed ->
+                    match resolve refreshed with
+                    | Error _ when not (WorktreeGit.isCurrent mainRoot refreshed) ->
+                        Error(Client.ValidationError "Git worktree registration changed during resolution.")
+                    | result -> result
 
 let resolveProjectContextForTarget (target: ProjectTarget) : IO<'rt, ResolvedProject> =
     effect {

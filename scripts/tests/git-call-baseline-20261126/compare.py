@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -45,7 +46,7 @@ def run(command: list[str], cwd: Path, *, env: dict[str, str] | None = None,
                               stdout=output, stderr=subprocess.STDOUT)
 
 
-def verify_trx(path: Path, label: str) -> None:
+def verify_trx(path: Path, label: str, filters: list[str]) -> None:
     if not path.is_file():
         raise RuntimeError(f"{label}: dotnet test did not produce its TRX result file: {path}")
     root = ET.parse(path).getroot()
@@ -62,6 +63,19 @@ def verify_trx(path: Path, label: str) -> None:
         raise RuntimeError(f"{label}: filter matched no executed tests ({total=}, {executed=})")
     if failed:
         raise RuntimeError(f"{label}: {failed} test(s) failed in {path}")
+    definitions = {}
+    for node in root.iter():
+        if node.tag.rsplit("}", 1)[-1] == "UnitTest":
+            method = next((child for child in node if child.tag.rsplit("}", 1)[-1] == "TestMethod"), None)
+            if method is not None:
+                definitions[node.attrib["id"]] = method.attrib["className"] + "." + method.attrib["name"]
+    passed_names = [definitions[node.attrib["testId"]] for node in root.iter()
+                    if node.tag.rsplit("}", 1)[-1] == "UnitTestResult"
+                    and node.attrib.get("outcome") == "Passed"]
+    for test_filter in filters:
+        prefix = "FullyQualifiedName~"
+        if not test_filter.startswith(prefix) or not any(test_filter[len(prefix):] in name for name in passed_names):
+            raise RuntimeError(f"{label}: no passed executed test for {test_filter!r}")
 
 
 def git(repo: Path, *args: str) -> str:
@@ -71,13 +85,10 @@ def git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def install_harness(source_root: Path, target_root: Path) -> None:
-    source = source_root / HARNESS_FILE
+def install_harness(harness_bytes: bytes, target_root: Path) -> None:
     target = target_root / HARNESS_FILE
-    if not source.is_file():
-        raise FileNotFoundError(source)
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, target)
+    target.write_bytes(harness_bytes)
 
     project = target_root / PROJECT_FILE
     tree = ET.parse(project, parser=ET.XMLParser(target=ET.TreeBuilder(insert_comments=True)))
@@ -119,14 +130,14 @@ def parse_reports(directory: Path, expected_sha: str) -> dict[str, dict[str, Any
 
 
 def run_source(source_root: Path, temp_root: Path, label: str, sha: str,
-               include_focused: bool) -> tuple[dict[str, dict[str, Any]], Path]:
+               include_focused: bool, harness_bytes: bytes) -> tuple[dict[str, dict[str, Any]], Path]:
     worktree = temp_root / label
     add = run(["git", "worktree", "add", "--detach", str(worktree), sha], source_root)
     if add.returncode:
         raise RuntimeError(f"Could not create {label} worktree at {sha}:\n{add.stdout}")
 
     try:
-        install_harness(source_root, worktree)
+        install_harness(harness_bytes, worktree)
         report_dir = temp_root / "reports" / label
         log_dir = temp_root / "logs" / label
         report_dir.mkdir(parents=True, exist_ok=True)
@@ -138,7 +149,7 @@ def run_source(source_root: Path, temp_root: Path, label: str, sha: str,
         if include_focused:
             filters.extend(FOCUSED_FILTERS)
 
-        for index, test_filter in enumerate(filters):
+        for index, test_filter in enumerate(["|".join(filters)]):
             command = [
                 "dotnet", "test", str(PROJECT_FILE), "-c", "Release", "-m:1",
                 "--filter", test_filter,
@@ -156,7 +167,7 @@ def run_source(source_root: Path, temp_root: Path, label: str, sha: str,
                 )
 
             trx_path = temp_root / "trx" / label / str(index) / f"{label}-{index}.trx"
-            verify_trx(trx_path, f"{label} filter {test_filter!r}")
+            verify_trx(trx_path, f"{label} filter {test_filter!r}", filters)
         return parse_reports(report_dir, sha), worktree
     except Exception:
         run(["git", "worktree", "remove", "--force", str(worktree)], source_root)
@@ -174,8 +185,10 @@ def metric(report: dict[str, Any], path: str, default: Any = 0) -> Any:
 
 def compare_field(before: dict[str, Any], after: dict[str, Any],
                   report: str, field: str) -> list[str]:
-    left = before.get(report, {}).get(field)
-    right = after.get(report, {}).get(field)
+    if field not in before.get(report, {}) or field not in after.get(report, {}):
+        return [f"FAIL {report}.{field}: missing required evidence"]
+    left = before[report][field]
+    right = after[report][field]
     if left == right:
         return []
     return [f"FAIL {report}.{field}: {left!r} -> {right!r}"]
@@ -203,25 +216,31 @@ def compare_reports(before: dict[str, dict[str, Any]],
 
     semantic_fields = [
         ("agent-inbox", "inboxResultClass"),
-        ("agent-inbox", "inboxPayloadSha256"),
+        ("agent-inbox", "inboxSemanticSha256"),
+        ("agent-inbox", "snapshotMatchesCanonicalRef"),
         ("agent-inbox", "taskOverviewResultClass"),
-        ("agent-inbox", "taskOverviewPayloadSha256"),
+        ("agent-inbox", "taskOverviewSemanticSha256"),
         ("agent-inbox", "invalidAgentResultClass"),
         ("agent-inbox", "canonicalRef"),
-        ("agent-inbox", "canonicalNormalizedTreeSha256"),
+        ("agent-inbox", "invalidAgentGitProcessStarts"),
         ("uncertain-publication", "initialResultClass"),
         ("uncertain-publication", "recoveryResultClass"),
         ("uncertain-publication", "recoveryReceiptFound"),
-        ("uncertain-publication", "recoveryReceiptSha256"),
+        ("uncertain-publication", "recoveryReceiptSemanticSha256"),
+        ("uncertain-publication", "receiptAndSnapshotVerified"),
+        ("uncertain-publication", "replayRefUnchanged"),
+        ("uncertain-publication", "conflictRefUnchanged"),
         ("uncertain-publication", "recoveredTaskSha256"),
         ("uncertain-publication", "replayResultClass"),
         ("uncertain-publication", "changedRequestResultClass"),
         ("uncertain-publication", "canonicalRef"),
-        ("uncertain-publication", "canonicalNormalizedTreeSha256"),
         ("worktree-discovery", "actualIdentitySha256"),
+        ("worktree-discovery", "actualHeadVerified"),
         ("worktree-discovery", "actualWorktreeCount"),
         ("controlled-transport-delay", "uploadPackWrapperInvocations"),
-        ("controlled-transport-cancellation", "pinnedSnapshotCommit"),
+        ("controlled-transport-cancellation", "pinnedSnapshotAndBlobVerified"),
+        ("controlled-transport-cancellation", "canonicalRefUnchanged"),
+        ("controlled-transport-cancellation", "pinnedReadResultClass"),
         ("controlled-transport-cancellation", "pinnedReadRemoteFetches"),
         ("controlled-transport-cancellation", "delayedFetchRemoteFetches"),
         ("controlled-transport-cancellation", "cancelledFetchResultClass"),
@@ -247,7 +266,7 @@ def compare_reports(before: dict[str, dict[str, Any]],
             if left.get(path) != right.get(path)
         }
         only_to_unknown = bool(differences) and all(
-            "unknown" in pair for pair in differences.values()
+            pair[0] in {"clean", "dirty"} and pair[1] == "unknown" for pair in differences.values()
         )
         if allow_cleanliness_unknown and only_to_unknown:
             notes.append(f"INFO Worktree IsClean changed only to unknown: {differences}")
@@ -255,6 +274,17 @@ def compare_reports(before: dict[str, dict[str, Any]],
             failures.append(f"FAIL worktree full payload changed: {differences}")
 
     for label, reports in (("baseline", before), ("candidate", after)):
+        for scenario, fields in {
+            "agent-inbox": ("snapshotMatchesCanonicalRef",),
+            "uncertain-publication": ("receiptAndSnapshotVerified", "replayRefUnchanged", "conflictRefUnchanged"),
+            "worktree-discovery": ("actualHeadVerified",),
+            "controlled-transport-cancellation": ("pinnedSnapshotAndBlobVerified", "canonicalRefUnchanged"),
+        }.items():
+            for field in fields:
+                if reports[scenario].get(field) is not True:
+                    failures.append(f"FAIL {label}: {scenario}.{field} was not verified")
+        if reports["agent-inbox"].get("invalidAgentGitProcessStarts") != 0:
+            failures.append(f"FAIL {label}: malformed inbox ID performed Git work")
         delay = reports["controlled-transport-delay"]
         if delay.get("uploadPackWrapperInvocations", 0) < 1:
             failures.append(f"FAIL {label}: controlled upload-pack delay was not exercised")
@@ -344,16 +374,19 @@ def main() -> int:
         git(repo, "rev-parse", "--verify", f"{sha}^{{commit}}")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    harness_bytes = (repo / HARNESS_FILE).read_bytes()
+    harness_sha = hashlib.sha256(harness_bytes).hexdigest()
     temp_root = Path(tempfile.mkdtemp(prefix="jarvis-git-call-compare-"))
+    (temp_root / "harness.fs").write_bytes(harness_bytes)
     worktrees: list[Path] = []
     successful = False
     try:
         baseline, baseline_worktree = run_source(
-            repo, temp_root, "baseline", args.baseline_sha, args.include_focused_suite
+            repo, temp_root, "baseline", args.baseline_sha, args.include_focused_suite, harness_bytes
         )
         worktrees.append(baseline_worktree)
         candidate, candidate_worktree = run_source(
-            repo, temp_root, "candidate", args.candidate_sha, args.include_focused_suite
+            repo, temp_root, "candidate", args.candidate_sha, args.include_focused_suite, harness_bytes
         )
         worktrees.append(candidate_worktree)
 
@@ -368,6 +401,7 @@ def main() -> int:
             print(failure)
 
         combined = {
+            "harnessSha256": harness_sha,
             "baselineSha": args.baseline_sha,
             "candidateSha": args.candidate_sha,
             "semanticEquivalent": not failures,
@@ -379,6 +413,7 @@ def main() -> int:
         (args.output_dir / "comparison.json").write_text(
             json.dumps(combined, indent=2, sort_keys=True), encoding="utf-8"
         )
+        shutil.copy2(temp_root / "harness.fs", args.output_dir / "harness.fs")
         for name in ("reports", "logs", "trx"):
             source = temp_root / name
             if source.exists():
@@ -389,7 +424,6 @@ def main() -> int:
     finally:
         for worktree in reversed(worktrees):
             run(["git", "worktree", "remove", "--force", str(worktree)], repo)
-        run(["git", "worktree", "prune"], repo)
         if successful:
             shutil.rmtree(temp_root, ignore_errors=True)
         else:

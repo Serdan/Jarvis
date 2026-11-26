@@ -6,14 +6,18 @@ open System.IO
 open System.Text.Json
 open NUnit.Framework
 open Common
+open Client
+open Client.ConsoleTui
+open Client.OrchestrationApi
 open Client.LedgerStore
 open Client.ReviewWorkflow
 open Client.ChallengeWorkflow
 open Client.AutomationJobTerminalWake
+open Client.WorkQueueReactiveWake
 
 module Durable = Client.BoundedProcess.DurableJobs
 
-[<TestFixture>]
+[<TestFixture; NonParallelizable>]
 type JobWakeTests() =
     let ok = function
         | Ok value -> value
@@ -36,6 +40,8 @@ type JobWakeTests() =
     let withFixture action =
         let root = Path.Combine(Path.GetTempPath(), "jarvis-job-wake-" + Guid.NewGuid().ToString("N"))
         Directory.CreateDirectory(root) |> ignore
+        let priorXdg = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+        Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", Path.Combine(root, "config"))
         try
             let bare, repo, jobs = Path.Combine(root, "remote.git"), Path.Combine(root, "repo"), Path.Combine(root, "jobs")
             git root ["init"; "--bare"; bare] |> ignore
@@ -55,6 +61,7 @@ type JobWakeTests() =
                 ReviewWorkflow.registerAgent binding (Guid.NewGuid()) agent |> ok |> ignore
             action jobs binding
         finally
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", priorXdg)
             Directory.Delete(root, true)
 
     let createJob jobs project actor =
@@ -292,3 +299,143 @@ type JobWakeTests() =
                     [definition "Worker A" "A"; definition "Worker A" "B"] with
             | Error(ReviewAccessDenied _) -> ()
             | other -> Assert.Fail(sprintf "Original job condition split: %A" other))
+
+    [<TestCase(false)>]
+    [<TestCase(true)>]
+    member _.RegisteredRuntimeUsesAuthenticatedCommitAndRecoversLostWake(restart: bool) =
+        withFixture (fun jobs binding ->
+            let runtime = Runtime(Path.GetDirectoryName jobs, ConsoleTui(), FullTrust)
+            let head = (LedgerStore.fetch binding |> ok).Commit
+            LedgerBindingConfig.bindExisting "repo" runtime binding.ProjectId binding.LedgerId binding.Epoch
+                "origin" binding.ApprovedFetchUrl binding.ApprovedPushUrl head true |> ok |> ignore
+            let load name = LedgerBindingConfig.load name runtime
+            Client.RoleInstructions.RoleInstructions.setLaunchTemplate binding "fixture" (Guid.NewGuid()) 0
+                "Agent {{agentId}}, project {{projectName}}. Call inbox." |> ok |> ignore
+            let directory, request = createJob jobs "repo" (Some "Worker A")
+            let task, attempt = startTask binding
+            let create: ChallengeWriteCommand =
+                { ProjectName = "repo"; ActorId = "Worker A"; OperationId = Guid.NewGuid().ToString("D")
+                  Action = "Create"; ChallengeId = ""; ConditionId = ""; ExpectedVersion = 0
+                  Title = "Original job"; TaskId = task; AttemptId = ""; DependencyChallengeIds = []
+                  ExpectedTaskVersion = 0; ExpectedAttemptVersion = 0; ExpectedAgentVersion = 0
+                  AssignmentGeneration = 0
+                  Conditions = [{ OwnerKind = "Agent"; OwnerAgentId = "Worker A"; SuggestedAgentId = ""
+                                  Description = JobTerminalCondition.describe(Guid.Parse request.JobId) }]
+                  Evidence = ""; Reason = ""; Outcome = ""; NewOwnerAgentId = ""; Subscribe = false }
+            let execute actor cmd callback =
+                let wire = JsonSerializer.Serialize<AgentCommand>(ChallengeWriteCommand cmd)
+                Client.SignalR.Client.executeAuthenticatedCommandWithChallengeWake runtime wire actor None false callback
+                |> fun pending -> pending.GetAwaiter().GetResult()
+            let mutable callbacks = 0
+            let mutable sends = 0
+            use sent = new System.Threading.ManualResetEventSlim(false)
+            use invalidated = new System.Threading.ManualResetEventSlim(false)
+            let sendPorts: Client.ScheduledReadyResume.ExecutionPorts =
+                { ReadLimits = fun _ _ -> Ok Client.ScheduledReadyResume.disabled
+                  CanSend = fun _ -> System.Threading.Tasks.Task.FromResult(Ok true)
+                  Send = fun prepared ->
+                    Assert.That(prepared.Ready.Generation, Is.EqualTo(2))
+                    System.Threading.Interlocked.Increment(&sends) |> ignore
+                    sent.Set()
+                    System.Threading.Tasks.Task.FromResult(Ok "fixture") }
+            let ports: Client.WorkQueueSchedulerHostLoop.SchedulerHostPorts =
+                { ReadVerifiedHeads = fun () -> Ok { AccountHead = "fixture-only"; ProjectHead = (LedgerStore.fetch binding |> ok).Commit }
+                  Wake = fun _ ->
+                    Client.ScheduledReadyResume.executeOnce sendPorts binding "fixture" "repo" "launchAgent.js" "script-sha" "route-sha"
+                    |> fun t -> t.GetAwaiter().GetResult() |> ignore
+                    WorkWakeResult.Disabled
+                  Report = ignore
+                  Delay = fun _ ct -> System.Threading.Tasks.Task.Delay(System.Threading.Timeout.Infinite, ct) }
+            use scheduler = new Client.WorkQueueSchedulerHostLoop.WorkQueueSchedulerHostLoop.Host(ports, enabled = true)
+            let invalidate _ ids =
+                if Array.contains "Worker A" ids then invalidated.Set()
+            let runRegistration () =
+                new RuntimeRegistration(true, (fun () -> jobs), load, scheduler,
+                    (fun _ _ -> failwith "fixture lost fast-path wake"), invalidate, ignore)
+            let registerAndBlock (registration: RuntimeRegistration) =
+                let callback cmd receipt =
+                    callbacks <- callbacks + 1
+                    registration.OnChallengeCommit(cmd, receipt)
+                let created = execute "Worker A" create callback
+                Assert.That(created.Error.IsNone, Is.True, sprintf "%A" created.Error)
+                Assert.That(callbacks, Is.EqualTo(1))
+                let id = Guid.Parse(create.OperationId).ToString("N")
+                let replay = execute "Worker A" create callback
+                Assert.That(replay.Error.IsNone, Is.True, sprintf "%A" replay.Error)
+                Assert.That(callbacks, Is.EqualTo(1))
+                let _, taskRecord, maybeAttempt = ReviewWorkflow.getTask binding task |> ok
+                let agent = (ReviewWorkflow.getAgentInbox binding "Worker A" |> ok).Agent
+                let blocked = { create with Action = "BlockAttempt"; OperationId = Guid.NewGuid().ToString("D")
+                                            AttemptId = attempt; Conditions = []; DependencyChallengeIds = [id]
+                                            ExpectedTaskVersion = taskRecord.Version; ExpectedAttemptVersion = maybeAttempt.Value.Version
+                                            ExpectedAgentVersion = agent.Version; AssignmentGeneration = 1; Reason = "Waiting" }
+                let response = execute "Worker A" blocked callback
+                Assert.That(response.Error.IsNone, Is.True, sprintf "%A" response.Error)
+                Assert.That(callbacks, Is.EqualTo(2))
+                Assert.That((execute "Worker B" { create with OperationId = Guid.NewGuid().ToString("D") } callback).Error.IsSome, Is.True)
+                Assert.That(callbacks, Is.EqualTo(2))
+                Assert.That((ReviewWorkflow.getAgentInbox binding "Worker A" |> ok).Agent.State, Is.EqualTo("NeedsWork"))
+            if restart then
+                do
+                    use registration = runRegistration()
+                    registerAndBlock registration
+                publish directory request JobStatus.Canceled true
+                let result = reconcile true jobs load (fun _ _ -> failwith "lost after canonical commit")
+                Assert.That(result.Committed, Is.EqualTo(1))
+                use registration = runRegistration()
+                registration.OnConnected()
+                Assert.That(sent.Wait(TimeSpan.FromSeconds 20.), Is.True)
+                registration.OnInvalidated()
+            else
+                use registration = runRegistration()
+                registerAndBlock registration
+                registration.OnConnected()
+                publish directory request (JobStatus.FailedToStart "fixture") true
+                Assert.That(invalidated.Wait(TimeSpan.FromSeconds 20.), Is.True)
+                Assert.That(sent.Wait(TimeSpan.FromSeconds 20.), Is.True)
+                registration.OnConnected()
+            scheduler.StopAsync().GetAwaiter().GetResult()
+            Assert.That(sends, Is.EqualTo(1))
+            Assert.That((ReviewWorkflow.getAgentInbox binding "Worker A" |> ok).RunnableQueue.Head.Attempt.AssignmentGeneration,
+                        Is.EqualTo(2)))
+
+    [<Test>]
+    member _.EvictedTerminalReceiptLeavesCanonicalWaitHeld() =
+        withFixture (fun jobs binding ->
+            let directory, request = createJob jobs "Fixture" (Some "Worker A")
+            let task, attempt = startTask binding
+            let challenge = register binding task request.JobId
+            block binding task attempt challenge |> ok |> ignore
+            publish directory request (JobStatus.Completed 0) true
+            Assert.That(Durable.tryPrune directory, Is.True)
+            let head = (LedgerStore.fetch binding |> ok).Commit
+            Assert.That((run jobs binding noCallback).Committed, Is.Zero)
+            Assert.That((LedgerStore.fetch binding |> ok).Commit, Is.EqualTo(head))
+            Assert.That((ReviewWorkflow.getAgentInbox binding "Worker A" |> ok).Agent.State, Is.EqualTo("NeedsWork")))
+
+    [<Test>]
+    member _.RuntimeRegistrationOffNeverOpensRegistryOrStartsScheduler() =
+        let ports: Client.WorkQueueSchedulerHostLoop.SchedulerHostPorts =
+            { ReadVerifiedHeads = fun () -> failwith "off head read"
+              Wake = fun _ -> failwith "off wake"
+              Report = ignore
+              Delay = fun _ _ -> failwith "off timer" }
+        use scheduler = new Client.WorkQueueSchedulerHostLoop.WorkQueueSchedulerHostLoop.Host(ports)
+        use registration = new RuntimeRegistration(false, (fun () -> failwith "off root"),
+                                    (fun _ -> failwith "off binding"), scheduler, noCallback,
+                                    (fun _ _ -> failwith "off invalidation"), ignore)
+        registration.OnConnected()
+        registration.OnInvalidated()
+        Assert.That(scheduler.IsRunning, Is.False)
+
+    [<Test>]
+    member _.ProgramRegistersTheSameDefaultOffRuntime() =
+        let source = File.ReadAllText(Path.GetFullPath(Path.Combine(__SOURCE_DIRECTORY__, "../../Client/Program.fs")))
+        Assert.That(source, Does.Contain("let challengeWakeEnabled = false"))
+        Assert.That(source, Does.Contain("BoundedProcess.DurableJobs.root workspace"))
+        Assert.That(source, Does.Contain("new AutomationJobTerminalWake.RuntimeRegistration("))
+        Assert.That(source, Does.Contain("jobWake.OnChallengeCommit(cmd, receipt)"))
+        Assert.That(source, Does.Contain("jobWake.OnConnected()"))
+        Assert.That(source, Does.Contain("jobWake.OnInvalidated()"))
+        Assert.That(source.IndexOf("(jobWake :> IDisposable).Dispose()", StringComparison.Ordinal),
+                    Is.LessThan(source.IndexOf("do! challengeHost.StopAsync()", StringComparison.Ordinal)))

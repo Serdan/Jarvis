@@ -279,3 +279,50 @@ type Host(enabled: bool, root: string,
                     jobWatches.Clear()
                     cancel.Dispose()
                     signal.Dispose()
+
+/// Compose the accepted job observer with the registered canonical Challenge
+/// scheduler host. The existing host owns wake admission and recovery scans.
+/// A failed fast-path hint never changes the committed operation's outcome.
+type RuntimeRegistration(enabled: bool, root: unit -> string,
+                         loadBinding: string -> Result<LedgerBinding, Client.EffectError>,
+                         scheduler: Client.WorkQueueSchedulerHostLoop.WorkQueueSchedulerHostLoop.Host,
+                         deliverChallenge: ChallengeWriteCommand -> OperationResponse.Presented -> unit,
+                         invalidate: string -> string array -> unit,
+                         report: string -> unit) =
+    let safeReport message = try report message with _ -> ()
+    let catchup () =
+        if enabled then
+            scheduler.Notify Client.WorkQueueReactiveWake.WorkWakeTrigger.ManualReconcile |> ignore
+    let deliverTerminal (cmd: ChallengeWriteCommand) (receipt: OperationResponse.Presented) =
+        // Internal writes bypass the SignalR command response, so invalidate
+        // the same local caches explicitly. Reconnect invalidates all caches.
+        try invalidate cmd.ProjectName (List.toArray receipt.changedAgentIds)
+        with ex -> safeReport ("Job wake cache invalidation held: " + ex.Message)
+        try deliverChallenge cmd receipt
+        finally catchup()
+    let jobs =
+        if enabled then Some(new Host(true, root(), loadBinding, deliverTerminal, report))
+        else None
+    let notifyJobs () = jobs |> Option.iter (fun host -> host.Notify() |> ignore)
+    member _.OnChallengeCommit(cmd: ChallengeWriteCommand, receipt: OperationResponse.Presented) =
+        if enabled then
+            match cmd.Action with
+            | "Create" | "BlockAttempt" ->
+                notifyJobs()
+                catchup()
+            | "Resolve" when cmd.Outcome = "Satisfied" ->
+                try deliverChallenge cmd receipt
+                finally catchup()
+            | _ -> ()
+    member _.OnConnected() =
+        if enabled then
+            scheduler.Start() |> ignore
+            notifyJobs()
+            catchup()
+    member _.OnInvalidated() =
+        if enabled then
+            notifyJobs()
+            catchup()
+    interface IDisposable with
+        member _.Dispose() =
+            jobs |> Option.iter (fun host -> (host :> IDisposable).Dispose())

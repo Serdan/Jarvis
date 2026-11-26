@@ -610,7 +610,7 @@ let recurringLegacyLauncherUsesCanonicalProjectOptIn () =
                 advance 6.
                 do! finish pending "created-unrelated"
                 let _, error = waitOccurrence "unrelated" ""
-                Assert.That(error, Is.Empty, "Unrelated scheduled script must still execute while Automation is off.")
+                Assert.That(error, Is.EqualTo("completed: "), "Unrelated scheduled script must still execute while Automation is off.")
                 service.Cancel("unrelated") |> good |> ignore
                 let pending = socketReceive socket
                 Volatile.Write(&raceArmed, 1)
@@ -625,7 +625,7 @@ let recurringLegacyLauncherUsesCanonicalProjectOptIn () =
                 advance 60.
                 do! finish pending "created-legacy"
                 let _, error = waitOccurrence "legacy-a" off
-                Assert.That(error, Is.Empty, "Re-enable must allow next occurrence using canonical main policy for worktree.")
+                Assert.That(error, Is.EqualTo("completed: "), "Re-enable must allow next occurrence using canonical main policy for worktree.")
             }).GetAwaiter().GetResult()
         finally
             Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", prior))

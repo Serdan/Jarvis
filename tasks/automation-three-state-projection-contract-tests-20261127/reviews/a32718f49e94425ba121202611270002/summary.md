@@ -1,0 +1,1 @@
+Isolated three-state lifecycle contract oracle and generated negative-space traces. Release command: dotnet run --project tests/AutomationThreeStateContract20261127/AutomationThreeStateContract.fsproj -c Release; exit 0, 448 states, 233765 assertions. No production changes; model only, real registered routes remain downstream verification. Checkpoint 18275.

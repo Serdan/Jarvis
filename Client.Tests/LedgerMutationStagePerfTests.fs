@@ -132,6 +132,53 @@ type LedgerMutationStagePerfTests() =
             TestContext.Progress.WriteLine("Perf3: all four routine write paths measured against disposable local bare Git"))
 
     [<Test>]
+    member _.TransactionChecksMultipleExactVersionsInOneTreeRead() =
+        withDisposableLedger (fun first second ->
+            let intent () : LedgerIntent =
+                { OperationId = Guid.NewGuid(); Actor = "Perf3Owner"
+                  Kind = "ExactVersionFixture"; RequestJson = "{}" }
+            let change path expected content : LedgerFileChange =
+                { Path = path; ExpectedBlobOid = expected; Content = content }
+            let firstPath, secondPath, newPath =
+                "records/exact/a.json", "records/exact/b.json", "records/exact/c.json"
+            let seed = intent ()
+            LedgerStore.transact first seed (fun _ ->
+                Ok [ change firstPath None "first"; change secondPath None "second" ])
+            |> good |> ignore
+            let pinned = LedgerStore.fetch second |> good
+            let _, firstOid = LedgerStore.readAt second pinned firstPath |> good
+            let _, secondOid = LedgerStore.readAt second pinned secondPath |> good
+            let changes =
+                [ change secondPath secondOid "updated-b"; change newPath None "new-c"
+                  change firstPath firstOid "updated-a" ]
+            let calls = ResizeArray<string list>()
+            let capture _ args = calls.Add args; None
+            let update = intent ()
+            let write =
+                LedgerStore.withGitTransportFaults capture (fun () ->
+                    LedgerStore.transact second update (fun _ -> Ok changes))
+                |> good
+            let treeChecks =
+                calls |> Seq.filter (fun args ->
+                    List.tryHead args = Some "ls-tree"
+                    && List.exists (fun p -> p = firstPath || p = secondPath || p = newPath) args)
+                |> Seq.toList
+            Assert.That(treeChecks.Length, Is.EqualTo(1), "One exact tree check, not one per entity")
+            let after = LedgerStore.fetch first |> good
+            Assert.That(after.Commit, Is.EqualTo(write.CurrentHead))
+            for c in changes do
+                let content, _ = LedgerStore.readAt first after c.Path |> good
+                Assert.That(content, Is.EqualTo(Some c.Content))
+            let rejected = intent ()
+            let result, metric = LedgerStore.measureMutationStages (fun () ->
+                LedgerStore.transact first rejected (fun _ -> Ok changes))
+            let expected : Result<LedgerWrite, LedgerFailure> = Error(StaleEntityVersion $"Ledger entity changed: {secondPath}")
+            Assert.That(result, Is.EqualTo(expected))
+            Assert.That(pushes metric, Is.Zero)
+            Assert.That((LedgerStore.fetch first |> good).Commit, Is.EqualTo(after.Commit))
+            Assert.That((LedgerStore.getOperationStatus first rejected.OperationId |> good |> snd).IsNone, Is.True))
+
+    [<Test>]
     member _.SlowFailedFetchHasNoPublicationAndNoReplayableExternalEffect() =
         withDisposableLedger (fun first _ ->
             let inject phase args =

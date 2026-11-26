@@ -322,6 +322,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let mutable launchPending: (Guid * (Guid -> Result<unit, LaunchTemplateEditFailure>)) option = None
     let mutable launchScroll = 0
     let mutable launchNeedsReload = false
+    let mutable clipboardCopy = Clipboard.copyText
     let mutable launchApprovalId: int option = None
     let mutable launchApprovalScroll = 0
     let mutable connectionState = Disconnected
@@ -2039,7 +2040,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         | ConsoleKey.F2 -> saveProjectEditorUnsafe()
         | ConsoleKey.F5 when not launchBusy && launchPending.IsNone -> loadProjectEditorUnsafe projectEditorKind launchProject
         | ConsoleKey.F6 ->
-            match Clipboard.copyText launchDraft with
+            match clipboardCopy launchDraft with
             | Ok _ -> launchNotice <- "Draft copied."
             | Error error -> launchNotice <- error
         | ConsoleKey.Escape when not launchBusy && launchPending.IsNone -> mode <- AgentsMode
@@ -2487,6 +2488,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     member _.SetCapacityPolicyAccess(access: CapacityPolicyUiAccess) =
         lock syncRoot (fun () -> capacityPolicyAccess <- Some access)
 
+    member internal _.SetClipboardCopyForFixture(copy: string -> Result<string, string>) =
+        lock syncRoot (fun () -> clipboardCopy <- copy)
+
     // Fixture drives the same modal load/key/save path as the selected Agents row.
     // No live Console.ReadKey or authenticated runtime binding is required.
     member internal _.DispatchCapacityPolicyKeyForFixture(snapshot: AgentView.Snapshot, keyInfo: ConsoleKeyInfo) =
@@ -2852,7 +2856,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     | ConsoleKey.DownArrow -> launchApprovalScroll <- launchApprovalScroll + 1
                                     | ConsoleKey.F6 ->
                                         launchApprovalUnsafe()
-                                        |> Option.iter (fun (_, cmd) -> if not (isNull cmd.Html) then Clipboard.copyText cmd.Html |> ignore)
+                                        |> Option.iter (fun (_, cmd) -> if not (isNull cmd.Html) then clipboardCopy cmd.Html |> ignore)
                                     | ConsoleKey.Y | ConsoleKey.D ->
                                         match launchApprovalUnsafe() with
                                         | Some(prompt, _) ->

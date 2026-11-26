@@ -99,6 +99,7 @@
         <Compile Include="WorkingTurnGuidanceTests.fs"/>
         <Compile Include="OrchestrationApiTests.fs"/>
         <Compile Include="AgentViewTests.fs"/>
+        <Compile Include="CapacityPolicyEditorTests.fs"/>
         <Compile Include="WorkDashboardViewTests.fs"/>
         <Compile Include="WorkStatefulProjectionTests.fs"/>
         <Compile Include="WorkStatefulTransportTests.fs"/>

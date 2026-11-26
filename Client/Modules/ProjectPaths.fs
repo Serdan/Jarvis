@@ -123,7 +123,7 @@ type private WorktreeCacheEntry =
       Invalidation: WorktreeCacheInvalidation
       Generation: int64 }
 
-type private WorktreeListing =
+type internal WorktreeListing =
     { Paths: string array
       WasCacheHit: bool
       Generation: int64 }
@@ -132,7 +132,7 @@ type private WorktreeListing =
 // but a descendant retains its stdout/stderr file descriptors. Cache only the
 // registered paths consumed by ProjectPaths: HEAD, branch, dirty and detached
 // state are deliberately not cached or used as source/ref identity.
-module private WorktreeGit =
+module internal WorktreeGit =
     let private pathComparison =
         if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal
 
@@ -178,6 +178,63 @@ module private WorktreeGit =
                     else None
             else None
         with _ -> None
+
+    // A cached path is only a hint. Verify that its .git pointer still refers
+    // to the exact registered worktree and that Git's reverse pointer agrees.
+    // This closes the FileSystemWatcher delivery window for moves/replacements
+    // without spawning Git or caching HEAD, branch, or dirty state.
+    let isRegisteredWorktreePath (mainRoot: string) (worktreePath: string) =
+        let pathEquals (left: string) (right: string) =
+            String.Equals(
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath left),
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath right),
+                pathComparison
+            )
+
+        try
+            match tryCommonGitDirectory mainRoot with
+            | None -> false
+            | Some commonGitDirectory ->
+                let dotGit = Path.Combine(worktreePath, ".git")
+                let dotGitAttributes = File.GetAttributes dotGit
+                if dotGitAttributes.HasFlag FileAttributes.ReparsePoint then false
+                elif dotGitAttributes.HasFlag FileAttributes.Directory then
+                    pathEquals dotGit commonGitDirectory
+                else
+                    let pointer = File.ReadAllText dotGit |> fun value -> value.Trim()
+                    if not (pointer.StartsWith("gitdir: ", StringComparison.Ordinal)) then false
+                    else
+                        let rawGitDirectory = pointer.Substring("gitdir: ".Length)
+                        let gitDirectory =
+                            if Path.IsPathRooted rawGitDirectory then rawGitDirectory
+                            else Path.Combine(worktreePath, rawGitDirectory)
+                        let gitDirectory = Path.GetFullPath gitDirectory
+                        let registryDirectory = Path.Combine(commonGitDirectory, "worktrees")
+                        let registryAttributes = File.GetAttributes registryDirectory
+                        let gitDirectoryAttributes = File.GetAttributes gitDirectory
+                        let commonDirectoryFile = Path.Combine(gitDirectory, "commondir")
+                        let commonDirectoryAttributes = File.GetAttributes commonDirectoryFile
+                        let reversePointerFile = Path.Combine(gitDirectory, "gitdir")
+                        let reversePointerAttributes = File.GetAttributes reversePointerFile
+
+                        if registryAttributes.HasFlag FileAttributes.ReparsePoint
+                           || gitDirectoryAttributes.HasFlag FileAttributes.ReparsePoint
+                           || commonDirectoryAttributes.HasFlag FileAttributes.ReparsePoint
+                           || reversePointerAttributes.HasFlag FileAttributes.ReparsePoint
+                           || not (pathEquals (Path.GetDirectoryName gitDirectory) registryDirectory) then
+                            false
+                        else
+                            let rawCommonDirectory = File.ReadAllText commonDirectoryFile |> fun value -> value.Trim()
+                            let worktreeCommonDirectory =
+                                if Path.IsPathRooted rawCommonDirectory then rawCommonDirectory
+                                else Path.Combine(gitDirectory, rawCommonDirectory)
+                            let rawReversePointer = File.ReadAllText reversePointerFile |> fun value -> value.Trim()
+                            let reversePointer =
+                                if Path.IsPathRooted rawReversePointer then rawReversePointer
+                                else Path.Combine(gitDirectory, rawReversePointer)
+                            pathEquals worktreeCommonDirectory commonGitDirectory
+                            && pathEquals reversePointer dotGit
+        with _ -> false
 
     let private tryCreateWatcher (mainRoot: string) =
         try
@@ -249,7 +306,7 @@ module private WorktreeGit =
 
     let private tryCached key =
         match cache.TryGetValue key with
-        | true entry when not entry.Invalidation.IsInvalidated ->
+        | true, entry when not entry.Invalidation.IsInvalidated ->
             Some
                 { Paths = entry.Paths
                   WasCacheHit = true
@@ -339,7 +396,7 @@ module private WorktreeGit =
             try
                 let key = cacheKey mainRoot
                 match cache.TryGetValue key with
-                | true entry ->
+                | true, entry ->
                     entry.Generation = listing.Generation && not entry.Invalidation.IsInvalidated
                 | _ -> false
             with _ -> false
@@ -349,11 +406,11 @@ module private WorktreeGit =
             try
                 let key = cacheKey mainRoot
                 match cache.TryGetValue key with
-                | true entry when entry.Generation = listing.Generation -> entry.Invalidation.Invalidate()
+                | true, entry when entry.Generation = listing.Generation -> entry.Invalidation.Invalidate()
                 | _ -> ()
             with _ -> ()
 
-let private resolveRegisteredWorktree (mainRoot: string) (selector: string) : Client.Result<string> =
+let internal resolveRegisteredWorktreeWith (executable: string) (mainRoot: string) (selector: string) : Client.Result<string> =
     if String.IsNullOrWhiteSpace selector
        || selector = "." || selector = ".."
        || selector.Contains('/') || selector.Contains('\\')
@@ -372,21 +429,26 @@ let private resolveRegisteredWorktree (mainRoot: string) (selector: string) : Cl
                             comparison
                         ))
                 match matches with
-                | [| path |] when Directory.Exists(path) ->
-                    let rec containsLink (dir: DirectoryInfo) =
-                        if dir = null then false
-                        elif dir.Attributes.HasFlag(FileAttributes.ReparsePoint) then true
-                        else containsLink dir.Parent
-                    if containsLink (DirectoryInfo(path)) then
-                        Error(Client.PermissionDenied "Worktree path contains a symbolic link.")
-                    elif not (WorktreeGit.isCurrent mainRoot listing) then
-                        Error(Client.ValidationError "Git worktree registration changed during resolution.")
-                    else Ok path
+                | [| path |] ->
+                    if not (Directory.Exists path) then
+                        Error(Client.NotFoundError "Registered worktree path no longer exists.")
+                    else
+                        let rec containsLink (dir: DirectoryInfo) =
+                            if dir = null then false
+                            elif dir.Attributes.HasFlag(FileAttributes.ReparsePoint) then true
+                            else containsLink dir.Parent
+                        if containsLink (DirectoryInfo(path)) then
+                            Error(Client.PermissionDenied "Worktree path contains a symbolic link.")
+                        elif not (WorktreeGit.isRegisteredWorktreePath mainRoot path) then
+                            Error(Client.ValidationError "Git worktree registration changed during resolution.")
+                        elif not (WorktreeGit.isCurrent mainRoot listing) then
+                            Error(Client.ValidationError "Git worktree registration changed during resolution.")
+                        else Ok path
                 | [||] -> Error(Client.NotFoundError "Unknown Git-registered worktree selector.")
                 | _ -> Error(Client.ValidationError "Ambiguous worktree selector.")
             with ex -> Error(Client.ExceptionError ex)
 
-        match WorktreeGit.list "git" mainRoot (TimeSpan.FromSeconds 10.) with
+        match WorktreeGit.list executable mainRoot (TimeSpan.FromSeconds 10.) with
         | Error error -> Error error
         | Ok listing ->
             match resolve listing with
@@ -396,13 +458,17 @@ let private resolveRegisteredWorktree (mainRoot: string) (selector: string) : Cl
                 // absent/ambiguous or its registered path no longer validates;
                 // a failed refresh never falls back to stale cached paths.
                 WorktreeGit.invalidate mainRoot listing
-                match WorktreeGit.list "git" mainRoot (TimeSpan.FromSeconds 10.) with
+                match WorktreeGit.list executable mainRoot (TimeSpan.FromSeconds 10.) with
                 | Error refreshError -> Error refreshError
                 | Ok refreshed ->
                     match resolve refreshed with
                     | Error _ when not (WorktreeGit.isCurrent mainRoot refreshed) ->
                         Error(Client.ValidationError "Git worktree registration changed during resolution.")
                     | result -> result
+            | Error error -> Error error
+
+let private resolveRegisteredWorktree (mainRoot: string) (selector: string) : Client.Result<string> =
+    resolveRegisteredWorktreeWith "git" mainRoot selector
 
 let resolveProjectContextForTarget (target: ProjectTarget) : IO<'rt, ResolvedProject> =
     effect {

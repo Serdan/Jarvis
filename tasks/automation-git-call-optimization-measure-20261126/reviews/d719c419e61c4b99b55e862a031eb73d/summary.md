@@ -1,0 +1,1 @@
+Exact-source Git-call performance and semantic equivalence harness, direct fixture 44/44, matched checkout focused Release 108/108 each, comparison zero failures; raw evidence and job-eviction limitation recorded in docs/perf/git-call-optimization-20261126.md. Independent review requested.

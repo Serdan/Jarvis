@@ -63,12 +63,15 @@ type Measurement =
       ResponseDigest: string option
       ResponseProjection: string option
       ToolResultDigest: string option
+      ToolResultProjection: string option
       ToolIsError: bool option
       Exception: string option
       StateDigestBefore: string option
       StateDigestAfter: string option
       RefsBefore: string list
       RefsAfter: string list
+      RefTargetsBefore: string list
+      RefTargetsAfter: string list
       TracePath: string }
 
 type Report =
@@ -318,11 +321,12 @@ module Program =
           LinkedWorktrees = linked }
 
     let private remoteState bare =
-        let refs =
-            git bare [ "for-each-ref"; "--format=%(refname)"; "refs/heads" ]
+        let targets =
+            git bare [ "for-each-ref"; "--format=%(refname)%09%(objectname)"; "refs/heads" ]
             |> fun output -> output.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
             |> Array.toList
             |> List.sort
+        let refs = targets |> List.map (fun target -> target.Split('\t')[0])
         let builder = StringBuilder()
         for reference in refs do
             builder.Append(reference).Append('\n') |> ignore
@@ -334,7 +338,7 @@ module Program =
                     if metadata.Length >= 3 then
                         let blob = git bare [ "cat-file"; "blob"; metadata[2] ]
                         builder.Append(parts[1]).Append('\u0000').Append(normalizeText "" blob).Append('\n') |> ignore
-        hash (builder.ToString()), refs
+        hash (builder.ToString()), refs, targets
 
     let private createToolHarness runtime =
         let userId = "perf-user"
@@ -512,21 +516,26 @@ module Program =
                   ResponseDigest = responseDigest
                   ResponseProjection = projection
                   ToolResultDigest = toolDigest
+                  ToolResultProjection = toolJson
                   ToolIsError = toolResult |> Option.bind toolIsError
                   Exception = exceptionText
                   StateDigestBefore = None
                   StateDigestAfter = None
                   RefsBefore = []
                   RefsAfter = []
+                  RefTargetsBefore = []
+                  RefTargetsAfter = []
                   TracePath = trace.TracePath }
         }
 
-    let private withState before after refsBefore refsAfter measurement =
+    let private withState (before, refsBefore, targetsBefore) (after, refsAfter, targetsAfter) measurement =
         { measurement with
             StateDigestBefore = Some before
             StateDigestAfter = Some after
             RefsBefore = refsBefore
-            RefsAfter = refsAfter }
+            RefsAfter = refsAfter
+            RefTargetsBefore = targetsBefore
+            RefTargetsAfter = targetsAfter }
 
     let private argValue flag defaultValue argv =
         argv
@@ -630,46 +639,56 @@ module Program =
                     (fun () -> JarvisMcpTools.GetTask("FixtureProject", "Operator", "perf-task-0001", harness.DeviceId, harness.Client, harness.Http))
             measurements.Add(getTask)
 
+            let! taskOverview =
+                measureTool fixtureRoot harness "task-overview" "TaskOverview" "Operator" [ "workspace:read" ]
+                    (fun () -> JarvisMcpTools.TaskOverview("FixtureProject", "Operator", harness.DeviceId, harness.Client, harness.Http))
+            measurements.Add(taskOverview)
+
+            let! agentInbox =
+                measureTool fixtureRoot harness "agent-inbox" "AgentInbox" "Operator" [ "workspace:read" ]
+                    (fun () -> JarvisMcpTools.AgentInbox("FixtureProject", "Operator", harness.DeviceId, harness.Client, harness.Http))
+            measurements.Add(agentInbox)
+
             // Project-scoped TaskWrite requires read for project selection and git:write for mutation.
-            let beforeWrite, refsBefore = remoteState fixture.BareRemote
+            let beforeWrite = remoteState fixture.BareRemote
             let operationId = "40000000-0000-4000-8000-000000000001"
             let! registerAgent =
                 measureTool fixtureRoot harness "register-agent" "RegisterAgent" "BenchmarkWorker" [ "workspace:read"; "git:write" ]
                     (fun () -> JarvisMcpTools.RegisterAgent("FixtureProject", "BenchmarkWorker", operationId, harness.DeviceId, harness.Client, harness.Http))
-            let afterWrite, refsAfter = remoteState fixture.BareRemote
-            measurements.Add(withState beforeWrite afterWrite refsBefore refsAfter registerAgent)
+            let afterWrite = remoteState fixture.BareRemote
+            measurements.Add(withState beforeWrite afterWrite registerAgent)
 
             let! operationStatus =
                 measureTool fixtureRoot harness "get-operation-status" "GetOperationStatus" "BenchmarkWorker" [ "workspace:read" ]
                     (fun () -> JarvisMcpTools.GetOperationStatus("FixtureProject", "BenchmarkWorker", operationId, harness.DeviceId, harness.Client, harness.Http))
             measurements.Add(operationStatus)
 
-            let beforeRetry, refsBeforeRetry = remoteState fixture.BareRemote
+            let beforeRetry = remoteState fixture.BareRemote
             let! retrySameOperation =
                 measureTool fixtureRoot harness "retry-same-operation" "RegisterAgent" "BenchmarkWorker" [ "workspace:read"; "git:write" ]
                     (fun () -> JarvisMcpTools.RegisterAgent("FixtureProject", "BenchmarkWorker", operationId, harness.DeviceId, harness.Client, harness.Http))
-            let afterRetry, refsAfterRetry = remoteState fixture.BareRemote
-            measurements.Add(withState beforeRetry afterRetry refsBeforeRetry refsAfterRetry retrySameOperation)
+            let afterRetry = remoteState fixture.BareRemote
+            measurements.Add(withState beforeRetry afterRetry retrySameOperation)
 
-            let beforeConflict, refsBeforeConflict = remoteState fixture.BareRemote
+            let beforeConflict = remoteState fixture.BareRemote
             let! reusedOperationChangedInput =
                 measureTool fixtureRoot harness "operation-id-reused-with-changed-input" "RegisterAgent" "DifferentWorker" [ "workspace:read"; "git:write" ]
                     (fun () -> JarvisMcpTools.RegisterAgent("FixtureProject", "DifferentWorker", operationId, harness.DeviceId, harness.Client, harness.Http))
-            let afterConflict, refsAfterConflict = remoteState fixture.BareRemote
-            measurements.Add(withState beforeConflict afterConflict refsBeforeConflict refsAfterConflict reusedOperationChangedInput)
+            let afterConflict = remoteState fixture.BareRemote
+            measurements.Add(withState beforeConflict afterConflict reusedOperationChangedInput)
 
-            let beforeUnauthorized, refsBeforeUnauthorized = remoteState fixture.BareRemote
+            let beforeUnauthorized = remoteState fixture.BareRemote
             let! unauthorizedWrite =
                 measureTool fixtureRoot harness "unauthorized-register-agent" "RegisterAgent" "UnauthorizedWorker" [ "workspace:read" ]
                     (fun () -> JarvisMcpTools.RegisterAgent("FixtureProject", "UnauthorizedWorker", "50000000-0000-4000-8000-000000000001", harness.DeviceId, harness.Client, harness.Http))
-            let afterUnauthorized, refsAfterUnauthorized = remoteState fixture.BareRemote
-            measurements.Add(withState beforeUnauthorized afterUnauthorized refsBeforeUnauthorized refsAfterUnauthorized unauthorizedWrite)
+            let afterUnauthorized = remoteState fixture.BareRemote
+            measurements.Add(withState beforeUnauthorized afterUnauthorized unauthorizedWrite)
 
             do! harness.Queue.Complete()
             harness.Services.Dispose()
 
             let report =
-                { SchemaVersion = 2
+                { SchemaVersion = 3
                   SourceRoot = sourceRoot
                   SourceBranch = sourceBranch
                   SourceSha = sourceSha

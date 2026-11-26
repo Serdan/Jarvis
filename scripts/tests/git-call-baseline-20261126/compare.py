@@ -17,8 +17,8 @@ from typing import Any
 BASELINE_SHA = "9dc95184896118c96f34493da28ce40bf5b3d8d6"
 HARNESS_FILE = Path("Client.Tests/GitCallBaselineTests.fs")
 PROJECT_FILE = Path("Client.Tests/Client.Tests.fsproj")
-COMPILE_MARKER = '<Compile Include="Program.fs" />'
-COMPILE_ITEM = '<Compile Include="GitCallBaselineTests.fs" />'
+COMPILE_MARKER = "Program.fs"
+COMPILE_ITEM = "GitCallBaselineTests.fs"
 
 FOCUSED_FILTERS = [
     "FullyQualifiedName~TaskOverviewBatchPerformanceTests",
@@ -80,12 +80,19 @@ def install_harness(source_root: Path, target_root: Path) -> None:
     shutil.copy2(source, target)
 
     project = target_root / PROJECT_FILE
-    text = project.read_text(encoding="utf-8")
-    if COMPILE_ITEM not in text:
-        if COMPILE_MARKER not in text:
-            raise RuntimeError(f"Could not find {COMPILE_MARKER!r} in {project}")
-        text = text.replace(COMPILE_MARKER, COMPILE_ITEM + "\n    " + COMPILE_MARKER, 1)
-        project.write_text(text, encoding="utf-8")
+    tree = ET.parse(project, parser=ET.XMLParser(target=ET.TreeBuilder(insert_comments=True)))
+    root = tree.getroot()
+    existing = [item for item in root.iter("Compile") if item.get("Include") == COMPILE_ITEM]
+    markers = [(group, index) for group in root.findall("ItemGroup") for index, item in enumerate(group)
+               if item.tag == "Compile" and item.get("Include") == COMPILE_MARKER]
+    if len(markers) != 1 or len(existing) > 1:
+        raise RuntimeError(f"Ambiguous F# compile order in {project}")
+    if not existing:
+        group, index = markers[0]
+        item = ET.Element("Compile", {"Include": COMPILE_ITEM})
+        item.tail = group[index].tail
+        group.insert(index, item)
+        tree.write(project, encoding="utf-8")
 
 
 def parse_reports(directory: Path, expected_sha: str) -> dict[str, dict[str, Any]]:

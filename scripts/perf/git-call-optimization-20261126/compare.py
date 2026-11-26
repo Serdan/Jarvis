@@ -9,6 +9,9 @@ import math
 import statistics
 import sys
 from pathlib import Path
+from subprocess import CalledProcessError
+
+from fixture_identity import FixtureIdentity
 
 
 def load(path: Path) -> dict:
@@ -48,6 +51,8 @@ def main() -> int:
         "list-worktrees",
         "get-worktree",
         "get-task",
+        "task-overview",
+        "agent-inbox",
         "register-agent",
         "get-operation-status",
         "retry-same-operation",
@@ -63,7 +68,7 @@ def main() -> int:
         failed.append("baseline and candidate reports identify the same source SHA")
 
     for label, report in (("baseline", baseline), ("candidate", candidate)):
-        if report.get("SchemaVersion") != 2:
+        if report.get("SchemaVersion") != 3:
             failed.append(f"{label}: unsupported or missing report schema version")
         if not report.get("SourceSha"):
             failed.append(f"{label}: exact measured source SHA was not captured")
@@ -74,6 +79,8 @@ def main() -> int:
         elif report.get("FixtureSeedSha") == report.get("FixturePublishedSha"):
             failed.append(f"{label}: second fixture clone did not publish a new head")
         actual = set(by_scenario(report))
+        if len(actual) != len(report.get("Measurements", [])):
+            failed.append(f"{label}: duplicate scenario identity")
         if actual != expected:
             missing = sorted(expected - actual)
             extra = sorted(actual - expected)
@@ -107,6 +114,8 @@ def main() -> int:
                 failed.append(f"{label} {scenario}: harness raised {measurement['Exception']}")
             if measurement.get("ToolResultDigest") is None:
                 failed.append(f"{label} {scenario}: MCP tool result was not captured")
+            if measurement.get("ToolResultProjection") is None:
+                failed.append(f"{label} {scenario}: raw MCP tool result projection was not captured")
             if measurement.get("ToolIsError") is None:
                 failed.append(f"{label} {scenario}: MCP error classification was not captured")
             if scenario == "unauthorized-register-agent":
@@ -116,11 +125,27 @@ def main() -> int:
                     failed.append(f"{label} {scenario}: missing OAuth denial result")
             elif measurement.get("ResponseDigest") is None or measurement.get("ResponseClass") is None:
                 failed.append(f"{label} {scenario}: correlated client response was not captured")
+            elif scenario == "operation-id-reused-with-changed-input":
+                if measurement.get("ToolIsError") is not True:
+                    failed.append(f"{label} {scenario}: expected MCP denial")
+            elif measurement.get("ResponseClass") != "Success" or measurement.get("ToolIsError") is not False:
+                failed.append(f"{label} {scenario}: expected a successful result")
 
     if baseline.get("FixtureSeedSha") != candidate.get("FixtureSeedSha"):
         failed.append("baseline and candidate did not use the same deterministic fixture seed")
     if baseline.get("FixturePublishedSha") != candidate.get("FixturePublishedSha"):
         failed.append("baseline and candidate did not use the same deterministic published fixture head")
+
+    # Verify actual objects, receipt hashes, exact ref transitions and raw
+    # payloads before normalizing independently generated fixture identities.
+    if failed:
+        print("FAILED:", *failed, sep="\n- ")
+        return 1
+    try:
+        left_identity, right_identity = FixtureIdentity(baseline), FixtureIdentity(candidate)
+    except (ValueError, KeyError, TypeError, OSError, CalledProcessError) as error:
+        print(f"FAILED: exact fixture evidence: {error}")
+        return 1
 
     print(
         f"baseline={baseline.get('SourceSha')} "
@@ -140,18 +165,22 @@ def main() -> int:
             print(f"{name:42} MISSING")
             continue
 
-        semantic_equal = (
-            a.get("ResponseClass") == b.get("ResponseClass")
-            and a.get("ResponseDigest") == b.get("ResponseDigest")
-            and a.get("ToolResultDigest") == b.get("ToolResultDigest")
-            and a.get("ToolIsError") == b.get("ToolIsError")
-        )
-        state_equal = (
-            a.get("RefsBefore") == b.get("RefsBefore")
-            and a.get("RefsAfter") == b.get("RefsAfter")
-            and a.get("StateDigestBefore") == b.get("StateDigestBefore")
-            and a.get("StateDigestAfter") == b.get("StateDigestAfter")
-        )
+        try:
+            semantic_equal = (
+                a.get("ResponseClass") == b.get("ResponseClass")
+                and a.get("ToolIsError") == b.get("ToolIsError")
+                and left_identity.projection(a, "ResponseProjection") == right_identity.projection(b, "ResponseProjection")
+                and left_identity.projection(a, "ToolResultProjection") == right_identity.projection(b, "ToolResultProjection")
+            )
+            state_equal = (
+                a.get("RefsBefore") == b.get("RefsBefore")
+                and a.get("RefsAfter") == b.get("RefsAfter")
+                and left_identity.state_projection(a, "Before") == right_identity.state_projection(b, "Before")
+                and left_identity.state_projection(a, "After") == right_identity.state_projection(b, "After")
+            )
+        except (ValueError, KeyError, TypeError, OSError, CalledProcessError) as error:
+            failed.append(f"{name}: invalid fixture evidence: {error}")
+            semantic_equal = state_equal = False
         semantic_label = "MATCH" if semantic_equal else "DIFF"
         state_label = "MATCH" if state_equal else "DIFF"
         git_delta = b.get("GitProcessStarts", 0) - a.get("GitProcessStarts", 0)

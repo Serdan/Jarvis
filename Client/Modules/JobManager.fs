@@ -14,52 +14,15 @@ open FsToolkit.ErrorHandling
 open Kehlet.FSharp.IO
 open Kehlet.FSharp.IO.Effect.Operators
 
-type private JobRecord =
-    { JobId: string
-      ProjectName: ProjectPaths.ProjectId
-      Executable: string
-      Args: string list
-      Reason: string option
-      WorkingDirectory: string option
-      StartedAt: DateTimeOffset
-      Process: Process
-      SyncRoot: obj
-      Events: ResizeArray<JobOutputEvent>
-      MaxOutputBytes: int
-      mutable OutputBytes: int
-      mutable OutputTruncated: bool
-      mutable NextSequence: int64
-      mutable CancellationRequested: bool
-      mutable Status: JobStatus
-      mutable CompletedAt: DateTimeOffset option }
-
 module private Core =
+    module Durable = BoundedProcess.DurableJobs
+
     let private defaultMaxOutputBytes = 64 * 1024
     let private maxCompletedJobs = 100
-    let private jobs = ConcurrentDictionary<string, JobRecord>()
-
-    // A registered worktree selects where a job executes, not which logical
-    // project owns its result. GetJobResult/CancelJob only receive projectName.
-    let private validateJobProject (requested: ProjectPaths.ProjectId option) (job: JobRecord) =
-        match requested with
-        | None -> Ok ()
-        | Some canonical when canonical = job.ProjectName -> Ok ()
-        | Some _ -> Error(ValidationError "jobId does not belong to the requested project.")
-
-    let private pruneCompletedJobs () =
-        jobs.Values
-        |> Seq.filter (fun job -> job.Status <> Running)
-        |> Seq.sortByDescending (fun job -> job.StartedAt)
-        |> Seq.indexed
-        |> Seq.choose (fun (index, job) ->
-            if index >= maxCompletedJobs then Some job else None)
-        |> Seq.iter (fun job ->
-            match jobs.TryRemove job.JobId with
-            | true, removed ->
-                try removed.Process.Dispose()
-                with _ -> ()
-            | false, _ -> ())
-
+    let private maxActiveJobs = 64
+    let private retention = TimeSpan.FromDays 7.
+    let private startupGrace = TimeSpan.FromMinutes 1.
+    let private startupWait = TimeSpan.FromSeconds 15.
     let private deniedExecutables =
         set [ "bash"; "sh"; "zsh"; "fish"; "cmd"; "cmd.exe"; "powershell"; "powershell.exe"; "pwsh"; "pwsh.exe" ]
 
@@ -77,207 +40,244 @@ module private Core =
         | Some relativePath ->
             ProjectPaths.resolveSourcePath context relativePath >>= FileIO.parseFolder
 
-    let private takeUtf8Prefix maxBytes (value: string) =
-        let output = StringBuilder()
-        let mutable bytes = 0
-        let mutable accepting = true
+    let private rootForRuntime (rt: #ProjectIO) =
+        let (ProjectDirectory workspace) = rt.Project.Root
+        Durable.root workspace
 
-        for rune in value.EnumerateRunes() do
-            if accepting then
-                let runeBytes = rune.Utf8SequenceLength
+    let private unknownMessage =
+        "Engineering job outcome is unknown: no authoritative terminal receipt and no verified live supervisor. Do not rerun to reconstruct evidence."
 
-                if bytes + runeBytes <= maxBytes then
-                    output.Append(rune.ToString()) |> ignore
-                    bytes <- bytes + runeBytes
-                else
-                    accepting <- false
+    let private statusAndReceipt = function
+        | Durable.Live receipt | Durable.Terminal receipt -> receipt.Status, Some receipt
+        | Durable.Unknown receipt -> JobStatus.RecoveryUnknown unknownMessage, receipt
 
-        output.ToString(), bytes
+    let private authorized (canonical: ProjectPaths.ProjectId option) (actor: string option) (request: Durable.Request) =
+        if canonical |> Option.exists (fun id -> ProjectPaths.ProjectId.value id <> request.Project) then
+            Error(Client.ValidationError "jobId does not belong to the requested project.")
+        elif actor.IsSome && (canonical.IsNone || actor <> request.Actor) then
+            Error(Client.ValidationError "Engineering job belongs to another initiating agent or project.")
+        else Ok()
 
-    let private appendEvent (job: JobRecord) stream (data: string) =
-        if not (isNull data) then
-            lock job.SyncRoot (fun () ->
-                job.NextSequence <- job.NextSequence + 1L
-                let value = data + Environment.NewLine
-                let remaining = max 0 (job.MaxOutputBytes - job.OutputBytes)
-                let fragment, addedBytes = takeUtf8Prefix remaining value
-                let valueBytes = Encoding.UTF8.GetByteCount value
+    let private pending now (request: Durable.Request) = now - request.StartedAt < startupGrace
 
-                if addedBytes > 0 then
-                    job.Events.Add
-                        { Sequence = job.NextSequence
-                          Stream = stream
-                          Text = fragment }
+    let private prune root =
+        // Admission is serialized across client hosts; the supervisor has its
+        // own lifetime claim. A concurrent observation cannot create a new job.
+        let now = DateTimeOffset.UtcNow
+        let entries =
+            Durable.entries root
+            |> Array.map (fun (directory, request) -> directory, request, Durable.observe directory request)
+        let active =
+            entries
+            |> Array.sumBy (fun (directory, request, observation) ->
+                match observation with
+                | Durable.Live _ -> 1
+                | Durable.Unknown _ when pending now request || Durable.hasClaimOwner directory -> 1
+                | _ -> 0)
+        entries
+        |> Array.choose (fun (directory, request, observation) ->
+            match observation with
+            | Durable.Live _ -> None
+            | Durable.Unknown _ when pending now request || Durable.hasClaimOwner directory -> None
+            | Durable.Terminal receipt ->
+                Some(directory, receipt.CompletedAt |> Option.defaultValue request.StartedAt)
+            | Durable.Unknown _ -> Some(directory, request.StartedAt))
+        |> Array.sortByDescending snd
+        |> Array.iteri (fun index (directory, completed) ->
+            if index >= maxCompletedJobs || now - completed >= retention then
+                Durable.tryPrune directory |> ignore)
+        active
 
-                job.OutputBytes <- job.OutputBytes + addedBytes
-                job.OutputTruncated <- job.OutputTruncated || addedBytes < valueBytes)
-
-    let private startProcess projectName workingDirectory executable args reason maxOutputBytes : Client.Result<StartJobResult> =
+    let private startProcess root projectName actor workingDirectory executable args reason maxOutputBytes : Client.Result<StartJobResult> =
         try
             match validateExecutable executable with
             | Error error -> Error error
             | Ok executable ->
-                let jobId = Guid.NewGuid().ToString("N")
-                let proc = new Process()
-
-                proc.StartInfo.FileName <- executable
-                proc.StartInfo.WorkingDirectory <- workingDirectory
-                proc.StartInfo.RedirectStandardOutput <- true
-                proc.StartInfo.RedirectStandardError <- true
-                proc.StartInfo.UseShellExecute <- false
-                proc.StartInfo.CreateNoWindow <- true
-                ProcessEnvironment.apply proc.StartInfo
-                proc.EnableRaisingEvents <- true
-                args |> List.iter proc.StartInfo.ArgumentList.Add
-
-                let job =
-                    { JobId = jobId
-                      ProjectName = projectName
+                let request: Durable.Request =
+                    { Schema = 1
+                      JobId = Guid.NewGuid().ToString("N")
+                      Project = ProjectPaths.ProjectId.value projectName
+                      Actor = actor
                       Executable = executable
                       Args = args
                       Reason = reason
-                      WorkingDirectory = Some workingDirectory
+                      WorkingDirectory = workingDirectory
                       StartedAt = DateTimeOffset.UtcNow
-                      Process = proc
-                      SyncRoot = obj()
-                      Events = ResizeArray()
-                      MaxOutputBytes = maxOutputBytes
-                      OutputBytes = 0
-                      OutputTruncated = false
-                      NextSequence = 0L
-                      CancellationRequested = false
-                      Status = Running
-                      CompletedAt = None }
-
-                proc.OutputDataReceived.Add(fun event ->
-                    appendEvent job JobOutputStream.StdOut event.Data)
-
-                proc.ErrorDataReceived.Add(fun event ->
-                    appendEvent job JobOutputStream.StdErr event.Data)
-
-                proc.Exited.Add(fun _ ->
-                    try proc.WaitForExit()
-                    with _ -> ()
-
-                    lock job.SyncRoot (fun () ->
-                        if job.CancellationRequested then
-                            job.Status <- Canceled
+                      MaxOutputBytes = maxOutputBytes }
+                let launch =
+                    Durable.withAdmission root (fun () ->
+                        if prune root >= maxActiveJobs then
+                            Error(Client.ContextError "Engineering job capacity reached (64 active supervisors).")
                         else
-                            try job.Status <- Completed proc.ExitCode
-                            with _ -> job.Status <- FailedToStart "Process exited before an exit code was available."
-                        job.CompletedAt <- Some DateTimeOffset.UtcNow)
-                    pruneCompletedJobs())
+                            let directory = Durable.create root request
+                            try
+                                let host = Environment.ProcessPath
+                                if String.IsNullOrWhiteSpace host then invalidOp "Cannot locate the Jarvis process host."
+                                let assembly = typeof<Durable.Request>.Assembly.Location
+                                let exe, hostArgs =
+                                    BoundedProcess.helperHostInvocation host assembly
+                                        [ BoundedProcess.groupHostFlag; Durable.mode; directory ]
+                                let info = ProcessStartInfo(exe)
+                                info.WorkingDirectory <- workingDirectory
+                                info.UseShellExecute <- false
+                                info.CreateNoWindow <- true
+                                ProcessEnvironment.apply info
+                                hostArgs |> List.iter info.ArgumentList.Add
+                                use supervisor = new Process(StartInfo = info)
+                                if not (supervisor.Start()) then invalidOp "Could not start engineering job supervisor."
+                                Ok directory
+                            with ex ->
+                                // No returned supervisor identity: do not
+                                // authorize a second spawn from this request.
+                                // Retain the original registration on ambiguity.
+                                Error(Client.ContextError $"Unable to launch engineering job supervisor (job {request.JobId}): {ex.Message}"))
+                match launch with
+                | Error error -> Error error
+                | Ok directory ->
+                    let deadline = Stopwatch.StartNew()
+                    let rec awaitStart () =
+                        match Durable.observe directory request with
+                        | Durable.Terminal receipt ->
+                            match receipt.Status with
+                            | FailedToStart message ->
+                                // Preserve existing no-ghost behavior for a
+                                // known failed start. No command was executed.
+                                Durable.withAdmission root (fun () ->
+                                    let cleanupDeadline = Stopwatch.StartNew()
+                                    let mutable removed = Durable.tryPrune directory
+                                    while not removed && cleanupDeadline.Elapsed < TimeSpan.FromSeconds 2. do
+                                        Thread.Sleep 25
+                                        removed <- Durable.tryPrune directory)
+                                Error(Client.ContextError message)
+                            | _ -> Ok { JobId = request.JobId; StartedAt = request.StartedAt }
+                        | Durable.Live receipt when receipt.Started ->
+                            Ok { JobId = request.JobId; StartedAt = request.StartedAt }
+                        | _ when deadline.Elapsed >= startupWait ->
+                            // A lost startup receipt is not proof of non-start.
+                            // Return the stable handle instead of encouraging replay.
+                            Ok { JobId = request.JobId; StartedAt = request.StartedAt }
+                        | _ ->
+                            Thread.Sleep 25
+                            awaitStart ()
+                    awaitStart ()
+        with ex -> Error(ExceptionError ex)
 
-                if not (jobs.TryAdd(jobId, job)) then
-                    proc.Dispose()
-                    Error(Client.ContextError "Failed to register job.")
-                else
-                    try
-                        if not (proc.Start()) then
-                            let mutable removed = Unchecked.defaultof<JobRecord>
-                            jobs.TryRemove(jobId, &removed) |> ignore
-                            proc.Dispose()
-                            Error(Client.ContextError "Failed to start job.")
-                        else
-                            proc.BeginOutputReadLine()
-                            proc.BeginErrorReadLine()
-                            Ok { JobId = jobId; StartedAt = job.StartedAt }
-                    with ex ->
-                        let mutable removed = Unchecked.defaultof<JobRecord>
-                        jobs.TryRemove(jobId, &removed) |> ignore
-                        proc.Dispose()
-                        Error(ExceptionError ex)
-        with ex ->
-            Error(ExceptionError ex)
-
-    let startJobForContext (context: ProjectPaths.ResolvedProject) (cmd: StartJobCommand) =
+    let startJobForContext actor (context: ProjectPaths.ResolvedProject) (cmd: StartJobCommand) =
         effect {
             let maxOutputBytes = cmd.MaxOutputBytes |> Option.defaultValue defaultMaxOutputBytes
-            if maxOutputBytes <= 0 then
-                return! Client.ValidationError "MaxOutputBytes must be greater than zero." |> Effect.ofError
+            if maxOutputBytes <= 0 || maxOutputBytes > Durable.maxOutputBytes then
+                return! Client.ValidationError $"MaxOutputBytes must be between 1 and {Durable.maxOutputBytes}." |> Effect.ofError
             else
                 let canonical =
                     context |> ProjectPaths.ResolvedProject.target |> ProjectPaths.ProjectTarget.projectId
                 let! (FolderPath workingDirectory) = resolveWorkingDirectory context cmd.WorkingDirectory
-                let! result = fun _ -> startProcess canonical workingDirectory cmd.Executable cmd.Args cmd.Reason maxOutputBytes
+                let! result = fun rt ->
+                    try startProcess (rootForRuntime rt) canonical actor workingDirectory cmd.Executable cmd.Args cmd.Reason maxOutputBytes
+                    with ex -> Error(ExceptionError ex)
                 return result
         }
 
-    let startJobForTarget (target: ProjectPaths.ProjectTarget) (cmd: StartJobCommand) =
+    let startJobForTarget actor (target: ProjectPaths.ProjectTarget) (cmd: StartJobCommand) =
         effect {
             let! context = ProjectPaths.resolveProjectContextForTarget target
-            return! startJobForContext context cmd
+            return! startJobForContext actor context cmd
         }
 
-    let private toSummary (job: JobRecord) =
-        lock job.SyncRoot (fun () ->
-            { JobId = job.JobId
-              ProjectName = ProjectPaths.ProjectId.value job.ProjectName
-              Executable = job.Executable
-              Args = job.Args
-              Reason = job.Reason
-              WorkingDirectory = job.WorkingDirectory
-              Kind = JobKind.Process
-              CommandName = None
-              OperationId = None
-              AgentId = None
-              Status = job.Status
-              StartedAt = job.StartedAt
-              CompletedAt = job.CompletedAt })
+    let private toSummary (request: Durable.Request) observation : JobSummary =
+        let status, receipt = statusAndReceipt observation
+        { JobId = request.JobId
+          ProjectName = request.Project
+          Executable = request.Executable
+          Args = request.Args
+          Reason = request.Reason
+          WorkingDirectory = Some request.WorkingDirectory
+          Kind = JobKind.Process
+          CommandName = None
+          OperationId = None
+          AgentId = request.Actor
+          Status = status
+          StartedAt = request.StartedAt
+          CompletedAt =
+            match observation with
+            | Durable.Terminal value -> value.CompletedAt
+            | _ -> None }
 
-    let listJobsForProject (canonical: ProjectPaths.ProjectId option) (cmd: ListJobsCommand) =
-        fun _ ->
-            jobs.Values
-            |> Seq.filter (fun job -> canonical |> Option.forall ((=) job.ProjectName))
-            |> Seq.filter (fun job -> cmd.IncludeCompleted || job.Status = Running)
-            |> Seq.sortBy (fun job -> job.StartedAt)
-            |> Seq.map toSummary
-            |> Seq.toList
-            |> fun items -> Ok { Jobs = items }
-
-    let getJobResultForProject (canonical: ProjectPaths.ProjectId option) (cmd: GetJobResultCommand) =
-        fun _ ->
-            match jobs.TryGetValue cmd.JobId with
-            | false, _ -> Error(NotFoundError $"Unknown job id: {cmd.JobId}")
-            | true, job ->
-                match validateJobProject canonical job with
-                | Error error -> Error error
-                | Ok () -> lock job.SyncRoot (fun () ->
-                    let afterSequence = defaultArg cmd.AfterSequence 0L |> max 0L
-                    let events =
-                        job.Events
-                        |> Seq.filter (fun event -> event.Sequence > afterSequence)
-                        |> Seq.toList
-
-                    Ok
-                        { JobId = job.JobId
-                          Status = job.Status
-                          Events = events
-                          NextSequence = job.NextSequence
-                          Truncated = job.OutputTruncated
-                          ToolResponse = None
-                          OperationId = None })
-
-    let cancelJobForProject (canonical: ProjectPaths.ProjectId option) (cmd: CancelJobCommand) =
-        fun _ ->
-            match jobs.TryGetValue cmd.JobId with
-            | false, _ -> Error(NotFoundError $"Unknown job id: {cmd.JobId}")
-            | true, job ->
-                match validateJobProject canonical job with
-                | Error error -> Error error
-                | Ok () ->
-                    if job.Status = Running then
-                        job.CancellationRequested <- true
-                        try
-                            if not job.Process.HasExited then job.Process.Kill(entireProcessTree = true)
-                            job.Status <- Canceled
-                            job.CompletedAt <- Some DateTimeOffset.UtcNow
-                            Ok()
-                        with ex ->
-                            job.CancellationRequested <- false
-                            Error(ExceptionError ex)
+    let listJobsForProject canonical actor (cmd: ListJobsCommand) =
+        fun rt ->
+            try
+                let root = rootForRuntime rt
+                Durable.withAdmission root (fun () -> prune root |> ignore)
+                Durable.entries root
+                |> Array.choose (fun (directory, request) ->
+                    let projectMatches = canonical |> Option.forall (fun id -> ProjectPaths.ProjectId.value id = request.Project)
+                    let actorMatches = actor |> Option.forall (fun id -> request.Actor = Some id)
+                    if not (projectMatches && actorMatches) then None
                     else
-                        Ok()
+                        let summary = toSummary request (Durable.observe directory request)
+                        if cmd.IncludeCompleted || summary.Status = Running then Some summary else None)
+                |> Array.sortBy (fun job -> job.StartedAt)
+                |> Array.toList
+                |> fun items -> Ok { Jobs = items }
+            with ex -> Error(ExceptionError ex)
+
+    let private withJob rt canonical actor id action =
+        try
+            let root = rootForRuntime rt
+            if not (Durable.validId id) then Error(NotFoundError $"Unknown job id: {id}")
+            else
+                let directory = Durable.jobDirectory root id
+                if not (Directory.Exists directory) then Error(NotFoundError $"Unknown job id: {id}")
+                else
+                    let request = Durable.readRequest directory
+                    match authorized canonical actor request with
+                    | Error error -> Error error
+                    | Ok () -> action directory request
+        with ex -> Error(ExceptionError ex)
+
+    let getJobResultForProject canonical actor (cmd: GetJobResultCommand) =
+        fun rt ->
+            withJob rt canonical actor cmd.JobId (fun directory request ->
+                let observation = Durable.observe directory request
+                let status, receipt = statusAndReceipt observation
+                let afterSequence = defaultArg cmd.AfterSequence 0L |> max 0L
+                let events =
+                    receipt |> Option.map (fun value -> value.Events |> List.filter (fun event -> event.Sequence > afterSequence))
+                    |> Option.defaultValue []
+                Ok
+                    { JobId = request.JobId
+                      Status = status
+                      Events = events
+                      NextSequence = receipt |> Option.map (fun value -> value.NextSequence) |> Option.defaultValue 0L
+                      Truncated =
+                        match observation with
+                        | Durable.Unknown _ -> true
+                        | _ -> receipt |> Option.exists (fun value -> value.Truncated)
+                      ToolResponse = None
+                      OperationId = None })
+
+    let cancelJobForProject canonical actor (cmd: CancelJobCommand) =
+        fun rt ->
+            withJob rt canonical actor cmd.JobId (fun directory request ->
+                match Durable.observe directory request with
+                | Durable.Terminal _ -> Ok()
+                | Durable.Unknown _ -> Error(Client.ContextError unknownMessage)
+                | Durable.Live _ ->
+                    // The supervisor owns the original child handle. Never
+                    // signal a recovered bare PID from the client process.
+                    Durable.requestCancel directory
+                    let deadline = Stopwatch.StartNew()
+                    let rec awaitCancel () =
+                        match Durable.observe directory request with
+                        | Durable.Terminal _ -> Ok()
+                        | Durable.Unknown _ -> Error(Client.ContextError unknownMessage)
+                        | Durable.Live receipt when receipt.CancelError.IsSome ->
+                            Error(Client.ContextError (Option.get receipt.CancelError))
+                        | Durable.Live _ when deadline.Elapsed >= startupWait ->
+                            Error(Client.ContextError "Cancellation requested; terminal receipt not yet available. Poll the original job.")
+                        | Durable.Live _ ->
+                            Thread.Sleep 50
+                            awaitCancel ()
+                    awaitCancel ())
 
 // Tool operations are intentionally separate from OS processes. Admission is
 // bounded before scheduling; the original task owns the one canonical result.
@@ -621,18 +621,24 @@ let private optionalProjectId raw =
     if String.IsNullOrWhiteSpace raw then Ok None
     else projectId raw |> Result.map Some
 
-let startJobForTarget (target: ProjectPaths.ProjectTarget) (cmd: StartJobCommand) = Core.startJobForTarget target cmd
-let startJobIn (context: ProjectPaths.ResolvedProject) (cmd: StartJobCommand) = Core.startJobForContext context cmd
+let startJobForTargetAsAgent (target: ProjectPaths.ProjectTarget) actor (cmd: StartJobCommand) =
+    Core.startJobForTarget actor target cmd
+let startJobInAsAgent (context: ProjectPaths.ResolvedProject) actor (cmd: StartJobCommand) =
+    Core.startJobForContext actor context cmd
+let startJobForTarget (target: ProjectPaths.ProjectTarget) (cmd: StartJobCommand) =
+    startJobForTargetAsAgent target None cmd
+let startJobIn (context: ProjectPaths.ResolvedProject) (cmd: StartJobCommand) =
+    startJobInAsAgent context None cmd
 
 let startJob (cmd: StartJobCommand) =
     effect {
         let! target = ProjectPaths.ProjectTarget.parse cmd.ProjectName |> Effect.ofResult
-        return! Core.startJobForTarget target cmd
+        return! Core.startJobForTarget None target cmd
     }
 
 let listJobsForProjectAsAgent (canonical: ProjectPaths.ProjectId option) actor (cmd: ListJobsCommand) =
     fun rt ->
-        match Core.listJobsForProject canonical cmd rt with
+        match Core.listJobsForProject canonical actor cmd rt with
         | Error error -> Error error
         | Ok processJobs ->
             let toolJobs = ToolOperations.list canonical actor cmd.IncludeCompleted
@@ -656,7 +662,7 @@ let getJobResultForProjectAsAgent (canonical: ProjectPaths.ProjectId option) act
         match ToolOperations.get canonical actor cmd.JobId with
         | Some result -> result
         | None ->
-            match Core.getJobResultForProject canonical cmd rt with
+            match Core.getJobResultForProject canonical actor cmd rt with
             | Error(NotFoundError _) ->
                 Error(NotFoundError
                     $"Unknown job id: {cmd.JobId}. If this was a client-owned tool operation, the client may have restarted or evicted the job; reconcile a persisted write using its original operationId rather than blindly repeating it.")
@@ -675,7 +681,7 @@ let cancelJobForProjectAsAgent (canonical: ProjectPaths.ProjectId option) actor 
     fun rt ->
         match ToolOperations.cancel canonical actor cmd.JobId with
         | Some result -> result
-        | None -> Core.cancelJobForProject canonical cmd rt
+        | None -> Core.cancelJobForProject canonical actor cmd rt
 
 let cancelJobForProject (canonical: ProjectPaths.ProjectId option) (cmd: CancelJobCommand) =
     cancelJobForProjectAsAgent canonical None cmd

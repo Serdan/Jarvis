@@ -1089,3 +1089,183 @@ let cancelingQueuedForwardedNotificationPreservesCommittedSourceActivation () =
         for _, completion in blockers do
             completion.WaitAsync(TimeSpan.FromSeconds(6.)).GetAwaiter().GetResult() |> ignore
         Directory.Delete(root, true)
+
+module Durable = Client.BoundedProcess.DurableJobs
+
+let private requireOk = function
+    | Ok value -> value
+    | Error err -> failwithf "%A" err
+
+let private durableTarget () = ProjectPaths.ProjectTarget.parse "Project1" |> requireOk
+let private durableProject () = durableTarget () |> ProjectPaths.ProjectTarget.projectId |> Some
+let private durableOwner = Some "fixture-owner"
+
+let durableChildProbe marker release =
+    File.AppendAllText(marker, "once\n")
+    printfn "durable stdout"
+    eprintfn "durable stderr"
+    let timer = Stopwatch.StartNew()
+    while not (File.Exists release) && timer.Elapsed < TimeSpan.FromSeconds 45. do
+        Thread.Sleep 25
+    if File.Exists release then 17 else 99
+
+let private durableResult root actor id =
+    getJobResultForProjectAsAgent (durableProject ()) actor
+        { ProjectName = "Project1"; JobId = id; AfterSequence = None }
+        (TestContext root)
+
+let private pollDurable root id predicate =
+    let timer = Stopwatch.StartNew()
+    let mutable result = durableResult root durableOwner id |> requireOk
+    while not (predicate result) && timer.Elapsed < TimeSpan.FromSeconds 15. do
+        Thread.Sleep 50
+        result <- durableResult root durableOwner id |> requireOk
+    if not (predicate result) then failwithf "Durable job did not reach expected state: %A" result
+    result
+
+let durableStartProbe root idFile marker release waitForTerminal =
+    let cmd =
+        { ProjectName = "Project1"; Executable = "dotnet"
+          Args = [ Assembly.GetExecutingAssembly().Location; "--durable-job-child-probe"; marker; release ]
+          Reason = Some "disposable restart fixture"; WorkingDirectory = None; MaxOutputBytes = Some 4096 }
+    let started = startJobForTargetAsAgent (durableTarget ()) durableOwner cmd (TestContext root) |> requireOk
+    File.WriteAllText(idFile, started.JobId)
+    if waitForTerminal then
+        pollDurable root started.JobId (fun result -> result.Status = Completed 17) |> ignore
+    0
+
+let private launchDurableProbe root waitForTerminal =
+    let idFile = Path.Combine(root, "job-id")
+    let marker = Path.Combine(root, "spawn-count")
+    let release = Path.Combine(root, "release")
+    if waitForTerminal then File.WriteAllText(release, "")
+    let info = ProcessStartInfo("dotnet")
+    info.UseShellExecute <- false
+    [ Assembly.GetExecutingAssembly().Location; "--durable-job-start-probe"; root; idFile; marker; release
+      string waitForTerminal ] |> List.iter info.ArgumentList.Add
+    use host = Process.Start(info)
+    if not (host.WaitForExit(25000)) then
+        host.Kill(true)
+        failwith "Disposable initiating host did not exit."
+    host.ExitCode |> shouldEqual 0
+    File.ReadAllText(idFile), marker, release
+
+let private withDurableFixture waitForTerminal f =
+    let root = createTempProject ()
+    try
+        let id, marker, release = launchDurableProbe root waitForTerminal
+        try f root id marker release
+        finally
+            File.WriteAllText(release, "")
+            // Only cancel the job owned by this disposable fixture.
+            cancelJobForProjectAsAgent (durableProject ()) durableOwner
+                { ProjectName = "Project1"; JobId = id } (TestContext root) |> ignore
+    finally
+        let registry = Durable.root root
+        for directory, _ in Durable.entries registry do Durable.tryPrune directory |> ignore
+        Directory.Delete(root, true)
+
+[<TestCase(false)>]
+[<TestCase(true)>]
+let ``durable receipt survives independent initiating host exit`` completedBeforeRestart =
+    withDurableFixture completedBeforeRestart (fun root id marker release ->
+        if not completedBeforeRestart then
+            let running = pollDurable root id (fun r -> r.Status = Running && File.Exists marker)
+            running.JobId |> shouldEqual id
+        // A fresh client context, with no inherited in-memory process record.
+        let ownerList =
+            listJobsForProjectAsAgent (durableProject ()) durableOwner
+                { ProjectName = Some "Project1"; IncludeCompleted = true } (TestContext root) |> requireOk
+        ownerList.Jobs |> List.exists (fun j -> j.JobId = id && j.AgentId = durableOwner) |> shouldEqual true
+        let wrongList =
+            listJobsForProjectAsAgent (durableProject ()) (Some "other")
+                { ProjectName = Some "Project1"; IncludeCompleted = true } (TestContext root) |> requireOk
+        wrongList.Jobs |> List.exists (fun j -> j.JobId = id) |> shouldEqual false
+        durableResult root (Some "other") id |> Result.isError |> shouldEqual true
+        let wrongProject = ProjectPaths.ProjectTarget.parse "Project2" |> requireOk |> ProjectPaths.ProjectTarget.projectId |> Some
+        getJobResultForProjectAsAgent wrongProject durableOwner
+            { ProjectName = "Project2"; JobId = id; AfterSequence = None } (TestContext root)
+            |> Result.isError |> shouldEqual true
+        cancelJobForProjectAsAgent (durableProject ()) (Some "other")
+            { ProjectName = "Project1"; JobId = id } (TestContext root)
+            |> Result.isError |> shouldEqual true
+        let directory = Durable.jobDirectory (Durable.root root) id
+        Durable.runSupervisor directory |> shouldEqual 1
+        File.WriteAllText(release, "")
+        let terminal = pollDurable root id (fun r -> r.Status = Completed 17)
+        terminal.Events |> List.exists (fun e -> e.Stream = JobOutputStream.StdOut && e.Text.Contains("durable stdout")) |> shouldEqual true
+        terminal.Events |> List.exists (fun e -> e.Stream = JobOutputStream.StdErr && e.Text.Contains("durable stderr")) |> shouldEqual true
+        File.ReadAllLines(marker) |> Array.toList |> shouldEqual ["once"]
+        durableResult root durableOwner id |> requireOk |> shouldEqual terminal)
+
+[<Test>]
+let ``durable cancellation after initiating host exit records observed cancellation`` () =
+    withDurableFixture false (fun root id marker _ ->
+        pollDurable root id (fun r -> r.Status = Running && File.Exists marker) |> ignore
+        cancelJobForProjectAsAgent (durableProject ()) durableOwner
+            { ProjectName = "Project1"; JobId = id } (TestContext root) |> requireOk
+        pollDurable root id (fun r -> r.Status = Canceled) |> ignore
+        File.ReadAllLines(marker) |> Array.toList |> shouldEqual ["once"])
+
+[<Test>]
+let ``durable recovery refuses mismatched process birth identity and bounds retention`` () =
+    let root = createTempProject ()
+    let registry = Durable.root root
+    try
+        let request age : Durable.Request =
+            { Schema = 1; JobId = Guid.NewGuid().ToString("N"); Project = "Project1"; Actor = durableOwner
+              Executable = "never-run"; Args = []; Reason = None; WorkingDirectory = root
+              StartedAt = DateTimeOffset.UtcNow - age; MaxOutputBytes = 64 }
+        let stale = request (TimeSpan.FromDays 8.)
+        Durable.create registry stale |> ignore
+        let jobs = [ for i in 1 .. 101 -> request (TimeSpan.FromHours(float i)) ]
+        for job in jobs do Durable.create registry job |> ignore
+        let first = List.head jobs
+        let directory = Durable.jobDirectory registry first.JobId
+        let fake : Durable.Receipt =
+            { Schema = 1; JobId = first.JobId; Supervisor = { Pid = Environment.ProcessId; Birth = "wrong-birth" }
+              Child = None; Started = true; Status = Running; CompletedAt = None; Events = []
+              NextSequence = 0L; Truncated = false; CancelError = None }
+        File.WriteAllBytes(Path.Combine(directory, "receipt.json"), System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(fake))
+        let result = durableResult root durableOwner first.JobId |> requireOk
+        match result.Status with
+        | RecoveryUnknown _ -> ()
+        | status -> failwithf "Expected uncertain outcome, got %A" status
+        result.Truncated |> shouldEqual true
+        cancelJobForProjectAsAgent (durableProject ()) durableOwner
+            { ProjectName = "Project1"; JobId = first.JobId } (TestContext root)
+            |> Result.isError |> shouldEqual true
+        let listed = listJobsForProjectAsAgent (durableProject ()) durableOwner
+                        { ProjectName = Some "Project1"; IncludeCompleted = true } (TestContext root) |> requireOk
+        listed.Jobs.Length |> shouldEqual 100
+        Directory.Exists(Durable.jobDirectory registry stale.JobId) |> shouldEqual false
+        Directory.Exists(Durable.jobDirectory registry (List.last jobs).JobId) |> shouldEqual false
+    finally
+        for directory, _ in Durable.entries registry do Durable.tryPrune directory |> ignore
+        Directory.Delete(root, true)
+
+[<Test>]
+let ``durable supervisor crash remains unknown without replay`` () =
+    withDurableFixture false (fun root id marker release ->
+        pollDurable root id (fun r -> r.Status = Running && File.Exists marker) |> ignore
+        let directory = Durable.jobDirectory (Durable.root root) id
+        let request = Durable.readRequest directory
+        match Durable.observe directory request with
+        | Durable.Live receipt ->
+            // Kill only the supervisor and child of our registered disposable test job.
+            use supervisor = Process.GetProcessById(receipt.Supervisor.Pid)
+            match Durable.observe directory request with
+            | Durable.Live verified when verified.Supervisor = receipt.Supervisor ->
+                supervisor.Kill(entireProcessTree = true)
+                supervisor.WaitForExit(5000) |> shouldEqual true
+            | other -> failwithf "Fixture identity no longer verified: %A" other
+        | other -> failwithf "Expected live fixture supervisor: %A" other
+        let unknown = pollDurable root id (fun r ->
+            match r.Status with RecoveryUnknown _ -> true | _ -> false)
+        unknown.Truncated |> shouldEqual true
+        cancelJobForProjectAsAgent (durableProject ()) durableOwner
+            { ProjectName = "Project1"; JobId = id } (TestContext root)
+            |> Result.isError |> shouldEqual true
+        Durable.runSupervisor directory |> shouldEqual 1
+        File.WriteAllText(release, "")
+        File.ReadAllLines(marker) |> Array.toList |> shouldEqual ["once"])

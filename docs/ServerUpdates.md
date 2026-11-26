@@ -1,6 +1,6 @@
 # Server self-update: verified readiness and recovery
 
-The production server is a single systemd service running as the unprivileged `jarvis` account. `UpdateServer` schedules an **independent** privileged transient systemd unit through the fixed sudoers entry; its MCP response means **scheduled**, never **successfully deployed**. `GetServerUpdateStatus` reads the last atomic status file after the initiating server connection drops. No public MCP API shape changes.
+The production server is a single systemd service running as the unprivileged `jarvis` account. `update_server` schedules an **independent** privileged transient systemd unit through the fixed sudoers entry; its MCP response means **scheduled**, never **successfully deployed**. `get_server_update_status` reads the last atomic status file after the initiating server connection drops. The update tool's own request/response contract is separate from the versioned client command protocol; a server release may still change other MCP tools, so refresh the active MCP tool list after an update.
 
 ## Bootstrap and prerequisites
 
@@ -31,7 +31,7 @@ If the release checksum equals the verified current executable, the updater repo
 
 ## Atomic status, rollback and interrupted updates
 
-The helper holds a persistent `flock` on a root-owned lock inode so concurrent updates cannot mutate the same service. Each update writes its status through a temporary file and atomic rename, keeping `GetServerUpdateStatus` readable even if the updater's initiating MCP connection is lost.
+The helper holds a persistent `flock` on a root-owned lock inode so concurrent updates cannot mutate the same service. Each update writes its status through a temporary file and atomic rename, keeping `get_server_update_status` readable even if the updater's initiating MCP connection is lost.
 
 The successful sequence is: preflight the existing service, fetch and verify release, stage the candidate, create and publish a complete verified `JarvisServer.prev`, write a private rollback-intent marker, stop the service, replace the executable, restart, verify the **candidate** executable hash and protocol routes, clear the intent marker, and **only then** report success.
 
@@ -53,7 +53,13 @@ Run `python3 scripts/test-server-updater.py` for the isolated black-box harness.
 
 Known boundary: the updater verifies the server's own Kestrel loopback listener, not the external reverse proxy, DNS, or remote Auth0 discovery. External end-to-end user connectivity should still be checked after a coordinated release.
 
-As of 10 November 2026, the production server runs protocol **3.63**. Clients are installed separately and may temporarily use an older protocol (for example, the Windows Kruso client remained on 3.62 after server deployment). Every future server/client protocol change and manual client update still needs explicit coordination. Passing source tests does not authorize deployment.
+## Protocol and deployment observations
+
+The repository currently declares client command protocol **3.68** in `Common/Messages/AgentCommand.fs` (`AgentProtocol.version`). On **2026-11-26**, the connected server's `list_commands` response reported `ProtocolVersion=3.68`, and `list_devices` reported the selected `Serdan-Home` device as Registered with `protocolVersion=3.68`.
+
+This is a dated observation of the connected server and selected device, not proof that every registered device or every deployment instance uses the same protocol. The previous 10 November 2026 note reporting 3.63 is historical and is superseded as a current-status statement. No deployment, restart or protocol cutover was performed as part of the documentation work.
+
+For a later check, re-read `list_commands`, `list_devices` and `get_connection_diagnostics`. Inspect the active MCP `tools/list` definitions for actual tool names and argument schemas: `list_commands` is a capability/compatibility catalog, not the MCP schema source. See [`AgentCommandSurface.md`](AgentCommandSurface.md).
 
 ## Emergency manual recovery
 

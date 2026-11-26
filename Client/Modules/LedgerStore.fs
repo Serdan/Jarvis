@@ -2218,6 +2218,94 @@ module LedgerStore =
                          SelectedWorktreeDirty = dirty }
                 | _ -> Error(SourceUnavailable "Cannot inspect registered source worktrees.")
 
+    // Initial binding and inferred review HEAD both require evidence from the
+    // actual registered source checkout, not the project-selected checkout.
+    // Use NUL-delimited registration records so quoted paths and newlines
+    // cannot be mistaken for branch or prunable fields.
+    let private verifiedSourceCheckout (binding: LedgerBinding) (sourceRef: string) allowDetached =
+        let unavailable = SourceUnavailable "Cannot verify a unique registered source checkout."
+        let repo = binding.RepositoryPath
+        let normalized (path: string) = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path))
+        let registrations () = result {
+            let! listing = run repo [ "worktree"; "list"; "--porcelain"; "-z" ]
+            let blocks = listing.Split([| "\000\000" |], StringSplitOptions.RemoveEmptyEntries)
+            let parsed =
+                blocks |> Array.map (fun block ->
+                    let fields = block.Split('\000', StringSplitOptions.RemoveEmptyEntries)
+                    let paths = fields |> Array.filter (fun f -> f.StartsWith("worktree ", StringComparison.Ordinal))
+                    let heads = fields |> Array.filter (fun f -> f.StartsWith("HEAD ", StringComparison.Ordinal))
+                    let branches = fields |> Array.filter (fun f -> f.StartsWith("branch ", StringComparison.Ordinal))
+                    if paths.Length <> 1 || heads.Length > 1 || branches.Length > 1
+                       || not (Path.IsPathFullyQualified(paths[0].Substring(9))) then None
+                    else
+                        let root = normalized (paths[0].Substring(9))
+                        let head = heads |> Array.tryHead |> Option.map (fun f -> f.Substring(5))
+                        let branch = branches |> Array.tryHead |> Option.map (fun f -> f.Substring(7))
+                        let detached = fields |> Array.contains "detached"
+                        let prunable = fields |> Array.exists (fun f -> f = "prunable" || f.StartsWith("prunable ", StringComparison.Ordinal))
+                        Some(root, head, branch, detached, prunable))
+            if parsed |> Array.exists Option.isNone then return! Error unavailable
+            return parsed |> Array.choose id
+        }
+        let select selected entries =
+            // A stale registration of the requested branch is not proof that
+            // the branch is safely absent. Never fall back around it.
+            match entries |> Array.filter (fun (_, _, branch, _, _) -> branch = Some sourceRef) with
+            | [| (root, Some head, _, false, false) |] when Directory.Exists root ->
+                Ok(root, head, false)
+            | [||] when allowDetached ->
+                match entries |> Array.filter (fun (root, _, _, _, _) -> root = selected) with
+                | [| (root, Some head, None, true, false) |] when Directory.Exists root ->
+                    Ok(root, head, true)
+                | _ -> Error unavailable
+            | _ -> Error unavailable
+        let observe root detached = result {
+            let! actualRoot = run root [ "rev-parse"; "--show-toplevel" ]
+            let! common = run root [ "rev-parse"; "--path-format=absolute"; "--git-common-dir" ]
+            let! symbolic = git root [ "symbolic-ref"; "--quiet"; "HEAD" ]
+            let! head = run root [ "rev-parse"; "--verify"; "HEAD^{commit}" ]
+            let! branchHead = run repo [ "rev-parse"; "--verify"; $"{sourceRef}^{{commit}}" ]
+            let! status = run root [ "--no-optional-locks"; "status"; "--porcelain"; "--untracked-files=all" ]
+            let expectedRef =
+                if detached then symbolic.ExitCode = 1 && symbolic.Stdout = ""
+                else symbolic.ExitCode = 0 && symbolic.Stdout = sourceRef
+            if normalized actualRoot <> root || not expectedRef
+               || head <> branchHead || not (validSourceCommitOid head) then
+                return! Error unavailable
+            return normalized common, head, status
+        }
+        try
+            result {
+                let! selectedRoot = run repo [ "rev-parse"; "--show-toplevel" ]
+                let selected = normalized selectedRoot
+                let! common = run repo [ "rev-parse"; "--path-format=absolute"; "--git-common-dir" ]
+                let! before = registrations ()
+                let! root, registeredHead, detached = select selected before
+                let! actualCommon, head, status = observe root detached
+                if actualCommon <> normalized common || registeredHead <> head then
+                    return! Error unavailable
+                // Recheck selection and observations together. This is not a
+                // filesystem lock, but rejects visible registration/ref/status drift.
+                let! after = registrations ()
+                let! rootAfter, registeredAfter, detachedAfter = select selected after
+                if (rootAfter, registeredAfter, detachedAfter) <> (root, head, detached) then
+                    return! Error unavailable
+                let! commonAfter, headAfter, statusAfter = observe root detached
+                if (commonAfter, headAfter, statusAfter) <> (actualCommon, head, status) then
+                    return! Error unavailable
+                return head, not (String.IsNullOrEmpty status)
+            }
+            |> Result.mapError (fun _ -> unavailable)
+        with
+        | :? ArgumentException | :? IOException | :? UnauthorizedAccessException -> Error unavailable
+
+    let initialSourceCheckout binding sourceRef allowDetached allowUncommitted = result {
+        let! head, dirty = verifiedSourceCheckout binding sourceRef allowDetached
+        if dirty && not allowUncommitted then
+            return! Error(SourceUnavailable "Uncommitted source checkout requires explicit allowUncommitted.")
+        return head
+    }
+
     // Convenience path for SubmitReview(headOid=""): resolve the one currently
     // checked-out source branch, and refuse dirty, detached or ambiguous trees.
     // An explicit headOid continues to work independently of worktree state.
@@ -2231,38 +2319,10 @@ module LedgerStore =
             match sourceRepositoryIdentity binding with
             | Error error -> Error error
             | Ok _ ->
-                match run binding.RepositoryPath [ "worktree"; "list"; "--porcelain" ] with
+                match verifiedSourceCheckout binding sourceRef false with
+                | Ok(head, false) -> Ok head
+                | Ok(_, true) -> Error(SourceUnavailable "Source worktree is dirty or uncommitted.")
                 | Error error -> Error error
-                | Ok listing ->
-                    let candidates =
-                        listing.Split([| "\n\n" |], StringSplitOptions.RemoveEmptyEntries)
-                        |> Array.choose (fun block ->
-                            let lines = block.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                            let branch = lines |> Array.exists (fun line -> line = "branch " + sourceRef)
-                            let prunable = lines |> Array.exists (fun line -> line.StartsWith("prunable ", StringComparison.Ordinal))
-                            let path =
-                                lines |> Array.tryPick (fun line ->
-                                    if line.StartsWith("worktree ", StringComparison.Ordinal) then
-                                        Some(line.Substring(9))
-                                    else None)
-                            match path with
-                            | Some root when branch && not prunable && Directory.Exists root -> Some root
-                            | _ -> None)
-                    if candidates.Length <> 1 then
-                        Error(SourceUnavailable "Review HEAD resolution requires exactly one live checkout of the source branch.")
-                    else
-                        let root = candidates[0]
-                        match run root [ "status"; "--porcelain"; "--untracked-files=all" ],
-                              run root [ "symbolic-ref"; "--quiet"; "HEAD" ],
-                              run root [ "rev-parse"; "--verify"; "HEAD^{commit}" ],
-                              run binding.RepositoryPath [ "rev-parse"; "--verify"; $"{sourceRef}^{{commit}}" ] with
-                        | Ok status, Ok currentRef, Ok head, Ok branchHead
-                            when String.IsNullOrWhiteSpace status
-                                 && currentRef = sourceRef
-                                 && head = branchHead
-                                 && validSourceCommitOid head -> Ok head
-                        | _ ->
-                            Error(SourceUnavailable "Source worktree is dirty, detached, uncommitted, or changed during inspection.")
     let private safeReviewRef (gitRef: string) =
         not (isNull gitRef)
         && Regex.IsMatch(gitRef, "^refs/heads/jarvis-review/[A-Za-z0-9_-]+/[a-f0-9]{32}/r[1-9][0-9]*$")

@@ -136,11 +136,12 @@ let registeredAutomationHealthPortsRequireFreshProjectOptIn () =
         Assert.That(candidate.AgentId, Is.EqualTo(original.AgentId))
         let mutable reads = 0
         let race =
-            { gated with Activity = fun project agent ->
-                reads <- reads + 1
-                if reads = 2 then
-                    ProjectCapacityPolicy.updateAutomation second "fixture" (Guid.NewGuid()) 1 false None Map.empty |> success |> ignore
-                gated.Activity project agent }
+            { gated with
+                Activity = fun project agent ->
+                    reads <- reads + 1
+                    if reads = 2 then
+                        ProjectCapacityPolicy.updateAutomation second "fixture" (Guid.NewGuid()) 1 false None Map.empty |> success |> ignore
+                    gated.Activity project agent }
         let held = check race
         Assert.That(held.Recoveries, Is.Zero)
         Assert.That(reads, Is.EqualTo(2))

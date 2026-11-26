@@ -1,0 +1,12 @@
+# Medium — definitive taskless start rejection cannot reconcile the dispatch journal
+
+## Contract
+The pinned spec requires StartTasklessWork success, definitive rejection, uncertain/lost acknowledgement and retry/reconciliation, and that pending or uncertain starts hold in-flight demand. A definitive rejection is not an uncertain start.
+
+## Evidence and reproduction
+Frozen 50ec1e737cba59516004d864531d1a709e674561, scripts/manager-heartbeat.mjs:296–329 only observes a live reviewer reservation when post-reservation attributed activity coexists with Working or a new TasklessYield. Otherwise it adds the agent to reserved and increments reviewer count on every tick. The journal records the launchId and review identity but not the taskless start operation ID or its outcome; config/manager/Manager.role.md:80–95 instructs the launched model to generate its own UUID, reconcile it locally, and stop on definitive rejection. There is no instruction or transition to associate that rejection receipt with the launch. CLI mark only permits blocked while reserved (pre-dispatch), never after submitted/uncertain; release requires an explicit Operator recovery reason.
+
+Example: Manager successfully submits a launch for R/Q, then Operator parks R before R's start. R's own inbox sees Parked or its start returns a definitive stale-version rejection. R obeys STOP and exits. Subsequent snapshots have R Parked/Stopped, attributed activity, and Q Unclaimed. The journal remains submitted; its reviewer count and Q reservation never clear, even if another reviewer is available. The same occurs after a definitive stale-version rejection leaving R NeedsWork. No new launch occurs, which is safe, but capacity and demand are stranded indefinitely until manual intervention. Source-derived scenario; no production mutation.
+
+## Impact and candidate remedy
+An ordinary race can consume a slot and freeze the exact review indefinitely despite an established no-start outcome; accumulated failures can halt the reviewer pool. Maintain fail-closed treatment of uncertain launches but record and reconcile the exact definitive start rejection (or equivalent proven terminal no-start outcome) against the reservation, allowing other eligible reviewers without overriding STOP. A bounded adjudication should choose the appropriate receipt channel and determine when explicit Operator recovery is required; do not weaken uncertain-send fencing.

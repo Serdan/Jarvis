@@ -546,6 +546,21 @@ let private runClient args =
             challengeWakeEnabled challengeHostPorts
             (fun project -> OrchestrationApi.LedgerBindingConfig.load project rt)
             tui.Log
+    // JobManager and this observer use the identical client workspace root.
+    // Root construction is deferred so the compiled OFF path performs no I/O.
+    let jobRoot () =
+        let (ProjectDirectory workspace) = (rt :> ProjectIO).Project.Root
+        BoundedProcess.DurableJobs.root workspace
+    use jobWake =
+        new AutomationJobTerminalWake.RuntimeRegistration(
+            challengeWakeEnabled, jobRoot,
+            (fun project -> OrchestrationApi.LedgerBindingConfig.load project rt),
+            challengeHost, onChallengeCommit,
+            (Client.invalidateAgentStates rt), tui.Log)
+    // Route the existing authenticated Challenge callback through the composite.
+    // No new command or scheduler authority is introduced.
+    let onChallengeCommit cmd receipt = jobWake.OnChallengeCommit(cmd, receipt)
+
     let toUiError result = result |> Result.mapError (fun error -> sprintf "%A" error)
     let toReplyError = function
         | LedgerFailureError failure when failure.Code = "StaleEntityVersion" ->
@@ -716,9 +731,11 @@ let private runClient args =
         connection.On<string, string, string>("ReceiveManualGrantApproval", Func<string, string, string, Task>(receiveManualApprovalQueued))
         connection.On<string, string array>("InvalidateAgentStates", Func<string, string array, Task>(fun project agentIds ->
             Client.invalidateAgentStates rt project agentIds
+            jobWake.OnInvalidated()
             Task.CompletedTask))
         connection.On("InvalidateAllAgentStates", Func<Task>(fun () ->
             Client.invalidateAllAgentStates rt
+            jobWake.OnInvalidated()
             Task.CompletedTask))
         connection.On<string, string, DateTimeOffset>("RecordAgentActivity",
             Func<string, string, DateTimeOffset, Task>(fun project agent seenAtUtc ->
@@ -799,14 +816,18 @@ let private runClient args =
                         connectionFailureCount <- 0
                         let! isRegistered = register tui connection deviceId resolveMachineName
                         registered <- isRegistered
-                        if isRegistered then Client.invalidateAllAgentStates rt
+                        if isRegistered then
+                            Client.invalidateAllAgentStates rt
+                            jobWake.OnConnected()
                     else
                         connectionFailureCount <- connectionFailureCount + 1
 
             elif connection.State = HubConnectionState.Connected && not registered then
                 let! isRegistered = register tui connection deviceId resolveMachineName
                 registered <- isRegistered
-                if isRegistered then Client.invalidateAllAgentStates rt
+                if isRegistered then
+                    Client.invalidateAllAgentStates rt
+                    jobWake.OnConnected()
 
             if not tui.ShouldQuit then
                 try
@@ -822,6 +843,8 @@ let private runClient args =
             do! dispatch.Complete().WaitAsync(TimeSpan.FromMinutes 2.0)
         with :? TimeoutException ->
             tui.Log "MCP dispatch shutdown exceeded two minutes; some command outcomes may be uncertain."
+        // Stop job ingress before its downstream scheduler after draining MCP.
+        (jobWake :> IDisposable).Dispose()
         // Stop the explicit default-off Challenge host after draining its ingress.
         do! challengeHost.StopAsync()
         scheduler |> Option.iter (fun service -> (service :> IDisposable).Dispose())

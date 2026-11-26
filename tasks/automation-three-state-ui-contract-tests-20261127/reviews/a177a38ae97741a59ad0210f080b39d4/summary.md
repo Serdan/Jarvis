@@ -1,0 +1,1 @@
+Single new F# script; dotnet fsi passed reference contract and five negative controls. Existing FilterSelectors exercised; no production AgentDashboard/AgentView/TUI route or Release acceptance. Checkpoint 18216 contains source evidence and handoff. Review compatibility facet choices and unknown/STOP handling.

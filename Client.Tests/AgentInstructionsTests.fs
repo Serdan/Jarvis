@@ -147,6 +147,26 @@ let private gitAt directory arguments =
     if proc.ExitCode <> 0 then failwithf "Git worktree fixture failed: %s" stderr
     stdout
 
+let private countingGit root =
+    if OperatingSystem.IsWindows() then Assert.Ignore("Shell fixture requires Unix executables.")
+    let realGit =
+        Environment.GetEnvironmentVariable("PATH").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
+        |> Array.tryPick (fun directory ->
+            let candidate = Path.Combine(directory, "git")
+            if File.Exists candidate then Some candidate else None)
+        |> Option.defaultWith (fun () -> failwith "Git executable not found on PATH")
+    let logPath = Path.Combine(root, "git-worktree-list.log")
+    let wrapper = Path.Combine(root, "counting-git.sh")
+    let body =
+        "#!/bin/sh\n"
+        + "if [ \"$1\" = \"worktree\" ] && [ \"$2\" = \"list\" ]; then printf 'list\\n' >> '" + logPath + "'; fi\n"
+        + "exec '" + realGit + "' \"$@\"\n"
+    File.WriteAllText(wrapper, body)
+    File.SetUnixFileMode(wrapper,
+        UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+    let count () = if File.Exists logPath then File.ReadAllLines(logPath).Length else 0
+    wrapper, count
+
 let private explicitInstructions (rt: Runtime) selector directory cursor =
     let target =
         ProjectPaths.ProjectTarget.parse selector
@@ -270,6 +290,243 @@ let registered_worktrees_resolve_distinct_instructions_from_actual_checkout_root
         | :? UnauthorizedAccessException -> ()
         | :? PlatformNotSupportedException -> ()
     )
+
+[<Test>]
+let registered_worktree_cache_reuses_paths_without_caching_head_or_status () =
+    if OperatingSystem.IsWindows() then Assert.Ignore("Shell fixture requires Unix executables.")
+    workspace (fun root rt ->
+        let main = Path.Combine(root, "Demo")
+        gitAt main [ "init"; "-q" ] |> ignore
+        gitAt main [ "config"; "user.name"; "Fixture" ] |> ignore
+        gitAt main [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+        create root "Demo/tracked.txt" "baseline" |> ignore
+        gitAt main [ "add"; "." ] |> ignore
+        gitAt main [ "commit"; "-qm"; "baseline" ] |> ignore
+        let worktreeRoot = Path.Combine(root, ".Demo-worktrees")
+        let a = Path.Combine(worktreeRoot, "tree-a")
+        let b = Path.Combine(worktreeRoot, "tree-b")
+        gitAt main [ "worktree"; "add"; "-qb"; "branch-a"; a; "HEAD" ] |> ignore
+        gitAt main [ "worktree"; "add"; "-qb"; "branch-b"; b; "HEAD" ] |> ignore
+        let wrapper, count = countingGit root
+        let resolve selector = ProjectPaths.resolveRegisteredWorktreeWith wrapper main selector
+
+        match resolve "missing" with
+        | Error(Client.NotFoundError _) -> ()
+        | other -> Assert.Fail(sprintf "Unknown selector must fail closed: %A" other)
+        Assert.That(count(), Is.EqualTo(1), "Cold resolution should launch one Git worktree-list process")
+
+        let pathA = resolve "tree-a" |> succeeded
+        let pathB = resolve "tree-b" |> succeeded
+        Assert.That(pathA, Is.EqualTo(a))
+        Assert.That(pathB, Is.EqualTo(b))
+        Assert.That(pathA, Is.Not.EqualTo(pathB))
+        let primaryRoot = ProjectPaths.resolveProjectRoot "Demo" rt |> succeeded
+        let isolatedRoot = ProjectPaths.resolveProjectRoot "Demo::tree-a" rt |> succeeded
+        Assert.That(primaryRoot, Is.Not.EqualTo(isolatedRoot), "Primary and isolated checkout roots must remain distinct")
+        Assert.That(count(), Is.EqualTo(1), "Warm resolutions and normal project-root resolution must reuse the path listing")
+
+        let originalHead = (gitAt a [ "rev-parse"; "HEAD" ]).Trim()
+        File.WriteAllText(Path.Combine(a, "tracked.txt"), "dirty")
+        Assert.That(gitAt a [ "status"; "--porcelain" ], Does.Contain("tracked.txt"))
+        Assert.That(resolve "tree-a" |> succeeded, Is.EqualTo(a))
+        gitAt a [ "add"; "tracked.txt" ] |> ignore
+        gitAt a [ "commit"; "-qm"; "updated" ] |> ignore
+        let updatedHead = (gitAt a [ "rev-parse"; "HEAD" ]).Trim()
+        Assert.That(updatedHead, Is.Not.EqualTo(originalHead), "Fixture must actually advance HEAD")
+        gitAt a [ "checkout"; "--detach"; "-q" ] |> ignore
+        Assert.That((gitAt a [ "branch"; "--show-current" ]).Trim(), Is.Empty, "Fixture must be detached")
+        Assert.That(resolve "tree-a" |> succeeded, Is.EqualTo(a))
+        Assert.That(count(), Is.EqualTo(1), "Dirty, committed and detached state must not invalidate path-only caching")
+
+        let moved = Path.Combine(worktreeRoot, "tree-a-moved")
+        gitAt main [ "worktree"; "move"; a; moved ] |> ignore
+        Directory.CreateDirectory(a) |> ignore
+        match resolve "tree-a" with
+        | Error(Client.NotFoundError _) -> ()
+        | Error(Client.ValidationError _) -> ()
+        | other -> Assert.Fail(sprintf "A recreated old path must never be accepted as the registered worktree: %A" other)
+        Assert.That(count(), Is.EqualTo(2), "A moved registration should trigger one fresh listing")
+        Assert.That(resolve "tree-a-moved" |> succeeded, Is.EqualTo(moved))
+        Assert.That(count(), Is.EqualTo(2), "The refreshed registration should be reused")
+    )
+
+[<Test>]
+let concurrent_worktree_move_during_discovery_never_returns_a_stale_path () =
+    if OperatingSystem.IsWindows() then Assert.Ignore("Shell fixture requires Unix executables.")
+    workspace (fun root _ ->
+        let main = Path.Combine(root, "Demo")
+        gitAt main [ "init"; "-q" ] |> ignore
+        gitAt main [ "config"; "user.name"; "Fixture" ] |> ignore
+        gitAt main [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+        create root "Demo/tracked.txt" "baseline" |> ignore
+        gitAt main [ "add"; "." ] |> ignore
+        gitAt main [ "commit"; "-qm"; "baseline" ] |> ignore
+        let worktreeRoot = Path.Combine(root, ".Demo-worktrees")
+        let oldPath = Path.Combine(worktreeRoot, "tree-a")
+        let newPath = Path.Combine(worktreeRoot, "tree-a-moved")
+        gitAt main [ "worktree"; "add"; "-qb"; "branch-a"; oldPath; "HEAD" ] |> ignore
+        let realGit =
+            Environment.GetEnvironmentVariable("PATH").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
+            |> Array.tryPick (fun directory ->
+                let candidate = Path.Combine(directory, "git")
+                if File.Exists candidate then Some candidate else None)
+            |> Option.defaultWith (fun () -> failwith "Git executable not found on PATH")
+        let logPath = Path.Combine(root, "concurrent-git.log")
+        let started = Path.Combine(root, "git-list-started")
+        let release = Path.Combine(root, "git-list-release")
+        let captured = Path.Combine(root, "git-list-captured")
+        let wrapper = Path.Combine(root, "blocking-git.sh")
+        let body =
+            "#!/bin/sh\n"
+            + "if [ \"$1\" = \"worktree\" ] && [ \"$2\" = \"list\" ]; then\n"
+            + "  printf 'list\\n' >> '" + logPath + "'\n"
+            + "  if [ ! -f '" + started + "' ]; then\n"
+            + "    '" + realGit + "' \"$@\" > '" + captured + "'\n"
+            + "    : > '" + started + "'\n"
+            + "    while [ ! -f '" + release + "' ]; do sleep 0.01; done\n"
+            + "    cat '" + captured + "'\n"
+            + "    exit 0\n"
+            + "  fi\n"
+            + "fi\n"
+            + "exec '" + realGit + "' \"$@\"\n"
+        File.WriteAllText(wrapper, body)
+        File.SetUnixFileMode(wrapper,
+            UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+        let pending =
+            System.Threading.Tasks.Task.Run(fun () ->
+                ProjectPaths.resolveRegisteredWorktreeWith wrapper main "tree-a")
+        try
+            let clock = Stopwatch.StartNew()
+            while not (File.Exists started) && clock.Elapsed < TimeSpan.FromSeconds 5. do
+                System.Threading.Thread.Sleep(10)
+            Assert.That(File.Exists started, Is.True, "The first Git listing must be paused after capturing its old path")
+            gitAt main [ "worktree"; "move"; oldPath; newPath ] |> ignore
+        finally
+            File.WriteAllText(release, "release")
+
+        match pending.GetAwaiter().GetResult() with
+        | Error(Client.NotFoundError _) -> ()
+        | Error(Client.ValidationError _) -> ()
+        | other -> Assert.Fail(sprintf "A selector invalidated during discovery must not return a stale path: %A" other)
+        let refreshed = ProjectPaths.resolveRegisteredWorktreeWith wrapper main "tree-a-moved" |> succeeded
+        Assert.That(refreshed, Is.EqualTo(newPath))
+        Assert.That(File.ReadAllLines(logPath).Length, Is.EqualTo(2), "Concurrent registration change should cause one refresh")
+    )
+
+[<Test>]
+let registered_worktree_symlink_paths_are_rejected () =
+    if OperatingSystem.IsWindows() then Assert.Ignore("Symlink fixture requires Unix executables.")
+    workspace (fun root _ ->
+        let main = Path.Combine(root, "Demo")
+        gitAt main [ "init"; "-q" ] |> ignore
+        gitAt main [ "config"; "user.name"; "Fixture" ] |> ignore
+        gitAt main [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+        create root "Demo/tracked.txt" "baseline" |> ignore
+        gitAt main [ "add"; "." ] |> ignore
+        gitAt main [ "commit"; "-qm"; "baseline" ] |> ignore
+        let worktreeRoot = Path.Combine(root, ".Demo-worktrees")
+        let path = Path.Combine(worktreeRoot, "tree-link")
+        let target = Path.Combine(worktreeRoot, "tree-link-target")
+        gitAt main [ "worktree"; "add"; "-qb"; "branch-link"; path; "HEAD" ] |> ignore
+        let wrapper, _ = countingGit root
+        ProjectPaths.resolveRegisteredWorktreeWith wrapper main "tree-link" |> succeeded |> ignore
+        try
+            Directory.Move(path, target)
+            Directory.CreateSymbolicLink(path, target) |> ignore
+            match ProjectPaths.resolveRegisteredWorktreeWith wrapper main "tree-link" with
+            | Error(Client.PermissionDenied _) -> ()
+            | other -> Assert.Fail(sprintf "A registered worktree reached through a symlink must be rejected: %A" other)
+        with
+        | :? UnauthorizedAccessException -> Assert.Ignore("Symlinks unavailable")
+        | :? PlatformNotSupportedException -> Assert.Ignore("Symlinks unsupported")
+    )
+
+[<Test>]
+let registered_worktree_metadata_identity_edges_reject_existing_mismatched_pointers () =
+    if OperatingSystem.IsWindows() then Assert.Ignore("Shell fixture requires Unix executables.")
+    for edgeName, edge in
+        [ "worktree .git pointer", "dotgit"
+          "commondir pointer", "commondir"
+          "reverse gitdir pointer", "gitdir" ] do
+        workspace (fun root _ ->
+            let main = Path.Combine(root, "Demo")
+            gitAt main [ "init"; "-q" ] |> ignore
+            gitAt main [ "config"; "user.name"; "Fixture" ] |> ignore
+            gitAt main [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+            create root "Demo/tracked.txt" "baseline" |> ignore
+            gitAt main [ "add"; "." ] |> ignore
+            gitAt main [ "commit"; "-qm"; "baseline" ] |> ignore
+            let worktreeRoot = Path.Combine(root, ".Demo-worktrees")
+            Directory.CreateDirectory(worktreeRoot) |> ignore
+            let a = Path.Combine(worktreeRoot, "tree-a")
+            let b = Path.Combine(worktreeRoot, "tree-b")
+            gitAt main [ "worktree"; "add"; "-qb"; "branch-a"; a; "HEAD" ] |> ignore
+            gitAt main [ "worktree"; "add"; "-qb"; "branch-b"; b; "HEAD" ] |> ignore
+
+            let dotGitA = Path.Combine(a, ".git")
+            let dotGitB = Path.Combine(b, ".git")
+            let adminDirectory worktree =
+                let pointer = File.ReadAllText(Path.Combine(worktree, ".git")).Trim()
+                Assert.That(pointer.StartsWith("gitdir: ", StringComparison.Ordinal), Is.True)
+                let raw = pointer.Substring("gitdir: ".Length)
+                if Path.IsPathRooted raw then Path.GetFullPath raw
+                else Path.GetFullPath(Path.Combine(worktree, raw))
+            let adminA = adminDirectory a
+            let adminB = adminDirectory b
+            let commonPointerA = Path.Combine(adminA, "commondir")
+            let reversePointerA = Path.Combine(adminA, "gitdir")
+
+            // Use a second real repository for the commondir mismatch so the
+            // wrong target exists and is itself a valid Git common directory.
+            let otherRepository = Path.Combine(root, "OtherRepo")
+            Directory.CreateDirectory(otherRepository) |> ignore
+            gitAt otherRepository [ "init"; "-q" ] |> ignore
+            let otherCommonDirectory = Path.Combine(otherRepository, ".git")
+
+            let wrapper, count = countingGit root
+            let resolve selector = ProjectPaths.resolveRegisteredWorktreeWith wrapper main selector
+            Assert.That(ProjectPaths.WorktreeGit.isRegisteredWorktreePath main a, Is.True,
+                        "Intact linked-worktree metadata must pass the identity gate")
+            Assert.That(resolve "tree-a" |> succeeded, Is.EqualTo(a),
+                        "Intact linked worktree must resolve before the negative control")
+            Assert.That(count(), Is.EqualTo(1), "The initial public resolution must warm the path cache")
+
+            let pointerFile, mismatchedValue =
+                match edge with
+                | "dotgit" -> dotGitA, "gitdir: " + adminB + Environment.NewLine
+                | "commondir" -> commonPointerA, otherCommonDirectory + Environment.NewLine
+                | "gitdir" -> reversePointerA, dotGitB + Environment.NewLine
+                | _ -> failwithf "Unknown metadata edge: %s" edge
+            let originalValue = File.ReadAllText pointerFile
+            File.WriteAllText(pointerFile, mismatchedValue)
+
+            // Every pointer and destination remains present. Only the identity
+            // edge differs, so this cannot pass by short-circuiting on absence.
+            Assert.That(File.Exists dotGitA, Is.True)
+            Assert.That(Directory.Exists adminA, Is.True)
+            Assert.That(Directory.Exists adminB, Is.True)
+            Assert.That(File.Exists(Path.Combine(adminB, "commondir")), Is.True)
+            Assert.That(File.Exists(Path.Combine(adminB, "gitdir")), Is.True)
+            Assert.That(File.Exists commonPointerA, Is.True)
+            Assert.That(File.Exists reversePointerA, Is.True)
+            Assert.That(File.Exists dotGitB, Is.True)
+            Assert.That(Directory.Exists otherCommonDirectory, Is.True)
+            Assert.That(ProjectPaths.WorktreeGit.isRegisteredWorktreePath main a, Is.False,
+                        sprintf "%s must fail the direct identity gate" edgeName)
+
+            match resolve "tree-a" with
+            | Error _ -> ()
+            | Ok path -> Assert.Fail(sprintf "%s must not resolve a cached path: %s" edgeName path)
+            Assert.That(count(), Is.EqualTo(2),
+                        sprintf "%s must invalidate/refresh rather than trust the cached path" edgeName)
+
+            File.WriteAllText(pointerFile, originalValue)
+            Assert.That(ProjectPaths.WorktreeGit.isRegisteredWorktreePath main a, Is.True,
+                        sprintf "Restored %s metadata must pass the identity gate" edgeName)
+            Assert.That(resolve "tree-a" |> succeeded, Is.EqualTo(a),
+                        sprintf "Restored %s metadata must resolve normally" edgeName)
+        )
+
 
 [<Test>]
 let explicit_hierarchy_reads_every_ancestor_across_pages () =
@@ -536,9 +793,9 @@ let worktree_git_discovery_drains_both_pipes_and_bounds_a_hung_process () =
         // If stderr is not drained, the process blocks before printing stdout.
         let verbose =
             script "verbose-git.sh"
-                "head -c 262144 /dev/zero >&2; printf 'worktree /tmp/fixture\n'"
+                "head -c 262144 /dev/zero >&2; printf 'worktree /tmp/fixture\\000'"
         match Client.ProjectPaths.WorktreeGit.list verbose root (TimeSpan.FromSeconds 3.) with
-        | Ok output -> Assert.That(output, Does.Contain("worktree /tmp/fixture"))
+        | Ok listing -> Assert.That(listing.Paths, Does.Contain("/tmp/fixture"))
         | other -> Assert.Fail(sprintf "Both pipes must drain concurrently: %A" other)
         // A producer that never closes stdout must still be terminated.
         let hung = script "hung-git.sh" "printf 'worktree /tmp/fixture\n'; sleep 30"

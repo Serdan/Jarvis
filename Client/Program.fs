@@ -399,10 +399,13 @@ let executeReadySchedule (authenticatedActor: unit -> string option) (rt: Runtim
 }
 
 // Shared production dispatch entry point, also used by disposable scheduler tests.
-let executeRegisteredSchedule readFence authenticatedActor rt tui browser action =
-    if BrowserSchedules.isReadyResume action then
-        executeReadySchedule authenticatedActor rt browser action
-    else executeScheduledAction readFence rt tui browser action
+let executeRegisteredSchedule readFence (actorProvider: (unit -> string option) ref) rt tui browser =
+    // Resolve the current provider at each auth check, including after registration changes.
+    let authenticatedActor () = actorProvider.Value()
+    fun action ->
+        if BrowserSchedules.isReadyResume action then
+            executeReadySchedule authenticatedActor rt browser action
+        else executeScheduledAction readFence rt tui browser action
 
 let private runClient args =
     let activityStore, activityStoreError =
@@ -467,7 +470,7 @@ let private runClient args =
     // One persistent execution scheduler for CLI and browser actions.
     // The browser bridge is optional; CLI scheduling works without an extension.
     let mutable registered = false
-    let mutable readyResumeActor : unit -> string option = fun () -> None
+    let readyResumeActor : (unit -> string option) ref = ref (fun () -> None)
     let executeScheduledAction = executeRegisteredSchedule ClientConfig.capacityFenceMode readyResumeActor rt tui browser
     // The runtime owns at most one local scheduler per private state file.
     // A second JarvisClient can still connect, but never becomes a competing
@@ -483,7 +486,7 @@ let private runClient args =
                     let canonical = if checkout < 0 then project else project.Substring(0, checkout)
                     tui.GetAgentLastSeen(canonical, agent)),
                 verifyIdleActivity=(fun project agent -> verifyIdleActivity project agent),
-                reconcileResume=(fun action selection -> reconcileReadySchedule readyResumeActor rt action selection),
+                reconcileResume=(fun action selection -> reconcileReadySchedule readyResumeActor.Value rt action selection),
                 onFault=tui.Log))
         with :? IOException as error ->
             tui.Log ("Execution scheduling inactive on this client: " + error.Message)
@@ -617,7 +620,7 @@ let private runClient args =
             )
             .Build()
 
-    readyResumeActor <- (fun () ->
+    readyResumeActor.Value <- (fun () ->
         if registered && connection.State = HubConnectionState.Connected then authenticatedOperator
         else None)
 

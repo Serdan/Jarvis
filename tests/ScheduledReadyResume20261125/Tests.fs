@@ -464,9 +464,10 @@ let actualScheduledCallerWithFakeBrowser () =
                 let mutable nowTicks = DateTimeOffset.UtcNow.Ticks
                 let clock () = DateTimeOffset(Interlocked.Read(&nowTicks), TimeSpan.Zero)
                 let advance (seconds: float) = Interlocked.Add(&nowTicks, TimeSpan.FromSeconds(seconds).Ticks) |> ignore
-                let actor () = Some "operator:fixture"
+                let actorProvider : (unit -> string option) ref = ref (fun () -> None)
+                let mutable registered = true
                 use service = new BrowserSchedules.Service(Path.Combine(root, "schedules.json"),
-                    Program.executeRegisteredSchedule (fun () -> Ok ClientConfig.Disabled) actor rt (ConsoleTui.ConsoleTui()) (Some bridge), now=clock, pollMs=25)
+                    Program.executeRegisteredSchedule (fun () -> Ok ClientConfig.Disabled) actorProvider rt (ConsoleTui.ConsoleTui()) (Some bridge), now=clock, pollMs=25)
                 rt.BrowserScheduler <- Some service
                 service.Schedule(a.Id, 5, a.Url, a.ProjectName, a.ScriptPath, a.Alias, a.ArgsJson, a.Active,
                     windowRegistration=a.WindowRegistration, closeAfter=false, repeatEverySeconds=60) |> good |> ignore
@@ -479,7 +480,15 @@ let actualScheduledCallerWithFakeBrowser () =
                 service.Start()
                 let pending = socketReceive socket
                 advance 6.
-                let absentSwitch = waitOccurrence ""
+                let unavailable = waitOccurrence ""
+                let _, _, error = scheduleState service a.Id
+                Assert.That(error, Does.Contain("Authenticated active resume schedule unavailable"))
+                Assert.That(pending.IsCompleted, Is.False, "No authenticated provider must mean no browser effect.")
+                actorProvider.Value <- (fun () -> if Volatile.Read(&registered) then Some "operator:fixture" else None)
+                advance 60.
+                let absentSwitch = waitOccurrence unavailable
+                let _, _, error = scheduleState service a.Id
+                Assert.That(error, Does.Contain("Project Automation is disabled"), "The already constructed callback must read the installed actor and reach the policy gate.")
                 Assert.That(pending.IsCompleted, Is.False, "Legacy capacity policy must not enable Automation.")
                 ProjectCapacityPolicy.updateAutomation binding "fixture" (Guid.NewGuid()) 1 true (Some 1) Map.empty
                 |> good |> ignore
@@ -488,6 +497,13 @@ let actualScheduledCallerWithFakeBrowser () =
                 Assert.That(pending.IsCompleted, Is.False, "Enabled cap must produce no browser effect.")
                 ProjectCapacityPolicy.updateAutomation binding "fixture" (Guid.NewGuid()) 2 true None Map.empty
                 |> good |> ignore
+                Volatile.Write(&registered, false)
+                advance 60.
+                let unregistered = waitOccurrence capped
+                let _, _, error = scheduleState service a.Id
+                Assert.That(error, Does.Contain("Authenticated active resume schedule unavailable"))
+                Assert.That(pending.IsCompleted, Is.False, "Registration loss must prevent dispatch even when policy permits it.")
+                Volatile.Write(&registered, true)
                 advance 60.
                 let! frame = pending.WaitAsync(TimeSpan.FromSeconds(15.))
                 Assert.That(prop frame "kind", Is.EqualTo("openTab"))
@@ -501,7 +517,7 @@ let actualScheduledCallerWithFakeBrowser () =
                 Assert.That(args.GetProperty("startUrl").GetString(), Is.EqualTo(a.Url))
                 Assert.That(args.EnumerateObject() |> Seq.length, Is.EqualTo(2))
                 do! socketSend socket (JsonSerializer.Serialize({| version=2; kind="result"; requestId=prop execute "requestId"; connectionId=connection; registrationId="created-01"; registrationGeneration=1; status="completed"; result={| status="outcomeUnknown"; stage="acknowledgement"; reason="SubmissionUnconfirmed" |} |}))
-                let launched = waitOccurrence capped
+                let launched = waitOccurrence unregistered
                 let _, _, error = scheduleState service a.Id
                 Assert.That(error, Does.Contain("OutcomeUnknown"))
                 let noReplay = socketReceive socket
@@ -569,7 +585,7 @@ let recurringLegacyLauncherUsesCanonicalProjectOptIn () =
                     Ok ClientConfig.Disabled
                 let actor () = Some "operator:fixture"
                 use service = new BrowserSchedules.Service(Path.Combine(root, "legacy-schedules.json"),
-                    Program.executeRegisteredSchedule readFence actor rt tui (Some bridge), now=clock, pollMs=25)
+                    Program.executeRegisteredSchedule readFence (ref actor) rt tui (Some bridge), now=clock, pollMs=25)
                 rt.BrowserScheduler <- Some service
                 let schedule id project script =
                     let route = route project

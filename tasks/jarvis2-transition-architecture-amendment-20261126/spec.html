@@ -1,0 +1,85 @@
+<article>
+<h1>Jarvis 2.0 architecture amendment: Work, execution, resources, and 1.0 maintenance</h1>
+<p><strong>Parent:</strong> <code>jarvis-post-automation-role-queue-evolution-20261122</code>. <strong>Status:</strong> DOCUMENTATION / ARCHITECTURE ALIGNMENT ONLY. This task is authorized to inspect current source, tests, accepted evidence and canonical Work state, and to prepare a reviewable documentation amendment. It is not authorization to implement, integrate, publish, deploy, create the stable branch, migrate SQLite, enable a Scheduler, launch paid provider calls, or alter any existing Work assignment.</p>
+<p><strong>Controlling purpose:</strong> define the minimum stable transition from Automation/Jarvis 1.0 to Jarvis 2.0 without major disruption. Reconcile the existing stateful Work/SQLite implementation with the Operator's newly clarified separation between server authority, ephemeral inference execution, and independently available JarvisClient resources. Resource management belongs inside the Work architecture; it is not a separate prerequisite milestone.</p>
+
+<h2>1. Required source inspection and evidence discipline</h2>
+<ul>
+<li>Use a new clean registered worktree based on the exact current verified <code>origin/main</code> commit. The project main checkout currently has unrelated uncommitted changes and is behind its remote; do not edit it, reset it, clean it, or assume its local HEAD is current. Record the exact base SHA and ancestry.</li>
+<li>Read the current <code>docs/specs/work-stateful-orchestration-2026-11-17.md</code> and <code>docs/specs/work-stateful-implementation-alignment-2026-11-17.md</code>, including their current history/status, plus the closed <code>work-stateful-orchestration-alignment</code> task and its exact accepted/frozen evidence. Preserve accepted design and historical evidence; do not silently rewrite the old contract.</li>
+<li>Inspect the actual current integrated source and tests for SQLite authority, scheduler/capacity, Work graph/producers, legacy import, backup/restore, recovery, client/device routing, browser bridge, local process/job execution, remote job execution and repository/worktree operations. At minimum examine the current equivalents of <code>Server/WorkSqliteAuthority.fs</code>, <code>WorkSchedulerSqlite.fs</code>, <code>WorkRecoverySqlite.fs</code>, <code>WorkLegacyImportSqlite.fs</code>, <code>WorkSnapshotCodec.fs</code>, <code>WorkSqliteBackup.fs</code>, <code>WorkBackupReplication.fs</code>, client Work adapters, <code>Client/SignalR/Client.fs</code>, device routing, BrowserBridge and job/process modules. Follow actual current paths; do not assume every named module exists on the chosen base.</li>
+<li>Reconcile canonical task state and exact source/review/integration evidence for at least: <code>work-sqlite-authority-substrate</code>, <code>work-sqlite-scheduler-capacity</code>, <code>work-verified-git-sqlite-import</code>, <code>work-trusted-source-ingress-adapters</code>, <code>work-trusted-sqlite-domain-provenance</code>, <code>work-sqlite-domain-backup-projection-contract</code>, <code>work-c1-normalized-scheduler-import-projection</code>, <code>work-stateful-orchestration-alignment</code>, and <code>draft-execution-resources-client-daemon-and-routing</code>. Distinguish integrated source, accepted-but-not-integrated source, blocked attempts, stale branches and merely proposed designs. A task's lifecycle label alone is not proof of source integration.</li>
+<li>The existing <code>draft-execution-resources-client-daemon-and-routing</code> is explicitly held and must not be promoted unchanged. Extract only requirements that survive comparison with current source, existing Work/SQLite design and the Operator decisions below.</li>
+<li>Record exact commit SHAs, relevant paths/line ranges, task/attempt IDs, review IDs and integration receipts for material claims. Clearly label inference and unresolved evidence. Do not invent a current deployment or claim the SQLite target is live authority unless source/deployment evidence proves it.</li>
+</ul>
+
+<h2>2. Architecture decisions to incorporate</h2>
+<h3>Work and three independent planes</h3>
+<ul>
+<li><strong>Work:</strong> durable intent, specifications, acceptance criteria, graph/dependencies, milestone membership, stages, priorities, checkpoints, evidence, attention and history. Work is not owned by an Agent or a client.</li>
+<li><strong>Inference execution:</strong> ephemeral provider session with provider/profile, execution identity, lifecycle and fenced authority. ChatGPT and Codex are the real-provider coverage required for 2.0 release; Claude and other providers are follow-on adapters. Provider choice is independent of resource choice. Conversation IDs/URLs are optional diagnostics, never canonical identity, authority or continuation state.</li>
+<li><strong>Resources:</strong> independently registered/authenticated JarvisClient hosts and their capabilities: repository checkouts/worktrees, filesystem operations, process/build/test execution, browser instances/extensions and later other measured compute. A client is a resource provider, not the execution context or owner of the model session.</li>
+<li><strong>Server control plane:</strong> Jarvis server is authoritative for Work and orchestration. The intended single local SQLite transaction domain (WAL initially preferred) owns Work, executions/launches, claims/generations, capacity, host/resource registry, resource leases, job/Challenge continuation state, idempotent receipts, audit events and queue projections. In-memory projections are disposable. Git remains source-code and immutable source/review/integration provenance plus asynchronous readable backup, not the hot-path coordination authority.</li>
+<li><strong>Scheduler:</strong> deterministic server-side selection of eligible Work, compatible role/queue, available inference profile/provider, and required resources. It enforces authority and capacity; a client availability event is a reason to re-evaluate canonical state, not launch authority.</li>
+<li><strong>Challenges:</strong> durable blockers/continuations for jobs, timers, dependencies and human decisions. A model execution can checkpoint/end while an engineering job continues on a resource host. Job and execution lifecycles are independent.</li>
+</ul>
+
+<h3>Client/resource semantics</h3>
+<ul>
+<li>Use the concrete motivating scenario: Serdan-Home supplies repository checkouts and local process/build/test capabilities to a model execution that may be running elsewhere. The model execution does not run on Serdan-Home merely because it uses those resources.</li>
+<li>Separate stable authenticated host identity from public <code>deviceId</code> routing labels, project/repository names, local paths, provider conversation IDs and model execution IDs. A reconnect updates the same enrolled host; replacing a machine requires explicit enrollment/identity semantics.</li>
+<li>Clients advertise typed, bounded capabilities and constraints: supported operations, repository/source availability, OS/toolchain, browser/profile/origin support, concurrency/exclusivity, locality and availability. Begin with existing concrete capabilities; no Kubernetes-like fleet manager or generic distributed hardware allocator.</li>
+<li>Server grants versioned, expiring, fenced resource leases scoped to Work stage/execution, host/resource, project/repository and permitted operations. Lease expiry revokes authority but does not prove that a process, provider session or external effect physically stopped. Stale generations cannot start new operations or mutate Work.</li>
+<li>Resource operations/jobs have stable identities, bounded inputs/outputs and durable provenance. Client disconnect, process timeout or lost acknowledgement produces explicit unknown/reconciliation state where appropriate; never fabricate success or blindly replay an external effect. A build/test can outlive its initiating inference session and must remain independently observable and reconcilable.</li>
+<li>Keep four lifecycles distinct: model execution liveness; host connectivity; resource-lease validity; engineering-job lifecycle. Do not reuse one heartbeat or stale threshold for all four. Closing a browser tab is never proof of model execution termination.</li>
+<li>Initially support repository/worktree, filesystem, process/build/test and browser resources. GPU/weighted CPU/memory allocation and advanced pools are follow-on only if measured need justifies them.</li>
+</ul>
+
+<h2>3. Jarvis 1.0 maintenance branch and release strategy</h2>
+<ul>
+<li>Keep Automation stabilization and acceptance as the immediate execution frontier. Do not cut 1.0 from an unverified or non-deployable point.</li>
+<li>After Automation passes independent acceptance, integration, release validation and uncertain-effect/job reconciliation, record the exact deployable release SHA, tested artifact/configuration and rollback procedure. Only then create <code>stable/1.x</code> from that exact commit and tag it immutably. This task must not create the branch or tag.</li>
+<li>After the cut, <code>stable/1.x</code> is targeted maintenance/hotfix only; <code>main</code> is the Jarvis 2.0 development line. Never merge the 2.0 development line wholesale into stable.</li>
+<li>A 1.0 hotfix branches from <code>stable/1.x</code>, receives focused Release/regression tests and independent review, merges back to stable and receives an immutable release tag as appropriate. Forward-port the semantic fix to <code>main</code> deliberately and validate it there; not every 1.0 implementation detail must survive in 2.0.</li>
+<li>Keep the known-good 1.0 release, deployment procedure and rollback available throughout 2.0 development. Branch creation, release, deployment and hotfix execution are outside this documentation task.</li>
+</ul>
+
+<h2>4. Work as the 2.0 transition boundary</h2>
+<ul>
+<li>Resource management is part of Work architecture and execution admission; it is not a separate milestone that Work waits for.</li>
+<li>Work implementation proceeds by dependency: reconcile architecture and current implementation; reuse/finish the existing SQLite transaction substrate and typed domain interfaces; establish host/resource identity and resource lease contracts; complete Work graph/queue/authority; implement durable Challenge suspension; integrate provider adapters and JarvisClient resource adapters; then event-driven Scheduler and Operator experience. Parallelize only after shared contracts and source ownership are explicit.</li>
+<li>Do not build a second SQLite database, duplicate an existing accepted subsystem, or create a parallel resource manager. The implementation alignment must say exactly which existing tasks/code are retained, adapted, completed, superseded, deferred or blocked, with evidence.</li>
+<li>Do not automatically reopen, cancel, assign or rewrite the existing Work SQLite tasks while preparing the document. If their remaining scopes conflict with the new target, record a recommendation and exact dependency for Operator decision.</li>
+<li>Keep milestones as scope/progress/priority structures, independent of hard scheduling dependencies. Completion counts accepted deliverables / explicitly included milestone deliverables; task splitting or extra review does not silently change the denominator.</li>
+</ul>
+
+<h2>5. Planned clean-slate coordination cutover</h2>
+<ul>
+<li>Pause dispatch intentionally; uninterrupted rolling dispatch is not required.</li>
+<li>Before switching, fence and reconcile every old execution, in-flight job, source writer and external effect that could still act. A missing session/tab or expired lease is not physical termination evidence.</li>
+<li>Leave the old Git-backed coordination ledger intact as read-only historical evidence. Do not rewrite/delete it and do not dual-write Git and SQLite as concurrent live authorities.</li>
+<li>Initialize 2.0 projects with blank coordination state. New projects start directly in 2.0. The Operator initiates selective manual migration of chosen Work, source refs and evidence; do not blanket-migrate Agents, task queues, claims or notifications.</li>
+<li>Source repositories and project code are not blanked or migrated merely because coordination state is. Preserve immutable commits, reviews and integration evidence as references. Reissued Work must be fenced from old sessions and uncertain effects.</li>
+<li>Cutover, DB activation, deployment and Scheduler enablement each require a separate explicit Operator GO.</li>
+</ul>
+
+<h2>6. Required document deliverables</h2>
+<ol>
+<li>Amend <code>docs/specs/work-stateful-orchestration-2026-11-17.md</code> to incorporate the authoritative server, Work/execution/resource separation, host/resource identity and lease semantics, separate lifecycles, 1.0/2.0 branch strategy and planned clean-slate cutover. Preserve original historical decisions and clearly identify superseded wording.</li>
+<li>Amend <code>docs/specs/work-stateful-implementation-alignment-2026-11-17.md</code> with a source-grounded current implementation matrix: integrated/accepted/blocked/proposed status for the existing SQLite and Work slices, missing adapters/contracts for resource-plane support, reuse/adapt/replace/defer recommendations, dependencies and release/cutover gates.</li>
+<li>Add a concise transition/dependency map showing which existing Work tasks should be completed, re-scoped, superseded or held. Do not create duplicate implementation tasks in this task.</li>
+<li>Include explicit open decisions rather than inventing answers: host enrollment/authentication details, capability schema, resource lease renewal/reclamation policy, remote job protocol, resource concurrency/exclusivity guarantees, backup interval/loss budget, exact SQLite schema changes and exact 1.0 release SHA.</li>
+<li>Record a short verification note: exact base/source SHA, changed paths, <code>git diff --check</code>, docs/link validation available in the repo, and confirmation that no source code, live DB, scheduler, deployment or existing task state was changed.</li>
+</ol>
+
+<h2>7. Acceptance and boundaries</h2>
+<ul>
+<li>Both amended specs agree on authority and boundaries; no competing Git/SQLite live authority or client-owned Scheduler is implied.</li>
+<li>Every claim about current implementation is supported by exact integrated source or canonical task/review/integration evidence; stale branches and accepted-but-unintegrated commits are labeled accurately.</li>
+<li>Serdan-Home scenario and four separate lifecycles are explicit and testable.</li>
+<li>1.0 stable branch cut point and hotfix/forward-port process are explicit, but no branch/tag/release is created here.</li>
+<li>Clean-slate coordination cutover and separate Operator authorization gates are explicit.</li>
+<li>All changes are documentation-only on a new isolated worktree. Commit locally for independent frozen review; do not push, integrate, merge, deploy or activate anything. No implementation source or tests are modified.</li>
+<li>After author completion, submit the exact frozen docs commit for independent review by an agent other than the author. Do not self-review or treat the author's validation as acceptance.</li>
+</ul>
+</article>

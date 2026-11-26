@@ -442,6 +442,93 @@ let registered_worktree_symlink_paths_are_rejected () =
     )
 
 [<Test>]
+let registered_worktree_metadata_identity_edges_reject_existing_mismatched_pointers () =
+    if OperatingSystem.IsWindows() then Assert.Ignore("Shell fixture requires Unix executables.")
+    for edgeName, edge in
+        [ "worktree .git pointer", "dotgit"
+          "commondir pointer", "commondir"
+          "reverse gitdir pointer", "gitdir" ] do
+        workspace (fun root _ ->
+            let main = Path.Combine(root, "Demo")
+            gitAt main [ "init"; "-q" ] |> ignore
+            gitAt main [ "config"; "user.name"; "Fixture" ] |> ignore
+            gitAt main [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+            create root "Demo/tracked.txt" "baseline" |> ignore
+            gitAt main [ "add"; "." ] |> ignore
+            gitAt main [ "commit"; "-qm"; "baseline" ] |> ignore
+            let worktreeRoot = Path.Combine(root, ".Demo-worktrees")
+            Directory.CreateDirectory(worktreeRoot) |> ignore
+            let a = Path.Combine(worktreeRoot, "tree-a")
+            let b = Path.Combine(worktreeRoot, "tree-b")
+            gitAt main [ "worktree"; "add"; "-qb"; "branch-a"; a; "HEAD" ] |> ignore
+            gitAt main [ "worktree"; "add"; "-qb"; "branch-b"; b; "HEAD" ] |> ignore
+
+            let dotGitA = Path.Combine(a, ".git")
+            let dotGitB = Path.Combine(b, ".git")
+            let adminDirectory worktree =
+                let pointer = File.ReadAllText(Path.Combine(worktree, ".git")).Trim()
+                Assert.That(pointer.StartsWith("gitdir: ", StringComparison.Ordinal), Is.True)
+                let raw = pointer.Substring("gitdir: ".Length)
+                if Path.IsPathRooted raw then Path.GetFullPath raw
+                else Path.GetFullPath(Path.Combine(worktree, raw))
+            let adminA = adminDirectory a
+            let adminB = adminDirectory b
+            let commonPointerA = Path.Combine(adminA, "commondir")
+            let reversePointerA = Path.Combine(adminA, "gitdir")
+
+            // Use a second real repository for the commondir mismatch so the
+            // wrong target exists and is itself a valid Git common directory.
+            let otherRepository = Path.Combine(root, "OtherRepo")
+            Directory.CreateDirectory(otherRepository) |> ignore
+            gitAt otherRepository [ "init"; "-q" ] |> ignore
+            let otherCommonDirectory = Path.Combine(otherRepository, ".git")
+
+            let wrapper, count = countingGit root
+            let resolve selector = ProjectPaths.resolveRegisteredWorktreeWith wrapper main selector
+            Assert.That(ProjectPaths.WorktreeGit.isRegisteredWorktreePath main a, Is.True,
+                        "Intact linked-worktree metadata must pass the identity gate")
+            Assert.That(resolve "tree-a" |> succeeded, Is.EqualTo(a),
+                        "Intact linked worktree must resolve before the negative control")
+            Assert.That(count(), Is.EqualTo(1), "The initial public resolution must warm the path cache")
+
+            let pointerFile, mismatchedValue =
+                match edge with
+                | "dotgit" -> dotGitA, "gitdir: " + adminB + Environment.NewLine
+                | "commondir" -> commonPointerA, otherCommonDirectory + Environment.NewLine
+                | "gitdir" -> reversePointerA, dotGitB + Environment.NewLine
+                | _ -> failwithf "Unknown metadata edge: %s" edge
+            let originalValue = File.ReadAllText pointerFile
+            File.WriteAllText(pointerFile, mismatchedValue)
+
+            // Every pointer and destination remains present. Only the identity
+            // edge differs, so this cannot pass by short-circuiting on absence.
+            Assert.That(File.Exists dotGitA, Is.True)
+            Assert.That(Directory.Exists adminA, Is.True)
+            Assert.That(Directory.Exists adminB, Is.True)
+            Assert.That(File.Exists(Path.Combine(adminB, "commondir")), Is.True)
+            Assert.That(File.Exists(Path.Combine(adminB, "gitdir")), Is.True)
+            Assert.That(File.Exists commonPointerA, Is.True)
+            Assert.That(File.Exists reversePointerA, Is.True)
+            Assert.That(File.Exists dotGitB, Is.True)
+            Assert.That(Directory.Exists otherCommonDirectory, Is.True)
+            Assert.That(ProjectPaths.WorktreeGit.isRegisteredWorktreePath main a, Is.False,
+                        sprintf "%s must fail the direct identity gate" edgeName)
+
+            match resolve "tree-a" with
+            | Error _ -> ()
+            | Ok path -> Assert.Fail(sprintf "%s must not resolve a cached path: %s" edgeName path)
+            Assert.That(count(), Is.EqualTo(2),
+                        sprintf "%s must invalidate/refresh rather than trust the cached path" edgeName)
+
+            File.WriteAllText(pointerFile, originalValue)
+            Assert.That(ProjectPaths.WorktreeGit.isRegisteredWorktreePath main a, Is.True,
+                        sprintf "Restored %s metadata must pass the identity gate" edgeName)
+            Assert.That(resolve "tree-a" |> succeeded, Is.EqualTo(a),
+                        sprintf "Restored %s metadata must resolve normally" edgeName)
+        )
+
+
+[<Test>]
 let explicit_hierarchy_reads_every_ancestor_across_pages () =
     workspace (fun root rt ->
         let workspaceText = String('w', 260000)

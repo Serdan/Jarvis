@@ -527,7 +527,7 @@ let durableDeadlineWakeSurvivesRestartWithoutChangingCadence () =
         let clock () = DateTimeOffset(Interlocked.Read(&nowTicks), TimeSpan.Zero)
         let setTime at = Interlocked.Exchange(&nowTicks, (at: DateTimeOffset).Ticks) |> ignore
         let wake = origin.AddSeconds(300.)
-        let cadence = origin.AddSeconds(3601.)
+        let cadence = origin.AddSeconds(3605.)
         let action = route "Fixture"
         let mutable calls = 0
         let mutable firstService: BrowserSchedules.Service option = None
@@ -546,10 +546,10 @@ let durableDeadlineWakeSurvivesRestartWithoutChangingCadence () =
         do
             use service = new BrowserSchedules.Service(path, execute, now=clock, pollMs=25)
             firstService <- Some service
-            service.Schedule(action.Id, 1, action.Url, action.ProjectName, action.ScriptPath, action.Alias, action.ArgsJson, action.Active,
+            service.Schedule(action.Id, 5, action.Url, action.ProjectName, action.ScriptPath, action.Alias, action.ArgsJson, action.Active,
                 windowRegistration=action.WindowRegistration, closeAfter=true, repeatEverySeconds=3600) |> good |> ignore
             service.Start()
-            setTime (origin.AddSeconds(1.))
+            setTime (origin.AddSeconds(5.))
             waitFinished service ""
             Assert.That(dueAndWake service, Is.EqualTo((cadence, wake)))
         use restarted = new BrowserSchedules.Service(path, (fun _ ->

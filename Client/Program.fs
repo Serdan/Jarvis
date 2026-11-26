@@ -429,11 +429,19 @@ let executeReadyScheduleWithActivity activity (authenticatedActor: unit -> strin
                                                     action.Url action.Alias action.Active source args
                                                     30000 action.CloseTabAfterExecution
                                     match result with
-                                    | Ok value -> return Ok value
+                                    | Ok value ->
+                                        use receipt = JsonDocument.Parse(value)
+                                        let root = receipt.RootElement
+                                        match root.TryGetProperty("status") with
+                                        | true, status when status.ValueKind = JsonValueKind.String && status.GetString() = "notSubmitted" ->
+                                            registrationId <- root.GetProperty("registrationId").GetString()
+                                            return Error(ScheduledReadyResume.DefinitelyNotInvoked("NotSubmitted: provider explicitly reported no Send; registrationId=" + registrationId))
+                                        | _ -> return Ok value
                                     | Error(id, reason) ->
                                         registrationId <- id
                                         if BrowserBridge.isConfirmedNoSendFailure id reason then
-                                            return Error(ScheduledReadyResume.DefinitelyNotInvoked("TabCapacityHold: " + reason))
+                                            let category = if String.IsNullOrEmpty id then "TabCapacityHold: " else "PreSendFailure: "
+                                            return Error(ScheduledReadyResume.DefinitelyNotInvoked(category + reason))
                                         else
                                             return Error(ScheduledReadyResume.SendOutcomeUnknown reason)
                         }

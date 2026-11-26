@@ -15,8 +15,9 @@ open NUnit.Framework
 
 [<Test>]
 let agentTabLimitIsConfirmedNoSendOnlyWithoutRegistration () =
-    Assert.That(BrowserBridge.isConfirmedNoSendFailure "" "AgentTabLimitReached", Is.True)
-    Assert.That(BrowserBridge.isConfirmedNoSendFailure "registration-123" "AgentTabLimitReached", Is.False)
+    Assert.That(BrowserBridge.isConfirmedNoSendFailure "" "BrowserOpenTabError:AgentTabLimitReached", Is.True)
+    Assert.That(BrowserBridge.isConfirmedNoSendFailure "registration-123" "BrowserOpenTabError:AgentTabLimitReached", Is.False)
+    Assert.That(BrowserBridge.isConfirmedNoSendFailure "" "AgentTabLimitReached", Is.False)
     Assert.That(BrowserBridge.isConfirmedNoSendFailure "" "ExtensionDisconnected", Is.False)
     Assert.That(BrowserBridge.isConfirmedNoSendFailure "" "OutcomeUnknown:AgentTabLimitReached", Is.False)
 

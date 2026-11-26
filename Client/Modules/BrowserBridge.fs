@@ -785,6 +785,8 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
                                        expectedRegistrationGeneration = createdGeneration,
                                        requireFreshHomeNoTurns = requireFreshHomeNoTurns) with
                 | Ok _ -> return Ok "closed"
+                | Error "BrowserCloseTabError:CleanupSafetyChanged" when requireFreshHomeNoTurns ->
+                    return Ok "retained"
                 | Error e ->
                     let safe = if e.Length > 100 then e.Substring(0, 100) else e
                     return Error("cleanupFailed:" + safe + "; registrationId=" + registrationId)
@@ -824,12 +826,9 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
                     let withinReadinessBudget () =
                         Stopwatch.GetElapsedTime(readinessStarted) < TimeSpan.FromSeconds(30.0)
                     let cleanupNotReady () = task {
-                        if not closeAfterExecution then
-                            return Error(registrationId, "TabNotReady; cleanup=retained; registrationId=" + registrationId)
-                        else
-                            match! closeGuarded() with
-                            | Ok cleanup -> return Error(registrationId, "TabNotReady; cleanup=" + cleanup)
-                            | Error failure -> return Error(registrationId, "TabNotReady; " + failure)
+                        match! closeGuarded() with
+                        | Ok cleanup -> return Error(registrationId, "TabNotReady; cleanup=" + cleanup)
+                        | Error failure -> return Error(registrationId, "TabNotReady; " + failure)
                     }
                     let mutable ready = false
                     let mutable ownershipChanged = false
@@ -897,8 +896,21 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
                                     | true, x when x.ValueKind = JsonValueKind.String -> x.GetString()
                                     | _ -> "completed"
                                 | _ -> "completed"
+                            let disposable =
+                                match payload.ValueKind with
+                                | JsonValueKind.Object ->
+                                    let conversationObserved =
+                                        match payload.TryGetProperty("reason") with
+                                        | true, reason when reason.ValueKind = JsonValueKind.String ->
+                                            reason.GetString() = "ExistingConversation" || reason.GetString() = "UnexpectedStartUrl"
+                                        | _ -> false
+                                    match payload.TryGetProperty("safeToDisposeCreatedTab") with
+                                    | true, proof -> proof.ValueKind = JsonValueKind.True && not conversationObserved
+                                    | _ -> false
+                                | _ -> false
                             let disposeFailedLaunch () =
                                 if closeAfterExecution then closeDefinitive()
+                                elif disposable then closeGuarded()
                                 else task { return Ok "retained" }
                             if status = "outcomeUnknown" then
                                 // Preserve only known, non-sensitive failure categories and
@@ -991,7 +1003,12 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
                                 // never changes this no-send classification.
                                 match! disposeFailedLaunch() with
                                 | Error failure -> return Error(registrationId, "NotSubmitted;" + failure)
-                                | Ok cleanup -> return Error(registrationId, "NotSubmitted; cleanup=" + cleanup + "; registrationId=" + registrationId)
+                                | Ok cleanup ->
+                                    return Ok(JsonSerializer.Serialize(
+                                        {| registrationId = registrationId
+                                           status = status
+                                           scriptResult = payload.Clone()
+                                           cleanup = cleanup |}))
                             else
                                 let mutable cleanup = "retained"
                                 if closeAfterExecution then

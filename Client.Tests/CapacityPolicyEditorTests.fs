@@ -71,7 +71,7 @@ let private currentNotice (ui: ConsoleTui) =
     let _, _, _, _, notice, _ = editorState ui
     notice
 
-let private renderContains (ui: ConsoleTui) needle =
+let private renderContains (ui: ConsoleTui) (needle: string) =
     ui.RenderProjectEditorForFixture(80, 24)
     |> Array.exists (fun line -> line.Contains(needle, StringComparison.Ordinal))
 
@@ -158,7 +158,7 @@ let saveReadbackPreservesCapsAndReloadCopyAndCancelRemainAvailable () =
     Assert.That(operation, Is.Not.EqualTo(Guid.Empty))
     Assert.That(saved, Is.EqualTo(expectedEnabledPolicy))
     Assert.That(saved.Total, Is.EqualTo(initialPolicy.Total))
-    Assert.That(saved.Roles, Is.EqualTo(initialPolicy.Roles))
+    Assert.That(saved.Roles = initialPolicy.Roles, Is.True)
 
     // F5 reloads the authenticated readback rather than retaining a local draft.
     press ui ConsoleKey.F5 '\000'

@@ -82,6 +82,39 @@ let private startServer () =
         return app, endpoint
     }
 
+let private startJarvisToolServer () =
+    task {
+        let endpoint = sprintf "http://127.0.0.1:%d" (unusedLoopbackPort ())
+        let builder = WebApplication.CreateBuilder()
+        builder.WebHost.UseUrls(endpoint) |> ignore
+        builder.Services.AddAuthorization() |> ignore
+        builder.Services.AddHttpContextAccessor() |> ignore
+        // The schema host only lists tools; mirror production service registration
+        // without constructing a client connection or executing a client-backed tool.
+        builder.Services.AddScoped<global.Server.Services.ClientService>(fun _ -> failwith "Schema-only test host") |> ignore
+        builder.Services
+            .AddMcpServer()
+            .WithHttpTransport(fun options -> options.Stateless <- true)
+            .WithRequestFilters(fun filters ->
+                filters.AddCallToolFilter(McpEndpoint.deviceRoutingFilter()) |> ignore)
+            .WithTools<JarvisMcpTools>()
+        |> ignore
+
+        let app = builder.Build()
+        app.UseRouting() |> ignore
+        app.Use(
+            Func<RequestDelegate, RequestDelegate>(fun next ->
+                RequestDelegate(fun context ->
+                    context.User <-
+                        ClaimsPrincipal(ClaimsIdentity([ Claim("sub", "one-operator") ], "test-auth"))
+                    next.Invoke(context)))
+        ) |> ignore
+        app.UseAuthorization() |> ignore
+        McpEndpoint.map app
+        do! app.StartAsync()
+        return app, endpoint
+    }
+
 let private postMcp (http: HttpClient) (endpoint: string) (payload: string) =
     task {
         use request = new HttpRequestMessage(HttpMethod.Post, endpoint + "/mcp")
@@ -203,4 +236,64 @@ let more_than_40_simultaneous_authenticated_mcp_tool_calls_enter_normal_handlers
             use result = responseJson body
             Assert.That(result.RootElement.GetProperty("result").ValueKind, Is.EqualTo(JsonValueKind.Object))
         Assert.That(ProbeState.entered.Count, Is.EqualTo(count))
+    }
+
+[<Test>]
+let registered_mcp_lifecycle_tools_publish_descriptions_and_argument_schemas () =
+    task {
+        let! instance, endpoint = startJarvisToolServer ()
+        use app = instance
+        use http = new HttpClient()
+        http.Timeout <- TimeSpan.FromSeconds(10.0)
+
+        use! listing = postMcp http endpoint """{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"""
+        let! body = listing.Content.ReadAsStringAsync()
+        Assert.That(listing.StatusCode, Is.EqualTo(HttpStatusCode.OK), body)
+        use document = responseJson body
+        let tools = document.RootElement.GetProperty("result").GetProperty("tools")
+        let normalize (value: string) =
+            value.Replace("_", "").Replace("-", "").Replace(".", "").ToLowerInvariant()
+
+        let findTool methodName =
+            tools.EnumerateArray()
+            |> Seq.tryFind (fun tool ->
+                let name = tool.GetProperty("name").GetString()
+                (normalize name).EndsWith(normalize methodName, StringComparison.Ordinal))
+            |> Option.defaultWith (fun () -> failwith $"MCP tools/list omitted {methodName}.")
+
+        let assertSchema methodName expectedRequired expectedOptional =
+            let tool = findTool methodName
+            let methodInfo = typeof<JarvisMcpTools>.GetMethod(methodName)
+            Assert.That(methodInfo, Is.Not.Null, methodName)
+            let expectedDescription =
+                (methodInfo.GetCustomAttributes(typeof<System.ComponentModel.DescriptionAttribute>, false)[0]
+                 :?> System.ComponentModel.DescriptionAttribute).Description
+            Assert.That(tool.GetProperty("description").GetString(), Is.EqualTo(expectedDescription), methodName)
+
+            let schema = tool.GetProperty("inputSchema")
+            let properties =
+                schema.GetProperty("properties").EnumerateObject()
+                |> Seq.map (fun property -> property.Name)
+                |> Set.ofSeq
+            let required =
+                schema.GetProperty("required").EnumerateArray()
+                |> Seq.map (fun property -> property.GetString())
+                |> Set.ofSeq
+            Assert.That(required, Is.EquivalentTo(expectedRequired), methodName)
+            for name in expectedRequired do
+                Assert.That(properties.Contains name, Is.True, $"{methodName}: {name}")
+            for name in expectedOptional do
+                Assert.That(properties.Contains name, Is.True, $"{methodName}: optional {name}")
+                Assert.That(required.Contains name, Is.False, $"{methodName}: optional {name} must not be required")
+            for injected in [ "client"; "http" ] do
+                Assert.That(properties.Contains injected, Is.False, $"{methodName}: injected service {injected} must not be public")
+
+        assertSchema "CheckpointAttempt"
+            [ "projectName"; "taskId"; "agentId"; "summary"; "nextAction" ]
+            [ "sourceCommit"; "evidence"; "expectedAttemptVersion"; "expectedAgentVersion";
+              "assignmentGeneration"; "operationId"; "deviceId" ]
+        assertSchema "YieldAgent"
+            [ "projectName"; "taskId"; "agentId"; "summary"; "nextAction" ]
+            [ "expectedAttemptVersion"; "expectedAgentVersion"; "assignmentGeneration";
+              "operationId"; "deviceId" ]
     }

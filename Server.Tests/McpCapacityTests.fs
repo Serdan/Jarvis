@@ -89,6 +89,7 @@ let private startJarvisToolServer () =
         builder.WebHost.UseUrls(endpoint) |> ignore
         builder.Services.AddAuthorization() |> ignore
         builder.Services.AddHttpContextAccessor() |> ignore
+        builder.Services.AddScoped<ClientService>() |> ignore
         builder.Services
             .AddMcpServer()
             .WithHttpTransport(fun options -> options.Stateless <- true)

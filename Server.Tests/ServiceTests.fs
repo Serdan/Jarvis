@@ -515,7 +515,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
                           "OperatorConversationRead"; "OperatorConversationWrite";
                           "WorkQueueRead"; "WorkQueueWrite"; "WorkPriority" ]
     let orchestrationTools =
-        set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "GetNotificationPreferences"; "GetResponseAlerts"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
+        set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "RecordAggregateInclusion"; "NotifyAgent"; "AcknowledgeNotification"; "GetNotificationPreferences"; "GetResponseAlerts"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
               "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"
               "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"
               "GetLaunchTemplate"; "RenderLaunchPrompt"; "SetLaunchTemplate"
@@ -663,7 +663,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
     // Preserve role/instruction aliases, Challenges, taskless execution and
     // recipient notifications, launch templates and composition APIs, plus six public Work aliases
     // over two hidden WorkQueue wire commands, all with device routing.
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 91 + (6 - 2) + 1)
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 92 + (6 - 2) + 1)
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -787,8 +787,9 @@ let ``public capability aliases reuse MCP descriptions without exposing schemas`
         |> Array.filter (fun methodInfo ->
             methodInfo.GetCustomAttributes(typeof<McpServerToolAttribute>, false).Length = 1)
 
+    let wireNames = AgentProtocol.capabilities |> List.map _.Name |> Set.ofList
     for methodInfo in registeredMethods do
-        if not (serverLocalNames.Contains methodInfo.Name) then
+        if not (serverLocalNames.Contains methodInfo.Name || wireNames.Contains methodInfo.Name) then
             let descriptions =
                 methodInfo.GetCustomAttributes(typeof<System.ComponentModel.DescriptionAttribute>, false)
             Assert.That(descriptions.Length, Is.EqualTo(1), methodInfo.Name)
@@ -1179,7 +1180,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
                   name, (if name = "AgentInbox" then
                              { taskRead with MutatesState = true }
                          else taskRead)
-              for name in [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
+              for name in [ "SubmitIntegration"; "CompleteIntegration"; "RecordAggregateInclusion"; "NotifyAgent"; "AcknowledgeNotification"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
                             "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"; "SetLaunchTemplate";
                             "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork";
                             "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork";

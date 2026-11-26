@@ -1,0 +1,22 @@
+<article>
+<h1>Correct MCP catalog descriptions and verify public tool schema parity</h1>
+<p><strong>Goal:</strong> ensure the Jarvis MCP API presents accurate, actionable tool names, descriptions and parameter schemas, and that its separate client/server capability catalog does not misdescribe operations. This task owns MCP implementation and MCP-specific tests only.</p>
+<h2>Evidence to investigate</h2>
+<p>The live <code>list_commands</code> response reported protocol <code>3.68</code> and advertised <code>CheckpointAttempt</code>, <code>YieldAgent</code>, <code>CompleteAgentWork</code> and <code>StartTasklessWork</code> with the generic description “Creates/assigns/starts tasks and binds immutable review base.” This is misleading. In source, <code>Server/McpTools.fs</code> builds <code>ledgerAliasCapabilities</code> by copying generic wire capability descriptions for public aliases; the actual MCP methods have their own <code>Description</code> attributes and typed signatures. The live MCP tool definitions in the refreshed session expose accurate signatures, while the client capability catalog is a distinct surface.</p>
+<h2>Scope</h2>
+<p>Inspect <code>Server/McpTools.fs</code>, <code>AgentProtocol</code> command capability definitions and <code>Server.Tests/ServiceTests.fs</code> catalog/schema tests. Audit representative lifecycle tools plus other aliases inheriting generic descriptions. Verify which schema belongs to which surface and whether the MCP server's actual public method signatures/descriptions are registered as expected. Do not edit docs or instruction-bearing artifacts; the other workstreams own those.</p>
+<h2>Required outcome</h2>
+<ul>
+<li>Give each advertised client capability alias an accurate, concise description of its own operation. At minimum cover checkpoint, yield, complete, taskless start/yield/recovery, assignment recovery, review claim/decision and other aliases that currently inherit unrelated generic descriptions.</li>
+<li>Preserve the distinction between the client/server command capability catalog and actual MCP tool schemas. Do not fabricate or blindly copy MCP JSON schemas into <code>InputSchemaJson</code>; first establish the intended contract and source of truth. If the catalog is intentionally only capability negotiation, document that in code comments/tests and ensure its descriptions remain truthful.</li>
+<li>Ensure actual MCP method descriptions and signatures remain consistent with implementation and that required arguments are discoverable from the registered MCP tool definitions. Do not change public method signatures or protocol version unless a concrete defect requires it and compatibility impact is explicitly justified.</li>
+<li>Add regression tests that fail if lifecycle aliases are assigned generic unrelated descriptions, if a public MCP lifecycle method disappears from the registered catalog, or if required parameters drift from the intended signature. Include representative tests for <code>CheckpointAttempt</code> and <code>YieldAgent</code>.</li>
+<li>Review all alias capability families for the same copy/paste defect; fix the root cause rather than only these two entries.</li>
+</ul>
+<h2>Validation and boundaries</h2>
+<ul>
+<li>Run focused Server Release tests for catalog consistency and MCP method signatures; record exact commands, source SHA, exit code and test counts.</li>
+<li>Commit on a new isolated branch/worktree based on verified current <code>origin/main</code>; bind exact source before editing. Submit the exact candidate for independent review.</li>
+<li>No production deployment, server restart, client update, tool catalog refresh operation, protocol cutover or unrelated server behavior changes. Report any operational refresh requirement separately; the Operator will authorize deployment if needed.</li>
+</ul>
+</article>

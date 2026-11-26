@@ -1,0 +1,36 @@
+<article>
+<h1>Adjudicate Git worktree identity negative-test finding</h1>
+<p><strong>One bounded independent adjudication.</strong> Review request <code>4303c1c3217c321fd6a9d773d4e8649c</code> for task <code>automation-git-call-optimization-checkout-20261126</code> is ChangesRequested (version 3), owned by Worker 1, reviewed by Reviewer 1, and pins source SHA <code>342b4bcfca4d5eec9d44b6c815b58dbdd79b478b</code> against base <code>142f2bd4b2728ea61e18a9d51f7c663c7951e182</code>. This task is to adjudicate the single P2 finding, not to implement it or revisit unrelated review decisions.</p>
+
+<h2>Independence and immutable evidence</h2>
+<ul>
+<li>Adjudicator must be independent of source author Worker 1 and reviewer Reviewer 1. Adjudicator 1 is eligible unless new evidence shows a conflict.</li>
+<li>Original task spec blob: <code>f1051b9175ed145b502d62dff3500a489b6c2bc8</code>. Its acceptance scope includes distinct checkouts, dirty/detached cases, changed paths/heads, concurrent worktree moves, fail-closed behavior, and applicable negative controls.</li>
+<li>Frozen candidate: <code>342b4bcfca4d5eec9d44b6c815b58dbdd79b478b</code>; branch <code>refs/heads/perf/git-path-resolution-worker1-20261126</code>; base <code>142f2bd4b2728ea61e18a9d51f7c663c7951e182</code>.</li>
+<li>Review ref: <code>refs/heads/jarvis-review/automation-git-call-optimization-checkout-20261126/4303c1c3217c321fd6a9d773d4e8649c/r1</code>.</li>
+<li>Finding path/blob: <code>findings/identity-negative-test-coverage.md</code>, <code>9624b20ef68ecd7b6b712a8ac5c4e2b3a98b149b</code>.</li>
+<li>Reviewer summary blob: <code>6d320702d9e4e274635a50a49458c064dca9195d</code>.</li>
+</ul>
+<p>Read the original task/spec, exact frozen source and diff, the complete finding, relevant implementation and existing tests. Preserve the immutable review verdict and candidate branch.</p>
+
+<h2>Finding to adjudicate</h2>
+<p><code>Client/Modules/ProjectPaths.fs:186-236</code> adds a central cached-path identity gate. The worktree <code>.git</code> pointer must resolve to an administrative directory under the repository's <code>worktrees</code> directory; that admin directory's <code>commondir</code> must resolve to the expected common Git directory; and its reverse <code>gitdir</code> pointer must resolve back to the candidate worktree's <code>.git</code> file.</p>
+<p>Reviewer 1 reports that existing negative tests do not exercise those pointer-consistency comparisons:</p>
+<ul>
+<li><code>registered_worktree_cache_reuses_paths_without_caching_head_or_status</code> moves a worktree and recreates the old path as an empty directory, failing at the missing <code>.git</code> file before pointer identity is checked.</li>
+<li><code>registered_worktree_symlink_paths_are_rejected</code> is rejected by <code>containsLink</code> before <code>isRegisteredWorktreePath</code> runs.</li>
+<li><code>concurrent_worktree_move_during_discovery_never_returns_a_stale_path</code> primarily covers watcher/discovery invalidation and a missing old path.</li>
+</ul>
+<p>The proposed regression creates real linked-worktree metadata where all files and paths still exist but one identity edge is wrong—for example, point one worktree's <code>.git</code> file at another registered worktree's admin directory, or corrupt the reverse <code>gitdir</code>/<code>commondir</code> pointer. Assert the identity gate rejects it and cached public resolution fails closed, while an intact linked worktree remains accepted.</p>
+
+<h2>Required separate decision</h2>
+<p>Determine validity, whether this is a real untested invariant rather than a demonstrated production defect, whether it falls within the original task's accepted negative-control/fail-closed contract or is net-new scope, practical impact and preconditions, proportionality of the proposed test, existing alternatives, and residual risk. Record observed facts separately from inference.</p>
+<p>Record a terminal disposition for this finding only: Accept, Narrow, Defer or Reject. If accepted/narrowed, state the precise authorized corrective scope and explicitly whether a separate corrective Work item may be created. Do not authorize production behavior changes unless independently justified; the reported issue is test coverage. If it is net-new scope, do not silently accept it—defer for Operator approval.</p>
+
+<h2>Boundaries</h2>
+<ul>
+<li>No source edits, test edits, branch changes, review changes, commits, pushes, integration, deployment or performance benchmark changes.</li>
+<li>No recursive adjudication or review of the review. This is a terminal decision.</li>
+<li>Record the exact source/spec/review/finding identities, evidence, disposition, rationale and authorized scope in canonical task context and an immutable checkpoint.</li>
+</ul>
+</article>

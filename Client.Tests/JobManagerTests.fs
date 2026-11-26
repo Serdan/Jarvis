@@ -1231,6 +1231,9 @@ let ``durable recovery refuses mismatched process birth identity and bounds rete
         match result.Status with
         | RecoveryUnknown _ -> ()
         | status -> failwithf "Expected uncertain outcome, got %A" status
+        let wire = System.Text.Json.JsonSerializer.Serialize result
+        let roundtrip = System.Text.Json.JsonSerializer.Deserialize<JobResult>(wire)
+        roundtrip |> shouldEqual result
         result.Truncated |> shouldEqual true
         cancelJobForProjectAsAgent (durableProject ()) durableOwner
             { ProjectName = "Project1"; JobId = first.JobId } (TestContext root)
@@ -1240,6 +1243,10 @@ let ``durable recovery refuses mismatched process birth identity and bounds rete
         listed.Jobs.Length |> shouldEqual 100
         Directory.Exists(Durable.jobDirectory registry stale.JobId) |> shouldEqual false
         Directory.Exists(Durable.jobDirectory registry (List.last jobs).JobId) |> shouldEqual false
+        durableResult root durableOwner stale.JobId |> Result.isError |> shouldEqual true
+        cancelJobForProjectAsAgent (durableProject ()) durableOwner
+            { ProjectName = "Project1"; JobId = stale.JobId } (TestContext root)
+            |> Result.isError |> shouldEqual true
     finally
         for directory, _ in Durable.entries registry do Durable.tryPrune directory |> ignore
         Directory.Delete(root, true)

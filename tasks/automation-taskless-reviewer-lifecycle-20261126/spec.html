@@ -1,0 +1,48 @@
+<article>
+<h1>Complete taskless reviewer activation and yielded-claim resumption</h1>
+<p><strong>Parent:</strong> <code>automation-role-aware-reviewer-dispatch</code>. <strong>Related review:</strong> <code>1721786f09ed99ae617a734f87f6d720</code> (Reviewer 1, ChangesRequested, frozen source <code>1a3bdf157183861adde9dda4496e1c07980e748a</code>). <strong>Adjudication:</strong> Adjudicator 1 completed checkpoint <code>17095</code> with separate Accept decisions for both taskless lifecycle defects; its checkpoint summary is concise, so the exact reviewer findings below remain the detailed evidence source.</p>
+<p><strong>Status:</strong> Authorized corrective implementation within the existing Automation reviewer-dispatch scope. No deployment, Scheduler activation, integration or production cutover is authorized. The original frozen source and review remain immutable historical evidence; do not edit the original branch or alter the original review verdict.</p>
+
+<h2>Source and provenance</h2>
+<ul>
+<li>Original frozen candidate: <code>1a3bdf157183861adde9dda4496e1c07980e748a</code>, base <code>9dc95184896118c96f34493da28ce40bf5b3d8d6</code>, branch <code>refs/heads/feat/automation-role-aware-reviewer-dispatch-w8-20261126</code>.</li>
+<li>Original review request: <code>1721786f09ed99ae617a734f87f6d720</code>; findings blobs <code>e64074ed4d5bff1c9292d2a9558ab13fce71da93</code> and <code>f3f80b24544bfe89bf961321d9f28947c537e263</code>.</li>
+<li>Adjudication task: <code>automation-adjudicate-taskless-reviewer-lifecycle-20261126</code>; Adjudicator 1 Completion checkpoint sequence <code>17095</code>, summary: separate Accept decisions for taskless reviewer start/activation and yielded-versus-Operator-park lifecycle defects.</li>
+<li>Create a new isolated registered worktree from the exact current verified <code>origin/main</code>. Preserve the original frozen branch. Port the reviewed candidate behavior from its exact SHA as a starting point, reconcile with current main, and record exact base/source provenance. Do not assume the old candidate was accepted or integrated.</li>
+</ul>
+
+<h2>Finding A — taskless Reviewer launch never starts execution</h2>
+<p>The original Reviewer launch only reads <code>reviewer_inbox</code>, claims a frozen review and acts after claim. <code>AgentInbox</code> does not activate an unassigned <code>NeedsWork</code> reviewer; <code>ClaimReview</code> changes only the review record. An unassigned reviewer therefore remains <code>NeedsWork/Stopped</code> after claiming. A subsequent planner tick can reserve another session for the same claimed review.</p>
+<p><strong>Required correction:</strong> wire the taskless lifecycle into the actual Reviewer launch path. The launched Reviewer must call its own <code>agent_inbox</code> first to obtain its exact current agent version, then call <code>start_taskless_work</code> as itself before reviewing/claiming work. Manager must never impersonate the Reviewer. A pending/uncertain start must count as in-flight demand and must not generate a second reservation while the first launch/start is unresolved. Reconcile start outcomes by original identity/receipt rather than blindly retrying.</p>
+
+<h2>Finding B — taskless Reviewer cannot resume a claimed review after yielding</h2>
+<p><code>YieldTasklessWork</code> parks an unassigned Working agent. The planner currently excludes <code>Parked</code> from reviewable states, so an outstanding runnable claimed review is never resumed. Simply treating every Parked reviewer as eligible would override intentional Operator parking.</p>
+<p><strong>Required correction:</strong> add a durable distinction between a taskless session parked by its normal yield and an intentional Operator park (or an equivalent explicit, versioned disposition). The planner may resume the exact runnable claimed review only when the Parked state is attributable to scheduler/taskless yield and no explicit Operator park/STOP fence exists. After a taskless review completes with no outstanding claim, the reviewer may be reused for unclaimed demand only if it has not been intentionally parked. Preserve existing manual park semantics.</p>
+
+<h2>Implementation scope</h2>
+<ul>
+<li>Update the generated Reviewer launch instructions and the smallest necessary launch/activation orchestration so the Reviewer starts its own taskless session before claim/review work.</li>
+<li>Update planner reservation/observation semantics so an unstarted or uncertain taskless reviewer launch cannot be double-reserved for the same review.</li>
+<li>Introduce the minimal durable lifecycle disposition needed to distinguish taskless yield from Operator park. Preserve version checks, idempotency, stale-session fencing and explicit STOP behavior.</li>
+<li>Keep role membership and the absence of standing Reviewer assignments. Do not restore a permanent Reviewer roster or require an idle named Reviewer slot.</li>
+<li>Do not broaden this into a general scheduler rewrite, a new resource model, or the Work/SQLite cutover. Use current Automation architecture and local Jarvis tools.</li>
+</ul>
+
+<h2>Required regression and property coverage</h2>
+<ul>
+<li>Full taskless launch → own inbox/version → StartTasklessWork → ReviewerInbox → claim → attributed activity sequence across successive planner ticks; the reviewer becomes Working and the same review is never reserved twice.</li>
+<li>StartTasklessWork success, definitive rejection, uncertain/lost acknowledgement and retry/reconciliation; Manager never starts or impersonates the Reviewer.</li>
+<li>Claimed review after YieldTasklessWork is resumable from its exact checkpoint when the yield disposition is scheduler/taskless-owned.</li>
+<li>Intentional Operator Park remains ineligible even when a review is claimed; STOP and newer generation always win.</li>
+<li>Completed taskless review can be followed by a distinct unclaimed review when not intentionally parked; no stale claim or old session can act.</li>
+<li>Duplicate/reordered planner ticks, concurrent claim/start, stale agent version, restart and uncertain browser send do not produce duplicate sessions, claims or review decisions.</li>
+<li>Run focused JavaScript manager tests, relevant Server.Tests and Client.Tests Release suites; record exact commands, counts, exit codes, source SHAs and TRX/output hashes. No hosted Actions.</li>
+</ul>
+
+<h2>Completion and review</h2>
+<ul>
+<li>Commit the corrected candidate on a new branch/worktree; preserve the old frozen source and review unchanged.</li>
+<li>Submit the new exact frozen source for independent review by an agent other than Worker 8. Address findings and obtain accepted review before integration.</li>
+<li>Do not integrate, deploy, activate recurring scheduling or change production settings. Record a durable checkpoint and complete the task only after all required tests and independent review submission are verified.</li>
+</ul>
+</article>

@@ -1376,8 +1376,8 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
     | GitCommitCommand cmd -> rt |> sourceOperation resolved (fun project -> ClientShell.gitCommitIn project cmd) (fun () -> ClientShell.gitCommit cmd) |> serialize'
     | StartJobCommand cmd ->
         match resolved, target with
-        | Some project, _ -> rt |> JobManager.startJobIn project cmd |> serialize'
-        | None, Some validated -> rt |> JobManager.startJobForTarget validated cmd |> serialize'
+        | Some project, _ -> rt |> JobManager.startJobInAsAgent project (Some agentId) cmd |> serialize'
+        | None, Some validated -> rt |> JobManager.startJobForTargetAsAgent validated (Some agentId) cmd |> serialize'
         | None, None -> rt |> JobManager.startJob cmd |> serialize'
     | ListJobsCommand cmd ->
         match target with

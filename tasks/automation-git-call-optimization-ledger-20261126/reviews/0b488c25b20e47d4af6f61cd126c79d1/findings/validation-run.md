@@ -12,10 +12,10 @@
 
 ## Cross-caller equivalence fixture
 
-- Status at checkpoint: running; no terminal result observed yet.
+- Status: terminal success.
 - Job ID: `4aa326190c5d48e58fee42dcc81afb42`
 - Command: `dotnet test Client.Tests/Client.Tests.fsproj --no-restore --configuration Release --filter "FullyQualifiedName~WorkQueueCredentialTests|FullyQualifiedName~CrossCloneStaleWriterAndOriginalReplayReceipt|FullyQualifiedName~LostPushAcknowledgementIsReconciledWithoutInventingOriginalSuccess|FullyQualifiedName~NonFastForwardConflictShowsRemoteShaAndPreservesBothBranchesForRecovery|FullyQualifiedName~ReviewsAreIndependentOfTaskPhaseAndAllowMultipleClaims|FullyQualifiedName~ConcurrentIndependentConditionWritersAreCASProtected|FullyQualifiedName~TwoCloneStateMachineTracesMatchCanonicalChallengeAndAudit"`
-- Purpose: extend validation across authenticated credential bindings, cross-clone remote advancement, lost-push uncertainty/CAS, and canonical review/challenge writes.
+- Exit code: 0; NUnit: 12 passed, 0 failed, 0 skipped.
+- Coverage: credential binding and foreign-credential rejection; cross-clone stale writer and original replay; lost-push uncertainty and non-fast-forward/CAS recovery; review lifecycle/document writes; concurrent challenge writes and two-clone challenge model traces.
 - Source: same exact clean candidate worktree and commit `ca4823ad1f198416ef2f96588f9e47b5ea87647a`.
-- Required terminal evidence: original job's terminal result, exit code, NUnit counts, and failure output. Do not infer success from a running state or rerun the command.
 - Safety scope: all selected fixtures use disposable local repositories; no live ledger, deployment, or activation.

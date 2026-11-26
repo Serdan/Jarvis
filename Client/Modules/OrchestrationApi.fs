@@ -249,6 +249,15 @@ module LedgerBindingConfig =
         ProjectPaths.resolveProjectRoot projectName rt
         |> Result.bind (fun (FolderPath root) -> loadAtRootWithSnapshot root)
 
+    // Unbound source projects retain their ordinary non-ledger behavior.
+    // An existing but unavailable or invalid binding is not absence.
+    let internal loadOptionalWithSnapshot projectName rt =
+        ProjectPaths.resolveProjectRoot projectName rt
+        |> Result.bind (fun (FolderPath root) ->
+            if File.Exists(pathForRoot root) then
+                loadAtRootWithSnapshot root |> Result.map Some
+            else Ok None)
+
     // Reuse only a remotely confirmed transaction head from this request. The
     // normal trust-anchor CAS still runs. If another reader already advanced the
     // anchor beyond that head, fetch afresh rather than returning an older view.

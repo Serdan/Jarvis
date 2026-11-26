@@ -200,7 +200,7 @@ type LegacyWriterProtocolFenceTests() =
 
     let inbox =
         TaskReadCommand {
-            ProjectName = "Fixture"; AgentId = "Historical"; Action = "AgentInbox"
+            ProjectName = "Fixture"; LaunchId = null; AgentId = "Historical"; Action = "AgentInbox"
             TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
             Cursor = ""; PageSize = 0; BeforeOid = ""; AfterOid = ""; RelativePath = "" }
 
@@ -216,7 +216,7 @@ type LegacyWriterProtocolFenceTests() =
 
     let historicalRead =
         TaskReadCommand {
-            ProjectName = "Fixture"; AgentId = "Historical"; Action = "GetTask"
+            ProjectName = "Fixture"; LaunchId = null; AgentId = "Historical"; Action = "GetTask"
             TaskId = "fixture-task"; AssignmentGeneration = 0; CheckpointSequence = 0L
             Cursor = ""; PageSize = 0; BeforeOid = ""; AfterOid = ""; RelativePath = "" }
 

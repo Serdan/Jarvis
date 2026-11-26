@@ -84,6 +84,254 @@ let private run ports binding =
     executeOnce ports binding "fixture" "Fixture" "launchAgent.js" "script-sha" "route-sha"
     |> fun task -> task.GetAwaiter().GetResult()
 
+let private held = function HeldCandidates [_] -> true | _ -> false
+
+let private captureLaunch binding =
+    let mutable captured = None
+    let ports =
+        { ReadLimits = readCurrentLimits
+          CanSend = fun _ -> Task.FromResult(Ok true)
+          Send = fun prepared -> captured <- Some prepared; Task.FromResult(Ok "submitted") }
+    Assert.That(run ports binding, Is.EqualTo(Submitted "submitted"))
+    captured.Value, ports
+
+[<TestCase(299, false)>]
+[<TestCase(300, true)>]
+[<TestCase(301, true)>]
+let deadlineRequiresVerifiedEvidence seconds expired =
+    fixture (fun binding assign ->
+        assign "Worker" "ready-task"
+        let launch, ports = captureLaunch binding
+        let id = launch.OperationId.ToString("D")
+        let sent = launch.SendBoundaryAtUtc.Value
+        let now = sent.AddSeconds(float seconds)
+        let deadline = sent.AddMinutes(5.)
+        let evidence = { LastSeenAtUtc = sent.AddSeconds(-1.); ServerNowAtUtc = now }
+        match reconcileAt binding id now None |> good with
+        | LaunchActivityEvidenceUnavailable _ when expired -> ()
+        | LaunchAwaitingCheckin at when not expired -> Assert.That(at, Is.EqualTo(deadline))
+        | other -> Assert.Fail(sprintf "Unexpected absent-evidence result: %A" other)
+        Assert.That(run ports binding |> held, Is.True)
+        match reconcileAt binding id now (Some evidence) |> good with
+        | LaunchOperatorResolutionRequired _ when expired -> ()
+        | LaunchAwaitingCheckin at when not expired -> Assert.That(at, Is.EqualTo(deadline))
+        | other -> Assert.Fail(sprintf "Unexpected verified-evidence result: %A" other)
+        if expired then
+            Assert.That(run ports binding |> held, Is.True, "Negative actor activity cannot authorize a second execution.")
+            let state = (inspectLaunchAt binding (LedgerStore.fetch binding |> good) launch.OperationId |> good).Value
+            Assert.That(state.NoCheckinAtUtc.IsSome, Is.True, "Deadline evidence remains durable diagnostic evidence.")
+            match reconcileAt binding id now (Some evidence) |> good with
+            | LaunchOperatorResolutionRequired _ -> ()
+            | other -> Assert.Fail(sprintf "Restart/reconciliation released the held launch: %A" other)
+            Assert.That(resolveOperator binding "fixture" id launch.Ready "verified old execution ended" true now |> good,
+                        Is.EqualTo(OperatorResolutionRecorded now))
+            let replacement, replacementPorts = captureLaunch binding
+            Assert.That(replacement.Ready, Is.EqualTo(launch.Ready))
+            Assert.That(replacement.OperationId, Is.Not.EqualTo(launch.OperationId))
+            match recordCheckin binding "Worker" id now |> good with
+            | CheckinLate _ -> ()
+            | other -> Assert.Fail(sprintf "Superseded check-in accepted: %A" other)
+            Assert.That(run replacementPorts binding |> held, Is.True)
+        else Assert.That(run ports binding |> held, Is.True))
+
+// Exercise the same registered post-journal execution core as SignalR,
+// not just the scheduler's recordCheckin helper. All bindings and activity
+// are disposable; a fresh runtime simulates client restart.
+[<Test; NonParallelizable>]
+let registeredIngressHoldsAmbiguousLaunchUntilVerifiedTermination () =
+    fixture (fun binding assign ->
+        let root = Path.GetDirectoryName(binding.RepositoryPath)
+        let previous = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+        Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", Path.Combine(root, "config"))
+        try
+            assign "Worker" "ready-task"
+            let tui = Client.ConsoleTui.ConsoleTui()
+            let runtime = Client.Runtime(root, tui, Client.FullTrust)
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting "local" runtime binding.ProjectId binding.LedgerId
+                binding.Epoch binding.RemoteName binding.ApprovedFetchUrl binding.ApprovedPushUrl
+                (LedgerStore.fetch binding |> good).Commit true |> good |> ignore
+            // Warm the advisory Ready cache before scheduling. A current
+            // request must still establish launch admission from fresh authority.
+            let target = Client.ProjectPaths.ProjectTarget.parse "local" |> good
+            Client.SignalR.Client.checkWorkingGuidanceAt DateTimeOffset.UtcNow runtime "Worker" (Some target) None
+            |> ignore
+            let launch, ports = captureLaunch binding
+            let id = launch.OperationId.ToString("D")
+            let now = launch.SendBoundaryAtUtc.Value.AddMinutes(5.)
+            let evidence = { LastSeenAtUtc = launch.SendBoundaryAtUtc.Value.AddSeconds(-1.); ServerNowAtUtc = now }
+            let read actor action launchId : Common.AgentCommand =
+                Common.TaskReadCommand
+                    { ProjectName = "local"; AgentId = actor; LaunchId = launchId; Action = action
+                      TaskId = "ready-task"; AssignmentGeneration = 0; CheckpointSequence = 0L
+                      Cursor = ""; PageSize = 0; BeforeOid = ""; AfterOid = ""; RelativePath = "" }
+            let execute rt actor command =
+                let wire = System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(command)
+                Client.SignalR.Client.executeAuthenticatedCommandWithChallengeWake rt wire actor None false
+                    (fun _ _ -> ())
+                |> fun pending -> pending.GetAwaiter().GetResult()
+            let state () = LedgerStore.fetch binding |> good
+            let reject (rt: Client.Runtime) actor command =
+                let head = (state()).Commit
+                let seen = rt.Tui.GetAgentLastSeen("local", actor)
+                let response = execute rt actor command
+                Assert.That(response.Error.IsSome, Is.True, sprintf "Expected registered ingress rejection: %A" response)
+                Assert.That(sprintf "%A" response.Error, Does.Contain("ScheduledLaunch"))
+                Assert.That((state()).Commit, Is.EqualTo(head), "Rejected ingress changed canonical state")
+                Assert.That(rt.Tui.GetAgentLastSeen("local", actor), Is.EqualTo(seen :> obj), "Rejected ingress advanced client-admitted activity")
+                Assert.That(response.AgentStateChanges, Is.Empty)
+            reject runtime "Worker" (read "Worker" "AgentInbox" "")
+            reject runtime "Worker" (read "Worker" "AgentInbox" (Guid.NewGuid().ToString("D")))
+            reject runtime "Worker" (read "Worker" "GetTask" "")
+            match reconcileAt binding id now (Some evidence) |> good with
+            | LaunchOperatorResolutionRequired _ -> ()
+            | other -> Assert.Fail(sprintf "Unexpected expiry result: %A" other)
+            Assert.That(run ports binding |> held, Is.True)
+            let restarted = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.FullTrust)
+            reject restarted "Worker" (read "Worker" "AgentInbox" id)
+            reject restarted "Worker" (read "Worker" "AgentInbox" "")
+            reject restarted "Worker" (read "Worker" "GetTask" "")
+            let retry : Common.AgentCommand =
+                Common.RetryPendingIntentCommand
+                    { ProjectName = "local"; OperatorId = "Worker"; OperationId = Guid.NewGuid().ToString("D")
+                      ExpectedCommandSha256 = String.replicate 64 "0"; ExpectedVerifiedHead = (state()).Commit }
+            reject restarted "Worker" retry
+            // A conflicting manual launch must not acquire a new durable intent.
+            let beforeManual = (state()).Commit
+            Assert.That(Client.SignalR.Client.beginAttributedLaunch binding "fixture" "Worker" (Guid.NewGuid()) "launchAgent.js" "fixture" |> Result.isError, Is.True)
+            Assert.That((state()).Commit, Is.EqualTo(beforeManual))
+            // Promotion uses the same execution core and cannot bypass admission.
+            let promotedCommand = read "Worker" "GetTask" ""
+            let runCore wire actor = task {
+                return! Client.SignalR.Client.executeAuthenticatedCommandWithChallengeWake restarted wire actor None false (fun _ _ -> ())
+            }
+            let promoted =
+                Client.SignalR.Client.executeOrPromoteWith restarted
+                    (System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(promotedCommand))
+                    "Worker" (TimeSpan.FromSeconds(30.)) runCore
+                |> fun pending -> pending.GetAwaiter().GetResult()
+            Assert.That(promoted.PendingJob.IsNone, Is.True, "Bounded fixture must observe the terminal promoted response")
+            Assert.That(sprintf "%A" promoted.Error, Does.Contain("ScheduledLaunchIngressRejected"))
+            Assert.That((state()).Commit, Is.EqualTo(beforeManual))
+            Assert.That(restarted.Tui.GetAgentLastSeen("local", "Worker").IsNone, Is.True)
+            Assert.That(resolveOperator binding "fixture" id launch.Ready "verified termination of A" true now |> good,
+                        Is.EqualTo(OperatorResolutionRecorded now))
+            let replacement, _ = captureLaunch binding
+            let replacementId = replacement.OperationId.ToString("D")
+            // Explicit old A is rejected both before and after exact B
+            // activation. Before B, omitted ID cannot win the Ready episode.
+            reject restarted "Worker" (read "Worker" "AgentInbox" id)
+            reject restarted "Worker" (read "Worker" "AgentInbox" "")
+            reject restarted "Worker" (read "Worker" "GetTask" "")
+            let activated = execute restarted "Worker" (read "Worker" "AgentInbox" replacementId)
+            Assert.That(activated.Error.IsNone, Is.True, sprintf "%A" activated.Error)
+            Assert.That(activated.InboxActivation.Value.ActivatedByThisCall, Is.True)
+            Assert.That((ReviewWorkflow.getAgentWorkingTurnAt binding (state()) "Worker" |> good).State, Is.EqualTo("Working"))
+            // The composed post-write request snapshot must contain the same
+            // Working episode as the exact activation receipt, never pre-CAS Ready.
+            use activatedPage = System.Text.Json.JsonDocument.Parse(activated.Result.Value)
+            Assert.That(activatedPage.RootElement.GetProperty("SnapshotCommit").GetString(),
+                        Is.EqualTo(activated.InboxActivation.Value.CommittedHead.Value))
+            Assert.That(activatedPage.RootElement.GetProperty("Agent").GetProperty("Execution").GetString(), Is.EqualTo("Working"))
+            let afterActivation = (state()).Commit
+            let duplicate = execute restarted "Worker" (read "Worker" "AgentInbox" replacementId)
+            Assert.That(duplicate.Error.IsNone, Is.True, sprintf "%A" duplicate.Error)
+            Assert.That(duplicate.InboxActivation.Value.ActivatedByThisCall, Is.False)
+            Assert.That((state()).Commit, Is.EqualTo(afterActivation))
+            reject restarted "Worker" (read "Worker" "AgentInbox" id)
+            let ordinary = execute restarted "Worker" (read "Worker" "AgentInbox" "")
+            Assert.That(ordinary.Error.IsNone, Is.True, sprintf "%A" ordinary.Error)
+            Assert.That(ordinary.InboxActivation.Value.ActivatedByThisCall, Is.False)
+            // No conflict: manual first ingress continues to work.
+            assign "Manual" "manual-task"
+            let manual = execute restarted "Manual" (read "Manual" "AgentInbox" "")
+            Assert.That(manual.Error.IsNone, Is.True, sprintf "%A" manual.Error)
+            Assert.That(manual.InboxActivation.Value.ActivatedByThisCall, Is.True)
+        finally
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", previous))
+
+[<Test>]
+let exactCheckinPreventsReplacement () =
+    fixture (fun binding assign ->
+        assign "Worker" "ready-task"
+        let launch, ports = captureLaunch binding
+        let id = launch.OperationId.ToString("D")
+        let sent = launch.SendBoundaryAtUtc.Value
+        Assert.That(recordCheckin binding "Wrong" id (sent.AddSeconds(1.)) |> Result.isError, Is.True)
+        Assert.That(recordCheckin binding "Worker" (Guid.NewGuid().ToString("D")) (sent.AddSeconds(1.)) |> Result.isError, Is.True)
+        let at = sent.AddSeconds(299.)
+        Assert.That(recordCheckin binding "Worker" id at |> good, Is.EqualTo(CheckinConfirmed at))
+        Assert.That(recordCheckin binding "Worker" id (at.AddSeconds(2.)) |> good, Is.EqualTo(CheckinDuplicate at))
+        let now = sent.AddSeconds(301.)
+        let evidence = { LastSeenAtUtc = sent.AddSeconds(-1.); ServerNowAtUtc = now }
+        Assert.That(reconcileAt binding id now (Some evidence) |> good, Is.EqualTo(LaunchStarted at))
+        Assert.That(run ports binding |> held, Is.True))
+
+[<Test>]
+let unrelatedActivityCannotAuthorizeReplacement () =
+    fixture (fun binding assign ->
+        assign "Worker" "ready-task"
+        let launch, ports = captureLaunch binding
+        let sent = launch.SendBoundaryAtUtc.Value
+        let now = sent.AddSeconds(301.)
+        let evidence = { LastSeenAtUtc = sent.AddSeconds(1.); ServerNowAtUtc = now }
+        match reconcileAt binding (launch.OperationId.ToString("D")) now (Some evidence) |> good with
+        | LaunchActivityEvidenceUnavailable _ -> ()
+        | other -> Assert.Fail(sprintf "Unattributed activity authorized replacement: %A" other)
+        Assert.That(run ports binding |> held, Is.True))
+
+[<Test>]
+let operatorResolutionRequiresOriginalOwnerAndExactAssignment () =
+    fixture (fun binding assign ->
+        assign "Worker" "ready-task"
+        let launch, ports = captureLaunch binding
+        let id = launch.OperationId.ToString("D")
+        let at = launch.SendBoundaryAtUtc.Value.AddSeconds(301.)
+        let resolve actor ready rationale ended = resolveOperator binding actor id ready rationale ended at
+        Assert.That(resolve "fixture" launch.Ready "verified" false |> Result.isError, Is.True)
+        Assert.That(resolve "foreign" launch.Ready "verified" true |> Result.isError, Is.True)
+        Assert.That(resolve "fixture" { launch.Ready with Generation = launch.Ready.Generation + 1 } "verified" true |> Result.isError, Is.True)
+        Assert.That(resolve "fixture" launch.Ready "" true |> Result.isError, Is.True)
+        Assert.That(resolve "fixture" launch.Ready "verified ended" true |> good, Is.EqualTo(OperatorResolutionRecorded at))
+        Assert.That(resolve "fixture" launch.Ready "verified ended" true |> good, Is.EqualTo(OperatorResolutionAlreadyRecorded at))
+        let replacement, replacementPorts = captureLaunch binding
+        Assert.That(replacement.Ready, Is.EqualTo(launch.Ready))
+        Assert.That(replacement.OperationId, Is.Not.EqualTo(launch.OperationId))
+        Assert.That(run replacementPorts binding |> held, Is.True)
+        match recordCheckin binding "Worker" id at |> good with
+        | CheckinLate _ -> ()
+        | other -> Assert.Fail(sprintf "Old launch check-in not fenced: %A" other))
+
+[<Test>]
+let heldLaunchDoesNotBlockOtherReadyAgent () =
+    fixture (fun binding assign ->
+        assign "Worker A" "ready-a"
+        let first, _ = captureLaunch binding
+        assign "Worker B" "ready-b"
+        let second, ports = captureLaunch binding
+        Assert.That(second.Ready.AgentId, Is.Not.EqualTo(first.Ready.AgentId))
+        match run ports binding with
+        | HeldCandidates launches ->
+            Assert.That(launches |> List.map _.LaunchId |> Set.ofList,
+                        Is.EqualTo(Set.ofList [first.OperationId; second.OperationId] :> obj))
+        | other -> Assert.Fail(sprintf "Expected two separately reported holds: %A" other))
+
+[<Test>]
+let expiryAndCheckinRaceNeverAuthorizeTwoOutcomes () =
+    fixture (fun binding assign ->
+        assign "Worker" "ready-task"
+        let launch, _ = captureLaunch binding
+        let id = launch.OperationId.ToString("D")
+        let sent = launch.SendBoundaryAtUtc.Value
+        let expiry = sent.AddSeconds(300.)
+        let evidence = { LastSeenAtUtc = sent.AddSeconds(-1.); ServerNowAtUtc = expiry }
+        let checkin = Task.Run(fun () -> recordCheckin binding "Worker" id (sent.AddSeconds(299.)))
+        let timeout = Task.Run(fun () -> reconcileAt binding id expiry (Some evidence))
+        Task.WaitAll([| checkin :> Task; timeout :> Task |])
+        let snapshot = LedgerStore.fetch binding |> good
+        let state = (inspectLaunchAt binding snapshot launch.OperationId |> good).Value
+        Assert.That(state.CheckinAtUtc.IsSome <> state.NoCheckinAtUtc.IsSome, Is.True,
+                    "Exactly one terminal proof must survive competing transitions."))
+
 [<Test>]
 let ``actual canonical Ready resumes once and unknown browser send cannot replay`` () =
     fixture (fun binding assign ->
@@ -94,11 +342,32 @@ let ``actual canonical Ready resumes once and unknown browser send cannot replay
               CanSend = fun _ -> Task.FromResult(Ok true)
               Send = fun prepared ->
                   sends <- sends + 1
-                  Assert.That(prepared.Rendered.Prompt, Is.EqualTo("Agent Worker, project Fixture. Call inbox."))
-                  Task.FromResult(Error "unknown browser receipt") }
+                  Assert.That(prepared.Rendered.Prompt, Does.StartWith("Agent Worker, project Fixture. Call inbox."))
+                  Assert.That(prepared.Rendered.Prompt, Does.Contain(prepared.OperationId.ToString("D")))
+                  Task.FromResult(Error(SendOutcomeUnknown "unknown browser receipt")) }
         Assert.That(run ports binding, Is.EqualTo(OutcomeUnknown "unknown browser receipt"))
-        Assert.That(run ports binding, Is.EqualTo(NoEligibleReady))
+        Assert.That(run ports binding |> held, Is.True)
         Assert.That(sends, Is.EqualTo(1)))
+
+[<Test>]
+let ``confirmed tab capacity rejection records no-send proof and retries next tick`` () =
+    fixture (fun binding assign ->
+        assign "Worker" "ready-task"
+        let mutable sends = 0
+        let ports =
+            { ReadLimits = fun _ _ -> Ok disabled
+              CanSend = fun _ -> Task.FromResult(Ok true)
+              Send = fun _ ->
+                  sends <- sends + 1
+                  if sends = 1 then
+                      Task.FromResult(Error(DefinitelyNotInvoked "TabCapacityHold: AgentTabLimitReached"))
+                  else
+                      Task.FromResult(Ok "submitted") }
+        match run ports binding with
+        | Held _ -> ()
+        | other -> Assert.Fail("Expected a durable no-send hold, got " + string other)
+        Assert.That(run ports binding, Is.EqualTo(Submitted "submitted"))
+        Assert.That(sends, Is.EqualTo(2)))
 
 [<Test>]
 let ``actual Working count holds scheduler then resumes below cap`` () =
@@ -171,7 +440,7 @@ let ``canonical role-only caps include manually Working agents`` () =
                   selected <- prepared.Ready.AgentId :: selected
                   Task.FromResult(Ok "submitted") }
         Assert.That(run ports binding, Is.EqualTo(Submitted "submitted"))
-        Assert.That(run ports binding, Is.EqualTo(NoEligibleReady))
+        Assert.That(run ports binding |> held, Is.True)
         Assert.That(selected, Is.EqualTo(["Reviewer"] :> obj)))
 
 [<Test>]
@@ -202,7 +471,7 @@ let ``actual challenge wait blocks launch and resolution makes the new generatio
             challenge.ConditionIds.Head 1 "Passed" "" |> good |> ignore
         Assert.That(run ports binding, Is.EqualTo(Submitted "submitted"))
         Assert.That(generations, Is.EqualTo([2] :> obj))
-        Assert.That(run ports binding, Is.EqualTo(NoEligibleReady)))
+        Assert.That(run ports binding |> held, Is.True))
 
 [<Test>]
 let ``canonical transient excess drains naturally without cancellation`` () =
@@ -245,18 +514,19 @@ let private route (project: string) : BrowserSchedules.ScheduledAction =
     { Id = "ready-resume"; DueAtUtc = DateTimeOffset.UtcNow; Url = "https://chatgpt.com/g/g-p-fixture/project"
       ProjectName = project; ScriptPath = "browser-scripts/chatgpt/launchAgent.js"; Alias = "agents"
       ArgsJson = """{"resumeReady":true}"""; Active = false; WindowRegistration = "agents"
-      CloseTabAfterExecution = false; RepeatEverySeconds = 60; Status = "running"
+      CloseTabAfterExecution = true; RepeatEverySeconds = 60; Status = "running"
       RegistrationId = ""; ConversationUrl = ""; Cleanup = ""; AttemptId = "attempt"; RevisionId = "revision"
       Error = ""; UpdatedAtUtc = DateTimeOffset.UtcNow; ActionKind = "BrowserScript"; TriggerKind = "Every"
       Executable = ""; CommandArgs = []; WorkingDirectory = ""; TimeoutSeconds = 30; MaxOutputBytes = 100
       IdleAgentId = ""; IdleSeconds = 0; LastActivityAtUtc = DateTimeOffset.MinValue
-      StartedAtUtc = DateTimeOffset.UtcNow; Disabled = false; LastResult = "" }
+      StartedAtUtc = DateTimeOffset.UtcNow; Disabled = false; CheckinWakeAtUtc = DateTimeOffset.MinValue; LastResult = "" }
 
 [<Test>]
 let onlyExplicitRecurringRoute () =
     let a = route "Fixture"
     Assert.That(BrowserSchedules.isReadyResume a, Is.True)
     Assert.That(validateRoute a, Is.EqualTo(Ok () : Result<unit,string>))
+    Assert.That(validateRoute { a with CloseTabAfterExecution = false }, Is.EqualTo(Ok () : Result<unit,string>))
     for invalid in [
         { a with TriggerKind = "Once"; RepeatEverySeconds = 0 }
         { a with ArgsJson = """{"resumeReady":true,"prompt":"injected"}""" }
@@ -312,7 +582,7 @@ let lateStopAfterIntent () =
         ReviewWorkflow.clearResponseAlert binding (Guid.NewGuid()) "fixture" "Worker" (Guid.Parse alert.AlertId)
         |> good |> ignore
         Assert.That(run ports binding, Is.EqualTo(Submitted "unexpected"))
-        Assert.That(run ports binding, Is.EqualTo(NoEligibleReady))
+        Assert.That(run ports binding |> held, Is.True)
         Assert.That(sends, Is.EqualTo(1)))
 
 [<TestCase(false)>]
@@ -354,7 +624,7 @@ let lateDenialThenConcurrentHealthyPolls isError =
         let a = compete()
         let b = compete()
         Task.WaitAll([| a :> Task; b :> Task |])
-        Assert.That(run healthy binding, Is.EqualTo(NoEligibleReady))
+        Assert.That(run healthy binding |> held, Is.True)
         Assert.That(sends, Is.EqualTo(1))
         let final = LedgerStore.fetch binding |> good
         Assert.That((LedgerStore.getOperationAt binding final second.OperationId |> good).IsSome, Is.True))
@@ -368,6 +638,59 @@ let private scheduleState (service: BrowserSchedules.Service) id =
     use doc = JsonDocument.Parse(service.Get(id) |> good)
     let p name = doc.RootElement.GetProperty(name: string).GetString()
     p "status", p "attemptId", p "error"
+
+[<Test>]
+let durableDeadlineWakeSurvivesRestartWithoutChangingCadence () =
+    let folder = Path.Combine(Path.GetTempPath(), "jarvis-checkin-wake-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(folder) |> ignore
+    try
+        let path = Path.Combine(folder, "schedules.json")
+        let origin = DateTimeOffset.UtcNow
+        let mutable nowTicks = origin.Ticks
+        let clock () = DateTimeOffset(Interlocked.Read(&nowTicks), TimeSpan.Zero)
+        let setTime at = Interlocked.Exchange(&nowTicks, (at: DateTimeOffset).Ticks) |> ignore
+        let wake = origin.AddSeconds(300.)
+        let cadence = origin.AddSeconds(3605.)
+        let action = route "Fixture"
+        let mutable calls = 0
+        let mutable firstService: BrowserSchedules.Service option = None
+        let execute claimed =
+            Interlocked.Increment(&calls) |> ignore
+            Assert.That(firstService.Value.RecordCheckinWake(claimed, Some wake, true), Is.True)
+            Task.FromResult(Ok """{"status":"completed"}""")
+        let waitFinished (service: BrowserSchedules.Service) old =
+            waitUntil(fun () ->
+                let status, attempt, _ = scheduleState service action.Id
+                status = "pending" && attempt <> old && not (String.IsNullOrWhiteSpace attempt))
+        let dueAndWake (service: BrowserSchedules.Service) =
+            use doc = JsonDocument.Parse(service.Get(action.Id) |> good)
+            doc.RootElement.GetProperty("dueAtUtc").GetDateTimeOffset(),
+            doc.RootElement.GetProperty("checkinWakeAtUtc").GetDateTimeOffset()
+        do
+            use service = new BrowserSchedules.Service(path, execute, now=clock, pollMs=25)
+            firstService <- Some service
+            service.Schedule(action.Id, 5, action.Url, action.ProjectName, action.ScriptPath, action.Alias, action.ArgsJson, action.Active,
+                windowRegistration=action.WindowRegistration, closeAfter=true, repeatEverySeconds=3600) |> good |> ignore
+            service.Start()
+            setTime (origin.AddSeconds(5.))
+            waitFinished service ""
+            Assert.That(dueAndWake service, Is.EqualTo((cadence, wake)))
+        use restarted = new BrowserSchedules.Service(path, (fun _ ->
+            Interlocked.Increment(&calls) |> ignore
+            Task.FromResult(Ok """{"status":"completed"}""")), now=clock, pollMs=25)
+        let _, previous, _ = scheduleState restarted action.Id
+        restarted.Start()
+        setTime (wake.AddSeconds(-1.))
+        Thread.Sleep(100)
+        Assert.That(Volatile.Read(&calls), Is.EqualTo(1))
+        setTime wake
+        waitFinished restarted previous
+        Assert.That(Volatile.Read(&calls), Is.EqualTo(2))
+        Assert.That(dueAndWake restarted, Is.EqualTo((cadence, DateTimeOffset.MinValue)))
+        setTime (wake.AddSeconds(1.))
+        Thread.Sleep(100)
+        Assert.That(Volatile.Read(&calls), Is.EqualTo(2))
+    finally Directory.Delete(folder, true)
 
 [<Test>]
 let interruptedClaimIsNotReplayed () =
@@ -470,7 +793,7 @@ let actualScheduledCallerWithFakeBrowser () =
                     Program.executeRegisteredSchedule (fun () -> Ok ClientConfig.Disabled) actorProvider rt (ConsoleTui.ConsoleTui()) (Some bridge), now=clock, pollMs=25)
                 rt.BrowserScheduler <- Some service
                 service.Schedule(a.Id, 5, a.Url, a.ProjectName, a.ScriptPath, a.Alias, a.ArgsJson, a.Active,
-                    windowRegistration=a.WindowRegistration, closeAfter=false, repeatEverySeconds=60) |> good |> ignore
+                    windowRegistration=a.WindowRegistration, closeAfter=true, repeatEverySeconds=60) |> good |> ignore
                 let waitOccurrence old =
                     waitUntil (fun () ->
                         let status, attempt, _ = scheduleState service a.Id
@@ -513,10 +836,15 @@ let actualScheduledCallerWithFakeBrowser () =
                 Assert.That(prop execute "kind", Is.EqualTo("executeJs"))
                 use request = JsonDocument.Parse execute
                 let args = request.RootElement.GetProperty("args")
-                Assert.That(args.GetProperty("prompt").GetString(), Is.EqualTo("Agent Worker, project local. Call inbox."))
+                Assert.That(args.GetProperty("prompt").GetString(), Does.StartWith("Agent Worker, project local. Call inbox."))
+                Assert.That(args.GetProperty("prompt").GetString(), Does.Contain("launchId"))
                 Assert.That(args.GetProperty("startUrl").GetString(), Is.EqualTo(a.Url))
                 Assert.That(args.EnumerateObject() |> Seq.length, Is.EqualTo(2))
                 do! socketSend socket (JsonSerializer.Serialize({| version=2; kind="result"; requestId=prop execute "requestId"; connectionId=connection; registrationId="created-01"; registrationGeneration=1; status="completed"; result={| status="outcomeUnknown"; stage="acknowledgement"; reason="SubmissionUnconfirmed" |} |}))
+                let! close = (socketReceive socket).WaitAsync(TimeSpan.FromSeconds(5.))
+                Assert.That(prop close "kind", Is.EqualTo("closeTab"))
+                Assert.That(prop close "registrationId", Is.EqualTo("created-01"))
+                do! socketSend socket (JsonSerializer.Serialize({| version=2; kind="tabClosed"; requestId=prop close "requestId"; connectionId=connection; registrationId="created-01"; registrationGeneration=1 |}))
                 let launched = waitOccurrence unregistered
                 let _, _, error = scheduleState service a.Id
                 Assert.That(error, Does.Contain("OutcomeUnknown"))
@@ -825,7 +1153,7 @@ let failedTerminalProofNeverAuthorizesRetry () =
         | other -> Assert.Fail(sprintf "Expected uncertain proof, got %A" other)
         File.Delete(hook)
         let healthy = { ports with CanSend = fun _ -> Task.FromResult(Ok true) }
-        Assert.That(run healthy binding, Is.EqualTo(NoEligibleReady))
+        Assert.That(run healthy binding |> held, Is.True)
         Assert.That(sends, Is.Zero))
 
 [<Test>]
@@ -851,7 +1179,7 @@ let legacyIntentRemainsFencedWithoutPositiveProof () =
             { ReadLimits = readCurrentLimits
               CanSend = fun _ -> Task.FromResult(Ok true)
               Send = fun _ -> sends <- sends + 1; Task.FromResult(Ok "unexpected") }
-        Assert.That(run ports binding, Is.EqualTo(NoEligibleReady))
+        Assert.That(run ports binding |> held, Is.True)
         Assert.That(sends, Is.Zero))
 
 [<Test>]

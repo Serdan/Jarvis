@@ -239,6 +239,7 @@ type WorkQueueWriteCommand =
 type TaskReadCommand =
     { ProjectName: string
       AgentId: string
+      LaunchId: string
       Action: string
       TaskId: string
       AssignmentGeneration: int

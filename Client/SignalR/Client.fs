@@ -541,6 +541,8 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
             // verified snapshot for Working guidance. Commands that can mutate
             // orchestration state must still refresh after dispatch.
             let mutable activationSnapshot = requestSnapshot.Value
+            if not (requestSnapshotCanSupplyGuidance command) then
+                requestSnapshot.Value <- None
             let rememberSnapshot (snapshot: RequestSnapshot) =
                 if requestSnapshotCanSupplyGuidance command then
                     match command, snapshot.Verified with
@@ -575,7 +577,9 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
             match command with
             | TaskReadCommand cmd when cmd.Action = "AgentInbox" ->
                 cache.InvalidateCache(projectId, agentId)
-                loadCurrentSnapshot() |> ignore
+                match activationSnapshot with
+                | Some snapshot when requestSnapshotMatches cache projectId agentId snapshot -> ()
+                | _ -> loadCurrentSnapshot() |> ignore
             | _ -> ()
             // A cached Ready agent is a hint, not a verified eligibility read.
             let current, generation =
@@ -589,12 +593,42 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
             let current =
                 if cache.IsCurrent(projectId, agentId, generation) then current
                 else Error(Client.ValidationError "Agent state changed during activation lookup.")
+            let scheduledLaunch =
+                match command with
+                | TaskReadCommand cmd when cmd.Action = "AgentInbox" &&
+                                           not (String.IsNullOrWhiteSpace cmd.LaunchId) -> Some cmd.LaunchId
+                | _ -> None
+            let mutable exactScheduledActivation: (Guid * ScheduledReadyResume.Ready) option = None
+            let current =
+                match scheduledLaunch, current with
+                | Some launchId, Ok(Some _) ->
+                    let inspectLaunch (snapshot: RequestSnapshot) =
+                        snapshot.Verified
+                        |> Result.bind (fun (binding, ledgerSnapshot) ->
+                            ScheduledReadyResume.confirmedActivationAt binding ledgerSnapshot agentId launchId
+                            |> Result.mapError (fun issue ->
+                                Client.ValidationError(sprintf "ScheduledLaunchActivationRejected: %A" issue))
+                            |> Result.bind (fun activation ->
+                                agentStateAt agentId (binding, ledgerSnapshot)
+                                |> Result.bind (function
+                                    | Some agent -> Ok(activation, agent)
+                                    | None -> Error(Client.ValidationError "ScheduledLaunchActivationRejected: missing agent."))))
+                    withCurrentRequestSnapshot rt projectId agentId activationSnapshot inspectLaunch
+                        (fun () -> loadCurrentSnapshot() |> Result.bind inspectLaunch)
+                    |> Result.map (fun (activation, agent) ->
+                        exactScheduledActivation <- activation
+                        Some agent)
+                | Some _, Error error -> Error error
+                | Some _, _ ->
+                    Error(Client.ValidationError "ScheduledLaunchActivationRejected: requires an exact verified agent snapshot.")
+                | None, _ -> current
             // A read of source should remain available without lifecycle
             // authority. Report uncertainty explicitly, never invent a
             // committed activation. Lifecycle commands must fail closed.
             let unavailable error =
-                match LegacyWriterProtocolFence.LegacyWriterProtocolFence.classify command with
-                | LegacyWriterProtocolFence.LegacyCommandKind.HistoricalRead ->
+                match scheduledLaunch, LegacyWriterProtocolFence.LegacyWriterProtocolFence.classify command with
+                | Some _, _ -> Error error
+                | None, LegacyWriterProtocolFence.LegacyCommandKind.HistoricalRead ->
                     Ok ([], None,
                         [ OperationalControl.ActivationUnverified
                             $"Automatic Ready-to-Working activation could not be verified: {error}. Reread the canonical inbox before continuing assignment work." ])
@@ -604,6 +638,7 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
             // not ordinary activity by an agent that is already Working (or
             // any other non-activation state). Keep the check before a possible
             // activation, and preserve its fail-closed behavior on read errors.
+            | Error error when scheduledLaunch.IsSome -> Error error
             | Error _ when not (oldSideEffectsAllowed rt target) -> Ok ([], None, [])
             | Error error -> unavailable error
             | Ok(Some agent) when agent.State = "Ready"
@@ -629,32 +664,67 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                     unavailable error
                 | Ok(_, Client.ReviewWorkflow.ActivationIneligible _) ->
                     cache.InvalidateCache(projectId, agentId)
-                    Ok ([], None, [])
+                    if scheduledLaunch.IsSome then
+                        Error(Client.ValidationError "ScheduledLaunchActivationRejected: no longer eligible for activation.")
+                    else Ok ([], None, [])
                 | Ok(binding, Client.ReviewWorkflow.ActivationEligible currentTaskId) ->
                     let result =
-                        ReviewWorkflow.ReviewWorkflow.activateReadyAgent binding (Guid.NewGuid())
-                            currentTaskId agentId
+                        match exactScheduledActivation with
+                        | Some(operationId, ready) when ready.TaskId = currentTaskId ->
+                            ReviewWorkflow.ReviewWorkflow.activateReadyAgentGuarded binding operationId
+                                currentTaskId agentId agent.Version ready.Generation
+                                (fun current ->
+                                    match scheduledLaunch with
+                                    | Some launchId ->
+                                        ScheduledReadyResume.confirmedActivationAt binding current agentId launchId
+                                        |> Result.bind (function
+                                            | Some(id, exact) when id = operationId && exact = ready -> Ok ()
+                                            | _ -> Error(LedgerStore.StaleEntityVersion "Scheduled activation lost its exact launch fence."))
+                                    | None -> Error(LedgerStore.StaleEntityVersion "Scheduled activation has no launch identity."))
+                        | Some _ ->
+                            Error(LedgerStore.StaleEntityVersion "Scheduled launch assignment changed before activation.")
+                        | None when scheduledLaunch.IsSome ->
+                            Error(LedgerStore.StaleEntityVersion "Scheduled launch does not own this Ready episode.")
+                        | None ->
+                            ReviewWorkflow.ReviewWorkflow.activateReadyAgentGuarded binding (Guid.NewGuid()) currentTaskId agentId 0 0
+                                (fun current -> ScheduledReadyResume.guardUncorrelatedIngressAt binding current agentId)
                     // The operation may have changed canonical state. Invalidate
                     // the generation before any confirmed post-write snapshot.
                     cache.Invalidate(projectId, agentId)
                     match result with
                     | Ok write ->
-                        if requestSnapshotCanSupplyGuidance command then
-                            loadSnapshotStable (fun () ->
-                                OrchestrationApi.LedgerBindingConfig.loadWithConfirmedWrite project rt binding write)
-                            |> ignore
-                        if write.AlreadyApplied then Ok ([], None, [])
-                        else
-                            // Only committed transitions emit Working metadata.
-                            let committed : AgentInboxActivation =
-                                { ProjectName = project
-                                  AgentId = agentId
-                                  ActivatedByThisCall = true
-                                  BeforeState = Some "Ready"
-                                  AfterState = Some "Working"
-                                  CommittedHead = Some write.CurrentHead
-                                  OperationId = Some write.Operation.OperationId }
-                            Ok (Client.LedgerStore.LedgerStore.changedAgentIds write, Some committed, [])
+                        let confirmed =
+                            if requestSnapshotCanSupplyGuidance command then
+                                loadSnapshotStable (fun () ->
+                                    OrchestrationApi.LedgerBindingConfig.loadWithConfirmedWrite project rt binding write)
+                                |> Result.map Some
+                            else Ok None
+                        let verified =
+                            match scheduledLaunch, confirmed with
+                            | Some launchId, Ok(Some snapshot) ->
+                                match snapshot.Verified with
+                                | Ok(currentBinding, ledgerSnapshot) when currentBinding = binding ->
+                                    match ScheduledReadyResume.confirmedActivationAt binding ledgerSnapshot agentId launchId with
+                                    | Ok None -> Ok ()
+                                    | _ -> Error(Client.ValidationError "ScheduledLaunchActivationRejected: no longer owns the confirmed Working episode.")
+                                | _ -> Error(Client.ValidationError "ScheduledLaunchActivationRejected: cannot verify activation receipt.")
+                            | Some _, _ -> Error(Client.ValidationError "ScheduledLaunchActivationRejected: cannot verify activation receipt.")
+                            | None, _ -> Ok ()
+                        verified |> Result.map (fun () ->
+                            if write.AlreadyApplied then ([], None, [])
+                            else
+                                // Only committed transitions emit Working metadata.
+                                let committed : AgentInboxActivation =
+                                    { ProjectName = project
+                                      AgentId = agentId
+                                      ActivatedByThisCall = true
+                                      BeforeState = Some "Ready"
+                                      AfterState = Some "Working"
+                                      CommittedHead = Some write.CurrentHead
+                                      OperationId = Some write.Operation.OperationId }
+                                (Client.LedgerStore.LedgerStore.changedAgentIds write, Some committed, []))
+                    | Error(Client.LedgerStore.StaleEntityVersion detail) when scheduledLaunch.IsSome ->
+                        Error(Client.ValidationError("ScheduledLaunchActivationRejected: " + detail))
                     | Error(Client.LedgerStore.StaleEntityVersion detail) ->
                         // Another call may have started or closed the task
                         // after eligibility was read. Reinspect canonically.
@@ -948,7 +1018,10 @@ let internal beginAttributedLaunch binding actor targetAgentId (launchId: Guid) 
           RequestJson = JsonSerializer.Serialize({| targetAgentId = targetAgentId; scriptPath = scriptPath
                                                     executedSourceSha256 = executedSourceSha256 |}) }
     Client.LegacyDirectWriterFence.LegacyDirectWriterFence.transact binding intent (fun snapshot ->
-        match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurnAt binding snapshot targetAgentId with
+        let admitted =
+            ScheduledReadyResume.guardUncorrelatedIngressAt binding snapshot targetAgentId
+            |> Result.bind (fun () -> ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurnAt binding snapshot targetAgentId)
+        match admitted with
         | Error e -> Error e
         | Ok target ->
             let taskId =
@@ -1688,6 +1761,33 @@ let private receivePreparedCommand (rt: Runtime)
                     return! receiveCommandForTarget rt target prepared.Source prepared.ProjectTask agentId command sourceOriginalId manualGrantAuthorized onChallengeCommit requestSnapshot
     }
 
+// The agent label authenticates the user/actor route, not a particular
+// inference execution. Refuse actor-only ingress while an unresolved launch
+// owns the Ready episode. This gate is shared by direct and promoted execution.
+let private admitOrdinaryLaunchIngress (rt: Runtime) agentId target =
+    match target with
+    | Some selected when not (String.IsNullOrWhiteSpace agentId) ->
+        let projectId = ProjectPaths.ProjectTarget.projectId selected
+        let project = ProjectPaths.ProjectId.value projectId
+        let cache = workingGuidanceCache rt
+        let rec admit retries =
+            let generation = cache.Capture(projectId, agentId)
+            let observedAt = DateTimeOffset.UtcNow
+            retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.loadOptionalWithSnapshot project rt)
+            |> Result.bind (fun verified ->
+                if not (cache.IsCurrent(projectId, agentId, generation)) then
+                    if retries > 0 then admit (retries - 1)
+                    else Error(Client.ValidationError "ScheduledLaunchIngressRejected: agent state changed during admission.")
+                else
+                    match verified with
+                    | None -> Ok None
+                    | Some(binding, snapshot) ->
+                        ScheduledReadyResume.guardUncorrelatedIngressAt binding snapshot agentId
+                        |> Result.map (fun () -> Some(createRequestSnapshot selected agentId generation observedAt (Ok(binding, snapshot))))
+                        |> Result.mapError (fun issue -> Client.ValidationError(sprintf "ScheduledLaunchIngressRejected: %A" issue)))
+        admit 2
+    | _ -> Ok None
+
 // Shared by SignalR receive and tests. Identity is supplied by the MCP call,
 // not inferred from provider conversation metadata.
 let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agentId: string)
@@ -1722,6 +1822,11 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                     // any activity attribution, or the canonical read.
                     let project =
                         match command with
+                        | TaskReadCommand inbox when inbox.Action = "AgentInbox"
+                            && not (String.IsNullOrWhiteSpace inbox.LaunchId)
+                            && (String.IsNullOrWhiteSpace agentId || inbox.AgentId <> agentId) ->
+                            Error(Client.ValidationError "Scheduled launch check-in requires the initiating agent identity.")
+
                         | ObserveAgentCommand observation
                             when String.IsNullOrWhiteSpace agentId
                                  || not (String.Equals(observation.ObserverAgentId, agentId, StringComparison.Ordinal)) ->
@@ -1754,6 +1859,31 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                                              |> Result.mapError (sprintf "%A")) command
                             |> Result.map (fun () -> scope)
                             |> Result.mapError Client.ValidationError)
+                    let requestSnapshot: RequestSnapshot option ref = ref None
+                    // Correlate the explicit launch before activity or automatic activation.
+                    // A late/invalid launch cannot activate the replacement's Ready episode.
+                    let project =
+                        project |> Result.bind (fun scope ->
+                            match command with
+                            | TaskReadCommand inbox when inbox.Action = "AgentInbox" &&
+                                                         not (String.IsNullOrWhiteSpace inbox.LaunchId) ->
+                                match OrchestrationApi.LedgerBindingConfig.load inbox.ProjectName rt with
+                                | Error error -> Error error
+                                | Ok binding ->
+                                    match ScheduledReadyResume.recordCheckin binding agentId inbox.LaunchId DateTimeOffset.UtcNow with
+                                    | Error error ->
+                                        Error(Client.ValidationError(sprintf "ScheduledLaunchCheckinRejected: %A" error))
+                                    | Ok(ScheduledReadyResume.CheckinLate reason) ->
+                                        Error(Client.ValidationError("ScheduledLaunchCheckinLate: " + reason))
+                                    | Ok(ScheduledReadyResume.CheckinConfirmed _)
+                                    | Ok(ScheduledReadyResume.CheckinDuplicate _) -> Ok scope
+                            | CreateProjectCommand _ -> Ok scope // no existing target ledger
+                            | _ ->
+                                admitOrdinaryLaunchIngress rt agentId (projectTarget scope)
+                                |> Result.map (fun verified ->
+                                    if requestSnapshotCanSupplyGuidance command && isLocalAgentActivity command then
+                                        requestSnapshot.Value <- verified
+                                    scope))
                     match project with
                     | Error error -> return Error error
                     | Ok scope ->
@@ -1771,14 +1901,16 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                             | GetJobResultCommand _ | ListJobsCommand _ | CancelJobCommand _ -> ""
                             | _ when isLocalAgentActivity command -> agentId
                             | _ -> ""
-                        if not (String.IsNullOrWhiteSpace localAgentId) then
-                            target |> Option.iter (fun selected ->
-                                rt.Tui.RecordAgentSeen(AgentView.activityProject selected, localAgentId))
-                        // Request-local only: never use this observation to serve another inbox.
-                        let requestSnapshot: RequestSnapshot option ref = ref None
+                        // The exact activation CAS may still reject an ordinary
+                        // request if a scheduled intent won since admission.
                         match activateReadyOnActivity rt localAgentId target requestSnapshot command with
-                        | Error error -> return Error error
+                        | Error error ->
+                            responseScope <- None
+                            return Error error
                         | Ok (changes, committedActivation, activationInstructions) ->
+                            if not (String.IsNullOrWhiteSpace localAgentId) then
+                                target |> Option.iter (fun selected ->
+                                    rt.Tui.RecordAgentSeen(AgentView.activityProject selected, localAgentId))
                             implicitChanges <- changes
                             match command, committedActivation with
                             | TaskReadCommand inbox, Some receipt when inbox.Action = "AgentInbox" ->
@@ -1868,10 +2000,20 @@ let executeAuthenticatedCommandWithChallengeWake
 let private withVisibleResponseAlerts (rt: Runtime) (agentId: string)
                                       (command: AgentCommand option)
                                       (response: AgentCommandResponse) =
+    let launchRejected =
+        match response.Error with
+        | Some(ValidationFailed message) when message.StartsWith("ScheduledLaunch", StringComparison.Ordinal) -> true
+        | _ -> false
     let alerts =
         match command with
-        | Some original when mayReceiveResponseAlert original ->
+        | Some original when mayReceiveResponseAlert original && not launchRejected ->
             match classifyProject original with
+            | Ok scope when response.PendingJob.IsSome ->
+                // A pending handle may precede admission. Do not allow its
+                // delivery path to mutate the held actor's response queue.
+                match admitOrdinaryLaunchIngress rt agentId (projectTarget scope) with
+                | Ok _ -> checkResponseAlerts rt agentId (projectTarget scope)
+                | Error _ -> []
             | Ok scope -> checkResponseAlerts rt agentId (projectTarget scope)
             | Error _ -> []
         | _ -> []

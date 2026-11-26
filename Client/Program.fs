@@ -309,7 +309,60 @@ let reconcileReadySchedule (authenticatedActor: unit -> string option) (rt: Runt
     | _ -> return false
 }
 
-let executeReadySchedule (authenticatedActor: unit -> string option) (rt: Runtime)
+/// Resolve only exact outstanding launch identities. Server activity is used
+/// as negative evidence, never as an inferred positive check-in.
+let private reconcileScheduledLaunches
+    (activity: string -> string -> Task<Result<AgentActivitySnapshot, string>>)
+    (stillAuthorized: unit -> bool) binding project = task {
+    match LedgerStore.fetch binding |> Result.bind (ScheduledReadyResume.heldForReconciliationAt ScheduledReadyResume.readAutomationLimits binding) with
+    | Error issue -> return Error(sprintf "%A" issue)
+    | Ok launches ->
+        let mutable diagnostics = Map.empty<Guid, string * string>
+        let mutable nextWake: DateTimeOffset option = None
+        for launch in launches do
+            let now = DateTimeOffset.UtcNow
+            let! evidence = task {
+                match launch.CheckinDeadlineAtUtc with
+                | Some deadline when now >= deadline && launch.CheckinStatus <> "started" ->
+                    try
+                        let! result = activity project launch.AgentId
+                        return
+                            match result with
+                            | Ok observed ->
+                                observed.LastSeenAtUtc
+                                |> Option.filter (fun at -> at <> DateTimeOffset.MinValue)
+                                |> Option.map (fun at ->
+                                    ({ LastSeenAtUtc = at
+                                       ServerNowAtUtc = observed.ServerNowUtc } : ScheduledReadyResume.ActivityEvidence))
+                            | Error _ -> None
+                    with _ -> return None
+                | _ -> return None
+            }
+            let status, reason =
+                match (if stillAuthorized() then ScheduledReadyResume.reconcileAt binding (launch.LaunchId.ToString("D")) now evidence
+                       else Error(LedgerFailure.InvalidBinding "Authenticated schedule claim changed during launch reconciliation.")) with
+                | Ok(ScheduledReadyResume.LaunchStarted at) ->
+                    "started", "Authenticated launch check-in: " + at.ToString("O")
+                | Ok(ScheduledReadyResume.LaunchReplacementAuthorized at) ->
+                    "replacementAuthorized", "Durable replacement authorization: " + at.ToString("O")
+                | Ok(ScheduledReadyResume.LaunchAwaitingCheckin deadline) ->
+                    let wake = max deadline (now.AddSeconds(1.))
+                    nextWake <- Some(nextWake |> Option.map (min wake) |> Option.defaultValue wake)
+                    "awaitingCheckin", "Awaiting exact launch check-in until " + deadline.ToString("O")
+                | Ok(ScheduledReadyResume.LaunchActivityEvidenceUnavailable reason) ->
+                    "activityEvidenceUnavailable", reason
+                | Ok(ScheduledReadyResume.LaunchOperatorResolutionRequired reason) ->
+                    "operatorResolutionRequired", reason
+                | Ok(ScheduledReadyResume.LaunchAssignmentNoLongerReady reason) ->
+                    "assignmentNoLongerReady", reason
+                | Ok(ScheduledReadyResume.LaunchIntentMissing reason) ->
+                    "intentMissing", reason
+                | Error issue -> "reconciliationRejected", sprintf "%A" issue
+            diagnostics <- diagnostics.Add(launch.LaunchId, (status, reason))
+        return Ok(diagnostics, nextWake)
+}
+
+let executeReadyScheduleWithActivity activity (authenticatedActor: unit -> string option) (rt: Runtime)
                          (browser: BrowserBridge.Service option) (action: BrowserSchedules.ScheduledAction) = task {
     let permission = rt :> PermissionIO
     let authorize () =
@@ -329,6 +382,14 @@ let executeReadySchedule (authenticatedActor: unit -> string option) (rt: Runtim
                     | Error error -> return Error("", sprintf "%A" error)
                     | Ok(binding, _) ->
                         let hash = readyResumeHash
+                        let stillAuthorized () = authenticatedActor() = Some actor && scheduler.IsCurrentClaim action
+                        let! reconciled = reconcileScheduledLaunches activity stillAuthorized binding action.ProjectName
+                        let diagnostics =
+                            match reconciled with
+                            | Ok(values, wake) ->
+                                scheduler.RecordCheckinWake(action, wake, true) |> ignore
+                                values
+                            | Error _ -> Map.empty
                         let routeHash =
                             JsonSerializer.Serialize(
                                 {| id = action.Id; revisionId = action.RevisionId; project = action.ProjectName; url = action.Url; script = action.ScriptPath
@@ -352,23 +413,37 @@ let executeReadySchedule (authenticatedActor: unit -> string option) (rt: Runtim
                                                |> Result.mapError (sprintf "%A")
                                     | Ok _ -> return Error "Project ledger binding changed."
                         }
-                        let send prepared = task {
+                        let send (prepared: ScheduledReadyResume.Prepared) = task {
                             // Check the exact authenticated occurrence again after
                             // the ledger read, immediately before entering the bridge.
                             if authenticatedActor() <> Some actor || not (scheduler.IsCurrentClaim action) then
-                                return Error "Schedule stopped before browser invocation."
+                                return Error(ScheduledReadyResume.DefinitelyNotInvoked "Schedule stopped before browser invocation.")
+                            elif not (scheduler.RecordCheckinWake(
+                                action, prepared.SendBoundaryAtUtc |> Option.map (fun at -> at.AddMinutes(5.)), false)) then
+                                return Error(ScheduledReadyResume.DefinitelyNotInvoked "Schedule stopped before deadline registration.")
                             else
                                 match ScheduledReadyResume.browserArguments action.Url prepared with
-                                | Error reason -> return Error reason
+                                | Error reason -> return Error(ScheduledReadyResume.DefinitelyNotInvoked reason)
                                 | Ok args ->
                                     let! result = BrowserBridge.runInNewTab bridge action.WindowRegistration
                                                     action.Url action.Alias action.Active source args
                                                     30000 action.CloseTabAfterExecution
                                     match result with
-                                    | Ok value -> return Ok value
+                                    | Ok value ->
+                                        use receipt = JsonDocument.Parse(value)
+                                        let root = receipt.RootElement
+                                        match root.TryGetProperty("status") with
+                                        | true, status when status.ValueKind = JsonValueKind.String && status.GetString() = "notSubmitted" ->
+                                            registrationId <- root.GetProperty("registrationId").GetString()
+                                            return Error(ScheduledReadyResume.DefinitelyNotInvoked("NotSubmitted: provider explicitly reported no Send; registrationId=" + registrationId))
+                                        | _ -> return Ok value
                                     | Error(id, reason) ->
                                         registrationId <- id
-                                        return Error reason
+                                        if BrowserBridge.isConfirmedNoSendFailure id reason then
+                                            let category = if String.IsNullOrEmpty id then "TabCapacityHold: " else "PreSendFailure: "
+                                            return Error(ScheduledReadyResume.DefinitelyNotInvoked(category + reason))
+                                        else
+                                            return Error(ScheduledReadyResume.SendOutcomeUnknown reason)
                         }
                         let ports : ScheduledReadyResume.ExecutionPorts =
                             { ReadLimits = ScheduledReadyResume.readAutomationLimits
@@ -380,13 +455,25 @@ let executeReadySchedule (authenticatedActor: unit -> string option) (rt: Runtim
                             let selection : BrowserSchedules.ResumeSelection =
                                 { Stage = stage; BindingSha256 = resumeBindingHash binding
                                   OperationId = intent.OperationId; Actor = actor; RequestJson = intent.RequestJson }
-                            scheduler.RecordResumeStage(action, selection)
+                            scheduler.RecordResumeStage(action, selection) &&
+                            // Persist a conservative early wake before the durable boundary.
+                            // The exact boundary is read again after restart; an early wake
+                            // merely re-arms to the recorded deadline, never authorizes Send.
+                            (stage <> "EnteringSend" || scheduler.RecordCheckinWake(action, Some(DateTimeOffset.UtcNow.AddMinutes(5.)), false))
                         let! outcome =
                             ScheduledReadyResume.executeOnceTracked track ports binding actor action.ProjectName
                                 action.ScriptPath sourceHash routeHash
                         match outcome with
                         | ScheduledReadyResume.NoEligibleReady -> return Ok """{"status":"noEligibleReady"}"""
-                        | ScheduledReadyResume.Held reason -> return Error("", reason)
+                        | ScheduledReadyResume.Held reason ->
+                            return Ok(JsonSerializer.Serialize {| status = "held"; reason = reason |})
+                        | ScheduledReadyResume.HeldCandidates held ->
+                            let reported =
+                                held |> List.map (fun launch ->
+                                    match diagnostics.TryFind launch.LaunchId with
+                                    | Some(status, reason) -> { launch with CheckinStatus = status; Reason = reason }
+                                    | None -> launch)
+                            return Ok(JsonSerializer.Serialize {| status = "heldLaunches"; launches = reported |})
                         | ScheduledReadyResume.Submitted value -> return Ok value
                         | ScheduledReadyResume.PublicationUncertain(operation, reason) ->
                             return Error("", $"ResumePublicationUncertain:{operation:D}:{reason}")
@@ -399,13 +486,22 @@ let executeReadySchedule (authenticatedActor: unit -> string option) (rt: Runtim
 }
 
 // Shared production dispatch entry point, also used by disposable scheduler tests.
-let executeRegisteredSchedule readFence (actorProvider: (unit -> string option) ref) rt tui browser =
+let executeRegisteredScheduleWithActivity activity readFence (actorProvider: (unit -> string option) ref) rt tui browser =
     // Resolve the current provider at each auth check, including after registration changes.
     let authenticatedActor () = actorProvider.Value()
     fun action ->
         if BrowserSchedules.isReadyResume action then
-            executeReadySchedule authenticatedActor rt browser action
+            executeReadyScheduleWithActivity activity authenticatedActor rt browser action
         else executeScheduledAction readFence rt tui browser action
+
+let private unavailableActivity _ _ =
+    Task.FromResult(Error "Authenticated activity unavailable.")
+
+let executeReadySchedule authenticatedActor rt browser action =
+    executeReadyScheduleWithActivity unavailableActivity authenticatedActor rt browser action
+
+let executeRegisteredSchedule readFence actorProvider rt tui browser =
+    executeRegisteredScheduleWithActivity unavailableActivity readFence actorProvider rt tui browser
 
 let private runClient args =
     let activityStore, activityStoreError =
@@ -471,7 +567,9 @@ let private runClient args =
     // The browser bridge is optional; CLI scheduling works without an extension.
     let mutable registered = false
     let readyResumeActor : (unit -> string option) ref = ref (fun () -> None)
-    let executeScheduledAction = executeRegisteredSchedule ClientConfig.capacityFenceMode readyResumeActor rt tui browser
+    let mutable readLaunchActivity = unavailableActivity
+    let executeScheduledAction =
+        executeRegisteredScheduleWithActivity (fun project agent -> readLaunchActivity project agent) ClientConfig.capacityFenceMode readyResumeActor rt tui browser
     // The runtime owns at most one local scheduler per private state file.
     // A second JarvisClient can still connect, but never becomes a competing
     // schedule writer/executor. Idle launches also require a *fresh* authenticated
@@ -624,6 +722,56 @@ let private runClient args =
         if registered && connection.State = HubConnectionState.Connected then authenticatedOperator
         else None)
 
+    // Local TUI only: the human must explicitly confirm the original
+    // execution has ended. Never grant replacement from an agent assertion.
+    tui.SetLaunchResolutionAccess(fun project agent ->
+        match readyResumeActor.Value() with
+        | None -> Error "Authenticated operator connection unavailable."
+        | Some actor ->
+            OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt
+            |> Result.mapError (sprintf "%A")
+            |> Result.bind (fun (binding, snapshot) ->
+                ScheduledReadyResume.heldForReconciliationAt ScheduledReadyResume.readCurrentLimits binding snapshot
+                |> Result.mapError (sprintf "%A")
+                |> Result.bind (fun launches ->
+                    match launches |> List.tryFind (fun launch -> launch.AgentId = agent) with
+                    | None -> Error "No unresolved scheduled launch for the selected Ready assignment."
+                    | Some launch when launch.CheckinStatus = "started" ->
+                        Error "The original launch has already checked in."
+                    | Some launch ->
+                        ScheduledReadyResume.inspectLaunchAt binding snapshot launch.LaunchId
+                        |> Result.mapError (sprintf "%A")
+                        |> Result.bind (function
+                            | None -> Error "Original launch intent missing."
+                            | Some inspection ->
+                                let expected = inspection.Ready
+                                Ok { LaunchId = launch.LaunchId.ToString("D")
+                                     AgentId = expected.AgentId; TaskId = expected.TaskId
+                                     AttemptId = expected.AttemptId; AssignmentGeneration = expected.Generation
+                                     StateSequence = expected.StateSequence; Reason = launch.Reason
+                                     Resolve = fun rationale ->
+                                        if readyResumeActor.Value() <> Some actor then
+                                            Error "Authenticated operator changed; reload the original launch."
+                                        else
+                                            match OrchestrationApi.LedgerBindingConfig.load project rt with
+                                            | Ok current when current = binding ->
+                                                ScheduledReadyResume.resolveOperator binding actor (launch.LaunchId.ToString("D"))
+                                                    expected rationale true DateTimeOffset.UtcNow
+                                                |> Result.map ignore |> Result.mapError (sprintf "%A")
+                                            | _ -> Error "Project binding changed; reload the original launch." }))))
+
+    readLaunchActivity <- (fun project agent -> task {
+        if not registered || connection.State <> HubConnectionState.Connected then
+            return Error "Authenticated server connection unavailable."
+        else
+            try
+                let pending = connection.InvokeCoreAsync<AgentActivitySnapshot>("GetAgentActivity", [| box project; box agent |])
+                let! observed = pending.WaitAsync(TimeSpan.FromSeconds(8.0))
+                return Ok observed
+            with ex ->
+                return Error ("Authenticated server activity failed: " + ex.GetType().Name)
+    })
+
     connection.KeepAliveInterval <- TimeSpan.FromSeconds 10.0
     connection.ServerTimeout <- TimeSpan.FromSeconds 60.0
 
@@ -741,17 +889,7 @@ let private runClient args =
     let nativeHealthDependencies : Client.NativeHealth.Dependencies =
         { Enumerate = (fun () -> Client.NativeHealth.NativeHealth.enumerateAutomation rt)
           Current = Client.NativeHealth.NativeHealth.currentAutomation rt
-          Activity = (fun project agent -> task {
-              if not registered || connection.State <> HubConnectionState.Connected then
-                  return Error "Authenticated server connection unavailable."
-              else
-                  try
-                      let pending = connection.InvokeCoreAsync<AgentActivitySnapshot>("GetAgentActivity", [| box project; box agent |])
-                      let! observed = pending.WaitAsync(TimeSpan.FromSeconds(8.0))
-                      return Ok observed
-                  with ex ->
-                      return Error ("Authenticated server activity failed: " + ex.GetType().Name)
-          })
+          Activity = (fun project agent -> readLaunchActivity project agent)
           Recover = Client.NativeHealth.NativeHealth.recoverAutomation rt }
     let nativeHealth =
         new Client.NativeHealth.NativeHealth.Service(

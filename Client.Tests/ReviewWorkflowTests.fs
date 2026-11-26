@@ -3051,7 +3051,7 @@ type ReviewWorkflowTests() =
                 // The server validates the source sender via its own inbox.
                 let sourceInbox : Common.AgentCommand =
                     Common.TaskReadCommand
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"
+                        { ProjectName = "owner"; LaunchId = null; AgentId = "Owner"; Action = "AgentInbox"
                           TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
                           RelativePath = null }
@@ -3240,14 +3240,14 @@ type ReviewWorkflowTests() =
                           OwnerId = "Owner" } |> ignore
                 let queued =
                     Client.OrchestrationApi.TaskApi.read
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null } ctx
+                        { ProjectName = "owner"; LaunchId = null; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null } ctx
                     |> function
                         | Ok value -> unbox<AgentInbox> value
                         | Error error -> failwithf " inbox failed: %A" error
                 Assert.That(queued.RunnableQueue.Length, Is.EqualTo(1))
                 Assert.That(queued.RunnableQueue.Head.Attempt.SpecBlobOid.Length, Is.EqualTo(40))
                 let generationLookup : Common.TaskReadCommand =
-                    { ProjectName = "owner"; AgentId = ""; Action = "GetAssignment"
+                    { ProjectName = "owner"; LaunchId = null; AgentId = ""; Action = "GetAssignment"
                       TaskId = taskId; AssignmentGeneration = 1; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let snapshotAssignment =
                     Client.OrchestrationApi.TaskApi.read generationLookup ctx
@@ -3299,7 +3299,7 @@ type ReviewWorkflowTests() =
                           NextAction = "Resume work" } |> ignore
                 let ready =
                     Client.OrchestrationApi.TaskApi.read
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null } ctx
+                        { ProjectName = "owner"; LaunchId = null; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null } ctx
                     |> function
                         | Ok value -> unbox<AgentInbox> value
                         | Error error -> failwithf " Ready inbox failed: %A" error
@@ -3359,7 +3359,7 @@ type ReviewWorkflowTests() =
                 Assert.That(ownerInbox.UnacknowledgedFeedback.Length, Is.EqualTo(1))
                 let after =
                     Client.OrchestrationApi.TaskApi.read
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null } ctx
+                        { ProjectName = "owner"; LaunchId = null; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null } ctx
                     |> function
                         | Ok value -> unbox<AgentInbox> value
                         | Error error -> failwithf " inbox failed: %A" error
@@ -3386,7 +3386,7 @@ type ReviewWorkflowTests() =
                 run { template "CancelOpenTask" adminTask with
                           ExpectedTaskVersion = 1; Reason = "Explicit cancellation" } |> ignore
                 let adminHistory : Common.TaskReadCommand =
-                    { ProjectName = "owner"; Action = "LifecycleHistory"; TaskId = adminTask
+                    { ProjectName = "owner"; LaunchId = null; Action = "LifecycleHistory"; TaskId = adminTask
                       AgentId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 match Client.OrchestrationApi.TaskApi.read adminHistory ctx with
                 | Ok value ->
@@ -3404,7 +3404,7 @@ type ReviewWorkflowTests() =
                 run { template "CreateTask" specTask with
                           Title = "Spec API"; Html = "<h1>API revision one</h1>\\n" } |> ignore
                 let pageCmd : Common.TaskReadCommand =
-                    { ProjectName = "owner"; Action = "GetSpecPage"; TaskId = specTask
+                    { ProjectName = "owner"; LaunchId = null; Action = "GetSpecPage"; TaskId = specTask
                       AgentId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                       Cursor = ""; PageSize = 128; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let pageBefore =
@@ -3951,7 +3951,7 @@ type ReviewWorkflowTests() =
                 Assert.That(now.Agent.CurrentAssignment, Is.Null)
                 let inbox : Common.AgentCommand =
                     Common.TaskReadCommand
-                        { ProjectName = "owner"; AgentId = "Reviewer"; Action = "AgentInbox"
+                        { ProjectName = "owner"; LaunchId = null; AgentId = "Reviewer"; Action = "AgentInbox"
                           TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
                           RelativePath = null }
@@ -3998,7 +3998,7 @@ type ReviewWorkflowTests() =
                     |> Async.AwaitTask |> Async.RunSynchronously
                 let read action =
                     Common.TaskReadCommand
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = action
+                        { ProjectName = "owner"; LaunchId = null; AgentId = "Owner"; Action = action
                           TaskId = taskId; AssignmentGeneration = 1; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
 
@@ -4093,7 +4093,7 @@ type ReviewWorkflowTests() =
                     |> Async.AwaitTask |> Async.RunSynchronously
                 let read : Common.AgentCommand =
                     Common.TaskReadCommand
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"
+                        { ProjectName = "owner"; LaunchId = null; AgentId = "Owner"; Action = "AgentInbox"
                           TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let _, inbox, receipt = invoke read
@@ -4149,7 +4149,7 @@ type ReviewWorkflowTests() =
                 |> success |> ignore
                 let rt = Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
                 let cmdData : Common.TaskReadCommand =
-                    { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"
+                    { ProjectName = "owner"; LaunchId = null; AgentId = "Owner"; Action = "AgentInbox"
                       TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                       Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let payload = System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(Common.TaskReadCommand cmdData)
@@ -4394,7 +4394,7 @@ type ReviewWorkflowTests() =
                 // must neither restart the Working clock nor last-seen.
                 let selfInbox : Common.AgentCommand =
                     Common.TaskReadCommand
-                        { ProjectName = "owner"; AgentId = firstTarget; Action = "AgentInbox"
+                        { ProjectName = "owner"; LaunchId = null; AgentId = firstTarget; Action = "AgentInbox"
                           TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
                           RelativePath = null }
@@ -4446,7 +4446,7 @@ type ReviewWorkflowTests() =
                 let failedTarget = targets.Tail.Head
                 let invalidInbox : Common.AgentCommand =
                     Common.TaskReadCommand
-                        { ProjectName = "owner"; AgentId = ""; Action = "AgentInbox"
+                        { ProjectName = "owner"; LaunchId = null; AgentId = ""; Action = "AgentInbox"
                           TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
                           RelativePath = null }
@@ -4483,7 +4483,7 @@ type ReviewWorkflowTests() =
                     Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
                 let command : Common.AgentCommand =
                     Common.TaskReadCommand
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"
+                        { ProjectName = "owner"; LaunchId = null; AgentId = "Owner"; Action = "AgentInbox"
                           TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let payload = System.Text.Json.JsonSerializer.Serialize(command)
@@ -7680,7 +7680,7 @@ type ReviewWorkflowTests() =
                 Assert.That((ReviewWorkflow.getResponseAlerts second "Reviewer" |> success).Pending, Is.Empty)
                 let ordinary : Common.AgentCommand =
                     Common.TaskReadCommand
-                        { ProjectName = "owner"; AgentId = "Reviewer"; Action = "GetNotificationPreferences"
+                        { ProjectName = "owner"; LaunchId = null; AgentId = "Reviewer"; Action = "GetNotificationPreferences"
                           TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let _, readResult, after = invoke "Reviewer" ordinary
@@ -7883,7 +7883,7 @@ type ReviewWorkflowTests() =
                             Is.EqualTo(1))
                 let unrelated : Common.AgentCommand =
                     Common.TaskReadCommand
-                        { ProjectName = "owner"; AgentId = actor; Action = "GetNotificationPreferences"
+                        { ProjectName = "owner"; LaunchId = null; AgentId = actor; Action = "GetNotificationPreferences"
                           TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let unrelatedReply = { original with Instructions = []; StateChangeEvidence = Common.StateChangeEvidence.Confirmed [] }
@@ -7930,7 +7930,7 @@ type ReviewWorkflowTests() =
                     "STOP — yield safely" |> success |> ignore
                 let inspect : Common.AgentCommand =
                     Common.TaskReadCommand
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = "GetResponseAlerts"
+                        { ProjectName = "owner"; LaunchId = null; AgentId = "Owner"; Action = "GetResponseAlerts"
                           TaskId = "Owner"; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
                           RelativePath = null }

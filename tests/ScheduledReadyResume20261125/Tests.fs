@@ -95,10 +95,30 @@ let ``actual canonical Ready resumes once and unknown browser send cannot replay
               Send = fun prepared ->
                   sends <- sends + 1
                   Assert.That(prepared.Rendered.Prompt, Is.EqualTo("Agent Worker, project Fixture. Call inbox."))
-                  Task.FromResult(Error "unknown browser receipt") }
+                  Task.FromResult(Error(SendOutcomeUnknown "unknown browser receipt")) }
         Assert.That(run ports binding, Is.EqualTo(OutcomeUnknown "unknown browser receipt"))
         Assert.That(run ports binding, Is.EqualTo(NoEligibleReady))
         Assert.That(sends, Is.EqualTo(1)))
+
+[<Test>]
+let ``confirmed tab capacity rejection records no-send proof and retries next tick`` () =
+    fixture (fun binding assign ->
+        assign "Worker" "ready-task"
+        let mutable sends = 0
+        let ports =
+            { ReadLimits = fun _ _ -> Ok disabled
+              CanSend = fun _ -> Task.FromResult(Ok true)
+              Send = fun _ ->
+                  sends <- sends + 1
+                  if sends = 1 then
+                      Task.FromResult(Error(DefinitelyNotInvoked "TabCapacityHold: AgentTabLimitReached"))
+                  else
+                      Task.FromResult(Ok "submitted") }
+        match run ports binding with
+        | Held _ -> ()
+        | other -> Assert.Fail("Expected a durable no-send hold, got " + string other)
+        Assert.That(run ports binding, Is.EqualTo(Submitted "submitted"))
+        Assert.That(sends, Is.EqualTo(2)))
 
 [<Test>]
 let ``actual Working count holds scheduler then resumes below cap`` () =

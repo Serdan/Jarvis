@@ -256,7 +256,7 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
 
     let update id attemptId status (rawResult: string) (error: string) =
         // Accept legacy registration-only results and structured browser workflow results.
-        let registrationId, conversationUrl, cleanup, effectiveStatus =
+        let registrationId, conversationUrl, cleanup, effectiveStatus, effectiveError =
             try
                 use doc = JsonDocument.Parse(rawResult)
                 let root = doc.RootElement
@@ -277,9 +277,15 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                     | true, uri when uri.Scheme = "https" || uri.Scheme = "http" ->
                         uri.GetLeftPart(UriPartial.Path)
                     | _ -> ""
+                let reason = prop "reason"
                 prop "registrationId", safeUrl, prop "cleanup",
-                (if state = "notSubmitted" then "failed" else status)
-            with _ -> rawResult, "", "", status
+                (match state with
+                 | "notSubmitted" -> "failed"
+                 | "held" -> "held"
+                 | "noEligibleReady" -> "noEligibleReady"
+                 | _ -> status),
+                (if String.IsNullOrWhiteSpace error then reason else error)
+            with _ -> rawResult, "", "", status, error
         lock gate (fun () ->
             match actions |> List.tryFind (fun a ->
                 not disposed && a.Id = id && a.AttemptId = attemptId && a.Status = "running") with
@@ -289,7 +295,11 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                     if a.Id = id && a.AttemptId = attemptId && a.Status = "running" then
                         let now = clock()
                         let resultSummary =
-                            if a.ActionKind = "RunCommand" then
+                            if isReadyResume a then
+                                if String.IsNullOrWhiteSpace(rawResult) then ""
+                                elif rawResult.Length > 4000 then rawResult.Substring(0, 4000)
+                                else rawResult
+                            elif a.ActionKind = "RunCommand" then
                                 if String.IsNullOrWhiteSpace(rawResult) then ""
                                 elif rawResult.Length > 200 then rawResult.Substring(0, 200)
                                 else rawResult
@@ -327,7 +337,7 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                             let skipped = floor(elapsed / seconds) + 1.0
                             { a with Status = "pending"; DueAtUtc = a.DueAtUtc.AddSeconds(skipped * seconds)
                                      RegistrationId = registrationId; ConversationUrl = conversationUrl
-                                     Cleanup = cleanup; Error = effectiveStatus + ": " + error
+                                     Cleanup = cleanup; Error = effectiveStatus + ": " + effectiveError
                                      LastResult = resultSummary; UpdatedAtUtc = current }
                         else
                             { a with Status = effectiveStatus; RegistrationId = registrationId

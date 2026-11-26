@@ -356,10 +356,10 @@ let executeReadySchedule (authenticatedActor: unit -> string option) (rt: Runtim
                             // Check the exact authenticated occurrence again after
                             // the ledger read, immediately before entering the bridge.
                             if authenticatedActor() <> Some actor || not (scheduler.IsCurrentClaim action) then
-                                return Error "Schedule stopped before browser invocation."
+                                return Error(ScheduledReadyResume.DefinitelyNotInvoked "Schedule stopped before browser invocation.")
                             else
                                 match ScheduledReadyResume.browserArguments action.Url prepared with
-                                | Error reason -> return Error reason
+                                | Error reason -> return Error(ScheduledReadyResume.DefinitelyNotInvoked reason)
                                 | Ok args ->
                                     let! result = BrowserBridge.runInNewTab bridge action.WindowRegistration
                                                     action.Url action.Alias action.Active source args
@@ -368,7 +368,10 @@ let executeReadySchedule (authenticatedActor: unit -> string option) (rt: Runtim
                                     | Ok value -> return Ok value
                                     | Error(id, reason) ->
                                         registrationId <- id
-                                        return Error reason
+                                        if BrowserBridge.isConfirmedNoSendFailure id reason then
+                                            return Error(ScheduledReadyResume.DefinitelyNotInvoked("TabCapacityHold: " + reason))
+                                        else
+                                            return Error(ScheduledReadyResume.SendOutcomeUnknown reason)
                         }
                         let ports : ScheduledReadyResume.ExecutionPorts =
                             { ReadLimits = ScheduledReadyResume.readAutomationLimits
@@ -386,7 +389,8 @@ let executeReadySchedule (authenticatedActor: unit -> string option) (rt: Runtim
                                 action.ScriptPath sourceHash routeHash
                         match outcome with
                         | ScheduledReadyResume.NoEligibleReady -> return Ok """{"status":"noEligibleReady"}"""
-                        | ScheduledReadyResume.Held reason -> return Error("", reason)
+                        | ScheduledReadyResume.Held reason ->
+                            return Ok(JsonSerializer.Serialize {| status = "held"; reason = reason |})
                         | ScheduledReadyResume.Submitted value -> return Ok value
                         | ScheduledReadyResume.PublicationUncertain(operation, reason) ->
                             return Error("", $"ResumePublicationUncertain:{operation:D}:{reason}")

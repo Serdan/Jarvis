@@ -654,6 +654,8 @@ module OrdinaryDispatchGitTests =
     open System.IO
     open System.Text.Json
     open Client.LedgerStore
+    open Client.AccountCapacityLedger
+    open Client.WorkQueueGitLedger
     open Client.ReviewWorkflow
     open Common
     open NUnit.Framework
@@ -762,6 +764,157 @@ module OrdinaryDispatchGitTests =
             Assert.That(afterWarm.Commit, Is.EqualTo(afterFirst.Commit), "Warm Working dispatch must not create a new durable ledger head.")
             Assert.That(git checkout [ "status"; "--porcelain" ], Is.Empty)
         finally
+            if File.Exists config then File.Delete config
+            if File.Exists(config + ".lock") then File.Delete(config + ".lock")
+            Directory.Delete(root, true)
+
+
+    [<Test; NonParallelizable>]
+    let WorkingDispatchSkipsLegacyFenceGitWhenAlreadyWorking () =
+        let oldHost =
+            Environment.GetEnvironmentVariable(
+                Client.LegacyWriterProtocolFence.LegacyWriterProtocolFence.HostBindingEnvironment)
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-dispatch-fence-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let hostPath = Path.Combine(root, "host-fence.json")
+        let projectCheckout = Path.Combine(root, "project")
+        let accountCheckout = Path.Combine(root, "account")
+        let config = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot projectCheckout
+        try
+            let repository name checkout =
+                let remote = Path.Combine(root, name + ".git")
+                git root [ "init"; "--bare"; "--initial-branch=main"; remote ] |> ignore
+                git root [ "clone"; remote; checkout ] |> ignore
+                git checkout [ "config"; "user.name"; "Dispatch Fence Test" ] |> ignore
+                git checkout [ "config"; "user.email"; "dispatch-fence@example.invalid" ] |> ignore
+                File.WriteAllText(Path.Combine(checkout, "source.txt"), "base")
+                git checkout [ "add"; "source.txt" ] |> ignore
+                git checkout [ "commit"; "-m"; "base" ] |> ignore
+                git checkout [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
+                remote
+
+            let projectRemote = repository "project" projectCheckout
+            let accountRemote = repository "account" accountCheckout
+            let binding: LedgerBinding =
+                { RepositoryPath = projectCheckout; RemoteName = "origin"
+                  ApprovedFetchUrl = projectRemote; ApprovedPushUrl = projectRemote
+                  ProjectId = Guid.NewGuid(); LedgerId = Guid.NewGuid(); Epoch = 1 }
+            let accountBinding: AccountBinding =
+                { RepositoryPath = accountCheckout; RemoteName = "origin"
+                  ApprovedFetchUrl = accountRemote; ApprovedPushUrl = accountRemote
+                  AccountId = Guid.NewGuid(); LedgerId = Guid.NewGuid(); Epoch = 1 }
+            AccountCapacityLedger.initialize accountBinding 3 |> success |> ignore
+            LedgerStore.initialize binding true |> success |> ignore
+            WorkQueueGitLedger.initialize binding "project" (Guid.NewGuid())
+                (Map.ofList [ "Owner", set [ "source" ]; "BlockedOwner", set [ "source" ] ])
+            |> success |> ignore
+            for agentId, taskId, title in
+                [ "Owner", "dispatch-task", "Dispatch"
+                  "BlockedOwner", "blocked-task", "Blocked dispatch" ] do
+                ReviewWorkflow.registerAgent binding (Guid.NewGuid()) agentId |> success |> ignore
+                ReviewWorkflow.createTask binding (Guid.NewGuid()) taskId title |> success |> ignore
+                ReviewWorkflow.assignTask binding (Guid.NewGuid()) taskId (Guid.NewGuid()) agentId
+                |> success |> ignore
+
+            let before = LedgerStore.fetch binding |> success
+            let rt = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting "project" rt
+                binding.ProjectId binding.LedgerId binding.Epoch binding.RemoteName
+                binding.ApprovedFetchUrl binding.ApprovedPushUrl before.Commit true
+            |> success |> ignore
+
+            let writeHost expectedAccountHead expectedProjectHead =
+                let document =
+                    {| schemaVersion = 1
+                       protocolVersion = Client.LegacyWriterProtocolFence.LegacyWriterProtocolFence.ProtocolVersion
+                       projectName = "project"
+                       projectRepositoryPath = binding.RepositoryPath
+                       projectRemoteName = binding.RemoteName
+                       projectApprovedFetchUrl = binding.ApprovedFetchUrl
+                       projectApprovedPushUrl = binding.ApprovedPushUrl
+                       projectId = binding.ProjectId.ToString("D")
+                       projectLedgerId = binding.LedgerId.ToString("D")
+                       projectEpoch = binding.Epoch
+                       accountRepositoryPath = accountBinding.RepositoryPath
+                       accountRemoteName = accountBinding.RemoteName
+                       accountApprovedFetchUrl = accountBinding.ApprovedFetchUrl
+                       accountApprovedPushUrl = accountBinding.ApprovedPushUrl
+                       accountId = accountBinding.AccountId.ToString("D")
+                       accountLedgerId = accountBinding.LedgerId.ToString("D")
+                       accountEpoch = accountBinding.Epoch
+                       expectedAccountHead = expectedAccountHead
+                       expectedProjectHead = expectedProjectHead |}
+                File.WriteAllText(hostPath, JsonSerializer.Serialize document)
+                if not (OperatingSystem.IsWindows()) then
+                    File.SetUnixFileMode(hostPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                Environment.SetEnvironmentVariable(
+                    Client.LegacyWriterProtocolFence.LegacyWriterProtocolFence.HostBindingEnvironment,
+                    hostPath)
+
+            let account = AccountCapacityLedger.fetch accountBinding |> success
+            writeHost account.Head before.Commit
+            let command =
+                ReadFileCommand
+                    { ProjectName = "project"; FilePath = "source.txt"
+                      StartLine = None; EndLine = None; IncludeLineNumbers = None }
+            let payload = JsonSerializer.Serialize command
+            let invoke agentId =
+                Client.SignalR.Client.executeAuthenticatedCommandWithChallengeWake
+                    rt payload agentId None false (fun _ _ -> ())
+                |> Async.AwaitTask |> Async.RunSynchronously
+            let measure agentId =
+                LedgerStore.measureGitReads (fun () ->
+                    LedgerStore.withGitTransportFaults (fun _ args ->
+                        match args with
+                        | "fetch" :: _ -> System.Threading.Thread.Sleep(10); None
+                        | _ -> None) (fun () -> invoke agentId))
+
+            let first, firstIo = measure "Owner"
+            Assert.That(first.Error.IsSome, Is.False, sprintf "%A" first.Error)
+            Assert.That(firstIo.RemoteFetches, Is.GreaterThan(3),
+                "A Ready agent must still consult the configured legacy fence before activation.")
+            let activated = ReviewWorkflow.getAgentInbox binding "Owner" |> success
+            Assert.That(activated.Agent.State, Is.EqualTo("Working"))
+
+            let warm, warmIo = measure "Owner"
+            Assert.That(warm.Error, Is.EqualTo(first.Error))
+            Assert.That(warm.Result, Is.EqualTo(first.Result))
+            Assert.That(warmIo.ProcessStarts, Is.EqualTo(0),
+                "An already-Working agent has no implicit lifecycle write for the migration fence to protect.")
+            Assert.That(warmIo.RemoteFetches, Is.EqualTo(0))
+
+            // A second Ready agent remains protected: once the account epoch is
+            // no longer LegacyActive, the same ordinary read must not activate it.
+            let accountBeforeFreeze = AccountCapacityLedger.fetch accountBinding |> success
+            git accountCheckout [ "checkout"; "-B"; "freeze-fixture"; accountBeforeFreeze.Head ] |> ignore
+            let statePath = Path.Combine(accountCheckout, "state.json")
+            let frozen =
+                { accountBeforeFreeze.State with
+                    MigrationPhase = "Frozen"
+                    StateVersion = accountBeforeFreeze.State.StateVersion + 1L
+                    NextSequence = accountBeforeFreeze.State.NextSequence + 1L }
+            File.WriteAllText(statePath, JsonSerializer.Serialize frozen)
+            git accountCheckout [ "add"; "state.json" ] |> ignore
+            git accountCheckout [ "commit"; "-m"; "fixture frozen migration phase" ] |> ignore
+            git accountCheckout [ "push"; "origin"; "HEAD:" + AccountCapacityLedger.AccountRef ] |> ignore
+            let frozenAccount = AccountCapacityLedger.fetch accountBinding |> success
+            let currentProject = LedgerStore.fetch binding |> success
+            writeHost frozenAccount.Head currentProject.Commit
+            let beforeBlockedRead = LedgerStore.fetch binding |> success
+            let blocked, blockedIo = measure "BlockedOwner"
+            Assert.That(blocked.Error.IsSome, Is.False, sprintf "%A" blocked.Error)
+            Assert.That(blocked.Result.IsSome, Is.True)
+            Assert.That(blockedIo.RemoteFetches, Is.GreaterThan(0),
+                "A Ready agent still requires a fresh fence check before implicit activation.")
+            let stillReady = ReviewWorkflow.getAgentInbox binding "BlockedOwner" |> success
+            Assert.That(stillReady.Agent.State, Is.EqualTo("Ready"))
+            let afterBlockedRead = LedgerStore.fetch binding |> success
+            Assert.That(afterBlockedRead.Commit, Is.EqualTo(beforeBlockedRead.Commit),
+                "A fenced read must not create a lifecycle transition.")
+        finally
+            Environment.SetEnvironmentVariable(
+                Client.LegacyWriterProtocolFence.LegacyWriterProtocolFence.HostBindingEnvironment,
+                oldHost)
             if File.Exists config then File.Delete config
             if File.Exists(config + ".lock") then File.Delete(config + ".lock")
             Directory.Delete(root, true)

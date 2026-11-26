@@ -391,7 +391,6 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
     else
         match target with
         | None -> Ok ([], None, [])
-        | Some target when not (oldSideEffectsAllowed rt target) -> Ok ([], None, [])
         | Some target ->
             let projectId = ProjectPaths.ProjectTarget.projectId target
             let project = ProjectPaths.ProjectId.value projectId
@@ -440,7 +439,16 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                             $"Automatic Ready-to-Working activation could not be verified: {error}. Reread the canonical inbox before continuing assignment work." ])
                 | _ -> Error error
             match current with
+            // The migration fence protects the implicit Ready->Working write,
+            // not ordinary activity by an agent that is already Working (or
+            // any other non-activation state). Keep the check before a possible
+            // activation, and preserve its fail-closed behavior on read errors.
+            | Error _ when not (oldSideEffectsAllowed rt target) -> Ok ([], None, [])
             | Error error -> unavailable error
+            | Ok(Some agent) when agent.State = "Ready"
+                                  && not (isNull (box agent.CurrentAssignment))
+                                  && not (String.IsNullOrWhiteSpace agent.CurrentAssignment.TaskId)
+                                  && not (oldSideEffectsAllowed rt target) -> Ok ([], None, [])
             | Ok(Some agent) when agent.State = "Ready"
                               && not (isNull (box agent.CurrentAssignment))
                               && not (String.IsNullOrWhiteSpace agent.CurrentAssignment.TaskId) ->

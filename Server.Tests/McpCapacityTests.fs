@@ -89,7 +89,9 @@ let private startJarvisToolServer () =
         builder.WebHost.UseUrls(endpoint) |> ignore
         builder.Services.AddAuthorization() |> ignore
         builder.Services.AddHttpContextAccessor() |> ignore
-        builder.Services.AddScoped<ClientService>() |> ignore
+        // The schema host only lists tools; mirror production service registration
+        // without constructing a client connection or executing a client-backed tool.
+        builder.Services.AddScoped<global.Server.Services.ClientService>(fun _ -> failwith "Schema-only test host") |> ignore
         builder.Services
             .AddMcpServer()
             .WithHttpTransport(fun options -> options.Stateless <- true)

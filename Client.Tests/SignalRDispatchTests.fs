@@ -733,8 +733,17 @@ module OrdinaryDispatchGitTests =
                     sprintf "ordinary dispatch %s missing=%b: git=%d fetches=%d elapsedMs=%d"
                         label missing io.ProcessStarts io.RemoteFetches sw.ElapsedMilliseconds)
                 response, io
-            let first, _ = measure "cold Ready"
-            let warm, _ = measure "warm Working"
+            let first, firstIo = measure "cold Ready"
+            let afterFirst = LedgerStore.fetch binding |> success
+            let warm, warmIo = measure "warm Working"
+            // Baseline on this fixture was 82 Git process starts and four
+            // remote fetches for the cold Ready call. The confirmed activation
+            // snapshot should replace the post-activation refetch; the warm
+            // Working read remains a zero-Git negative control.
+            Assert.That(firstIo.ProcessStarts, Is.LessThan(82), "Cold dispatch must remove a redundant Git read.")
+            Assert.That(firstIo.RemoteFetches, Is.EqualTo(3), "Cold dispatch should retain only the eligibility, transaction and confirmation fetches.")
+            Assert.That(warmIo.ProcessStarts, Is.EqualTo(0))
+            Assert.That(warmIo.RemoteFetches, Is.EqualTo(0))
             Assert.That(first.Error.IsSome, Is.EqualTo(missing), sprintf "%A" first.Error)
             Assert.That(warm.Error, Is.EqualTo(first.Error))
             Assert.That(warm.Result, Is.EqualTo(first.Result))
@@ -748,7 +757,9 @@ module OrdinaryDispatchGitTests =
             let canonical = ReviewWorkflow.getAgentInbox binding "Owner" |> success
             Assert.That(canonical.Agent.State, Is.EqualTo("Working"))
             Assert.That(canonical.Focused.Value.Attempt.Phase, Is.EqualTo("Started"))
-            Assert.That((LedgerStore.fetch binding |> success).Commit, Is.Not.EqualTo(before.Commit))
+            let afterWarm = LedgerStore.fetch binding |> success
+            Assert.That(afterFirst.Commit, Is.Not.EqualTo(before.Commit))
+            Assert.That(afterWarm.Commit, Is.EqualTo(afterFirst.Commit), "Warm Working dispatch must not create a new durable ledger head.")
             Assert.That(git checkout [ "status"; "--porcelain" ], Is.Empty)
         finally
             if File.Exists config then File.Delete config

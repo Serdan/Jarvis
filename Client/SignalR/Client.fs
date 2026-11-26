@@ -317,6 +317,47 @@ let private classifyProject command =
         | None -> Ok Unscoped
         | Some raw -> ProjectPaths.ProjectTarget.parse raw |> Result.map Checkout
 
+// Resource provenance comes from the typed command, never its display name.
+// Most coordination commands are ledger-only; branch-selected source observations are not.
+let private worktreeScope scope command =
+    let project = projectTarget scope |> Option.map ProjectPaths.ProjectTarget.projectId
+    let explicitPath (path: string) =
+        if System.IO.Path.IsPathFullyQualified path then WorktreeActivity.Paths [ path ]
+        else WorktreeActivity.Unknown project
+    match command with
+    | InspectWorktreeRemovalCommand cmd -> explicitPath cmd.WorktreePath
+    | RemoveWorktreeCommand cmd -> explicitPath cmd.WorktreePath
+    | GetWorktreeCommand cmd -> explicitPath cmd.WorktreePath
+    | ListWorktreesCommand _ | CreateWorktreeCommand _ ->
+        match project with
+        | Some id -> WorktreeActivity.ProjectWorktrees id
+        | None -> WorktreeActivity.Unknown None
+    | TaskWriteCommand cmd when cmd.Action = "ExportTaskSpec" || cmd.Action = "ImportTaskSpec" ->
+        match projectTarget scope with
+        | Some target -> WorktreeActivity.Checkout target
+        | None -> WorktreeActivity.Unknown project
+    | TaskWriteCommand cmd when cmd.Action = "BindAttemptSource" ->
+        WorktreeActivity.projectWorktrees project
+    | ReviewWriteCommand cmd -> WorktreeActivity.reviewScope project cmd
+    | TaskReadCommand _ | TaskWriteCommand _ | ObserveAgentCommand _
+    | CrossProjectNotificationCommand _ | ChallengeReadCommand _ | ChallengeWriteCommand _
+    | LedgerReadCommand _ | LedgerWriteCommand _ | ReviewReadCommand _
+    | WorkQueueReadCommand _ | WorkQueueWriteCommand _ | WorkPriorityCommand _
+    | OperatorConversationReadCommand _ | OperatorConversationWriteCommand _
+    | RetryPendingIntentCommand _ | SupersedePendingIntentCommand _ | AbandonPendingIntentCommand _
+    | ListJobsCommand _ | GetJobResultCommand _ | CancelJobCommand _
+    | MessageCommand _ | GetClientActivityCommand _ ->
+        WorktreeActivity.NoCheckout
+    | _ ->
+        match projectTarget scope with
+        | Some target -> WorktreeActivity.Checkout target
+        | None -> WorktreeActivity.NoCheckout
+
+// Both direct dispatch paths use this same typed admission; promoted work
+// registers worktreeScope before scheduling and retains that claim.
+let internal admitCommand command =
+    classifyProject command
+    |> Result.bind (fun scope -> WorktreeActivity.admitDirect (worktreeScope scope command))
 
 // Trust-binding locks are held only around local config access, never
 // remote Git fetches. Retry only the typed, pre-write contention case.
@@ -1547,8 +1588,12 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
 
 let receiveCommand (rt: Runtime) (command: AgentCommand) =
     task {
-        let! result = receiveCommandForTarget rt None None None "" command None false None None
-        return result |> Result.map (fun outcome -> outcome.Payload)
+        match admitCommand command with
+        | Error error -> return Error error
+        | Ok admission ->
+            use _admission = admission
+            let! result = receiveCommandForTarget rt None None None "" command None false None None
+            return result |> Result.map (fun outcome -> outcome.Payload)
     }
 
 // Prepare the source checkout and configured-task definition once, independently
@@ -1624,10 +1669,23 @@ let private receivePreparedCommand (rt: Runtime)
                                    (onChallengeCommit: ChallengeWakePostCommit option)
                                    (requestSnapshot: RequestSnapshot option) =
     task {
-        match prepareSourceOperation rt target command with
+        match admitCommand command with
         | Error error -> return Error error
-        | Ok prepared ->
-            return! receiveCommandForTarget rt target prepared.Source prepared.ProjectTask agentId command sourceOriginalId manualGrantAuthorized onChallengeCommit requestSnapshot
+        | Ok admission ->
+            use _admission = admission
+            match prepareSourceOperation rt target command with
+            | Error error -> return Error error
+            | Ok prepared ->
+                let resolved =
+                    match prepared.Source with
+                    | None -> Ok ()
+                    | Some project ->
+                        let (FolderPath root) = ProjectPaths.ResolvedProject.sourceRoot project
+                        WorktreeActivity.resolveCurrent root
+                match resolved with
+                | Error error -> return Error error
+                | Ok () ->
+                    return! receiveCommandForTarget rt target prepared.Source prepared.ProjectTask agentId command sourceOriginalId manualGrantAuthorized onChallengeCommit requestSnapshot
     }
 
 // Shared by SignalR receive and tests. Identity is supplied by the MCP call,
@@ -1894,11 +1952,12 @@ let executeOrPromoteWith (rt: Runtime) (commandJson: string) (agentId: string)
                     | Checkout target -> Some(ProjectPaths.ProjectTarget.projectId target)
                     | ActivityLabel _ | Unscoped -> None
                 let registered =
-                    JobManager.startToolOperationWithCancelEvidence canonical project agentId
+                    JobManager.startToolOperationWithScopeAndCancelEvidence canonical project agentId
                         (AgentCommandInfo.protocolName command)
                         (AgentCommandInfo.operationId command
                          |> Option.filter (String.IsNullOrWhiteSpace >> not))
                         (Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(normalizedJson))))
+                        (worktreeScope scope command)
                         (fun () -> task {
                             let! outcome = runCommand normalizedJson agentId
                             return merge outcome

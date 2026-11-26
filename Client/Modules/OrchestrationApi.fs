@@ -3236,7 +3236,13 @@ module PendingRecoveryApi =
                                               "Release"; "Withdraw" ]) then
                                         Error(Client.ValidationError
                                             "ReplayRejectedStale: saved review action cannot be retried by this operator tool.")
-                                    else ReviewApi.write saved rt)
+                                    else
+                                        // Only validated, unapplied implicit-head review
+                                        // replays require branch checkout admission.
+                                        WorktreeActivity.admitReviewReplay saved
+                                        |> Result.bind (fun admission ->
+                                            use _admission = admission
+                                            ReviewApi.write saved rt))
                             | _ ->
                                 Error(Client.ValidationError "Saved ledger setup/lifecycle command is not on the operator retry allowlist."))))
 

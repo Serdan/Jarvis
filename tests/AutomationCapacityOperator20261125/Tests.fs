@@ -223,6 +223,100 @@ let staleModalRequiresRefreshBeforeSaving () =
         Assert.That(body, Is.EqualTo("automation=off\ntotal=3\nrole Reviewer=1")))
 
 [<Test; NonParallelizable>]
+let policyEditorEditsAutomationInPlaceWithoutDroppingCaps () =
+    withClones (fun a b ->
+        let initial = openAt a
+        initial.Save (Guid.NewGuid()) (draft (Some 3) ["Worker",2]) |> good |> ignore
+        let tui = ConsoleTui()
+        tui.SetCapacityPolicyAccess(create (fun () -> Some "operator:fixture") (resolve a))
+        tui.OpenCapacityPolicyForFixture("Fixture")
+        awaitEditor tui
+        let _,_,_,body,_,_ = tui.InspectProjectEditorForFixture()
+        Assert.That(body, Is.EqualTo("automation=off\ntotal=3\nrole Worker=2"))
+        let frame = tui.RenderProjectEditorForFixture(80,24)
+        Assert.That(frame |> Array.exists (fun line -> line.Contains("▏")), Is.True)
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.Home)
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.UpArrow)
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.UpArrow)
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.End)
+        for _ in 1 .. 3 do tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.LeftArrow)
+        for _ in 1 .. 3 do tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.Delete)
+        for c in "on" do tui.DispatchProjectEditorKeyForFixture(typeChar c)
+        let _,_,_,edited,_,_ = tui.InspectProjectEditorForFixture()
+        Assert.That(edited, Is.EqualTo("automation=on\ntotal=3\nrole Worker=2"))
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.F2)
+        awaitEditor tui
+        let saved = openAt b
+        let expected = { draft (Some 3) ["Worker",2] with AutomationEnabled=true }
+        Assert.That(saved.Draft = expected, Is.True)
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.F5)
+        awaitEditor tui
+        let _,_,_,reloaded,_,needsReload = tui.InspectProjectEditorForFixture()
+        Assert.That(needsReload, Is.False)
+        Assert.That(reloaded, Is.EqualTo("automation=on\ntotal=3\nrole Worker=2")))
+
+[<Test; NonParallelizable>]
+let policyEditorHorizontalAndDeletionBoundariesPreserveDraftAndCancel () =
+    withClones (fun a b ->
+        let initialDraft = draft (Some 3) ["Worker",2]
+        (openAt a).Save (Guid.NewGuid()) initialDraft |> good |> ignore
+        let tui = ConsoleTui()
+        tui.SetCapacityPolicyAccess(create (fun () -> Some "operator:fixture") (resolve a))
+        tui.OpenCapacityPolicyForFixture("Fixture")
+        awaitEditor tui
+        let originalText = "automation=off\ntotal=3\nrole Worker=2"
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.Home)
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.LeftArrow)
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.RightArrow)
+        tui.DispatchProjectEditorKeyForFixture(typeChar 'X')
+        let _,_,_,inserted,_,_ = tui.InspectProjectEditorForFixture()
+        Assert.That(inserted, Is.EqualTo("automation=off\ntotal=3\nXrole Worker=2"))
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.Backspace)
+        let _,_,_,restored,_,_ = tui.InspectProjectEditorForFixture()
+        Assert.That(restored, Is.EqualTo(originalText))
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.Backspace)
+        let _,_,_,joinedByBackspace,_,_ = tui.InspectProjectEditorForFixture()
+        Assert.That(joinedByBackspace, Is.EqualTo("automation=off\ntotal=3role Worker=2"))
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.F5)
+        awaitEditor tui
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.Home)
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.LeftArrow)
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.Delete)
+        let _,_,_,joinedByDelete,_,_ = tui.InspectProjectEditorForFixture()
+        Assert.That(joinedByDelete, Is.EqualTo("automation=off\ntotal=3role Worker=2"))
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.F5)
+        awaitEditor tui
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.F6)
+        let _,_,_,copiedDraft,_,_ = tui.InspectProjectEditorForFixture()
+        Assert.That(copiedDraft, Is.EqualTo(originalText))
+        tui.DispatchProjectEditorKeyForFixture(typeChar 'x')
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.Escape)
+        let mode,_,_,_,_,_ = tui.InspectProjectEditorForFixture()
+        Assert.That(mode, Is.EqualTo("AgentsMode"))
+        Assert.That((openAt b).Draft = initialDraft, Is.True))
+
+[<Test; NonParallelizable>]
+let policyEditorVerticalMovementPreservesPreferredColumnAndLineBoundaries () =
+    withClones (fun a b ->
+        let initialDraft = draft (Some 3) ["Worker",2]
+        (openAt a).Save (Guid.NewGuid()) initialDraft |> good |> ignore
+        let tui = ConsoleTui()
+        tui.SetCapacityPolicyAccess(create (fun () -> Some "operator:fixture") (resolve a))
+        tui.OpenCapacityPolicyForFixture("Fixture")
+        awaitEditor tui
+        // The loaded cursor starts at the end of the final line (column 13).
+        // Moving through the shorter total line must retain that preferred column.
+        for _ in 1 .. 3 do tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.UpArrow)
+        let frame = tui.RenderProjectEditorForFixture(80,24)
+        Assert.That(frame |> Array.exists (fun line -> line.Contains("automation=of▏f")), Is.True)
+        for _ in 1 .. 3 do tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.DownArrow)
+        tui.DispatchProjectEditorKeyForFixture(typeChar 'X')
+        let _,_,_,edited,_,_ = tui.InspectProjectEditorForFixture()
+        Assert.That(edited, Is.EqualTo("automation=off\ntotal=3\nrole Worker=2X"))
+        tui.DispatchProjectEditorKeyForFixture(key ConsoleKey.Escape)
+        Assert.That((openAt b).Draft = initialDraft, Is.True))
+
+[<Test; NonParallelizable>]
 let sharedEditorPreservesLaunchTemplateBodySemantics () =
     let projectId,ledgerId = Guid.NewGuid(),Guid.NewGuid()
     let mutable body = "<old template>"

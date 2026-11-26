@@ -315,6 +315,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let mutable projectEditorKind = LaunchTemplateEditor
     let mutable launchSnapshot: ProjectEditorSnapshot option = None
     let mutable launchDraft = ""
+    let mutable launchCursor = 0
+    let mutable launchPreferredColumn: int option = None
     let mutable launchBusy = false
     let mutable launchNotice = ""
     let mutable launchPending: (Guid * (Guid -> Result<unit, LaunchTemplateEditFailure>)) option = None
@@ -1634,7 +1636,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         draw.WriteLine "F2 save/retry | F5 reload (discard draft) | F6 copy | Esc back"
         if projectEditorKind = CapacityPolicyEditor then
             draw.WriteLine "automation=on/off; total=off or total=N; role RoleId=N; omit role to uncap."
-            draw.WriteLine "Automatic launch/recovery only; manual actions bypass. Ctrl+U clear, Enter newline."
+            draw.WriteLine "Automatic launch/recovery only; manual actions bypass."
+            if launchBusy || launchPending.IsSome || launchNeedsReload then
+                draw.WriteLine "Editing locked: Up/Down scroll."
+            else draw.WriteLine "Arrows move caret; Home/End line; Backspace/Delete edit."
+            draw.WriteLine "Ctrl+U clear; Enter newline."
         else draw.WriteLine "Append/paste text, Enter newline, Backspace, Ctrl+U clear; Up/Down scroll."
         if launchBusy then draw.WriteLine "Ledger operation in progress..."
         if launchNeedsReload then
@@ -1642,11 +1648,32 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         launchPending |> Option.iter (fun (op, _) -> draw.WriteLine(trim (sprintf "Pending exact operation: %O" op) width))
         if launchNotice <> "" then
             wrappedLines width launchNotice |> List.truncate 3 |> List.iter (safe >> draw.WriteLine)
-        let lines =
-            launchDraft.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n')
-            |> Array.toList
-            |> List.collect (fun line -> if line = "" then [""] else wrappedLines width line)
+        let sourceLines = launchDraft.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n')
+        let showCaret =
+            projectEditorKind = CapacityPolicyEditor
+            && not launchBusy
+            && launchPending.IsNone
+            && not launchNeedsReload
+        let maxWidth = max 20 width
+        let visualLines = ResizeArray<string>()
+        let mutable sourceOffset = 0
+        let mutable visualOffset = 0
+        let mutable caretVisualLine: int option = None
+        for line in sourceLines do
+            let column = launchCursor - sourceOffset
+            let hasCaret = showCaret && column >= 0 && column <= line.Length
+            let display = if hasCaret then line.Insert(column, "▏") else line
+            let wrapped = if line = "" && not hasCaret then [""] else wrappedLines width display
+            if hasCaret then caretVisualLine <- Some(visualOffset + column / maxWidth)
+            visualLines.AddRange(wrapped)
+            visualOffset <- visualOffset + wrapped.Length
+            sourceOffset <- sourceOffset + line.Length + 1
+        let lines = visualLines |> Seq.toList
         let rows = max 1 (TerminalLayout.availableRows draw.Height draw.CursorTop 1)
+        match caretVisualLine with
+        | Some line when line < launchScroll -> launchScroll <- line
+        | Some line when line >= launchScroll + rows -> launchScroll <- line - rows + 1
+        | _ -> ()
         launchScroll <- min (max 0 (lines.Length - rows)) (max 0 launchScroll)
         lines |> List.skip launchScroll |> List.truncate rows |> List.iter (safe >> draw.WriteLine)
 
@@ -1852,6 +1879,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             launchBusy <- true
             if kind <> projectEditorKind || project <> launchProject then
                 launchDraft <- ""
+                launchCursor <- 0
+                launchPreferredColumn <- None
                 launchScroll <- 0
             projectEditorKind <- kind
             launchProject <- project
@@ -1887,6 +1916,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     | Ok snapshot ->
                         launchSnapshot <- Some snapshot
                         launchDraft <- snapshot.Body
+                        launchCursor <- snapshot.Body.Length
+                        launchPreferredColumn <- None
                         launchScroll <- 0
                         launchNeedsReload <- false
                     | Error error -> launchNotice <- error
@@ -1933,6 +1964,47 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         | Some row, Some _ -> loadProjectEditorUnsafe CapacityPolicyEditor row.Project
         | _ -> ()
 
+    let editorLineBounds (text: string) cursor =
+        let cursor = max 0 (min text.Length cursor)
+        let start = if cursor = 0 then 0 else text.LastIndexOf('\n', cursor - 1) + 1
+        let nextNewline = text.IndexOf('\n', cursor)
+        start, (if nextNewline < 0 then text.Length else nextNewline)
+
+    let previousTextBoundary (text: string) cursor =
+        if cursor >= 2 && Char.IsLowSurrogate(text[cursor - 1]) && Char.IsHighSurrogate(text[cursor - 2]) then cursor - 2
+        else cursor - 1
+
+    let nextTextBoundary (text: string) cursor =
+        if cursor + 1 < text.Length && Char.IsHighSurrogate(text[cursor]) && Char.IsLowSurrogate(text[cursor + 1]) then cursor + 2
+        else cursor + 1
+
+    let snapTextBoundary (text: string) cursor =
+        if cursor > 0 && cursor < text.Length && Char.IsHighSurrogate(text[cursor - 1]) && Char.IsLowSurrogate(text[cursor]) then cursor - 1
+        else cursor
+
+    let moveProjectEditorCursorVertical direction =
+        let lineStart, lineEnd = editorLineBounds launchDraft launchCursor
+        let preferred = defaultArg launchPreferredColumn (launchCursor - lineStart)
+        let target =
+            if direction < 0 && lineStart > 0 then
+                let previousEnd = lineStart - 1
+                let previousStart = if previousEnd = 0 then 0 else launchDraft.LastIndexOf('\n', previousEnd - 1) + 1
+                Some(previousStart + min preferred (previousEnd - previousStart))
+            elif direction > 0 && lineEnd < launchDraft.Length then
+                let nextStart = lineEnd + 1
+                let nextNewline = launchDraft.IndexOf('\n', nextStart)
+                let nextEnd = if nextNewline < 0 then launchDraft.Length else nextNewline
+                Some(nextStart + min preferred (nextEnd - nextStart))
+            else None
+        target |> Option.iter (fun position ->
+            launchCursor <- snapTextBoundary launchDraft position
+            launchPreferredColumn <- Some preferred)
+
+    let moveProjectEditorCursorToLineEdge toEnd =
+        let start, finish = editorLineBounds launchDraft launchCursor
+        launchCursor <- if toEnd then finish else start
+        launchPreferredColumn <- None
+
     let handleProjectEditorKeyUnsafe (keyInfo: ConsoleKeyInfo) =
         let editable = not launchBusy && launchPending.IsNone && not launchNeedsReload
         let append value =
@@ -1942,8 +2014,27 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             let limit = if projectEditorKind = CapacityPolicyEditor then 128 * 1024 else 32768
             if System.Text.Encoding.UTF8.GetByteCount(next) <= limit then
                 launchDraft <- next
+                launchCursor <- next.Length
                 launchScroll <- Int32.MaxValue
             else launchNotice <- "Draft size limit reached."
+        let insertAtCursor value =
+            let next = launchDraft.Insert(launchCursor, value)
+            if System.Text.Encoding.UTF8.GetByteCount(next) <= 128 * 1024 then
+                launchDraft <- next
+                launchCursor <- launchCursor + value.Length
+                launchPreferredColumn <- None
+            else launchNotice <- "Draft size limit reached."
+        let backspaceAtCursor () =
+            if launchCursor > 0 then
+                let previous = previousTextBoundary launchDraft launchCursor
+                launchDraft <- launchDraft.Remove(previous, launchCursor - previous)
+                launchCursor <- previous
+                launchPreferredColumn <- None
+        let deleteAtCursor () =
+            if launchCursor < launchDraft.Length then
+                let next = nextTextBoundary launchDraft launchCursor
+                launchDraft <- launchDraft.Remove(launchCursor, next - launchCursor)
+                launchPreferredColumn <- None
         match keyInfo.Key with
         | ConsoleKey.F2 -> saveProjectEditorUnsafe()
         | ConsoleKey.F5 when not launchBusy && launchPending.IsNone -> loadProjectEditorUnsafe projectEditorKind launchProject
@@ -1952,15 +2043,42 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             | Ok _ -> launchNotice <- "Draft copied."
             | Error error -> launchNotice <- error
         | ConsoleKey.Escape when not launchBusy && launchPending.IsNone -> mode <- AgentsMode
+        | ConsoleKey.U when editable && keyInfo.Modifiers.HasFlag ConsoleModifiers.Control ->
+            launchDraft <- ""
+            launchCursor <- 0
+            launchPreferredColumn <- None
+            launchScroll <- 0
+        | _ when projectEditorKind = CapacityPolicyEditor ->
+            if editable then
+                match keyInfo.Key with
+                | ConsoleKey.LeftArrow when launchCursor > 0 ->
+                    launchCursor <- previousTextBoundary launchDraft launchCursor
+                    launchPreferredColumn <- None
+                | ConsoleKey.RightArrow when launchCursor < launchDraft.Length ->
+                    launchCursor <- nextTextBoundary launchDraft launchCursor
+                    launchPreferredColumn <- None
+                | ConsoleKey.UpArrow -> moveProjectEditorCursorVertical -1
+                | ConsoleKey.DownArrow -> moveProjectEditorCursorVertical 1
+                | ConsoleKey.Home -> moveProjectEditorCursorToLineEdge false
+                | ConsoleKey.End -> moveProjectEditorCursorToLineEdge true
+                | ConsoleKey.Enter -> insertAtCursor "\n"
+                | ConsoleKey.Backspace -> backspaceAtCursor()
+                | ConsoleKey.Delete -> deleteAtCursor()
+                | _ when not (Char.IsControl keyInfo.KeyChar) -> insertAtCursor (string keyInfo.KeyChar)
+                | _ -> ()
+            else
+                match keyInfo.Key with
+                | ConsoleKey.UpArrow -> launchScroll <- max 0 (launchScroll - 1)
+                | ConsoleKey.DownArrow -> launchScroll <- launchScroll + 1
+                | _ -> ()
         | ConsoleKey.UpArrow -> launchScroll <- max 0 (launchScroll - 1)
         | ConsoleKey.DownArrow -> launchScroll <- launchScroll + 1
-        | ConsoleKey.U when editable && keyInfo.Modifiers.HasFlag ConsoleModifiers.Control ->
-            launchDraft <- ""; launchScroll <- 0
         | ConsoleKey.Enter when editable -> append "\n"
         | ConsoleKey.Backspace when editable && launchDraft.Length > 0 ->
             let n = launchDraft.Length
             let count = if n >= 2 && Char.IsSurrogatePair(launchDraft, n - 2) then 2 else 1
             launchDraft <- launchDraft.Substring(0, n - count)
+            launchCursor <- launchDraft.Length
         | _ when editable && not (Char.IsControl keyInfo.KeyChar) -> append (string keyInfo.KeyChar)
         | _ -> ()
 
@@ -2391,6 +2509,14 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     member internal _.InspectProjectEditorForFixture() =
         lock syncRoot (fun () ->
             string mode, launchBusy, (launchPending |> Option.map fst), launchDraft, launchNotice, launchNeedsReload)
+
+    member internal _.RenderProjectEditorForFixture(width: int, height: int) =
+        lock syncRoot (fun () ->
+            draw <- Frame(width, height)
+            renderProjectEditorUnsafe width
+            [| for row in 0 .. draw.Height - 1 ->
+                   [| for column in 0 .. draw.Width - 1 -> draw.GetCell(row, column).Text |]
+                   |> String.concat "" |])
 
     member _.SetChallengeAccess(access: OperatorChallengeUiAccess) =
         lock syncRoot (fun () ->

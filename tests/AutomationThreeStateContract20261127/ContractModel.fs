@@ -62,5 +62,5 @@ let apply request s =
         | None -> s
         | Some t -> { t with Version = s.Version + 1; Applied = Set.add request.Operation s.Applied }
 
-let request operation command s =
+let request operation command (s: Snapshot) =
     { Operation = operation; Version = s.Version; Generation = s.Generation; Command = command }

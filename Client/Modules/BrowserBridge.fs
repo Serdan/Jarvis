@@ -774,6 +774,19 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
     | Some reason -> return Error("", reason)
     | None ->
         let mutable registrationId = ""
+        let mutable ownerConnectionId = ""
+        let mutable createdGeneration = 0
+        let closeOwnedTab () = task {
+            if String.IsNullOrWhiteSpace registrationId || String.IsNullOrWhiteSpace ownerConnectionId || createdGeneration <= 0 then
+                return Error "cleanup=retained; cleanupReason=ownershipUnverified"
+            else
+                match! bridge.CloseTab(registrationId, ownerConnectionId = ownerConnectionId,
+                                       expectedRegistrationGeneration = createdGeneration) with
+                | Ok _ -> return Ok "closed"
+                | Error e ->
+                    let safe = if e.Length > 100 then e.Substring(0, 100) else e
+                    return Error("cleanupFailed:" + safe + "; registrationId=" + registrationId)
+        }
         try
             let! opened = bridge.OpenTab(windowRegistration, url, alias, makeActive)
             match opened with
@@ -782,8 +795,8 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
                 use openDoc = JsonDocument.Parse(response)
                 let createdTab = openDoc.RootElement.GetProperty("tab")
                 registrationId <- createdTab.GetProperty("registrationId").GetString()
-                let ownerConnectionId = openDoc.RootElement.GetProperty("connectionId").GetString()
-                let createdGeneration =
+                ownerConnectionId <- openDoc.RootElement.GetProperty("connectionId").GetString()
+                createdGeneration <-
                     match createdTab.TryGetProperty("registrationGeneration") with
                     | true, value when value.ValueKind = JsonValueKind.Number -> value.GetInt32()
                     | _ -> 0
@@ -791,7 +804,7 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
                     match createdTab.TryGetProperty("agentCreated") with
                     | true, value when value.ValueKind = JsonValueKind.True -> true
                     | _ -> false
-                if String.IsNullOrWhiteSpace(registrationId) || createdGeneration < 1 || not agentCreated then
+                if String.IsNullOrWhiteSpace(registrationId) || String.IsNullOrWhiteSpace ownerConnectionId || createdGeneration < 1 || not agentCreated then
                     return Error(registrationId, "OutcomeUnknown: created tab identity or provenance was missing")
                 else
                     // A detached ChatGPT execution continues when its launch
@@ -799,17 +812,7 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
                     // outcomes; the narrow acknowledged project-route exception
                     // below retains evidence instead. Debug retention keeps the
                     // old fresh-home guard.
-                    let closeDefinitive () = task {
-                        match! bridge.CloseTab(registrationId, ownerConnectionId = ownerConnectionId,
-                                               expectedRegistrationGeneration = createdGeneration,
-                                               requireFreshHomeNoTurns = not closeAfterExecution) with
-                        | Ok _ -> return Ok "closed"
-                        | Error "BrowserCloseTabError:CleanupSafetyChanged" when not closeAfterExecution ->
-                            return Ok "retained"
-                        | Error e ->
-                            let safe = if e.Length > 100 then e.Substring(0, 100) else e
-                            return Error("cleanupFailed:" + safe)
-                    }
+                    let closeDefinitive () = closeOwnedTab()
                     // Readiness advertised by the extension is not atomic with
                     // Chrome's live tab status. A page can start another load
                     // between ListTabs and the extension's execute preflight.
@@ -817,9 +820,9 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
                     let withinReadinessBudget () =
                         Stopwatch.GetElapsedTime(readinessStarted) < TimeSpan.FromSeconds(30.0)
                     let cleanupNotReady () = task {
-                        // No user script was injected. The post-success preference
-                        // must not retain a definitive failed launch.
-                        match! closeDefinitive() with
+                        if not closeAfterExecution then
+                            return Error(registrationId, "TabNotReady; cleanup=retained; registrationId=" + registrationId)
+                        else match! closeDefinitive() with
                         | Ok cleanup -> return Error(registrationId, "TabNotReady; cleanup=" + cleanup)
                         | Error failure -> return Error(registrationId, "TabNotReady; " + failure)
                     }
@@ -889,26 +892,8 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
                                     | true, x when x.ValueKind = JsonValueKind.String -> x.GetString()
                                     | _ -> "completed"
                                 | _ -> "completed"
-                            // Never equate "script did not click Send" with "no
-                            // conversation exists". Only explicitly asserted
-                            // fresh-home/zero-turn evidence permits disposal.
-                            let disposable =
-                                match payload.ValueKind with
-                                | JsonValueKind.Object ->
-                                    // Contradictory evidence must fail closed even
-                                    // if a script accidentally asserts disposal.
-                                    let conversationObserved =
-                                        match payload.TryGetProperty("reason") with
-                                        | true, reason when reason.ValueKind = JsonValueKind.String ->
-                                            reason.GetString() = "ExistingConversation" ||
-                                            reason.GetString() = "UnexpectedStartUrl"
-                                        | _ -> false
-                                    match payload.TryGetProperty("safeToDisposeCreatedTab") with
-                                    | true, proof -> proof.ValueKind = JsonValueKind.True && not conversationObserved
-                                    | _ -> false
-                                | _ -> false
                             let disposeFailedLaunch () =
-                                if closeAfterExecution || disposable then closeDefinitive()
+                                if closeAfterExecution then closeDefinitive()
                                 else task { return Ok "retained" }
                             if status = "outcomeUnknown" then
                                 // Preserve only known, non-sensitive failure categories and
@@ -941,45 +926,11 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
                                     | _ -> ""
                                 let detail = "OutcomeUnknown:" + stage + ":" + reason +
                                              (if timing = "" then "" else ";" + timing)
-                                // A matching project turn may be acknowledged while
-                                // the durable URL remains unbound. Do not derive
-                                // this disposition from generic evidence arrays or
-                                // caller arguments alone. Require the typed result,
-                                // explicit null URL and the exact bound project entry.
-                                let acknowledgedProjectRouteUnknown =
-                                    let matchingAcknowledgement =
-                                        match payload.TryGetProperty("projectRouteAcknowledgement") with
-                                        | true, field when field.ValueKind = JsonValueKind.String ->
-                                            match field.GetString() with
-                                            | "matchingUserBubble" | "matchingLegacyUserTurn" -> true
-                                            | _ -> false
-                                        | _ -> false
-                                    let missingConversationUrl =
-                                        match payload.TryGetProperty("conversationUrl") with
-                                        | true, field -> field.ValueKind = JsonValueKind.Null
-                                        | _ -> false
-                                    let projectEntryPath (raw: string) =
-                                        match Uri.TryCreate(raw, UriKind.Absolute) with
-                                        | true, entry when entry.Scheme = Uri.UriSchemeHttps &&
-                                                           entry.Host = "chatgpt.com" && entry.IsDefaultPort &&
-                                                           entry.UserInfo = "" && entry.Query = "" && entry.Fragment = "" &&
-                                                           Text.RegularExpressions.Regex.IsMatch(entry.AbsolutePath, @"^/g/g-p-[a-z0-9]+/project/?\z") ->
-                                            Some(entry.AbsolutePath.TrimEnd('/'))
-                                        | _ -> None
-                                    if stage <> "conversationRoute" || reason <> "ConversationUrlUnavailable" ||
-                                       not matchingAcknowledgement || not missingConversationUrl then false
-                                    else
-                                        match projectEntryPath url with
-                                        | None -> false
-                                        | Some boundPath ->
-                                            use args = JsonDocument.Parse(argsJson)
-                                            match args.RootElement.TryGetProperty("startUrl") with
-                                            | true, start when start.ValueKind = JsonValueKind.String ->
-                                                projectEntryPath (start.GetString()) = Some boundPath
-                                            | _ -> false
-                                if closeAfterExecution && acknowledgedProjectRouteUnknown then
-                                    return Error(registrationId, detail + ";cleanup=retained")
-                                elif closeAfterExecution then
+                                // Disposal is independent of send certainty. A matching
+                                // user turn with no durable conversation URL is still a
+                                // terminal outcome for this owned tab; closing it does not
+                                // authorize replay of the uncertain send.
+                                if closeAfterExecution then
                                     match! closeDefinitive() with
                                     | Ok cleanup -> return Error(registrationId, detail + ";cleanup=" + cleanup)
                                     | Error failure -> return Error(registrationId, detail + ";" + failure)
@@ -1030,44 +981,51 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
                                 | Ok cleanup -> return Error(registrationId, details + ";cleanup=" + cleanup)
                                 | Error failure -> return Error(registrationId, details + ";" + failure)
                             elif status = "notSubmitted" then
-                                // An unsent draft is disposable, but a new turn or
-                                // route is not, even if this script did not send.
+                                // The provider explicitly confirms that Send was not
+                                // invoked. Preserve explicit tab retention; cleanup
+                                // never changes this no-send classification.
                                 match! disposeFailedLaunch() with
                                 | Error failure -> return Error(registrationId, "NotSubmitted;" + failure)
-                                | Ok cleanup ->
-                                    return Ok(JsonSerializer.Serialize(
-                                        {| registrationId = registrationId
-                                           status = status
-                                           scriptResult = payload.Clone()
-                                           cleanup = cleanup |}))
+                                | Ok cleanup -> return Error(registrationId, "NotSubmitted; cleanup=" + cleanup + "; registrationId=" + registrationId)
                             else
                                 let mutable cleanup = "retained"
                                 if closeAfterExecution then
-                                    let! closed = bridge.CloseTab(registrationId, ownerConnectionId = ownerConnectionId,
-                                                                  expectedRegistrationGeneration = createdGeneration)
-                                    cleanup <- match closed with
-                                               | Ok _ -> "closed"
-                                               | Error e -> "cleanupFailed:" + (if e.Length > 100 then e.Substring(0, 100) else e)
+                                    let! closed = closeDefinitive()
+                                    cleanup <- match closed with | Ok value -> value | Error e -> e
                                 return Ok(JsonSerializer.Serialize(
                                     {| registrationId = registrationId
                                        status = status
                                        scriptResult = payload.Clone()
                                        cleanup = cleanup |}))
         with e ->
-            if closeAfterExecution && not (String.IsNullOrWhiteSpace(registrationId)) then
-                // This path can fail before the pinned owner/generation is read.
-                // The extension still refuses to close non-agent-created tabs.
-                let! closed = bridge.CloseTab(registrationId)
-                let cleanup = match closed with
-                              | Ok _ -> "closed"
-                              | Error reason -> "cleanupFailed:" + reason
-                return Error(registrationId, "OutcomeUnknown: " + e.GetType().Name + ";cleanup=" + cleanup)
-            else return Error(registrationId, "OutcomeUnknown: " + e.GetType().Name)
+            if closeAfterExecution then
+                match! closeOwnedTab() with
+                | Ok cleanup -> return Error(registrationId, "OutcomeUnknown: " + e.GetType().Name + ";cleanup=" + cleanup)
+                | Error cleanup -> return Error(registrationId, "OutcomeUnknown: " + e.GetType().Name + ";" + cleanup)
+            else
+                let retained = if String.IsNullOrWhiteSpace registrationId then "" else ";cleanup=retained;registrationId=" + registrationId
+                return Error(registrationId, "OutcomeUnknown: " + e.GetType().Name + retained)
 }
 
 // The browser profile shares model/effort preferences across fresh tabs.
 // Reserve the origin until a single launch has returned and cleaned up its tab.
 // Agents continue on the server after launch, so this does not serialize work.
+/// This exact extension response is emitted by the capacity preflight before
+/// tabs.create is called. Other transport/open errors may have lost their reply
+/// after a tab was created and must remain OutcomeUnknown.
+let isConfirmedNoSendFailure (registrationId: string) (reason: string) =
+    let starts prefix = reason.StartsWith(prefix, StringComparison.Ordinal)
+    if String.IsNullOrEmpty registrationId then
+        // This exact response is emitted by the extension's capacity preflight
+        // before tabs.create. Do not generalize to other open/transport errors.
+        String.Equals(reason, "BrowserOpenTabError:AgentTabLimitReached", StringComparison.Ordinal)
+    else
+        // These typed outcomes are emitted before the provider's Send action:
+        // the tab never became ready, its ownership changed before Execute, or
+        // the launch script explicitly declined to submit the prompt.
+        starts "TabNotReady;" || starts "TabRegistrationChanged;" ||
+        starts "UiIncompatible:" || starts "NotSubmitted;"
+
 let runInNewTabWithObservation (bridge: Service) (windowRegistration: string) (url: string)
                 (alias: string) (makeActive: bool) (source: string) (argsJson: string)
                 (timeoutMs: int) (closeAfterExecution: bool) (observe: JsonElement -> unit) = task {

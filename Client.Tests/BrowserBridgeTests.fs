@@ -13,6 +13,13 @@ open Client
 open Common
 open NUnit.Framework
 
+[<Test>]
+let agentTabLimitIsConfirmedNoSendOnlyWithoutRegistration () =
+    Assert.That(BrowserBridge.isConfirmedNoSendFailure "" "AgentTabLimitReached", Is.True)
+    Assert.That(BrowserBridge.isConfirmedNoSendFailure "registration-123" "AgentTabLimitReached", Is.False)
+    Assert.That(BrowserBridge.isConfirmedNoSendFailure "" "ExtensionDisconnected", Is.False)
+    Assert.That(BrowserBridge.isConfirmedNoSendFailure "" "OutcomeUnknown:AgentTabLimitReached", Is.False)
+
 let private findPort () =
     use socket = new TcpListener(IPAddress.Loopback, 0)
     socket.Start()
@@ -826,12 +833,11 @@ let closeAfterExecutionReclaimsTabEvenWhenSubmissionIsUncertain (scriptStatus: s
             tabs.Contains("personal-tab") && not (tabs.Contains("cleanup-all-created"))))
 }
 
-// Only the typed, acknowledged project-route-unknown result can override
-// close-after-execution. Arbitrary evidence, unbound entry and generic
-// unknowns retain their existing disposition; successful launches still close.
-[<TestCase("matchingBubble", true, false)>]
+// Send certainty and tab disposal are independent: every terminal outcome closes
+// the exact owned tab when requested, including a matching turn without a URL.
+[<TestCase("matchingBubble", true, true)>]
 [<TestCase("matchingBubble", false, false)>]
-[<TestCase("matchingLegacy", true, false)>]
+[<TestCase("matchingLegacy", true, true)>]
 [<TestCase("genericRoute", true, true)>]
 [<TestCase("genericEvidence", true, true)>]
 [<TestCase("malformedMarker", true, true)>]
@@ -845,7 +851,7 @@ let closeAfterExecutionReclaimsTabEvenWhenSubmissionIsUncertain (scriptStatus: s
 [<TestCase("differentArgumentProject", true, true)>]
 [<TestCase("missingArgumentProject", true, true)>]
 [<TestCase("submitted", true, true)>]
-let projectRouteAcknowledgementRetainsOnlyBoundUnknown
+let closeAfterExecutionDisposesEveryOwnedUncertainTab
     (scenario: string, closeAfterExecution: bool, shouldClose: bool) = task {
     let projectUrl = "https://chatgpt.com/g/g-p-abc123/project"
     let conversationUrl = "https://chatgpt.com/g/g-p-abc123/c/00000000-0000-0000-0000-000000000001"
@@ -936,7 +942,6 @@ let projectRouteAcknowledgementRetainsOnlyBoundUnknown
         Assert.That(detail, Does.Contain("OutcomeUnknown:" + stage + ":" + reason))
         Assert.That(detail, Does.Contain("elapsedSinceSendMs=8000"))
         if shouldClose then Assert.That(detail, Does.Contain("cleanup=closed"))
-        elif closeAfterExecution then Assert.That(detail, Does.Contain("cleanup=retained"))
         else Assert.That(detail, Does.Not.Contain("cleanup="))
     | _ -> Assert.Fail("Unexpected project launch disposition")
     do! waitUntil (fun () ->

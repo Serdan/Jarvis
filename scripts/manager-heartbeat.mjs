@@ -15,6 +15,9 @@ const ALLOWED_EXECUTIONS = new Set(["Working", "Stopped", "Unknown"]);
 const LIVE_RECORDS = new Set(["reserved", "dispatching", "submitted", "uncertain"]);
 const TERMINAL_RECORDS = new Set(["blocked", "observed", "cleared"]);
 const LAUNCH_RESULTS = new Set(["submitted", "uncertain", "blocked"]);
+const REVIEW_ID_PATTERN = /^[a-f0-9]{32}$/;
+const TASK_ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
+const REVIEWABLE_AGENT_STATES = new Set(["Ready", "NeedsWork", "Free"]);
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -24,6 +27,76 @@ function validTime(value, label) {
   assert(typeof value === "string" && Number.isFinite(Date.parse(value)) &&
     /(?:Z|[+-]\d\d:\d\d)$/.test(value), label + " must be an offset-aware ISO timestamp");
   return Date.parse(value);
+}
+
+function reviewKey(review) {
+  return `${review.taskId}/${review.reviewId}`;
+}
+
+function reviewIdentity(review, mode) {
+  return {
+    mode,
+    taskId: review.taskId,
+    attemptId: review.attemptId ?? null,
+    reviewerId: review.reviewerId ?? null,
+    reviewId: review.reviewId,
+    version: review.version
+  };
+}
+
+function validateReviewerInboxes(config, snapshot) {
+  assert(Array.isArray(snapshot.reviewerInboxes), "Missing per-reviewer inbox evidence");
+  const inboxes = new Map();
+  const unclaimed = new Map();
+  const claimed = new Map();
+  for (const inbox of snapshot.reviewerInboxes) {
+    assert(inbox && typeof inbox.reviewerId === "string" &&
+      config.reviewerIds.includes(inbox.reviewerId) && !inboxes.has(inbox.reviewerId),
+      "Unexpected or duplicate reviewer inbox");
+    assert(inbox.snapshotCommit === snapshot.ledgerHead,
+      "Reviewer inbox ledger head mismatch: " + inbox.reviewerId);
+    assert(Array.isArray(inbox.reviews), "Missing reviewer inbox reviews: " + inbox.reviewerId);
+    const seen = new Set();
+    for (const review of inbox.reviews) {
+      assert(review && typeof review === "object" && !Array.isArray(review),
+        "Invalid review in inbox: " + inbox.reviewerId);
+      assert(typeof review.taskId === "string" && TASK_ID_PATTERN.test(review.taskId) &&
+        (review.attemptId == null || (typeof review.attemptId === "string" &&
+          REVIEW_ID_PATTERN.test(review.attemptId))) &&
+        typeof review.reviewId === "string" && REVIEW_ID_PATTERN.test(review.reviewId) &&
+        Number.isInteger(review.version) && review.version >= 1 &&
+        Number.isSafeInteger(review.createdSequence) && review.createdSequence >= 1 &&
+        ["Unclaimed", "Claimed"].includes(review.status),
+        "Invalid canonical review identity: " + inbox.reviewerId);
+      const key = reviewKey(review);
+      assert(!seen.has(key), "Duplicate review in inbox: " + key);
+      seen.add(key);
+      if (review.status === "Unclaimed") {
+        assert(review.reviewerId == null || review.reviewerId === "",
+          "Unclaimed review has a reviewer identity: " + key);
+        const fingerprint = JSON.stringify([review.attemptId ?? null, review.version,
+          review.createdSequence ?? null]);
+        assert(!unclaimed.has(key) || unclaimed.get(key) === fingerprint,
+          "Inconsistent unclaimed review across reviewer inboxes: " + key);
+        unclaimed.set(key, fingerprint);
+      } else {
+        assert(review.reviewerId === inbox.reviewerId,
+          "Claimed review is not owned by the inbox reviewer: " + key);
+        assert(!claimed.has(key) || claimed.get(key) === inbox.reviewerId,
+          "Claimed review appears under multiple reviewers: " + key);
+        claimed.set(key, inbox.reviewerId);
+      }
+    }
+    inboxes.set(inbox.reviewerId, inbox.reviews);
+  }
+  assert(inboxes.size === config.reviewerIds.length, "Missing or extra reviewer inbox");
+  for (const reviewerId of config.reviewerIds) {
+    assert(inboxes.has(reviewerId), "Missing reviewer inbox: " + reviewerId);
+  }
+  for (const key of claimed.keys()) {
+    assert(!unclaimed.has(key), "Review is both claimed and unclaimed: " + key);
+  }
+  return inboxes;
 }
 
 export function validateConfig(config) {
@@ -66,8 +139,6 @@ export function validateSnapshot(config, snapshot, nowUtc) {
   const now = validTime(nowUtc, "nowUtc");
   assert(observed <= now + 1000 && now - observed <= 180000,
     "Snapshot is stale or from the future");
-  assert(Number.isInteger(snapshot.unclaimedReviewCount) &&
-    snapshot.unclaimedReviewCount >= 0, "Invalid review count");
   assert(Array.isArray(snapshot.agents), "Missing agents");
   const agents = new Map();
   for (const agent of snapshot.agents) {
@@ -114,7 +185,8 @@ export function validateSnapshot(config, snapshot, nowUtc) {
   assert(agents.has(config.managerAgentId) &&
     agents.get(config.managerAgentId).kind === "manager",
     "Missing verified Manager agent");
-  return agents;
+  const reviewerInboxes = validateReviewerInboxes(config, snapshot);
+  return { agents, reviewerInboxes };
 }
 
 function freshJournal(projectName) {
@@ -133,6 +205,21 @@ export function validateJournal(journal, projectName) {
       ["worker", "reviewer"].includes(rec.kind) &&
       [...LIVE_RECORDS, ...TERMINAL_RECORDS].includes(rec.status),
       "Invalid journal record");
+    if (rec.review !== undefined && rec.review !== null) {
+      assert(rec.kind === "reviewer" && rec.review &&
+        typeof rec.review === "object" && !Array.isArray(rec.review) &&
+        ["claimed", "unclaimed"].includes(rec.review.mode) &&
+        typeof rec.review.taskId === "string" && TASK_ID_PATTERN.test(rec.review.taskId) &&
+        (rec.review.attemptId == null || (typeof rec.review.attemptId === "string" &&
+          REVIEW_ID_PATTERN.test(rec.review.attemptId))) &&
+        typeof rec.review.reviewId === "string" && REVIEW_ID_PATTERN.test(rec.review.reviewId) &&
+        Number.isInteger(rec.review.version) && rec.review.version >= 1 &&
+        (rec.review.reviewerId == null ||
+          (typeof rec.review.reviewerId === "string" &&
+            (rec.review.mode === "claimed" ? rec.review.reviewerId === rec.agentId :
+              rec.review.reviewerId === ""))),
+        "Invalid journal review identity");
+    }
     validTime(rec.reservedAtUtc, "journal reservation");
     if (rec.status === "observed") validTime(rec.observedAtUtc, "observedAtUtc");
     ids.add(rec.launchId);
@@ -152,7 +239,7 @@ function yieldedAfterActivity(agent, activityAtUtc) {
 
 export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
   validateConfig(config);
-  const agents = validateSnapshot(config, snapshot, nowUtc);
+  const { agents, reviewerInboxes } = validateSnapshot(config, snapshot, nowUtc);
   validateJournal(journal, config.projectName);
   const result = {
     projectName: config.projectName,
@@ -210,53 +297,122 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
     result.suppressed.push({ reason: "DisabledByConfiguration" });
     return result;
   }
-  let remainingReviews = snapshot.unclaimedReviewCount;
-  for (const kind of ["worker", "reviewer"]) {
-    const order = [...config[kind + "Ids"]];
-    if (kind === "worker") {
-      order.sort((a, b) => (agents.get(a).priorityRank ?? 100000) -
-        (agents.get(b).priorityRank ?? 100000));
+  const visibleReviewKeys = new Set();
+  for (const reviews of reviewerInboxes.values()) {
+    for (const review of reviews) visibleReviewKeys.add(reviewKey(review));
+  }
+  const reservedReviewDemands = new Set();
+  let unscopedReviewerReservation = false;
+  for (const rec of journal.records) {
+    if (rec.kind !== "reviewer") continue;
+    const agent = agents.get(rec.agentId);
+    const active = !agent || ACTIVE_STATES.has(agent.state) ||
+      agent.execution === "Working" || agent.execution === "Unknown";
+    const unresolved = LIVE_RECORDS.has(rec.status) ||
+      (rec.status === "observed" && active);
+    if (!unresolved) continue;
+    if (rec.review) {
+      const key = reviewKey(rec.review);
+      if (visibleReviewKeys.has(key)) reservedReviewDemands.add(key);
+    } else {
+      // Old journal records do not identify their review request. Keep an
+      // uncertain/active legacy reviewer launch as a wildcard review hold.
+      unscopedReviewerReservation = true;
     }
-    for (const agentId of order) {
-      const agent = agents.get(agentId);
-      let reason = null;
-      if (result.reservations.length >= config.maxLaunchesPerTick) reason = "TickLimit";
-      else if (result.counts[kind] >= config.budgets[kind]) reason = "BudgetFull";
-      else if (reserved.has(agentId)) reason = "PriorLaunchPendingOrUncertain";
-      else if (observedThisPass.has(agentId) || observedAssignments.has(agentId))
-        reason = "AlreadyObservedThisAssignment";
-      else if (agent.waitingOnChallenge) reason = "ChallengeBlocked";
-      else if (kind === "worker" &&
-        !(agent.state === "Ready" && agent.execution === "Stopped" &&
-          agent.hasReadyAssignment)) reason = "NoReadyAssignment";
-      else if (kind === "reviewer" &&
-        !((agent.state === "NeedsWork" || agent.state === "Free") &&
-        agent.execution === "Stopped" && agent.slotAvailable &&
-        !agent.hasReadyAssignment &&
-        remainingReviews > 0)) reason = "NoUnclaimedReviewOrReviewerBusy";
-      if (reason) {
-        result.suppressed.push({ agentId, kind, reason });
-        continue;
-      }
-      const launchId = dryRun ? "dry-run-" + kind + "-" + agentId :
-        randomUUID();
-      result.reservations.push({
-        launchId, agentId, kind,
-        reason: kind === "worker" ? "ReadyImplementation" : "UnclaimedFrozenReview"
-      });
-      result.counts[kind]++;
-      reserved.add(agentId);
-      if (kind === "reviewer") remainingReviews--;
-      if (!dryRun) {
-        journal.records.push({
-          launchId, agentId, kind,
-          reservedAtUtc: nowUtc,
-          assignmentKey: agent.assignmentKey ?? null,
-          ledgerHead: snapshot.ledgerHead,
-          status: "reserved"
-        });
-      }
+  }
+  const addReservation = (agent, kind, reason, review = null) => {
+    const launchId = dryRun ? "dry-run-" + kind + "-" + agent.agentId : randomUUID();
+    const reservation = { launchId, agentId: agent.agentId, kind, reason };
+    if (review) reservation.review = review;
+    result.reservations.push(reservation);
+    result.counts[kind]++;
+    reserved.add(agent.agentId);
+    if (review) reservedReviewDemands.add(reviewKey(review));
+    if (!dryRun) {
+      const record = {
+        launchId, agentId: agent.agentId, kind,
+        reservedAtUtc: nowUtc,
+        assignmentKey: kind === "worker" ? (agent.assignmentKey ?? null) : null,
+        ledgerHead: snapshot.ledgerHead,
+        status: "reserved"
+      };
+      if (review) record.review = review;
+      journal.records.push(record);
     }
+  };
+
+  const workerOrder = [...config.workerIds].sort((a, b) =>
+    (agents.get(a).priorityRank ?? 100000) - (agents.get(b).priorityRank ?? 100000));
+  for (const agentId of workerOrder) {
+    const agent = agents.get(agentId);
+    let reason = null;
+    if (result.reservations.length >= config.maxLaunchesPerTick) reason = "TickLimit";
+    else if (result.counts.worker >= config.budgets.worker) reason = "BudgetFull";
+    else if (reserved.has(agentId)) reason = "PriorLaunchPendingOrUncertain";
+    else if (observedThisPass.has(agentId) || observedAssignments.has(agentId))
+      reason = "AlreadyObservedThisAssignment";
+    else if (agent.waitingOnChallenge) reason = "ChallengeBlocked";
+    else if (!(agent.state === "Ready" && agent.execution === "Stopped" &&
+      agent.hasReadyAssignment)) reason = "NoReadyAssignment";
+    if (reason) {
+      result.suppressed.push({ agentId, kind: "worker", reason });
+      continue;
+    }
+    addReservation(agent, "worker", "ReadyImplementation");
+  }
+
+  // A claim is already owned by its reviewer. Resume that reviewer first;
+  // never transfer or claim review work from the Manager session.
+  for (const agentId of config.reviewerIds) {
+    const agent = agents.get(agentId);
+    const claimed = reviewerInboxes.get(agentId).filter(review => review.status === "Claimed");
+    if (claimed.length === 0) continue;
+    const resumableClaim = claimed.find(review => !reservedReviewDemands.has(reviewKey(review)));
+    let reason = null;
+    if (result.reservations.length >= config.maxLaunchesPerTick) reason = "TickLimit";
+    else if (result.counts.reviewer >= config.budgets.reviewer) reason = "BudgetFull";
+    else if (reserved.has(agentId)) reason = "PriorLaunchPendingOrUncertain";
+    else if (observedThisPass.has(agentId)) reason = "AlreadyObservedThisPass";
+    else if (agent.waitingOnChallenge) reason = "ChallengeBlocked";
+    else if (unscopedReviewerReservation) reason = "PriorReviewerLaunchPendingOrActive";
+    else if (!resumableClaim) reason = "PriorReviewLaunchPendingOrActive";
+    else if (agent.execution !== "Stopped" || !REVIEWABLE_AGENT_STATES.has(agent.state))
+      reason = "NoRunnableClaimedReview";
+    if (reason) {
+      result.suppressed.push({ agentId, kind: "reviewer", reason });
+      continue;
+    }
+    addReservation(agent, "reviewer", "ClaimedReviewResume",
+      reviewIdentity(resumableClaim, "claimed"));
+  }
+
+  // Unclaimed demand is visible only through each reviewer's canonical inbox.
+  // Reserve its immutable identity across reviewers and across Manager ticks.
+  for (const agentId of config.reviewerIds) {
+    const agent = agents.get(agentId);
+    const reviews = reviewerInboxes.get(agentId);
+    const hasClaimedReview = reviews.some(review => review.status === "Claimed");
+    const unclaimed = reviews.find(review => review.status === "Unclaimed" &&
+      !reservedReviewDemands.has(reviewKey(review)));
+    let reason = null;
+    if (result.reservations.length >= config.maxLaunchesPerTick) reason = "TickLimit";
+    else if (result.counts.reviewer >= config.budgets.reviewer) reason = "BudgetFull";
+    else if (reserved.has(agentId)) reason = "PriorLaunchPendingOrUncertain";
+    else if (observedThisPass.has(agentId)) reason = "AlreadyObservedThisPass";
+    else if (agent.waitingOnChallenge) reason = "ChallengeBlocked";
+    else if (hasClaimedReview) reason = "ClaimedReviewAlreadyOwned";
+    else if (!unclaimed) reason = reviews.some(review => review.status === "Unclaimed")
+      ? "ReviewAlreadyReserved" : "NoUnclaimedReviewForReviewer";
+    else if (unscopedReviewerReservation) reason = "PriorReviewerLaunchPendingOrActive";
+    else if (!((agent.state === "NeedsWork" || agent.state === "Free") &&
+      agent.execution === "Stopped" && agent.slotAvailable && !agent.hasReadyAssignment))
+      reason = "NoAvailableReviewerSlot";
+    if (reason) {
+      result.suppressed.push({ agentId, kind: "reviewer", reason });
+      continue;
+    }
+    addReservation(agent, "reviewer", "UnclaimedFrozenReview",
+      reviewIdentity(unclaimed, "unclaimed"));
   }
   return result;
 }

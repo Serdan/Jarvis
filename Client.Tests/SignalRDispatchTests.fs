@@ -1035,3 +1035,180 @@ module OrdinaryDispatchGitTests =
             if File.Exists config then File.Delete config
             if File.Exists(config + ".lock") then File.Delete(config + ".lock")
             Directory.Delete(root, true)
+
+
+    [<Test>]
+    let ReadyClosedTaskReadReusesActivationSnapshotForGuidance () =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-dispatch-closed-task-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let remote = Path.Combine(root, "remote.git")
+        let checkout = Path.Combine(root, "project")
+        let config = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot checkout
+        try
+            git root [ "init"; "--bare"; "--initial-branch=main"; remote ] |> ignore
+            git root [ "clone"; remote; checkout ] |> ignore
+            git checkout [ "config"; "user.name"; "Dispatch Closed Task Test" ] |> ignore
+            git checkout [ "config"; "user.email"; "dispatch-closed@example.invalid" ] |> ignore
+            File.WriteAllText(Path.Combine(checkout, "source.txt"), "base")
+            git checkout [ "add"; "source.txt" ] |> ignore
+            git checkout [ "commit"; "-m"; "base" ] |> ignore
+            git checkout [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
+            let binding: LedgerBinding =
+                { RepositoryPath = checkout; RemoteName = "origin"
+                  ApprovedFetchUrl = remote; ApprovedPushUrl = remote
+                  ProjectId = Guid.NewGuid(); LedgerId = Guid.NewGuid(); Epoch = 1 }
+            LedgerStore.initialize binding true |> success |> ignore
+            ReviewWorkflow.registerAgent binding (Guid.NewGuid()) "ClosedOwner" |> success |> ignore
+            ReviewWorkflow.createTask binding (Guid.NewGuid()) "closed-task" "Closed task" |> success |> ignore
+            ReviewWorkflow.assignTask binding (Guid.NewGuid()) "closed-task" (Guid.NewGuid()) "ClosedOwner"
+            |> success |> ignore
+            let _, task, _ = ReviewWorkflow.getTask binding "closed-task" |> success
+            ReviewWorkflow.closeTaskAs binding "Lead" (Guid.NewGuid()) "closed-task" task.Version
+            |> success |> ignore
+            let before = LedgerStore.fetch binding |> success
+            let rt = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting "project" rt
+                binding.ProjectId binding.LedgerId binding.Epoch binding.RemoteName
+                binding.ApprovedFetchUrl binding.ApprovedPushUrl before.Commit true
+            |> success |> ignore
+            let command =
+                ReadFileCommand
+                    { ProjectName = "project"; FilePath = "source.txt"
+                      StartLine = None; EndLine = None; IncludeLineNumbers = None }
+            let payload = JsonSerializer.Serialize command
+            let invoke () =
+                Client.SignalR.Client.executeAuthenticatedCommandWithChallengeWake
+                    rt payload "ClosedOwner" None false (fun _ _ -> ())
+                |> Async.AwaitTask |> Async.RunSynchronously
+            let sw = Stopwatch.StartNew()
+            let response, io =
+                LedgerStore.measureGitReads (fun () ->
+                    LedgerStore.withGitTransportFaults (fun _ args ->
+                        match args with
+                        | "fetch" :: _ -> System.Threading.Thread.Sleep(50); None
+                        | _ -> None) invoke)
+            sw.Stop()
+            TestContext.Progress.WriteLine(
+                sprintf "ordinary dispatch cold Ready closed task: git=%d fetches=%d elapsedMs=%d"
+                    io.ProcessStarts io.RemoteFetches sw.ElapsedMilliseconds)
+            Assert.That(io.RemoteFetches, Is.EqualTo(1),
+                "A cold closed-task read needs one canonical fetch; eligibility and guidance must reuse that snapshot without a write or another fetch.")
+            Assert.That(response.Error.IsSome, Is.False, sprintf "%A" response.Error)
+            Assert.That(JsonSerializer.Deserialize<string>(response.Result.Value), Is.EqualTo("base"))
+            Assert.That(response.Instructions, Is.Empty)
+            Assert.That(response.AgentStateChanges, Is.Empty)
+            Assert.That(response.InboxActivation.IsNone, Is.True)
+            let closedInbox = ReviewWorkflow.getAgentInbox binding "ClosedOwner" |> success
+            Assert.That(closedInbox.Agent.State, Is.EqualTo("Ready"))
+            Assert.That(closedInbox.Focused.Value.Attempt.Phase, Is.EqualTo("Queued"))
+            let _, closedTask, _ = ReviewWorkflow.getTask binding "closed-task" |> success
+            Assert.That(closedTask.Lifecycle, Is.EqualTo("Closed"))
+            let after = LedgerStore.fetch binding |> success
+            Assert.That(after.Commit, Is.EqualTo(before.Commit),
+                "A read for a closed task must not create a lifecycle transition.")
+            Assert.That(git checkout [ "status"; "--porcelain" ], Is.Empty)
+        finally
+            if File.Exists config then File.Delete config
+            if File.Exists(config + ".lock") then File.Delete(config + ".lock")
+            Directory.Delete(root, true)
+
+
+    [<Test>]
+    let RequestSnapshotGenerationGuardsWorkingGuidanceReuse () =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-dispatch-snapshot-generation-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let remote = Path.Combine(root, "remote.git")
+        let checkout = Path.Combine(root, "project")
+        let config = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot checkout
+        try
+            git root [ "init"; "--bare"; "--initial-branch=main"; remote ] |> ignore
+            git root [ "clone"; remote; checkout ] |> ignore
+            git checkout [ "config"; "user.name"; "Dispatch Snapshot Test" ] |> ignore
+            git checkout [ "config"; "user.email"; "dispatch-snapshot@example.invalid" ] |> ignore
+            File.WriteAllText(Path.Combine(checkout, "source.txt"), "base")
+            git checkout [ "add"; "source.txt" ] |> ignore
+            git checkout [ "commit"; "-m"; "base" ] |> ignore
+            git checkout [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
+            let binding: LedgerBinding =
+                { RepositoryPath = checkout; RemoteName = "origin"
+                  ApprovedFetchUrl = remote; ApprovedPushUrl = remote
+                  ProjectId = Guid.NewGuid(); LedgerId = Guid.NewGuid(); Epoch = 1 }
+            LedgerStore.initialize binding true |> success |> ignore
+            ReviewWorkflow.registerAgent binding (Guid.NewGuid()) "Owner" |> success |> ignore
+            let before = LedgerStore.fetch binding |> success
+            let rt = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting "project" rt
+                binding.ProjectId binding.LedgerId binding.Epoch binding.RemoteName
+                binding.ApprovedFetchUrl binding.ApprovedPushUrl before.Commit true
+            |> success |> ignore
+            let target = Client.ProjectPaths.ProjectTarget.parse "project" |> success
+            let projectId = Client.ProjectPaths.ProjectTarget.projectId target
+            let command =
+                ReadFileCommand
+                    { ProjectName = "project"; FilePath = "source.txt"
+                      StartLine = None; EndLine = None; IncludeLineNumbers = None }
+            let requestGeneration =
+                Client.SignalR.Client.captureWorkingGuidanceGeneration rt target "Owner"
+            let requestLedgerSnapshot = LedgerStore.fetch binding |> success
+            let requestSnapshot =
+                Client.SignalR.Client.createRequestSnapshot target "Owner" requestGeneration (Ok(binding, requestLedgerSnapshot))
+            let guidance, warmIo =
+                LedgerStore.measureGitReads (fun () ->
+                    Client.SignalR.Client.checkWorkingGuidance rt "Owner" (Some target) (Some requestSnapshot) command)
+            Assert.That(warmIo.RemoteFetches, Is.EqualTo(0),
+                "A current request snapshot should supply guidance without another remote fetch.")
+            Assert.That(guidance, Is.Empty)
+
+            // An invalidation for another agent must not discard this snapshot.
+            let unrelatedSnapshot =
+                Client.SignalR.Client.createRequestSnapshot target "Owner" requestGeneration (Ok(binding, requestLedgerSnapshot))
+            Client.SignalR.Client.invalidateAgentStates rt "project" [| "Other" |]
+            let mutable usedUnrelatedSnapshot = false
+            let mutable unrelatedFallback = false
+            let unrelated =
+                Client.SignalR.Client.withCurrentRequestSnapshot rt projectId "Owner" (Some unrelatedSnapshot)
+                    (fun _ -> usedUnrelatedSnapshot <- true; Ok "snapshot")
+                    (fun () -> unrelatedFallback <- true; Ok "fallback")
+            Assert.That(unrelated, Is.EqualTo(Ok "snapshot" : Result<string, Client.EffectError>))
+            Assert.That(usedUnrelatedSnapshot, Is.True)
+            Assert.That(unrelatedFallback, Is.False)
+
+            // Invalidation during use must discard the result and take the fresh path.
+            let mutable postUseFallback = false
+            let duringUse =
+                Client.SignalR.Client.withCurrentRequestSnapshot rt projectId "Owner" (Some unrelatedSnapshot)
+                    (fun _ ->
+                        Client.SignalR.Client.invalidateAgentStates rt "project" [| "Owner" |]
+                        Ok "stale")
+                    (fun () -> postUseFallback <- true; Ok "fresh")
+            Assert.That(duringUse, Is.EqualTo(Ok "fresh" : Result<string, Client.EffectError>))
+            Assert.That(postUseFallback, Is.True)
+
+            let _, invalidatedIo =
+                LedgerStore.measureGitReads (fun () ->
+                    Client.SignalR.Client.checkWorkingGuidance rt "Owner" (Some target) (Some unrelatedSnapshot) command)
+            Assert.That(invalidatedIo.RemoteFetches, Is.EqualTo(1),
+                "A same-agent push must force a fresh canonical read instead of reusing the stale request snapshot.")
+
+            // A reconnect invalidates every agent generation.
+            let globalGeneration =
+                Client.SignalR.Client.captureWorkingGuidanceGeneration rt target "Owner"
+            let globalLedgerSnapshot = LedgerStore.fetch binding |> success
+            let globalSnapshot =
+                Client.SignalR.Client.createRequestSnapshot target "Owner" globalGeneration (Ok(binding, globalLedgerSnapshot))
+            Client.SignalR.Client.invalidateAllAgentStates rt
+            let mutable globalFallback = false
+            let globalResult =
+                Client.SignalR.Client.withCurrentRequestSnapshot rt projectId "Owner" (Some globalSnapshot)
+                    (fun _ -> Ok "stale")
+                    (fun () -> globalFallback <- true; Ok "fresh")
+            Assert.That(globalResult, Is.EqualTo(Ok "fresh" : Result<string, Client.EffectError>))
+            Assert.That(globalFallback, Is.True)
+
+            let after = LedgerStore.fetch binding |> success
+            Assert.That(after.Commit, Is.EqualTo(before.Commit),
+                "Cache generation changes must not mutate durable ledger state.")
+        finally
+            if File.Exists config then File.Delete config
+            if File.Exists(config + ".lock") then File.Delete(config + ".lock")
+            Directory.Delete(root, true)

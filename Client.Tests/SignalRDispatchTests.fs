@@ -644,3 +644,113 @@ module DispatchProbeTests =
                    p99Ms = percentile 0.99
                    maxMs = values |> Array.max |}))
     }
+
+
+// Independent disposable fixture for the ordinary (non-inbox) authenticated
+// dispatch path. Measure only the actual command, not setup or observations.
+module OrdinaryDispatchGitTests =
+    open System
+    open System.Diagnostics
+    open System.IO
+    open System.Text.Json
+    open Client.LedgerStore
+    open Client.ReviewWorkflow
+    open Common
+    open NUnit.Framework
+
+    let private success = function
+        | Ok value -> value
+        | Error error -> failwithf "Unexpected fixture result: %A" error
+
+    let private git directory args =
+        use proc = new Process()
+        proc.StartInfo.FileName <- "git"
+        proc.StartInfo.WorkingDirectory <- directory
+        proc.StartInfo.RedirectStandardOutput <- true
+        proc.StartInfo.RedirectStandardError <- true
+        args |> List.iter proc.StartInfo.ArgumentList.Add
+        if not (proc.Start()) then failwith "Could not start fixture Git."
+        let stdout = proc.StandardOutput.ReadToEndAsync()
+        let stderr = proc.StandardError.ReadToEndAsync()
+        if not (proc.WaitForExit(10000)) then
+            proc.Kill(true)
+            failwith "Fixture Git timed out."
+        if proc.ExitCode <> 0 then failwithf "Fixture Git failed: %s" (stderr.GetAwaiter().GetResult())
+        stdout.GetAwaiter().GetResult().Trim()
+
+    [<TestCase(false)>]
+    [<TestCase(true)>]
+    let OrdinarySourceDispatchActivationGitBudget(missing: bool) =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-dispatch-git-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let remote = Path.Combine(root, "remote.git")
+        let checkout = Path.Combine(root, "project")
+        let config = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot checkout
+        try
+            git root [ "init"; "--bare"; "--initial-branch=main"; remote ] |> ignore
+            git root [ "clone"; remote; checkout ] |> ignore
+            git checkout [ "config"; "user.name"; "Dispatch Test" ] |> ignore
+            git checkout [ "config"; "user.email"; "dispatch@example.invalid" ] |> ignore
+            File.WriteAllText(Path.Combine(checkout, "source.txt"), "base")
+            git checkout [ "add"; "source.txt" ] |> ignore
+            git checkout [ "commit"; "-m"; "base" ] |> ignore
+            git checkout [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
+            let binding: LedgerBinding =
+                { RepositoryPath = checkout; RemoteName = "origin"
+                  ApprovedFetchUrl = remote; ApprovedPushUrl = remote
+                  ProjectId = Guid.NewGuid(); LedgerId = Guid.NewGuid(); Epoch = 1 }
+            LedgerStore.initialize binding true |> success |> ignore
+            ReviewWorkflow.registerAgent binding (Guid.NewGuid()) "Owner" |> success |> ignore
+            ReviewWorkflow.createTask binding (Guid.NewGuid()) "dispatch-task" "Dispatch" |> success |> ignore
+            ReviewWorkflow.assignTask binding (Guid.NewGuid()) "dispatch-task" (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let before = LedgerStore.fetch binding |> success
+            let rt = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting "project" rt
+                binding.ProjectId binding.LedgerId binding.Epoch binding.RemoteName
+                binding.ApprovedFetchUrl binding.ApprovedPushUrl before.Commit true
+            |> success |> ignore
+            let command =
+                ReadFileCommand
+                    { ProjectName = "project"
+                      FilePath = if missing then "missing.txt" else "source.txt"
+                      StartLine = None; EndLine = None; IncludeLineNumbers = None }
+            let payload = JsonSerializer.Serialize(command)
+            let invoke () =
+                Client.SignalR.Client.executeAuthenticatedCommandWithChallengeWake
+                    rt payload "Owner" None false (fun _ _ -> ())
+                |> Async.AwaitTask |> Async.RunSynchronously
+            let measure label =
+                let sw = Stopwatch.StartNew()
+                let response, io =
+                    LedgerStore.measureGitReads (fun () ->
+                        LedgerStore.withGitTransportFaults (fun _ args ->
+                            match args with
+                            | "fetch" :: _ -> System.Threading.Thread.Sleep(50); None
+                            | _ -> None) invoke)
+                sw.Stop()
+                TestContext.Progress.WriteLine(
+                    sprintf "ordinary dispatch %s missing=%b: git=%d fetches=%d elapsedMs=%d"
+                        label missing io.ProcessStarts io.RemoteFetches sw.ElapsedMilliseconds)
+                response, io
+            let first, _ = measure "cold Ready"
+            let warm, _ = measure "warm Working"
+            Assert.That(first.Error.IsSome, Is.EqualTo(missing), sprintf "%A" first.Error)
+            Assert.That(warm.Error, Is.EqualTo(first.Error))
+            Assert.That(warm.Result, Is.EqualTo(first.Result))
+            if not missing then Assert.That(JsonSerializer.Deserialize<string>(first.Result.Value), Is.EqualTo("base"))
+            Assert.That(first.Instructions, Is.Empty)
+            Assert.That(warm.Instructions, Is.Empty)
+            Assert.That(first.AgentStateChanges |> List.map (fun change -> change.AgentId), Is.EqualTo([ "Owner" ]))
+            Assert.That(warm.AgentStateChanges, Is.Empty)
+            Assert.That(first.InboxActivation.IsNone, Is.True)
+            Assert.That(warm.InboxActivation.IsNone, Is.True)
+            let canonical = ReviewWorkflow.getAgentInbox binding "Owner" |> success
+            Assert.That(canonical.Agent.State, Is.EqualTo("Working"))
+            Assert.That(canonical.Focused.Value.Attempt.Phase, Is.EqualTo("Started"))
+            Assert.That((LedgerStore.fetch binding |> success).Commit, Is.Not.EqualTo(before.Commit))
+            Assert.That(git checkout [ "status"; "--porcelain" ], Is.Empty)
+        finally
+            if File.Exists config then File.Delete config
+            if File.Exists(config + ".lock") then File.Delete(config + ".lock")
+            Directory.Delete(root, true)

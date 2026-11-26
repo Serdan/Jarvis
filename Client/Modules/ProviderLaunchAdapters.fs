@@ -9,6 +9,7 @@ open System.Text.RegularExpressions
 open System.Threading
 open System.Threading.Tasks
 open Client.ProviderLaunch
+open Client.ProviderMcpProvisioning
 
 let chatGptProvider = "chatgpt-browser"
 let codexProvider = "codex-cli"
@@ -42,9 +43,9 @@ type private OneEffect<'a>() =
 type BrowserBinding =
     { Profile: InferenceProfile
       McpProfile: string
-      /// The existing authenticated project context must already provision
-      /// this MCP profile. A label is not proof of plugin selection.
-      ExistingContextProvisioned: bool
+      McpScope: Scope
+      ProvisioningEvidence: Evidence option
+      ProjectContextId: string
       WindowRegistration: string
       Url: string
       Alias: string
@@ -70,16 +71,19 @@ let prepareBrowser (binding: BrowserBinding) request =
     | Error reason -> Error reason
     | Ok () when request.Profile <> binding.Profile || request.Profile.Provider <> chatGptProvider
                  || request.McpProfile <> binding.McpProfile
-                 || not binding.ExistingContextProvisioned ->
+                 || binding.McpScope.Id <> binding.McpProfile ->
         Error "ChatGPT context does not provision the requested profile"
     | Ok () when (Option.isSome request.Profile.Model || Option.isSome request.Profile.ReasoningEffort)
                     <> Option.isSome binding.ModelOverride
                  || not (binding.ModelOverride |> Option.forall nonblank) ->
         Error "ChatGPT model/effort profile requires an explicit existing model override mapping"
-    | Ok () when not (nonblank binding.WindowRegistration) || not (nonblank binding.Url)
+    | Ok () when not (nonblank binding.ProjectContextId)
+                 || not (nonblank binding.WindowRegistration) || not (nonblank binding.Url)
                  || not (nonblank binding.ScriptSource)
                  || binding.BridgeTimeoutMs < 1 || binding.BridgeTimeoutMs > 30000 ->
         Error "Invalid browser binding"
+    | Ok () when validate request (Browser(binding.ProjectContextId, binding.WindowRegistration, binding.Url, binding.StartUrl)) binding.McpScope binding.ProvisioningEvidence |> Result.isError ->
+        Error "ChatGPT effective MCP context not verified"
     | Ok () ->
         let arguments = Dictionary<string, obj>()
         arguments.Add("prompt", box request.Bootstrap.Prompt)
@@ -151,6 +155,8 @@ type CodexBinding =
       WorkingDirectory: string
       McpServerName: string
       McpServerUrl: Uri
+      McpScope: Scope
+      ProvisioningEvidence: Evidence option
       Timeout: TimeSpan }
 
 let private cliToken (value: string) =
@@ -170,7 +176,9 @@ let prepareCodex (binding: CodexBinding) request : Microsoft.FSharp.Core.Result<
     match validateRequest request with
     | Error reason -> Error reason
     | Ok () when request.Profile <> binding.Profile || request.Profile.Provider <> codexProvider
-                 || request.McpProfile <> binding.McpProfile ->
+                 || request.McpProfile <> binding.McpProfile
+                 || binding.McpScope.Id <> binding.McpProfile
+                 || binding.McpScope.SurfaceName <> binding.McpServerName ->
         Error "Codex binding does not match the requested profile"
     | Ok () when not (nonblank binding.Executable) || not (Path.IsPathFullyQualified binding.Executable)
                  || not (nonblank binding.WorkingDirectory) || not (Path.IsPathFullyQualified binding.WorkingDirectory)
@@ -179,6 +187,10 @@ let prepareCodex (binding: CodexBinding) request : Microsoft.FSharp.Core.Result<
                  || not (request.Profile.Model |> Option.forall cliToken)
                  || not (request.Profile.ReasoningEffort |> Option.forall cliToken) ->
         Error "Invalid Codex binding"
+    | Ok () when not (safeEndpoint binding.McpScope.Endpoint)
+                 || binding.McpScope.Endpoint.AbsoluteUri <> binding.McpServerUrl.AbsoluteUri
+                 || (validate request (Codex(binding.Executable, binding.WorkingDirectory)) binding.McpScope binding.ProvisioningEvidence |> Result.isError) ->
+        Error "Codex effective MCP configuration not verified"
     | Ok () ->
         let prefix = "mcp_servers." + binding.McpServerName
         let quoted (value: string) = JsonSerializer.Serialize(value)
@@ -191,6 +203,8 @@ let prepareCodex (binding: CodexBinding) request : Microsoft.FSharp.Core.Result<
               yield prefix + ".enabled=true"
               yield "-c"
               yield prefix + ".required=true"
+              yield "-c"
+              yield prefix + ".enabled_tools=" + JsonSerializer.Serialize(Set.toArray binding.McpScope.Tools)
               match request.Profile.Model with
               | Some model -> yield "--model"; yield model
               | None -> ()

@@ -8,6 +8,7 @@ open System.Threading.Tasks
 open NUnit.Framework
 open Client.ProviderLaunch
 open Client.ProviderLaunchAdapters
+open Client.ProviderMcpProvisioning
 
 let private eq expected actual =
     Assert.That((actual = expected), Is.True, sprintf "Expected %A; actual %A" expected actual)
@@ -96,9 +97,20 @@ let ``work targets do not need an agent and canonical prompt bytes are immutable
     let modified = { r with Bootstrap = { r.Bootstrap with Prompt = r.Bootstrap.Prompt + "!" } }
     eq true (validateRequest modified |> Result.isError)
 
-let private browserBinding =
-    { Profile = browser; McpProfile = "worker"; ExistingContextProvisioned = true
-      WindowRegistration = "registered"; Url = "https://chatgpt.com/"
+let private scope name : Scope =
+    { Id = "worker"; ConfigurationIdentity = "fixture-config-v1"; Endpoint = Uri("https://example.invalid/mcp/worker")
+      SurfaceName = name; Tools = set ["agent_inbox"; "read_file"] }
+
+let private evidence (r: LaunchRequest) context (s: Scope) : Evidence option =
+    Some { Identity = r.Identity; ProfileId = r.Profile.Id; McpProfile = s.Id; ConfigurationIdentity = s.ConfigurationIdentity; Context = context
+           EffectiveSurfaces = Some [{ Name = s.SurfaceName; Endpoint = s.Endpoint; Tools = s.Tools }]
+           Policy = Some { Identity = r.Identity; ProfileId = r.Profile.Id; McpProfile = s.Id; ConfigurationIdentity = s.ConfigurationIdentity; Endpoint = s.Endpoint; CallableTools = s.Tools } }
+
+let private browserBinding r =
+    let s = scope "worker-plugin"
+    { Profile = browser; McpProfile = "worker"; McpScope = s
+      ProvisioningEvidence = evidence r (Browser("fixture-project", "registered", "https://chatgpt.com/", None)) s
+      ProjectContextId = "fixture-project"; WindowRegistration = "registered"; Url = "https://chatgpt.com/"
       Alias = ""; Active = false; CloseAfterExecution = true; ScriptSource = "// existing script"
       BridgeTimeoutMs = 30000; ScriptTimeoutMs = None; StartUrl = None; ModelOverride = None }
 
@@ -107,10 +119,11 @@ let ``browser reuses exact bridge envelope and acknowledges independently of URL
     let r = request browser
     let mutable invocations = 0
     let mutable arguments = ""
+    let b = browserBinding r
     let adapter =
-        browserAdapter browserBinding (fun invocation ->
+        browserAdapter b (fun invocation ->
             invocations <- invocations + 1
-            eq browserBinding invocation.Binding
+            eq b invocation.Binding
             arguments <- invocation.ArgumentsJson
             Task.FromResult(Ok """{"status":"submitted","cleanup":"cleanupFailed","scriptResult":{"conversationUrl":null}}"""))
     let! first = adapter.Launch r
@@ -123,7 +136,7 @@ let ``browser reuses exact bridge envelope and acknowledges independently of URL
     eq [transport r UnsupportedCapability] cancel
     let! observation = adapter.Observe r
     eq first observation
-    let restart = browserAdapter browserBinding (fun _ -> failwith "Observe must not submit after restart")
+    let restart = browserAdapter b (fun _ -> failwith "Observe must not submit after restart")
     let! restarted = restart.Observe r
     eq (Ok Uncertain) (state r restarted [])
     let foreign = { r with Identity = { r.Identity with Target = QueueClaim("another", 4L) } }
@@ -142,7 +155,8 @@ let ``browser classifier preserves definitive failures and refuses generic succe
     eq OutcomeUnknown (classifyBrowser (Error("", "OutcomeUnknown:acknowledgement")))
     eq OutcomeUnknown (classifyBrowser (Ok "invalid"))
     eq OutcomeUnknown (classifyBrowser (Error("", "transport disconnected")))
-    eq true (prepareBrowser { browserBinding with ExistingContextProvisioned = false } (request browser) |> Result.isError)
+    let r = request browser
+    eq true (prepareBrowser { browserBinding r with ProvisioningEvidence = None } r |> Result.isError)
 
 let private withFake script (action: string -> string -> Task<unit>) = task {
     if not (OperatingSystem.IsLinux()) then Assert.Ignore("Hermetic executable fixture is Linux-specific")
@@ -157,9 +171,11 @@ let private withFake script (action: string -> string -> Task<unit>) = task {
         Directory.Delete(dir, true)
 }
 
-let private codexBinding dir exe =
+let private codexBinding r dir exe =
+    let s = scope "JarvisWorker"
     { Profile = codex; McpProfile = "worker"; Executable = exe; WorkingDirectory = dir
-      McpServerName = "JarvisWorker"; McpServerUrl = Uri("https://example.invalid/mcp/worker")
+      McpServerName = s.SurfaceName; McpServerUrl = s.Endpoint; McpScope = s
+      ProvisioningEvidence = evidence r (Codex(exe, dir)) s
       Timeout = TimeSpan.FromSeconds 15. }
 
 let private eventually predicate = task {
@@ -178,7 +194,7 @@ printf '%s\n' '{"type":"turn.started"}' '{"type":"turn.completed"}'
 """
     withFake script (fun dir exe -> task {
         let r = request codex
-        let b = codexBinding dir exe
+        let b = codexBinding r dir exe
         let completed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
         let adapter =
             codexAdapter b (fun token cmd ->
@@ -200,6 +216,7 @@ printf '%s\n' '{"type":"turn.started"}' '{"type":"turn.completed"}'
         let args = File.ReadAllLines(Path.Combine(dir, "argv")) |> Array.toList
         eq ["exec"; "--json"; "-c"; "mcp_servers.JarvisWorker.url=\"https://example.invalid/mcp/worker\"";
             "-c"; "mcp_servers.JarvisWorker.enabled=true"; "-c"; "mcp_servers.JarvisWorker.required=true";
+            "-c"; "mcp_servers.JarvisWorker.enabled_tools=[\"agent_inbox\",\"read_file\"]";
             "--model"; "configured-model"; "-c"; "model_reasoning_effort=\"high\""; "-"] args
         eq true (prepareCodex b { r with McpProfile = "reviewer" } |> Result.isError)
         let fresh = codexAdapter b (fun _ _ -> failwith "Restart observation must never execute")
@@ -219,7 +236,7 @@ touch incorrectly-survived
         let r = request codex
         let completed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
         let adapter =
-            codexAdapter (codexBinding dir exe) (fun token cmd ->
+            codexAdapter (codexBinding r dir exe) (fun token cmd ->
                 try Client.BoundedProcess.runWithCancellation token cmd
                 finally completed.TrySetResult(()) |> ignore)
         let! _ = adapter.Launch r
@@ -235,7 +252,7 @@ touch incorrectly-survived
 [<Test>]
 let ``Codex wrong profile fails before process effect and missing acknowledgement remains unknown`` () = task {
     let r = request codex
-    let b = codexBinding "/tmp" "/tmp/never-executed"
+    let b = codexBinding r "/tmp" "/tmp/never-executed"
     let adapter = codexAdapter b (fun _ _ -> failwith "Wrong profile must never run")
     let invalid = { r with McpProfile = "reviewer" }
     let! observations = adapter.Launch invalid
@@ -244,4 +261,65 @@ let ``Codex wrong profile fails before process effect and missing acknowledgemen
         { ExitCode = 0; TimedOut = false; StdOut = "{\"type\":\"thread.started\"}\n"
           StdErr = "private"; StdOutTruncated = false; StdErrTruncated = false }
     eq [OutcomeUnknown; LocalProcessExited 0] (classifyCodex output)
+}
+
+[<Test>]
+let ``effective scope requires complete provider and independent authenticated policy evidence`` () = task {
+    let r = request browser
+    let b = browserBinding r
+    let e = b.ProvisioningEvidence.Value
+    let surface = e.EffectiveSurfaces.Value.Head
+    let policy = e.Policy.Value
+    let invalid =
+        [ None
+          Some { e with Identity = { e.Identity with EffectId = Guid.NewGuid() } }
+          Some { e with ProfileId = "another" }
+          Some { e with McpProfile = "reviewer" }
+          Some { e with ConfigurationIdentity = "stale-config" }
+          Some { e with Context = Browser("wrong-project", b.WindowRegistration, b.Url, b.StartUrl) }
+          Some { e with Context = Browser(b.ProjectContextId, "another-window", b.Url, b.StartUrl) }
+          Some { e with EffectiveSurfaces = None }
+          Some { e with EffectiveSurfaces = Some [] }
+          Some { e with EffectiveSurfaces = Some [surface; { surface with Name = "inherited" }] }
+          Some { e with EffectiveSurfaces = Some [{ surface with Name = "wrong-plugin" }] }
+          Some { e with EffectiveSurfaces = Some [{ surface with Endpoint = Uri("https://other.invalid/mcp") }] }
+          Some { e with EffectiveSurfaces = Some [{ surface with Tools = Set.add "update_server" surface.Tools }] }
+          Some { e with EffectiveSurfaces = Some [{ surface with Tools = Set.remove "read_file" surface.Tools }] }
+          Some { e with Policy = None }
+          Some { e with Policy = Some { policy with Identity = { policy.Identity with LaunchId = Guid.NewGuid() } } }
+          Some { e with Policy = Some { policy with McpProfile = "reviewer" } }
+          Some { e with Policy = Some { policy with ConfigurationIdentity = "stale-config" } }
+          Some { e with Policy = Some { policy with Endpoint = Uri("https://other.invalid/mcp") } }
+          Some { e with Policy = Some { policy with CallableTools = Set.add "update_server" policy.CallableTools } } ]
+    eq true (prepareBrowser b r |> Result.isOk)
+    for observation in invalid do
+        let rejected = { b with ProvisioningEvidence = observation }
+        eq true (prepareBrowser rejected r |> Result.isError)
+        let adapter = browserAdapter rejected (fun _ -> failwith "unverified browser must never run")
+        let! result = adapter.Launch r
+        eq [transport r DefinitiveNoSend] result
+}
+
+[<Test>]
+let ``Codex refuses additional inherited MCP sources and broader authenticated policy before process entry`` () = task {
+    let r = request codex
+    let b = codexBinding r "/tmp" "/tmp/never-executed"
+    let e = b.ProvisioningEvidence.Value
+    let surface = e.EffectiveSurfaces.Value.Head
+    let policy = e.Policy.Value
+    let invalid =
+        [ { b with ProvisioningEvidence = None }
+          { b with ProvisioningEvidence = Some { e with EffectiveSurfaces = None } }
+          { b with ProvisioningEvidence = Some { e with EffectiveSurfaces = Some [surface; { surface with Name = "other" }] } }
+          { b with ProvisioningEvidence = Some { e with EffectiveSurfaces = Some [{ surface with Tools = Set.add "update_server" surface.Tools }] } }
+          { b with ProvisioningEvidence = Some { e with Policy = Some { policy with CallableTools = Set.add "update_server" policy.CallableTools } } }
+          { b with WorkingDirectory = "/other" }
+          { b with McpServerName = "WrongServer" }
+          { b with McpServerUrl = Uri("https://other.invalid/mcp") } ]
+    eq true (prepareCodex b r |> Result.isOk)
+    for binding in invalid do
+        eq true (prepareCodex binding r |> Result.isError)
+        let adapter = codexAdapter binding (fun _ _ -> failwith "unverified Codex must never run")
+        let! result = adapter.Launch r
+        eq [transport r DefinitiveNoSend] result
 }

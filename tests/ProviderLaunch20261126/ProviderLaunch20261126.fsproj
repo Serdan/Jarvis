@@ -10,6 +10,7 @@
   <ItemGroup>
     <ProjectReference Include="../../Client/Client.fsproj" />
     <Compile Include="../../Client/Modules/ProviderLaunch.fs" />
+    <Compile Include="../../Client/Modules/ProviderMcpProvisioning.fs" />
     <Compile Include="../../Client/Modules/ProviderLaunchAdapters.fs" />
     <Compile Include="Tests.fs" />
   </ItemGroup>

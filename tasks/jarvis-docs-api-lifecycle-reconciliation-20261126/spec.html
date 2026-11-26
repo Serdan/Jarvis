@@ -1,0 +1,22 @@
+<article>
+<h1>Reconcile Jarvis API, lifecycle and version documentation</h1>
+<p><strong>Goal:</strong> clean up the human-facing documentation so it accurately describes the current Jarvis command surface, lifecycle semantics and client/server protocol state. This is a documentation-only task; code and instruction configuration are owned by separate workstreams.</p>
+<h2>Scope</h2>
+<p>Audit the relevant maintained documents, prioritizing <code>docs/AgentCommandSurface.md</code>, <code>docs/OrchestrationMigration.md</code> and <code>docs/ServerUpdates.md</code>. Find stale version statements, duplicated or contradictory lifecycle guidance, retired tool names, misleading command descriptions, and ambiguity between the client transport capability catalog returned by <code>list_commands</code> and the actual public MCP tool schemas generated from MCP method signatures. Do not edit <code>AGENTS.md</code>, launch/role templates, instruction configuration, <code>docs/specs/**</code>, <code>docs/tasks/**</code> or source code; another workstream owns those areas.</p>
+<h2>Required outcome</h2>
+<ul>
+<li>Document the actual distinction between MCP tool definitions (names, parameter schemas and descriptions exposed by the active MCP server) and the Jarvis client/server <code>list_commands</code> capability catalog. Do not imply that a capability description or missing <code>InputSchemaJson</code> is the authoritative MCP argument schema.</li>
+<li>Describe lifecycle operations accurately: checkpoint preserves Working; yield transitions the assigned Working session to Ready; completion releases the assignment; a rejected tool call does not transition state; success must be established from the tool result/canonical state.</li>
+<li>Use exact current public names and required parameter names. Clearly label retired/internal wire actions and historical migration notes so they are not mistaken for current public tools.</li>
+<li>Reconcile protocol-version documentation against verifiable source and the current observed deployment evidence. The connected server and selected Serdan-Home device reported protocol 3.68 on 2026-11-26; distinguish that observation from repository-supported release facts and avoid timeless claims based on a single observation. Do not claim a deployment occurred as part of this task.</li>
+<li>Remove duplicated explanations where a canonical section can be referenced. Keep the documents concise and preserve useful historical migration context.</li>
+<li>Check links, anchors, command names and version references across the scoped documents. If a discrepancy cannot be established, record it as an explicit open question rather than guessing.</li>
+</ul>
+<h2>Validation</h2>
+<ul>
+<li>Cross-check every normative API statement against current source or actual tool definitions; record source paths/lines in the change or review summary.</li>
+<li>Run <code>git diff --check</code> and the repository's applicable documentation/link validation. Search the scoped docs for obsolete public method names and stale protocol claims.</li>
+<li>Commit on a new isolated branch/worktree based on verified current <code>origin/main</code>; bind exact source before editing. Submit the exact candidate for independent review.</li>
+<li>No MCP implementation changes, instruction/prompt changes, integration, deployment, server restart or protocol cutover.</li>
+</ul>
+</article>

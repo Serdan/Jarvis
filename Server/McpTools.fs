@@ -402,16 +402,41 @@ module McpToolHelpers =
           "ResolveChallengeCondition"; "ReopenChallengeCondition"
           "CancelChallenge"; "BlockOnChallenges"; "RequeueChallengeBlockedAttempt" ]
 
-    let private ledgerAliasCapabilities =
+    let private publicMcpToolDescription (toolType: Type) publicName =
+        let matches =
+            toolType.GetMethods(System.Reflection.BindingFlags.Public ||| System.Reflection.BindingFlags.Static)
+            |> Array.filter (fun methodInfo -> methodInfo.Name = publicName)
+
+        match matches with
+        | [| methodInfo |] ->
+            let registered = methodInfo.GetCustomAttributes(typeof<McpServerToolAttribute>, false)
+            let descriptions = methodInfo.GetCustomAttributes(typeof<DescriptionAttribute>, false)
+            match registered, descriptions with
+            | [| :? McpServerToolAttribute |], [| :? DescriptionAttribute as description |]
+                when not (String.IsNullOrWhiteSpace description.Description) ->
+                description.Description
+            | _ ->
+                invalidOp $"Client capability alias '{publicName}' must map to one registered MCP tool with a non-empty DescriptionAttribute."
+        | _ ->
+            invalidOp $"Client capability alias '{publicName}' must map to exactly one public static MCP method."
+
+    // The client catalog negotiates command capabilities; it is not the MCP
+    // tools/list schema. Permissions and mutation semantics come from the wire
+    // capability family, while each public alias reuses its registered MCP
+    // method's human-facing description. MCP input schemas are generated from
+    // method signatures separately; InputSchemaJson/OutputSchemaJson stay None.
+    let private ledgerAliasCapabilities (toolType: Type) =
         let fromWire wireName publicName =
             AgentProtocol.capabilities
             |> List.find (fun capability -> capability.Name = wireName)
-            |> fun capability -> { capability with Name = publicName }
+            |> fun capability ->
+                { capability with
+                    Name = publicName
+                    Description = publicMcpToolDescription toolType publicName }
 
         [ for name in ledgerTaskReadMethods ->
               if name = "AgentInbox" then
                   { fromWire "TaskRead" name with
-                      Description = "Self-inbox: an agent's call may activate its Ready assignment into Working. Use ObserveAgent to inspect another agent without activity."
                       MutatesState = true }
               else fromWire "TaskRead" name
           for name in ledgerTaskWriteMethods -> fromWire "TaskWrite" name
@@ -434,7 +459,7 @@ module McpToolHelpers =
           for name in [ "SetWorkPriority" ] ->
               fromWire "WorkPriority" name ]
 
-    let mcpListCommandsResult : ListCommandsResult =
+    let mcpListCommandsResult (toolType: Type) : ListCommandsResult =
         { ProtocolVersion = AgentProtocol.version
           Commands =
             (AgentProtocol.capabilities
@@ -448,7 +473,7 @@ module McpToolHelpers =
                  && capability.Name <> "WorkQueueRead"
                  && capability.Name <> "WorkQueueWrite"
                  && capability.Name <> "WorkPriority"))
-            @ ledgerAliasCapabilities
+            @ ledgerAliasCapabilities toolType
             @ [ serverLocalCapability
                     "GetProfile"
                     "Returns the profile represented by the authenticated OAuth credentials."
@@ -1667,12 +1692,12 @@ module McpToolHelpers =
                         |> jsonResult
         }
 
-    let listMcpCommands (http: IHttpContextAccessor) =
+    let listMcpCommands (http: IHttpContextAccessor) (toolType: Type) =
         task {
             match authenticatedFeedbackContext http with
             | Error result -> return result
             | Ok _ ->
-                return mcpListCommandsResult |> jsonResult
+                return mcpListCommandsResult toolType |> jsonResult
         }
 
     let optionOfString (value: string) =
@@ -1774,7 +1799,7 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "List commands", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List the complete public Jarvis MCP command catalog, including server-local tools.")>]
     static member ListCommands(http: IHttpContextAccessor) =
-        McpToolHelpers.listMcpCommands http
+        McpToolHelpers.listMcpCommands http typeof<JarvisMcpTools>
 
     [<McpServerTool(Title = "List projects", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List projects exposed by the connected Jarvis client.")>]
     static member ListProjects([<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

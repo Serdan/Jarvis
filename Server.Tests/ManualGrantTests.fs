@@ -175,7 +175,7 @@ let ``public manual grant API has explicit bearer and no model approval endpoint
         let method = methods |> Array.find (fun item -> item.Name = name)
         let credential = method.GetParameters() |> Array.find (fun arg -> arg.Name = "manualGrantCredential")
         Assert.That(credential.IsOptional, Is.True, $"Manual credential must be opt-in on {name}.")
-    let published = McpToolHelpers.mcpListCommandsResult.Commands
+    let published = (McpToolHelpers.mcpListCommandsResult typeof<JarvisMcpTools>).Commands
     Assert.That(published |> List.exists (fun cap -> cap.Name = "RequestGrant"), Is.True)
 
 [<Test>]

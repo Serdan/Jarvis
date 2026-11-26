@@ -769,11 +769,35 @@ let ``server ListCommands catalog matches public MCP tools`` () =
         |> Set.ofArray
 
     let listedNames =
-        McpToolHelpers.mcpListCommandsResult.Commands
+        (McpToolHelpers.mcpListCommandsResult typeof<JarvisMcpTools>).Commands
         |> List.map (fun capability -> capability.Name)
         |> Set.ofList
 
     listedNames |> shouldEqual mcpNames
+
+[<Test>]
+let ``public capability aliases reuse MCP descriptions without exposing schemas`` () =
+    let serverLocalNames =
+        set [ "GetProfile"; "Feedback"; "ListFeedback"; "GetFeedback"; "UpdateFeedback";
+              "GetConnectionDiagnostics"; "GetFeedbackSummary"; "ListDevices"; "SelectDevice";
+              "UpdateServer"; "GetServerUpdateStatus"; "RequestGrant" ]
+    let catalog = (McpToolHelpers.mcpListCommandsResult typeof<JarvisMcpTools>).Commands
+    let registeredMethods =
+        typeof<JarvisMcpTools>.GetMethods()
+        |> Array.filter (fun methodInfo ->
+            methodInfo.GetCustomAttributes(typeof<McpServerToolAttribute>, false).Length = 1)
+
+    for methodInfo in registeredMethods do
+        if not (serverLocalNames.Contains methodInfo.Name) then
+            let descriptions =
+                methodInfo.GetCustomAttributes(typeof<System.ComponentModel.DescriptionAttribute>, false)
+            Assert.That(descriptions.Length, Is.EqualTo(1), methodInfo.Name)
+            let description =
+                (descriptions[0] :?> System.ComponentModel.DescriptionAttribute).Description
+            let capability = catalog |> List.find (fun item -> item.Name = methodInfo.Name)
+            Assert.That(capability.Description, Is.EqualTo(description), methodInfo.Name)
+            Assert.That(capability.InputSchemaJson, Is.EqualTo(None), methodInfo.Name)
+            Assert.That(capability.OutputSchemaJson, Is.EqualTo(None), methodInfo.Name)
 
 [<Test>]
 let ``MCP bridge returns successful JSON as text without a mismatched output schema`` () =
@@ -1240,7 +1264,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
 [<Test>]
 let ``Work write MCP facades publish explicit UUIDv4 credential and git-write metadata`` () =
     let publicWorkWrites = [ "ConnectWork"; "ClaimNextWork"; "CheckpointWork"; "CompleteWork" ]
-    let catalog = McpToolHelpers.mcpListCommandsResult.Commands
+    let catalog = (McpToolHelpers.mcpListCommandsResult typeof<JarvisMcpTools>).Commands
 
     for name in publicWorkWrites do
         let entries = catalog |> List.filter (fun item -> item.Name = name)
@@ -1298,7 +1322,7 @@ let ``Work write MCP facades publish explicit UUIDv4 credential and git-write me
 [<Test>]
 let observe_agent_is_explicitly_read_only_while_self_inbox_is_activity () =
     let byName name =
-        McpToolHelpers.mcpListCommandsResult.Commands
+        (McpToolHelpers.mcpListCommandsResult typeof<JarvisMcpTools>).Commands
         |> List.find (fun item -> item.Name = name)
     let observation = byName "ObserveAgent"
     let inbox = byName "AgentInbox"
@@ -3192,7 +3216,7 @@ let priority_set_command_schema_is_explicit_git_cas_and_not_work_launch () =
         Assert.That(names.Contains required, Is.True, required)
     Assert.That(names.Contains "credential", Is.False)
     Assert.That(names.Contains "launchId", Is.False)
-    let capability = McpToolHelpers.mcpListCommandsResult.Commands
+    let capability = (McpToolHelpers.mcpListCommandsResult typeof<JarvisMcpTools>).Commands
                      |> List.find (fun c -> c.Name = "SetWorkPriority")
     Assert.That(capability.Permissions, Does.Contain(VersionControlWrite))
     Assert.That(capability.MutatesState, Is.True)

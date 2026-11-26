@@ -1,0 +1,26 @@
+<article>
+<h1>Consolidate executor instructions and lifecycle contract</h1>
+<p><strong>Goal:</strong> simplify the complete instruction set actually delivered to Jarvis executors so the correct behavior is clear, non-contradictory and not repeated across layers. This is an implementation task: update the canonical instruction sources and relevant tests, not merely write an audit report.</p>
+<h2>Scope</h2>
+<p>Inspect the currently effective instruction delivery path from launch through execution, including the configured launch template, shared role instructions, project/workspace <code>AGENTS.md</code>, agent-specific instruction configuration and task/assignment prompt. Read the resolved instruction output for representative Worker and Reviewer roles; distinguish persisted configuration from what a newly launched session actually receives. Determine precedence and which layers are injected automatically.</p>
+<p>Own only instruction-bearing artifacts and their tests: launch templates, role/agent instruction configuration, <code>AGENTS.md</code> guidance and instruction rendering/validation tests. Do not edit human-facing <code>docs/*.md</code>, task specs, server MCP method descriptions or production application behavior. Coordinate findings with the separate Docs and MCP workstreams without editing their files.</p>
+<h2>Required outcome</h2>
+<ul>
+<li>Produce one concise shared execution/lifecycle contract and keep role-specific instructions limited to genuinely role-specific behavior. Remove duplicated or obsolete copies rather than adding another instruction layer.</li>
+<li>Make the normal lifecycle explicit: while Working, continue until complete or genuinely blocked; before ending the turn, either complete the assignment or successfully yield it to Ready with a checkpoint/continuation. A progress checkpoint alone does not yield. A tool invocation attempt, validation error, or conversational claim is not a lifecycle transition.</li>
+<li>Require inspecting the actual currently exposed tool schema before invoking an unfamiliar, changed or uncertain operation. Use the exact required parameter names and required fields. Do not infer argument names from memory, stale prompt examples, generic catalog descriptions or similarly named tools.</li>
+<li>On schema validation failure, treat the rejected call as not executed, inspect the current schema, correct the arguments and retry the intended operation. Never report success without a successful tool result; for uncertain outcomes reconcile the original operation ID and canonical state before retrying.</li>
+<li>State the distinction between a bounded pending-job wait and indefinite polling. Reconcile only a real pending handle; use a bounded useful work slice, checkpoint and yield when the result is not yet terminal or the turn budget is reached.</li>
+<li>Keep identity and lifecycle boundaries clear: own inbox for self; observe for other agents; never impersonate a target agent; never use an administrative correction in place of an ordinary worker yield.</li>
+<li>Preserve task-specific acceptance criteria and project guidance. Avoid turning the shared contract into an exhaustive handbook or repeating it in every role prompt.</li>
+</ul>
+<h2>Validation</h2>
+<ul>
+<li>Trace the final resolved instruction set for at least one Worker and one Reviewer and record exactly which files/configurations are included and in what order.</li>
+<li>Add/update tests that catch duplicate/conflicting lifecycle clauses, stale tool argument examples, and failure to include the current schema-inspection/retry rule where appropriate.</li>
+<li>Run focused Release tests for instruction resolution/rendering and any relevant prompt validation; record exact command, source SHA, exit code and test counts.</li>
+<li>Commit on a new isolated branch/worktree based on verified current <code>origin/main</code>; bind exact source before editing. Submit the exact candidate for independent review. Do not integrate, deploy, restart or alter production settings.</li>
+</ul>
+<h2>Boundaries</h2>
+<p>Do not change MCP server code or general documentation. Do not assume a tool catalog refresh fixes already-open sessions; state what newly launched sessions receive and what existing sessions require. Keep this a bounded cleanup with a concise inventory, concrete edits, tests and review submission.</p>
+</article>

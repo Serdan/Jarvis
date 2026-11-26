@@ -381,6 +381,8 @@ let private requestSnapshotCanSupplyGuidance = function
     | ListDirectoryCommand _ | SearchFilesCommand _ | SearchTextCommand _
     | ReadFileCommand _ | ReadFilePageCommand _ | ReadFilesCommand _
     | GetAgentInstructionsCommand _ | ReadImageCommand _
+    | GetProjectDetailsCommand _ | ListConfiguredTasksCommand _
+    | ListSkillsCommand _ | GetSkillCommand _ | ExportFileCommand _
     | GetGitStatusCommand _ | GetGitDiffCommand _ -> true
     | _ -> false
 

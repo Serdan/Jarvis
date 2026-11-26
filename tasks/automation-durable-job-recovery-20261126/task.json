@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"automation-durable-job-recovery-20261126","title":"[P0][Automation] Preserve engineering job identity and terminal evidence across client restart","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"automation-durable-job-recovery-20261126","title":"[P0][Automation] Preserve engineering job identity and terminal evidence across client restart","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"be61d477083243fcb25f1d0f7541622a"}

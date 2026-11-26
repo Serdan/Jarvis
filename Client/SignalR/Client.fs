@@ -507,10 +507,9 @@ let private serialize'<'a> (result: Result<'a, Client.EffectError>) =
     result
     |> Result.bind (fun value ->
         let changedAgentIds =
-            match box value with
-            | :? OrchestrationApi.OperationResponse.Presented as operation ->
-                operation.changedAgentIds
-            | _ -> []
+            OrchestrationApi.OperationResponse.tryPresented (box value)
+            |> Option.map _.changedAgentIds
+            |> Option.defaultValue []
         serialize value
         |> Result.map (fun payload ->
             { Payload = payload; ChangedAgentIds = changedAgentIds }))
@@ -1134,13 +1133,16 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
     | ChallengeReadCommand cmd -> rt |> OrchestrationApi.ChallengeApi.read cmd |> serialize'
     | ChallengeWriteCommand cmd ->
         // Only a trusted successful post-journal receipt is eligible. No callback
-        // on failed, uncertain or already-applied original operation IDs.
+        // on failed, uncertain or already-applied original operation IDs. Create
+        // and BlockAttempt also register job waits; their events are hints only.
         let committed = rt |> OrchestrationApi.ChallengeApi.write cmd
-        match committed, onChallengeCommit with
-        | Ok (:? OrchestrationApi.OperationResponse.Presented as receipt), Some callback
+        let receipt = committed |> Result.toOption |> Option.bind OrchestrationApi.OperationResponse.tryPresented
+        match receipt, onChallengeCommit with
+        | Some receipt, Some callback
             when not (String.IsNullOrWhiteSpace agentId)
                  && String.Equals(cmd.ActorId, agentId, StringComparison.Ordinal)
-                 && cmd.Action = "Resolve" && cmd.Outcome = "Satisfied"
+                 && ((cmd.Action = "Resolve" && cmd.Outcome = "Satisfied")
+                     || cmd.Action = "Create" || cmd.Action = "BlockAttempt")
                  && not receipt.alreadyApplied ->
             try callback cmd receipt
             with _ -> rt.Tui.Log "Challenge wake hint not accepted; original Git commit remains authoritative."

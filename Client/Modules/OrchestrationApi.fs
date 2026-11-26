@@ -2250,6 +2250,19 @@ module OperationResponse =
           [<System.Text.Json.Serialization.JsonIgnore>]
           changedAgentIds: string list }
 
+    // Preserve the existing Create/Split JSON response envelope while giving
+    // the authenticated post-commit route a typed, non-JSON receipt.
+    type ChallengeCreatedPresented =
+        { challengeId: string
+          conditionIds: string list
+          receipt: Presented }
+
+    let tryPresented (value: obj) =
+        match value with
+        | :? Presented as receipt -> Some receipt
+        | :? ChallengeCreatedPresented as created -> Some created.receipt
+        | _ -> None
+
     let presentWithNotification (notification: Client.ReviewWorkflow.NotificationDelivery option) (write: LedgerStore.LedgerWrite) =
         use document = JsonDocument.Parse(write.Operation.OriginalResultJson)
         box
@@ -3079,9 +3092,10 @@ module ChallengeApi =
                                 cmd.Conditions |> List.mapi (fun index _ ->
                                     let digest = SHA256.HashData(Encoding.UTF8.GetBytes(challengeId + ":condition:" + string index))
                                     Guid(digest.AsSpan(0, 16)).ToString("N"))
-                        box {| challengeId = challengeId
-                               conditionIds = conditionIds
-                               receipt = OperationResponse.present receipt |}
+                        let presented: OperationResponse.ChallengeCreatedPresented =
+                            { challengeId = challengeId; conditionIds = conditionIds
+                              receipt = OperationResponse.present receipt |> unbox }
+                        box presented
                     else OperationResponse.present receipt)))
 
 // Operator-only recovery re-enters the current typed writers. Archived or

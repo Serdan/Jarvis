@@ -175,35 +175,55 @@ let server_authentication_and_routing_start_with_missing_corrupt_or_unavailable_
 
 [<Test>]
 let write_tools_expose_optional_operation_ids () =
-    let methods = typeof<Server.JarvisMcpTools>.GetMethods()
-    let writeMethods =
-        methods
-        |> Array.filter (fun methodInfo -> methodInfo.Name <> "Feedback")
+    // The server registers JarvisMcpTools via WithTools<JarvisMcpTools>().
+    // Inventory the named contracts, not a count: removing an operationId
+    // parameter, exchanging tools, or adding an unclassified one must fail.
+    let optionalIds =
+        [ "Feedback"; "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"
+          "CloseTask"; "MutateWorkComposition"; "AcceptWorkCompositionIntegrated"
+          "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "SetLaunchTemplate"
+          "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"
+          "SubmitIntegration"; "CompleteIntegration"
+          "SetNotificationSenderBlock"; "SetNotificationMute"; "QueueResponseAlert"
+          "ClearResponseAlert"; "NotifyAgent"; "AcknowledgeNotification"
+          "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"; "SetAttemptSource"
+          "AcknowledgeReviewFeedback"; "StartTasklessWork"; "YieldTasklessWork"
+          "RecoverTasklessWork"; "YieldAgent"; "CompleteAgentWork"; "SetAgentState"
+          "CorrectAgentWorkingState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"
+          "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"
+          "TransferOwner"; "ReopenTask"; "ExportTaskSpec"; "ImportTaskSpec"
+          "PutReviewDocument"; "SubmitReview"; "ClaimReview"; "DecideReview"
+          "ReleaseReview"; "WithdrawReview"; "CreateChallenge"; "SetChallengeSubscription"
+          "AssignChallengeCondition"; "SplitChallengeCondition"; "ResolveChallengeCondition"
+          "ReopenChallengeCondition"; "CancelChallenge"; "BlockOnChallenges"
+          "RequeueChallengeBlockedAttempt"; "PostOperatorConversationMessage"
+          "ClaimOperatorConversationMessage"; "HandleOperatorConversationMessage"
+          "ReleaseOperatorConversationMessage"; "RepairOperatorConversation"
+          "SetWorkPriority"; "ConnectWork"; "ClaimNextWork"; "CheckpointWork"; "CompleteWork" ]
+    // Existing-operation selectors require their exact ID. Aggregate inclusion
+    // is a distinct write whose caller must retain the exact attestation UUID.
+    let requiredIds =
+        [ "GetOperationStatus"; "AcknowledgePendingOperation"; "InspectPendingOperation"
+          "InspectOperatorConversationOperation"; "RetryPendingIntent"
+          "SupersedePendingIntent"; "AbandonPendingIntent"; "RecordAggregateInclusion" ]
+    let registeredIds =
+        typeof<Server.JarvisMcpTools>.GetMethods()
+        |> Array.filter (fun methodInfo ->
+            methodInfo.IsDefined(typeof<ModelContextProtocol.Server.McpServerToolAttribute>, false))
         |> Array.choose (fun methodInfo ->
-            match methodInfo.GetParameters() |> Array.tryFind (fun p -> p.Name = "operationId") with
-            | Some id when not (List.contains methodInfo.Name
-                            [ "GetOperationStatus"; "AcknowledgePendingOperation";
-                              "InspectPendingOperation"; "InspectOperatorConversationOperation";
-                              "RetryPendingIntent"; "SupersedePendingIntent"; "AbandonPendingIntent" ]) ->
-                Some (methodInfo.Name, id)
-            | _ -> None)
-    // Preserve challenge-domain, taskless, notification, composition and default-off Work writes.
-    Assert.That(writeMethods.Length, Is.EqualTo(69), String.concat ", " (writeMethods |> Array.map fst))
-    for newTool in [ "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork"
-                     "ConnectWork"; "ClaimNextWork"; "CheckpointWork"; "CompleteWork"
-                     "SetWorkPriority" ] do
-        Assert.That(writeMethods |> Array.exists (fun (name, _) -> name = newTool), Is.True,
-                    $"Lifecycle tool {newTool} missing from the public MCP surface.")
-    for name, id in writeMethods do
-        Assert.That(id.IsOptional, Is.True, $"operationId is required on {name}")
-        Assert.That(id.DefaultValue, Is.EqualTo(""), $"operationId default differs on {name}")
+            methodInfo.GetParameters()
+            |> Array.tryFind (fun p -> p.Name = "operationId")
+            |> Option.map (fun id -> methodInfo.Name, id))
 
-    for selector in [ "GetOperationStatus"; "AcknowledgePendingOperation";
-                      "InspectPendingOperation"; "InspectOperatorConversationOperation";
-                      "RetryPendingIntent"; "SupersedePendingIntent"; "AbandonPendingIntent" ] do
-        let id = typeof<Server.JarvisMcpTools>.GetMethod(selector).GetParameters()
-                 |> Array.find (fun parameter -> parameter.Name = "operationId")
-        Assert.That(id.IsOptional, Is.False, $"Selector ID must remain required: {selector}")
+    Assert.That(registeredIds |> Array.map fst, Is.EquivalentTo(optionalIds @ requiredIds),
+                "Registered MCP operation-ID contracts must be explicitly classified.")
+    for name, id in registeredIds do
+        Assert.That(id.ParameterType, Is.EqualTo(typeof<string>), $"operationId type differs on {name}")
+        if List.contains name optionalIds then
+            Assert.That(id.IsOptional, Is.True, $"operationId is required on {name}")
+            Assert.That(id.DefaultValue, Is.EqualTo(""), $"operationId default differs on {name}")
+        else
+            Assert.That(id.IsOptional, Is.False, $"operationId must remain required on {name}")
 
 [<Test>]
 let omitted_operation_id_is_generated_and_explicit_retry_id_is_preserved () =

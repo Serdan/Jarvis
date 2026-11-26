@@ -281,6 +281,9 @@ module McpToolHelpers =
         else
             projectName + "::" + worktreeName
 
+    let reviewerInboxSubject caller reviewer =
+        if String.IsNullOrWhiteSpace reviewer then caller else reviewer
+
     let private formatError error =
         match error with
         | NotFound message -> $"NotFound: {message}"
@@ -2338,9 +2341,12 @@ type JarvisMcpTools =
                     { cmd with DocumentPath = documentPath; Content = content
                                ExpectedBlobOid = expectedBlobOid })
 
-    [<McpServerTool(Title = "reviewer inbox", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List unclaimed reviews available to this reviewer and reviews currently claimed by this reviewer.")>]
-        static member ReviewerInbox(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-            McpToolHelpers.send client http (ReviewCommands.query projectName "ReviewerQueue" "" "" agentId)
+    [<McpServerTool(Title = "reviewer inbox", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List unclaimed reviews available to the selected reviewer and reviews currently claimed by that reviewer. agentId identifies the calling agent for activity attribution; optional reviewerId selects the inbox subject and defaults to agentId.")>]
+        static member ReviewerInbox(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] reviewerId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+            // Reading another reviewer's queue must not attribute activity to that reviewer.
+            // The MCP agentId is the caller; reviewerId is the selected inbox subject.
+            let subject = McpToolHelpers.reviewerInboxSubject agentId reviewerId
+            McpToolHelpers.send client http (ReviewCommands.query projectName "ReviewerQueue" "" "" subject)
 
     [<McpServerTool(Title = "submit review", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Publish an immutable remotely fetchable review snapshot without pushing the contributor branch. Supply explicit headOid for any local committed object, or empty headOid plus sourceRef for the single clean, committed and non-detached source worktree HEAD. Dirty, detached or ambiguous worktrees fail. No assignment or review phase required. expectedRequestVersion replaces only an unclaimed review; claimed reviews are immutable. Replacements preserve targetRef/purpose. Omit taskId for independent reviews (_reviews).")>]
         static member SubmitReview(projectName: string, agentId: string, requestId: string, headOid: string, [<Optional; DefaultParameterValue("")>] operationId: string,

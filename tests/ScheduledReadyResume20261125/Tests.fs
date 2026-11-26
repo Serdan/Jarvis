@@ -583,7 +583,7 @@ let recurringLegacyLauncherUsesCanonicalProjectOptIn () =
                     attempt, error
                 let hold id old =
                     let attempt, error = waitOccurrence id old
-                    Assert.That(error, Does.StartWith("AutomationHold:"))
+                    Assert.That(error, Does.StartWith("failed: AutomationHold:"))
                     attempt
                 let finish (pending: Task<string>) registration = task {
                     let! frame = pending.WaitAsync(TimeSpan.FromSeconds(15.))

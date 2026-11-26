@@ -80,11 +80,19 @@ config and journal together through ordinary client restarts.
 
 ## Authoritative snapshot contract
 
-The Manager gets task_overview at a verified ledger head, observes **all**
-configured agents using observe_agent, checks the independent review queue,
-task readiness, challenges, and relevant client activity. Include other
-working or uncertain agents in the snapshot so their activity counts against
-the per-project budget. Unclassified active or uncertain agents fail closed. Never set complete/verified flags by assumption.
+The Manager gets canonical task_overview and copies its SnapshotCommit to
+snapshot.ledgerHead, observes **all** configured agents using observe_agent,
+and calls reviewer_inbox with every configured reviewer ID. Set each
+reviewerInboxes entry's reviewerId to the requested ID and copy the response's
+snapshotCommit and reviews unchanged. Every snapshotCommit must equal the
+task_overview SnapshotCommit; if any differs, discard and recapture the
+snapshot. The inbox reviews are the eligibility source: unclaimed reviews may
+appear in several inboxes, while a claimed review appears only in its owner's
+inbox. Do not substitute a global unclaimed-review count. Also inspect task
+readiness, priorities, blockers, durable challenges and relevant client
+activity. Include other working or uncertain agents in the snapshot so their
+activity counts against the per-project budget. Unclassified active or
+uncertain agents fail closed. Never set complete/verified flags by assumption.
 
 The planner accepts JSON in this form (the example is deliberately
 incomplete for the full 5/3 Jarvis config; the real file must include all
@@ -99,7 +107,38 @@ configured labels):
   "challengesVerified": true,
   "ledgerHead": "6ab793928fa7f998b9d5796061cf66d3c0b02e40",
   "capturedAtUtc": "2026-11-15T02:00:00Z",
-  "unclaimedReviewCount": 1,
+  "reviewerInboxes": [
+    {
+      "reviewerId": "Reviewer 1",
+      "snapshotCommit": "6ab793928fa7f998b9d5796061cf66d3c0b02e40",
+      "reviews": [
+        {
+          "taskId": "_reviews",
+          "attemptId": null,
+          "reviewId": "11111111111111111111111111111111",
+          "version": 1,
+          "status": "Unclaimed",
+          "reviewerId": null,
+          "createdSequence": 123
+        }
+      ]
+    },
+    {
+      "reviewerId": "Reviewer 2",
+      "snapshotCommit": "6ab793928fa7f998b9d5796061cf66d3c0b02e40",
+      "reviews": [
+        {
+          "taskId": "_reviews",
+          "attemptId": null,
+          "reviewId": "11111111111111111111111111111111",
+          "version": 1,
+          "status": "Unclaimed",
+          "reviewerId": null,
+          "createdSequence": 123
+        }
+      ]
+    }
+  ],
   "agents": [
     {
       "agentId": "Manager",
@@ -151,6 +190,17 @@ completeness booleans true. A missing registered agent, missing challenge
 query, stale data, contradictory state or incomplete queue read must fail
 closed. Captures older than three minutes are rejected.
 
+reviewQueueVerified is true only after every reviewer inbox is complete and
+all snapshotCommit values equal ledgerHead. The planner deduplicates unclaimed
+demand by (taskId, reviewId): one request is one unit of demand even when it
+appears in every inbox. Its durable reservation holds that request while a
+launch is pending, uncertain or active, including if it becomes claimed
+before the first session is observed. The Manager never claims or transfers a
+review. A reviewer can resume only a claim it owns; a Challenge-blocked claim
+waits for its dependency. A standing task does not make a Reviewer eligible
+for generic unclaimed dispatch, but does not prevent the owner from resuming
+a runnable claim.
+
 ## One bounded Manager pass
 
 Capture the snapshot at artifacts/manager/Jarvis/snapshot.json. Test without
@@ -168,16 +218,29 @@ node scripts/manager-heartbeat.mjs plan --config artifacts/manager/Jarvis/config
 
 The returned reservations are the **only** approved launch candidates for
 that pass. The planner fills workers with Ready assignments first, ordered by
-optional verified canonical priorityRank (0 is highest), then eligible
-taskless reviewers against the unclaimed frozen review count,
-and counts prior pending/uncertain launches and other Working agents against
-the 5/3 budget. Unclassified live or uncertain agents prevent all launches. Duplicate timer ticks reserve nothing twice.
+optional verified canonical priorityRank (0 is highest), then resumes runnable
+claims already owned by their reviewers, then dispatches at most one idle
+taskless reviewer per distinct unclaimed request visible in that reviewer's
+inbox. Unclaimed requests repeated across inboxes are one unit of demand; the
+planner does not use an aggregate count. A pending, uncertain or active
+reservation holds the same (taskId, reviewId) across ticks, even if the
+request changes from unclaimed to claimed. A standing task alone never makes
+a Reviewer eligible for generic ready-assignment dispatch. It does not block
+that Reviewer from resuming a runnable claim it already owns. Challenge-blocked
+claims wait for their dependency. Existing pending/uncertain launches and
+other Working agents count against the 5/3 budget. Unclassified live or
+uncertain agents prevent all launches. Duplicate timer ticks reserve nothing
+twice.
 
-For each reservation, re-observe the agent and review demand immediately
-before dispatch. If eligibility changed, mark the reservation blocked and
-do not launch. A blocked-before-dispatch record remains in the audit journal
-but frees its capacity; a later eligible pass may reserve again. Otherwise
-atomically **begin** the reserved launch:
+For each reservation, re-observe the agent, re-read task_overview and read
+its reviewer_inbox immediately before dispatch. Require the inbox
+snapshotCommit to equal task_overview's SnapshotCommit. For an unclaimed
+reservation, confirm the same taskId/reviewId/version remains unclaimed; for a
+claim resume, confirm the same claim remains owned by that reviewer. Never
+claim or transfer a review for the reviewer. If eligibility changed, mark the
+reservation blocked and do not launch. A blocked-before-dispatch record
+remains in the audit journal but frees its capacity; a later eligible pass
+may reserve again. Otherwise atomically **begin** the reserved launch:
 
 ~~~sh
 node scripts/manager-heartbeat.mjs begin --config artifacts/manager/Jarvis/config.json --journal artifacts/manager/Jarvis/journal.json --launch-id <launch-id>

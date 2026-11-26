@@ -17,6 +17,28 @@ const config = (projectName = "Jarvis") => ({
   workerIds: ["Worker 1", "Worker 2"],
   reviewerIds: ["Reviewer 1", "Reviewer 2"]
 });
+const REVIEW_A = Object.freeze({
+  taskId: "_reviews", attemptId: null, reviewId: "1".repeat(32),
+  version: 1, status: "Unclaimed", reviewerId: null, createdSequence: 10
+});
+const REVIEW_B = Object.freeze({
+  taskId: "task-b", attemptId: "a".repeat(32), reviewId: "2".repeat(32),
+  version: 1, status: "Unclaimed", reviewerId: null, createdSequence: 11
+});
+function review(overrides = {}) {
+  return { ...REVIEW_A, ...overrides };
+}
+function setReviewerInboxes(c, s, byReviewer = {}) {
+  s.reviewerInboxes = c.reviewerIds.map(reviewerId => ({
+    reviewerId,
+    snapshotCommit: s.ledgerHead,
+    reviews: (byReviewer[reviewerId] ?? []).map(item => ({ ...item }))
+  }));
+}
+function setUnclaimedReviews(c, s, reviews) {
+  const shared = reviews.map(item => ({ ...item }));
+  setReviewerInboxes(c, s, Object.fromEntries(c.reviewerIds.map(reviewerId => [reviewerId, shared])));
+}
 function agent(agentId, kind, state, overrides = {}) {
   return {
     agentId, kind, state, execution: state === "Working" ? "Working" : "Stopped",
@@ -31,10 +53,10 @@ function agent(agentId, kind, state, overrides = {}) {
   };
 }
 function snapshot(projectName = "Jarvis") {
-  return {
+  const s = {
     projectName, complete: true, agentActivityVerified: true,
     reviewQueueVerified: true, challengesVerified: true,
-    ledgerHead: HEAD, capturedAtUtc: NOW, unclaimedReviewCount: 2,
+    ledgerHead: HEAD, capturedAtUtc: NOW,
     agents: [
       agent("Manager", "manager", "Working"),
       agent("Worker 1", "worker", "Ready"),
@@ -43,6 +65,8 @@ function snapshot(projectName = "Jarvis") {
       agent("Reviewer 2", "reviewer", "NeedsWork")
     ]
   };
+  setUnclaimedReviews(config(projectName), s, [REVIEW_A, REVIEW_B]);
+  return s;
 }
 const journal = (projectName = "Jarvis") => ({
   schemaVersion: 1, projectName, revision: 0, records: []
@@ -52,7 +76,7 @@ test("zero ready implementation and zero unclaimed reviews launch no one", () =>
   const s = snapshot();
   s.agents[1].state = s.agents[2].state = "Free";
   s.agents[1].hasReadyAssignment = s.agents[2].hasReadyAssignment = false;
-  s.unclaimedReviewCount = 0;
+  setUnclaimedReviews(config(), s, []);
   assert.equal(decide(config(), s, journal(), NOW).reservations.length, 0);
 });
 
@@ -133,7 +157,7 @@ test("new observed Jarvis activity releases reservation, not a successful UI sen
 test("challenge-blocked agent and no-review demand do not launch", () => {
   const s = snapshot();
   s.agents[1].waitingOnChallenge = true;
-  s.unclaimedReviewCount = 0;
+  setUnclaimedReviews(config(), s, []);
   const r = decide(config(), s, journal(), NOW);
   assert.deepEqual(r.reservations.map(x => x.agentId), ["Worker 2"]);
 });
@@ -281,9 +305,207 @@ test("shared review demand bounds taskless reviewer launches", () => {
   const c = config();
   c.budgets.worker = 0;
   const s = snapshot();
-  s.unclaimedReviewCount = 1;
+  setUnclaimedReviews(c, s, [REVIEW_A]);
   const r = decide(c, s, journal(), NOW);
   assert.deepEqual(r.reservations.map(x => x.agentId), ["Reviewer 1"]);
+});
+
+test("reviewer inboxes must be complete, consistent and tied to the snapshot head", () => {
+  const c = config();
+  const missing = snapshot();
+  missing.reviewerInboxes.pop();
+  assert.throws(() => decide(c, missing, journal(), NOW), /Missing or extra reviewer inbox/);
+
+  const stale = snapshot();
+  stale.reviewerInboxes[0].snapshotCommit = "b".repeat(40);
+  assert.throws(() => decide(c, stale, journal(), NOW), /ledger head mismatch/);
+
+  const inconsistent = snapshot();
+  inconsistent.reviewerInboxes[1].reviews[0].version = 2;
+  assert.throws(() => decide(c, inconsistent, journal(), NOW), /Inconsistent unclaimed review/);
+
+  const wrongOwner = snapshot();
+  setReviewerInboxes(c, wrongOwner, {
+    "Reviewer 1": [],
+    "Reviewer 2": [review({ status: "Claimed", reviewerId: "Reviewer 1" })]
+  });
+  assert.throws(() => decide(c, wrongOwner, journal(), NOW), /not owned by the inbox reviewer/);
+});
+
+test("one unclaimed request dispatches only one of several reviewers and leaves claim to reviewer", () => {
+  const c = config();
+  c.budgets.worker = 0;
+  const s = snapshot();
+  setUnclaimedReviews(c, s, [REVIEW_A]);
+  const inboxesBefore = JSON.stringify(s.reviewerInboxes);
+  const j = journal();
+  const r = decide(c, s, j, NOW);
+
+  assert.deepEqual(r.reservations.map(x => x.agentId), ["Reviewer 1"]);
+  assert.deepEqual(r.reservations[0].review, {
+    mode: "unclaimed", taskId: "_reviews", attemptId: null,
+    reviewerId: null, reviewId: REVIEW_A.reviewId, version: 1
+  });
+  assert.equal(JSON.stringify(s.reviewerInboxes), inboxesBefore);
+  assert.equal(j.records[0].review.reviewerId, null);
+});
+
+test("an uncertain reviewer send holds its request across successive ticks", () => {
+  const c = config();
+  c.budgets.worker = 0;
+  const j = journal();
+  const firstSnapshot = snapshot();
+  setUnclaimedReviews(c, firstSnapshot, [REVIEW_A]);
+  assert.deepEqual(decide(c, firstSnapshot, j, NOW).reservations.map(x => x.agentId),
+    ["Reviewer 1"]);
+  j.records[0].status = "uncertain";
+
+  const later = snapshot();
+  later.capturedAtUtc = "2026-11-15T02:01:00Z";
+  setUnclaimedReviews(c, later, [REVIEW_A]);
+  const second = decide(c, later, j, later.capturedAtUtc);
+  assert.deepEqual(second.reservations, []);
+  assert.equal(second.counts.reviewer, 1);
+  assert.equal(j.records.length, 1);
+});
+
+test("a claim that appears while an earlier reviewer send is unresolved is not relaunched", () => {
+  const c = config();
+  c.budgets.worker = 0;
+  const j = journal();
+  const initial = snapshot();
+  setUnclaimedReviews(c, initial, [REVIEW_A]);
+  decide(c, initial, j, NOW);
+  j.records[0].status = "uncertain";
+
+  const transferred = snapshot();
+  transferred.ledgerHead = "b".repeat(40);
+  transferred.capturedAtUtc = "2026-11-15T02:01:00Z";
+  setReviewerInboxes(c, transferred, {
+    "Reviewer 1": [],
+    "Reviewer 2": [review({ status: "Claimed", reviewerId: "Reviewer 2" })]
+  });
+  const next = decide(c, transferred, j, transferred.capturedAtUtc);
+  assert.deepEqual(next.reservations, []);
+  assert.equal(next.suppressed.find(x => x.agentId === "Reviewer 2").reason,
+    "PriorReviewLaunchPendingOrActive");
+});
+
+test("unclaimed demand selects an idle eligible reviewer, not an assigned or blocked reviewer", () => {
+  const c = config();
+  c.budgets.worker = 0;
+  c.reviewerIds.push("Reviewer 3");
+  c.budgets.reviewer = 3;
+  const s = snapshot();
+  s.agents.push(agent("Reviewer 3", "reviewer", "Free"));
+  setUnclaimedReviews(c, s, [REVIEW_A]);
+
+  const assigned = s.agents.find(x => x.agentId === "Reviewer 1");
+  assigned.state = "Ready";
+  assigned.hasReadyAssignment = true;
+  assigned.slotAvailable = false;
+  const blocked = s.agents.find(x => x.agentId === "Reviewer 2");
+  blocked.waitingOnChallenge = true;
+
+  const r = decide(c, s, journal(), NOW);
+  assert.deepEqual(r.reservations.map(x => x.agentId), ["Reviewer 3"]);
+  assert.equal(r.reservations[0].review.reviewId, REVIEW_A.reviewId);
+});
+
+test("a reviewer resumes only its own claimed review, including with a standing task", () => {
+  const c = config();
+  c.budgets.worker = 0;
+  const s = snapshot();
+  setReviewerInboxes(c, s, {
+    "Reviewer 1": [review({ status: "Claimed", reviewerId: "Reviewer 1" })],
+    "Reviewer 2": []
+  });
+  const reviewer = s.agents.find(x => x.agentId === "Reviewer 1");
+  reviewer.state = "Ready";
+  reviewer.hasReadyAssignment = true;
+  reviewer.slotAvailable = false;
+
+  const r = decide(c, s, journal(), NOW);
+  assert.deepEqual(r.reservations.map(x => x.agentId), ["Reviewer 1"]);
+  assert.equal(r.reservations[0].reason, "ClaimedReviewResume");
+  assert.equal(r.reservations[0].review.mode, "claimed");
+  assert.equal(r.reservations[0].review.reviewerId, "Reviewer 1");
+});
+
+test("a blocked claimed review waits for its dependency, then becomes resumable", () => {
+  const c = config();
+  c.budgets.worker = 0;
+  const blocked = snapshot();
+  setReviewerInboxes(c, blocked, {
+    "Reviewer 1": [review({ status: "Claimed", reviewerId: "Reviewer 1" })],
+    "Reviewer 2": []
+  });
+  blocked.agents.find(x => x.agentId === "Reviewer 1").waitingOnChallenge = true;
+  const first = decide(c, blocked, journal(), NOW);
+  assert.deepEqual(first.reservations, []);
+  assert.equal(first.suppressed.find(x => x.agentId === "Reviewer 1").reason, "ChallengeBlocked");
+
+  const resumed = snapshot();
+  resumed.ledgerHead = "c".repeat(40);
+  resumed.capturedAtUtc = "2026-11-15T02:01:00Z";
+  setReviewerInboxes(c, resumed, {
+    "Reviewer 1": [review({ status: "Claimed", reviewerId: "Reviewer 1" })],
+    "Reviewer 2": []
+  });
+  const r = decide(c, resumed, journal(), resumed.capturedAtUtc);
+  assert.deepEqual(r.reservations.map(x => x.agentId), ["Reviewer 1"]);
+});
+
+test("a standing task alone never makes a Reviewer eligible for generic ready dispatch", () => {
+  const c = config();
+  c.budgets.worker = 0;
+  const s = snapshot();
+  setUnclaimedReviews(c, s, [REVIEW_A]);
+  for (const reviewerId of c.reviewerIds) {
+    const reviewer = s.agents.find(x => x.agentId === reviewerId);
+    reviewer.state = "Ready";
+    reviewer.hasReadyAssignment = true;
+    reviewer.slotAvailable = false;
+  }
+  assert.deepEqual(decide(c, s, journal(), NOW).reservations, []);
+});
+
+test("empty reviewer inboxes leave ordinary Worker dispatch unchanged", () => {
+  const c = config();
+  c.budgets.reviewer = 0;
+  const s = snapshot();
+  setUnclaimedReviews(c, s, []);
+  assert.deepEqual(decide(c, s, journal(), NOW).reservations.map(x => x.agentId),
+    ["Worker 1", "Worker 2"]);
+});
+
+test("the registered Manager plan route deduplicates inbox demand in disposable fixtures", () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-manager-review-route-"));
+  try {
+    const c = config();
+    c.budgets.worker = 0;
+    const s = snapshot();
+    setUnclaimedReviews(c, s, [REVIEW_A]);
+    s.capturedAtUtc = new Date().toISOString();
+    const conf = path.join(temp, "config.json");
+    const snap = path.join(temp, "snapshot.json");
+    const state = path.join(temp, "journal.json");
+    fs.writeFileSync(conf, JSON.stringify(c));
+    fs.writeFileSync(snap, JSON.stringify(s));
+    const args = ["plan", "--config", conf, "--snapshot", snap, "--journal", state];
+
+    const first = spawnSync(process.execPath, [SCRIPT, ...args], { encoding: "utf8" });
+    assert.equal(first.status, 0, first.stderr);
+    const decisions = JSON.parse(first.stdout);
+    assert.deepEqual(decisions.reservations.map(x => x.agentId), ["Reviewer 1"]);
+    assert.equal(decisions.reservations[0].review.reviewId, REVIEW_A.reviewId);
+
+    const second = spawnSync(process.execPath, [SCRIPT, ...args], { encoding: "utf8" });
+    assert.equal(second.status, 0, second.stderr);
+    assert.deepEqual(JSON.parse(second.stdout).reservations, []);
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
 });
 
 test("begin atomically consumes launch, never dispatches the same reservation twice", () => {

@@ -76,7 +76,7 @@ module LedgerBindingConfig =
             | 11 | 32 | 33 | 35 -> true // Linux EAGAIN, Windows sharing/lock, macOS EAGAIN
             | _ -> false
 
-    let private withConfigLock (path: string) operation =
+    let internal withConfigLockUsing (wait: int -> unit) (path: string) operation =
         try
             let dir = Path.GetDirectoryName path
             Directory.CreateDirectory(dir) |> ignore
@@ -87,20 +87,26 @@ module LedgerBindingConfig =
                 if File.Exists(lockPath) && File.GetAttributes(lockPath).HasFlag(FileAttributes.ReparsePoint) then
                     Error(Client.ValidationError " binding lock must not be a symlink.")
                 else
-                    // One nonblocking attempt. The caller's next dashboard refresh
-                    // retries transient contention; remote fetches never run here.
-                    let acquired =
+                    // Retry only acquisition, before entering the protected operation.
+                    // Four waits (150 ms total) absorb brief competing local readers
+                    // and writers without turning a persistent holder into a hang.
+                    let rec acquire delays =
                         try
                             Ok (new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite,
                                                FileShare.None, 4096, FileOptions.None))
                         with
                         | :? IOException as ex when isTransientSharingViolation ex ->
-                            Error(LedgerErrors.toEffect (LedgerStore.TrustBindingContended ex.Message))
+                            match delays with
+                            | delay :: remaining ->
+                                wait delay
+                                acquire remaining
+                            | [] ->
+                                Error(LedgerErrors.toEffect (LedgerStore.TrustBindingContended ex.Message))
                         | :? UnauthorizedAccessException as ex ->
                             Error(Client.PermissionDenied $"Cannot access trust-binding lock: {ex.Message}")
                         | :? IOException as ex ->
                             Error(Client.ValidationError $"Cannot open trust-binding lock: {ex.Message}")
-                    match acquired with
+                    match acquire [10; 20; 40; 80] with
                     | Error error -> Error error
                     | Ok stream ->
                         use held = stream
@@ -112,6 +118,9 @@ module LedgerBindingConfig =
             Error(Client.PermissionDenied $"Cannot access trust binding: {ex.Message}")
         | ex ->
             Error(Client.ValidationError $"Cannot access trust binding: {ex.Message}")
+
+    let private withConfigLock path operation =
+        withConfigLockUsing (fun delay -> System.Threading.Thread.Sleep(delay)) path operation
 
     let private readStored (path: string) =
         try
@@ -2644,7 +2653,7 @@ module TaskApi =
         | Ok(_, Some applied) -> Ok applied.Actor
         | Ok(_, None) -> Ok "AuthenticatedUser"
 
-    let private writeUsingContext (context: ProjectPaths.ResolvedProject option) (expectedBinding: LedgerStore.LedgerBinding option) (cmd: TaskWriteCommand) rt =
+    let private writeUsingContext completeIntegration (context: ProjectPaths.ResolvedProject option) (expectedBinding: LedgerStore.LedgerBinding option) (cmd: TaskWriteCommand) rt =
         let inspectLocal () =
             match context with
             | Some resolved -> LedgerBindingConfig.inspectLocalForContext resolved
@@ -2708,7 +2717,7 @@ module TaskApi =
                             | "CompleteIntegration" ->
                                 guid "submissionId" cmd.AttemptId
                                 |> Result.bind (fun submissionId ->
-                                    ReviewWorkflow.ReviewWorkflow.completeIntegration binding operationId
+                                    completeIntegration binding operationId
                                         cmd.TaskId cmd.ActorId submissionId cmd.BaseOid |> mapError)
                             | "RecordAggregateInclusion" ->
                                 guid "submissionId" cmd.AttemptId
@@ -2937,13 +2946,17 @@ module TaskApi =
 
 
     let writeForContext (context: ProjectPaths.ResolvedProject) (cmd: TaskWriteCommand) rt =
-        writeUsingContext (Some context) None cmd rt
+        writeUsingContext ReviewWorkflow.ReviewWorkflow.completeIntegration (Some context) None cmd rt
 
     let writeForExpectedBinding context binding cmd rt =
-        writeUsingContext (Some context) (Some binding) cmd rt
+        writeUsingContext ReviewWorkflow.ReviewWorkflow.completeIntegration (Some context) (Some binding) cmd rt
+
+    // Test the real journal/binding preflight while substituting only publication.
+    let internal writeWithIntegrationPublisher completeIntegration (cmd: TaskWriteCommand) rt =
+        writeUsingContext completeIntegration None None cmd rt
 
     let write (cmd: TaskWriteCommand) rt =
-        writeUsingContext None None cmd rt
+        writeWithIntegrationPublisher ReviewWorkflow.ReviewWorkflow.completeIntegration cmd rt
 
 module ChallengeApi =
     let private mapError (result: Result<'a, LedgerStore.LedgerFailure>) =

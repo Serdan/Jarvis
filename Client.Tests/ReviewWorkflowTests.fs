@@ -6270,6 +6270,84 @@ type ReviewWorkflowTests() =
 
 
     [<Test>]
+    member _.CompleteIntegrationTrustBindingPreflightNeverReplaysPublication() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let path = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            let anchor = (LedgerStore.fetch first |> success).Commit
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                "owner" ctx first.ProjectId first.LedgerId first.Epoch
+                first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl anchor true
+            |> success |> ignore
+            let operationId, submissionId = Guid.NewGuid(), Guid.NewGuid()
+            let cmd : Common.TaskWriteCommand =
+                { ProjectName = "owner"; Action = "CompleteIntegration"
+                  OperationId = operationId.ToString("D"); TaskId = "integration-preflight"
+                  AttemptId = submissionId.ToString("D"); ActorId = "Integrator"; OwnerId = ""
+                  Title = ""; Html = ""; ExpectedVersion = 0; ExpectedAgentVersion = 0
+                  ExpectedTaskVersion = 0; AssignmentGeneration = 0; Summary = ""
+                  NextAction = ""; Reason = ""; BaseOid = String.replicate 40 "a"
+                  TargetRef = ""; SourceRef = ""; AllowDetached = false
+                  AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+            let mutable published = 0
+            let publisher (binding: LedgerBinding) (id: Guid) (task: string) (actor: string) (submission: Guid) (candidate: string) : Result<LedgerWrite, LedgerFailure> =
+                Assert.That(binding, Is.EqualTo(first))
+                Assert.That(id, Is.EqualTo(operationId))
+                Assert.That(task, Is.EqualTo(cmd.TaskId))
+                Assert.That(actor, Is.EqualTo(cmd.ActorId))
+                Assert.That(submission, Is.EqualTo(submissionId))
+                Assert.That(candidate, Is.EqualTo(cmd.BaseOid))
+                published <- published + 1
+                Error(OutcomeUnknown "fake publication response lost")
+            let run () = Client.OrchestrationApi.TaskApi.writeWithIntegrationPublisher publisher cmd ctx
+            let mutable held : FileStream option = None
+            let release () =
+                held |> Option.iter (fun stream -> stream.Dispose())
+                held <- None
+            try
+                // Acquire a competing lock during the first remote fetch, after
+                // local inspection and durable journaling, before trust-anchor CAS.
+                let contended =
+                    LedgerStore.withGitTransportFaults
+                        (fun _ args ->
+                            match args, held with
+                            | "fetch" :: _, None ->
+                                held <- Some(new FileStream(path + ".lock", FileMode.OpenOrCreate,
+                                                           FileAccess.ReadWrite, FileShare.None))
+                                None
+                            | _ -> None)
+                        run
+                Assert.That(held.IsSome, Is.True)
+                match contended with
+                | Error(Client.LedgerFailureError issue) ->
+                    Assert.That(issue.Code, Is.EqualTo("TrustBindingContended"))
+                    Assert.That(issue.OperationId, Is.EqualTo(Some(cmd.OperationId)))
+                | other -> Assert.Fail(sprintf "Expected prepublication contention: %A" other)
+                Assert.That(published, Is.Zero)
+                let pending =
+                    Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                    |> success |> Option.get
+                Assert.That(pending.CommandJson, Is.EqualTo(System.Text.Json.JsonSerializer.Serialize cmd))
+                release()
+                // Same UUID is accepted through preflight exactly once; even an
+                // ambiguous response from the publication seam is not replayed.
+                match run() with
+                | Error(Client.LedgerFailureError issue) ->
+                    Assert.That(issue.Code, Is.EqualTo("OutcomeUnknown"))
+                    Assert.That(issue.OperationId, Is.EqualTo(Some(cmd.OperationId)))
+                | other -> Assert.Fail(sprintf "Expected ambiguous fake publication: %A" other)
+                Assert.That(published, Is.EqualTo(1))
+                let after =
+                    Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                    |> success |> Option.get
+                Assert.That(after.CommandJson, Is.EqualTo(pending.CommandJson))
+                Assert.That(after.CommandSha256, Is.EqualTo(pending.CommandSha256))
+                Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(anchor))
+            finally
+                release()
+                if File.Exists path then File.Delete path)
+
+    [<Test>]
     member _.TrustBindingSerializesConcurrentReadersAndNeverRegresses() =
         withFixture (fun one two first second _ _ _ _ ->
             let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)

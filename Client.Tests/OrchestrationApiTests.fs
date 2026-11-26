@@ -311,6 +311,59 @@ let trustBindingSharingContentionReturnsTypedErrorWithoutBlockingDashboard () =
 
 
 [<Test>]
+let trustBindingRetriesOnlyAcquisitionWithBoundedBackoff () =
+    let root = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(root) |> ignore
+    let path = Path.Combine(root, "trust.json")
+    let lockPath = path + ".lock"
+    let waits = ResizeArray<int>()
+    let mutable invoked = 0
+    let operation () =
+        invoked <- invoked + 1
+        Ok 42
+    try
+        use held = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)
+        let exhausted =
+            Client.OrchestrationApi.LedgerBindingConfig.withConfigLockUsing waits.Add path operation
+        match exhausted with
+        | Error(Client.LedgerFailureError issue) ->
+            Assert.That(issue.Code, Is.EqualTo("TrustBindingContended"))
+        | other -> Assert.Fail(sprintf "Expected bounded contention: %A" other)
+        Assert.That(waits.ToArray(), Is.EqualTo([|10; 20; 40; 80|] :> obj))
+        Assert.That(invoked, Is.Zero)
+        waits.Clear()
+        let recovered =
+            Client.OrchestrationApi.LedgerBindingConfig.withConfigLockUsing
+                (fun delay -> waits.Add delay; held.Dispose()) path operation
+        match recovered with
+        | Ok value -> Assert.That(value, Is.EqualTo(42))
+        | other -> Assert.Fail(sprintf "Expected recovery after release: %A" other)
+        Assert.That(waits.ToArray(), Is.EqualTo([|10|] :> obj))
+        Assert.That(invoked, Is.EqualTo(1))
+        waits.Clear()
+        let failed =
+            Client.OrchestrationApi.LedgerBindingConfig.withConfigLockUsing waits.Add path
+                (fun () ->
+                    invoked <- invoked + 1
+                    raise (IOException("protected operation failure", int 0x8007000Bu)))
+        match failed with
+        | Error(Client.ValidationError message) ->
+            Assert.That(message, Does.Contain("protected operation failure"))
+        | other -> Assert.Fail(sprintf "Protected failure must not be classified as contention: %A" other)
+        Assert.That(waits, Is.Empty)
+        Assert.That(invoked, Is.EqualTo(2))
+        File.Delete lockPath
+        Directory.CreateDirectory lockPath |> ignore
+        let invalid =
+            Client.OrchestrationApi.LedgerBindingConfig.withConfigLockUsing waits.Add path operation
+        match invalid with
+        | Error(Client.PermissionDenied _) | Error(Client.ValidationError _) -> ()
+        | other -> Assert.Fail(sprintf "Invalid lock path must fail closed: %A" other)
+        Assert.That(waits, Is.Empty)
+        Assert.That(invoked, Is.EqualTo(2))
+    finally Directory.Delete(root, true)
+
+[<Test>]
 let trustBindingErrorClassifierRecognizesSharingOnlyNotOtherIoOrSecurityFailures () =
     let classified = Client.OrchestrationApi.LedgerBindingConfig.isTransientSharingViolation
     // Simulate errno 11 (Linux EAGAIN), errno 35 (macOS EAGAIN), and

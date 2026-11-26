@@ -1227,7 +1227,7 @@ module LedgerStore =
                     if assigned then
                         Some (if str "execution" = Some "Working" then "Working" else "Ready")
                     else
-                        Some (if str "unassignedDisposition" = Some "Parked" then "Parked" else "NeedsWork")
+                        Some (if List.contains (str "unassignedDisposition") [ Some "Parked"; Some "TasklessYield" ] then "Parked" else "NeedsWork")
                 else str "state"
             { Path = path; EntityKind = entityKind
               ContentSha256 = digest change.Content

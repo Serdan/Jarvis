@@ -515,7 +515,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
                           "OperatorConversationRead"; "OperatorConversationWrite";
                           "WorkQueueRead"; "WorkQueueWrite"; "WorkPriority" ]
     let orchestrationTools =
-        set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "GetNotificationPreferences"; "GetResponseAlerts"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
+        set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "RecordAggregateInclusion"; "NotifyAgent"; "AcknowledgeNotification"; "GetNotificationPreferences"; "GetResponseAlerts"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
               "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"
               "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"
               "GetLaunchTemplate"; "RenderLaunchPrompt"; "SetLaunchTemplate"
@@ -583,6 +583,14 @@ let ``public orchestration tool metadata describes canonical branch reviews`` ()
     Assert.That(reviewDescription "ClaimReview", Does.Contain("Git branch"))
     Assert.That(reviewDescription "DecideReview", Does.Contain("Markdown"))
     Assert.That(reviewDescription "SubmitReview", Does.Contain("No assignment"))
+    let startDescription = reviewDescription "StartTasklessWork"
+    Assert.That(startDescription, Does.Contain("caller-stable operationId"))
+    Assert.That(startDescription, Does.Contain("same ID and payload"))
+    Assert.That(startDescription, Does.Contain("explicit Parked disposition is an Operator STOP"))
+    let startParameters = typeof<JarvisMcpTools>.GetMethod("StartTasklessWork").GetParameters()
+    let startOperationId = startParameters |> Array.find (fun parameter -> parameter.Name = "operationId")
+    Assert.That(startOperationId.IsOptional, Is.True)
+    Assert.That(reviewDescription "YieldTasklessWork", Does.Contain("TasklessYield"))
     let inboxParameters = typeof<JarvisMcpTools>.GetMethod("ReviewerInbox").GetParameters()
     let caller = inboxParameters |> Array.find (fun parameter -> parameter.Name = "agentId")
     let subject = inboxParameters |> Array.find (fun parameter -> parameter.Name = "reviewerId")
@@ -673,7 +681,8 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
     // Preserve role/instruction aliases, Challenges, taskless execution and
     // recipient notifications, launch templates and composition APIs, plus six public Work aliases
     // over two hidden WorkQueue wire commands, all with device routing.
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 91 + (6 - 2) + 1)
+    // RecordAggregateInclusion is an additional authenticated client-backed integration alias.
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 91 + (6 - 2) + 2)
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -1165,7 +1174,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
                   name, (if name = "AgentInbox" then
                              { taskRead with MutatesState = true }
                          else taskRead)
-              for name in [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
+              for name in [ "SubmitIntegration"; "CompleteIntegration"; "RecordAggregateInclusion"; "NotifyAgent"; "AcknowledgeNotification"; "QueueResponseAlert"; "ClearResponseAlert"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
                             "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"; "SetLaunchTemplate";
                             "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork";
                             "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork";
@@ -1887,8 +1896,10 @@ let ``project scoped MCP tools standardize explicit agentId arguments`` () =
     let tools = typeof<JarvisMcpTools>.GetMethods(System.Reflection.BindingFlags.Public ||| System.Reflection.BindingFlags.Static)
     for tool in tools do
         let parameters = tool.GetParameters() |> Array.map (fun p -> p.Name) |> Set.ofArray
-        for deprecated in [ "ownerId"; "newOwnerId"; "actorId"; "reviewerId"; "requesterId" ] do
+        for deprecated in [ "ownerId"; "newOwnerId"; "actorId"; "requesterId" ] do
             Assert.That(parameters.Contains(deprecated), Is.False, tool.Name + " exposes " + deprecated)
+        if tool.Name <> "ReviewerInbox" then
+            Assert.That(parameters.Contains("reviewerId"), Is.False, tool.Name + " exposes reviewerId")
         if parameters.Contains("projectName") && not (excluded.Contains tool.Name) then
             let isGlobalFilter =
                 tool.Name = "Feedback" || tool.Name = "ListFeedback"

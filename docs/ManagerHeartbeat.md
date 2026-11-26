@@ -142,6 +142,21 @@ configured labels):
           "createdSequence": 123
         }
       ]
+    },
+    {
+      "reviewerId": "Reviewer 3",
+      "snapshotCommit": "6ab793928fa7f998b9d5796061cf66d3c0b02e40",
+      "reviews": [
+        {
+          "taskId": "_reviews",
+          "attemptId": null,
+          "reviewId": "11111111111111111111111111111111",
+          "version": 1,
+          "status": "Unclaimed",
+          "reviewerId": null,
+          "createdSequence": 123
+        }
+      ]
     }
   ],
   "agents": [
@@ -153,6 +168,7 @@ configured labels):
       "slotAvailable": true,
       "verified": true,
       "hasReadyAssignment": false,
+      "unassignedDisposition": "NeedsWork",
       "waitingOnChallenge": false,
       "lastAttributedActivityAtUtc": null
     },
@@ -164,9 +180,47 @@ configured labels):
       "slotAvailable": false,
       "verified": true,
       "hasReadyAssignment": true,
+      "unassignedDisposition": null,
       "stateEnteredAtUtc": "2026-11-15T01:59:00Z",
       "assignmentKey": "task-123/attempt-456/gen-1",
       "priorityRank": 0,
+      "waitingOnChallenge": false,
+      "lastAttributedActivityAtUtc": null
+    },
+    {
+      "agentId": "Reviewer 1",
+      "kind": "reviewer",
+      "state": "NeedsWork",
+      "execution": "Stopped",
+      "slotAvailable": true,
+      "verified": true,
+      "hasReadyAssignment": false,
+      "unassignedDisposition": "NeedsWork",
+      "waitingOnChallenge": false,
+      "lastAttributedActivityAtUtc": null
+    },
+    {
+      "agentId": "Reviewer 2",
+      "kind": "reviewer",
+      "state": "Parked",
+      "execution": "Stopped",
+      "slotAvailable": true,
+      "verified": true,
+      "hasReadyAssignment": false,
+      "unassignedDisposition": "Parked",
+      "waitingOnChallenge": false,
+      "lastAttributedActivityAtUtc": null
+    },
+    {
+      "agentId": "Reviewer 3",
+      "kind": "reviewer",
+      "state": "Parked",
+      "execution": "Stopped",
+      "slotAvailable": true,
+      "verified": true,
+      "hasReadyAssignment": false,
+      "unassignedDisposition": "TasklessYield",
+      "stateEnteredAtUtc": "2026-11-15T01:58:00Z",
       "waitingOnChallenge": false,
       "lastAttributedActivityAtUtc": null
     }
@@ -177,15 +231,40 @@ configured labels):
 Important: observe_agent reports **state** and **execution** separately.
 Ready workers normally have state Ready and execution Stopped; reviewers
 available for the shared queue commonly have state NeedsWork and execution
-Stopped. A Ready worker must carry an `assignmentKey` made from canonical
-task ID, attempt ID and generation; this suppresses stale Ready relaunches
-after an observed tool call. Include canonical `stateEnteredAtUtc` from
-`observe_agent` for Ready workers: the same assignment can be relaunched only
-when a verified Ready/Stopped transition is later than the attributed launch
-activity. An old Ready snapshot cannot prove yield. The local lastSeenAtUtc field is explicitly
-noncanonical and must
-not be copied into lastAttributedActivityAtUtc merely because it is recent.
-Only a positively observed, project/agent-attributed tool call may populate
+Stopped. An unassigned reviewer may receive new unclaimed demand in either
+NeedsWork/Stopped with `unassignedDisposition: NeedsWork`, or Parked/Stopped
+with `unassignedDisposition: TasklessYield`. Parked/Stopped with disposition
+`Parked` is an explicit Operator Park/STOP and is never automatically resumed,
+even when a review is claimed. Include `unassignedDisposition` exactly as
+returned by `observe_agent`; state alone cannot distinguish these cases.
+
+A reviewer launch is not observed by `agent_inbox` or `reviewer_inbox` activity
+alone. The launched reviewer must call its own `agent_inbox` for the exact
+version, then call `start_taskless_work` as itself before `reviewer_inbox`.
+StartTasklessWork accepts only `NeedsWork` or `TasklessYield` dispositions;
+`Parked` is an explicit Operator STOP and the API rejects it even when the
+caller supplies the current version. Newly registered agents begin Parked; the
+Operator must explicitly set `NeedsWork` before taskless dispatch is eligible.
+A `TasklessYield` is the only parked state the Manager may resume automatically.
+Supply a caller-stable `operationId`; an uncertain/lost acknowledgement must
+be reconciled with get_operation_status using the same ID before any retry; retry only the same ID and exact payload when the original receipt says it is safe. A reservation
+remains live through inbox-only and uncertain start attempts. It is observed
+only after attributed activity with execution Working, or after a later
+TasklessYield transition whose state-entered time and attributed activity are
+both newer than the reservation. This prevents a second launch while the
+first session is not yet started or has completed between Manager ticks.
+
+A claimed review can be resumed only by its owner; TasklessYield is a valid
+Parked resume state, while explicit Parked is not. A standing task does not
+qualify a Reviewer for generic unclaimed-review dispatch. A Ready worker must
+carry an `assignmentKey` made from canonical task ID, attempt ID and generation;
+this suppresses stale Ready relaunches after an observed tool call. Include
+canonical `stateEnteredAtUtc` from `observe_agent` for Ready workers: the same
+assignment can be relaunched only when a verified Ready/Stopped transition is
+later than the attributed launch activity. An old Ready snapshot cannot prove
+yield. The local lastSeenAtUtc field is explicitly noncanonical and must not
+be copied into lastAttributedActivityAtUtc merely because it is recent. Only
+a positively observed, project/agent-attributed tool call may populate
 lastAttributedActivityAtUtc, with activityEvidence set to
 "ExplicitAttributedToolCall". Otherwise leave it null, allowing the durable
 reservation to remain uncertain until independently resolved.
@@ -200,11 +279,20 @@ all snapshotCommit values equal ledgerHead. The planner deduplicates unclaimed
 demand by (taskId, reviewId): one request is one unit of demand even when it
 appears in every inbox. Its durable reservation holds that request while a
 launch is pending, uncertain or active, including if it becomes claimed
-before the first session is observed. The Manager never claims or transfers a
-review. A reviewer can resume only a claim it owns; a Challenge-blocked claim
-waits for its dependency. A standing task does not make a Reviewer eligible
-for generic unclaimed dispatch, but does not prevent the owner from resuming
-a runnable claim.
+before the first session is observed. A taskless reviewer launch is not
+observed from attributed activity alone while execution is still Stopped:
+`agent_inbox` before `start_taskless_work` is not proof that the session began.
+The planner observes the launch only after attributed activity with execution
+Working, or after a TasklessYield state transition whose stateEnteredAtUtc and
+attributed activity are both later than the reservation. That releases the
+old reservation without losing evidence if the session completed between
+Manager ticks. The exact still-owned claim can then be resumed; if no claim
+remains, the yielded reviewer can receive new unclaimed demand. An explicit
+Parked disposition always blocks automatic resume, including for a claimed
+review. The Manager never claims or transfers a review. A reviewer can resume
+only a claim it owns; a Challenge-blocked claim waits for its dependency. A
+standing task does not make a Reviewer eligible for generic unclaimed
+dispatch, but does not prevent the owner from resuming a runnable claim.
 
 ## One bounded Manager pass
 

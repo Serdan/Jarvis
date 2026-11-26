@@ -100,7 +100,7 @@ type ReviewAgent =
         member this.State =
             if this.Execution = "Working" then "Working"
             elif not (isNull (box this.CurrentAssignment)) then "Ready"
-            elif this.UnassignedDisposition = "Parked" then "Parked"
+            elif List.contains this.UnassignedDisposition [ "Parked"; "TasklessYield" ] then "Parked"
             else "NeedsWork"
         [<System.Text.Json.Serialization.JsonIgnore>]
         member this.FocusAttemptId =
@@ -504,6 +504,9 @@ module ReviewWorkflow =
                          WorkingTurnStartedAtUtc = if execution = "Working" then now else null
                          ActiveSessionId = if execution = "Working" then agent.ActiveSessionId else null }
 
+    let private enterTasklessYield (agent: ReviewAgent) =
+        { (enterState "Parked" agent) with UnassignedDisposition = "TasklessYield" }
+
     let private assigned taskId attemptId (agent: ReviewAgent) =
         let current : AgentAssignment = { TaskId = taskId; AttemptId = attemptId }
         { agent with CurrentAssignment = current; UnassignedDisposition = null
@@ -621,7 +624,7 @@ module ReviewWorkflow =
                                     (status "execution" [ "Working" ]
                                      && disposition.ValueKind = JsonValueKind.Null)
                                     || (status "execution" [ "Stopped" ]
-                                        && status "unassignedDisposition" [ "NeedsWork"; "Parked" ])
+                                        && status "unassignedDisposition" [ "NeedsWork"; "Parked"; "TasklessYield" ])
                                 else current.ValueKind = JsonValueKind.Object
                                      && disposition.ValueKind = JsonValueKind.Null))
                     | "ReviewAttempt" -> status "phase" [ "Queued"; "Started"; "Finished"; "Deferred"; "Blocked";
@@ -2751,8 +2754,8 @@ module ReviewWorkflow =
                     if agent.Version <> expectedAgentVersion
                        || not (isNull (box agent.CurrentAssignment))
                        || agent.Execution <> "Stopped"
-                       || not (List.contains agent.State [ "Parked"; "NeedsWork" ]) then
-                        return! Error(StaleEntityVersion "StartTasklessWork requires an idle unassigned agent at the exact version.")
+                       || not (List.contains agent.UnassignedDisposition [ "NeedsWork"; "TasklessYield" ]) then
+                        return! Error(StaleEntityVersion "StartTasklessWork requires an idle unassigned agent at the exact version with NeedsWork or TasklessYield disposition; Operator Park is a stop fence.")
                     let updated = enterState "Working" (resetSessions agent)
                     return [ change (agentPath agentId) (Some agentOid)
                                  { updated with Version = agent.Version + 1
@@ -2773,7 +2776,7 @@ module ReviewWorkflow =
                        || not (isNull (box agent.CurrentAssignment))
                        || agent.Execution <> "Working" then
                         return! Error(StaleEntityVersion "YieldTasklessWork requires this agent's active taskless session at the exact version.")
-                    let updated = enterState "Parked" (resetSessions agent)
+                    let updated = enterTasklessYield (resetSessions agent)
                     return [ change (agentPath agentId) (Some agentOid)
                                  { updated with Version = agent.Version + 1
                                                 StateReason = summary

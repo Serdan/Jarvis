@@ -18,6 +18,7 @@ const LAUNCH_RESULTS = new Set(["submitted", "uncertain", "blocked"]);
 const REVIEW_ID_PATTERN = /^[a-f0-9]{32}$/;
 const TASK_ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
 const REVIEWABLE_AGENT_STATES = new Set(["Ready", "NeedsWork", "Free"]);
+const UNASSIGNED_DISPOSITIONS = new Set(["NeedsWork", "Parked", "TasklessYield"]);
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -159,6 +160,23 @@ export function validateSnapshot(config, snapshot, nowUtc) {
     assert(agent.priorityRank === undefined ||
       (Number.isInteger(agent.priorityRank) && agent.priorityRank >= 0 &&
        agent.priorityRank <= 100000), "Invalid canonical task priority rank");
+    if (agent.unassignedDisposition !== undefined && agent.unassignedDisposition !== null) {
+      assert(UNASSIGNED_DISPOSITIONS.has(agent.unassignedDisposition),
+        "Invalid canonical unassigned disposition: " + agent.agentId);
+    }
+    if (agent.kind === "reviewer" && agent.hasReadyAssignment) {
+      assert(agent.unassignedDisposition == null,
+        "Assigned reviewer cannot retain an unassigned disposition: " + agent.agentId);
+    }
+    if (agent.kind === "reviewer" && agent.execution === "Stopped" &&
+      !agent.hasReadyAssignment && ["NeedsWork", "Free", "Parked"].includes(agent.state)) {
+      assert(UNASSIGNED_DISPOSITIONS.has(agent.unassignedDisposition),
+        "Missing canonical reviewer unassigned disposition: " + agent.agentId);
+      assert(agent.state === "Parked"
+        ? ["Parked", "TasklessYield"].includes(agent.unassignedDisposition)
+        : agent.unassignedDisposition === "NeedsWork",
+      "Reviewer state/disposition mismatch: " + agent.agentId);
+    }
     if (agent.lastAttributedActivityAtUtc !== null) {
       validTime(agent.lastAttributedActivityAtUtc, "lastAttributedActivityAtUtc");
       assert(agent.activityEvidence === "ExplicitAttributedToolCall",
@@ -237,6 +255,18 @@ function yieldedAfterActivity(agent, activityAtUtc) {
     Date.parse(agent.stateEnteredAtUtc) > Date.parse(activityAtUtc);
 }
 
+function tasklessYieldedReviewer(agent) {
+  return agent?.kind === "reviewer" && agent.state === "Parked" &&
+    agent.execution === "Stopped" && agent.hasReadyAssignment === false &&
+    agent.slotAvailable === true && agent.unassignedDisposition === "TasklessYield";
+}
+
+function tasklessYieldedAfterReservation(agent, reservedAtUtc) {
+  return tasklessYieldedReviewer(agent) &&
+    typeof agent.stateEnteredAtUtc === "string" &&
+    Date.parse(agent.stateEnteredAtUtc) > Date.parse(reservedAtUtc);
+}
+
 export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
   validateConfig(config);
   const { agents, reviewerInboxes } = validateSnapshot(config, snapshot, nowUtc);
@@ -266,11 +296,21 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
     if (!LIVE_RECORDS.has(rec.status)) continue;
     const agent = agents.get(rec.agentId);
     const activity = agent?.lastAttributedActivityAtUtc;
-    const observed = activity !== null && activity !== undefined &&
+    const activityObserved = activity !== null && activity !== undefined &&
       Date.parse(activity) > Date.parse(rec.reservedAtUtc) &&
       Date.parse(activity) <= Date.parse(snapshot.capturedAtUtc);
+    // A reviewer inbox read is not a started session: taskless reviewers must
+    // explicitly enter Working. If the session has already yielded before a
+    // Manager tick, its durable TasklessYield disposition plus a post-reserve
+    // state transition and attributed activity proves the same lifecycle.
+    const yieldedTaskless = rec.kind === "reviewer" &&
+      tasklessYieldedAfterReservation(agent, rec.reservedAtUtc);
+    const observed = activityObserved && (rec.kind !== "reviewer" ||
+      agent?.execution === "Working" || yieldedTaskless);
     if (observed) {
-      if (!yieldedAfterActivity(agent, activity)) observedThisPass.add(rec.agentId);
+      if (!yieldedAfterActivity(agent, activity) && !yieldedTaskless) {
+        observedThisPass.add(rec.agentId);
+      }
       if (rec.kind === "worker" && rec.assignmentKey &&
         agent.assignmentKey === rec.assignmentKey &&
         !yieldedAfterActivity(agent, activity)) observedAssignments.add(rec.agentId);
@@ -376,7 +416,10 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
     else if (agent.waitingOnChallenge) reason = "ChallengeBlocked";
     else if (unscopedReviewerReservation) reason = "PriorReviewerLaunchPendingOrActive";
     else if (!resumableClaim) reason = "PriorReviewLaunchPendingOrActive";
-    else if (agent.execution !== "Stopped" || !REVIEWABLE_AGENT_STATES.has(agent.state))
+    else if (agent.state === "Parked" && agent.unassignedDisposition === "Parked")
+      reason = "OperatorParked";
+    else if (agent.execution !== "Stopped" ||
+      !(REVIEWABLE_AGENT_STATES.has(agent.state) || tasklessYieldedReviewer(agent)))
       reason = "NoRunnableClaimedReview";
     if (reason) {
       result.suppressed.push({ agentId, kind: "reviewer", reason });
@@ -404,7 +447,10 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
     else if (!unclaimed) reason = reviews.some(review => review.status === "Unclaimed")
       ? "ReviewAlreadyReserved" : "NoUnclaimedReviewForReviewer";
     else if (unscopedReviewerReservation) reason = "PriorReviewerLaunchPendingOrActive";
-    else if (!((agent.state === "NeedsWork" || agent.state === "Free") &&
+    else if (agent.state === "Parked" && agent.unassignedDisposition === "Parked")
+      reason = "OperatorParked";
+    else if (!((agent.state === "NeedsWork" || agent.state === "Free" ||
+      tasklessYieldedReviewer(agent)) &&
       agent.execution === "Stopped" && agent.slotAvailable && !agent.hasReadyAssignment))
       reason = "NoAvailableReviewerSlot";
     if (reason) {

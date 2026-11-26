@@ -218,8 +218,12 @@ type ReviewWorkflowTests() =
                           let id = sprintf "Crowd%d" i
                           ReviewWorkflow.registerAgent first (Guid.NewGuid()) id |> success |> ignore
                           attach id
-                          let current = ReviewWorkflow.getAgentWorkingTurn first id |> success
-                          ReviewWorkflow.startTasklessWork first (Guid.NewGuid()) id current.Version "Fixture occupancy"
+                          let current = ReviewWorkflow.getAgentInbox first id |> success
+                          ReviewWorkflow.setAgentAdministrativeStateAs first "AuthenticatedUser" (Guid.NewGuid())
+                              id "NeedsWork" current.Agent.Version "Operator enabled capacity fixture agent"
+                          |> success |> ignore
+                          let eligible = ReviewWorkflow.getAgentInbox first id |> success
+                          ReviewWorkflow.startTasklessWork first (Guid.NewGuid()) id eligible.Agent.Version "Fixture occupancy"
                           |> success |> ignore
                           yield id ]
                 // Write the same canonical policy record format as the isolated
@@ -3715,6 +3719,7 @@ type ReviewWorkflowTests() =
                     (Guid.NewGuid()) id "Auditor" 0 |> success |> ignore
             let initial = ReviewWorkflow.getAgentInbox second "Reviewer" |> success
             Assert.That(initial.Agent.State, Is.EqualTo("Parked"))
+            Assert.That(initial.Agent.UnassignedDisposition, Is.EqualTo("Parked"))
             Assert.That(initial.Agent.CurrentAssignment, Is.Null)
             Assert.That(initial.InstructionLayers.RoleIds, Is.EqualTo(box [ "Auditor" ]))
             Assert.That((ReviewWorkflow.getAgentInbox first "Reviewer" |> success).Agent.State,
@@ -3725,18 +3730,24 @@ type ReviewWorkflowTests() =
             Assert.That(observation.Agent.State, Is.EqualTo("Parked"))
             Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(beforeObserved))
 
+            ReviewWorkflow.setAgentAdministrativeStateAs first "AuthenticatedUser" (Guid.NewGuid())
+                "Reviewer" "NeedsWork" initial.Agent.Version "Operator enabled taskless reviewer"
+            |> success |> ignore
+            let eligible = ReviewWorkflow.getAgentInbox second "Reviewer" |> success
+            Assert.That(eligible.Agent.State, Is.EqualTo("NeedsWork"))
+            Assert.That(eligible.Agent.UnassignedDisposition, Is.EqualTo("NeedsWork"))
             let startId = Guid.NewGuid()
             let start =
-                ReviewWorkflow.startTasklessWork first startId "Reviewer" initial.Agent.Version
+                ReviewWorkflow.startTasklessWork first startId "Reviewer" eligible.Agent.Version
                     "Review incoming integration" |> success
             Assert.That(start.AlreadyApplied, Is.False)
             Assert.That(LedgerStore.changedAgentIds start, Does.Contain("Reviewer"))
             let replay =
-                ReviewWorkflow.startTasklessWork second startId "Reviewer" initial.Agent.Version
+                ReviewWorkflow.startTasklessWork second startId "Reviewer" eligible.Agent.Version
                     "Review incoming integration" |> success
             Assert.That(replay.AlreadyApplied, Is.True)
             expectStale (ReviewWorkflow.startTasklessWork second (Guid.NewGuid()) "Reviewer"
-                            initial.Agent.Version "Concurrent duplicate start")
+                            eligible.Agent.Version "Concurrent duplicate start")
             let running = ReviewWorkflow.getAgentInbox second "Reviewer" |> success
             Assert.That(running.Agent.State, Is.EqualTo("Working"))
             Assert.That(running.Agent.Execution, Is.EqualTo("Working"))
@@ -3802,6 +3813,7 @@ type ReviewWorkflowTests() =
                     current.Version "Independent review finished" |> success |> ignore
                 let parked = ReviewWorkflow.getAgentInbox first "Reviewer" |> success
                 Assert.That(parked.Agent.State, Is.EqualTo("Parked"))
+                Assert.That(parked.Agent.UnassignedDisposition, Is.EqualTo("TasklessYield"))
                 Assert.That(parked.Agent.Execution, Is.EqualTo("Stopped"))
                 Assert.That(parked.Agent.CurrentAssignment, Is.Null)
                 Assert.That(parked.InstructionLayers.RoleIds, Is.EqualTo(box [ "Auditor" ]))
@@ -3810,6 +3822,41 @@ type ReviewWorkflowTests() =
                     (fun row -> row.Agent = "Reviewer")), Is.False)
                 let parkedRow = after.Agents |> List.find (fun row -> row.Agent = "Reviewer")
                 Assert.That(parkedRow.RoleIds, Is.EqualTo(box [ "Auditor" ]))
+                Assert.That(parkedRow.State, Is.EqualTo("Parked"))
+                let resumeStartId = Guid.NewGuid()
+                let resumeStart =
+                    ReviewWorkflow.startTasklessWork first resumeStartId "Reviewer"
+                        parked.Agent.Version "Resume after taskless yield" |> success
+                Assert.That(resumeStart.AlreadyApplied, Is.False)
+                let resumeReplay =
+                    ReviewWorkflow.startTasklessWork second resumeStartId "Reviewer"
+                        parked.Agent.Version "Resume after taskless yield" |> success
+                Assert.That(resumeReplay.AlreadyApplied, Is.True)
+                expectStale (ReviewWorkflow.startTasklessWork second (Guid.NewGuid()) "Reviewer"
+                                parked.Agent.Version "Concurrent resume")
+                let resumed = ReviewWorkflow.getAgentInbox second "Reviewer" |> success
+                Assert.That(resumed.Agent.State, Is.EqualTo("Working"))
+                Assert.That(resumed.Agent.UnassignedDisposition, Is.Null)
+                ReviewWorkflow.yieldTasklessWork second (Guid.NewGuid()) "Reviewer"
+                    resumed.Agent.Version "Yield after resumption" |> success |> ignore
+                let yieldedAgain = ReviewWorkflow.getAgentInbox first "Reviewer" |> success
+                Assert.That(yieldedAgain.Agent.UnassignedDisposition, Is.EqualTo("TasklessYield"))
+                ReviewWorkflow.parkAgent first (Guid.NewGuid()) "Reviewer"
+                    yieldedAgain.Agent.Version "Operator explicitly parked after taskless yield"
+                |> success |> ignore
+                let operatorParked = ReviewWorkflow.getAgentInbox second "Reviewer" |> success
+                Assert.That(operatorParked.Agent.State, Is.EqualTo("Parked"))
+                Assert.That(operatorParked.Agent.UnassignedDisposition, Is.EqualTo("Parked"))
+                expectStale (ReviewWorkflow.startTasklessWork first (Guid.NewGuid()) "Reviewer"
+                                operatorParked.Agent.Version "Explicit Operator Park must fence taskless start")
+                let stillOperatorParked = ReviewWorkflow.getAgentInbox second "Reviewer" |> success
+                Assert.That(stillOperatorParked.Agent.Version, Is.EqualTo(operatorParked.Agent.Version))
+                Assert.That(stillOperatorParked.Agent.UnassignedDisposition, Is.EqualTo("Parked"))
+                let finalDashboard = Client.AgentDashboard.load context |> success
+                let finalRow = finalDashboard.Agents |> List.find (fun row -> row.Agent = "Reviewer")
+                Assert.That(finalRow.State, Is.EqualTo("Parked"))
+                Assert.That((Client.AgentView.visibleRows "" finalDashboard |> List.exists
+                    (fun row -> row.Agent = "Reviewer")), Is.False)
             finally
                 if File.Exists configPath then File.Delete configPath)
 
@@ -3823,7 +3870,11 @@ type ReviewWorkflowTests() =
                 Client.RoleInstructions.RoleInstructions.attachRole first "AuthenticatedUser"
                     (Guid.NewGuid()) id "Shared" 0 |> success |> ignore
             let reviewer = (ReviewWorkflow.getAgentInbox first "Reviewer" |> success).Agent
-            ReviewWorkflow.startTasklessWork first (Guid.NewGuid()) "Reviewer" reviewer.Version
+            ReviewWorkflow.setAgentAdministrativeStateAs first "AuthenticatedUser" (Guid.NewGuid())
+                "Reviewer" "NeedsWork" reviewer.Version "Operator enabled taskless reviewer"
+            |> success |> ignore
+            let eligible = (ReviewWorkflow.getAgentInbox second "Reviewer" |> success).Agent
+            ReviewWorkflow.startTasklessWork first (Guid.NewGuid()) "Reviewer" eligible.Version
                 "Independent analysis" |> success |> ignore
             ReviewWorkflow.createTask first (Guid.NewGuid()) "busy-task" "Cannot steal role-only worker"
             |> success |> ignore
@@ -3874,8 +3925,12 @@ type ReviewWorkflowTests() =
             initTask "assigned-owner"
             let assigned = ReviewWorkflow.getAgentInbox first "Owner" |> success
             let unassigned = ReviewWorkflow.getAgentInbox first "Reviewer" |> success
+            ReviewWorkflow.setAgentAdministrativeStateAs first "AuthenticatedUser" (Guid.NewGuid())
+                "Reviewer" "NeedsWork" unassigned.Agent.Version "Operator enabled taskless reviewer"
+            |> success |> ignore
+            let eligible = ReviewWorkflow.getAgentInbox first "Reviewer" |> success
             ReviewWorkflow.startTasklessWork first (Guid.NewGuid()) "Reviewer"
-                unassigned.Agent.Version "Investigate dead agent" |> success |> ignore
+                eligible.Agent.Version "Investigate dead agent" |> success |> ignore
             let working = ReviewWorkflow.getAgentInbox second "Reviewer" |> success
             expectStale (ReviewWorkflow.recoverTasklessWorkAs second "AuthenticatedUser"
                             (Guid.NewGuid()) "Reviewer" unassigned.Agent.Version "Stale recovery")
@@ -3930,6 +3985,10 @@ type ReviewWorkflowTests() =
                       NextAction = ""; Reason = ""; BaseOid = ""; TargetRef = ""
                       SourceRef = ""; AllowDetached = false; AllowUncommitted = false
                       DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+                let initial = ReviewWorkflow.getAgentInbox first "Reviewer" |> success
+                ReviewWorkflow.setAgentAdministrativeStateAs first "AuthenticatedUser" (Guid.NewGuid())
+                    "Reviewer" "NeedsWork" initial.Agent.Version "Operator enabled taskless reviewer"
+                |> success |> ignore
                 let original = ReviewWorkflow.getAgentInbox first "Reviewer" |> success
                 let _, forgedResult, forgedReceipt =
                     invoke (Common.TaskWriteCommand(request "StartTasklessWork" "Owner" "" original.Agent.Version))

@@ -1,0 +1,1 @@
+18 serial stages, isolated source and Git/HOME, bounded deadlines, durable result receipts, read-only reconnect inspection, disposable nonce probe, documented historical RED and real registered path gaps. 8/8 Python self-tests PASS, all matrix paths present, exact diff check clean. No .NET qualification, live restart, provider call or deployment.

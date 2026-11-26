@@ -630,7 +630,7 @@ let prepared_project_task_snapshot_keeps_authorization_and_execution_in_sync () 
 let project_executor_contract_has_one_lifecycle_and_current_tool_rules () =
     let path = Path.GetFullPath(Path.Combine(__SOURCE_DIRECTORY__, "../AGENTS.md"))
     let instructions = File.ReadAllText path
-    let count needle = instructions.Split([| needle |], StringSplitOptions.None).Length - 1
+    let count (needle: string) = instructions.Split([| needle |], StringSplitOptions.None).Length - 1
 
     Assert.That(count "## Jarvis executor details", Is.EqualTo(1))
     Assert.That(count "### Lifecycle semantics", Is.EqualTo(1))

@@ -138,6 +138,30 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Optio
             Task.FromException<AgentActivitySnapshot>(
                 UnauthorizedAccessException("A registered Jarvis client is required to verify agent activity."))
 
+    // An authenticated registered device may request a scoped invalidation, not
+    // assert terminal evidence. The user comes exclusively from the connection.
+    member this.PublishJobWakeInvalidation(hint: JobWakeInvalidation) : Task =
+        match users.GetSessionByConnection(this.Context.ConnectionId) with
+        | ValueSome session when session.State = Registered
+                                 && session.ConnectionId = Some this.Context.ConnectionId
+                                 && session.UserId = this.UserId ->
+            if not (JobWakeInvalidation.valid hint) then
+                Task.FromException(ArgumentException("Invalid bounded job-wake invalidation."))
+            else
+                let recipients =
+                    users.ListDevices(session.UserId)
+                    |> Array.choose (fun target ->
+                        if target.State = Registered && target.UserId = session.UserId then
+                            target.ConnectionId |> Option.filter ((<>) this.Context.ConnectionId)
+                        else None)
+                    |> Array.distinct
+                if recipients.Length = 0 then Task.CompletedTask
+                else
+                    this.Clients.Clients(recipients).InvalidateJobWake(
+                        { hint with AgentIds = Array.distinct hint.AgentIds })
+        | _ ->
+            Task.FromException(UnauthorizedAccessException("A registered Jarvis client is required to publish a job-wake hint."))
+
     member this.SendClientResponse(correlationId: string, response: AgentCommandResponse) =
         users.TouchConnection(this.Context.ConnectionId)
         match users.GetSessionByConnection(this.Context.ConnectionId) with
@@ -152,5 +176,7 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Optio
         member this.Connect(registration) = this.Connect(registration)
 
         member this.GetAgentActivity(projectName, agentId) = this.GetAgentActivity(projectName, agentId)
+
+        member this.PublishJobWakeInvalidation(hint) = this.PublishJobWakeInvalidation(hint)
 
         member this.SendClientResponse(correlationId, result) = this.SendClientResponse(correlationId, result)

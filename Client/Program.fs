@@ -530,6 +530,18 @@ let private runClient args =
             oauth.GetAccessTokenAsync().GetAwaiter().GetResult()
             |> operatorActorFromAccessToken
         with _ -> None
+    let connection =
+        HubConnectionBuilder()
+            .AddJsonProtocol()
+            .WithUrl(
+                BuildInfo.ServerUrl,
+                Action<Microsoft.AspNetCore.Http.Connections.Client.HttpConnectionOptions>(fun options ->
+                    options.AccessTokenProvider <-
+                        Func<Task<string>>(fun () -> oauth.GetAccessTokenAsync()))
+            )
+            .Build()
+
+
     // B1 and native session host share a single compiled default-off registration.
     // No environment switch can enable the unfinished authority boundary.
     let challengeWakeEnabled = false
@@ -556,7 +568,8 @@ let private runClient args =
             challengeWakeEnabled, jobRoot,
             (fun project -> OrchestrationApi.LedgerBindingConfig.load project rt),
             challengeHost, onChallengeCommit,
-            (Client.invalidateAgentStates rt), tui.Log)
+            (Client.invalidateAgentStates rt),
+            (AutomationJobTerminalWake.publishInvalidation connection (fun () -> registered)), tui.Log)
     // Route the existing authenticated Challenge callback through the composite.
     // No new command or scheduler authority is introduced.
     let onChallengeCommit cmd receipt = jobWake.OnChallengeCommit(cmd, receipt)
@@ -624,16 +637,6 @@ let private runClient args =
     | None ->
         tui.Log "Operator challenge replies unavailable: authenticated OAuth subject missing."
 
-    let connection =
-        HubConnectionBuilder()
-            .AddJsonProtocol()
-            .WithUrl(
-                BuildInfo.ServerUrl,
-                Action<Microsoft.AspNetCore.Http.Connections.Client.HttpConnectionOptions>(fun options ->
-                    options.AccessTokenProvider <-
-                        Func<Task<string>>(fun () -> oauth.GetAccessTokenAsync()))
-            )
-            .Build()
 
     readyResumeActor.Value <- (fun () ->
         if registered && connection.State = HubConnectionState.Connected then authenticatedOperator
@@ -733,6 +736,9 @@ let private runClient args =
             Client.invalidateAgentStates rt project agentIds
             jobWake.OnInvalidated()
             Task.CompletedTask))
+        AutomationJobTerminalWake.registerInvalidationReceiver connection (fun () -> registered)
+            (fun project -> OrchestrationApi.LedgerBindingConfig.inspectLocal project rt |> Result.map fst)
+            (Client.invalidateAgentStates rt) jobWake.OnInvalidated tui.Log
         connection.On("InvalidateAllAgentStates", Func<Task>(fun () ->
             Client.invalidateAllAgentStates rt
             jobWake.OnInvalidated()

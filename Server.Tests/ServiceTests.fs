@@ -1960,6 +1960,7 @@ let client_request_abort_cancels_outstanding_device_correlation_without_faulting
                         tracker.Complete(correlationId, user, connection, registered.Generation, expected) |> ignore
                     Task.CompletedTask
                 member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+                member _.InvalidateJobWake(_) = Task.CompletedTask
                 member _.RecordAgentActivity(_, _, _) = Task.CompletedTask
                 member _.InvalidateAllAgentStates() = Task.CompletedTask }
         let clients =
@@ -2070,6 +2071,7 @@ let post_commit_uncertain_client_reply_remains_unknown_across_server_dispatch_an
                                          registered.Generation, uncertain) |> ignore
                     } :> Task
                 member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+                member _.InvalidateJobWake(_) = Task.CompletedTask
                 member _.RecordAgentActivity(_, _, _) = Task.CompletedTask
                 member _.InvalidateAllAgentStates() =
                     System.Threading.Interlocked.Increment(&cacheInvalidations) |> ignore
@@ -2341,6 +2343,7 @@ let private routedNotificationFixtureWithReceipt (sourceReceipt: AgentInboxActiv
                 member _.ReceiveMessage(_) = Task.CompletedTask
                 member _.ReceiveSourceCommand(_, _, _, _) = Task.CompletedTask
                 member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+                member _.InvalidateJobWake(_) = Task.CompletedTask
                 member _.RecordAgentActivity(_, _, _) = Task.CompletedTask
                 member _.InvalidateAllAgentStates() = Task.CompletedTask
                 member _.ReceiveManualGrantedCommand(_, _, _) = Task.CompletedTask
@@ -2670,6 +2673,7 @@ let browser_dom_mcp_tools_route_only_when_all_required_oauth_scopes_are_present 
                       Error = None; Instructions = []; StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }) |> ignore
                 Task.CompletedTask
             member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+            member _.InvalidateJobWake(_) = Task.CompletedTask
             member _.RecordAgentActivity(_, _, _) = Task.CompletedTask
             member _.InvalidateAllAgentStates() = Task.CompletedTask }
     let clients =
@@ -2792,6 +2796,7 @@ let attributed_tool_dispatch_survives_missing_sqlite_and_notifies_only_user_devi
                 |> ignore
                 Task.CompletedTask
             member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+            member _.InvalidateJobWake(_) = Task.CompletedTask
             member _.InvalidateAllAgentStates() = Task.CompletedTask
             member _.RecordAgentActivity(project, agent, timestamp) =
                 received.Enqueue((connection, project, agent, timestamp))
@@ -2889,6 +2894,7 @@ let stalled_cross_device_activity_hints_drop_without_unbounded_tasks_or_blocking
                                  registrations[connection], accepted) |> ignore
                 Task.CompletedTask
             member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+            member _.InvalidateJobWake(_) = Task.CompletedTask
             member _.InvalidateAllAgentStates() = Task.CompletedTask
             member _.RecordAgentActivity(_, _, _) =
                 if System.Threading.Interlocked.Increment(&hintSends) = 2 then
@@ -3006,6 +3012,7 @@ let source_uuid_signalr_dispatch_preserves_caller_identity_and_legacy_receiver (
                     observed.Enqueue((commandJson, actor, original))
                     reply correlation
                 member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+                member _.InvalidateJobWake(_) = Task.CompletedTask
                 member _.RecordAgentActivity(_, _, _) = Task.CompletedTask
                 member _.InvalidateAllAgentStates() = Task.CompletedTask }
         let clients =
@@ -3139,6 +3146,7 @@ let wq06_authenticated_mcp_post_forwards_only_oauth_derived_actor_and_original_u
                     forwardedJson <- commandJson
                     reply correlation
                 member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+                member _.InvalidateJobWake(_) = Task.CompletedTask
                 member _.RecordAgentActivity(_, _, _) = Task.CompletedTask
                 member _.InvalidateAllAgentStates() = Task.CompletedTask }
         let clients =

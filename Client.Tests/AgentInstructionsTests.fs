@@ -624,3 +624,26 @@ let prepared_project_task_snapshot_keeps_authorization_and_execution_in_sync () 
             Assert.That(output.StdOut.Trim(), Is.Not.Empty)
         | Error error -> Assert.Fail(sprintf "Prepared task could not run: %A" error)
     )
+
+
+[<Test>]
+let project_executor_contract_has_one_lifecycle_and_current_tool_rules () =
+    let path = Path.GetFullPath(Path.Combine(__SOURCE_DIRECTORY__, "../AGENTS.md"))
+    let instructions = File.ReadAllText path
+    let count needle = instructions.Split([| needle |], StringSplitOptions.None).Length - 1
+
+    Assert.That(count "## Jarvis executor details", Is.EqualTo(1))
+    Assert.That(count "### Lifecycle semantics", Is.EqualTo(1))
+    Assert.That(instructions, Does.Contain("single shared execution/lifecycle contract"))
+    Assert.That(count "complete_agent_work", Is.EqualTo(1))
+    Assert.That(count "yield_agent", Is.EqualTo(1))
+    Assert.That(instructions, Does.Contain("schema-validation failure"))
+    Assert.That(instructions, Does.Contain("rejected call did not execute"))
+    Assert.That(instructions, Does.Contain("retry the same intended operation"))
+    Assert.That(instructions, Does.Contain("at most three spaced checks"))
+    Assert.That(instructions, Does.Contain("Do not poll or wait for an engineering job in an inference turn"))
+    Assert.That(instructions, Does.Contain("A checkpoint alone, tool-call attempt, schema-validation error or conversational claim is not a lifecycle transition"))
+    Assert.That(instructions, Does.Contain("Never use an administrative recovery or state correction in place of an ordinary worker yield"))
+    Assert.That(instructions, Does.Contain("agentId` is the initiating actor; `targetAgentId` is the subject"))
+    for stale in [ "AgentInbox("; "ObserveAgent("; "YieldAgent("; "RecoverAgentAssignment("; "ToolCompleted"; "yield_agent("; "agent_inbox("; "projectName="; "agentId="; "targetAgentId=" ] do
+        Assert.That(instructions, Does.Not.Contain(stale), $"Stale instruction example: {stale}")

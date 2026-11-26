@@ -687,3 +687,46 @@ type RoleInstructionsTests() =
             match RoleInstructions.getLaunchTemplate two with
             | Error(LedgerIntegrityError _) -> ()
             | other -> Assert.Fail(sprintf "Expected corrupt record failure: %A" other))
+
+
+    [<Test>]
+    member _.LaunchTemplateIsBootstrapOnlyAndRoleInstructionsRemainSeparate() =
+        fixture (fun one two ->
+            let roleBody =
+                "Review one exact frozen source submission, inspect provenance and tests, and record a verdict with reproducible evidence. Never edit author source."
+            RoleInstructions.createRole one "AuthenticatedUser" (Guid.NewGuid())
+                "Reviewer" "Independent source review" roleBody
+            |> success |> ignore
+            RoleInstructions.attachRole one "AuthenticatedUser" (Guid.NewGuid())
+                "Reviewer 1" "Reviewer" 0
+            |> success |> ignore
+
+            let template =
+                "Your agent ID is {{agentId}}. Your project is {{projectName}}.\n\n" +
+                "Call agent_inbox for your own agent ID, then call get_agent_instructions for the applicable " +
+                "workspace/project/directory AGENTS.md hierarchy. The inbox supplies your focused assignment " +
+                "and role/agent layers; the explicit read supplies AGENTS.md and repeats those layers. " +
+                "Read the pinned task specification, current assignment, latest checkpoint and review feedback before acting."
+            RoleInstructions.setLaunchTemplate one "AuthenticatedUser" (Guid.NewGuid()) 0 template
+            |> success |> ignore
+
+            let rendered = RoleInstructions.renderLaunchPrompt two "Jarvis" "Reviewer 1" |> success
+            Assert.That(rendered.Prompt,
+                        Is.EqualTo("Your agent ID is Reviewer 1. Your project is Jarvis.\n\n" +
+                                   "Call agent_inbox for your own agent ID, then call get_agent_instructions for the applicable " +
+                                   "workspace/project/directory AGENTS.md hierarchy. The inbox supplies your focused assignment " +
+                                   "and role/agent layers; the explicit read supplies AGENTS.md and repeats those layers. " +
+                                   "Read the pinned task specification, current assignment, latest checkpoint and review feedback before acting."))
+            Assert.That(rendered.Prompt, Does.Not.Contain(roleBody))
+            Assert.That(rendered.Prompt, Does.Not.Contain("Working lifecycle"))
+            Assert.That(rendered.Prompt, Does.Not.Contain("yield_agent"))
+
+            let resolved = RoleInstructions.resolve two "Reviewer 1" |> success
+            Assert.That(resolved.Precedence,
+                        Is.EqualTo(box [ "global"; "workspace"; "project/directory"; "role (attachment order)"; "agent"; "assignment" ]))
+            Assert.That(resolved.Documents |> List.map (fun layer -> layer.Content),
+                        Is.EqualTo(box [ roleBody ]))
+
+            for stale in [ "AgentInbox("; "ObserveAgent("; "YieldAgent("; "ToolCompleted"; "yield_agent(" ] do
+                Assert.That(template, Does.Not.Contain(stale), $"Stale launch/role example: {stale}")
+                Assert.That(roleBody, Does.Not.Contain(stale), $"Stale launch/role example: {stale}"))

@@ -701,22 +701,35 @@ type RoleInstructionsTests() =
                 "Reviewer 1" "Reviewer" 0
             |> success |> ignore
 
-            let template =
-                "Your agent ID is {{agentId}}. Your project is {{projectName}}.\n\n" +
+            let stable =
+                "You are an autonomous Jarvis executor. Your primary output is completed work through canonical Jarvis tools, not conversational progress reports.\n\n" +
                 "Call agent_inbox for your own agent ID, then call get_agent_instructions for the applicable " +
-                "workspace/project/directory AGENTS.md hierarchy. The inbox supplies your focused assignment " +
-                "and role/agent layers; the explicit read supplies AGENTS.md and repeats those layers. " +
-                "Read the pinned task specification, current assignment, latest checkpoint and review feedback before acting."
+                "workspace/project/directory AGENTS.md hierarchy. The inbox supplies the focused assignment and resolved role/agent layers; " +
+                "the explicit instruction read supplies AGENTS.md and repeats those layers. " +
+                "Read the pinned task specification, current assignment generation, latest checkpoint and review feedback before acting.\n\n"
+            let template = stable + "Your project is {{projectName}}. Your agent ID is {{agentId}}."
             RoleInstructions.setLaunchTemplate one "AuthenticatedUser" (Guid.NewGuid()) 0 template
             |> success |> ignore
 
-            let rendered = RoleInstructions.renderLaunchPrompt two "Jarvis" "Reviewer 1" |> success
-            Assert.That(rendered.Prompt,
-                        Is.EqualTo("Your agent ID is Reviewer 1. Your project is Jarvis.\n\n" +
-                                   "Call agent_inbox for your own agent ID, then call get_agent_instructions for the applicable " +
-                                   "workspace/project/directory AGENTS.md hierarchy. The inbox supplies your focused assignment " +
-                                   "and role/agent layers; the explicit read supplies AGENTS.md and repeats those layers. " +
-                                   "Read the pinned task specification, current assignment, latest checkpoint and review feedback before acting."))
+            let render project agent = RoleInstructions.renderLaunchPrompt two project agent |> success
+            let rendered = render "Jarvis" "Reviewer 1"
+            let sameRole = render "Jarvis" "Reviewer 2"
+            let otherRole = render "Jarvis" "Worker A"
+            let otherProject = render "Other" "Reviewer 1"
+            let sameProjectPrefix = stable + "Your project is Jarvis. Your agent ID is "
+            Assert.That(rendered.Prompt, Is.EqualTo(sameProjectPrefix + "Reviewer 1."))
+            Assert.That(sameRole.Prompt, Is.EqualTo(sameProjectPrefix + "Reviewer 2."))
+            Assert.That(otherRole.Prompt, Is.EqualTo(sameProjectPrefix + "Worker A."))
+            Assert.That(otherProject.Prompt, Is.EqualTo(stable + "Your project is Other. Your agent ID is Reviewer 1."))
+            Assert.That((render "Jarvis" "Reviewer 1").Prompt, Is.EqualTo(rendered.Prompt))
+            RoleInstructions.attachRole one "AuthenticatedUser" (Guid.NewGuid()) "Reviewer 2" "Reviewer" 0
+            |> success |> ignore
+            RoleInstructions.setAgentInstructions one "AuthenticatedUser" (Guid.NewGuid()) "Reviewer 2" 1 "Check concurrency."
+            |> success |> ignore
+            Assert.That((render "Jarvis" "Reviewer 2").Prompt, Is.EqualTo(sameRole.Prompt))
+            let updated = RoleInstructions.resolve two "Reviewer 2" |> success
+            Assert.That(updated.Documents |> List.map (fun layer -> layer.Content),
+                        Is.EqualTo(box [ roleBody; "Check concurrency." ]))
             Assert.That(rendered.Prompt, Does.Not.Contain(roleBody))
             Assert.That(rendered.Prompt, Does.Not.Contain("Working lifecycle"))
             Assert.That(rendered.Prompt, Does.Not.Contain("yield_agent"))

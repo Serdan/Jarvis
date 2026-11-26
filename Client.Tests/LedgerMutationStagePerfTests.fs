@@ -172,7 +172,8 @@ type LedgerMutationStagePerfTests() =
             let rejected = intent ()
             let result, metric = LedgerStore.measureMutationStages (fun () ->
                 LedgerStore.transact first rejected (fun _ -> Ok changes))
-            Assert.That(result, Is.EqualTo(Error(StaleEntityVersion $"Ledger entity changed: {secondPath}")))
+            let expected : Result<LedgerWrite, LedgerFailure> = Error(StaleEntityVersion $"Ledger entity changed: {secondPath}")
+            Assert.That(result, Is.EqualTo(expected))
             Assert.That(pushes metric, Is.Zero)
             Assert.That((LedgerStore.fetch first |> good).Commit, Is.EqualTo(after.Commit))
             Assert.That((LedgerStore.getOperationStatus first rejected.OperationId |> good |> snd).IsNone, Is.True))

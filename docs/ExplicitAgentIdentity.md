@@ -34,11 +34,12 @@ Representative renames confirmed in `Server/McpTools.fs`:
 | `ownerId` | `agentId` | `AssignTask`, `ReissueAssignment`, `CheckpointAttempt`, `SetAttemptSource`, `AcknowledgeReviewFeedback`, `YieldAgent`, `ResumeAgent`, `CompleteAgentWork`, `ReissueQueuedAttempt`, `RecoverAgentAssignment` |
 | `newOwnerId` | `agentId` | `TransferOwner` (target of ownership transfer) |
 | `actorId` | `agentId` | `SubmitIntegration`, `CompleteIntegration`, `PutReviewDocument`, `ReleaseReview`, `WithdrawReview` |
-| `reviewerId` | `agentId` | `ReviewerInbox`, `ClaimReview`, `DecideReview` |
+| `reviewerId` | `agentId` | `ClaimReview`, `DecideReview` (review actor) |
+| — | optional `reviewerId` | `ReviewerInbox` (selected inbox subject; `agentId` remains caller) |
 | `agentId` | unchanged | `AgentInbox`, `RegisterAgent`, `AcknowledgeNotification`, `ParkAgent` |
 | `fromAgentId`, `toAgentId` | unchanged | `NotifyAgent` (genuine sender/recipient distinction) |
 
-Apply `agentId` consistently to agent-initiated project/file/search/read/write/command/Git/job/skill/review utilities as well as state transitions, including read-only and failed calls. Where an operation's existing parameter identifies the *subject* rather than the caller (e.g. fetching another agent's inbox), retain or explicitly define a different subject parameter **only when the distinction is essential**. Avoid introducing a redundant `actorId` just to record initiators.
+Apply `agentId` consistently to agent-initiated project/file/search/read/write/command/Git/job/skill/review utilities as well as state transitions, including read-only and failed calls. Where an operation reads another agent's inbox, keep the distinction explicit: `ReviewerInbox.agentId` identifies the caller for activity attribution, while optional `reviewerId` selects the inbox subject and defaults to `agentId`. Never put the subject reviewer ID in `agentId` when a Manager reads another reviewer's queue; that would fabricate reviewer activity and could release an in-flight launch reservation. Avoid introducing a redundant `actorId` just to record initiators.
 
 Keep `projectName`, `taskId`, `attemptId`, `deviceId`, `operationId`, `requestId`, `reviewId`, etc. unchanged. `deviceId` is routing, not identity. Do not confuse `agentId` with OAuth user ID.
 

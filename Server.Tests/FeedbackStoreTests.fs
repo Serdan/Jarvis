@@ -471,6 +471,13 @@ let ``explicit agent identity uses tool arguments without provider metadata`` ()
     resolve (request "agentId" "GUI Agent") |> shouldEqual (Some "GUI Agent", None)
     resolve (request "fromAgentId" "Lead") |> shouldEqual (Some "Lead", None)
     resolve (request "agentId" "") |> shouldEqual (None, None)
+    let requestWithReviewer caller reviewer =
+        let args = System.Collections.Generic.Dictionary<string, JsonElement>()
+        args["agentId"] <- JsonSerializer.SerializeToElement(caller)
+        args["reviewerId"] <- JsonSerializer.SerializeToElement(reviewer)
+        ModelContextProtocol.Protocol.CallToolRequestParams(Name = "ReviewerInbox", Arguments = args)
+    resolve (requestWithReviewer "Manager" "Reviewer 1")
+    |> shouldEqual (Some "Manager", None)
     let invalid =
         RequestDeviceRouting.withMetadata (request "agentId" "") (fun () ->
             task { return RequestDeviceRouting.invalidAgentId() })

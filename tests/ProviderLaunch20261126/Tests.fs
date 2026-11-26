@@ -171,11 +171,12 @@ let private eventually predicate = task {
 
 [<Test>]
 let ``Codex fake executable receives exact scoped MCP argv and canonical stdin without vendor history`` () =
-    withFake """printf '%s\n' "$@" > argv
+    let script = """printf '%s\n' "$@" > argv
 cat > stdin
 printf 'launch\n' >> launches
 printf '%s\n' '{"type":"turn.started"}' '{"type":"turn.completed"}'
-""" (fun dir exe -> task {
+"""
+    withFake script (fun dir exe -> task {
         let r = request codex
         let b = codexBinding dir exe
         let completed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
@@ -186,7 +187,7 @@ printf '%s\n' '{"type":"turn.started"}' '{"type":"turn.completed"}'
         let! _ = adapter.Launch r
         let! _ = adapter.Launch r
         do! completed.Task.WaitAsync(TimeSpan.FromSeconds 10.)
-        let mutable observations = []
+        let mutable observations : TransportObservation list = []
         let deadline = DateTime.UtcNow.AddSeconds 8.
         while not (observations |> List.exists (fun o -> o.Fact = Acknowledged)) && DateTime.UtcNow < deadline do
             let! observed = adapter.Observe r
@@ -209,11 +210,12 @@ printf '%s\n' '{"type":"turn.started"}' '{"type":"turn.completed"}'
 
 [<Test>]
 let ``Codex cancellation uses bounded process cancellation and never implies terminal Work`` () =
-    withFake """cat > stdin
+    let script = """cat > stdin
 touch started
 sleep 10
 touch incorrectly-survived
-""" (fun dir exe -> task {
+"""
+    withFake script (fun dir exe -> task {
         let r = request codex
         let completed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
         let adapter =

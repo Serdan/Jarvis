@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"automation-simplify-agent-execution-state","title":"[Automation] Simplify agent execution state to Idle and Working","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"automation-simplify-agent-execution-state","title":"[Automation] Simplify agent state to Idle, Working and Blocked","version":2,"lifecycle":"Open","specVersion":2,"attemptId":null}

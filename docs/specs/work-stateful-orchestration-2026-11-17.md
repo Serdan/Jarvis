@@ -4,6 +4,8 @@
 **Status:** Operator design direction recorded for alignment. This document does **not** authorize production activation, migration, deployment, live unattended scheduling, or retroactive reinterpretation of accepted reviews.
 **Relationship to existing work:** Complements and corrects docs/specs/work-queues-and-ephemeral-executions.md, the canonical work-queues-ephemeral-executions epic, and composable-work-units. Preserve independently accepted and integrated work as evidence; migrate selectively rather than rebuilding it blindly.
 
+> **Current controlling amendment (2026-11-26):** Section 16 is authoritative for Work/execution/resource boundaries, Jarvis 1.0/2.0 branch strategy, and clean-slate cutover. Sections 1–15 are preserved historical decisions; where they conflict with Section 16, the dated amendment supersedes them. This document still does not authorize production activation, migration, deployment, or Scheduler operation.
+
 ## 1. Purpose and governing principles
 
 Jarvis manages durable engineering work, not persistent named agents. A non-model Scheduler coordinates replaceable, ephemeral model executions against canonical work. Lead exercises engineering judgment—scope, approval, priority, dependencies—rather than performing mechanical rounds of assignment and resumption.
@@ -251,3 +253,107 @@ Priority sort: (blocking, Lead priority, FIFO); queues are role-compatible sourc
 Storage: SQLite is live authority. Git is source provenance plus asynchronous human-readable JSON backup. Recovery is a specialized Work queue handled by intelligent ephemeral executions behind deterministic uncertainty fences.
 
 **This is the new target contract. The existing Git-CAS implementation is an interim baseline, not evidence that this migration has already occurred.**
+
+
+---
+
+## 16. 2026-11-26 amendment — Work, inference execution, resources, and clean-slate transition
+
+**Authority and precedence.** This dated amendment is the controlling current architecture direction for Work, model execution, JarvisClient resources, branch strategy, and cutover. Sections 1–15 remain the preserved 2026-11-17 design history and continue to govern retained Work semantics. Where older wording implies that an agent, provider conversation, connected device, or long-running process owns Work, or that cutover means bulk-converting the existing Git task/Agent state, this amendment supersedes that interpretation. It does not authorize production activation, deployment, migration, or live Scheduler operation.
+
+### 16.1 Work, execution, resources, jobs, and Challenges are separate domains
+
+The continuity boundary is durable Work. A provider session, Agent record, connected JarvisClient, resource lease, and OS process are not Work owners.
+
+| Domain | Owns | Lifecycle relationship |
+|---|---|---|
+| **Work** | Durable intent, scope, specification, constraints, acceptance, dependencies, priority, milestones, decisions, checkpoints, evidence, and history | Persists while executions and resources come and go. May be dormant, blocked, or actionable without a running model. |
+| **Inference execution** | One ephemeral model/provider session acting on a bounded Work claim | Can start, stop, fail, or be replaced without closing or transferring ownership of Work. Provider conversation IDs and URLs are diagnostics, not Work identity. |
+| **Host and resource** | An enrolled JarvisClient host and its independently addressable capabilities: checkout, worktree, filesystem, process runner, browser, and later other measured resources | Exists independently of any particular model execution. A host may serve several providers or Work items subject to explicit capacity and exclusivity. |
+| **Resource lease** | Temporary, fenced authority to use a particular resource for a particular Work/stage/execution and bounded operations | Can expire or be revoked while the physical process remains alive. Expiry is not proof that a job stopped. |
+| **Job** | A concrete long-running operation such as a process, build, test, browser action, or artifact transfer | Can outlive the inference execution that requested it. Its result must be independently observable and reconciled. |
+| **Challenge** | A durable blocker or continuation condition: dependency, timer, job completion, unknown outcome, approval, or human decision | Suspends or reactivates Work without requiring a model session to remain open. It is not an Agent conversation or a notification. |
+
+These are separate versioned state machines. Their exact enum vocabularies remain implementation choices; they must not be collapsed into one generic Running/Finished status. In particular, Work completion does not imply that every process has stopped, a model session has not ended, and lease expiry does not imply that a job is terminal.
+
+Work remains composable Project/System/Feature intent with explicit required scope, hard prerequisites, parent-specific acceptance, and derived actionable projections. Extend that model so milestone scope, priority, and progress are first-class, versioned Work data. Progress should derive from accepted required deliverables and explicit scope, not the number of tasks, sessions, or agents. Splitting one deliverable into more tasks must not increase the milestone denominator or manufacture progress. Scope changes and optional/required status changes remain explicit and reviewable.
+
+### 16.2 Serdan-Home is a resource host, not an inference location
+
+A model session may run in ChatGPT or Codex on a different machine while Jarvis assigns work to a capable JarvisClient host such as Serdan-Home. The Scheduler selects a compatible host and resource, grants a scoped lease, and dispatches a durable job. The host performs the local operation against its registered repository/worktree or browser resource and reports bounded progress and terminal evidence to the Jarvis control plane. The model session may end while the job continues; a Challenge can reactivate the relevant Work when the job completes, fails, times out, or requires a human decision.
+
+The model provider, Jarvis server, resource host, and browser are not assumed to be co-located. A JarvisClient is a resource provider and authenticated command endpoint, not the owner of Work and not the model execution itself.
+
+### 16.3 Host identity, resource identity, capabilities, and leases
+
+The target must distinguish at least:
+
+- **Host identity:** stable identity of an enrolled JarvisClient machine/service, with an independently authenticated credential and explicit enrollment, rotation, and revocation.
+- **Client-instance identity:** one running client/service instance, so two processes on one machine are not silently treated as one connection.
+- **Resource identity:** a stable host-scoped identity for a particular checkout, worktree, filesystem boundary, process runner, browser profile, or other capability.
+- **Routing identity:** the existing public deviceId label used to select a connected client. It is a compatibility/routing key, not proof of host identity.
+- **Repository/worktree identity:** verified source repository and checkout identities, not local path strings or host identity.
+- **Provider/execution identity:** provider, account/profile, and one ephemeral model execution; never inferred from a deviceId or conversation URL.
+
+A host reconnecting with valid enrollment retains its host identity. A replacement machine is explicitly enrolled. Multiple client instances must be distinguishable. Do not copy the existing deviceId file and treat the resulting duplicate as a new authenticated host.
+
+A host advertises a versioned, typed, bounded capability description. Initial useful dimensions include supported operation kinds, repository/source availability, registered checkout and worktree references, OS and toolchain versions, permitted filesystem roots, process/build/test support, browser profiles and allowed origins, locality, current availability, concurrency limits, and exclusive-resource constraints. Capability freshness and trust must be explicit; a client-supplied string list is not an authorization proof. The exact schema and attestation mechanism remain open. Do not introduce Kubernetes or a general-purpose cluster manager.
+
+A resource lease is server-issued and scoped to the Work item, stage, execution, host/resource, repository/worktree where applicable, and allowed operations. It carries a monotonically fenced generation and bounded expiry/renewal semantics. Revocation or a newer generation prevents stale executions from acquiring or mutating the resource. The server must distinguish lease expiry from verified process termination and reconcile jobs whose host disconnects or whose acknowledgement is lost.
+
+Jobs need stable IDs and operation IDs, idempotent admission, bounded stdout/stderr and progress, terminal evidence, explicit cancellation semantics, and an Unknown/reconciliation path. A model execution ending must not erase the job record. A reconnecting host must not cause an uncertain operation to be blindly repeated.
+
+### 16.4 One control plane; no parallel resource subsystem
+
+The intended Jarvis-host control plane owns the Work graph, role/queue demand, priority and admission, provider execution records, host/resource registry, capability snapshots, leases and fencing generations, durable jobs, Challenges, idempotency receipts, external-effect journals, audit, and queue projections. In-memory indexes are disposable accelerators, never authority.
+
+Use one authoritative SQLite transaction domain on the Jarvis server for the Work/control-plane state. JarvisClient hosts connect through authenticated RPC and execute only the operations covered by their current leases. Do not replicate the authority database across resource hosts or create a second SQLite database and independent Scheduler for resources. Resource admission belongs inside the same Work/Scheduler authority boundary.
+
+Git remains the source-code and immutable source/review/integration provenance system, plus a readable asynchronous backup target. Remote Git CAS is not the hot-path coordination transaction. Backup lag and restore uncertainty remain explicit operational risks and Recovery work. The existing account-level Work capacity limit is model-execution admission; it is not a physical host, CPU, GPU, browser, or repository capacity model. Add resource-specific capacity only where real scheduling evidence requires it.
+
+Scheduler selection remains deterministic: first determine eligible Work and compatible role/provider demand, then require a compatible available resource and lease. Preserve the existing blocker/Lead-priority/FIFO semantics within feasible demand. A host-availability event should trigger reevaluation; it is not itself authority to claim or execute Work. Keep manual grants transient and separate from durable scheduled credentials.
+
+### 16.5 Provider coverage
+
+Jarvis 2.0 requires real-provider execution coverage for both **ChatGPT and Codex**. Do not design the execution model around ChatGPT conversation IDs or a ChatGPT-only browser launch path. Provider adapters own the provider-specific launch/session/termination details; the Work and resource contracts remain provider-neutral. Claude and other providers can follow as adapters, not as assumptions embedded in Work identity or resource ownership.
+
+The exact provider authentication, account/profile selection, quota handling, and session lifecycle APIs remain open implementation decisions. No provider adapter or host resource may fabricate a completed Work outcome without durable evidence.
+
+### 16.6 Jarvis 1.0 / 2.0 branch strategy
+
+- **main is the Jarvis 2.0 development line.** It carries the new Work-first control plane, provider-neutral execution model, resource identity/lease model, durable Jobs and Challenges, and their tests.
+- Do not create the maintenance branch until the current Automation milestone has passed independent acceptance, integration, full release validation, and reconciliation of uncertain external effects and long-running jobs. Record the exact deployable release SHA plus the tested artifact and configuration.
+- At that point, create **stable/1.x** from that exact accepted 1.0 SHA. Keep it a maintenance line for critical correctness and security fixes, independently tested and cherry-picked as needed. Do not back-merge the 2.0 architecture into 1.x or use a moving main branch as the 1.0 release reference.
+- The 1.0 release SHA and stable/1.x branch do not yet exist as approved cutover artifacts. Do not guess a branch point or create the branch prematurely.
+
+### 16.7 Clean-slate cutover contract
+
+Clean-slate means a clean 2.0 coordination state, not deletion of source repositories, source history, accepted reviews, or audit evidence.
+
+1. First complete and freeze the 1.0 release as described above. Keep the stable/1.x artifact and rollback instructions immutable.
+2. Before 2.0 activation, pause 1.0 Work dispatch, new claims, and old live writers. Reconcile or explicitly quarantine every running, pending, and uncertain process/browser/Git side effect. Do not infer that a lost connection means an operation did not happen.
+3. Preserve the old Git-backed ledgers, task/Agent history, source refs, reviews, integration receipts, and external-effect evidence as read-only historical material. Do not run old and new schedulers or writers against the same live Work.
+4. Initialize the 2.0 authoritative database empty. Do not bulk-import persistent Agents, old task queues, claims, conversations, notification history, model sessions, process handles, or stale reservations/leases. Historical Agent records may remain readable for audit but are not active 2.0 owners.
+5. Start new 2.0 Projects and Work with explicit scope and acceptance. The Operator may selectively migrate a specific useful Work item or specification, with its verified source/review/integration lineage and an explicit new acceptance decision. The C0–C3 fixture work is not permission for automatic or blanket migration.
+6. Enroll JarvisClient hosts under the new authenticated host/resource identity contract. Do not equate a legacy deviceId, project name, worktree name, or local path with an enrolled host/resource.
+7. Validate fresh-database startup, backup/restore, host reconnect/replacement, lease expiry and stale-generation rejection, jobs that outlive model sessions, unknown job outcomes, and ChatGPT/Codex provider execution while the new Scheduler remains default-off.
+8. Activate 2.0 only after a separate explicit Operator GO. Rollback selects the frozen 1.0 artifact; it does not replay 2.0 state into 1.0 or permit both versions to mutate the same Work.
+
+No production migration, deployment, host restart, Scheduler activation, or data conversion is authorized by this architecture amendment.
+
+### 16.8 Open design decisions
+
+Resolve these with focused implementation evidence rather than silently selecting a schema or protocol in this document:
+
+- Host enrollment/authentication, credential rotation/revocation, multi-instance identity, and recovery after reinstall or machine replacement.
+- Capability schema, version negotiation, advertisement freshness, trust/attestation, locality, and resource exclusivity.
+- Lease TTL, renewal, revocation, fencing generation, and what evidence proves that an expired host job actually stopped.
+- Durable job protocol, output/artifact transfer, retry/idempotency, cancellation, retention, and Unknown-outcome reconciliation.
+- Provider authentication and profile selection for ChatGPT and Codex, with provider-specific limits kept outside Work identity.
+- Resource capacity/fairness and whether any GPU/CPU/memory dimensions are justified by measured demand. Defer GPU scheduling until there is a concrete workload.
+- Backup frequency, retention, acceptable loss window, and the format/schema transition from the current schema-1 backup implementation to the full typed domain projection.
+- Selective historical Work migration policy and how a migrated item is re-accepted in 2.0.
+- Whether JarvisClient needs a headless daemon/service mode in addition to its current interactive client process; do not assume that such a daemon or durable remote-job service already exists.
+- The milestone progress/weighting contract and how scope changes affect a milestone without making task decomposition a progress hack.
+
+**Interpretation correction for the 2026-11-17 decision summary:** references to SQLite as the live authority describe the intended post-cutover 2.0 state. The current runtime remains Git-backed until the separately reviewed and Operator-approved cutover. The 2026-11-17 plan to import the existing active Git ledgers is superseded as the default cutover path by this clean-slate start with optional, selective, evidence-preserving migration.

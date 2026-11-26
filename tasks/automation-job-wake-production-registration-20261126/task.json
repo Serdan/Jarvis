@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"automation-job-wake-production-registration-20261126","title":"[P0][Automation] Register accepted durable job wake in actual default-off runtime","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"4a65b91246d14a0d918cb7cd1391ef93"}
+{"schemaVersion":2,"taskId":"automation-job-wake-production-registration-20261126","title":"[P0][Automation] Register accepted durable job wake in actual default-off runtime","version":3,"lifecycle":"Closed","specVersion":1,"attemptId":"4a65b91246d14a0d918cb7cd1391ef93"}

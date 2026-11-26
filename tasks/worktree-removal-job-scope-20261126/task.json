@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"worktree-removal-job-scope-20261126","title":"[P0][Repository hygiene] Make worktree removal guard target-specific and non-self-blocking","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"worktree-removal-job-scope-20261126","title":"[P0][Repository hygiene] Make worktree removal guard target-specific and non-self-blocking","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"7e3c24a77b0d4ef69e8cf9ef4e987a68"}

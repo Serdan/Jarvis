@@ -4,6 +4,7 @@ open System
 open System.IO
 open System.Threading
 open System.Collections.Generic
+open Common
 
 /// A declared checkout resource, independent of the public job summary.
 /// Unresolved selectors are resolved only when a removal is being considered.
@@ -13,6 +14,18 @@ type Scope =
     | Paths of string list
     | ProjectWorktrees of ProjectPaths.ProjectId
     | Unknown of ProjectPaths.ProjectId option
+
+// Branch-selected checkout observation is not necessarily at the command's
+// selected root. Keep a project-wide claim until its last use; detached
+// fallback and re-observation can otherwise change the actual root.
+let projectWorktrees = function
+    | Some project -> ProjectWorktrees project
+    | None -> Unknown None
+
+let reviewScope project (command: ReviewWriteCommand) =
+    if (command.Action = "Submit" || command.Action = "Update")
+       && String.IsNullOrWhiteSpace command.HeadOid then projectWorktrees project
+    else NoCheckout
 
 type RemovalTarget =
     { Project: ProjectPaths.ProjectId
@@ -98,6 +111,16 @@ let admitDirect scope =
         |> Result.map (fun admission ->
             let context = enter id
             lease (fun () -> context.Dispose(); admission.Dispose()))
+
+// Validated saved-command replay starts under a ledger-only parent claim.
+// A separate child lease must pass the same gate even in an existing
+// dispatch context; it must not be elided by admitDirect.
+let admitReviewReplay (saved: ReviewWriteCommand) =
+    ProjectPaths.ProjectTarget.parse saved.ProjectName
+    |> Result.bind (fun target ->
+        match reviewScope (Some (ProjectPaths.ProjectTarget.projectId target)) saved with
+        | NoCheckout -> Ok(lease ignore)
+        | scope -> admit (Guid.NewGuid().ToString("N")) scope)
 
 let private blockers target =
     seq {

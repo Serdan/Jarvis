@@ -381,3 +381,179 @@ let ``promoted inspection and removal exclude themselves but count active target
         finally
             for gate in [ coordination; sibling; targetOperation; inspectGate; removeGate ] do gate.TrySetResult() |> ignore
             for handle in jobs do finish handle |> ignore)
+
+
+let private reviewCommand project action head : ReviewWriteCommand =
+    { ProjectName = project; Action = action; OperationId = Guid.NewGuid().ToString("D")
+      TaskId = "review-task"; RequestId = Guid.NewGuid().ToString("D")
+      ActorId = "Worker 3"; ReviewerId = ""; ExpectedVersion = 1
+      Kind = ""; SourceRef = "refs/heads/feature/observed"; HeadOid = head
+      TargetRef = ""; Summary = ""; Verdict = ""; DocumentPath = ""; Content = ""; ExpectedBlobOid = "" }
+
+let private bindCommand project action =
+    TaskWriteCommand
+        { ProjectName = project; Action = action; OperationId = Guid.NewGuid().ToString("D")
+          TaskId = "review-task"; AttemptId = ""; ActorId = "Worker 3"; OwnerId = "Worker 3"
+          Title = ""; Html = ""; ExpectedVersion = 1; ExpectedAgentVersion = 0
+          ExpectedTaskVersion = 0; AssignmentGeneration = 1; Summary = ""; NextAction = ""
+          Reason = ""; BaseOid = ""; TargetRef = ""; SourceRef = "refs/heads/feature/observed"
+          AllowDetached = false; AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+
+let private checkoutObservationCommands project =
+    [ ReviewWriteCommand (reviewCommand project "Submit" "")
+      ReviewWriteCommand (reviewCommand project "Update" " \t")
+      bindCommand project "BindAttemptSource"
+      ReviewWriteCommand { reviewCommand project "Submit" "" with SourceRef = "" } ]
+
+let private coordinationCommands project =
+    [ ReviewWriteCommand (reviewCommand project "Submit" (String.replicate 40 "a"))
+      ReviewWriteCommand (reviewCommand project "Update" (String.replicate 40 "a"))
+      ReviewWriteCommand (reviewCommand project "Claim" "")
+      bindCommand project "RebindAttemptSource"
+      bindCommand project "CheckpointAttempt"
+      RetryPendingIntentCommand
+          { ProjectName = project; OperationId = Guid.NewGuid().ToString("D")
+            OperatorId = "Lead"; ExpectedCommandSha256 = ""; ExpectedVerifiedHead = "" } ]
+
+let private makeObservationTarget root context =
+    let created =
+        createWorktree
+            { ProjectName = "Project1"; Name = "observed"; Branch = "feature/observed"; BaseRef = "HEAD" } context
+        |> function Ok item -> item | Error e -> failwithf "%A" e
+    let selected = ProjectPaths.ProjectTarget.parse "Project1" |> function Ok x -> x | Error e -> failwithf "%A" e
+    let target: WorktreeActivity.RemovalTarget =
+        { Project = ProjectPaths.ProjectTarget.projectId selected; Path = created.Path
+          ResolveCheckout = fun _ -> Ok(Path.Combine(root, "Project1")) }
+    target
+
+let private accepted = function Ok lease -> lease | Error error -> failwithf "Admission failed: %A" error
+let private rejected = function
+    | Error(ValidationError message) -> Assert.That(message, Does.Contain("worktree removal"))
+    | Error error -> Assert.Fail(sprintf "Unexpected error: %A" error)
+    | Ok (lease: IDisposable) -> lease.Dispose(); Assert.Fail("Conflicting admission succeeded.")
+
+[<Test>]
+let ``typed direct checkout observations fence a different registered branch`` () =
+    withRepo (fun root _ context ->
+        let target = makeObservationTarget root context
+        let admit = Client.SignalR.Client.admitCommand
+        let runtime = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+        for command in checkoutObservationCommands "Project1" do
+            do
+                use active = admit command |> accepted
+                // Independent removal operation, not the observing command itself.
+                use observer = WorktreeActivity.enter "independent-removal"
+                WorktreeActivity.count target |> shouldEqual 1
+                let query: InspectWorktreeRemovalCommand =
+                    { ProjectName = "Project1"; WorktreePath = target.Path; TargetRef = None }
+                let inspection = inspectRemoval query context |> function Ok x -> x | Error e -> failwithf "%A" e
+                inspection.CanRemove |> shouldEqual false
+                inspection.RunningJobCount |> shouldEqual 1
+                match WorktreeActivity.reserveRemoval target with
+                | Error 1 -> ()
+                | other -> Assert.Fail(sprintf "Unexpected reservation: %A" other)
+            WorktreeActivity.count target |> shouldEqual 0
+            do
+                use reservation = WorktreeActivity.reserveRemoval target |> function Ok x -> x | Error n -> failwithf "%d" n
+                admit command |> rejected
+                match Client.SignalR.Client.receiveCommand runtime command |> _.GetAwaiter().GetResult() with
+                | Error(ValidationError message) -> Assert.That(message, Does.Contain("worktree removal"))
+                | other -> Assert.Fail(sprintf "Direct dispatch crossed removal reservation: %A" other)
+                for control in coordinationCommands "Project1" @ checkoutObservationCommands "OtherProject" do
+                    use allowed = admit control |> accepted
+                    ()
+            use resumed = admit command |> accepted
+            ())
+
+[<Test>]
+let ``typed promoted checkout observations fence before executing callback`` () =
+    withRepo (fun root _ context ->
+        let target = makeObservationTarget root context
+        let runtime = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+        let response: AgentCommandResponse =
+            { Result = Some "{}"; Error = None; Instructions = []
+              StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
+        let run command callback =
+            let json = System.Text.Json.JsonSerializer.Serialize<AgentCommand>(command)
+            Client.SignalR.Client.executeOrPromoteWith runtime json "Worker 3" TimeSpan.Zero callback
+            |> _.GetAwaiter().GetResult()
+        let finish (handle: ToolJobHandle) =
+            let mutable terminal = None
+            let observed =
+                System.Threading.SpinWait.SpinUntil((fun () ->
+                    match Client.JobManager.getJobResult
+                        { ProjectName = "Project1"; JobId = handle.JobId; AfterSequence = None } context with
+                    | Ok result when result.ToolResponse.IsSome -> terminal <- result.ToolResponse; true
+                    | _ -> false), TimeSpan.FromSeconds(10.))
+            if not observed then failwithf "No terminal result for %s" handle.JobId
+            terminal.Value
+        for command in checkoutObservationCommands "Project1" do
+            let gate = System.Threading.Tasks.TaskCompletionSource<unit>(System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously)
+            let started =
+                run command (fun _ _ -> task {
+                    do! gate.Task
+                    return response
+                })
+            let handle = started.PendingJob |> Option.defaultWith (fun () -> failwithf "Expected promoted job: %A" started)
+            try
+                WorktreeActivity.count target |> shouldEqual 1
+                match WorktreeActivity.reserveRemoval target with
+                | Error 1 -> ()
+                | other -> Assert.Fail(sprintf "Unexpected reservation: %A" other)
+            finally
+                gate.TrySetResult() |> ignore
+                (finish handle).Error |> shouldEqual None
+            do
+                use reservation = WorktreeActivity.reserveRemoval target |> function Ok x -> x | Error n -> failwithf "%d" n
+                let mutable called = false
+                let callback _ _ =
+                    called <- true
+                    System.Threading.Tasks.Task.FromResult response
+                // The exact terminal operation can return its cached result
+                // without re-executing the checkout observation.
+                let cached = run command callback
+                cached.Error |> shouldEqual None
+                called |> shouldEqual false
+                let newId = Guid.NewGuid().ToString("D")
+                let fresh =
+                    match command with
+                    | ReviewWriteCommand saved -> ReviewWriteCommand { saved with OperationId = newId }
+                    | TaskWriteCommand saved -> TaskWriteCommand { saved with OperationId = newId }
+                    | _ -> failwith "Unexpected checkout observation command."
+                let blocked = run fresh callback
+                blocked.PendingJob |> shouldEqual None
+                blocked.Error.IsSome |> shouldEqual true
+                called |> shouldEqual false
+                for control in coordinationCommands "Project1" do
+                    let allowed = run control (fun _ _ -> System.Threading.Tasks.Task.FromResult response)
+                    match allowed.PendingJob with
+                    | Some handle -> (finish handle).Error |> shouldEqual None
+                    | None -> allowed.Error |> shouldEqual None
+            WorktreeActivity.count target |> shouldEqual 0)
+
+[<Test>]
+let ``saved review replay takes its own lease within ledger-only parent`` () =
+    withRepo (fun root _ context ->
+        let target = makeObservationTarget root context
+        let parentId = Guid.NewGuid().ToString("N")
+        use parent = WorktreeActivity.admit parentId WorktreeActivity.NoCheckout |> accepted
+        use parentContext = WorktreeActivity.enter parentId
+        for action in [ "Submit"; "Update" ] do
+            let saved = reviewCommand "Project1" action ""
+            do
+                use replay = WorktreeActivity.admitReviewReplay saved |> accepted
+                use observer = WorktreeActivity.enter "independent-removal"
+                WorktreeActivity.count target |> shouldEqual 1
+                match WorktreeActivity.reserveRemoval target with
+                | Error 1 -> ()
+                | other -> Assert.Fail(sprintf "Replay did not fence: %A" other)
+            WorktreeActivity.count target |> shouldEqual 0
+            do
+                use reservation = WorktreeActivity.reserveRemoval target |> function Ok x -> x | Error n -> failwithf "%d" n
+                WorktreeActivity.admitReviewReplay saved |> rejected
+                use explicitHead =
+                    WorktreeActivity.admitReviewReplay { saved with HeadOid = String.replicate 40 "a" } |> accepted
+                use ledgerOnly = WorktreeActivity.admitReviewReplay { saved with Action = "Claim" } |> accepted
+                ()
+            use resumed = WorktreeActivity.admitReviewReplay saved |> accepted
+            ())

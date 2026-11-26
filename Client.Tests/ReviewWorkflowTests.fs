@@ -5709,6 +5709,68 @@ type ReviewWorkflowTests() =
                 if File.Exists configPath then File.Delete configPath)
 
     [<Test>]
+    member _.OperatorRetryFencesOnlyUnappliedImplicitReviewCheckoutObservation() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            let before = (LedgerStore.fetch first |> success).Commit
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                "owner" context first.ProjectId first.LedgerId first.Epoch
+                first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl before true
+            |> success |> ignore
+            let linked = Path.Combine(Path.GetDirectoryName one, "review-linked")
+            let sourceRef = "refs/heads/feature/linked"
+            git one [ "worktree"; "add"; "-b"; "feature/linked"; linked; "HEAD" ] |> ignore
+            let selected = Client.ProjectPaths.ProjectTarget.parse "owner" |> success
+            let target: Client.WorktreeActivity.RemovalTarget =
+                { Project = Client.ProjectPaths.ProjectTarget.projectId selected
+                  Path = linked; ResolveCheckout = fun _ -> Ok one }
+            let reviewId = Guid.NewGuid()
+            let parentId = Guid.NewGuid().ToString("N")
+            try
+                use parent = Client.WorktreeActivity.admit parentId Client.WorktreeActivity.NoCheckout |> success
+                use scope = Client.WorktreeActivity.enter parentId
+                for action in [ "Submit"; "Update" ] do
+                    let operationId = Guid.NewGuid()
+                    let command: Common.ReviewWriteCommand =
+                        { ProjectName = "owner"; Action = action; OperationId = operationId.ToString("D")
+                          TaskId = "retry-review"; RequestId = reviewId.ToString("D")
+                          ActorId = "Owner"; ReviewerId = ""; ExpectedVersion = 1
+                          Kind = ""; SourceRef = sourceRef; HeadOid = ""; TargetRef = ""
+                          Summary = action; Verdict = ""; DocumentPath = ""; Content = ""; ExpectedBlobOid = "" }
+                    let persist () =
+                        Client.OrchestrationApi.PendingIntentJournal.persist first operationId
+                            "ReviewWrite" (System.Text.Json.JsonSerializer.Serialize command) |> success
+                        Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                        |> success |> Option.get
+                    let saved = persist()
+                    let authorization: Common.RetryPendingIntentCommand =
+                        { ProjectName = "owner"; OperationId = command.OperationId
+                          OperatorId = "Lead"; ExpectedCommandSha256 = saved.CommandSha256
+                          ExpectedVerifiedHead = (LedgerStore.fetch first |> success).Commit }
+                    do
+                        use reservation = Client.WorktreeActivity.reserveRemoval target |> success
+                        match Client.OrchestrationApi.PendingRecoveryApi.retry authorization context with
+                        | Error(Client.ValidationError message) -> Assert.That(message, Does.Contain("worktree removal"))
+                        | other -> Assert.Fail(sprintf "Saved implicit review crossed reservation: %A" other)
+                        Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(authorization.ExpectedVerifiedHead))
+                    Client.OrchestrationApi.PendingRecoveryApi.retry authorization context |> success |> ignore
+                    let newHead = (LedgerStore.fetch first |> success).Commit
+                    let receipt = LedgerStore.getOperationStatus first operationId |> success |> snd
+                    Assert.That(receipt.IsSome, Is.True)
+                    let savedAgain = persist()
+                    use reservation = Client.WorktreeActivity.reserveRemoval target |> success
+                    let result =
+                        Client.OrchestrationApi.PendingRecoveryApi.retry
+                            { authorization with ExpectedVerifiedHead = newHead
+                                                 ExpectedCommandSha256 = savedAgain.CommandSha256 } context |> success
+                    Assert.That(System.Text.Json.JsonSerializer.Serialize result, Does.Contain("Applied"))
+                    Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(newHead))
+                    Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome, Is.True)
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
     member _.OperatorRetryNeverResurrectsLegacyResumeOrStaleEntity() =
         withFixture (fun one _ first _ _ _ _ _ ->
             let before = (LedgerStore.fetch first |> success).Commit

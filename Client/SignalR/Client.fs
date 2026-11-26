@@ -226,7 +226,7 @@ let private classifyProject command =
         | Some raw -> ProjectPaths.ProjectTarget.parse raw |> Result.map Checkout
 
 // Resource provenance comes from the typed command, never its display name.
-// Coordination commands use the canonical ledger, not the selected checkout.
+// Most coordination commands are ledger-only; branch-selected source observations are not.
 let private worktreeScope scope command =
     let project = projectTarget scope |> Option.map ProjectPaths.ProjectTarget.projectId
     let explicitPath (path: string) =
@@ -244,9 +244,12 @@ let private worktreeScope scope command =
         match projectTarget scope with
         | Some target -> WorktreeActivity.Checkout target
         | None -> WorktreeActivity.Unknown project
+    | TaskWriteCommand cmd when cmd.Action = "BindAttemptSource" ->
+        WorktreeActivity.projectWorktrees project
+    | ReviewWriteCommand cmd -> WorktreeActivity.reviewScope project cmd
     | TaskReadCommand _ | TaskWriteCommand _ | ObserveAgentCommand _
     | CrossProjectNotificationCommand _ | ChallengeReadCommand _ | ChallengeWriteCommand _
-    | LedgerReadCommand _ | LedgerWriteCommand _ | ReviewReadCommand _ | ReviewWriteCommand _
+    | LedgerReadCommand _ | LedgerWriteCommand _ | ReviewReadCommand _
     | WorkQueueReadCommand _ | WorkQueueWriteCommand _ | WorkPriorityCommand _
     | OperatorConversationReadCommand _ | OperatorConversationWriteCommand _
     | RetryPendingIntentCommand _ | SupersedePendingIntentCommand _ | AbandonPendingIntentCommand _
@@ -258,6 +261,11 @@ let private worktreeScope scope command =
         | Some target -> WorktreeActivity.Checkout target
         | None -> WorktreeActivity.NoCheckout
 
+// Both direct dispatch paths use this same typed admission; promoted work
+// registers worktreeScope before scheduling and retains that claim.
+let internal admitCommand command =
+    classifyProject command
+    |> Result.bind (fun scope -> WorktreeActivity.admitDirect (worktreeScope scope command))
 
 // Trust-binding locks are held only around local config access, never
 // remote Git fetches. Retry only the typed, pre-write contention case.
@@ -1421,7 +1429,7 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
 
 let receiveCommand (rt: Runtime) (command: AgentCommand) =
     task {
-        match classifyProject command |> Result.bind (fun scope -> WorktreeActivity.admitDirect (worktreeScope scope command)) with
+        match admitCommand command with
         | Error error -> return Error error
         | Ok admission ->
             use _admission = admission
@@ -1502,7 +1510,7 @@ let private receivePreparedCommand (rt: Runtime)
                                    (onChallengeCommit: ChallengeWakePostCommit option)
                                    (inboxSnapshot: InboxSnapshot option) =
     task {
-        match classifyProject command |> Result.bind (fun scope -> WorktreeActivity.admitDirect (worktreeScope scope command)) with
+        match admitCommand command with
         | Error error -> return Error error
         | Ok admission ->
             use _admission = admission

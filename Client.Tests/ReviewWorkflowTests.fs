@@ -3994,8 +3994,10 @@ type ReviewWorkflowTests() =
                     invoke (Common.TaskWriteCommand(request "StartTasklessWork" "Owner" "" original.Agent.Version))
                 Assert.That(forgedResult.IsError, Is.True)
                 Assert.That(forgedReceipt.AgentStateChanges, Is.Empty)
-                Assert.That((ReviewWorkflow.getAgentInbox second "Reviewer" |> success).Agent.State,
-                            Is.EqualTo("Parked"))
+                let afterForged = (ReviewWorkflow.getAgentInbox second "Reviewer" |> success).Agent
+                Assert.That(afterForged.State, Is.EqualTo("NeedsWork"))
+                Assert.That(afterForged.UnassignedDisposition, Is.EqualTo(original.Agent.UnassignedDisposition))
+                Assert.That(afterForged.Version, Is.EqualTo(original.Agent.Version))
                 let _, misboundResult, _ =
                     invoke (Common.TaskWriteCommand(request "StartTasklessWork" "Reviewer" "made-up-task" original.Agent.Version))
                 Assert.That(misboundResult.IsError, Is.True)

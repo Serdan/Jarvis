@@ -33,10 +33,13 @@ type internal RequestSnapshot =
     { ProjectId: ProjectPaths.ProjectId
       AgentId: string
       Generation: GuidanceGeneration
+      ObservedAt: DateTimeOffset
       Verified: Result<LedgerStore.LedgerBinding * LedgerStore.LedgerSnapshot, EffectError> }
 
+let private workingGuidanceRefreshInterval = TimeSpan.FromMinutes 2.
+
 type private WorkingGuidanceCache() =
-    let entries = WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.)
+    let entries = WorkingTurnGuidance.AgentCache(workingGuidanceRefreshInterval)
     let generationGate = obj()
     let agentGenerations = ConcurrentDictionary<ProjectPaths.ProjectId * string, int64>()
     let mutable globalGeneration = 0L
@@ -57,7 +60,7 @@ type private WorkingGuidanceCache() =
     member this.Get(now, project, agentId, load) =
         let rec read retries =
             let generation = this.Capture(project, agentId)
-            let value = entries.Get(now, project, agentId, load)
+            let value = entries.GetObserved(now, project, agentId, load)
             if this.IsCurrent(project, agentId, generation) then value, generation
             elif retries > 0 then read (retries - 1)
             else
@@ -87,9 +90,20 @@ let internal captureWorkingGuidanceGeneration (rt: Runtime) (target: ProjectPath
     let projectId = ProjectPaths.ProjectTarget.projectId target
     (workingGuidanceCache rt).Capture(projectId, agentId)
 
-let internal createRequestSnapshot (target: ProjectPaths.ProjectTarget) agentId generation verified =
+let internal createRequestSnapshot (target: ProjectPaths.ProjectTarget) agentId generation observedAt verified =
     let projectId = ProjectPaths.ProjectTarget.projectId target
-    { ProjectId = projectId; AgentId = agentId; Generation = generation; Verified = verified }
+    { ProjectId = projectId; AgentId = agentId; Generation = generation
+      ObservedAt = observedAt; Verified = verified }
+
+let private requestSnapshotIsCurrent (cache: WorkingGuidanceCache) now projectId agentId snapshot =
+    snapshot.ProjectId = projectId
+    && String.Equals(snapshot.AgentId, agentId, StringComparison.OrdinalIgnoreCase)
+    && cache.IsCurrent(projectId, agentId, snapshot.Generation)
+    && WorkingTurnGuidance.isFresh workingGuidanceRefreshInterval now snapshot.ObservedAt
+
+let private observedAgentState (snapshot: RequestSnapshot) agentId stateAt =
+    snapshot.Verified |> Result.bind (stateAt agentId)
+    |> Result.map (fun value -> snapshot.ObservedAt, value)
 
 let internal withCurrentRequestSnapshot (rt: Runtime) projectId agentId
                                         (requestSnapshot: RequestSnapshot option)
@@ -98,11 +112,9 @@ let internal withCurrentRequestSnapshot (rt: Runtime) projectId agentId
     let cache = workingGuidanceCache rt
     match requestSnapshot with
     | Some snapshot
-        when snapshot.ProjectId = projectId
-             && String.Equals(snapshot.AgentId, agentId, StringComparison.OrdinalIgnoreCase)
-             && cache.IsCurrent(projectId, agentId, snapshot.Generation) ->
+        when requestSnapshotIsCurrent cache DateTimeOffset.UtcNow projectId agentId snapshot ->
         let result = useSnapshot snapshot
-        if cache.IsCurrent(projectId, agentId, snapshot.Generation) then result else fallback()
+        if requestSnapshotIsCurrent cache DateTimeOffset.UtcNow projectId agentId snapshot then result else fallback()
     | _ -> fallback()
 
 type private AlertProbe =
@@ -329,8 +341,9 @@ let private loadAgentState (rt: Runtime) (project: string) (agentId: string) =
     retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt)
     |> Result.bind (agentStateAt agentId)
 
-let internal checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.ProjectTarget option)
-                                  (requestSnapshot: RequestSnapshot option) _command =
+let internal checkWorkingGuidanceAt (now: DateTimeOffset) (rt: Runtime) agentId
+                                    (target: ProjectPaths.ProjectTarget option)
+                                    (requestSnapshot: RequestSnapshot option) =
     if String.IsNullOrWhiteSpace agentId then []
     else
         match target with
@@ -338,22 +351,21 @@ let internal checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.Pr
         | Some target ->
             let projectId = ProjectPaths.ProjectTarget.projectId target
             let project = ProjectPaths.ProjectId.value projectId
-            let now = DateTimeOffset.UtcNow
             let cache = workingGuidanceCache rt
             let load () =
                 match requestSnapshot with
-                | Some snapshot
-                    when snapshot.ProjectId = projectId
-                         && String.Equals(snapshot.AgentId, agentId, StringComparison.OrdinalIgnoreCase)
-                         && cache.IsCurrent(projectId, agentId, snapshot.Generation) ->
-                    snapshot.Verified |> Result.bind (agentStateAt agentId)
-                | _ -> loadAgentState rt project agentId
+                | Some snapshot when requestSnapshotIsCurrent cache now projectId agentId snapshot ->
+                    observedAgentState snapshot agentId agentStateAt
+                | _ -> loadAgentState rt project agentId |> Result.map (fun value -> now, value)
             let agent, generation = cache.Get(now, projectId, agentId, load)
             let guidance =
                 agent |> Result.toOption |> Option.flatten
                 |> Option.bind (WorkingTurnGuidance.instructionAt now)
                 |> Option.bind OperationalControl.workingTurn |> Option.toList
             if cache.IsCurrent(projectId, agentId, generation) then guidance else []
+
+let internal checkWorkingGuidance rt agentId target requestSnapshot _command =
+    checkWorkingGuidanceAt DateTimeOffset.UtcNow rt agentId target requestSnapshot
 
 // A read can still mutate the original Agent ledger via automatic activation
 // or one-shot response-alert consumption. Verify that *side effect* separately
@@ -495,10 +507,11 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
             let loadSnapshotStable load =
                 let rec attempt retries =
                     let generation = cache.Capture(projectId, agentId)
+                    // Timestamp the start of the authoritative observation,
+                    // conservatively including any contention/retry latency.
+                    let observedAt = DateTimeOffset.UtcNow
                     let verified = retryBindingContention load
-                    let snapshot =
-                        { ProjectId = projectId; AgentId = agentId
-                          Generation = generation; Verified = verified }
+                    let snapshot = createRequestSnapshot target agentId generation observedAt verified
                     if cache.IsCurrent(projectId, agentId, generation) then
                         activationSnapshot <- Some snapshot
                         rememberSnapshot snapshot
@@ -523,13 +536,10 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                 cache.Get(DateTimeOffset.UtcNow, projectId, agentId, fun () ->
                     let verified =
                         match activationSnapshot with
-                        | Some snapshot
-                            when snapshot.ProjectId = projectId
-                                 && String.Equals(snapshot.AgentId, agentId, StringComparison.OrdinalIgnoreCase)
-                                 && cache.IsCurrent(projectId, agentId, snapshot.Generation) ->
-                            snapshot.Verified
-                        | _ -> loadCurrentSnapshot() |> Result.bind (fun snapshot -> snapshot.Verified)
-                    verified |> Result.bind (agentStateAt agentId))
+                        | Some snapshot when requestSnapshotIsCurrent cache DateTimeOffset.UtcNow projectId agentId snapshot ->
+                            Ok snapshot
+                        | _ -> loadCurrentSnapshot()
+                    verified |> Result.bind (fun snapshot -> observedAgentState snapshot agentId agentStateAt))
             let current =
                 if cache.IsCurrent(projectId, agentId, generation) then current
                 else Error(Client.ValidationError "Agent state changed during activation lookup.")

@@ -52,28 +52,38 @@ type private CacheEntry =
     { Gate: obj
       mutable Verified: (DateTimeOffset * ReviewAgent option) option }
 
+let isFresh (refreshInterval: TimeSpan) (now: DateTimeOffset) (observedAt: DateTimeOffset) =
+    now >= observedAt && now - observedAt < refreshInterval
+
 type AgentCache(refreshInterval: TimeSpan) =
     let entries = ConcurrentDictionary<ProjectPaths.ProjectId * string, CacheEntry>()
 
-    member _.Get(now: DateTimeOffset, project: ProjectPaths.ProjectId, agentId: string,
-                 load: unit -> Result<ReviewAgent option, Client.EffectError>) =
+    // Reusing verified request evidence must retain its original observation
+    // time; delivery into an empty cache does not establish new freshness.
+    member _.GetObserved(now: DateTimeOffset, project: ProjectPaths.ProjectId, agentId: string,
+                         load: unit -> Result<DateTimeOffset * ReviewAgent option, Client.EffectError>) =
         let key = project, agentId.ToUpperInvariant()
         let entry =
             entries.GetOrAdd(key, fun _ ->
                 { Gate = obj(); Verified = None })
         lock entry.Gate (fun () ->
             match entry.Verified with
-            | Some (checkedAt, value) when now >= checkedAt && now - checkedAt < refreshInterval ->
+            | Some (checkedAt, value) when isFresh refreshInterval now checkedAt ->
                 Ok value
             | _ ->
                 // A failed refresh establishes neither presence nor absence.
                 // The next call must retry rather than use stale lifecycle evidence.
                 entry.Verified <- None
                 match load() with
-                | Ok value ->
-                    entry.Verified <- Some(now, value)
+                | Ok (observedAt, value) ->
+                    entry.Verified <- Some(observedAt, value)
                     Ok value
                 | Error error -> Error error)
+
+    member this.Get(now: DateTimeOffset, project: ProjectPaths.ProjectId, agentId: string,
+                    load: unit -> Result<ReviewAgent option, Client.EffectError>) =
+        this.GetObserved(now, project, agentId, fun () ->
+            load() |> Result.map (fun value -> now, value))
 
     member _.Invalidate(project: ProjectPaths.ProjectId, agentId: string) =
         let key = project, agentId.ToUpperInvariant()

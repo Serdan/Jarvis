@@ -95,15 +95,14 @@ let internal createRequestSnapshot (target: ProjectPaths.ProjectTarget) agentId 
     { ProjectId = projectId; AgentId = agentId; Generation = generation
       ObservedAt = observedAt; Verified = verified }
 
-let private requestSnapshotIsCurrent (cache: WorkingGuidanceCache) now projectId agentId snapshot =
+let private requestSnapshotMatches (cache: WorkingGuidanceCache) projectId agentId snapshot =
     snapshot.ProjectId = projectId
     && String.Equals(snapshot.AgentId, agentId, StringComparison.OrdinalIgnoreCase)
     && cache.IsCurrent(projectId, agentId, snapshot.Generation)
-    && WorkingTurnGuidance.isFresh workingGuidanceRefreshInterval now snapshot.ObservedAt
 
-let private observedAgentState (snapshot: RequestSnapshot) agentId stateAt =
-    snapshot.Verified |> Result.bind (stateAt agentId)
-    |> Result.map (fun value -> snapshot.ObservedAt, value)
+let private requestSnapshotIsFresh cache now projectId agentId snapshot =
+    requestSnapshotMatches cache projectId agentId snapshot
+    && WorkingTurnGuidance.isFresh workingGuidanceRefreshInterval now snapshot.ObservedAt
 
 let internal withCurrentRequestSnapshot (rt: Runtime) projectId agentId
                                         (requestSnapshot: RequestSnapshot option)
@@ -112,9 +111,11 @@ let internal withCurrentRequestSnapshot (rt: Runtime) projectId agentId
     let cache = workingGuidanceCache rt
     match requestSnapshot with
     | Some snapshot
-        when requestSnapshotIsCurrent cache DateTimeOffset.UtcNow projectId agentId snapshot ->
+        // Preserve request-pinned inbox/activation semantics. The fallback
+        // TTL belongs to the shared guidance cache, not the inbox payload.
+        when requestSnapshotMatches cache projectId agentId snapshot ->
         let result = useSnapshot snapshot
-        if requestSnapshotIsCurrent cache DateTimeOffset.UtcNow projectId agentId snapshot then result else fallback()
+        if cache.IsCurrent(projectId, agentId, snapshot.Generation) then result else fallback()
     | _ -> fallback()
 
 type private AlertProbe =
@@ -337,6 +338,10 @@ let private agentStateAt agentId (binding, snapshot) =
     | Error(LedgerStore.StaleEntityVersion _) -> Ok None
     | Error error -> Error(OrchestrationApi.LedgerErrors.toEffect error)
 
+let private observedAgentState agentId (snapshot: RequestSnapshot) =
+    snapshot.Verified |> Result.bind (agentStateAt agentId)
+    |> Result.map (fun value -> snapshot.ObservedAt, value)
+
 let private loadAgentState (rt: Runtime) (project: string) (agentId: string) =
     retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt)
     |> Result.bind (agentStateAt agentId)
@@ -354,8 +359,8 @@ let internal checkWorkingGuidanceAt (now: DateTimeOffset) (rt: Runtime) agentId
             let cache = workingGuidanceCache rt
             let load () =
                 match requestSnapshot with
-                | Some snapshot when requestSnapshotIsCurrent cache now projectId agentId snapshot ->
-                    observedAgentState snapshot agentId agentStateAt
+                | Some snapshot when requestSnapshotIsFresh cache now projectId agentId snapshot ->
+                    observedAgentState agentId snapshot
                 | _ -> loadAgentState rt project agentId |> Result.map (fun value -> now, value)
             let agent, generation = cache.Get(now, projectId, agentId, load)
             let guidance =
@@ -536,10 +541,10 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                 cache.Get(DateTimeOffset.UtcNow, projectId, agentId, fun () ->
                     let verified =
                         match activationSnapshot with
-                        | Some snapshot when requestSnapshotIsCurrent cache DateTimeOffset.UtcNow projectId agentId snapshot ->
+                        | Some snapshot when requestSnapshotIsFresh cache DateTimeOffset.UtcNow projectId agentId snapshot ->
                             Ok snapshot
                         | _ -> loadCurrentSnapshot()
-                    verified |> Result.bind (fun snapshot -> observedAgentState snapshot agentId agentStateAt))
+                    verified |> Result.bind (fun snapshot -> observedAgentState agentId snapshot))
             let current =
                 if cache.IsCurrent(projectId, agentId, generation) then current
                 else Error(Client.ValidationError "Agent state changed during activation lookup.")

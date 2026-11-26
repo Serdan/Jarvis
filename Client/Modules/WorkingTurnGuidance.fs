@@ -52,7 +52,7 @@ type private CacheEntry =
     { Gate: obj
       mutable Verified: (DateTimeOffset * ReviewAgent option) option }
 
-let isFresh (refreshInterval: TimeSpan) (now: DateTimeOffset) (observedAt: DateTimeOffset) =
+let internal isFresh (refreshInterval: TimeSpan) (now: DateTimeOffset) (observedAt: DateTimeOffset) =
     now >= observedAt && now - observedAt < refreshInterval
 
 type AgentCache(refreshInterval: TimeSpan) =
@@ -60,7 +60,7 @@ type AgentCache(refreshInterval: TimeSpan) =
 
     // Reusing verified request evidence must retain its original observation
     // time; delivery into an empty cache does not establish new freshness.
-    member _.GetObserved(now: DateTimeOffset, project: ProjectPaths.ProjectId, agentId: string,
+    member internal _.GetObserved(now: DateTimeOffset, project: ProjectPaths.ProjectId, agentId: string,
                          load: unit -> Result<DateTimeOffset * ReviewAgent option, Client.EffectError>) =
         let key = project, agentId.ToUpperInvariant()
         let entry =

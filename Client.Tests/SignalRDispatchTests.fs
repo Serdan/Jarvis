@@ -1246,12 +1246,14 @@ module OrdinaryDispatchGitTests =
             // There is no two-minute sleep and no mutation of ledger timestamps.
             let t0 = DateTimeOffset.Parse(agent.WorkingTurnStartedAtUtc).AddMinutes(29.)
             let target = Client.ProjectPaths.ProjectTarget.parse "project" |> success
+            // The on-disk binding is shared; each runtime has its own cache.
+            let bindingRt = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting "project" bindingRt
+                binding.ProjectId binding.LedgerId binding.Epoch binding.RemoteName
+                binding.ApprovedFetchUrl binding.ApprovedPushUrl verified.Commit true
+            |> success |> ignore
             let createRuntime () =
                 let rt = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
-                Client.OrchestrationApi.LedgerBindingConfig.bindExisting "project" rt
-                    binding.ProjectId binding.LedgerId binding.Epoch binding.RemoteName
-                    binding.ApprovedFetchUrl binding.ApprovedPushUrl verified.Commit true
-                |> success |> ignore
                 let generation = Client.SignalR.Client.captureWorkingGuidanceGeneration rt target "Owner"
                 let snapshot = Client.SignalR.Client.createRequestSnapshot target "Owner" generation t0 (Ok(binding, verified))
                 rt, snapshot

@@ -73,6 +73,12 @@ function snapshot(projectName = "Jarvis") {
 const journal = (projectName = "Jarvis") => ({
   schemaVersion: 1, projectName, revision: 0, records: []
 });
+function addLegacyReviewReservation(j, status = "uncertain") {
+  j.records.push({ launchId: "legacy-review-launch", agentId: "Reviewer 1", kind: "reviewer",
+    status, reservedAtUtc: NOW, ledgerHead: HEAD,
+    review: { mode: "unclaimed", taskId: REVIEW_A.taskId, attemptId: null,
+      reviewerId: null, reviewId: REVIEW_A.reviewId, version: 1 } });
+}
 
 test("zero ready implementation and zero unclaimed reviews launch no one", () => {
   const s = snapshot();
@@ -85,8 +91,9 @@ test("zero ready implementation and zero unclaimed reviews launch no one", () =>
 test("under budget: implementation before shared frozen reviewers", () => {
   const result = decide(config(), snapshot(), journal(), NOW);
   assert.deepEqual(result.reservations.map(x => x.agentId),
-    ["Worker 1", "Worker 2", "Reviewer 1", "Reviewer 2"]);
-  assert.deepEqual(result.counts, { worker: 2, reviewer: 2 });
+    ["Worker 1", "Worker 2"]);
+  assert.deepEqual(result.reviewHolds.map(x => x.agentId), ["Reviewer 1", "Reviewer 2"]);
+  assert.deepEqual(result.counts, { worker: 2, reviewer: 0 });
 });
 
 test("hard worker/reviewer budgets reject oversized per-project config", () => {
@@ -132,12 +139,12 @@ test("stale, future or incomplete observation fails closed", () => {
 test("pending/uncertain launch prevents duplicate idle ticks", () => {
   const j = journal();
   const first = decide(config(), snapshot(), j, NOW);
-  assert.equal(first.reservations.length, 4);
+  assert.equal(first.reservations.length, 2);
   j.records[0].status = "uncertain";
   const second = decide(config(), snapshot(), j, NOW);
   assert.equal(second.reservations.length, 0);
   assert.equal(j.records[0].status, "uncertain");
-  assert.equal(j.records.length, 4);
+  assert.equal(j.records.length, 2);
 });
 
 test("new observed Jarvis activity releases reservation, not a successful UI send", () => {
@@ -198,7 +205,7 @@ test("process restart retains reservations; explicit result and operator release
     const first = spawnSync(process.execPath, [SCRIPT, ...args], { encoding: "utf8" });
     assert.equal(first.status, 0, first.stderr);
     const firstDecisions = JSON.parse(first.stdout).reservations;
-    assert.equal(firstDecisions.length, 4);
+    assert.equal(firstDecisions.length, 2);
     const second = spawnSync(process.execPath, [SCRIPT, ...args], { encoding: "utf8" });
     assert.equal(second.status, 0, second.stderr);
     assert.equal(JSON.parse(second.stdout).reservations.length, 0);
@@ -309,7 +316,7 @@ test("shared review demand bounds taskless reviewer launches", () => {
   const s = snapshot();
   setUnclaimedReviews(c, s, [REVIEW_A]);
   const r = decide(c, s, journal(), NOW);
-  assert.deepEqual(r.reservations.map(x => x.agentId), ["Reviewer 1"]);
+  assert.deepEqual(r.reviewHolds.map(x => x.agentId), ["Reviewer 1"]);
 });
 
 test("reviewer inboxes must be complete, consistent and tied to the snapshot head", () => {
@@ -343,13 +350,13 @@ test("one unclaimed request dispatches only one of several reviewers and leaves 
   const j = journal();
   const r = decide(c, s, j, NOW);
 
-  assert.deepEqual(r.reservations.map(x => x.agentId), ["Reviewer 1"]);
-  assert.deepEqual(r.reservations[0].review, {
+  assert.deepEqual(r.reviewHolds.map(x => x.agentId), ["Reviewer 1"]);
+  assert.deepEqual(r.reviewHolds[0].review, {
     mode: "unclaimed", taskId: "_reviews", attemptId: null,
     reviewerId: null, reviewId: REVIEW_A.reviewId, version: 1
   });
   assert.equal(JSON.stringify(s.reviewerInboxes), inboxesBefore);
-  assert.equal(j.records[0].review.reviewerId, null);
+  assert.equal(j.records.length, 0);
 });
 
 test("an uncertain reviewer send holds its request across successive ticks", () => {
@@ -358,9 +365,9 @@ test("an uncertain reviewer send holds its request across successive ticks", () 
   const j = journal();
   const firstSnapshot = snapshot();
   setUnclaimedReviews(c, firstSnapshot, [REVIEW_A]);
-  assert.deepEqual(decide(c, firstSnapshot, j, NOW).reservations.map(x => x.agentId),
+  assert.deepEqual(decide(c, firstSnapshot, j, NOW).reviewHolds.map(x => x.agentId),
     ["Reviewer 1"]);
-  j.records[0].status = "uncertain";
+  addLegacyReviewReservation(j);
 
   const later = snapshot();
   later.capturedAtUtc = "2026-11-15T02:01:00Z";
@@ -378,7 +385,7 @@ test("a claim that appears while an earlier reviewer send is unresolved is not r
   const initial = snapshot();
   setUnclaimedReviews(c, initial, [REVIEW_A]);
   decide(c, initial, j, NOW);
-  j.records[0].status = "uncertain";
+  addLegacyReviewReservation(j);
 
   const transferred = snapshot();
   transferred.ledgerHead = "b".repeat(40);
@@ -411,8 +418,8 @@ test("unclaimed demand selects an idle eligible reviewer, not an assigned or blo
   blocked.waitingOnChallenge = true;
 
   const r = decide(c, s, journal(), NOW);
-  assert.deepEqual(r.reservations.map(x => x.agentId), ["Reviewer 3"]);
-  assert.equal(r.reservations[0].review.reviewId, REVIEW_A.reviewId);
+  assert.deepEqual(r.reviewHolds.map(x => x.agentId), ["Reviewer 3"]);
+  assert.equal(r.reviewHolds[0].review.reviewId, REVIEW_A.reviewId);
 });
 
 test("a reviewer resumes only its own claimed review, including with a standing task", () => {
@@ -430,10 +437,10 @@ test("a reviewer resumes only its own claimed review, including with a standing 
   reviewer.unassignedDisposition = null;
 
   const r = decide(c, s, journal(), NOW);
-  assert.deepEqual(r.reservations.map(x => x.agentId), ["Reviewer 1"]);
-  assert.equal(r.reservations[0].reason, "ClaimedReviewResume");
-  assert.equal(r.reservations[0].review.mode, "claimed");
-  assert.equal(r.reservations[0].review.reviewerId, "Reviewer 1");
+  assert.deepEqual(r.reviewHolds.map(x => x.agentId), ["Reviewer 1"]);
+  assert.equal(r.reviewHolds[0].reason, "ClaimedReviewResume");
+  assert.equal(r.reviewHolds[0].review.mode, "claimed");
+  assert.equal(r.reviewHolds[0].review.reviewerId, "Reviewer 1");
 });
 
 test("a blocked claimed review waits for its dependency, then becomes resumable", () => {
@@ -457,7 +464,7 @@ test("a blocked claimed review waits for its dependency, then becomes resumable"
     "Reviewer 2": []
   });
   const r = decide(c, resumed, journal(), resumed.capturedAtUtc);
-  assert.deepEqual(r.reservations.map(x => x.agentId), ["Reviewer 1"]);
+  assert.deepEqual(r.reviewHolds.map(x => x.agentId), ["Reviewer 1"]);
 });
 
 test("a standing task alone never makes a Reviewer eligible for generic ready dispatch", () => {
@@ -502,12 +509,13 @@ test("the registered Manager plan route deduplicates inbox demand in disposable 
     const first = spawnSync(process.execPath, [SCRIPT, ...args], { encoding: "utf8" });
     assert.equal(first.status, 0, first.stderr);
     const decisions = JSON.parse(first.stdout);
-    assert.deepEqual(decisions.reservations.map(x => x.agentId), ["Reviewer 1"]);
-    assert.equal(decisions.reservations[0].review.reviewId, REVIEW_A.reviewId);
+    assert.deepEqual(decisions.reviewHolds.map(x => x.agentId), ["Reviewer 1"]);
+    assert.equal(decisions.reviewHolds[0].review.reviewId, REVIEW_A.reviewId);
 
     const second = spawnSync(process.execPath, [SCRIPT, ...args], { encoding: "utf8" });
     assert.equal(second.status, 0, second.stderr);
     assert.deepEqual(JSON.parse(second.stdout).reservations, []);
+    assert.deepEqual(JSON.parse(second.stdout).reviewHolds, decisions.reviewHolds);
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
   }
@@ -670,10 +678,10 @@ test("unclassified active or uncertain project agents fail closed", () => {
   }
   const s = snapshot();
   s.agents.push(agent("Inactive helper", "other", "Parked"));
-  assert.equal(decide(config(), s, journal(), NOW).reservations.length, 4);
+  assert.equal(decide(config(), s, journal(), NOW).reservations.length, 2);
 });
 
-test("taskless reviewer reservation survives inbox-only activity and resumes the exact claim after yield", () => {
+test("taskless reviewer reservation survives inbox-only activity and holds the exact claim after yield", () => {
   const c = config();
   c.budgets.worker = 0;
   c.budgets.reviewer = 1;
@@ -681,8 +689,8 @@ test("taskless reviewer reservation survives inbox-only activity and resumes the
   const initial = snapshot();
   setUnclaimedReviews(c, initial, [REVIEW_A]);
   const first = decide(c, initial, j, NOW);
-  assert.deepEqual(first.reservations.map(x => x.agentId), ["Reviewer 1"]);
-  j.records[0].status = "uncertain";
+  assert.deepEqual(first.reviewHolds.map(x => x.agentId), ["Reviewer 1"]);
+  addLegacyReviewReservation(j);
 
   const inboxOnly = snapshot();
   inboxOnly.capturedAtUtc = "2026-11-15T02:01:00Z";
@@ -709,7 +717,7 @@ test("taskless reviewer reservation survives inbox-only activity and resumes the
     "Reviewer 2": []
   });
   assert.deepEqual(decide(c, started, j, started.capturedAtUtc).reservations, []);
-  assert.equal(j.records[0].status, "observed");
+  assert.equal(j.records[0].status, "uncertain");
 
   const yielded = snapshot();
   yielded.capturedAtUtc = "2026-11-15T02:03:00Z";
@@ -727,12 +735,11 @@ test("taskless reviewer reservation survives inbox-only activity and resumes the
     "Reviewer 2": []
   });
   const resumed = decide(c, yielded, j, yielded.capturedAtUtc);
-  assert.deepEqual(resumed.reservations.map(x => x.agentId), ["Reviewer 1"]);
-  assert.equal(resumed.reservations[0].reason, "ClaimedReviewResume");
-  assert.equal(resumed.reservations[0].review.reviewId, REVIEW_A.reviewId);
-  assert.equal(resumed.reservations[0].review.version, 2);
-  assert.equal(j.records[0].status, "observed");
-  assert.equal(j.records[1].status, "reserved");
+  assert.deepEqual(resumed.reservations, []);
+  assert.deepEqual(resumed.reviewHolds, []);
+  assert.equal(resumed.unresolvedReviewerLaunches[0].review.reviewId, REVIEW_A.reviewId);
+  assert.equal(j.records[0].status, "uncertain");
+  assert.equal(j.records.length, 1);
   assert.equal(j.records.filter(record =>
     ["reserved", "dispatching", "submitted", "uncertain"].includes(record.status)).length, 1);
   assert.deepEqual(decide(c, yielded, j, yielded.capturedAtUtc).reservations, []);
@@ -752,7 +759,7 @@ test("taskless reviewer reservation survives inbox-only activity and resumes the
     "Reviewer 2": []
   });
   assert.deepEqual(decide(c, resumeInboxOnly, j, resumeInboxOnly.capturedAtUtc).reservations, []);
-  assert.equal(j.records[1].status, "reserved");
+  assert.equal(j.records.length, 1);
 
   const resumedWorking = snapshot();
   resumedWorking.capturedAtUtc = "2026-11-15T02:05:00Z";
@@ -768,7 +775,7 @@ test("taskless reviewer reservation survives inbox-only activity and resumes the
     "Reviewer 2": []
   });
   assert.deepEqual(decide(c, resumedWorking, j, resumedWorking.capturedAtUtc).reservations, []);
-  assert.equal(j.records[1].status, "observed");
+  assert.equal(j.records[0].status, "uncertain");
 });
 
 test("reviewer dispatch eligibility follows durable disposition across claimed and unclaimed demand", () => {
@@ -798,13 +805,13 @@ test("reviewer dispatch eligibility follows durable disposition across claimed a
         }
         const result = decide(c, s, journal(), NOW);
         const expected = disposition !== "Parked" && !waitingOnChallenge;
-        assert.equal(result.reservations.some(x => x.agentId === "Reviewer 1"), expected,
+        assert.equal(result.reviewHolds.some(x => x.agentId === "Reviewer 1"), expected,
           `${mode}/${disposition}/challenge=${waitingOnChallenge}`);
         if (disposition === "Parked" && !waitingOnChallenge) {
           assert.equal(result.suppressed.find(x => x.agentId === "Reviewer 1").reason,
             "OperatorParked");
         }
-        const reviewKeys = result.reservations.filter(x => x.kind === "reviewer")
+        const reviewKeys = result.reviewHolds.filter(x => x.kind === "reviewer")
           .map(x => `${x.review.taskId}/${x.review.reviewId}`);
         assert.equal(new Set(reviewKeys).size, reviewKeys.length);
       }
@@ -813,7 +820,7 @@ test("reviewer dispatch eligibility follows durable disposition across claimed a
 });
 
 
-test("completed taskless review releases its old claim and reuses the yielded reviewer for new demand", () => {
+test("completed taskless review does not prove the old execution terminated", () => {
   const c = config();
   c.budgets.worker = 0;
   c.budgets.reviewer = 1;
@@ -822,9 +829,9 @@ test("completed taskless review releases its old claim and reuses the yielded re
   const initial = snapshot();
   setUnclaimedReviews(c, initial, [REVIEW_A]);
   const first = decide(c, initial, j, NOW);
-  assert.equal(first.reservations[0].reason, "UnclaimedFrozenReview");
-  assert.equal(first.reservations[0].review.reviewId, REVIEW_A.reviewId);
-  j.records[0].status = "uncertain";
+  assert.equal(first.reviewHolds[0].reason, "UnclaimedFrozenReview");
+  assert.equal(first.reviewHolds[0].review.reviewId, REVIEW_A.reviewId);
+  addLegacyReviewReservation(j);
 
   const working = snapshot();
   working.capturedAtUtc = "2026-11-15T02:02:00Z";
@@ -840,7 +847,7 @@ test("completed taskless review releases its old claim and reuses the yielded re
     "Reviewer 2": []
   });
   assert.deepEqual(decide(c, working, j, working.capturedAtUtc).reservations, []);
-  assert.equal(j.records[0].status, "observed");
+  assert.equal(j.records[0].status, "uncertain");
 
   const yielded = snapshot();
   yielded.capturedAtUtc = "2026-11-15T02:03:00Z";
@@ -856,15 +863,14 @@ test("completed taskless review releases its old claim and reuses the yielded re
   setUnclaimedReviews(c, yielded, [REVIEW_B]);
 
   const reused = decide(c, yielded, j, yielded.capturedAtUtc);
-  assert.deepEqual(reused.reservations.map(x => x.agentId), ["Reviewer 1"]);
-  assert.equal(reused.reservations[0].reason, "UnclaimedFrozenReview");
-  assert.equal(reused.reservations[0].review.reviewId, REVIEW_B.reviewId);
-  assert.equal(j.records[0].status, "observed");
-  assert.equal(j.records[1].status, "reserved");
-  assert.equal(j.records[1].review.reviewId, REVIEW_B.reviewId);
+  assert.deepEqual(reused.reservations, []);
+  assert.deepEqual(reused.reviewHolds, []);
+  assert.equal(reused.counts.reviewer, 1);
+  assert.equal(j.records[0].status, "uncertain");
+  assert.equal(j.records.length, 1);
   assert.equal(j.records.some(record =>
     ["reserved", "dispatching", "submitted", "uncertain"].includes(record.status) &&
-    record.review?.reviewId === REVIEW_A.reviewId), false);
+    record.review?.reviewId === REVIEW_A.reviewId), true);
 });
 
 test("Manager reviewer launch prompt self-starts before inbox and preserves Operator STOP", () => {
@@ -881,4 +887,91 @@ test("Manager reviewer launch prompt self-starts before inbox and preserves Oper
   assert.match(prompt, /Parked with unassignedDisposition=Parked is an\s+explicit Operator STOP/);
   assert.match(prompt, /A definitive start rejection means do not\s+review, claim or decide/);
   assert.match(role, /The Manager must never call .+start_taskless_work.+for a Reviewer/);
+});
+
+test("unbound taskless review demand is visible but never authorizes a browser send", () => {
+  const c = config();
+  const s = snapshot();
+  const j = journal();
+  const r = decide(c, s, j, NOW);
+  assert.deepEqual(r.reservations.map(x => x.kind), ["worker", "worker"]);
+  assert.equal(r.reviewHolds.length, 2);
+  assert.equal(r.reviewHolds[0].holdReason, "ProviderExecutionIdentityUnbound");
+  assert.equal(j.records.filter(x => x.kind === "reviewer").length, 0);
+});
+
+test("actor-only Working, yield, park and reordered ticks cannot resolve old reviewer dispatch", () => {
+  const c = config();
+  c.budgets.worker = 0;
+  const j = journal();
+  j.records.push({ launchId: "original-review", agentId: "Reviewer 1", kind: "reviewer",
+    status: "submitted", reservedAtUtc: NOW, ledgerHead: HEAD,
+    review: { mode: "unclaimed", taskId: REVIEW_A.taskId, attemptId: null,
+      reviewerId: null, reviewId: REVIEW_A.reviewId, version: 1 } });
+  const s = snapshot();
+  s.capturedAtUtc = "2026-11-15T02:01:00Z";
+  const a = s.agents[3];
+  a.lastAttributedActivityAtUtc = "2026-11-15T02:00:30Z";
+  a.activityEvidence = "ExplicitAttributedToolCall";
+  a.state = "Working"; a.execution = "Working"; a.slotAvailable = false;
+  a.unassignedDisposition = null;
+  const next = decide(c, s, j, s.capturedAtUtc);
+  assert.equal(j.records[0].status, "submitted");
+  assert.equal(next.counts.reviewer, 1);
+  a.state = "Parked"; a.execution = "Stopped"; a.slotAvailable = true;
+  a.unassignedDisposition = "TasklessYield";
+  a.stateEnteredAtUtc = "2026-11-15T02:00:45Z";
+  const yielded = decide(c, s, j, s.capturedAtUtc);
+  assert.equal(j.records[0].launchId, "original-review");
+  assert.equal(j.records[0].status, "submitted");
+  assert.equal(yielded.counts.reviewer, 1);
+  assert.equal(yielded.reviewHolds[0].review.reviewId, REVIEW_B.reviewId);
+  a.unassignedDisposition = "Parked";
+  assert.equal(decide(c, s, j, s.capturedAtUtc).counts.reviewer, 1);
+});
+
+test("legacy reviewer journal distinguishes exact pre-send closure from ambiguous dispatch", () => {
+  const c = config();
+  const s = snapshot();
+  const j = journal();
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-review-hold-"));
+  try {
+    const conf = path.join(temp, "config.json");
+    const state = path.join(temp, "journal.json");
+    fs.writeFileSync(conf, JSON.stringify(c));
+    addLegacyReviewReservation(j, "reserved");
+    const rec = j.records[0];
+    rec.reservedAtUtc = new Date().toISOString();
+    const call = (action, ...args) => runCli([action, "--config", conf, "--journal", state,
+      "--launch-id", rec.launchId, ...args]);
+    const save = () => fs.writeFileSync(state, JSON.stringify(j));
+    save();
+    assert.throws(() => call("check"), /reviewer dispatch held/);
+    assert.throws(() => call("begin"), /reviewer dispatch held/);
+    assert.equal(call("release", "--reason", "Explicitly close unsent reservation").status, "cleared");
+    let closed = JSON.parse(fs.readFileSync(state, "utf8"));
+    assert.equal(closed.records[0].launchId, rec.launchId);
+    assert.equal(closed.records[0].releasedFromStatus, "reserved");
+    assert.equal(decide(c, s, closed, NOW).unresolvedReviewerLaunches.length, 0);
+    save();
+    assert.equal(call("mark", "--result", "blocked").status, "blocked");
+    closed = JSON.parse(fs.readFileSync(state, "utf8"));
+    assert.equal(decide(c, s, closed, NOW).unresolvedReviewerLaunches.length, 0);
+    rec.dispatchedAtUtc = rec.reservedAtUtc;
+    save();
+    assert.throws(() => call("mark", "--result", "blocked"), /conflicts with recorded dispatch/);
+    assert.throws(() => call("release", "--reason", "Operator says it stopped"), /terminal no-start evidence/);
+    for (const status of ["dispatching", "submitted", "uncertain", "observed", "cleared"]) {
+      rec.status = status;
+      if (status === "observed") rec.observedAtUtc = rec.reservedAtUtc;
+      save();
+      assert.equal(decide(c, s, j, NOW).unresolvedReviewerLaunches[0].launchId, rec.launchId);
+      assert.throws(() => call("release", "--reason", "Operator says it stopped"));
+    }
+    delete rec.dispatchedAtUtc;
+    rec.status = "cleared";
+    assert.equal(decide(c, s, j, NOW).unresolvedReviewerLaunches.length, 1);
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
 });

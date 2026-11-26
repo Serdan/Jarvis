@@ -261,10 +261,14 @@ function tasklessYieldedReviewer(agent) {
     agent.slotAvailable === true && agent.unassignedDisposition === "TasklessYield";
 }
 
-function tasklessYieldedAfterReservation(agent, reservedAtUtc) {
-  return tasklessYieldedReviewer(agent) &&
-    typeof agent.stateEnteredAtUtc === "string" &&
-    Date.parse(agent.stateEnteredAtUtc) > Date.parse(reservedAtUtc);
+// Legacy observed/cleared reviewer records are not terminal execution proof.
+// The old planner accepted actor-only activity and an arbitrary recovery reason.
+// Only a blocked-before-send or explicitly recorded pre-send release is safe.
+function reviewerReservationUnresolved(rec) {
+  return rec.kind === "reviewer" &&
+    !(rec.status === "blocked" && rec.dispatchedAtUtc == null) &&
+    !(rec.status === "cleared" && rec.releasedFromStatus === "reserved" &&
+      rec.dispatchedAtUtc == null);
 }
 
 export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
@@ -278,6 +282,8 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
     enabled: config.enabled,
     counts: { worker: 0, reviewer: 0 },
     reservations: [],
+    reviewHolds: [],
+    unresolvedReviewerLaunches: [],
     suppressed: []
   };
   const reserved = new Set();
@@ -288,6 +294,17 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
   // session. It may release a reservation; neither time elapsed nor a
   // successful UI submission is proof the agent started.
   for (const rec of journal.records) {
+    if (rec.kind === "reviewer") {
+      if (reviewerReservationUnresolved(rec)) {
+        reserved.add(rec.agentId);
+        result.counts.reviewer++;
+        result.unresolvedReviewerLaunches.push({
+          launchId: rec.launchId, agentId: rec.agentId, status: rec.status,
+          review: rec.review ?? null, holdReason: "OriginalExecutionTerminationUnproven"
+        });
+      }
+      continue;
+    }
     if (rec.status === "observed" && rec.kind === "worker" &&
       rec.assignmentKey && agents.get(rec.agentId)?.assignmentKey === rec.assignmentKey &&
       !yieldedAfterActivity(agents.get(rec.agentId), rec.observedAtUtc)) {
@@ -299,20 +316,9 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
     const activityObserved = activity !== null && activity !== undefined &&
       Date.parse(activity) > Date.parse(rec.reservedAtUtc) &&
       Date.parse(activity) <= Date.parse(snapshot.capturedAtUtc);
-    // A reviewer inbox read is not a started session: taskless reviewers must
-    // explicitly enter Working. If the session has already yielded before a
-    // Manager tick, its durable TasklessYield disposition plus a post-reserve
-    // state transition and attributed activity proves the same lifecycle.
-    const yieldedTaskless = rec.kind === "reviewer" &&
-      tasklessYieldedAfterReservation(agent, rec.reservedAtUtc);
-    const observed = activityObserved && (rec.kind !== "reviewer" ||
-      agent?.execution === "Working" || yieldedTaskless);
-    if (observed) {
-      if (!yieldedAfterActivity(agent, activity) && !yieldedTaskless) {
-        observedThisPass.add(rec.agentId);
-      }
-      if (rec.kind === "worker" && rec.assignmentKey &&
-        agent.assignmentKey === rec.assignmentKey &&
+    if (activityObserved) {
+      if (!yieldedAfterActivity(agent, activity)) observedThisPass.add(rec.agentId);
+      if (rec.assignmentKey && agent.assignmentKey === rec.assignmentKey &&
         !yieldedAfterActivity(agent, activity)) observedAssignments.add(rec.agentId);
       if (!dryRun) {
         rec.status = "observed";
@@ -345,12 +351,7 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
   let unscopedReviewerReservation = false;
   for (const rec of journal.records) {
     if (rec.kind !== "reviewer") continue;
-    const agent = agents.get(rec.agentId);
-    const active = !agent || ACTIVE_STATES.has(agent.state) ||
-      agent.execution === "Working" || agent.execution === "Unknown";
-    const unresolved = LIVE_RECORDS.has(rec.status) ||
-      (rec.status === "observed" && active);
-    if (!unresolved) continue;
+    if (!reviewerReservationUnresolved(rec)) continue;
     if (rec.review) {
       const key = reviewKey(rec.review);
       if (visibleReviewKeys.has(key)) reservedReviewDemands.add(key);
@@ -361,6 +362,15 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
     }
   }
   const addReservation = (agent, kind, reason, review = null) => {
+    // No trusted provider execution binding exists. Expose exact review demand
+    // without minting a dispatchable reservation or consuming real capacity.
+    if (kind === "reviewer") {
+      result.reviewHolds.push({ agentId: agent.agentId, kind, reason, review,
+        holdReason: "ProviderExecutionIdentityUnbound" });
+      reserved.add(agent.agentId);
+      reservedReviewDemands.add(reviewKey(review));
+      return;
+    }
     const launchId = dryRun ? "dry-run-" + kind + "-" + agent.agentId : randomUUID();
     const reservation = { launchId, agentId: agent.agentId, kind, reason };
     if (review) reservation.review = review;
@@ -409,8 +419,8 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
     if (claimed.length === 0) continue;
     const resumableClaim = claimed.find(review => !reservedReviewDemands.has(reviewKey(review)));
     let reason = null;
-    if (result.reservations.length >= config.maxLaunchesPerTick) reason = "TickLimit";
-    else if (result.counts.reviewer >= config.budgets.reviewer) reason = "BudgetFull";
+    if (result.reservations.length + result.reviewHolds.length >= config.maxLaunchesPerTick) reason = "TickLimit";
+    else if (result.counts.reviewer + result.reviewHolds.length >= config.budgets.reviewer) reason = "BudgetFull";
     else if (reserved.has(agentId)) reason = "PriorLaunchPendingOrUncertain";
     else if (observedThisPass.has(agentId)) reason = "AlreadyObservedThisPass";
     else if (agent.waitingOnChallenge) reason = "ChallengeBlocked";
@@ -438,8 +448,8 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
     const unclaimed = reviews.find(review => review.status === "Unclaimed" &&
       !reservedReviewDemands.has(reviewKey(review)));
     let reason = null;
-    if (result.reservations.length >= config.maxLaunchesPerTick) reason = "TickLimit";
-    else if (result.counts.reviewer >= config.budgets.reviewer) reason = "BudgetFull";
+    if (result.reservations.length + result.reviewHolds.length >= config.maxLaunchesPerTick) reason = "TickLimit";
+    else if (result.counts.reviewer + result.reviewHolds.length >= config.budgets.reviewer) reason = "BudgetFull";
     else if (reserved.has(agentId)) reason = "PriorLaunchPendingOrUncertain";
     else if (observedThisPass.has(agentId)) reason = "AlreadyObservedThisPass";
     else if (agent.waitingOnChallenge) reason = "ChallengeBlocked";
@@ -541,6 +551,7 @@ export function runCli(argv) {
     const rec = journal.records.find(x => x.launchId === opts["launch-id"]);
     assert(rec && rec.status === "reserved",
       "Launch is no longer a fresh reservation");
+    assert(rec.kind !== "reviewer", "Provider execution identity unbound; reviewer dispatch held");
     const age = Date.now() - validTime(rec.reservedAtUtc, "reservation");
     assert(age >= -1000 && age <= 180000, "Launch reservation is stale");
     return { projectName: config.projectName, launchId: rec.launchId,
@@ -565,6 +576,7 @@ export function runCli(argv) {
       if (action === "begin") {
         assert(config.enabled, "Manager launch switch is disabled");
         assert(rec.status === "reserved", "Launch already dispatched or closed");
+        assert(rec.kind !== "reviewer", "Provider execution identity unbound; reviewer dispatch held");
         const age = Date.now() - validTime(rec.reservedAtUtc, "reservation");
         assert(age >= -1000 && age <= 180000, "Launch reservation is stale");
         rec.status = "dispatching";
@@ -577,6 +589,8 @@ export function runCli(argv) {
           (opts.result !== "blocked" && rec.status === "dispatching") ||
           rec.status === opts.result,
           "Conflicting result; manual recovery required");
+        assert(rec.kind !== "reviewer" || opts.result !== "blocked" || rec.dispatchedAtUtc == null,
+          "Reviewer no-send proof conflicts with recorded dispatch");
         rec.status = opts.result;
         rec.reportedAtUtc ??= new Date().toISOString();
         result = { launchId: rec.launchId, status: rec.status };
@@ -584,6 +598,10 @@ export function runCli(argv) {
         assert(typeof opts.reason === "string" && opts.reason.trim().length >= 12,
           "Explicit operator recovery reason required");
         assert(LIVE_RECORDS.has(rec.status), "Only live reservations can be released");
+        assert(rec.kind !== "reviewer" ||
+          (rec.status === "reserved" && rec.dispatchedAtUtc == null),
+          "Reviewer release requires exact trusted terminal no-start evidence; not available on this route");
+        rec.releasedFromStatus = rec.status;
         rec.status = "cleared";
         rec.recoveryReason = opts.reason;
         rec.releasedAtUtc = new Date().toISOString();

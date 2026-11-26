@@ -832,6 +832,26 @@ module ReviewWorkflow =
             | None -> return! Error(StaleEntityVersion $"Missing ledger entity: {path}")
         }
 
+    // Existing MCP routes authenticate the account and actor label, not
+    // a particular inference execution. A taskless start is therefore an
+    // unresolved review authority episode, not a credential. Until there is
+    // trusted provider termination/binding evidence, do not let ordinary
+    // actor-only writes bypass it, even after yield, STOP or another start.
+    // This runs inside the current ledger transaction (also on retry/promotion).
+    let private guardReviewAuthorityAt binding snapshot actor = result {
+        let path = agentPath actor
+        let! current = read<ReviewAgent> binding snapshot path
+        let! original = LedgerStore.latestTasklessStartForAgentAt binding snapshot path actor
+        let unresolvedState =
+            current |> Option.exists (fun (agent, _) ->
+                isNull (box agent.CurrentAssignment) &&
+                (agent.Execution = "Working" || agent.UnassignedDisposition = "TasklessYield"))
+        if original.IsSome || unresolvedState then
+            return! Error(StaleEntityVersion
+                $"ReviewAuthorityHeld: {actor} has unresolved taskless execution; trusted provider authority or terminal evidence required.")
+        return ()
+    }
+
     let private requiredFromRecords<'t> (records: Map<string, string>) path =
         match Map.tryFind path records with
         | None -> Error(StaleEntityVersion $"Missing ledger entity: {path}")
@@ -4131,6 +4151,7 @@ module ReviewWorkflow =
                     {| taskId = taskId; requestId = id; documentPath = documentPath
                        expectedBlobOid = expectedBlobOid; contentSha256 = specDigest content |})
                 (fun snapshot -> result {
+                    do! guardReviewAuthorityAt binding snapshot actorId
                     let! _ = required<BranchReview> binding snapshot (branchReviewPath taskId id)
                     return [ { Path = reviewDocumentPath taskId id documentPath
                                ExpectedBlobOid = expected; Content = content } ]
@@ -4578,6 +4599,7 @@ module ReviewWorkflow =
                     {| taskId = taskId; reviewId = id; reviewerId = reviewerId
                        expectedVersion = expectedVersion |})
                 (fun snapshot -> result {
+                    do! guardReviewAuthorityAt binding snapshot reviewerId
                     let! review, oid = required<BranchReview> binding snapshot (branchReviewPath taskId id)
                     if review.Version <> expectedVersion || review.Status <> "Unclaimed" then
                         return! Error(ReviewAlreadyClaimed "Review is no longer unclaimed.")
@@ -4597,6 +4619,7 @@ module ReviewWorkflow =
                     {| taskId = taskId; reviewId = id; reviewerId = reviewerId
                        expectedVersion = expectedVersion; status = status |})
                 (fun snapshot -> result {
+                    do! guardReviewAuthorityAt binding snapshot reviewerId
                     let! review, oid = required<BranchReview> binding snapshot (branchReviewPath taskId id)
                     if review.Status <> "Claimed" || review.Version <> expectedVersion
                        || review.ReviewerId <> reviewerId then
@@ -4639,7 +4662,10 @@ module ReviewWorkflow =
                     {| taskId = taskId; reviewId = id; actorId = actorId
                        expectedVersion = expectedVersion |})
                 (fun snapshot -> result {
+                    do! guardReviewAuthorityAt binding snapshot actorId
                     let! review, oid = required<BranchReview> binding snapshot (branchReviewPath taskId id)
+                    if not (String.IsNullOrWhiteSpace review.ReviewerId) && review.ReviewerId <> actorId then
+                        do! guardReviewAuthorityAt binding snapshot review.ReviewerId
                     if review.Version <> expectedVersion || review.Status <> "Claimed" then
                         return! Error(ReviewVersionConflict "Review claim has changed.")
                     return [ change (branchReviewPath taskId id) (Some oid)
@@ -4657,6 +4683,7 @@ module ReviewWorkflow =
                     {| taskId = taskId; reviewId = id; actorId = actorId
                        expectedVersion = expectedVersion |})
                 (fun snapshot -> result {
+                    do! guardReviewAuthorityAt binding snapshot actorId
                     let! review, oid = required<BranchReview> binding snapshot (branchReviewPath taskId id)
                     if review.Version <> expectedVersion
                        || not (List.contains review.Status [ "Unclaimed"; "Claimed" ])

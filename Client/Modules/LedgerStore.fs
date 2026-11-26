@@ -1201,6 +1201,44 @@ module LedgerStore =
         return found
     }
 
+    // A taskless start is durable positive evidence that an actor may have
+    // an outstanding execution. Yield, park and another start are not terminal
+    // provider evidence. Read the original immutable receipt at the exact
+    // transaction snapshot; a mutable current agent state cannot erase it.
+    let internal latestTasklessStartForAgentAt (binding: LedgerBinding)
+            (snapshot: LedgerSnapshot) (path: string) (actor: string) = result {
+        if not (ledgerPath.IsMatch path) || path.Contains("..", StringComparison.Ordinal) then
+            return! Error(InvalidBinding "Invalid taskless authority path.")
+        let! history =
+            run binding.RepositoryPath
+                [ "log"; "--first-parent"; "-1"; "--format=%H"
+                  "--grep=^Jarvis StartTasklessWork$"; snapshot.Commit; "--"; path ]
+        let commit = history.Trim()
+        if String.IsNullOrWhiteSpace commit then return None
+        elif not (oidPattern.IsMatch commit) then
+            return! Error(LedgerIntegrityError "Invalid taskless start origin.")
+        else
+            let! message = run binding.RepositoryPath [ "show"; "-s"; "--format=%B"; commit ]
+            let marker = Regex.Match(message, @"(?m)^Jarvis-Operation-Id: ([0-9a-fA-F-]{36})\r?$")
+            if not marker.Success then
+                return! Error(LedgerIntegrityError "Taskless start lacks an operation ID.")
+            match Guid.TryParseExact(marker.Groups[1].Value, "D") with
+            | true, operationId when operationId <> Guid.Empty ->
+                let! candidate = getOperationAt binding snapshot operationId
+                match candidate with
+                | Some operation when operation.Type = "StartTasklessWork"
+                                      && operation.Actor = actor
+                                      && not (isNull operation.Paths)
+                                      && Array.contains path operation.Paths ->
+                    let! origin = getOperationOriginAt binding snapshot operation
+                    if origin <> commit then
+                        return! Error(LedgerIntegrityError "Displaced taskless start operation.")
+                    return Some operation
+                | _ ->
+                    return! Error(LedgerIntegrityError "Taskless start receipt does not match its actor/path.")
+            | _ -> return! Error(LedgerIntegrityError "Invalid taskless start operation ID.")
+    }
+
     let findCompletionOperationForPathAt binding snapshot path =
         findIntegrationOperationForPathAt binding snapshot path "CompleteIntegration"
         |> Result.bind (function

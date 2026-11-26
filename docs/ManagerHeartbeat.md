@@ -238,25 +238,19 @@ with `unassignedDisposition: TasklessYield`. Parked/Stopped with disposition
 even when a review is claimed. Include `unassignedDisposition` exactly as
 returned by `observe_agent`; state alone cannot distinguish these cases.
 
-A reviewer launch is not observed by `agent_inbox` or `reviewer_inbox` activity
-alone. The launched reviewer must call its own `agent_inbox` for the exact
-version, then call `start_taskless_work` as itself before `reviewer_inbox`.
-StartTasklessWork accepts only `NeedsWork` or `TasklessYield` dispositions;
-`Parked` is an explicit Operator STOP and the API rejects it even when the
-caller supplies the current version. Newly registered agents begin Parked; the
-Operator must explicitly set `NeedsWork` before taskless dispatch is eligible.
-A `TasklessYield` is the only parked state the Manager may resume automatically.
-Supply a caller-stable `operationId`; an uncertain/lost acknowledgement must
-be reconciled with get_operation_status using the same ID before any retry; retry only the same ID and exact payload when the original receipt says it is safe. A reservation
-remains live through inbox-only and uncertain start attempts. It is observed
-only after attributed activity with execution Working, or after a later
-TasklessYield transition whose state-entered time and attributed activity are
-both newer than the reservation. This prevents a second launch while the
-first session is not yet started or has completed between Manager ticks.
+**Managed reviewer dispatch is held until provider execution identity is
+authoritatively bound.** Actor labels, inbox calls, taskless starts, yields,
+STOP and successful browser submission cannot prove the identity or termination
+of a particular inference execution. The planner reports exact eligible
+review demand in `reviewHolds` instead of creating a dispatchable reservation.
+The start/yield lifecycle remains available with exact versions and stable
+operation IDs; neither it nor later administrative changes authorize
+actor-only review writes after an unresolved taskless start. A distinct
+conflict-free manual reviewer retains the ordinary review path. A claimed
+review is never automatically transferred or resumed while authority is held.
+TasklessYield is distinct from explicit Operator Park/STOP.
 
-A claimed review can be resumed only by its owner; TasklessYield is a valid
-Parked resume state, while explicit Parked is not. A standing task does not
-qualify a Reviewer for generic unclaimed-review dispatch. A Ready worker must
+A Ready worker must
 carry an `assignmentKey` made from canonical task ID, attempt ID and generation;
 this suppresses stale Ready relaunches after an observed tool call. Include
 canonical `stateEnteredAtUtc` from `observe_agent` for Ready workers: the same
@@ -275,24 +269,14 @@ query, stale data, contradictory state or incomplete queue read must fail
 closed. Captures older than three minutes are rejected.
 
 reviewQueueVerified is true only after every reviewer inbox is complete and
-all snapshotCommit values equal ledgerHead. The planner deduplicates unclaimed
-demand by (taskId, reviewId): one request is one unit of demand even when it
-appears in every inbox. Its durable reservation holds that request while a
-launch is pending, uncertain or active, including if it becomes claimed
-before the first session is observed. A taskless reviewer launch is not
-observed from attributed activity alone while execution is still Stopped:
-`agent_inbox` before `start_taskless_work` is not proof that the session began.
-The planner observes the launch only after attributed activity with execution
-Working, or after a TasklessYield state transition whose stateEnteredAtUtc and
-attributed activity are both later than the reservation. That releases the
-old reservation without losing evidence if the session completed between
-Manager ticks. The exact still-owned claim can then be resumed; if no claim
-remains, the yielded reviewer can receive new unclaimed demand. An explicit
-Parked disposition always blocks automatic resume, including for a claimed
-review. The Manager never claims or transfers a review. A reviewer can resume
-only a claim it owns; a Challenge-blocked claim waits for its dependency. A
-standing task does not make a Reviewer eligible for generic unclaimed
-dispatch, but does not prevent the owner from resuming a runnable claim.
+all snapshotCommit values equal ledgerHead. The planner deduplicates demand by
+(taskId, reviewId); an owned runnable claim is considered before unclaimed
+demand. Explicit Parked and Challenge-blocked claims remain ineligible.
+Existing unresolved reviewer reservations retain their original UUID, demand
+and capacity in `unresolvedReviewerLaunches` even if actor-only activity
+changes to Working, TasklessYield, or STOP. Historical observed or cleared
+records are not assumed to prove execution termination. Unrelated worker
+launches and otherwise eligible review-demand diagnostics remain available.
 
 ## One bounded Manager pass
 
@@ -310,32 +294,19 @@ node scripts/manager-heartbeat.mjs plan --config artifacts/manager/Jarvis/config
 ~~~
 
 The returned reservations are the **only** approved launch candidates for
-that pass. The planner fills workers with Ready assignments first, ordered by
-optional verified canonical priorityRank (0 is highest), then resumes runnable
-claims already owned by their reviewers, then dispatches at most one idle
-taskless reviewer per distinct unclaimed request visible in that reviewer's
-inbox. Unclaimed requests repeated across inboxes are one unit of demand; the
-planner does not use an aggregate count. A pending, uncertain or active
-reservation holds the same (taskId, reviewId) across ticks, even if the
-request changes from unclaimed to claimed. A standing task alone never makes
-a Reviewer eligible for generic ready-assignment dispatch. It does not block
-that Reviewer from resuming a runnable claim it already owns. Challenge-blocked
-claims wait for their dependency. Existing pending/uncertain launches and
-other Working agents count against the 5/3 budget. Unclassified live or
-uncertain agents prevent all launches. Duplicate timer ticks reserve nothing
-twice.
+that pass. Workers with Ready assignments are ordered by verified canonical
+priorityRank (0 is highest). The planner exposes runnable owned claims and
+distinct eligible unclaimed review requests as diagnostic holds, not browser
+launch instructions. Unresolved launches and other Working agents count
+against capacity. Unclassified live or uncertain agents prevent all launches.
+Duplicate timer ticks cannot reserve a worker twice.
 
-For each reservation, re-observe the agent and re-read task_overview
-immediately before dispatch. For a reviewer reservation, read
-reviewer_inbox with the Manager's own `agentId` and the reserved reviewer as
-`reviewerId`; never attribute this subject read to the reviewer. Require the
-inbox snapshotCommit to equal task_overview's SnapshotCommit. For an unclaimed
-reservation, confirm the same taskId/reviewId/version remains unclaimed; for a
-claim resume, confirm the same claim remains owned by that reviewer. Never
-claim or transfer a review for the reviewer. If eligibility changed, mark the
-reservation blocked and do not launch. A blocked-before-dispatch record
-remains in the audit journal but frees its capacity; a later eligible pass
-may reserve again. Otherwise atomically **begin** the reserved launch:
+For each worker reservation, re-observe the agent and re-read task_overview
+immediately before dispatch. If eligibility changed, mark the reservation
+blocked and do not launch. A blocked-before-dispatch record remains in the
+audit journal but frees its capacity. Both check and begin reject legacy
+reviewer reservations, even when they still appear reserved. Otherwise
+atomically **begin** the reserved worker launch:
 
 ~~~sh
 node scripts/manager-heartbeat.mjs begin --config artifacts/manager/Jarvis/config.json --journal artifacts/manager/Jarvis/journal.json --launch-id <launch-id>
@@ -349,8 +320,7 @@ Use `check` only for read-only diagnostics, never as the dispatch gate. Otherwis
 browser_run_in_new_tab with the registered window, url
 "https://chatgpt.com/", projectName "Jarvis", scriptPath
 "browser-scripts/chatgpt/launchAgent.js", closeTabAfterExecution true,
-and argsJson containing a minimal prompt for that one Worker N or
-Reviewer N. The Manager role file contains the exact prompt convention.
+and argsJson containing a minimal prompt for that one Worker N. The Manager role file contains the exact prompt convention.
 Do not launch a reviewer by named notification: the reviewer claims from
 the shared frozen queue.
 
@@ -365,8 +335,9 @@ or unverified submission, and --result blocked on a known safe pre-launch
 stop. Never retry a dispatched or uncertain launch automatically. A blocked
 pre-dispatch reservation is terminal, not a browser retry, and is safe to
 replan. A successful browser submission is not proof the agent called Jarvis.
-Retain dispatched/uncertain reservations until positive attributed activity
-or explicit operator recovery. Verified Ready/Stopped stateEnteredAtUtc after
+For workers, retain dispatched/uncertain reservations until positive attributed activity
+or explicit operator recovery. Reviewer reservations with any possible send
+remain held; no actor-only evidence releases them. Verified Ready/Stopped stateEnteredAtUtc after
 such activity proves the worker later yielded and can resume the same task.
 
 ## Start the one Manager idle heartbeat (only after approval)
@@ -434,6 +405,16 @@ explicitly clear a **specific** reservation with a durable audit reason:
 ~~~sh
 node scripts/manager-heartbeat.mjs release --config artifacts/manager/Jarvis/config.json --journal artifacts/manager/Jarvis/journal.json --launch-id <launch-id> --reason "Operator verified previous launch cannot be active"
 ~~~
+
+For reviewers, the local release route can clear only an exact original
+reservation that never crossed begin. An arbitrary operator reason is not
+authenticated terminal evidence for a dispatched reviewer. This source does
+not provide a trusted provider termination receipt or authenticated resolution
+route for that case. Preserve the record and do not replace its execution.
+Before any future rollout, reconcile any legacy browser dispatches that may
+predate a canonical taskless-start receipt: a local journal is not a
+cross-client canonical authority source. Do not enable managed review
+dispatch or reuse an ambiguous actor until this evidence boundary is resolved.
 
 If journal.json.lock remains after a crash, verify there is no running
 planner process or competing Manager before manually removing that lock.

@@ -49,6 +49,10 @@ At the start of every pass:
    config, snapshot and durable per-project launch journal. The planner reserves
    intended launches *before* any browser side effect. Do not create a launch
    outside its returned reservations or reinterpret its budget/suppression rules.
+   Report `reviewHolds` and `unresolvedReviewerLaunches` with their exact
+   request/launch identities. These are not reservations or launch permission.
+   Until a trusted provider execution identity is available, even the first
+   managed reviewer dispatch is held; no manual browser bypass or replacement.
 6. For each reserved agent, re-observe its canonical state, re-read
    `task_overview` immediately before dispatch. For a reviewer reservation,
    read `reviewer_inbox` with your Manager `agentId` and the reserved reviewer
@@ -97,13 +101,16 @@ At the start of every pass:
    Transport failures, ambiguous UI outcomes, missing receipts and timeouts are
    uncertain even if the call may have worked. Never retry by opening a new
    tab. `submitted` proves prompt submission, not agent activity.
-   Only subsequent positively verified agent activity releases a dispatched
-   or uncertain reservation. For Ready workers, preserve the exact canonical
+   For workers only, subsequent positively verified agent activity can release
+   a reservation. For Ready workers, preserve the exact canonical
    task/attempt/generation as `assignmentKey`. Relaunching the same assignment
    requires verified Ready/Stopped stateEnteredAtUtc newer than the attributed
    activity: a stale Ready label alone cannot prove a yield.
-   Any manual clearing of an uncertain reservation needs an explicit,
-   recorded operator recovery reason.
+   For reviewers, actor-only activity, yield, STOP, receipt rejection, and
+   arbitrary recovery text do not establish termination of the original
+   execution. Preserve unresolved original launch identity and capacity.
+   Pre-send blocked records alone release safely here; a dispatched reviewer
+   requires exact authenticated terminal evidence not provided by this route.
 8. Do not notify named reviewers or use notifications for routine work.
    Eligible reviewers claim from the shared frozen review queue. Use canonical
    task, review, challenge and assignment mechanisms for coordination.

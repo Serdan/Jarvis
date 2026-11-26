@@ -92,47 +92,107 @@ def command(project, name, result_dir):
             "--logger", f"trx;LogFileName={name}.trx",
             "--results-directory", str(result_dir)]
 
+# Supported flat Linux VSTest TRX format observed in the retained qualification
+# evidence. This is a candidate predicate, not a generic TRX validator.
+VSTEST_COUNTS = {"total", "executed", "passed", "failed", "notExecuted"}
+VSTEST_OTHER_OUTCOMES = {
+    "error", "timeout", "aborted", "inconclusive", "passedButRunAborted",
+    "notRunnable", "disconnected", "warning", "completed", "inProgress", "pending",
+}
+GROUP_DRAIN_SECONDS = 2
+TERMINATE_GRACE_SECONDS = 2
+KILL_REAP_SECONDS = 10
+
+
 def trx_summary(path):
     # Preserve raw TRX; distinguish missing/invalid/contradictory metadata.
     if not path.is_file():
         return {"state": "missing"}
     try:
         root = ET.parse(path).getroot()
-        summary = root.find(".//{*}ResultSummary")
-        counters = summary.find("{*}Counters") if summary is not None else None
+        summaries = root.findall("./{*}ResultSummary")
+        summary = summaries[0] if len(summaries) == 1 else None
+        counter_nodes = summary.findall("./{*}Counters") if summary is not None else []
+        counters = counter_nodes[0] if len(counter_nodes) == 1 else None
         rows = root.findall(".//{*}UnitTestResult")
+        results = root.findall("./{*}Results")
+        flat = (root.tag.rsplit("}", 1)[-1] == "TestRun"
+                and len(results) == 1
+                and list(results[0]) == rows
+                and len(root.findall(".//{*}ResultSummary")) == 1
+                and len(root.findall(".//{*}Counters")) == 1)
         outcomes = {}
         for row in rows:
             key = row.attrib.get("outcome", "Missing")
             outcomes[key] = outcomes.get(key, 0) + 1
-        return {"state": "parsed" if counters is not None else "invalid",
+        return {"state": "parsed" if counters is not None and flat else "invalid",
                 "summary": summary.attrib if summary is not None else {},
                 "counters": counters.attrib if counters is not None else {},
                 "rows": len(rows), "outcomes": outcomes}
-    except ET.ParseError as exc:
+    except (ET.ParseError, OSError) as exc:
         return {"state": "invalid", "error": str(exc)}
 
 
 def consistent_trx(trx):
-    if trx.get("state") != "parsed":
+    # Only Completed runs consisting of Passed and NotExecuted rows are
+    # supported for candidate evidence. Skip acceptance is still independent.
+    if trx.get("state") != "parsed" or trx["summary"].get("outcome") != "Completed":
         return False
     outcomes = trx["outcomes"]
     counters = trx["counters"]
-    try:
-        return (int(counters["total"]) == trx["rows"]
-                and int(counters["passed"]) == outcomes.get("Passed", 0)
-                and int(counters.get("notExecuted", "0")) == outcomes.get("NotExecuted", 0)
-                and int(counters["failed"]) == outcomes.get("Failed", 0))
-    except (KeyError, ValueError):
+    if (set(outcomes) - {"Passed", "NotExecuted"}
+            or set(counters) != VSTEST_COUNTS | VSTEST_OTHER_OUTCOMES
+            or any(not re.fullmatch(r"[0-9]+", value) for value in counters.values())):
         return False
+    try:
+        counts = {key: int(value) for key, value in counters.items()}
+    except ValueError:
+        return False
+    passed = outcomes.get("Passed", 0)
+    skipped = outcomes.get("NotExecuted", 0)
+    # Nonzero unsupported outcome counters (including warning) are ambiguous
+    # here, not proof of a failed test. Ordinary run log warnings are distinct.
+    return (counts["total"] == trx["rows"] == passed + skipped
+            and counts["executed"] == counts["passed"] == passed
+            and counts["notExecuted"] == skipped
+            and counts["failed"] == 0
+            and all(counts[key] == 0 for key in VSTEST_OTHER_OUTCOMES))
+
+
+def group_absence(pgid):
+    """Bounded, signal-zero-only observation after reaping the stage leader.
+
+    ESRCH establishes absence of the original process group. A surviving
+    zombie, permission error or even a recycled PGID is conservatively
+    noncandidate. Never send a killing signal after the leader is reaped.
+    """
+    deadline = time.monotonic() + GROUP_DRAIN_SECONDS
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return "absent"
+        except OSError as exc:
+            return f"probe_failed: {exc}"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "present_or_unreaped"
+        time.sleep(min(0.05, remaining))
+
 
 def run_stage(name, args, seconds, checkout, env, evidence):
     stage = evidence / name
     stage.mkdir()  # Never overwrite a prior witness or replay unknown work.
     receipt(stage / "started.json", {"argv": args, "deadline_seconds": seconds,
+                                     "group_drain_seconds": GROUP_DRAIN_SECONDS,
+                                     "terminate_grace_seconds": TERMINATE_GRACE_SECONDS,
+                                     "kill_reap_seconds": KILL_REAP_SECONDS,
                                      "started_unix": time.time()})
     log = stage / "console.log"
     timed_out = False
+    code = None
+    boundary = "leader_not_reaped"
+    cleanup_errors = []
     with log.open("xb") as stream:
         try:
             process = subprocess.Popen(args, cwd=checkout, env=env,
@@ -146,32 +206,51 @@ def run_stage(name, args, seconds, checkout, env, evidence):
             code = process.wait(timeout=seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
+            # Popen.wait timed out without reaping the leader. Its PID pins
+            # the original group identity through both cleanup signals.
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(process.pid, sig)
+                except ProcessLookupError:
+                    pass
+                except OSError as exc:
+                    cleanup_errors.append(str(exc))
+                if sig == signal.SIGTERM:
+                    time.sleep(TERMINATE_GRACE_SECONDS)
             try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
+                code = process.wait(timeout=KILL_REAP_SECONDS)
+            except subprocess.TimeoutExpired:
                 pass
-            # Keep the leader unreaped through the grace period; also kill
-            # descendants in its original group if the leader exits early.
-            time.sleep(2)
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            code = process.wait(timeout=10)
+            except OSError as exc:
+                cleanup_errors.append(str(exc))
+        except OSError as exc:
+            cleanup_errors.append(str(exc))
+        if code is not None:
+            boundary = group_absence(process.pid)
         stream.flush()
         os.fsync(stream.fileno())
+
+    # No stable manifest or parsed TRX assertion while an original group
+    # member may still write. Keep partial raw files and stop the matrix.
+    result = {"state": "process_boundary_unknown",
+              "exit_code": code, "timed_out": timed_out,
+              "process_group": process.pid, "group_observation": boundary,
+              "cleanup_errors": cleanup_errors, "finished_unix": time.time()}
+    if boundary != "absent":
+        receipt(stage / "terminal.json", result)
+        return False
+
     trx = trx_summary(stage / (name + ".trx"))
     files = {str(p.relative_to(stage)): sha(p) for p in sorted(stage.rglob("*"))
              if p.is_file()}
     # Not final acceptance: the reviewer must reconcile all counters, skips,
     # platform exclusions, exact source, and independently verified receipts.
-    result = {"state": "timeout" if timed_out else "exited", "exit_code": code,
-              "finished_unix": time.time(), "sha256": files, "trx": trx,
-              "trx_counters_consistent": consistent_trx(trx)}
+    consistent = consistent_trx(trx)
+    result.update({"state": "timeout" if timed_out else "exited",
+                   "finished_unix": time.time(), "sha256": files, "trx": trx,
+                   "trx_counters_consistent": consistent})
     receipt(stage / "terminal.json", result)
-    return (not timed_out and code == 0 and consistent_trx(trx)
-            and trx["outcomes"].get("Passed", 0) > 0
-            and set(trx["outcomes"]) <= {"Passed", "NotExecuted"})
+    return not timed_out and code == 0 and consistent and trx["outcomes"].get("Passed", 0) > 0
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)

@@ -28,9 +28,9 @@ open Common.SignalR
 open Microsoft.AspNetCore.SignalR
 open Server.Services
 open NUnit.Framework
-open Client
-open Client.LedgerStore
-open Client.ReviewWorkflow
+open global.Client
+open global.Client.LedgerStore
+open global.Client.ReviewWorkflow
 open AutomationHealthHostedFixture
 
 let private subject = "SyntheticSubject"

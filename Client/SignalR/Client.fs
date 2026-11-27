@@ -232,44 +232,6 @@ type private ResponseAlertReconciler(runtime: Runtime) =
                     let last = lock entry.Gate (fun () -> entry.LastUsed)
                     if now - last > idle then probes.TryRemove(key) |> ignore
                     else schedule entry false), null, period, period)
-    // A read-only job poll may reuse fresh non-Ready, no-alert evidence
-    // from the background verified snapshot. Do not wait on a remote
-    // fetch or use the default-false presence hint as admission evidence.
-    member _.HasVerifiedNoAlertNonReady(target, agentId) =
-        try
-            let projectId = ProjectPaths.ProjectTarget.projectId target
-            match snapshots.TryGetValue projectId with
-            | true, state when Monitor.TryEnter(state.Gate) ->
-                let observed =
-                    try
-                        if WorkingTurnGuidance.isFresh period DateTimeOffset.UtcNow state.CheckedAt then
-                            state.Verified |> Option.map (fun verified -> state.CheckedAt, verified)
-                        else None
-                    finally Monitor.Exit(state.Gate)
-                match observed with
-                | None -> false
-                | Some(checkedAt, (binding, snapshot)) ->
-                    let nonReady =
-                        match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurnAt binding snapshot agentId with
-                        | Ok agent -> agent.State <> "Ready"
-                        | Error(LedgerStore.StaleEntityVersion _) -> true
-                        | Error _ -> false
-                    let noAlert =
-                        match ReviewWorkflow.ReviewWorkflow.getResponseAlertsAt binding snapshot agentId with
-                        | Ok queue -> queue.Pending.IsEmpty
-                        | Error _ -> false
-                    if nonReady && noAlert && Monitor.TryEnter(state.Gate) then
-                        try
-                            state.CheckedAt = checkedAt
-                            && WorkingTurnGuidance.isFresh period DateTimeOffset.UtcNow checkedAt
-                            && (match snapshots.TryGetValue projectId with
-                                | true, current -> obj.ReferenceEquals(current, state)
-                                | _ -> false)
-                        finally Monitor.Exit(state.Gate)
-                    else false
-            | _ -> false
-        with _ -> false
-
     member _.InvalidateAdmissionSnapshot(projectId) = invalidateSnapshot projectId
 
     member _.MayHavePending(target, agentId) =
@@ -490,8 +452,8 @@ let private checkResponseAlerts (rt: Runtime) agentId (target: ProjectPaths.Proj
                     match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt with
                     | Error _ -> []
                     | Ok (binding, snapshot) ->
-                        // Pending handles and read-only polls are not activity.
-                        // Actual alert consumption still requires a verified
+                        // Pending handles are not activity. Job reads never reach this
+                        // consumption path. Actual alert consumption still requires a verified
                         // launch guard and the existing queue-version CAS.
                         match ScheduledReadyResume.guardUncorrelatedIngressAt binding snapshot agentId with
                         | Error _ -> []
@@ -514,6 +476,10 @@ let private mayReceiveResponseAlert = function
     // Observer and operator inspection are administrative, not the target
     // agent's ordinary tool usage. They must never consume a message.
     | ObserveAgentCommand _ -> false
+    // Retrieving an existing job is not a new agent action. Even a queued
+    // STOP must remain for the next eligible action response, not be consumed
+    // by a status read that is needed to retrieve the original outcome.
+    | GetJobResultCommand _ | ListJobsCommand _ -> false
     | OperatorConversationReadCommand _ -> false
     | WorkQueueReadCommand _
     | WorkQueueWriteCommand _
@@ -1831,10 +1797,11 @@ let private receivePreparedCommand (rt: Runtime)
                     return! receiveCommandForTarget rt target prepared.Source prepared.ProjectTask agentId command sourceOriginalId manualGrantAuthorized onChallengeCommit requestSnapshot
     }
 
-// The agent label authenticates the user/actor route, not a particular
-// inference execution. Ready admission must use fresh authority. The only
-// cache exception is a read-only operation with verified non-Ready evidence;
-// neither this evidence nor an unavailable local read authorizes a write.
+// The agent label identifies the user/actor route, not a particular
+// inference execution. Ready admission must use fresh authority. Historical
+// source reads may reuse verified Working evidence; neither this evidence
+// nor an unavailable local read authorizes a write. Job-result reads do not
+// enter ordinary lifecycle admission.
 type private OrdinaryIngress =
     | VerifiedIngress of RequestSnapshot option
     | CachedReadIngress
@@ -1849,10 +1816,6 @@ let private localSourceRead = function
     | GetGitStatusCommand _ | GetGitDiffCommand _ -> true
     | _ -> false
 
-let private readOnlyJobPoll = function
-    | GetJobResultCommand _ | ListJobsCommand _ -> true
-    | _ -> false
-
 let private admitOrdinaryLaunchIngress (rt: Runtime) agentId target command =
     match target with
     | Some selected when not (String.IsNullOrWhiteSpace agentId) ->
@@ -1861,8 +1824,6 @@ let private admitOrdinaryLaunchIngress (rt: Runtime) agentId target command =
         let cache = workingGuidanceCache rt
         let historical = localSourceRead command
         if historical && cache.HasVerifiedWorking(DateTimeOffset.UtcNow, projectId, agentId) then
-            Ok CachedReadIngress
-        elif readOnlyJobPoll command && (responseAlertCache rt).HasVerifiedNoAlertNonReady(selected, agentId) then
             Ok CachedReadIngress
         else
             let rec admit retries =
@@ -1981,6 +1942,14 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                                     | Ok(ScheduledReadyResume.CheckinConfirmed _)
                                     | Ok(ScheduledReadyResume.CheckinDuplicate _) -> Ok scope
                             | CreateProjectCommand _ -> Ok scope // no existing target ledger
+                            // Job reads only retrieve already-registered work.
+                            // The original inbox may still be Ready (including
+                            // after its durable check-in). Requiring lifecycle
+                            // admission here would fence its own pending result.
+                            // Project/device/account routing and JobManager's
+                            // scope checks remain in force; cancellation does
+                            // not share this exception.
+                            | GetJobResultCommand _ | ListJobsCommand _ -> Ok scope
                             | _ ->
                                 admitOrdinaryLaunchIngress rt agentId (projectTarget scope) command
                                 |> Result.map (fun ingress ->
@@ -2129,8 +2098,8 @@ let executeAuthenticatedCommandWithChallengeWake
     }
 
 // Background completion is not an agent-visible response. This is the only
-// response-alert consumption point for SignalR-delivered tool calls, including
-// pending handles, quick completions, polls and errors.
+// response-alert consumption point for eligible SignalR-delivered tool calls,
+// including pending handles, quick completions and errors. Job reads are excluded.
 let private withVisibleResponseAlerts (rt: Runtime) (agentId: string)
                                       (command: AgentCommand option)
                                       (response: AgentCommandResponse) =

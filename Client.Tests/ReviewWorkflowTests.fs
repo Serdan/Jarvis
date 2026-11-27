@@ -7695,7 +7695,7 @@ type ReviewWorkflowTests() =
 
 
     [<Test>]
-    member _.ResponseAlertsReachErroredPollAndUnrelatedToolResponsesWithoutActivity() =
+    member _.ResponseAlertsSkipErroredPollAndReachUnrelatedToolResponses() =
         withFixture (fun one _ first second _ _ _ _ ->
             let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
             try
@@ -7729,14 +7729,11 @@ type ReviewWorkflowTests() =
                 (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" "Reviewer").GetAwaiter().GetResult()
                 let _, polled, delivered = invoke "Reviewer" poll
                 Assert.That(polled.IsError, Is.True)
-                let alerts = delivered.OperationalControls |> List.filter Common.OperationalControl.isAlert
-                Assert.That(alerts.Length, Is.EqualTo(2))
-                Assert.That(Common.OperationalControl.text alerts.Head, Does.Contain("STOP"))
-                Assert.That(Common.OperationalControl.text alerts.[1], Does.Contain("preserve test evidence"))
+                Assert.That(delivered.OperationalControls |> List.exists Common.OperationalControl.isAlert, Is.False)
                 Assert.That(delivered.AgentStateChanges, Is.Empty)
                 Assert.That(delivered.InboxActivation.IsNone, Is.True)
                 Assert.That(runtime.Tui.GetAgentLastSeen("owner", "Reviewer").IsNone, Is.True)
-                Assert.That((ReviewWorkflow.getResponseAlerts second "Reviewer" |> success).Pending, Is.Empty)
+                Assert.That((ReviewWorkflow.getResponseAlerts second "Reviewer" |> success).Pending.Length, Is.EqualTo(2))
                 let ordinary : Common.AgentCommand =
                     Common.TaskReadCommand
                         { ProjectName = "owner"; LaunchId = null; AgentId = "Reviewer"; Action = "GetNotificationPreferences"
@@ -7744,7 +7741,11 @@ type ReviewWorkflowTests() =
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let _, readResult, after = invoke "Reviewer" ordinary
                 Assert.That(readResult.IsOk, Is.True)
-                Assert.That(after.OperationalControls |> List.exists Common.OperationalControl.isAlert, Is.False)
+                let alerts = after.OperationalControls |> List.filter Common.OperationalControl.isAlert
+                Assert.That(alerts.Length, Is.EqualTo(2))
+                Assert.That(Common.OperationalControl.text alerts.Head, Does.Contain("STOP"))
+                Assert.That(Common.OperationalControl.text alerts.[1], Does.Contain("preserve test evidence"))
+                Assert.That((ReviewWorkflow.getResponseAlerts second "Reviewer" |> success).Pending, Is.Empty)
                 ReviewWorkflow.queueResponseAlert first (Guid.NewGuid()) "Lead"
                     "Reviewer" "Non-stop instruction" |> success |> ignore
                 let missing : Common.AgentCommand =
@@ -7775,10 +7776,17 @@ type ReviewWorkflowTests() =
                 let poll : Common.AgentCommand =
                     Common.GetJobResultCommand
                         { ProjectName = "owner"; JobId = "missing-job"; AfterSequence = None }
-                let invoke actor =
+                let invokeCommand actor (command: Common.AgentCommand) =
                     Client.SignalR.Client.processIncomingCommand runtime
-                        (System.Text.Json.JsonSerializer.Serialize(poll)) actor
+                        (System.Text.Json.JsonSerializer.Serialize(command)) actor
                     |> Async.AwaitTask |> Async.RunSynchronously
+                let invoke actor =
+                    let ordinary : Common.AgentCommand =
+                        Common.TaskReadCommand
+                            { ProjectName = "owner"; LaunchId = null; AgentId = actor; Action = "GetNotificationPreferences"
+                              TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
+                              Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
+                    invokeCommand actor ordinary
                 let refresh actor =
                     (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" actor).GetAwaiter().GetResult()
                 let shown (reply: Common.AgentCommandResponse) =
@@ -7786,7 +7794,7 @@ type ReviewWorkflowTests() =
 
                 refresh "Owner"
                 refresh "Reviewer"
-                let (ownerPoll, count) = LedgerStore.measureGitReads (fun () -> invoke "Owner")
+                let (ownerPoll, count) = LedgerStore.measureGitReads (fun () -> invokeCommand "Owner" poll)
                 Assert.That(count.RemoteFetches, Is.EqualTo(0),
                             "A no-alert poll cannot wait on a remote Git fetch.")
                 let _, _, ownerResponse = ownerPoll
@@ -7911,11 +7919,11 @@ type ReviewWorkflowTests() =
                     System.Threading.Tasks.TaskCompletionSource<Common.AgentCommandResponse>(
                         System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously)
 
-                // The first visible completed poll must consume STOP exactly once.
+                // Completed polls must never consume a queued STOP.
                 let firstJob = newBlocked ()
                 let firstHandle = startPromoted firstJob
                 ReviewWorkflow.queueResponseAlert second (Guid.NewGuid()) "Lead" actor
-                    "STOP — only first completed poll may show this" |> success |> ignore
+                    "STOP — first queued alert must survive job polling" |> success |> ignore
                 firstJob.SetResult original
                 waitForCompletion firstHandle.JobId
                 Assert.That((stored firstHandle.JobId).ToolResponse, Is.EqualTo(Some original))
@@ -7923,15 +7931,14 @@ type ReviewWorkflowTests() =
                             Is.EqualTo(1), "Background completion must not consume STOP.")
                 (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" actor).GetAwaiter().GetResult()
                 let firstPoll = visiblePoll firstHandle.JobId
-                Assert.That(alertInstructions firstPoll |> List.map Common.OperationalControl.text,
-                            Has.Some.Contains("only first completed poll"))
-                Assert.That((ReviewWorkflow.getResponseAlerts first actor |> success).Pending, Is.Empty)
+                Assert.That(alertInstructions firstPoll, Is.Empty)
+                Assert.That((ReviewWorkflow.getResponseAlerts first actor |> success).Pending.Length, Is.EqualTo(1))
                 let repeatPoll = visiblePoll firstHandle.JobId
                 Assert.That(alertInstructions repeatPoll, Is.Empty,
-                            "The immutable stored completion must not replay the consumed STOP.")
+                            "A repeated poll must not consume the queued STOP.")
                 Assert.That(repeatPoll.Result, Is.EqualTo(firstPoll.Result))
 
-                // A completed job that is never polled cannot strand its STOP.
+                // Both alerts remain available to the next eligible action response.
                 let secondJob = newBlocked ()
                 let secondHandle = startPromoted secondJob
                 ReviewWorkflow.queueResponseAlert second (Guid.NewGuid()) "Lead" actor
@@ -7939,7 +7946,7 @@ type ReviewWorkflowTests() =
                 secondJob.SetResult original
                 waitForCompletion secondHandle.JobId
                 Assert.That((ReviewWorkflow.getResponseAlerts second actor |> success).Pending.Length,
-                            Is.EqualTo(1))
+                            Is.EqualTo(2))
                 let unrelated : Common.AgentCommand =
                     Common.TaskReadCommand
                         { ProjectName = "owner"; LaunchId = null; AgentId = actor; Action = "GetNotificationPreferences"
@@ -7954,6 +7961,8 @@ type ReviewWorkflowTests() =
                     |> await
                 Assert.That(alertInstructions visible |> List.map Common.OperationalControl.text,
                             Has.Some.Contains("next unrelated visible tool reply"))
+                Assert.That(alertInstructions visible |> List.map Common.OperationalControl.text,
+                            Has.Some.Contains("first queued alert must survive job polling"))
                 Assert.That((ReviewWorkflow.getResponseAlerts first actor |> success).Pending, Is.Empty)
                 Assert.That(alertInstructions (visiblePoll secondHandle.JobId), Is.Empty)
                 Assert.That((stored secondHandle.JobId).ToolResponse, Is.EqualTo(Some original))
@@ -8005,7 +8014,8 @@ type ReviewWorkflowTests() =
                 (Client.SignalR.Client.reconcileResponseAlerts runtime "owner" "Owner").GetAwaiter().GetResult()
                 let _, polled, response = invoke poll
                 Assert.That(polled.IsError, Is.True)
-                Assert.That(response.OperationalControls |> List.exists (fun control -> Common.OperationalControl.isAlert control && (Common.OperationalControl.text control).Contains("STOP")), Is.True)
+                Assert.That(response.OperationalControls |> List.exists Common.OperationalControl.isAlert, Is.False)
+                Assert.That((ReviewWorkflow.getResponseAlerts first "Owner" |> success).Pending.Length, Is.EqualTo(1))
                 Assert.That(response.AgentStateChanges, Is.Empty)
                 Assert.That(response.InboxActivation.IsNone, Is.True)
                 let after = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent

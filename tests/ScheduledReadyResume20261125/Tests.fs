@@ -137,6 +137,118 @@ let deadlineRequiresVerifiedEvidence seconds expired =
 // Exercise the same registered post-journal execution core as SignalR,
 // not just the scheduler's recordCheckin helper. All bindings and activity
 // are disposable; a fresh runtime simulates client restart.
+// Force the original inbox across the actual client promotion boundary.
+// The caller must be able to retrieve its exact handle before check-in,
+// after check-in but before activation, and after terminal publication.
+[<Test; NonParallelizable>]
+let promotedScheduledInboxJobReadsRemainIndependentOfReadyIngress () =
+    fixture (fun binding assign ->
+        let root = Path.GetDirectoryName(binding.RepositoryPath)
+        let previous = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+        Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", Path.Combine(root, "config"))
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let entered = TaskCompletionSource<Task<Common.AgentCommandResponse>>(TaskCreationOptions.RunContinuationsAsynchronously)
+        try
+            assign "Worker" "ready-task"
+            let runtime = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.FullTrust)
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting "local" runtime binding.ProjectId binding.LedgerId
+                binding.Epoch binding.RemoteName binding.ApprovedFetchUrl binding.ApprovedPushUrl
+                (LedgerStore.fetch binding |> good).Commit true |> good |> ignore
+            let launch, _ = captureLaunch binding
+            let id = launch.OperationId.ToString("D")
+            let actor = "Worker"
+            let serialize (command: Common.AgentCommand) =
+                System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(command)
+            let core wire who =
+                Client.SignalR.Client.executeAuthenticatedCommandWithChallengeWake runtime wire who None false (fun _ _ -> ())
+            let invoke command =
+                Client.SignalR.Client.executeOrPromoteWith runtime (serialize command) actor TimeSpan.Zero core
+                |> fun pending -> pending.GetAwaiter().GetResult()
+            let inbox : Common.AgentCommand =
+                Common.TaskReadCommand
+                    { ProjectName = "local"; AgentId = actor; LaunchId = id; Action = "AgentInbox"
+                      TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
+                      Cursor = ""; PageSize = 0; BeforeOid = ""; AfterOid = ""; RelativePath = "" }
+            let pending =
+                Client.SignalR.Client.executeOrPromoteWith runtime (serialize inbox) actor
+                    (TimeSpan.FromMilliseconds 10.) (fun wire who ->
+                        let execution = task {
+                            do! release.Task
+                            return! core wire who
+                        }
+                        entered.SetResult(execution)
+                        execution)
+                |> fun response -> response.GetAwaiter().GetResult()
+            Assert.That(pending.PendingJob.IsSome, Is.True)
+            Assert.That(entered.Task.Wait(TimeSpan.FromSeconds 5.), Is.True)
+            let handle = pending.PendingJob.Value
+            let poll project jobId =
+                invoke (Common.GetJobResultCommand { ProjectName = project; JobId = jobId; AfterSequence = None })
+            let state () = LedgerStore.fetch binding |> good
+            let jobResult (reply: Common.AgentCommandResponse) =
+                Assert.That(reply.Error.IsNone, Is.True, sprintf "Job poll failed: %A" reply.Error)
+                Assert.That(reply.AgentStateChanges, Is.Empty)
+                Assert.That(reply.InboxActivation.IsNone, Is.True)
+                Assert.That(reply.OperationalControls |> List.exists Common.OperationalControl.isAlert, Is.False)
+                System.Text.Json.JsonSerializer.Deserialize<Common.JobResult>(reply.Result.Value)
+            let checkPending () =
+                let head = (state()).Commit
+                let reply, io = LedgerStore.measureGitReads (fun () -> poll "local" handle.JobId)
+                Assert.That(io.RemoteFetches, Is.Zero, "A Ready poll must not synchronously consult the ledger")
+                let result = reply |> jobResult
+                Assert.That(result.ToolResponse.IsNone, Is.True)
+                let listed, listIo = LedgerStore.measureGitReads (fun () ->
+                    invoke (Common.ListJobsCommand { ProjectName = Some "local"; IncludeCompleted = true }))
+                Assert.That(listIo.RemoteFetches, Is.Zero)
+                Assert.That(listed.Error.IsNone, Is.True, sprintf "%A" listed.Error)
+                let jobs = System.Text.Json.JsonSerializer.Deserialize<Common.ListJobsResult>(listed.Result.Value)
+                Assert.That(jobs.Jobs |> List.exists (fun job -> job.JobId = handle.JobId), Is.True)
+                Assert.That(listed.AgentStateChanges, Is.Empty)
+                Assert.That(listed.OperationalControls |> List.exists Common.OperationalControl.isAlert, Is.False)
+                Assert.That((state()).Commit, Is.EqualTo(head))
+                Assert.That(runtime.Tui.GetAgentLastSeen("local", actor).IsNone, Is.True)
+                Assert.That((ReviewWorkflow.getAgentWorkingTurnAt binding (state()) actor |> good).State, Is.EqualTo("Ready"))
+            checkPending ()
+            recordCheckin binding actor id DateTimeOffset.UtcNow |> good |> ignore
+            ReviewWorkflow.queueResponseAlert binding (Guid.NewGuid()) "fixture" actor
+                "STOP — preserve until an eligible response" |> good |> ignore
+            (Client.SignalR.Client.reconcileResponseAlerts runtime "local" actor).GetAwaiter().GetResult()
+            checkPending ()
+            Assert.That((ReviewWorkflow.getResponseAlerts binding actor |> good).Pending.Length, Is.EqualTo(1))
+            let ordinary =
+                match inbox with
+                | Common.TaskReadCommand request -> Common.TaskReadCommand { request with LaunchId = ""; Action = "GetTask"; TaskId = "ready-task" }
+                | _ -> failwith "fixture inbox"
+            let denied = core (serialize ordinary) actor |> fun response -> response.GetAwaiter().GetResult()
+            Assert.That(sprintf "%A" denied.Error, Does.Contain("ScheduledLaunchIngressRejected"))
+            let cancel = invoke (Common.CancelJobCommand { ProjectName = "local"; JobId = handle.JobId })
+            Assert.That(sprintf "%A" cancel.Error, Does.Contain("ScheduledLaunchIngressRejected"))
+            let missing = poll "local" "missing-job"
+            Assert.That(missing.Error.IsSome, Is.True)
+            Assert.That(sprintf "%A" missing.Error, Does.Not.Contain("ScheduledLaunchIngressRejected"))
+            Assert.That((poll "other" handle.JobId).Error.IsSome, Is.True)
+            release.SetResult(())
+            let original = entered.Task.Result.GetAwaiter().GetResult()
+            Assert.That(original.Error.IsNone, Is.True, sprintf "%A" original.Error)
+            Assert.That(original.InboxActivation.Value.ActivatedByThisCall, Is.True)
+            let mutable terminal = None
+            Assert.That(System.Threading.SpinWait.SpinUntil((fun () ->
+                let result = poll "local" handle.JobId |> jobResult
+                terminal <- result.ToolResponse
+                terminal.IsSome), TimeSpan.FromSeconds 5.), Is.True)
+            Assert.That(terminal.Value, Is.EqualTo(original))
+            let after = (state()).Commit
+            let seen = runtime.Tui.GetAgentLastSeen("local", actor)
+            Assert.That((poll "local" handle.JobId |> jobResult).ToolResponse, Is.EqualTo(terminal))
+            Assert.That((state()).Commit, Is.EqualTo(after))
+            Assert.That(runtime.Tui.GetAgentLastSeen("local", actor), Is.EqualTo(seen :> obj))
+            Assert.That((ReviewWorkflow.getResponseAlerts binding actor |> good).Pending.Length, Is.EqualTo(1))
+        finally
+            release.TrySetResult(()) |> ignore
+            if entered.Task.IsCompletedSuccessfully then
+                entered.Task.Result.GetAwaiter().GetResult() |> ignore
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", previous))
+
 [<Test; NonParallelizable>]
 let registeredIngressHoldsAmbiguousLaunchUntilVerifiedTermination () =
     fixture (fun binding assign ->

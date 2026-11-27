@@ -138,6 +138,24 @@ type ChallengeOwner =
     | Agent of string
     | Operator
 
+/// Backwards-compatible condition discriminator: the existing description field
+/// carries an exact versioned machine locator, not free-form terminal evidence.
+/// OwnerAgentId remains the original initiating agent. No new ledger schema.
+module JobTerminalCondition =
+    let private prefix = "jarvis:job-terminal:v1:"
+    let isReserved (description: string) =
+        not (isNull description) && description.StartsWith(prefix, StringComparison.Ordinal)
+    let tryJobId (description: string) =
+        if not (isReserved description) then None
+        else
+            let id = description.Substring(prefix.Length)
+            match Guid.TryParseExact(id, "N") with
+            | true, parsed when parsed <> Guid.Empty && parsed.ToString("N") = id -> Some id
+            | _ -> None
+    let describe (id: Guid) =
+        if id = Guid.Empty then invalidArg "id" "A nonempty original engineering job identity is required."
+        prefix + id.ToString("N")
+
 module ChallengeWorkflow =
     let private options =
         JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
@@ -703,7 +721,11 @@ module ChallengeWorkflow =
                || (d.OwnerKind = "Operator" && not (String.IsNullOrWhiteSpace d.SuggestedAgentId))
                || (not (String.IsNullOrWhiteSpace d.OwnerAgentId) && not (agentId d.OwnerAgentId))
                || (not (String.IsNullOrWhiteSpace d.SuggestedAgentId) && not (agentId d.SuggestedAgentId))
-               || not (text 2048 d.Description))) then
+               || not (text 2048 d.Description)
+               || (JobTerminalCondition.isReserved d.Description
+                   && ((JobTerminalCondition.tryJobId d.Description).IsNone
+                       || owner d.OwnerKind d.OwnerAgentId <> Some(ChallengeOwner.Agent issuer)
+                       || not (String.IsNullOrWhiteSpace d.SuggestedAgentId))))) then
             Error(InvalidBinding "Challenge requires valid issuer, title, optional task, and 1-32 owned conditions.")
         else
             let challengeId = operationId
@@ -880,7 +902,7 @@ module ChallengeWorkflow =
         return List.rev writes
     }
     let private update binding operationId actor challengeId conditionId expectedVersion kind
-                       evidence reason =
+                       evidence reason (terminalJobId: string option) =
         match guidN challengeId with
         | None -> Error(InvalidBinding "Challenge ID must be a non-empty UUID.")
         | Some id when operationId = Guid.Empty || not (agentId actor)
@@ -937,6 +959,10 @@ module ChallengeWorkflow =
                                 | _ -> Error(StaleEntityVersion "Operator condition is not pending or response is empty.")
                             | "ResolveChallengeCondition" ->
                                 match target with
+                                | Some condition when JobTerminalCondition.tryJobId condition.Description <> terminalJobId ->
+                                    Error(ReviewAccessDenied "Job terminal conditions require authoritative original-job evidence.")
+                                | Some condition when terminalJobId.IsSome && challenge.IssuerAgentId <> actor ->
+                                    Error(ReviewAccessDenied "Job terminal condition must belong to its initiating owner.")
                                 | Some condition when ownerOf condition = Some(ChallengeOwner.Agent actor)
                                                       && condition.Status = "Pending"
                                                       && (text 8192 evidence || text 4096 reason) ->
@@ -988,16 +1014,23 @@ module ChallengeWorkflow =
     // One response resolves the operator input request; it is not a chat message.
     let respondOperator binding operationId operatorActor challengeId conditionId version response =
         update binding operationId operatorActor challengeId conditionId version
-            "RespondOperatorCondition" response ""
+            "RespondOperatorCondition" response "" None
 
     let resolve binding operationId actor challengeId conditionId version evidence blockedReason =
         update binding operationId actor challengeId conditionId version
-            "ResolveChallengeCondition" evidence blockedReason
+            "ResolveChallengeCondition" evidence blockedReason None
+
+    // Only the in-process durable receipt adapter uses this route. The remote
+    // ChallengeWrite Resolve command cannot satisfy a reserved job condition.
+    let internal resolveJobTerminal binding operationId actor challengeId conditionId version jobId evidence =
+        update binding operationId actor challengeId conditionId version
+            "ResolveChallengeCondition" evidence "" (Some jobId)
+
     let reopen binding operationId issuer challengeId conditionId version reason =
         update binding operationId issuer challengeId conditionId version
-            "ReopenChallengeCondition" "" reason
+            "ReopenChallengeCondition" "" reason None
     let cancel binding operationId issuer challengeId version reason =
-        update binding operationId issuer challengeId "" version "CancelChallenge" "" reason
+        update binding operationId issuer challengeId "" version "CancelChallenge" "" reason None
 
     /// The issuer may assign/reassign a Pending condition directly. A
     /// subscriber may dispatch only an unassigned condition. Both routes use
@@ -1026,6 +1059,8 @@ module ChallengeWorkflow =
                         match target with
                         | Some c when c.Status <> "Pending" ->
                             Error(StaleEntityVersion "Only Pending conditions can be assigned.")
+                        | Some c when (JobTerminalCondition.tryJobId c.Description).IsSome ->
+                            Error(ReviewAccessDenied "Original engineering job ownership cannot be reassigned.")
                         | Some c when ownerOf c = Some ChallengeOwner.Operator ->
                             Error(ReviewAccessDenied "Operator input cannot be reassigned or dispatched.")
                         | Some c when actor = challenge.IssuerAgentId ||
@@ -1068,6 +1103,7 @@ module ChallengeWorkflow =
                            (owner d.OwnerKind d.OwnerAgentId).IsNone
                            || (d.OwnerKind = "Operator" && not (String.IsNullOrWhiteSpace d.SuggestedAgentId))
                            || not (text 2048 d.Description)
+                           || JobTerminalCondition.isReserved d.Description
                            || (not (String.IsNullOrWhiteSpace d.OwnerAgentId) && not (agentId d.OwnerAgentId))
                            || (not (String.IsNullOrWhiteSpace d.SuggestedAgentId) && not (agentId d.SuggestedAgentId)))) ->
             Error(InvalidBinding "Split requires 2-32 valid condition definitions and exact version.")
@@ -1099,6 +1135,8 @@ module ChallengeWorkflow =
                         let! original =
                             match challenge.Conditions |> List.tryFind (fun c -> c.ConditionId = conditionId) with
                             | None -> Error(InvalidBinding "Unknown challenge condition for split.")
+                            | Some c when (JobTerminalCondition.tryJobId c.Description).IsSome ->
+                                Error(ReviewAccessDenied "Original engineering job conditions cannot be split.")
                             | Some c when ownerOf c = Some ChallengeOwner.Operator ->
                                 Error(ReviewAccessDenied "Operator input conditions cannot be split.")
                             | Some c when c.Status <> "Pending" ->

@@ -48,7 +48,7 @@ let enter id =
 let private comparison =
     if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal
 
-let private overlaps (left: string) (right: string) =
+let overlaps (left: string) (right: string) =
     try
         if not (Path.IsPathFullyQualified left && Path.IsPathFullyQualified right) then true
         else

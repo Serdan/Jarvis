@@ -1,4 +1,4 @@
-﻿module Program
+module Program
 
 open System
 open System.IO
@@ -8,6 +8,10 @@ open Client.Effect
 [<EntryPoint>]
 let main args =
     match args with
+    | [| "--durable-job-child-probe"; marker; release |] ->
+        JobManagerTests.durableChildProbe marker release
+    | [| "--durable-job-start-probe"; root; idFile; marker; release; waitForTerminal |] ->
+        JobManagerTests.durableStartProbe root idFile marker release (Boolean.Parse waitForTerminal)
     | [| "--job-environment-probe"; variable |] ->
         // Test the actual inherited environment without the variable startup cost of FSI.
         Environment.GetEnvironmentVariable(variable)

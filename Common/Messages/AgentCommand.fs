@@ -42,6 +42,8 @@ type JobStatus =
     | Canceled
     | ToolCompleted
     | ToolFailed of message: string
+    /// No authoritative exit receipt and no verified live supervisor.
+    | RecoveryUnknown of message: string
 
 type CommandCapability =
     { Name: string

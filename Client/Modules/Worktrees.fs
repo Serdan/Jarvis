@@ -184,6 +184,18 @@ let private removalTarget projectName (entry: WorktreeInfo) =
                            root) } : WorktreeActivity.RemovalTarget)
     }
 
+module Durable = BoundedProcess.DurableJobs
+
+let private durableRoot (rt: #ProjectIO) =
+    let (ProjectDirectory workspace) = rt.Project.Root
+    Durable.root workspace
+
+// The in-memory reservation is acquired first and released last. The
+// durable admission lock covers the registry observation and Git effect.
+let private withDurableAdmission run (rt: #ProjectIO) =
+    try Durable.withAdmission (durableRoot rt) (fun () -> run rt)
+    with ex -> Error(Client.ExceptionError ex)
+
 let private inspectEntry (cmd: InspectWorktreeRemovalCommand) (entry: WorktreeInfo) resource =
     effect {
         let! target =
@@ -199,7 +211,9 @@ let private inspectEntry (cmd: InspectWorktreeRemovalCommand) (entry: WorktreeIn
                 }
         let! status = git cmd.ProjectName [ "-C"; entry.Path; "status"; "--porcelain" ]
         let! integrated = git cmd.ProjectName [ "merge-base"; "--is-ancestor"; entry.Head; target ]
-        let jobs = WorktreeActivity.count resource
+        let! durableJobs = fun rt ->
+            Ok(Durable.countCheckoutBlockers (durableRoot rt) (WorktreeActivity.overlaps entry.Path))
+        let jobs = WorktreeActivity.count resource + durableJobs
         let clean =
             if status.ExitCode = 0 && not status.TimedOut && not status.Truncated then
                 Some(String.IsNullOrWhiteSpace status.StdOut)
@@ -233,7 +247,7 @@ let inspectRemoval (cmd: InspectWorktreeRemovalCommand) =
                 let! entry = getRegistration cmd.ProjectName cmd.WorktreePath
                 let! resource = removalTarget cmd.ProjectName entry
                 return! inspectEntry cmd entry resource
-            }) rt
+            }) |> withDurableAdmission <| rt
 
 let private removeReserved (cmd: RemoveWorktreeCommand) resource =
     effect {
@@ -281,4 +295,4 @@ let removeWorktree (cmd: RemoveWorktreeCommand) =
                     Error(Client.ValidationError($"Jarvis has {count} active job(s) using this worktree or with unresolved resource provenance."))
                 | Ok reservation ->
                     use _reservation = reservation
-                    removeReserved cmd resource rt
+                    withDurableAdmission (removeReserved cmd resource) rt

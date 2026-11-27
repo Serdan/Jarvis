@@ -557,3 +557,90 @@ let ``saved review replay takes its own lease within ledger-only parent`` () =
                 ()
             use resumed = WorktreeActivity.admitReviewReplay saved |> accepted
             ())
+
+
+[<Test>]
+let ``durable unknown child registration blocks removal without in-memory process activity`` () =
+    withRepo (fun root _ context ->
+        let make name =
+            createWorktree
+                { ProjectName = "Project1"; Name = name; Branch = "feature/" + name; BaseRef = "HEAD" } context
+            |> function Ok item -> item | Error e -> failwithf "%A" e
+        let target = make "unknown-job"
+        let other = make "independent"
+        let child = Path.Combine(target.Path, "child")
+        Directory.CreateDirectory child |> ignore
+        let registry = BoundedProcess.DurableJobs.root root
+        let request: BoundedProcess.DurableJobs.Request =
+            { Schema = 1
+              JobId = Guid.NewGuid().ToString("N")
+              Project = "project1"
+              Actor = None
+              Executable = "never-started"
+              Args = []
+              Reason = None
+              WorkingDirectory = child
+              StartedAt = DateTimeOffset.UtcNow.AddHours(-1.)
+              MaxOutputBytes = 1024 }
+        let directory =
+            BoundedProcess.DurableJobs.withAdmission registry (fun () ->
+                BoundedProcess.DurableJobs.create registry request)
+        try
+            let inspect path =
+                inspectRemoval { ProjectName = "Project1"; WorktreePath = path; TargetRef = None } context
+                |> function Ok result -> result | Error e -> failwithf "%A" e
+            let blocked = inspect target.Path
+            blocked.RunningJobCount |> shouldEqual 1
+            blocked.CanRemove |> shouldEqual false
+            (inspect other.Path).CanRemove |> shouldEqual true
+            match removeWorktree { ProjectName = "Project1"; WorktreePath = target.Path; TargetRef = None } context with
+            | Error _ -> Directory.Exists target.Path |> shouldEqual true
+            | Ok _ -> Assert.Fail("Removed checkout with an unknown durable process outcome.")
+        finally
+            // This is an isolated synthetic record; no supervisor was launched.
+            BoundedProcess.DurableJobs.withAdmission registry (fun () ->
+                BoundedProcess.DurableJobs.tryPrune directory |> ignore))
+
+
+[<Test>]
+let ``removal rechecks durable registrations after acquiring its reservation`` () =
+    withRepo (fun root _ context ->
+        let target =
+            createWorktree
+                { ProjectName = "Project1"; Name = "registration-race"; Branch = "feature/registration-race"; BaseRef = "HEAD" } context
+            |> function Ok item -> item | Error e -> failwithf "%A" e
+        let registry = BoundedProcess.DurableJobs.root root
+        let request: BoundedProcess.DurableJobs.Request =
+            { Schema = 1
+              JobId = Guid.NewGuid().ToString("N")
+              Project = "project1"
+              Actor = None
+              Executable = "never-started"
+              Args = []
+              Reason = None
+              WorkingDirectory = target.Path
+              StartedAt = DateTimeOffset.UtcNow.AddHours(-1.)
+              MaxOutputBytes = 1024 }
+        let mutable removal = Unchecked.defaultof<System.Threading.Tasks.Task<Client.Result<unit>>>
+        let mutable registration = None
+        try
+            BoundedProcess.DurableJobs.withAdmission registry (fun () ->
+                // Hold the process-admission domain while removal reserves the checkout.
+                removal <- System.Threading.Tasks.Task.Run(fun () ->
+                    removeWorktree { ProjectName = "Project1"; WorktreePath = target.Path; TargetRef = None } context
+                    |> Result.map ignore)
+                let reservationObserved =
+                    System.Threading.SpinWait.SpinUntil((fun () ->
+                        match WorktreeActivity.admit (Guid.NewGuid().ToString("N")) (WorktreeActivity.Paths [target.Path]) with
+                        | Error _ -> true
+                        | Ok probe -> probe.Dispose(); false), 5000)
+                reservationObserved |> shouldEqual true
+                registration <- Some(BoundedProcess.DurableJobs.create registry request))
+            removal.Wait(15000) |> shouldEqual true
+            removal.Result |> Result.isError |> shouldEqual true
+            Directory.Exists target.Path |> shouldEqual true
+        finally
+            if not (isNull removal) then removal.Wait(15000) |> ignore
+            registration |> Option.iter (fun directory ->
+                BoundedProcess.DurableJobs.withAdmission registry (fun () ->
+                    BoundedProcess.DurableJobs.tryPrune directory |> ignore)))

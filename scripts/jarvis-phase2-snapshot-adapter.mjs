@@ -137,11 +137,13 @@ function normalizeProject(view, diagnostics) {
       }
     }
     const unassignedWorking = !assigned && a.execution === "Working";
+    const parkedDisposition = a.unassignedDisposition === "Parked" ||
+      a.unassignedDisposition === "TasklessYield";
     const state = a.execution === "Working" ? "Working" :
-      assigned ? "Ready" : a.unassignedDisposition === "Parked" ? "Parked" : "NeedsWork";
+      assigned ? "Ready" : parkedDisposition ? "Parked" : "NeedsWork";
     if ((assigned && a.unassignedDisposition != null) ||
         (!assigned && a.execution === "Stopped" &&
-         !["Parked", "NeedsWork"].includes(a.unassignedDisposition))) {
+         !["Parked", "TasklessYield", "NeedsWork"].includes(a.unassignedDisposition))) {
       issue(issues, "agents", "ContradictoryAgentDisposition", path);
     }
     // A Working agent without a current assignment has no ownership/generation

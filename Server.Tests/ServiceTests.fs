@@ -583,6 +583,24 @@ let ``public orchestration tool metadata describes canonical branch reviews`` ()
     Assert.That(reviewDescription "ClaimReview", Does.Contain("Git branch"))
     Assert.That(reviewDescription "DecideReview", Does.Contain("Markdown"))
     Assert.That(reviewDescription "SubmitReview", Does.Contain("No assignment"))
+    let startDescription = reviewDescription "StartTasklessWork"
+    Assert.That(startDescription, Does.Contain("caller-stable operationId"))
+    Assert.That(startDescription, Does.Contain("same ID and payload"))
+    Assert.That(startDescription, Does.Contain("explicit Parked disposition is an Operator STOP"))
+    let startParameters = typeof<JarvisMcpTools>.GetMethod("StartTasklessWork").GetParameters()
+    let startOperationId = startParameters |> Array.find (fun parameter -> parameter.Name = "operationId")
+    Assert.That(startOperationId.IsOptional, Is.True)
+    Assert.That(reviewDescription "YieldTasklessWork", Does.Contain("TasklessYield"))
+    let inboxParameters = typeof<JarvisMcpTools>.GetMethod("ReviewerInbox").GetParameters()
+    let caller = inboxParameters |> Array.find (fun parameter -> parameter.Name = "agentId")
+    let subject = inboxParameters |> Array.find (fun parameter -> parameter.Name = "reviewerId")
+    Assert.That(caller.IsOptional, Is.False, "agentId remains the calling agent")
+    Assert.That(subject.IsOptional, Is.True, "reviewerId selects another inbox without impersonation")
+    Assert.That(subject.DefaultValue, Is.EqualTo(""), "legacy own-inbox calls default to agentId")
+    Assert.That(reviewDescription "ReviewerInbox", Does.Contain("agentId identifies the calling agent"))
+    Assert.That(reviewDescription "ReviewerInbox", Does.Contain("reviewerId selects the inbox subject"))
+    Assert.That(McpToolHelpers.reviewerInboxSubject "Manager" "Reviewer 1", Is.EqualTo("Reviewer 1"))
+    Assert.That(McpToolHelpers.reviewerInboxSubject "Reviewer 1" "", Is.EqualTo("Reviewer 1"))
 
 [<Test>]
 let ``public SubmitReview accepts arbitrary commit and optional context without worker phase`` () =
@@ -1902,8 +1920,10 @@ let ``project scoped MCP tools standardize explicit agentId arguments`` () =
     let tools = typeof<JarvisMcpTools>.GetMethods(System.Reflection.BindingFlags.Public ||| System.Reflection.BindingFlags.Static)
     for tool in tools do
         let parameters = tool.GetParameters() |> Array.map (fun p -> p.Name) |> Set.ofArray
-        for deprecated in [ "ownerId"; "newOwnerId"; "actorId"; "reviewerId"; "requesterId" ] do
+        for deprecated in [ "ownerId"; "newOwnerId"; "actorId"; "requesterId" ] do
             Assert.That(parameters.Contains(deprecated), Is.False, tool.Name + " exposes " + deprecated)
+        if tool.Name <> "ReviewerInbox" then
+            Assert.That(parameters.Contains("reviewerId"), Is.False, tool.Name + " exposes reviewerId")
         if parameters.Contains("projectName") && not (excluded.Contains tool.Name) then
             let isGlobalFilter =
                 tool.Name = "Feedback" || tool.Name = "ListFeedback"

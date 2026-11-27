@@ -1321,7 +1321,7 @@ type GeneratedComposition() =
                 equal "editor revision" revision loaded.Revision
                 equal "editor previous total" total loaded.Draft.Total
                 equal "editor previous roles" roles loaded.Draft.Roles
-                loaded.Save (Guid.NewGuid()) { Total = cap; Roles = roleCaps } |> success
+                loaded.Save (Guid.NewGuid()) { AutomationEnabled = loaded.Draft.AutomationEnabled; Total = cap; Roles = roleCaps } |> success
                 revision <- revision + 1
                 total <- cap
                 roles <- roleCaps
@@ -1337,7 +1337,14 @@ type GeneratedComposition() =
                 let current = ReviewWorkflow.getAgentWorkingTurnAt binding snapshot manual |> success
                 if working <> manualWorking then
                     if working then
-                        ReviewWorkflow.startTasklessWork binding (Guid.NewGuid()) manual current.Version "manual fixture start" |> success |> ignore
+                        let inbox = ReviewWorkflow.getAgentInbox binding manual |> success
+                        if inbox.Agent.UnassignedDisposition = "Parked" then
+                            ReviewWorkflow.setAgentAdministrativeStateAs binding "Operator" (Guid.NewGuid())
+                                manual "NeedsWork" inbox.Agent.Version "Operator enabled manual fixture reviewer"
+                            |> success |> ignore
+                        let latest = LedgerStore.fetch binding |> success
+                        let eligible = ReviewWorkflow.getAgentWorkingTurnAt binding latest manual |> success
+                        ReviewWorkflow.startTasklessWork binding (Guid.NewGuid()) manual eligible.Version "manual fixture start" |> success |> ignore
                     else
                         ReviewWorkflow.yieldTasklessWork binding (Guid.NewGuid()) manual current.Version "manual fixture end" |> success |> ignore
                     manualWorking <- working

@@ -16,6 +16,10 @@ let createRole binding role = RoleInstructions.createRole binding "Operator" (op
 let attach binding id role version = RoleInstructions.attachRole binding "Operator" (op ()) id role version |> ignoreGood
 let agent binding id = ReviewWorkflow.getAgentWorkingTurnAt binding (snapshot binding) id |> good
 let start binding id =
+    let current = ReviewWorkflow.getAgentInbox binding id |> good
+    if current.Agent.UnassignedDisposition = "Parked" then
+        ReviewWorkflow.setAgentAdministrativeStateAs binding "Operator" (op ()) id "NeedsWork"
+            current.Agent.Version "Operator enabled fixture agent" |> ignoreGood
     ReviewWorkflow.startTasklessWork binding (op ()) id (agent binding id).Version "Fixture start" |> ignoreGood
 let stop binding id =
     ReviewWorkflow.yieldTasklessWork binding (op ()) id (agent binding id).Version "Fixture stop" |> ignoreGood

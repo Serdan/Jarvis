@@ -202,6 +202,10 @@ let authenticatedHealthAndChallengeWakeReachRecurringScheduler () =
                 for id in ["Manual"; "Worker"] do
                     RoleInstructions.attachRole second "fixture" (Guid.NewGuid()) id "Worker" 0 |> success |> ignore
 
+                let manualAgent = agent "Manual"
+                ReviewWorkflow.setAgentAdministrativeStateAs second "fixture" (Guid.NewGuid())
+                    "Manual" "NeedsWork" manualAgent.Version "Operator enabled manual fixture agent"
+                |> success |> ignore
                 do! withScheduler root launchRt "Fixture" first.RepositoryPath (fun noEffect send refuseManual -> task {
                     noEffect() |> ignore
                     startManual()

@@ -105,6 +105,7 @@ let authenticated_client_ingress_and_registered_hub_aggregate_by_user_project_ag
                     |> ignore
                     Task.CompletedTask
                 member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+                member _.InvalidateJobWake(_) = Task.CompletedTask
                 member _.InvalidateAllAgentStates() = Task.CompletedTask
                 member _.RecordAgentActivity(_, _, _) = Task.CompletedTask }
         let clients =

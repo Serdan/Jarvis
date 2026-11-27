@@ -194,6 +194,49 @@ let actual_registered_routes_preserve_legacy_and_compiled_off_native_authority (
                     Assert.That(Volatile.Read(&bindingReads), Is.Zero, "Native OFF must never read its authority binding.")
                     Assert.That(noFrame(), Is.True, "Native OFF must not dispatch the paired extension.")
 
+                    // Exercise the new route through the actual registered receiver,
+                    // not a fixture-local copy of its callback. The sender is a second
+                    // authenticated, registered device. A direct disposable Git write
+                    // changes the receiver's cached alert-presence observation without
+                    // any legacy invalidation. The hint must refresh it before the
+                    // ordinary 15-second background probe can do so.
+                    let sender =
+                        HubConnectionBuilder()
+                            .WithUrl(address + "/client", Action<Microsoft.AspNetCore.Http.Connections.Client.HttpConnectionOptions>(fun options ->
+                                options.AccessTokenProvider <- Func<Task<string>>(fun () -> Task.FromResult(token "client:connect"))))
+                            .Build()
+                    try
+                        do! sender.StartAsync()
+                        let senderIdentity : Common.SignalR.ClientRegistration =
+                            { DeviceId = "wake-sender"; DeviceName = "wake-sender"; ProtocolVersion = AgentProtocol.version
+                              ClientVersion = "offline-actual-registration"; SupportedCommands = [] }
+                        let! _ = sender.InvokeAsync<ClientRegistrationResult>("Connect", senderIdentity)
+                        let probeWindow = System.Diagnostics.Stopwatch.StartNew()
+                        do! Client.SignalR.Client.reconcileResponseAlerts rt "Fixture" "Worker"
+                        Assert.That(Client.SignalR.Client.responseAlertProbePending rt "Fixture" "Worker", Is.False)
+                        ReviewWorkflow.queueResponseAlert second (Guid.NewGuid()) "fixture" "Worker" "Scoped wake observation"
+                        |> success |> ignore
+                        let hint : JobWakeInvalidation =
+                            { ProjectName = "Fixture"; ProjectId = first.ProjectId; LedgerId = first.LedgerId
+                              Epoch = first.Epoch; AgentIds = [|"Worker"|] }
+                        Client.AutomationJobTerminalWake.publishInvalidation sender (fun () -> true) hint
+                        while not (Client.SignalR.Client.responseAlertProbePending rt "Fixture" "Worker")
+                              && probeWindow.Elapsed < TimeSpan.FromSeconds(10.) do
+                            do! Task.Delay(25)
+                        Assert.That(Client.SignalR.Client.responseAlertProbePending rt "Fixture" "Worker", Is.True,
+                                    "Scoped wake hint must refresh the actual registration cache.")
+                        Assert.That(probeWindow.Elapsed, Is.LessThan(TimeSpan.FromSeconds(15.)),
+                                    "Ordinary periodic catchup is not evidence of the registered hint path.")
+                        let scopedAlert = (ReviewWorkflow.getResponseAlerts second "Worker" |> success).Pending |> List.exactlyOne
+                        ReviewWorkflow.clearResponseAlert second (Guid.NewGuid()) "fixture" "Worker" (Guid.Parse scopedAlert.AlertId)
+                        |> success |> ignore
+                        do! Client.SignalR.Client.reconcileResponseAlerts rt "Fixture" "Worker"
+                        Assert.That(Volatile.Read(&rootReads), Is.Zero, "A hint cannot activate the native OFF host.")
+                        Assert.That(Volatile.Read(&bindingReads), Is.Zero, "A hint cannot run the native authority read.")
+                        Assert.That(noFrame(), Is.True)
+                    finally
+                        sender.DisposeAsync().AsTask().GetAwaiter().GetResult()
+
                     let schedule id =
                         call scopes "schedule_browser_execution"
                             {| scheduleId=id; runAfterSeconds=5; url="https://chatgpt.com/g/g-p-fixture/project"; projectName="Fixture"

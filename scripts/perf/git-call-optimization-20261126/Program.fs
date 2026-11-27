@@ -385,6 +385,7 @@ module Program =
                 member _.ReceiveManualGrantedCommand(_correlationId: string, _commandJson: string, _agentId: string) = Task.CompletedTask
                 member _.ReceiveManualGrantApproval(_correlationId: string, _requestJson: string, _agentId: string) = Task.CompletedTask
                 member _.InvalidateAgentStates(_projectName: string, _agentIds: string array) = Task.CompletedTask
+                member _.InvalidateJobWake(_) = Task.CompletedTask
                 member _.InvalidateAllAgentStates() = Task.CompletedTask
                 member _.RecordAgentActivity(_projectName: string, _agentId: string, _observedAtUtc: DateTimeOffset) = Task.CompletedTask }
 

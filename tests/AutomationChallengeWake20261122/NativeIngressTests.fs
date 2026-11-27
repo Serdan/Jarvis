@@ -184,10 +184,10 @@ type AuthenticatedNativeIngress() =
                     "A production-compiled Program is required, not a test-only source")
         Assert.That(registrationPresent program, Is.True, "B1 Program registration/lifecycle disappeared")
 
-        let reject name mutant =
+        let reject (name: string) (mutant: string) =
             Assert.That(mutant, Is.Not.EqualTo(program), name + ": mutation must change the source")
             Assert.That(registrationPresent mutant, Is.False, name)
-        let replace name (original: string) (replacement: string) =
+        let replace (name: string) (original: string) (replacement: string) =
             reject name (program.Replace(original, replacement))
         let invocation = "    let connection, authenticatedOperator = prepareConnection()\n"
         replace "Missing connection preparation" invocation ""

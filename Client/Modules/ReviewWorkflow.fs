@@ -100,7 +100,7 @@ type ReviewAgent =
         member this.State =
             if this.Execution = "Working" then "Working"
             elif not (isNull (box this.CurrentAssignment)) then "Ready"
-            elif this.UnassignedDisposition = "Parked" then "Parked"
+            elif List.contains this.UnassignedDisposition [ "Parked"; "TasklessYield" ] then "Parked"
             else "NeedsWork"
         [<System.Text.Json.Serialization.JsonIgnore>]
         member this.FocusAttemptId =
@@ -504,6 +504,9 @@ module ReviewWorkflow =
                          WorkingTurnStartedAtUtc = if execution = "Working" then now else null
                          ActiveSessionId = if execution = "Working" then agent.ActiveSessionId else null }
 
+    let private enterTasklessYield (agent: ReviewAgent) =
+        { (enterState "Parked" agent) with UnassignedDisposition = "TasklessYield" }
+
     let private assigned taskId attemptId (agent: ReviewAgent) =
         let current : AgentAssignment = { TaskId = taskId; AttemptId = attemptId }
         { agent with CurrentAssignment = current; UnassignedDisposition = null
@@ -621,7 +624,7 @@ module ReviewWorkflow =
                                     (status "execution" [ "Working" ]
                                      && disposition.ValueKind = JsonValueKind.Null)
                                     || (status "execution" [ "Stopped" ]
-                                        && status "unassignedDisposition" [ "NeedsWork"; "Parked" ])
+                                        && status "unassignedDisposition" [ "NeedsWork"; "Parked"; "TasklessYield" ])
                                 else current.ValueKind = JsonValueKind.Object
                                      && disposition.ValueKind = JsonValueKind.Null))
                     | "ReviewAttempt" -> status "phase" [ "Queued"; "Started"; "Finished"; "Deferred"; "Blocked";
@@ -828,6 +831,26 @@ module ReviewWorkflow =
             | Some record -> return record
             | None -> return! Error(StaleEntityVersion $"Missing ledger entity: {path}")
         }
+
+    // Existing MCP routes authenticate the account and actor label, not
+    // a particular inference execution. A taskless start is therefore an
+    // unresolved review authority episode, not a credential. Until there is
+    // trusted provider termination/binding evidence, do not let ordinary
+    // actor-only writes bypass it, even after yield, STOP or another start.
+    // This runs inside the current ledger transaction (also on retry/promotion).
+    let private guardReviewAuthorityAt binding snapshot actor = result {
+        let path = agentPath actor
+        let! current = read<ReviewAgent> binding snapshot path
+        let! original = LedgerStore.latestTasklessStartForAgentAt binding snapshot path actor
+        let unresolvedState =
+            current |> Option.exists (fun (agent, _) ->
+                isNull (box agent.CurrentAssignment) &&
+                (agent.Execution = "Working" || agent.UnassignedDisposition = "TasklessYield"))
+        if original.IsSome || unresolvedState then
+            return! Error(StaleEntityVersion
+                $"ReviewAuthorityHeld: {actor} has unresolved taskless execution; trusted provider authority or terminal evidence required.")
+        return ()
+    }
 
     let private requiredFromRecords<'t> (records: Map<string, string>) path =
         match Map.tryFind path records with
@@ -2751,8 +2774,8 @@ module ReviewWorkflow =
                     if agent.Version <> expectedAgentVersion
                        || not (isNull (box agent.CurrentAssignment))
                        || agent.Execution <> "Stopped"
-                       || not (List.contains agent.State [ "Parked"; "NeedsWork" ]) then
-                        return! Error(StaleEntityVersion "StartTasklessWork requires an idle unassigned agent at the exact version.")
+                       || not (List.contains agent.UnassignedDisposition [ "NeedsWork"; "TasklessYield" ]) then
+                        return! Error(StaleEntityVersion "StartTasklessWork requires an idle unassigned agent at the exact version with NeedsWork or TasklessYield disposition; Operator Park is a stop fence.")
                     let updated = enterState "Working" (resetSessions agent)
                     return [ change (agentPath agentId) (Some agentOid)
                                  { updated with Version = agent.Version + 1
@@ -2773,7 +2796,7 @@ module ReviewWorkflow =
                        || not (isNull (box agent.CurrentAssignment))
                        || agent.Execution <> "Working" then
                         return! Error(StaleEntityVersion "YieldTasklessWork requires this agent's active taskless session at the exact version.")
-                    let updated = enterState "Parked" (resetSessions agent)
+                    let updated = enterTasklessYield (resetSessions agent)
                     return [ change (agentPath agentId) (Some agentOid)
                                  { updated with Version = agent.Version + 1
                                                 StateReason = summary
@@ -4144,6 +4167,7 @@ module ReviewWorkflow =
                     {| taskId = taskId; requestId = id; documentPath = documentPath
                        expectedBlobOid = expectedBlobOid; contentSha256 = specDigest content |})
                 (fun snapshot -> result {
+                    do! guardReviewAuthorityAt binding snapshot actorId
                     let! _ = required<BranchReview> binding snapshot (branchReviewPath taskId id)
                     return [ { Path = reviewDocumentPath taskId id documentPath
                                ExpectedBlobOid = expected; Content = content } ]
@@ -4591,6 +4615,7 @@ module ReviewWorkflow =
                     {| taskId = taskId; reviewId = id; reviewerId = reviewerId
                        expectedVersion = expectedVersion |})
                 (fun snapshot -> result {
+                    do! guardReviewAuthorityAt binding snapshot reviewerId
                     let! review, oid = required<BranchReview> binding snapshot (branchReviewPath taskId id)
                     if review.Version <> expectedVersion || review.Status <> "Unclaimed" then
                         return! Error(ReviewAlreadyClaimed "Review is no longer unclaimed.")
@@ -4610,6 +4635,7 @@ module ReviewWorkflow =
                     {| taskId = taskId; reviewId = id; reviewerId = reviewerId
                        expectedVersion = expectedVersion; status = status |})
                 (fun snapshot -> result {
+                    do! guardReviewAuthorityAt binding snapshot reviewerId
                     let! review, oid = required<BranchReview> binding snapshot (branchReviewPath taskId id)
                     if review.Status <> "Claimed" || review.Version <> expectedVersion
                        || review.ReviewerId <> reviewerId then
@@ -4652,7 +4678,10 @@ module ReviewWorkflow =
                     {| taskId = taskId; reviewId = id; actorId = actorId
                        expectedVersion = expectedVersion |})
                 (fun snapshot -> result {
+                    do! guardReviewAuthorityAt binding snapshot actorId
                     let! review, oid = required<BranchReview> binding snapshot (branchReviewPath taskId id)
+                    if not (String.IsNullOrWhiteSpace review.ReviewerId) && review.ReviewerId <> actorId then
+                        do! guardReviewAuthorityAt binding snapshot review.ReviewerId
                     if review.Version <> expectedVersion || review.Status <> "Claimed" then
                         return! Error(ReviewVersionConflict "Review claim has changed.")
                     return [ change (branchReviewPath taskId id) (Some oid)
@@ -4670,6 +4699,7 @@ module ReviewWorkflow =
                     {| taskId = taskId; reviewId = id; actorId = actorId
                        expectedVersion = expectedVersion |})
                 (fun snapshot -> result {
+                    do! guardReviewAuthorityAt binding snapshot actorId
                     let! review, oid = required<BranchReview> binding snapshot (branchReviewPath taskId id)
                     if review.Version <> expectedVersion
                        || not (List.contains review.Status [ "Unclaimed"; "Claimed" ])

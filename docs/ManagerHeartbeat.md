@@ -80,11 +80,24 @@ config and journal together through ordinary client restarts.
 
 ## Authoritative snapshot contract
 
-The Manager gets task_overview at a verified ledger head, observes **all**
-configured agents using observe_agent, checks the independent review queue,
-task readiness, challenges, and relevant client activity. Include other
-working or uncertain agents in the snapshot so their activity counts against
-the per-project budget. Unclassified active or uncertain agents fail closed. Never set complete/verified flags by assumption.
+The Manager gets canonical task_overview and copies its SnapshotCommit to
+snapshot.ledgerHead, observes **all** configured agents using observe_agent,
+and calls reviewer_inbox for every configured reviewer. Pass the Manager's own
+ID as `agentId` (the caller) and the configured reviewer ID as `reviewerId` (the
+inbox subject). Never put the subject reviewer ID in `agentId`: reviewer inbox
+reads are attributed activity, so doing so would fabricate reviewer activity
+and could falsely mark an in-flight launch as observed, releasing its
+deduplication reservation. Set each reviewerInboxes entry's reviewerId to the
+requested subject and copy the response's snapshotCommit and reviews unchanged.
+Every snapshotCommit must equal the task_overview SnapshotCommit; if any differs,
+discard and recapture the snapshot. The inbox reviews are the eligibility
+source: unclaimed reviews may
+appear in several inboxes, while a claimed review appears only in its owner's
+inbox. Do not substitute a global unclaimed-review count. Also inspect task
+readiness, priorities, blockers, durable challenges and relevant client
+activity. Include other working or uncertain agents in the snapshot so their
+activity counts against the per-project budget. Unclassified active or
+uncertain agents fail closed. Never set complete/verified flags by assumption.
 
 The planner accepts JSON in this form (the example is deliberately
 incomplete for the full 5/3 Jarvis config; the real file must include all
@@ -99,7 +112,53 @@ configured labels):
   "challengesVerified": true,
   "ledgerHead": "6ab793928fa7f998b9d5796061cf66d3c0b02e40",
   "capturedAtUtc": "2026-11-15T02:00:00Z",
-  "unclaimedReviewCount": 1,
+  "reviewerInboxes": [
+    {
+      "reviewerId": "Reviewer 1",
+      "snapshotCommit": "6ab793928fa7f998b9d5796061cf66d3c0b02e40",
+      "reviews": [
+        {
+          "taskId": "_reviews",
+          "attemptId": null,
+          "reviewId": "11111111111111111111111111111111",
+          "version": 1,
+          "status": "Unclaimed",
+          "reviewerId": null,
+          "createdSequence": 123
+        }
+      ]
+    },
+    {
+      "reviewerId": "Reviewer 2",
+      "snapshotCommit": "6ab793928fa7f998b9d5796061cf66d3c0b02e40",
+      "reviews": [
+        {
+          "taskId": "_reviews",
+          "attemptId": null,
+          "reviewId": "11111111111111111111111111111111",
+          "version": 1,
+          "status": "Unclaimed",
+          "reviewerId": null,
+          "createdSequence": 123
+        }
+      ]
+    },
+    {
+      "reviewerId": "Reviewer 3",
+      "snapshotCommit": "6ab793928fa7f998b9d5796061cf66d3c0b02e40",
+      "reviews": [
+        {
+          "taskId": "_reviews",
+          "attemptId": null,
+          "reviewId": "11111111111111111111111111111111",
+          "version": 1,
+          "status": "Unclaimed",
+          "reviewerId": null,
+          "createdSequence": 123
+        }
+      ]
+    }
+  ],
   "agents": [
     {
       "agentId": "Manager",
@@ -109,6 +168,7 @@ configured labels):
       "slotAvailable": true,
       "verified": true,
       "hasReadyAssignment": false,
+      "unassignedDisposition": "NeedsWork",
       "waitingOnChallenge": false,
       "lastAttributedActivityAtUtc": null
     },
@@ -120,9 +180,47 @@ configured labels):
       "slotAvailable": false,
       "verified": true,
       "hasReadyAssignment": true,
+      "unassignedDisposition": null,
       "stateEnteredAtUtc": "2026-11-15T01:59:00Z",
       "assignmentKey": "task-123/attempt-456/gen-1",
       "priorityRank": 0,
+      "waitingOnChallenge": false,
+      "lastAttributedActivityAtUtc": null
+    },
+    {
+      "agentId": "Reviewer 1",
+      "kind": "reviewer",
+      "state": "NeedsWork",
+      "execution": "Stopped",
+      "slotAvailable": true,
+      "verified": true,
+      "hasReadyAssignment": false,
+      "unassignedDisposition": "NeedsWork",
+      "waitingOnChallenge": false,
+      "lastAttributedActivityAtUtc": null
+    },
+    {
+      "agentId": "Reviewer 2",
+      "kind": "reviewer",
+      "state": "Parked",
+      "execution": "Stopped",
+      "slotAvailable": true,
+      "verified": true,
+      "hasReadyAssignment": false,
+      "unassignedDisposition": "Parked",
+      "waitingOnChallenge": false,
+      "lastAttributedActivityAtUtc": null
+    },
+    {
+      "agentId": "Reviewer 3",
+      "kind": "reviewer",
+      "state": "Parked",
+      "execution": "Stopped",
+      "slotAvailable": true,
+      "verified": true,
+      "hasReadyAssignment": false,
+      "unassignedDisposition": "TasklessYield",
+      "stateEnteredAtUtc": "2026-11-15T01:58:00Z",
       "waitingOnChallenge": false,
       "lastAttributedActivityAtUtc": null
     }
@@ -133,15 +231,34 @@ configured labels):
 Important: observe_agent reports **state** and **execution** separately.
 Ready workers normally have state Ready and execution Stopped; reviewers
 available for the shared queue commonly have state NeedsWork and execution
-Stopped. A Ready worker must carry an `assignmentKey` made from canonical
-task ID, attempt ID and generation; this suppresses stale Ready relaunches
-after an observed tool call. Include canonical `stateEnteredAtUtc` from
-`observe_agent` for Ready workers: the same assignment can be relaunched only
-when a verified Ready/Stopped transition is later than the attributed launch
-activity. An old Ready snapshot cannot prove yield. The local lastSeenAtUtc field is explicitly
-noncanonical and must
-not be copied into lastAttributedActivityAtUtc merely because it is recent.
-Only a positively observed, project/agent-attributed tool call may populate
+Stopped. An unassigned reviewer may receive new unclaimed demand in either
+NeedsWork/Stopped with `unassignedDisposition: NeedsWork`, or Parked/Stopped
+with `unassignedDisposition: TasklessYield`. Parked/Stopped with disposition
+`Parked` is an explicit Operator Park/STOP and is never automatically resumed,
+even when a review is claimed. Include `unassignedDisposition` exactly as
+returned by `observe_agent`; state alone cannot distinguish these cases.
+
+**Managed reviewer dispatch is held until provider execution identity is
+authoritatively bound.** Actor labels, inbox calls, taskless starts, yields,
+STOP and successful browser submission cannot prove the identity or termination
+of a particular inference execution. The planner reports exact eligible
+review demand in `reviewHolds` instead of creating a dispatchable reservation.
+The start/yield lifecycle remains available with exact versions and stable
+operation IDs; neither it nor later administrative changes authorize
+actor-only review writes after an unresolved taskless start. A distinct
+conflict-free manual reviewer retains the ordinary review path. A claimed
+review is never automatically transferred or resumed while authority is held.
+TasklessYield is distinct from explicit Operator Park/STOP.
+
+A Ready worker must
+carry an `assignmentKey` made from canonical task ID, attempt ID and generation;
+this suppresses stale Ready relaunches after an observed tool call. Include
+canonical `stateEnteredAtUtc` from `observe_agent` for Ready workers: the same
+assignment can be relaunched only when a verified Ready/Stopped transition is
+later than the attributed launch activity. An old Ready snapshot cannot prove
+yield. The local lastSeenAtUtc field is explicitly noncanonical and must not
+be copied into lastAttributedActivityAtUtc merely because it is recent. Only
+a positively observed, project/agent-attributed tool call may populate
 lastAttributedActivityAtUtc, with activityEvidence set to
 "ExplicitAttributedToolCall". Otherwise leave it null, allowing the durable
 reservation to remain uncertain until independently resolved.
@@ -150,6 +267,16 @@ Record the actual task/agent/review evidence before setting all four
 completeness booleans true. A missing registered agent, missing challenge
 query, stale data, contradictory state or incomplete queue read must fail
 closed. Captures older than three minutes are rejected.
+
+reviewQueueVerified is true only after every reviewer inbox is complete and
+all snapshotCommit values equal ledgerHead. The planner deduplicates demand by
+(taskId, reviewId); an owned runnable claim is considered before unclaimed
+demand. Explicit Parked and Challenge-blocked claims remain ineligible.
+Existing unresolved reviewer reservations retain their original UUID, demand
+and capacity in `unresolvedReviewerLaunches` even if actor-only activity
+changes to Working, TasklessYield, or STOP. Historical observed or cleared
+records are not assumed to prove execution termination. Unrelated worker
+launches and otherwise eligible review-demand diagnostics remain available.
 
 ## One bounded Manager pass
 
@@ -167,17 +294,19 @@ node scripts/manager-heartbeat.mjs plan --config artifacts/manager/Jarvis/config
 ~~~
 
 The returned reservations are the **only** approved launch candidates for
-that pass. The planner fills workers with Ready assignments first, ordered by
-optional verified canonical priorityRank (0 is highest), then eligible
-taskless reviewers against the unclaimed frozen review count,
-and counts prior pending/uncertain launches and other Working agents against
-the 5/3 budget. Unclassified live or uncertain agents prevent all launches. Duplicate timer ticks reserve nothing twice.
+that pass. Workers with Ready assignments are ordered by verified canonical
+priorityRank (0 is highest). The planner exposes runnable owned claims and
+distinct eligible unclaimed review requests as diagnostic holds, not browser
+launch instructions. Unresolved launches and other Working agents count
+against capacity. Unclassified live or uncertain agents prevent all launches.
+Duplicate timer ticks cannot reserve a worker twice.
 
-For each reservation, re-observe the agent and review demand immediately
-before dispatch. If eligibility changed, mark the reservation blocked and
-do not launch. A blocked-before-dispatch record remains in the audit journal
-but frees its capacity; a later eligible pass may reserve again. Otherwise
-atomically **begin** the reserved launch:
+For each worker reservation, re-observe the agent and re-read task_overview
+immediately before dispatch. If eligibility changed, mark the reservation
+blocked and do not launch. A blocked-before-dispatch record remains in the
+audit journal but frees its capacity. Both check and begin reject legacy
+reviewer reservations, even when they still appear reserved. Otherwise
+atomically **begin** the reserved worker launch:
 
 ~~~sh
 node scripts/manager-heartbeat.mjs begin --config artifacts/manager/Jarvis/config.json --journal artifacts/manager/Jarvis/journal.json --launch-id <launch-id>
@@ -191,8 +320,7 @@ Use `check` only for read-only diagnostics, never as the dispatch gate. Otherwis
 browser_run_in_new_tab with the registered window, url
 "https://chatgpt.com/", projectName "Jarvis", scriptPath
 "browser-scripts/chatgpt/launchAgent.js", closeTabAfterExecution true,
-and argsJson containing a minimal prompt for that one Worker N or
-Reviewer N. The Manager role file contains the exact prompt convention.
+and argsJson containing a minimal prompt for that one Worker N. The Manager role file contains the exact prompt convention.
 Do not launch a reviewer by named notification: the reviewer claims from
 the shared frozen queue.
 
@@ -207,8 +335,9 @@ or unverified submission, and --result blocked on a known safe pre-launch
 stop. Never retry a dispatched or uncertain launch automatically. A blocked
 pre-dispatch reservation is terminal, not a browser retry, and is safe to
 replan. A successful browser submission is not proof the agent called Jarvis.
-Retain dispatched/uncertain reservations until positive attributed activity
-or explicit operator recovery. Verified Ready/Stopped stateEnteredAtUtc after
+For workers, retain dispatched/uncertain reservations until positive attributed activity
+or explicit operator recovery. Reviewer reservations with any possible send
+remain held; no actor-only evidence releases them. Verified Ready/Stopped stateEnteredAtUtc after
 such activity proves the worker later yielded and can resume the same task.
 
 ## Start the one Manager idle heartbeat (only after approval)
@@ -276,6 +405,16 @@ explicitly clear a **specific** reservation with a durable audit reason:
 ~~~sh
 node scripts/manager-heartbeat.mjs release --config artifacts/manager/Jarvis/config.json --journal artifacts/manager/Jarvis/journal.json --launch-id <launch-id> --reason "Operator verified previous launch cannot be active"
 ~~~
+
+For reviewers, the local release route can clear only an exact original
+reservation that never crossed begin. An arbitrary operator reason is not
+authenticated terminal evidence for a dispatched reviewer. This source does
+not provide a trusted provider termination receipt or authenticated resolution
+route for that case. Preserve the record and do not replace its execution.
+Before any future rollout, reconcile any legacy browser dispatches that may
+predate a canonical taskless-start receipt: a local journal is not a
+cross-client canonical authority source. Do not enable managed review
+dispatch or reuse an ambiguous actor until this evidence boundary is resolved.
 
 If journal.json.lock remains after a crash, verify there is no running
 planner process or competing Manager before manually removing that lock.

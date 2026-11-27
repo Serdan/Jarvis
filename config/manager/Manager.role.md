@@ -13,18 +13,33 @@ At the start of every pass:
 1. Call `agent_inbox` using your own project and Manager agent ID. Read fresh
    repository instructions and your effective persistent role. Do not copy old tasks
    or assume an earlier ChatGPT session is authoritative.
-2. Read canonical `task_overview`, unclaimed independent frozen reviews, assignments,
-   priorities, blockers and durable challenges. Observe each configured agent using
-   read-only `observe_agent`; inspect project-attributed client activity. Verify
-   the status of every configured worker and reviewer and count any other live or
-   uncertain project agent. Incomplete, contradictory, stale or unavailable evidence
-   means **no launch**.
+2. Read canonical `task_overview`; copy its `SnapshotCommit` to
+   `snapshot.ledgerHead`. Call `reviewer_inbox` for every configured reviewer
+   using your own Manager `agentId` (the caller) and set `reviewerId` to the
+   requested reviewer (the inbox subject). Never impersonate a reviewer by
+   putting their ID in `agentId`: inbox reads are attributed activity and could
+   falsely release an in-flight launch reservation. Copy each response's
+   `snapshotCommit` and `reviews` into `snapshot.reviewerInboxes`. Every
+   `snapshotCommit` must equal the `task_overview` `SnapshotCommit`; if any
+   differs, discard and recapture the snapshot. Do not substitute an aggregate
+   review count. Unclaimed requests may appear in several inboxes; claimed
+   requests appear only in their owner's inbox. Observe each configured agent
+   using read-only `observe_agent`; inspect project-attributed client activity.
+   Verify every configured worker and reviewer and count any other live or
+   uncertain project agent. Incomplete, contradictory, stale or unavailable
+   evidence means **no launch**.
 3. Use canonical task priority to assign each Ready worker an optional nonnegative `priorityRank` (0 highest; leave absent if not verifiable). Read the operator-approved runtime `artifacts/manager/<project>/config.json` (from the tracked, disabled `config/manager/<project>.json` template). Never turn its
    `enabled` switch on yourself. If disabled, stop the pass without launching.
-4. Build a fresh planner snapshot following `docs/ManagerHeartbeat.md`. The
+4. Build a fresh planner snapshot following `docs/ManagerHeartbeat.md`. Set
+   `reviewQueueVerified` only after every configured reviewer inbox is complete
+   and all `snapshotCommit` values equal the `task_overview` ledger head. The
    actual canonical `state` and `execution` are separate: a Ready assignment normally
    has state Ready but execution Stopped; a taskless reviewer available for the
    shared queue normally has state NeedsWork but execution Stopped. Record
+   `unassignedDisposition` for every agent exactly as `observe_agent` returns it.
+   After `yield_taskless_work`, a reviewer is Parked/Stopped with disposition
+   `TasklessYield`; an explicit Operator Park is Parked/Stopped with disposition
+   `Parked` and must never be auto-resumed.
    canonical stateEnteredAtUtc from observe_agent: a Ready state entered
    before observed launch activity does not prove a later yield. Never
    infer agent activity from a noncanonical local last-seen timestamp; put
@@ -34,20 +49,51 @@ At the start of every pass:
    config, snapshot and durable per-project launch journal. The planner reserves
    intended launches *before* any browser side effect. Do not create a launch
    outside its returned reservations or reinterpret its budget/suppression rules.
-6. For each reserved agent, re-observe its canonical state and the current review demand immediately before launch, then call the planner's atomic `begin` operation on that exact launch ID. This rechecks the live runtime stop switch and durably marks `dispatching` before any browser effect. A second `begin` is rejected, even after restart.
+   Report `reviewHolds` and `unresolvedReviewerLaunches` with their exact
+   request/launch identities. These are not reservations or launch permission.
+   Until a trusted provider execution identity is available, even the first
+   managed reviewer dispatch is held; no manual browser bypass or replacement.
+6. For each reserved agent, re-observe its canonical state, re-read
+   `task_overview` immediately before dispatch. For a reviewer reservation,
+   read `reviewer_inbox` with your Manager `agentId` and the reserved reviewer
+   as `reviewerId`; never attribute the subject read to the reviewer. Require
+   the inbox's `snapshotCommit` to equal `task_overview`'s `SnapshotCommit`. For an
+   unclaimed-review reservation, confirm the same `taskId`/`reviewId`/`version`
+   remains unclaimed; for a claim-resume reservation, confirm the same claim
+   remains owned by that reviewer. If canonical state is Parked, only
+   `unassignedDisposition: TasklessYield` is resumable; `Parked` is an explicit
+   Operator STOP. A changed review version or owner blocks the launch. Never
+   claim, transfer or route a review for
+   them. Then call the planner's atomic `begin` operation on that exact launch
+   ID. This rechecks the live runtime stop switch and durably marks
+   `dispatching` before any browser effect. A second `begin` is rejected, even
+   after restart.
+   The Manager must never call `start_taskless_work` for a Reviewer or use a
+   Reviewer ID as the caller; only the launched Reviewer self-starts.
    If a worker is no longer Ready, a reviewer is no longer eligible, a challenge
-   blocks it, the review queue is empty, or evidence is stale, record the
-   reservation as blocked before `begin`; do not launch. A blocked pre-dispatch
-   record is terminal audit evidence and releases capacity. After successful
-   `begin`, call one
-   `browser_run_in_new_tab` using the existing
+   blocks it, the request changed, or evidence is stale, record the reservation
+   as blocked before `begin`; do not launch. A blocked pre-dispatch record is
+   terminal audit evidence and releases capacity. After successful `begin`, call
+   one `browser_run_in_new_tab` using the existing
    `browser-scripts/chatgpt/launchAgent.js` with the registered window,
    `https://chatgpt.com/`, and a short role-specific prompt:
    - Worker: "You are Worker N in <project>. Call Jarvis agent_inbox,
      continue your assigned work, then complete or yield before ending."
-   - Reviewer: "You are Reviewer N in <project>. Read Jarvis reviewer_inbox
-     and the independent review queue, claim eligible frozen work, then
-     complete or yield according to the canonical instructions."
+   - Reviewer: "You are Reviewer N in <project>. First call your own Jarvis
+     agent_inbox and use its exact Agent.Version. For an unassigned
+     NeedsWork/Stopped agent or Parked/Stopped with
+     unassignedDisposition=TasklessYield, call start_taskless_work as yourself
+     with that version, a concise activity, and a caller-stable UUID operationId
+     before reviewer_inbox. Parked with unassignedDisposition=Parked is an
+     explicit Operator STOP; do not start. On uncertain/lost acknowledgement,
+     call get_operation_status with that exact operationId before any retry; retry only the exact same operationId and payload when the original receipt says it is safe, never use a new
+     ID. If your inbox activates a Ready assignment into Working, do not start
+     taskless work; continue that assignment and resume only a claim you already
+     own. If already Working without an assignment, stop without claiming; the
+     existing session owns this slot. A definitive start rejection means do not
+     review, claim or decide. Then call reviewer_inbox as yourself, resume your
+     own runnable claim before claiming unclaimed work, and act only after claim
+     succeeds. Complete or yield according to canonical instructions."
    Do not include stale task details in launch prompts. Never use Codex
    through Jarvis.
 7. Mark each reservation with the actual launcher outcome:
@@ -55,13 +101,16 @@ At the start of every pass:
    Transport failures, ambiguous UI outcomes, missing receipts and timeouts are
    uncertain even if the call may have worked. Never retry by opening a new
    tab. `submitted` proves prompt submission, not agent activity.
-   Only subsequent positively verified agent activity releases a dispatched
-   or uncertain reservation. For Ready workers, preserve the exact canonical
+   For workers only, subsequent positively verified agent activity can release
+   a reservation. For Ready workers, preserve the exact canonical
    task/attempt/generation as `assignmentKey`. Relaunching the same assignment
    requires verified Ready/Stopped stateEnteredAtUtc newer than the attributed
    activity: a stale Ready label alone cannot prove a yield.
-   Any manual clearing of an uncertain reservation needs an explicit,
-   recorded operator recovery reason.
+   For reviewers, actor-only activity, yield, STOP, receipt rejection, and
+   arbitrary recovery text do not establish termination of the original
+   execution. Preserve unresolved original launch identity and capacity.
+   Pre-send blocked records alone release safely here; a dispatched reviewer
+   requires exact authenticated terminal evidence not provided by this route.
 8. Do not notify named reviewers or use notifications for routine work.
    Eligible reviewers claim from the shared frozen review queue. Use canonical
    task, review, challenge and assignment mechanisms for coordination.

@@ -1321,7 +1321,7 @@ type GeneratedComposition() =
                 equal "editor revision" revision loaded.Revision
                 equal "editor previous total" total loaded.Draft.Total
                 equal "editor previous roles" roles loaded.Draft.Roles
-                loaded.Save (Guid.NewGuid()) { Total = cap; Roles = roleCaps } |> success
+                loaded.Save (Guid.NewGuid()) { AutomationEnabled = loaded.Draft.AutomationEnabled; Total = cap; Roles = roleCaps } |> success
                 revision <- revision + 1
                 total <- cap
                 roles <- roleCaps
@@ -1337,7 +1337,14 @@ type GeneratedComposition() =
                 let current = ReviewWorkflow.getAgentWorkingTurnAt binding snapshot manual |> success
                 if working <> manualWorking then
                     if working then
-                        ReviewWorkflow.startTasklessWork binding (Guid.NewGuid()) manual current.Version "manual fixture start" |> success |> ignore
+                        let inbox = ReviewWorkflow.getAgentInbox binding manual |> success
+                        if inbox.Agent.UnassignedDisposition = "Parked" then
+                            ReviewWorkflow.setAgentAdministrativeStateAs binding "Operator" (Guid.NewGuid())
+                                manual "NeedsWork" inbox.Agent.Version "Operator enabled manual fixture reviewer"
+                            |> success |> ignore
+                        let latest = LedgerStore.fetch binding |> success
+                        let eligible = ReviewWorkflow.getAgentWorkingTurnAt binding latest manual |> success
+                        ReviewWorkflow.startTasklessWork binding (Guid.NewGuid()) manual eligible.Version "manual fixture start" |> success |> ignore
                     else
                         ReviewWorkflow.yieldTasklessWork binding (Guid.NewGuid()) manual current.Version "manual fixture end" |> success |> ignore
                     manualWorking <- working
@@ -1349,19 +1356,25 @@ type GeneratedComposition() =
             // the external browser boundary fake, but use real intent CAS.
             Client.RoleInstructions.RoleInstructions.setLaunchTemplate a "Operator" (Guid.NewGuid()) 0
                 "Agent {{agentId}}, project {{projectName}}. Call inbox." |> success |> ignore
-            let mutable consumed : Set<string * int> = Set.empty
+            let mutable consumed : Map<string * int,Client.ScheduledReadyResume.Ready * Guid> = Map.empty
             let mutable intents : Set<Guid> = Set.empty
             let poll client allowedBefore allowedAfter =
                 let binding,reader = if client = 0 then a,b else b,a
                 let before = (LedgerStore.fetch binding |> success).Commit
                 let workers = [first; sibling] |> List.filter (fun f -> f.State.Phase = Working) |> List.length
                 let reviewers = if manualWorking then 1 else 0
-                let eligible =
+                let candidates =
                     [first; sibling]
                     |> List.filter (fun f ->
                         f.State.Phase = Ready
-                        && not (expected "Worker" total roles workers reviewers)
-                        && not (Set.contains (f.Original.AgentId,f.State.Generation) consumed))
+                        && not (expected "Worker" total roles workers reviewers))
+                let episode (f: Fixture) = f.Original.AgentId,f.State.Generation
+                let eligible = candidates |> List.filter (fun f -> not (Map.containsKey (episode f) consumed))
+                let expectedHolds =
+                    candidates
+                    |> List.choose (fun f -> Map.tryFind (episode f) consumed)
+                    |> List.map (fun (ready,id) -> ready.AgentId,ready.TaskId,ready.AttemptId,ready.Generation,id)
+                    |> Set.ofList
                 let mutable sent : (string * int) list = []
                 let mutable selected : Client.ScheduledReadyResume.Prepared option = None
                 let mutable checks = 0
@@ -1398,7 +1411,25 @@ type GeneratedComposition() =
                     key
                 match eligible,allowedBefore,allowedAfter with
                 | [],_,_ ->
-                    equal "no eligible scheduled episode" Client.ScheduledReadyResume.NoEligibleReady outcome
+                    // W3 reports unresolved prior sends separately from an empty queue.
+                    // Derive the exact held identities from previously observed sends,
+                    // not from the scheduler's own preparation or inspection routines.
+                    if Set.isEmpty expectedHolds then
+                        equal "no eligible scheduled episode" Client.ScheduledReadyResume.NoEligibleReady outcome
+                    else
+                        match outcome with
+                        | Client.ScheduledReadyResume.HeldCandidates held ->
+                            let actual =
+                                held
+                                |> List.map (fun h -> h.AgentId,h.TaskId,h.AttemptId,h.AssignmentGeneration,h.LaunchId)
+                            equal "exact held launch count" expectedHolds.Count actual.Length
+                            equal "exact held launch identities" expectedHolds (Set.ofList actual)
+                            for h in held do
+                                equal "held send boundary" "SendBoundaryRecorded" h.LastKnownOutcome
+                                equal "held send timestamp exists" true h.SendBoundaryAtUtc.IsSome
+                        | other -> raise (PropertyViolation("unresolved scheduled episodes", sprintf "expected held launches %A, actual %A" expectedHolds other))
+                    equal "no eligible selected episode" None selected
+                    equal "no eligible permission checks" 0 checks
                     equal "no eligible send" [] sent
                     equal "no eligible intent commit" before (LedgerStore.fetch reader |> success).Commit
                 | _,false,_ ->
@@ -1416,7 +1447,8 @@ type GeneratedComposition() =
                     equal "single external invocation" 1 sent.Length
                     let key = verifyIntent ()
                     equal "effect belongs to selected episode" key sent.Head
-                    consumed <- Set.add key consumed
+                    let prepared = selected.Value
+                    consumed <- Map.add key (prepared.Ready,prepared.OperationId) consumed
                 verify ()
             let workerCap n = Map.ofList ["Worker",n]
             verify ()

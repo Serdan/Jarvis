@@ -27,7 +27,7 @@ Agent {
     agentId, version,
     currentAssignment: { taskId, attemptId } | null,
     execution: Stopped | Working,
-    unassignedDisposition: NeedsWork | Parked | null,
+    unassignedDisposition: NeedsWork | Parked | TasklessYield | null,
     reason, sequence,
     executionEnteredAtUtc,
     workingTurnStartedAtUtc?,
@@ -41,6 +41,7 @@ The shape is conceptual, not a requirement for exact .NET property names.
 - `currentAssignment` is the **single current assignment slot**. It points to the authoritative task/attempt; it does not duplicate the task spec, owner, phase, issue, or checkpoint. An attempt retains its `ownerAgentId` even after it is finished, blocked, deferred, abandoned or superseded.
 - `execution` records whether that agent is logically in a Working turn. `Stopped` does not mean the process has exited, the ChatGPT session is unavailable, or the agent cannot receive review feedback.
 - `unassignedDisposition` is **null if and only if** `currentAssignment` is present. A present disposition always implies `execution = Stopped`.
+- `NeedsWork` is an Operator-enabled idle state; `Parked` is an explicit Operator STOP; `TasklessYield` is an agent-initiated taskless session boundary. TasklessYield remains unavailable to ordinary assignment/requeue and may be resumed only by the taskless-work dispatcher.
 - A currently assigned agent can be Stopped/Ready or Working; it cannot be unassigned/Parked and Working simultaneously.
 - An agent's current assignment identifies both the task **and** the attempt. Do not rely on a bare attempt ID being globally unique across unrelated tasks.
 - Remove the legacy redundant `state`, `focusAttemptId` and `activeAttemptId` fields in the canonical converted representation. A current Working attempt is resolved using `currentAssignment`, not a second active pointer.

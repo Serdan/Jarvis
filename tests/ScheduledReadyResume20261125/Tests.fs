@@ -363,7 +363,7 @@ let registeredIngressHoldsAmbiguousLaunchUntilVerifiedTermination () =
             Assert.That((state()).Commit, Is.EqualTo(beforeManual))
             let seenBeforePromotion = restarted.Tui.GetAgentLastSeen("local", "Worker")
             // Promotion uses the same core: independent read succeeds without activation.
-            let promotedCommand = read "Worker" "GetTask" ""
+            let promotedCommand = read "Worker" "LifecycleHistory" ""
             let runCore wire actor = task {
                 return! Client.SignalR.Client.executeAuthenticatedCommandWithChallengeWake restarted wire actor None false (fun _ _ -> ())
             }

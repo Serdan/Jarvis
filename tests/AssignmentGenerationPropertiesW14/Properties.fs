@@ -208,10 +208,14 @@ let private request seed (s: Step) m other : LedgerBinding -> Result<LedgerWrite
             ReviewWorkflow.resumeAgent b id m.Task other.Owner v other.AgentVersion g
         | _ -> failwithf "Unknown request command %s" s.Verb
 
-let private options = JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
-let private decode<'a> (s: string) : 'a =
-    try JsonSerializer.Deserialize<'a>(s, options)
-    with ex -> failwithf "Cannot decode %s from %s: %s" typeof<'a>.Name s ex.Message
+// Read exactly the persisted JSON field contract; no production record deserializer.
+let private decode (raw: string) =
+    use doc = JsonDocument.Parse(raw)
+    doc.RootElement.Clone()
+let private prop (name: string) (value: JsonElement) = value.GetProperty(name)
+let private str name value = (prop name value).GetString()
+let private i32 name value = (prop name value).GetInt32()
+let private i64 name value = (prop name value).GetInt64()
 let private taskPath m = $"tasks/{m.Task}/task.json"
 let private specPath m = $"tasks/{m.Task}/spec.html"
 let private attemptPath m = $"tasks/{m.Task}/attempts/{m.Attempt}.json"
@@ -234,59 +238,58 @@ let private observe b snapshot m =
     let required path = read path |> Option.defaultWith (fun () -> failwithf "Missing %s" path)
     let check name = equal $"{m.Task}/{name}"
     let taskRaw = required (taskPath m)
-    let task = decode<ReviewTask> taskRaw
-    if isNull task.TaskId then failwithf "Task JSON decoded without identity: %s" taskRaw
-    check "task identity" m.Task task.TaskId
-    check "task title" m.Task task.Title
-    check "task attempt" m.Attempt task.AttemptId
-    check "lifecycle" "InProgress" task.Lifecycle
-    check "task version" m.TaskVersion task.Version
-    check "spec version" m.SpecVersion task.SpecVersion
+    let task = decode taskRaw
+    check "task identity" m.Task (str "taskId" task)
+    check "task title" m.Task (str "title" task)
+    check "task attempt" m.Attempt (str "attemptId" task)
+    check "lifecycle" "InProgress" (str "lifecycle" task)
+    check "task version" m.TaskVersion (i32 "version" task)
+    check "spec version" m.SpecVersion (i32 "specVersion" task)
     check "canonical html" m.Canonical (required (specPath m))
     check "canonical blob" (Some(blobOid m.Canonical)) records[specPath m]
-    let attempt = required (attemptPath m) |> decode<ReviewAttempt>
-    check "attempt task" m.Task attempt.TaskId
-    check "attempt identity" m.Attempt attempt.AttemptId
-    check "attempt owner" m.Owner attempt.OwnerAgentId
-    check "attempt version" m.AttemptVersion attempt.Version
-    check "attempt phase" (if m.Slot = Unstarted then "Queued" else "Started") attempt.Phase
-    check "generation" (generation m) attempt.AssignmentGeneration
-    check "pinned spec" (blobOid (current m).Html) attempt.SpecBlobOid
-    check "issued sequence" (current m).Sequence attempt.IssuedSequence
-    let agent = required (agentPath m) |> decode<ReviewAgent>
-    check "agent identity" m.Owner agent.AgentId
-    check "agent version" m.AgentVersion agent.Version
-    check "slot execution" (if m.Slot = Running then "Working" else "Stopped") agent.Execution
-    check "slot task" m.Task agent.CurrentAssignment.TaskId
-    check "slot attempt" m.Attempt agent.CurrentAssignment.AttemptId
-    check "unassigned disposition" null agent.UnassignedDisposition
+    let attempt = required (attemptPath m) |> decode
+    check "attempt task" m.Task (str "taskId" attempt)
+    check "attempt identity" m.Attempt (str "attemptId" attempt)
+    check "attempt owner" m.Owner (str "ownerAgentId" attempt)
+    check "attempt version" m.AttemptVersion (i32 "version" attempt)
+    check "attempt phase" (if m.Slot = Unstarted then "Queued" else "Started") (str "phase" attempt)
+    check "generation" (generation m) (i32 "assignmentGeneration" attempt)
+    check "pinned spec" (blobOid (current m).Html) (str "specBlobOid" attempt)
+    check "issued sequence" (current m).Sequence (i64 "issuedSequence" attempt)
+    let agent = required (agentPath m) |> decode
+    check "agent identity" m.Owner (str "agentId" agent)
+    check "agent version" m.AgentVersion (i32 "version" agent)
+    check "slot execution" (if m.Slot = Running then "Working" else "Stopped") (str "execution" agent)
+    check "slot task" m.Task (str "taskId" (prop "currentAssignment" agent))
+    check "slot attempt" m.Attempt (str "attemptId" (prop "currentAssignment" agent))
+    check "unassigned disposition" null (str "unassignedDisposition" agent)
     m.History |> List.iteri (fun i expected ->
         let g = i + 1
-        let issue = required (issuePath m g) |> decode<AssignmentIssue>
-        check $"issue {g} identity" (m.Task,m.Attempt,m.Owner,g) (issue.TaskId,issue.AttemptId,issue.OwnerAgentId,issue.Generation)
-        check $"issue {g} previous" (g - 1) issue.PreviousGeneration
-        check $"issue {g} reason" expected.Reason issue.Reason
-        check $"issue {g} sequence" expected.Sequence issue.IssuedSequence
-        check $"issue {g} spec" (blobOid expected.Html) issue.SpecBlobOid
-        expected.Instructions |> Option.iter (fun value -> check $"issue {g} instructions" value issue.Instructions)
+        let issue = required (issuePath m g) |> decode
+        check $"issue {g} identity" (m.Task,m.Attempt,m.Owner,g) ((str "taskId" issue),(str "attemptId" issue),(str "ownerAgentId" issue),(i32 "generation" issue))
+        check $"issue {g} previous" (g - 1) (i32 "previousGeneration" issue)
+        check $"issue {g} reason" expected.Reason (str "reason" issue)
+        check $"issue {g} sequence" expected.Sequence (i64 "issuedSequence" issue)
+        check $"issue {g} spec" (blobOid expected.Html) (str "specBlobOid" issue)
+        expected.Instructions |> Option.iter (fun value -> check $"issue {g} instructions" value (str "instructions" issue))
         match expected.Ack, read (ackPath m g) with
         | None, None -> ()
         | Some seq, Some raw ->
-            let ack = decode<AssignmentReceipt> raw
-            check $"ack {g} identity" (m.Task,m.Attempt,m.Owner,g) (ack.TaskId,ack.AttemptId,ack.OwnerAgentId,ack.Generation)
-            check $"ack {g} spec" (blobOid expected.Html) ack.SpecBlobOid
-            check $"ack {g} issue sequence" expected.Sequence ack.IssueSequence
-            check $"ack {g} sequence" seq ack.AcknowledgedSequence
+            let ack = decode raw
+            check $"ack {g} identity" (m.Task,m.Attempt,m.Owner,g) ((str "taskId" ack),(str "attemptId" ack),(str "ownerAgentId" ack),(i32 "generation" ack))
+            check $"ack {g} spec" (blobOid expected.Html) (str "specBlobOid" ack)
+            check $"ack {g} issue sequence" expected.Sequence (i64 "issueSequence" ack)
+            check $"ack {g} sequence" seq (i64 "acknowledgedSequence" ack)
         | other -> failwithf "Generation %d acknowledgment presence differs: %A" g other)
     check "future issue absent" None (read (issuePath m (generation m + 1)))
     check "future receipt absent" None (read (ackPath m (generation m + 1)))
     for expected in m.Checkpoints do
-        let cp = required ($"{checkpointPrefix m}{expected.Sequence}.json") |> decode<AgentCheckpoint>
-        check "checkpoint identity" (m.Task,m.Attempt,m.Owner,expected.Generation) (cp.TaskId,cp.AttemptId,cp.OwnerAgentId,cp.AssignmentGeneration)
-        check "checkpoint sequence" expected.Sequence cp.Sequence
-        check "checkpoint kind" expected.Kind cp.Kind
-        check "checkpoint summary" expected.Summary cp.Summary
-        check "checkpoint continuation" expected.Next cp.NextAction
+        let cp = required ($"{checkpointPrefix m}{expected.Sequence}.json") |> decode
+        check "checkpoint identity" (m.Task,m.Attempt,m.Owner,expected.Generation) ((str "taskId" cp),(str "attemptId" cp),(str "ownerAgentId" cp),(i32 "assignmentGeneration" cp))
+        check "checkpoint sequence" expected.Sequence (i64 "sequence" cp)
+        check "checkpoint kind" expected.Kind (str "kind" cp)
+        check "checkpoint summary" expected.Summary (str "summary" cp)
+        check "checkpoint continuation" expected.Next (str "nextAction" cp)
     records
 
 let private verifyPreserved targeted (before: Lane array) (after: Lane array)

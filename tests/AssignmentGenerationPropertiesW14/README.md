@@ -105,9 +105,17 @@ executed. Aggregated realized outcomes (80 steps):
   wrong owner 5, wrong phase 6, phase or no new spec 2, unadopted 3;
 - exact replay 5, UUID collision 4.
 
-The minimized calibration on this same SHA is a separate engineering job
-`ee7ea5b7606c41a9873744cf2b121797`. Its terminal evidence is pending;
-no mutant result or production defect is claimed yet.
+Calibration job `ee7ea5b7606c41a9873744cf2b121797` completed exit 0 on
+archived SHA `6b9457381d04e20b9aa040c9e3747c6e10dfb2a8`.
+Unmodified replay: 2/2 passed, exit 0. Removing only the generation fence
+in `resumeAgentCore`: 2/2 failed, exit 1, both at step 2 (`stale-generation`),
+prediction `Deny "generation"`, actual `Ok`. Minimal prefix is the two
+steps above; this is a mutant witness, not a defect on unmodified main.
+Original SHA-256: `3f49499123bab884eac4cc03acaf9eb3b337fba34052dc6e35b0f7f4cbbdaf54`.
+Mutant SHA-256: `0dd8c74955a93fb34b307d882a68d2c5a51fc8bef73c0c6b302eeebb56a6868e`.
+Events 1–132 contain the archive identity, both terminal test outcomes,
+divergence traces and confirmation of disposable source restoration.
+The calibration driver exited 0 after checking restoration.
 
 ## Boundaries
 

@@ -1451,8 +1451,19 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
         | None -> rt |> OrchestrationApi.TaskApi.read cmd |> serialize'
     | TaskReadCommand cmd -> rt |> OrchestrationApi.TaskApi.read cmd |> serialize'
     | ObserveAgentCommand cmd ->
-        rt |> OrchestrationApi.AgentObservationApi.observe cmd
-            (fun project agent -> rt.Tui.GetAgentLastSeen(project, agent)) |> serialize'
+        let lastSeen project agent = rt.Tui.GetAgentLastSeen(project, agent)
+        let observed =
+            match target, requestSnapshot with
+            | Some selected, Some _ ->
+                let projectId = ProjectPaths.ProjectTarget.projectId selected
+                withCurrentRequestSnapshot rt projectId cmd.ObserverAgentId requestSnapshot
+                    (fun snapshot ->
+                        snapshot.Verified
+                        |> Result.bind (fun (binding, ledgerSnapshot) ->
+                            OrchestrationApi.AgentObservationApi.observeAt cmd lastSeen binding ledgerSnapshot))
+                    (fun () -> Error(Client.ValidationError "Observer state changed during verified observation."))
+            | _ -> OrchestrationApi.AgentObservationApi.observe cmd lastSeen rt
+        observed |> serialize'
     | TaskWriteCommand cmd when cmd.Action = "ExportTaskSpec" || cmd.Action = "ImportTaskSpec" ->
         match resolved with
         | Some context -> rt |> OrchestrationApi.TaskApi.writeForContext context cmd |> serialize'
@@ -1977,6 +1988,10 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                                     match ingress with
                                     | VerifiedIngress verified when requestSnapshotCanSupplyGuidance command && isLocalAgentActivity command ->
                                         requestSnapshot.Value <- verified
+                                    | VerifiedIngress verified ->
+                                        match command with
+                                        | ObserveAgentCommand _ -> requestSnapshot.Value <- verified
+                                        | _ -> ()
                                     | _ -> ()
                                     scope))
                     match project with

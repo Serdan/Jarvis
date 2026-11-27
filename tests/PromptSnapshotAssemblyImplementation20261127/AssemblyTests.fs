@@ -35,8 +35,9 @@ let input =
           scoped scope { Pin = Some pin; Kind = ActionKind.Review; Ordinal = 0; Text = "OWN-FOCUSED-REVIEW" } ] }
 let run input baseline = assemble input baseline noBudgets
 let ok = function Ok result -> result | Error e -> failwithf "Unexpected assembly failure: %A" e
-let rejected expected = function
-    | Error errors -> Assert.That(errors, Does.Contain(expected))
+let rejected (expected: Invalid) (result: Result<Assembled, Invalid list>) =
+    match result with
+    | Error errors -> Assert.That(List.contains expected errors, Is.True, sprintf "Expected %A among %A" expected errors)
     | Ok _ -> Assert.Fail("Invalid evidence assembled a prompt.")
 let withAssignment assignment = { input with Focus = resolved scope (Assigned assignment) }
 

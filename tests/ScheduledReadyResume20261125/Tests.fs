@@ -224,11 +224,12 @@ let promotedScheduledInboxJobReadsRemainIndependentOfReadyIngress () =
             ReviewWorkflow.clearResponseAlert binding (Guid.NewGuid()) "fixture" actor stop |> good |> ignore
             let ordinary =
                 match inbox with
-                | Common.TaskReadCommand request -> Common.TaskReadCommand { request with LaunchId = ""; Action = "GetTask"; TaskId = "ready-task" }
+                | Common.TaskReadCommand request -> Common.TaskReadCommand { request with LaunchId = ""; Action = "LifecycleHistory"; TaskId = "ready-task" }
                 | _ -> failwith "fixture inbox"
             let beforeOrdinary = (state()).Commit
             let read = core (serialize ordinary) actor |> fun response -> response.GetAwaiter().GetResult()
             Assert.That(read.Error.IsNone, Is.True, sprintf "%A" read.Error)
+            Assert.That(read.Result.IsSome, Is.True)
             Assert.That(read.AgentStateChanges, Is.Empty)
             Assert.That((state()).Commit, Is.EqualTo(beforeOrdinary))
             // Cancellation is independent of launch correlation, but must
@@ -315,8 +316,9 @@ let registeredIngressHoldsAmbiguousLaunchUntilVerifiedTermination () =
                 Assert.That(response.AgentStateChanges, Is.Empty)
             let independentRead rt =
                 let head = (state()).Commit
-                let response = execute rt "Worker" (read "Worker" "GetTask" "")
+                let response = execute rt "Worker" (read "Worker" "LifecycleHistory" "")
                 Assert.That(response.Error.IsNone, Is.True, sprintf "%A" response.Error)
+                Assert.That(response.Result.IsSome, Is.True)
                 Assert.That(response.AgentStateChanges, Is.Empty)
                 Assert.That((state()).Commit, Is.EqualTo(head))
             reject runtime "Worker" (read "Worker" "AgentInbox" "")

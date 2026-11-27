@@ -208,8 +208,10 @@ let private request seed (s: Step) m other : LedgerBinding -> Result<LedgerWrite
             ReviewWorkflow.resumeAgent b id m.Task other.Owner v other.AgentVersion g
         | _ -> failwithf "Unknown request command %s" s.Verb
 
-let private options = JsonSerializerOptions(PropertyNameCaseInsensitive = true)
-let private decode<'a> (s: string) = JsonSerializer.Deserialize<'a>(s, options)
+let private options = JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
+let private decode<'a> (s: string) : 'a =
+    try JsonSerializer.Deserialize<'a>(s, options)
+    with ex -> failwithf "Cannot decode %s from %s: %s" typeof<'a>.Name s ex.Message
 let private taskPath m = $"tasks/{m.Task}/task.json"
 let private specPath m = $"tasks/{m.Task}/spec.html"
 let private attemptPath m = $"tasks/{m.Task}/attempts/{m.Attempt}.json"
@@ -231,7 +233,9 @@ let private observe b snapshot m =
         content
     let required path = read path |> Option.defaultWith (fun () -> failwithf "Missing %s" path)
     let check name = equal $"{m.Task}/{name}"
-    let task = required (taskPath m) |> decode<ReviewTask>
+    let taskRaw = required (taskPath m)
+    let task = decode<ReviewTask> taskRaw
+    if isNull task.TaskId then failwithf "Task JSON decoded without identity: %s" taskRaw
     check "task identity" m.Task task.TaskId
     check "task title" m.Task task.Title
     check "task attempt" m.Attempt task.AttemptId

@@ -212,7 +212,7 @@ let private runCase action mode = task {
                     do! hub.SendCoreAsync("SendClientResponse", [|box correlation; box response|], CancellationToken.None)
                 } :> Task))
         let mutable requestId = 0
-        let call user scopes name (fields: (string * obj) list) = task {
+        let callEnvelope user scopes name (fields: (string * obj) list) = task {
             let id = Interlocked.Increment(&requestId)
             let args = dict fields
             let raw = JsonSerializer.Serialize({| jsonrpc="2.0"; id=id; ``method``="tools/call"; ``params``={| name=name; arguments=args |} |})
@@ -229,6 +229,11 @@ let private runCase action mode = task {
                 else body
             use envelope = JsonDocument.Parse(payload)
             Assert.That(envelope.RootElement.GetProperty("id").GetInt32(), Is.EqualTo(id))
+            return payload
+        }
+        let call user scopes name fields = task {
+            let! payload = callEnvelope user scopes name fields
+            use envelope = JsonDocument.Parse(payload)
             match envelope.RootElement.TryGetProperty("result") with
             | false, _ -> return true, payload
             | true, result ->
@@ -314,10 +319,41 @@ let private runCase action mode = task {
                 Assert.That(json, Is.EqualTo(canonical), "All canonical wire fields are independently pinned.")
                 // These are synthetic fixtures; replay exactly one fresh in-memory
                 // request while its original operation is still pending.
-                let! duplicateFailed, duplicateRaw = call "alice" scopes scenario.Route originalArgs
-                Assert.That(duplicateFailed, Is.False, duplicateRaw)
-                let duplicate = parseFirstLine<ToolJobHandle> duplicateRaw
-                Assert.That(duplicate.JobId, Is.EqualTo(job.JobId))
+                let! duplicateEnvelopeRaw = callEnvelope "alice" scopes scenario.Route originalArgs
+                // Only the disposable synthetic MCP response is logged, never request
+                // headers, JWTs or environment. Retain every block/type before decoding.
+                TestContext.WriteLine("Duplicate MCP response (synthetic): " + duplicateEnvelopeRaw)
+                use duplicateEnvelope = JsonDocument.Parse(duplicateEnvelopeRaw)
+                let duplicateResult = duplicateEnvelope.RootElement.GetProperty("result")
+                let duplicateFailed =
+                    match duplicateResult.TryGetProperty("isError") with
+                    | true, value -> value.GetBoolean()
+                    | _ -> false
+                Assert.That(duplicateFailed, Is.False, duplicateEnvelopeRaw)
+                let duplicateBlocks =
+                    duplicateResult.GetProperty("content").EnumerateArray()
+                    |> Seq.map (fun block ->
+                        Assert.That(block.GetProperty("type").GetString(), Is.EqualTo("text"), block.GetRawText())
+                        block.GetProperty("text").GetString())
+                    |> Seq.toArray
+                // MCP prepends queued operational alerts to the actual payload.
+                // The known legacy actor defect may expose this exact synthetic
+                // subject alert. Keep it visible as attribution evidence; do not
+                // treat arbitrary text, an error, or a second JSON object as a handle.
+                let seededAlert =
+                    OperationalControl.queuedAlert "fixture" "Synthetic target alert must remain pending"
+                    |> OperationalControl.text
+                let alertBlocks = duplicateBlocks |> Array.filter ((=) seededAlert)
+                Assert.That(alertBlocks.Length, Is.LessThanOrEqualTo(1), duplicateEnvelopeRaw)
+                if alertBlocks.Length = 1 then
+                    Assert.That(transportedActor, Is.EqualTo(subject), "Subject alert exposed to a different transport actor.")
+                    Assert.That(action, Is.Not.EqualTo("RegisterAgent"), "RegisterAgent has no seeded subject alert.")
+                    Assert.That(duplicateBlocks.[0], Is.EqualTo(seededAlert), "Operational alert must precede the payload.")
+                    TestContext.WriteLine("Observed seeded subject alert on legacy subject-as-actor route; not a privacy success.")
+                let duplicatePayload = duplicateBlocks |> Array.filter ((<>) seededAlert)
+                Assert.That(duplicatePayload.Length, Is.EqualTo(1), duplicateEnvelopeRaw)
+                let duplicate = JsonSerializer.Deserialize<ToolJobHandle>(duplicatePayload.[0])
+                Assert.That(duplicate, Is.EqualTo(job), "Duplicate must return the identical pending handle.")
                 // The operation registry key includes the transport actor.
                 // Keep that actor fixed when checking changed canonical bytes.
                 // Registration has no mutable field other than its subject,

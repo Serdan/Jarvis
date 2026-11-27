@@ -154,6 +154,14 @@ module private DurableScheduleFile =
             File.Move(temp, path, true)
             syncParentDirectory (Path.GetDirectoryName(Path.GetFullPath(path)))
 
+let private effectiveActionKind (a: ScheduledAction) =
+    if String.IsNullOrWhiteSpace a.ActionKind then "BrowserScript" else a.ActionKind
+
+let private effectiveTriggerKind (a: ScheduledAction) =
+    if String.IsNullOrWhiteSpace a.TriggerKind then
+        if a.RepeatEverySeconds > 0 then "Every" else "Once"
+    else a.TriggerKind
+
 let private describe (a: ScheduledAction) =
     let origin =
         match Uri.TryCreate(a.Url, UriKind.Absolute) with
@@ -165,9 +173,8 @@ let private describe (a: ScheduledAction) =
        checkinWakeAtUtc = a.CheckinWakeAtUtc
        status = a.Status
        projectName = a.ProjectName
-       actionKind = (if String.IsNullOrWhiteSpace a.ActionKind then "BrowserScript" else a.ActionKind)
-       triggerKind = (if String.IsNullOrWhiteSpace a.TriggerKind then
-                          (if a.RepeatEverySeconds > 0 then "Every" else "Once") else a.TriggerKind)
+       actionKind = effectiveActionKind a
+       triggerKind = effectiveTriggerKind a
        executable = a.Executable
        commandArgumentCount = (if isNull (box a.CommandArgs) then 0 else a.CommandArgs.Length)
        workingDirectory = a.WorkingDirectory
@@ -191,6 +198,89 @@ let private describe (a: ScheduledAction) =
        lastResult = a.LastResult
        error = a.Error
        updatedAtUtc = a.UpdatedAtUtc |}
+
+// This is a read selector, not an authorization decision. The route must
+// independently resolve and authorize the canonical project before calling it.
+[<RequireQualifiedAccess>]
+type ScheduleHistory = Current | All | ExactStatus of string
+
+[<RequireQualifiedAccess>]
+type ScheduleAction = Browser | Command | Any
+
+type ScheduleQuery =
+    { AuthorizedProject: string
+      History: ScheduleHistory
+      Action: ScheduleAction }
+
+let private terminalStatus = function
+    | "canceled" | "completed" | "failed" | "held" | "heldLaunches" | "noEligibleReady" -> true
+    | _ -> false
+
+let private knownTime (value: DateTimeOffset) =
+    if value = DateTimeOffset.MinValue then Nullable() else Nullable(value)
+
+// Candidate time is not a dispatch or capacity decision. In particular idle
+// schedules still need independent activity verification; unknown states never
+// acquire a countdown just because a stored timestamp is present.
+let private readTiming (now: DateTimeOffset) (a: ScheduledAction) =
+    let noCandidate state = state, Nullable<DateTimeOffset>(), Nullable<double>()
+    match a.Status with
+    | "running" -> noCandidate (if a.Disabled then "runningCancellationRequested" else "running")
+    | "waitingActivity" -> noCandidate (if a.Disabled then "disabled" else "waitingForActivity")
+    | "suspended" -> noCandidate "suspendedNeedsAttention"
+    | "outcomeUnknown" -> noCandidate "outcomeUnknown"
+    | "pending" when a.Disabled -> noCandidate "disabled"
+    | "pending" ->
+        match effectiveActionKind a, effectiveTriggerKind a with
+        | action, _ when action <> "BrowserScript" && action <> "RunCommand" -> noCandidate "unknownAction"
+        | _, trigger when trigger <> "Once" && trigger <> "Every" && trigger <> "AfterAgentIdle" -> noCandidate "unknownTrigger"
+        | _, _ when a.DueAtUtc = DateTimeOffset.MinValue -> noCandidate "deadlineUnknown"
+        | _, trigger ->
+            let due =
+                if isReadyResume a && a.CheckinWakeAtUtc <> DateTimeOffset.MinValue then
+                    min a.DueAtUtc a.CheckinWakeAtUtc
+                else a.DueAtUtc
+            let state =
+                if trigger = "AfterAgentIdle" then "awaitingIdleVerification"
+                elif due <= now then "dueCandidate"
+                else "scheduledCandidate"
+            state, Nullable(due), Nullable(max 0.0 (due - now).TotalSeconds)
+    | status when terminalStatus status -> noCandidate "terminal"
+    | _ -> noCandidate "unknownStatus"
+
+let private scopedSchedules (now: DateTimeOffset) (query: ScheduleQuery) (actions: ScheduledAction list) =
+    if ProjectSelector.identity query.AuthorizedProject <> Some query.AuthorizedProject then
+        invalidArg "query" "A canonical project identity is required."
+    match query.History with
+    | ScheduleHistory.ExactStatus status when String.IsNullOrWhiteSpace status ->
+        invalidArg "query" "Exact status must be nonblank."
+    | _ -> ()
+    actions
+    |> List.filter (fun a ->
+        ProjectSelector.identity a.ProjectName = Some query.AuthorizedProject &&
+        (match query.History with
+         | ScheduleHistory.All -> true
+         | ScheduleHistory.Current -> not (terminalStatus a.Status)
+         | ScheduleHistory.ExactStatus status -> a.Status = status) &&
+        (match query.Action with
+         | ScheduleAction.Any -> true
+         | ScheduleAction.Browser -> effectiveActionKind a = "BrowserScript"
+         | ScheduleAction.Command -> effectiveActionKind a = "RunCommand"))
+    |> List.sortBy (fun a -> a.DueAtUtc, a.Id)
+    |> List.map (fun a ->
+        let state, candidate, seconds = readTiming now a
+        {| id = a.Id
+           projectName = query.AuthorizedProject
+           actionKind = effectiveActionKind a
+           triggerKind = effectiveTriggerKind a
+           status = a.Status
+           state = state
+           disabled = a.Disabled
+           dueAtUtc = knownTime a.DueAtUtc
+           candidateDueAtUtc = candidate
+           secondsUntilCandidateDue = seconds
+           repeatEverySeconds = a.RepeatEverySeconds
+           updatedAtUtc = a.UpdatedAtUtc |})
 
 type Service(path: string, execute: ScheduledAction -> Task<Result<string,string * string>>, ?now: unit -> DateTimeOffset, ?pollMs: int, ?agentLastSeen: string -> string -> DateTimeOffset option, ?verifyIdleActivity: string -> string -> Task<Result<DateTimeOffset option,string>>, ?onFault: string -> unit, ?reconcileResume: ScheduledAction -> ResumeSelection -> Task<bool>) =
     let gate = obj()
@@ -620,6 +710,16 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
             |> List.sortBy (fun a -> a.DueAtUtc)
             |> List.map describe
             |> JsonSerializer.Serialize)
+
+    /// Read the authorized project's selected schedules without exposing private
+    /// diagnostics or invoking any execution/verification path.
+    member _.Query(query: ScheduleQuery) =
+        lock gate (fun () ->
+            let observed = clock()
+            let schedules = scopedSchedules observed query actions
+            JsonSerializer.Serialize(
+                {| observedAtUtc = observed; clockSource = "clientSchedulerClock"
+                   schedules = schedules |}))
 
     member _.Get(id: string) =
         lock gate (fun () ->

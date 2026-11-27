@@ -25,6 +25,32 @@ local activity age cannot establish authoritative Health recovery eligibility.
 Review actual registered route outputs at realistic scale, including terminal job
 responses and compatibility adapters; see [the response audit](reviews/2026-11-27-pertinent-response-audit.md).
 
+Treat response pertinence as part of [measured context efficiency](DevelopmentProcess.md#context-efficiency-as-a-quality-attribute).
+Measure the actual model-facing default and expansion paths together: include
+catalog schemas, bootstrap/continuation prompts, terminal job wrappers,
+compatibility adapters, repeated receipts, and follow-up calls needed to obtain
+mandatory evidence. Use the same context-accounting boundary as the development
+process; report actual provider tokens/cache data when available, otherwise
+explicitly labeled byte or token-estimate proxies. Set justified budgets against
+observed representative baselines, not a universal byte cap. Verify that shorter
+responses preserve decision usefulness, exact lookup and authorization, and do
+not increase retries or transfer avoidable work to the model.
+
+Prefer role-scoped tool catalogs for the inference-facing surface, while
+preserving canonical capability discovery and independently enforced permission
+checks. Keep stable prompt prefixes byte-stable where practical; place dynamic
+assignment and runtime facts in a separately identifiable suffix. These are
+design criteria, not evidence that a provider cached a prefix or that a catalog
+projection enforces authority.
+
+Under the current launch contract, executors still obtain assignment context
+through their self-inbox and explicitly read applicable instructions. A future
+independently reviewed and operator-authorized transition may deliver resolved
+instructions and focused assignment context directly in a versioned launch
+prompt, eliminating a redundant ordinary bootstrap inbox read only if current
+assignment, activation, evidence and recovery semantics remain intact. Until
+that cutover, the existing launch and inbox contract remains authoritative.
+
 ## Explicit repository guidance
 
 Ordinary operations return requested results, errors and necessary operational receipts or alerts, not automatic repository documents. Read applicable repository guidance with `get_agent_instructions` and obtain dynamic role/assignment context through the self-agent inbox. The closed `OperationalControls` wire union distinguishes Working-turn soft/hard advisory limits, exceptional queued alerts, and an unverified activation diagnostic. During staged compatibility, a narrow adapter projects these controls into the legacy `Instructions` field only when present; new peers prefer typed controls and ignore legacy repository documents/notices, including nested terminal job results. `AgentStateChangesStatus` distinguishes confirmed (including an empty list), unknown (including any known partial mutations), and pending evidence independently of operation success. Missing or null legacy mutation evidence is unknown, never confirmed empty on new readers. This source behavior is gated on canonical launch-template readiness and coordinated cutover; see [AgentInstructions.md](AgentInstructions.md) and [AgentCommandResponse.schema.json](AgentCommandResponse.schema.json).

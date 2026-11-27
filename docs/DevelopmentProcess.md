@@ -15,6 +15,55 @@ within documented scope, deterministic ordering, exact expansion/pagination,
 authorization and state/effect evidence preservation. Measure response bytes and
 decision usefulness before introducing a broader abstraction.
 
+## Context efficiency as a quality attribute
+
+Optimize total inference burden per successfully completed work item, not the
+size of an isolated response or the number of calls alone. A successful item
+meets its acceptance criteria, including required verification, independent
+review and lifecycle evidence. Account for all contributing attempts, roles,
+continuations, retries, recovery, failed speculation and review rework; report
+incomplete/failed items separately and include their consumed resources in the
+workload total. Never improve the denominator by declaring incomplete work done.
+
+For changes affecting prompts, tools, orchestration, context delivery or recovery,
+record an observed baseline and comparable before/after evidence for the affected
+flows. Use a representative suite covering bootstrap, continuation, reviewer,
+orchestration and recovery, including adverse paths and realistic project scale;
+justify any unaffected or unmeasurable cases. Hold task scope, acceptance
+criteria, provider/model, configuration and workload comparable, distinguish
+cold and warm caches, and record versions, sample size and measurement boundary.
+Prefer authorized offline fixtures/replays where adequate; live measurement
+requires its own authorization.
+
+Report actual provider input/output tokens and cached-input tokens where
+available (including reasoning usage if separately reported). Otherwise label
+UTF-8 bytes or locally estimated tokens explicitly as proxies, not provider
+usage, cache hits or money saved. Record per-stage prompt and tool-catalog sizes,
+tool result bytes, repeated immutable content, number of inference turns/tool
+calls, retries, and end-to-end latency to successful work (including tail or
+failure cases as appropriate). Report missing instrumentation as unknown;
+do not infer cache hits from stable prefixes or quote speculative savings.
+Use the existing context-accounting measurements as they become available;
+do not build a parallel accounting mechanism.
+
+Set justified, flow-specific budgets against the measured baseline and review
+growth in context, calls and latency, including trade-offs between them.
+A budget is not permission to truncate required evidence, weaken authority,
+reduce review independence, skip validation or move cost into follow-up calls.
+Accept growth only with a documented correctness/usefulness benefit and
+proportionate cost; investigate regressions rather than applying arbitrary
+global caps. Prefer stable cache-friendly prompt prefixes, explicitly versioned
+dynamic suffixes, role-scoped tool catalogs and deterministic runtime decisions
+over repeated model interpretation. See [pertinence by default](AgentCommandSurface.md#pertinence-by-default-operator-decision-2026-11-27)
+for response-specific requirements.
+
+Independent review of affected changes must evaluate the measurement evidence,
+the budget/trade-off justification, and semantic preservation. For unaffected
+changes a short scope justification suffices. Missing evidence is a limitation
+to resolve or explicitly adjudicate, never a passing measurement. Context
+efficiency complements rather than replaces correctness, safety, maintainability
+and usability criteria.
+
 ---
 
 ## Lightweight Workflow

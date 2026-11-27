@@ -1,0 +1,1 @@
+Docs-only Operator principle, development gate, measured live inbox/ObserveAgent/receipt examples, source route anchors and prioritized nonoverlapping candidate implementation slices. No code changes or rollout; source baseline 175ad976a6226f1cb07901b4b43f3d6b0ecf3de1. git show --check and isolated status verified.

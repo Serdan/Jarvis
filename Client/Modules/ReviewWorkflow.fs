@@ -2945,7 +2945,7 @@ module ReviewWorkflow =
                     return snapshot, task, attempt, issuance, receipt |> Option.map fst
             }
 
-    let beginAttemptWithSession binding operationId taskId ownerId expectedVersion generation sessionId =
+    let internal beginAttemptWithSessionGuarded binding operationId taskId ownerId expectedVersion generation sessionId admit =
         if not (validTaskId taskId) || not (validAgent ownerId) || expectedVersion < 1 || generation < 1 then
             Error(InvalidBinding "Invalid BeginAttempt request.")
         else
@@ -2976,6 +2976,7 @@ module ReviewWorkflow =
                             return! Error(StaleEntityVersion "Agent has not been assigned this attempt for startup.")
                         if not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
                             return! Error(AgentBusy "Agent is already Working.")
+                        do! admit snapshot
                         return
                             [ change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
                                 { attempt with Version = attempt.Version + 1; Phase = "Started" }
@@ -2991,6 +2992,9 @@ module ReviewWorkflow =
                                else [])
                     })
 
+
+    let beginAttemptWithSession binding operationId taskId ownerId expectedVersion generation sessionId =
+        beginAttemptWithSessionGuarded binding operationId taskId ownerId expectedVersion generation sessionId (fun _ -> Ok ())
 
     let beginAttempt binding operationId taskId ownerId expectedVersion generation =
         beginAttemptWithSession binding operationId taskId ownerId expectedVersion generation ""
@@ -3173,8 +3177,11 @@ module ReviewWorkflow =
                             return! Error(StaleEntityVersion "Resume requires a Ready queued/started attempt or a Working attempt on the same assignment.")
                     })
 
+    let internal resumeAgentWithSessionGuarded binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation sessionId admit =
+        resumeAgentCore binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation sessionId true admit
+
     let resumeAgentWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation sessionId =
-        resumeAgentCore binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation sessionId true (fun _ -> Ok ())
+        resumeAgentWithSessionGuarded binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation sessionId (fun _ -> Ok ())
 
     // Automatic activation is only a Ready -> Working transition. Repeated or
     // concurrent calls must never restart a Working agent's clock.

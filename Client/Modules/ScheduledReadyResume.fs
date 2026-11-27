@@ -493,11 +493,11 @@ let private requireCurrentLaunchAt binding snapshot ready id =
         | currentId, Some _ when currentId = id -> Ok ()
         | _ -> bad "This launch is not the current unresolved launch; its predecessor or replacement is fenced.")
 
-/// An ordinary actor label is not sufficient to bypass an unresolved
-/// scheduled launch. Derive the exact episode independently of STOP/capacity:
-/// those affect scheduling eligibility, not ownership of an existing intent.
-/// A confirmed first check-in is still fenced until its exact activation.
-let guardUncorrelatedIngressAt binding snapshot agentId =
+/// An actor label alone cannot activate or launch a Ready episode owned by
+/// an unresolved scheduled launch. STOP/capacity affect scheduling eligibility,
+/// not ownership of an existing intent. This is a transition guard, never a
+/// prerequisite for independent authenticated command dispatch.
+let guardUncorrelatedActivationAt binding snapshot agentId =
     match ReviewWorkflow.getAgentWorkingTurnAt binding snapshot agentId with
     | Error(StaleEntityVersion _) -> Ok () // no registered agent
     | Error issue -> Error issue
@@ -518,7 +518,7 @@ let guardUncorrelatedIngressAt binding snapshot agentId =
                 |> Result.bind (function
                     | _, None -> Ok ()
                     | id, Some _ ->
-                        bad ($"Launch {id:D} owns this Ready episode. Ordinary actor-only ingress is held until exact check-in/activation, verified no-send, or explicit operator-confirmed termination."))
+                        Error(AgentBusy ($"Launch {id:D} owns this Ready episode. Uncorrelated activation is held until exact check-in/activation, verified no-send, or explicit operator-confirmed termination.")))
             | _ -> bad "Cannot establish the exact Ready assignment for launch admission.")
 
 let private checkinStateAt binding snapshot id =

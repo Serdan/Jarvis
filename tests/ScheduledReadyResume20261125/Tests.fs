@@ -210,23 +210,45 @@ let promotedScheduledInboxJobReadsRemainIndependentOfReadyIngress () =
                 Assert.That((ReviewWorkflow.getAgentWorkingTurnAt binding (state()) actor |> good).State, Is.EqualTo("Ready"))
             checkPending ()
             recordCheckin binding actor id DateTimeOffset.UtcNow |> good |> ignore
-            ReviewWorkflow.queueResponseAlert binding (Guid.NewGuid()) "fixture" actor
+            let stop = Guid.NewGuid()
+            ReviewWorkflow.queueResponseAlert binding stop "fixture" actor
                 "STOP — preserve until an eligible response" |> good |> ignore
             (Client.SignalR.Client.reconcileResponseAlerts runtime "local" actor).GetAwaiter().GetResult()
             checkPending ()
             Assert.That((ReviewWorkflow.getResponseAlerts binding actor |> good).Pending.Length, Is.EqualTo(1))
+            // STOP must still prevent correlated activation. Clear only the
+            // fixture's explicit STOP before testing successful activation.
+            match recordCheckin binding actor id DateTimeOffset.UtcNow |> good with
+            | CheckinLate _ -> ()
+            | other -> Assert.Fail(sprintf "STOP did not fence the original launch: %A" other)
+            ReviewWorkflow.clearResponseAlert binding (Guid.NewGuid()) "fixture" actor stop |> good |> ignore
             let ordinary =
                 match inbox with
                 | Common.TaskReadCommand request -> Common.TaskReadCommand { request with LaunchId = ""; Action = "GetTask"; TaskId = "ready-task" }
                 | _ -> failwith "fixture inbox"
-            let denied = core (serialize ordinary) actor |> fun response -> response.GetAwaiter().GetResult()
-            Assert.That(sprintf "%A" denied.Error, Does.Contain("ScheduledLaunchIngressRejected"))
-            let cancel = invoke (Common.CancelJobCommand { ProjectName = "local"; JobId = handle.JobId })
-            Assert.That(sprintf "%A" cancel.Error, Does.Contain("ScheduledLaunchIngressRejected"))
+            let beforeOrdinary = (state()).Commit
+            let read = core (serialize ordinary) actor |> fun response -> response.GetAwaiter().GetResult()
+            Assert.That(read.Error.IsNone, Is.True, sprintf "%A" read.Error)
+            Assert.That(read.AgentStateChanges, Is.Empty)
+            Assert.That((state()).Commit, Is.EqualTo(beforeOrdinary))
+            // Cancellation is independent of launch correlation, but must
+            // preserve the tool job's existing cancellation policy.
+            let cancel, cancelIo = LedgerStore.measureGitReads (fun () ->
+                invoke (Common.CancelJobCommand { ProjectName = "local"; JobId = handle.JobId }))
+            Assert.That(cancelIo.RemoteFetches, Is.Zero)
+            Assert.That(cancel.Error.IsSome, Is.True)
+            Assert.That(sprintf "%A" cancel.Error, Does.Not.Contain("ScheduledLaunch"))
+            Assert.That(cancel.AgentStateChanges, Is.Empty)
             let missing = poll "local" "missing-job"
             Assert.That(missing.Error.IsSome, Is.True)
-            Assert.That(sprintf "%A" missing.Error, Does.Not.Contain("ScheduledLaunchIngressRejected"))
+            Assert.That(sprintf "%A" missing.Error, Does.Not.Contain("ScheduledLaunch"))
             Assert.That((poll "other" handle.JobId).Error.IsSome, Is.True)
+            // A non-STOP alert permits activation; the terminal poll must not
+            // consume even this eligible response alert.
+            ReviewWorkflow.queueResponseAlert binding (Guid.NewGuid()) "fixture" actor
+                "Preserve until an eligible response" |> good |> ignore
+            (Client.SignalR.Client.reconcileResponseAlerts runtime "local" actor).GetAwaiter().GetResult()
+            checkPending ()
             release.SetResult(())
             let original = entered.Task.Result.GetAwaiter().GetResult()
             Assert.That(original.Error.IsNone, Is.True, sprintf "%A" original.Error)
@@ -291,9 +313,31 @@ let registeredIngressHoldsAmbiguousLaunchUntilVerifiedTermination () =
                 Assert.That((state()).Commit, Is.EqualTo(head), "Rejected ingress changed canonical state")
                 Assert.That(rt.Tui.GetAgentLastSeen("local", actor), Is.EqualTo(seen :> obj), "Rejected ingress advanced client-admitted activity")
                 Assert.That(response.AgentStateChanges, Is.Empty)
+            let independentRead rt =
+                let head = (state()).Commit
+                let response = execute rt "Worker" (read "Worker" "GetTask" "")
+                Assert.That(response.Error.IsNone, Is.True, sprintf "%A" response.Error)
+                Assert.That(response.AgentStateChanges, Is.Empty)
+                Assert.That((state()).Commit, Is.EqualTo(head))
             reject runtime "Worker" (read "Worker" "AgentInbox" "")
             reject runtime "Worker" (read "Worker" "AgentInbox" (Guid.NewGuid().ToString("D")))
-            reject runtime "Worker" (read "Worker" "GetTask" "")
+            independentRead runtime
+            // Legacy explicit activation commands use the same verified CAS boundary.
+            let activationHead = state()
+            let _, attempt = ReviewWorkflow.getTaskAt binding activationHead "ready-task" |> good
+            let agent = ReviewWorkflow.getAgentWorkingTurnAt binding activationHead "Worker" |> good
+            for action in ["BeginAttempt"; "ResumeAgent"] do
+                let command : Common.TaskWriteCommand =
+                    { ProjectName = "local"; Action = action; OperationId = Guid.NewGuid().ToString("D")
+                      TaskId = "ready-task"; AttemptId = ""; ActorId = "Worker"; OwnerId = ""
+                      Title = ""; Html = ""; ExpectedVersion = attempt.Value.Version; ExpectedAgentVersion = agent.Version
+                      ExpectedTaskVersion = 0; AssignmentGeneration = attempt.Value.AssignmentGeneration
+                      Summary = ""; NextAction = ""; Reason = ""; BaseOid = ""; TargetRef = ""; SourceRef = ""
+                      AllowDetached = false; AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+                let response = Client.OrchestrationApi.TaskApi.write command runtime
+                Assert.That(response |> Result.isError, Is.True, sprintf "%s bypassed launch ownership: %A" action response)
+                Assert.That(sprintf "%A" response, Does.Contain("Uncorrelated activation is held"))
+                Assert.That((state()).Commit, Is.EqualTo(activationHead.Commit))
             match reconcileAt binding id now (Some evidence) |> good with
             | LaunchOperatorResolutionRequired _ -> ()
             | other -> Assert.Fail(sprintf "Unexpected expiry result: %A" other)
@@ -301,17 +345,22 @@ let registeredIngressHoldsAmbiguousLaunchUntilVerifiedTermination () =
             let restarted = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.FullTrust)
             reject restarted "Worker" (read "Worker" "AgentInbox" id)
             reject restarted "Worker" (read "Worker" "AgentInbox" "")
-            reject restarted "Worker" (read "Worker" "GetTask" "")
+            independentRead restarted
             let retry : Common.AgentCommand =
                 Common.RetryPendingIntentCommand
                     { ProjectName = "local"; OperatorId = "Worker"; OperationId = Guid.NewGuid().ToString("D")
                       ExpectedCommandSha256 = String.replicate 64 "0"; ExpectedVerifiedHead = (state()).Commit }
-            reject restarted "Worker" retry
+            let beforeRetry = (state()).Commit
+            let retryResult = execute restarted "Worker" retry
+            Assert.That(retryResult.Error.IsSome, Is.True)
+            Assert.That(sprintf "%A" retryResult.Error, Does.Not.Contain("ScheduledLaunch"))
+            Assert.That((state()).Commit, Is.EqualTo(beforeRetry))
             // A conflicting manual launch must not acquire a new durable intent.
             let beforeManual = (state()).Commit
             Assert.That(Client.SignalR.Client.beginAttributedLaunch binding "fixture" "Worker" (Guid.NewGuid()) "launchAgent.js" "fixture" |> Result.isError, Is.True)
             Assert.That((state()).Commit, Is.EqualTo(beforeManual))
-            // Promotion uses the same execution core and cannot bypass admission.
+            let seenBeforePromotion = restarted.Tui.GetAgentLastSeen("local", "Worker")
+            // Promotion uses the same core: independent read succeeds without activation.
             let promotedCommand = read "Worker" "GetTask" ""
             let runCore wire actor = task {
                 return! Client.SignalR.Client.executeAuthenticatedCommandWithChallengeWake restarted wire actor None false (fun _ _ -> ())
@@ -322,9 +371,10 @@ let registeredIngressHoldsAmbiguousLaunchUntilVerifiedTermination () =
                     "Worker" (TimeSpan.FromSeconds(30.)) runCore
                 |> fun pending -> pending.GetAwaiter().GetResult()
             Assert.That(promoted.PendingJob.IsNone, Is.True, "Bounded fixture must observe the terminal promoted response")
-            Assert.That(sprintf "%A" promoted.Error, Does.Contain("ScheduledLaunchIngressRejected"))
+            Assert.That(promoted.Error.IsNone, Is.True, sprintf "%A" promoted.Error)
+            Assert.That(promoted.AgentStateChanges, Is.Empty)
             Assert.That((state()).Commit, Is.EqualTo(beforeManual))
-            Assert.That(restarted.Tui.GetAgentLastSeen("local", "Worker").IsNone, Is.True)
+            Assert.That(restarted.Tui.GetAgentLastSeen("local", "Worker"), Is.EqualTo(seenBeforePromotion :> obj))
             Assert.That(resolveOperator binding "fixture" id launch.Ready "verified termination of A" true now |> good,
                         Is.EqualTo(OperatorResolutionRecorded now))
             let replacement, _ = captureLaunch binding
@@ -333,7 +383,7 @@ let registeredIngressHoldsAmbiguousLaunchUntilVerifiedTermination () =
             // activation. Before B, omitted ID cannot win the Ready episode.
             reject restarted "Worker" (read "Worker" "AgentInbox" id)
             reject restarted "Worker" (read "Worker" "AgentInbox" "")
-            reject restarted "Worker" (read "Worker" "GetTask" "")
+            independentRead restarted
             let activated = execute restarted "Worker" (read "Worker" "AgentInbox" replacementId)
             Assert.That(activated.Error.IsNone, Is.True, sprintf "%A" activated.Error)
             Assert.That(activated.InboxActivation.Value.ActivatedByThisCall, Is.True)

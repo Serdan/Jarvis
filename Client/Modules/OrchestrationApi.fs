@@ -2947,8 +2947,8 @@ module TaskApi =
                                     cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
                                 |> mapError
                             | "BeginAttempt" ->
-                                ReviewWorkflow.ReviewWorkflow.beginAttemptWithSession binding operationId cmd.TaskId
-                                    cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration cmd.SessionId
+                                ReviewWorkflow.ReviewWorkflow.beginAttemptWithSessionGuarded binding operationId cmd.TaskId
+                                    cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration cmd.SessionId (fun current -> ScheduledReadyResume.guardUncorrelatedActivationAt binding current cmd.ActorId)
                                 |> mapError
                             | "BindReviewBase" ->
                                 ReviewWorkflow.ReviewWorkflow.bindReviewBase binding operationId cmd.TaskId
@@ -2978,9 +2978,9 @@ module TaskApi =
                             // Backward compatibility for operations already persisted in
                             // protocol 3.57 pending journals; no public resume tool exists.
                             | "ResumeAgent" ->
-                                ReviewWorkflow.ReviewWorkflow.resumeAgentWithSession binding operationId
+                                ReviewWorkflow.ReviewWorkflow.resumeAgentWithSessionGuarded binding operationId
                                     cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                                    cmd.AssignmentGeneration cmd.SessionId |> mapError
+                                    cmd.AssignmentGeneration cmd.SessionId (fun current -> ScheduledReadyResume.guardUncorrelatedActivationAt binding current cmd.ActorId) |> mapError
                             | "CompleteAgentWork" ->
                                 ReviewWorkflow.ReviewWorkflow.completeAgentWorkWithSession binding operationId
                                     cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion

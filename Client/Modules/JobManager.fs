@@ -51,12 +51,19 @@ module private Core =
         | Durable.Live receipt | Durable.Terminal receipt -> receipt.Status, Some receipt
         | Durable.Unknown receipt -> JobStatus.RecoveryUnknown unknownMessage, receipt
 
-    let private authorized (canonical: ProjectPaths.ProjectId option) (actor: string option) (request: Durable.Request) =
+    let private authorizeRead (canonical: ProjectPaths.ProjectId option) (actor: string option) (request: Durable.Request) =
         if canonical |> Option.exists (fun id -> ProjectPaths.ProjectId.value id <> request.Project) then
             Error(Client.ValidationError "jobId does not belong to the requested project.")
-        elif actor.IsSome && (canonical.IsNone || actor <> request.Actor) then
-            Error(Client.ValidationError "Engineering job belongs to another initiating agent or project.")
+        elif actor.IsSome && canonical.IsNone then
+            Error(Client.ValidationError "Engineering job requires its project selector.")
         else Ok()
+
+    let private authorizeCancel canonical actor (request: Durable.Request) =
+        match authorizeRead canonical actor request with
+        | Error error -> Error error
+        | Ok () when actor.IsSome && actor <> request.Actor ->
+            Error(Client.ValidationError "Engineering job belongs to another initiating agent or project.")
+        | Ok () -> Ok()
 
     let private pending now (request: Durable.Request) = now - request.StartedAt < startupGrace
 
@@ -218,7 +225,7 @@ module private Core =
             | Durable.Terminal value -> value.CompletedAt
             | _ -> None }
 
-    let listJobsForProject canonical actor (cmd: ListJobsCommand) =
+    let listJobsForProject canonical (cmd: ListJobsCommand) =
         fun rt ->
             try
                 let root = rootForRuntime rt
@@ -226,8 +233,7 @@ module private Core =
                 Durable.entries root
                 |> Array.choose (fun (directory, request) ->
                     let projectMatches = canonical |> Option.forall (fun id -> ProjectPaths.ProjectId.value id = request.Project)
-                    let actorMatches = actor |> Option.forall (fun id -> request.Actor = Some id)
-                    if not (projectMatches && actorMatches) then None
+                    if not projectMatches then None
                     else
                         let summary = toSummary request (Durable.observe directory request)
                         if cmd.IncludeCompleted || summary.Status = Running then Some summary else None)
@@ -236,7 +242,7 @@ module private Core =
                 |> fun items -> Ok { Jobs = items }
             with ex -> Error(ExceptionError ex)
 
-    let private withJob rt canonical actor id action =
+    let private withJob rt authorize canonical actor id action =
         try
             let root = rootForRuntime rt
             if not (Durable.validId id) then Error(NotFoundError $"Unknown job id: {id}")
@@ -245,14 +251,14 @@ module private Core =
                 if not (Directory.Exists directory) then Error(NotFoundError $"Unknown job id: {id}")
                 else
                     let request = Durable.readRequest directory
-                    match authorized canonical actor request with
+                    match authorize canonical actor request with
                     | Error error -> Error error
                     | Ok () -> action directory request
         with ex -> Error(ExceptionError ex)
 
     let getJobResultForProject canonical actor (cmd: GetJobResultCommand) =
         fun rt ->
-            withJob rt canonical actor cmd.JobId (fun directory request ->
+            withJob rt authorizeRead canonical actor cmd.JobId (fun directory request ->
                 let observation = Durable.observe directory request
                 let status, receipt = statusAndReceipt observation
                 let afterSequence = defaultArg cmd.AfterSequence 0L |> max 0L
@@ -273,7 +279,7 @@ module private Core =
 
     let cancelJobForProject canonical actor (cmd: CancelJobCommand) =
         fun rt ->
-            withJob rt canonical actor cmd.JobId (fun directory request ->
+            withJob rt authorizeCancel canonical actor cmd.JobId (fun directory request ->
                 match Durable.observe directory request with
                 | Durable.Terminal _ -> Ok()
                 | Durable.Unknown _ -> Error(Client.ContextError unknownMessage)
@@ -667,7 +673,7 @@ let startJob (cmd: StartJobCommand) =
 
 let listJobsForProjectAsAgent (canonical: ProjectPaths.ProjectId option) (_actor: string option) (cmd: ListJobsCommand) =
     fun rt ->
-        match Core.listJobsForProject canonical actor cmd rt with
+        match Core.listJobsForProject canonical cmd rt with
         | Error error -> Error error
         | Ok processJobs ->
             let toolJobs = ToolOperations.list canonical cmd.IncludeCompleted

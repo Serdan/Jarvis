@@ -1226,15 +1226,36 @@ let ``durable receipt survives independent initiating host exit`` completedBefor
             listJobsForProjectAsAgent (durableProject ()) durableOwner
                 { ProjectName = Some "Project1"; IncludeCompleted = true } (TestContext root) |> requireOk
         ownerList.Jobs |> List.exists (fun j -> j.JobId = id && j.AgentId = durableOwner) |> shouldEqual true
-        let wrongList =
-            listJobsForProjectAsAgent (durableProject ()) (Some "other")
-                { ProjectName = Some "Project1"; IncludeCompleted = true } (TestContext root) |> requireOk
-        wrongList.Jobs |> List.exists (fun j -> j.JobId = id) |> shouldEqual false
-        durableResult root (Some "other") id |> Result.isError |> shouldEqual true
+        let otherActor = Some "other"
+        let listFor project actor includeCompleted =
+            listJobsForProjectAsAgent project actor
+                { ProjectName = project |> Option.map ProjectPaths.ProjectId.value; IncludeCompleted = includeCompleted }
+                (TestContext root) |> requireOk
+        let matchingJob jobs =
+            jobs.Jobs |> List.tryFind (fun j -> j.JobId = id)
+        let sameProject = listFor (durableProject ()) otherActor true |> matchingJob |> Option.get
+        sameProject.Kind |> shouldEqual JobKind.Process
+        sameProject.AgentId |> shouldEqual durableOwner
+        let peerRead = durableResult root otherActor id |> requireOk
+        peerRead.JobId |> shouldEqual id
+        peerRead.Status |> shouldEqual (if completedBeforeRestart then Completed 17 else Running)
+        let allProjects = listFor None otherActor true |> matchingJob |> Option.get
+        allProjects.AgentId |> shouldEqual durableOwner
+        listFor (durableProject ()) otherActor false |> matchingJob |> Option.isSome
+        |> shouldEqual (not completedBeforeRestart)
         let wrongProject = ProjectPaths.ProjectTarget.parse "Project2" |> requireOk |> ProjectPaths.ProjectTarget.projectId |> Some
-        getJobResultForProjectAsAgent wrongProject durableOwner
-            { ProjectName = "Project2"; JobId = id; AfterSequence = None } (TestContext root)
-            |> Result.isError |> shouldEqual true
+        for actor in [durableOwner; otherActor] do
+            listFor wrongProject actor true |> matchingJob |> shouldEqual None
+            getJobResultForProjectAsAgent wrongProject actor
+                { ProjectName = "Project2"; JobId = id; AfterSequence = None } (TestContext root)
+                |> Result.isError |> shouldEqual true
+            getJobResultForProjectAsAgent None actor
+                { ProjectName = ""; JobId = id; AfterSequence = None } (TestContext root)
+                |> Result.isError |> shouldEqual true
+        for scope in [wrongProject; None] do
+            cancelJobForProjectAsAgent scope durableOwner
+                { ProjectName = ""; JobId = id } (TestContext root)
+                |> Result.isError |> shouldEqual true
         cancelJobForProjectAsAgent (durableProject ()) (Some "other")
             { ProjectName = "Project1"; JobId = id } (TestContext root)
             |> Result.isError |> shouldEqual true
@@ -1245,7 +1266,14 @@ let ``durable receipt survives independent initiating host exit`` completedBefor
         terminal.Events |> List.exists (fun e -> e.Stream = JobOutputStream.StdOut && e.Text.Contains("durable stdout")) |> shouldEqual true
         terminal.Events |> List.exists (fun e -> e.Stream = JobOutputStream.StdErr && e.Text.Contains("durable stderr")) |> shouldEqual true
         File.ReadAllLines(marker) |> Array.toList |> shouldEqual ["once"]
-        durableResult root durableOwner id |> requireOk |> shouldEqual terminal)
+        durableResult root durableOwner id |> requireOk |> shouldEqual terminal
+        durableResult root otherActor id |> requireOk |> shouldEqual terminal
+        listFor (durableProject ()) otherActor false |> matchingJob |> shouldEqual None
+        cancelJobForProjectAsAgent (durableProject ()) otherActor
+            { ProjectName = "Project1"; JobId = id } (TestContext root)
+            |> Result.isError |> shouldEqual true
+        cancelJobForProjectAsAgent (durableProject ()) durableOwner
+            { ProjectName = "Project1"; JobId = id } (TestContext root) |> requireOk)
 
 [<Test>]
 let ``durable cancellation after initiating host exit records observed cancellation`` () =
@@ -1295,7 +1323,7 @@ let ``durable recovery preserves unknown registrations and bounds terminal reten
             File.WriteAllBytes(Path.Combine(terminalDirectory, "receipt.json"), System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(receipt))
         let listed = listJobsForProjectAsAgent (durableProject ()) durableOwner
                         { ProjectName = Some "Project1"; IncludeCompleted = true } (TestContext root) |> requireOk
-        listed.Jobs.Length |> shouldEqual 202
+        listed.Jobs |> List.filter (fun job -> job.Kind = JobKind.Process) |> List.length |> shouldEqual 202
         for job in stale :: jobs do
             Directory.Exists(Durable.jobDirectory registry job.JobId) |> shouldEqual true
             match (durableResult root durableOwner job.JobId |> requireOk).Status with

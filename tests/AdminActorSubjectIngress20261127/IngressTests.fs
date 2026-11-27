@@ -258,15 +258,15 @@ let private runCase action mode = task {
             call user scopes "get_job_result"
                 ["projectName", box proj; "agentId", box who; "deviceId", box device
                  "jobId", box id; "afterSequence", null]
-        let rec terminal who jobId deadline = task {
+        let rec terminal expectedStatus who jobId deadline = task {
             let! failed, raw = poll "alice" who project jobId
             Assert.That(failed, Is.False, raw)
             let job = parseFirstLine<JobResult> raw
             match job.Status with
-            | ToolCompleted -> return job
+            | status when status = expectedStatus -> return job
             | Running when DateTimeOffset.UtcNow < deadline ->
                 do! Task.Delay(50)
-                return! terminal who jobId deadline
+                return! terminal expectedStatus who jobId deadline
             | _ -> return failwithf "Unexpected or expired disposable job: %A" job.Status
         }
         try
@@ -363,15 +363,43 @@ let private runCase action mode = task {
                     let! changedFailed, changedRaw = call "alice" scopes scenario.Route changedArgs
                     Assert.That(changedFailed, Is.True, changedRaw)
                 Assert.That(Volatile.Read(&executions), Is.EqualTo(1))
+            // Snapshot after the already-observed legacy ingress/duplicate effects,
+            // while the actual dispatcher is still gated. Rejection must add
+            // no canonical bytes, versions, alert consumption or activity.
+            // This does NOT claim that legacy ingress attribution was correct.
+            let invalidControl = mode = "control" && not scenario.ShouldApply
+            let! rejectionBaseline = task {
+                if invalidControl then
+                    let snapshot = LedgerStore.fetch second |> success
+                    let alerts = ReviewWorkflow.getResponseAlertsAt second snapshot subject |> success
+                    let! activity = verifiedActivity subject
+                    return Some(snapshot, alerts, activity.LastSeenAtUtc)
+                else return None
+            }
             gate.TrySetResult(()) |> ignore
             let! response = finished.Task.WaitAsync(TimeSpan.FromSeconds(35.))
             let _, receipt = LedgerStore.getOperationStatus second (Guid.Parse operation) |> success
             TestContext.WriteLine(sprintf "terminal error=%A, receipt=%A, target activity=%A" response.Error (receipt |> Option.map (fun r -> r.Type)) after.LastSeenAtUtc)
             if mode = "control" then
-                // No claim that every route succeeds in every ledger state:
-                // the passing cases prove terminal evidence; deliberate invalid
-                // state cases prove only actual routing, bytes and privacy.
-                let! result = terminal transportedActor job.JobId (DateTimeOffset.UtcNow.AddSeconds(15.))
+                let expectedStatus =
+                    if scenario.ShouldApply then ToolCompleted
+                    else
+                        let expectedCode, expectedMessage =
+                            match action with
+                            | "AdoptTaskSpec" ->
+                                "StaleEntityVersion",
+                                string (LedgerStore.StaleEntityVersion "Spec adoption requires an unstarted, unchanged Assigned attempt and exact new canonical blob.")
+                            | "ReissueQueuedAttempt" ->
+                                "AgentBusy",
+                                string (LedgerStore.AgentBusy "Cannot replace the current assignment of a Ready or Working agent.")
+                            | _ -> failwithf "No authorized negative control for %s" action
+                        match response.Error with
+                        | Some (AgentError.LedgerFailure failure) ->
+                            Assert.That(failure.Code, Is.EqualTo(expectedCode))
+                            Assert.That(failure.Message, Is.EqualTo(expectedMessage))
+                        | error -> Assert.Fail(sprintf "Expected exact typed rejection, got %A" error)
+                        ToolFailed(sprintf "%A" response.Error.Value)
+                let! result = terminal expectedStatus transportedActor job.JobId (DateTimeOffset.UtcNow.AddSeconds(15.))
                 Assert.That(result.ToolResponse.IsSome, Is.True)
                 Assert.That(result.ToolResponse.Value.Error, Is.EqualTo(response.Error))
                 if scenario.ShouldApply then
@@ -384,6 +412,21 @@ let private runCase action mode = task {
                         let snapshot = LedgerStore.fetch second |> success
                         let state = ReviewWorkflow.getAgentWorkingTurnAt second snapshot subject |> success
                         Assert.That(state.State, Is.EqualTo("Ready"))
+                else
+                    Assert.That(result.JobId, Is.EqualTo(job.JobId))
+                    Assert.That(result.OperationId, Is.EqualTo(job.OperationId))
+                    Assert.That(result.ToolResponse.Value, Is.EqualTo(response))
+                    Assert.That(response.Result.IsNone, Is.True)
+                    Assert.That(response.PendingJob.IsNone, Is.True)
+                    Assert.That(receipt.IsNone, Is.True, "Rejected operation must have no applied receipt.")
+                    let snapshotBefore, alertsBefore, activityBefore = rejectionBaseline.Value
+                    let snapshotAfter = LedgerStore.fetch second |> success
+                    Assert.That(snapshotAfter.Commit, Is.EqualTo(snapshotBefore.Commit), "Rejected dispatch must leave every canonical byte/version unchanged.")
+                    let alertsAfter = ReviewWorkflow.getResponseAlertsAt second snapshotAfter subject |> success
+                    Assert.That(alertsAfter, Is.EqualTo(alertsBefore), "Rejected dispatch must not additionally consume an alert.")
+                    let! activityAfter = verifiedActivity subject
+                    Assert.That(activityAfter.LastSeenAtUtc, Is.EqualTo(activityBefore), "Rejected dispatch must not additionally change subject activity.")
+                    Assert.That(Volatile.Read(&executions), Is.EqualTo(1))
             elif mode = "legacy" then
                 // Desired legacy invariant: subject-only input does not establish
                 // an agent owner or activity. This is intentionally RED on baseline.
@@ -395,7 +438,7 @@ let private runCase action mode = task {
                 Assert.That(job.AgentId, Is.EqualTo(initiator))
                 Assert.That(json, Is.EqualTo(canonical), "Explicit actor must not change canonical subject or request bytes.")
                 Assert.That(after.LastSeenAtUtc, Is.EqualTo(before.LastSeenAtUtc))
-                let! result = terminal initiator job.JobId (DateTimeOffset.UtcNow.AddSeconds(15.))
+                let! result = terminal ToolCompleted initiator job.JobId (DateTimeOffset.UtcNow.AddSeconds(15.))
                 Assert.That(result.ToolResponse.IsSome, Is.True)
                 if action <> "RegisterAgent" then
                     let alerts = ReviewWorkflow.getResponseAlerts second subject |> success

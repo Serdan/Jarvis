@@ -1,0 +1,1 @@
+Scoped preflight only: 3/3 legacy green, 1/1 expected red on all three contract assertions, 1/1 authenticated real registration green; report includes exact job IDs and measured direct/HTTP bytes and Git IO, pinned historical retrieval, compatibility and minimum production wiring. No production edits. New implementation requires fresh lease.

@@ -1,27 +1,28 @@
 #!/usr/bin/env dotnet
 using System.Diagnostics;
-using System.Security.Cryptography;
 
-var root = Directory.GetCurrentDirectory();
-var process = Process.Start(new ProcessStartInfo("dotnet")
+// The shared publisher owns the build, evidence and final-copy boundary.
+var root = FindRepositoryRoot();
+var start = new ProcessStartInfo(OperatingSystem.IsWindows() ? "python" : "python3")
 {
-    ArgumentList = { "scripts/build.cs", "publish-server", "--rid", "linux-x64" },
     UseShellExecute = false
-}) ?? throw new Exception("Could not start server publish.");
+};
+start.ArgumentList.Add("-B");
+start.ArgumentList.Add(Path.Combine(root, "scripts", "release-provenance-publisher-composition", "publish.py"));
+start.ArgumentList.Add("JarvisServer");
+foreach (var arg in args)
+    start.ArgumentList.Add(arg);
+using var process = Process.Start(start) ?? throw new InvalidOperationException("Could not start provenance publisher.");
 process.WaitForExit();
-if (process.ExitCode != 0) return process.ExitCode;
-var dir = Path.Combine(root, "artifacts", "downloads");
-Directory.CreateDirectory(dir);
-var file = "JarvisServer-linux-x64";
-var source = Path.Combine(root, "artifacts", "server", "linux-x64", "JarvisServer");
-File.Copy(source, Path.Combine(dir, file), true);
-using var stream = File.OpenRead(Path.Combine(dir, file));
-var hash = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
-var manifest = Path.Combine(dir, "SHA256SUMS");
-var lines = File.Exists(manifest)
-    ? File.ReadAllLines(manifest).Where(line => !line.EndsWith("  " + file, StringComparison.Ordinal)).ToList()
-    : new List<string>();
-lines.Add(hash + "  " + file);
-File.WriteAllLines(manifest, lines.Order(StringComparer.Ordinal));
-Console.WriteLine($"Published {file}: {hash}");
-return 0;
+return process.ExitCode;
+
+string FindRepositoryRoot()
+{
+    foreach (var startDirectory in new[] { Directory.GetCurrentDirectory(), AppContext.BaseDirectory })
+    {
+        for (var current = new DirectoryInfo(startDirectory); current is not null; current = current.Parent)
+            if (File.Exists(Path.Combine(current.FullName, "Jarvis.slnx")))
+                return current.FullName;
+    }
+    throw new InvalidOperationException("Could not find repository root containing Jarvis.slnx.");
+}

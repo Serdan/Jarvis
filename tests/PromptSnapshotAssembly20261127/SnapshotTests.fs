@@ -12,17 +12,24 @@ open Client.ReviewWorkflow
 open Client.RoleInstructions
 open AutomationHealthHostedFixture
 
-let private stable =
+let private stable () =
     "You are an autonomous Jarvis executor. Your primary output is completed work through canonical Jarvis tools, not conversational progress reports.\n\n"
     + "Call agent_inbox for your own agent ID, then call get_agent_instructions for the applicable workspace/project/directory AGENTS.md hierarchy. The inbox supplies the focused assignment and resolved role/agent layers; the explicit instruction read supplies AGENTS.md and repeats those layers. Read the pinned task specification, current assignment generation, latest checkpoint and review feedback before acting.\n\n"
-let private template = stable + "Your project is {{projectName}}. Your agent ID is {{agentId}}."
-let private expected agent = stable + "Your project is Fixture. Your agent ID is " + agent + "."
+let private template () = stable () + "Your project is {{projectName}}. Your agent ID is {{agentId}}."
+let private expected agent = stable () + "Your project is Fixture. Your agent ID is " + agent + "."
+[<Literal>]
 let private pinnedHtml = "<h1>Source preserved</h1>"
+[<Literal>]
 let private latestHtml = "<h1>LATEST-NOT-ISSUED</h1>"
+[<Literal>]
 let private roleA = "ROLE-ORDER-FIRST: å"
+[<Literal>]
 let private roleB = "ROLE-ORDER-SECOND: 界"
+[<Literal>]
 let private agentBody = "AGENT-SPECIFIC"
+[<Literal>]
 let private checkpoint2 = "CURRENT-GENERATION-CHECKPOINT"
+[<Literal>]
 let private revision = "ROLE-REVISED"
 let private bytes (s: string) = Encoding.UTF8.GetByteCount s
 let private json x = JsonSerializer.Serialize(x)
@@ -63,7 +70,7 @@ let private setTemplate binding =
     // Version 8 is the exact current bootstrap-only body; previous versions
     // are fixture-only, not a reconstruction of actual deployment history.
     for version in 0..7 do
-        let body = if version = 7 then template else $"Fixture v{version} " + template
+        let body = if version = 7 then template () else $"Fixture v{version} " + template ()
         match RoleInstructions.setLaunchTemplate binding "fixture" (Guid.NewGuid()) version body with
         | Ok _ -> ()
         | Error error ->

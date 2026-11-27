@@ -214,6 +214,60 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(2, proc.returncode)
         self.assertEqual("invalid", json.loads(proc.stdout)["status"])
 
+    def cli_report(self, expected_exit):
+        path = self.root / "manifest.json"
+        path.write_text(json.dumps(self.manifest), encoding="utf-8")
+        proc = subprocess.run([sys.executable, "-B", str(Path(__file__).with_name("verify.py")),
+                               str(path), "--repo", str(self.repo)], capture_output=True, text=True)
+        self.assertEqual(expected_exit, proc.returncode, proc.stderr)
+        self.assertEqual("", proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_surrogate_paths_cli(self):
+        for field in ("path", "stamp", "build", "release"):
+            for surrogate in ("\ud800", "\udfff", "\udc80"):
+                with self.subTest(field=field, surrogate=repr(surrogate)):
+                    original = copy.deepcopy(self.entry)
+                    try:
+                        malformed = "bad" + surrogate + ".bin"
+                        if field == "path":
+                            self.entry["path"] = malformed
+                        else:
+                            self.entry[field]["path"] = malformed
+                        reason = ("invalid_artifact_path" if field == "path"
+                                  else "invalid_receipt_reference")
+                        self.assertEqual({"status": "invalid", "reasons": [reason]},
+                                         self.cli_report(2))
+                    finally:
+                        self.entry.clear()
+                        self.entry.update(original)
+
+    def test_unicode_paths_cli(self):
+        path = self.root / "\u00e9-\U0001f600.bin"
+        self.artifact.rename(path)
+        self.entry["path"] = path.name
+        for field in ("stamp", "build", "release"):
+            old = self.root / self.entry[field]["path"]
+            new = self.root / (field + "-\u00e9-\U0001f600.json")
+            old.rename(new)
+            self.entry[field]["path"] = new.name
+        self.assertEqual("verified", self.cli_report(0)["status"])
+
+    def test_missing_unicode_artifact_cli(self):
+        self.entry["path"] = "missing-\u00e9.bin"
+        report = self.cli_report(2)
+        self.assertEqual("unknown", report["status"])
+        self.assertEqual("unknown", report["artifacts"][0]["artifactBytes"]["status"])
+
+    def test_unicode_artifact_digest_mismatch_cli(self):
+        path = self.root / "\u00e9.bin"
+        self.artifact.rename(path)
+        self.entry["path"] = path.name
+        self.entry["expectedSha256"] = "0" * 64
+        report = self.cli_report(1)
+        self.assertEqual("mismatch", report["status"])
+        self.assertEqual("mismatch", report["artifacts"][0]["artifactBytes"]["status"])
+
     def test_multiple_artifacts_not_cross_attributed(self):
         another = copy.deepcopy(self.entry)
         another["id"] = "server"

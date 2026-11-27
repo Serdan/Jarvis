@@ -46,7 +46,9 @@ def target_identity(value):
 
 
 def explicit_path(value):
-    return isinstance(value, str) and 0 < len(value) <= 4096 and "\x00" not in value
+    # JSON paths are Unicode scalar strings, not host-specific surrogateescape byte paths.
+    return (isinstance(value, str) and 0 < len(value) <= 4096 and "\x00" not in value
+            and not any(0xD800 <= ord(char) <= 0xDFFF for char in value))
 
 
 def unique_object(pairs):

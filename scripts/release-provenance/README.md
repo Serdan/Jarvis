@@ -22,7 +22,11 @@ report the source-tree binding as unknown.
 
 Use a JSON manifest with an exact source commit and tree, and one to sixteen
 explicit artifact entries. Paths are relative to the manifest's directory
-unless absolute. Use lowercase full Git object IDs (SHA-1 or SHA-256, with the
+unless absolute. Artifact and receipt paths must be nonempty Unicode scalar
+strings of at most 4096 characters, with no NUL or surrogate code points
+(including host-specific surrogateescape byte paths). Invalid paths are rejected
+before file observation; well-formed but missing files remain unknown.
+Use lowercase full Git object IDs (SHA-1 or SHA-256, with the
 same length for the commit and tree) and lowercase 64-digit SHA-256 values.
 The fixture in `test_verify.py` constructs an entire matching manifest and its
 receipts using a disposable local Git repository and synthetic artifact bytes.

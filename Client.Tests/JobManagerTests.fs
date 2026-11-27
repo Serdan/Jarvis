@@ -60,6 +60,20 @@ let ``job lifecycle starts lists reads and cancels`` () =
             result.NextSequence >= 0L |> shouldEqual true
         | Error error -> Assert.Fail($"Expected GetJobResult Ok, got {error}")
 
+        let project =
+            match ProjectPaths.ProjectTarget.parse "Project1" with
+            | Ok target -> Some(ProjectPaths.ProjectTarget.projectId target)
+            | Error error -> failwith $"Cannot parse test project: {error}"
+        for actor in [Some "Worker 1"; Some "Worker 2"] do
+            match listJobsForProjectAsAgent project actor { ProjectName = Some "Project1"; IncludeCompleted = true } context with
+            | Ok result ->
+                let job = result.Jobs |> List.find (fun job -> job.JobId = jobId)
+                job.Kind |> shouldEqual JobKind.Process
+                job.AgentId |> shouldEqual None
+            | Error error -> Assert.Fail($"Expected process listing: {error}")
+            match getJobResultForProjectAsAgent project actor { ProjectName = "Project1"; JobId = jobId; AfterSequence = None } context with
+            | Ok result -> result.JobId |> shouldEqual jobId
+            | Error error -> Assert.Fail($"Expected process result: {error}")
         cancelJob { ProjectName = "Project1"; JobId = jobId } context |> shouldEqual (Ok())
     finally
         Directory.Delete(root, true)
@@ -370,9 +384,9 @@ let private completedToolResponse payload : AgentCommandResponse =
 [<Test>]
 let autoPromotedToolRetainsIdenticalTypedOutcomeAndNeverExecutesTwice () =
     let root = createTempProject ()
+    let blocked = TaskCompletionSource<AgentCommandResponse>(TaskCreationOptions.RunContinuationsAsynchronously)
     try
         let context = TestContext root
-        let blocked = TaskCompletionSource<AgentCommandResponse>(TaskCreationOptions.RunContinuationsAsynchronously)
         let count = ref 0
         let registered =
             match startToolOperation jobProject (Some "Project1") "Worker 1" "ReadFile"
@@ -392,36 +406,71 @@ let autoPromotedToolRetainsIdenticalTypedOutcomeAndNeverExecutesTwice () =
         Assert.That(handle.Status, Is.EqualTo("Running"))
         Assert.That(handle.OperationId, Is.EqualTo(Some "operation-one"))
         let cmd = { ProjectName = "Project1"; JobId = handle.JobId; AfterSequence = None }
-        match getJobResultForProjectAsAgent jobProject (Some "Worker 1") cmd context with
-        | Ok value ->
-            Assert.That(value.Status, Is.EqualTo(JobStatus.Running))
-            Assert.That(value.ToolResponse.IsNone, Is.True)
-        | Error error -> Assert.Fail($"Expected running tool: {error}")
+        let actors = [Some "Worker 1"; Some "Worker 2"]
+        let listFor project actor includeCompleted =
+            match listJobsForProjectAsAgent project actor
+                      { ProjectName = Some "Project1"; IncludeCompleted = includeCompleted } context with
+            | Ok result -> result.Jobs |> List.tryFind (fun job -> job.JobId = handle.JobId)
+            | Error error -> failwith $"Listing failed: {error}"
+        for actor in actors do
+            match getJobResultForProjectAsAgent jobProject actor cmd context with
+            | Ok value ->
+                Assert.That(value.Status, Is.EqualTo(JobStatus.Running))
+                Assert.That(value.ToolResponse.IsNone, Is.True)
+            | Error error -> Assert.Fail($"Expected running tool: {error}")
+            let listed = listFor jobProject actor false |> Option.get
+            Assert.That(listed.AgentId, Is.EqualTo(Some "Worker 1"))
+            Assert.That(listed.Status, Is.EqualTo(JobStatus.Running))
+        let cancel = { ProjectName = "Project1"; JobId = handle.JobId }
+        match cancelJobForProjectAsAgent jobProject (Some "Worker 2") cancel context with
+        | Error(Client.ValidationError message) ->
+            Assert.That(message, Is.EqualTo("Tool job belongs to another initiating agent."))
+        | other -> Assert.Fail($"Cross-agent running cancellation must remain denied: {other}")
+        Assert.That((listFor None (Some "Worker 2") false |> Option.get).AgentId,
+                    Is.EqualTo(Some "Worker 1"))
         let original = completedToolResponse """{"result":"complete"}"""
         blocked.SetResult original
         let _, completion = registered
         let observed = completion.WaitAsync(TimeSpan.FromSeconds 4.).GetAwaiter().GetResult()
         Assert.That(observed, Is.EqualTo(original))
-        for _ in 1 .. 3 do
-            match getJobResultForProjectAsAgent jobProject (Some "Worker 1") cmd context with
-            | Ok value ->
-                Assert.That(value.Status, Is.EqualTo(JobStatus.ToolCompleted))
-                Assert.That(value.ToolResponse, Is.EqualTo(Some original))
-                Assert.That(value.OperationId, Is.EqualTo(Some "operation-one"))
-            | Error error -> Assert.Fail($"Expected complete tool: {error}")
+        for actor in actors do
+            for _ in 1 .. 3 do
+                match getJobResultForProjectAsAgent jobProject actor cmd context with
+                | Ok value ->
+                    Assert.That(value.Status, Is.EqualTo(JobStatus.ToolCompleted))
+                    Assert.That(value.ToolResponse, Is.EqualTo(Some original))
+                    Assert.That(value.OperationId, Is.EqualTo(Some "operation-one"))
+                | Error error -> Assert.Fail($"Expected complete tool: {error}")
+            let listed = listFor jobProject actor true |> Option.get
+            Assert.That(listed.AgentId, Is.EqualTo(Some "Worker 1"))
+            Assert.That(listed.Status, Is.EqualTo(JobStatus.ToolCompleted))
+            Assert.That(listFor jobProject actor false, Is.EqualTo(None))
         Assert.That(count.Value, Is.EqualTo(1),
                     "Polling must not reexecute the original operation or its ledger mutations.")
-        match getJobResultForProjectAsAgent jobProject (Some "OtherAgent") cmd context with
-        | Error _ -> ()
-        | Ok _ -> Assert.Fail("Wrong agent must not read a tool operation job.")
         let otherProject =
             match ProjectPaths.ProjectTarget.parse "OtherProject" with
             | Ok target -> Some(ProjectPaths.ProjectTarget.projectId target)
-            | Error _ -> None
-        match getJobResultForProjectAsAgent otherProject (Some "Worker 1") cmd context with
-        | Error _ -> ()
-        | Ok _ -> Assert.Fail("Wrong project must not read a tool operation job.")
+            | Error error -> failwith $"Cannot parse other test project: {error}"
+        for actor in actors do
+            match getJobResultForProjectAsAgent otherProject actor cmd context with
+            | Error(Client.ValidationError message) ->
+                Assert.That(message, Is.EqualTo("Tool job belongs to a different project; use its project selector."))
+            | other -> Assert.Fail($"Wrong project must not read a tool operation job: {other}")
+            Assert.That(listFor otherProject actor true, Is.EqualTo(None))
+        match cancelJobForProjectAsAgent otherProject (Some "Worker 1") cancel context with
+        | Error(Client.ValidationError message) ->
+            Assert.That(message, Is.EqualTo("Tool job belongs to a different project; use its project selector."))
+        | other -> Assert.Fail($"Owner cancellation with wrong project must remain denied: {other}")
+        for project in [jobProject; otherProject] do
+            match cancelJobForProjectAsAgent project (Some "Worker 2") cancel context with
+            | Error(Client.ValidationError message) ->
+                Assert.That(message, Is.EqualTo("Tool job belongs to another initiating agent."))
+            | other -> Assert.Fail($"Cross-agent cancellation must remain denied: {other}")
+        match cancelJobForProjectAsAgent jobProject (Some "Worker 1") cancel context with
+        | Ok () -> ()
+        | other -> Assert.Fail($"Owner terminal cancellation must remain idempotent: {other}")
     finally
+        blocked.TrySetResult(completedToolResponse """{"cleanup":true}""") |> ignore
         Directory.Delete(root, true)
 
 [<Test>]

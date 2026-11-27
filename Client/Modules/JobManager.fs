@@ -498,15 +498,17 @@ module private ToolOperations =
 
     let contains jobId = records.ContainsKey jobId
 
-    let private authorize (entry: ToolOperationRecord) canonical agent =
+    let private authorizeRead (entry: ToolOperationRecord) canonical agent =
+        // Local TUI access has no actor but remains confined to this client.
+        if canonical <> entry.CanonicalProject && Option.isSome agent then
+            Error(Client.ValidationError "Tool job belongs to a different project; use its project selector.")
+        else Ok ()
+
+    let private authorizeCancel (entry: ToolOperationRecord) canonical agent =
         match agent with
         | Some actor when not (String.Equals(entry.Handle.AgentId, actor, StringComparison.Ordinal)) ->
             Error(Client.ValidationError "Tool job belongs to another initiating agent.")
-        | _ ->
-            // Local TUI access has no actor but remains confined to this client.
-            if canonical <> entry.CanonicalProject && agent.IsSome then
-                Error(Client.ValidationError "Tool job belongs to a different project; use its project selector.")
-            else Ok ()
+        | _ -> authorizeRead entry canonical agent
 
     let private toSummary (entry: ToolOperationRecord) =
         { JobId = entry.Handle.JobId
@@ -523,14 +525,13 @@ module private ToolOperations =
           StartedAt = entry.Handle.StartedAt
           CompletedAt = entry.CompletedAt }
 
-    let list canonical actor includeCompleted =
+    let list canonical includeCompleted =
         lock gate (fun () ->
             prune DateTimeOffset.UtcNow
             records.Values
             |> Seq.filter (fun entry ->
                 entry.Exposed
                 && (canonical |> Option.forall (fun requested -> Some requested = entry.CanonicalProject))
-                && (actor |> Option.forall (fun id -> id = entry.Handle.AgentId))
                 && (includeCompleted || entry.Status = Running))
             |> Seq.map toSummary
             |> Seq.toList)
@@ -541,7 +542,7 @@ module private ToolOperations =
             match records.TryGetValue jobId with
             | true, entry ->
                 let result =
-                    match authorize entry canonical actor with
+                    match authorizeRead entry canonical actor with
                     | Error error -> Error error
                     | Ok () ->
                         let response =
@@ -573,7 +574,7 @@ module private ToolOperations =
             | false, _ -> None
             | true, entry ->
                 let response =
-                    match authorize entry canonical actor with
+                    match authorizeCancel entry canonical actor with
                     | Error error -> Error error
                     | Ok () when entry.Status <> Running -> Ok ()
                     | Ok () when entry.StartedExecution ->
@@ -630,12 +631,12 @@ let startJob (cmd: StartJobCommand) =
         return! Core.startJobForTarget target cmd
     }
 
-let listJobsForProjectAsAgent (canonical: ProjectPaths.ProjectId option) actor (cmd: ListJobsCommand) =
+let listJobsForProjectAsAgent (canonical: ProjectPaths.ProjectId option) (_actor: string option) (cmd: ListJobsCommand) =
     fun rt ->
         match Core.listJobsForProject canonical cmd rt with
         | Error error -> Error error
         | Ok processJobs ->
-            let toolJobs = ToolOperations.list canonical actor cmd.IncludeCompleted
+            let toolJobs = ToolOperations.list canonical cmd.IncludeCompleted
             Ok { Jobs = processJobs.Jobs @ toolJobs }
 
 let listJobsForProject (canonical: ProjectPaths.ProjectId option) (cmd: ListJobsCommand) =

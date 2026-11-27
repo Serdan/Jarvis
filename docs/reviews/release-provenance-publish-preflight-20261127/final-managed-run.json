@@ -1,0 +1,101 @@
+{
+  "JobId": "deda0527a5f245a7908d721ea338fe93",
+  "Status": {
+    "case": "Completed",
+    "exitCode": 0
+  },
+  "NextSequence": 18,
+  "Truncated": false,
+  "Events": [
+    {
+      "Sequence": 1,
+      "Stream": "StdOut",
+      "Text": "{\"source\": {\"commit\": \"291b5499051fbddfff1c76308e1a0202a5d1862f\", \"tree\": \"fc4aaf661d434c479b403d09ee1535e3d58d3442\"}, \"helperCommit\": \"92bcb1a97a5a8d27f36eb535553961c4cabb4ce9\", \"helperSha256\": \"905a0edac953f4495624ca52e743bb688af1bd79fa0a0b3f32e2721aaf30c7eb\", \"sdk\": \"11.0.100\", \"fixtureOnly\": true, \"harnessSha256\": \"9c017e4074c66fe2414303e793e841f0ca43bccc93e96a9fe115a568a38bc3cc\"}\n"
+    },
+    {
+      "Sequence": 2,
+      "Stream": "StdOut",
+      "Text": "{\"scenario\": \"positive\", \"product\": \"JarvisServer\", \"nonce\": \"c4410d26c8ab44ada80eb758e892c1b1\", \"publisherExit\": 0, \"invocations\": 1, \"helperExit\": 0, \"helperStatus\": \"verified\", \"freshOccurrence\": true, \"qualificationVerified\": true, \"gate\": \"accepted\", \"manifest\": \"740a9c17c779a9a4c1d9dbd5cd01cb9b32b8fd2d9574a8b5ac9ea7b6a2694bea\", \"qualification\": \"faf1a0ab410b7357d6e70012946f0ac75e698a46daa80b0afe16cb916a4f3823\", \"publisherReceipt\": \"2aa19192080afb8ee85a56f9d6bad5a0607944cc24b78b929c52c988ae10b7b3\", \"artifacts\": [{\"name\": \"JarvisServer-linux-x64\", \"expected\": \"d65b45deb0a103b3cf5d9ba4d28d80db80c8a4876d7386886c7910be794836c4\", \"observed\": \"d65b45deb0a103b3cf5d9ba4d28d80db80c8a4876d7386886c7910be794836c4\", \"invocation\": \"1f2d4f6ddf8c3e04c66fefdf271481c946cff8ea7ede30271788cc6d1b09ca7f\", \"receiptPins\": {\"build\": \"4449c80706f6c82f638346cf096e57a99e6e0f3ccf4075f92a6d5e9204ffc3d9\", \"stamp\": \"adfb008520fceaee4a9685300496a38820b9287cd23df71f3fc263bc5794800c\", \"release\": \"07e1e4fd845a0f62db343570f1e48568ebfb517b4ba53cf1842973578a15f6dd\"}}]}\n"
+    },
+    {
+      "Sequence": 3,
+      "Stream": "StdOut",
+      "Bundle": "JarvisServer-positive.json"
+    },
+    {
+      "Sequence": 4,
+      "Stream": "StdOut",
+      "Text": "{\"scenario\": \"positive\", \"product\": \"JarvisClient\", \"nonce\": \"d3bb689240fe4f14a73f89a450f7a085\", \"publisherExit\": 0, \"invocations\": 3, \"helperExit\": 0, \"helperStatus\": \"verified\", \"freshOccurrence\": true, \"qualificationVerified\": true, \"gate\": \"accepted\", \"manifest\": \"a6474d76b96fe542881eaa0ece14f69909ae084798f247533fa69c1e69b0fd0e\", \"qualification\": \"5c9f34023c9df699615e309152d18a8ade7bd4e1eea3e7e2b0363131edb02bd0\", \"publisherReceipt\": \"45ada106116efe32839a3b93fdb57c5a16badcc1c55009a4aee012a69c1b3976\", \"artifacts\": [{\"name\": \"JarvisClient-linux-x64\", \"expected\": \"28d5ec0314b8710220ec33243beda12a4fa72c8808fd9bf0de564691105b680c\", \"observed\": \"28d5ec0314b8710220ec33243beda12a4fa72c8808fd9bf0de564691105b680c\", \"invocation\": \"1917c188af38a613520331f44acbcf4ec2fd51216a8b93d1a7fb7b94a1bbae5c\", \"receiptPins\": {\"build\": \"8ac33e7af2a390cbafc5849c7254921bbd169a14ea2c2334914604938a9a8157\", \"stamp\": \"d3798d416d30e62029abd1b515ec871ee8ef3b87560050e01b25b00f5495dff2\", \"release\": \"8c98963380313db9e91405598219c18a5c7c0deff0f75fc87c5d3277cb30c0a0\"}}, {\"name\": \"JarvisClient-win-x64.exe\", \"expected\": \"59c45ef370520a602515d65471dac7d02fd3728a636f2304ef522110553bbe46\", \"observed\": \"59c45ef370520a602515d65471dac7d02fd3728a636f2304ef522110553bbe46\", \"invocation\": \"adce6cdb0adf9400df6bde94a9d155e999b992f818d9faf31041c75e7831efeb\", \"receiptPins\": {\"build\": \"0f0e7f9b06af146ff7bd15a919b363c0129466e08aaeaa133db19e47b85cbcc9\", \"stamp\": \"ed5e3104c3bcf799e8f32fc9a59f9d93287f75de80aff81a5122e64071138909\", \"release\": \"ff4babd11848dac18a3132dc49cbb17b36a679588b31021681ecbe9092af1b1e\"}}, {\"name\": \"JarvisClient-osx-arm64\", \"expected\": \"e03a0031c7e4636af75f4a134947b04d69553514979d2a2123d5e59067e35824\", \"observed\": \"e03a0031c7e4636af75f4a134947b04d69553514979d2a2123d5e59067e35824\", \"invocation\": \"d62bf508847bb085e7b91ed15f70185fabfe8d2c5b1cfd631d618ebd94748a39\", \"receiptPins\": {\"build\": \"fd4231321e188b1588b5de5c9c686fff81724a2f50aa28e77e97b4f30fdd62af\", \"stamp\": \"d8b8ed3b9c59bfaf029ccf1dc9e0fd8fb8140857c3c1cb2a88147aa9fd1b3bdb\", \"release\": \"028b16ab2cb71c6ff08429c61ae9b393159915f731b76216503fc6738074b7b2\"}}]}\n"
+    },
+    {
+      "Sequence": 5,
+      "Stream": "StdOut",
+      "Bundle": "JarvisClient-positive.json"
+    },
+    {
+      "Sequence": 6,
+      "Stream": "StdOut",
+      "Text": "{\"scenario\": \"absent\", \"product\": \"JarvisServer\", \"nonce\": \"c163e89e176b4fbe9c0275b8ab751e9e\", \"publisherExit\": 0, \"invocations\": 1, \"helperExit\": 2, \"helperStatus\": \"unknown\", \"freshOccurrence\": false, \"qualificationVerified\": true, \"gate\": \"rejected\", \"manifest\": \"a6cc588aa5cf3226cfc95b7cdc328f4f2ea34b4ecb0a028d0ffc181f6137a50f\", \"qualification\": \"57814a2bc0427c1892312f916dc541f4b07e310d0c738c44a25c8a44e4c81af4\", \"publisherReceipt\": \"eccc1b3f05c1f56c285e4c4f6129ae1f20b7af29e39b2c9369c2fa3ffcb7233f\", \"artifacts\": [{\"name\": \"JarvisServer-linux-x64\", \"expected\": \"d65b45deb0a103b3cf5d9ba4d28d80db80c8a4876d7386886c7910be794836c4\", \"observed\": \"d65b45deb0a103b3cf5d9ba4d28d80db80c8a4876d7386886c7910be794836c4\", \"invocation\": \"4fdb678d3cb504d5c39725ee4c27351b50885b99247647e953bfb843771494ab\", \"receiptPins\": {}}]}\n"
+    },
+    {
+      "Sequence": 7,
+      "Stream": "StdOut",
+      "Bundle": "JarvisServer-absent.json"
+    },
+    {
+      "Sequence": 8,
+      "Stream": "StdOut",
+      "Text": "{\"scenario\": \"qualification-absent\", \"product\": \"JarvisServer\", \"nonce\": \"b6bd7ebf354740f2b46e651df26c0ecd\", \"publisherExit\": 0, \"invocations\": 1, \"helperExit\": 0, \"helperStatus\": \"verified\", \"freshOccurrence\": true, \"qualificationVerified\": false, \"gate\": \"rejected\", \"manifest\": \"07742a98ce843102b3d2bfee9fb1adcac1a0a1b3384f14a7b4646a01d5c3da83\", \"qualification\": \"fe06d81ca23017ab9a65c82163bb4f53e6f4b1c84efc60854b2b18e5753c7cff\", \"publisherReceipt\": \"0fbced2aa75767755a062ac11a3d7d0c8e38b14a34d17956e59c730d5a942cd4\", \"artifacts\": [{\"name\": \"JarvisServer-linux-x64\", \"expected\": \"d65b45deb0a103b3cf5d9ba4d28d80db80c8a4876d7386886c7910be794836c4\", \"observed\": \"d65b45deb0a103b3cf5d9ba4d28d80db80c8a4876d7386886c7910be794836c4\", \"invocation\": \"fe9d2689cc334903e57c8079232fb3db2b2ee0dd5e5804ea69b0c83e89469441\", \"receiptPins\": {\"build\": \"3820f1a8280a62db79ca609a77e1858c78c9a0d0bd59bbe6381a2290dc4686c7\", \"stamp\": \"adfb008520fceaee4a9685300496a38820b9287cd23df71f3fc263bc5794800c\", \"release\": \"ddcbfa8a6095c2cec95c023cb708dd7ab2047e84a47019005bf5d055a0781b88\"}}]}\n"
+    },
+    {
+      "Sequence": 9,
+      "Stream": "StdOut",
+      "Bundle": "JarvisServer-qualification-absent.json"
+    },
+    {
+      "Sequence": 10,
+      "Stream": "StdOut",
+      "Text": "{\"scenario\": \"dirty\", \"product\": \"JarvisServer\", \"nonce\": \"cce093f006b5420698a60a9d07633ba0\", \"publisherExit\": 0, \"invocations\": 1, \"helperExit\": 1, \"helperStatus\": \"mismatch\", \"freshOccurrence\": true, \"qualificationVerified\": false, \"gate\": \"rejected\", \"manifest\": \"d46b2912f2ae9e82e7a9455ce70c2eff4b70eac15ad209c3b62f2add988b89e0\", \"qualification\": \"2414da7f8e4c1e41bf53bf812842562a39747871d8e8ebf4c069b78e84739b86\", \"publisherReceipt\": \"5c5002eb284099fa213338a6edb4d214a4af8d1b5d3e93eb5c7fdfb9d710ca38\", \"artifacts\": [{\"name\": \"JarvisServer-linux-x64\", \"expected\": \"d65b45deb0a103b3cf5d9ba4d28d80db80c8a4876d7386886c7910be794836c4\", \"observed\": \"d65b45deb0a103b3cf5d9ba4d28d80db80c8a4876d7386886c7910be794836c4\", \"invocation\": \"93f938d40ea6f5614f33b948fdea03563ed034ada27bda4ff8e47b0695dce0de\", \"receiptPins\": {\"build\": \"dd7bbceada36cc40ace1cf0a6dcc57d7f1f5c3ff182954f1f3ee254f32ac060c\", \"stamp\": \"adfb008520fceaee4a9685300496a38820b9287cd23df71f3fc263bc5794800c\", \"release\": \"7096af059c06703b8421eb105da7649bc3c128ce9f37bbfd5433fbeefb7ae3aa\"}}]}\n"
+    },
+    {
+      "Sequence": 11,
+      "Stream": "StdOut",
+      "Bundle": "JarvisServer-dirty.json"
+    },
+    {
+      "Sequence": 12,
+      "Stream": "StdOut",
+      "Text": "{\"scenario\": \"stale\", \"product\": \"JarvisServer\", \"nonce\": \"3708ab0177a14208895a06a36c862580\", \"publisherExit\": 0, \"invocations\": 1, \"helperExit\": 0, \"helperStatus\": \"verified\", \"freshOccurrence\": false, \"qualificationVerified\": true, \"gate\": \"rejected\", \"manifest\": \"994d60d6902697d0d70cad246508368f30ce5a5000755558d9114e28b89f4868\", \"qualification\": \"ef6917f16384499daa3d74c70e46c36e4c14b261e622b1b3b7cfd0e8ceb4c167\", \"publisherReceipt\": \"a91370d0efc94fe080d1dbe74ae2867b5f60bb1a76456fb8eda5fb7595741a1c\", \"artifacts\": [{\"name\": \"JarvisServer-linux-x64\", \"expected\": \"d65b45deb0a103b3cf5d9ba4d28d80db80c8a4876d7386886c7910be794836c4\", \"observed\": \"d65b45deb0a103b3cf5d9ba4d28d80db80c8a4876d7386886c7910be794836c4\", \"invocation\": \"8c608a2c1a9d816d332f221f8985504ae07bb3f0b2b91757d9954833002ff144\", \"receiptPins\": {\"build\": \"4449c80706f6c82f638346cf096e57a99e6e0f3ccf4075f92a6d5e9204ffc3d9\", \"stamp\": \"adfb008520fceaee4a9685300496a38820b9287cd23df71f3fc263bc5794800c\", \"release\": \"6d8f56db18f856b4c9f3e1322f2727fd36a66a8b41fe04c87cc0f17e07caf2aa\"}}]}\n"
+    },
+    {
+      "Sequence": 13,
+      "Stream": "StdOut",
+      "Bundle": "JarvisServer-stale.json"
+    },
+    {
+      "Sequence": 14,
+      "Stream": "StdOut",
+      "Text": "{\"scenario\": \"substitution\", \"product\": \"JarvisServer\", \"nonce\": \"2489957eb00840f980e15b076d4c7d93\", \"publisherExit\": 0, \"invocations\": 1, \"helperExit\": 1, \"helperStatus\": \"mismatch\", \"freshOccurrence\": true, \"qualificationVerified\": true, \"gate\": \"rejected\", \"manifest\": \"12078ca22e3b9d65ed2c8892201b6a63b745948cb1eaec9f7f06ef8ea8cc9a77\", \"qualification\": \"a8cb0c585bf0025b4e26bd56acdb6e7bd0695c02c8bff3804df2cfb655da29d9\", \"publisherReceipt\": \"563cc4382f8ed0c9a1552d461c226dfbddaf2197f503577b5f19eb1a2b337a19\", \"artifacts\": [{\"name\": \"JarvisServer-linux-x64\", \"expected\": \"d65b45deb0a103b3cf5d9ba4d28d80db80c8a4876d7386886c7910be794836c4\", \"observed\": \"9e2aaf0a26f9d926406c869247ee2a1178243fdfa308d76d85f8a65220152a14\", \"invocation\": \"e5180ac7e9de1b7fcac7d22571cbcc0ad62c675d04b3113aca35d5c64b6bdcd4\", \"receiptPins\": {\"build\": \"149f94a8a3253475a76b6657700c4b7f21d133b263ceec3a98face893b986fc5\", \"stamp\": \"adfb008520fceaee4a9685300496a38820b9287cd23df71f3fc263bc5794800c\", \"release\": \"a3541484cd003037588bf3805e981062a876528438b6fae8e0612f5189932d2f\"}}]}\n"
+    },
+    {
+      "Sequence": 15,
+      "Stream": "StdOut",
+      "Bundle": "JarvisServer-substitution.json"
+    },
+    {
+      "Sequence": 16,
+      "Stream": "StdOut",
+      "Text": "{\"scenario\": \"build-failed\", \"product\": \"JarvisServer\", \"publisherExit\": 7, \"invocations\": 1, \"publisherReceipt\": \"dd2ce9b46ee4819b1b7397bef5a82640e24cb45a84a8b54e776da4f9897667e9\", \"gate\": \"rejected\"}\n"
+    },
+    {
+      "Sequence": 17,
+      "Stream": "StdOut",
+      "Bundle": "JarvisServer-build-failed.json"
+    },
+    {
+      "Sequence": 18,
+      "Stream": "StdOut",
+      "Text": "PASS: actual publisher command boundary, synthetic evidence only\n"
+    }
+  ]
+}

@@ -20,8 +20,8 @@ let ``exact ordered section sizes include framing and supplementary characters``
     let result = measure fragments
     Assert.That(result.Prompt.Utf8Bytes, Is.EqualTo(12L))
     Assert.That(result.Prompt.Utf16Units, Is.EqualTo(7L))
-    Assert.That(result.Sections |> Array.map (fun x -> x.Size.Utf8Bytes), Is.EqualTo([|3L;7L;2L|]))
-    Assert.That(result.Sections |> Array.map (fun x -> x.Kind), Is.EqualTo([|SectionKind.Framing;SectionKind.Role;SectionKind.Framing|]))
+    Assert.That(result.Sections |> Array.map (fun x -> x.Size.Utf8Bytes), Is.EqualTo(box [|3L;7L;2L|]))
+    Assert.That(result.Sections |> Array.map (fun x -> x.Kind), Is.EqualTo(box [|SectionKind.Framing;SectionKind.Role;SectionKind.Framing|]))
     Assert.That(serialize result, Is.EqualTo(serialize (measure fragments)))
 
 [<Test>]
@@ -62,7 +62,7 @@ let ``duplicate identity is explicit and independent of version or equal content
           fragment SectionKind.Role None (Some 1) "x"
           fragment SectionKind.Agent (Some 0) (Some 1) "x" ]
     let result = measure fragments
-    Assert.That(result.Sections |> Array.map (fun x -> x.DuplicateLayer), Is.EqualTo([|false;false;true;false;false;false|]))
+    Assert.That(result.Sections |> Array.map (fun x -> x.DuplicateLayer), Is.EqualTo(box [|false;false;true;false;false;false|]))
 
 [<Test>]
 let ``advisory budgets exact boundary growth and absent baselines`` () =
@@ -71,12 +71,12 @@ let ``advisory budgets exact boundary growth and absent baselines`` () =
     Assert.That(exact.Warnings, Is.Empty)
     Assert.That(exact.Delta.Value.Utf8Bytes, Is.EqualTo(2L))
     let over = account [framing "😀a"] (Some(ActualPrompt "ab")) (Some "1234") budgets
-    Assert.That(over.Warnings |> Array.map (fun x -> x.Reason), Is.EqualTo([|WarningReason.PromptUtf8;WarningReason.PromptUtf16;WarningReason.EnvelopeUtf8;WarningReason.GrowthUtf8|]))
-    Assert.That(over.Warnings |> Array.map (fun x -> x.Observed - x.Threshold), Is.EqualTo([|1L;1L;1L;1L|]))
+    Assert.That(over.Warnings |> Array.map (fun x -> x.Reason), Is.EqualTo(box [|WarningReason.PromptUtf8;WarningReason.PromptUtf16;WarningReason.EnvelopeUtf8;WarningReason.GrowthUtf8|]))
+    Assert.That(over.Warnings |> Array.map (fun x -> x.Observed - x.Threshold), Is.EqualTo(box [|1L;1L;1L;1L|]))
     let missing = account [framing "😀a"] None None budgets
     Assert.That(missing.Delta.HasValue, Is.False)
     Assert.That(missing.EnvelopeUtf8Bytes.HasValue, Is.False)
-    Assert.That(missing.Warnings |> Array.map (fun x -> x.Reason), Is.EqualTo([|WarningReason.PromptUtf8;WarningReason.PromptUtf16|]))
+    Assert.That(missing.Warnings |> Array.map (fun x -> x.Reason), Is.EqualTo(box [|WarningReason.PromptUtf8;WarningReason.PromptUtf16|]))
     let shrink = account [framing "a"] (Some(ActualPrompt "abcd")) None budgets
     Assert.That(shrink.Delta.Value.Utf8Bytes, Is.EqualTo(-3L))
     Assert.That(shrink.Warnings, Is.Empty)

@@ -120,6 +120,8 @@ let account (fragments: Fragment list) (baseline: Baseline option)
         if Option.exists (fun n -> n < 0L) threshold then
             invalidArg "budgets" "Thresholds must be nonnegative."
 
+    if Option.exists (fun b -> obj.ReferenceEquals(b, null)) baseline then
+        invalidArg "baseline" "Baseline must be valid."
     let baselineSize, baselineBytes =
         match baseline with
         | None -> None, None
@@ -129,7 +131,6 @@ let account (fragments: Fragment list) (baseline: Baseline option)
         | Some(SizeOnly measured) ->
             validateSize measured
             Some measured, None
-        | Some _ -> invalidArg "baseline" "Baseline must be valid."
 
     let envelopeBytes = serializedEnvelope |> Option.map (validateText "serializedEnvelope" >> int64)
     let seen = HashSet<SectionKind * int>()

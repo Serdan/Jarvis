@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <GenerateProgramFile>false</GenerateProgramFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../Client/Client.fsproj" />
+    <Compile Include="../../Client/Modules/PromptContextAccounting.fs" Link="PromptContextAccounting.fs" />
+    <Compile Include="../../Client/Modules/PromptSnapshotAssembly.fs" Link="PromptSnapshotAssembly.fs" />
+    <Compile Include="../AutomationHealthHosted20261123/GitFixture.fs" Link="GitFixture.fs" />
+    <Compile Include="../PromptSnapshotAssembly20261127/SnapshotTests.fs" Link="FrozenSnapshotTests.fs" />
+    <Compile Include="AssemblyTests.fs" />
+    <Compile Include="FixtureAdapter.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="NUnit" Version="4.3.2" />
+    <PackageReference Include="NUnit3TestAdapter" Version="4.6.0" />
+  </ItemGroup>
+</Project>

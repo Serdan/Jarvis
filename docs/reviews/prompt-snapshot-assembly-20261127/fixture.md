@@ -7,8 +7,8 @@ Task robustness-prompt-snapshot-assembly-regression-20261127; pinned spec 047ec9
 From the isolated checkout:
 
 ```sh
-dotnet test tests/PromptSnapshotAssembly20261127/PromptSnapshotAssembly20261127.fsproj -c Release --logger 'console;verbosity=normal'
-dotnet test tests/PromptSnapshotAssembly20261127/PromptSnapshotAssembly20261127.fsproj -c Release --filter FullyQualifiedName~new_mode_must_include_exact_issued_context_not_latest_spec --logger 'console;verbosity=normal'
+dotnet test tests/PromptSnapshotAssembly20261127/PromptSnapshotAssembly20261127.fsproj -c Release --logger 'console;verbosity=normal' -m:1
+dotnet test tests/PromptSnapshotAssembly20261127/PromptSnapshotAssembly20261127.fsproj -c Release --no-build --filter FullyQualifiedName~new_mode_must_include_exact_issued_context_not_latest_spec --logger 'console;verbosity=normal' -m:1
 ```
 
 The second command is an intentional RED contract against the existing render API; the NUnit Explicit case is not a normal release-green expectation. No new-mode runtime or switch exists at this baseline. It must ultimately target the actual new registered composition route when introduced, not the legacy fallback.
@@ -35,4 +35,8 @@ After composition independently reviewed, separately authorize actual render/wir
 
 ## Evidence and limits
 
-The green controls and RED are executable cases, not claims of successful execution yet. Release job 00fdc8021a2747b1b2a9680ddac7dd43 started on this worktree; terminal output must be reconciled before freezing evidence. The test emits actual render text UTF-8 bytes and JSON serialization proxies for actual separate reader results. These are controlled fixture data only; no provider token/cache, hidden context, real fleet or full wire accounting claims. Review and dependency applicability are explicit contract cases; registered route, adjudication selection, production fingerprint and authenticated check-in remain implementation gates.
+Executed test source fd405afe782bf900b3078df307ddfcfeb2761cb7. Corrected Release job e12c7de59e304c2399069b9dfd68b3f4 exited 0 (sequences 13–25): 3 passed, 0 failed; blocked_dependencies_are_snapshot_bound_and_not_launch_authority, legacy_render_and_exact_separate_context_controls, malformed_checkpoint_and_valid_shape_wrong_identity_are_distinct. NUnit excluded the explicit RED from the ordinary run.
+
+Separately filtered RED job ae4726ff86794bd7be7b1f31b445c79f exited 1, exactly one selected Explicit case discovered, one failed (sequences 5–55, 93–96). The assertion failures were missing issued HTML, first and second ordered role context, agent context, and current-generation continuation; actual output was the v8 identity-only bootstrap. This is the intended missing-context failure, not a discovery, compilation or setup failure. No latest-spec substitution was observed.
+
+Measured fixture renderTextBytes=607, renderJsonProxyBytes=948, separateContextJsonProxyBytes=5942, historicalSpecBytes=25, checkpointJsonProxyBytes=288. These are controlled fixture UTF-8/JSON serialization proxies only; no provider token/cache, hidden context, real fleet or full wire accounting claims. Review and dependency applicability are explicit contract cases; registered route, adjudication selection, production fingerprint and authenticated check-in remain implementation gates.

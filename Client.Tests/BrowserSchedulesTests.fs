@@ -414,8 +414,8 @@ let recurringBoundsAgreeAcrossAdmissionPaths (interval: int) (accepted: bool) =
                 Assert.That(entry.GetProperty("repeatEverySeconds").GetInt32(), Is.EqualTo(interval))
                 Assert.That(entry.GetProperty("triggerKind").GetString(), Is.EqualTo("Every"))
         else
-            Assert.That(legacy, Is.EqualTo(Error "InvalidRepeatInterval: must be 1 second to 30 days."))
-            Assert.That(every, Is.EqualTo(Error "InvalidEveryTrigger: interval must be 1 second to 30 days."))
+            Assert.That(legacy, Is.EqualTo(Error "InvalidRepeatInterval: must be 1 second to 30 days." : Result<DateTimeOffset,string>))
+            Assert.That(every, Is.EqualTo(Error "InvalidEveryTrigger: interval must be 1 second to 30 days." : Result<DateTimeOffset,string>))
             Assert.That(native, Is.EqualTo(every))
             Assert.That(store.List(), Is.EqualTo("[]"))
     finally

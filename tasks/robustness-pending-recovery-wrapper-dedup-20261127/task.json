@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"robustness-pending-recovery-wrapper-dedup-20261127","title":"[P1][Reliability] Make pending-operation recovery commands independently retryable across head changes","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"robustness-pending-recovery-wrapper-dedup-20261127","title":"[P1][Reliability] Make pending-operation recovery commands independently retryable across head changes","version":2,"lifecycle":"Open","specVersion":2,"attemptId":null}

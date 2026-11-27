@@ -21,3 +21,22 @@ Task robustness-task-metadata-projection-20261127, spec 50654dbee83dd65a62143da8
 ## Evidence scope
 
 Standalone Release tests reference the actual Client project and use the existing disposable two-clone Git fixture. Git reads are measured with LedgerStore.measureGitReads, not estimated by counting test-side reads. API payload is the actual ReviewApi result serialized with the same default JsonSerializer used in the client dispatcher; an independently constructed AgentCommandResponse serialized by its real converter is a local wire-size witness, not actual MCP/HTTP bytes. Registered-route evidence, where executed, will be explicitly separate. No test outcome is claimed until terminal receipts are recorded.
+
+## Terminal Release receipts (retrieved on resumption)
+
+All tests ran on the test sources frozen in be27d46d36b6d2cc1e2d967566d2a5eef7ac7a4f, directly based on d5788cecf7eafa9ec946a5a67bb974784f6901eb. The subsequent report-only commit adds these receipts; test and production sources are unchanged. Initial green job b1dfa7eecbe14e3c94e687a125fa4857 failed compilation (FS0041); fixed the expected:string annotation before the following runs.
+
+- Green: `dotnet test tests/TaskMetadataProjection20261127/TaskMetadataProjection20261127.fsproj -c Release --filter TestCategory!=ExpectedRed --logger "console;verbosity=detailed"`; job cb692580b0014a9e9abdcd5095de7dd7, terminal exit 0, 3/3 passed (events 16–25). Covers no attempt, large escaped HTML, missing spec/invalid metadata, unsafe body boundary, pinned revision and historical exact retrieval, cursor continuity across concurrent head advance, cross-task rejection and unchanged ledger head.
+- Intentional red: same project, `-c Release --no-build --filter TestCategory=ExpectedRed --logger "console;verbosity=detailed"`; job 8801159e7d4749e5812f55a68e153a65, terminal exit 1, 1/1 expected failure (events 7–56). All three assertions failed: specHtml present, raw payload not below 4096 bytes, Git output not below 65536 bytes. Not a compile/setup failure.
+- Registered legacy control: `dotnet test tests/TaskMetadataProjection20261127/Registered/RegisteredProjection.fsproj -c Release --logger "console;verbosity=detailed"`; job 4e10bcbfb4e04ea5b688b35d026c6ea3, terminal exit 0, 1/1 passed (events 19–20, 53, 89–91). Production server registration and Program.registerClientRuntime via authenticated disposable HTTP/MCP and SignalR loopback; workspace:read denial checked; both requests returned directly, no promoted-job path observed. Ledger head unchanged.
+
+| Witness | HTML bytes | Raw JSON bytes | Outer bytes | Git starts | Fetches | Individual blob reads | Git stdout bytes |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Direct legacy Lead-size | 8192 | 12108 | 13194 | 26 | 2 | 4 | 9742 |
+| Direct legacy skew | 524288 | 758270 | 809100 | 26 | 2 | 4 | 525838 |
+| Direct legacy assigned/revised | 8192 | 12753 | 14099 | 28 | 2 | 5 | 10549 |
+| Direct intended default red | 524288 | 758265 | 809095 | 26 | 2 | 4 | 525839 |
+| Registered legacy Lead-size | 8192 | 8499 | 9054 | — | — | — | — |
+| Registered legacy skew | 262144 | 262451 | 263006 | — | — | — | — |
+
+Direct outer = locally serialized real AgentCommandResponse converter; registered outer = actual UTF-8 HTTP response body (including MCP envelope), not HTTP headers or network framing. Registered bodies use plain text markup, not the escaped/Unicode direct fixture, so sizes are not directly comparable. Registered route covers unassigned current-body and permission controls; pinned revision and corruption controls are source-level, not registered-route proof. Corrupt/missing physical Git objects, new metadata action, generation-selecting external route and its cursor rejection remain future implementation gates. No production changes or broad test suite were authorized or executed. TaskOverview exceeded the response guard; scope relies on the explicit exclusive assignment and verified isolated diff, not a complete current roster audit.

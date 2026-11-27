@@ -9,8 +9,11 @@ open Client.LedgerStore
 open Client.ReviewWorkflow
 open Client.TaskOverviewProjection
 
+// System.Text.Json requires public properties and a public constructor for
+// this CLIMutable record. Keep the signing/validation functions private,
+// not the serialization contract.
 [<CLIMutable>]
-type private Cursor =
+type CursorPayload =
     { ProjectId: Guid
       LedgerId: Guid
       Epoch: int
@@ -28,7 +31,7 @@ let private encodeBytes (bytes: byte[]) =
 let private decodeBytes (value: string) =
     let normalized = value.Replace('-', '+').Replace('_', '/')
     Convert.FromBase64String(normalized.PadRight((normalized.Length + 3) / 4 * 4, '='))
-let private encode (cursor: Cursor) =
+let private encode (cursor: CursorPayload) =
     let data = JsonSerializer.SerializeToUtf8Bytes(cursor)
     encodeBytes data + "." + encodeBytes (HMACSHA256.HashData(key.Value, data))
 let private decode (token: string) =
@@ -44,7 +47,7 @@ let private decode (token: string) =
                 if supplied.Length <> expected.Length
                    || not (CryptographicOperations.FixedTimeEquals(supplied, expected)) then invalid
                 else
-                    let cursor = JsonSerializer.Deserialize<Cursor>(data)
+                    let cursor = JsonSerializer.Deserialize<CursorPayload>(data)
                     if isNull (box cursor) then invalid else Ok cursor
             | _ -> invalid
     with _ -> invalid

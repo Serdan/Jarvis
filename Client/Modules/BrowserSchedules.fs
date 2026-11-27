@@ -103,6 +103,11 @@ let private suspendResume action =
     | Some selection -> uncertainPrefix + JsonSerializer.Serialize(selection)
     | None -> uncertainPrefix + " interrupted ambiguous resume; reconcile original intent."
 
+let private maxRecurrenceSeconds = 30 * 24 * 60 * 60
+
+let private validRecurrence seconds =
+    seconds >= 1 && seconds <= maxRecurrenceSeconds
+
 let private nextOccurrence (now: DateTimeOffset) (action: ScheduledAction) =
     let seconds = float action.RepeatEverySeconds
     let elapsed = max 0.0 (now - action.DueAtUtc).TotalSeconds
@@ -442,8 +447,9 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
             Error "InvalidScheduleId: use 1-64 letters, numbers, - or _."
         elif String.IsNullOrWhiteSpace(window) || window.Length > 128 then
             Error "WindowRegistrationRequired"
-        elif repeat <> 0 && (repeat < 60 || repeat > 30 * 24 * 60 * 60) then
-            Error "InvalidRepeatInterval: must be 60 seconds to 30 days."
+        // Omission remains a one-shot; an explicitly supplied recurrence must be positive.
+        elif repeatEverySeconds |> Option.exists (validRecurrence >> not) then
+            Error "InvalidRepeatInterval: must be 1 second to 30 days."
         elif seconds < 5 || seconds > 30 * 24 * 60 * 60 then
             Error "InvalidDelay: must be between 5 seconds and 30 days."
         elif String.IsNullOrWhiteSpace(project) || String.IsNullOrWhiteSpace(script) then
@@ -516,11 +522,11 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                 | _ -> Error "InvalidOnceTrigger: supply a future UTC time or a delay of at most 30 days."
             | "Every" ->
                 match cmd.RepeatEverySeconds, cmd.RunAtUtc, cmd.RunAfterSeconds with
-                | Some repeat, None, delay when repeat >= 60 && repeat <= maxSeconds &&
+                | Some repeat, None, delay when validRecurrence repeat &&
                                                 (delay |> Option.defaultValue 0) >= 0 &&
                                                 (delay |> Option.defaultValue 0) <= maxSeconds ->
                     Ok(time.AddSeconds(float (delay |> Option.defaultValue repeat)))
-                | _ -> Error "InvalidEveryTrigger: interval must be 60 seconds to 30 days."
+                | _ -> Error "InvalidEveryTrigger: interval must be 1 second to 30 days."
             | "AfterAgentIdle" ->
                 match cmd.IdleAgentId, cmd.IdleSeconds with
                 | Some agent, Some idle when not (String.IsNullOrWhiteSpace agent) &&

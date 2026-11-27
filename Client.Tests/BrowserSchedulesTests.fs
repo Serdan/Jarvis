@@ -243,8 +243,9 @@ let inputValidation () =
         Directory.Delete(dir, true)
 
 
-[<Test>]
-let recurrenceSkipsMissedIntervalsOnRestart () = task {
+[<TestCase(1)>]
+[<TestCase(3600)>]
+let recurrenceSkipsMissedIntervalsOnRestart (interval: int) = task {
     let dir,path = temp()
     let mutable clock = DateTimeOffset.UtcNow
     let mutable called = 0
@@ -255,7 +256,7 @@ let recurrenceSkipsMissedIntervalsOnRestart () = task {
     try
         let first = new BrowserSchedules.Service(path, action, now=(fun () -> clock), pollMs=25)
         Assert.That(first.Schedule("hourly",600,"https://chatgpt.com/","Scripts","launch.js","",
-            "{}" ,false,windowRegistration="agents",closeAfter=true,repeatEverySeconds=3600).IsOk, Is.True)
+            "{}" ,false,windowRegistration="agents",closeAfter=true,repeatEverySeconds=interval).IsOk, Is.True)
         first.Start()
         clock <- clock.AddSeconds(601.)
         do! awaitStatus (fun () -> called = 1 && status first "hourly" = "pending")
@@ -374,6 +375,157 @@ let private getDue (service: BrowserSchedules.Service) id =
     use json = JsonDocument.Parse(valueOrFail (service.Get(id)))
     json.RootElement.GetProperty("dueAtUtc").GetDateTimeOffset()
 
+let private legacyRecurring (store: BrowserSchedules.Service) id interval =
+    store.Schedule(id, 5, "https://example.test/chat", "Scripts", "launch.js",
+        "", "{}", false, windowRegistration="agents", ?repeatEverySeconds=interval)
+
+let private everyCommand id interval =
+    { commandSchedule id "Every" with RunAfterSeconds = None; RepeatEverySeconds = interval }
+
+[<TestCase(-1, false)>]
+[<TestCase(0, false)>]
+[<TestCase(1, true)>]
+[<TestCase(30, true)>]
+[<TestCase(60, true)>]
+[<TestCase(2592000, true)>]
+[<TestCase(2592001, false)>]
+let recurringBoundsAgreeAcrossAdmissionPaths (interval: int) (accepted: bool) =
+    let dir, path = temp()
+    let clock = DateTimeOffset.UtcNow
+    let execute (_: BrowserSchedules.ScheduledAction) = task { return Ok "unused" }
+    try
+        use store = new BrowserSchedules.Service(path, execute, now=(fun () -> clock))
+        let legacy = legacyRecurring store "legacy" (Some interval)
+        let every = store.ScheduleExecution(everyCommand "every" (Some interval))
+        let nativeBrowser =
+            { everyCommand "native" (Some interval) with
+                ActionKind = "BrowserScript"; Executable = None; Args = []
+                WindowRegistration = Some "agents"; Url = Some "https://example.test/chat"
+                ScriptPath = Some "browser-scripts/chatgpt/launchAgent.js"
+                ArgsJson = Some """{"resumeReady":true}""" }
+        let native = store.ScheduleExecution(nativeBrowser)
+        if accepted then
+            Assert.That(valueOrFail legacy, Is.EqualTo(clock.AddSeconds(5.)))
+            Assert.That(valueOrFail every, Is.EqualTo(clock.AddSeconds(float interval)))
+            Assert.That(valueOrFail native, Is.EqualTo(clock.AddSeconds(float interval)))
+            use listed = JsonDocument.Parse(store.List())
+            Assert.That(listed.RootElement.GetArrayLength(), Is.EqualTo(3))
+            for entry in listed.RootElement.EnumerateArray() do
+                Assert.That(entry.GetProperty("repeatEverySeconds").GetInt32(), Is.EqualTo(interval))
+                Assert.That(entry.GetProperty("triggerKind").GetString(), Is.EqualTo("Every"))
+        else
+            Assert.That(legacy, Is.EqualTo(Error "InvalidRepeatInterval: must be 1 second to 30 days."))
+            Assert.That(every, Is.EqualTo(Error "InvalidEveryTrigger: interval must be 1 second to 30 days."))
+            Assert.That(native, Is.EqualTo(every))
+            Assert.That(store.List(), Is.EqualTo("[]"))
+    finally
+        Directory.Delete(dir, true)
+
+[<Test>]
+let recurrenceFloorDoesNotChangeOneShotOrIdleAdmission () =
+    let dir, path = temp()
+    let clock = DateTimeOffset.UtcNow
+    let execute (_: BrowserSchedules.ScheduledAction) = task { return Ok "unused" }
+    try
+        use store = new BrowserSchedules.Service(path, execute, now=(fun () -> clock))
+        Assert.That(valueOrFail (legacyRecurring store "legacy-once" None), Is.EqualTo(clock.AddSeconds(5.)))
+        Assert.That(store.Schedule("short-delay", 1, "https://example.test/chat", "Scripts", "launch.js",
+            "", "{}", false, windowRegistration="agents").IsError, Is.True)
+        let once = { commandSchedule "once" "Once" with RunAfterSeconds = Some 0 }
+        Assert.That(valueOrFail (store.ScheduleExecution once), Is.EqualTo(clock))
+        Assert.That(store.ScheduleExecution(everyCommand "missing" None).IsError, Is.True)
+        let idle seconds =
+            { commandSchedule "idle" "AfterAgentIdle" with
+                RunAfterSeconds = None; IdleAgentId = Some "Manager"; IdleSeconds = Some seconds }
+        for seconds in [-1; 0; 1; 30; 59; 2592001] do
+            Assert.That(store.ScheduleExecution(idle seconds).IsError, Is.True)
+        for seconds in [60; 2592000] do
+            Assert.That(valueOrFail (store.ScheduleExecution(idle seconds)), Is.EqualTo(clock.AddSeconds(float seconds)))
+    finally
+        Directory.Delete(dir, true)
+
+[<TestCase(true)>]
+[<TestCase(false)>]
+let minimumRecurrenceCoalescesWhileRunningAndRetainsIdentity (legacy: bool) = task {
+    let dir, path = temp()
+    let mutable clock = DateTimeOffset.UtcNow
+    let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let observed = System.Collections.Concurrent.ConcurrentQueue<BrowserSchedules.ScheduledAction>()
+    let execute (a: BrowserSchedules.ScheduledAction) = task {
+        observed.Enqueue(a)
+        do! release.Task
+        return Ok "done"
+    }
+    try
+        use store = new BrowserSchedules.Service(path, execute, now=(fun () -> clock), pollMs=25)
+        let due =
+            if legacy then legacyRecurring store "minimum" (Some 1) |> valueOrFail
+            else store.ScheduleExecution(everyCommand "minimum" (Some 1)) |> valueOrFail
+        store.Start()
+        clock <- due
+        do! awaitStatus (fun () -> observed.Count = 1 && status store "minimum" = "running")
+        clock <- due.AddSeconds(10.)
+        do! Task.Delay(150)
+        Assert.That(observed.Count, Is.EqualTo(1), "No overlapping occurrences")
+        Assert.That(status store "minimum", Is.EqualTo("running"))
+        release.TrySetResult(()) |> ignore
+        do! awaitStatus (fun () -> status store "minimum" = "pending")
+        Assert.That(getDue store "minimum", Is.EqualTo(due.AddSeconds(11.)))
+        do! Task.Delay(150)
+        Assert.That(observed.Count, Is.EqualTo(1), "No accumulated catch-up backlog")
+        clock <- due.AddSeconds(11.)
+        do! awaitStatus (fun () -> observed.Count = 2 && status store "minimum" = "pending")
+        let attempts = observed.ToArray()
+        Assert.That(attempts[0].RevisionId, Is.Not.Empty)
+        Assert.That(attempts[1].RevisionId, Is.EqualTo(attempts[0].RevisionId))
+        Assert.That(attempts[0].AttemptId, Is.Not.Empty)
+        Assert.That(attempts[1].AttemptId, Is.Not.Empty)
+        Assert.That(attempts[1].AttemptId, Is.Not.EqualTo(attempts[0].AttemptId))
+        Assert.That(getDue store "minimum", Is.EqualTo(due.AddSeconds(12.)))
+        Assert.That(store.Cancel("minimum").IsOk, Is.True)
+        clock <- due.AddSeconds(100.)
+        do! Task.Delay(100)
+        Assert.That(observed.Count, Is.EqualTo(2))
+    finally
+        release.TrySetResult(()) |> ignore
+        Directory.Delete(dir, true)
+}
+
+[<TestCase(true)>]
+[<TestCase(false)>]
+let minimumRecurrenceNeverReplaysInterruptedOccurrence (legacy: bool) = task {
+    let dir, path = temp()
+    let mutable clock = DateTimeOffset.UtcNow
+    let mutable calls = 0
+    let execute (_: BrowserSchedules.ScheduledAction) = task {
+        Interlocked.Increment(&calls) |> ignore
+        return Ok "done"
+    }
+    try
+        let due =
+            use store = new BrowserSchedules.Service(path, execute, now=(fun () -> clock))
+            if legacy then legacyRecurring store "minimum" (Some 1) |> valueOrFail
+            else store.ScheduleExecution(everyCommand "minimum" (Some 1)) |> valueOrFail
+        let state = JsonNode.Parse(File.ReadAllText(path))
+        state["actions"][0]["Status"] <- JsonValue.Create("running")
+        state["actions"][0]["AttemptId"] <- JsonValue.Create("interrupted-attempt")
+        File.WriteAllText(path, state.ToJsonString())
+        clock <- due.AddSeconds(10.)
+        use restored = new BrowserSchedules.Service(path, execute, now=(fun () -> clock), pollMs=25)
+        Assert.That(status restored "minimum", Is.EqualTo("pending"))
+        Assert.That(getDue restored "minimum", Is.EqualTo(due.AddSeconds(11.)))
+        Assert.That(valueOrFail (restored.Get("minimum")), Does.Contain("outcomeUnknown"))
+        restored.Start()
+        do! Task.Delay(150)
+        Assert.That(calls, Is.Zero)
+        clock <- due.AddSeconds(11.)
+        do! awaitStatus (fun () -> calls = 1 && status restored "minimum" = "pending")
+        Assert.That(getDue restored "minimum", Is.EqualTo(due.AddSeconds(12.)))
+        Assert.That(valueOrFail (restored.Get("minimum")), Does.Not.Contain("interrupted-attempt"))
+    finally
+        Directory.Delete(dir, true)
+}
+
 [<Test>]
 let generalCliSchedulesAreDurableAndRedactArguments () = task {
     let dir,path = temp()
@@ -444,8 +596,9 @@ let idleManagerResetsFromCrossClientActivityAndWaitsForFreshActivityToRearm () =
         Directory.Delete(dir, true)
 }
 
-[<Test>]
-let recurringCliSkipsMissedOccurrencesOnRestart () = task {
+[<TestCase(1)>]
+[<TestCase(3600)>]
+let recurringCliSkipsMissedOccurrencesOnRestart (interval: int) = task {
     let dir,path = temp()
     let mutable clock = DateTimeOffset.UtcNow
     let mutable calls = 0
@@ -456,7 +609,7 @@ let recurringCliSkipsMissedOccurrencesOnRestart () = task {
     try
         let config =
             { commandSchedule "hourly-cli" "Every" with
-                RunAfterSeconds = Some 600; RepeatEverySeconds = Some 3600 }
+                RunAfterSeconds = Some 600; RepeatEverySeconds = Some interval }
         do
             use first = new BrowserSchedules.Service(path, executor, now=(fun () -> clock), pollMs=25)
             Assert.That(first.ScheduleExecution(config).IsOk, Is.True)
@@ -480,7 +633,7 @@ let newSchedulerValidationAndReadOnlyInspection () =
     try
         use store = new BrowserSchedules.Service(path, executor)
         let basic = commandSchedule "manager" "Once"
-        Assert.That(store.ScheduleExecution({ basic with TriggerKind = "Every"; RepeatEverySeconds = Some 30 }).IsError, Is.True)
+        Assert.That(store.ScheduleExecution({ basic with TriggerKind = "Every"; RepeatEverySeconds = Some 0 }).IsError, Is.True)
         Assert.That(store.ScheduleExecution({ basic with TriggerKind = "AfterAgentIdle"; RunAfterSeconds = None; IdleSeconds = Some 900 }).IsError, Is.True)
         Assert.That(store.ScheduleExecution({ basic with TriggerKind = "Unknown" }).IsError, Is.True)
         Assert.That(store.ScheduleExecution({ basic with ActionKind = "BrowserScript" }).IsError, Is.True)

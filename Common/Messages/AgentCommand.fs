@@ -369,13 +369,30 @@ type LedgerWriteCommand =
       ExpectedRequestHash: string
       AcknowledgeVisibility: bool }
 
+/// Optional typed query for ListProjectTasks; absent means the bounded default.
+type TaskOverviewRequest =
+    { Scope: string
+      Lifecycle: string
+      Phase: string
+      Assignee: string
+      ReviewStatus: string
+      SinceSequence: int64
+      PageSize: int
+      Cursor: string }
+
+module TaskOverviewRequest =
+    let defaultValue =
+        { Scope = ""; Lifecycle = ""; Phase = ""; Assignee = ""; ReviewStatus = ""
+          SinceSequence = -1L; PageSize = 0; Cursor = "" }
+
 type ReviewReadCommand =
     { ProjectName: string
       Action: string
       TaskId: string
       RequestId: string
       ReviewerId: string
-      DocumentPath: string }
+      DocumentPath: string
+      TaskOverview: TaskOverviewRequest option }
 
 type ReviewWriteCommand =
     { ProjectName: string

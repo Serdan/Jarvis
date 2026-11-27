@@ -66,7 +66,7 @@ let ledgerReviewMutationsNeedGitApprovalWhileReadsDoNot () =
     Client.PermissionPolicy.clearGrants ()
     let read = ReviewReadCommand
                     { ProjectName = "Project1"; Action = "ReviewerQueue"
-                      TaskId = ""; RequestId = ""; ReviewerId = "Reviewer"; DocumentPath = "" }
+                      TaskId = ""; RequestId = ""; ReviewerId = "Reviewer"; DocumentPath = ""; TaskOverview = None }
     match Client.PermissionPolicy.evaluate read with
     | Ok () -> ()
     | other -> Assert.Fail(sprintf "Expected read-only  access, got %A" other)

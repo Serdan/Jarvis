@@ -270,3 +270,110 @@ type TaskOverviewBatchPerformanceTests() =
             match ReviewWorkflow.listProjectTasks reader with
             | Error(InvalidBinding _) -> ()
             | result -> Assert.Fail(sprintf "Invalid linked attempt locator was accepted: %A" result))
+
+    [<Test>]
+    member _.LargeMixedHistoryUsesActualAuthenticatedBridgeAndPinnedPages() =
+        withFixture 1500 2000 (fun checkout reader ->
+            // Most records are history. Preserve explicit current blockers,
+            // null attempts, and unresolved review work for a closed task.
+            let taskAt i =
+                JsonSerializer.Deserialize<ReviewTask>(File.ReadAllText(Path.Combine(checkout, taskPath i)), jsonOptions)
+            let attemptAt i =
+                JsonSerializer.Deserialize<ReviewAttempt>(File.ReadAllText(Path.Combine(checkout, attemptPath i)), jsonOptions)
+            let reviewAt i owner =
+                JsonSerializer.Deserialize<BranchReview>(File.ReadAllText(Path.Combine(checkout, reviewPath i owner)), jsonOptions)
+            for i in 1 .. 1500 do
+                let t, a = taskAt i, attemptAt i
+                let lifecycle = if i <= 4 then "InProgress" else "Closed"
+                let phase = if i = 1 then "Blocked" elif i = 2 then "Deferred" elif i <= 4 then "Started" else "Finished"
+                put checkout (taskPath i) (entityJson 2 { t with Lifecycle = lifecycle })
+                put checkout (attemptPath i) (entityJson 3 { a with Phase = phase })
+            put checkout (taskPath 4) (entityJson 2 { taskAt 4 with Lifecycle = "Open"; AttemptId = null })
+            for i in 1 .. 2000 do
+                let owner = 1 + ((i - 1) % 1500)
+                let r = reviewAt i owner
+                let status = if i = 5 then "Unclaimed" elif i = 6 then "Claimed" else "Accepted"
+                put checkout (reviewPath i owner)
+                    (entityJson 3 { r with Status = status; Acknowledged = i <> 3 && i <> 5 && i <> 6
+                                           ReviewerId = if i = 6 then "Reviewer" else null })
+            commitAndPublish checkout
+
+            let before = LedgerStore.fetch reader |> ok
+            let root = Path.GetDirectoryName reader.RepositoryPath
+            let rt = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+            let bind = Client.OrchestrationApi.LedgerBindingConfig.bindExisting "reader" rt
+            bind reader.ProjectId reader.LedgerId reader.Epoch reader.RemoteName
+                reader.ApprovedFetchUrl reader.ApprovedPushUrl before.Commit true
+            |> function Ok _ -> () | Error e -> failwithf "Binding failed: %A" e
+            let config = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot reader.RepositoryPath
+            try
+                let command request =
+                    Common.ReviewReadCommand
+                        { ProjectName = "reader"; Action = "ListProjectTasks"; TaskId = ""
+                          RequestId = ""; ReviewerId = ""; DocumentPath = ""; TaskOverview = request }
+                let invoke request =
+                    let payload = JsonSerializer.Serialize(command request)
+                    Client.SignalR.Client.executeAuthenticatedCommandWithChallengeWake
+                        rt payload "PerfFixture" None false (fun _ _ -> ())
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                let parse (response: Common.AgentCommandResponse) =
+                    Assert.That(response.Error.IsNone, Is.True, sprintf "%A" response.Error)
+                    Assert.That(response.Result.IsSome, Is.True)
+                    JsonSerializer.Deserialize<Client.TaskOverviewProjection.Page>(response.Result.Value)
+                let unbounded = ReviewWorkflow.listProjectTasks reader |> ok
+                let oldPayload = JsonSerializer.Serialize unbounded
+                Assert.That(System.Text.Encoding.UTF8.GetByteCount oldPayload,
+                            Is.GreaterThan(Common.AgentProtocol.maxResponseBytes))
+                let dispatched: Client.SignalR.Client.DispatchedResult =
+                    { Payload = oldPayload; ChangedAgentIds = [] }
+                match (Client.SignalR.Client.toAgentResponse (command None) [] [] None (Ok dispatched)).Error with
+                | Some(Common.OutputTruncated _) -> ()
+                | e -> Assert.Fail(sprintf "Legacy overview bypassed actual bridge cap: %A" e)
+
+                let first = invoke None |> parse
+                Assert.That(first.SnapshotCommit, Is.EqualTo(before.Commit))
+                Assert.That(first.TotalTasks, Is.EqualTo(1500))
+                Assert.That(first.TotalReviews, Is.EqualTo(2000))
+                Assert.That(first.HasMore, Is.False)
+                Assert.That(first.Tasks |> List.map (fun x -> x.Task.TaskId), Is.EqualTo([ for i in 1 .. 6 -> taskId i ]))
+                Assert.That(first.Reviews |> List.map (fun x -> x.ReviewId), Is.EqualTo([ for i in [3;5;6] -> reviewId i ]))
+                Assert.That(first.Reviews |> List.forall (fun x -> x.Detail.IsNone), Is.True)
+                Assert.That((LedgerStore.fetch reader |> ok).Commit, Is.EqualTo(before.Commit))
+
+                let request = { Common.TaskOverviewRequest.defaultValue with Scope = "history"; PageSize = 100 }
+                let historyFirst = invoke (Some request) |> parse
+                Assert.That(historyFirst.HasMore, Is.True)
+                Assert.That(historyFirst.MatchingTasks, Is.EqualTo(1500))
+                Assert.That(historyFirst.MatchingReviews, Is.EqualTo(2000))
+
+                let reject request =
+                    let response = invoke (Some request)
+                    Assert.That(response.Error.IsSome, Is.True)
+                    Assert.That(response.Result.IsNone, Is.True)
+                reject { request with Cursor = historyFirst.NextCursor; Assignee = "different" }
+                reject { request with Cursor = historyFirst.NextCursor + "!" }
+                reject { request with Scope = "unknown" }
+                reject { request with PageSize = 101 }
+                reject { request with SinceSequence = -2L }
+
+                // A later canonical commit must not shift a pinned continuation.
+                put checkout (taskPath 1) (entityJson 2 { taskAt 1 with Title = "Later title" })
+                commitAndPublish checkout
+                let fresh = invoke None |> parse
+                Assert.That(fresh.SnapshotCommit, Is.Not.EqualTo(before.Commit))
+                Assert.That(fresh.Tasks.Head.Task.Title, Is.EqualTo("Later title"))
+
+                let rec enumerate (page: Client.TaskOverviewProjection.Page) tasks reviews =
+                    Assert.That(page.SnapshotCommit, Is.EqualTo(before.Commit))
+                    let tasks = List.rev page.Tasks @ tasks
+                    let reviews = List.rev page.Reviews @ reviews
+                    if page.HasMore then
+                        Assert.That(page.NextCursor, Is.Not.Null.And.Not.Empty)
+                        enumerate (invoke (Some { request with Cursor = page.NextCursor }) |> parse) tasks reviews
+                    else List.rev tasks, List.rev reviews
+                let tasks, reviews = enumerate historyFirst [] []
+                Assert.That(tasks |> List.map (fun t -> t.Task, t.Attempt),
+                            Is.EqualTo(unbounded.Tasks |> List.map (fun t -> t.Task, t.Attempt)))
+                Assert.That(reviews |> List.map (fun r -> r.Detail.Value), Is.EqualTo(unbounded.Reviews))
+            finally
+                if File.Exists config then File.Delete config)

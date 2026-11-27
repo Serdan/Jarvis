@@ -68,8 +68,12 @@ module RoleInstructions =
                               PropertyNameCaseInsensitive = true)
     let private utf8 = Encoding.UTF8
     let private roleIdPattern = Regex("^[A-Za-z0-9_-]{1,80}$", RegexOptions.Compiled)
-    let private isRoleId (value: string) =
-        not (isNull value) && roleIdPattern.IsMatch value
+    let private roleIdError (value: string) =
+        if not (isNull value) && roleIdPattern.IsMatch value then None
+        else
+            let size = if isNull value then "null" else $"measured {value.Length} UTF-16 code units"
+            Some $"Role ID must match {roleIdPattern} ({size})."
+    let private isRoleId value = roleIdError value |> Option.isNone
     let private isAgentId (value: string) =
         not (String.IsNullOrWhiteSpace value)
         && utf8.GetByteCount value <= 120
@@ -79,13 +83,32 @@ module RoleInstructions =
     // source bytes) keeps 16 roles plus one agent override below the 640 KiB
     // explicit instruction page budget even for control-heavy text.
     let private maxEscapedBodyBytes = 16 * 1024
-    let private validBody allowEmpty (value: string) =
-        not (isNull value)
-        && (allowEmpty || not (String.IsNullOrWhiteSpace value))
-        && utf8.GetByteCount value <= 32768
-        && utf8.GetByteCount(JsonSerializer.Serialize(value, options)) <= maxEscapedBodyBytes
-    let private validPurpose (value: string) =
-        not (String.IsNullOrWhiteSpace value) && utf8.GetByteCount value <= 4096
+    let private bodyError allowEmpty (value: string) =
+        if isNull value || (not allowEmpty && String.IsNullOrWhiteSpace value) then
+            Some (if allowEmpty then "Role instructions must not be null." else "Role instructions must be nonblank.")
+        else
+            let rawBytes = utf8.GetByteCount value
+            if rawBytes > 32768 then
+                Some $"Role instructions exceed 32768 UTF-8 bytes (measured {rawBytes})."
+            else
+                let escapedBytes = utf8.GetByteCount(JsonSerializer.Serialize(value, options))
+                if escapedBytes > maxEscapedBodyBytes then
+                    Some $"Role instructions exceed {maxEscapedBodyBytes} JSON-escaped UTF-8 bytes including quotes (measured {escapedBytes})."
+                else None
+    let private validBody allowEmpty value = bodyError allowEmpty value |> Option.isNone
+    let private purposeError (value: string) =
+        if String.IsNullOrWhiteSpace value then Some "Role purpose must be nonblank."
+        else
+            let size = utf8.GetByteCount value
+            if size > 4096 then Some $"Role purpose exceeds 4096 UTF-8 bytes (measured {size})."
+            else None
+    let private validPurpose value = purposeError value |> Option.isNone
+    let private versionError minimum value =
+        if value < minimum then Some $"Role version must be at least {minimum} (measured {value})."
+        else None
+    let private actorError value =
+        if String.IsNullOrWhiteSpace value then Some "Role actor must be nonblank."
+        else None
     let private validRoles (values: string list) =
         not (isNull (box values))
         && values.Length <= 16
@@ -157,8 +180,8 @@ module RoleInstructions =
         isRoleId role.RoleId
         && validPurpose role.Purpose
         && validBody false role.Instructions
-        && role.Version >= 1
-        && not (String.IsNullOrWhiteSpace role.UpdatedBy)
+        && (versionError 1 role.Version |> Option.isNone)
+        && (actorError role.UpdatedBy |> Option.isNone)
         && role.UpdatedSequence > 0L
 
     let private validConfig (config: AgentInstructionConfig) =
@@ -224,10 +247,15 @@ module RoleInstructions =
         }
 
     let private editRole binding actor operationId roleId expectedVersion purpose instructions =
-        if not (isRoleId roleId) || expectedVersion < 0 || not (validPurpose purpose)
-           || not (validBody false instructions) || String.IsNullOrWhiteSpace actor then
-            Error(InvalidBinding "Invalid role ID, version, purpose or instructions.")
-        else
+        let validation =
+            roleIdError roleId
+            |> Option.orElseWith (fun () -> versionError 0 expectedVersion)
+            |> Option.orElseWith (fun () -> purposeError purpose)
+            |> Option.orElseWith (fun () -> bodyError false instructions)
+            |> Option.orElseWith (fun () -> actorError actor)
+        match validation with
+        | Some message -> Error(InvalidBinding message)
+        | None ->
             let kind = if expectedVersion = 0 then "CreateRole" else "UpdateRole"
             LegacyDirectWriterFence.transact binding
                 (intent operationId actor kind
@@ -249,8 +277,9 @@ module RoleInstructions =
         editRole binding actor operationId roleId 0 purpose instructions
 
     let updateRole binding actor operationId roleId expectedVersion purpose instructions =
-        if expectedVersion < 1 then Error(InvalidBinding "An existing role version is required.")
-        else editRole binding actor operationId roleId expectedVersion purpose instructions
+        match versionError 1 expectedVersion with
+        | Some message -> Error(InvalidBinding message)
+        | None -> editRole binding actor operationId roleId expectedVersion purpose instructions
 
     let attachRole binding actor operationId agentId roleId expectedVersion =
         if not (isAgentId agentId) || not (isRoleId roleId) || expectedVersion < 0

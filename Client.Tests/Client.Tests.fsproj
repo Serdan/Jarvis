@@ -73,6 +73,7 @@
         <Compile Include="RoleInstructionsTests.fs"/>
         <Compile Include="PerformanceRegression.fs"/>
         <Compile Include="ReviewWorkflowTests.fs"/>
+        <Compile Include="ReviewAuthorityHistoryTests.fs"/>
         <Compile Include="TaskOverviewBatchPerformanceTests.fs"/>
         <Compile Include="ChallengeWorkflowTests.fs"/>
         <Compile Include="ChallengeStateMachinePropertyTests.fs"/>

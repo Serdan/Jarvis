@@ -503,73 +503,34 @@ let executeReadySchedule authenticatedActor rt browser action =
 let executeRegisteredSchedule readFence actorProvider rt tui browser =
     executeRegisteredScheduleWithActivity unavailableActivity readFence actorProvider rt tui browser
 
-let private runClient args =
-    let activityStore, activityStoreError =
-        try
-            Some(Client.ActivityLog.Store.CreateDefault()), None
-        with ex ->
-            None, Some ex.Message
+/// Lifetime of the actual Client registration. The caller owns the connection
+/// and browser transport; drain accepted dispatches before disposing either.
+type ClientRegistration =
+    { Connection: HubConnection
+      IsRegistered: unit -> bool
+      RegisterAsync: string -> (unit -> string) -> Task<bool>
+      ResetRegistration: unit -> unit
+      ReadLaunchActivity: string -> string -> Task<Result<AgentActivitySnapshot, string>>
+      StartScheduler: unit -> unit
+      StopAsync: unit -> Task<unit>
+      DisposeWake: unit -> unit }
+    interface IDisposable with
+        member this.Dispose() = this.DisposeWake()
 
-    let tui =
-        match activityStore with
-        | Some store -> ConsoleTui(activityLog = store)
-        | None -> ConsoleTui()
-
-    tui.SetConnectionState(Disconnected, BuildInfo.ServerUrl)
-    activityStoreError
-    |> Option.iter (fun error -> tui.Log $"Activity persistence unavailable: {error}")
-
-    let _, effective =
-        match parseArgs args with
-        | Ok result -> result
-        | Error message ->
-            eprintfn "%s" message
-            eprintfn "Usage: JarvisClient [--path <workspace>] [--machine-name <name>] [--trust none|partial|full] [--allow-env NAME]... [--max-import-bytes BYTES] [--browser-port PORT]"
-            exit 2
-
-    let dir = effective.WorkspacePath
-    let allowedEnvironmentVariables = effective.AllowedEnvironmentVariables
-    let maxImportBytes = effective.MaxImportBytes
-    let resolveMachineName () =
-        // Re-read only the display name on registration, leaving runtime settings unchanged.
-        match ClientConfig.load() with
-        | Error error ->
-            tui.Log $"Unable to reload configured machine name: {error}"
-            effective.MachineName
-        | Ok latest ->
-            match ClientConfig.resolve latest.Stored (args |> Array.toList) with
-            | Ok current -> current.MachineName
-            | Error error ->
-                tui.Log $"Unable to reload configured machine name: {error}"
-                effective.MachineName
-    let trustLevel =
-        match TrustLevel.parse effective.TrustLevel with
-        | Ok level -> level
-        | Error error -> eprintfn "%s" error; exit 2
-
-    tui.SetSettingsAccess
-        { Load = ClientConfig.load
-          Save = ClientConfig.save
-          Effective = effective }
-    ProcessEnvironment.configureAllowedEnvironmentVariables allowedEnvironmentVariables
-    let rt = Runtime(getDir dir, tui, trustLevel, maxImportBytes)
-    // Opt-in local browser bridge. The extension must authenticate and register a tab.
-    let browserPort = effective.BrowserPort
-    let browser =
-        browserPort |> Option.map (fun port ->
-            let bridge = BrowserBridge.Service(port, BrowserBridge.getOrCreateSecret())
-            bridge.Start()
-            rt.Browser <- Some bridge
-            tui.Log $"Browser bridge listening on 127.0.0.1:{port}; registered windows and explicit tab registrations required."
-            bridge)
-
+/// Production and disposable hosted tests use the same scheduler callback,
+/// compiled-OFF native wake registration, and original SignalR routes.
+/// Connection preparation remains caller-owned (OAuth and concrete transport).
+let registerClientRuntime (rt: Runtime) (tui: ConsoleTui) browser schedulePath readFence
+                          (loadBinding: string -> Result<LedgerBinding, EffectError>)
+                          (jobRoot: unit -> string)
+                          (prepareConnection: unit -> HubConnection * string option) =
     // One persistent execution scheduler for CLI and browser actions.
     // The browser bridge is optional; CLI scheduling works without an extension.
     let mutable registered = false
     let readyResumeActor : (unit -> string option) ref = ref (fun () -> None)
     let mutable readLaunchActivity = unavailableActivity
     let executeScheduledAction =
-        executeRegisteredScheduleWithActivity (fun project agent -> readLaunchActivity project agent) ClientConfig.capacityFenceMode readyResumeActor rt tui browser
+        executeRegisteredScheduleWithActivity (fun project agent -> readLaunchActivity project agent) readFence readyResumeActor rt tui browser
     // The runtime owns at most one local scheduler per private state file.
     // A second JarvisClient can still connect, but never becomes a competing
     // schedule writer/executor. Idle launches also require a *fresh* authenticated
@@ -578,7 +539,7 @@ let private runClient args =
         fun _ _ -> Task.FromResult(Error "ActivityVerificationUnavailable: not connected.")
     let scheduler =
         try
-            Some(new BrowserSchedules.Service(BrowserSchedules.defaultPath(), executeScheduledAction,
+            Some(new BrowserSchedules.Service(schedulePath, executeScheduledAction,
                 agentLastSeen=(fun project agent ->
                     let checkout = project.IndexOf("::", StringComparison.Ordinal)
                     let canonical = if checkout < 0 then project else project.Substring(0, checkout)
@@ -591,43 +552,7 @@ let private runClient args =
             None
     rt.BrowserScheduler <- scheduler
 
-    let formatJobResult value = value |> Result.mapError (fun error -> sprintf "%A" error)
-    tui.SetJobAccess
-        { List = (fun () ->
-            JobManager.listJobs { ProjectName = None; IncludeCompleted = true } rt
-            |> Result.map (fun result -> result.Jobs)
-            |> formatJobResult)
-          Read = (fun jobId afterSequence ->
-            JobManager.getJobResult { ProjectName = ""; JobId = jobId; AfterSequence = Some afterSequence } rt
-            |> formatJobResult)
-          Cancel = (fun jobId ->
-            JobManager.cancelJob { ProjectName = ""; JobId = jobId } rt
-            |> formatJobResult) }
-    tui.SetAgentAccess { Load = (fun () -> AgentDashboard.load rt) }
-    // Explicit local opt-in. No claims, Scheduler or Agent-based Work source.
-    let workTuiEnabled =
-        String.Equals(Environment.GetEnvironmentVariable("JARVIS_WORK_TUI_READONLY"),
-                      "1", StringComparison.Ordinal)
-    WorkQueueDashboardHost.installIfEnabled workTuiEnabled tui
-        (fun () -> WorkQueueDashboardHost.createAccess rt)
-    if workTuiEnabled then
-        tui.Log "Read-only Git-verified Work view enabled; account capacity and dispatch remain UNKNOWN."
-    tui.Log $"Trust: {TrustLevel.toDisplayName trustLevel}"
-    tui.Log $"Allowed sensitive environment variables: {allowedEnvironmentVariables.Length}"
-    let importSizeDescription =
-        if maxImportBytes = 0L then "unlimited" else $"{maxImportBytes} bytes"
-    tui.Log $"Maximum import size: {importSizeDescription}"
-
-    let oauth =
-        OAuth.login tui.Log tui.ShowSignInLink
-        |> Async.AwaitTask
-        |> Async.RunSynchronously
-
-    let authenticatedOperator =
-        try
-            oauth.GetAccessTokenAsync().GetAwaiter().GetResult()
-            |> operatorActorFromAccessToken
-        with _ -> None
+    let connection, authenticatedOperator = prepareConnection()
     // B1 and native session host share a single compiled default-off registration.
     // No environment switch can enable the unfinished authority boundary.
     let challengeWakeEnabled = false
@@ -642,96 +567,19 @@ let private runClient args =
     let challengeHost, onChallengeCommit =
         Client.AutomationChallengeWakeAdapter.registerHost
             challengeWakeEnabled challengeHostPorts
-            (fun project -> OrchestrationApi.LedgerBindingConfig.load project rt)
+            loadBinding
             tui.Log
     // JobManager and this observer use the identical client workspace root.
     // Root construction is deferred so the compiled OFF path performs no I/O.
-    let jobRoot () =
-        let (ProjectDirectory workspace) = (rt :> ProjectIO).Project.Root
-        BoundedProcess.DurableJobs.root workspace
-    use jobWake =
+    let jobWake =
         new AutomationJobTerminalWake.RuntimeRegistration(
             challengeWakeEnabled, jobRoot,
-            (fun project -> OrchestrationApi.LedgerBindingConfig.load project rt),
+            loadBinding,
             challengeHost, onChallengeCommit,
             (Client.invalidateAgentStates rt), tui.Log)
     // Route the existing authenticated Challenge callback through the composite.
     // No new command or scheduler authority is introduced.
     let onChallengeCommit cmd receipt = jobWake.OnChallengeCommit(cmd, receipt)
-
-    let toUiError result = result |> Result.mapError (fun error -> sprintf "%A" error)
-    let toReplyError = function
-        | LedgerFailureError failure when failure.Code = "StaleEntityVersion" ->
-            StaleOperatorReply failure.Message
-        // Every other failed/uncertain write retains the exact retry operation ID.
-        // Only a definitive CAS stale response can authorize a new intent.
-        | error -> OtherOperatorReplyFailure(sprintf "%A" error)
-    registerCapacityPolicyAccess tui rt authenticatedOperator (fun () ->
-        try
-            oauth.GetAccessTokenAsync().GetAwaiter().GetResult()
-            |> operatorActorFromAccessToken
-        with _ -> None)
-    match authenticatedOperator with
-    | Some actor ->
-        tui.SetChallengeAccess
-            { Load = (fun () -> OrchestrationApi.OperatorChallengeApi.list rt |> toUiError)
-              Reply = (fun request ->
-                  OrchestrationApi.OperatorChallengeApi.reply actor request rt
-                  |> Result.map ignore |> Result.mapError toReplyError) }
-        let resolveLaunchBinding projectName =
-            ProjectPaths.resolveProjectContext projectName rt
-            |> Result.bind (fun context ->
-                OrchestrationApi.LedgerBindingConfig.loadForContext context
-                |> Result.map (fun binding -> context, binding))
-        tui.SetLaunchTemplateAccess
-            { Load = (fun projectName ->
-                resolveLaunchBinding projectName
-                |> Result.bind (fun (_, binding) ->
-                    RoleInstructions.RoleInstructions.getLaunchTemplate binding
-                    |> Result.mapError OrchestrationApi.LedgerErrors.toEffect
-                    |> Result.map (fun snapshot ->
-                        { LaunchProjectName = projectName
-                          ProjectId = binding.ProjectId
-                          LedgerId = binding.LedgerId
-                          Epoch = binding.Epoch
-                          Version = snapshot.Template |> Option.map _.Version |> Option.defaultValue 0
-                          Template = snapshot.Template |> Option.map _.Template |> Option.defaultValue "" }))
-                |> toUiError)
-              Save = (fun snapshot operationId body ->
-                resolveLaunchBinding snapshot.LaunchProjectName
-                |> Result.mapError (fun error -> TemplateUncertain(sprintf "%A" error))
-                |> Result.bind (fun (context, binding) ->
-                    if binding.ProjectId <> snapshot.ProjectId || binding.LedgerId <> snapshot.LedgerId
-                       || binding.Epoch <> snapshot.Epoch then
-                        Error(TemplateUncertain "Project binding changed; restore the original trusted binding before retrying.")
-                    else
-                        let cmd: TaskWriteCommand =
-                            { ProjectName = snapshot.LaunchProjectName; Action = "SetLaunchTemplate"
-                              OperationId = operationId.ToString("D"); TaskId = ""; AttemptId = ""
-                              ActorId = "Orchestrator"; OwnerId = ""; Title = ""; Html = body
-                              ExpectedVersion = snapshot.Version; ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
-                              AssignmentGeneration = 0; Summary = ""; NextAction = ""; Reason = ""
-                              BaseOid = ""; TargetRef = ""; SourceRef = ""; AllowDetached = false
-                              AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""; SessionId = "" }
-                        OrchestrationApi.TaskApi.writeForExpectedBinding context binding cmd rt
-                        |> Result.map ignore
-                        |> Result.mapError (function
-                            | LedgerFailureError failure when failure.Code = "StaleEntityVersion" -> TemplateStale failure.Message
-                            | LedgerFailureError failure when failure.Code = "InvalidBinding" -> TemplateRejected failure.Message
-                            | error -> TemplateUncertain(sprintf "%A" error)))) }
-    | None ->
-        tui.Log "Operator challenge replies unavailable: authenticated OAuth subject missing."
-
-    let connection =
-        HubConnectionBuilder()
-            .AddJsonProtocol()
-            .WithUrl(
-                BuildInfo.ServerUrl,
-                Action<Microsoft.AspNetCore.Http.Connections.Client.HttpConnectionOptions>(fun options ->
-                    options.AccessTokenProvider <-
-                        Func<Task<string>>(fun () -> oauth.GetAccessTokenAsync()))
-            )
-            .Build()
 
     readyResumeActor.Value <- (fun () ->
         if registered && connection.State = HubConnectionState.Connected then authenticatedOperator
@@ -795,9 +643,6 @@ let private runClient args =
     // client/Git activity source exists. Once/Every are unaffected.
     verifyIdleActivity <- (fun _ _ ->
         Task.FromResult(Error "ActivityProofUnavailable: independent durable activity evidence is not implemented."))
-    scheduler |> Option.iter (fun service -> service.Start())
-    if scheduler.IsSome then
-        tui.Log "Persistent scheduler enabled; AfterAgentIdle disabled pending durable activity proof."
 
     let dispatch =
         CommandDispatchQueue(
@@ -901,12 +746,227 @@ let private runClient args =
             tui.Log $"SignalR connection closed: {detail}"
             Task.CompletedTask))
 
+    { Connection = connection
+      IsRegistered = (fun () -> registered)
+      RegisterAsync = (fun deviceId machineName -> task {
+          let! accepted = register tui connection deviceId machineName
+          registered <- accepted
+          if accepted then
+              Client.invalidateAllAgentStates rt
+              jobWake.OnConnected()
+          return accepted
+      })
+      ResetRegistration = (fun () -> registered <- false)
+      ReadLaunchActivity = (fun project agent -> readLaunchActivity project agent)
+      StartScheduler = (fun () ->
+          scheduler |> Option.iter (fun service -> service.Start())
+          if scheduler.IsSome then
+              tui.Log "Persistent scheduler enabled; AfterAgentIdle disabled pending durable activity proof.")
+      StopAsync = (fun () -> task {
+            // Keep the connection and browser services alive while accepted MCP
+            // commands and their replies drain. Stop future schedules afterward.
+            try
+                do! dispatch.Complete().WaitAsync(TimeSpan.FromMinutes 2.0)
+            with :? TimeoutException ->
+                tui.Log "MCP dispatch shutdown exceeded two minutes; some command outcomes may be uncertain."
+            // Stop job ingress before its downstream scheduler after draining MCP.
+            (jobWake :> IDisposable).Dispose()
+            // Stop the explicit default-off Challenge host after draining its ingress.
+            do! challengeHost.StopAsync()
+            scheduler |> Option.iter (fun service -> (service :> IDisposable).Dispose())
+      })
+      DisposeWake = (fun () -> (jobWake :> IDisposable).Dispose()) }
+
+let private runClient args =
+    let activityStore, activityStoreError =
+        try
+            Some(Client.ActivityLog.Store.CreateDefault()), None
+        with ex ->
+            None, Some ex.Message
+
+    let tui =
+        match activityStore with
+        | Some store -> ConsoleTui(activityLog = store)
+        | None -> ConsoleTui()
+
+    tui.SetConnectionState(Disconnected, BuildInfo.ServerUrl)
+    activityStoreError
+    |> Option.iter (fun error -> tui.Log $"Activity persistence unavailable: {error}")
+
+    let _, effective =
+        match parseArgs args with
+        | Ok result -> result
+        | Error message ->
+            eprintfn "%s" message
+            eprintfn "Usage: JarvisClient [--path <workspace>] [--machine-name <name>] [--trust none|partial|full] [--allow-env NAME]... [--max-import-bytes BYTES] [--browser-port PORT]"
+            exit 2
+
+    let dir = effective.WorkspacePath
+    let allowedEnvironmentVariables = effective.AllowedEnvironmentVariables
+    let maxImportBytes = effective.MaxImportBytes
+    let resolveMachineName () =
+        // Re-read only the display name on registration, leaving runtime settings unchanged.
+        match ClientConfig.load() with
+        | Error error ->
+            tui.Log $"Unable to reload configured machine name: {error}"
+            effective.MachineName
+        | Ok latest ->
+            match ClientConfig.resolve latest.Stored (args |> Array.toList) with
+            | Ok current -> current.MachineName
+            | Error error ->
+                tui.Log $"Unable to reload configured machine name: {error}"
+                effective.MachineName
+    let trustLevel =
+        match TrustLevel.parse effective.TrustLevel with
+        | Ok level -> level
+        | Error error -> eprintfn "%s" error; exit 2
+
+    tui.SetSettingsAccess
+        { Load = ClientConfig.load
+          Save = ClientConfig.save
+          Effective = effective }
+    ProcessEnvironment.configureAllowedEnvironmentVariables allowedEnvironmentVariables
+    let rt = Runtime(getDir dir, tui, trustLevel, maxImportBytes)
+    // Opt-in local browser bridge. The extension must authenticate and register a tab.
+    let browserPort = effective.BrowserPort
+    let browser =
+        browserPort |> Option.map (fun port ->
+            let bridge = BrowserBridge.Service(port, BrowserBridge.getOrCreateSecret())
+            bridge.Start()
+            rt.Browser <- Some bridge
+            tui.Log $"Browser bridge listening on 127.0.0.1:{port}; registered windows and explicit tab registrations required."
+            bridge)
+
+    let prepareConnection () =
+        let formatJobResult value = value |> Result.mapError (fun error -> sprintf "%A" error)
+        tui.SetJobAccess
+            { List = (fun () ->
+                JobManager.listJobs { ProjectName = None; IncludeCompleted = true } rt
+                |> Result.map (fun result -> result.Jobs)
+                |> formatJobResult)
+              Read = (fun jobId afterSequence ->
+                JobManager.getJobResult { ProjectName = ""; JobId = jobId; AfterSequence = Some afterSequence } rt
+                |> formatJobResult)
+              Cancel = (fun jobId ->
+                JobManager.cancelJob { ProjectName = ""; JobId = jobId } rt
+                |> formatJobResult) }
+        tui.SetAgentAccess { Load = (fun () -> AgentDashboard.load rt) }
+        // Explicit local opt-in. No claims, Scheduler or Agent-based Work source.
+        let workTuiEnabled =
+            String.Equals(Environment.GetEnvironmentVariable("JARVIS_WORK_TUI_READONLY"),
+                          "1", StringComparison.Ordinal)
+        WorkQueueDashboardHost.installIfEnabled workTuiEnabled tui
+            (fun () -> WorkQueueDashboardHost.createAccess rt)
+        if workTuiEnabled then
+            tui.Log "Read-only Git-verified Work view enabled; account capacity and dispatch remain UNKNOWN."
+        tui.Log $"Trust: {TrustLevel.toDisplayName trustLevel}"
+        tui.Log $"Allowed sensitive environment variables: {allowedEnvironmentVariables.Length}"
+        let importSizeDescription =
+            if maxImportBytes = 0L then "unlimited" else $"{maxImportBytes} bytes"
+        tui.Log $"Maximum import size: {importSizeDescription}"
+
+        let oauth =
+            OAuth.login tui.Log tui.ShowSignInLink
+            |> Async.AwaitTask
+            |> Async.RunSynchronously
+
+        let authenticatedOperator =
+            try
+                oauth.GetAccessTokenAsync().GetAwaiter().GetResult()
+                |> operatorActorFromAccessToken
+            with _ -> None
+        let toUiError result = result |> Result.mapError (fun error -> sprintf "%A" error)
+        let toReplyError = function
+            | LedgerFailureError failure when failure.Code = "StaleEntityVersion" ->
+                StaleOperatorReply failure.Message
+            // Every other failed/uncertain write retains the exact retry operation ID.
+            // Only a definitive CAS stale response can authorize a new intent.
+            | error -> OtherOperatorReplyFailure(sprintf "%A" error)
+        registerCapacityPolicyAccess tui rt authenticatedOperator (fun () ->
+            try
+                oauth.GetAccessTokenAsync().GetAwaiter().GetResult()
+                |> operatorActorFromAccessToken
+            with _ -> None)
+        match authenticatedOperator with
+        | Some actor ->
+            tui.SetChallengeAccess
+                { Load = (fun () -> OrchestrationApi.OperatorChallengeApi.list rt |> toUiError)
+                  Reply = (fun request ->
+                      OrchestrationApi.OperatorChallengeApi.reply actor request rt
+                      |> Result.map ignore |> Result.mapError toReplyError) }
+            let resolveLaunchBinding projectName =
+                ProjectPaths.resolveProjectContext projectName rt
+                |> Result.bind (fun context ->
+                    OrchestrationApi.LedgerBindingConfig.loadForContext context
+                    |> Result.map (fun binding -> context, binding))
+            tui.SetLaunchTemplateAccess
+                { Load = (fun projectName ->
+                    resolveLaunchBinding projectName
+                    |> Result.bind (fun (_, binding) ->
+                        RoleInstructions.RoleInstructions.getLaunchTemplate binding
+                        |> Result.mapError OrchestrationApi.LedgerErrors.toEffect
+                        |> Result.map (fun snapshot ->
+                            { LaunchProjectName = projectName
+                              ProjectId = binding.ProjectId
+                              LedgerId = binding.LedgerId
+                              Epoch = binding.Epoch
+                              Version = snapshot.Template |> Option.map _.Version |> Option.defaultValue 0
+                              Template = snapshot.Template |> Option.map _.Template |> Option.defaultValue "" }))
+                    |> toUiError)
+                  Save = (fun snapshot operationId body ->
+                    resolveLaunchBinding snapshot.LaunchProjectName
+                    |> Result.mapError (fun error -> TemplateUncertain(sprintf "%A" error))
+                    |> Result.bind (fun (context, binding) ->
+                        if binding.ProjectId <> snapshot.ProjectId || binding.LedgerId <> snapshot.LedgerId
+                           || binding.Epoch <> snapshot.Epoch then
+                            Error(TemplateUncertain "Project binding changed; restore the original trusted binding before retrying.")
+                        else
+                            let cmd: TaskWriteCommand =
+                                { ProjectName = snapshot.LaunchProjectName; Action = "SetLaunchTemplate"
+                                  OperationId = operationId.ToString("D"); TaskId = ""; AttemptId = ""
+                                  ActorId = "Orchestrator"; OwnerId = ""; Title = ""; Html = body
+                                  ExpectedVersion = snapshot.Version; ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
+                                  AssignmentGeneration = 0; Summary = ""; NextAction = ""; Reason = ""
+                                  BaseOid = ""; TargetRef = ""; SourceRef = ""; AllowDetached = false
+                                  AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+                            OrchestrationApi.TaskApi.writeForExpectedBinding context binding cmd rt
+                            |> Result.map ignore
+                            |> Result.mapError (function
+                                | LedgerFailureError failure when failure.Code = "StaleEntityVersion" -> TemplateStale failure.Message
+                                | LedgerFailureError failure when failure.Code = "InvalidBinding" -> TemplateRejected failure.Message
+                                | error -> TemplateUncertain(sprintf "%A" error)))) }
+        | None ->
+            tui.Log "Operator challenge replies unavailable: authenticated OAuth subject missing."
+
+        let connection =
+            HubConnectionBuilder()
+                .AddJsonProtocol()
+                .WithUrl(
+                    BuildInfo.ServerUrl,
+                    Action<Microsoft.AspNetCore.Http.Connections.Client.HttpConnectionOptions>(fun options ->
+                        options.AccessTokenProvider <-
+                            Func<Task<string>>(fun () -> oauth.GetAccessTokenAsync()))
+                )
+                .Build()
+
+        connection, authenticatedOperator
+
+    let jobRoot () =
+        let (ProjectDirectory workspace) = (rt :> ProjectIO).Project.Root
+        BoundedProcess.DurableJobs.root workspace
+    use registration =
+        registerClientRuntime rt tui browser (BrowserSchedules.defaultPath()) ClientConfig.capacityFenceMode
+            (fun project -> OrchestrationApi.LedgerBindingConfig.load project rt)
+            jobRoot prepareConnection
+    let connection = registration.Connection
+    registration.StartScheduler()
+
     // Native Health is ordinary client application code, not a browser schedule
     // or an MCP worker. The default-off switch is reloaded on each check.
     let nativeHealthDependencies : Client.NativeHealth.Dependencies =
         { Enumerate = (fun () -> Client.NativeHealth.NativeHealth.enumerateAutomation rt)
           Current = Client.NativeHealth.NativeHealth.currentAutomation rt
-          Activity = (fun project agent -> readLaunchActivity project agent)
+          Activity = registration.ReadLaunchActivity
           Recover = Client.NativeHealth.NativeHealth.recoverAutomation rt }
     let nativeHealth =
         new Client.NativeHealth.NativeHealth.Service(
@@ -934,7 +994,7 @@ let private runClient args =
 
         while not tui.ShouldQuit do
             if connection.State = HubConnectionState.Disconnected then
-                registered <- false
+                registration.ResetRegistration()
                 let retryDelay = ReconnectSchedule.delayForFailureCount connectionFailureCount
 
                 if retryDelay > TimeSpan.Zero then
@@ -952,20 +1012,14 @@ let private runClient args =
 
                     if connected then
                         connectionFailureCount <- 0
-                        let! isRegistered = register tui connection deviceId resolveMachineName
-                        registered <- isRegistered
-                        if isRegistered then
-                            Client.invalidateAllAgentStates rt
-                            jobWake.OnConnected()
+                        let! _ = registration.RegisterAsync deviceId resolveMachineName
+                        ()
                     else
                         connectionFailureCount <- connectionFailureCount + 1
 
-            elif connection.State = HubConnectionState.Connected && not registered then
-                let! isRegistered = register tui connection deviceId resolveMachineName
-                registered <- isRegistered
-                if isRegistered then
-                    Client.invalidateAllAgentStates rt
-                    jobWake.OnConnected()
+            elif connection.State = HubConnectionState.Connected && not (registration.IsRegistered()) then
+                let! _ = registration.RegisterAsync deviceId resolveMachineName
+                ()
 
             if not tui.ShouldQuit then
                 try
@@ -975,17 +1029,7 @@ let private runClient args =
 
         cts.Cancel()
         do! nativeHealth.StopAsync()
-        // Keep the connection and browser services alive while accepted MCP
-        // commands and their replies drain. Stop future schedules afterward.
-        try
-            do! dispatch.Complete().WaitAsync(TimeSpan.FromMinutes 2.0)
-        with :? TimeoutException ->
-            tui.Log "MCP dispatch shutdown exceeded two minutes; some command outcomes may be uncertain."
-        // Stop job ingress before its downstream scheduler after draining MCP.
-        (jobWake :> IDisposable).Dispose()
-        // Stop the explicit default-off Challenge host after draining its ingress.
-        do! challengeHost.StopAsync()
-        scheduler |> Option.iter (fun service -> (service :> IDisposable).Dispose())
+        do! registration.StopAsync()
         browser |> Option.iter (fun bridge -> (bridge :> IDisposable).Dispose())
         do! connection.DisposeAsync()
 

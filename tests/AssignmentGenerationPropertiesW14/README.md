@@ -89,10 +89,25 @@ Initial test-only executable commit:
 `11a602ba7c7b2b39b7fe6b0acb57f83cd37e8c65`.
 
 First actual Release test job: `d743723818cd4e468cf1adcb05e3c85d` using
-the command above. Terminal evidence has not yet been retrieved. No pass,
-realized coverage, mutant result or defect is claimed at this checkpoint.
-The calibration script syntax and uniqueness of the mutation needle have been
-checked; its actual production-code perturbation has not yet been executed.
+the command above. Early fixture decoding failed before transitions could
+be observed; the oracle now reads persisted JSON fields explicitly.
+
+Verified test-only commit `6b9457381d04e20b9aa040c9e3747c6e10dfb2a8`:
+Release job `faa8527c841440caad4a0be0c9c59621` exited 0, events 14–24,
+2/2 tests passed in 17.8861 seconds. Same command as above with
+`LogFileName=assignment-generation-json.trx`. Both 40-step histories
+executed. Aggregated realized outcomes (80 steps):
+
+- adoption 4, new-spec issuance 2, unchanged issuance 4, revision without
+  adoption 5, first resume 11, working resume 1, resume after yield 2,
+  working recovery 5, yielded recovery 3, yield 6;
+- denied stale generation 4, stale attempt version 4, stale agent version 4,
+  wrong owner 5, wrong phase 6, phase or no new spec 2, unadopted 3;
+- exact replay 5, UUID collision 4.
+
+The minimized calibration on this same SHA is a separate engineering job
+`ee7ea5b7606c41a9873744cf2b121797`. Its terminal evidence is pending;
+no mutant result or production defect is claimed yet.
 
 ## Boundaries
 

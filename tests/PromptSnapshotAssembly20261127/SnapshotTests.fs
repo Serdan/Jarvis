@@ -133,9 +133,9 @@ let private explicitInstructions (rt: Runtime) =
 let private submitFeedback binding task owner reviewer summary =
     let review = Guid.NewGuid()
     let source = git binding.RepositoryPath [ "rev-parse"; "HEAD" ]
-    ReviewWorkflow.submitBranchReview binding (Guid.NewGuid()) task owner review "" source summary "" "" |> success |> ignore
+    ReviewWorkflow.submitBranchReview binding (Guid.NewGuid()) task owner review "" source "Fixture source summary" "" "" |> success |> ignore
     ReviewWorkflow.claimBranchReview binding (Guid.NewGuid()) task review reviewer 1 |> success |> ignore
-    ReviewWorkflow.putReviewDocument binding (Guid.NewGuid()) task review reviewer "summary.md" "" summary |> success |> ignore
+    ReviewWorkflow.putReviewDocument binding (Guid.NewGuid()) task review reviewer "findings/context.md" "" summary |> success |> ignore
     ReviewWorkflow.decideBranchReview binding (Guid.NewGuid()) task review reviewer 2 RequestChanges |> success |> ignore
     review
 
@@ -196,9 +196,9 @@ let legacy_render_and_exact_separate_context_controls () =
         Assert.That(own.UnacknowledgedFeedback |> List.map _.RequestId,
                     Is.EquivalentTo([ownReview.ToString("N"); oldReview.ToString("N")] :> string seq))
         Assert.That(own.UnacknowledgedFeedback |> List.forall (fun n -> isNull n.Feedback), Is.True)
-        let _, ownDoc = ReviewWorkflow.getReviewDocument reader task ownReview "summary.md" |> success
+        let _, ownDoc = ReviewWorkflow.getReviewDocument reader task ownReview "findings/context.md" |> success
         Assert.That(ownDoc.Content, Is.EqualTo("OWN-FOCUSED-REVIEW"))
-        let _, foreignDoc = ReviewWorkflow.getReviewDocument reader "foreign-task" foreignReview "summary.md" |> success
+        let _, foreignDoc = ReviewWorkflow.getReviewDocument reader "foreign-task" foreignReview "findings/context.md" |> success
         Assert.That(foreignDoc.Content, Is.EqualTo("FOREIGN-REVIEW"))
         // Document lookup is not a self-inbox filter; assembly must select applicable references.
         let reviewer = inbox reader snapshot "Reviewer"

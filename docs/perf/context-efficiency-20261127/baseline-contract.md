@@ -111,3 +111,47 @@ runtime to a verified fresh build; do not retroactively label them bound.
 
 Fresh bound evidence and matched repeat terminal receipts must be recorded
 separately before making any new qualification or timing claim.
+
+### Fresh matched controlled repeat (2026-11-27)
+
+Engineering job `32bccf87e296412db17c08de3641097a` completed exit 0.
+Runtime commit `291b5499051fbddfff1c76308e1a0202a5d1862f`;
+harness commit `faa3dde304a0b56073a155e9bc1499e06b215451` (this
+report-only amendment does not alter measured code). From that clean
+corrective checkout, run separately for evidence-dir suffixes r1 and r2:
+
+```sh
+python3 -B scripts/perf/context-efficiency-20261127/run_evidence.py \
+  --source-root /home/serdan/Projects/.Jarvis-worktrees/perf-context-comparator-p1 \
+  --source-sha 291b5499051fbddfff1c76308e1a0202a5d1862f \
+  --history 526 --representative --transport-delay-ms 20 \
+  --evidence-dir /tmp/jarvis-context-bound-p1-correction-r1
+```
+
+Both isolated builds and executions completed exit 0. Each directory retains
+`report.json.receipt.json`, exact resolved Client/Server reference paths
+under its `runtime/` checkout, fresh `build/` outputs, build/run logs and
+digests, full command vectors and artifact digest. Report SHA-256:
+
+- r1: `cd5db64d51cb4e3db29bdce7b32150200a293aa0623b2ed2185b1af4873b1bfe`
+- r2: `4e62f7954b9981393c1e42fc4e6bb63035966d9be040113d8591255f25adcd5f`
+
+`python3 -B scripts/perf/context-efficiency-20261127/summarize.py /tmp/jarvis-context-bound-p1-correction-r1/report.json /tmp/jarvis-context-bound-p1-correction-r2/report.json`
+returned exit 0, both provenance statuses bound, `comparison_provenance_bound: true`,
+`semantic_differences: []`. Both runs: 27/27 successful logical routes,
+27 physical calls (18/4/4/1), zero inner handles/polls, default threshold,
+539 tasks/731 reviews; identical per-cycle payload byte totals.
+
+| Cycle | Delivered MCP JSON bytes (each) | r1 elapsed ms | r2 elapsed ms |
+| --- | ---: | ---: | ---: |
+| Interpreter | 63,101 | 3,818.53 | 4,194.19 |
+| Worker bootstrap | 64,065 | 799.95 | 901.14 |
+| Reviewer bootstrap | 35,425 | 3,508.10 | 3,587.39 |
+| Overview | 974,611 | 241.77 | 264.53 |
+
+These are two same-runtime observations, not a production speedup or
+candidate-vs-baseline performance claim. The original ceiling observation
+2,297,055 > 921,600 remains separate qualified historical evidence; no new
+ceiling or low-threshold run is asserted. No provider token/cache, deployed
+host benefit, or inner promotion observed. Independent review remains required
+before use as a release gate.

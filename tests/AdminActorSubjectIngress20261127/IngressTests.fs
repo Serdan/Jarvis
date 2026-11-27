@@ -108,7 +108,7 @@ let private prepare binding action operation =
           ShouldApply = action = "RecoverAgentAssignment" }
     | "TransferOwner" ->
         let fields, av, gv, gen = versions "PreviousOwner"
-        { Route = "transfer_owner"; Args = baseArgs @ fields @ ["expectedTaskVersion", box task.Version
+        { Route = "transfer_owner"; Args = baseArgs @ fields @ ["expectedTaskVersion", box task.Version;
                                                               "newAttemptId", box nextAttempt; "reason", box reason]
           Expected = { cmd with AttemptId = nextAttempt; OwnerId = subject; ExpectedVersion = av
                                 ExpectedAgentVersion = gv; ExpectedTaskVersion = task.Version
@@ -187,7 +187,7 @@ let private runCase action mode = task {
                 .WithUrl(address + "/client", Action<Microsoft.AspNetCore.Http.Connections.Client.HttpConnectionOptions>(fun options ->
                     options.AccessTokenProvider <- Func<Task<string>>(fun () -> Task.FromResult(token "alice" "client:connect"))))
                 .Build()
-        let run json actor =
+        let run (json: string) actor =
             task {
                 let cmd = JsonSerializer.Deserialize<AgentCommand>(json)
                 let isOriginal =

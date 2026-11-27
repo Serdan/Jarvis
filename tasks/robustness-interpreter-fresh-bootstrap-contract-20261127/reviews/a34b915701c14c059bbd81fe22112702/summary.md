@@ -1,0 +1,1 @@
+Current v6 role preserves original semantic requirements; proposed minimal fresh-session paragraph and role-aware coordinator render contract. v9 template unchanged; measured 2631 B common prefix and repeated 3318 B role body. Fourteen precise acceptance vectors not executed; no runtime or deployment claim.

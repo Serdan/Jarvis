@@ -3053,7 +3053,7 @@ module ReviewWorkflow =
             else return None
         }
 
-    let private resumeAgentCore binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation sessionId allowWorkingContinuation =
+    let private resumeAgentCore binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation sessionId allowWorkingContinuation admit =
         if not (validTaskId taskId) || not (validAgent ownerId)
            || expectedAttemptVersion < 0 || expectedAgentVersion < 0 || generation < 0 then
             Error(InvalidBinding "Invalid ResumeAgent version or generation.")
@@ -3066,6 +3066,9 @@ module ReviewWorkflow =
                        sessionId = sessionId |})
                 (fun snapshot ->
                     result {
+                        // Admission belongs to the transaction's current verified
+                        // snapshot, not a potentially superseded preflight read.
+                        do! admit snapshot
                         let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
                         let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
                         let generation = if generation = 0 then attempt.AssignmentGeneration else generation
@@ -3148,12 +3151,25 @@ module ReviewWorkflow =
                     })
 
     let resumeAgentWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation sessionId =
-        resumeAgentCore binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation sessionId true
+        resumeAgentCore binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation sessionId true (fun _ -> Ok ())
 
     // Automatic activation is only a Ready -> Working transition. Repeated or
     // concurrent calls must never restart a Working agent's clock.
     let activateReadyAgent binding operationId taskId agentId =
-        resumeAgentCore binding operationId taskId agentId 0 0 0 "" false
+        resumeAgentCore binding operationId taskId agentId 0 0 0 "" false (fun _ -> Ok ())
+
+    // Scheduled check-in has already established an exact Ready episode at a
+    // verified snapshot. Fence the ensuing activation against any intervening
+    // assignment/state transition; the caller provides a launch-derived ID.
+    let activateReadyAgentExact binding operationId taskId agentId agentVersion generation =
+        if agentVersion <= 0 || generation <= 0 then
+            Error(InvalidBinding "Scheduled activation requires exact agent version and assignment generation.")
+        else resumeAgentCore binding operationId taskId agentId 0 agentVersion generation "" false (fun _ -> Ok ())
+
+    // Registered ingress supplies the launch fence from the scheduler module
+    // without introducing a dependency from the ledger workflow to its caller.
+    let internal activateReadyAgentGuarded binding operationId taskId agentId agentVersion generation admit =
+        resumeAgentCore binding operationId taskId agentId 0 agentVersion generation "" false admit
 
     let resumeAgent binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation =
         resumeAgentWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation ""

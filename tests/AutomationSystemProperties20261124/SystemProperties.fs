@@ -1376,7 +1376,7 @@ type GeneratedComposition() =
                           Task.FromResult(Ok (if checks = 1 then allowedBefore else allowedAfter))
                       Send = fun prepared ->
                           sent <- (prepared.Ready.AgentId,prepared.Ready.Generation) :: sent
-                          Task.FromResult(Error "fixture unknown receipt") }
+                          Task.FromResult(Error(Client.ScheduledReadyResume.SendOutcomeUnknown "fixture unknown receipt")) }
                 let track stage prepared =
                     if stage = "Selected" then selected <- Some prepared
                     true

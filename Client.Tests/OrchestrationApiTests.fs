@@ -100,7 +100,7 @@ let ledgerTaskSetupAndInboxRefuseUnconfiguredCheckout () =
     try
         let context = GitCommandTests.TestContext root
         GitCommandTests.initRepo context
-        let inbox : TaskReadCommand = { ProjectName = "Project1"; AgentId = "Worker"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
+        let inbox : TaskReadCommand = { ProjectName = "Project1"; LaunchId = null; AgentId = "Worker"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
         match Client.OrchestrationApi.TaskApi.read inbox context with
         | Error(Client.ValidationError message) ->
             Assert.That(message, Does.Contain(" ledger disabled"))
@@ -136,7 +136,7 @@ let ledgerTaskSetupAndInboxRefuseUnconfiguredCheckout () =
 [<Test>]
 let ledgerTaskMutationsRequireGitWritePermission () =
     Client.PermissionPolicy.clearGrants()
-    let inbox = TaskReadCommand { ProjectName = "Project1"; AgentId = "Worker"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
+    let inbox = TaskReadCommand { ProjectName = "Project1"; LaunchId = null; AgentId = "Worker"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
     match Client.PermissionPolicy.evaluate inbox with
     | Ok () -> ()
     | other -> Assert.Fail(sprintf "Inbox should be read-only: %A" other)

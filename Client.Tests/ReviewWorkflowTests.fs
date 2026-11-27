@@ -3051,7 +3051,7 @@ type ReviewWorkflowTests() =
                 // The server validates the source sender via its own inbox.
                 let sourceInbox : Common.AgentCommand =
                     Common.TaskReadCommand
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"
+                        { ProjectName = "owner"; LaunchId = null; AgentId = "Owner"; Action = "AgentInbox"
                           TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
                           RelativePath = null }
@@ -3240,14 +3240,14 @@ type ReviewWorkflowTests() =
                           OwnerId = "Owner" } |> ignore
                 let queued =
                     Client.OrchestrationApi.TaskApi.read
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null } ctx
+                        { ProjectName = "owner"; LaunchId = null; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null } ctx
                     |> function
                         | Ok value -> unbox<AgentInbox> value
                         | Error error -> failwithf " inbox failed: %A" error
                 Assert.That(queued.RunnableQueue.Length, Is.EqualTo(1))
                 Assert.That(queued.RunnableQueue.Head.Attempt.SpecBlobOid.Length, Is.EqualTo(40))
                 let generationLookup : Common.TaskReadCommand =
-                    { ProjectName = "owner"; AgentId = ""; Action = "GetAssignment"
+                    { ProjectName = "owner"; LaunchId = null; AgentId = ""; Action = "GetAssignment"
                       TaskId = taskId; AssignmentGeneration = 1; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let snapshotAssignment =
                     Client.OrchestrationApi.TaskApi.read generationLookup ctx
@@ -3299,7 +3299,7 @@ type ReviewWorkflowTests() =
                           NextAction = "Resume work" } |> ignore
                 let ready =
                     Client.OrchestrationApi.TaskApi.read
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null } ctx
+                        { ProjectName = "owner"; LaunchId = null; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null } ctx
                     |> function
                         | Ok value -> unbox<AgentInbox> value
                         | Error error -> failwithf " Ready inbox failed: %A" error
@@ -3359,7 +3359,7 @@ type ReviewWorkflowTests() =
                 Assert.That(ownerInbox.UnacknowledgedFeedback.Length, Is.EqualTo(1))
                 let after =
                     Client.OrchestrationApi.TaskApi.read
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null } ctx
+                        { ProjectName = "owner"; LaunchId = null; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null } ctx
                     |> function
                         | Ok value -> unbox<AgentInbox> value
                         | Error error -> failwithf " inbox failed: %A" error
@@ -3386,7 +3386,7 @@ type ReviewWorkflowTests() =
                 run { template "CancelOpenTask" adminTask with
                           ExpectedTaskVersion = 1; Reason = "Explicit cancellation" } |> ignore
                 let adminHistory : Common.TaskReadCommand =
-                    { ProjectName = "owner"; Action = "LifecycleHistory"; TaskId = adminTask
+                    { ProjectName = "owner"; LaunchId = null; Action = "LifecycleHistory"; TaskId = adminTask
                       AgentId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 match Client.OrchestrationApi.TaskApi.read adminHistory ctx with
                 | Ok value ->
@@ -3404,7 +3404,7 @@ type ReviewWorkflowTests() =
                 run { template "CreateTask" specTask with
                           Title = "Spec API"; Html = "<h1>API revision one</h1>\\n" } |> ignore
                 let pageCmd : Common.TaskReadCommand =
-                    { ProjectName = "owner"; Action = "GetSpecPage"; TaskId = specTask
+                    { ProjectName = "owner"; LaunchId = null; Action = "GetSpecPage"; TaskId = specTask
                       AgentId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                       Cursor = ""; PageSize = 128; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let pageBefore =
@@ -3951,7 +3951,7 @@ type ReviewWorkflowTests() =
                 Assert.That(now.Agent.CurrentAssignment, Is.Null)
                 let inbox : Common.AgentCommand =
                     Common.TaskReadCommand
-                        { ProjectName = "owner"; AgentId = "Reviewer"; Action = "AgentInbox"
+                        { ProjectName = "owner"; LaunchId = null; AgentId = "Reviewer"; Action = "AgentInbox"
                           TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
                           RelativePath = null }
@@ -3998,7 +3998,7 @@ type ReviewWorkflowTests() =
                     |> Async.AwaitTask |> Async.RunSynchronously
                 let read action =
                     Common.TaskReadCommand
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = action
+                        { ProjectName = "owner"; LaunchId = null; AgentId = "Owner"; Action = action
                           TaskId = taskId; AssignmentGeneration = 1; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
 
@@ -4093,7 +4093,7 @@ type ReviewWorkflowTests() =
                     |> Async.AwaitTask |> Async.RunSynchronously
                 let read : Common.AgentCommand =
                     Common.TaskReadCommand
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"
+                        { ProjectName = "owner"; LaunchId = null; AgentId = "Owner"; Action = "AgentInbox"
                           TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let _, inbox, receipt = invoke read
@@ -4149,7 +4149,7 @@ type ReviewWorkflowTests() =
                 |> success |> ignore
                 let rt = Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
                 let cmdData : Common.TaskReadCommand =
-                    { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"
+                    { ProjectName = "owner"; LaunchId = null; AgentId = "Owner"; Action = "AgentInbox"
                       TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                       Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let payload = System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(Common.TaskReadCommand cmdData)
@@ -4394,7 +4394,7 @@ type ReviewWorkflowTests() =
                 // must neither restart the Working clock nor last-seen.
                 let selfInbox : Common.AgentCommand =
                     Common.TaskReadCommand
-                        { ProjectName = "owner"; AgentId = firstTarget; Action = "AgentInbox"
+                        { ProjectName = "owner"; LaunchId = null; AgentId = firstTarget; Action = "AgentInbox"
                           TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
                           RelativePath = null }
@@ -4446,7 +4446,7 @@ type ReviewWorkflowTests() =
                 let failedTarget = targets.Tail.Head
                 let invalidInbox : Common.AgentCommand =
                     Common.TaskReadCommand
-                        { ProjectName = "owner"; AgentId = ""; Action = "AgentInbox"
+                        { ProjectName = "owner"; LaunchId = null; AgentId = ""; Action = "AgentInbox"
                           TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
                           RelativePath = null }
@@ -4483,7 +4483,7 @@ type ReviewWorkflowTests() =
                     Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
                 let command : Common.AgentCommand =
                     Common.TaskReadCommand
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"
+                        { ProjectName = "owner"; LaunchId = null; AgentId = "Owner"; Action = "AgentInbox"
                           TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let payload = System.Text.Json.JsonSerializer.Serialize(command)
@@ -5864,6 +5864,68 @@ type ReviewWorkflowTests() =
                 Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
                             Is.True)
                 Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(newHead))
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
+    member _.OperatorRetryFencesOnlyUnappliedImplicitReviewCheckoutObservation() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            let before = (LedgerStore.fetch first |> success).Commit
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                "owner" context first.ProjectId first.LedgerId first.Epoch
+                first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl before true
+            |> success |> ignore
+            let linked = Path.Combine(Path.GetDirectoryName one, "review-linked")
+            let sourceRef = "refs/heads/feature/linked"
+            git one [ "worktree"; "add"; "-b"; "feature/linked"; linked; "HEAD" ] |> ignore
+            let selected = Client.ProjectPaths.ProjectTarget.parse "owner" |> success
+            let target: Client.WorktreeActivity.RemovalTarget =
+                { Project = Client.ProjectPaths.ProjectTarget.projectId selected
+                  Path = linked; ResolveCheckout = fun _ -> Ok one }
+            let reviewId = Guid.NewGuid()
+            let parentId = Guid.NewGuid().ToString("N")
+            try
+                use parent = Client.WorktreeActivity.admit parentId Client.WorktreeActivity.NoCheckout |> success
+                use scope = Client.WorktreeActivity.enter parentId
+                for action in [ "Submit"; "Update" ] do
+                    let operationId = Guid.NewGuid()
+                    let command: Common.ReviewWriteCommand =
+                        { ProjectName = "owner"; Action = action; OperationId = operationId.ToString("D")
+                          TaskId = "retry-review"; RequestId = reviewId.ToString("D")
+                          ActorId = "Owner"; ReviewerId = ""; ExpectedVersion = 1
+                          Kind = ""; SourceRef = sourceRef; HeadOid = ""; TargetRef = ""
+                          Summary = action; Verdict = ""; DocumentPath = ""; Content = ""; ExpectedBlobOid = "" }
+                    let persist () =
+                        Client.OrchestrationApi.PendingIntentJournal.persist first operationId
+                            "ReviewWrite" (System.Text.Json.JsonSerializer.Serialize command) |> success
+                        Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                        |> success |> Option.get
+                    let saved = persist()
+                    let authorization: Common.RetryPendingIntentCommand =
+                        { ProjectName = "owner"; OperationId = command.OperationId
+                          OperatorId = "Lead"; ExpectedCommandSha256 = saved.CommandSha256
+                          ExpectedVerifiedHead = (LedgerStore.fetch first |> success).Commit }
+                    do
+                        use reservation = Client.WorktreeActivity.reserveRemoval target |> success
+                        match Client.OrchestrationApi.PendingRecoveryApi.retry authorization context with
+                        | Error(Client.ValidationError message) -> Assert.That(message, Does.Contain("worktree removal"))
+                        | other -> Assert.Fail(sprintf "Saved implicit review crossed reservation: %A" other)
+                        Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(authorization.ExpectedVerifiedHead))
+                    Client.OrchestrationApi.PendingRecoveryApi.retry authorization context |> success |> ignore
+                    let newHead = (LedgerStore.fetch first |> success).Commit
+                    let receipt = LedgerStore.getOperationStatus first operationId |> success |> snd
+                    Assert.That(receipt.IsSome, Is.True)
+                    let savedAgain = persist()
+                    use reservation = Client.WorktreeActivity.reserveRemoval target |> success
+                    let result =
+                        Client.OrchestrationApi.PendingRecoveryApi.retry
+                            { authorization with ExpectedVerifiedHead = newHead
+                                                 ExpectedCommandSha256 = savedAgain.CommandSha256 } context |> success
+                    Assert.That(System.Text.Json.JsonSerializer.Serialize result, Does.Contain("Applied"))
+                    Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(newHead))
+                    Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome, Is.True)
             finally
                 if File.Exists configPath then File.Delete configPath)
 
@@ -7618,7 +7680,7 @@ type ReviewWorkflowTests() =
                 Assert.That((ReviewWorkflow.getResponseAlerts second "Reviewer" |> success).Pending, Is.Empty)
                 let ordinary : Common.AgentCommand =
                     Common.TaskReadCommand
-                        { ProjectName = "owner"; AgentId = "Reviewer"; Action = "GetNotificationPreferences"
+                        { ProjectName = "owner"; LaunchId = null; AgentId = "Reviewer"; Action = "GetNotificationPreferences"
                           TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let _, readResult, after = invoke "Reviewer" ordinary
@@ -7821,7 +7883,7 @@ type ReviewWorkflowTests() =
                             Is.EqualTo(1))
                 let unrelated : Common.AgentCommand =
                     Common.TaskReadCommand
-                        { ProjectName = "owner"; AgentId = actor; Action = "GetNotificationPreferences"
+                        { ProjectName = "owner"; LaunchId = null; AgentId = actor; Action = "GetNotificationPreferences"
                           TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let unrelatedReply = { original with Instructions = []; StateChangeEvidence = Common.StateChangeEvidence.Confirmed [] }
@@ -7868,7 +7930,7 @@ type ReviewWorkflowTests() =
                     "STOP — yield safely" |> success |> ignore
                 let inspect : Common.AgentCommand =
                     Common.TaskReadCommand
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = "GetResponseAlerts"
+                        { ProjectName = "owner"; LaunchId = null; AgentId = "Owner"; Action = "GetResponseAlerts"
                           TaskId = "Owner"; AssignmentGeneration = 0; CheckpointSequence = 0L
                           Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
                           RelativePath = null }

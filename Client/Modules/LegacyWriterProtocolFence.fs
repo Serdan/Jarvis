@@ -283,5 +283,5 @@ module LegacyWriterProtocolFence =
                 { ProjectName = projectName; AgentId = ""; Action = "AgentInbox"
                   TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                   Cursor = ""; PageSize = 0; BeforeOid = ""; AfterOid = ""
-                  RelativePath = "" }
+                  RelativePath = ""; LaunchId = "" }
         checkHost trustedProject effect |> Result.isOk

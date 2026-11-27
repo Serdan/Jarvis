@@ -350,6 +350,25 @@ module DurableJobs =
             with _ -> None)
         |> Seq.toArray
 
+    // Removal must not silently omit an unreadable registration. A valid
+    // job directory with missing or corrupt provenance is a conservative
+    // blocker; a verified terminal receipt alone releases the checkout.
+    // Call under withAdmission to serialize with registration and pruning.
+    let countCheckoutBlockers root overlaps =
+        Directory.EnumerateDirectories(root)
+        |> Seq.sumBy (fun directory ->
+            if not (validId (Path.GetFileName directory)) then 0
+            else
+                try
+                    rejectLink directory
+                    let request = readRequest directory
+                    if not (overlaps request.WorkingDirectory) then 0
+                    else
+                        match observe directory request with
+                        | Terminal _ -> 0
+                        | Live _ | Unknown _ -> 1
+                with _ -> 1)
+
     // Stable admission lock (never unlink). A supervisor never takes this
     // lock, so polling or a slow client cannot prevent terminal publication.
     let withAdmission root f =

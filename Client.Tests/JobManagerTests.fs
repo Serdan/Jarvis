@@ -1208,7 +1208,7 @@ let ``durable cancellation after initiating host exit records observed cancellat
         File.ReadAllLines(marker) |> Array.toList |> shouldEqual ["once"])
 
 [<Test>]
-let ``durable recovery refuses mismatched process birth identity and bounds retention`` () =
+let ``durable recovery preserves unknown registrations and bounds terminal retention`` () =
     let root = createTempProject ()
     let registry = Durable.root root
     try
@@ -1238,12 +1238,22 @@ let ``durable recovery refuses mismatched process birth identity and bounds rete
         cancelJobForProjectAsAgent (durableProject ()) durableOwner
             { ProjectName = "Project1"; JobId = first.JobId } (TestContext root)
             |> Result.isError |> shouldEqual true
+        let terminals = [ for i in 1 .. 101 -> request (TimeSpan.FromHours(float i)) ]
+        let agedTerminal = request (TimeSpan.FromDays 8.)
+        for job in agedTerminal :: terminals do
+            let terminalDirectory = Durable.create registry job
+            let receipt = { fake with JobId = job.JobId; Status = Completed 0; CompletedAt = Some job.StartedAt }
+            File.WriteAllBytes(Path.Combine(terminalDirectory, "receipt.json"), System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(receipt))
         let listed = listJobsForProjectAsAgent (durableProject ()) durableOwner
                         { ProjectName = Some "Project1"; IncludeCompleted = true } (TestContext root) |> requireOk
-        listed.Jobs.Length |> shouldEqual 100
-        Directory.Exists(Durable.jobDirectory registry stale.JobId) |> shouldEqual false
-        Directory.Exists(Durable.jobDirectory registry (List.last jobs).JobId) |> shouldEqual false
-        durableResult root durableOwner stale.JobId |> Result.isError |> shouldEqual true
+        listed.Jobs.Length |> shouldEqual 202
+        for job in stale :: jobs do
+            Directory.Exists(Durable.jobDirectory registry job.JobId) |> shouldEqual true
+            match (durableResult root durableOwner job.JobId |> requireOk).Status with
+            | RecoveryUnknown _ -> ()
+            | status -> failwithf "Expected preserved unknown registration, got %A" status
+        Directory.Exists(Durable.jobDirectory registry agedTerminal.JobId) |> shouldEqual false
+        Directory.Exists(Durable.jobDirectory registry (List.last terminals).JobId) |> shouldEqual false
         cancelJobForProjectAsAgent (durableProject ()) durableOwner
             { ProjectName = "Project1"; JobId = stale.JobId } (TestContext root)
             |> Result.isError |> shouldEqual true

@@ -124,7 +124,7 @@ let invalid_guidance_does_not_preempt_real_ledger_status_error () =
         File.WriteAllBytes(Path.Combine(root, "Demo", "AGENTS.md"), [| 0xffuy |])
         let command =
             TaskReadCommand
-                { ProjectName = "Demo"; AgentId = "Agent 7"; Action = "AgentInbox"
+                { ProjectName = "Demo"; LaunchId = null; AgentId = "Agent 7"; Action = "AgentInbox"
                   TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                   Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
         match invoke rt command with

@@ -85,7 +85,7 @@ let run () = task {
         let rt = Runtime(root, ConsoleTui.ConsoleTui(), FullTrust)
         rt.Browser <- Some bridge
         let action : BrowserSchedules.ScheduledAction =
-            { Id="test"; DueAtUtc=DateTimeOffset.UtcNow; Url="https://example.test/"; ProjectName="Project1"; ScriptPath="launch.js"; Alias=""; ArgsJson="{}"; Active=false; WindowRegistration="agents"; CloseTabAfterExecution=false; RepeatEverySeconds=0; Status=""; RegistrationId=""; ConversationUrl=""; Cleanup=""; AttemptId=""; RevisionId=""; Error=""; UpdatedAtUtc=DateTimeOffset.UtcNow; ActionKind="BrowserScript"; TriggerKind="Once"; Executable=""; CommandArgs=[]; WorkingDirectory=""; TimeoutSeconds=1; MaxOutputBytes=100; IdleAgentId=""; IdleSeconds=0; LastActivityAtUtc=DateTimeOffset.MinValue; StartedAtUtc=DateTimeOffset.MinValue; Disabled=false; LastResult="" }
+            { Id="test"; DueAtUtc=DateTimeOffset.UtcNow; Url="https://example.test/"; ProjectName="Project1"; ScriptPath="launch.js"; Alias=""; ArgsJson="{}"; Active=false; WindowRegistration="agents"; CloseTabAfterExecution=false; RepeatEverySeconds=0; Status=""; RegistrationId=""; ConversationUrl=""; Cleanup=""; AttemptId=""; RevisionId=""; Error=""; UpdatedAtUtc=DateTimeOffset.UtcNow; ActionKind="BrowserScript"; TriggerKind="Once"; Executable=""; CommandArgs=[]; WorkingDirectory=""; TimeoutSeconds=1; MaxOutputBytes=100; IdleAgentId=""; IdleSeconds=0; LastActivityAtUtc=DateTimeOffset.MinValue; StartedAtUtc=DateTimeOffset.MinValue; Disabled=false; CheckinWakeAtUtc=DateTimeOffset.MinValue; LastResult="" }
         let execute () = Program.executeScheduledAction ClientConfig.capacityFenceMode rt (ConsoleTui.ConsoleTui()) (Some bridge) action
         printfn "stage: pending"
         let pending = receive socket

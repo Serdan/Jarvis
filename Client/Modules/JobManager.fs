@@ -78,17 +78,17 @@ module private Core =
         |> Array.choose (fun (directory, request, observation) ->
             match observation with
             | Durable.Live _ -> None
-            | Durable.Unknown _ when pending now request || Durable.hasClaimOwner directory -> None
+            // Unknown outcomes retain the durable checkout fence until terminal evidence exists.
+            | Durable.Unknown _ -> None
             | Durable.Terminal receipt ->
-                Some(directory, receipt.CompletedAt |> Option.defaultValue request.StartedAt)
-            | Durable.Unknown _ -> Some(directory, request.StartedAt))
+                Some(directory, receipt.CompletedAt |> Option.defaultValue request.StartedAt))
         |> Array.sortByDescending snd
         |> Array.iteri (fun index (directory, completed) ->
             if index >= maxCompletedJobs || now - completed >= retention then
                 Durable.tryPrune directory |> ignore)
         active
 
-    let private startProcess root projectName actor workingDirectory executable args reason maxOutputBytes : Client.Result<StartJobResult> =
+    let private startProcess root projectName actor workingDirectory validateScope executable args reason maxOutputBytes : Client.Result<StartJobResult> =
         try
             match validateExecutable executable with
             | Error error -> Error error
@@ -106,9 +106,11 @@ module private Core =
                       MaxOutputBytes = maxOutputBytes }
                 let launch =
                     Durable.withAdmission root (fun () ->
-                        if prune root >= maxActiveJobs then
+                        match validateScope () with
+                        | Error error -> Error error
+                        | Ok () when prune root >= maxActiveJobs ->
                             Error(Client.ContextError "Engineering job capacity reached (64 active supervisors).")
-                        else
+                        | Ok () ->
                             let directory = Durable.create root request
                             try
                                 let host = Environment.ProcessPath
@@ -172,8 +174,22 @@ module private Core =
                     context |> ProjectPaths.ResolvedProject.target |> ProjectPaths.ProjectTarget.projectId
                 let! (FolderPath workingDirectory) = resolveWorkingDirectory context cmd.WorkingDirectory
                 let! result = fun rt ->
-                    try startProcess (rootForRuntime rt) canonical actor workingDirectory cmd.Executable cmd.Args cmd.Reason maxOutputBytes
-                    with ex -> Error(ExceptionError ex)
+                    let (FolderPath sourceRoot) = ProjectPaths.ResolvedProject.sourceRoot context
+                    match WorktreeActivity.admit (Guid.NewGuid().ToString("N")) (WorktreeActivity.Paths [ sourceRoot; workingDirectory ]) with
+                    | Error error -> Error error
+                    | Ok admission ->
+                        use _admission = admission
+                        let validateScope () =
+                            (effect {
+                                let! fresh = ProjectPaths.resolveProjectContextForTarget (ProjectPaths.ResolvedProject.target context)
+                                let! (FolderPath freshDirectory) = resolveWorkingDirectory fresh cmd.WorkingDirectory
+                                let (FolderPath freshRoot) = ProjectPaths.ResolvedProject.sourceRoot fresh
+                                if freshRoot <> sourceRoot || freshDirectory <> workingDirectory || not (Directory.Exists workingDirectory) then
+                                    return! Client.ValidationError "Engineering job checkout changed before admission." |> Effect.ofError
+                                else return ()
+                            }) rt
+                        try startProcess (rootForRuntime rt) canonical actor workingDirectory validateScope cmd.Executable cmd.Args cmd.Reason maxOutputBytes
+                        with ex -> Error(ExceptionError ex)
                 return result
         }
 
@@ -287,6 +303,7 @@ type private ToolOperationRecord =
       CommandHash: string
       OperationKey: string option
       Completion: TaskCompletionSource<AgentCommandResponse>
+      Admission: IDisposable
       PreserveEvidence: AgentCommandResponse -> AgentCommandResponse
       mutable Status: JobStatus
       mutable StartedExecution: bool
@@ -371,6 +388,7 @@ module private ToolOperations =
                     | Some error -> ToolFailed(sprintf "%A" error)
                     | None -> ToolCompleted
                 entry.CompletedAt <- Some DateTimeOffset.UtcNow
+                entry.Admission.Dispose()
                 entry.Completion.TrySetResult(response) |> ignore
             // Cancellation of a queued job may already have released its slot.
             if entry.Counted then
@@ -396,6 +414,7 @@ module private ToolOperations =
                         if shouldExecute then
                             let! response =
                                 task {
+                                    use _context = WorktreeActivity.enter entry.Handle.JobId
                                     try return! execute ()
                                     with ex ->
                                         return entry.PreserveEvidence (
@@ -420,7 +439,7 @@ module private ToolOperations =
             } :> Task))
         |> ignore
 
-    let start canonical projectName actor commandName operationId commandHash execute preserveEvidence =
+    let start canonical projectName actor commandName operationId commandHash scope execute preserveEvidence =
         lock gate (fun () ->
             prune DateTimeOffset.UtcNow
             let identity = canonical |> Option.map ProjectPaths.ProjectId.value |> Option.defaultValue "@unscoped"
@@ -450,36 +469,41 @@ module private ToolOperations =
                     "The client has reached its bounded tool-operation capacity (32 running/queued). Retry after an existing job finishes.")
             | None ->
                 let id = Guid.NewGuid().ToString("N")
-                let handle =
-                    { JobId = id
-                      Kind = JobKind.ToolOperation
-                      Status = "Running"
-                      ProjectName = projectName
-                      DeviceId = None
-                      AgentId = actor
-                      OperationId = operationId
-                      CommandName = commandName
-                      StartedAt = DateTimeOffset.UtcNow }
-                let entry =
-                    { Handle = handle
-                      CanonicalProject = canonical
-                      CommandHash = commandHash
-                      OperationKey = key
-                      Completion = TaskCompletionSource<AgentCommandResponse>(TaskCreationOptions.RunContinuationsAsynchronously)
-                      PreserveEvidence = preserveEvidence
-                      Status = Running
-                      StartedExecution = false
-                      Counted = true
-                      Exposed = false
-                      CompletedAt = None }
-                if not (records.TryAdd(id, entry)) then
-                    Error(Client.ContextError "Unable to register client-owned tool operation.")
-                else
-                    inFlight <- inFlight + 1
-                    key |> Option.iter (fun value ->
-                        byOperation[value] <- struct (id, commandHash, handle.StartedAt))
-                    schedule entry execute
-                    Ok(handle, entry.Completion.Task))
+                match WorktreeActivity.admit id scope with
+                | Error error -> Error error
+                | Ok admission ->
+                    let handle =
+                        { JobId = id
+                          Kind = JobKind.ToolOperation
+                          Status = "Running"
+                          ProjectName = projectName
+                          DeviceId = None
+                          AgentId = actor
+                          OperationId = operationId
+                          CommandName = commandName
+                          StartedAt = DateTimeOffset.UtcNow }
+                    let entry =
+                        { Handle = handle
+                          CanonicalProject = canonical
+                          CommandHash = commandHash
+                          OperationKey = key
+                          Completion = TaskCompletionSource<AgentCommandResponse>(TaskCreationOptions.RunContinuationsAsynchronously)
+                          Admission = admission
+                          PreserveEvidence = preserveEvidence
+                          Status = Running
+                          StartedExecution = false
+                          Counted = true
+                          Exposed = false
+                          CompletedAt = None }
+                    if not (records.TryAdd(id, entry)) then
+                        admission.Dispose()
+                        Error(Client.ContextError "Unable to register client-owned tool operation.")
+                    else
+                        inFlight <- inFlight + 1
+                        key |> Option.iter (fun value ->
+                            byOperation[value] <- struct (id, commandHash, handle.StartedAt))
+                        schedule entry execute
+                        Ok(handle, entry.Completion.Task))
 
     let promote jobId =
         lock gate (fun () ->
@@ -582,6 +606,7 @@ module private ToolOperations =
                     | Ok () ->
                         entry.Status <- Canceled
                         entry.CompletedAt <- Some DateTimeOffset.UtcNow
+                        entry.Admission.Dispose()
                         if entry.Counted then
                             entry.Counted <- false
                             inFlight <- inFlight - 1
@@ -591,10 +616,13 @@ module private ToolOperations =
                 Some response)
 
 let startToolOperation canonical projectName actor commandName operationId commandHash execute =
-    ToolOperations.start canonical projectName actor commandName operationId commandHash execute id
+    ToolOperations.start canonical projectName actor commandName operationId commandHash (WorktreeActivity.Unknown canonical) execute id
 
 let startToolOperationWithCancelEvidence canonical projectName actor commandName operationId commandHash execute preserveEvidence =
-    ToolOperations.start canonical projectName actor commandName operationId commandHash execute preserveEvidence
+    ToolOperations.start canonical projectName actor commandName operationId commandHash (WorktreeActivity.Unknown canonical) execute preserveEvidence
+
+let internal startToolOperationWithScopeAndCancelEvidence canonical projectName actor commandName operationId commandHash scope execute preserveEvidence =
+    ToolOperations.start canonical projectName actor commandName operationId commandHash scope execute preserveEvidence
 
 let promoteToolOperation jobId = ToolOperations.promote jobId
 let forgetQuickToolOperation jobId = ToolOperations.forgetQuick jobId

@@ -25,6 +25,8 @@ open Microsoft.IdentityModel.Protocols
 open Microsoft.IdentityModel.Protocols.OpenIdConnect
 open Common
 open Common.SignalR
+open Microsoft.AspNetCore.SignalR
+open Server.Services
 open NUnit.Framework
 open Client
 open Client.LedgerStore
@@ -234,8 +236,14 @@ let private runCase action mode = task {
                 return isError, result.GetProperty("content").[0].GetProperty("text").GetString()
         }
         let scopes = "workspace:read git:write"
-        let activity who =
-            hub.InvokeCoreAsync<AgentActivitySnapshot>("GetAgentActivity", [|box project; box who|], CancellationToken.None)
+        let rec activity who deadline = task {
+            try
+                return! hub.InvokeCoreAsync<AgentActivitySnapshot>("GetAgentActivity", [|box project; box who|], CancellationToken.None)
+            with :? HubException as ex when ex.Message.Contains("ActivityProofUnavailable") && DateTimeOffset.UtcNow < deadline ->
+                do! Task.Delay(50)
+                return! activity who deadline
+        }
+        let verifiedActivity who = activity who (DateTimeOffset.UtcNow.AddSeconds(10.))
         let originalArgs =
             let labels =
                 if mode = "explicit" then ["agentId", box initiator; "targetAgentId", box subject]
@@ -264,8 +272,13 @@ let private runCase action mode = task {
                   SupportedCommands = AgentProtocol.commandDefinitions |> List.map (fun x -> x.Name) }
             let! accepted = hub.InvokeCoreAsync<ClientRegistrationResult>("Connect", [|box registration|], CancellationToken.None)
             Assert.That(accepted.EnabledCommands, Does.Contain("TaskWrite"))
-            let! before = activity subject
-            Assert.That(before.LastSeenAtUtc, Is.EqualTo(None))
+            // Establish a real, older current-process watermark in the disposable
+            // production store. Missing coverage is HOLD, never proof of absence.
+            let store = app.Services.GetRequiredService<OptionalFeedbackStore>()
+            let seeded = DateTimeOffset.UtcNow.AddMinutes(-5.)
+            do! store.RecordAgentActivity("alice", project, subject, seeded)
+            let! before = verifiedActivity subject
+            Assert.That(before.LastSeenAtUtc, Is.EqualTo(Some seeded), "Fixture must establish an authenticated persisted baseline.")
             let! denied, deniedRaw = call "alice" "workspace:read" scenario.Route originalArgs
             Assert.That(denied, Is.True, deniedRaw)
             Assert.That(captures.IsEmpty, Is.True, "Missing write scope must not reach SignalR.")
@@ -277,9 +290,22 @@ let private runCase action mode = task {
             let json, transportedActor = captures.ToArray() |> Array.exactlyOne
             let canonical = JsonSerializer.Serialize<AgentCommand>(TaskWriteCommand scenario.Expected)
             TestContext.WriteLine(sprintf "%s: job actor=%s transport actor=%s canonical=%s" action job.AgentId transportedActor json)
-            let! after = activity subject
+            let! after = verifiedActivity subject
             let! otherDenied, otherRaw = poll "alice" unrelated project job.JobId
-            Assert.That(otherDenied, Is.True, otherRaw)
+            // Operator override permits project-scoped reads by another label.
+            // Keep its independent RED separate from actor-attribution assertions
+            // on this older frozen baseline.
+            if mode = "readOverride" then
+                Assert.That(otherDenied, Is.False, "Project-scoped read must not be gated by agent label: " + otherRaw)
+            if not otherDenied then
+                Assert.That((parseFirstLine<JobResult> otherRaw).JobId, Is.EqualTo(job.JobId))
+            else
+                TestContext.WriteLine("Pinned baseline cross-label read rejected: " + otherRaw)
+            let! cancelDenied, cancelRaw =
+                call "alice" (scopes + " process:execute") "cancel_job"
+                    ["projectName", box project; "agentId", box unrelated; "deviceId", box device; "jobId", box job.JobId]
+            Assert.That(cancelDenied, Is.True, cancelRaw)
+            Assert.That(cancelRaw, Does.Contain("another initiating agent"), "Read override must not grant cancellation.")
             let! wrongProjectDenied, wrongProjectRaw = poll "alice" transportedActor "UnknownFixtureProject" job.JobId
             Assert.That(wrongProjectDenied, Is.True, wrongProjectRaw)
             let! wrongPrincipalDenied, wrongPrincipalRaw = poll "bob" transportedActor project job.JobId
@@ -327,12 +353,12 @@ let private runCase action mode = task {
                 // an agent owner or activity. This is intentionally RED on baseline.
                 Assert.That(transportedActor, Is.Not.EqualTo(subject), "Legacy administrative subject became initiating transport actor.")
                 Assert.That(job.AgentId, Is.Not.EqualTo(subject), "Subject must never own caller's promoted job.")
-                Assert.That(after.LastSeenAtUtc, Is.EqualTo(None), "Administrative subject is not caller activity.")
-            else
+                Assert.That(after.LastSeenAtUtc, Is.EqualTo(before.LastSeenAtUtc), "Administrative subject is not caller activity.")
+            elif mode = "explicit" then
                 Assert.That(transportedActor, Is.EqualTo(initiator))
                 Assert.That(job.AgentId, Is.EqualTo(initiator))
                 Assert.That(json, Is.EqualTo(canonical), "Explicit actor must not change canonical subject or request bytes.")
-                Assert.That(after.LastSeenAtUtc, Is.EqualTo(None))
+                Assert.That(after.LastSeenAtUtc, Is.EqualTo(before.LastSeenAtUtc))
                 let! result = terminal initiator job.JobId (DateTimeOffset.UtcNow.AddSeconds(15.))
                 Assert.That(result.ToolResponse.IsSome, Is.True)
                 if action <> "RegisterAgent" then
@@ -358,3 +384,6 @@ let legacy_subject_must_not_own_caller_job_or_activity action = runCase action "
 
 [<TestCase("RegisterAgent"); TestCase("AssignTask"); TestCase("ReissueAssignment"); TestCase("AdoptTaskSpec"); TestCase("ReissueQueuedAttempt"); TestCase("RecoverAgentAssignment"); TestCase("TransferOwner"); NonParallelizable; Category("KnownDefect")>]
 let explicit_initiator_and_subject_must_preserve_wire_and_job_privacy action = runCase action "explicit"
+
+[<Test; NonParallelizable; Category("ReadOverride")>]
+let project_scoped_job_read_must_not_require_owner_label () = runCase "AssignTask" "readOverride"

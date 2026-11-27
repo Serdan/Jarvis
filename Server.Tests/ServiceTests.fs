@@ -2790,7 +2790,7 @@ let attributed_tool_dispatch_survives_missing_sqlite_and_notifies_only_user_devi
             users.Register(user,
                 { DeviceId = device; DeviceName = device
                   ProtocolVersion = AgentProtocol.version; ClientVersion = "test"
-                  SupportedCommands = [ "RunCommand"; "ListJobs" ] }, connection)
+                  SupportedCommands = [ "RunCommand"; "ListJobs"; "GetJobResult" ] }, connection)
         registrations[connection] <- receipt.Generation
     register "alice" "desktop" "desktop-connection"
     register "alice" "laptop" "laptop-connection"
@@ -2859,6 +2859,17 @@ let attributed_tool_dispatch_survives_missing_sqlite_and_notifies_only_user_devi
     let! result2 = service.SendCommandToUser("alice", poll, deviceId = "desktop", agentId = "Manager")
     Assert.That(result2.Result, Is.EqualTo(Some "ok"))
     Assert.That(received.Count, Is.EqualTo(2), "Job polling must not reset Manager idle clock")
+    let read = GetJobResultCommand { ProjectName = "Jarvis"; JobId = "known-job-id"; AfterSequence = None }
+    let beforeForeignReads = deliveredCommands
+    // Neither knowing the job ID nor supplying an agent label grants access
+    // to a device registered under a different authenticated account.
+    for command in [poll; read] do
+        let! denied = service.SendCommandToUser("bob", command, deviceId = "desktop", agentId = "Manager")
+        Assert.That(denied.Error.IsSome, Is.True)
+        Assert.That(denied.Result.IsNone, Is.True)
+    Assert.That(deliveredCommands, Is.EqualTo(beforeForeignReads),
+                "Foreign-account job reads must not reach Alice's client.")
+
     // Missing or corrupt SQLite is irrelevant to tool dispatch; simulated
     // server service replacement retains in-memory session routing here.
     let beforeRestart = deliveredCommands

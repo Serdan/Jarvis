@@ -335,8 +335,8 @@ type TaskOverviewBatchPerformanceTests() =
                 Assert.That(first.TotalTasks, Is.EqualTo(1500))
                 Assert.That(first.TotalReviews, Is.EqualTo(2000))
                 Assert.That(first.HasMore, Is.False)
-                Assert.That(first.Tasks |> List.map (fun x -> x.Task.TaskId), Is.EqualTo([ for i in 1 .. 6 -> taskId i ]))
-                Assert.That(first.Reviews |> List.map (fun x -> x.ReviewId), Is.EqualTo([ for i in [3;5;6] -> reviewId i ]))
+                Assert.That(first.Tasks |> List.map (fun x -> x.Task.TaskId), Is.EqualTo(box [ for i in 1 .. 6 -> taskId i ]))
+                Assert.That(first.Reviews |> List.map (fun x -> x.ReviewId), Is.EqualTo(box [ for i in [3;5;6] -> reviewId i ]))
                 Assert.That(first.Reviews |> List.forall (fun x -> x.Detail.IsNone), Is.True)
                 Assert.That((LedgerStore.fetch reader |> ok).Commit, Is.EqualTo(before.Commit))
 
@@ -373,7 +373,7 @@ type TaskOverviewBatchPerformanceTests() =
                     else List.rev tasks, List.rev reviews
                 let tasks, reviews = enumerate historyFirst [] []
                 Assert.That(tasks |> List.map (fun t -> t.Task, t.Attempt),
-                            Is.EqualTo(unbounded.Tasks |> List.map (fun t -> t.Task, t.Attempt)))
-                Assert.That(reviews |> List.map (fun r -> r.Detail.Value), Is.EqualTo(unbounded.Reviews))
+                            Is.EqualTo(box (unbounded.Tasks |> List.map (fun t -> t.Task, t.Attempt))))
+                Assert.That(reviews |> List.map (fun r -> r.Detail.Value), Is.EqualTo(box unbounded.Reviews))
             finally
                 if File.Exists config then File.Delete config)

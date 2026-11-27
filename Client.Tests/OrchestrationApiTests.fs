@@ -19,7 +19,7 @@ let disabledReadAndWriteDoNotTouchV1Tasks () =
               Action = "ReviewerQueue"
               TaskId = ""
               RequestId = ""
-              ReviewerId = "Reviewer"; DocumentPath = "" }
+              ReviewerId = "Reviewer"; DocumentPath = ""; TaskOverview = None }
         match Client.OrchestrationApi.ReviewApi.read query context with
         | Error(Client.ValidationError message) ->
             Assert.That(message, Does.Contain(" ledger disabled"))

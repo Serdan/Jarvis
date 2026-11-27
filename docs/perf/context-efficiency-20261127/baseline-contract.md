@@ -79,3 +79,35 @@ Separate process-only promotion qualification started 15:09:58Z, exact tool-oper
 Exact outer job 3f53cc6bd58748c2b59a66eb47d79c17 returned ToolCompleted, inner ExitCode=0, TimedOut=false, Truncated=false, no stderr, 27 calls. Strict summarize.py exited 0; SHA-256 b5d067c344cf0bd443e8c257839bc7bbb05a101a7d18c223db35cf682dc446b6 for /tmp/jarvis-context-promotion-p1-r1.json. All 27 registered routes succeeded with identical byte and count metrics to the default-threshold representative run. **No inner job handles or polls were returned**, despite the process-only threshold prefix; this does not qualify the actual inner wrapper or correlation path. The outer engineering tool-operation receipt is distinct from an inner route job. No claim is made about why promotion did not occur. No live retry, artificial production change, or further forced promotion is authorized by this evidence.
 
 The primary baseline uses one measured representative run and one ceiling run. The separate low-threshold run is not an additional matched timing repetition. Candidate release decisions require repeat measurements under the default threshold and an independently reviewed equivalence adapter if route shape changes. Provider/cache, actual inner job promotion, production-wired candidate and deployed-host validation remain separate gaps.
+
+## Adjudicated corrective follow-up (2026-11-27)
+
+Task robustness-context-baseline-comparator-correction-20261127, gen1 pin
+ee8ec6ed53277a3b1738e3c2f3ff39f715cfd518. Authority: independent adjudication
+checkpoint 19342; original frozen source 749f106da1eed88c45d00edbbb19e6bafce1c9f8
+and review fa6d28a324fb46b381474e8d215639b4 (ChangesRequested seq19283) remain
+unchanged. The original numeric evidence above is qualified source-level evidence,
+not a release gate. The original direct invocations did not bind the measured
+runtime to a verified fresh build; do not retroactively label them bound.
+
+- The exact F# option activation receipt is parsed and validated against the
+  worker cycle's after head and the inbox snapshot, then only its two
+  run-specific identities are masked; stable assignment/spec/actor/state remain
+  required. The explicit ordered route matrix and terminal classes are checked
+  before either standalone or pairwise qualification, including exact job polls.
+- Controlled evidence invocation snapshots exact clean runtime and harness
+  revisions, explicitly sets project references, builds into fresh output, runs
+  the resulting assembly, checks unchanged source identities/output and emits
+  the command/log/exit/digest sidecar. Unverifiable or stale direct reports remain
+  diagnostic only. This is practical local reproducibility, not cryptographic
+  attestation. See the corrected README for exact commands.
+- Focused Python regressions: 8/8 pass (exit 0). The corrected comparator also
+  loaded the retained representative, low-threshold and ceiling artifacts
+  (27/27/1 logical routes), with zero semantic differences between the two
+  representative route sets. Their thresholds differ; this reproduces the
+  comparator fix, not a matched timing claim. Their historic numeric results
+  and artifact hashes are unchanged. No provider token/cache, deployed benefit,
+  or additional inner promotion claim. Independent corrective review is required.
+
+Fresh bound evidence and matched repeat terminal receipts must be recorded
+separately before making any new qualification or timing claim.

@@ -2598,56 +2598,62 @@ module AgentObservationApi =
     // SignalR actor label before any dispatch reaches this function.
     // Only summarized canonical metadata is returned; notification bodies,
     // evidence, source documents and session IDs are never exposed here.
-    let observe (cmd: ObserveAgentRequest) (getLocalLastSeen: string -> string -> DateTimeOffset option) rt =
+    let observeAt (cmd: ObserveAgentRequest) (getLocalLastSeen: string -> string -> DateTimeOffset option) binding snapshot =
+        if String.IsNullOrWhiteSpace cmd.ObserverAgentId
+           || String.IsNullOrWhiteSpace cmd.TargetAgentId then
+            Error(Client.ValidationError "Observer and target agent identities are required.")
+        else
+            ReviewWorkflow.ReviewWorkflow.getObservedAgentInboxAt
+                binding snapshot cmd.ObserverAgentId cmd.TargetAgentId
+            |> Result.mapError LedgerErrors.toEffect
+            |> Result.map (fun inbox ->
+                    let agent = inbox.Agent
+                    let focus = inbox.Focused |> Option.map (fun item ->
+                        {| taskId = item.Task.TaskId
+                           title = item.Task.Title
+                           lifecycle = item.Task.Lifecycle
+                           attemptId = item.Attempt.AttemptId
+                           attemptVersion = item.Attempt.Version
+                           attemptPhase = item.Attempt.Phase
+                           assignmentGeneration = item.Attempt.AssignmentGeneration |})
+                    let lastSeen = getLocalLastSeen cmd.ProjectName cmd.TargetAgentId
+                    box
+                        {| projectName = cmd.ProjectName
+                           observerAgentId = cmd.ObserverAgentId
+                           targetAgentId = agent.AgentId
+                           snapshotCommit = inbox.SnapshotCommit
+                           canonicalStateSource = "VerifiedGitLedger"
+                           canonicalStateFreshness = "FetchedForThisObservation"
+                           observedAtUtc = DateTimeOffset.UtcNow.ToString("O")
+                           agentVersion = agent.Version
+                           stateSequence = agent.StateSequence
+                           state = agent.State
+                           execution = agent.Execution
+                           unassignedDisposition = Option.ofObj agent.UnassignedDisposition
+                           stateReason = Option.ofObj agent.StateReason
+                           stateEnteredAtUtc = Option.ofObj agent.StateEnteredAtUtc
+                           workingTurnStartedAtUtc = Option.ofObj agent.WorkingTurnStartedAtUtc
+                           focused = focus
+                           operatorActionRequired = inbox.OperatorActionRequired
+                           needsOrchestratorAssignment = inbox.NeedsOrchestratorAssignment
+                           slotAvailable = inbox.SlotAvailable
+                           pendingNotificationCount = inbox.PendingNotifications.Length
+                           pendingReviewCount = inbox.PendingReviews.Length
+                           availableReviewCount = inbox.AvailableReviews.Length
+                           unacknowledgedFeedbackCount = inbox.UnacknowledgedFeedback.Length
+                           blockedAttemptCount = inbox.Blocked.Length
+                           blockedTaskIds = inbox.Blocked |> List.map (fun item -> item.Task.TaskId)
+                           lastSeenAtUtc = lastSeen |> Option.map (fun seen -> seen.ToString("O"))
+                           lastSeenProvenance = if lastSeen.IsSome then "LocalClientActivityCache" else "Unknown"
+                           lastSeenIsCanonical = false |})
+
+    let observe (cmd: ObserveAgentRequest) getLocalLastSeen rt =
         if String.IsNullOrWhiteSpace cmd.ObserverAgentId
            || String.IsNullOrWhiteSpace cmd.TargetAgentId then
             Error(Client.ValidationError "Observer and target agent identities are required.")
         else
             LedgerBindingConfig.loadWithSnapshot cmd.ProjectName rt
-            |> Result.bind (fun (binding, snapshot) ->
-                ReviewWorkflow.ReviewWorkflow.getObservedAgentInboxAt
-                    binding snapshot cmd.ObserverAgentId cmd.TargetAgentId
-                |> Result.mapError LedgerErrors.toEffect
-                |> Result.map (fun inbox ->
-                        let agent = inbox.Agent
-                        let focus = inbox.Focused |> Option.map (fun item ->
-                            {| taskId = item.Task.TaskId
-                               title = item.Task.Title
-                               lifecycle = item.Task.Lifecycle
-                               attemptId = item.Attempt.AttemptId
-                               attemptVersion = item.Attempt.Version
-                               attemptPhase = item.Attempt.Phase
-                               assignmentGeneration = item.Attempt.AssignmentGeneration |})
-                        let lastSeen = getLocalLastSeen cmd.ProjectName cmd.TargetAgentId
-                        box
-                            {| projectName = cmd.ProjectName
-                               observerAgentId = cmd.ObserverAgentId
-                               targetAgentId = agent.AgentId
-                               snapshotCommit = inbox.SnapshotCommit
-                               canonicalStateSource = "VerifiedGitLedger"
-                               canonicalStateFreshness = "FetchedForThisObservation"
-                               observedAtUtc = DateTimeOffset.UtcNow.ToString("O")
-                               agentVersion = agent.Version
-                               stateSequence = agent.StateSequence
-                               state = agent.State
-                               execution = agent.Execution
-                               unassignedDisposition = Option.ofObj agent.UnassignedDisposition
-                               stateReason = Option.ofObj agent.StateReason
-                               stateEnteredAtUtc = Option.ofObj agent.StateEnteredAtUtc
-                               workingTurnStartedAtUtc = Option.ofObj agent.WorkingTurnStartedAtUtc
-                               focused = focus
-                               operatorActionRequired = inbox.OperatorActionRequired
-                               needsOrchestratorAssignment = inbox.NeedsOrchestratorAssignment
-                               slotAvailable = inbox.SlotAvailable
-                               pendingNotificationCount = inbox.PendingNotifications.Length
-                               pendingReviewCount = inbox.PendingReviews.Length
-                               availableReviewCount = inbox.AvailableReviews.Length
-                               unacknowledgedFeedbackCount = inbox.UnacknowledgedFeedback.Length
-                               blockedAttemptCount = inbox.Blocked.Length
-                               blockedTaskIds = inbox.Blocked |> List.map (fun item -> item.Task.TaskId)
-                               lastSeenAtUtc = lastSeen |> Option.map (fun seen -> seen.ToString("O"))
-                               lastSeenProvenance = if lastSeen.IsSome then "LocalClientActivityCache" else "Unknown"
-                               lastSeenIsCanonical = false |}))
+            |> Result.bind (fun (binding, snapshot) -> observeAt cmd getLocalLastSeen binding snapshot)
 
 module TaskApi =
     let private mapError (result: Result<'a, LedgerStore.LedgerFailure>) : Result<'a, EffectError> =

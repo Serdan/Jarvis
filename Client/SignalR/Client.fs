@@ -68,6 +68,17 @@ type private WorkingGuidanceCache() =
                 this.Capture(project, agentId)
         read 2
 
+    // Probe existing verified state only: a cache miss does not establish
+    // absence, refresh freshness, or authorize a Ready episode.
+    member this.HasVerifiedWorking(now, project, agentId) =
+        let value, generation =
+            this.Get(now, project, agentId, fun () ->
+                Error(Client.ValidationError "No fresh Working observation."))
+        match value with
+        | Ok(Some agent) when agent.State = "Working" ->
+            this.IsCurrent(project, agentId, generation)
+        | _ -> false
+
     member _.InvalidateCache(project, agentId) =
         entries.Invalidate(project, agentId)
 
@@ -221,6 +232,46 @@ type private ResponseAlertReconciler(runtime: Runtime) =
                     let last = lock entry.Gate (fun () -> entry.LastUsed)
                     if now - last > idle then probes.TryRemove(key) |> ignore
                     else schedule entry false), null, period, period)
+    // A read-only job poll may reuse fresh non-Ready, no-alert evidence
+    // from the background verified snapshot. Do not wait on a remote
+    // fetch or use the default-false presence hint as admission evidence.
+    member _.HasVerifiedNoAlertNonReady(target, agentId) =
+        try
+            let projectId = ProjectPaths.ProjectTarget.projectId target
+            match snapshots.TryGetValue projectId with
+            | true, state when Monitor.TryEnter(state.Gate) ->
+                let observed =
+                    try
+                        if WorkingTurnGuidance.isFresh period DateTimeOffset.UtcNow state.CheckedAt then
+                            state.Verified |> Option.map (fun verified -> state.CheckedAt, verified)
+                        else None
+                    finally Monitor.Exit(state.Gate)
+                match observed with
+                | None -> false
+                | Some(checkedAt, (binding, snapshot)) ->
+                    let nonReady =
+                        match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurnAt binding snapshot agentId with
+                        | Ok agent -> agent.State <> "Ready"
+                        | Error(LedgerStore.StaleEntityVersion _) -> true
+                        | Error _ -> false
+                    let noAlert =
+                        match ReviewWorkflow.ReviewWorkflow.getResponseAlertsAt binding snapshot agentId with
+                        | Ok queue -> queue.Pending.IsEmpty
+                        | Error _ -> false
+                    if nonReady && noAlert && Monitor.TryEnter(state.Gate) then
+                        try
+                            state.CheckedAt = checkedAt
+                            && WorkingTurnGuidance.isFresh period DateTimeOffset.UtcNow checkedAt
+                            && (match snapshots.TryGetValue projectId with
+                                | true, current -> obj.ReferenceEquals(current, state)
+                                | _ -> false)
+                        finally Monitor.Exit(state.Gate)
+                    else false
+            | _ -> false
+        with _ -> false
+
+    member _.InvalidateAdmissionSnapshot(projectId) = invalidateSnapshot projectId
+
     member _.MayHavePending(target, agentId) =
         let entry = get target agentId
         let result = lock entry.Gate (fun () ->
@@ -439,14 +490,20 @@ let private checkResponseAlerts (rt: Runtime) agentId (target: ProjectPaths.Proj
                     match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt with
                     | Error _ -> []
                     | Ok (binding, snapshot) ->
-                        match ReviewWorkflow.ReviewWorkflow.takeResponseAlertsAt binding snapshot agentId with
-                        | Error _ -> [] // CAS raced or failed; pending remains durable.
-                        | Ok alerts ->
-                            alerts
-                            |> List.sortBy (fun alert ->
-                                (if alert.Message.TrimStart().StartsWith("STOP", StringComparison.OrdinalIgnoreCase)
-                                 then 0 else 1), alert.QueuedAtUtc, alert.AlertId)
-                            |> List.map (fun alert -> OperationalControl.queuedAlert alert.AlertId alert.Message)
+                        // Pending handles and read-only polls are not activity.
+                        // Actual alert consumption still requires a verified
+                        // launch guard and the existing queue-version CAS.
+                        match ScheduledReadyResume.guardUncorrelatedIngressAt binding snapshot agentId with
+                        | Error _ -> []
+                        | Ok () ->
+                            match ReviewWorkflow.ReviewWorkflow.takeResponseAlertsAt binding snapshot agentId with
+                            | Error _ -> [] // CAS raced or failed; pending remains durable.
+                            | Ok alerts ->
+                                alerts
+                                |> List.sortBy (fun alert ->
+                                    (if alert.Message.TrimStart().StartsWith("STOP", StringComparison.OrdinalIgnoreCase)
+                                     then 0 else 1), alert.QueuedAtUtc, alert.AlertId)
+                                |> List.map (fun alert -> OperationalControl.queuedAlert alert.AlertId alert.Message)
             finally
                 (responseAlertCache rt).AfterAttempt(selected, agentId)
 
@@ -1394,8 +1451,19 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
         | None -> rt |> OrchestrationApi.TaskApi.read cmd |> serialize'
     | TaskReadCommand cmd -> rt |> OrchestrationApi.TaskApi.read cmd |> serialize'
     | ObserveAgentCommand cmd ->
-        rt |> OrchestrationApi.AgentObservationApi.observe cmd
-            (fun project agent -> rt.Tui.GetAgentLastSeen(project, agent)) |> serialize'
+        let lastSeen project agent = rt.Tui.GetAgentLastSeen(project, agent)
+        let observed =
+            match target, requestSnapshot with
+            | Some selected, Some _ ->
+                let projectId = ProjectPaths.ProjectTarget.projectId selected
+                withCurrentRequestSnapshot rt projectId cmd.ObserverAgentId requestSnapshot
+                    (fun snapshot ->
+                        snapshot.Verified
+                        |> Result.bind (fun (binding, ledgerSnapshot) ->
+                            OrchestrationApi.AgentObservationApi.observeAt cmd lastSeen binding ledgerSnapshot))
+                    (fun () -> Error(Client.ValidationError "Observer state changed during verified observation."))
+            | _ -> OrchestrationApi.AgentObservationApi.observe cmd lastSeen rt
+        observed |> serialize'
     | TaskWriteCommand cmd when cmd.Action = "ExportTaskSpec" || cmd.Action = "ImportTaskSpec" ->
         match resolved with
         | Some context -> rt |> OrchestrationApi.TaskApi.writeForContext context cmd |> serialize'
@@ -1764,31 +1832,63 @@ let private receivePreparedCommand (rt: Runtime)
     }
 
 // The agent label authenticates the user/actor route, not a particular
-// inference execution. Refuse actor-only ingress while an unresolved launch
-// owns the Ready episode. This gate is shared by direct and promoted execution.
-let private admitOrdinaryLaunchIngress (rt: Runtime) agentId target =
+// inference execution. Ready admission must use fresh authority. The only
+// cache exception is a read-only operation with verified non-Ready evidence;
+// neither this evidence nor an unavailable local read authorizes a write.
+type private OrdinaryIngress =
+    | VerifiedIngress of RequestSnapshot option
+    | CachedReadIngress
+    | UnverifiedLocalRead of EffectError
+
+let private localSourceRead = function
+    | ListDirectoryCommand _ | SearchFilesCommand _ | SearchTextCommand _
+    | ReadFileCommand _ | ReadFilePageCommand _ | ReadFilesCommand _
+    | GetAgentInstructionsCommand _ | ReadImageCommand _
+    | GetProjectDetailsCommand _ | ListConfiguredTasksCommand _
+    | ListSkillsCommand _ | GetSkillCommand _
+    | GetGitStatusCommand _ | GetGitDiffCommand _ -> true
+    | _ -> false
+
+let private readOnlyJobPoll = function
+    | GetJobResultCommand _ | ListJobsCommand _ -> true
+    | _ -> false
+
+let private admitOrdinaryLaunchIngress (rt: Runtime) agentId target command =
     match target with
     | Some selected when not (String.IsNullOrWhiteSpace agentId) ->
         let projectId = ProjectPaths.ProjectTarget.projectId selected
         let project = ProjectPaths.ProjectId.value projectId
         let cache = workingGuidanceCache rt
-        let rec admit retries =
-            let generation = cache.Capture(projectId, agentId)
-            let observedAt = DateTimeOffset.UtcNow
-            retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.loadOptionalWithSnapshot project rt)
-            |> Result.bind (fun verified ->
+        let historical = localSourceRead command
+        if historical && cache.HasVerifiedWorking(DateTimeOffset.UtcNow, projectId, agentId) then
+            Ok CachedReadIngress
+        elif readOnlyJobPoll command && (responseAlertCache rt).HasVerifiedNoAlertNonReady(selected, agentId) then
+            Ok CachedReadIngress
+        else
+            let rec admit retries =
+                let generation = cache.Capture(projectId, agentId)
+                let observedAt = DateTimeOffset.UtcNow
+                let loaded =
+                    retryBindingContention (fun () -> OrchestrationApi.LedgerBindingConfig.loadOptionalWithSnapshot project rt)
                 if not (cache.IsCurrent(projectId, agentId, generation)) then
                     if retries > 0 then admit (retries - 1)
                     else Error(Client.ValidationError "ScheduledLaunchIngressRejected: agent state changed during admission.")
                 else
-                    match verified with
-                    | None -> Ok None
-                    | Some(binding, snapshot) ->
+                    match loaded with
+                    | Error error when historical ->
+                        // Local historical reads remain available. No activation,
+                        // Seen attribution or alert consumption is inferred
+                        // from the missing canonical launch/assignment state.
+                        Ok(UnverifiedLocalRead error)
+                    | Error error -> Error error
+                    | Ok None -> Ok(VerifiedIngress None)
+                    | Ok(Some(binding, snapshot)) ->
                         ScheduledReadyResume.guardUncorrelatedIngressAt binding snapshot agentId
-                        |> Result.map (fun () -> Some(createRequestSnapshot selected agentId generation observedAt (Ok(binding, snapshot))))
-                        |> Result.mapError (fun issue -> Client.ValidationError(sprintf "ScheduledLaunchIngressRejected: %A" issue)))
-        admit 2
-    | _ -> Ok None
+                        |> Result.map (fun () ->
+                            VerifiedIngress(Some(createRequestSnapshot selected agentId generation observedAt (Ok(binding, snapshot)))))
+                        |> Result.mapError (fun issue -> Client.ValidationError(sprintf "ScheduledLaunchIngressRejected: %A" issue))
+            admit 2
+    | _ -> Ok(VerifiedIngress None)
 
 // Shared by SignalR receive and tests. Identity is supplied by the MCP call,
 // not inferred from provider conversation metadata.
@@ -1862,6 +1962,7 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                             |> Result.map (fun () -> scope)
                             |> Result.mapError Client.ValidationError)
                     let requestSnapshot: RequestSnapshot option ref = ref None
+                    let mutable ordinaryIngress: OrdinaryIngress option = None
                     // Correlate the explicit launch before activity or automatic activation.
                     // A late/invalid launch cannot activate the replacement's Ready episode.
                     let project =
@@ -1881,16 +1982,27 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                                     | Ok(ScheduledReadyResume.CheckinDuplicate _) -> Ok scope
                             | CreateProjectCommand _ -> Ok scope // no existing target ledger
                             | _ ->
-                                admitOrdinaryLaunchIngress rt agentId (projectTarget scope)
-                                |> Result.map (fun verified ->
-                                    if requestSnapshotCanSupplyGuidance command && isLocalAgentActivity command then
+                                admitOrdinaryLaunchIngress rt agentId (projectTarget scope) command
+                                |> Result.map (fun ingress ->
+                                    ordinaryIngress <- Some ingress
+                                    match ingress with
+                                    | VerifiedIngress verified when requestSnapshotCanSupplyGuidance command && isLocalAgentActivity command ->
                                         requestSnapshot.Value <- verified
+                                    | VerifiedIngress verified ->
+                                        match command with
+                                        | ObserveAgentCommand _ -> requestSnapshot.Value <- verified
+                                        | _ -> ()
+                                    | _ -> ()
                                     scope))
                     match project with
                     | Error error -> return Error error
                     | Ok scope ->
                         let target = projectTarget scope
-                        if mayReceiveResponseAlert command then
+                        let unavailableLocalRead =
+                            match ordinaryIngress with
+                            | Some(UnverifiedLocalRead error) -> Some error
+                            | _ -> None
+                        if mayReceiveResponseAlert command && unavailableLocalRead.IsNone then
                             responseScope <- target
                         // The caller's agentId belongs to the source project
                         // of a cross-project notification, not the destination.
@@ -1905,14 +2017,30 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                             | _ -> ""
                         // The exact activation CAS may still reject an ordinary
                         // request if a scheduled intent won since admission.
-                        match activateReadyOnActivity rt localAgentId target requestSnapshot command with
-                        | Error error ->
-                            responseScope <- None
-                            return Error error
-                        | Ok (changes, committedActivation, activationInstructions) ->
+                        let recordSeen () =
                             if not (String.IsNullOrWhiteSpace localAgentId) then
                                 target |> Option.iter (fun selected ->
                                     rt.Tui.RecordAgentSeen(AgentView.activityProject selected, localAgentId))
+                        let activation =
+                            match unavailableLocalRead with
+                            | Some error ->
+                                Ok([], None,
+                                    [ OperationalControl.ActivationUnverified
+                                        $"Automatic Ready-to-Working activation could not be verified: {error}. Reread the canonical inbox before continuing assignment work." ])
+                            | None -> activateReadyOnActivity rt localAgentId target requestSnapshot command
+                        match activation with
+                        | Error error ->
+                            responseScope <- None
+                            // A sessionless authenticated command on an unbound
+                            // project is still observed even if its ledger
+                            // operation fails. Never attribute a rejected Ready
+                            // launch or unknown canonical admission.
+                            match ordinaryIngress with
+                            | Some(VerifiedIngress None) -> recordSeen()
+                            | _ -> ()
+                            return Error error
+                        | Ok (changes, committedActivation, activationInstructions) ->
+                            if unavailableLocalRead.IsNone then recordSeen()
                             implicitChanges <- changes
                             match command, committedActivation with
                             | TaskReadCommand inbox, Some receipt when inbox.Action = "AgentInbox" ->
@@ -1930,12 +2058,16 @@ let private processIncomingCommandCore (rt: Runtime) (commandJson: string) (agen
                             | Some selected, Ok outcome when not outcome.ChangedAgentIds.IsEmpty ->
                                 let cache = workingGuidanceCache rt
                                 let projectId = ProjectPaths.ProjectTarget.projectId selected
+                                (responseAlertCache rt).InvalidateAdmissionSnapshot(projectId)
                                 for changed in outcome.ChangedAgentIds do
                                     cache.Invalidate(projectId, changed)
                                 if List.contains localAgentId outcome.ChangedAgentIds then
                                     requestSnapshot.Value <- None
                             | _ -> ()
-                            instructions <- OperationalControl.ordered (activationInstructions @ checkWorkingGuidance rt localAgentId target requestSnapshot.Value command)
+                            let guidance =
+                                if unavailableLocalRead.IsSome then []
+                                else checkWorkingGuidance rt localAgentId target requestSnapshot.Value command
+                            instructions <- OperationalControl.ordered (activationInstructions @ guidance)
                             return result
                 with ex ->
                     unexpectedFailure <- true
@@ -2010,12 +2142,9 @@ let private withVisibleResponseAlerts (rt: Runtime) (agentId: string)
         match command with
         | Some original when mayReceiveResponseAlert original && not launchRejected ->
             match classifyProject original with
-            | Ok scope when response.PendingJob.IsSome ->
-                // A pending handle may precede admission. Do not allow its
-                // delivery path to mutate the held actor's response queue.
-                match admitOrdinaryLaunchIngress rt agentId (projectTarget scope) with
-                | Ok _ -> checkResponseAlerts rt agentId (projectTarget scope)
-                | Error _ -> []
+            // The presence probe is nonblocking, and checkResponseAlerts
+            // independently verifies launch admission before any consumption.
+            // A pending handle cannot itself authorize a queue mutation.
             | Ok scope -> checkResponseAlerts rt agentId (projectTarget scope)
             | Error _ -> []
         | _ -> []

@@ -8,6 +8,13 @@ The goal is simple: understand the code, make focused changes, verify them, and 
 
 Use the full process for substantial work. Use the lightweight workflow for small fixes.
 
+For new or changed tool surfaces, [pertinence by default](AgentCommandSurface.md#pertinence-by-default-operator-decision-2026-11-27)
+is an architectural acceptance criterion, not optional optimization. Verify the
+actual registered route's bounded default output at realistic scale, completeness
+within documented scope, deterministic ordering, exact expansion/pagination,
+authorization and state/effect evidence preservation. Measure response bytes and
+decision usefulness before introducing a broader abstraction.
+
 ---
 
 ## Lightweight Workflow

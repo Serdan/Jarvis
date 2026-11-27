@@ -4,6 +4,27 @@ This document describes the approved next-generation Jarvis command surface.
 
 Jarvis should not try to be a complete coding-agent runtime. Its purpose is to expose a small, safe, local bridge from the assistant to a user-selected workspace. The command surface should focus on project discovery, file access, patching, controlled execution, and git review/commit operations.
 
+## Pertinence by default (Operator decision, 2026-11-27)
+
+For every Jarvis tool, including future Work surfaces, return a deterministic,
+bounded, purpose-specific projection at the producing boundary before serialization
+and transport. Scope defaults to the requested operation, explicit query, and relevant
+caller assignment or role where appropriate. Include decision-ready facts, exact
+references, state transitions, uncertainty, negative evidence and actionable errors;
+omit unrelated history, repeated immutable documents and redundant receipts. This is
+not an authorization mechanism or a model-based relevance ranking. Preserve canonical
+records, evidence and authorization independently of the projection.
+
+Provide explicit exact lookup, filters or snapshot-consistent paging for omitted
+detail. Document scope, ordering, bounds, totals/omissions and continuation where
+needed; do not silently truncate or imply completeness beyond the stated scope.
+Compute recurring deterministic calculations and classifications once at the
+authoritative boundary; retain raw evidence and clock/source provenance as needed.
+Unknown, stale, invalid and blocked evidence must remain distinct. In particular,
+local activity age cannot establish authoritative Health recovery eligibility.
+Review actual registered route outputs at realistic scale, including terminal job
+responses and compatibility adapters; see [the response audit](reviews/2026-11-27-pertinent-response-audit.md).
+
 ## Explicit repository guidance
 
 Ordinary operations return requested results, errors and necessary operational receipts or alerts, not automatic repository documents. Read applicable repository guidance with `get_agent_instructions` and obtain dynamic role/assignment context through the self-agent inbox. The closed `OperationalControls` wire union distinguishes Working-turn soft/hard advisory limits, exceptional queued alerts, and an unverified activation diagnostic. During staged compatibility, a narrow adapter projects these controls into the legacy `Instructions` field only when present; new peers prefer typed controls and ignore legacy repository documents/notices, including nested terminal job results. `AgentStateChangesStatus` distinguishes confirmed (including an empty list), unknown (including any known partial mutations), and pending evidence independently of operation success. Missing or null legacy mutation evidence is unknown, never confirmed empty on new readers. This source behavior is gated on canonical launch-template readiness and coordinated cutover; see [AgentInstructions.md](AgentInstructions.md) and [AgentCommandResponse.schema.json](AgentCommandResponse.schema.json).

@@ -60,7 +60,7 @@ type ReviewAuthorityHistoryTests() =
             let first = binding one
             let second = binding two
             LedgerStore.initialize first true |> success |> ignore
-            for id in [ "Owner"; "Reviewer" ] do
+            for id in [ "Owner"; "R1"; "R2"; "R3" ] do
                 ReviewWorkflow.registerAgent first (Guid.NewGuid()) id |> success |> ignore
             let baseOid = git one [ "rev-parse"; "HEAD" ]
             let sourceRef = "refs/heads/" + git one [ "branch"; "--show-current" ]
@@ -94,32 +94,11 @@ type ReviewAuthorityHistoryTests() =
     [<TestCase("TasklessYield")>]
     [<TestCase("Stopped")>]
     [<TestCase("NeedsWork")>]
-    member _.HistoricalTasklessStartDoesNotDisqualifyReviewRoute(finalState: string) =
+    member _.HistoricalTasklessStartsDoNotDisqualifyPreviouslyBlockedReviewers(finalState: string) =
         withFixture (fun one _ first second baseOid sourceRef _ _ ->
             let taskId = "review-authority-history"
-            let id = Guid.NewGuid()
             ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Review history"
             |> success |> ignore
-            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
-                id sourceRef baseOid "Review source" "Independent audit" ""
-            |> success |> ignore
-            let agent () = (ReviewWorkflow.getAgentInbox second "Reviewer" |> success).Agent
-            ReviewWorkflow.setAgentAdministrativeStateAs first "AuthenticatedUser" (Guid.NewGuid())
-                "Reviewer" "NeedsWork" (agent ()).Version "Enable taskless activity"
-            |> success |> ignore
-            let startId = Guid.NewGuid()
-            ReviewWorkflow.startTasklessWork first startId "Reviewer" (agent ()).Version "Taskless start"
-            |> success |> ignore
-            if finalState <> "Working" then
-                ReviewWorkflow.yieldTasklessWork first (Guid.NewGuid()) "Reviewer" (agent ()).Version "Yield"
-                |> success |> ignore
-            if finalState = "Stopped" || finalState = "NeedsWork" then
-                ReviewWorkflow.parkAgent first (Guid.NewGuid()) "Reviewer" (agent ()).Version "Operator STOP"
-                |> success |> ignore
-            if finalState = "NeedsWork" then
-                ReviewWorkflow.setAgentAdministrativeStateAs first "AuthenticatedUser" (Guid.NewGuid())
-                    "Reviewer" "NeedsWork" (agent ()).Version "Resume ordinary review"
-                |> success |> ignore
             let path = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
             let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
             try
@@ -129,48 +108,128 @@ type ReviewAuthorityHistoryTests() =
                     first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl head true
                 |> success |> ignore
                 let runtime = Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
-                let command : Common.ReviewWriteCommand =
-                    { ProjectName = "owner"; Action = "Claim"; OperationId = Guid.NewGuid().ToString("D")
-                      TaskId = taskId; RequestId = id.ToString("D"); ActorId = "Reviewer"
-                      ReviewerId = ""; ExpectedVersion = 1; Kind = ""; SourceRef = ""
-                      HeadOid = ""; TargetRef = ""; Summary = ""; Verdict = ""
-                      DocumentPath = ""; Content = ""; ExpectedBlobOid = "" }
                 let run actor cmd =
                     let _, outcome, _ =
                         Client.SignalR.Client.processIncomingCommand runtime
                             (System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(Common.ReviewWriteCommand cmd)) actor
                         |> Async.AwaitTask |> Async.RunSynchronously
                     outcome
-                // The exact old StartTasklessWork receipt remains in canonical history.
-                let _, original = LedgerStore.getOperationStatus second startId |> success
-                Assert.That(original.IsSome, Is.True)
-                let claimed = run "Reviewer" command
-                Assert.That(claimed.IsOk, Is.True, sprintf "%A" claimed)
-                let read () = (ReviewWorkflow.getBranchReview second taskId id |> success).Review
-                Assert.That((read ()).ReviewerId, Is.EqualTo("Reviewer"))
-                Assert.That((read ()).Version, Is.EqualTo(2))
-                let reject action actor version =
-                    let rejected = run actor { command with Action = action; ActorId = actor
-                                                            OperationId = Guid.NewGuid().ToString("D")
-                                                            ExpectedVersion = version; Verdict = "Accept" }
-                    Assert.That(rejected.IsError, Is.True, sprintf "%A" rejected)
-                let claimHead = (LedgerStore.fetch second |> success).Commit
-                reject "Claim" "Reviewer" 1
-                reject "Decide" "Reviewer" 1
-                reject "Decide" "Owner" 2
-                Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(claimHead))
-                let release = run "Reviewer" { command with Action = "Release"; ExpectedVersion = 2
-                                                            OperationId = Guid.NewGuid().ToString("D") }
-                Assert.That(release.IsOk, Is.True, sprintf "%A" release)
-                Assert.That((read ()).Status, Is.EqualTo("Unclaimed"))
-                let reclaimed = run "Reviewer" { command with ExpectedVersion = 3
-                                                              OperationId = Guid.NewGuid().ToString("D") }
-                Assert.That(reclaimed.IsOk, Is.True, sprintf "%A" reclaimed)
-                let decided = run "Reviewer" { command with Action = "Decide"; ExpectedVersion = 4
-                                                            Verdict = "Accept"; OperationId = Guid.NewGuid().ToString("D") }
-                Assert.That(decided.IsOk, Is.True, sprintf "%A" decided)
-                Assert.That((read ()).Status, Is.EqualTo("Accepted"))
-                let _, stillOriginal = LedgerStore.getOperationStatus second startId |> success
-                Assert.That(stillOriginal, Is.EqualTo(original))
+                for reviewer in [ "R1"; "R2"; "R3" ] do
+                    let id = Guid.NewGuid()
+                    ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
+                        id sourceRef baseOid "Review source" "Independent audit" ""
+                    |> success |> ignore
+                    let agent () = (ReviewWorkflow.getAgentInbox second reviewer |> success).Agent
+                    ReviewWorkflow.setAgentAdministrativeStateAs first "AuthenticatedUser" (Guid.NewGuid())
+                        reviewer "NeedsWork" (agent()).Version "Enable taskless activity"
+                    |> success |> ignore
+                    let startId = Guid.NewGuid()
+                    ReviewWorkflow.startTasklessWork first startId reviewer (agent()).Version "Taskless start"
+                    |> success |> ignore
+                    if finalState <> "Working" then
+                        ReviewWorkflow.yieldTasklessWork first (Guid.NewGuid()) reviewer (agent()).Version "Yield"
+                        |> success |> ignore
+                    if finalState = "Stopped" || finalState = "NeedsWork" then
+                        ReviewWorkflow.parkAgent first (Guid.NewGuid()) reviewer (agent()).Version "Operator STOP"
+                        |> success |> ignore
+                    if finalState = "NeedsWork" then
+                        ReviewWorkflow.setAgentAdministrativeStateAs first "AuthenticatedUser" (Guid.NewGuid())
+                            reviewer "NeedsWork" (agent()).Version "Resume ordinary review"
+                        |> success |> ignore
+                    let command : Common.ReviewWriteCommand =
+                        { ProjectName = "owner"; Action = "Claim"; OperationId = Guid.NewGuid().ToString("D")
+                          TaskId = taskId; RequestId = id.ToString("D"); ActorId = reviewer
+                          ReviewerId = ""; ExpectedVersion = 1; Kind = ""; SourceRef = ""
+                          HeadOid = ""; TargetRef = ""; Summary = ""; Verdict = ""
+                          DocumentPath = ""; Content = ""; ExpectedBlobOid = "" }
+                    // The exact old StartTasklessWork receipt remains in canonical history.
+                    let _, original = LedgerStore.getOperationStatus second startId |> success
+                    Assert.That(original.IsSome, Is.True)
+                    let claimed = run reviewer command
+                    Assert.That(claimed.IsOk, Is.True, sprintf "%A" claimed)
+                    let read () = (ReviewWorkflow.getBranchReview second taskId id |> success).Review
+                    Assert.That((read ()).ReviewerId, Is.EqualTo(reviewer))
+                    Assert.That((read ()).Version, Is.EqualTo(2))
+                    let reject action actor version =
+                        let rejected =
+                            run actor { command with Action = action; ActorId = actor
+                                                     OperationId = Guid.NewGuid().ToString("D")
+                                                     ExpectedVersion = version; Verdict = "Accept" }
+                        Assert.That(rejected.IsError, Is.True, sprintf "%A" rejected)
+                    let claimHead = (LedgerStore.fetch second |> success).Commit
+                    reject "Claim" reviewer 1
+                    reject "Decide" reviewer 1
+                    reject "Decide" "Owner" 2
+                    Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(claimHead))
+                    let release =
+                        run reviewer { command with Action = "Release"; ExpectedVersion = 2
+                                                    OperationId = Guid.NewGuid().ToString("D") }
+                    Assert.That(release.IsOk, Is.True, sprintf "%A" release)
+                    Assert.That((read ()).Status, Is.EqualTo("Unclaimed"))
+                    let reclaimed =
+                        run reviewer { command with ExpectedVersion = 3
+                                                    OperationId = Guid.NewGuid().ToString("D") }
+                    Assert.That(reclaimed.IsOk, Is.True, sprintf "%A" reclaimed)
+                    let decided =
+                        run reviewer { command with Action = "Decide"; ExpectedVersion = 4
+                                                    Verdict = "Accept"; OperationId = Guid.NewGuid().ToString("D") }
+                    Assert.That(decided.IsOk, Is.True, sprintf "%A" decided)
+                    Assert.That((read ()).Status, Is.EqualTo("Accepted"))
             finally
                 if File.Exists path then File.Delete path)
+
+
+    [<Test>]
+    member _.ConcurrentClaimsHaveOneCanonicalWinnerAfterHistoricalTasklessStarts() =
+        withFixture (fun _ _ first second baseOid sourceRef _ _ ->
+            let taskId = "review-authority-race"
+            let reviewId = Guid.NewGuid()
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Concurrent review claim"
+            |> success |> ignore
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
+                reviewId sourceRef baseOid "Review source" "Independent audit" ""
+            |> success |> ignore
+            let start reviewer =
+                let before = (ReviewWorkflow.getAgentInbox first reviewer |> success).Agent
+                ReviewWorkflow.setAgentAdministrativeStateAs first "AuthenticatedUser" (Guid.NewGuid())
+                    reviewer "NeedsWork" before.Version "Enable taskless activity"
+                |> success |> ignore
+                let ready = (ReviewWorkflow.getAgentInbox first reviewer |> success).Agent
+                ReviewWorkflow.startTasklessWork first (Guid.NewGuid()) reviewer ready.Version "Taskless start"
+                |> success |> ignore
+            start "R1"
+            start "R2"
+            use gate = new System.Threading.ManualResetEventSlim(false)
+            let firstClaim =
+                System.Threading.Tasks.Task.Run(fun () ->
+                    gate.Wait()
+                    ReviewWorkflow.claimBranchReview first (Guid.NewGuid()) taskId reviewId "R1" 1)
+            let secondClaim =
+                System.Threading.Tasks.Task.Run(fun () ->
+                    gate.Wait()
+                    ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId reviewId "R2" 1)
+            gate.Set()
+            System.Threading.Tasks.Task.WaitAll
+                [| firstClaim :> System.Threading.Tasks.Task; secondClaim :> System.Threading.Tasks.Task |]
+            let winner, loser, loserBinding =
+                match firstClaim.Result, secondClaim.Result with
+                | Ok _, Error _ -> "R1", "R2", second
+                | Error _, Ok _ -> "R2", "R1", first
+                | other -> failwithf "Expected exactly one live claim winner: %A" other
+            let claimed = (ReviewWorkflow.getBranchReview first taskId reviewId |> success).Review
+            Assert.That(claimed.Status, Is.EqualTo("Claimed"))
+            Assert.That(claimed.ReviewerId, Is.EqualTo(winner))
+            Assert.That(claimed.Version, Is.EqualTo(2))
+            let head = (LedgerStore.fetch second |> success).Commit
+            match ReviewWorkflow.claimBranchReview loserBinding (Guid.NewGuid()) taskId reviewId loser 1 with
+            | Error(ReviewAlreadyClaimed _) -> ()
+            | other -> Assert.Fail(sprintf "Losing claimant must observe the canonical claim: %A" other)
+            match ReviewWorkflow.decideBranchReview loserBinding (Guid.NewGuid()) taskId reviewId loser 2 Accept with
+            | Error(ReviewVersionConflict _) -> ()
+            | other -> Assert.Fail(sprintf "Losing claimant must not decide another reviewer's claim: %A" other)
+            Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(head))
+            ReviewWorkflow.decideBranchReview first (Guid.NewGuid()) taskId reviewId winner 2 Accept
+            |> success |> ignore
+            let decided = (ReviewWorkflow.getBranchReview second taskId reviewId |> success).Review
+            Assert.That(decided.Status, Is.EqualTo("Accepted"))
+            Assert.That(decided.ReviewerId, Is.EqualTo(winner)))

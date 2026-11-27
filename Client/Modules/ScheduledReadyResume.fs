@@ -55,21 +55,11 @@ let candidates limits roster =
     |> List.choose _.Ready
     |> List.sortBy (fun r -> -int64 r.Priority, r.IssuedSequence, r.AgentId, r.TaskId, r.AttemptId)
 
-let private key (id: string) =
-    Convert.ToBase64String(Encoding.UTF8.GetBytes id).TrimEnd('=').Replace('+', '-').Replace('/', '_')
-
-let private readAgentId binding snapshot path =
-    LedgerStore.readAt binding snapshot path
-    |> Result.bind (function
-        | Some raw, Some _ ->
-            try
-                use json = JsonDocument.Parse raw
-                let id = json.RootElement.GetProperty("agentId").GetString()
-                if String.IsNullOrWhiteSpace id || path <> "agents/" + key id + ".json" then
-                    bad "Agent identity/path mismatch."
-                else Ok id
-            with _ -> bad "Malformed registered agent record."
-        | _ -> bad "Missing registered agent record.")
+let private readAgentId (raw: string) =
+    try
+        use json = JsonDocument.Parse raw
+        Ok (json.RootElement.GetProperty("agentId").GetString())
+    with _ -> bad "Malformed registered agent record."
 
 // Ready is read without invoking agent_inbox (which would activate the agent).
 // The canonical inbox projection also validates blocked attempt/wait indexes.
@@ -107,15 +97,11 @@ let private readReady binding snapshot (agent: ReviewAgent) =
 /// With no role caps, role-resolution failures of unrelated Working agents
 /// must not become a capacity prerequisite.
 let readRosterAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) (limits: Limits) =
-    LedgerStore.listAt binding snapshot "agents"
-    |> Result.bind (fun paths ->
-        let paths = paths |> List.filter (fun path ->
-            path.StartsWith("agents/", StringComparison.Ordinal)
-            && path.EndsWith(".json", StringComparison.Ordinal)
-            && not (path.EndsWith(".challenge-subscription.json", StringComparison.Ordinal)))
-        let read path =
-            readAgentId binding snapshot path
-            |> Result.bind (fun id -> ReviewWorkflow.getAgentWorkingTurnAt binding snapshot id)
+    LedgerStore.readSchedulerRosterRecordsAt binding snapshot
+    |> Result.bind (fun records ->
+        let read (path, struct (_, raw)) =
+            readAgentId raw
+            |> Result.bind (fun id -> ReviewWorkflow.decodeSchedulerRosterAgent path id raw)
             |> Result.bind (fun agent ->
                 readReady binding snapshot agent
                 |> Result.bind (fun ready ->
@@ -127,8 +113,10 @@ let readRosterAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) (limits: Li
                             |> Result.map (fun resolved -> Set.ofList resolved.RoleIds)
                     roles |> Result.map (fun ids ->
                         { AgentId = agent.AgentId; Working = working; Roles = ids; Ready = ready })))
-        paths |> List.fold (fun state path ->
-            state |> Result.bind (fun entries -> read path |> Result.map (fun entry -> entry :: entries))) (Ok []))
+        // Canonical agent paths are ASCII; map order matches the old Git
+        // tree listing. Consing retains the original reverse path order.
+        records |> Map.toList |> List.fold (fun state record ->
+            state |> Result.bind (fun entries -> read record |> Result.map (fun entry -> entry :: entries))) (Ok []))
 
 // One stable ID per Ready episode. Changes to unrelated project head, policy,
 // rendered prompt or schedule occurrence cannot mint a replacement send.

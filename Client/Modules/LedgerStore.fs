@@ -1714,7 +1714,7 @@ module LedgerStore =
 
     // One immutable tree listing and one cat-file batch (only for previously
     // unseen blobs), instead of two Git processes per entity.
-    let private readSelectedRecordsAt (prefixes: string list) includePath (binding: LedgerBinding) (snapshot: LedgerSnapshot) =
+    let private readSelectedRecordsAtCore useCache (prefixes: string list) includePath (binding: LedgerBinding) (snapshot: LedgerSnapshot) =
         let repo = binding.RepositoryPath
         // The caller supplies the scoped prefixes and path predicate.
         let treeArgs = [ "ls-tree"; "-r"; "-z"; snapshot.Commit; "--" ] @ prefixes
@@ -1726,7 +1726,9 @@ module LedgerStore =
                 listing.Split('\000', StringSplitOptions.RemoveEmptyEntries)
                 |> Array.choose (fun entry ->
                     let separator = entry.IndexOf('\t')
-                    if separator < 0 then None
+                    if separator < 0 then
+                        if not useCache then malformedRecordPath <- Some "<malformed tree entry>"
+                        None
                     else
                         let header = entry.Substring(0, separator).Split(' ')
                         let path = entry.Substring(separator + 1)
@@ -1745,15 +1747,18 @@ module LedgerStore =
                 records
                 |> Array.map snd
                 |> Array.distinct
-            for oid in distinctOids do
-                match dashboardBlobCache.TryGet oid with
-                | ValueSome content -> cached.Add(oid, content)
-                | ValueNone -> ()
+            if useCache then
+                for oid in distinctOids do
+                    match dashboardBlobCache.TryGet oid with
+                    | ValueSome content -> cached.Add(oid, content)
+                    | ValueNone -> ()
             let missing = distinctOids |> Array.filter (fun oid -> not (cached.ContainsKey oid))
             let fetched = System.Collections.Generic.Dictionary<string, string>(StringComparer.Ordinal)
             let load () =
                 match malformedRecordPath with
                 | Some path -> Error(LedgerIntegrityError $"Unexpected ledger object type: {path}.")
+                | None when not useCache && (records |> Array.map fst |> Array.distinct |> Array.length) <> records.Length ->
+                    Error(LedgerIntegrityError "Duplicate scheduler roster path.")
                 | None when missing.Length = 0 -> Ok ()
                 | None ->
                     let input = String.concat "\n" missing + "\n"
@@ -1787,8 +1792,9 @@ module LedgerStore =
                                 offset <- offset + 1
                                 fetched.Add(expected, content)
                             if offset <> bytes.Length then failwith "Unexpected trailing Git batch bytes."
-                            for KeyValue(oid, content) in fetched do
-                                dashboardBlobCache.Add(oid, content, estimatedBlobBytes oid content)
+                            if useCache then
+                                for KeyValue(oid, content) in fetched do
+                                    dashboardBlobCache.Add(oid, content, estimatedBlobBytes oid content)
                             Ok ()
                         with ex -> Error(LedgerIntegrityError("Invalid Git dashboard batch: " + ex.Message))
             match load () with
@@ -1802,6 +1808,21 @@ module LedgerStore =
                 |> Array.map (fun (path, oid) -> path, struct (oid, content oid))
                 |> Map.ofArray
                 |> Ok
+
+    let private readSelectedRecordsAt prefixes includePath binding snapshot =
+        readSelectedRecordsAtCore true prefixes includePath binding snapshot
+
+    // Scheduler admission must re-read every selected physical blob at each
+    // fresh preflight; a warm dashboard cache must not mask a missing object.
+    // The predicate is the old listAt agent filter, including its exclusion of
+    // challenge subscriptions. All remaining paths require normal blob mode.
+    let internal readSchedulerRosterRecordsAt binding snapshot =
+        let canonical (path: string) =
+            path.StartsWith("agents/", StringComparison.Ordinal)
+            && path.EndsWith(".json", StringComparison.Ordinal)
+            && not (path.EndsWith(".challenge-subscription.json", StringComparison.Ordinal))
+            && not (path.Contains(".."))
+        readSelectedRecordsAtCore false [ "agents" ] canonical binding snapshot
 
     let private readViewRecordsAt includeIntegrations includeInstructionConfigs binding snapshot =
         let prefixes = [ "agents"; "tasks"; "notifications" ]

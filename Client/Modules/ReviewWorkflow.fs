@@ -4139,6 +4139,15 @@ module ReviewWorkflow =
         if not (validAgent agentId) then Error(InvalidBinding "Invalid Working agent ID.")
         else required<ReviewAgent> binding snapshot (agentPath agentId) |> Result.map fst
 
+    // Equivalent to the scheduler's former raw identity/path check followed
+    // by getAgentWorkingTurnAt. The caller selected the verified normal blob
+    // from the same immutable head; no second lookup is needed.
+    let internal decodeSchedulerRosterAgent path agentId content =
+        if String.IsNullOrWhiteSpace agentId || path <> agentPath agentId then
+            Error(InvalidBinding "Scheduled ready resume: Agent identity/path mismatch.")
+        elif not (validAgent agentId) then Error(InvalidBinding "Invalid Working agent ID.")
+        else decodeEntity<ReviewAgent> path content
+
     let getAgentWorkingTurn binding agentId =
         LedgerStore.fetch binding
         |> Result.bind (fun snapshot -> getAgentWorkingTurnAt binding snapshot agentId)

@@ -1,0 +1,1 @@
+Exact accepted role body unchanged; 903-unit replacement override preserves v4 constraints, corrects three-feature scope. FSI exit 0: exact role equality, hashes, serializer limits; bootstrap decoded 43,833→25,455 units. Reviewed CAS sequence and rollback, no live writes, exact historical rejected append unavailable. Documentation-only.

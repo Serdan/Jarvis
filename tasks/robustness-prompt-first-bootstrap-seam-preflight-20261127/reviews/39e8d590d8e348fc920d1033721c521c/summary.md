@@ -1,0 +1,1 @@
+Independent evidence/contract review: registered manual/scheduled renderer divergence, generation-bound authenticated ingress gap, pinned assembly and context accounting contract. Read-only actual byte sample, no production changes or runtime tests.

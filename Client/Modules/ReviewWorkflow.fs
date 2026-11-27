@@ -3330,17 +3330,73 @@ module ReviewWorkflow =
         checkpointAttemptWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion
             generation summary nextAction sourceCommit evidence ""
 
-    let getCheckpoint binding taskId sequence =
+    let internal getCheckpointAt binding snapshot taskId sequence =
         if not (validTaskId taskId) || sequence < 1L then
             Error(InvalidBinding "Invalid checkpoint sequence.")
         else result {
-            let! snapshot = LedgerStore.fetch binding
-            let! _, _, attempt, _ = getAttempt binding snapshot taskId
-            let! checkpoint, _ =
-                required<AgentCheckpoint> binding snapshot
-                    (checkpointPath taskId attempt.AttemptId sequence)
-            return snapshot.Commit, checkpoint
+            let! task, _ = required<ReviewTask> binding snapshot (taskPath taskId)
+            if task.TaskId <> taskId then
+                return! Error(LedgerIntegrityError "Checkpoint task identity mismatch.")
+            if sequence >= snapshot.Header.NextSequence then
+                return! Error(StaleEntityVersion "Checkpoint sequence is not present at the pinned ledger head.")
+
+            // Replacement, abandonment and reopening leave immutable task-scoped
+            // lifecycle events naming the outgoing attempt. Discover candidates
+            // at this same snapshot, without enumerating other tasks or guessing
+            // the checkpoint's assignment generation from the current attempt.
+            let mutable candidates = Set.empty<string>
+            let validAttemptId (id: string) = not (isNull id) && Regex.IsMatch(id, "^[a-f0-9]{32}$")
+            if not (String.IsNullOrWhiteSpace task.AttemptId) then
+                if not (validAttemptId task.AttemptId) then
+                    return! Error(LedgerIntegrityError "Invalid checkpoint task attempt identity.")
+                candidates <- Set.add task.AttemptId candidates
+            let! events = LedgerStore.listAt binding snapshot ($"tasks/{taskId}/lifecycle")
+            for path in events do
+                let! event, _ = indexRequired<TaskLifecycleEvent> binding snapshot path
+                if event.TaskId <> taskId || path <> lifecycleEventPath taskId event.Sequence
+                   || event.Sequence < 1L || event.Sequence >= snapshot.Header.NextSequence then
+                    return! Error(LedgerIntegrityError "Invalid checkpoint lifecycle event identity.")
+                if not (String.IsNullOrWhiteSpace event.AttemptId) then
+                    if not (validAttemptId event.AttemptId) then
+                        return! Error(LedgerIntegrityError "Invalid historical checkpoint attempt identity.")
+                    candidates <- Set.add event.AttemptId candidates
+
+            let mutable found: AgentCheckpoint option = None
+            for attemptId in candidates do
+                let path = checkpointPath taskId attemptId sequence
+                let! record = read<AgentCheckpoint> binding snapshot path
+                match record with
+                | None -> ()
+                | Some(checkpoint, _) ->
+                    if checkpoint.TaskId <> taskId || checkpoint.AttemptId <> attemptId
+                       || checkpoint.Sequence <> sequence || checkpoint.AssignmentGeneration < 1
+                       || not (validAgent checkpoint.OwnerAgentId) then
+                        return! Error(LedgerIntegrityError "Checkpoint record identity mismatch.")
+                    let! attempt, _ = indexRequired<ReviewAttempt> binding snapshot (attemptPath taskId attemptId)
+                    let! issuance, _ = indexRequired<AssignmentIssue> binding snapshot
+                                            (issuePath taskId attemptId checkpoint.AssignmentGeneration)
+                    if attempt.TaskId <> taskId || attempt.AttemptId <> attemptId
+                       || checkpoint.AssignmentGeneration > attempt.AssignmentGeneration
+                       || issuance.TaskId <> taskId || issuance.AttemptId <> attemptId
+                       || issuance.Generation <> checkpoint.AssignmentGeneration
+                       || issuance.OwnerAgentId <> checkpoint.OwnerAgentId
+                       || issuance.IssuedSequence < 1L
+                       || issuance.IssuedSequence >= sequence then
+                        return! Error(LedgerIntegrityError "Checkpoint assignment provenance mismatch.")
+                    if found.IsSome then
+                        return! Error(LedgerIntegrityError "Ambiguous checkpoint sequence for task.")
+                    found <- Some checkpoint
+            match found with
+            | Some checkpoint -> return snapshot.Commit, checkpoint
+            | None -> return! Error(StaleEntityVersion "Checkpoint sequence is not present for this task.")
         }
+
+    let getCheckpoint binding taskId sequence =
+        if not (validTaskId taskId) || sequence < 1L then
+            Error(InvalidBinding "Invalid checkpoint sequence.")
+        else
+            LedgerStore.fetch binding
+            |> Result.bind (fun snapshot -> getCheckpointAt binding snapshot taskId sequence)
 
     let parkAgentAs binding actor operationId agentId expectedAgentVersion reason =
         if not (validAgent agentId) || expectedAgentVersion < 1 || not (validText 2048 reason) then

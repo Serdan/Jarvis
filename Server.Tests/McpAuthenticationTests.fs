@@ -85,6 +85,16 @@ let unauthenticated_mcp_requests_get_http_oauth_challenge_but_resource_metadata_
             Assert.That(challenge, Does.Contain("Bearer"))
             Assert.That(challenge, Does.Contain("resource_metadata=\"https://jarvis2.kehlet.dev/.well-known/oauth-protected-resource\""))
             Assert.That(challenge, Does.Not.Contain("scope=\"client:connect\""))
+        // Scoped provider URLs must not bypass production JWT authentication,
+        // even while the authenticated provider dispatch path is held.
+        for path in [ "/mcp/provider"; "/mcp/provider/Worker" ] do
+            use request = new HttpRequestMessage(HttpMethod.Post, endpoint + path)
+            request.Content <- new StringContent(requests.Head, System.Text.Encoding.UTF8, "application/json")
+            request.Headers.TryAddWithoutValidation("Accept", "application/json, text/event-stream") |> ignore
+            use response = http.SendAsync(request).GetAwaiter().GetResult()
+            Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.Unauthorized), path)
+            Assert.That(response.Headers.WwwAuthenticate |> Seq.map string |> String.concat ",",
+                        Does.Contain("Bearer"), path)
         // Verify the updater's SignalR readiness contract against the real router.
         use negotiate = new HttpRequestMessage(HttpMethod.Post, endpoint + "/client/negotiate?negotiateVersion=1")
         use negotiateResponse = http.SendAsync(negotiate).GetAwaiter().GetResult()

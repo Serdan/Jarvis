@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"robustness-notification-retirement-fresh-send-boundary-20261128","title":"[P0][1.0] Retire fresh notification writes at canonical mutation boundary","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"robustness-notification-retirement-fresh-send-boundary-20261128","title":"[P0][1.0] Retire fresh notification writes at canonical mutation boundary","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"b6e1901af7634ee39c956a5eacb88138"}

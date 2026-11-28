@@ -1355,17 +1355,12 @@ module AgentCommandInfo =
         | CrossProjectNotificationCommand _ -> false
         | _ -> true
 
-    let taskOverviewCapability = "ReviewRead:TaskOverview"
-
     let protocolName command =
-        match command with
-        | ReviewReadCommand review when review.Action = "TaskOverview" -> taskOverviewCapability
-        | _ ->
-            let commandName = name command
-            if commandName.EndsWith("Command", StringComparison.Ordinal) then
-                commandName.Substring(0, commandName.Length - "Command".Length)
-            else
-                commandName
+        let commandName = name command
+        if commandName.EndsWith("Command", StringComparison.Ordinal) then
+            commandName.Substring(0, commandName.Length - "Command".Length)
+        else
+            commandName
 
     let displayName = function
         | ListCommandsCommand -> "ListCommands"
@@ -1860,15 +1855,6 @@ module AgentProtocol =
               else Some maxResponseBytes
           InputSchemaJson = None
           OutputSchemaJson = None }
-
-    // Action-level capabilities are negotiated separately from command definitions:
-    // they are not public MCP commands, but they prevent older peers from silently
-    // treating a bounded TaskOverview request as the legacy unbounded list action.
-    let actionCapabilities = [ AgentCommandInfo.taskOverviewCapability ]
-
-    let supportedCommands =
-        (commandDefinitions |> List.map (fun definition -> definition.Name))
-        @ actionCapabilities
 
     let capabilities = commandDefinitions |> List.map toCapability
 

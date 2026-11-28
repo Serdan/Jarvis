@@ -1,4 +1,4 @@
-module Server.Tests.TaskOverviewMixedVersionTests
+module Server.Tests.TaskOverviewRouteTests
 
 open System.Collections.Concurrent
 open System.Security.Claims
@@ -15,9 +15,9 @@ open Server
 open Server.Services
 
 [<TestFixture>]
-type TaskOverviewMixedVersionTests() =
+type TaskOverviewRouteTests() =
     [<Test>]
-    member _.bounded_task_overview_route_negotiates_the_selected_peer_capability() =
+    member _.bounded_task_overview_route_preserves_filters_and_authorization() =
         task {
             let userId = "task-overview-operator"
             let users = UserService()
@@ -43,22 +43,12 @@ type TaskOverviewMixedVersionTests() =
                       SupportedCommands = supportedCommands },
                     connectionId)
 
-            let legacyCommands =
+            let supportedCommands =
                 AgentProtocol.commandDefinitions
                 |> List.map (fun definition -> definition.Name)
 
-            let legacy =
-                register "legacy" "legacy-connection" "legacy-client" legacyCommands
-
-            let modern =
-                register
-                    "modern"
-                    "modern-connection"
-                    "modern-client"
-                    (legacyCommands @ [ "ReviewRead:TaskOverview" ])
-
-            Assert.That(legacy.EnabledCommands, Does.Not.Contain("ReviewRead:TaskOverview"))
-            Assert.That(modern.EnabledCommands, Does.Contain("ReviewRead:TaskOverview"))
+            let registration = register "matched" "matched-connection" "matched-client" supportedCommands
+            Assert.That(registration.EnabledCommands, Does.Contain("ReviewRead"))
 
             let recipient connectionId =
                 { new IClientService with
@@ -162,18 +152,15 @@ type TaskOverviewMixedVersionTests() =
                         | _ -> None)
                 |> String.concat "\n"
 
-            Assert.That(users.SetDefaultDevice(userId, "legacy"), Is.True)
-
-            let! oldPeerResult =
-                invoke "pertinent" "" "" "" "" -1L 0 ""
-
-            Assert.That(isError oldPeerResult, Is.True)
-            Assert.That(contentText oldPeerResult, Does.Contain("ReviewRead:TaskOverview"))
-            Assert.That(contentText oldPeerResult, Does.Contain("Update Jarvis"))
+            Assert.That(users.SetDefaultDevice(userId, "matched"), Is.True)
+            let authorized = context.User
+            context.User <- ClaimsPrincipal(ClaimsIdentity([ Claim("sub", userId) ], "task-overview-test"))
+            let! denied = invoke "pertinent" "" "" "" "" -1L 0 ""
+            Assert.That(isError denied, Is.True)
+            Assert.That(contentText denied, Does.Contain("workspace:read"))
             Assert.That(captured.IsEmpty, Is.True)
             Assert.That(dispatchedConnections.IsEmpty, Is.True)
-
-            Assert.That(users.SetDefaultDevice(userId, "modern"), Is.True)
+            context.User <- authorized
 
             let! defaultResult =
                 invoke "pertinent" "" "" "" "" -1L 0 ""
@@ -182,7 +169,7 @@ type TaskOverviewMixedVersionTests() =
 
             match captured.TryDequeue() with
             | true, ReviewReadCommand command ->
-                Assert.That(command.Action, Is.EqualTo("TaskOverview"))
+                Assert.That(command.Action, Is.EqualTo("ListProjectTasks"))
                 match command.TaskOverview with
                 | Some query ->
                     Assert.That(query.Scope, Is.EqualTo("pertinent"))
@@ -192,8 +179,8 @@ type TaskOverviewMixedVersionTests() =
             | _ -> Assert.Fail("The public TaskOverview tool did not send ReviewReadCommand.")
 
             match dispatchedConnections.TryDequeue() with
-            | true, connectionId -> Assert.That(connectionId, Is.EqualTo("modern-connection"))
-            | _ -> Assert.Fail("The selected modern device did not receive the bounded action.")
+            | true, connectionId -> Assert.That(connectionId, Is.EqualTo("matched-connection"))
+            | _ -> Assert.Fail("The selected matched device did not receive the bounded action.")
 
             let! historyResult =
                 invoke "history" "Open" "Blocked" "Worker 6" "Pending" 42L 1 "cursor-token"
@@ -202,7 +189,7 @@ type TaskOverviewMixedVersionTests() =
 
             match captured.TryDequeue() with
             | true, ReviewReadCommand command ->
-                Assert.That(command.Action, Is.EqualTo("TaskOverview"))
+                Assert.That(command.Action, Is.EqualTo("ListProjectTasks"))
                 match command.TaskOverview with
                 | Some query ->
                     Assert.That(query.Scope, Is.EqualTo("history"))
@@ -217,34 +204,12 @@ type TaskOverviewMixedVersionTests() =
             | _ -> Assert.Fail("The history TaskOverview call did not send ReviewReadCommand.")
 
             match dispatchedConnections.TryDequeue() with
-            | true, connectionId -> Assert.That(connectionId, Is.EqualTo("modern-connection"))
-            | _ -> Assert.Fail("The history request was not routed to the selected modern device.")
+            | true, connectionId -> Assert.That(connectionId, Is.EqualTo("matched-connection"))
+            | _ -> Assert.Fail("The history request was not routed to the selected matched device.")
 
-            let boundedCommand =
-                ReviewReadCommand
-                    { ProjectName = "Jarvis"
-                      Action = "TaskOverview"
-                      TaskId = ""
-                      RequestId = ""
-                      ReviewerId = ""
-                      DocumentPath = ""
-                      TaskOverview = None }
-
-            let unrelatedCommand =
-                ReviewReadCommand
-                    { ProjectName = "Jarvis"
-                      Action = "GetReview"
-                      TaskId = ""
-                      RequestId = ""
-                      ReviewerId = ""
-                      DocumentPath = ""
-                      TaskOverview = None }
-
-            Assert.That(
-                AgentCommandInfo.protocolName boundedCommand,
-                Is.EqualTo("ReviewRead:TaskOverview"))
-            Assert.That(AgentCommandInfo.protocolName unrelatedCommand, Is.EqualTo("ReviewRead"))
-            Assert.That(
-                AgentCommandInfo.requiredScopes boundedCommand,
-                Is.EqualTo(AgentCommandInfo.requiredScopes unrelatedCommand))
+            // The matched-version bounded request stays under the normal
+            // ReviewRead command and authorization boundary.
+            Assert.That(AgentProtocol.commandDefinitions |> List.exists (fun d -> d.Name = "ReviewRead"), Is.True)
+            Assert.That(captured.IsEmpty, Is.True)
+            Assert.That(dispatchedConnections.IsEmpty, Is.True)
         }

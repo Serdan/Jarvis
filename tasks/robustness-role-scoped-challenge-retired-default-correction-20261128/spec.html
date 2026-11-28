@@ -1,0 +1,21 @@
+<article>
+<h1>[P1][1.0] Correct retired Health/Manager defaults in Stage B Challenge policy</h1>
+<p>Bounded corrective follow-up to parent task <code>robustness-role-scoped-challenge-escalation-20261127</code>. Original owner: Worker 12. Exact source reviewed: <code>084376cc80464a028c01cf5a285677af0f1f744d</code>, actual parent <code>175ad976a6226f1cb07901b4b43f3d6b0ecf3de1</code>. Detached review <code>7f4261eaaf67434b8a7b575322e3023d</code> received immutable ChangesRequested from Reviewer 7 at seq20382. Independent read-only adjudication by Adjudicator 2 accepted the sole finding at seq20433; checkpoint 20433 records the exact source, provenance caveat, impact, and authorization. This task implements only that accepted correction; it does not revise or erase the original review decision.</p>
+<h2>Authorized scope — strict Stage B lease</h2>
+<p>Only these paths may be edited:</p>
+<ul>
+<li><code>Client/Modules/ChallengeRolePolicy.fs</code></li>
+<li><code>tests/ChallengeRolePolicy20261127/**</code></li>
+</ul>
+<p>Remove <code>Health</code> and <code>Manager</code> from the default <code>AgentRoles</code> ordinary-executor set and therefore from its generated edges to <code>Lead</code>. Update the expected graph. Add negative default-policy assertions for both retired principals, especially retired actor-to-Lead admission and unassigned admission/owner/dispatch where the existing APIs expose those cases. Use the existing policy and fixture APIs; do not invent a new role system or a global blacklist.</p>
+<p>Preserve all active default edges, explicitly configured peer behavior, the trusted-human Operator boundary, and deterministic waits/dependencies outside escalation policy. Preserve fail-closed handling for invalid, missing, unknown, and mixed roles. The correction must not grant or infer any human authority.</p>
+<h2>Execution and evidence</h2>
+<ul>
+<li>Fetch and verify the current remote <code>origin/main</code> at the start; create a dedicated clean registered worktree from that exact current target. Do not use the stale local main at <code>175ad976</code> as the new base. The old source commit <code>084376cc</code> is evidence/reference only; transplant the minimal Stage B files onto the fresh target and verify the exact diff.</li>
+<li>Maintain an exclusive lease limited to the two path families above. Do not edit project files, workflows, ledger, role configuration, catalog, routes, shared source, or production wiring.</li>
+<li>Preserve the prior red-first evidence: cp20323 records 2/2 passing controls and 6/6 intended assertions RED; cp20330 records exact pretest blobs. Do not replay original qualification job <code>14f549f119c74b4dafc59309eda03287</code> or any prior review/test job. Produce a distinct new Release qualification with a unique job identity and TRX path, persistent compiler log/binlog, exact source SHA, command, exit code, counters, failures/skips, and artifact SHA256. Report actual results; do not infer pass counts.</li>
+<li>Freeze the exact corrected source and request a new independent review of the complete scoped diff. Keep original review <code>7f4261eaaf67434b8a7b575322e3023d</code> immutable and preserve its ChangesRequested verdict.</li>
+</ul>
+<h2>Explicit exclusions</h2>
+<p>No production ChallengeWorkflow/LedgerStore/ReviewWorkflow wiring, role configuration or migration, route registration, live grant, human-privilege change, integration, publication, deployment, activation, or Scheduler mutation. Do not broaden scope to the parent task's later production-composition stages. If the fresh target, exclusive path lease, or required test route cannot be verified, checkpoint the exact blocker and yield without editing outside scope.</p>
+</article>

@@ -40,9 +40,23 @@ let ``malformed porcelain record is reported`` () =
     | _ -> Assert.Fail("Malformed records must fail.")
 
 [<Test>]
+let ``NUL porcelain parser preserves paths containing newlines`` () =
+    let main = Path.Combine(Path.GetTempPath(), "main\ncheckout")
+    let linked = Path.Combine(Path.GetTempPath(), "linked\ncheckout")
+    let sample =
+        $"worktree {main}\000HEAD abc\000branch refs/heads/main\000\000worktree {linked}\000HEAD def\000branch refs/heads/feature/linked\000\000"
+    match parsePorcelainZ main sample with
+    | Ok [ mainEntry; linkedEntry ] ->
+        mainEntry.Path |> shouldEqual (Path.GetFullPath main)
+        mainEntry.IsMain |> shouldEqual true
+        linkedEntry.Path |> shouldEqual (Path.GetFullPath linked)
+        linkedEntry.Branch |> shouldEqual (Some "feature/linked")
+    | other -> Assert.Fail($"Unexpected parsed worktrees: {other}")
+
+[<Test>]
 let ``discovery includes existing sibling worktrees outside naming convention`` () =
     withRepo (fun root project context ->
-        let sibling = Path.Combine(root, "another-layout")
+        let sibling = Path.Combine(root, "another\nlayout")
         GitCommandTests.expectGitSuccess context [ "worktree"; "add"; "-b"; "feature/old"; sibling; "HEAD" ]
         match listWorktrees { ProjectName = "Project1" } context with
         | Ok entries ->
@@ -259,7 +273,8 @@ let ``removal reservation fences concurrent admission and unresolved provenance`
         let target: WorktreeActivity.RemovalTarget =
             { Project = ProjectPaths.ProjectTarget.projectId selected
               Path = Path.Combine(root, "target")
-              ResolveCheckout = fun _ -> Error(ValidationError "unresolved") }
+              ResolveCheckout = fun _ -> Error(ValidationError "unresolved")
+              ResolveSourceRef = fun _ -> Error(ValidationError "unresolved") }
         let admit scope =
             WorktreeActivity.admit (Guid.NewGuid().ToString("N")) scope
         do
@@ -270,6 +285,14 @@ let ``removal reservation fences concurrent admission and unresolved provenance`
             match WorktreeActivity.reserveRemoval target with
             | Error 1 -> ()
             | _ -> Assert.Fail("Unresolved resource must block reservation.")
+        do
+            use unknownSource =
+                admit (WorktreeActivity.SourceRef(selected, "refs/heads/feature/source", false))
+                |> function Ok x -> x | Error e -> failwithf "%A" e
+            WorktreeActivity.count target |> shouldEqual 1
+            match WorktreeActivity.reserveRemoval target with
+            | Error 1 -> ()
+            | _ -> Assert.Fail("Unresolved source-ref provenance must block reservation.")
         use reservation =
             WorktreeActivity.reserveRemoval target
             |> function Ok x -> x | Error n -> failwithf "Blocked by %d" n
@@ -281,6 +304,12 @@ let ``removal reservation fences concurrent admission and unresolved provenance`
         rejected (WorktreeActivity.Paths [ root ])
         rejected (WorktreeActivity.Unknown (Some target.Project))
         rejected (WorktreeActivity.Checkout selected)
+        let otherProject =
+            ProjectPaths.ProjectTarget.parse "Project2"
+            |> function Ok x -> x | Error e -> failwithf "%A" e
+        use unrelatedProject =
+            admit (WorktreeActivity.ProjectWorktrees (ProjectPaths.ProjectTarget.projectId otherProject))
+            |> function Ok x -> x | Error e -> failwithf "%A" e
         use unrelated =
             admit (WorktreeActivity.Paths [ target.Path + "-sibling" ])
             |> function Ok x -> x | Error e -> failwithf "%A" e
@@ -381,3 +410,146 @@ let ``promoted inspection and removal exclude themselves but count active target
         finally
             for gate in [ coordination; sibling; targetOperation; inspectGate; removeGate ] do gate.TrySetResult() |> ignore
             for handle in jobs do finish handle |> ignore)
+
+[<Test>]
+let ``branch-selected checkout writes are target scoped and fenced by reservations`` () =
+    withRepo (fun root _ context ->
+        let runtime = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+        let make name branch =
+            createWorktree
+                { ProjectName = "Project1"; Name = name; Branch = branch; BaseRef = "HEAD" } context
+            |> function Ok item -> item | Error e -> failwithf "%A" e
+        let source = make "branch-source" "feature/branch-source"
+        let sibling = make "branch-sibling" "feature/branch-sibling"
+        let sourceRef = "refs/heads/feature/branch-source"
+        let response payload: AgentCommandResponse =
+            { Result = Some payload; Error = None; Instructions = []
+              StateChangeEvidence = StateChangeEvidence.Confirmed []; InboxActivation = None; PendingJob = None }
+        let serialize (command: AgentCommand) = System.Text.Json.JsonSerializer.Serialize<AgentCommand>(command)
+        let startHeld (command: AgentCommand) =
+            let resolveGate = System.Threading.Tasks.TaskCompletionSource<unit>(System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously)
+            let resolved = System.Threading.Tasks.TaskCompletionSource<unit>(System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously)
+            let gate = System.Threading.Tasks.TaskCompletionSource<unit>(System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously)
+            let reply =
+                Client.SignalR.Client.executeOrPromoteWith runtime (serialize command) "Worker 3" TimeSpan.Zero
+                    (fun _ _ ->
+                        task {
+                            do! resolveGate.Task
+                            let resolution = WorktreeActivity.resolveCurrent source.Path
+                            resolved.TrySetResult() |> ignore
+                            match resolution with
+                            | Ok () -> ()
+                            | Error e -> failwithf "Could not pin resolved checkout: %A" e
+                            do! gate.Task
+                            return response "{}"
+                        })
+                |> _.GetAwaiter().GetResult()
+            match reply.PendingJob with
+            | Some handle -> handle, resolveGate, resolved, gate
+            | None ->
+                resolveGate.TrySetResult() |> ignore
+                gate.TrySetResult() |> ignore
+                failwithf "Expected pending operation: %A" reply
+        let finish (handle: ToolJobHandle) =
+            let mutable terminal = None
+            let observed =
+                System.Threading.SpinWait.SpinUntil((fun () ->
+                    match Client.JobManager.getJobResult
+                        { ProjectName = "Project1"; JobId = handle.JobId; AfterSequence = None } context with
+                    | Ok result when result.ToolResponse.IsSome ->
+                        terminal <- result.ToolResponse
+                        true
+                    | _ -> false), TimeSpan.FromSeconds(10.))
+            if not observed then failwithf "No terminal result for %s" handle.JobId
+            terminal.Value
+        let inspect path =
+            let query: InspectWorktreeRemovalCommand =
+                { ProjectName = "Project1"; WorktreePath = path; TargetRef = None }
+            match inspectRemoval query context with
+            | Ok check -> check
+            | Error e -> failwithf "Inspection failed: %A" e
+        let review action headOid : AgentCommand =
+            ReviewWriteCommand
+                { ProjectName = "Project1"; Action = action; OperationId = Guid.NewGuid().ToString("D")
+                  TaskId = "worktree-removal-test"; RequestId = Guid.NewGuid().ToString("D")
+                  ActorId = "Worker 3"; ReviewerId = ""; ExpectedVersion = 1; Kind = ""
+                  SourceRef = sourceRef; HeadOid = headOid; TargetRef = ""; Summary = ""; Verdict = ""
+                  DocumentPath = ""; Content = ""; ExpectedBlobOid = "" }
+        let taskWrite action : AgentCommand =
+            TaskWriteCommand
+                { ProjectName = "Project1"; Action = action; OperationId = Guid.NewGuid().ToString("D")
+                  TaskId = "worktree-removal-test"; AttemptId = "attempt"; ActorId = "Worker 3"
+                  OwnerId = "Worker 3"; Title = ""; Html = ""; ExpectedVersion = 1
+                  ExpectedAgentVersion = 1; ExpectedTaskVersion = 1; AssignmentGeneration = 1
+                  Summary = ""; NextAction = ""; Reason = ""; BaseOid = ""
+                  TargetRef = "refs/heads/main"; SourceRef = sourceRef; AllowDetached = false
+                  AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+        let runHeldCase command verifyRelocation =
+            let handle, resolveGate, resolved, gate = startHeld command
+            try
+                let targetCheck = inspect source.Path
+                targetCheck.CanRemove |> shouldEqual false
+                targetCheck.RunningJobCount |> shouldEqual 1
+                let siblingCheck = inspect sibling.Path
+                siblingCheck.CanRemove |> shouldEqual true
+                siblingCheck.RunningJobCount |> shouldEqual 0
+                resolveGate.TrySetResult() |> ignore
+                if not (resolved.Task.Wait(TimeSpan.FromSeconds(10.))) then failwith "Source checkout resolution did not complete."
+                let pinnedCheck = inspect source.Path
+                pinnedCheck.CanRemove |> shouldEqual false
+                pinnedCheck.RunningJobCount |> shouldEqual 1
+                if verifyRelocation then
+                    GitCommandTests.expectGitSuccess context [ "-C"; source.Path; "switch"; "-c"; "feature/after-resolution" ]
+                    let relocated = Path.Combine(root, "branch-source-relocated")
+                    GitCommandTests.expectGitSuccess context [ "worktree"; "add"; relocated; sourceRef ]
+                    let originalCheck = inspect source.Path
+                    originalCheck.CanRemove |> shouldEqual false
+                    originalCheck.RunningJobCount |> shouldEqual 1
+                    let relocatedCheck = inspect relocated
+                    relocatedCheck.CanRemove |> shouldEqual true
+                    relocatedCheck.RunningJobCount |> shouldEqual 0
+                    GitCommandTests.expectGitSuccess context [ "worktree"; "remove"; relocated ]
+                    GitCommandTests.expectGitSuccess context [ "-C"; source.Path; "switch"; "feature/branch-source" ]
+            finally
+                resolveGate.TrySetResult() |> ignore
+                gate.TrySetResult() |> ignore
+            (finish handle).Error |> shouldEqual None
+        runHeldCase (review "Submit" "") true
+        runHeldCase (review "Update" "") false
+        runHeldCase (taskWrite "BindAttemptSource") false
+
+        let selected =
+            ProjectPaths.ProjectTarget.parse "Project1"
+            |> function Ok target -> target | Error e -> failwithf "%A" e
+        let removalTarget: WorktreeActivity.RemovalTarget =
+            { Project = ProjectPaths.ProjectTarget.projectId selected
+              Path = source.Path
+              ResolveCheckout = fun _ -> Ok source.Path
+              ResolveSourceRef = fun reference ->
+                  if reference = sourceRef then Ok(Some source.Path) else Ok None }
+        use reservation =
+            WorktreeActivity.reserveRemoval removalTarget
+            |> function Ok lease -> lease | Error count -> failwithf "Unexpected blockers: %d" count
+        let reject command =
+            let reply =
+                Client.SignalR.Client.executeOrPromoteWith runtime (serialize command) "Worker 3" TimeSpan.Zero
+                    (fun _ _ -> System.Threading.Tasks.Task.FromResult(response "{}"))
+                |> _.GetAwaiter().GetResult()
+            match reply.PendingJob, reply.Error with
+            | None, Some _ -> ()
+            | _ -> Assert.Fail(sprintf "Conflicting source operation was admitted: %A" reply)
+        let allow command =
+            let reply =
+                Client.SignalR.Client.executeOrPromoteWith runtime (serialize command) "Worker 3" (TimeSpan.FromSeconds 5.)
+                    (fun _ _ -> System.Threading.Tasks.Task.FromResult(response "{}"))
+                |> _.GetAwaiter().GetResult()
+            reply.Error |> shouldEqual None
+            match reply.PendingJob with
+            | Some handle -> (finish handle).Error |> shouldEqual None
+            | None -> ()
+        reject (review "Submit" "")
+        reject (review "Update" "")
+        reject (taskWrite "BindAttemptSource")
+        allow (review "Claim" "")
+        allow (review "Submit" (String.replicate 40 "0"))
+        allow (taskWrite "RebindAttemptSource"))

@@ -10,6 +10,7 @@ open System.Collections.Generic
 type Scope =
     | NoCheckout
     | Checkout of ProjectPaths.ProjectTarget
+    | SourceRef of ProjectPaths.ProjectTarget * string * bool
     | Paths of string list
     | ProjectWorktrees of ProjectPaths.ProjectId
     | Unknown of ProjectPaths.ProjectId option
@@ -17,7 +18,8 @@ type Scope =
 type RemovalTarget =
     { Project: ProjectPaths.ProjectId
       Path: string
-      ResolveCheckout: ProjectPaths.ProjectTarget -> Client.Result<string> }
+      ResolveCheckout: ProjectPaths.ProjectTarget -> Client.Result<string>
+      ResolveSourceRef: string -> Client.Result<string option> }
 
 let private gate = obj()
 let private uses = Dictionary<string, Scope>(StringComparer.Ordinal)
@@ -56,6 +58,18 @@ let private conflicts target = function
         match target.ResolveCheckout selected with
         | Ok path -> overlaps target.Path path
         | Error _ -> true // No resolved filesystem identity: cannot prove disjointness.
+    | SourceRef (selected, sourceRef, allowDetached) ->
+        if target.Project <> ProjectPaths.ProjectTarget.projectId selected then false
+        else
+            match target.ResolveSourceRef sourceRef with
+            | Ok(Some path) -> overlaps target.Path path
+            | Ok None when allowDetached ->
+                // BindAttemptSource may explicitly use the selected detached
+                // checkout when the requested branch is not checked out.
+                match target.ResolveCheckout selected with
+                | Ok path -> overlaps target.Path path
+                | Error _ -> true
+            | Ok None | Error _ -> true // An unresolved source checkout must fail closed.
 
 let private removalConflict scope =
     removals.Values |> Seq.exists (fun target -> conflicts target scope)
@@ -72,7 +86,7 @@ let admit id scope =
             uses.Add(id, scope)
             Ok(lease (fun () -> lock gate (fun () -> uses.Remove id |> ignore))))
 
-/// Capture the exact source root once normal command preparation resolves it.
+/// Capture the exact source root once command preparation or branch selection resolves it.
 /// The unresolved claim already prevents removal from racing this resolution.
 let resolveCurrent sourceRoot =
     lock gate (fun () ->
@@ -80,7 +94,7 @@ let resolveCurrent sourceRoot =
         | null -> Ok ()
         | id ->
             match uses.TryGetValue id with
-            | true, Checkout _ ->
+            | true, (Checkout _ | SourceRef _) ->
                 let scope = Paths [ sourceRoot ]
                 if removalConflict scope then
                     Error(Client.ValidationError "A conflicting worktree removal is in progress.")

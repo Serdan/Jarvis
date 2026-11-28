@@ -2281,6 +2281,10 @@ module LedgerStore =
                 let! common = run repo [ "rev-parse"; "--path-format=absolute"; "--git-common-dir" ]
                 let! before = registrations ()
                 let! root, registeredHead, detached = select selected before
+                let! () =
+                    match WorktreeActivity.resolveCurrent root with
+                    | Ok () -> Ok ()
+                    | Error _ -> Error unavailable
                 let! actualCommon, head, status = observe root detached
                 if actualCommon <> normalized common || registeredHead <> head then
                     return! Error unavailable

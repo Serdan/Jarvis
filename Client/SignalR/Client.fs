@@ -240,6 +240,15 @@ let private worktreeScope scope command =
         match project with
         | Some id -> WorktreeActivity.ProjectWorktrees id
         | None -> WorktreeActivity.Unknown None
+    | TaskWriteCommand cmd when cmd.Action = "BindAttemptSource" ->
+        match projectTarget scope with
+        | Some target -> WorktreeActivity.SourceRef(target, cmd.SourceRef, cmd.AllowDetached)
+        | None -> WorktreeActivity.Unknown project
+    | ReviewWriteCommand cmd
+        when (cmd.Action = "Submit" || cmd.Action = "Update") && String.IsNullOrWhiteSpace cmd.HeadOid ->
+        match projectTarget scope with
+        | Some target -> WorktreeActivity.SourceRef(target, cmd.SourceRef, false)
+        | None -> WorktreeActivity.Unknown project
     | TaskWriteCommand cmd when cmd.Action = "ExportTaskSpec" || cmd.Action = "ImportTaskSpec" ->
         match projectTarget scope with
         | Some target -> WorktreeActivity.Checkout target

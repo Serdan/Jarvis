@@ -73,15 +73,60 @@ let parsePorcelain (mainPath: string) (output: string) : Result<WorktreeInfo lis
         | _, Error e -> Error e) (Ok [])
     |> Result.map List.rev
 
+/// Decode the NUL-delimited porcelain format. Unlike line-delimited porcelain,
+/// this preserves valid filesystem paths that contain newlines.
+let parsePorcelainZ (mainPath: string) (output: string) : Result<WorktreeInfo list, string> =
+    let mainPath = Path.GetFullPath(mainPath).TrimEnd(Path.DirectorySeparatorChar)
+    let parse (record: string) =
+        let fields = record.Split('\000', StringSplitOptions.RemoveEmptyEntries)
+        let values (prefix: string) =
+            fields
+            |> Array.choose (fun (field: string) ->
+                if field.StartsWith(prefix, StringComparison.Ordinal) then
+                    Some(field.Substring(prefix.Length))
+                else None)
+        let paths = values "worktree "
+        let heads = values "HEAD "
+        let branches = values "branch "
+        match paths, heads with
+        | [| path |], [| head |] when not (String.IsNullOrWhiteSpace path) && not (String.IsNullOrWhiteSpace head) && branches.Length <= 1 ->
+            try
+                let path = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar)
+                let branch =
+                    branches
+                    |> Array.tryHead
+                    |> Option.map (fun value ->
+                        if value.StartsWith("refs/heads/", StringComparison.Ordinal) then value.Substring(11)
+                        else value)
+                Ok
+                    { Path = path
+                      MainPath = mainPath
+                      Head = head
+                      Branch = branch
+                      IsMain = String.Equals(path, mainPath, (if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal))
+                      IsDetached = Array.contains "detached" fields
+                      IsLocked = fields |> Array.exists (fun field -> field = "locked" || field.StartsWith("locked ", StringComparison.Ordinal))
+                      IsPrunable = fields |> Array.exists (fun field -> field = "prunable" || field.StartsWith("prunable ", StringComparison.Ordinal))
+                      IsClean = None }
+            with ex -> Error($"Invalid Git worktree path: {ex.Message}")
+        | _ -> Error "Malformed NUL-delimited git worktree --porcelain record."
+    output.Split([| "\000\000" |], StringSplitOptions.RemoveEmptyEntries)
+    |> Array.fold (fun state record ->
+        match state, parse record with
+        | Ok items, Ok item -> Ok(item :: items)
+        | Error error, _ -> Error error
+        | _, Error error -> Error error) (Ok [])
+    |> Result.map List.rev
+
 // Internal registration discovery does not inspect unrelated checkout files.
 let private listRegistrations projectName =
     effect {
-        let! result = git projectName [ "worktree"; "list"; "--porcelain" ]
+        let! result = git projectName [ "worktree"; "list"; "--porcelain"; "-z" ]
         if result.ExitCode <> 0 || result.TimedOut || result.Truncated then
             return! Client.ValidationError($"Cannot inspect Git worktrees: {result.StdErr}") |> Effect.ofError
         else
             let firstPath =
-                result.StdOut.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                result.StdOut.Split('\000', StringSplitOptions.RemoveEmptyEntries)
                 |> Array.tryPick (fun line ->
                     if line.StartsWith("worktree ", StringComparison.Ordinal) then Some(line.Substring(9))
                     else None)
@@ -89,7 +134,7 @@ let private listRegistrations projectName =
                 match firstPath with
                 | None -> Client.ValidationError "Git did not return a main worktree." |> Effect.ofError
                 | Some mainPath ->
-                    match parsePorcelain mainPath result.StdOut with
+                    match parsePorcelainZ mainPath result.StdOut with
                     | Ok items -> fun _ -> Ok items
                     | Error message -> Client.ValidationError message |> Effect.ofError
     }
@@ -174,6 +219,25 @@ let private removalTarget projectName (entry: WorktreeInfo) =
     effect {
         let! selected = ProjectPaths.ProjectTarget.parse projectName |> Effect.ofResult
         return! fun rt ->
+            // Share one NUL-safe registration snapshot across all active source
+            // claims checked during this inspection/reservation.
+            let registrations = lazy (listRegistrations projectName rt)
+            let resolveSourceRef sourceRef =
+                let prefix = "refs/heads/"
+                if String.IsNullOrWhiteSpace sourceRef
+                   || not (sourceRef.StartsWith(prefix, StringComparison.Ordinal))
+                   || not (safeRef (sourceRef.Substring(prefix.Length))) then
+                    Error(Client.ValidationError "A normal fully qualified source branch is required to resolve checkout use.")
+                else
+                    let branch = sourceRef.Substring(prefix.Length)
+                    match registrations.Value with
+                    | Error error -> Error error
+                    | Ok entries ->
+                        match entries |> List.filter (fun candidate -> candidate.Branch = Some branch) with
+                        | [] -> Ok None
+                        | [ candidate ] when not candidate.IsDetached && not candidate.IsPrunable && Directory.Exists candidate.Path ->
+                            Ok(Some candidate.Path)
+                        | _ -> Error(Client.ValidationError "Cannot resolve a unique registered source checkout.")
             Ok
                 ({ Project = ProjectPaths.ProjectTarget.projectId selected
                    Path = entry.Path
@@ -181,7 +245,8 @@ let private removalTarget projectName (entry: WorktreeInfo) =
                        ProjectPaths.resolveProjectContextForTarget target rt
                        |> Result.map (fun project ->
                            let (FolderPath root) = ProjectPaths.ResolvedProject.sourceRoot project
-                           root) } : WorktreeActivity.RemovalTarget)
+                           root)
+                   ResolveSourceRef = resolveSourceRef } : WorktreeActivity.RemovalTarget)
     }
 
 let private inspectEntry (cmd: InspectWorktreeRemovalCommand) (entry: WorktreeInfo) resource =

@@ -2492,7 +2492,7 @@ module ReviewApi =
         |> Result.bind (fun binding ->
             match cmd.Action with
             | "ListProjectTasks" ->
-                ReviewWorkflow.ReviewWorkflow.listProjectTasks binding
+                TaskOverviewReader.read binding (defaultArg cmd.TaskOverview TaskOverviewRequest.defaultValue)
                 |> mapError |> Result.map box
             | "GetTask" ->
                 ReviewWorkflow.ReviewWorkflow.getTaskWithSpec binding cmd.TaskId

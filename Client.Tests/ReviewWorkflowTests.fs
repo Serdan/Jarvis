@@ -3288,7 +3288,7 @@ type ReviewWorkflowTests() =
                           BaseOid = baseOid; TargetRef = sourceRef } |> ignore
                 let getTask : Common.ReviewReadCommand =
                     { ProjectName = "owner"; Action = "GetTask"; TaskId = taskId
-                      RequestId = ""; ReviewerId = ""; DocumentPath = "" }
+                      RequestId = ""; ReviewerId = ""; DocumentPath = ""; TaskOverview = None }
                 match Client.OrchestrationApi.ReviewApi.read getTask ctx with
                 | Error error -> Assert.Fail(sprintf "Task read failed: %A" error)
                 | Ok value ->

@@ -4751,9 +4751,8 @@ module ReviewWorkflow =
     let closeTask binding operationId taskId expectedTaskVersion =
         closeTaskAs binding legacyAdministrativeActor operationId taskId expectedTaskVersion
 
-    let listProjectTasks binding =
+    let listProjectTasksAt binding snapshot =
         result {
-            let! snapshot = LedgerStore.fetch binding
             let! records = LedgerStore.readTaskOverviewPrimaryRecordsAt binding snapshot
             let mutable taskItems = []
             let mutable activeAttempts = []
@@ -4784,3 +4783,7 @@ module ReviewWorkflow =
                       Tasks = tasks |> List.sortBy (fun item -> item.Task.TaskId)
                       Reviews = reviews |> List.sortBy (fun item -> item.CreatedSequence, item.ReviewId) |}
         }
+
+
+    let listProjectTasks binding =
+        LedgerStore.fetch binding |> Result.bind (listProjectTasksAt binding)

@@ -99,6 +99,8 @@
         <Compile Include="Modules\BrowserArguments.fs"/>
         <Compile Include="Modules\RoleInstructions.fs"/>
         <Compile Include="Modules\\ReviewWorkflow.fs"/>
+        <Compile Include="Modules\TaskOverviewProjection.fs"/>
+        <Compile Include="Modules\TaskOverviewReader.fs"/>
         <Compile Include="Modules\NativeSchedulerAccountReservation.fs"/>
         <Compile Include="Modules\WorkCompositionAcceptanceAdapter.fs"/>
         <Compile Include="Modules\WorkCompositionOperatorInputs.fs"/>

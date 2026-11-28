@@ -44,7 +44,7 @@ module private ReviewCommands =
               TaskId = taskId
               RequestId = requestId
               ReviewerId = reviewerId
-              DocumentPath = "" }
+              DocumentPath = ""; TaskOverview = None }
 
     let write projectName action operationId taskId requestId actorId expectedVersion =
         { ProjectName = projectName
@@ -2339,9 +2339,23 @@ type JarvisMcpTools =
         static member GetTask(projectName: string, agentId: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
             McpToolHelpers.send client http (ReviewCommands.query projectName "GetTask" taskId "" "")
 
-    [<McpServerTool(Title = "task overview", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read all canonical tasks, attempts and independently managed reviews from one ledger snapshot.")>]
-        static member TaskOverview(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-            McpToolHelpers.send client http (ReviewCommands.query projectName "ListProjectTasks" "" "" "")
+    [<McpServerTool(Title = "task overview", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a bounded, snapshot-pinned task/review overview. Default scope pertinent includes nonterminal tasks, active/blocked or unknown attempts, pending/claimed reviews and current unacknowledged decisions; history explicitly includes terminal records and full review detail. Exact optional filters narrow scope; assignee is attempt/review owner and sinceSequence uses attempt issuance or review creation/decision (-1 disables). Page size 1..100 (0 defaults to 50). Follow NextCursor with the same query and device until HasMore is false; totals distinguish matching and full counts. Use targeted detail reads for individual records.")>]
+        static member TaskOverview(projectName: string, agentId: string,
+                                   [<Optional; DefaultParameterValue("pertinent")>] scope: string,
+                                   [<Optional; DefaultParameterValue("")>] lifecycle: string,
+                                   [<Optional; DefaultParameterValue("")>] phase: string,
+                                   [<Optional; DefaultParameterValue("")>] assignee: string,
+                                   [<Optional; DefaultParameterValue("")>] reviewStatus: string,
+                                   [<Optional; DefaultParameterValue(-1L)>] sinceSequence: int64,
+                                   [<Optional; DefaultParameterValue(0)>] pageSize: int,
+                                   [<Optional; DefaultParameterValue("")>] cursor: string,
+                                   [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+            McpToolHelpers.send client http (ReviewReadCommand
+                { ProjectName = projectName; Action = "ListProjectTasks"; TaskId = ""
+                  RequestId = ""; ReviewerId = ""; DocumentPath = ""
+                  TaskOverview = Some { Scope = scope; Lifecycle = lifecycle; Phase = phase
+                                        Assignee = assignee; ReviewStatus = reviewStatus
+                                        SinceSequence = sinceSequence; PageSize = pageSize; Cursor = cursor } })
 
     [<McpServerTool(Title = "review details", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read an independent review request, snapshot ref, optional diff context and recorded feedback.")>]
         static member ReviewDetails(projectName: string, agentId: string, taskId: string, requestId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
@@ -2356,7 +2370,7 @@ type JarvisMcpTools =
             McpToolHelpers.send client http
                 (ReviewReadCommand
                     { ProjectName = projectName; Action = "ReadDocument"; TaskId = taskId
-                      RequestId = requestId; ReviewerId = ""; DocumentPath = documentPath })
+                      RequestId = requestId; ReviewerId = ""; DocumentPath = documentPath; TaskOverview = None })
 
     [<McpServerTool(Title = "write review document", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create or update one review summary.md or findings/<slug>.md on the Git ledger (up to 512 KiB). Supply the current blob ID when replacing a document; review status is unchanged.")>]
         static member PutReviewDocument(projectName: string, taskId: string, requestId: string, agentId: string, documentPath: string, content: string, expectedBlobOid: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] manualGrantCredential: string, client: ClientService, http: IHttpContextAccessor) =

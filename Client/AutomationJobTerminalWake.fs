@@ -7,6 +7,8 @@ open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open Common
+open Common.SignalR
+open Microsoft.AspNetCore.SignalR.Client
 open Client.LedgerStore
 open Client.ChallengeWorkflow
 open Client.OrchestrationApi
@@ -82,9 +84,9 @@ let private discover binding actor =
 /// JobManager. There is no second registry, no job spawning, and no inferred
 /// terminal state on eviction, wrong owner, foreign project or unknown result.
 /// The supplied binding resolver is the trusted client-local project resolver.
-let reconcile enabled root
+let private reconcileBound enabled root
               (loadBinding: string -> Result<LedgerBinding, Client.EffectError>)
-              (onCommitted: ChallengeWriteCommand -> OperationResponse.Presented -> unit) =
+              (onCommitted: LedgerBinding -> ChallengeWriteCommand -> OperationResponse.Presented -> unit) =
     if not enabled then { Committed = 0; Failures = [] }
     else
         let failures = ResizeArray<string>()
@@ -165,11 +167,14 @@ let reconcile enabled root
                                             | Ok write ->
                                                 if not write.AlreadyApplied then
                                                     committed <- committed + 1
-                                                    try onCommitted cmd (OperationResponse.present write |> unbox)
+                                                    try onCommitted binding cmd (OperationResponse.present write |> unbox)
                                                     with ex -> report ("Committed wake hint failed: " + ex.Message)
                                                 more <- true
             with ex -> report ("Job reconciliation held: " + ex.Message)
         { Committed = committed; Failures = List.ofSeq failures }
+
+let reconcile enabled root loadBinding onCommitted =
+    reconcileBound enabled root loadBinding (fun _ -> onCommitted)
 
 /// A single coalescing event consumer. Startup, atomic receipt publication,
 /// post-commit registration and reconnect call the same reconciliation.
@@ -178,7 +183,7 @@ let reconcile enabled root
 /// until the production scheduler and registration ingress are jointly proved.
 type Host(enabled: bool, root: string,
           loadBinding: string -> Result<LedgerBinding, Client.EffectError>,
-          onCommitted: ChallengeWriteCommand -> OperationResponse.Presented -> unit,
+          onCommitted: LedgerBinding -> ChallengeWriteCommand -> OperationResponse.Presented -> unit,
           report: string -> unit) =
     let gate = obj()
     let signal = new SemaphoreSlim(0, 1)
@@ -255,7 +260,7 @@ type Host(enabled: bool, root: string,
                                 let outcome =
                                     try
                                         refreshWatches()
-                                        reconcile true root loadBinding onCommitted
+                                        reconcileBound true root loadBinding onCommitted
                                     with ex -> { Committed = 0; Failures = ["Receipt watch unavailable: " + ex.Message] }
                                 retry <- not (List.isEmpty outcome.Failures)
                                 for failure in outcome.Failures do safeReport failure
@@ -280,6 +285,43 @@ type Host(enabled: bool, root: string,
                     cancel.Dispose()
                     signal.Dispose()
 
+/// The same authenticated connection used for registered client commands.
+/// Only bounded hints leave the client; failed sends do not undo the CAS.
+let publishInvalidation (connection: HubConnection) (registered: unit -> bool) hint =
+    if not (JobWakeInvalidation.valid hint) then
+        invalidArg "hint" "Invalid bounded job-wake invalidation."
+    if not (registered()) || connection.State <> HubConnectionState.Connected then
+        invalidOp "Registered client transport unavailable."
+    use cancellation = new CancellationTokenSource(TimeSpan.FromSeconds 8.)
+    connection.InvokeCoreAsync<obj>("PublishJobWakeInvalidation", [| box hint |], cancellation.Token)
+        .GetAwaiter().GetResult() |> ignore
+
+/// Compare against the receiver's own approved binding, not event-supplied
+/// authority. This is only a cache invalidation and wake; the scheduler must
+/// reread verified heads and independently decide whether any work is eligible.
+let acceptInvalidation (inspectBinding: string -> Result<LedgerBinding, Client.EffectError>)
+                       (invalidate: string -> string array -> unit)
+                       (notify: unit -> unit) (hint: JobWakeInvalidation) =
+    if not (JobWakeInvalidation.valid hint) then false
+    else
+        match inspectBinding hint.ProjectName with
+        | Ok binding when binding.ProjectId = hint.ProjectId
+                          && binding.LedgerId = hint.LedgerId && binding.Epoch = hint.Epoch ->
+            invalidate hint.ProjectName (Array.distinct hint.AgentIds)
+            notify()
+            true
+        | _ -> false
+
+/// Register the exact production receiver on the authenticated client connection.
+/// An unregistered/replaced transport cannot authorize even a fast-path wake.
+let registerInvalidationReceiver (connection: HubConnection) (registered: unit -> bool)
+                                 inspectBinding invalidate notify report =
+    connection.On<JobWakeInvalidation>("InvalidateJobWake", Func<JobWakeInvalidation, Task>(fun hint ->
+        if registered() then
+            try acceptInvalidation inspectBinding invalidate notify hint |> ignore
+            with ex -> report ("Job wake invalidation held: " + ex.Message)
+        Task.CompletedTask))
+
 /// Compose the accepted job observer with the registered canonical Challenge
 /// scheduler host. The existing host owns wake admission and recovery scans.
 /// A failed fast-path hint never changes the committed operation's outcome.
@@ -288,18 +330,31 @@ type RuntimeRegistration(enabled: bool, root: unit -> string,
                          scheduler: Client.WorkQueueSchedulerHostLoop.WorkQueueSchedulerHostLoop.Host,
                          deliverChallenge: ChallengeWriteCommand -> OperationResponse.Presented -> unit,
                          invalidate: string -> string array -> unit,
+                         publish: JobWakeInvalidation -> unit,
                          report: string -> unit) =
     let safeReport message = try report message with _ -> ()
     let catchup () =
         if enabled then
             scheduler.Notify Client.WorkQueueReactiveWake.WorkWakeTrigger.ManualReconcile |> ignore
-    let deliverTerminal (cmd: ChallengeWriteCommand) (receipt: OperationResponse.Presented) =
-        // Internal writes bypass the SignalR command response, so invalidate
-        // the same local caches explicitly. Reconnect invalidates all caches.
-        try invalidate cmd.ProjectName (List.toArray receipt.changedAgentIds)
+    let deliverTerminal (binding: LedgerBinding) (cmd: ChallengeWriteCommand) (receipt: OperationResponse.Presented) =
+        let ids = receipt.changedAgentIds |> List.distinct |> List.toArray
+        // The binding is the exact verified source used by the committed CAS,
+        // never re-resolved from a mutable label after the operation.
+        try invalidate cmd.ProjectName ids
         with ex -> safeReport ("Job wake cache invalidation held: " + ex.Message)
         try deliverChallenge cmd receipt
-        finally catchup()
+        finally
+            catchup()
+            // Local catchup has already been queued. A lost hint is covered by
+            // receiver reconnect/startup and the existing verified-head full scan.
+            if ids.Length > 0 then
+                try
+                    match ProjectSelector.identity cmd.ProjectName with
+                    | Some project ->
+                        publish { ProjectName = project; ProjectId = binding.ProjectId
+                                  LedgerId = binding.LedgerId; Epoch = binding.Epoch; AgentIds = ids }
+                    | None -> invalidOp "Committed job project is not a valid project selector."
+                with ex -> safeReport ("Cross-device job wake hint held: " + ex.Message)
     let jobs =
         if enabled then Some(new Host(true, root(), loadBinding, deliverTerminal, report))
         else None

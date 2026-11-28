@@ -4,9 +4,27 @@ open System
 open System.Diagnostics
 open System.IO
 open System.Text.Json
+open System.Collections.Generic
+open System.Collections.Concurrent
+open System.IdentityModel.Tokens.Jwt
+open System.Security.Claims
+open System.Text
+open System.Threading
+open System.Threading.Tasks
+open Microsoft.AspNetCore.Authentication.JwtBearer
+open Microsoft.AspNetCore.Builder
+open Microsoft.AspNetCore.Hosting
+open Microsoft.AspNetCore.SignalR
+open Microsoft.AspNetCore.SignalR.Client
+open Microsoft.Extensions.Configuration
+open Microsoft.Extensions.DependencyInjection
+open Microsoft.IdentityModel.Protocols
+open Microsoft.IdentityModel.Protocols.OpenIdConnect
+open Microsoft.IdentityModel.Tokens
+open Common.SignalR
 open NUnit.Framework
 open Common
-open Client
+open global.Client
 open Client.ConsoleTui
 open Client.OrchestrationApi
 open Client.LedgerStore
@@ -239,7 +257,7 @@ type JobWakeTests() =
                     Error(Client.ContextError "Disposable disconnected binding")
             let mutable callbackCount = 0
             use host = new Host(true, jobs, load,
-                                (fun _ _ ->
+                                (fun _ _ _ ->
                                     System.Threading.Interlocked.Increment(&callbackCount) |> ignore
                                     delivered.Set()),
                                 ignore)
@@ -259,7 +277,7 @@ type JobWakeTests() =
             use host = new Host(true, jobs, (fun project ->
                                     if project = "Fixture" then Ok binding
                                     else Error(Client.ValidationError "Unknown fixture project")),
-                                (fun _ _ -> delivered.Set()), ignore)
+                                (fun _ _ _ -> delivered.Set()), ignore)
             let directory, request = createJob jobs "Fixture" (Some "Worker A")
             let challenge = register binding task request.JobId
             block binding task attempt challenge |> ok |> ignore
@@ -274,7 +292,7 @@ type JobWakeTests() =
     [<Test>]
     member _.DefaultOffHostDoesNotOpenRegistryOrBinding() =
         use host = new Host(false, "/path/does/not/exist", (fun _ -> failwith "off binding read"),
-                            noCallback, (fun _ -> failwith "off host report"))
+                            (fun _ -> noCallback), (fun _ -> failwith "off host report"))
         Assert.That(host.Notify(), Is.False)
 
     [<Test>]
@@ -351,7 +369,7 @@ type JobWakeTests() =
                 if Array.contains "Worker A" ids then invalidated.Set()
             let runRegistration () =
                 new RuntimeRegistration(true, (fun () -> jobs), load, scheduler,
-                    (fun _ _ -> failwith "fixture lost fast-path wake"), invalidate, ignore)
+                    (fun _ _ -> failwith "fixture lost fast-path wake"), invalidate, ignore, ignore)
             let registerAndBlock (registration: RuntimeRegistration) =
                 let callback cmd receipt =
                     callbacks <- callbacks + 1
@@ -423,7 +441,7 @@ type JobWakeTests() =
         use scheduler = new Client.WorkQueueSchedulerHostLoop.WorkQueueSchedulerHostLoop.Host(ports)
         use registration = new RuntimeRegistration(false, (fun () -> failwith "off root"),
                                     (fun _ -> failwith "off binding"), scheduler, noCallback,
-                                    (fun _ _ -> failwith "off invalidation"), ignore)
+                                    (fun _ _ -> failwith "off invalidation"), (fun _ -> failwith "off transport"), ignore)
         registration.OnConnected()
         registration.OnInvalidated()
         Assert.That(scheduler.IsRunning, Is.False)
@@ -439,3 +457,219 @@ type JobWakeTests() =
         Assert.That(source, Does.Contain("jobWake.OnInvalidated()"))
         Assert.That(source.IndexOf("(jobWake :> IDisposable).Dispose()", StringComparison.Ordinal),
                     Is.LessThan(source.IndexOf("do! challengeHost.StopAsync()", StringComparison.Ordinal)))
+
+    // Real loopback host, existing JWT-authenticated client ingress and two
+    // separate checkouts of one canonical ledger. Only the launch effect is fake.
+    [<TestCase(0)>] // delivered hint
+    [<TestCase(1)>] // disconnected receiver, recover on reconnect
+    [<TestCase(2)>] // dropped hint while connected, recover on full rescan
+    member _.HostedAuthenticatedJobWake(mode: int) =
+        withFixture (fun jobs binding ->
+            let await (t: Task<'T>) = t.GetAwaiter().GetResult()
+            let wait (t: Task) = t.GetAwaiter().GetResult()
+            let root = Path.GetDirectoryName jobs
+            let root2 = Path.Combine(root, "second-device")
+            Directory.CreateDirectory(root2) |> ignore
+            let repo2 = Path.Combine(root2, "repo")
+            let jobs2 = Path.Combine(root2, "jobs")
+            Directory.CreateDirectory(jobs2) |> ignore
+            git root2 ["clone"; binding.ApprovedFetchUrl; repo2] |> ignore
+            git repo2 ["config"; "user.name"; "Second Job Wake Fixture"] |> ignore
+            git repo2 ["config"; "user.email"; "wake2@example.test"] |> ignore
+            let binding2 = { binding with RepositoryPath = repo2 }
+            let rt1 = Runtime(root, ConsoleTui(), FullTrust)
+            let rt2 = Runtime(root2, ConsoleTui(), FullTrust)
+            Client.RoleInstructions.RoleInstructions.setLaunchTemplate binding "fixture" (Guid.NewGuid()) 0
+                "Agent {{agentId}}, project {{projectName}}. Call inbox." |> ok |> ignore
+            let taskId, attemptId = startTask binding
+            let directory, request = createJob jobs "repo" (Some "Worker A")
+            let challenge = register binding taskId request.JobId
+            block binding taskId attemptId challenge |> ok |> ignore
+            let head = (LedgerStore.fetch binding |> ok).Commit
+            for runtime in [rt1; rt2] do
+                LedgerBindingConfig.bindExisting "repo" runtime binding.ProjectId binding.LedgerId binding.Epoch
+                    "origin" binding.ApprovedFetchUrl binding.ApprovedPushUrl head true |> ok |> ignore
+
+            let issuer = "urn:jarvis:offline:job-wake"
+            let audience = "urn:jarvis:offline"
+            let key = SymmetricSecurityKey(Encoding.UTF8.GetBytes("disposable-job-wake-test-signing-key-not-for-production-20261126"))
+            let token user =
+                JwtSecurityToken(issuer, audience,
+                    [Claim("sub", user); Claim("scope", "client:connect")],
+                    DateTime.UtcNow.AddMinutes(-1.), DateTime.UtcNow.AddMinutes(10.),
+                    SigningCredentials(key, SecurityAlgorithms.HmacSha256))
+                |> JwtSecurityTokenHandler().WriteToken
+            let builder = WebApplication.CreateBuilder()
+            builder.WebHost.UseUrls("http://127.0.0.1:0") |> ignore
+            builder.Configuration.AddInMemoryCollection(
+                [KeyValuePair("Auth0Domain", issuer)
+                 KeyValuePair("Audience", audience)
+                 KeyValuePair("DatabasePath", Path.Combine(root, "telemetry.sqlite"))]) |> ignore
+            Program.configureServices builder.Services builder.Configuration
+            builder.Services.PostConfigure<JwtBearerOptions>(JwtBearerDefaults.AuthenticationScheme, fun options ->
+                let metadata = OpenIdConnectConfiguration()
+                metadata.Issuer <- issuer
+                metadata.SigningKeys.Add(key)
+                options.ConfigurationManager <- StaticConfigurationManager<OpenIdConnectConfiguration>(metadata)
+                options.TokenValidationParameters.ValidIssuer <- issuer
+                options.TokenValidationParameters.ValidateIssuer <- true
+                options.TokenValidationParameters.ValidAudience <- audience
+                options.TokenValidationParameters.ValidateAudience <- true
+                options.TokenValidationParameters.IssuerSigningKey <- key
+                options.TokenValidationParameters.ValidateIssuerSigningKey <- true
+                options.TokenValidationParameters.ValidateLifetime <- true) |> ignore
+            use app = builder.Build()
+            Program.configureApp app |> ignore
+            wait (app.StartAsync())
+            let address = app.Urls |> Seq.exactlyOne
+            let makeHub user =
+                let jwt = token user
+                HubConnectionBuilder()
+                    .WithUrl(address + "/client", Action<Microsoft.AspNetCore.Http.Connections.Client.HttpConnectionOptions>(fun o ->
+                        o.AccessTokenProvider <- Func<Task<string>>(fun () -> Task.FromResult jwt)))
+                    .Build()
+            let registerHub (hub: HubConnection) device =
+                hub.InvokeAsync<ClientRegistrationResult>("Connect",
+                    { DeviceId = device; DeviceName = device; ProtocolVersion = AgentProtocol.version
+                      ClientVersion = "offline-job-wake-fixture"; SupportedCommands = [] }) |> await
+            let one, two, foreign, unregistered = makeHub "alice", makeHub "alice", makeHub "bob", makeHub "alice"
+            let stale, replacement = makeHub "alice", makeHub "alice"
+            let hubs = [one; two; foreign; unregistered; stale; replacement]
+            let mutable sends = 0
+            let mutable wakes = 0
+            let mutable accepted = 0
+            let mutable foreignSeen = 0
+            let mutable unregisteredSeen = 0
+            let mutable rawReceived = 0
+            let mutable allowReceiver = true
+            let captured = ConcurrentQueue<JobWakeInvalidation>()
+            use sent = new ManualResetEventSlim(false)
+            use timerPulse = new SemaphoreSlim(0, 1)
+            let until (label: string) condition =
+                Assert.That(SpinWait.SpinUntil(Func<bool>(condition), TimeSpan.FromSeconds 30.), Is.True, label)
+            let sendPorts: Client.ScheduledReadyResume.ExecutionPorts =
+                { ReadLimits = fun _ _ -> Ok Client.ScheduledReadyResume.disabled
+                  CanSend = fun _ -> Task.FromResult(Ok true)
+                  Send = fun prepared ->
+                    Assert.That(prepared.Ready.Generation, Is.EqualTo(2))
+                    Interlocked.Increment(&sends) |> ignore
+                    sent.Set()
+                    Task.FromResult(Ok "fake-launch") }
+            let receiverPorts: Client.WorkQueueSchedulerHostLoop.SchedulerHostPorts =
+                { ReadVerifiedHeads = fun () -> Ok { AccountHead = "fixture-only"; ProjectHead = (LedgerStore.fetch binding2 |> ok).Commit }
+                  Wake = fun _ ->
+                    try
+                        Client.ScheduledReadyResume.executeOnce sendPorts binding2 "fixture" "repo" "launchAgent.js" "script-sha" "route-sha"
+                        |> await |> ignore
+                        WorkWakeResult.Disabled
+                    finally Interlocked.Increment(&wakes) |> ignore
+                  Report = ignore
+                  Delay = fun _ ct -> timerPulse.WaitAsync(ct) }
+            let offPorts: Client.WorkQueueSchedulerHostLoop.SchedulerHostPorts =
+                { ReadVerifiedHeads = fun () -> failwith "sender scheduler disabled"
+                  Wake = fun _ -> failwith "sender scheduler disabled"
+                  Report = ignore; Delay = fun _ _ -> failwith "sender scheduler disabled" }
+            use scheduler1 = new Client.WorkQueueSchedulerHostLoop.WorkQueueSchedulerHostLoop.Host(offPorts)
+            use scheduler2 = new Client.WorkQueueSchedulerHostLoop.WorkQueueSchedulerHostLoop.Host(receiverPorts, enabled = true)
+            let reports = ConcurrentQueue<string>()
+            use receiver = new RuntimeRegistration(true, (fun () -> jobs2), (fun name -> LedgerBindingConfig.load name rt2),
+                                scheduler2, (fun _ _ -> ()), (fun _ _ -> ()), (fun _ -> ()), reports.Enqueue)
+            use sender = new RuntimeRegistration(true, (fun () -> jobs), (fun name -> LedgerBindingConfig.load name rt1),
+                                scheduler1, (fun _ _ -> failwith "local fast path lost"), (fun _ _ -> ()),
+                                publishInvalidation one (fun () -> true), reports.Enqueue)
+            use receiverSubscription =
+                registerInvalidationReceiver two (fun () -> allowReceiver)
+                    (fun name -> LedgerBindingConfig.inspectLocal name rt2 |> Result.map fst)
+                    (fun project ids ->
+                        Assert.That(project, Is.EqualTo("repo"))
+                        Assert.That((ids = [|"Worker A"|]), Is.True)
+                        Client.SignalR.Client.invalidateAgentStates rt2 project ids
+                        Interlocked.Increment(&accepted) |> ignore)
+                    receiver.OnInvalidated reports.Enqueue
+            use rawSubscription = two.On<JobWakeInvalidation>("InvalidateJobWake", Action<JobWakeInvalidation>(fun hint ->
+                captured.Enqueue hint
+                Interlocked.Increment(&rawReceived) |> ignore))
+            use foreignSubscription = foreign.On<JobWakeInvalidation>("InvalidateJobWake", Action<JobWakeInvalidation>(fun _ ->
+                Interlocked.Increment(&foreignSeen) |> ignore))
+            use unregisteredSubscription = unregistered.On<JobWakeInvalidation>("InvalidateJobWake", Action<JobWakeInvalidation>(fun _ ->
+                Interlocked.Increment(&unregisteredSeen) |> ignore))
+            let hint =
+                { ProjectName = "repo"; ProjectId = binding.ProjectId; LedgerId = binding.LedgerId
+                  Epoch = binding.Epoch; AgentIds = [|"Worker A"|] }
+            let rejected hub invalidHint =
+                let mutable failed = false
+                try
+                    (hub: HubConnection).InvokeCoreAsync<obj>("PublishJobWakeInvalidation", [|box invalidHint|]) |> await |> ignore
+                with :? HubException -> failed <- true
+                Assert.That(failed, Is.True, "unregistered, stale, or malformed publish must be rejected")
+            try
+                for hub in hubs do wait (hub.StartAsync())
+                registerHub one "a" |> ignore
+                registerHub two "b" |> ignore
+                registerHub foreign "a" |> ignore
+                registerHub stale "replaced" |> ignore
+                registerHub replacement "replaced" |> ignore
+                receiver.OnConnected()
+                sender.OnConnected()
+                until "startup verified scan" (fun () -> Volatile.Read(&wakes) >= 1)
+                rejected unregistered hint
+                rejected stale hint
+                rejected one { hint with ProjectName = "../repo" }
+                // Valid shape from another user never reaches Alice's devices.
+                publishInvalidation foreign (fun () -> true) hint
+                // Same user but foreign label, ledger, or epoch: reject before
+                // invalidating a local cache or requesting a wake.
+                publishInvalidation one (fun () -> true) { hint with ProjectName = "foreign" }
+                publishInvalidation one (fun () -> true) { hint with ProjectId = Guid.NewGuid() }
+                publishInvalidation one (fun () -> true) { hint with LedgerId = Guid.NewGuid() }
+                publishInvalidation one (fun () -> true) { hint with Epoch = binding.Epoch + 1 }
+                until "foreign project hints reached the transport" (fun () -> Volatile.Read(&rawReceived) >= 4)
+                Assert.That(Volatile.Read(&accepted), Is.Zero)
+                // Even a correctly scoped stale/forged hint is not terminal truth.
+                let beforeWake = Volatile.Read(&wakes)
+                publishInvalidation one (fun () -> true) hint
+                until "valid hint accepted" (fun () -> Volatile.Read(&accepted) >= 1)
+                until "valid hint requested verified scan" (fun () -> Volatile.Read(&wakes) > beforeWake)
+                Assert.That(Volatile.Read(&sends), Is.Zero)
+                Assert.That((ReviewWorkflow.getAgentInbox binding2 "Worker A" |> ok).Agent.State, Is.EqualTo("NeedsWork"))
+                let beforeAccepted = Volatile.Read(&accepted)
+                let beforeRaw = Volatile.Read(&rawReceived)
+                if mode = 1 then wait (two.StopAsync())
+                elif mode = 2 then allowReceiver <- false
+
+                // Atomic durable receipt publication drives the real observer,
+                // canonical resolve/requeue CAS, registered sender, and remote receiver.
+                publish directory request (JobStatus.Completed 0) true
+                until "canonical requeue committed" (fun () ->
+                    (ReviewWorkflow.getAgentInbox binding "Worker A" |> ok).Agent.State = "Ready")
+                if mode = 0 then
+                    until "remote post-CAS hint accepted" (fun () -> Volatile.Read(&accepted) > beforeAccepted)
+                elif mode = 1 then
+                    Assert.That(Volatile.Read(&sends), Is.Zero)
+                    wait (two.StartAsync())
+                    registerHub two "b" |> ignore
+                    Client.SignalR.Client.invalidateAllAgentStates rt2
+                    receiver.OnConnected()
+                else
+                    until "lost hint reached transport" (fun () -> Volatile.Read(&rawReceived) > beforeRaw)
+                    Assert.That(Volatile.Read(&accepted), Is.EqualTo(beforeAccepted))
+                    Assert.That(Volatile.Read(&sends), Is.Zero)
+                    allowReceiver <- true
+                    timerPulse.Release() |> ignore
+                Assert.That(sent.Wait(TimeSpan.FromSeconds 30.), Is.True, "canonical catchup must reach fake launch")
+                Assert.That((ReviewWorkflow.getAgentInbox binding2 "Worker A" |> ok).RunnableQueue.Head.Attempt.AssignmentGeneration,
+                            Is.EqualTo(2))
+                // Duplicate and reordered stale hints cannot duplicate launch.
+                let beforeDuplicate = Volatile.Read(&wakes)
+                publishInvalidation one (fun () -> true) hint
+                publishInvalidation one (fun () -> true) { hint with Epoch = binding.Epoch + 1 }
+                publishInvalidation one (fun () -> true) hint
+                until "duplicate hint was reconciled" (fun () -> Volatile.Read(&wakes) > beforeDuplicate)
+                wait (scheduler2.StopAsync())
+                Assert.That(Volatile.Read(&sends), Is.EqualTo(1))
+                Assert.That(Volatile.Read(&foreignSeen), Is.Zero)
+                Assert.That(Volatile.Read(&unregisteredSeen), Is.Zero)
+                Assert.That(captured.ToArray() |> Array.exists (fun h -> h = hint), Is.True)
+            finally
+                for hub in hubs do wait (hub.DisposeAsync().AsTask())
+                wait (app.StopAsync()))

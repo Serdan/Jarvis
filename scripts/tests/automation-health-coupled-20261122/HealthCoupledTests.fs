@@ -447,6 +447,7 @@ type CoupledHealthPropertyTests() =
                                              session.Generation, completed) |> ignore
                             Task.CompletedTask
                         member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+                        member _.InvalidateJobWake(_) = Task.CompletedTask
                         member _.InvalidateAllAgentStates() = Task.CompletedTask
                         member _.RecordAgentActivity(_, _, _) = Task.CompletedTask }
                 let clients =

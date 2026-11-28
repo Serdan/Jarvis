@@ -119,35 +119,95 @@ type AuthenticatedNativeIngress() =
         |> fun pending -> pending.GetAwaiter().GetResult()
 
     let registrationPresent (program: string) =
-        // The generated Client assembly is compiled by ProjectReference. These
-        // source-anchored assertions additionally make callback removal from
-        // its Program registration a RED test instead of silently succeeding
-        // through a test-only injected Host.
-        program.Contains("let challengeWakeEnabled = false")
-        && program.Contains("let challengeCoordinator =")
-        && program.Contains("let challengeHost, onChallengeCommit =")
-        && program.Contains("Client.AutomationChallengeWakeAdapter.registerHost")
-        && program.Contains("Client.receiveAuthenticatedCommandAndReplyWithChallengeWakeTiming")
-        && program.Contains("false report onChallengeCommit")
-        && program.Contains("true report onChallengeCommit")
-        && program.IndexOf("OAuth.login", StringComparison.Ordinal)
-           < program.IndexOf("let challengeHost, onChallengeCommit =", StringComparison.Ordinal)
-        && program.IndexOf("do! dispatch.Complete()", StringComparison.Ordinal)
-           < program.IndexOf("do! challengeHost.StopAsync()", StringComparison.Ordinal)
+        // This is a source-topology guard alongside the compiled registration
+        // tests, not runtime instrumentation. Check the caller and callee
+        // separately: declaration order does not determine invocation order.
+        let span (source: string) (first: string) (last: string) =
+            let start = source.IndexOf(first, StringComparison.Ordinal)
+            if start < 0 then ""
+            else
+                let finish = source.IndexOf(last, start + first.Length, StringComparison.Ordinal)
+                if finish < 0 then "" else source.Substring(start, finish - start)
+        let normalize (source: string) =
+            source.Split('\n')
+            |> Array.map (fun line -> line.Trim())
+            |> Array.filter (fun line -> line <> "" && not (line.StartsWith("//", StringComparison.Ordinal)))
+            |> String.concat " "
+        let ordered (source: string) (anchors: string list) =
+            let rec loop offset = function
+                | [] -> true
+                | (anchor: string) :: rest ->
+                    let index = source.IndexOf(anchor, offset, StringComparison.Ordinal)
+                    index >= 0 && loop (index + anchor.Length) rest
+            loop 0 anchors
+
+        let registration = span program "\nlet registerClientRuntime " "\nlet private runClient "
+        let routes = span registration "\n    let receiveQueuedWithSource " "\n    let receiveQueued " |> normalize
+        let shutdown = span registration "\n      StopAsync = " "\n      DisposeWake = " |> normalize
+        let caller = span program "\nlet private runClient " "\n[<EntryPoint>]"
+        let preparation = span caller "\n    let prepareConnection () =" "\n    let jobRoot () =" |> normalize
+        let registration = normalize registration
+        let caller = normalize caller
+
+        ordered registration
+            [ "let connection, authenticatedOperator = prepareConnection()"
+              "let challengeWakeEnabled = false"
+              "let challengeCoordinator = Client.WorkQueueReactiveWake.WorkQueueReactiveWake.Coordinator(challengeWakePorts)"
+              "let challengeHostPorts = Client.AutomationNativeProviderSessionHost.defaultOffHostPorts challengeCoordinator tui.Log"
+              "let challengeHost, onChallengeCommit = Client.AutomationChallengeWakeAdapter.registerHost challengeWakeEnabled challengeHostPorts loadBinding tui.Log"
+              "let jobWake = new AutomationJobTerminalWake.RuntimeRegistration("
+              "let onChallengeCommit cmd receipt = jobWake.OnChallengeCommit(cmd, receipt)" ]
+        && ordered routes
+            [ "elif manualGranted then Client.receiveAuthenticatedCommandAndReplyWithChallengeWakeTiming connection rt correlationId commandJson agentId None true report onChallengeCommit"
+              "| Some original -> Client.receiveAuthenticatedCommandAndReplyWithChallengeWakeTiming connection rt correlationId commandJson agentId (Some original) false report onChallengeCommit"
+              "| None -> Client.receiveAuthenticatedCommandAndReplyWithChallengeWakeTiming connection rt correlationId commandJson agentId None false report onChallengeCommit" ]
+        && ordered shutdown
+            [ "do! dispatch.Complete()"
+              "(jobWake :> IDisposable).Dispose()"
+              "do! challengeHost.StopAsync()"
+              "scheduler |> Option.iter (fun service -> (service :> IDisposable).Dispose())" ]
+        && ordered preparation
+            [ "let oauth = OAuth.login tui.Log tui.ShowSignInLink |> Async.AwaitTask |> Async.RunSynchronously"
+              "let connection = HubConnectionBuilder()"
+              "connection, authenticatedOperator" ]
+        && ordered caller
+            [ "let prepareConnection () ="
+              "use registration = registerClientRuntime rt tui browser (BrowserSchedules.defaultPath()) ClientConfig.capacityFenceMode (fun project -> OrchestrationApi.LedgerBindingConfig.load project rt) jobRoot prepareConnection"
+              "let connection = registration.Connection"
+              "do! registration.StopAsync()" ]
 
     [<Test>]
     member _.CompiledProgramOwnsCallbackRegistrationAndShutdownOrder() =
         let file = Path.GetFullPath(Path.Combine(__SOURCE_DIRECTORY__, "..", "..", "Client", "Program.fs"))
-        let program = File.ReadAllText(file)
+        let program = File.ReadAllText(file).Replace("\r\n", "\n")
         Assert.That(typeof<Runtime>.Assembly.GetType("Program"), Is.Not.Null,
                     "A production-compiled Program is required, not a test-only source")
         Assert.That(registrationPresent program, Is.True, "B1 Program registration/lifecycle disappeared")
-        let mutant = program.Replace("false report onChallengeCommit", "false report (fun _ _ -> ())")
-        Assert.That(registrationPresent mutant, Is.False,
-                    "Removing the registered callback must be detected")
-        let shutdownMutant = program.Replace("do! challengeHost.StopAsync()", "do! System.Threading.Tasks.Task.CompletedTask")
-        Assert.That(registrationPresent shutdownMutant, Is.False,
-                    "Removing production Host shutdown must be detected")
+
+        let reject (name: string) (mutant: string) =
+            Assert.That(mutant, Is.Not.EqualTo(program), name + ": mutation must change the source")
+            Assert.That(registrationPresent mutant, Is.False, name)
+        let replace (name: string) (original: string) (replacement: string) =
+            reject name (program.Replace(original, replacement))
+        let invocation = "    let connection, authenticatedOperator = prepareConnection()\n"
+        replace "Missing connection preparation" invocation ""
+        reject "Preparation after host registration"
+            (program.Replace(invocation, "").Replace("    let jobWake =", invocation + "    let jobWake ="))
+        replace "Caller bypasses concrete preparation" "jobRoot prepareConnection" "jobRoot alternatePreparation"
+        replace "Caller no longer performs synchronous OAuth" "|> Async.RunSynchronously\n\n        let authenticatedOperator" "|> ignore\n\n        let authenticatedOperator"
+        replace "Manual-granted callback removed" "None true report onChallengeCommit" "None true report (fun _ _ -> ())"
+        replace "Original-operation callback removed" "(Some original) false report onChallengeCommit" "(Some original) false report (fun _ _ -> ())"
+        replace "Ordinary callback removed" "None false report onChallengeCommit" "None false report (fun _ _ -> ())"
+        replace "Composite callback removed" "jobWake.OnChallengeCommit(cmd, receipt)" "()"
+        replace "Production host shutdown removed" "do! challengeHost.StopAsync()" "do! System.Threading.Tasks.Task.CompletedTask"
+        replace "Production caller shutdown removed" "do! registration.StopAsync()" "do! System.Threading.Tasks.Task.CompletedTask"
+        let drain = "do! dispatch.Complete().WaitAsync(TimeSpan.FromMinutes 2.0)"
+        let stop = "do! challengeHost.StopAsync()"
+        reject "Host stops before dispatch drains"
+            (program.Replace(drain, "__DRAIN__").Replace(stop, drain).Replace("__DRAIN__", stop))
+        let dispose = "            (jobWake :> IDisposable).Dispose()\n"
+        reject "Job ingress stops after downstream host"
+            (program.Replace(dispose, "").Replace("            " + stop + "\n", "            " + stop + "\n" + dispose))
 
     [<Test>]
     member _.RealPostJournalAuthenticatedSignalRCoreTwoClientsAndReplay() =

@@ -14,6 +14,8 @@ type IClientService =
     abstract ReceiveManualGrantApproval: correlationId: string * requestJson: string * agentId: string -> Task
     /// Best-effort cross-device hint: the project ledger may have changed agent assignments.
     abstract InvalidateAgentStates: projectName: string * agentIds: string array -> Task
+    /// Best-effort job wake hint; the recipient must match its approved ledger identity.
+    abstract InvalidateJobWake: hint: JobWakeInvalidation -> Task
     /// The mutation scope is unknown: invalidate the complete local agent-state cache.
     abstract InvalidateAllAgentStates: unit -> Task
     /// Authenticated cross-device activity hint; never a canonical agent-state mutation.

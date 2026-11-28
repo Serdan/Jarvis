@@ -576,7 +576,8 @@ let registerClientRuntime (rt: Runtime) (tui: ConsoleTui) browser schedulePath r
             challengeWakeEnabled, jobRoot,
             loadBinding,
             challengeHost, onChallengeCommit,
-            (Client.invalidateAgentStates rt), tui.Log)
+            (Client.invalidateAgentStates rt),
+            (AutomationJobTerminalWake.publishInvalidation connection (fun () -> registered)), tui.Log)
     // Route the existing authenticated Challenge callback through the composite.
     // No new command or scheduler authority is introduced.
     let onChallengeCommit cmd receipt = jobWake.OnChallengeCommit(cmd, receipt)
@@ -726,6 +727,9 @@ let registerClientRuntime (rt: Runtime) (tui: ConsoleTui) browser schedulePath r
             Client.invalidateAgentStates rt project agentIds
             jobWake.OnInvalidated()
             Task.CompletedTask))
+        AutomationJobTerminalWake.registerInvalidationReceiver connection (fun () -> registered)
+            (fun project -> OrchestrationApi.LedgerBindingConfig.inspectLocal project rt |> Result.map fst)
+            (Client.invalidateAgentStates rt) jobWake.OnInvalidated tui.Log
         connection.On("InvalidateAllAgentStates", Func<Task>(fun () ->
             Client.invalidateAllAgentStates rt
             jobWake.OnInvalidated()

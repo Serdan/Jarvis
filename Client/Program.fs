@@ -982,7 +982,11 @@ let private runClient args =
         // redraw via its Closed callback after the input loop stops.
         use tracking = Client.TerminalMouse.Tracking.enable()
         use cts = new CancellationTokenSource()
-        let inputLoop = tui.RunInputLoop(cts.Token)
+        let inputLoop =
+            if Console.IsInputRedirected && Environment.GetEnvironmentVariable("JARVIS_OAUTH_MODE") = "unattended" then
+                Task.FromResult(())
+            else
+                tui.RunInputLoop(cts.Token)
         let deviceId = DeviceIdentity.getOrCreate ()
         let mutable connectionFailureCount = 0
 
@@ -1073,4 +1077,6 @@ let main args =
         Client.TaskFirstUiSnapshotAdapter.TaskFirstUiSnapshotAdapter.run (args |> Array.toList)
     elif args.Length > 0 && args[0] = "queue-producer" then
         Client.WorkQueueReceiptProducer.WorkQueueReceiptProducer.run (args |> Array.toList)
+    elif args.Length = 2 && args[0] = "auth" && args[1] = "device" then
+        OAuth.runDeviceEnrollmentCommand()
     else runClient args

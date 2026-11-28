@@ -81,7 +81,7 @@ let private corruptCommit binding (head: LedgerSnapshot) mutate =
     git local ["-c"; "user.name=Fixture"; "-c"; "user.email=fixture@example.test"; "commit"; "-m"; "negative fixture"] |> ignore
     { head with Commit = git local ["rev-parse"; "HEAD"] }
 
-let private put local relative text =
+let private put local relative (text: string) =
     let file = Path.Combine(local, relative)
     Directory.CreateDirectory(Path.GetDirectoryName file) |> ignore
     File.WriteAllText(file, text)

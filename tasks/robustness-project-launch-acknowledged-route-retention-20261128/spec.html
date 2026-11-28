@@ -1,0 +1,24 @@
+<article>
+<h1>P0 — Retain only acknowledged project-route-unknown launcher tabs</h1>
+<p>Operator-approved retention policy from the original project route-binding task remains part of the production contract, but the currently integrated BrowserBridge violates it. In <code>Client/Modules/BrowserBridge.fs</code> around lines 915–953, every provider <code>status=outcomeUnknown</code> is unconditionally passed to <code>closeDefinitive()</code> when <code>closeAfterExecution=true</code>. This closes the tab even for the specific acknowledged project-route-unknown case, and the live Jarvis launcher failures report <code>cleanup=closed</code> despite a matching newly rendered user turn. The project-owned launch script returns a bounded typed result for this case: <code>status=outcomeUnknown</code>, <code>stage=conversationRoute</code>, <code>reason=ConversationUrlUnavailable</code>, <code>conversationUrl=null</code>, <code>projectRouteAcknowledgement=matchingUserBubble|matchingLegacyUserTurn</code>, with evidence including <code>newUserTurn</code>. Do not conflate this with generic unknown sends or unacknowledged timeouts.</p>
+<h2>Required behavior</h2>
+<ul>
+<li>When <code>closeAfterExecution=true</code>, retain the Jarvis-created tab only for the exact bounded acknowledged-project-route-unknown shape above, including a recognized matching turn marker and null URL. Return the registration ID and truthful <code>cleanup=retained</code> in the typed outcome.</li>
+<li>Continue closing successful submitted tabs when requested.</li>
+<li>Continue closing unrelated generic <code>outcomeUnknown</code>, send-click uncertainty, submission-unconfirmed, unexpected post-send errors, and all other failures exactly as before. Never replay Send.</li>
+<li>When <code>closeAfterExecution=false</code>, preserve current retention behavior for every result.</li>
+<li>Do not accept arbitrary project links, fabricated URLs, unbounded evidence, raw DOM, prompt text, or private content. Validate exact allowed enum values and required evidence markers only.</li>
+</ul>
+<h2>Regression tests</h2>
+<p>Extend <code>Client.Tests/BrowserBridgeTests.fs</code> with a focused matrix proving:</p>
+<ol>
+<li>Acknowledged project route unknown plus closeAfterExecution=true retains the created tab and returns the registration ID.</li>
+<li>The same acknowledged case plus closeAfterExecution=false remains retained.</li>
+<li>Generic route unknown without matching-turn acknowledgement closes when requested.</li>
+<li>SubmissionUnconfirmed, SendClickUncertain and UnexpectedUiErrorAfterSend close when requested.</li>
+<li>Successful submitted result closes when requested and remains retained otherwise.</li>
+<li>Malformed/unknown acknowledgement markers, non-null fabricated URL, missing <code>newUserTurn</code>, and invalid stage/reason do not receive the retention exception.</li>
+<li>Existing cleanup ownership, generation, registration identity, and no-replay invariants remain unchanged.</li>
+</ol>
+<p>Use a deterministic bridge fixture; do not send live prompts to test this. Record exact source SHA, commands, exit codes, test counters and retained artifacts. Submit an immutable independent review of the exact source. Integrator remains the sole serial composition/publication owner. Coordinate with the separate P0 <code>robustness-project-launch-atomic-route-ack-20261128</code> script fix; this task owns only BrowserBridge and its focused tests. No deployment, client restart, Scheduler activation, live notification or agent send is authorized.</p>
+</article>

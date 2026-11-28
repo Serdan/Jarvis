@@ -125,6 +125,16 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
         .AddSingleton<OptionalFeedbackStore>(fun sp ->
             new OptionalFeedbackStore(databasePath,
                 logger = sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<OptionalFeedbackStore>>()))
+        // Explicit cutover only; construction performs no initialization or migration.
+        // An enabled but invalid/unavailable path never falls back to legacy writes.
+        .AddSingleton<FeedbackStorageMode>(
+            match configuration["EnableDurableFeedback"] with
+            | value when String.Equals(value, "true", StringComparison.OrdinalIgnoreCase) ->
+                FeedbackStorageMode.Durable(DurableFeedbackStore(configuration["DurableFeedbackDatabasePath"]))
+            | value when String.IsNullOrWhiteSpace(value) || String.Equals(value, "false", StringComparison.OrdinalIgnoreCase) ->
+                FeedbackStorageMode.Legacy
+            // A malformed explicit flag must not silently restore legacy authority.
+            | _ -> FeedbackStorageMode.Durable(DurableFeedbackStore("")))
         .AddScoped<ClientService>()
     |> ignore
 

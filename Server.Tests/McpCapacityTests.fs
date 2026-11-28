@@ -92,6 +92,8 @@ let private startJarvisToolServer () =
         // The schema host only lists tools; mirror production service registration
         // without constructing a client connection or executing a client-backed tool.
         builder.Services.AddScoped<global.Server.Services.ClientService>(fun _ -> failwith "Schema-only test host") |> ignore
+        builder.Services.AddSingleton<global.Server.Services.OptionalFeedbackStore>(fun _ -> new global.Server.Services.OptionalFeedbackStore("")) |> ignore
+        builder.Services.AddSingleton<global.Server.Services.FeedbackStorageMode>(global.Server.Services.FeedbackStorageMode.Legacy) |> ignore
         builder.Services
             .AddMcpServer()
             .WithHttpTransport(fun options -> options.Stateless <- true)
@@ -354,4 +356,33 @@ let registered_mcp_lifecycle_tools_publish_descriptions_and_argument_schemas () 
             [ "projectName"; "taskId"; "agentId"; "summary"; "nextAction" ]
             [ "expectedAttemptVersion"; "expectedAgentVersion"; "assignmentGeneration";
               "operationId"; "deviceId" ]
+    }
+
+[<Test>]
+let registered_feedback_tools_hide_storage_authority_and_expose_exact_request_ids () =
+    task {
+        let! instance, endpoint = startJarvisToolServer ()
+        use app = instance
+        use http = new HttpClient()
+        http.Timeout <- TimeSpan.FromSeconds(10.)
+        use! listing = postMcp http endpoint """{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"""
+        let! body = listing.Content.ReadAsStringAsync()
+        Assert.That(listing.StatusCode, Is.EqualTo(HttpStatusCode.OK), body)
+        use document = responseJson body
+        let tools = document.RootElement.GetProperty("result").GetProperty("tools").EnumerateArray() |> Seq.toArray
+        let normalize (name: string) = name.Replace("_","").Replace("-","").Replace(".","").ToLowerInvariant()
+        let names = [ "Feedback"; "ListFeedback"; "GetFeedback"; "UpdateFeedback"; "GetFeedbackSummary" ]
+        for name in names do
+            let tool = tools |> Array.find (fun tool -> normalize(tool.GetProperty("name").GetString()) = normalize name)
+            let schema = tool.GetProperty("inputSchema")
+            let properties = schema.GetProperty("properties").EnumerateObject() |> Seq.map _.Name |> Set.ofSeq
+            for injected in ["store";"mode";"http"] do
+                Assert.That(properties.Contains injected, Is.False, $"{name}: {injected} must not be public")
+            let mutation = name = "Feedback" || name = "UpdateFeedback"
+            Assert.That(properties.Contains "requestId", Is.EqualTo(mutation), name)
+            if mutation then
+                let required = schema.GetProperty("required").EnumerateArray() |> Seq.map _.GetString() |> Set.ofSeq
+                Assert.That(required.Contains "requestId", Is.False, "Legacy mode retains its old argument contract; durable mode validates UUID")
+                Assert.That(schema.GetProperty("properties").GetProperty("requestId").GetProperty("description").GetString(), Does.Contain("UUID"))
+        do! app.StopAsync()
     }

@@ -55,6 +55,7 @@
         <Compile Include="Services\ExportStore.fs"/>
         <Compile Include="Services\FeedbackStore.fs"/>
         <Compile Include="Services\OptionalFeedbackStore.fs"/>
+        <Compile Include="Services\DurableFeedbackStore.fs"/>
         <Compile Include="Services\HubService.fs"/>
         <Compile Include="Services\ClientService.fs"/>
         <Compile Include="McpTools.fs"/>

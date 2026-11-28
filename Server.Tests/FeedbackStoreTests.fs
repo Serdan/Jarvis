@@ -609,3 +609,109 @@ let ``connection diagnostics retain current authenticated device state when opti
     finally
         Directory.Delete(directory, true)
 }
+
+let private withDurableRouteFixture test =
+    let root = Path.Combine(Path.GetTempPath(), "jarvis-durable-feedback-route-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(root) |> ignore
+    try
+        use legacy = new FeedbackStore(Path.Combine(root,"legacy.db"), runPruneTimer=false)
+        let durable = DurableFeedbackStore(Path.Combine(root,"durable.db"))
+        durable.InitializeOffline()
+        test root legacy durable
+    finally
+        SqliteConnection.ClearAllPools()
+        Directory.Delete(root,true)
+
+let private awaitFeedback (work: Task<'T>) = work.GetAwaiter().GetResult()
+
+[<Test>]
+let ``durable feedback routes remain usable without optional diagnostics and replay exactly`` () =
+    withDurableRouteFixture (fun _ _ durable ->
+        use diagnostics = new OptionalFeedbackStore("")
+        let mode = FeedbackStorageMode.Durable durable
+        let alice = authenticatedAccessor "alice"
+        let key = Guid.NewGuid().ToString("D")
+        let submit key summary =
+            JarvisMcpTools.Feedback("Jarvis","PatchFile","Other","Info",summary,"","",key,"unverified-id",diagnostics,mode,alice)
+            |> awaitFeedback
+        (submit "" "report").IsError |> shouldEqual (Nullable true)
+        (submit key "report").IsError |> shouldEqual (Nullable false)
+        (submit key "report").IsError |> shouldEqual (Nullable false)
+        (submit key "changed").IsError |> shouldEqual (Nullable true)
+        let entry =
+            match durable.TryList("alice",None,None,None,None,10) |> awaitFeedback with
+            | Ok [| entry |] -> entry
+            | other -> failwithf "Expected exactly one report: %A" other
+        entry.OperationId |> shouldEqual ""
+        entry.RequestedOperationId |> shouldEqual "unverified-id"
+        entry.OperationLinkState |> shouldEqual "Unverified"
+        (JarvisMcpTools.ListFeedback("","","","",50,diagnostics,mode,alice) |> awaitFeedback).IsError |> shouldEqual (Nullable false)
+        (JarvisMcpTools.GetFeedback(entry.Id,diagnostics,mode,alice) |> awaitFeedback).IsError |> shouldEqual (Nullable false)
+        let closeKey = Guid.NewGuid().ToString("D")
+        let update key status notes =
+            JarvisMcpTools.UpdateFeedback(entry.Id,status,"",notes,key,diagnostics,mode,alice) |> awaitFeedback
+        (update "" "Resolved" "fixed").IsError |> shouldEqual (Nullable true)
+        (update closeKey "Resolved" "fixed").IsError |> shouldEqual (Nullable false)
+        (update (Guid.NewGuid().ToString("D")) "Open" "").IsError |> shouldEqual (Nullable false)
+        (update closeKey "Resolved" "fixed").IsError |> shouldEqual (Nullable false)
+        match durable.TryGet("alice",entry.Id) |> awaitFeedback with
+        | Ok (Some current) -> current.Status |> shouldEqual "Open"
+        | other -> failwithf "Expected report after exact replay: %A" other
+        (JarvisMcpTools.GetFeedbackSummary("","",diagnostics,mode,alice) |> awaitFeedback).IsError |> shouldEqual (Nullable false)
+        let bob = authenticatedAccessor "bob"
+        (JarvisMcpTools.GetFeedback(entry.Id,diagnostics,mode,bob) |> awaitFeedback).IsError |> shouldEqual (Nullable true)
+        (JarvisMcpTools.UpdateFeedback(entry.Id,"Resolved","","",Guid.NewGuid().ToString("D"),diagnostics,mode,bob) |> awaitFeedback).IsError |> shouldEqual (Nullable true)
+    )
+
+[<Test>]
+let ``durable feedback route verifies only same-user observed operation evidence`` () =
+    withDurableRouteFixture (fun _ legacy durable ->
+        let op = legacy.BeginOperation("alice","PatchFile",Some "Jarvis","server",None,None)
+        legacy.CompleteOperation(op.Id,false,Some "Failure",1L)
+        use diagnostics = new OptionalFeedbackStore(legacy.DatabasePath,timeout=TimeSpan.FromSeconds(2.))
+        let mode = FeedbackStorageMode.Durable durable
+        let submit user key explicitId =
+            let http = authenticatedAccessor user
+            JarvisMcpTools.Feedback("Jarvis","PatchFile","Other","Info","report","","",key,explicitId,diagnostics,mode,http)
+            |> awaitFeedback
+        (submit "alice" (Guid.NewGuid().ToString("D")) op.Id).IsError |> shouldEqual (Nullable false)
+        (submit "bob" (Guid.NewGuid().ToString("D")) op.Id).IsError |> shouldEqual (Nullable false)
+        (submit "alice" (Guid.NewGuid().ToString("D")) "").IsError |> shouldEqual (Nullable false)
+        legacy.PruneTelemetry(DateTimeOffset.UtcNow.AddDays(31.))
+        match durable.TryList("alice",None,None,None,None,10) |> awaitFeedback with
+        | Ok entries ->
+            entries.Length |> shouldEqual 2
+            entries |> Array.iter (fun entry ->
+                entry.OperationId |> shouldEqual op.Id
+                entry.OperationLinkState |> shouldEqual "Verified")
+        | Error reason -> failwith reason
+        match durable.TryList("bob",None,None,None,None,10) |> awaitFeedback with
+        | Ok [| entry |] ->
+            entry.OperationId |> shouldEqual ""
+            entry.RequestedOperationId |> shouldEqual op.Id
+            entry.OperationLinkState |> shouldEqual "Unverified"
+        | other -> failwithf "Expected isolated unverified report: %A" other
+        match durable.TrySummary("alice",None,None) |> awaitFeedback with
+        | Ok summary -> summary.LinkedToFailedOperation |> shouldEqual 2
+        | Error reason -> failwith reason
+    )
+
+[<Test>]
+let ``feedback storage selection never falls back from an unavailable durable authority`` () =
+    withDurableRouteFixture (fun root legacy _ ->
+        use diagnostics = new OptionalFeedbackStore(legacy.DatabasePath,timeout=TimeSpan.FromSeconds(2.))
+        let missing = DurableFeedbackStore(Path.Combine(root,"missing.db"))
+        let alice = authenticatedAccessor "alice"
+        let submit mode key =
+            JarvisMcpTools.Feedback("Jarvis","PatchFile","Other","Info","report","","",key,"",diagnostics,mode,alice)
+            |> awaitFeedback
+        (submit (FeedbackStorageMode.Durable missing) (Guid.NewGuid().ToString("D"))).IsError |> shouldEqual (Nullable true)
+        legacy.ListFeedback("alice",None,None,None,None,10).Length |> shouldEqual 0
+        File.Exists(Path.Combine(root,"missing.db")) |> shouldEqual false
+        (submit FeedbackStorageMode.Legacy (Guid.NewGuid().ToString("D"))).IsError |> shouldEqual (Nullable true)
+        legacy.ListFeedback("alice",None,None,None,None,10).Length |> shouldEqual 0
+        (submit FeedbackStorageMode.Legacy "").IsError |> shouldEqual (Nullable false)
+        legacy.ListFeedback("alice",None,None,None,None,10).Length |> shouldEqual 1
+        (JarvisMcpTools.ListFeedback("","","","",50,diagnostics,FeedbackStorageMode.Durable missing,alice) |> awaitFeedback).IsError
+        |> shouldEqual (Nullable true)
+    )

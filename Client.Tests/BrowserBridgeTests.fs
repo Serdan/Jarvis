@@ -839,6 +839,13 @@ let closeAfterExecutionReclaimsTabEvenWhenSubmissionIsUncertain (scriptStatus: s
 [<TestCase("matchingBubble", true, false)>]
 [<TestCase("matchingBubble", false, false)>]
 [<TestCase("matchingLegacy", true, false)>]
+[<TestCase("matchingBubbleHyphen", true, false)>]
+[<TestCase("matchingLegacyHyphen", true, false)>]
+[<TestCase("matchingBubbleTrailingSlash", true, false)>]
+[<TestCase("emptyMiddleSegment", true, true)>]
+[<TestCase("emptyFirstSegment", true, true)>]
+[<TestCase("emptyLastSegment", true, true)>]
+[<TestCase("differentHyphenatedProject", true, true)>]
 [<TestCase("mismatchedBubbleEvidence", true, true)>]
 [<TestCase("mismatchedLegacyEvidence", true, true)>]
 [<TestCase("genericRoute", true, true)>]
@@ -863,17 +870,27 @@ let closeAfterExecutionReclaimsTabEvenWhenSubmissionIsUncertain (scriptStatus: s
 [<TestCase("submitted", false, false)>]
 let projectRouteAcknowledgementRetainsOnlyBoundUnknown
     (scenario: string, closeAfterExecution: bool, shouldClose: bool) = task {
-    let projectUrl = "https://chatgpt.com/g/g-p-abc123/project"
+    let projectUrl =
+        match scenario with
+        | "matchingBubbleHyphen" -> "https://chatgpt.com/g/g-p-abc123-jarvisagents/project"
+        | "matchingLegacyHyphen" | "matchingBubbleTrailingSlash" | "differentHyphenatedProject" -> "https://chatgpt.com/g/g-p-abc123-jarvis-agents/project"
+        | "emptyMiddleSegment" -> "https://chatgpt.com/g/g-p-abc123--agents/project"
+        | "emptyFirstSegment" -> "https://chatgpt.com/g/g-p--abc123/project"
+        | "emptyLastSegment" -> "https://chatgpt.com/g/g-p-abc123-/project"
+        | _ -> "https://chatgpt.com/g/g-p-abc123/project"
     let conversationUrl = "https://chatgpt.com/g/g-p-abc123/c/00000000-0000-0000-0000-000000000001"
     let url =
         match scenario with
         | "home" -> "https://chatgpt.com/"
         | "wrongOrigin" -> "https://other.example/g/g-p-abc123/project"
+        | "matchingLegacyHyphen" -> projectUrl + "/"
         | _ -> projectUrl
     let args =
         match scenario with
         | "differentArgumentProject" -> """{"prompt":"Go","startUrl":"https://chatgpt.com/g/g-p-other/project"}"""
         | "missingArgumentProject" -> """{"prompt":"Go"}"""
+        | "differentHyphenatedProject" -> JsonSerializer.Serialize({| prompt = "Go"; startUrl = "https://chatgpt.com/g/g-p-abc123-jarvis-other/project" |})
+        | "matchingBubbleTrailingSlash" -> JsonSerializer.Serialize({| prompt = "Go"; startUrl = projectUrl + "/" |})
         | _ -> JsonSerializer.Serialize({| prompt = "Go"; startUrl = projectUrl |})
     let stage =
         if scenario = "wrongStage" then "acknowledgement"
@@ -896,7 +913,7 @@ let projectRouteAcknowledgementRetainsOnlyBoundUnknown
         fields["reason"] <- box reason
         match scenario with
         | "genericRoute" | "genericEvidence" -> ()
-        | "matchingLegacy" | "mismatchedLegacyEvidence" -> fields["projectRouteAcknowledgement"] <- box "matchingLegacyUserTurn"
+        | "matchingLegacy" | "matchingLegacyHyphen" | "mismatchedLegacyEvidence" -> fields["projectRouteAcknowledgement"] <- box "matchingLegacyUserTurn"
         | "malformedMarker" -> fields["projectRouteAcknowledgement"] <- box true
         | "unrecognizedMarker" -> fields["projectRouteAcknowledgement"] <- box "other"
         | _ -> fields["projectRouteAcknowledgement"] <- box "matchingUserBubble"
@@ -906,7 +923,7 @@ let projectRouteAcknowledgementRetainsOnlyBoundUnknown
         | _ -> fields["conversationUrl"] <- null
         if scenario <> "genericRoute" then
             let turn =
-                if scenario = "matchingLegacy" || scenario = "mismatchedBubbleEvidence" then "matchingLegacyUserTurn"
+                if scenario = "matchingLegacy" || scenario = "matchingLegacyHyphen" || scenario = "mismatchedBubbleEvidence" then "matchingLegacyUserTurn"
                 else "matchingUserBubble"
             match scenario with
             | "missingNewUserTurn" -> fields["evidence"] <- box [| turn |]
@@ -965,7 +982,7 @@ let projectRouteAcknowledgementRetainsOnlyBoundUnknown
         Assert.That(id, Is.EqualTo("project-created"))
         Assert.That(detail, Does.Contain("OutcomeUnknown:" + stage + ":" + reason))
         Assert.That(detail, Does.Contain("elapsedSinceSendMs=8000"))
-        let shouldRetainAcknowledged = closeAfterExecution && (scenario = "matchingBubble" || scenario = "matchingLegacy")
+        let shouldRetainAcknowledged = closeAfterExecution && not shouldClose
         if shouldClose then Assert.That(detail, Does.Contain("cleanup=closed"))
         elif shouldRetainAcknowledged then Assert.That(detail, Does.Contain("cleanup=retained"))
         else Assert.That(detail, Does.Not.Contain("cleanup="))

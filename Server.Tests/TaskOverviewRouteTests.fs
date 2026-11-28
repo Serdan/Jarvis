@@ -8,6 +8,7 @@ open Microsoft.AspNetCore.Http
 open Microsoft.AspNetCore.SignalR
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Logging.Abstractions
+open Microsoft.Extensions.Options
 open NUnit.Framework
 open Common
 open Common.SignalR
@@ -99,7 +100,13 @@ type TaskOverviewRouteTests() =
             services.AddLogging() |> ignore
             services.AddSingleton<UserService>(users) |> ignore
             services.AddSingleton<OptionalFeedbackStore>(feedbackStore) |> ignore
-            let provider = services.BuildServiceProvider()
+            services.AddSingleton<IOptions<JarvisOptions>>(
+                Options.Create(
+                    { Auth0Domain = "auth.example.test"
+                      Audience = "https://jarvis.example.test"
+                      OpenAIAppsChallenge = ""
+                      EnableOperatorConversations = false })) |> ignore
+            use provider = services.BuildServiceProvider()
 
             let context = DefaultHttpContext()
             context.RequestServices <- provider

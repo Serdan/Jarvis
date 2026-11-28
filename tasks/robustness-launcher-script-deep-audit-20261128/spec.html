@@ -1,0 +1,33 @@
+<article>
+<h2>Objective</h2>
+<p>Perform a deep, independent audit of the project-owned ChatGPT launcher <code>browser-scripts/chatgpt/launchAgent.js</code> and the end-to-end paths that invoke it. The Operator explicitly reports that a previous session started using the ChatGPT home URL (<code>https://chatgpt.com/</code>) instead of the canonical Jarvis project URL, causing cleanup and loss of project context. Determine why this can happen, whether callers consistently pass the project URL, and whether the launcher correctly preserves it through navigation and route capture.</p>
+<h2>Canonical launch target</h2>
+<p>For all real Jarvis agent launches use exactly <code>https://chatgpt.com/g/g-p-6b049ba947008191a1301e8e2afd527e/project</code>. Do not substitute <code>https://chatgpt.com/</code>, <code>https://chatgpt.com/g/...</code> without <code>/project</code>, another host, or a remembered alternate. The script's default home URL may remain useful for generic/manual cases, but assess whether its default is unsafe for Jarvis agent launches and whether every canonical caller supplies <code>startUrl</code> explicitly.</p>
+<h2>Scope of audit</h2>
+<ul>
+<li>Read the entire launcher source, related tests/fixtures, browser bridge invocation and routing code, project launch template, scheduled/manual launch callers, and relevant documentation.</li>
+<li>Trace the exact argument path from Interpreter/Lead/worker launch to <code>browser_run_in_new_tab</code>, extension script execution, ChatGPT navigation, prompt submission, server-issued conversation route capture, and tab cleanup.</li>
+<li>Audit URL parsing/allowlisting, path canonicalization, redirect/navigation handling, project-specific composer detection, Chat/Work and model/effort selection, selector uniqueness/visibility, hydration and timing budgets, pre-send fallback, one-shot send semantics, uncertain outcomes, route acknowledgement, privacy of diagnostics, and cleanup safety.</li>
+<li>Inspect existing automated tests and identify missing negative-space, regression, race, timeout, provider-DOM-change, and URL-routing cases. Run bounded existing Node/DOM tests and any focused tests that can run safely; report exact commands and terminal results.</li>
+<li>Use the already registered browser window whose alias is <code>sandbox</code> and registration is <code>121967020c7f1a1bc856bd45a98b7b38</code> for live DOM inspection and browser tests. Opening background test tabs there and submitting innocuous test prompts is explicitly authorized. If submitting a prompt, use only <code>hi</code> (or similarly harmless text), a fresh disposable test conversation, and a registered unassigned test recipient after verifying it has no active assignment. Never send test prompts into an active worker/reviewer conversation.</li>
+<li>Do not create a browser window. Do not use, close, reauthorize, unregister, or otherwise alter the <code>agents</code> or <code>agents2</code> registrations. Use only <code>sandbox</code>. If sandbox is unavailable, stop live testing and report the blocker rather than opening another window.</li>
+<li>Do not use the wrong home URL for an operational agent launch. A DOM-only or non-submitting control test may compare route behavior if safe; do not submit prompts to the generic ChatGPT home.</li>
+</ul>
+<h2>Boundaries</h2>
+<ul>
+<li>This is an audit, not an implementation task. Do not edit source, tests, docs, launch templates, browser registrations, or project configuration; do not commit, publish, merge, deploy, restart, or change account/auth settings.</li>
+<li>Do not send real task prompts or secrets. Do not target any active agent session. Do not retry an uncertain browser send or route effect.</li>
+<li>Preserve the current source and all existing sessions. Any test tab created must be a Jarvis-created background tab and closed after execution. Never close a manually opened tab or browser window.</li>
+<li>Use canonical Jarvis task/checkpoint state for findings. Do not create follow-up implementation tasks yourself; recommend precise bounded corrections for Lead to prioritize.</li>
+</ul>
+<h2>Deliverable</h2>
+<p>Produce a concise but technically deep audit report in canonical task checkpoint/evidence, including:</p>
+<ol>
+<li>Executive assessment: whether the launcher and its callers reliably preserve the canonical Jarvis project URL.</li>
+<li>End-to-end launch sequence and exact call sites, identifying any caller that omits or overrides <code>startUrl</code>, uses the root URL, or constructs an incorrect GPT/project route.</li>
+<li>Findings ranked by severity, each with file/line references, evidence, reproducible scenario, actual versus expected behavior, confidence, and a narrowly scoped recommendation.</li>
+<li>Test inventory: commands, fixtures, browser window used, exact URL used, harmless prompt used (if any), observed DOM/route/cleanup result, and terminal status. Distinguish source inspection, mocked DOM tests, and live browser qualification.</li>
+<li>Explicit limitations and anything not tested. No unsupported claim of reliability or successful route capture.</li>
+</ol>
+<p>Completion requires the report and a canonical completion checkpoint. If browser testing is blocked, complete the static/call-site/test audit and checkpoint the live-test blocker with exact evidence.</p>
+</article>

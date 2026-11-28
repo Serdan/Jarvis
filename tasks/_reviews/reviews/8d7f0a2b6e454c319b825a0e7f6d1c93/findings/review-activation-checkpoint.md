@@ -17,6 +17,7 @@ Review request: `8d7f0a2b6e454c319b825a0e7f6d1c93`.
 - Parsed TRX counters: 21 total/executed, 7 passed, 14 failed, zero errors/timeouts/aborts/inconclusive/not-executed.
 - All seven passing cases are the registered legacy-route controls across RegisterAgent, AssignTask, ReissueAssignment, AdoptTaskSpec, ReissueQueuedAttempt, RecoverAgentAssignment and TransferOwner.
 - All fourteen failures are the seven intended legacy subject-as-transport-actor assertions and seven intended explicit initiator/subject wire assertions. No cross-label privacy override failure remains.
+- Captured legacy RED diagnostics show the promoted job and transport actor both labeled `SyntheticSubject`, with post-ingress subject activity timestamps; source `ClientService.SendCommandToUser` records activity against the supplied transport `agentId` before SignalR dispatch.
 
 ## Engineering test job (do not poll while running)
 
@@ -35,6 +36,11 @@ Review request: `8d7f0a2b6e454c319b825a0e7f6d1c93`.
 - The scope note explicitly defers quick/slow/terminal/unknown and concurrent AsyncLocal isolation to full qualification, without claiming broad task completion. These remain unqualified original-task obligations.
 - The referenced Lead challenge `d498f96d71d34f34963b983cf0dd5129` could not be independently read by Reviewer 9 (canonical access denied to non-issuer/non-owner); the cited sequence 20566 is not a checkpoint on this task. The source's claimed adjudication provenance is therefore supported here by the frozen scope note and prior review record, not by direct challenge inspection.
 
+## Lifecycle reconciliation
+
+- A `yield_agent` request for pseudo-task `_reviews` was attempted with operation ID `912e9c3e-af23-4b41-9b70-b5a87f8608e1`; its initial result was `RemoteUnavailable` and did not establish success.
+- Canonical `get_operation_status` for that exact ID returned pending read job `e8ec83e4c5994e3a853b27b55abdb582`; one `get_job_result` read reported `Running`. Do not retry the original yield request. Reconcile this exact status-read handle and original operation ID before any new lifecycle action.
+
 ## Continuation
 
-Once the engineering job is terminal, retrieve its result once and compare it with the independently verified prior TRX. If it matches and static review remains clean, write the final review summary and submit the verdict for this exact SHA. If it differs, inspect the terminal evidence and record any reproducible issue before deciding.
+First reconcile yield operation `912e9c3e-af23-4b41-9b70-b5a87f8608e1` using the existing status-read handle; do not assume yield succeeded. Then, when engineering job `b6bbc19564204ab9931551688ecb5e11` is terminal, retrieve its result once and compare it with the independently verified prior TRX. If the run matches and the review claim remains active, record the final review summary and decide Accepted or ChangesRequested for exact head `7035fe2bc2463c6a8d754a83964166a9a88386c5`. Keep quick/slow/terminal/unknown and concurrent AsyncLocal isolation explicitly unqualified; do not edit source, merge, or authorize Stage B.

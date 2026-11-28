@@ -3709,7 +3709,7 @@ type ReviewWorkflowTests() =
                 if File.Exists reviewerConfigPath then File.Delete reviewerConfigPath)
 
     [<Test>]
-    member _.RoleOnlyReviewerTasklessLifecycleYieldsWithoutTaskAndHoldsReviewAuthority() =
+    member _.RoleOnlyReviewerTasklessLifecycleYieldsWithoutTaskAndAllowsIndependentClaim() =
         withFixture (fun one _ first second baseOid sourceRef _ initTask ->
             Client.RoleInstructions.RoleInstructions.createRole first "AuthenticatedUser" (Guid.NewGuid())
                 "Auditor" "Independent code review" "Review changes and document findings."
@@ -3776,10 +3776,12 @@ type ReviewWorkflowTests() =
             ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
                 reviewId sourceRef baseOid "Review source changes" "Independent audit" ""
             |> success |> ignore
-            expectStale (ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId reviewId
-                            "Reviewer" 1)
-            let pending = ReviewWorkflow.getBranchReview first taskId reviewId |> success
-            Assert.That(pending.Review.Status, Is.EqualTo("Unclaimed"))
+            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId reviewId
+                "Reviewer" 1 |> success |> ignore
+            let claimed = ReviewWorkflow.getBranchReview first taskId reviewId |> success
+            Assert.That(claimed.Review.Status, Is.EqualTo("Claimed"))
+            Assert.That(claimed.Review.ReviewerId, Is.EqualTo("Reviewer"))
+            Assert.That(claimed.Review.Version, Is.EqualTo(2))
             Assert.That((ReviewWorkflow.getAgentInbox first "Reviewer" |> success).Agent.State,
                         Is.EqualTo("Working"))
 

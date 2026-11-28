@@ -1,0 +1,20 @@
+<article>
+<h1>Independent adjudication — W11 headless-auth review findings</h1>
+<p><strong>Purpose:</strong> Independently adjudicate the two findings in Reviewer 9's immutable review of W11. This is a bounded technical adjudication, not source implementation, review amendment, integration, or deployment authorization.</p>
+<h2>Pinned evidence</h2>
+<ul>
+<li>Implementation task: <code>robustness-headless-auth0-device-enrollment-20261128</code>, spec v1 blob <code>8fc7e213f0c2473b29a192dacb2c33db295a962a</code>.</li>
+<li>Frozen reviewed source: <code>1c08d1b16816286ef55ba9b802806305f8a6fa35</code>, base <code>89d9e38531869ca6f4fa4e514f9d2f4ed13e51a1</code>.</li>
+<li>Review: <code>0b592b4a1b7e4f378cb311ad37d9025b</code>, Reviewer 9, v4, ChangesRequested, decision sequence 21654.</li>
+<li>Read the review summary and both exact finding documents before deciding. Preserve the review verdict and frozen snapshot unchanged.</li>
+</ul>
+<h2>Finding A — P1 Auth0 prerequisite evidence</h2>
+<p>The review reports that the existing application's Authorization Code, Device Code, and Refresh Token grants were observed enabled, but the <code>offline_access</code> setting and token endpoint authentication method were not verified. These matter because enrollment requests <code>offline_access</code>, requires a refresh token, and the existing public client must be able to call the token endpoint without a client secret.</p>
+<p>Adjudicate whether this is a valid gap against the original task's explicit read-only Auth0 prerequisite verification requirement. Assess whether the exact evidence can be obtained within existing authority. No Auth0 setting may be changed. If read-only evidence is unavailable without an Operator-reserved credential/trust decision, define the narrow readiness hold and the exact evidence needed; do not invent an additional approval requirement or silently assume the settings.</p>
+<h2>Finding B — P2 browser-flow regression coverage</h2>
+<p>The candidate refactors shared login/refresh behavior, but the new browser test checks only the generated authorization URI; the review found no end-to-end fake-endpoint test for the default browser callback, authorization-code exchange, and refresh-token persistence/fallback path. The original task explicitly requires preserving and testing the old browser flow.</p>
+<p>Adjudicate validity and proportionality against that pinned scope. If accepted/narrowed, authorize only a bounded isolated fake-endpoint/injected-seam regression test; no live Auth0 credentials.</p>
+<h2>Required adjudication record</h2>
+<p>For each finding independently record Accept, Narrow, Defer, or Reject; demonstrated validity and assumptions; original pinned scope and threat relevance; impact and conditions; proportionality/cost; simpler existing alternatives; and the exact authorized correction or reason for no change. Distinguish the defect from the reviewer's proposed remedy.</p>
+<p>Inspect the exact frozen source and tests as needed. Do not edit source, run implementation tests, change the original review, create another review request, or authorize integration/deployment. A previous adjudication of a separate unattended-startup finding is not a disposition of these two findings. Return a durable adjudication checkpoint and leave implementation to the original owner after Lead records the resulting authorized scope.</p>
+</article>

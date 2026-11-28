@@ -1,0 +1,28 @@
+<article>
+<h1>P0 — Fix project-launch acknowledgement when route and new user turn appear atomically</h1>
+<p>Operator-approved continuation after repeated live Jarvis agent launch failures on 2026-11-28. The registered browser launcher sent prompts and observed the exact newly rendered user bubble, but returned <code>OutcomeUnknown:conversationRoute:ConversationUrlUnavailable</code>. The failure is reproducible in the maintained <code>browser-scripts/chatgpt/launchAgent.js</code> project path: the project acknowledgement loop requires a durable scoped route to be observed on one sample without the matching turn, then the same route on a later sample with the matching turn. This rejects a legitimate SPA transition where the project conversation URL and the matching new user bubble become visible together.</p>
+<p>Observed current UI shape (read-only, no send): initial project composer URL is <code>/g/g-p-6b049ba947008191a1301e8e2afd527e/project</code>; rendered project conversation links use <code>/g/g-p-6b049ba947008191a1301e8e2afd527e/c/{uuid}</code>. The existing <code>projectPrefix</code> already resolves to the correct <code>/g/{project-id}</code> prefix. Existing script checks the empty project start surface and records initial bubbles before Send. Do not treat this as a wrong-prefix defect.</p>
+<h2>Required behavior</h2>
+<ul>
+<li>Keep the single Send attempt and all current pre-send safety, model selection, prompt matching, timeout, and unknown-outcome behavior.</li>
+<li>For a project launch, accept a causal acknowledgement when (a) the start URL is the exact project home route, (b) the pre-send surface has no existing user turns, (c) a newly rendered user bubble/turn exactly matches the submitted normalized prompt, and (d) the current URL is a server-issued UUID conversation route scoped to the same project and differs from the initial project-home URL. This must succeed even if route and matching turn appear in the same first post-Send observation.</li>
+<li>Retain the existing two-sample same-route path where the route appears before the matching turn. Do not use project sidebar links, stale route markers, arbitrary DOM text, guessed URLs, local temporary IDs, or route IDs from another project.</li>
+<li>Keep failure behavior fail-closed: no exact matching new turn, no durable UUID route, wrong project, malformed/local route, stale pre-existing conversation, or prompt mismatch must remain unconfirmed/unknown as appropriate. Never retry Send or manufacture a conversation URL.</li>
+<li>Preserve the Operator-approved acknowledged-project-route-unknown tab-retention behavior; successful closes and unrelated generic unknown reclamation remain unchanged.</li>
+</ul>
+<h2>Regression-first tests</h2>
+<p>Extend the existing launcher Node fixture suite at <code>browser-extension/tests/chatgpt-launcher.test.cjs</code> using deterministic DOM/route transitions. At minimum cover:</p>
+<ol>
+<li>Atomic first observation: exact project UUID route and exact newly rendered prompt bubble appear together — submitted with that route.</li>
+<li>Two-sample route-first transition remains accepted.</li>
+<li>Route appears with wrong/mismatched prompt — never submitted.</li>
+<li>Matching prompt without a durable route — remains outcome unknown with null URL and no retry.</li>
+<li>Malformed UUID, temporary local-chatgpt route, wrong-project route, and pre-existing conversation remain rejected.</li>
+<li>Unrelated sidebar links and stale route markers cannot establish a route.</li>
+<li>Exactly one Send attempt in every case; no replay after any post-Send uncertainty.</li>
+<li>Retention/cleanup behavior remains unchanged for acknowledged route-unknown, successful close, and unrelated generic unknown.</li>
+</ol>
+<p>Run focused Node tests and relevant BrowserBridge Release tests only if the bridge contract changed. Record exact source SHA, command, exit, full counters, and artifact hashes. Obtain a fresh independent review of the exact candidate before integration. Integrator remains the sole serial composition/publication owner. No deployment, client restart, Scheduler activation, live agent message, or replay of any uncertain previous send is authorized by this task.</p>
+<h2>Evidence and no-replay boundary</h2>
+<p>Read-only observation of the registered project page confirmed the project route shape and a rendered composer. Prior browser launch operations returned <code>ConversationUrlUnavailable</code> after the matching-turn acknowledgement path; these are uncertain sends and must not be replayed. Reconcile canonical agent state before any new launch. Keep the existing P0 notification, reviewer-authority, W7 release and W17 integration work independent; this task repairs the shared launch path but does not authorize restarting those sessions until the launcher correction is reviewed and integrated.</p>
+</article>

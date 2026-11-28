@@ -1710,6 +1710,17 @@ test("project route binding: delayed route with only the earlier matching turn i
   assert.equal(result.timing.elapsedSinceSendMs, result.timing.budgetAtSendMs);
 });
 
+test("project route binding: delayed route with only the earlier matching legacy turn is unbound", async () => {
+  const { result } = await runProjectRoute([
+    { afterMs: 75, legacy: projectPrompt },
+    { afterMs: 300, href: projectRouteA }
+  ], { noLegacyTurnMarkers: false });
+  assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
+  assert.equal(result.reason, "ConversationUrlUnavailable");
+  assert.equal(result.conversationUrl, null);
+  assert.equal(result.projectRouteAcknowledgement, "matchingLegacyUserTurn");
+});
+
 for (const [label, href] of [
   ["temporary", "https://chatgpt.com/g/g-p-abc123/c/local-chatgpt%3Atemp"],
   ["malformed", "https://chatgpt.com/g/g-p-abc123/c/000000000000000000000000000000000000"],
@@ -1778,12 +1789,12 @@ for (const [marker, evidence, extra] of [
     assert.equal(h.pendingProjectEventCount, 0);
   });
 
-  test(`project route binding: ${marker} simultaneous route and matching turn are unbound`, async () => {
-    const { result } = await runProjectRoute([{ afterMs: 75, href: projectRouteA, [marker]: projectPrompt }], extra);
-    assert.equal(result.status, "outcomeUnknown", JSON.stringify(result));
-    assert.equal(result.reason, "ConversationUrlUnavailable");
-    assert.equal(result.conversationUrl, null);
-    assert.equal(result.projectRouteAcknowledgement, evidence);
+  test(`project route binding: ${marker} simultaneous route and matching turn are accepted atomically`, async () => {
+    const { h, result } = await runProjectRoute([{ afterMs: 75, href: projectRouteA, [marker]: projectPrompt }], extra);
+    assert.equal(result.status, "submitted", JSON.stringify(result));
+    assert.equal(result.conversationUrl, projectRouteA);
+    assert.deepEqual(Array.from(result.evidence), ["newUserTurn", evidence, "conversationRoute"]);
+    assert.equal(h.pendingProjectEventCount, 0);
   });
 }
 

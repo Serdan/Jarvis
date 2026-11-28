@@ -833,17 +833,17 @@ async function executeLaunch(args, observeSelection) {
   });
 
   if (projectStart) {
-    // A matching rendered turn acknowledges Send independently of route binding.
-    // The SPA may change its URL before replacing the previous route's DOM.
-    // Require an observed scoped durable route without the matching turn, then
-    // a matching turn on that same route. Co-observation at a route transition,
-    // persistent text, and a change of marker alone do not establish freshness.
+    // A project launch is acknowledged by either an atomic route+turn
+    // observation from the empty project home, or a route-first transition
+    // followed by the matching turn on that same route. A turn observed before
+    // navigation, a route change from another conversation, and a foreign
+    // origin break the causal chain.
     let projectRouteAcknowledgement = null;
     let previousSample = null;
     const bound = await until(() => {
       const current = currentPage();
       if (!current) {
-        previousSample = null;
+        previousSample = { conversationUrl: null, hasMatchingTurn: false, atProjectHome: false };
         return null;
       }
       const conversationUrl = durableRoute(current);
@@ -853,14 +853,20 @@ async function executeLaunch(args, observeSelection) {
         .slice(initialTurns).some(matchesPrompt);
       const matchingTurn = matchingBubble ? "matchingUserBubble"
         : bubbles.length === 0 && matchingLegacy ? "matchingLegacyUserTurn" : null;
+      const atomicFresh = conversationUrl && conversationUrl !== initialUrl && matchingTurn &&
+        (!previousSample || (previousSample.atProjectHome && !previousSample.hasMatchingTurn));
       const freshOnRoute = conversationUrl && previousSample &&
         previousSample.conversationUrl === conversationUrl && !previousSample.hasMatchingTurn;
       // Track either marker for freshness even when bubble evidence takes
       // precedence for acknowledgement. A marker change is not a new turn.
-      previousSample = { conversationUrl, hasMatchingTurn: matchingBubble || matchingLegacy };
+      previousSample = {
+        conversationUrl,
+        hasMatchingTurn: matchingBubble || matchingLegacy,
+        atProjectHome: atStart()
+      };
       if (!matchingTurn) return null;
       projectRouteAcknowledgement = matchingTurn;
-      return freshOnRoute ? { conversationUrl, matchingTurn } : null;
+      return atomicFresh || freshOnRoute ? { conversationUrl, matchingTurn } : null;
     });
     if (bound) return submitted(bound.conversationUrl,
       ["newUserTurn", bound.matchingTurn, "conversationRoute"]);

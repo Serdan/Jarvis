@@ -90,7 +90,7 @@ let private send binding id source message =
 let private delivery binding result =
     result |> ok |> ReviewWorkflow.notificationDelivery binding |> ok
 
-let private assertUnchanged binding before =
+let private assertUnchanged binding (before: string) =
     Assert.That((snapshot binding).Commit, Is.EqualTo(before))
 
 [<TestFixture; NonParallelizable>]
@@ -178,7 +178,7 @@ type LegacyControls() =
             Assert.That(alerts.Pending.Head.AlertId, Is.EqualTo(alertId.ToString("N")))
             Assert.That(alerts.Pending.Head.Message, Does.StartWith("STOP"))
             Assert.That((ReviewWorkflow.getResponseAlerts first "FixtureSender" |> ok).Pending, Is.Empty)
-            Assert.That(ReviewWorkflow.takeResponseAlerts second "FixtureRecipient" |> ok, Is.EqualTo(alerts.Pending))
+            Assert.That(ReviewWorkflow.takeResponseAlerts second "FixtureRecipient" |> ok, Is.EqualTo(box alerts.Pending))
             Assert.That(ReviewWorkflow.takeResponseAlerts first "FixtureRecipient" |> ok, Is.Empty)
             setMute false ""
             let after = (snapshot second).Commit

@@ -74,6 +74,7 @@
         <Compile Include="PerformanceRegression.fs"/>
         <Compile Include="ReviewWorkflowTests.fs"/>
         <Compile Include="TaskOverviewBatchPerformanceTests.fs"/>
+        <Compile Include="TaskOverviewMixedVersionTests.fs"/>
         <Compile Include="ChallengeWorkflowTests.fs"/>
         <Compile Include="ChallengeStateMachinePropertyTests.fs"/>
         <Compile Include="WorkQueueCanonicalSourceEvidenceTests.fs"/>

@@ -87,9 +87,7 @@ let register (tui: ConsoleTui) (connection: HubConnection) deviceId (machineName
               DeviceName = machineName()
               ProtocolVersion = AgentProtocol.version
               ClientVersion = clientVersion
-              SupportedCommands =
-                AgentProtocol.commandDefinitions
-                |> List.map (fun definition -> definition.Name) }
+              SupportedCommands = AgentProtocol.supportedCommands }
 
         let! result = connection.invokeResultAsync<ClientRegistrationResult>("Connect", registration)
 

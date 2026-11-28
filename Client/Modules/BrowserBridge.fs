@@ -943,11 +943,56 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
                                     | _ -> ""
                                 let detail = "OutcomeUnknown:" + stage + ":" + reason +
                                              (if timing = "" then "" else ";" + timing)
-                                // Disposal is independent of send certainty. A matching
-                                // user turn with no durable conversation URL is still a
-                                // terminal outcome for this owned tab; closing it does not
-                                // authorize replay of the uncertain send.
-                                if closeAfterExecution then
+                                // Retain only the exact, bounded project-route acknowledgement:
+                                // a newly rendered user turn, no conversation URL, and a
+                                // recognized marker tied to the caller's project entry.
+                                let acknowledgedProjectRouteUnknown =
+                                    let acknowledgementMarker =
+                                        match payload.TryGetProperty("projectRouteAcknowledgement") with
+                                        | true, marker when marker.ValueKind = JsonValueKind.String ->
+                                            match marker.GetString() with
+                                            | "matchingUserBubble" -> Some "matchingUserBubble"
+                                            | "matchingLegacyUserTurn" -> Some "matchingLegacyUserTurn"
+                                            | _ -> None
+                                        | _ -> None
+                                    let conversationUrlIsNull =
+                                        match payload.TryGetProperty("conversationUrl") with
+                                        | true, value -> value.ValueKind = JsonValueKind.Null
+                                        | _ -> false
+                                    let hasRequiredEvidence =
+                                        match payload.TryGetProperty("evidence") with
+                                        | true, evidence when evidence.ValueKind = JsonValueKind.Array &&
+                                                             evidence.GetArrayLength() <= 8 ->
+                                            let containsMarker expected =
+                                                evidence.EnumerateArray()
+                                                |> Seq.exists (fun marker ->
+                                                    marker.ValueKind = JsonValueKind.String &&
+                                                    marker.GetString() = expected)
+                                            containsMarker "newUserTurn" &&
+                                            (acknowledgementMarker |> Option.exists containsMarker)
+                                        | _ -> false
+                                    let projectEntryPath (raw: string) =
+                                        match Uri.TryCreate(raw, UriKind.Absolute) with
+                                        | true, entry when entry.Scheme = Uri.UriSchemeHttps &&
+                                                           entry.Host = "chatgpt.com" && entry.IsDefaultPort &&
+                                                           entry.UserInfo = "" && entry.Query = "" && entry.Fragment = "" &&
+                                                           Text.RegularExpressions.Regex.IsMatch(entry.AbsolutePath, @"^/g/g-p-[a-z0-9]+/project/?\z") ->
+                                            Some(entry.AbsolutePath.TrimEnd('/'))
+                                        | _ -> None
+                                    if stage <> "conversationRoute" || reason <> "ConversationUrlUnavailable" ||
+                                       acknowledgementMarker.IsNone || not conversationUrlIsNull || not hasRequiredEvidence then false
+                                    else
+                                        match projectEntryPath url with
+                                        | None -> false
+                                        | Some boundPath ->
+                                            use args = JsonDocument.Parse(argsJson)
+                                            match args.RootElement.TryGetProperty("startUrl") with
+                                            | true, start when start.ValueKind = JsonValueKind.String ->
+                                                projectEntryPath (start.GetString()) = Some boundPath
+                                            | _ -> false
+                                if closeAfterExecution && acknowledgedProjectRouteUnknown then
+                                    return Error(registrationId, detail + ";cleanup=retained")
+                                elif closeAfterExecution then
                                     match! closeDefinitive() with
                                     | Ok cleanup -> return Error(registrationId, detail + ";cleanup=" + cleanup)
                                     | Error failure -> return Error(registrationId, detail + ";" + failure)

@@ -834,25 +834,34 @@ let closeAfterExecutionReclaimsTabEvenWhenSubmissionIsUncertain (scriptStatus: s
             tabs.Contains("personal-tab") && not (tabs.Contains("cleanup-all-created"))))
 }
 
-// Send certainty and tab disposal are independent: every terminal outcome closes
-// the exact owned tab when requested, including a matching turn without a URL.
-[<TestCase("matchingBubble", true, true)>]
+// Only a bounded, acknowledged project-route unknown overrides close-after-execution.
+// Generic unknowns still close, and disabling close-after-execution retains every tab.
+[<TestCase("matchingBubble", true, false)>]
 [<TestCase("matchingBubble", false, false)>]
-[<TestCase("matchingLegacy", true, true)>]
+[<TestCase("matchingLegacy", true, false)>]
+[<TestCase("mismatchedBubbleEvidence", true, true)>]
+[<TestCase("mismatchedLegacyEvidence", true, true)>]
 [<TestCase("genericRoute", true, true)>]
+[<TestCase("genericRoute", false, false)>]
 [<TestCase("genericEvidence", true, true)>]
 [<TestCase("malformedMarker", true, true)>]
 [<TestCase("unrecognizedMarker", true, true)>]
 [<TestCase("missingUrl", true, true)>]
 [<TestCase("nonNullUrl", true, true)>]
+[<TestCase("missingNewUserTurn", true, true)>]
+[<TestCase("malformedEvidence", true, true)>]
+[<TestCase("oversizedEvidence", true, true)>]
 [<TestCase("wrongStage", true, true)>]
 [<TestCase("wrongReason", true, true)>]
+[<TestCase("sendClickUncertain", true, true)>]
+[<TestCase("unexpectedUiErrorAfterSend", true, true)>]
 [<TestCase("home", true, true)>]
 [<TestCase("wrongOrigin", true, true)>]
 [<TestCase("differentArgumentProject", true, true)>]
 [<TestCase("missingArgumentProject", true, true)>]
 [<TestCase("submitted", true, true)>]
-let closeAfterExecutionDisposesEveryOwnedUncertainTab
+[<TestCase("submitted", false, false)>]
+let projectRouteAcknowledgementRetainsOnlyBoundUnknown
     (scenario: string, closeAfterExecution: bool, shouldClose: bool) = task {
     let projectUrl = "https://chatgpt.com/g/g-p-abc123/project"
     let conversationUrl = "https://chatgpt.com/g/g-p-abc123/c/00000000-0000-0000-0000-000000000001"
@@ -866,8 +875,16 @@ let closeAfterExecutionDisposesEveryOwnedUncertainTab
         | "differentArgumentProject" -> """{"prompt":"Go","startUrl":"https://chatgpt.com/g/g-p-other/project"}"""
         | "missingArgumentProject" -> """{"prompt":"Go"}"""
         | _ -> JsonSerializer.Serialize({| prompt = "Go"; startUrl = projectUrl |})
-    let stage = if scenario = "wrongStage" then "acknowledgement" else "conversationRoute"
-    let reason = if scenario = "wrongReason" then "SubmissionUnconfirmed" else "ConversationUrlUnavailable"
+    let stage =
+        if scenario = "wrongStage" then "acknowledgement"
+        elif scenario = "sendClickUncertain" then "sendClick"
+        elif scenario = "unexpectedUiErrorAfterSend" then "acknowledgement"
+        else "conversationRoute"
+    let reason =
+        if scenario = "wrongReason" then "SubmissionUnconfirmed"
+        elif scenario = "sendClickUncertain" then "SendClickUncertain"
+        elif scenario = "unexpectedUiErrorAfterSend" then "UnexpectedUiErrorAfterSend"
+        else "ConversationUrlUnavailable"
     let fields = Collections.Generic.Dictionary<string, obj>()
     if scenario = "submitted" then
         fields["status"] <- box "submitted"
@@ -879,7 +896,7 @@ let closeAfterExecutionDisposesEveryOwnedUncertainTab
         fields["reason"] <- box reason
         match scenario with
         | "genericRoute" | "genericEvidence" -> ()
-        | "matchingLegacy" -> fields["projectRouteAcknowledgement"] <- box "matchingLegacyUserTurn"
+        | "matchingLegacy" | "mismatchedLegacyEvidence" -> fields["projectRouteAcknowledgement"] <- box "matchingLegacyUserTurn"
         | "malformedMarker" -> fields["projectRouteAcknowledgement"] <- box true
         | "unrecognizedMarker" -> fields["projectRouteAcknowledgement"] <- box "other"
         | _ -> fields["projectRouteAcknowledgement"] <- box "matchingUserBubble"
@@ -888,8 +905,14 @@ let closeAfterExecutionDisposesEveryOwnedUncertainTab
         | "nonNullUrl" -> fields["conversationUrl"] <- box conversationUrl
         | _ -> fields["conversationUrl"] <- null
         if scenario <> "genericRoute" then
-            let turn = if scenario = "matchingLegacy" then "matchingLegacyUserTurn" else "matchingUserBubble"
-            fields["evidence"] <- box [| "newUserTurn"; turn |]
+            let turn =
+                if scenario = "matchingLegacy" || scenario = "mismatchedBubbleEvidence" then "matchingLegacyUserTurn"
+                else "matchingUserBubble"
+            match scenario with
+            | "missingNewUserTurn" -> fields["evidence"] <- box [| turn |]
+            | "malformedEvidence" -> fields["evidence"] <- box "newUserTurn"
+            | "oversizedEvidence" -> fields["evidence"] <- box (Array.append [| "newUserTurn"; turn |] (Array.create 7 "unrelated"))
+            | _ -> fields["evidence"] <- box [| "newUserTurn"; turn |]
         fields["timing"] <- box {| budgetAtSendMs = 8000; elapsedSinceSendMs = 8000 |}
         fields["observedSelection"] <- box {| mode = (null: string); model = "Latest"; effort = "Medium" |}
     let payload = JsonSerializer.SerializeToElement(fields)
@@ -937,12 +960,14 @@ let closeAfterExecutionDisposesEveryOwnedUncertainTab
     Assert.That(captured.Value.GetRawText(), Is.EqualTo(payload.GetRawText()))
     match result with
     | Ok response when scenario = "submitted" ->
-        Assert.That(response, Does.Contain("\"cleanup\":\"closed\""))
+        Assert.That(response, Does.Contain(if shouldClose then "\"cleanup\":\"closed\"" else "\"cleanup\":\"retained\""))
     | Error (id, detail) ->
         Assert.That(id, Is.EqualTo("project-created"))
         Assert.That(detail, Does.Contain("OutcomeUnknown:" + stage + ":" + reason))
         Assert.That(detail, Does.Contain("elapsedSinceSendMs=8000"))
+        let shouldRetainAcknowledged = closeAfterExecution && (scenario = "matchingBubble" || scenario = "matchingLegacy")
         if shouldClose then Assert.That(detail, Does.Contain("cleanup=closed"))
+        elif shouldRetainAcknowledged then Assert.That(detail, Does.Contain("cleanup=retained"))
         else Assert.That(detail, Does.Not.Contain("cleanup="))
     | _ -> Assert.Fail("Unexpected project launch disposition")
     do! waitUntil (fun () ->

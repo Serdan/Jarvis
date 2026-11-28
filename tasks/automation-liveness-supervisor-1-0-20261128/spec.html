@@ -1,0 +1,51 @@
+<article>
+<h1>Bounded liveness and safe recovery for active 1.0 orchestration</h1>
+<p><strong>Outcome:</strong> Jarvis 1.0 must not let active work silently stall forever. Add the smallest practical platform-owned liveness supervisor using the existing 1.0 client/server, task, job, review, challenge and pending-intent machinery. This is required now, not deferred wholesale to 2.0.</p>
+<h2>Binding design invariants</h2>
+<ul>
+<li>Every nonterminal item has an accountable owner, concrete next action, wake condition, bounded deadline, and recovery/escalation policy.</li>
+<li>The platform owns liveness, leases, reconciliation, retries, recovery and escalation. Executors execute work; they do not have to diagnose orchestration or invent authorization rules.</li>
+<li>A blocked dependency blocks only dependent work. Independent work continues.</li>
+<li>Real Operator decisions remain real decisions: surface them once with a concise actionable request; never auto-resolve or silently bypass them. Preserve explicit Operator Park.</li>
+<li>This supervisor is independent of Scheduler activation. Scheduler stays OFF; do not enable scheduled dispatch as a side effect.</li>
+<li>No new machine identity or parallel authorization architecture. Use existing authenticated client and canonical state.</li>
+</ul>
+<h2>Phase A — safe pending Task/Review intent recovery (P0)</h2>
+<ul>
+<li>On startup, reconnect and bounded periodic/event wake, reconcile the local pending-intent journal against one verified canonical ledger snapshot.</li>
+<li>For an exact matching Applied receipt, automatically acknowledge/remove the local journal record only after verifying operation UUID, request hash and ledger binding.</li>
+<li>For NotFoundAtVerifiedHead, do not treat absence as proof that a delayed write cannot arrive. Automatic retry is allowed only for a demonstrably idempotent, explicitly allowlisted TaskWrite/ReviewWrite action that can re-enter the current typed writer using the exact saved command, original UUID, exact saved SHA256, matching ledger binding, current verified head and current CAS/version guards.</li>
+<li>Prove same-UUID duplicate/delayed-arrival behavior under concurrent retry and original late publication. The ledger operation receipt and typed writer must ensure at most one logical effect. Never mint a new UUID, rewrite saved command JSON, bypass current CAS, or retry arbitrary Git/external effects.</li>
+<li>Retain explicit operator-only archive/abandon/supersede controls. Do not automatically archive an unresolved intent.</li>
+<li>IdentityMismatch, BindingMismatch, malformed or non-roundtripping commands, stale CAS/entity state, retired/unsupported actions, archive presence, and any non-idempotent/uncertain external effect must stop automatic retry and produce an actionable escalation.</li>
+<li>Bound attempts and backoff durably across restart. Reinspect the current head before each attempt. Do not let repeated transport failures create an infinite hot loop. Expose last attempt, count, next retry and terminal/escalated reason.</li>
+<li>Preserve the current typed retry allowlist unless tests and code audit justify a narrow change. In particular do not retry SubmitIntegration, LedgerWrite, WorkQueue/external effects or retired lifecycle commands.</li>
+</ul>
+<h2>Phase B — active-work liveness supervisor</h2>
+<ul>
+<li>Track active task attempts, agent sessions, engineering job handles, review handoffs and challenge dependencies using canonical state plus durable checkpoints. Do not rely solely on client-local last-seen timestamps.</li>
+<li>Detect stale Ready launches, vanished executors, overdue job polling, lost terminal acknowledgements, unclaimed/abandoned review handoffs and challenge conditions with no active owner/wake.</li>
+<li>For a suspected dead executor, first reconcile active process/job handles, leases and exact canonical assignment. If truly dead, recover the same assignment with a new generation and durable checkpoint, or reassign only under the explicitly approved recovery policy. Never duplicate a live executor or discard its work.</li>
+<li>Persist next-action and wake metadata; use event-driven wake where available and a bounded periodic sweep as repair. Recovery must survive client/server restart.</li>
+<li>Agent-owned challenge conditions and review handoffs should be dispatched/reassigned within the declared authority model. Operator-owned conditions are escalated once and remain blocking only their dependent work.</li>
+<li>Use bounded retry/backoff and terminal dispositions: completed, recovered, escalated, or genuinely blocked with a named dependency. No indefinite unowned Ready/Pending state.</li>
+<li>Expose a compact liveness summary: stale items, owner, age, next action, next wake/deadline, retries, and escalation reason. Avoid UUID-heavy operator-facing text.</li>
+</ul>
+<h2>Implementation boundaries</h2>
+<ul>
+<li>Start with a code/architecture audit and identify the existing process that can host the supervisor. Prefer a small service/module over a new orchestration subsystem.</li>
+<li>Keep safe pending-intent retry and active-work recovery policy explicit and separately testable. Do not couple them to Scheduler ON/OFF or scheduled message dispatch.</li>
+<li>Preserve existing explicit operator permissions for destructive archival and genuine authority decisions; remove only unnecessary human gating from the narrowly proven idempotent retry path.</li>
+<li>Do not modify unrelated auth, Browser Bridge, feedback, worktree-removal, or release code. Coordinate if shared files are unavoidable.</li>
+</ul>
+<h2>Qualification</h2>
+<ul>
+<li>Tests for exact saved command/hash/binding, Applied auto-ack, NotFound safe retry, late original arrival racing a retry, duplicate concurrent retries, same UUID at-most-once effect, stale CAS, IdentityMismatch, BindingMismatch, malformed/retired/unsupported action, archive refusal, bounded backoff and restart recovery.</li>
+<li>Tests proving integration publication and external/non-idempotent effects are never auto-retried.</li>
+<li>Tests for live vs dead executor, active job/lease protection, lost job handle, delayed terminal result, stale Ready launch, ownerless challenge/review wake, Operator-owned challenge escalation, explicit Park preservation, and dependency-local blocking.</li>
+<li>Verify no work is duplicated, no independent work is blocked, and Scheduler remains OFF.</li>
+<li>Run focused Release tests, capture exact terminal evidence, submit an independent review, and integrate through the normal serial publication path. No production policy activation before review and integration.</li>
+</ul>
+<h2>Priority</h2>
+<p>Unblock safe 1.0 recovery of Worker 11's exact saved headless review submission as the first concrete scenario, after the safe retry path is implemented and independently qualified. Do not ad-hoc retry it under the current operator-only tool. Then demonstrate restart-safe recovery on at least one other TaskWrite/ReviewWrite scenario. Report any genuinely required Operator decision separately.</p>
+</article>

@@ -1,0 +1,35 @@
+<article>
+<h1>Automatic worktree retention and disk-pressure reclamation</h1>
+<p><strong>Outcome:</strong> Jarvis reclaims storage from completed engineering worktrees automatically, before disk pressure becomes an operational incident. Cleanup should be a normal consequence of work lifecycle and storage pressure, not a recurring Operator chore.</p>
+<h2>Observed baseline</h2>
+<p>On 2026-11-28 the Jarvis checkout had 972 registered worktrees and only about 6.6 GB free on a 1.8 TB filesystem. An Operator-requested conservative cleanup removed 369 stale worktrees that were clean, integrated, unlocked, old, and contained only reproducible generated files; approximately 68.8 GB was recovered, leaving 603 registered worktrees and about 71–75 GB free. The cleanup retained recent work, unmerged branches, dirty worktrees, locked worktrees, and unique ignored evidence such as TestResults and artifacts.</p>
+<h2>Required behavior</h2>
+<ul>
+<li>Automatically identify completed worktrees after the owning attempt and all engineering jobs are terminal and no active lease or process can use the checkout.</li>
+<li>Reclaim only worktrees that pass the existing canonical removal checks: clean, unlocked, integrated against a freshly resolved target, no unique untracked/ignored evidence, and no active use. Preserve branch refs and committed history; worktree deletion must not delete branches.</li>
+<li>Use the supported Jarvis inspect/remove worktree operations and their concurrency fencing. Never use raw <code>git worktree remove</code> as an automation bypass.</li>
+<li>Correctly classify every operation that can read or mutate a branch-selected checkout. In particular, account for implicit-head SubmitReview/Update and BindAttemptSource paths described by review <code>8e019179058e4a41ba64fd97169f4268</code>; unresolved targets must claim the appropriate project-worktree/unknown resource until resolved. Keep unrelated ledger-only operations non-blocking.</li>
+<li>Make inspection/removal itself non-self-blocking while still excluding unrelated jobs and preventing a race between admission and deletion.</li>
+<li>Preserve unique qualification evidence. If archiving evidence is required, use a durable evidence location and verify it before removing its source worktree; otherwise retain the worktree.</li>
+<li>Use configurable disk-pressure thresholds / retention policy with hysteresis. Propose defaults from measured behavior; do not invent fixed policy silently. Under pressure, reclaim the oldest eligible worktrees first and stop at a healthy free-space target.</li>
+<li>Expose concise results: bytes reclaimed, worktrees removed, and counts/reasons for skipped candidates. Avoid per-worktree Operator approval prompts when the configured policy already authorizes safe reclamation.</li>
+</ul>
+<h2>Safety and scope</h2>
+<ul>
+<li>Never force-remove a dirty, locked, unintegrated, active, or ambiguous worktree.</li>
+<li>Never discard uncommitted changes, unique test artifacts, review evidence, logs, or detached work without an explicit retention/archival rule.</li>
+<li>Never delete branches or commits as part of this task.</li>
+<li>Do not weaken the existing worktree removal guard. The separate P0 task <code>worktree-removal-job-scope-20261126</code> and its ChangesRequested review <code>8e019179058e4a41ba64fd97169f4268</code> contain the relevant checkout-sensitive admission defect; coordinate with that work rather than duplicating its source edits.</li>
+<li>Do not alter Scheduler activation or unrelated automation policy. A cleanup cadence may be event-driven after terminal lifecycle transitions plus a periodic disk-pressure check.</li>
+</ul>
+<h2>Qualification</h2>
+<ul>
+<li>Deterministic tests for active job, pending/uncertain operation, lease, dirty/untracked/ignored evidence, lock, detached/unmerged head, stale target, and checkout-sensitive branch-selected operation.</li>
+<li>Concurrency tests proving that a target checkout cannot be removed while a branch-selected review/task operation is using it, and that a new operation cannot enter after removal reservation.</li>
+<li>Verify ordinary ledger-only coordination is not blocked by unrelated worktrees.</li>
+<li>Verify dry-run candidate selection, disk-pressure hysteresis, oldest-first reclamation, evidence archival/retention, restart recovery, and idempotent retry.</li>
+<li>Run focused Release tests, submit an independent review, and integrate through the normal serial publication path. No production deletion policy activation until qualification and review are complete.</li>
+</ul>
+<h2>Coordination</h2>
+<p>Lead owns policy and sequencing. The implementation must be coordinated with <code>worktree-removal-job-scope-20261126</code>; do not create a parallel competing removal guard. The goal is measurable storage reclaimed with minimal Operator involvement.</p>
+</article>

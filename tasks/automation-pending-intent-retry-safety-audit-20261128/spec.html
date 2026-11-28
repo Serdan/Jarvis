@@ -1,0 +1,15 @@
+<article>
+<h1>Read-only audit: at-most-once safety of automatic pending-intent recovery</h1>
+<p>Support the P0 1.0 liveness supervisor task <code>automation-liveness-supervisor-1-0-20261128</code>. Perform a bounded read-only source and test audit; do not modify files or retry any pending operation.</p>
+<h2>Questions to answer from source</h2>
+<ul>
+<li>Trace the exact current flow: PendingIntentJournal reconciliation/prepareRetry, PendingRecoveryApi.retry, TaskApi.write/ReviewApi.write, LedgerStore.transact/getOperationAt and the Git publication/receipt path.</li>
+<li>Determine whether two concurrent retries with the same original UUID and exact command can produce at most one logical effect. Include a delayed original request arriving concurrently with the automatic retry, and process restart after publication but before local acknowledgement.</li>
+<li>Determine what NotFoundAtVerifiedHead proves and does not prove. Identify the actual concurrency/late-arrival fences, not assumptions.</li>
+<li>Inventory current retry allowlist and current explicit operator confirmation requirements. Identify which actions are demonstrably safe for unattended retry and which must remain escalated. Do not broaden policy.</li>
+<li>Audit tests covering duplicate same-UUID submissions, concurrency, delayed arrival, stale CAS, Applied acknowledgement, binding/identity mismatch, and restart. Identify precise missing tests.</li>
+<li>Use W11's exact saved ReviewWrite Submit operation as a worked example: operation UUID <code>a76ecddc-1bbc-473c-a472-f78199299a13</code>, request <code>0b592b4a1b7e4f378cb311ad37d9025b</code>, SHA256 <code>E39F748BC2BD9F7C2DABB42D6F5FBC05228F8D796B926B374E3C07D7B1D61455</code>, verified ledger head at last inspection <code>d73c9ebf53611ad8827b0e88b964ea322fe9c632</code>, disposition NotFoundAtVerifiedHead and PresentLocally=true. Do not retry it; its existing Operator-owned recovery decision remains pending.</li>
+</ul>
+<h2>Output</h2>
+<p>Record exact file/line references, control-flow explanation, proven guarantees, gaps and a minimal safe recommendation in a durable checkpoint. Clearly distinguish verified source behavior from hypotheses. No implementation, no journal mutation, no ledger writes, no challenge resolution and no Operator approval changes.</p>
+</article>

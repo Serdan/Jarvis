@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"automation-pending-intent-retry-safety-audit-20261128","title":"[P0][1.0] Audit same-UUID pending-intent retry and late-arrival safety","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"automation-pending-intent-retry-safety-audit-20261128","title":"[P0][1.0] Audit same-UUID pending-intent retry and late-arrival safety","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"ea9d8d201c944f2e90e08cfe2b0d7ef4"}

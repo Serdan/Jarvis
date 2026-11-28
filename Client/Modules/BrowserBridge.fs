@@ -976,7 +976,7 @@ let private runInNewTabCore (bridge: Service) (windowRegistration: string) (url:
                                         | true, entry when entry.Scheme = Uri.UriSchemeHttps &&
                                                            entry.Host = "chatgpt.com" && entry.IsDefaultPort &&
                                                            entry.UserInfo = "" && entry.Query = "" && entry.Fragment = "" &&
-                                                           Text.RegularExpressions.Regex.IsMatch(entry.AbsolutePath, @"^/g/g-p-[a-z0-9]+/project/?\z") ->
+                                                           Text.RegularExpressions.Regex.IsMatch(entry.AbsolutePath, @"^/g/g-p-[a-z0-9]+(?:-[a-z0-9]+)*/project/?\z") ->
                                             Some(entry.AbsolutePath.TrimEnd('/'))
                                         | _ -> None
                                     if stage <> "conversationRoute" || reason <> "ConversationUrlUnavailable" ||

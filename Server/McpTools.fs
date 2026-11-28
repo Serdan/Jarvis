@@ -1373,8 +1373,8 @@ module McpToolHelpers =
         optionalFeedbackAccess store.TryExecute http action
     let optionalFeedbackRead (store: OptionalFeedbackStore) http action =
         optionalFeedbackAccess store.TryRead http action
-    let submitFeedback
-        (store: FeedbackStore)
+    let private submitFeedbackCore
+        (submit: string -> FeedbackInput -> Task<CallToolResult>)
         (http: IHttpContextAccessor)
         (projectName: string)
         (toolName: string)
@@ -1424,29 +1424,58 @@ module McpToolHelpers =
                         operationResult
                     with
                     | Ok project, Ok tool, Ok category, Ok severity, Ok summary, Ok details, Ok workaround, Ok explicitOperation ->
-                        match store.ResolveOperation(userId, explicitOperation, tool, project) with
-                        | Error message ->
-                            return errorResult (ValidationFailed message)
-                        | Ok linkedOperation ->
-                            let input =
-                                { ProjectName = project
-                                  ToolName = tool
-                                  Category = category
-                                  Severity = severity
-                                  Summary = summary
-                                  Details = details
-                                  Workaround = workaround
-                                  OperationId = explicitOperation }
+                        let input =
+                            { ProjectName = project
+                              ToolName = tool
+                              Category = category
+                              Severity = severity
+                              Summary = summary
+                              Details = details
+                              Workaround = workaround
+                              OperationId = explicitOperation }
 
-                            return
-                                store.AddFeedback(userId, input, linkedOperation)
-                                |> jsonResult
+                        return! submit userId input
                     | _ ->
                         return errorResult (ExecutionFailed "Feedback validation aggregation invariant failed.")
         }
 
-    let listFeedback
-        (store: FeedbackStore)
+    let submitFeedback (store: FeedbackStore) http project tool category severity summary details workaround operation =
+        submitFeedbackCore
+            (fun user input ->
+                (match store.ResolveOperation(user, input.OperationId, input.ToolName, input.ProjectName) with
+                 | Error message -> errorResult (ValidationFailed message)
+                 | Ok linked -> store.AddFeedback(user, input, linked) |> jsonResult)
+                |> Task.FromResult)
+            http project tool category severity summary details workaround operation
+
+    let private feedbackRequestId (value: string) =
+        match Guid.TryParse(value) with
+        | true, id when id <> Guid.Empty -> Ok id
+        | _ -> Error(errorResult (ValidationFailed "requestId must be a nonempty caller-generated UUID; retain it and reuse it only for exact retries."))
+
+    let private durableOutcome convert = function
+        | Ok value -> convert value
+        | Error message -> errorResult (ExecutionFailed message)
+
+    let submitDurableFeedback (store: DurableFeedbackStore) (diagnostics: OptionalFeedbackStore) http requestId project tool category severity summary details workaround operation =
+        submitFeedbackCore
+            (fun user input -> task {
+                match feedbackRequestId requestId with
+                | Error result -> return result
+                | Ok id ->
+                    // Optional evidence cannot gate durable submission, and is never
+                    // inferred from a caller-supplied operation ID.
+                    let! observed =
+                        diagnostics.TryRead(fun db ->
+                            FeedbackOperationEvidence.read db.DatabasePath user input.OperationId input.ToolName input.ProjectName)
+                    let evidence = observed |> Result.toOption |> Option.flatten
+                    let! outcome = store.TrySubmit(user, id, input, evidence)
+                    return durableOutcome jsonResult outcome
+            })
+            http project tool category severity summary details workaround operation
+
+    let private listFeedbackCore
+        (list: string -> string option -> string option -> string option -> string option -> int -> Task<CallToolResult>)
         (http: IHttpContextAccessor)
         (projectName: string)
         (toolName: string)
@@ -1483,12 +1512,28 @@ module McpToolHelpers =
                     else
                         match categoryResult, severityResult with
                         | Ok category, Ok severity ->
-                            return store.ListFeedback(userId, project, tool, category, severity, requestedLimit) |> jsonResult
+                            return! list userId project tool category severity requestedLimit
                         | _ ->
                             return errorResult (ExecutionFailed "Feedback filter validation aggregation invariant failed.")
         }
 
-    let getFeedback (store: FeedbackStore) (http: IHttpContextAccessor) (feedbackId: string) =
+    let listFeedback (store: FeedbackStore) http project tool category severity limit =
+        listFeedbackCore
+            (fun user p t c s n -> store.ListFeedback(user,p,t,c,s,n) |> jsonResult |> Task.FromResult)
+            http project tool category severity limit
+
+    let listDurableFeedback (store: DurableFeedbackStore) http project tool category severity limit =
+        listFeedbackCore
+            (fun user p t c s n -> task {
+                let! outcome = store.TryList(user,p,t,c,s,n)
+                return durableOutcome jsonResult outcome
+            })
+            http project tool category severity limit
+
+    let private feedbackNotFound () =
+        errorResult (NotFound "Feedback was not found for the authenticated user.")
+
+    let private getFeedbackCore (get: string -> string -> Task<CallToolResult>) (http: IHttpContextAccessor) (feedbackId: string) =
         task {
             match authenticatedFeedbackContext http with
             | Error result -> return result
@@ -1496,13 +1541,28 @@ module McpToolHelpers =
                 match validateText "feedbackId" 64 feedbackId with
                 | Error message -> return errorResult (ValidationFailed message)
                 | Ok id ->
-                    match store.GetFeedback(userId, id) with
-                    | Some entry -> return jsonResult entry
-                    | None -> return errorResult (NotFound "Feedback was not found for the authenticated user.")
+                    return! get userId id
         }
 
-    let updateFeedback
-        (store: FeedbackStore) (http: IHttpContextAccessor)
+    let getFeedback (store: FeedbackStore) http feedbackId =
+        getFeedbackCore
+            (fun user id ->
+                (match store.GetFeedback(user,id) with
+                 | Some entry -> jsonResult entry
+                 | None -> feedbackNotFound ())
+                |> Task.FromResult)
+            http feedbackId
+
+    let getDurableFeedback (store: DurableFeedbackStore) http feedbackId =
+        getFeedbackCore
+            (fun user id -> task {
+                let! outcome = store.TryGet(user,id)
+                return durableOutcome (function Some entry -> jsonResult entry | None -> feedbackNotFound ()) outcome
+            })
+            http feedbackId
+
+    let private updateFeedbackCore
+        (update: string -> string -> string -> string option -> string option -> Task<CallToolResult>) (http: IHttpContextAccessor)
         (feedbackId: string) (status: string) (resolutionCommit: string) (resolutionNotes: string) =
         task {
             match authenticatedFeedbackContext http with
@@ -1521,21 +1581,59 @@ module McpToolHelpers =
                 else
                     match idResult, statusResult, commitResult, notesResult with
                     | Ok id, Ok state, Ok commit, Ok notes ->
-                        match store.UpdateFeedback(userId, id, state, commit, notes) with
-                        | Some updated -> return jsonResult updated
-                        | None -> return errorResult (NotFound "Feedback was not found for the authenticated user.")
+                        return! update userId id state commit notes
                     | _ -> return errorResult (ExecutionFailed "Feedback validation aggregation invariant failed.")
         }
 
-    let feedbackSummary (store: FeedbackStore) (http: IHttpContextAccessor) (projectName: string) (toolName: string) =
+    let updateFeedback (store: FeedbackStore) http feedbackId status resolutionCommit resolutionNotes =
+        updateFeedbackCore
+            (fun user id state commit notes ->
+                (match store.UpdateFeedback(user,id,state,commit,notes) with
+                 | Some updated -> jsonResult updated
+                 | None -> feedbackNotFound ())
+                |> Task.FromResult)
+            http feedbackId status resolutionCommit resolutionNotes
+
+    let updateDurableFeedback (store: DurableFeedbackStore) http requestId feedbackId status resolutionCommit resolutionNotes =
+        updateFeedbackCore
+            (fun user id state commit notes -> task {
+                match feedbackRequestId requestId with
+                | Error result -> return result
+                | Ok key ->
+                    let! outcome = store.TryUpdate(user,key,id,state,commit,notes)
+                    return durableOutcome (function Some entry -> jsonResult entry | None -> feedbackNotFound ()) outcome
+            })
+            http feedbackId status resolutionCommit resolutionNotes
+
+    let private feedbackSummaryCore (summary: string -> string option -> string option -> Task<CallToolResult>) (http: IHttpContextAccessor) (projectName: string) (toolName: string) =
         task {
             match authenticatedFeedbackContext http with
             | Error result -> return result
             | Ok(_, userId) ->
-                return
-                    store.GetSummary(userId, optionalString projectName, optionalString toolName)
-                    |> jsonResult
+                return! summary userId (optionalString projectName) (optionalString toolName)
         }
+
+    let feedbackSummary (store: FeedbackStore) http project tool =
+        feedbackSummaryCore
+            (fun user p t -> store.GetSummary(user,p,t) |> jsonResult |> Task.FromResult)
+            http project tool
+
+    let durableFeedbackSummary (store: DurableFeedbackStore) http project tool =
+        feedbackSummaryCore
+            (fun user p t -> task {
+                let! outcome = store.TrySummary(user,p,t)
+                return durableOutcome jsonResult outcome
+            })
+            http project tool
+
+    let legacyFeedbackMutation (store: OptionalFeedbackStore) http (requestId: string) action =
+        match authenticatedFeedbackContext http with
+        | Error result -> Task.FromResult result
+        | Ok _ when not (String.IsNullOrWhiteSpace requestId) ->
+            // The old authority has no durable receipt contract. Never claim
+            // that a caller-supplied UUID deduplicates legacy mutations.
+            Task.FromResult(errorResult (ExecutionFailed "Durable feedback is not enabled; legacy feedback cannot reconcile a requestId."))
+        | Ok _ -> optionalFeedback store http action
 
     let private serverUpdateGate = obj()
     let mutable private serverUpdatePending = false
@@ -1735,12 +1833,18 @@ type JarvisMcpTools =
         summary: string,
         [<Optional; DefaultParameterValue("")>] details: string,
         [<Optional; DefaultParameterValue("")>] workaround: string,
+        [<Optional; DefaultParameterValue(""); Description("Caller-generated UUID, required with durable feedback enabled. Retain and reuse only for exact retries.")>] requestId: string,
         [<Optional; DefaultParameterValue("")>] operationId: string,
         store: OptionalFeedbackStore,
+        mode: FeedbackStorageMode,
         http: IHttpContextAccessor
     ) =
-        McpToolHelpers.optionalFeedback store http (fun db ->
-            McpToolHelpers.submitFeedback db http projectName toolName category severity summary details workaround operationId)
+        match mode with
+        | FeedbackStorageMode.Legacy ->
+            McpToolHelpers.legacyFeedbackMutation store http requestId (fun db ->
+                McpToolHelpers.submitFeedback db http projectName toolName category severity summary details workaround operationId)
+        | FeedbackStorageMode.Durable durable ->
+            McpToolHelpers.submitDurableFeedback durable store http requestId projectName toolName category severity summary details workaround operationId
 
     [<McpServerTool(Title = "List feedback", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List recent feedback submitted by the authenticated user. Filters are optional and limit defaults to 50.")>]
     static member ListFeedback(
@@ -1750,30 +1854,50 @@ type JarvisMcpTools =
         [<Optional; DefaultParameterValue("")>] severity: string,
         [<Optional; DefaultParameterValue(50)>] limit: int,
         store: OptionalFeedbackStore,
+        mode: FeedbackStorageMode,
         http: IHttpContextAccessor
     ) =
-        McpToolHelpers.optionalFeedbackRead store http (fun db ->
-            McpToolHelpers.listFeedback db http projectName toolName category severity (Nullable limit))
+        match mode with
+        | FeedbackStorageMode.Legacy ->
+            McpToolHelpers.optionalFeedbackRead store http (fun db ->
+                McpToolHelpers.listFeedback db http projectName toolName category severity (Nullable limit))
+        | FeedbackStorageMode.Durable durable ->
+            McpToolHelpers.listDurableFeedback durable http projectName toolName category severity (Nullable limit)
 
     [<McpServerTool(Title = "Get feedback", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get a feedback record by ID for the authenticated user.")>]
-    static member GetFeedback(feedbackId: string, store: OptionalFeedbackStore, http: IHttpContextAccessor) =
-        McpToolHelpers.optionalFeedbackRead store http (fun db ->
-            McpToolHelpers.getFeedback db http feedbackId)
+    static member GetFeedback(feedbackId: string, store: OptionalFeedbackStore, mode: FeedbackStorageMode, http: IHttpContextAccessor) =
+        match mode with
+        | FeedbackStorageMode.Legacy ->
+            McpToolHelpers.optionalFeedbackRead store http (fun db ->
+                McpToolHelpers.getFeedback db http feedbackId)
+        | FeedbackStorageMode.Durable durable -> McpToolHelpers.getDurableFeedback durable http feedbackId
 
     [<McpServerTool(Title = "Update feedback", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Update feedback status: Open, InProgress, Resolved, WontFix. Closing stores resolution commit and notes; reopening clears resolution details.")>]
-    static member UpdateFeedback(feedbackId: string, status: string, resolutionCommit: string, resolutionNotes: string, store: OptionalFeedbackStore, http: IHttpContextAccessor) =
-        McpToolHelpers.optionalFeedback store http (fun db ->
-            McpToolHelpers.updateFeedback db http feedbackId status resolutionCommit resolutionNotes)
+    static member UpdateFeedback(
+        feedbackId: string, status: string, resolutionCommit: string, resolutionNotes: string,
+        [<Optional; DefaultParameterValue(""); Description("Caller-generated UUID, required with durable feedback enabled. Retain and reuse only for exact retries.")>] requestId: string,
+        store: OptionalFeedbackStore, mode: FeedbackStorageMode, http: IHttpContextAccessor) =
+        match mode with
+        | FeedbackStorageMode.Legacy ->
+            McpToolHelpers.legacyFeedbackMutation store http requestId (fun db ->
+                McpToolHelpers.updateFeedback db http feedbackId status resolutionCommit resolutionNotes)
+        | FeedbackStorageMode.Durable durable ->
+            McpToolHelpers.updateDurableFeedback durable http requestId feedbackId status resolutionCommit resolutionNotes
 
     [<McpServerTool(Title = "Get feedback summary", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Summarize feedback counts by tool, category, and severity for the authenticated user.")>]
     static member GetFeedbackSummary(
         [<Optional; DefaultParameterValue("")>] projectName: string,
         [<Optional; DefaultParameterValue("")>] toolName: string,
         store: OptionalFeedbackStore,
+        mode: FeedbackStorageMode,
         http: IHttpContextAccessor
     ) =
-        McpToolHelpers.optionalFeedbackRead store http (fun db ->
-            McpToolHelpers.feedbackSummary db http projectName toolName)
+        match mode with
+        | FeedbackStorageMode.Legacy ->
+            McpToolHelpers.optionalFeedbackRead store http (fun db ->
+                McpToolHelpers.feedbackSummary db http projectName toolName)
+        | FeedbackStorageMode.Durable durable ->
+            McpToolHelpers.durableFeedbackSummary durable http projectName toolName
 
     [<McpServerTool(Title = "Update server", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Update the Jarvis server from a verified published release, with automatic rollback. The service restarts during the update.")>]
     static member UpdateServer(http: IHttpContextAccessor) =

@@ -201,7 +201,7 @@ CREATE TABLE feedback_receipts (
         let commit = field "resolution_commit" "NULL"
         let notes = field "resolution_notes" "NULL"
         let query =
-            $"SELECT f.id,f.user_id,f.created_at,f.project_name,f.tool_name,f.category,f.severity,f.summary,f.details,f.workaround,{verified},f.operation_id,{status},{resolved},{commit},{notes} FROM feedback f {join};"
+            $"SELECT f.id,f.user_id,f.created_at,f.project_name,f.tool_name,f.category,f.severity,f.summary,f.details,f.workaround,{verified},f.operation_id,{status},{resolved},{commit},{notes} FROM feedback f {join} ORDER BY f.user_id COLLATE BINARY,f.id COLLATE BINARY;"
         use cmd = command old oldTx query []
         use rows = cmd.ExecuteReader()
         let mutable copied = 0L
@@ -215,6 +215,27 @@ CREATE TABLE feedback_receipts (
         if copied <> number old oldTx "SELECT COUNT(*) FROM feedback;" [] ||
            copied <> number destination tx "SELECT COUNT(*) FROM feedback;" [] then
             invalidOp "Legacy feedback snapshot count mismatch."
+        // Independently read the projection back from the target while the same
+        // source snapshot is still open. Compare every field and identity in
+        // stable tenant/id order; total count alone cannot detect corruption or
+        // misattribution. Equality also establishes each tenant's row count.
+        use original = command old oldTx query []
+        use originals = original.ExecuteReader()
+        use imported = command destination tx
+                            """SELECT id,user_id,created_at,project_name,tool_name,category,severity,summary,details,workaround,
+                                      operation_id,operation_success,requested_operation_id,status,resolved_at,resolution_commit,resolution_notes
+                               FROM feedback ORDER BY user_id COLLATE BINARY,id COLLATE BINARY;""" []
+        use copies = imported.ExecuteReader()
+        let mutable verifiedRows = 0L
+        while originals.Read() do
+            if not (copies.Read()) ||
+               not ([0..16] |> List.forall (fun i -> Object.Equals(originals.GetValue i, copies.GetValue i))) then
+                invalidOp "Legacy feedback snapshot identity/content/provenance mismatch."
+            verifiedRows <- verifiedRows + 1L
+        if copies.Read() || verifiedRows <> copied then
+            invalidOp "Legacy feedback verification count mismatch."
+        originals.Close()
+        copies.Close()
         snapshot.Commit()
 
     let initialize path maxDatabaseBytes legacy =
@@ -238,6 +259,8 @@ CREATE TABLE feedback_receipts (
         let tx = Some transaction
         execute db tx schema []
         legacy |> Option.iter (fun source -> importLegacy source db tx)
+        if not (Object.Equals(scalar db tx "PRAGMA integrity_check;" [], "ok")) then
+            invalidOp "Durable feedback destination failed integrity verification."
         execute db tx $"PRAGMA application_id={applicationId};" []
         execute db tx $"PRAGMA user_version={schemaVersion};" []
         transaction.Commit()
@@ -418,3 +441,34 @@ type DurableFeedbackStore(databasePath: string, ?timeout: TimeSpan, ?maxDiskByte
                   ByTool = group "tool_name"; ByCategory = group "category"; BySeverity = group "severity" }
             transaction.Commit()
             result)
+
+/// Read-only observation of optional diagnostics; invoke exclusively inside
+/// OptionalFeedbackStore.TryRead so its physical single-flight limit applies.
+module FeedbackOperationEvidence =
+    let read databasePath user explicitId tool project =
+        use db = DurableFeedbackSql.openDatabase databasePath true
+        DurableFeedbackSql.boundSql db
+        let sql, parameters =
+            match explicitId with
+            | Some id ->
+                "SELECT id,success FROM operations WHERE user_id=$user AND id=$id LIMIT 1;",
+                [ "$user", box user; "$id", box id ]
+            | None ->
+                let filters = [ "tool_name",tool; "project_name",project ]
+                let active = filters |> List.choose (fun (name,value) -> value |> Option.map (fun v -> name,v))
+                let where = active |> List.map (fun (name,_) -> $" AND {name}=${name}") |> String.concat ""
+                let args = active |> List.map (fun (name,v) -> "$"+name,box v)
+                $"SELECT id,success FROM operations WHERE user_id=$user AND completed_at IS NOT NULL AND created_at >= $since{where} ORDER BY created_at DESC,id LIMIT 1;",
+                [ "$user", box user; "$since", box (DateTimeOffset.UtcNow.AddMinutes(-10.).ToString("O")) ] @ args
+        use cmd = DurableFeedbackSql.command db None sql parameters
+        use r = cmd.ExecuteReader()
+        if r.Read() then
+            Some { UserId = user; OperationId = r.GetString 0
+                   Success = if r.IsDBNull 1 then None else Some(r.GetInt64(1) <> 0L) }
+        else None
+
+/// Exactly one feedback authority is selected at service startup.
+[<RequireQualifiedAccess>]
+type FeedbackStorageMode =
+    | Legacy
+    | Durable of DurableFeedbackStore

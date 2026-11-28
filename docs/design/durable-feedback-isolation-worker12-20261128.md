@@ -45,6 +45,11 @@ retention-policy change is authorized by this document.
   `d6d8a03f630649ef9601cde995346593` requests explicit shared-file ownership
   before composition.
 
+Lead resolved challenge d6d8a03f630649ef9601cde995346593 at ledger
+sequence 20906: GO for feedback-specific DI/compile/tool composition and
+isolated migration preparation; no activation, no shared retention/routing
+or W14 edits.
+
 ## Proposed separation
 
 The feedback data is durable operator-authored application data, unlike
@@ -82,24 +87,24 @@ A response timeout or SQLite exception after admission is conservatively
 outcome-unknown. Retry the exact mutation with the same UUID; do not generate
 a fresh ID, infer non-commit from elapsed time, or replay with changed inputs.
 If no response or request key was retained, reconcile using bounded list/get
-and operator judgment; do not claim exact deduplication. Composition must
-expose an optional caller-retained request ID or require one, document how it
-is returned before/after failures, and preserve authenticated user isolation.
+and operator judgment; do not claim exact deduplication. The MCP schema exposes an optional requestId string to preserve the
+default-off legacy contract. With durable feedback enabled, submit and
+update require a nonempty caller-generated UUID before admission. Reuse
+exactly that UUID only for the same normalized mutation; it is retained by
+the caller before the first request. Default-off legacy mode rejects a
+supplied requestId rather than promising deduplication it cannot provide.
+No active durable store failure can fall back to a legacy write.
 
-Optional operation metadata is evidence, not a precondition. A successful
-same-tenant explicit or recent matching diagnostic lookup can supply a
-snapshot of operation ID and success; unavailable or expired telemetry
-cannot establish linkage. Preserve a supplied but unverified operation ID
-separately from verified linkage and never count it as a failed operation.
-Do not disclose whether an operation belongs to a different tenant.
-The adapter must not pass arbitrary caller-supplied values as verified
-evidence. The prototype explicitly rejects evidence with a different user
-or a mismatching explicit ID. Verified links are no longer mutable by
-diagnostic retention; failure counts use the captured observation. This
-is a semantic change from previous explicit-ID rejection on missing
-telemetry and requires the composition decision recorded by Lead.
-Unverified does not mean that the operation was absent, and verified is
-not proof of a canonical command receipt.
+Optional operation metadata is evidence, not a precondition. A bounded
+read-only SQL statement via the existing optional diagnostic worker selects
+only the authenticated user's explicit or recent matching operation and
+captures success in the same statement. An unavailable, expired, missing
+or different-tenant operation produces no verified link. Preserve a
+supplied but unverified operation ID separately from verified linkage and
+never count it as a failed operation. No distinct error discloses another
+tenant's operation. Verified links are no longer mutable by diagnostic
+retention; failure counts use the captured observation. Unverified does not
+mean absent; verified is not proof of a canonical command receipt.
 
 ## Offline preparation and recovery
 
@@ -117,7 +122,11 @@ schemas without status use Open. Preserve surviving operation IDs as
 requested evidence, and mark as verified only when a same-user operation
 row exists; snapshot its known success. Null links already cleared by old
 retention cannot be reconstructed. Source rows are not changed. Validate
-source/target counts before commit. Distinct application ID and schema
+source/target counts, then independently compare every projected identity,
+tenant, content and provenance field in deterministic tenant/id order
+inside the same source snapshot and destination transaction. This also
+establishes per-tenant count equality. Run SQLite integrity_check before
+marking the destination. Distinct application ID and schema
 version are written atomically with the new schema and rows. A failed
 import leaves an unmarked destination for inspection; runtime refuses it
 and initialization refuses to overwrite an existing main/sidecar. Use
@@ -127,15 +136,37 @@ partial output or accept it as empty history.
 Before cutover, verify source and target per-tenant counts and record
 identity/content/resolution equality, operation-link classifications, SQLite
 integrity, backup/restore and sufficient independent disk headroom. The
-prototype currently verifies total count in its transaction; detailed
-operator verification and a reviewed offline invocation mechanism are
-required before activation. Retain the source backup and record the
+isolated offline invocation is below. Its confirmation flag is an operator
+attestation, not automatic proof that all legacy writers are quiescent.
+Independently verify and record backup/restore, the reviewed source SHA,
+destination identity and available disk capacity before enabling it. Retain the source backup and record the
 migration evidence. Switch exactly one feedback writer authority after
 validation. Never start the new writer while legacy feedback can still
 be written, never fall back to writing legacy on a new-store error, and
 do not roll back to stale legacy state after new writes without explicit
 reconciliation. Ordinary telemetry can continue using its existing file
 after approved cutover; it does not own the new feedback history.
+
+The following is a **review-only operator procedure**, not an instruction to
+run against any live database now:
+
+```sh
+dotnet run --project tools/DurableFeedbackMigration/DurableFeedbackMigration.fsproj -c Release -- \
+  --offline-confirmed --legacy /path/to/consistent-legacy.db \
+  --destination /path/to/new-durable-feedback.db
+```
+
+The new path must not exist, including SQLite sidecars. The tool does not
+activate or edit the legacy database. It exits nonzero on any failed
+verification and leaves files intact for investigation. After independent
+review, merged-route qualification, backup/restore verification and
+explicit operator approval, configure the server with
+`EnableDurableFeedback=true` and `DurableFeedbackDatabasePath=<new-path>`
+(using the existing Jarvis configuration prefix for environment variables).
+The flag defaults off; an invalid explicit flag or missing/unmarked path
+with the flag enabled fails closed, not back to legacy. Selection is fixed
+at startup and constructors do not perform I/O. Restart/cutover is an
+operator-only action, not part of this source change.
 
 On durable quota pressure or SQLite failure, preserve all files and use
 the durable feedback read/reconciliation path if available. Investigate
@@ -158,14 +189,19 @@ shared test composition.
 dotnet test tests/DurableFeedback20261128/DurableFeedback20261128.fsproj -c Release
 ```
 
-Engineering job `4c13a373377744db823022a4058d92d7` was started against that
-commit. Its terminal result was not yet observed when writing this document.
+Engineering job `4c13a373377744db823022a4058d92d7` completed against that
+commit: exit 0, 9 passed, 0 failed, 0 skipped, 381 ms test execution. This is
+the initial linked-source test result only, not qualification of later
+composition changes.
 The fixture covers diagnostic quota, separate durable admission, idempotent
 submit/update, tenant isolation, preserved evidence after pruning, legacy
 migration and failed import, durable quota read/replay, and a real competing
 SQLite writer with uncertain outcome. Compile/test claims must use terminal
 job evidence, not this planned list.
 
-Production composition, optional evidence acquisition, request-ID schema
-contract, and activation/import tooling are pending Lead's exact ownership
-decision. No existing feedback tool is changed by the prototype.
+After Lead GO, the composition candidate adds only the feedback service
+compile entry, explicit feedback DI, five feedback MCP method/helper hunks,
+feedback-specific route and schema tests, and an isolated offline CLI.
+No runtime migration or activation is performed. New candidate compilation,
+the scoped Release tests, independent review and merged-route qualification
+remain required; the earlier nine passing tests do not establish these.

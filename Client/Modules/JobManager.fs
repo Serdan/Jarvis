@@ -81,18 +81,21 @@ module private Core =
                 | Durable.Live _ -> 1
                 | Durable.Unknown _ when pending now request || Durable.hasClaimOwner directory -> 1
                 | _ -> 0)
-        entries
-        |> Array.choose (fun (directory, request, observation) ->
-            match observation with
-            | Durable.Live _ -> None
-            // Unknown outcomes retain the durable checkout fence until terminal evidence exists.
-            | Durable.Unknown _ -> None
-            | Durable.Terminal receipt ->
-                Some(directory, receipt.CompletedAt |> Option.defaultValue request.StartedAt))
-        |> Array.sortByDescending snd
-        |> Array.iteri (fun index (directory, completed) ->
-            if index >= maxCompletedJobs || now - completed >= retention then
-                Durable.tryPrune directory |> ignore)
+        let expired =
+            entries
+            |> Array.choose (fun (directory, request, observation) ->
+                match observation with
+                | Durable.Live _ -> None
+                // Unknown outcomes retain the durable checkout fence until terminal evidence exists.
+                | Durable.Unknown _ -> None
+                | Durable.Terminal receipt ->
+                    Some(directory, receipt.CompletedAt |> Option.defaultValue request.StartedAt))
+            |> Array.sortByDescending snd
+            |> Array.mapi (fun index (directory, completed) ->
+                if index >= maxCompletedJobs || now - completed >= retention then Some directory else None)
+            |> Array.choose id |> Array.toList
+        // The admission lock covers reservation capture and ordinary pruning.
+        Durable.pruneDirectories root expired |> ignore
         active
 
     let private startProcess root projectName actor workingDirectory validateScope executable args reason maxOutputBytes : Client.Result<StartJobResult> =

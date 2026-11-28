@@ -383,10 +383,246 @@ module DurableJobs =
         if not (OperatingSystem.IsWindows()) then File.SetUnixFileMode(path, fileMode)
         f ()
 
+    // One bounded durable reservation per canonical Create operation. The
+    // caller reserves BEFORE dispatch and holds it through uncertain writes;
+    // release requires verified retirement of all conditions or definitive
+    // nonpublication. There is deliberately no time-based release.
+    type ReservationScope =
+        { Project: string
+          Actor: string
+          ProjectId: Guid
+          LedgerId: Guid
+          Epoch: int
+          CreationId: Guid }
+
+    type CompactTerminal =
+        { CompletedAt: DateTimeOffset
+          Outcome: string
+          ReceiptSha256: string }
+
+    type TerminalEvidence =
+        { JobId: string
+          Project: string
+          Actor: string
+          StartedAt: DateTimeOffset
+          Terminal: CompactTerminal }
+
+    type ReservedJob =
+        { JobId: string
+          StartedAt: DateTimeOffset
+          RequestSha256: string
+          Terminal: CompactTerminal option }
+
+    type TerminalReservation =
+        { Schema: int
+          Scope: ReservationScope
+          Jobs: ReservedJob list }
+
+    let maxTerminalReservations = 64
+    let private maxJobsPerReservation = 32
+    let private maxReservationBytes = 256 * 1024
+    let private reservationDirectory root = Path.Combine(root, "terminal-reservations-v1")
+    let private reservationPath root (id: Guid) =
+        Path.Combine(reservationDirectory root, id.ToString("N") + ".json")
+
+    let private validText (value: string) =
+        not (String.IsNullOrWhiteSpace value) && Encoding.UTF8.GetByteCount value <= 2048
+
+    let private validateScope (scope: ReservationScope) =
+        if not (validText scope.Project && validText scope.Actor)
+           || scope.ProjectId = Guid.Empty || scope.LedgerId = Guid.Empty
+           || scope.CreationId = Guid.Empty || scope.Epoch < 0 then
+            invalidArg "scope" "Invalid engineering-job reservation scope."
+
+    let private validateJobIds (jobIds: string list) =
+        let ids = jobIds |> List.distinct |> List.sort
+        if ids.IsEmpty || ids.Length > maxJobsPerReservation
+           || (ids |> List.exists (fun id -> not (validId id) || id = Guid.Empty.ToString("N"))) then
+            invalidArg "jobIds" "A reservation requires 1-32 original engineering job IDs."
+        ids
+
+    let private sha256 (bytes: byte array) =
+        SHA256.HashData bytes |> Convert.ToHexString |> fun hex -> hex.ToLowerInvariant()
+
+    let private requestDigest (request: Request) = sha256 (JsonSerializer.SerializeToUtf8Bytes request)
+
+    let private validDigest (digest: string) =
+        not (isNull digest) && digest.Length = 64
+        && (digest |> Seq.forall (fun c -> ('0' <= c && c <= '9') || ('a' <= c && c <= 'f')))
+
+    let private matchesRequest (scope: ReservationScope) (job: ReservedJob) (request: Request) =
+        request.JobId = job.JobId && request.Project = scope.Project
+        && request.Actor = Some scope.Actor && request.StartedAt.EqualsExact(job.StartedAt)
+        && requestDigest request = job.RequestSha256
+
+    let private validTerminal (proof: CompactTerminal) =
+        let validOutcome =
+            if isNull proof.Outcome then false
+            elif proof.Outcome = "Canceled" then true
+            elif proof.Outcome.StartsWith("FailedToStart: ", StringComparison.Ordinal) then
+                proof.Outcome.Length <= 527
+            elif proof.Outcome.StartsWith("Completed(", StringComparison.Ordinal)
+                 && proof.Outcome.EndsWith(")", StringComparison.Ordinal) then
+                match Int32.TryParse(proof.Outcome.Substring(10, proof.Outcome.Length - 11)) with
+                | true, code -> proof.Outcome = sprintf "Completed(%d)" code
+                | _ -> false
+            else false
+        validOutcome && validDigest proof.ReceiptSha256
+
+    let private validateReservation (id: Guid) (reservation: TerminalReservation) =
+        validateScope reservation.Scope
+        let ids = reservation.Jobs |> List.map _.JobId
+        if reservation.Schema <> 1 || reservation.Scope.CreationId <> id
+           || validateJobIds ids <> ids
+           || (reservation.Jobs |> List.exists (fun job ->
+                not (validDigest job.RequestSha256) || (job.Terminal |> Option.exists (validTerminal >> not)))) then
+            invalidOp "Invalid engineering-job reservation record."
+        reservation
+
+    // All reservation reads/writes and pruning share the existing admission
+    // lock. A stale atomic stage belongs to a crashed writer, never a record.
+    let private readReservations root =
+        let directory = reservationDirectory root
+        rejectLink directory
+        if File.Exists directory then invalidOp "Engineering-job reservation directory is unavailable."
+        if not (Directory.Exists directory) then []
+        else
+            let files =
+                Directory.EnumerateFileSystemEntries directory
+                |> Seq.truncate (2 * maxTerminalReservations + 1) |> Seq.toList
+            if files.Length > 2 * maxTerminalReservations then
+                invalidOp "Engineering-job reservation storage bound exceeded."
+            let records =
+                files |> List.choose (fun path ->
+                    rejectLink path
+                    let parts = (Path.GetFileName path).Split('.')
+                    if parts.Length = 4 && validId parts[0] && parts[1] = "json"
+                       && validId parts[2] && parts[3] = "tmp" then
+                        File.Delete path
+                        None
+                    elif parts.Length = 2 && validId parts[0] && parts[1] = "json" then
+                        Some(Guid.ParseExact(parts[0], "N"), path)
+                    else invalidOp "Unexpected engineering-job reservation entry.")
+            if records.Length > maxTerminalReservations then
+                invalidOp "Engineering-job reservation capacity exceeded."
+            records |> List.map (fun (id, path) ->
+                readBounded<TerminalReservation> maxReservationBytes path
+                |> validateReservation id)
+
+    let private saveReservation root (reservation: TerminalReservation) =
+        ensureDirectory (reservationDirectory root)
+        writeAtomic maxReservationBytes (reservationPath root reservation.Scope.CreationId) reservation
+
+    // Same exact digest and bounded outcome as the existing terminal-wake
+    // observer. The compact record is never an ordinary GetJobResult receipt.
+    let terminalEvidence directory (request: Request) =
+        match request.Actor, observe directory request with
+        | Some actor, Terminal receipt when not (String.IsNullOrWhiteSpace actor) ->
+            let outcome =
+                match receipt.Status with
+                | Completed code -> sprintf "Completed(%d)" code
+                | Canceled -> "Canceled"
+                | FailedToStart error ->
+                    let message = if isNull error then "" else error
+                    "FailedToStart: " + message.Substring(0, min 512 message.Length)
+                | _ -> invalidOp "Nonterminal observation cannot supply terminal evidence."
+            Some
+                { JobId = request.JobId; Project = request.Project; Actor = actor
+                  StartedAt = request.StartedAt
+                  Terminal =
+                    { CompletedAt = receipt.CompletedAt.Value; Outcome = outcome
+                      ReceiptSha256 = SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes receipt)
+                                      |> Convert.ToHexString |> fun hex -> hex.ToLowerInvariant() } }
+        | _ -> None
+
+    let terminalEvidenceJson (proof: TerminalEvidence) =
+        JsonSerializer.Serialize
+            {| schema = "engineering-job-terminal-v1"
+               jobId = proof.JobId; project = proof.Project; actor = proof.Actor
+               startedAt = proof.StartedAt.ToString("O"); completedAt = proof.Terminal.CompletedAt.ToString("O")
+               outcome = proof.Terminal.Outcome; receiptSha256 = proof.Terminal.ReceiptSha256 |}
+
+    let private sameBinding (left: ReservationScope) (right: ReservationScope) =
+        left.Project = right.Project && left.Actor = right.Actor
+        && left.ProjectId = right.ProjectId && left.LedgerId = right.LedgerId && left.Epoch = right.Epoch
+
+    let reserveTerminalDependencies root scope jobIds =
+        validateScope scope
+        let ids = validateJobIds jobIds
+        withAdmission root (fun () ->
+            let reservations = readReservations root
+            match reservations |> List.tryFind (fun record -> record.Scope.CreationId = scope.CreationId) with
+            | Some existing ->
+                if existing.Scope <> scope || (existing.Jobs |> List.map _.JobId) <> ids then
+                    invalidOp "Engineering-job reservation creation identity was reused."
+                existing
+            | None ->
+                if reservations.Length >= maxTerminalReservations then
+                    invalidOp "Engineering-job reservation capacity reached."
+                let jobs =
+                    ids |> List.map (fun id ->
+                        let directory = jobDirectory root id
+                        if Directory.Exists directory then
+                            let request = readRequest directory
+                            let job = { JobId = id; StartedAt = request.StartedAt
+                                        RequestSha256 = requestDigest request; Terminal = None }
+                            if not (matchesRequest scope job request) then
+                                invalidOp "Engineering job belongs to another initiating agent or project."
+                            job
+                        else
+                            // Existing matching compact evidence is not a
+                            // resurrection; a missing unreserved receipt is.
+                            let existing =
+                                reservations |> List.filter (fun record -> sameBinding scope record.Scope)
+                                |> List.collect _.Jobs
+                                |> List.filter (fun job -> job.JobId = id && job.Terminal.IsSome)
+                                |> List.distinct
+                            match existing with
+                            | [job] -> job
+                            | _ -> invalidOp "Original engineering job evidence unavailable locally.")
+                let record = { Schema = 1; Scope = scope; Jobs = jobs }
+                saveReservation root record
+                record)
+
+    let listTerminalReservations root =
+        withAdmission root (fun () -> readReservations root)
+
+    let tryReservedTerminalEvidence root scope jobId =
+        validateScope scope
+        withAdmission root (fun () ->
+            readReservations root
+            |> List.tryFind (fun record -> record.Scope = scope)
+            |> Option.bind (fun record -> record.Jobs |> List.tryFind (fun job -> job.JobId = jobId))
+            |> Option.bind (fun job ->
+                match job.Terminal with
+                | Some proof ->
+                    Some { JobId = job.JobId; Project = scope.Project; Actor = scope.Actor
+                           StartedAt = job.StartedAt; Terminal = proof }
+                | None ->
+                    let directory = jobDirectory root job.JobId
+                    if not (Directory.Exists directory) then None
+                    else
+                        let request = readRequest directory
+                        if not (matchesRequest scope job request) then
+                            invalidOp "Original engineering job identity changed."
+                        terminalEvidence directory request))
+
+    // The caller supplies the same creation scope only after the canonical
+    // ledger proves every condition retired or the Create never published.
+    // The storage layer intentionally cannot infer that proof from a hint.
+    let releaseTerminalDependencies root scope =
+        validateScope scope
+        withAdmission root (fun () ->
+            match readReservations root |> List.tryFind (fun record -> record.Scope.CreationId = scope.CreationId) with
+            | None -> ()
+            | Some record when record.Scope = scope ->
+                File.Delete(reservationPath root scope.CreationId)
+            | Some _ -> invalidOp "Engineering-job reservation release identity differs.")
+
     // The permanent claim also has a lifetime lock. Retention cannot delete a
     // live writer even if identity probing is unavailable. Fence late startup
     // by taking or creating the claim before removing the immutable request.
-    let tryPrune directory =
+    let private tryRemoveDirectory directory =
         try
             rejectLink directory
             let claim = claimPath directory
@@ -409,6 +645,46 @@ module DurableJobs =
             Directory.Delete(directory, false)
             true
         with _ -> false
+
+    // Call while holding admission. Publish every compact proof before any
+    // ordinary request/output deletion. If storage is unavailable or corrupt,
+    // propagate the failure to admission rather than silently growing the
+    // normal receipt store or deleting the sole evidence.
+    let pruneDirectories (root: string) (directories: string list) =
+        let original = readReservations root
+        let mutable records = original
+        let eligible =
+            directories |> List.map (fun directory ->
+                let id = Path.GetFileName directory
+                let linked =
+                    records |> List.filter (fun record ->
+                        record.Jobs |> List.exists (fun job -> job.JobId = id))
+                if List.isEmpty linked then true
+                else
+                    let request = readRequest directory
+                    match terminalEvidence directory request with
+                    | None -> false
+                    | Some proof ->
+                        records <-
+                            records |> List.map (fun record ->
+                                { record with
+                                    Jobs =
+                                        record.Jobs |> List.map (fun job ->
+                                            if job.JobId <> id then job
+                                            elif not (matchesRequest record.Scope job request) then
+                                                invalidOp "Reserved engineering job identity changed."
+                                            else
+                                                match job.Terminal with
+                                                | Some prior when prior <> proof.Terminal ->
+                                                    invalidOp "Reserved engineering job terminal evidence changed."
+                                                | _ -> { job with Terminal = Some proof.Terminal }) })
+                        true)
+        for before, after in List.zip original records do
+            if before <> after then saveReservation root after
+        List.map2 (fun directory allowed -> allowed && tryRemoveDirectory directory) directories eligible
+
+    let tryPrune (directory: string) =
+        pruneDirectories (Path.GetDirectoryName directory) [directory] |> List.head
 
     let runSupervisor directory =
         try

@@ -1363,3 +1363,219 @@ let ``durable supervisor crash remains unknown without replay`` () =
         Durable.runSupervisor directory |> shouldEqual 1
         File.WriteAllText(release, "")
         File.ReadAllLines(marker) |> Array.toList |> shouldEqual ["once"])
+
+
+// Disposable storage-only fixtures; no real supervisor or canonical mutation.
+let private reservationRequest root age : Durable.Request =
+    { Schema = 1; JobId = Guid.NewGuid().ToString("N"); Project = "Project1"; Actor = durableOwner
+      Executable = "fixture-only"; Args = []; Reason = None; WorkingDirectory = root
+      StartedAt = DateTimeOffset.UtcNow - age; MaxOutputBytes = 64 }
+
+let private reservationScope () : Durable.ReservationScope =
+    { Project = "Project1"; Actor = durableOwner.Value; ProjectId = Guid.NewGuid()
+      LedgerId = Guid.NewGuid(); Epoch = 1; CreationId = Guid.NewGuid() }
+
+let private terminalFixture directory (request: Durable.Request) status =
+    let receipt : Durable.Receipt =
+        { Schema = 1; JobId = request.JobId; Supervisor = { Pid = Environment.ProcessId; Birth = "fixture" }
+          Child = None; Started = true; Status = status; CompletedAt = Some request.StartedAt
+          Events = [{ Sequence = 1L; Stream = JobOutputStream.StdOut; Text = "ordinary output" }]
+          NextSequence = 1L; Truncated = false; CancelError = None }
+    File.WriteAllBytes(Path.Combine(directory, "receipt.json"),
+        System.Text.Json.JsonSerializer.SerializeToUtf8Bytes receipt)
+    receipt
+
+let private withReservationFixture f =
+    let root = createTempProject ()
+    let registry = Durable.root root
+    try f root registry
+    finally
+        Directory.Delete(registry, true)
+        Directory.Delete(root, true)
+
+let private pruneFixture root =
+    listJobsForProjectAsAgent (durableProject ()) durableOwner
+        { ProjectName = Some "Project1"; IncludeCompleted = true } (TestContext root)
+
+let private rejects f =
+    let rejected = try f (); false with _ -> true
+    rejected |> shouldEqual true
+
+[<Test>]
+let ``reserved terminal evidence survives age and count pruning without retaining ordinary output`` () =
+    withReservationFixture (fun root registry ->
+        let aged = reservationRequest root (TimeSpan.FromDays 8.)
+        let directory = Durable.create registry aged
+        let receipt = terminalFixture directory aged (Completed 17)
+        let expected = Durable.terminalEvidence directory aged |> Option.get
+        let exactDigest =
+            System.Security.Cryptography.SHA256.HashData(System.Text.Json.JsonSerializer.SerializeToUtf8Bytes receipt)
+            |> Convert.ToHexString |> fun hex -> hex.ToLowerInvariant()
+        let expectedJson =
+            System.Text.Json.JsonSerializer.Serialize
+                {| schema = "engineering-job-terminal-v1"; jobId = aged.JobId
+                   project = aged.Project; actor = aged.Actor.Value
+                   startedAt = aged.StartedAt.ToString("O"); completedAt = receipt.CompletedAt.Value.ToString("O")
+                   outcome = "Completed(17)"; receiptSha256 = exactDigest |}
+        Durable.terminalEvidenceJson expected |> shouldEqual expectedJson
+
+        let first = reservationScope ()
+        let second = { first with CreationId = Guid.NewGuid() }
+        let acquired = Durable.reserveTerminalDependencies registry first [aged.JobId; aged.JobId]
+        acquired.Jobs.Length |> shouldEqual 1
+        Durable.reserveTerminalDependencies registry first [aged.JobId] |> shouldEqual acquired
+        Durable.reserveTerminalDependencies registry second [aged.JobId] |> ignore
+
+        let recent = [ for i in 1 .. 101 -> reservationRequest root (TimeSpan.FromHours(float i)) ]
+        for job in recent do terminalFixture (Durable.create registry job) job (Completed 0) |> ignore
+        let oldest = List.last recent
+        let third = { first with CreationId = Guid.NewGuid() }
+        Durable.reserveTerminalDependencies registry third [oldest.JobId] |> ignore
+        let expectedOldest =
+            Durable.terminalEvidence (Durable.jobDirectory registry oldest.JobId) oldest |> Option.get
+        let listed = pruneFixture root |> requireOk
+        listed.Jobs |> List.filter (fun job -> job.Kind = JobKind.Process) |> List.length |> shouldEqual 100
+        Directory.Exists directory |> shouldEqual false
+        Directory.Exists(Durable.jobDirectory registry oldest.JobId) |> shouldEqual false
+        durableResult root durableOwner aged.JobId |> Result.isError |> shouldEqual true
+
+        // Reopen from the durable registry, not the original in-memory receipt.
+        let reopened = Durable.root root
+        for scope in [first; second] do
+            Durable.tryReservedTerminalEvidence reopened scope aged.JobId |> shouldEqual (Some expected)
+        Durable.tryReservedTerminalEvidence reopened third oldest.JobId |> shouldEqual (Some expectedOldest)
+        Durable.listTerminalReservations reopened |> List.length |> shouldEqual 3
+        let wrongLedger = { first with LedgerId = Guid.NewGuid() }
+        Durable.tryReservedTerminalEvidence reopened wrongLedger aged.JobId |> shouldEqual None
+        rejects (fun () -> Durable.releaseTerminalDependencies reopened wrongLedger)
+        Durable.releaseTerminalDependencies reopened first
+        Durable.releaseTerminalDependencies reopened first
+        Durable.tryReservedTerminalEvidence reopened first aged.JobId |> shouldEqual None
+        Durable.tryReservedTerminalEvidence reopened second aged.JobId |> shouldEqual (Some expected)
+
+        // A new condition can refer to an existing matching compact proof,
+        // never to evidence that has already disappeared.
+        let fourth = { second with CreationId = Guid.NewGuid() }
+        Durable.reserveTerminalDependencies reopened fourth [aged.JobId] |> ignore
+        Durable.tryReservedTerminalEvidence reopened fourth aged.JobId |> shouldEqual (Some expected)
+        rejects (fun () -> Durable.reserveTerminalDependencies reopened
+                            { wrongLedger with CreationId = Guid.NewGuid() } [aged.JobId] |> ignore)
+        for scope in [second; third; fourth] do Durable.releaseTerminalDependencies reopened scope
+        Durable.listTerminalReservations reopened |> shouldEqual []
+        rejects (fun () -> Durable.reserveTerminalDependencies reopened
+                            { first with CreationId = Guid.NewGuid() } [aged.JobId] |> ignore))
+
+[<Test>]
+let ``reserved unknown job never yields terminal success and later cancellation is captured`` () =
+    withReservationFixture (fun root registry ->
+        let request = reservationRequest root (TimeSpan.FromDays 8.)
+        let directory = Durable.create registry request
+        let scope = reservationScope ()
+        Durable.reserveTerminalDependencies registry scope [request.JobId] |> ignore
+        Durable.tryReservedTerminalEvidence registry scope request.JobId |> shouldEqual None
+        // Explicit prune cannot delete a reserved uncertain original.
+        Durable.withAdmission registry (fun () -> Durable.tryPrune directory) |> shouldEqual false
+        Directory.Exists directory |> shouldEqual true
+        pruneFixture root |> requireOk |> ignore
+        Directory.Exists directory |> shouldEqual true
+        let receipt = terminalFixture directory request Canceled
+        let expected = Durable.terminalEvidence directory request |> Option.get
+        expected.Terminal.Outcome |> shouldEqual "Canceled"
+        expected.Terminal.CompletedAt |> shouldEqual receipt.CompletedAt.Value
+        pruneFixture root |> requireOk |> ignore
+        Directory.Exists directory |> shouldEqual false
+        Durable.tryReservedTerminalEvidence registry scope request.JobId |> shouldEqual (Some expected)
+        Durable.releaseTerminalDependencies registry scope)
+
+[<Test>]
+let ``reservation admission is atomic identity bound idempotent and capacity limited`` () =
+    withReservationFixture (fun root registry ->
+        let first = reservationRequest root TimeSpan.Zero
+        let second = reservationRequest root TimeSpan.Zero
+        Durable.create registry first |> ignore
+        Durable.create registry second |> ignore
+        let scope = reservationScope ()
+        let missing = Guid.NewGuid().ToString("N")
+        rejects (fun () -> Durable.reserveTerminalDependencies registry scope [first.JobId; missing] |> ignore)
+        rejects (fun () -> Durable.reserveTerminalDependencies registry
+                            { scope with Actor = "another actor" } [first.JobId] |> ignore)
+        rejects (fun () -> Durable.reserveTerminalDependencies registry
+                            { scope with Project = "Project2" } [first.JobId] |> ignore)
+        Durable.listTerminalReservations registry |> shouldEqual []
+        let firstRecord = Durable.reserveTerminalDependencies registry scope [first.JobId; second.JobId]
+        Durable.reserveTerminalDependencies registry scope [second.JobId; first.JobId] |> shouldEqual firstRecord
+        rejects (fun () -> Durable.reserveTerminalDependencies registry scope [first.JobId] |> ignore)
+        rejects (fun () -> Durable.reserveTerminalDependencies registry
+                            { scope with Epoch = 2 } [first.JobId; second.JobId] |> ignore)
+        let scopes = [ for _ in 2 .. Durable.maxTerminalReservations -> { scope with CreationId = Guid.NewGuid() } ]
+        for item in scopes do Durable.reserveTerminalDependencies registry item [first.JobId] |> ignore
+        Durable.listTerminalReservations registry |> List.length |> shouldEqual Durable.maxTerminalReservations
+        let extra = { scope with CreationId = Guid.NewGuid() }
+        rejects (fun () -> Durable.reserveTerminalDependencies registry extra [first.JobId] |> ignore)
+        Durable.reserveTerminalDependencies registry scope [first.JobId; second.JobId] |> shouldEqual firstRecord
+        Durable.releaseTerminalDependencies registry (List.head scopes)
+        Durable.reserveTerminalDependencies registry extra [first.JobId] |> ignore
+        Durable.listTerminalReservations registry |> List.length |> shouldEqual Durable.maxTerminalReservations)
+
+[<Test>]
+let ``corrupt reservation fails closed before sole terminal evidence is pruned`` () =
+    withReservationFixture (fun root registry ->
+        let request = reservationRequest root (TimeSpan.FromDays 8.)
+        let directory = Durable.create registry request
+        terminalFixture directory request (Completed 0) |> ignore
+        let scope = reservationScope ()
+        Durable.reserveTerminalDependencies registry scope [request.JobId] |> ignore
+        let reservationPath =
+            Path.Combine(registry, "terminal-reservations-v1", scope.CreationId.ToString("N") + ".json")
+        let bytes = File.ReadAllBytes reservationPath
+        File.WriteAllText(reservationPath, "{")
+        pruneFixture root |> Result.isError |> shouldEqual true
+        Directory.Exists directory |> shouldEqual true
+        rejects (fun () -> Durable.tryReservedTerminalEvidence registry scope request.JobId |> ignore)
+        File.WriteAllBytes(reservationPath, bytes)
+        let expected = Durable.terminalEvidence directory request |> Option.get
+        pruneFixture root |> requireOk |> ignore
+        Directory.Exists directory |> shouldEqual false
+        Durable.tryReservedTerminalEvidence registry scope request.JobId |> shouldEqual (Some expected))
+
+[<Test>]
+let ``reservation prune ordering never publishes a reservation without its retained evidence`` () =
+    withReservationFixture (fun root registry ->
+        // Both admission orders are deterministic and cover the critical
+        // linearization boundary without timing-dependent process launches.
+        for reserveFirst in [true; false] do
+            let request = reservationRequest root (TimeSpan.FromDays 8.)
+            let directory = Durable.create registry request
+            terminalFixture directory request (Completed 0) |> ignore
+            let expected = Durable.terminalEvidence directory request |> Option.get
+            let scope = reservationScope ()
+            if reserveFirst then
+                Durable.reserveTerminalDependencies registry scope [request.JobId] |> ignore
+                pruneFixture root |> requireOk |> ignore
+                Durable.tryReservedTerminalEvidence registry scope request.JobId |> shouldEqual (Some expected)
+                Durable.releaseTerminalDependencies registry scope
+            else
+                pruneFixture root |> requireOk |> ignore
+                rejects (fun () -> Durable.reserveTerminalDependencies registry scope [request.JobId] |> ignore)
+                Durable.tryReservedTerminalEvidence registry scope request.JobId |> shouldEqual None
+            Directory.Exists directory |> shouldEqual false)
+
+[<Test>]
+let ``reservation preserves exact request identity and refuses substituted evidence`` () =
+    withReservationFixture (fun root registry ->
+        let request = reservationRequest root (TimeSpan.FromDays 8.)
+        let directory = Durable.create registry request
+        terminalFixture directory request (Completed 0) |> ignore
+        let scope = reservationScope ()
+        Durable.reserveTerminalDependencies registry scope [request.JobId] |> ignore
+        let path = Path.Combine(directory, "request.json")
+        let bytes = File.ReadAllBytes path
+        let substituted = { request with Executable = "different-command" }
+        File.WriteAllBytes(path, System.Text.Json.JsonSerializer.SerializeToUtf8Bytes substituted)
+        rejects (fun () -> Durable.tryReservedTerminalEvidence registry scope request.JobId |> ignore)
+        pruneFixture root |> Result.isError |> shouldEqual true
+        Directory.Exists directory |> shouldEqual true
+        File.WriteAllBytes(path, bytes)
+        let expected = Durable.terminalEvidence directory request |> Option.get
+        pruneFixture root |> requireOk |> ignore
+        Durable.tryReservedTerminalEvidence registry scope request.JobId |> shouldEqual (Some expected))

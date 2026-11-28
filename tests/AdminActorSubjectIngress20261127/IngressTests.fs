@@ -284,6 +284,17 @@ let private runCase action mode = task {
             do! store.RecordAgentActivity("alice", project, subject, seeded)
             let! before = verifiedActivity subject
             Assert.That(before.LastSeenAtUtc, Is.EqualTo(Some seeded), "Fixture must establish an authenticated persisted baseline.")
+            // Explicit controls must preserve the state before any administrative ingress.
+            let explicitBaseline =
+                if mode = "explicit" then
+                    let snapshot = LedgerStore.fetch second |> success
+                    let caller = ReviewWorkflow.getAgentWorkingTurnAt second snapshot initiator |> success
+                    let alerts =
+                        if not scenario.ShouldApply then
+                            Some (ReviewWorkflow.getResponseAlertsAt second snapshot subject |> success)
+                        else None
+                    Some(snapshot, caller, alerts)
+                else None
             let! denied, deniedRaw = call "alice" "workspace:read" scenario.Route originalArgs
             Assert.That(denied, Is.True, deniedRaw)
             Assert.That(captures.IsEmpty, Is.True, "Missing write scope must not reach SignalR.")
@@ -297,20 +308,13 @@ let private runCase action mode = task {
             TestContext.WriteLine(sprintf "%s: job actor=%s transport actor=%s canonical=%s" action job.AgentId transportedActor json)
             let! after = verifiedActivity subject
             let! otherDenied, otherRaw = poll "alice" unrelated project job.JobId
-            // Operator override permits project-scoped reads by another label.
-            // Keep its independent RED separate from actor-attribution assertions
-            // on this older frozen baseline.
-            if mode = "readOverride" then
-                Assert.That(otherDenied, Is.False, "Project-scoped read must not be gated by agent label: " + otherRaw)
-            if not otherDenied then
-                Assert.That((parseFirstLine<JobResult> otherRaw).JobId, Is.EqualTo(job.JobId))
-            else
-                TestContext.WriteLine("Pinned baseline cross-label read rejected: " + otherRaw)
+            Assert.That(otherDenied, Is.True, otherRaw)
+            Assert.That(otherRaw, Does.Contain("ValidationFailed: Tool job belongs to another initiating agent"), "Unrelated actors must not read private jobs.")
             let! cancelDenied, cancelRaw =
                 call "alice" (scopes + " process:execute") "cancel_job"
                     ["projectName", box project; "agentId", box unrelated; "deviceId", box device; "jobId", box job.JobId]
             Assert.That(cancelDenied, Is.True, cancelRaw)
-            Assert.That(cancelRaw, Does.Contain("another initiating agent"), "Read override must not grant cancellation.")
+            Assert.That(cancelRaw, Does.Contain("another initiating agent"), "Unrelated actors must not cancel private jobs.")
             let! wrongProjectDenied, wrongProjectRaw = poll "alice" transportedActor "UnknownFixtureProject" job.JobId
             Assert.That(wrongProjectDenied, Is.True, wrongProjectRaw)
             let! wrongPrincipalDenied, wrongPrincipalRaw = poll "bob" transportedActor project job.JobId
@@ -363,24 +367,29 @@ let private runCase action mode = task {
                     let! changedFailed, changedRaw = call "alice" scopes scenario.Route changedArgs
                     Assert.That(changedFailed, Is.True, changedRaw)
                 Assert.That(Volatile.Read(&executions), Is.EqualTo(1))
-            // Snapshot after the already-observed legacy ingress/duplicate effects,
-            // while the actual dispatcher is still gated. Rejection must add
-            // no canonical bytes, versions, alert consumption or activity.
-            // This does NOT claim that legacy ingress attribution was correct.
-            let invalidControl = mode = "control" && not scenario.ShouldApply
+            // Legacy control baseline follows the known ingress/duplicate effects.
+            // Explicit negative controls instead preserve the pre-ingress baseline.
             let! rejectionBaseline = task {
-                if invalidControl then
+                if not scenario.ShouldApply && mode = "control" then
                     let snapshot = LedgerStore.fetch second |> success
                     let alerts = ReviewWorkflow.getResponseAlertsAt second snapshot subject |> success
                     let! activity = verifiedActivity subject
                     return Some(snapshot, alerts, activity.LastSeenAtUtc)
+                elif not scenario.ShouldApply && mode = "explicit" then
+                    let snapshot, _, alerts = explicitBaseline.Value
+                    return Some(snapshot, alerts.Value, before.LastSeenAtUtc)
                 else return None
             }
             gate.TrySetResult(()) |> ignore
             let! response = finished.Task.WaitAsync(TimeSpan.FromSeconds(35.))
             let _, receipt = LedgerStore.getOperationStatus second (Guid.Parse operation) |> success
             TestContext.WriteLine(sprintf "terminal error=%A, receipt=%A, target activity=%A" response.Error (receipt |> Option.map (fun r -> r.Type)) after.LastSeenAtUtc)
-            if mode = "control" then
+            if mode = "explicit" then
+                Assert.That(transportedActor, Is.EqualTo(initiator))
+                Assert.That(job.AgentId, Is.EqualTo(initiator))
+                Assert.That(json, Is.EqualTo(canonical), "Explicit actor must not change canonical subject or request bytes.")
+                Assert.That(after.LastSeenAtUtc, Is.EqualTo(before.LastSeenAtUtc))
+            if mode = "control" || mode = "explicit" then
                 let expectedStatus =
                     if scenario.ShouldApply then ToolCompleted
                     else
@@ -406,7 +415,46 @@ let private runCase action mode = task {
                     Assert.That(response.Error.IsNone, Is.True, sprintf "%A" response.Error)
                     Assert.That(receipt.IsSome, Is.True, "Applied route must have canonical receipt.")
                     Assert.That(receipt.Value.Type, Is.EqualTo(action))
-                    if action = "AssignTask" then
+                    if mode = "explicit" then
+                        Assert.That(response.Result.IsSome, Is.True, "Applied response must include its result.")
+                        Assert.That(response.PendingJob.IsNone, Is.True)
+                        Assert.That(result.JobId, Is.EqualTo(job.JobId))
+                        Assert.That(result.OperationId, Is.EqualTo(job.OperationId))
+                        Assert.That(result.ToolResponse.Value, Is.EqualTo(response))
+                        Assert.That(Guid.Parse receipt.Value.OperationId, Is.EqualTo(Guid.Parse operation))
+                        let snapshotBefore, callerBefore, _ = explicitBaseline.Value
+                        let snapshot = LedgerStore.fetch second |> success
+                        let callerAfter = ReviewWorkflow.getAgentWorkingTurnAt second snapshot initiator |> success
+                        Assert.That(callerAfter, Is.EqualTo(callerBefore), "Administrative operation must not mutate the initiator's canonical record.")
+                        let target = ReviewWorkflow.getAgentWorkingTurnAt second snapshot subject |> success
+                        if action = "RegisterAgent" then
+                            Assert.That(target.AgentId, Is.EqualTo(subject))
+                            Assert.That(target.Version, Is.EqualTo(1))
+                            Assert.That(target.State, Is.EqualTo("Parked"))
+                            Assert.That(box target.CurrentAssignment, Is.Null)
+                        else
+                            let _, current = ReviewWorkflow.getTaskAt second snapshot taskId |> success
+                            let attempt = current.Value
+                            Assert.That(attempt.OwnerAgentId, Is.EqualTo(subject))
+                            Assert.That(attempt.Phase, Is.EqualTo("Queued"))
+                            Assert.That(target.State, Is.EqualTo("Ready"))
+                            Assert.That(target.CurrentAssignment.TaskId, Is.EqualTo(taskId))
+                            Assert.That(target.FocusAttemptId, Is.EqualTo(attempt.AttemptId))
+                            Assert.That(target.ActiveAttemptId, Is.Null)
+                            match action with
+                            | "AssignTask" | "TransferOwner" ->
+                                Assert.That(Guid.Parse attempt.AttemptId, Is.EqualTo(Guid.Parse scenario.Expected.AttemptId))
+                                Assert.That(attempt.AssignmentGeneration, Is.EqualTo(1))
+                                if action = "TransferOwner" then
+                                    let previous = ReviewWorkflow.getAgentWorkingTurnAt second snapshot "PreviousOwner" |> success
+                                    Assert.That(box previous.CurrentAssignment, Is.Null)
+                                    Assert.That(previous.State, Is.Not.EqualTo("Working"))
+                            | "ReissueAssignment" | "RecoverAgentAssignment" ->
+                                let _, prior = ReviewWorkflow.getTaskAt second snapshotBefore taskId |> success
+                                Assert.That(attempt.AttemptId, Is.EqualTo(prior.Value.AttemptId))
+                                Assert.That(attempt.AssignmentGeneration, Is.EqualTo(prior.Value.AssignmentGeneration + 1))
+                            | _ -> failwithf "No authorized successful explicit control for %s" action
+                    elif action = "AssignTask" then
                         let _, _, attempt = ReviewWorkflow.getTask second taskId |> success
                         Assert.That(attempt.Value.OwnerAgentId, Is.EqualTo(subject))
                         let snapshot = LedgerStore.fetch second |> success
@@ -427,22 +475,18 @@ let private runCase action mode = task {
                     let! activityAfter = verifiedActivity subject
                     Assert.That(activityAfter.LastSeenAtUtc, Is.EqualTo(activityBefore), "Rejected dispatch must not additionally change subject activity.")
                     Assert.That(Volatile.Read(&executions), Is.EqualTo(1))
+                if mode = "explicit" then
+                    let! activityAfter = verifiedActivity subject
+                    Assert.That(activityAfter.LastSeenAtUtc, Is.EqualTo(before.LastSeenAtUtc))
+                    if action <> "RegisterAgent" then
+                        let alerts = ReviewWorkflow.getResponseAlerts second subject |> success
+                        Assert.That(alerts.Pending |> List.length, Is.EqualTo(1), "Subject alert was consumed by caller.")
             elif mode = "legacy" then
                 // Desired legacy invariant: subject-only input does not establish
                 // an agent owner or activity. This is intentionally RED on baseline.
                 Assert.That(transportedActor, Is.Not.EqualTo(subject), "Legacy administrative subject became initiating transport actor.")
                 Assert.That(job.AgentId, Is.Not.EqualTo(subject), "Subject must never own caller's promoted job.")
                 Assert.That(after.LastSeenAtUtc, Is.EqualTo(before.LastSeenAtUtc), "Administrative subject is not caller activity.")
-            elif mode = "explicit" then
-                Assert.That(transportedActor, Is.EqualTo(initiator))
-                Assert.That(job.AgentId, Is.EqualTo(initiator))
-                Assert.That(json, Is.EqualTo(canonical), "Explicit actor must not change canonical subject or request bytes.")
-                Assert.That(after.LastSeenAtUtc, Is.EqualTo(before.LastSeenAtUtc))
-                let! result = terminal ToolCompleted initiator job.JobId (DateTimeOffset.UtcNow.AddSeconds(15.))
-                Assert.That(result.ToolResponse.IsSome, Is.True)
-                if action <> "RegisterAgent" then
-                    let alerts = ReviewWorkflow.getResponseAlerts second subject |> success
-                    Assert.That(alerts.Pending |> List.length, Is.EqualTo(1), "Subject alert was consumed by caller.")
         finally
             // Release the synthetic gate even if a RED assertion fires before completion.
             gate.TrySetResult(()) |> ignore
@@ -463,6 +507,3 @@ let legacy_subject_must_not_own_caller_job_or_activity action = runCase action "
 
 [<TestCase("RegisterAgent"); TestCase("AssignTask"); TestCase("ReissueAssignment"); TestCase("AdoptTaskSpec"); TestCase("ReissueQueuedAttempt"); TestCase("RecoverAgentAssignment"); TestCase("TransferOwner"); NonParallelizable; Category("KnownDefect")>]
 let explicit_initiator_and_subject_must_preserve_wire_and_job_privacy action = runCase action "explicit"
-
-[<Test; NonParallelizable; Category("ReadOverride")>]
-let project_scoped_job_read_must_not_require_owner_label () = runCase "AssignTask" "readOverride"

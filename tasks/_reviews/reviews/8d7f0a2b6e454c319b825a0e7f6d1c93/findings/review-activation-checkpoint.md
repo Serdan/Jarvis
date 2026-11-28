@@ -39,8 +39,9 @@ Review request: `8d7f0a2b6e454c319b825a0e7f6d1c93`.
 ## Lifecycle reconciliation
 
 - A `yield_agent` request for pseudo-task `_reviews` was attempted with operation ID `912e9c3e-af23-4b41-9b70-b5a87f8608e1`; its initial result was `RemoteUnavailable` and did not establish success.
-- Canonical `get_operation_status` for that exact ID returned pending read job `e8ec83e4c5994e3a853b27b55abdb582`; one `get_job_result` read reported `Running`. Do not retry the original yield request. Reconcile this exact status-read handle and original operation ID before any new lifecycle action.
+- Canonical `get_operation_status` for that exact ID completed with `NotFoundAtVerifiedHead`; `inspect_pending_operation` also reported `PresentLocally=false`, with no disposition or record.
+- Retrying the identical request with the same operation ID failed closed with `StaleEntityVersion: Missing ledger entity tasks/_reviews/task.json`. `_reviews` is a review namespace, not a task assignment; do not retry `yield_agent` against it or invent a task ID. The review remains claimed and must be resumed through the existing review request.
 
 ## Continuation
 
-First reconcile yield operation `912e9c3e-af23-4b41-9b70-b5a87f8608e1` using the existing status-read handle; do not assume yield succeeded. Then, when engineering job `b6bbc19564204ab9931551688ecb5e11` is terminal, retrieve its result once and compare it with the independently verified prior TRX. If the run matches and the review claim remains active, record the final review summary and decide Accepted or ChangesRequested for exact head `7035fe2bc2463c6a8d754a83964166a9a88386c5`. Keep quick/slow/terminal/unknown and concurrent AsyncLocal isolation explicitly unqualified; do not edit source, merge, or authorize Stage B.
+Resume the existing claimed review only; do not claim another review. Do not poll or rerun engineering job `b6bbc19564204ab9931551688ecb5e11` while running. When terminal evidence becomes available, retrieve it exactly once and compare it with the independently verified prior TRX. If it matches and static review remains clean, record the final review summary and decide Accepted or ChangesRequested for exact head `7035fe2bc2463c6a8d754a83964166a9a88386c5`. Keep quick/slow/terminal/unknown and concurrent AsyncLocal isolation explicitly unqualified; do not edit source, merge, or authorize Stage B.
